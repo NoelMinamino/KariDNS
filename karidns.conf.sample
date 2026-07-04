@@ -1,0 +1,48 @@
+options {
+    port 53;
+    
+    // リッスンするIPアドレス (IPv4 / IPv6)
+    bind-address { 0.0.0.0; ::; };
+    
+    // 起動後にドロップする特権ユーザーとグループ
+    user "named";
+    group "named";
+};
+
+logging {
+    channel queries_log {
+        // 容量ベースのローテーション (10MBを超えたらローテーション、3世代保存)
+        file "/var/log/named/queries.log" versions 3 size 10M;
+        
+        // 日付ベース(日次)ローテーションの場合は以下を使用:
+        // file "/var/log/named/queries.log" versions 3 suffix timestamp;
+        
+        print-time yes;
+        print-category yes;
+        print-severity yes;
+    };
+    category queries { queries_log; };
+};
+
+// ゾーン転送(AXFR)やNOTIFYで使用するTSIGキー
+key "tsig-key-example" {
+    algorithm "hmac-sha256";
+    secret "BASE64_ENCODED_SECRET_HERE=";
+};
+
+// マスターゾーンの定義
+zone "example.com" {
+    type master;
+    file "/usr/local/etc/namedb/master/example.com.zone";
+    allow-transfer { 192.168.1.100; };
+    also-notify { 192.168.1.100 port 53; };
+    notify-source "192.168.1.1";
+};
+
+// スレーブゾーンの定義
+zone "slave.example.net" {
+    type slave;
+    file "/usr/local/etc/namedb/slave/slave.example.net.zone";
+    masters { 10.0.0.1 port 53; };
+    tsig-key "tsig-key-example";
+};
