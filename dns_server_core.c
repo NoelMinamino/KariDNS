@@ -3113,6 +3113,7 @@ static void write_query_log(const char *client_ip, int client_port, const char *
                        client_ip, client_port, qname, qname, class_str, type_str, edns_str);
                        
     if (len <= 0) return;
+    if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1; // snprintfの戻り値は切り詰め前の必要長を返すため、write()に渡す前にクランプする
     
     pthread_mutex_lock(&ch->lock);
     
