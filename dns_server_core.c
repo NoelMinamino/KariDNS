@@ -31,7 +31,7 @@
 #include <grp.h>
 #include <poll.h>
 
-// my_dns
+// karidns
 // Copyright (c) 2026 Noel Minamino
 // Lisence: MIT
 // All codes are developed by Gemini Pro, Claude Sonnet with Human Idea and test.
