@@ -32,6 +32,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
+
 // karidns
 // Copyright (c) 2026 Noel Minamino
 // Lisence: MIT
@@ -46,12 +48,6 @@
 #define BUFFER_SIZE 4096
 
 #define MAX_FIELDS 64
-#define MAX_RDATA 48
-#define MAX_JUMPS 16
-
-#define COMPRESS_HASH_SIZE 4096
-#define COMPRESS_HASH_MASK (COMPRESS_HASH_SIZE - 1)
-#define MAX_PROBE_DEPTH 8
 
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t')
 #define IS_NEWLINE(c) ((c) == '\n' || (c) == '\r')
@@ -72,20 +68,8 @@ typedef struct {
 // 2. データ構造定義
 // ============================================================================
 
-typedef struct {
-  char *name;
-  char *ttl;
-  char *class_str;
-  char *type;
-  uint16_t type_code;
-  char *rdata[MAX_RDATA];
-  int rdata_count;
-  uint16_t generic_len;
-  uint8_t *generic_data;
-  int next_record;
-} dns_record_t;
-
-typedef struct {
+// Zoneデータメモリプール (アリーナ)
+typedef struct zone_arena_s {
   dns_record_t *records;
   size_t count;
   size_t records_cap;
@@ -120,16 +104,7 @@ typedef struct {
   _Atomic(int) active_axfr;
 } zone_db_entry_t;
 
-typedef struct {
-  uint32_t hash;
-  uint16_t offset;
-  uint16_t generation;
-} compress_entry_t;
-typedef struct {
-  compress_entry_t table[COMPRESS_HASH_SIZE];
-  uint16_t current_generation;
-} compress_ctx_t;
-
+// TCPストリーム解析ステート
 typedef enum { TCP_STATE_READ_LEN, TCP_STATE_READ_BODY } tcp_state_t;
 typedef struct {
   tcp_state_t state;
@@ -167,15 +142,6 @@ typedef struct zone_config {
   int allow_transfer_count;
   struct zone_config *next;
 } zone_config_t;
-
-typedef struct tsig_key {
-  char *name;
-  char *algorithm;
-  char *secret;
-  uint8_t secret_decoded[256];
-  size_t secret_decoded_len;
-  struct tsig_key *next;
-} tsig_key_t;
 
 typedef struct log_channel {
   char *name;
@@ -579,7 +545,7 @@ static void enter_capsicum_sandbox(void) {
 }
 
 // ============================================================================
-// 3. パーサー・各種ユーティリティ (中略なし・既存実装維持)
+// 3. パーサー・各種ユーティリティ
 // ============================================================================
 
 static void skip_spaces_and_comments(token_ctx_t *ctx) {
@@ -791,9 +757,7 @@ static bool match_cidr(const char *client_ip_str, const char *cidr_str) {
   return false;
 }
 
-static int parse_string_list(token_ctx_t *ctx, char ***list, int *count,
-                             const char *dir_name) {
-  (void)dir_name;
+static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
   token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_token(&tok);
@@ -830,9 +794,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count,
   return 0;
 }
 
-static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count,
-                              const char *dir_name) {
-  (void)dir_name;
+static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
   token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_token(&tok);
@@ -955,8 +917,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             ctx.pos = saved_pos;
             free_token(&tok);
             if (parse_string_list(&ctx, &config->bind_addresses,
-                                  &config->bind_address_count,
-                                  "bind-address") != 0) {
+                                  &config->bind_address_count) != 0) {
               free(key);
               return -1;
             }
@@ -1031,24 +992,22 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         char *key = strdup(tok.value);
         free_token(&tok);
         if (strcmp(key, "masters") == 0) {
-          if (parse_ip_port_list(&ctx, &zone->masters, &zone->masters_count,
-                                 "masters") != 0) {
+          if (parse_ip_port_list(&ctx, &zone->masters, &zone->masters_count) !=
+              0) {
             free(key);
             free_zone_config(zone);
             return -1;
           }
         } else if (strcmp(key, "also-notify") == 0) {
           if (parse_ip_port_list(&ctx, &zone->also_notify,
-                                 &zone->also_notify_count,
-                                 "also-notify") != 0) {
+                                 &zone->also_notify_count) != 0) {
             free(key);
             free_zone_config(zone);
             return -1;
           }
         } else if (strcmp(key, "allow-transfer") == 0) {
           if (parse_string_list(&ctx, &zone->allow_transfer,
-                                &zone->allow_transfer_count,
-                                "allow-transfer") != 0) {
+                                &zone->allow_transfer_count) != 0) {
             free(key);
             free_zone_config(zone);
             return -1;
@@ -1586,7 +1545,7 @@ static int hex_char_to_val(char c) {
   return -1;
 }
 
-static inline void *arena_alloc(zone_arena_t *arena, size_t size) {
+void *arena_alloc(zone_arena_t *arena, size_t size) {
   if (arena->current_pool_idx + size > arena->current_pool_cap ||
       arena->data_pool_count == 0) {
     if (arena->data_pool_count >= 128)
@@ -2075,319 +2034,6 @@ void load_zones_from_config(server_config_t *config) {
   }
 }
 
-static inline void compress_ctx_init_packet(compress_ctx_t *ctx) {
-  ctx->current_generation++;
-  if (ctx->current_generation == 0) {
-    memset(ctx->table, 0, sizeof(ctx->table));
-    ctx->current_generation = 1;
-  }
-}
-static inline uint32_t calc_fnv1a_suffix(const uint8_t *name) {
-  uint32_t hash = 2166136261u;
-  const uint8_t *p = name;
-  while (*p != 0) {
-    uint8_t len = *p++;
-    hash ^= len;
-    hash *= 16777619u;
-    for (uint8_t i = 0; i < len; i++) {
-      uint8_t c = *p++;
-      if (c >= 'A' && c <= 'Z')
-        c |= 0x20;
-      hash ^= c;
-      hash *= 16777619u;
-    }
-  }
-  return hash;
-}
-static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset,
-                                 const uint8_t *name) {
-  const uint8_t *p = packet_buf + offset, *n = name;
-  int jump_count = 0;
-  while (*n != 0) {
-    if ((*p & 0xC0) == 0xC0) {
-      if (++jump_count > MAX_JUMPS)
-        return false;
-      uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
-      if (next_offset >= offset)
-        return false;
-      offset = next_offset;
-      p = packet_buf + offset;
-      continue;
-    }
-    if (*p != *n)
-      return false;
-    uint8_t len = *p;
-    p++;
-    n++;
-    for (uint8_t i = 0; i < len; i++) {
-      uint8_t c1 = *p++, c2 = *n++;
-      if (c1 >= 'A' && c1 <= 'Z')
-        c1 |= 0x20;
-      if (c2 >= 'A' && c2 <= 'Z')
-        c2 |= 0x20;
-      if (c1 != c2)
-        return false;
-    }
-  }
-  jump_count = 0;
-  while ((*p & 0xC0) == 0xC0) {
-    if (++jump_count > MAX_JUMPS)
-      return false;
-    uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
-    if (next_offset >= offset)
-      return false;
-    offset = next_offset;
-    p = packet_buf + offset;
-  }
-  return *p == 0;
-}
-
-int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name,
-                  compress_ctx_t *ctx) {
-  const uint8_t *s = name;
-  while (*s != 0) {
-    if (*offset >= 0x3FFF)
-      return -1;
-    uint32_t hash = calc_fnv1a_suffix(s), idx = hash & COMPRESS_HASH_MASK;
-    for (int i = 0; i < MAX_PROBE_DEPTH; i++) {
-      compress_entry_t *entry = &ctx->table[(idx + i) & COMPRESS_HASH_MASK];
-      if (entry->generation != ctx->current_generation)
-        break;
-      if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, s)) {
-        uint16_t ptr = 0xC000 | entry->offset;
-        packet_buf[(*offset)++] = ptr >> 8;
-        packet_buf[(*offset)++] = ptr & 0xFF;
-        return 0;
-      }
-    }
-    for (int i = 0; i < MAX_PROBE_DEPTH; i++) {
-      compress_entry_t *entry = &ctx->table[(idx + i) & COMPRESS_HASH_MASK];
-      if (entry->generation != ctx->current_generation) {
-        entry->generation = ctx->current_generation;
-        entry->hash = hash;
-        entry->offset = *offset;
-        break;
-      }
-    }
-    uint8_t len = *s;
-    packet_buf[(*offset)++] = *s++;
-    for (uint8_t i = 0; i < len; i++)
-      packet_buf[(*offset)++] = *s++;
-  }
-  packet_buf[(*offset)++] = 0;
-  return 0;
-}
-
-int skip_wire_name(const uint8_t *packet, size_t packet_len,
-                   size_t current_offset, size_t *next_offset) {
-  size_t p = current_offset;
-  int jump_count = 0;
-  bool jumped = false;
-  size_t jumped_offset = 0;
-  while (1) {
-    if (p >= packet_len)
-      return -1;
-    uint8_t len = packet[p];
-    if ((len & 0xC0) == 0xC0) {
-      if (p + 1 >= packet_len)
-        return -1;
-      if (++jump_count > MAX_JUMPS)
-        return -1;
-      uint16_t ptr = ((len & 0x3F) << 8) | packet[p + 1];
-      if (!jumped) {
-        jumped_offset = p + 2;
-        jumped = true;
-      }
-      if (ptr >= p && jumped)
-        return -1;
-      p = ptr;
-      continue;
-    }
-    if (len == 0) {
-      p++;
-      break;
-    }
-    p += 1 + len;
-  }
-  *next_offset = jumped ? jumped_offset : p;
-  return 0;
-}
-
-int expand_wire_name(const uint8_t *packet, size_t packet_len,
-                     size_t current_offset, size_t *next_offset,
-                     zone_arena_t *arena, char **name_out) {
-  size_t p = current_offset, jumped_offset = 0;
-  bool jumped = false;
-  int jump_count = 0;
-  char buf[256];
-  size_t written = 0;
-  while (1) {
-    if (p >= packet_len)
-      return -1;
-    uint8_t len = packet[p];
-    if ((len & 0xC0) == 0xC0) {
-      if (p + 1 >= packet_len || ++jump_count > MAX_JUMPS)
-        return -1;
-      uint16_t ptr = ((len & 0x3F) << 8) | packet[p + 1];
-      if (!jumped) {
-        jumped_offset = p + 2;
-        jumped = true;
-      }
-      if (ptr >= p && jumped)
-        return -1;
-      p = ptr;
-      continue;
-    }
-    p++;
-    if (len == 0) {
-      if (written == 0 || buf[written - 1] != '.') {
-        if (written >= 256)
-          return -1;
-        buf[written++] = '.';
-      }
-      buf[written++] = '\0';
-      break;
-    }
-    if (written > 0 && buf[written - 1] != '.') {
-      if (written >= 256)
-        return -1;
-      buf[written++] = '.';
-    }
-    if (written + len >= 256)
-      return -1;
-    memcpy(&buf[written], &packet[p], len);
-    written += len;
-    p += len;
-  }
-  *next_offset = jumped ? jumped_offset : p;
-  char *dst = arena_alloc(arena, written);
-  if (!dst)
-    return -1;
-  memcpy(dst, buf, written);
-  *name_out = dst;
-  return 0;
-}
-
-static const char *get_type_str(uint16_t type, zone_arena_t *arena) {
-  switch (type) {
-  case 1:
-    return "A";
-  case 2:
-    return "NS";
-  case 5:
-    return "CNAME";
-  case 6:
-    return "SOA";
-  case 15:
-    return "MX";
-  case 16:
-    return "TXT";
-  case 28:
-    return "AAAA";
-  case 33:
-    return "SRV";
-  case 250:
-    return "TSIG";
-  case 252:
-    return "AXFR";
-  default: {
-    if (arena == NULL) {
-      static __thread char tl_buf[16];
-      snprintf(tl_buf, 16, "TYPE%d", type);
-      return tl_buf;
-    }
-    char *buf = arena_alloc(arena, 16);
-    if (buf)
-      snprintf(buf, 16, "TYPE%d", type);
-    return buf ? buf : "UNKNOWN";
-  }
-  }
-}
-
-int parse_resource_record(const uint8_t *packet, size_t packet_len,
-                          size_t *offset, zone_arena_t *arena,
-                          dns_record_t *rec, uint16_t *type_out) {
-  char *name;
-  if (expand_wire_name(packet, packet_len, *offset, offset, arena, &name) != 0)
-    return -1;
-  rec->name = name;
-  if (*offset + 10 > packet_len)
-    return -1;
-  uint16_t type = (packet[*offset] << 8) | packet[*offset + 1];
-  uint16_t class_val = (packet[*offset + 2] << 8) | packet[*offset + 3];
-  uint32_t ttl = ((uint32_t)packet[*offset + 4] << 24) |
-                 ((uint32_t)packet[*offset + 5] << 16) |
-                 ((uint32_t)packet[*offset + 6] << 8) | packet[*offset + 7];
-  uint16_t rdlen = (packet[*offset + 8] << 8) | packet[*offset + 9];
-  *offset += 10;
-  if (*offset + rdlen > packet_len)
-    return -1;
-  *type_out = type;
-  rec->type_code = type;
-  rec->class_str = (class_val == 1) ? "IN" : "CH";
-  rec->type = (char *)get_type_str(type, arena);
-  char *ttl_buf = arena_alloc(arena, 16);
-  if (!ttl_buf)
-    return -1;
-  snprintf(ttl_buf, 16, "%u", ttl);
-  rec->ttl = ttl_buf;
-  rec->rdata_count = 0;
-  if (type == 6) {
-    size_t rdata_p = *offset;
-    char *mname, *rname;
-    if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena,
-                         &mname) != 0)
-      return -1;
-    if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena,
-                         &rname) != 0)
-      return -1;
-    rec->rdata[0] = mname;
-    rec->rdata[1] = rname;
-    rec->rdata_count = 2;
-    for (int j = 0; j < 5; j++) {
-      if (rdata_p + 4 > *offset + rdlen)
-        return -1;
-      uint32_t val = ((uint32_t)packet[rdata_p] << 24) |
-                     ((uint32_t)packet[rdata_p + 1] << 16) |
-                     ((uint32_t)packet[rdata_p + 2] << 8) | packet[rdata_p + 3];
-      char *val_buf = arena_alloc(arena, 16);
-      if (!val_buf)
-        return -1;
-      snprintf(val_buf, 16, "%u", val);
-      rec->rdata[rec->rdata_count++] = val_buf;
-      rdata_p += 4;
-    }
-  } else if (type == 1) {
-    if (rdlen != 4)
-      return -1;
-    char *ip_buf = arena_alloc(arena, 16);
-    if (!ip_buf)
-      return -1;
-    snprintf(ip_buf, 16, "%d.%d.%d.%d", packet[*offset], packet[*offset + 1],
-             packet[*offset + 2], packet[*offset + 3]);
-    rec->rdata[0] = ip_buf;
-    rec->rdata_count = 1;
-  } else if (type == 2 || type == 5 || type == 12) {
-    size_t rdata_p = *offset;
-    char *target;
-    if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena,
-                         &target) != 0)
-      return -1;
-    rec->rdata[0] = target;
-    rec->rdata_count = 1;
-  } else {
-    uint8_t *blob = (uint8_t *)arena_alloc(arena, rdlen);
-    if (!blob)
-      return -1;
-    memcpy(blob, &packet[*offset], rdlen);
-    rec->generic_data = blob;
-    rec->generic_len = rdlen;
-    rec->rdata_count = 0;
-  }
-  *offset += rdlen;
-  return 0;
-}
-
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
                          uint16_t *len_out) {
   while (1) {
@@ -2583,309 +2229,6 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
   return 0;
 }
 
-static int const_time_memcmp(const void *a, const void *b, size_t len) {
-  const unsigned char *p1 = a;
-  const unsigned char *p2 = b;
-  unsigned char res = 0;
-  for (size_t i = 0; i < len; i++)
-    res |= p1[i] ^ p2[i];
-  return res == 0 ? 0 : 1;
-}
-static size_t write_uncompressed_name(uint8_t *buf, const char *name) {
-  size_t w_len = 0;
-  const char *p = name;
-  while (*p) {
-    const char *dot = strchr(p, '.');
-    if (!dot) {
-      size_t len = strlen(p);
-      buf[w_len++] = len;
-      for (size_t i = 0; i < len; i++)
-        buf[w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
-      break;
-    } else {
-      size_t len = dot - p;
-      if (len > 0) {
-        buf[w_len++] = len;
-        for (size_t i = 0; i < len; i++)
-          buf[w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
-      }
-      p = dot + 1;
-    }
-  }
-  buf[w_len++] = 0;
-  return w_len;
-}
-
-int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len,
-                     tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac,
-                     size_t *prior_mac_len) {
-  if (!key || *packet_len + 512 > max_len)
-    return -1;
-  size_t pre_mac_len = *packet_len;
-  size_t pre_mac_cap =
-      pre_mac_len + 512 + (key->algorithm ? strlen(key->algorithm) : 11) +
-      strlen(key->name) +
-      (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0);
-  uint8_t *pre_mac = malloc(pre_mac_cap);
-  if (!pre_mac)
-    return -1;
-  size_t offset = 0;
-  if (prior_mac_len && *prior_mac_len > 0) {
-    pre_mac[offset++] = *prior_mac_len >> 8;
-    pre_mac[offset++] = *prior_mac_len & 0xFF;
-    memcpy(&pre_mac[offset], prior_mac, *prior_mac_len);
-    offset += *prior_mac_len;
-  }
-  memcpy(&pre_mac[offset], packet, pre_mac_len);
-  offset += pre_mac_len;
-  offset += write_uncompressed_name(&pre_mac[offset], key->name);
-  pre_mac[offset++] = 0x00;
-  pre_mac[offset++] = 0xFF;
-  pre_mac[offset++] = 0x00;
-  pre_mac[offset++] = 0x00;
-  pre_mac[offset++] = 0x00;
-  pre_mac[offset++] = 0x00;
-  const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-  offset += write_uncompressed_name(&pre_mac[offset], alg);
-  uint64_t now = time(NULL);
-  pre_mac[offset++] = 0;
-  pre_mac[offset++] = 0;
-  pre_mac[offset++] = (now >> 24) & 0xFF;
-  pre_mac[offset++] = (now >> 16) & 0xFF;
-  pre_mac[offset++] = (now >> 8) & 0xFF;
-  pre_mac[offset++] = now & 0xFF;
-  uint16_t fudge = 300;
-  pre_mac[offset++] = fudge >> 8;
-  pre_mac[offset++] = fudge & 0xFF;
-  pre_mac[offset++] = tsig_error >> 8;
-  pre_mac[offset++] = tsig_error & 0xFF;
-  if (tsig_error == 18) {
-    pre_mac[offset++] = 0;
-    pre_mac[offset++] = 6;
-    uint64_t now_48 = time(NULL);
-    pre_mac[offset++] = (now_48 >> 40) & 0xFF;
-    pre_mac[offset++] = (now_48 >> 32) & 0xFF;
-    pre_mac[offset++] = (now_48 >> 24) & 0xFF;
-    pre_mac[offset++] = (now_48 >> 16) & 0xFF;
-    pre_mac[offset++] = (now_48 >> 8) & 0xFF;
-    pre_mac[offset++] = now_48 & 0xFF;
-  } else {
-    pre_mac[offset++] = 0;
-    pre_mac[offset++] = 0;
-  }
-  unsigned int mac_len = 0;
-  unsigned char mac[EVP_MAX_MD_SIZE];
-  if (key->secret_decoded_len > 0) {
-    const EVP_MD *evp_md = EVP_sha256();
-    if (strstr(alg, "sha1"))
-      evp_md = EVP_sha1();
-    else if (strstr(alg, "sha512"))
-      evp_md = EVP_sha512();
-    else if (strstr(alg, "md5"))
-      evp_md = EVP_md5();
-    HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, offset,
-         mac, &mac_len);
-  }
-  free(pre_mac);
-  if (prior_mac_len && prior_mac) {
-    *prior_mac_len = mac_len;
-    if (mac_len > 0)
-      memcpy(prior_mac, mac, mac_len);
-  }
-  size_t p_offset = *packet_len;
-  p_offset += write_uncompressed_name(&packet[p_offset], key->name);
-  packet[p_offset++] = 0x00;
-  packet[p_offset++] = 250;
-  packet[p_offset++] = 0x00;
-  packet[p_offset++] = 0xFF;
-  packet[p_offset++] = 0x00;
-  packet[p_offset++] = 0x00;
-  packet[p_offset++] = 0x00;
-  packet[p_offset++] = 0x00;
-  size_t rdata_len_idx = p_offset;
-  p_offset += 2;
-  p_offset += write_uncompressed_name(&packet[p_offset], alg);
-  packet[p_offset++] = 0;
-  packet[p_offset++] = 0;
-  packet[p_offset++] = (now >> 24) & 0xFF;
-  packet[p_offset++] = (now >> 16) & 0xFF;
-  packet[p_offset++] = (now >> 8) & 0xFF;
-  packet[p_offset++] = now & 0xFF;
-  packet[p_offset++] = fudge >> 8;
-  packet[p_offset++] = fudge & 0xFF;
-  packet[p_offset++] = mac_len >> 8;
-  packet[p_offset++] = mac_len & 0xFF;
-  memcpy(&packet[p_offset], mac, mac_len);
-  p_offset += mac_len;
-  packet[p_offset++] = packet[0];
-  packet[p_offset++] = packet[1];
-  packet[p_offset++] = tsig_error >> 8;
-  packet[p_offset++] = tsig_error & 0xFF;
-  if (tsig_error == 18) {
-    packet[p_offset++] = 0;
-    packet[p_offset++] = 6;
-    uint64_t now_48 = time(NULL);
-    packet[p_offset++] = (now_48 >> 40) & 0xFF;
-    packet[p_offset++] = (now_48 >> 32) & 0xFF;
-    packet[p_offset++] = (now_48 >> 24) & 0xFF;
-    packet[p_offset++] = (now_48 >> 16) & 0xFF;
-    packet[p_offset++] = (now_48 >> 8) & 0xFF;
-    packet[p_offset++] = now_48 & 0xFF;
-  } else {
-    packet[p_offset++] = 0;
-    packet[p_offset++] = 0;
-  }
-  uint16_t rdlen = p_offset - rdata_len_idx - 2;
-  packet[rdata_len_idx] = rdlen >> 8;
-  packet[rdata_len_idx + 1] = rdlen & 0xFF;
-  uint16_t arcount = (packet[10] << 8) | packet[11];
-  arcount++;
-  packet[10] = arcount >> 8;
-  packet[11] = arcount & 0xFF;
-  *packet_len = p_offset;
-  return 0;
-}
-
-int tsig_verify_packet(const uint8_t *packet, size_t packet_len,
-                       tsig_key_t *key) {
-  if (!key || packet_len < 12)
-    return -1;
-  uint16_t arcount = (packet[10] << 8) | packet[11];
-  if (arcount == 0)
-    return -1;
-  size_t offset = 12;
-  uint16_t qdcount = (packet[4] << 8) | packet[5],
-           ancount = (packet[6] << 8) | packet[7],
-           nscount = (packet[8] << 8) | packet[9];
-  for (int i = 0; i < qdcount; i++) {
-    while (offset < packet_len && packet[offset] != 0 &&
-           (packet[offset] & 0xC0) != 0xC0)
-      offset += packet[offset] + 1;
-    if (offset < packet_len && (packet[offset] & 0xC0) == 0xC0)
-      offset += 2;
-    else
-      offset++;
-    offset += 4;
-  }
-  size_t last_rr_offset = 0;
-  for (int i = 0; i < ancount + nscount + arcount; i++) {
-    if (i == qdcount + ancount + nscount + arcount - 1)
-      last_rr_offset = offset;
-    if (offset >= packet_len)
-      return -1;
-    while (offset < packet_len && packet[offset] != 0 &&
-           (packet[offset] & 0xC0) != 0xC0)
-      offset += packet[offset] + 1;
-    if (offset < packet_len && (packet[offset] & 0xC0) == 0xC0)
-      offset += 2;
-    else
-      offset++;
-    if (offset + 10 > packet_len)
-      return -1;
-    uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
-    offset += 10 + rdlen;
-  }
-  if (last_rr_offset == 0 || offset > packet_len)
-    return -1;
-  size_t tsig_p = last_rr_offset;
-  while (tsig_p < packet_len && packet[tsig_p] != 0 &&
-         (packet[tsig_p] & 0xC0) != 0xC0)
-    tsig_p += packet[tsig_p] + 1;
-  if (tsig_p < packet_len && (packet[tsig_p] & 0xC0) == 0xC0)
-    tsig_p += 2;
-  else
-    tsig_p++;
-  if (tsig_p + 10 > packet_len)
-    return -1;
-  uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p + 1];
-  if (type != 250)
-    return -1;
-  tsig_p += 10;
-  while (tsig_p < packet_len && packet[tsig_p] != 0)
-    tsig_p += packet[tsig_p] + 1;
-  tsig_p++;
-  if (tsig_p + 16 > packet_len)
-    return -1;
-  size_t time_fudge_start = tsig_p;
-  uint64_t time_signed = ((uint64_t)packet[time_fudge_start] << 40) |
-                         ((uint64_t)packet[time_fudge_start + 1] << 32) |
-                         ((uint64_t)packet[time_fudge_start + 2] << 24) |
-                         ((uint64_t)packet[time_fudge_start + 3] << 16) |
-                         ((uint64_t)packet[time_fudge_start + 4] << 8) |
-                         (uint64_t)packet[time_fudge_start + 5];
-  uint16_t fudge =
-      (packet[time_fudge_start + 6] << 8) | packet[time_fudge_start + 7];
-  uint64_t now = time(NULL);
-  if (now > time_signed + fudge || now + fudge < time_signed)
-    return 18;
-  tsig_p += 8;
-  uint16_t mac_size = (packet[tsig_p] << 8) | packet[tsig_p + 1];
-  tsig_p += 2;
-  if (tsig_p + mac_size + 6 > packet_len)
-    return -1;
-  const uint8_t *mac = &packet[tsig_p];
-  tsig_p += mac_size;
-  uint16_t orig_id = (packet[tsig_p] << 8) | packet[tsig_p + 1];
-  tsig_p += 2;
-  uint16_t err = (packet[tsig_p] << 8) | packet[tsig_p + 1];
-  tsig_p += 2;
-  uint16_t other_len = (packet[tsig_p] << 8) | packet[tsig_p + 1];
-  tsig_p += 2;
-  if (tsig_p + other_len > packet_len)
-    return -1;
-  size_t pre_mac_cap = last_rr_offset + 512 + other_len;
-  uint8_t *pre_mac = malloc(pre_mac_cap);
-  if (!pre_mac)
-    return -1;
-  memcpy(pre_mac, packet, last_rr_offset);
-  pre_mac[0] = orig_id >> 8;
-  pre_mac[1] = orig_id & 0xFF;
-  uint16_t new_arcount = arcount - 1;
-  pre_mac[10] = new_arcount >> 8;
-  pre_mac[11] = new_arcount & 0xFF;
-  size_t p_offset = last_rr_offset;
-  p_offset += write_uncompressed_name(&pre_mac[p_offset], key->name);
-  pre_mac[p_offset++] = 0x00;
-  pre_mac[p_offset++] = 0xFF;
-  pre_mac[p_offset++] = 0x00;
-  pre_mac[p_offset++] = 0x00;
-  pre_mac[p_offset++] = 0x00;
-  pre_mac[p_offset++] = 0x00;
-  const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-  p_offset += write_uncompressed_name(&pre_mac[p_offset], alg);
-  memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8);
-  p_offset += 8;
-  pre_mac[p_offset++] = err >> 8;
-  pre_mac[p_offset++] = err & 0xFF;
-  pre_mac[p_offset++] = other_len >> 8;
-  pre_mac[p_offset++] = other_len & 0xFF;
-  if (other_len > 0) {
-    memcpy(&pre_mac[p_offset], &packet[tsig_p], other_len);
-    p_offset += other_len;
-  }
-  unsigned int calc_mac_len = 0;
-  unsigned char calc_mac[EVP_MAX_MD_SIZE];
-  const EVP_MD *evp_md = EVP_sha256();
-  if (strstr(alg, "sha1"))
-    evp_md = EVP_sha1();
-  else if (strstr(alg, "sha512"))
-    evp_md = EVP_sha512();
-  else if (strstr(alg, "md5"))
-    evp_md = EVP_md5();
-  HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, p_offset,
-       calc_mac, &calc_mac_len);
-  free(pre_mac);
-  if (calc_mac_len != mac_size)
-    return 16;
-  if (const_time_memcmp(calc_mac, mac, mac_size) != 0)
-    return 16;
-  return 0;
-}
-
-// ============================================================================
-// （これ以降のDNS処理ロジックも継続）
-// ============================================================================
-
 int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tcp_stream_ctx_t *stream_ctx, axfr_session_t *session,
                       tsig_key_t *tsig_key) {
@@ -2943,163 +2286,6 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       return 1;
     }
   }
-}
-
-static int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset,
-                              const char *name, compress_ctx_t *ctx) {
-  uint8_t wire[256];
-  size_t w_len = 0;
-  const char *p = name;
-  while (*p) {
-    const char *dot = strchr(p, '.');
-    if (!dot) {
-      size_t len = strlen(p);
-      if (len > 63 || w_len + len + 1 > 255)
-        return -1;
-      wire[w_len++] = len;
-      memcpy(&wire[w_len], p, len);
-      w_len += len;
-      break;
-    } else {
-      size_t len = dot - p;
-      if (len > 63)
-        return -1;
-      if (len > 0) {
-        if (w_len + len + 1 > 255)
-          return -1;
-        wire[w_len++] = len;
-        memcpy(&wire[w_len], p, len);
-        w_len += len;
-      }
-      p = dot + 1;
-    }
-  }
-  if (w_len + 1 > 255)
-    return -1;
-  wire[w_len++] = 0;
-  return compress_name(packet_buf, offset, wire, ctx);
-}
-
-static int serialize_dns_record(uint8_t *res, size_t max_res_len,
-                                uint16_t *offset_ptr, dns_record_t *rec,
-                                compress_ctx_t *comp_ctx,
-                                const char *owner_name, uint32_t override_ttl) {
-  uint16_t offset = *offset_ptr;
-  uint16_t rec_type = rec->type_code;
-  if (offset + 12 > max_res_len)
-    return -1;
-  if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name,
-                         comp_ctx) != 0)
-    return -1;
-  if (offset + 10 > max_res_len)
-    return -1;
-  res[offset++] = rec_type >> 8;
-  res[offset++] = rec_type & 0xFF;
-  res[offset++] = 0;
-  res[offset++] = 1;
-  uint32_t ttl = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
-  if (override_ttl != 0xFFFFFFFF && override_ttl < ttl)
-    ttl = override_ttl;
-  res[offset++] = ttl >> 24;
-  res[offset++] = (ttl >> 16) & 0xFF;
-  res[offset++] = (ttl >> 8) & 0xFF;
-  res[offset++] = ttl & 0xFF;
-  uint16_t rdlength_idx = offset;
-  offset += 2;
-  if (rec->generic_data && rec->generic_len > 0) {
-    if (offset + rec->generic_len > max_res_len)
-      return -1;
-    memcpy(&res[offset], rec->generic_data, rec->generic_len);
-    offset += rec->generic_len;
-  } else if (rec_type == 1 && rec->rdata_count > 0) {
-    if (offset + 4 > max_res_len)
-      return -1;
-    struct in_addr addr;
-    inet_pton(AF_INET, rec->rdata[0], &addr);
-    memcpy(&res[offset], &addr.s_addr, 4);
-    offset += 4;
-  } else if (rec_type == 28 && rec->rdata_count > 0) {
-    if (offset + 16 > max_res_len)
-      return -1;
-    struct in6_addr addr;
-    inet_pton(AF_INET6, rec->rdata[0], &addr);
-    memcpy(&res[offset], &addr.s6_addr, 16);
-    offset += 16;
-  } else if ((rec_type == 2 || rec_type == 5 || rec_type == 12) &&
-             rec->rdata_count > 0) {
-    if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx) != 0 ||
-        offset > max_res_len)
-      return -1;
-  } else if (rec_type == 15 && rec->rdata_count >= 2) {
-    if (offset + 2 > max_res_len)
-      return -1;
-    uint16_t pref = atoi(rec->rdata[0]);
-    res[offset++] = pref >> 8;
-    res[offset++] = pref & 0xFF;
-    if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0 ||
-        offset > max_res_len)
-      return -1;
-  } else if (rec_type == 33 && rec->rdata_count >= 4) {
-    if (offset + 6 > max_res_len)
-      return -1;
-    uint16_t prio = atoi(rec->rdata[0]);
-    uint16_t weight = atoi(rec->rdata[1]);
-    uint16_t port = atoi(rec->rdata[2]);
-    res[offset++] = prio >> 8;
-    res[offset++] = prio & 0xFF;
-    res[offset++] = weight >> 8;
-    res[offset++] = weight & 0xFF;
-    res[offset++] = port >> 8;
-    res[offset++] = port & 0xFF;
-    if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx) != 0 ||
-        offset > max_res_len)
-      return -1;
-  } else if (rec_type == 6 && rec->rdata_count >= 7) {
-    if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx) != 0 ||
-        write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0)
-      return -1;
-    if (offset + 20 > max_res_len)
-      return -1;
-    for (int j = 2; j < 7; j++) {
-      uint32_t val = strtoul(rec->rdata[j], NULL, 10);
-      res[offset++] = val >> 24;
-      res[offset++] = (val >> 16) & 0xFF;
-      res[offset++] = (val >> 8) & 0xFF;
-      res[offset++] = val & 0xFF;
-    }
-  } else if (rec_type == 16 && rec->rdata_count > 0) {
-    size_t req = 0;
-    for (int j = 0; j < rec->rdata_count; j++) {
-      size_t len = strlen(rec->rdata[j]);
-      size_t chunks = (len + 254) / 255;
-      if (chunks == 0)
-        chunks = 1;
-      req += chunks + len;
-    }
-    if (offset + req > max_res_len)
-      return -1;
-    for (int j = 0; j < rec->rdata_count; j++) {
-      size_t len = strlen(rec->rdata[j]);
-      const char *str = rec->rdata[j];
-      if (len == 0)
-        res[offset++] = 0;
-      else {
-        while (len > 0) {
-          size_t chunk_len = (len > 255) ? 255 : len;
-          res[offset++] = chunk_len;
-          memcpy(&res[offset], str, chunk_len);
-          offset += chunk_len;
-          str += chunk_len;
-          len -= chunk_len;
-        }
-      }
-    }
-  }
-  uint16_t rdlength = offset - rdlength_idx - 2;
-  res[rdlength_idx] = rdlength >> 8;
-  res[rdlength_idx + 1] = rdlength & 0xFF;
-  *offset_ptr = offset;
-  return 0;
 }
 
 static bool find_delegation(zone_arena_t *current_zone, const char *qname,
@@ -3494,39 +2680,9 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   uint16_t client_payload_size = 512;
   bool has_edns = false;
-  size_t scan_offset = 12;
-  for (int i = 0; i < qdcount + ancount_req + nscount_req + arcount_req; i++) {
-    if (scan_offset >= req_len)
-      break;
-    bool is_opt = (i >= qdcount + ancount_req + nscount_req);
-    while (scan_offset < req_len) {
-      uint8_t len = req[scan_offset];
-      if (len == 0) {
-        scan_offset++;
-        break;
-      }
-      if ((len & 0xC0) == 0xC0) {
-        scan_offset += 2;
-        break;
-      }
-      scan_offset += len + 1;
-    }
-    if (i < qdcount)
-      scan_offset += 4;
-    else {
-      if (scan_offset + 10 <= req_len) {
-        uint16_t rtype = (req[scan_offset] << 8) | req[scan_offset + 1];
-        uint16_t rclass = (req[scan_offset + 2] << 8) | req[scan_offset + 3];
-        uint16_t rdlen = (req[scan_offset + 8] << 8) | req[scan_offset + 9];
-        if (is_opt && rtype == 41) {
-          has_edns = true;
-          client_payload_size = rclass;
-          break;
-        }
-        scan_offset += 10 + rdlen;
-      }
-    }
-  }
+  parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req,
+                 &has_edns, &client_payload_size);
+
   if (has_edns && max_res_len == 512) {
     if (client_payload_size > 1232)
       client_payload_size = 1232;
@@ -3593,20 +2749,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   uint16_t offset = q_offset, ancount = 0, nscount = 0, arcount = 0;
   resolve_name(current_qname, qtype, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount);
-  if (has_edns && offset + 11 <= max_res_len) {
-    res[offset++] = 0;
-    res[offset++] = 0;
-    res[offset++] = 41;
-    res[offset++] = 1232 >> 8;
-    res[offset++] = 1232 & 0xFF;
-    res[offset++] = 0;
-    res[offset++] = 0;
-    res[offset++] = 0;
-    res[offset++] = 0;
-    res[offset++] = 0;
-    res[offset++] = 0;
-    arcount++;
+
+  if (has_edns) {
+    assemble_edns_opt(res, max_res_len, &offset, &arcount);
   }
+
   *res_ancount = htons(ancount);
   *res_nscount = htons(nscount);
   *res_arcount = htons(arcount);
@@ -3808,7 +2955,6 @@ void send_notify_to_all(const char *domain) {
     } else
       continue;
 
-    // Capsicum対応：動的UDPソケット生成を避け、FrontendへIPC転送して送信を依頼する
     udp_ipc_t msg;
     msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
     msg.client_addr = dest_addr;
@@ -4171,9 +3317,6 @@ void *worker_thread_func(void *arg) {
   int port = active_cfg && active_cfg->port > 0 ? active_cfg->port : DNS_PORT;
   int bind_count = active_cfg ? active_cfg->bind_address_count : 0;
 
-  int created_sockets = 0;
-
-  // 【変更点】 WorkerではTCPのみバインドする (UDPはFrontendが担当)
   for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
     struct sockaddr_in addr4;
     struct sockaddr_in6 addr6;
@@ -4220,7 +3363,6 @@ void *worker_thread_func(void *arg) {
           struct kevent ev;
           EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
-          created_sockets++;
         } else
           close(tcp_fd);
       }
@@ -4242,18 +3384,10 @@ void *worker_thread_func(void *arg) {
           struct kevent ev;
           EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
-          created_sockets++;
         } else
           close(tcp_fd);
       }
     }
-  }
-
-  if (created_sockets == 0) {
-    syslog(LOG_WARNING,
-           "[Worker %d] No TCP listener could be bound; TCP queries/AXFR will "
-           "not be served by this worker",
-           ctx->thread_id);
   }
 
   // FrontendからのUDP転送を受け取るIPCパイプをkqueueに登録 (udata=1)
@@ -4262,7 +3396,6 @@ void *worker_thread_func(void *arg) {
   EV_SET(&ev_ipc, my_ipc_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)1);
   kevent(kq, &ev_ipc, 1, NULL, 0, NULL);
 
-  // (TCPリスナーが開けなくてもIPCでUDP処理は可能なのでエラー終了しない)
   atomic_fetch_add(&g_bound_workers, 1);
   goto worker_startup_success;
 
@@ -4289,7 +3422,7 @@ worker_startup_success:;
         close(client_fd);
         free(ctx_tcp);
       } else if (ev_list[i].udata == (void *)1) {
-        // 【変更点】 UDP (IPC経由)
+        // UDP (IPC経由)
         int active_fd = ev_list[i].ident; // my_ipc_fd
         while (1) {
           uint8_t req_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
@@ -4600,58 +3733,6 @@ worker_startup_success:;
                           has_edns, dnssec_ok);
 
           if (qtype == 252 || qtype == 251) {
-            uint32_t req_serial = 0;
-            (void)
-                req_serial; // TODO:
-                            // IXFR応答(差分転送)を実装する際にここで使う。現状は常にフルAXFRを返す
-            if (qtype == 251) {
-              size_t offset = 12;
-              uint16_t qdcount = (msg[4] << 8) | msg[5];
-              uint16_t nscount = (msg[8] << 8) | msg[9];
-              for (int k = 0; k < qdcount; k++) {
-                while (offset < msg_len && msg[offset] != 0 &&
-                       (msg[offset] & 0xC0) != 0xC0)
-                  offset += msg[offset] + 1;
-                if (offset < msg_len && (msg[offset] & 0xC0) == 0xC0)
-                  offset += 2;
-                else
-                  offset++;
-                offset += 4;
-              }
-              if (nscount > 0 && offset + 10 <= msg_len) {
-                while (offset < msg_len && msg[offset] != 0 &&
-                       (msg[offset] & 0xC0) != 0xC0)
-                  offset += msg[offset] + 1;
-                if (offset < msg_len && (msg[offset] & 0xC0) == 0xC0)
-                  offset += 2;
-                else
-                  offset++;
-                uint16_t rr_type = (msg[offset] << 8) | msg[offset + 1];
-                offset += 8;
-                uint16_t rdlen = (msg[offset] << 8) | msg[offset + 1];
-                offset += 2;
-                if (rr_type == 6 && offset + rdlen <= msg_len) {
-                  size_t ptr = offset;
-                  while (ptr < msg_len && msg[ptr] != 0 &&
-                         (msg[ptr] & 0xC0) != 0xC0)
-                    ptr += msg[ptr] + 1;
-                  if (ptr < msg_len && (msg[ptr] & 0xC0) == 0xC0)
-                    ptr += 2;
-                  else
-                    ptr++;
-                  while (ptr < msg_len && msg[ptr] != 0 &&
-                         (msg[ptr] & 0xC0) != 0xC0)
-                    ptr += msg[ptr] + 1;
-                  if (ptr < msg_len && (msg[ptr] & 0xC0) == 0xC0)
-                    ptr += 2;
-                  else
-                    ptr++;
-                  if (ptr + 4 <= msg_len)
-                    req_serial = (msg[ptr] << 24) | (msg[ptr + 1] << 16) |
-                                 (msg[ptr + 2] << 8) | msg[ptr + 3];
-                }
-              }
-            }
             server_config_t *cfg =
                 atomic_load_explicit(&g_config_db.active, memory_order_acquire);
             zone_config_t *zcfg = cfg->zones;
@@ -4817,18 +3898,15 @@ void *control_thread_func(void *arg) {
           free_zone_config(curr);
           curr = next;
         }
-        standby->zones = NULL;
-        free_logging_channels(standby);
         tsig_key_t *k = standby->keys;
         while (k) {
           tsig_key_t *next_k = k->next;
-          free(k->name);
-          free(k->algorithm);
-          free(k->secret);
+          free(k->name); free(k->algorithm); free(k->secret);
           free(k);
           k = next_k;
         }
-        standby->keys = NULL;
+        standby->zones = NULL;
+        free_logging_channels(standby);
         if (parse_named_conf(config_str, standby) == 0) {
           init_logging_channels(standby);
           atomic_store_explicit(&g_config_db.active, standby,
@@ -4906,7 +3984,7 @@ void *control_thread_func(void *arg) {
 // 13. Frontend Router Thread (特権維持・UDP送受信ルーティング)
 // ============================================================================
 
-static void run_frontend_router(pid_t backend_pid) {
+static void run_frontend_router(void) {
   int kq = kqueue();
   if (kq < 0)
     exit(1);
@@ -4945,10 +4023,7 @@ static void run_frontend_router(pid_t backend_pid) {
     for (int i = 0; i < n; i++) {
       uintptr_t ud = (uintptr_t)ev_list[i].udata;
       if (ud == 1000) {
-        syslog(LOG_CRIT,
-               "[Frontend] Backend process (pid=%d) exited unexpectedly. "
-               "Shutting down.",
-               backend_pid);
+        syslog(LOG_CRIT, "[Frontend] Backend process (pid=%d) exited unexpectedly. Shutting down.", backend_pid);
         exit(1);
       }
       if (ud < MAX_BIND_ADDRS) {
@@ -5150,10 +4225,8 @@ int main(int argc, char **argv) {
   if (num_workers <= 0)
     num_workers = 2;
 
-  // 【追加】プロセス分岐前のUDP・IPCソケット初期化
   setup_udp_and_ipc(&g_config_db.config_a, num_workers);
 
-  // 【追加】プロセスの分離
   pid_t pid = fork();
   if (pid < 0) {
     syslog(LOG_ERR, "fork for frontend router failed");
@@ -5161,13 +4234,10 @@ int main(int argc, char **argv) {
   }
 
   if (pid > 0) {
-    // --- 親プロセス (Frontend UDP Router) ---
     run_frontend_router(pid);
     exit(0);
   }
 
-  // --- 子プロセス (Backend DNS Workers) ---
-  // Frontend用FDのクローズ
   for (int i = 0; i < g_num_ipc; i++)
     close(g_ipc_fds[i][0]);
   for (int i = 0; i < g_num_udp_fds; i++)
@@ -5203,15 +4273,20 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
       target_gid = grp->gr_gid;
     }
-    setgroups(0, NULL);
-    setgid(target_gid);
-    setuid(pwd->pw_uid);
+    if (setgroups(0, NULL) != 0)
+      exit(EXIT_FAILURE);
+    if (setgid(target_gid) != 0)
+      exit(EXIT_FAILURE);
+    if (setuid(pwd->pw_uid) != 0)
+      exit(EXIT_FAILURE);
   } else if (cfg->group) {
     struct group *grp = getgrnam(cfg->group);
     if (!grp)
       exit(EXIT_FAILURE);
-    setgroups(0, NULL);
-    setgid(grp->gr_gid);
+    if (setgroups(0, NULL) != 0)
+      exit(EXIT_FAILURE);
+    if (setgid(grp->gr_gid) != 0)
+      exit(EXIT_FAILURE);
   }
 
   tzset();
