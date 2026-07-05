@@ -2752,7 +2752,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     return q_offset;
   }
   if (!current_zone) {
-    res[3] |= 3;
+    res[3] |= 5;
     return q_offset;
   }
 
