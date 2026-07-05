@@ -2198,15 +2198,18 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         clone_zone_arena(active, standby);
         session->is_deleting = true;
       } else if (session->is_ixfr &&
-                 current_serial == session->initial_soa_serial)
+                 current_serial == session->initial_soa_serial) {
         session->is_finished = true;
-      else if (session->is_ixfr) {
+        standby->count--;
+      } else if (session->is_ixfr) {
         session->is_deleting = !session->is_deleting;
         standby->count--;
       } else {
-        if (strcmp(session->initial_soa_name, rec->name) == 0 &&
-            session->initial_soa_serial == current_serial)
+        if (strcasecmp(session->initial_soa_name, rec->name) == 0 &&
+            session->initial_soa_serial == current_serial) {
           session->is_finished = true;
+          standby->count--;
+        }
       }
     } else {
       if (session->soa_count == 1 && session->is_ixfr)
