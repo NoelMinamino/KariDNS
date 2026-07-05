@@ -10,6 +10,7 @@ KariDNS is a high-performance, lightweight, and modern authoritative DNS server 
 - **RCU (Read-Copy-Update) Architecture:** Lock-free, concurrent data structure swaps. Configuration and zone files can be hot-reloaded instantly without dropping a single query or blocking worker threads.
 - **Master/Slave Support:** Built-in support for AXFR (Authoritative Zone Transfer), handling both master (sending) and slave (receiving) roles concurrently with background workers.
 - **Security & Reliability:**
+  - **Capsicum Sandbox:** Runs in FreeBSD's capability mode. Filesystem access is restricted to pre-opened directory descriptors (using `openat`/`renameat`), enabling secure config reloading and log rotation without escaping the sandbox. Network sockets are protected via `cap_rights_limit`.
   - Robust TSIG (Transaction Signature) verification for zone transfers and NOTIFY messages.
   - Privilege dropping (`user` / `group` directives).
   - RRL (Response Rate Limiting) against DNS amplification attacks.
