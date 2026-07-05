@@ -115,7 +115,7 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
 
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
     size_t p = current_offset, jumped_offset = 0; bool jumped = false; int jump_count = 0;
-    char buf[256]; size_t written = 0;
+    char buf[257]; size_t written = 0;
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t len = packet[p];
@@ -173,6 +173,7 @@ const char *get_type_str(uint16_t type, zone_arena_t *arena) {
         case 257: return "CAA"; case 258: return "AVC"; case 259: return "DOA"; case 260: return "AMTRELAY";
         case 32768: return "TA"; case 32769: return "DLV";
         default: {
+            if (!arena) return NULL;
             char *buf = arena_alloc(arena, 16);
             if (buf) snprintf(buf, 16, "TYPE%d", type);
             return buf;
@@ -265,12 +266,14 @@ size_t write_uncompressed_name(uint8_t *buf, const char *name) {
         const char *dot = strchr(p, '.');
         if (!dot) {
             size_t len = strlen(p);
+            if (len > 63 || w_len + len + 1 > 255) break;
             buf[w_len++] = len;
             for (size_t i = 0; i < len; i++) buf[w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
             break;
         } else {
             size_t len = dot - p;
             if (len > 0) {
+                if (len > 63 || w_len + len + 1 > 255) break;
                 buf[w_len++] = len;
                 for (size_t i = 0; i < len; i++) buf[w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
             }
@@ -302,7 +305,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
     offset += write_uncompressed_name(&pre_mac[offset], alg);
     uint64_t now = time(NULL);
-    pre_mac[offset++] = 0; pre_mac[offset++] = 0;
+    pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
     pre_mac[offset++] = (now >> 8) & 0xFF; pre_mac[offset++] = now & 0xFF;
     uint16_t fudge = 300;
@@ -339,7 +342,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     packet[p_offset++] = 0x00; packet[p_offset++] = 0x00; packet[p_offset++] = 0x00; packet[p_offset++] = 0x00; // TTL
     size_t rdata_len_idx = p_offset; p_offset += 2;
     p_offset += write_uncompressed_name(&packet[p_offset], alg);
-    packet[p_offset++] = 0; packet[p_offset++] = 0;
+    packet[p_offset++] = (now >> 40) & 0xFF; packet[p_offset++] = (now >> 32) & 0xFF;
     packet[p_offset++] = (now >> 24) & 0xFF; packet[p_offset++] = (now >> 16) & 0xFF;
     packet[p_offset++] = (now >> 8) & 0xFF; packet[p_offset++] = now & 0xFF;
     packet[p_offset++] = fudge >> 8; packet[p_offset++] = fudge & 0xFF;
@@ -371,7 +374,11 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     size_t offset = 12;
     uint16_t qdcount = (packet[4] << 8) | packet[5], ancount = (packet[6] << 8) | packet[7], nscount = (packet[8] << 8) | packet[9];
     for (int i = 0; i < qdcount; i++) {
-        while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) offset += packet[offset] + 1;
+        int jump_count = 0;
+        while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) {
+            offset += packet[offset] + 1;
+            if (++jump_count > 128) return -1;
+        }
         if (offset < packet_len && (packet[offset] & 0xC0) == 0xC0) offset += 2; else offset++;
         offset += 4;
     }
@@ -379,7 +386,11 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     for (int i = 0; i < ancount + nscount + arcount; i++) {
         if (i == qdcount + ancount + nscount + arcount - 1) last_rr_offset = offset;
         if (offset >= packet_len) return -1;
-        while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) offset += packet[offset] + 1;
+        int jump_count = 0;
+        while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) {
+            offset += packet[offset] + 1;
+            if (++jump_count > 128) return -1;
+        }
         if (offset < packet_len && (packet[offset] & 0xC0) == 0xC0) offset += 2; else offset++;
         if (offset + 10 > packet_len) return -1;
         uint16_t rdlen = (packet[offset+8] << 8) | packet[offset+9];
@@ -387,14 +398,22 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     }
     if (last_rr_offset == 0 || offset > packet_len) return -1;
     size_t tsig_p = last_rr_offset;
-    while (tsig_p < packet_len && packet[tsig_p] != 0 && (packet[tsig_p] & 0xC0) != 0xC0) tsig_p += packet[tsig_p] + 1;
+    int jump_count = 0;
+    while (tsig_p < packet_len && packet[tsig_p] != 0 && (packet[tsig_p] & 0xC0) != 0xC0) {
+        tsig_p += packet[tsig_p] + 1;
+        if (++jump_count > 128) return -1;
+    }
     if (tsig_p < packet_len && (packet[tsig_p] & 0xC0) == 0xC0) tsig_p += 2; else tsig_p++;
     if (tsig_p + 10 > packet_len) return -1;
     uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p+1];
     if (type != 250) return -1;
     tsig_p += 10;
     size_t alg_start = tsig_p; (void)alg_start;
-    while (tsig_p < packet_len && packet[tsig_p] != 0) tsig_p += packet[tsig_p] + 1;
+    jump_count = 0;
+    while (tsig_p < packet_len && packet[tsig_p] != 0) {
+        tsig_p += packet[tsig_p] + 1;
+        if (++jump_count > 128) return -1;
+    }
     tsig_p++;
     if (tsig_p + 16 > packet_len) return -1;
     size_t time_fudge_start = tsig_p;

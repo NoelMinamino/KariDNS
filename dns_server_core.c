@@ -904,9 +904,10 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
           free_token(&tok);
-          if (strcmp(key, "port") == 0)
-            config->port = atoi(val);
-          else if (strcmp(key, "user") == 0)
+          if (strcmp(key, "port") == 0) {
+            int p = atoi(val);
+            if (p > 0 && p <= 65535) config->port = p;
+          } else if (strcmp(key, "user") == 0)
             config->user = val;
           else
             config->group = val;
@@ -1110,6 +1111,12 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             int len = EVP_DecodeBlock(tsig->secret_decoded,
                                       (const unsigned char *)tsig->secret,
                                       strlen(tsig->secret));
+            if (len < 0) {
+              free(key_prop);
+              free(val);
+              free_token(&tok);
+              return -1;
+            }
             int padding = 0;
             size_t slen = strlen(tsig->secret);
             if (slen > 0 && tsig->secret[slen - 1] == '=')
@@ -2088,7 +2095,7 @@ static char *arena_strdup(zone_arena_t *arena, const char *str) {
   return dup;
 }
 static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
-  for (int i = 1; i < dst->data_pool_count; i++) {
+  for (int i = 0; i < dst->data_pool_count; i++) {
     if (dst->data_pools[i])
       free(dst->data_pools[i]);
   }
@@ -2921,7 +2928,7 @@ void send_notify_to_all(const char *domain) {
 
   uint8_t req[512];
   memset(req, 0, 12);
-  uint16_t id = (uint16_t)(time(NULL) & 0xFFFF);
+  uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
   req[0] = id >> 8;
   req[1] = id & 0xFF;
   req[2] = 0x20;
@@ -2985,9 +2992,10 @@ static void init_logging_channels(server_config_t *cfg) {
           ch->current_size = st.st_size;
       }
       time_t now = time(NULL);
-      struct tm *tm_info = localtime(&now);
-      ch->current_date = (tm_info->tm_year + 1900) * 10000 +
-                         (tm_info->tm_mon + 1) * 100 + tm_info->tm_mday;
+      struct tm tm_info;
+      localtime_r(&now, &tm_info);
+      ch->current_date = (tm_info.tm_year + 1900) * 10000 +
+                         (tm_info.tm_mon + 1) * 100 + tm_info.tm_mday;
     }
     ch = ch->next;
   }
@@ -3025,13 +3033,14 @@ static void write_query_log(const char *client_ip, int client_port,
   log_channel_t *ch = cfg->logging.queries_channel;
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
-  struct tm *tm_info = localtime(&ts.tv_sec);
-  int today = (tm_info->tm_year + 1900) * 10000 + (tm_info->tm_mon + 1) * 100 +
-              tm_info->tm_mday;
+  struct tm tm_info;
+  localtime_r(&ts.tv_sec, &tm_info);
+  int today = (tm_info.tm_year + 1900) * 10000 + (tm_info.tm_mon + 1) * 100 +
+              tm_info.tm_mday;
   char time_str[64] = "";
   if (ch->print_time) {
     char buf[32];
-    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", tm_info);
+    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
     snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf,
              ts.tv_nsec / 1000000);
   }
@@ -3171,6 +3180,11 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   }
 
   uint8_t *res = malloc(65535);
+  if (!res) {
+    atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
+                              memory_order_release);
+    return;
+  }
   size_t q_offset = 12;
   while (q_offset < req_len) {
     uint8_t len = req[q_offset];
@@ -4068,9 +4082,11 @@ static void run_frontend_router(pid_t backend_pid) {
           if (len < (ssize_t)sizeof(udp_ipc_t))
             break; // EAGAIN
           udp_ipc_t *msg = (udp_ipc_t *)buffer;
-          sendto(g_udp_fds[msg->sock_fd_idx], buffer + sizeof(udp_ipc_t),
-                 msg->payload_len, 0, (struct sockaddr *)&msg->client_addr,
-                 msg->addr_len);
+          if (msg->sock_fd_idx >= 0 && msg->sock_fd_idx < g_num_udp_fds) {
+            sendto(g_udp_fds[msg->sock_fd_idx], buffer + sizeof(udp_ipc_t),
+                   msg->payload_len, 0, (struct sockaddr *)&msg->client_addr,
+                   msg->addr_len);
+          }
         }
       }
     }
