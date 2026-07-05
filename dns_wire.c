@@ -173,8 +173,7 @@ const char *get_type_str(uint16_t type, zone_arena_t *arena) {
         case 257: return "CAA"; case 258: return "AVC"; case 259: return "DOA"; case 260: return "AMTRELAY";
         case 32768: return "TA"; case 32769: return "DLV";
         default: {
-            if (!arena) return NULL;
-            char *buf = arena_alloc(arena, 16);
+            char *buf = arena ? arena_alloc(arena, 16) : malloc(16);
             if (buf) snprintf(buf, 16, "TYPE%d", type);
             return buf;
         }

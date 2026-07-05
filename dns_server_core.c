@@ -3406,6 +3406,9 @@ void *worker_thread_func(void *arg) {
 
   // FrontendからのUDP転送を受け取るIPCパイプをkqueueに登録 (udata=1)
   int my_ipc_fd = g_ipc_fds[ctx->thread_id][1];
+  cap_rights_t ipc_rights;
+  cap_rights_init(&ipc_rights, CAP_EVENT, CAP_READ, CAP_WRITE, CAP_RECV, CAP_SEND);
+  cap_rights_limit(my_ipc_fd, &ipc_rights);
   struct kevent ev_ipc;
   EV_SET(&ev_ipc, my_ipc_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)1);
   kevent(kq, &ev_ipc, 1, NULL, 0, NULL);
@@ -3442,15 +3445,13 @@ worker_startup_success:;
           uint8_t req_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
           ssize_t received =
               recv(active_fd, req_buf_full, sizeof(req_buf_full), 0);
-          if (received < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-              break;
-            break;
-          }
+          if (received <= 0) break;
           if (received < (ssize_t)sizeof(udp_ipc_t))
             continue;
 
           udp_ipc_t *ipc_msg = (udp_ipc_t *)req_buf_full;
+          if (ipc_msg->payload_len > received - (ssize_t)sizeof(udp_ipc_t))
+            continue;
           uint8_t *req_buf = req_buf_full + sizeof(udp_ipc_t);
           ssize_t payload_received = ipc_msg->payload_len;
           struct sockaddr_storage *client_addr = &ipc_msg->client_addr;
@@ -3999,6 +4000,27 @@ void *control_thread_func(void *arg) {
 // ============================================================================
 
 static void run_frontend_router(pid_t backend_pid) {
+  server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  if (cfg->user) {
+    struct passwd *pwd = getpwnam(cfg->user);
+    if (pwd) {
+      gid_t target_gid = pwd->pw_gid;
+      if (cfg->group) {
+        struct group *grp = getgrnam(cfg->group);
+        if (grp) target_gid = grp->gr_gid;
+      }
+      setgroups(0, NULL);
+      setgid(target_gid);
+      setuid(pwd->pw_uid);
+    }
+  } else if (cfg->group) {
+    struct group *grp = getgrnam(cfg->group);
+    if (grp) {
+      setgroups(0, NULL);
+      setgid(grp->gr_gid);
+    }
+  }
+
   int kq = kqueue();
   if (kq < 0)
     exit(1);
@@ -4020,6 +4042,10 @@ static void run_frontend_router(pid_t backend_pid) {
   EV_SET(&ev_notify, g_notify_ipc[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
          (void *)(uintptr_t)999);
   kevent(kq, &ev_notify, 1, NULL, 0, NULL);
+
+  struct kevent ev_proc;
+  EV_SET(&ev_proc, backend_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)1000);
+  kevent(kq, &ev_proc, 1, NULL, 0, NULL);
 
   uint8_t buffer[65536];
   int rr = 0; // ラウンドロビン分配用
@@ -4048,7 +4074,7 @@ static void run_frontend_router(pid_t backend_pid) {
           msg->addr_len = sizeof(struct sockaddr_storage);
           ssize_t len =
               recvfrom(fd, buffer + sizeof(udp_ipc_t),
-                       sizeof(buffer) - sizeof(udp_ipc_t), 0,
+                       BUFFER_SIZE, 0,
                        (struct sockaddr *)&msg->client_addr, &msg->addr_len);
           if (len < 0)
             break; // EAGAIN
@@ -4135,6 +4161,11 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
           fcntl(g_ipc_fds[i][0], F_GETFL, 0) | O_NONBLOCK);
     fcntl(g_ipc_fds[i][1], F_SETFL,
           fcntl(g_ipc_fds[i][1], F_GETFL, 0) | O_NONBLOCK);
+    int bufsize = 2 * 1024 * 1024; // 2MB
+    setsockopt(g_ipc_fds[i][0], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(g_ipc_fds[i][0], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    setsockopt(g_ipc_fds[i][1], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(g_ipc_fds[i][1], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
   }
 
   socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc);
@@ -4142,6 +4173,11 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
         fcntl(g_notify_ipc[0], F_GETFL, 0) | O_NONBLOCK);
   fcntl(g_notify_ipc[1], F_SETFL,
         fcntl(g_notify_ipc[1], F_GETFL, 0) | O_NONBLOCK);
+  int nbufsize = 1024 * 1024; // 1MB
+  setsockopt(g_notify_ipc[0], SOL_SOCKET, SO_RCVBUF, &nbufsize, sizeof(nbufsize));
+  setsockopt(g_notify_ipc[0], SOL_SOCKET, SO_SNDBUF, &nbufsize, sizeof(nbufsize));
+  setsockopt(g_notify_ipc[1], SOL_SOCKET, SO_RCVBUF, &nbufsize, sizeof(nbufsize));
+  setsockopt(g_notify_ipc[1], SOL_SOCKET, SO_SNDBUF, &nbufsize, sizeof(nbufsize));
 
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int bind_count = cfg->bind_address_count;
