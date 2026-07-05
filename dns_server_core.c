@@ -2564,6 +2564,47 @@ static void resolve_name(const char *qname, uint16_t qtype,
     res[3] |= 0x02;
 }
 
+// ============================================================================
+// Server Cookie 生成 (RFC 9018準拠)
+// ============================================================================
+static uint8_t g_server_cookie_secret[16];
+
+static void generate_server_cookie(const char *client_ip, const uint8_t client_cookie[8], uint8_t server_cookie[16], uint32_t timestamp) {
+    uint8_t hash[SHA256_DIGEST_LENGTH];
+    unsigned int hash_len = 0;
+    
+    server_cookie[0] = 1; // Version
+    server_cookie[1] = 0; // Reserved
+    server_cookie[2] = 0;
+    server_cookie[3] = 0;
+    server_cookie[4] = (timestamp >> 24) & 0xFF;
+    server_cookie[5] = (timestamp >> 16) & 0xFF;
+    server_cookie[6] = (timestamp >> 8) & 0xFF;
+    server_cookie[7] = timestamp & 0xFF;
+
+    uint8_t data[64];
+    size_t data_len = 0;
+    
+    struct sockaddr_storage addr;
+    memset(&addr, 0, sizeof(addr));
+    if (inet_pton(AF_INET, client_ip, &((struct sockaddr_in *)&addr)->sin_addr) == 1) {
+        memcpy(data, &((struct sockaddr_in *)&addr)->sin_addr, 4);
+        data_len = 4;
+    } else if (inet_pton(AF_INET6, client_ip, &((struct sockaddr_in6 *)&addr)->sin6_addr) == 1) {
+        memcpy(data, &((struct sockaddr_in6 *)&addr)->sin6_addr, 16);
+        data_len = 16;
+    }
+    memcpy(data + data_len, client_cookie, 8);
+    data_len += 8;
+    memcpy(data + data_len, server_cookie, 8); // Include Version, Reserved, Timestamp
+    data_len += 8;
+    
+    HMAC(EVP_sha256(), g_server_cookie_secret, sizeof(g_server_cookie_secret),
+         data, data_len, hash, &hash_len);
+    
+    memcpy(server_cookie + 8, hash, 8);
+}
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
@@ -2688,16 +2729,49 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     return copy_len;
   }
 
-  uint16_t client_payload_size = 512;
-  bool has_edns = false;
-  parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req,
-                 &has_edns, &client_payload_size);
+  edns_info_t edns;
+  parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns);
+  
+  // Do not echo client EDEs
+  edns.ede_count = 0;
 
-  if (has_edns && max_res_len == 512) {
-    if (client_payload_size > 1232)
-      client_payload_size = 1232;
-    if (client_payload_size > 512)
-      max_res_len = client_payload_size;
+  if (edns.present && max_res_len == 512) {
+    if (edns.udp_payload_size > 1232)
+      edns.udp_payload_size = 1232;
+    if (edns.udp_payload_size > 512)
+      max_res_len = edns.udp_payload_size;
+  }
+
+  uint8_t ext_rcode_out = 0;
+  bool is_badcookie = false;
+  
+  if (edns.has_cookie) {
+      if (edns.server_cookie_len == 0) {
+          edns.server_cookie_len = 16;
+          generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL));
+      } else {
+          bool valid = false;
+          if (edns.server_cookie_len == 16 && edns.server_cookie[0] == 1) {
+              uint32_t ts = ((uint32_t)edns.server_cookie[4] << 24) |
+                            ((uint32_t)edns.server_cookie[5] << 16) |
+                            ((uint32_t)edns.server_cookie[6] << 8) |
+                            edns.server_cookie[7];
+              uint32_t now = time(NULL);
+              if ((now >= ts && now - ts <= 3600) || (now < ts && ts - now <= 300)) {
+                  uint8_t expected_server_cookie[16];
+                  generate_server_cookie(client_ip, edns.client_cookie, expected_server_cookie, ts);
+                  if (memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
+                      valid = true;
+                  }
+              }
+          }
+          if (!valid) {
+              is_badcookie = true;
+              ext_rcode_out = 1; // BADCOOKIE (Extended RCODE 1, making 12-bit RCODE 16)
+              edns.server_cookie_len = 16;
+              generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL));
+          }
+      }
   }
 
   size_t q_offset = 12;
@@ -2753,15 +2827,36 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   if (!current_zone) {
     res[3] |= 5;
-    return q_offset;
+    uint16_t offset = q_offset;
+    uint16_t arcount = 0;
+    if (edns.present) {
+      edns.ede_count = 1;
+      edns.ede_list[0].code = 20; // Not Authoritative
+      strncpy(edns.ede_list[0].text, "recursion disabled", sizeof(edns.ede_list[0].text) - 1);
+      edns.ede_list[0].text[sizeof(edns.ede_list[0].text) - 1] = '\0';
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);
+      *res_arcount = htons(arcount);
+    }
+    return offset;
   }
 
   uint16_t offset = q_offset, ancount = 0, nscount = 0, arcount = 0;
+
+  if (is_badcookie) {
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);
+    }
+    *res_arcount = htons(arcount);
+    if (current_zone)
+      atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+    return offset;
+  }
+
   resolve_name(current_qname, qtype, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount);
 
-  if (has_edns) {
-    assemble_edns_opt(res, max_res_len, &offset, &arcount);
+  if (edns.present) {
+    assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);
   }
 
   *res_ancount = htons(ancount);
@@ -4240,6 +4335,13 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
 }
 
 int main(int argc, char **argv) {
+  arc4random_buf(g_server_cookie_secret, sizeof(g_server_cookie_secret));
+  tzset();
+  
+  // Force OpenSSL lazy initialization before entering Capsicum sandbox
+  uint8_t dummy_cookie[16];
+  generate_server_cookie("127.0.0.1", (const uint8_t *)"12345678", dummy_cookie, time(NULL));
+
   if (argc < 2) {
     syslog(LOG_ERR, "Usage: %s <config_file>", argv[0]);
     return 1;
