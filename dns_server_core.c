@@ -2767,7 +2767,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
           }
           if (!valid) {
               is_badcookie = true;
-              ext_rcode_out = 1; // BADCOOKIE (Extended RCODE 1, making 12-bit RCODE 16)
+              ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
               edns.server_cookie_len = 16;
               generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL));
           }
@@ -2843,6 +2843,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   uint16_t offset = q_offset, ancount = 0, nscount = 0, arcount = 0;
 
   if (is_badcookie) {
+    res[3] = (res[3] & 0xF0) | 0x07;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);
     }
@@ -4206,7 +4207,10 @@ static void run_frontend_router(pid_t backend_pid) {
           if (len < (ssize_t)sizeof(udp_ipc_t))
             break; // EAGAIN
           udp_ipc_t *msg = (udp_ipc_t *)buffer;
-          if (msg->sock_fd_idx >= 0 && msg->sock_fd_idx < g_num_udp_fds) {
+          ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
+          if (msg->payload_len > max_valid_payload) {
+            syslog(LOG_WARNING, "[Frontend] Dropping backend reply with inconsistent payload_len");
+          } else if (msg->sock_fd_idx >= 0 && msg->sock_fd_idx < g_num_udp_fds) {
             sendto(g_udp_fds[msg->sock_fd_idx], buffer + sizeof(udp_ipc_t),
                    msg->payload_len, 0, (struct sockaddr *)&msg->client_addr,
                    msg->addr_len);
