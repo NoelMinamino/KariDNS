@@ -3984,7 +3984,7 @@ void *control_thread_func(void *arg) {
 // 13. Frontend Router Thread (特権維持・UDP送受信ルーティング)
 // ============================================================================
 
-static void run_frontend_router(void) {
+static void run_frontend_router(pid_t backend_pid) {
   int kq = kqueue();
   if (kq < 0)
     exit(1);
