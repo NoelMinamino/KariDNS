@@ -614,9 +614,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 void parse_edns_opt(const uint8_t *req, size_t req_len,
                     uint16_t qdcount, uint16_t ancount_req,
                     uint16_t nscount_req, uint16_t arcount_req,
-                    bool *has_edns_out, uint16_t *client_payload_size_out) {
-    *has_edns_out = false;
-    *client_payload_size_out = 512;
+                    edns_info_t *edns) {
+    memset(edns, 0, sizeof(edns_info_t));
+    edns->udp_payload_size = 512;
 
     size_t scan_offset = 12;
     for (int i = 0; i < qdcount + ancount_req + nscount_req + arcount_req; i++) {
@@ -636,11 +636,59 @@ void parse_edns_opt(const uint8_t *req, size_t req_len,
             if (scan_offset + 10 <= req_len) {
                 uint16_t rtype = (req[scan_offset] << 8) | req[scan_offset+1];
                 uint16_t rclass = (req[scan_offset+2] << 8) | req[scan_offset+3];
+                uint32_t ttl = ((uint32_t)req[scan_offset+4] << 24) |
+                               ((uint32_t)req[scan_offset+5] << 16) |
+                               ((uint32_t)req[scan_offset+6] << 8) |
+                               req[scan_offset+7];
                 uint16_t rdlen = (req[scan_offset+8] << 8) | req[scan_offset+9];
                 
                 if (is_opt && rtype == 41) {
-                    *has_edns_out = true;
-                    *client_payload_size_out = rclass;
+                    edns->present = true;
+                    edns->udp_payload_size = rclass;
+                    edns->ext_rcode = (ttl >> 24) & 0xFF;
+                    edns->version = (ttl >> 16) & 0xFF;
+                    edns->dnssec_ok = (ttl & 0x00008000) != 0;
+                    
+                    size_t rdata_offset = scan_offset + 10;
+                    size_t rdata_end = rdata_offset + rdlen;
+                    if (rdata_end > req_len) rdata_end = req_len;
+                    
+                    while (rdata_offset + 4 <= rdata_end) {
+                        uint16_t opt_code = (req[rdata_offset] << 8) | req[rdata_offset+1];
+                        uint16_t opt_len = (req[rdata_offset+2] << 8) | req[rdata_offset+3];
+                        rdata_offset += 4;
+                        if (rdata_offset + opt_len > rdata_end) break;
+                        
+                        if (opt_code == 10) { // DNS Cookie
+                            if (opt_len >= 8) {
+                                edns->has_cookie = true;
+                                memcpy(edns->client_cookie, req + rdata_offset, 8);
+                                if (opt_len > 8) {
+                                    edns->server_cookie_len = opt_len - 8;
+                                    if (edns->server_cookie_len > sizeof(edns->server_cookie))
+                                        edns->server_cookie_len = sizeof(edns->server_cookie);
+                                    memcpy(edns->server_cookie, req + rdata_offset + 8, edns->server_cookie_len);
+                                }
+                            }
+                        } else if (opt_code == 15) { // Extended DNS Error
+                            if (opt_len >= 2) {
+                                if (edns->ede_count < MAX_EDE_COUNT) {
+                                    parsed_ede_t *ede = &edns->ede_list[edns->ede_count++];
+                                    ede->code = (req[rdata_offset] << 8) | req[rdata_offset+1];
+                                    ede->text[0] = '\0';
+                                    if (opt_len > 2) {
+                                        size_t text_len = opt_len - 2;
+                                        if (text_len >= sizeof(ede->text)) {
+                                            text_len = sizeof(ede->text) - 1;
+                                        }
+                                        memcpy(ede->text, req + rdata_offset + 2, text_len);
+                                        ede->text[text_len] = '\0';
+                                    }
+                                }
+                            }
+                        }
+                        rdata_offset += opt_len;
+                    }
                     break;
                 }
                 scan_offset += 10 + rdlen;
@@ -650,15 +698,61 @@ void parse_edns_opt(const uint8_t *req, size_t req_len,
 }
 
 void assemble_edns_opt(uint8_t *res, size_t max_res_len,
-                       uint16_t *offset_inout, uint16_t *arcount_inout) {
+                       uint16_t *offset_inout, uint16_t *arcount_inout,
+                       edns_info_t *edns, uint8_t rcode_ext) {
     uint16_t offset = *offset_inout;
-    if (offset + 11 <= max_res_len) {
+    uint16_t rdlen = 0;
+    if (edns && edns->has_cookie) {
+        rdlen += 4 + 8 + edns->server_cookie_len;
+    }
+    if (edns && edns->ede_count > 0) {
+        for (uint16_t i = 0; i < edns->ede_count; i++) {
+            rdlen += 4 + 2;
+            if (edns->ede_list[i].text[0] != '\0') {
+                rdlen += strlen(edns->ede_list[i].text);
+            }
+        }
+    }
+
+    if (offset + 11 + rdlen <= max_res_len) {
         res[offset++] = 0; // Root name
         res[offset++] = 0; res[offset++] = 41; // TYPE OPT
         res[offset++] = 1232 >> 8; res[offset++] = 1232 & 0xFF; // UDP Payload size
-        res[offset++] = 0; res[offset++] = 0; // Extended RCODE (0) and Version (0)
-        res[offset++] = 0; res[offset++] = 0; // DO bit / Z (0)
-        res[offset++] = 0; res[offset++] = 0; // RDLENGTH 0
+        
+        res[offset++] = rcode_ext; 
+        res[offset++] = 0; // Version (0)
+        
+        uint16_t flags = 0;
+        if (edns && edns->dnssec_ok) flags |= 0x8000;
+        res[offset++] = flags >> 8; res[offset++] = flags & 0xFF;
+        
+        res[offset++] = rdlen >> 8; res[offset++] = rdlen & 0xFF; // RDLENGTH
+        
+        if (edns && edns->has_cookie) {
+            uint16_t opt_len = 8 + edns->server_cookie_len;
+            res[offset++] = 0; res[offset++] = 10; // Option Code: 10
+            res[offset++] = opt_len >> 8; res[offset++] = opt_len & 0xFF; // Option Length
+            memcpy(res + offset, edns->client_cookie, 8);
+            offset += 8;
+            if (edns->server_cookie_len > 0) {
+                memcpy(res + offset, edns->server_cookie, edns->server_cookie_len);
+                offset += edns->server_cookie_len;
+            }
+        }
+        
+        if (edns && edns->ede_count > 0) {
+            for (uint16_t i = 0; i < edns->ede_count; i++) {
+                uint16_t text_len = strlen(edns->ede_list[i].text);
+                res[offset++] = 0; res[offset++] = 15; // Option Code: 15 (Extended DNS Error)
+                res[offset++] = (2 + text_len) >> 8; res[offset++] = (2 + text_len) & 0xFF;  // Option Length
+                res[offset++] = edns->ede_list[i].code >> 8; res[offset++] = edns->ede_list[i].code & 0xFF; // EDE Code
+                if (text_len > 0) {
+                    memcpy(res + offset, edns->ede_list[i].text, text_len);
+                    offset += text_len;
+                }
+            }
+        }
+        
         (*arcount_inout)++;
     }
     *offset_inout = offset;

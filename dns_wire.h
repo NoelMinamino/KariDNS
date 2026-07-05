@@ -63,6 +63,34 @@ typedef struct tsig_key {
 } tsig_key_t;
 
 // ============================================================================
+// EDNS 情報構造体
+// ============================================================================
+#define MAX_EDE_COUNT 16
+
+typedef struct {
+    uint16_t code;
+    char text[256];
+} parsed_ede_t;
+
+typedef struct {
+    bool present;
+    uint16_t udp_payload_size;
+    uint8_t ext_rcode;
+    uint8_t version;
+    bool dnssec_ok;
+    
+    // DNS Cookie
+    bool has_cookie;
+    uint8_t client_cookie[8];
+    uint8_t server_cookie[32];
+    uint16_t server_cookie_len;
+    
+    // Extended DNS Errors (EDE)
+    uint16_t ede_count;
+    parsed_ede_t ede_list[MAX_EDE_COUNT];
+} edns_info_t;
+
+// ============================================================================
 // 関数プロトタイプ
 // ============================================================================
 
@@ -91,8 +119,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 void parse_edns_opt(const uint8_t *req, size_t req_len,
                     uint16_t qdcount, uint16_t ancount_req,
                     uint16_t nscount_req, uint16_t arcount_req,
-                    bool *has_edns_out, uint16_t *client_payload_size_out);
+                    edns_info_t *edns);
 void assemble_edns_opt(uint8_t *res, size_t max_res_len,
-                       uint16_t *offset_inout, uint16_t *arcount_inout);
+                       uint16_t *offset_inout, uint16_t *arcount_inout,
+                       edns_info_t *edns, uint8_t rcode_ext);
 
 #endif // DNS_WIRE_H
