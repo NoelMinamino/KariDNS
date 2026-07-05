@@ -11,9 +11,11 @@ KariDNS is a high-performance, lightweight, and modern authoritative DNS server 
 - **Master/Slave Support:** Built-in support for AXFR (Authoritative Zone Transfer), handling both master (sending) and slave (receiving) roles concurrently with background workers.
 - **Security & Reliability:**
   - **Capsicum Sandbox:** Runs in FreeBSD's capability mode. Filesystem access is restricted to pre-opened directory descriptors (using `openat`/`renameat`), enabling secure config reloading and log rotation without escaping the sandbox. Network sockets are protected via `cap_rights_limit`.
-  - Robust TSIG (Transaction Signature) verification for zone transfers and NOTIFY messages.
-  - Privilege dropping (`user` / `group` directives).
-  - RRL (Response Rate Limiting) against DNS amplification attacks.
+  - **Robust TSIG (Transaction Signature):** Verification for zone transfers and NOTIFY messages.
+  - **DNS Cookies (RFC 7873/9018):** Mitigates IP spoofing and amplification attacks by issuing and verifying client/server cookies.
+  - **Extended DNS Errors (EDE, RFC 8914):** Provides enhanced troubleshooting by returning specific error codes and messages (e.g., Not Authoritative) when appropriate.
+  - **Privilege Dropping:** Supports `user` / `group` directives to run with least privilege.
+  - **RRL (Response Rate Limiting):** Protects against DNS amplification attacks.
 - **BIND-compatible Query Logging:** Thread-safe query logging with automatic rotation by size or date.
 
 ## Building and Running
