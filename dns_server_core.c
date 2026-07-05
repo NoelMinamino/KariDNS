@@ -30,6 +30,9 @@
 #include <pwd.h>
 #include <grp.h>
 #include <poll.h>
+#include <limits.h>       // PATH_MAX, NAME_MAX
+#include <sys/capsicum.h> // Capsicum capability mode / rights
+#include <sys/procctl.h>  // PROC_TRAPCAP (diagnostics for capsicum violations)
 
 // karidns
 // Copyright (c) 2026 Noel Minamino
@@ -309,6 +312,230 @@ static const char *g_config_path = NULL;
 static _Atomic int g_bound_workers = 0;
 #define MAX_ZONE_AXFR 4
 
+// ============================================================================
+// Capsicum capability-mode support
+//
+// Design summary:
+//   Every path-based filesystem access in this program (named.conf, zone
+//   master files, log files/rotation) is funneled through a small cache of
+//   *directory* file descriptors, resolved with openat(2)/renameat(2)
+//   relative to those directory fds. Directories are only ever opened while
+//   running in "normal" (non-capability) mode, i.e. during startup and
+//   during config/zone reload triggered from files that were already known
+//   before we entered capability mode. Once cap_enter() has been called
+//   (see enter_capsicum_sandbox() in main()), any attempt to resolve a
+//   directory that isn't already cached is refused by this code *before*
+//   the kernel would refuse it, so we get a clear log message instead of a
+//   bare ENOTCAPABLE/EPERM failure buried in the kernel path lookup.
+//
+//   This also fixes a pre-existing weakness where read_entire_file() opened
+//   absolute paths directly with open(2), bypassing any notion of a
+//   filesystem boundary. All file opens now go through open_via_dir_cache(),
+//   so an attacker who can influence a *value* inside named.conf (but not
+//   the file itself) cannot use it to reach arbitrary files outside of the
+//   directories that were legitimately referenced at startup.
+// ============================================================================
+
+typedef struct dir_fd_entry {
+    char *dirpath;
+    int fd;
+    struct dir_fd_entry *next;
+} dir_fd_entry_t;
+
+static dir_fd_entry_t *g_dir_fd_table = NULL;
+static pthread_mutex_t g_dir_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool g_capsicum_enabled = false;
+
+// Splits `path` into a directory component (dir_out) and a single final
+// path component (base_out). No ".." or embedded '/' can survive in
+// base_out by construction; we additionally reject ".." defensively.
+// Returns false on any malformed/oversized/suspicious input.
+static bool split_path_for_openat(const char *path, char *dir_out, size_t dir_out_sz,
+                                   char *base_out, size_t base_out_sz) {
+    if (!path || !*path) return false;
+    size_t plen = strlen(path);
+    if (plen >= PATH_MAX) return false;
+
+    const char *slash = strrchr(path, '/');
+    if (!slash) {
+        if (strlen(path) >= base_out_sz) return false;
+        if (snprintf(dir_out, dir_out_sz, ".") >= (int)dir_out_sz) return false;
+        memcpy(base_out, path, plen + 1);
+    } else {
+        size_t dir_len = (size_t)(slash - path);
+        if (dir_len == 0) dir_len = 1; // "/file" -> dir "/"
+        if (dir_len >= dir_out_sz) return false;
+        memcpy(dir_out, path, dir_len);
+        dir_out[dir_len] = '\0';
+
+        const char *base = slash + 1;
+        size_t base_len = strlen(base);
+        if (base_len == 0 || base_len >= base_out_sz) return false; // trailing '/' - not a file
+        memcpy(base_out, base, base_len + 1);
+    }
+    if (strcmp(base_out, "..") == 0 || strcmp(base_out, ".") == 0) return false;
+    if (strstr(base_out, "/") != NULL) return false; // impossible by construction, kept as a hard invariant check
+    return true;
+}
+
+// Returns a cached, rights-limited directory descriptor for `dirpath`
+// (never to be close()'d by the caller). Opens and caches it on first use.
+// `writable` selects a rights profile that additionally permits creating,
+// writing, truncating, and renaming files within the directory (used for
+// log directories); read-only directories (zone/config files) get a
+// strictly smaller right set.
+//
+// Once g_capsicum_enabled is true, only directories already present in the
+// cache can be resolved -- opening a *new* directory at that point would
+// require escaping the sandbox, so we refuse it outright.
+static int get_or_open_dir_fd(const char *dirpath, bool writable) {
+    pthread_mutex_lock(&g_dir_fd_lock);
+    for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
+        if (strcmp(e->dirpath, dirpath) == 0) {
+            int fd = e->fd;
+            pthread_mutex_unlock(&g_dir_fd_lock);
+            return fd;
+        }
+    }
+
+    if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+        pthread_mutex_unlock(&g_dir_fd_lock);
+        syslog(LOG_ERR, "[Capsicum] Refusing to open new directory '%s' after entering "
+                         "capability mode; all zone/log/config directories must be "
+                         "reachable at startup time.", dirpath);
+        errno = ENOTCAPABLE;
+        return -1;
+    }
+
+    int fd;
+    if (dirpath[0] == '/') {
+        fd = open(dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+    } else {
+        fd = (g_cwd_fd >= 0) ? openat(g_cwd_fd, dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY)
+                              : open(dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+    }
+    if (fd < 0) {
+        syslog(LOG_ERR, "Failed to open directory '%s': %s", dirpath, strerror(errno));
+        pthread_mutex_unlock(&g_dir_fd_lock);
+        return -1;
+    }
+
+    cap_rights_t rights;
+    if (writable) {
+        cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_WRITE, CAP_CREATE,
+                         CAP_FSTAT, CAP_FSTATFS, CAP_FTRUNCATE, CAP_SEEK,
+                         CAP_RENAMEAT_SOURCE, CAP_RENAMEAT_TARGET, CAP_UNLINKAT);
+    } else {
+        cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT, CAP_FSTATFS, CAP_SEEK);
+    }
+    if (cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) {
+        syslog(LOG_WARNING, "cap_rights_limit failed for directory '%s': %s", dirpath, strerror(errno));
+        close(fd);
+        pthread_mutex_unlock(&g_dir_fd_lock);
+        return -1;
+    }
+
+    dir_fd_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) { close(fd); pthread_mutex_unlock(&g_dir_fd_lock); return -1; }
+    e->dirpath = strdup(dirpath);
+    if (!e->dirpath) { free(e); close(fd); pthread_mutex_unlock(&g_dir_fd_lock); return -1; }
+    e->fd = fd;
+    e->next = g_dir_fd_table;
+    g_dir_fd_table = e;
+    pthread_mutex_unlock(&g_dir_fd_lock);
+    return fd;
+}
+
+// Capability-mode-safe replacement for open(2)/openat(2) by arbitrary path.
+// `path` may be absolute or relative (relative paths are resolved against
+// the original startup working directory, g_cwd_fd, exactly like before).
+static int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
+    char dirbuf[PATH_MAX];
+    char basebuf[PATH_MAX];
+    if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+        syslog(LOG_ERR, "Rejecting malformed or unsafe path: %s", path ? path : "(null)");
+        errno = EINVAL;
+        return -1;
+    }
+    int dfd = get_or_open_dir_fd(dirbuf, writable);
+    if (dfd < 0) return -1;
+    return openat(dfd, basebuf, flags, mode);
+}
+
+// Capability-mode-safe replacement for rename(2)/truncate(2)-by-path for
+// two paths that must live in already-known (registered) directories, e.g.
+// log rotation ("queries.log" -> "queries.log.0"). Both directories are
+// resolved independently so this also works across differently-spelled
+// (but equal) directory strings.
+static int renameat_via_dir_cache(const char *old_path, const char *new_path) {
+    char odir[PATH_MAX], obase[PATH_MAX];
+    char ndir[PATH_MAX], nbase[PATH_MAX];
+    if (!split_path_for_openat(old_path, odir, sizeof(odir), obase, sizeof(obase))) return -1;
+    if (!split_path_for_openat(new_path, ndir, sizeof(ndir), nbase, sizeof(nbase))) return -1;
+    int ofd = get_or_open_dir_fd(odir, true);
+    int nfd = get_or_open_dir_fd(ndir, true);
+    if (ofd < 0 || nfd < 0) return -1;
+    return renameat(ofd, obase, nfd, nbase);
+}
+
+// Applies a minimal capability right set to a bound-and-listening (or
+// about-to-listen) UDP/TCP server socket. Called right after bind()/listen()
+// succeeds, before the socket is ever exposed to untrusted network input.
+static void limit_server_socket_rights(int fd, bool is_listening_tcp) {
+    cap_rights_t rights;
+    if (is_listening_tcp) {
+        cap_rights_init(&rights, CAP_ACCEPT, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT,
+                         CAP_SHUTDOWN, CAP_GETSOCKNAME, CAP_GETPEERNAME);
+    } else {
+        cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT,
+                         CAP_SHUTDOWN, CAP_GETSOCKNAME, CAP_GETPEERNAME);
+    }
+    if (cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) {
+        syslog(LOG_WARNING, "cap_rights_limit failed for server socket fd=%d: %s", fd, strerror(errno));
+    }
+}
+
+// Applies a minimal capability right set to a freshly-accept()ed TCP client
+// socket, or to an AXFR/NOTIFY client socket right after connect(2) returns.
+static void limit_client_socket_rights(int fd) {
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT,
+                     CAP_SHUTDOWN, CAP_GETSOCKNAME, CAP_GETPEERNAME);
+    if (cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) {
+        syslog(LOG_WARNING, "cap_rights_limit failed for client socket fd=%d: %s", fd, strerror(errno));
+    }
+}
+
+// Enters Capsicum capability mode for the whole process (all threads).
+// Must be called only after: (1) all listening sockets are created & bound,
+// (2) all files that need to be read/written at startup have been opened at
+// least once (so their directories are cached), and (3) privilege drop
+// (setuid/setgid) has already happened, since capability mode does not
+// itself restrict credential syscalls but we want defense-in-depth ordered
+// correctly regardless.
+static void enter_capsicum_sandbox(void) {
+    // Ask the kernel to deliver SIGTRAP on capability violations during
+    // testing/diagnostics; harmless in production (default is to just
+    // return ENOTCAPABLE/EPERM to the offending syscall).
+    int trapmode = PROC_TRAPCAP_CTL_ENABLE;
+    procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);
+
+    if (cap_enter() != 0) {
+        if (errno == ENOSYS) {
+            syslog(LOG_WARNING, "[Capsicum] Kernel does not support capability mode; running unsandboxed.");
+            return;
+        }
+        syslog(LOG_ERR, "[Capsicum] cap_enter() failed: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);
+    syslog(LOG_NOTICE, "[Capsicum] Entered capability mode; process is now sandboxed.");
+
+    if (!cap_sandboxed()) {
+        syslog(LOG_WARNING, "[Capsicum] cap_enter() succeeded but cap_sandboxed() reports false.");
+    }
+}
+
 
 // ============================================================================
 
@@ -413,13 +640,13 @@ void free_zone_config(zone_config_t *zone) {
 }
 
 static char *read_entire_file(const char *path) {
-    // Removed directory traversal check as it was not a real security boundary for absolute paths
-    int fd = -1;
-    if (path[0] == '/') {
-        fd = open(path, O_RDONLY);
-    } else {
-        fd = (g_cwd_fd >= 0) ? openat(g_cwd_fd, path, O_RDONLY) : open(path, O_RDONLY);
-    }
+    // All reads go through the directory-fd cache (see get_or_open_dir_fd()
+    // above) so that: (1) we never issue a raw open() by absolute path at
+    // runtime once running in Capsicum capability mode, and (2) the
+    // directory boundary implied by "known at startup" is actually
+    // enforced, rather than being a no-op as in earlier revisions of this
+    // function.
+    int fd = open_via_dir_cache(path, O_RDONLY, 0, false);
     if (fd < 0) return NULL;
     FILE *f = fdopen(fd, "rb");
     if (!f) { close(fd); return NULL; }
@@ -2695,6 +2922,10 @@ void *axfr_bg_thread_func(void *arg) {
     if (tcp_fd >= 0) {
         size_t addr_len = (domain_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
         if (connect(tcp_fd, (struct sockaddr *)&master_addr, addr_len) == 0) {
+        // Socket already connected; it no longer needs CAP_CONNECT etc.
+        // Restrict it down to send/recv-class rights before any data is
+        // exchanged with the remote master.
+        limit_client_socket_rights(tcp_fd);
         struct timeval tv;
         tv.tv_sec = 30; tv.tv_usec = 0;
         setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
@@ -3031,7 +3262,7 @@ static void init_logging_channels(server_config_t *cfg) {
     log_channel_t *ch = cfg->logging.channels;
     while (ch) {
         if (ch->file_path) {
-            ch->fd = open(ch->file_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND, 0644, true);
             if (ch->fd >= 0) {
                 struct stat st;
                 if (fstat(ch->fd, &st) == 0) {
@@ -3127,25 +3358,45 @@ static void write_query_log(const char *client_ip, int client_port, const char *
     if (rotate) {
         close(ch->fd);
         ch->fd = -1;
-        
+        int reopen_flags = O_WRONLY | O_CREAT | O_APPEND;
+
         if (ch->suffix_timestamp) {
-            char old_name[512], new_name[512];
-            snprintf(old_name, sizeof(old_name), "%s", ch->file_path);
-            snprintf(new_name, sizeof(new_name), "%s.%08d", ch->file_path, ch->current_date);
-            rename(old_name, new_name);
+            char new_name[600];
+            int r = snprintf(new_name, sizeof(new_name), "%s.%08d", ch->file_path, ch->current_date);
+            if (r > 0 && r < (int)sizeof(new_name)) {
+                if (renameat_via_dir_cache(ch->file_path, new_name) != 0 && errno != ENOENT) {
+                    syslog(LOG_WARNING, "Log rotate: rename %s -> %s failed: %s", ch->file_path, new_name, strerror(errno));
+                }
+            } else {
+                syslog(LOG_WARNING, "Log rotate: rotated filename too long for %s, skipping rename", ch->file_path);
+            }
         } else if (ch->versions > 0) {
             for (int i = ch->versions - 1; i >= 0; i--) {
-                char old_name[512], new_name[512];
-                if (i == 0) snprintf(old_name, sizeof(old_name), "%s", ch->file_path);
-                else snprintf(old_name, sizeof(old_name), "%s.%d", ch->file_path, i - 1);
-                snprintf(new_name, sizeof(new_name), "%s.%d", ch->file_path, i);
-                rename(old_name, new_name);
+                char old_name[600], new_name[600];
+                int r1 = (i == 0) ? snprintf(old_name, sizeof(old_name), "%s", ch->file_path)
+                                  : snprintf(old_name, sizeof(old_name), "%s.%d", ch->file_path, i - 1);
+                int r2 = snprintf(new_name, sizeof(new_name), "%s.%d", ch->file_path, i);
+                if (r1 > 0 && r1 < (int)sizeof(old_name) && r2 > 0 && r2 < (int)sizeof(new_name)) {
+                    // ENOENT is expected/benign here: not every version slot
+                    // exists yet, especially right after startup.
+                    renameat_via_dir_cache(old_name, new_name);
+                } else {
+                    syslog(LOG_WARNING, "Log rotate: rotated filename too long for %s, skipping version %d", ch->file_path, i);
+                }
             }
         } else {
-            truncate(ch->file_path, 0);
+            // Fold truncate(2)-by-path into the reopen itself: this avoids a
+            // separate pathname-based truncate() call entirely, which is
+            // both simpler and required for Capsicum capability mode
+            // (truncate(2) is not capability-safe; ftruncate(2) on an
+            // already-open fd would be, but we're reopening anyway).
+            reopen_flags |= O_TRUNC;
         }
-        
-        ch->fd = open(ch->file_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+        ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
+        if (ch->fd < 0) {
+            syslog(LOG_ERR, "Log rotate: failed to reopen %s: %s", ch->file_path, strerror(errno));
+        }
         ch->current_size = 0;
         ch->current_date = today;
     }
@@ -3210,6 +3461,7 @@ void *worker_thread_func(void *arg) {
                 setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
                 if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
+                    limit_server_socket_rights(udp_fd, false);
                     struct kevent ev; EV_SET(&ev, udp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void*)1);
                     kevent(kq, &ev, 1, NULL, 0, NULL);
                     created_sockets++;
@@ -3228,6 +3480,7 @@ void *worker_thread_func(void *arg) {
 #endif
                 if (bind(tcp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
                     listen(tcp_fd, 1024);
+                    limit_server_socket_rights(tcp_fd, true);
                     struct kevent ev; EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void*)2);
                     kevent(kq, &ev, 1, NULL, 0, NULL);
                     created_sockets++;
@@ -3248,6 +3501,7 @@ void *worker_thread_func(void *arg) {
                 setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
                 if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+                    limit_server_socket_rights(udp_fd, false);
                     struct kevent ev; EV_SET(&ev, udp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void*)1);
                     kevent(kq, &ev, 1, NULL, 0, NULL);
                     created_sockets++;
@@ -3267,6 +3521,7 @@ void *worker_thread_func(void *arg) {
 #endif
                 if (bind(tcp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
                     listen(tcp_fd, 1024);
+                    limit_server_socket_rights(tcp_fd, true);
                     struct kevent ev; EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void*)2);
                     kevent(kq, &ev, 1, NULL, 0, NULL);
                     created_sockets++;
@@ -3411,6 +3666,7 @@ worker_startup_success:
                     int client_fd = accept(active_tcp_fd, (struct sockaddr *)&client_addr, &client_len);
                     if (client_fd < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; break; }
                     
+                    limit_client_socket_rights(client_fd);
                     int cflags = fcntl(client_fd, F_GETFL, 0); fcntl(client_fd, F_SETFL, cflags | O_NONBLOCK);
                     tcp_stream_ctx_t *ctx_tcp = calloc(1, sizeof(tcp_stream_ctx_t));
                     if (!ctx_tcp) { close(client_fd); continue; }
@@ -3798,6 +4054,19 @@ static void daemonize(void) {
     if (fd != STDIN_FILENO) return;
     dup2(fd, STDOUT_FILENO);
     dup2(fd, STDERR_FILENO);
+
+    // Defense-in-depth: these three descriptors now only ever need to be
+    // read from / written to as /dev/null placeholders, never re-opened,
+    // seeked meaningfully, or used for anything socket- or path-related.
+    cap_rights_t io_rights;
+    cap_rights_init(&io_rights, CAP_READ, CAP_WRITE, CAP_FSTAT);
+    for (int stdio_fd = STDIN_FILENO; stdio_fd <= STDERR_FILENO; stdio_fd++) {
+        if (cap_rights_limit(stdio_fd, &io_rights) != 0 && errno != ENOSYS) {
+            // Non-fatal: some environments may have redirected stdio to
+            // something these rights don't cover; just log and continue.
+            syslog(LOG_WARNING, "cap_rights_limit failed for stdio fd=%d: %s", stdio_fd, strerror(errno));
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -3807,6 +4076,18 @@ int main(int argc, char **argv) {
     }
     g_cwd_fd = open(".", O_DIRECTORY | O_CLOEXEC | O_RDONLY);
     if (g_cwd_fd < 0) syslog(LOG_WARNING, "Failed to open current directory, relative paths may not work");
+    else {
+        // g_cwd_fd is only ever used as the base for openat() when
+        // resolving *other* directories referenced (directly or relatively)
+        // from named.conf, during the pre-sandbox phase. Limit it to
+        // lookup/read/stat now so it cannot be (mis)used for anything else,
+        // and it remains a harmless, inert fd after cap_enter().
+        cap_rights_t cwd_rights;
+        cap_rights_init(&cwd_rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT);
+        if (cap_rights_limit(g_cwd_fd, &cwd_rights) != 0 && errno != ENOSYS) {
+            syslog(LOG_WARNING, "cap_rights_limit failed for g_cwd_fd: %s", strerror(errno));
+        }
+    }
     
     g_config_path = argv[1];
     openlog("my_dns", LOG_PID | LOG_NDELAY, LOG_DAEMON);
@@ -3891,7 +4172,18 @@ int main(int argc, char **argv) {
     }
     syslog(LOG_NOTICE, "Successfully dropped privileges");
 
-
+    // At this point:
+    //  - every listening socket has already been created and bound (we
+    //    waited on g_bound_workers above),
+    //  - the initial config, all master zone files, and all log files have
+    //    already been opened at least once (their directories are cached),
+    //  - uid/gid have already been dropped.
+    // It is now safe to enter Capsicum capability mode for the whole
+    // process. Any subsequent SIGHUP config reload can still re-read
+    // already-known config/zone/log files and re-open log files for
+    // rotation, but cannot open any path in a directory we haven't already
+    // seen (see get_or_open_dir_fd()).
+    enter_capsicum_sandbox();
 
     // クリーンアップ用ループ待機
     for (int i = 0; i < num_workers; i++) pthread_join(threads[i], NULL);
