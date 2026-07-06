@@ -10,23 +10,26 @@ KariDNS is a high-performance, lightweight, and modern authoritative DNS server 
 - **RCU (Read-Copy-Update) Architecture:** Lock-free, concurrent data structure swaps. Configuration and zone files can be hot-reloaded instantly without dropping a single query or blocking worker threads.
 - **Master/Slave Support:** Built-in support for AXFR (Authoritative Zone Transfer), handling both master (sending) and slave (receiving) roles concurrently with background workers.
 - **Security & Reliability:**
-  - **Capsicum Sandbox:** Runs in FreeBSD's capability mode. Filesystem access is restricted to pre-opened directory descriptors (using `openat`/`renameat`), enabling secure config reloading and log rotation without escaping the sandbox. Network sockets are protected via `cap_rights_limit`.
-  - **Robust TSIG (Transaction Signature):** Verification for zone transfers and NOTIFY messages.
-  - **DNS Cookies (RFC 7873/9018):** Mitigates IP spoofing and amplification attacks by issuing and verifying client/server cookies.
-  - **Extended DNS Errors (EDE, RFC 8914):** Provides enhanced troubleshooting by returning specific error codes and messages (e.g., Not Authoritative) when appropriate.
-  - **Privilege Dropping:** Supports `user` / `group` directives to run with least privilege.
-  - **RRL (Response Rate Limiting):** Protects against DNS amplification attacks.
+- **Advanced Capsicum Sandboxing & Dual-Process Architecture:** 
+  - KariDNS adopts a strictly isolated two-process model (Frontend Router and Backend Workers). The Frontend binds privileged ports and routes UDP traffic while remaining outside the sandbox. The Backend drops privileges, enters the Capsicum sandbox (`cap_enter()`), and securely processes DNS logic without any filesystem or network socket creation rights.
+  - Configuration reloading inside the sandbox is achieved safely using pre-opened directory file descriptors (`openat`/`renameat`).
+- **Robust TSIG (Transaction Signature):** Verification for zone transfers and NOTIFY messages.
+- **DNS Cookies (RFC 7873/9018):** Mitigates IP spoofing and amplification attacks by issuing and verifying client/server cookies.
+- **Extended DNS Errors (EDE, RFC 8914):** Provides enhanced troubleshooting by returning specific error codes (e.g., Not Authoritative, Unsupported DNSKEY Algorithm, DNSSEC Bogus) when appropriate.
+- **Privilege Dropping:** Supports `user` / `group` directives to run with least privilege.
+- **RRL (Response Rate Limiting):** Protects against DNS amplification attacks.
 - **BIND-compatible Query Logging:** Thread-safe query logging with automatic rotation by size or date.
+- **RNDC-style Control Channel (`karictl`):** Secure local administration using a UNIX domain socket and HMAC-SHA256 challenge-response authentication.
 
 ## Building and Running
 
 ### Prerequisites
-- FreeBSD operating system(I tested FreeBSD 15.0p9)
+- FreeBSD operating system (tested on FreeBSD 15.0p9)
 - Clang or GCC compiler
-- OpenSSL (for TSIG HMAC-SHA256 support)
+- OpenSSL (for TSIG and Control Channel HMAC-SHA256 support)
 
 ### Compilation
-Simply run `make` or `make all` in the project root to compile the server:
+Simply run `make` or `make all` in the project root to compile the server and the `karictl` client:
 ```sh
 make all
 ```
@@ -37,18 +40,59 @@ Start KariDNS by passing the path to your configuration file as the first argume
 ./karidns /path/to/karidns.conf
 ```
 
-To reload the configuration and zone files dynamically without restarting the server (zero downtime), send a `SIGHUP` signal to the process:
+To reload the configuration and zone files dynamically without restarting the server, you can use the `karictl` tool:
 ```sh
-pkill -HUP karidns
+./karictl reload
+```
+
+## Control Channel & Configuration Format
+
+KariDNS supports an administrative control channel similar to BIND's `rndc`. 
+
+### karidns.conf (Server Side)
+To enable the control channel on the server, add the `control-channel` block to your `karidns.conf`:
+```
+control-channel {
+    algorithm hmac-sha256;
+    secret "your-base64-secret-here";
+};
+```
+
+### karictl.conf (Client Side)
+Create a file at `/usr/local/etc/karictl.conf` (or any path) for the `karictl` client with a matching secret block:
+```
+key "karictl" {
+    algorithm hmac-sha256;
+    secret "your-base64-secret-here";
+};
+```
+
+### Using karictl
+`karictl` uses `/usr/local/etc/karictl.conf` by default. You can specify a custom config path using the `-f` flag.
+```sh
+# Check server status
+./karictl -f /custom/karictl.conf status
+
+# Reload configuration and all zones
+./karictl reload
+
+# Stop the server gracefully
+./karictl stop
+
+# Send NOTIFY to slaves for a specific zone
+./karictl notify example.com
+
+# Request a zone transfer (AXFR) from the master
+./karictl retransfer example.com
 ```
 
 ## Configuration Examples
 
 To get started, you can refer to the provided sample files:
 
-- **Main Configuration:** [karidns.conf.sample](karidns.conf.sample)
+- **Main Configuration:** `karidns.conf.sample`
   Demonstrates how to configure listen ports, privilege dropping, TSIG keys, and set up thread-safe query logging with size/date-based rotation.
-- **Zone File:** [example.com.zone.sample](example.com.zone.sample)
+- **Zone File:** `example.com.zone.sample`
   Provides a standard master zone file template for KariDNS.
 
 ## License

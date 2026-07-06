@@ -31,6 +31,8 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/un.h>
+#include <sys/ucred.h>
 
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
 
@@ -100,6 +102,7 @@ typedef struct {
   uint32_t expire;
   time_t next_check;
   _Atomic bool refresh_now;
+  _Atomic bool notify_now;
   _Atomic bool is_transferring;
   _Atomic(int) active_axfr;
 } zone_db_entry_t;
@@ -166,6 +169,14 @@ typedef struct {
 } logging_config_t;
 
 typedef struct {
+  bool enabled;
+  char *algorithm;
+  char *secret;
+  uint8_t secret_decoded[256];
+  size_t secret_decoded_len;
+} control_channel_config_t;
+
+typedef struct {
   int port;
   char **bind_addresses;
   int bind_address_count;
@@ -174,6 +185,7 @@ typedef struct {
   zone_config_t *zones;
   tsig_key_t *keys;
   logging_config_t logging;
+  control_channel_config_t control;
 } server_config_t;
 
 typedef enum {
@@ -186,7 +198,7 @@ typedef enum {
 typedef struct {
   token_type_t type;
   char *value;
-} token_t;
+} conf_token_t;
 typedef struct {
   const char *src;
   size_t pos;
@@ -278,6 +290,8 @@ static int g_num_udp_fds = 0;
 static int (*g_ipc_fds)[2] = NULL;
 static int g_num_ipc = 0;
 static int g_notify_ipc[2];
+static int g_control_sock = -1;
+static _Atomic(bool) g_frontend_alive = true;
 
 // Broker
 static int g_broker_sock = -1;
@@ -574,8 +588,8 @@ static void skip_spaces_and_comments(token_ctx_t *ctx) {
   }
 }
 
-token_t get_next_token(token_ctx_t *ctx) {
-  token_t tok = {TOKEN_EOF, NULL};
+conf_token_t get_next_token(token_ctx_t *ctx) {
+  conf_token_t tok = {TOKEN_EOF, NULL};
   skip_spaces_and_comments(ctx);
   if (ctx->pos >= ctx->len)
     return tok;
@@ -632,7 +646,7 @@ token_t get_next_token(token_ctx_t *ctx) {
   return tok;
 }
 
-void free_token(token_t *tok) {
+void free_token(conf_token_t *tok) {
   if (tok->value) {
     free(tok->value);
     tok->value = NULL;
@@ -693,7 +707,7 @@ static char *read_entire_file(const char *path) {
 static void skip_unknown_block(token_ctx_t *ctx) {
   int brace_level = 0;
   while (1) {
-    token_t tok = get_next_token(ctx);
+    conf_token_t tok = get_next_token(ctx);
     if (tok.type == TOKEN_EOF) {
       free_token(&tok);
       break;
@@ -758,7 +772,7 @@ static bool match_cidr(const char *client_ip_str, const char *cidr_str) {
 }
 
 static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
-  token_t tok = get_next_token(ctx);
+  conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_token(&tok);
     return -1;
@@ -795,7 +809,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
 }
 
 static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
-  token_t tok = get_next_token(ctx);
+  conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_LBRACE) {
     free_token(&tok);
     return -1;
@@ -859,7 +873,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->group = NULL;
   zone_config_t *last_zone = NULL;
   while (1) {
-    token_t tok = get_next_token(&ctx);
+    conf_token_t tok = get_next_token(&ctx);
     if (tok.type == TOKEN_EOF)
       break;
     if (tok.type != TOKEN_STRING) {
@@ -1137,6 +1151,76 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       free_token(&tok);
       tsig->next = config->keys;
       config->keys = tsig;
+    } else if (strcmp(tok.value, "control-channel") == 0) {
+      free_token(&tok);
+      tok = get_next_token(&ctx);
+      if (tok.type != TOKEN_LBRACE) {
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      config->control.enabled = true;
+      while (1) {
+        tok = get_next_token(&ctx);
+        if (tok.type == TOKEN_RBRACE) {
+          free_token(&tok);
+          break;
+        }
+        if (tok.type != TOKEN_STRING) {
+          free_token(&tok);
+          return -1;
+        }
+        char *key_prop = strdup(tok.value);
+        free_token(&tok);
+        if (strcmp(key_prop, "algorithm") == 0 ||
+            strcmp(key_prop, "secret") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key_prop);
+            free_token(&tok);
+            return -1;
+          }
+          char *val = strdup(tok.value);
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key_prop);
+            free(val);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+          if (strcmp(key_prop, "algorithm") == 0)
+            config->control.algorithm = val;
+          else {
+            config->control.secret = val;
+            int len = EVP_DecodeBlock(config->control.secret_decoded,
+                                      (const unsigned char *)config->control.secret,
+                                      strlen(config->control.secret));
+            if (len < 0) {
+              free(key_prop);
+              free(val);
+              free_token(&tok);
+              return -1;
+            }
+            int padding = 0;
+            size_t slen = strlen(config->control.secret);
+            if (slen > 0 && config->control.secret[slen - 1] == '=')
+              padding++;
+            if (slen > 1 && config->control.secret[slen - 2] == '=')
+              padding++;
+            config->control.secret_decoded_len = len - padding;
+          }
+        } else
+          skip_unknown_block(&ctx);
+        free(key_prop);
+      }
+      tok = get_next_token(&ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
     } else if (strcmp(tok.value, "logging") == 0) {
       free_token(&tok);
       tok = get_next_token(&ctx);
@@ -2999,10 +3083,18 @@ void *axfr_bg_thread_func(void *arg) {
     uint16_t msg_len = req_len - 2;
     axfr_req[0] = msg_len >> 8;
     axfr_req[1] = msg_len & 0xFF;
-    if (send(tcp_fd, axfr_req, req_len, 0) == req_len)
-      handle_axfr_event(tcp_fd, ctx->entry, &stream_ctx, &session,
-                        ctx->tsig_key);
+    if (send(tcp_fd, axfr_req, req_len, 0) == req_len) {
+      if (handle_axfr_event(tcp_fd, ctx->entry, &stream_ctx, &session, ctx->tsig_key) > 0) {
+        syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
+      } else {
+        syslog(LOG_ERR, "[AXFR] Failed to transfer zone %s from %s", ctx->domain, ctx->master_ip);
+      }
+    } else {
+      syslog(LOG_ERR, "[AXFR] Failed to send request for zone %s to %s", ctx->domain, ctx->master_ip);
+    }
     close(tcp_fd);
+  } else {
+    syslog(LOG_ERR, "[AXFR] Failed to connect to %s for zone %s", ctx->master_ip, ctx->domain);
   }
   if (ctx->entry)
     atomic_store_explicit(&ctx->entry->is_transferring, false,
@@ -3544,7 +3636,10 @@ worker_startup_success:;
           uint8_t req_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
           ssize_t received =
               recv(active_fd, req_buf_full, sizeof(req_buf_full), 0);
-          if (received <= 0) break;
+          if (received <= 0) {
+            if (received == 0) atomic_store(&g_frontend_alive, false);
+            break;
+          }
           if (received < (ssize_t)sizeof(udp_ipc_t))
             continue;
 
@@ -3969,6 +4064,102 @@ worker_startup_success:;
 // ============================================================================
 // 12. Control Thread
 // ============================================================================
+typedef enum {
+  CTRL_STATE_NEW,
+  CTRL_STATE_AUTH_WAIT,
+  CTRL_STATE_CMD_WAIT
+} ctrl_state_t;
+
+typedef struct ctrl_client {
+  int fd;
+  ctrl_state_t state;
+  char challenge[65];
+  char buf[1024];
+  size_t buf_len;
+  struct ctrl_client *next;
+} ctrl_client_t;
+
+static ctrl_client_t *g_ctrl_clients = NULL;
+
+static void free_ctrl_client(int fd) {
+  ctrl_client_t **p = &g_ctrl_clients;
+  while (*p) {
+    if ((*p)->fd == fd) {
+      ctrl_client_t *c = *p;
+      *p = c->next;
+      close(c->fd);
+      free(c);
+      return;
+    }
+    p = &(*p)->next;
+  }
+}
+
+static ctrl_client_t *get_ctrl_client(int fd) {
+  ctrl_client_t *p = g_ctrl_clients;
+  while (p) {
+    if (p->fd == fd) return p;
+    p = p->next;
+  }
+  return NULL;
+}
+
+static void perform_config_reload(void) {
+  char *config_str = read_entire_file(g_config_path);
+  if (!config_str)
+    return;
+  server_config_t *active =
+      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *standby = (active == &g_config_db.config_a)
+                                 ? &g_config_db.config_b
+                                 : &g_config_db.config_a;
+  for (int j = 0; j < standby->bind_address_count; j++)
+    free(standby->bind_addresses[j]);
+  free(standby->bind_addresses);
+  standby->bind_addresses = NULL;
+  standby->bind_address_count = 0;
+  zone_config_t *curr = standby->zones;
+  while (curr) {
+    zone_config_t *next = curr->next;
+    free_zone_config(curr);
+    curr = next;
+  }
+  tsig_key_t *k = standby->keys;
+  while (k) {
+    tsig_key_t *next_k = k->next;
+    free(k->name); free(k->algorithm); free(k->secret);
+    free(k);
+    k = next_k;
+  }
+  standby->zones = NULL;
+  standby->keys = NULL;
+  free_logging_channels(standby);
+  if (parse_named_conf(config_str, standby) == 0) {
+    init_logging_channels(standby);
+    atomic_store_explicit(&g_config_db.active, standby,
+                          memory_order_release);
+    load_zones_from_config(standby);
+    syslog(LOG_NOTICE, "Configuration and zones reloaded successfully.");
+  } else {
+    syslog(LOG_ERR, "Failed to reload configuration: parse error.");
+  }
+  free(config_str);
+}
+
+static const char *find_configured_domain(const char *arg) {
+  server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  zone_config_t *zcfg = active->zones;
+  size_t arg_len = strlen(arg);
+  while (zcfg) {
+    size_t z_len = strlen(zcfg->domain);
+    if (strcasecmp(zcfg->domain, arg) == 0) return zcfg->domain;
+    if (arg_len + 1 == z_len && zcfg->domain[z_len - 1] == '.' && strncasecmp(zcfg->domain, arg, arg_len) == 0) return zcfg->domain;
+    if (z_len + 1 == arg_len && arg[arg_len - 1] == '.' && strncasecmp(zcfg->domain, arg, z_len) == 0) return zcfg->domain;
+    zcfg = zcfg->next;
+  }
+  return arg;
+}
+
 void *control_thread_func(void *arg) {
   (void)arg;
   int kq = kqueue();
@@ -3983,6 +4174,14 @@ void *control_thread_func(void *arg) {
     close(kq);
     pthread_exit(NULL);
   }
+  if (g_control_sock >= 0) {
+    EV_SET(&ev_set[0], g_control_sock, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1) {
+      close(kq);
+      pthread_exit(NULL);
+    }
+  }
+
   struct kevent ev_list[4];
   while (1) {
     int n = kevent(kq, NULL, 0, ev_list, 4, NULL);
@@ -3992,42 +4191,197 @@ void *control_thread_func(void *arg) {
       break;
     }
     for (int i = 0; i < n; i++) {
-      if (ev_list[i].filter == EVFILT_SIGNAL && ev_list[i].ident == SIGHUP) {
-        char *config_str = read_entire_file(g_config_path);
-        if (!config_str)
+      if (g_control_sock >= 0 && ev_list[i].ident == (uintptr_t)g_control_sock) {
+        struct sockaddr_un cli_addr;
+        socklen_t cli_len = sizeof(cli_addr);
+        int cfd = accept(g_control_sock, (struct sockaddr *)&cli_addr, &cli_len);
+        if (cfd >= 0) {
+          struct xucred cr;
+          socklen_t cr_len = sizeof(cr);
+          if (getsockopt(cfd, 0, LOCAL_PEERCRED, &cr, &cr_len) == 0 && cr.cr_version == XUCRED_VERSION) {
+            bool allowed = false;
+            uid_t my_uid = geteuid();
+            if (cr.cr_uid == my_uid || cr.cr_uid == 0) {
+              allowed = true;
+            }
+            if (!allowed) {
+              close(cfd);
+              continue;
+            }
+          } else {
+            close(cfd);
+            continue;
+          }
+
+          fcntl(cfd, F_SETFL, fcntl(cfd, F_GETFL, 0) | O_NONBLOCK);
+          cap_rights_t rights;
+          cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT);
+          cap_rights_limit(cfd, &rights);
+          
+          ctrl_client_t *c = calloc(1, sizeof(ctrl_client_t));
+          c->fd = cfd;
+          c->state = CTRL_STATE_NEW;
+          c->next = g_ctrl_clients;
+          g_ctrl_clients = c;
+          
+          struct kevent ev_c;
+          EV_SET(&ev_c, cfd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void*)1);
+          kevent(g_control_kq, &ev_c, 1, NULL, 0, NULL);
+          
+          uint8_t rand_bytes[32];
+          arc4random_buf(rand_bytes, 32);
+          for(int k=0; k<32; k++) snprintf(&c->challenge[k*2], 3, "%02x", rand_bytes[k]);
+          c->challenge[64] = '\0';
+          
+          char msg[128];
+          int mlen = snprintf(msg, sizeof(msg), "CHALLENGE %s\n", c->challenge);
+          send(cfd, msg, mlen, 0);
+          c->state = CTRL_STATE_AUTH_WAIT;
+        }
+      } else if (ev_list[i].udata == (void*)1) {
+        int cfd = ev_list[i].ident;
+        ctrl_client_t *c = get_ctrl_client(cfd);
+        if (!c) continue;
+        if (ev_list[i].flags & EV_EOF) {
+          free_ctrl_client(cfd);
           continue;
-        server_config_t *active =
-            atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-        server_config_t *standby = (active == &g_config_db.config_a)
-                                       ? &g_config_db.config_b
-                                       : &g_config_db.config_a;
-        for (int j = 0; j < standby->bind_address_count; j++)
-          free(standby->bind_addresses[j]);
-        free(standby->bind_addresses);
-        standby->bind_addresses = NULL;
-        standby->bind_address_count = 0;
-        zone_config_t *curr = standby->zones;
-        while (curr) {
-          zone_config_t *next = curr->next;
-          free_zone_config(curr);
-          curr = next;
         }
-        tsig_key_t *k = standby->keys;
-        while (k) {
-          tsig_key_t *next_k = k->next;
-          free(k->name); free(k->algorithm); free(k->secret);
-          free(k);
-          k = next_k;
+        ssize_t r = recv(cfd, c->buf + c->buf_len, sizeof(c->buf) - c->buf_len - 1, 0);
+        if (r <= 0) {
+          free_ctrl_client(cfd);
+          continue;
         }
-        standby->zones = NULL;
-        free_logging_channels(standby);
-        if (parse_named_conf(config_str, standby) == 0) {
-          init_logging_channels(standby);
-          atomic_store_explicit(&g_config_db.active, standby,
-                                memory_order_release);
-          load_zones_from_config(standby);
+        c->buf_len += r;
+        c->buf[c->buf_len] = '\0';
+        
+        char *nl = strchr(c->buf, '\n');
+        if (nl) {
+          *nl = '\0';
+          if (c->state == CTRL_STATE_AUTH_WAIT) {
+            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+            if (strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
+              char *client_hmac = c->buf + 5;
+              unsigned char md[EVP_MAX_MD_SIZE];
+              unsigned int md_len;
+              HMAC(EVP_sha256(), cfg->control.secret_decoded, cfg->control.secret_decoded_len, 
+                   (unsigned char*)c->challenge, 64, md, &md_len);
+              char expected[65];
+              for(unsigned int k=0; k<md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
+              
+              if (strcmp(client_hmac, expected) == 0) {
+                send(cfd, "OK\n", 3, 0);
+                c->state = CTRL_STATE_CMD_WAIT;
+              } else {
+                send(cfd, "AUTH_FAILED\n", 12, 0);
+                free_ctrl_client(cfd);
+                continue;
+              }
+            } else {
+              send(cfd, "AUTH_FAILED\n", 12, 0);
+              free_ctrl_client(cfd);
+              continue;
+            }
+          } else if (c->state == CTRL_STATE_CMD_WAIT) {
+            char *cmd = c->buf;
+            char *arg = strchr(cmd, ' ');
+            if (arg) { *arg = '\0'; arg++; }
+            
+            if (strcmp(cmd, "reload") == 0) {
+              if (arg && strlen(arg) > 0) {
+                const char *canon_arg = find_configured_domain(arg);
+                server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+                zone_config_t *zcfg = active->zones;
+                while (zcfg) {
+                  if (strcasecmp(zcfg->domain, canon_arg) == 0) break;
+                  zcfg = zcfg->next;
+                }
+                if (zcfg) {
+                  syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
+                  zone_db_entry_t *entry = get_or_create_zone(zcfg->domain);
+                  if (entry) {
+                    char *buf = read_entire_file(zcfg->file);
+                    if (buf) {
+                      pthread_mutex_lock(&entry->writer_lock);
+                      zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+                      (void)z_active;
+                      pthread_mutex_unlock(&entry->writer_lock);
+                      free(buf);
+                    }
+                  }
+                  perform_config_reload();
+                  send(cfd, "OK reloaded\n", 12, 0);
+                } else {
+                  syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
+                  send(cfd, "ERROR zone not found\n", 21, 0);
+                }
+              } else {
+                syslog(LOG_NOTICE, "[Control] Received full reload command");
+                perform_config_reload();
+                send(cfd, "OK reloaded\n", 12, 0);
+              }
+            } else if (strcmp(cmd, "stop") == 0) {
+              syslog(LOG_NOTICE, "[Control] Received stop command");
+              udp_ipc_t msg;
+              memset(&msg, 0, sizeof(msg));
+              msg.sock_fd_idx = -2;
+              uint8_t pkt[sizeof(msg)];
+              memcpy(pkt, &msg, sizeof(msg));
+              send(g_notify_ipc[1], pkt, sizeof(pkt), 0);
+              send(cfd, "OK stopping\n", 12, 0);
+              exit(0);
+            } else if (strcmp(cmd, "status") == 0) {
+              char smsg[256];
+              bool frontend_alive = atomic_load(&g_frontend_alive);
+              int slen = snprintf(smsg, sizeof(smsg), "OK frontend_alive=%d pid=%d\n", frontend_alive, getpid());
+              send(cfd, smsg, slen, 0);
+            } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
+              const char *canon_arg = find_configured_domain(arg);
+              zone_db_entry_t *entry = get_zone(canon_arg);
+              if (entry) {
+                char smsg[256];
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", entry->serial, entry->refresh);
+                send(cfd, smsg, slen, 0);
+              } else {
+                syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              }
+            } else if (strcmp(cmd, "notify") == 0 && arg) {
+              const char *canon_arg = find_configured_domain(arg);
+              zone_db_entry_t *entry = get_zone(canon_arg);
+              if (entry) {
+                syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s", canon_arg);
+                atomic_store_explicit(&entry->notify_now, true, memory_order_release);
+                send(cfd, "OK\n", 3, 0);
+              } else {
+                syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              }
+            } else if (strcmp(cmd, "retransfer") == 0 && arg) {
+              const char *canon_arg = find_configured_domain(arg);
+              zone_db_entry_t *entry = get_zone(canon_arg);
+              if (entry) {
+                syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
+                atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+                send(cfd, "OK\n", 3, 0);
+              } else {
+                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              }
+            } else {
+              syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
+              send(cfd, "ERROR unknown command\n", 22, 0);
+            }
+            free_ctrl_client(cfd);
+            continue;
+          }
+          size_t rem = c->buf_len - (nl + 1 - c->buf);
+          memmove(c->buf, nl + 1, rem);
+          c->buf_len = rem;
+        } else if (c->buf_len >= sizeof(c->buf) - 1) {
+          free_ctrl_client(cfd);
         }
-        free(config_str);
+      } else if (ev_list[i].filter == EVFILT_SIGNAL && ev_list[i].ident == SIGHUP) {
+        perform_config_reload();
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
@@ -4099,6 +4453,10 @@ void *control_thread_func(void *arg) {
 // ============================================================================
 
 static void run_frontend_router(pid_t backend_pid) {
+  if (g_control_sock >= 0) {
+    close(g_control_sock);
+    g_control_sock = -1;
+  }
   server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   if (cfg->user) {
     struct passwd *pwd = getpwnam(cfg->user);
@@ -4191,6 +4549,10 @@ static void run_frontend_router(pid_t backend_pid) {
             break; // EAGAIN
 
           udp_ipc_t *msg = (udp_ipc_t *)buffer;
+          if (msg->sock_fd_idx == -2) {
+            syslog(LOG_NOTICE, "[Frontend] Received stop command from backend. Shutting down cleanly.");
+            exit(0);
+          }
           int sock = socket(msg->client_addr.ss_family, SOCK_DGRAM, 0);
           if (sock >= 0) {
             sendto(sock, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
@@ -4387,6 +4749,44 @@ int main(int argc, char **argv) {
     num_workers = 2;
 
   setup_udp_and_ipc(&g_config_db.config_a, num_workers);
+
+  if (g_config_db.config_a.control.enabled) {
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof(un));
+    un.sun_family = AF_UNIX;
+    strncpy(un.sun_path, "/var/run/karidns/control.sock", sizeof(un.sun_path) - 1);
+    mkdir("/var/run/karidns", 0755);
+    unlink(un.sun_path);
+    g_control_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (g_control_sock >= 0) {
+      mode_t old_mask = umask(0177);
+      if (bind(g_control_sock, (struct sockaddr *)&un, sizeof(un)) == 0) {
+        listen(g_control_sock, 5);
+        server_config_t *cfg = &g_config_db.config_a;
+        if (cfg->user) {
+          struct passwd *pwd = getpwnam(cfg->user);
+          if (pwd) {
+            uid_t target_uid = pwd->pw_uid;
+            gid_t target_gid = pwd->pw_gid;
+            if (cfg->group) {
+              struct group *grp = getgrnam(cfg->group);
+              if (grp) target_gid = grp->gr_gid;
+            }
+            chown(un.sun_path, target_uid, target_gid);
+          }
+        }
+        fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
+        cap_rights_t ctrl_rights;
+        cap_rights_init(&ctrl_rights, CAP_ACCEPT, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_RECV, CAP_SEND);
+        cap_rights_limit(g_control_sock, &ctrl_rights);
+      } else {
+        syslog(LOG_ERR, "Failed to bind control socket: %m");
+        close(g_control_sock);
+        g_control_sock = -1;
+      }
+      umask(old_mask);
+    }
+  }
 
   pid_t pid = fork();
   if (pid < 0) {
