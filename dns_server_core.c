@@ -1955,8 +1955,10 @@ STATE_FIND_TOKEN:
   }
   if (*p == ';') {
     char *nl = memchr(p, '\n', end - p);
-    if (!nl)
+    if (!nl) {
+      p = end;
       goto PROCESS_RECORD;
+    }
     p = nl;
     goto STATE_FIND_TOKEN;
   }
@@ -2021,8 +2023,10 @@ STATE_FIND_TOKEN:
   }
   if (delimiter == ';') {
     char *nl = memchr(p, '\n', end - p);
-    if (!nl)
+    if (!nl) {
+      p = end;
       goto PROCESS_RECORD;
+    }
     p = nl;
     goto STATE_FIND_TOKEN;
   }
