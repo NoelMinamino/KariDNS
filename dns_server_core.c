@@ -93,6 +93,26 @@ typedef struct {
   zone_arena_t arena_b;
 } zone_rcu_t;
 
+#define MAX_IXFR_HISTORY 32
+
+typedef struct {
+  uint32_t old_serial;
+  uint32_t new_serial;
+  dns_record_t *deleted;
+  int deleted_count;
+  dns_record_t *added;
+  int added_count;
+  _Atomic int ref_count;
+  zone_arena_t arena; // mini-arena for strings/blob
+} ixfr_txn_t;
+
+typedef struct {
+  ixfr_txn_t entries[MAX_IXFR_HISTORY];
+  int head;
+  int count;
+  pthread_mutex_t lock;
+} ixfr_history_t;
+
 typedef struct {
   char domain[256];
   zone_rcu_t rcu;
@@ -106,6 +126,7 @@ typedef struct {
   _Atomic bool notify_now;
   _Atomic bool is_transferring;
   _Atomic(int) active_axfr;
+  ixfr_history_t ixfr_history;
 } zone_db_entry_t;
 
 // TCPストリーム解析ステート
@@ -2260,6 +2281,9 @@ zone_db_entry_t *get_or_create_zone(const char *domain) {
   strncpy(z->domain, domain, sizeof(z->domain) - 1);
   z->domain[sizeof(z->domain) - 1] = '\0';
   pthread_mutex_init(&z->writer_lock, NULL);
+  pthread_mutex_init(&z->ixfr_history.lock, NULL);
+  z->ixfr_history.count = 0;
+  z->ixfr_history.head = 0;
   zone_arena_init(&z->rcu.arena_a);
   zone_arena_init(&z->rcu.arena_b);
   atomic_init(&z->rcu.active, &z->rcu.arena_a);
@@ -2288,6 +2312,129 @@ static void wait_for_readers(zone_arena_t *arena) {
     if (++retries % 1000 == 0)
       syslog(LOG_WARNING, "[RCU] wait_for_readers stalled");
   }
+}
+
+static char *arena_strdup(zone_arena_t *arena, const char *str);
+
+static bool compare_records(const dns_record_t *a, const dns_record_t *b) {
+  if (a->type_code != b->type_code) return false;
+  if ((a->name == NULL) != (b->name == NULL)) return false;
+  if (a->name && b->name && strcasecmp(a->name, b->name) != 0) return false;
+  if ((a->ttl == NULL) != (b->ttl == NULL)) return false;
+  if (a->ttl && b->ttl && strcmp(a->ttl, b->ttl) != 0) return false;
+  if (a->rdata_count != b->rdata_count) return false;
+  for (int i = 0; i < a->rdata_count; i++) {
+    if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
+    if (a->rdata[i] && b->rdata[i] && strcmp(a->rdata[i], b->rdata[i]) != 0) return false;
+  }
+  if (a->generic_len != b->generic_len) return false;
+  if (a->generic_len > 0 && memcmp(a->generic_data, b->generic_data, a->generic_len) != 0) return false;
+  return true;
+}
+
+static bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
+  if (!arena->hash_table) return false;
+  uint32_t hash = calc_fnv1a_str(target->name);
+  size_t idx = hash & (arena->hash_size - 1);
+  for (int i = arena->hash_table[idx]; i != -1; i = arena->records[i].next_record) {
+    if (compare_records(&arena->records[i], target)) return true;
+  }
+  return false;
+}
+
+static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
+  if (!old_arena->hash_table || !new_arena->hash_table) return;
+  uint32_t old_serial = 0, new_serial = 0;
+  for (size_t i = 0; i < old_arena->count; i++) {
+    if (old_arena->records[i].type_code == 6 && old_arena->records[i].rdata_count >= 3 && old_arena->records[i].rdata[2]) {
+      old_serial = strtoul(old_arena->records[i].rdata[2], NULL, 10);
+      break;
+    }
+  }
+  for (size_t i = 0; i < new_arena->count; i++) {
+    if (new_arena->records[i].type_code == 6 && new_arena->records[i].rdata_count >= 3 && new_arena->records[i].rdata[2]) {
+      new_serial = strtoul(new_arena->records[i].rdata[2], NULL, 10);
+      break;
+    }
+  }
+  if (old_serial == 0 || new_serial == 0) return;
+  if ((int32_t)(new_serial - old_serial) <= 0) return;
+
+  int del_count = 0, add_count = 0;
+  for (size_t i = 0; i < old_arena->count; i++) {
+    if (!record_exists_in_arena(new_arena, &old_arena->records[i])) del_count++;
+  }
+  for (size_t i = 0; i < new_arena->count; i++) {
+    if (!record_exists_in_arena(old_arena, &new_arena->records[i])) add_count++;
+  }
+  
+  if (del_count + add_count > 10000) return;
+  
+  pthread_mutex_lock(&entry->ixfr_history.lock);
+  
+  int new_head = entry->ixfr_history.head;
+  if (entry->ixfr_history.count == MAX_IXFR_HISTORY) {
+    if (atomic_load_explicit(&entry->ixfr_history.entries[new_head].ref_count, memory_order_acquire) > 0) {
+      pthread_mutex_unlock(&entry->ixfr_history.lock);
+      return;
+    }
+    zone_arena_destroy(&entry->ixfr_history.entries[new_head].arena);
+    free(entry->ixfr_history.entries[new_head].deleted);
+    free(entry->ixfr_history.entries[new_head].added);
+  } else {
+    entry->ixfr_history.count++;
+  }
+
+  ixfr_txn_t *txn = &entry->ixfr_history.entries[new_head];
+  txn->old_serial = old_serial;
+  txn->new_serial = new_serial;
+  txn->deleted_count = del_count;
+  txn->added_count = add_count;
+  txn->deleted = malloc(sizeof(dns_record_t) * del_count);
+  txn->added = malloc(sizeof(dns_record_t) * add_count);
+  atomic_init(&txn->ref_count, 0);
+  zone_arena_init(&txn->arena);
+
+  int d_idx = 0;
+  for (size_t i = 0; i < old_arena->count; i++) {
+    if (!record_exists_in_arena(new_arena, &old_arena->records[i])) {
+      txn->deleted[d_idx] = old_arena->records[i];
+      txn->deleted[d_idx].name = arena_strdup(&txn->arena, old_arena->records[i].name);
+      txn->deleted[d_idx].ttl = arena_strdup(&txn->arena, old_arena->records[i].ttl);
+      txn->deleted[d_idx].class_str = arena_strdup(&txn->arena, old_arena->records[i].class_str);
+      txn->deleted[d_idx].type = arena_strdup(&txn->arena, old_arena->records[i].type);
+      for (int j = 0; j < old_arena->records[i].rdata_count; j++) {
+         txn->deleted[d_idx].rdata[j] = arena_strdup(&txn->arena, old_arena->records[i].rdata[j]);
+      }
+      if (old_arena->records[i].generic_len > 0) {
+         txn->deleted[d_idx].generic_data = arena_alloc(&txn->arena, old_arena->records[i].generic_len);
+         memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
+      }
+      d_idx++;
+    }
+  }
+
+  int a_idx = 0;
+  for (size_t i = 0; i < new_arena->count; i++) {
+    if (!record_exists_in_arena(old_arena, &new_arena->records[i])) {
+      txn->added[a_idx] = new_arena->records[i];
+      txn->added[a_idx].name = arena_strdup(&txn->arena, new_arena->records[i].name);
+      txn->added[a_idx].ttl = arena_strdup(&txn->arena, new_arena->records[i].ttl);
+      txn->added[a_idx].class_str = arena_strdup(&txn->arena, new_arena->records[i].class_str);
+      txn->added[a_idx].type = arena_strdup(&txn->arena, new_arena->records[i].type);
+      for (int j = 0; j < new_arena->records[i].rdata_count; j++) {
+         txn->added[a_idx].rdata[j] = arena_strdup(&txn->arena, new_arena->records[i].rdata[j]);
+      }
+      if (new_arena->records[i].generic_len > 0) {
+         txn->added[a_idx].generic_data = arena_alloc(&txn->arena, new_arena->records[i].generic_len);
+         memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
+      }
+      a_idx++;
+    }
+  }
+
+  entry->ixfr_history.head = (new_head + 1) % MAX_IXFR_HISTORY;
+  pthread_mutex_unlock(&entry->ixfr_history.lock);
 }
 
 void load_zones_from_config(server_config_t *config) {
@@ -2334,9 +2481,11 @@ void load_zones_from_config(server_config_t *config) {
               break;
             }
           }
-          if (has_soa)
+          if (has_soa) {
+            compute_ixfr_diff(entry, z_active, z_standby);
             atomic_store_explicit(&entry->rcu.active, z_standby,
                                   memory_order_release);
+          }
         }
         pthread_mutex_unlock(&entry->writer_lock);
       }
@@ -3626,9 +3775,41 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
     }
     q_offset += len + 1;
   }
-  q_offset += 4;
-  if (q_offset > req_len)
+  if (q_offset + 4 > req_len) {
     q_offset = req_len;
+  } else {
+    q_offset += 4;
+  }
+  uint16_t qtype = (q_offset >= 4) ? ((req[q_offset - 4] << 8) | req[q_offset - 3]) : 0;
+  bool is_ixfr = (qtype == 251);
+  uint32_t client_serial = 0;
+  if (is_ixfr) {
+    uint16_t nscount = (req[8] << 8) | req[9];
+    if (nscount > 0) {
+      size_t p = q_offset;
+      size_t next_p;
+      if (skip_wire_name(req, req_len, p, &next_p) == 0) {
+        p = next_p;
+        if (p + 10 <= req_len) {
+          uint16_t auth_type = (req[p] << 8) | req[p+1];
+          uint16_t auth_rdlen = (req[p+8] << 8) | req[p+9];
+          p += 10;
+          if (auth_type == 6 && p + auth_rdlen <= req_len) {
+            size_t rp = p;
+            if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
+              rp = next_p;
+              if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
+                rp = next_p;
+                if (rp + 4 <= p + auth_rdlen) {
+                  client_serial = ((uint32_t)req[rp] << 24) | ((uint32_t)req[rp+1] << 16) | ((uint32_t)req[rp+2] << 8) | req[rp+3];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   uint16_t offset = q_offset;
   uint16_t answers = 0;
   uint16_t *res_ancount = (uint16_t *)&res[6];
@@ -3659,53 +3840,116 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
     return;
   }
 
-  for (int step = 0; step < 3; step++) {
-    size_t start_idx = 0, end_idx = 0;
-    if (step == 0) {
-      start_idx = soa_idx;
-      end_idx = soa_idx + 1;
-    } else if (step == 1) {
-      start_idx = 0;
-      end_idx = current_zone->count;
-    } else if (step == 2) {
-      start_idx = soa_idx;
-      end_idx = soa_idx + 1;
-    }
-    for (size_t i = start_idx; i < end_idx; i++) {
-      if (step == 1 && (int)i == soa_idx)
-        continue;
-      dns_record_t *rec = &current_zone->records[i];
-      uint16_t prev_offset = offset;
-      if (serialize_dns_record(res, 65000, &offset, rec, &comp_ctx, NULL,
-                               0xFFFFFFFF) < 0) {
-        *res_ancount = htons(answers);
-        if (tsig_key) {
-          size_t sign_len = prev_offset;
-          tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, prior_mac,
-                           &prior_mac_len);
-          prev_offset = sign_len;
-        }
-        uint8_t len_prefix[2] = {prev_offset >> 8, prev_offset & 0xFF};
-        if (send_tcp_robust(client_fd, len_prefix, 2) < 0)
-          goto axfr_error;
-        if (send_tcp_robust(client_fd, res, prev_offset) < 0)
-          goto axfr_error;
-        offset = q_offset;
-        answers = 0;
-        memcpy(res, req, q_offset);
-        res[2] |= 0x84;
-        res[3] &= 0x0F;
-        res[8] = 0;
-        res[9] = 0;
-        res[10] = 0;
-        res[11] = 0;
-        memset(&comp_ctx, 0, sizeof(comp_ctx));
-        compress_ctx_init_packet(&comp_ctx);
-        if (serialize_dns_record(res, 65000, &offset, rec, &comp_ctx, NULL,
-                                 0xFFFFFFFF) < 0)
-          continue;
+  bool send_ixfr = false;
+  ixfr_txn_t *txn_list[MAX_IXFR_HISTORY];
+  int txn_count = 0;
+  uint32_t current_serial = strtoul(current_zone->records[soa_idx].rdata[2], NULL, 10);
+
+  if (is_ixfr && client_serial == current_serial) {
+    send_ixfr = true;
+  } else if (is_ixfr && entry->ixfr_history.count > 0) {
+    pthread_mutex_lock(&entry->ixfr_history.lock);
+    int start_idx = (entry->ixfr_history.head + MAX_IXFR_HISTORY - entry->ixfr_history.count) % MAX_IXFR_HISTORY;
+    int found_idx = -1;
+    for (int i = 0; i < entry->ixfr_history.count; i++) {
+      int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+      if (entry->ixfr_history.entries[idx].old_serial == client_serial) {
+        found_idx = i;
+        break;
       }
-      answers++;
+    }
+    if (found_idx >= 0) {
+      bool continuous = true;
+      uint32_t expected_serial = client_serial;
+      for (int i = found_idx; i < entry->ixfr_history.count; i++) {
+        int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+        if (entry->ixfr_history.entries[idx].old_serial != expected_serial) {
+          continuous = false;
+          break;
+        }
+        expected_serial = entry->ixfr_history.entries[idx].new_serial;
+      }
+      if (continuous && expected_serial == current_serial) {
+        send_ixfr = true;
+        for (int i = found_idx; i < entry->ixfr_history.count; i++) {
+          int idx = (start_idx + i) % MAX_IXFR_HISTORY;
+          atomic_fetch_add_explicit(&entry->ixfr_history.entries[idx].ref_count, 1, memory_order_acquire);
+          txn_list[txn_count++] = &entry->ixfr_history.entries[idx];
+        }
+      }
+    }
+    pthread_mutex_unlock(&entry->ixfr_history.lock);
+  }
+
+#define SERIALIZE_ADD_RECORD(rec_ptr) do { \
+  uint16_t prev_offset = offset; \
+  if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
+    *res_ancount = htons(answers); \
+    if (tsig_key) { \
+      size_t sign_len = prev_offset; \
+      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, prior_mac, &prior_mac_len); \
+      prev_offset = sign_len; \
+    } \
+    uint8_t len_prefix[2] = {prev_offset >> 8, prev_offset & 0xFF}; \
+    if (send_tcp_robust(client_fd, len_prefix, 2) < 0) goto axfr_error; \
+    if (send_tcp_robust(client_fd, res, prev_offset) < 0) goto axfr_error; \
+    offset = q_offset; \
+    answers = 0; \
+    memcpy(res, req, q_offset); \
+    res[2] |= 0x84; res[3] &= 0x0F; \
+    res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
+    memset(&comp_ctx, 0, sizeof(comp_ctx)); \
+    compress_ctx_init_packet(&comp_ctx); \
+    if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) \
+      continue; \
+  } \
+  answers++; \
+} while (0)
+
+  if (send_ixfr) {
+    SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+    for (int t = 0; t < txn_count; t++) {
+      ixfr_txn_t *txn = txn_list[t];
+      int soa_del_idx = -1;
+      for (int i = 0; i < txn->deleted_count; i++) {
+        if (txn->deleted[i].type_code == 6) { soa_del_idx = i; break; }
+      }
+      if (soa_del_idx >= 0) SERIALIZE_ADD_RECORD(&txn->deleted[soa_del_idx]);
+      for (int i = 0; i < txn->deleted_count; i++) {
+        if (i == soa_del_idx) continue;
+        SERIALIZE_ADD_RECORD(&txn->deleted[i]);
+      }
+      int soa_add_idx = -1;
+      for (int i = 0; i < txn->added_count; i++) {
+        if (txn->added[i].type_code == 6) { soa_add_idx = i; break; }
+      }
+      if (soa_add_idx >= 0) SERIALIZE_ADD_RECORD(&txn->added[soa_add_idx]);
+      for (int i = 0; i < txn->added_count; i++) {
+        if (i == soa_add_idx) continue;
+        SERIALIZE_ADD_RECORD(&txn->added[i]);
+      }
+    }
+    if (txn_count > 0) {
+      SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+    }
+  } else {
+    for (int step = 0; step < 3; step++) {
+      size_t start_idx = 0, end_idx = 0;
+      if (step == 0) {
+        start_idx = soa_idx;
+        end_idx = soa_idx + 1;
+      } else if (step == 1) {
+        start_idx = 0;
+        end_idx = current_zone->count;
+      } else if (step == 2) {
+        start_idx = soa_idx;
+        end_idx = soa_idx + 1;
+      }
+      for (size_t i = start_idx; i < end_idx; i++) {
+        if (step == 1 && (int)i == soa_idx)
+          continue;
+        SERIALIZE_ADD_RECORD(&current_zone->records[i]);
+      }
     }
   }
   if (answers > 0) {
@@ -3722,11 +3966,19 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
     if (send_tcp_robust(client_fd, res, offset) < 0)
       goto axfr_error;
   }
+  for (int t = 0; t < txn_count; t++) {
+    atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release);
+  }
+  if (res) free(res);
+  atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+  return;
+
 axfr_error:
-  if (res)
-    free(res);
-  atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                            memory_order_release);
+  for (int t = 0; t < txn_count; t++) {
+    atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release);
+  }
+  if (res) free(res);
+  atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
 }
 
 void *axfr_worker_thread(void *arg) {
