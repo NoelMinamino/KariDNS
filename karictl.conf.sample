@@ -1,0 +1,11 @@
+// karictl.conf.sample
+//
+// KariDNS コントロールチャネルクライアント (karictl) 用の設定ファイル
+// デフォルトでは /usr/local/etc/karictl.conf が読み込まれます。
+// -f オプションで別のパスを指定することも可能です。
+
+key "karictl" {
+    algorithm "hmac-sha256";
+    // サーバー側の control-channel { secret "..."; } と同じ Base64 文字列を指定してください。
+    secret "BASE64_ENCODED_SECRET_HERE=";
+};

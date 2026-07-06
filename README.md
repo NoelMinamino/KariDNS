@@ -17,7 +17,7 @@ KariDNS is a high-performance, lightweight, and modern authoritative DNS server 
 - **DNS Cookies (RFC 7873/9018):** Mitigates IP spoofing and amplification attacks by issuing and verifying client/server cookies.
 - **Extended DNS Errors (EDE, RFC 8914):** Provides enhanced troubleshooting by returning specific error codes (e.g., Not Authoritative, Unsupported DNSKEY Algorithm, DNSSEC Bogus) when appropriate.
 - **Privilege Dropping:** Supports `user` / `group` directives to run with least privilege.
-- **RRL (Response Rate Limiting):** Protects against DNS amplification attacks.
+- **RRL (Response Rate Limiting):** Protects against DNS reflection and amplification attacks with BIND9-compatible configuration, precise response classification, CIDR aggregations, and `slip` (truncation) fallback logic.
 - **BIND-compatible Query Logging:** Thread-safe query logging with automatic rotation by size or date.
 - **RNDC-style Control Channel (`karictl`):** Secure local administration using a UNIX domain socket and HMAC-SHA256 challenge-response authentication.
 
@@ -55,6 +55,23 @@ To enable the control channel on the server, add the `control-channel` block to 
 control-channel {
     algorithm hmac-sha256;
     secret "your-base64-secret-here";
+};
+```
+
+### Response Rate Limiting (RRL)
+
+RRL helps mitigate DNS amplification attacks by limiting the number of identical responses sent to a single client subnet. It is disabled by default. You can enable it globally in `options` or override it per-zone:
+
+```
+options {
+    rate-limit {
+        responses-per-second 50;
+        nxdomains-per-second 20;
+        errors-per-second 10;
+        window 15;
+        slip 2;
+        exempt-clients { 127.0.0.1/32; 192.168.0.0/16; };
+    };
 };
 ```
 

@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -131,6 +132,18 @@ typedef struct {
   int port;
 } ip_port_t;
 
+typedef struct {
+  bool configured;
+  bool log_only;
+  uint32_t responses_per_second;
+  uint32_t nxdomains_per_second;
+  uint32_t errors_per_second;
+  uint32_t window_seconds;
+  uint32_t slip;
+  ip_port_t *exempt_clients;
+  int exempt_clients_count;
+} rate_limit_config_t;
+
 typedef struct zone_config {
   char *domain;
   char *file;
@@ -143,6 +156,7 @@ typedef struct zone_config {
   char *notify_source;
   char **allow_transfer;
   int allow_transfer_count;
+  rate_limit_config_t rrl;
   struct zone_config *next;
 } zone_config_t;
 
@@ -186,6 +200,7 @@ typedef struct {
   tsig_key_t *keys;
   logging_config_t logging;
   control_channel_config_t control;
+  rate_limit_config_t rrl;
 } server_config_t;
 
 typedef enum {
@@ -217,57 +232,153 @@ typedef struct {
   server_config_t config_b;
 } config_rcu_t;
 
-// RRL
+typedef enum {
+  RRL_RESP_NOERROR,
+  RRL_RESP_NODATA,
+  RRL_RESP_NXDOMAIN,
+  RRL_RESP_ERROR
+} rrl_response_class_t;
+
 #define RRL_TABLE_SIZE 4096
-#define RRL_RATE 50
-#define RRL_BURST 100
+
 typedef struct {
   atomic_flag lock;
-  uint64_t last_update;
-  int tokens;
+  _Atomic uint32_t client_hash;
+  _Atomic int64_t last_refill_ms;
+  _Atomic int32_t tokens[4];
+  _Atomic uint32_t slip_counter;
 } rrl_bucket_t;
 static rrl_bucket_t g_rrl_table[RRL_TABLE_SIZE];
 
-static bool rrl_check(const struct sockaddr *client_addr) {
-  uint32_t hash = 0;
-  if (client_addr->sa_family == AF_INET) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)client_addr;
-    uint32_t ip = sin->sin_addr.s_addr;
-    hash = ip ^ (ip >> 16);
-  } else if (client_addr->sa_family == AF_INET6) {
-    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)client_addr;
-    const uint32_t *w = (const uint32_t *)sin6->sin6_addr.s6_addr;
-    hash = w[0] ^ w[1] ^ w[2] ^ w[3];
+_Atomic uint64_t g_rrl_dropped_total = 0;
+_Atomic uint64_t g_rrl_slip_total = 0;
+
+static bool match_cidr(const char *client_ip_str, const char *cidr_str);
+
+static rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len) {
+  if (res_len < 12) return RRL_RESP_ERROR;
+  uint8_t rcode = res_buf[3] & 0x0F;
+  uint16_t ancount = (res_buf[6] << 8) | res_buf[7];
+  if (rcode == 3) return RRL_RESP_NXDOMAIN;
+  if (rcode == 0) {
+    if (ancount > 0) return RRL_RESP_NOERROR;
+    return RRL_RESP_NODATA;
   }
+  return RRL_RESP_ERROR;
+}
+
+static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_class_t cls, const rate_limit_config_t *cfg, bool *out_slip) {
+  *out_slip = false;
+  if (!cfg || !cfg->configured) return true;
+
+  uint32_t rate = 0;
+  switch (cls) {
+    case RRL_RESP_NOERROR: rate = cfg->responses_per_second; break;
+    case RRL_RESP_NODATA:  rate = cfg->responses_per_second; break;
+    case RRL_RESP_NXDOMAIN: rate = cfg->nxdomains_per_second; break;
+    case RRL_RESP_ERROR:   rate = cfg->errors_per_second; break;
+  }
+  if (rate == 0) return true; // 0 means no limit
+
+  char ip_str[INET6_ADDRSTRLEN] = {0};
+  if (client_addr->ss_family == AF_INET) {
+    inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
+  } else if (client_addr->ss_family == AF_INET6) {
+    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
+  }
+
+  if (cfg->exempt_clients_count > 0) {
+    for (int i = 0; i < cfg->exempt_clients_count; i++) {
+      if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return true;
+    }
+  }
+
+  uint32_t hash = 0;
+  uint32_t full_hash = 0;
+  if (client_addr->ss_family == AF_INET) {
+    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr;
+    ip &= htonl(0xFFFFFF00); // /24 mask
+    full_hash = ip;
+    hash = ip ^ (ip >> 16);
+  } else if (client_addr->ss_family == AF_INET6) {
+    const uint32_t *w = (const uint32_t *)((const struct sockaddr_in6 *)client_addr)->sin6_addr.s6_addr;
+    uint32_t w0 = w[0], w1 = w[1];
+    w1 &= htonl(0xFFFFFF00); // /56 mask
+    full_hash = w0 ^ w1;
+    hash = w0 ^ w1 ^ (w1 >> 16);
+  }
+
   size_t idx = hash & (RRL_TABLE_SIZE - 1);
   rrl_bucket_t *b = &g_rrl_table[idx];
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  uint64_t now_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
-  while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
-  }
-  uint64_t elapsed_ms =
-      (now_ms > b->last_update) ? (now_ms - b->last_update) : 0;
-  if (b->last_update == 0) {
-    b->tokens = RRL_BURST;
-    b->last_update = now_ms;
+  while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {}
+
+  if (b->client_hash != full_hash) {
+    b->client_hash = full_hash;
+    b->last_refill_ms = now_ms;
+    b->tokens[0] = cfg->responses_per_second;
+    b->tokens[1] = cfg->responses_per_second;
+    b->tokens[2] = cfg->nxdomains_per_second;
+    b->tokens[3] = cfg->errors_per_second;
+    b->slip_counter = 0;
   } else {
-    uint64_t add_tokens_u64 = (elapsed_ms * RRL_RATE) / 1000;
-    int add_tokens =
-        (add_tokens_u64 > RRL_BURST) ? RRL_BURST : (int)add_tokens_u64;
-    b->tokens += add_tokens;
-    if (b->tokens > RRL_BURST)
-      b->tokens = RRL_BURST;
-    if (add_tokens > 0)
-      b->last_update = now_ms;
+    int64_t elapsed_ms = now_ms - b->last_refill_ms;
+    if (elapsed_ms > 0) {
+      uint32_t rates[4] = {
+        cfg->responses_per_second,
+        cfg->responses_per_second,
+        cfg->nxdomains_per_second,
+        cfg->errors_per_second
+      };
+      for(int i=0; i<4; i++) {
+        uint64_t add_t = ((uint64_t)elapsed_ms * rates[i]) / 1000;
+        if (add_t > 0) {
+          b->tokens[i] += (int32_t)add_t;
+          if (b->tokens[i] > (int32_t)rates[i]) b->tokens[i] = rates[i];
+        }
+      }
+      // Only update last_refill_ms if we added at least 1 token to a rate > 0
+      // For simplicity, just update it if elapsed_ms > 0.
+      // But wait, if elapsed_ms < 1000/rate, add_t is 0, and we lose those ms!
+      // To be precise:
+      bool updated = false;
+      for(int i=0; i<4; i++) {
+        if (rates[i] > 0 && ((uint64_t)elapsed_ms * rates[i]) / 1000 > 0) {
+          updated = true; break;
+        }
+      }
+      if (updated) {
+        b->last_refill_ms = now_ms;
+      }
+    }
   }
+
   bool allow = false;
-  if (b->tokens > 0) {
-    b->tokens--;
+  if (b->tokens[cls] > 0) {
+    b->tokens[cls]--;
     allow = true;
+  } else {
+    b->slip_counter++;
+    if (cfg->slip > 0 && (b->slip_counter % cfg->slip) == 0) {
+      *out_slip = true;
+    }
   }
   atomic_flag_clear_explicit(&b->lock, memory_order_release);
+
+  if (!allow && !*out_slip) {
+    atomic_fetch_add_explicit(&g_rrl_dropped_total, 1, memory_order_relaxed);
+  } else if (!allow && *out_slip) {
+    atomic_fetch_add_explicit(&g_rrl_slip_total, 1, memory_order_relaxed);
+  }
+
+  if (cfg->log_only && !allow) {
+    syslog(LOG_INFO, "[RRL] would rate-limit %s (log-only)", ip_str);
+    return true; // allow anyway
+  }
+
   return allow;
 }
 
@@ -653,6 +764,16 @@ void free_token(conf_token_t *tok) {
   }
 }
 
+void free_rate_limit_config(rate_limit_config_t *rrl) {
+  if (rrl->exempt_clients) {
+    for (int i = 0; i < rrl->exempt_clients_count; i++) {
+      free(rrl->exempt_clients[i].ip);
+    }
+    free(rrl->exempt_clients);
+    rrl->exempt_clients = NULL;
+  }
+}
+
 void free_zone_config(zone_config_t *zone) {
   if (!zone)
     return;
@@ -670,6 +791,7 @@ void free_zone_config(zone_config_t *zone) {
   for (int i = 0; i < zone->allow_transfer_count; i++)
     free(zone->allow_transfer[i]);
   free(zone->allow_transfer);
+  free_rate_limit_config(&zone->rrl);
   free(zone);
 }
 
@@ -863,6 +985,89 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
   return 0;
 }
 
+static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  rrl->configured = true;
+  rrl->log_only = false;
+  rrl->responses_per_second = 0;
+  rrl->nxdomains_per_second = 0;
+  rrl->errors_per_second = 0;
+  rrl->window_seconds = 15;
+  rrl->slip = 2;
+  rrl->exempt_clients = NULL;
+  rrl->exempt_clients_count = 0;
+
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING) {
+      free_token(&tok);
+      return -1;
+    }
+    char *key = strdup(tok.value);
+    free_token(&tok);
+
+    if (strcmp(key, "exempt-clients") == 0) {
+      if (parse_ip_port_list(ctx, &rrl->exempt_clients, &rrl->exempt_clients_count) != 0) {
+        free(key);
+        return -1;
+      }
+      free(key);
+      continue;
+    }
+
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_STRING) {
+      free(key);
+      free_token(&tok);
+      return -1;
+    }
+    char *val = strdup(tok.value);
+    free_token(&tok);
+
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) {
+      free(key); free(val); free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+
+    if (strcmp(key, "responses-per-second") == 0) {
+      rrl->responses_per_second = atoi(val);
+    } else if (strcmp(key, "nxdomains-per-second") == 0) {
+      rrl->nxdomains_per_second = atoi(val);
+    } else if (strcmp(key, "errors-per-second") == 0) {
+      rrl->errors_per_second = atoi(val);
+    } else if (strcmp(key, "window") == 0) {
+      rrl->window_seconds = atoi(val);
+    } else if (strcmp(key, "slip") == 0) {
+      rrl->slip = atoi(val);
+    } else if (strcmp(key, "log-only") == 0) {
+      rrl->log_only = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else {
+      syslog(LOG_WARNING, "[Config] Unknown rate-limit option '%s'", key);
+    }
+    free(key);
+    free(val);
+  }
+  
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return 0;
+}
+
 int parse_named_conf(const char *config_str, server_config_t *config) {
   token_ctx_t ctx = {config_str, 0, strlen(config_str)};
   config->port = 53;
@@ -953,6 +1158,11 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           } else {
             free(key);
             free_token(&tok);
+            return -1;
+          }
+        } else if (strcmp(key, "rate-limit") == 0) {
+          if (parse_rate_limit_config(&ctx, &config->rrl) != 0) {
+            free(key);
             return -1;
           }
         } else
@@ -1056,6 +1266,12 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             zone->tsig_key = val;
           else
             zone->notify_source = val;
+        } else if (strcmp(key, "rate-limit") == 0) {
+          if (parse_rate_limit_config(&ctx, &zone->rrl) != 0) {
+            free(key);
+            free_zone_config(zone);
+            return -1;
+          }
         } else
           skip_unknown_block(&ctx);
         free(key);
@@ -2692,7 +2908,7 @@ static void generate_server_cookie(const char *client_ip, const uint8_t client_c
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
-                      bool is_tcp) {
+                      bool is_tcp, rate_limit_config_t **out_rrl_cfg) {
   char current_qname[256];
   strncpy(current_qname, qname, 255);
   current_qname[255] = '\0';
@@ -2727,6 +2943,23 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       }
     }
     atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+  }
+
+  if (out_rrl_cfg) {
+    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    *out_rrl_cfg = &cfg->rrl;
+    if (db_entry) {
+      zone_config_t *zcfg = cfg->zones;
+      while (zcfg) {
+        if (strcasecmp(zcfg->domain, db_entry->domain) == 0) {
+          if (zcfg->rrl.configured) {
+            *out_rrl_cfg = &zcfg->rrl;
+          }
+          break;
+        }
+        zcfg = zcfg->next;
+      }
+    }
   }
 
   if (req_len >= 12 && ((req[2] >> 3) & 0x0F) == 4) { // NOTIFY
@@ -3707,6 +3940,7 @@ worker_startup_success:;
           uint16_t qclass = 1;
           bool has_edns = false;
           bool dnssec_ok = false;
+          size_t question_end = 12; // default fallback
           if (payload_received > 12) {
             size_t offset = 12;
             while (offset < (size_t)payload_received) {
@@ -3717,6 +3951,7 @@ worker_startup_success:;
               }
               offset += len + 1;
             }
+            question_end = offset + 4;
             if (offset + 3 < (size_t)payload_received)
               qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
             uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
@@ -3769,16 +4004,32 @@ worker_startup_success:;
 
           uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
           uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
+          rate_limit_config_t *rrl_cfg = NULL;
           int res_len =
               process_dns_query(req_buf, payload_received, res_buf, 512, qname,
-                                qtype, client_ip, &thread_compress_ctx, false);
+                                qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg);
           if (res_len > 0) {
-            if (rrl_check((struct sockaddr *)client_addr)) {
+            bool slip_triggered = false;
+            rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
+            if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
               udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
               *res_msg = *ipc_msg;
               res_msg->payload_len = res_len;
-              send(active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len,
-                   0); // IPCでFrontendに送り返す
+              send(active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0);
+            } else if (slip_triggered) {
+              res_buf[2] |= 0x02; // Set TC bit
+              res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
+              res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
+              res_buf[10] = 0; res_buf[11] = 0; // ARCOUNT = 0
+              
+              int qlen = (int)question_end;
+              if (qlen > res_len) qlen = res_len; // Safe fallback
+              if (qlen > payload_received) qlen = payload_received;
+              
+              udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
+              *res_msg = *ipc_msg;
+              res_msg->payload_len = qlen;
+              send(active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0);
             }
           }
         }
@@ -4042,7 +4293,7 @@ worker_startup_success:;
             if (tcp_res) {
               int res_len = process_dns_query(msg, msg_len, tcp_res, 65535,
                                               qname, qtype, ctx_tcp->client_ip,
-                                              &thread_compress_ctx, true);
+                                              &thread_compress_ctx, true, NULL);
               if (res_len > 0) {
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
                 send(client_fd, len_prefix, 2, 0);
@@ -4136,6 +4387,8 @@ static void perform_config_reload(void) {
   if (standby->control.algorithm) free(standby->control.algorithm);
   if (standby->control.secret) free(standby->control.secret);
   memset(&standby->control, 0, sizeof(control_channel_config_t));
+  free_rate_limit_config(&standby->rrl);
+  memset(&standby->rrl, 0, sizeof(rate_limit_config_t));
   free_logging_channels(standby);
   if (parse_named_conf(config_str, standby) == 0) {
     init_logging_channels(standby);
@@ -4376,7 +4629,10 @@ void *control_thread_func(void *arg) {
             } else if (strcmp(cmd, "status") == 0) {
               char smsg[256];
               bool frontend_alive = atomic_load(&g_frontend_alive);
-              int slen = snprintf(smsg, sizeof(smsg), "OK frontend_alive=%d pid=%d\n", frontend_alive, getpid());
+              uint64_t dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
+              uint64_t slipped = atomic_load_explicit(&g_rrl_slip_total, memory_order_relaxed);
+              int slen = snprintf(smsg, sizeof(smsg), "OK frontend_alive=%d pid=%d RRL_Dropped=%" PRIu64 " RRL_Slipped=%" PRIu64 "\n", 
+                                  frontend_alive, getpid(), dropped, slipped);
               send(cfd, smsg, slen, 0);
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
