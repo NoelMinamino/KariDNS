@@ -1,0 +1,53 @@
+name: KariDNS CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build and Test on FreeBSD VM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build and Smoke Test inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '15.0'
+          run: |
+            set -e
+
+            echo "::group::📦 [Build] Build KariDNS and Tools"
+            make all
+            echo "::endgroup::"
+
+            echo "::group::📦 [Build] Build Fuzzers"
+            make fuzz fuzz_core
+            echo "::endgroup::"
+
+            echo "::group::🔍 [Smoke Test] Test dog client against Google DNS"
+            echo "Testing UDP query..."
+            ./dog www.google.com A @8.8.8.8
+            
+            echo "Testing TCP query..."
+            ./dog google.com TXT @8.8.8.8 +tcp
+            echo "::endgroup::"
+
+            echo "::group::🔍 [Smoke Test] Run Fuzzers (10 seconds each)"
+            echo "Running fuzz_dns_wire for 10 seconds..."
+            ./tests/fuzz/fuzz_dns_wire -max_total_time=10
+
+            echo "Running fuzz_dns_server_core for 10 seconds..."
+            ./tests/fuzz/fuzz_dns_server_core -max_total_time=10
+            echo "::endgroup::"
+
+            echo ""
+            echo "🎉 All builds and smoke tests passed!"
