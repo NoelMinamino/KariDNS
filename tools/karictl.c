@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 
 char *read_entire_file(const char *path) {
   FILE *f = fopen(path, "r");
@@ -59,11 +60,30 @@ int main(int argc, char **argv) {
                 return 1;
         }
     }
-
     if (optind >= argc) {
         fprintf(stderr, "Usage: %s [-f config_path] <command> [args...]\n", argv[0]);
-        fprintf(stderr, "Commands: status, reload [zone], stop, notify <zone>, retransfer <zone>, zonestatus <zone>\n");
+        fprintf(stderr, "Commands: status, reload [zone], stop, notify <zone>, retransfer <zone>, zonestatus <zone>, tsig-keygen [keyname]\n");
         return 1;
+    }
+
+    if (strcmp(argv[optind], "tsig-keygen") == 0) {
+        const char *keyname = "transfer-key";
+        if (optind + 1 < argc) keyname = argv[optind + 1];
+        
+        unsigned char rand_bytes[32];
+        if (RAND_bytes(rand_bytes, sizeof(rand_bytes)) != 1) {
+            fprintf(stderr, "Failed to generate random bytes\n");
+            return 1;
+        }
+        
+        char b64_key[64];
+        EVP_EncodeBlock((unsigned char *)b64_key, rand_bytes, sizeof(rand_bytes));
+        
+        printf("key \"%s\" {\n", keyname);
+        printf("  algorithm hmac-sha256;\n");
+        printf("  secret \"%s\";\n", b64_key);
+        printf("};\n");
+        return 0;
     }
 
     char *secret_b64 = extract_secret_from_config(conf_path);

@@ -2750,6 +2750,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           }
         }
         build_zone_index(standby);
+        compute_ixfr_diff(entry, active, standby);
         atomic_store_explicit(&entry->rcu.active, standby,
                               memory_order_release);
         wait_for_readers(active);
