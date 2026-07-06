@@ -7,6 +7,18 @@ options {
     // 起動後にドロップする特権ユーザーとグループ
     user "named";
     group "named";
+
+    // Response Rate Limiting (RRL) - DNSリフレクション攻撃対策
+    // 指定しない場合はRRLは無効（制限なし）となります
+    rate-limit {
+        responses-per-second 50;
+        nxdomains-per-second 20;
+        errors-per-second 10;
+        window 15;
+        slip 2;
+        // log-only yes; // 有効にすると制限はせずログ出力のみ行います
+        exempt-clients { 127.0.0.1/32; 192.168.0.0/16; ::1/128; };
+    };
 };
 
 logging {
@@ -24,6 +36,14 @@ logging {
     category queries { queries_log; };
 };
 
+// karictl コントロールチャネルの設定
+// karictlコマンドによる動的リロードやステータス確認を許可する場合に設定します
+control-channel {
+    algorithm "hmac-sha256";
+    // karictl.conf側の key "karictl" に設定した secret と一致させてください
+    secret "BASE64_ENCODED_SECRET_HERE=";
+};
+
 // ゾーン転送(AXFR)やNOTIFYで使用するTSIGキー
 key "tsig-key-example" {
     algorithm "hmac-sha256";
@@ -37,6 +57,13 @@ zone "example.com" {
     allow-transfer { 192.168.1.100; };
     also-notify { 192.168.1.100 port 53; };
     notify-source "192.168.1.1";
+    
+    // 特定のゾーンに対してRRL設定を上書きすることも可能
+    // 指定した場合はグローバルオプションより優先されます
+    rate-limit {
+        responses-per-second 100;
+        slip 0; // slipを0にするとTC応答せず即座に破棄します
+    };
 };
 
 // スレーブゾーンの定義

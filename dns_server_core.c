@@ -4826,12 +4826,15 @@ static void run_frontend_router(pid_t backend_pid) {
     for (int i = 0; i < n; i++) {
       uintptr_t ud = (uintptr_t)ev_list[i].udata;
       if (ud == 1000) {
-        ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), MSG_DONTWAIT);
-        if (len >= (ssize_t)sizeof(udp_ipc_t)) {
-          udp_ipc_t *msg = (udp_ipc_t *)buffer;
-          if (msg->sock_fd_idx == -2) {
-            syslog(LOG_NOTICE, "[Frontend] Received stop command from backend. Shutting down cleanly.");
-            exit(0);
+        while (1) {
+          ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), MSG_DONTWAIT);
+          if (len < 0) break; // キューが空になった (EAGAIN等)
+          if (len >= (ssize_t)sizeof(udp_ipc_t)) {
+            udp_ipc_t *msg = (udp_ipc_t *)buffer;
+            if (msg->sock_fd_idx == -2) {
+              syslog(LOG_NOTICE, "[Frontend] Received stop command from backend. Shutting down cleanly.");
+              exit(0);
+            }
           }
         }
         syslog(LOG_CRIT, "[Frontend] Backend process (pid=%d) exited unexpectedly. Shutting down.", backend_pid);
