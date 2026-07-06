@@ -4133,6 +4133,9 @@ static void perform_config_reload(void) {
   }
   standby->zones = NULL;
   standby->keys = NULL;
+  if (standby->control.algorithm) free(standby->control.algorithm);
+  if (standby->control.secret) free(standby->control.secret);
+  memset(&standby->control, 0, sizeof(control_channel_config_t));
   free_logging_channels(standby);
   if (parse_named_conf(config_str, standby) == 0) {
     init_logging_channels(standby);
@@ -4389,9 +4392,15 @@ void *control_thread_func(void *arg) {
             atomic_load_explicit(&g_config_db.active, memory_order_acquire);
         zone_config_t *zone = active->zones;
         while (zone) {
+          zone_db_entry_t *entry = get_or_create_zone(zone->domain);
+          if (entry) {
+            if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
+              syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
+              send_notify_to_all(entry->domain);
+            }
+          }
           if (zone->type && strcasecmp(zone->type, "slave") == 0 &&
               zone->masters_count > 0 && zone->masters[0].ip != NULL) {
-            zone_db_entry_t *entry = get_or_create_zone(zone->domain);
             if (entry) {
               bool force = atomic_exchange_explicit(&entry->refresh_now, false,
                                                     memory_order_acquire);
