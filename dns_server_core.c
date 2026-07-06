@@ -107,7 +107,7 @@ typedef struct {
 } ixfr_txn_t;
 
 typedef struct {
-  ixfr_txn_t entries[MAX_IXFR_HISTORY];
+  ixfr_txn_t *entries[MAX_IXFR_HISTORY];
   int head;
   int count;
   pthread_mutex_t lock;
@@ -265,7 +265,7 @@ typedef enum {
 typedef struct {
   atomic_flag lock;
   _Atomic uint32_t client_hash;
-  _Atomic int64_t last_refill_ms;
+  _Atomic int64_t last_refill_ms[4];
   _Atomic int32_t tokens[4];
   _Atomic uint32_t slip_counter;
 } rrl_bucket_t;
@@ -339,40 +339,31 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
 
   if (b->client_hash != full_hash) {
     b->client_hash = full_hash;
-    b->last_refill_ms = now_ms;
+    for (int i = 0; i < 4; i++) {
+        b->last_refill_ms[i] = now_ms;
+    }
     b->tokens[0] = cfg->responses_per_second;
     b->tokens[1] = cfg->responses_per_second;
     b->tokens[2] = cfg->nxdomains_per_second;
     b->tokens[3] = cfg->errors_per_second;
     b->slip_counter = 0;
   } else {
-    int64_t elapsed_ms = now_ms - b->last_refill_ms;
-    if (elapsed_ms > 0) {
-      uint32_t rates[4] = {
-        cfg->responses_per_second,
-        cfg->responses_per_second,
-        cfg->nxdomains_per_second,
-        cfg->errors_per_second
-      };
-      for(int i=0; i<4; i++) {
+    uint32_t rates[4] = {
+      cfg->responses_per_second,
+      cfg->responses_per_second,
+      cfg->nxdomains_per_second,
+      cfg->errors_per_second
+    };
+    for(int i=0; i<4; i++) {
+      if (rates[i] == 0) continue;
+      int64_t elapsed_ms = now_ms - b->last_refill_ms[i];
+      if (elapsed_ms > 0) {
         uint64_t add_t = ((uint64_t)elapsed_ms * rates[i]) / 1000;
         if (add_t > 0) {
           b->tokens[i] += (int32_t)add_t;
           if (b->tokens[i] > (int32_t)rates[i]) b->tokens[i] = rates[i];
+          b->last_refill_ms[i] = now_ms;
         }
-      }
-      // Only update last_refill_ms if we added at least 1 token to a rate > 0
-      // For simplicity, just update it if elapsed_ms > 0.
-      // But wait, if elapsed_ms < 1000/rate, add_t is 0, and we lose those ms!
-      // To be precise:
-      bool updated = false;
-      for(int i=0; i<4; i++) {
-        if (rates[i] > 0 && ((uint64_t)elapsed_ms * rates[i]) / 1000 > 0) {
-          updated = true; break;
-        }
-      }
-      if (updated) {
-        b->last_refill_ms = now_ms;
       }
     }
   }
@@ -2334,12 +2325,21 @@ static bool compare_records(const dns_record_t *a, const dns_record_t *b) {
 
 static bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
   if (!arena->hash_table) return false;
+  if (!target->name) return false;
   uint32_t hash = calc_fnv1a_str(target->name);
   size_t idx = hash & (arena->hash_size - 1);
   for (int i = arena->hash_table[idx]; i != -1; i = arena->records[i].next_record) {
     if (compare_records(&arena->records[i], target)) return true;
   }
   return false;
+}
+
+static void free_ixfr_txn(ixfr_txn_t *txn) {
+  if (!txn) return;
+  zone_arena_destroy(&txn->arena);
+  if (txn->deleted) free(txn->deleted);
+  if (txn->added) free(txn->added);
+  free(txn);
 }
 
 static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
@@ -2370,29 +2370,24 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
   
   if (del_count + add_count > 10000) return;
   
-  pthread_mutex_lock(&entry->ixfr_history.lock);
-  
-  int new_head = entry->ixfr_history.head;
-  if (entry->ixfr_history.count == MAX_IXFR_HISTORY) {
-    if (atomic_load_explicit(&entry->ixfr_history.entries[new_head].ref_count, memory_order_acquire) > 0) {
-      pthread_mutex_unlock(&entry->ixfr_history.lock);
-      return;
-    }
-    zone_arena_destroy(&entry->ixfr_history.entries[new_head].arena);
-    free(entry->ixfr_history.entries[new_head].deleted);
-    free(entry->ixfr_history.entries[new_head].added);
-  } else {
-    entry->ixfr_history.count++;
+  ixfr_txn_t *txn = malloc(sizeof(ixfr_txn_t));
+  if (!txn) return;
+  memset(txn, 0, sizeof(ixfr_txn_t));
+
+  if (del_count > 0) {
+    txn->deleted = malloc(sizeof(dns_record_t) * del_count);
+    if (!txn->deleted) { free(txn); return; }
+  }
+  if (add_count > 0) {
+    txn->added = malloc(sizeof(dns_record_t) * add_count);
+    if (!txn->added) { if (txn->deleted) free(txn->deleted); free(txn); return; }
   }
 
-  ixfr_txn_t *txn = &entry->ixfr_history.entries[new_head];
   txn->old_serial = old_serial;
   txn->new_serial = new_serial;
   txn->deleted_count = del_count;
   txn->added_count = add_count;
-  txn->deleted = malloc(sizeof(dns_record_t) * del_count);
-  txn->added = malloc(sizeof(dns_record_t) * add_count);
-  atomic_init(&txn->ref_count, 0);
+  atomic_init(&txn->ref_count, 1);
   zone_arena_init(&txn->arena);
 
   int d_idx = 0;
@@ -2433,6 +2428,22 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
     }
   }
 
+  pthread_mutex_lock(&entry->ixfr_history.lock);
+  
+  int new_head = entry->ixfr_history.head;
+  if (entry->ixfr_history.count == MAX_IXFR_HISTORY) {
+    ixfr_txn_t *old_txn = entry->ixfr_history.entries[new_head];
+    if (old_txn) {
+      if (atomic_fetch_sub_explicit(&old_txn->ref_count, 1, memory_order_release) == 1) {
+        atomic_thread_fence(memory_order_acquire);
+        free_ixfr_txn(old_txn);
+      }
+    }
+  } else {
+    entry->ixfr_history.count++;
+  }
+
+  entry->ixfr_history.entries[new_head] = txn;
   entry->ixfr_history.head = (new_head + 1) % MAX_IXFR_HISTORY;
   pthread_mutex_unlock(&entry->ixfr_history.lock);
 }
@@ -3853,7 +3864,8 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
     int found_idx = -1;
     for (int i = 0; i < entry->ixfr_history.count; i++) {
       int idx = (start_idx + i) % MAX_IXFR_HISTORY;
-      if (entry->ixfr_history.entries[idx].old_serial == client_serial) {
+      ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
+      if (txn && txn->old_serial == client_serial) {
         found_idx = i;
         break;
       }
@@ -3863,18 +3875,22 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
       uint32_t expected_serial = client_serial;
       for (int i = found_idx; i < entry->ixfr_history.count; i++) {
         int idx = (start_idx + i) % MAX_IXFR_HISTORY;
-        if (entry->ixfr_history.entries[idx].old_serial != expected_serial) {
+        ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
+        if (!txn || txn->old_serial != expected_serial) {
           continuous = false;
           break;
         }
-        expected_serial = entry->ixfr_history.entries[idx].new_serial;
+        expected_serial = txn->new_serial;
       }
       if (continuous && expected_serial == current_serial) {
         send_ixfr = true;
         for (int i = found_idx; i < entry->ixfr_history.count; i++) {
           int idx = (start_idx + i) % MAX_IXFR_HISTORY;
-          atomic_fetch_add_explicit(&entry->ixfr_history.entries[idx].ref_count, 1, memory_order_acquire);
-          txn_list[txn_count++] = &entry->ixfr_history.entries[idx];
+          ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
+          if (txn) {
+            atomic_fetch_add_explicit(&txn->ref_count, 1, memory_order_acquire);
+            txn_list[txn_count++] = txn;
+          }
         }
       }
     }
@@ -3966,8 +3982,12 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
     if (send_tcp_robust(client_fd, res, offset) < 0)
       goto axfr_error;
   }
+
   for (int t = 0; t < txn_count; t++) {
-    atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release);
+    if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release) == 1) {
+       atomic_thread_fence(memory_order_acquire);
+       free_ixfr_txn(txn_list[t]);
+    }
   }
   if (res) free(res);
   atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
@@ -3975,7 +3995,10 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
 
 axfr_error:
   for (int t = 0; t < txn_count; t++) {
-    atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release);
+    if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release) == 1) {
+       atomic_thread_fence(memory_order_acquire);
+       free_ixfr_txn(txn_list[t]);
+    }
   }
   if (res) free(res);
   atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
@@ -4839,6 +4862,7 @@ void *control_thread_func(void *arg) {
                             }
                           }
                           if (has_soa) {
+                            compute_ixfr_diff(entry, z_active, z_standby);
                             atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
                             syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", zcfg->domain);
                             send(cfd, "OK reloaded\n", 12, 0);
