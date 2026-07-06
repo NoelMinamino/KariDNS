@@ -611,7 +611,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 // EDNS 処理 (process_dns_query から切り出し)
 // ============================================================================
 
-void parse_edns_opt(const uint8_t *req, size_t req_len,
+int parse_edns_opt(const uint8_t *req, size_t req_len,
                     uint16_t qdcount, uint16_t ancount_req,
                     uint16_t nscount_req, uint16_t arcount_req,
                     edns_info_t *edns) {
@@ -651,7 +651,7 @@ void parse_edns_opt(const uint8_t *req, size_t req_len,
                     
                     size_t rdata_offset = scan_offset + 10;
                     size_t rdata_end = rdata_offset + rdlen;
-                    if (rdata_end > req_len) rdata_end = req_len;
+                    if (rdata_end > req_len) return -1; // Truncated OPT record
                     
                     while (rdata_offset + 4 <= rdata_end) {
                         uint16_t opt_code = (req[rdata_offset] << 8) | req[rdata_offset+1];
@@ -695,6 +695,7 @@ void parse_edns_opt(const uint8_t *req, size_t req_len,
             }
         }
     }
+    return 0;
 }
 
 void assemble_edns_opt(uint8_t *res, size_t max_res_len,

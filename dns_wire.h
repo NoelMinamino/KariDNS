@@ -117,7 +117,7 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
 
 // EDNS
-void parse_edns_opt(const uint8_t *req, size_t req_len,
+int parse_edns_opt(const uint8_t *req, size_t req_len,
                     uint16_t qdcount, uint16_t ancount_req,
                     uint16_t nscount_req, uint16_t arcount_req,
                     edns_info_t *edns);

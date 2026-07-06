@@ -3212,8 +3212,15 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   edns_info_t edns;
-  parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns);
-  
+  if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
+    if (current_zone)
+      atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+    memcpy(res, req, 12);
+    res[2] |= 0x80;
+    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
+    memset(&res[4], 0, 8); // qdcount, ancount, nscount, arcount = 0
+    return 12;
+  }
   // Do not echo client EDEs
   edns.ede_count = 0;
 
@@ -4181,7 +4188,7 @@ worker_startup_success:;
             while (offset < recv_len) {
               uint8_t len = req_buf[offset];
               if (len == 0 || (len & 0xC0) == 0xC0) {
-                offset++;
+                offset += (len == 0) ? 1 : 2;
                 break;
               }
               offset++;
