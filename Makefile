@@ -34,7 +34,7 @@ $(KARICTL_TARGET): $(KARICTL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lcrypto
 
 $(DOG_TARGET): $(DOG_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
