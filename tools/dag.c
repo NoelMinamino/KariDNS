@@ -323,6 +323,19 @@ typedef struct {
     uint8_t subnet_addr[16];
     int subnet_prefix;
 
+    struct {
+        uint16_t code;
+        uint16_t len;
+        uint8_t data[512];
+    } custom_edns_opts[8];
+    int custom_edns_opt_count;
+
+    bool want_padding;
+    int padding_size;
+
+    int timeout_sec;
+    int tries;
+
     bool is_ixfr;
     uint32_t ixfr_serial;
 } query_opts_t;
@@ -410,6 +423,27 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
         }
         memcpy(&pkt[offset], addr_copy, addr_bytes);
         offset += addr_bytes;
+    }
+
+    for (int i = 0; i < qo->custom_edns_opt_count; i++) {
+        if ((size_t)offset + 4 + qo->custom_edns_opts[i].len > max_len) break;
+        pkt[offset++] = qo->custom_edns_opts[i].code >> 8;
+        pkt[offset++] = qo->custom_edns_opts[i].code & 0xFF;
+        pkt[offset++] = qo->custom_edns_opts[i].len >> 8;
+        pkt[offset++] = qo->custom_edns_opts[i].len & 0xFF;
+        if (qo->custom_edns_opts[i].len > 0) {
+            memcpy(&pkt[offset], qo->custom_edns_opts[i].data, qo->custom_edns_opts[i].len);
+            offset += qo->custom_edns_opts[i].len;
+        }
+    }
+
+    if (qo->want_padding && qo->padding_size >= 0) {
+        if ((size_t)offset + 4 + qo->padding_size <= max_len) {
+            pkt[offset++] = 0x00; pkt[offset++] = 0x0C; // Padding (12)
+            pkt[offset++] = qo->padding_size >> 8; pkt[offset++] = qo->padding_size & 0xFF;
+            memset(&pkt[offset], 0, qo->padding_size);
+            offset += qo->padding_size;
+        }
     }
 
 done:
@@ -580,7 +614,7 @@ static int connect_tcp(const char *server, int port) {
 
 static ssize_t do_udp_exchange(const char *server, int port,
                                 const uint8_t *pkt, size_t pkt_len,
-                                uint8_t *resp, size_t resp_cap) {
+                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
     struct sockaddr_storage dest; socklen_t dest_len;
     int sock = connect_udp(server, port, &dest, &dest_len);
     if (sock < 0) return -1;
@@ -592,7 +626,7 @@ static ssize_t do_udp_exchange(const char *server, int port,
         perror("sendto"); close(sock); return -1;
     }
 
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ssize_t n = recv(sock, resp, resp_cap, 0);
     close(sock);
@@ -601,7 +635,7 @@ static ssize_t do_udp_exchange(const char *server, int port,
 
 static ssize_t do_tcp_exchange(const char *server, int port,
                                 const uint8_t *pkt, size_t pkt_len,
-                                uint8_t *resp, size_t resp_cap) {
+                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
     int sock = connect_tcp(server, port);
     if (sock < 0) return -1;
 
@@ -650,7 +684,7 @@ static ssize_t do_tcp_exchange(const char *server, int port,
         if (send(sock, pkt, body_len, 0) < 0) { perror("send(body)"); close(sock); return -1; }
     }
 
-    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     uint8_t rlen_buf[2];
@@ -942,49 +976,322 @@ fallback:
 /* ========================================================================
  * 8. main
  * ==================================================================== */
+
+static int hex_char_to_int(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
+    size_t out_len = 0;
+    while (*hex) {
+        int h1 = hex_char_to_int(*hex++);
+        if (h1 < 0) continue;
+        int h2 = -1;
+        while (*hex) {
+            h2 = hex_char_to_int(*hex++);
+            if (h2 >= 0) break;
+        }
+        if (h2 < 0) break;
+        if (out_len < out_cap) out[out_len++] = (uint8_t)((h1 << 4) | h2);
+    }
+    return out_len;
+}
+static int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
+                    bool use_tcp, bool use_ldnsz, bool short_mode, bool norecurse,
+                    bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
+                    query_opts_t *qo, const char *hex_payload) {
+    if (test_name) {
+        printf("=========================================================\n");
+        printf(">>> TEST: %s\n", test_name);
+        printf("=========================================================\n");
+    }
+
+    uint16_t qtype = 0;
+    if (strncasecmp(qtype_s, "IXFR=", 5) == 0) {
+        qtype = 251;
+        qo->is_ixfr = true;
+        qo->ixfr_serial = strtoul(qtype_s + 5, NULL, 10);
+        use_tcp = true;
+    } else {
+        qtype = parse_qtype(qtype_s);
+    }
+
+    uint8_t pkt[65535];
+    size_t pkt_len = 0;
+
+    if (hex_payload) {
+        pkt_len = parse_hex_string(hex_payload, pkt, sizeof(pkt));
+        if (pkt_len == 0) {
+            fprintf(stderr, "Error: Invalid or empty hex payload\n");
+            return 1;
+        }
+    } else {
+        pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
+        if (pkt_len == 0) return 1;
+    }
+
+    if (norecurse) {
+        pkt[2] &= ~0x01; // Clear RD bit
+    }
+    if (adflag) {
+        pkt[3] |= 0x20;  // Set AD bit
+    }
+    if (cdflag) {
+        pkt[3] |= 0x10;  // Set CD bit
+    }
+    if (aaflag) {
+        pkt[2] |= 0x04;  // Set AA bit
+    }
+    if (tcflag) {
+        pkt[2] |= 0x02;  // Set TC bit
+    }
+    if (zflag) {
+        pkt[3] |= 0x40;  // Set Z bit
+    }
+
+    bool retry_tcp = false;
+    do {
+        retry_tcp = false;
+
+        if (!short_mode) {
+            printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
+            printf("Query (%zu bytes):\n", pkt_len);
+            hexdump(pkt, pkt_len);
+            printf("\n");
+        }
+
+        static uint8_t resp[65535];
+        ssize_t n = -1;
+        int attempts = 0;
+        int max_tries = (qo->tries < 1) ? 1 : qo->tries;
+        
+        while (attempts < max_tries) {
+            attempts++;
+            n = use_tcp
+                ? do_tcp_exchange(server, port, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec)
+                : do_udp_exchange(server, port, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+            
+            if (n >= 0) break;
+            if (attempts < max_tries) {
+                if (!short_mode) printf(";; connection timed out; retrying...\n");
+            }
+        }
+
+        if (n < 0) {
+            printf(";; no usable response received\n");
+            return 1;
+        }
+
+        if (!short_mode) {
+            printf("Response (%zd bytes%s):\n", n, use_tcp ? ", TCP" : "");
+            hexdump(resp, (size_t)n);
+            if (use_ldnsz) {
+                print_ldnsz_url(resp, (size_t)n);
+            }
+            printf("\n");
+            print_response(resp, (size_t)n);
+        } else {
+            uint16_t ancount = (resp[6] << 8) | resp[7];
+            size_t off = 12;
+            uint16_t qdcount = (resp[4] << 8) | resp[5];
+            for (int k=0; k<qdcount; k++) {
+                size_t nxt; if(skip_wire_name(resp, n, off, &nxt)==0) off = nxt + 4;
+            }
+            for (int k=0; k<ancount; k++) {
+                size_t nxt; if(skip_wire_name(resp, n, off, &nxt)==0) {
+                    uint16_t type = (resp[nxt]<<8)|resp[nxt+1];
+                    uint16_t rdlen = (resp[nxt+8]<<8)|resp[nxt+9];
+                    print_rdata(resp, n, type, nxt+10, rdlen);
+                    printf("\n");
+                    off = nxt+10+rdlen;
+                } else break;
+            }
+        }
+
+        if (!use_tcp && n >= 12 && (resp[2] & 0x02) != 0) {
+            printf("\n;; Truncated, retrying in TCP mode...\n\n");
+            use_tcp = true;
+            retry_tcp = true;
+        }
+    } while (retry_tcp);
+
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s <name> <type|IXFR=serial> @<server> [-p <port>] [+tcp]\n"
         "          [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie]\n"
-        "          [+subnet=addr[/prefix]] [+ldnsz] [--break <kind>[=<param>] ...]\n"
+        "          [+subnet=addr[/prefix]] [+bufsize=N] [+adflag] [+cdflag]\n"
+        "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]]\n"
+        "          [+padding=N] [+timeout=N] [+tries=N] [+ldnsz]\n"
+        "          [--test-all] [--break <kind>[=<param>] ...]\n"
         "\n"
         "       %s --break-help    (list all --break kinds)\n",
         prog, prog);
 }
 
+static bool make_reverse_name(const char *ip_str, char *out_name, size_t out_len) {
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (inet_pton(AF_INET, ip_str, &a4) == 1) {
+        uint8_t *p = (uint8_t *)&a4.s_addr;
+        snprintf(out_name, out_len, "%u.%u.%u.%u.in-addr.arpa", p[3], p[2], p[1], p[0]);
+        return true;
+    } else if (inet_pton(AF_INET6, ip_str, &a6) == 1) {
+        uint8_t *p = a6.s6_addr;
+        char *ptr = out_name;
+        for (int i = 15; i >= 0; i--) {
+            ptr += snprintf(ptr, out_len - (ptr - out_name), "%x.%x.", p[i] & 0x0F, p[i] >> 4);
+        }
+        snprintf(ptr, out_len - (ptr - out_name), "ip6.arpa");
+        return true;
+    }
+    return false;
+}
+
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
-    if (argc < 4) { usage(argv[0]); return 1; }
+    if (argc < 3) { usage(argv[0]); return 1; }
 
-    const char *qname = argv[1];
-    const char *qtype_s = argv[2];
-    const char *server_arg = argv[3];
+    int arg_idx = 1;
+    char rev_name[128];
+    const char *qname = NULL;
+    const char *qtype_s = NULL;
+    const char *server_arg = NULL;
+    const char *hex_payload = NULL;
+
+    if (strcmp(argv[arg_idx], "--hex") == 0) {
+        if (arg_idx + 1 >= argc) { usage(argv[0]); return 1; }
+        hex_payload = argv[arg_idx + 1];
+        arg_idx += 2;
+        qname = "(hex)";
+        qtype_s = "ANY";
+    } else if (strncmp(argv[arg_idx], "--hex=", 6) == 0) {
+        hex_payload = argv[arg_idx] + 6;
+        arg_idx++;
+        qname = "(hex)";
+        qtype_s = "ANY";
+    } else if (strcmp(argv[arg_idx], "-x") == 0) {
+        arg_idx++;
+        if (arg_idx >= argc) { usage(argv[0]); return 1; }
+        if (!make_reverse_name(argv[arg_idx], rev_name, sizeof(rev_name))) {
+            fprintf(stderr, "Invalid IP address for -x\n");
+            return 1;
+        }
+        qname = rev_name;
+        qtype_s = "PTR";
+        arg_idx++;
+    } else {
+        qname = argv[arg_idx++];
+        if (arg_idx < argc && argv[arg_idx][0] != '@' && argv[arg_idx][0] != '+' && argv[arg_idx][0] != '-') {
+            qtype_s = argv[arg_idx++];
+        } else {
+            qtype_s = "A";
+        }
+    }
+
+    if (arg_idx < argc && argv[arg_idx][0] == '@') {
+        server_arg = argv[arg_idx++];
+    } else {
+        fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1\n");
+        return 1;
+    }
+
+    const char *server = server_arg + 1;
+
     int port = 53;
     bool use_tcp = false;
     bool use_ldnsz = false;
-
-    if (server_arg[0] != '@') { fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1\n"); return 1; }
-    const char *server = server_arg + 1;
+    bool short_mode = false;
+    bool norecurse = false;
+    bool adflag = false;
+    bool cdflag = false;
+    bool aaflag = false;
+    bool tcflag = false;
+    bool zflag = false;
+    bool test_all = false;
 
     query_opts_t qo;
     memset(&qo, 0, sizeof(qo));
     qo.udp_payload_size = 1232;
+    qo.timeout_sec = 5;
+    qo.tries = 1;
 
-    for (int i = 4; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--test-all") == 0) test_all = true;
+        if (strcmp(argv[i], "--break") == 0 && i + 1 < argc && strcmp(argv[i+1], "all") == 0) test_all = true;
+    }
+
+    for (int i = arg_idx; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--tcp") == 0 || strcmp(argv[i], "+tcp") == 0) {
             use_tcp = true;
         } else if (strcmp(argv[i], "+ldnsz") == 0) {
             use_ldnsz = true;
+        } else if (strcmp(argv[i], "+short") == 0) {
+            short_mode = true;
+        } else if (strcmp(argv[i], "+norec") == 0 || strcmp(argv[i], "+norecurse") == 0) {
+            norecurse = true;
         } else if (strcmp(argv[i], "--break") == 0 && i + 1 < argc) {
-            parse_break_arg(argv[++i]);
+            char *brk = argv[++i];
+            if (strcmp(brk, "all") == 0) {
+                // Already handled in the first loop
+            } else {
+                parse_break_arg(brk);
+            }
         } else if (strcmp(argv[i], "+edns") == 0) {
             qo.want_opt = true;
         } else if (strcmp(argv[i], "+dnssec") == 0) {
             qo.want_opt = true; qo.dnssec_ok = true;
         } else if (strcmp(argv[i], "+nsid") == 0) {
             qo.want_opt = true; qo.want_nsid = true;
+        } else if (strncmp(argv[i], "+bufsize=", 9) == 0) {
+            qo.want_opt = true; qo.udp_payload_size = (uint16_t)atoi(argv[i] + 9);
+        } else if (strcmp(argv[i], "+adflag") == 0) {
+            adflag = true;
+        } else if (strcmp(argv[i], "+cdflag") == 0) {
+            cdflag = true;
+        } else if (strcmp(argv[i], "+aaflag") == 0) {
+            aaflag = true;
+        } else if (strcmp(argv[i], "+tcflag") == 0) {
+            tcflag = true;
+        } else if (strcmp(argv[i], "+zflag") == 0) {
+            zflag = true;
+        } else if (strncmp(argv[i], "+timeout=", 9) == 0) {
+            qo.timeout_sec = atoi(argv[i] + 9);
+        } else if (strncmp(argv[i], "+tries=", 7) == 0) {
+            qo.tries = atoi(argv[i] + 7);
+        } else if (strncmp(argv[i], "+padding=", 9) == 0) {
+            qo.want_opt = true; qo.want_padding = true;
+            qo.padding_size = atoi(argv[i] + 9);
+        } else if (strncmp(argv[i], "+ednsopt=", 9) == 0) {
+            qo.want_opt = true;
+            if (qo.custom_edns_opt_count < 8) {
+                const char *val = argv[i] + 9;
+                char *colon = strchr(val, ':');
+                if (colon) {
+                    qo.custom_edns_opts[qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
+                    const char *hex = colon + 1;
+                    size_t hex_len = strlen(hex);
+                    size_t bytes = hex_len / 2;
+                    if (bytes > sizeof(qo.custom_edns_opts[0].data)) bytes = sizeof(qo.custom_edns_opts[0].data);
+                    qo.custom_edns_opts[qo.custom_edns_opt_count].len = (uint16_t)bytes;
+                    for (size_t j = 0; j < bytes; j++) {
+                        unsigned int b; sscanf(hex + j * 2, "%02x", &b);
+                        qo.custom_edns_opts[qo.custom_edns_opt_count].data[j] = (uint8_t)b;
+                    }
+                } else {
+                    qo.custom_edns_opts[qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
+                    qo.custom_edns_opts[qo.custom_edns_opt_count].len = 0;
+                }
+                qo.custom_edns_opt_count++;
+            }
         } else if (strncmp(argv[i], "+subnet=", 8) == 0) {
             if (parse_subnet_arg(argv[i] + 8, &qo)) { qo.want_opt = true; qo.want_subnet = true; }
         } else if (strncmp(argv[i], "+cookie", 7) == 0) {
@@ -1008,6 +1315,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "+nocookie") == 0) {
             qo.want_cookie = false;
+        } else if (strcmp(argv[i], "--test-all") == 0) {
+            // Already handled earlier
         } else {
             fprintf(stderr, "warning: unrecognized argument '%s', ignoring\n", argv[i]);
         }
@@ -1020,53 +1329,74 @@ int main(int argc, char **argv) {
         }
     }
 
-    uint16_t qtype = 0;
-    if (strncasecmp(qtype_s, "IXFR=", 5) == 0) {
-        qtype = 251;
-        qo.is_ixfr = true;
-        qo.ixfr_serial = strtoul(qtype_s + 5, NULL, 10);
-        use_tcp = true;
+    if (test_all) {
+        struct {
+            const char *name; break_kind_t kind; long param; bool tcp;
+            bool cdflag; bool zflag; bool aaflag; bool tcflag;
+            int padding; int edns_code;
+        } all_tests[] = {
+            {"Compression Loop", BRK_COMPRESSION_LOOP, 0, false, false,false,false,false, -1, -1},
+            {"Compression Forward", BRK_COMPRESSION_FORWARD, 0, false, false,false,false,false, -1, -1},
+            {"Label Too Long", BRK_LABEL_TOO_LONG, 100, false, false,false,false,false, -1, -1},
+            {"Reserved Length Bits", BRK_RESERVED_LENGTH_BITS, 0, false, false,false,false,false, -1, -1},
+            {"Oversized QNAME", BRK_OVERSIZED_QNAME, 0, false, false,false,false,false, -1, -1},
+            {"Override QDCOUNT", BRK_QDCOUNT, 2, false, false,false,false,false, -1, -1},
+            {"Truncated Question", BRK_TRUNCATED_QUESTION, 0, false, false,false,false,false, -1, -1},
+            {"Fake OPT RDLEN", BRK_OPT_RDLEN, 500, false, false,false,false,false, -1, -1},
+            {"Override ARCOUNT", BRK_ARCOUNT, 10, false, false,false,false,false, -1, -1},
+            {"Override OPCODE", BRK_OPCODE, 15, false, false,false,false,false, -1, -1},
+            {"Set QR Bit", BRK_QR_BIT, 0, false, false,false,false,false, -1, -1},
+            {"Notify No Question", BRK_NOTIFY_NO_QUESTION, 0, false, false,false,false,false, -1, -1},
+            {"Too Short Packet", BRK_TOO_SHORT, 0, false, false,false,false,false, -1, -1},
+            {"TCP Length Overclaim", BRK_TCP_LENGTH_OVERCLAIM, 50, true, false,false,false,false, -1, -1},
+            {"TCP Zero Length", BRK_TCP_ZERO_LENGTH, 0, true, false,false,false,false, -1, -1},
+            {"TCP Idle Hold", BRK_TCP_IDLE_HOLD, 2, true, false,false,false,false, -1, -1},
+            {"Bogus EDNS Option", BRK_NONE, 0, false, false,false,false,false, -1, 65535},
+            {"Z-Flag Set", BRK_NONE, 0, false, false,true,false,false, -1, -1},
+            {"AA-Flag Set", BRK_NONE, 0, false, false,false,true,false, -1, -1},
+            {"CD-Flag Set", BRK_NONE, 0, false, true,false,false,false, -1, -1},
+            {"TC-Flag Set", BRK_NONE, 0, false, false,false,false,true, -1, -1},
+            {"Massive Padding", BRK_NONE, 0, false, false,false,false,false, 2000, -1},
+        };
+
+        qo.timeout_sec = 1; // Faster fail for tests
+        qo.tries = 1;
+
+        for (size_t t = 0; t < sizeof(all_tests)/sizeof(all_tests[0]); t++) {
+            g_break_count = 0;
+            if (all_tests[t].kind != BRK_NONE) {
+                g_breaks[0].kind = all_tests[t].kind;
+                g_breaks[0].param = all_tests[t].param;
+                g_breaks[0].has_param = true;
+                g_break_count = 1;
+            }
+            
+            query_opts_t t_qo = qo;
+            if (all_tests[t].edns_code >= 0) {
+                t_qo.want_opt = true;
+                t_qo.custom_edns_opts[0].code = all_tests[t].edns_code;
+                t_qo.custom_edns_opts[0].len = 4;
+                t_qo.custom_edns_opts[0].data[0] = 0xDE;
+                t_qo.custom_edns_opts[0].data[1] = 0xAD;
+                t_qo.custom_edns_opts[0].data[2] = 0xBE;
+                t_qo.custom_edns_opts[0].data[3] = 0xEF;
+                t_qo.custom_edns_opt_count = 1;
+            }
+            if (all_tests[t].padding >= 0) {
+                t_qo.want_opt = true;
+                t_qo.want_padding = true;
+                t_qo.padding_size = all_tests[t].padding;
+            }
+
+            run_test(all_tests[t].name, qname, qtype_s, server, port,
+                     use_tcp || all_tests[t].tcp, use_ldnsz, short_mode, norecurse,
+                     adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
+                     &t_qo, hex_payload);
+        }
+
     } else {
-        qtype = parse_qtype(qtype_s);
+        run_test(NULL, qname, qtype_s, server, port, use_tcp, use_ldnsz, short_mode, norecurse,
+                 adflag, cdflag, aaflag, tcflag, zflag, &qo, hex_payload);
     }
-
-    static uint8_t pkt[65535];
-    size_t pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, &qo);
-    if (pkt_len == 0) return 1;
-
-    bool retry_tcp = false;
-    do {
-        retry_tcp = false;
-
-        printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
-        printf("Query (%zu bytes):\n", pkt_len);
-        hexdump(pkt, pkt_len);
-        printf("\n");
-
-        static uint8_t resp[65535];
-        ssize_t n = use_tcp
-            ? do_tcp_exchange(server, port, pkt, pkt_len, resp, sizeof(resp))
-            : do_udp_exchange(server, port, pkt, pkt_len, resp, sizeof(resp));
-
-        if (n < 0) {
-            printf(";; no usable response received\n");
-            return 1;
-        }
-
-        printf("Response (%zd bytes%s):\n", n, use_tcp ? ", TCP" : "");
-        hexdump(resp, (size_t)n);
-        if (use_ldnsz) {
-            print_ldnsz_url(resp, (size_t)n);
-        }
-        printf("\n");
-        print_response(resp, (size_t)n);
-
-        if (!use_tcp && n >= 12 && (resp[2] & 0x02) != 0) {
-            printf("\n;; Truncated, retrying in TCP mode...\n\n");
-            use_tcp = true;
-            retry_tcp = true;
-        }
-    } while (retry_tcp);
-
     return 0;
 }
