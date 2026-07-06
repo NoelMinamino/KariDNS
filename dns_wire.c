@@ -251,7 +251,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 // TSIG ヘルパー
 // ============================================================================
 
-static int const_time_memcmp(const void *a, const void *b, size_t len) {
+int const_time_memcmp(const void *a, const void *b, size_t len) {
     const unsigned char *p1 = a; const unsigned char *p2 = b;
     unsigned char res = 0;
     for (size_t i = 0; i < len; i++) res |= p1[i] ^ p2[i];

@@ -107,6 +107,7 @@ const char *get_type_str(uint16_t type, zone_arena_t *arena);
 int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out);
 
 // TSIG
+int const_time_memcmp(const void *a, const void *b, size_t len);
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len);
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key);
 

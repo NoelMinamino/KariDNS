@@ -4271,7 +4271,8 @@ void *control_thread_func(void *arg) {
               char expected[65];
               for(unsigned int k=0; k<md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
               
-              if (strcmp(client_hmac, expected) == 0) {
+              if (strlen(client_hmac) == strlen(expected) &&
+                  const_time_memcmp(client_hmac, expected, strlen(expected)) == 0) {
                 send(cfd, "OK\n", 3, 0);
                 c->state = CTRL_STATE_CMD_WAIT;
               } else {
@@ -4302,17 +4303,57 @@ void *control_thread_func(void *arg) {
                   syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
                   zone_db_entry_t *entry = get_or_create_zone(zcfg->domain);
                   if (entry) {
-                    char *buf = read_entire_file(zcfg->file);
-                    if (buf) {
-                      pthread_mutex_lock(&entry->writer_lock);
-                      zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-                      (void)z_active;
-                      pthread_mutex_unlock(&entry->writer_lock);
-                      free(buf);
+                    if (zcfg->type && (strcmp(zcfg->type, "master") == 0 || strcmp(zcfg->type, "primary") == 0)) {
+                      char *buf = read_entire_file(zcfg->file);
+                      if (buf) {
+                        pthread_mutex_lock(&entry->writer_lock);
+                        zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+                        zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
+                        wait_for_readers(z_standby);
+                        for (int i = 0; i < z_standby->file_buf_count; i++) free(z_standby->file_bufs[i]);
+                        z_standby->count = 0;
+                        z_standby->data_pool_count = 0;
+                        z_standby->current_pool_cap = 0;
+                        z_standby->current_pool_idx = 0;
+                        z_standby->file_buf_count = 0;
+                        z_standby->file_bufs[z_standby->file_buf_count++] = buf;
+                        char *prev_owner = NULL, *origin = zcfg->domain, *default_ttl_str = NULL;
+                        int count = parse_zone_fast(buf, strlen(buf), z_standby, &prev_owner, &origin, &default_ttl_str);
+                        if (count >= 0) {
+                          build_zone_index(z_standby);
+                          bool has_soa = false;
+                          uint32_t hash = calc_fnv1a_str(zcfg->domain);
+                          size_t idx = hash & (z_standby->hash_size - 1);
+                          for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
+                            if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, zcfg->domain) == 0) {
+                              has_soa = true; break;
+                            }
+                          }
+                          if (has_soa) {
+                            atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+                            syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", zcfg->domain);
+                            send(cfd, "OK reloaded\n", 12, 0);
+                          } else {
+                            syslog(LOG_ERR, "[Control] Targeted reload failed for %s: missing SOA", zcfg->domain);
+                            send(cfd, "ERROR missing SOA\n", 18, 0);
+                          }
+                        } else {
+                          syslog(LOG_ERR, "[Control] Targeted reload failed for %s: parse error", zcfg->domain);
+                          send(cfd, "ERROR parse error\n", 18, 0);
+                        }
+                        pthread_mutex_unlock(&entry->writer_lock);
+                      } else {
+                        syslog(LOG_ERR, "[Control] Targeted reload failed for %s: file read error", zcfg->domain);
+                        send(cfd, "ERROR file read error\n", 22, 0);
+                      }
+                    } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
+                      syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", zcfg->domain);
+                      atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+                      send(cfd, "OK reloaded (slave)\n", 20, 0);
+                    } else {
+                      send(cfd, "ERROR unknown zone type\n", 24, 0);
                     }
                   }
-                  perform_config_reload();
-                  send(cfd, "OK reloaded\n", 12, 0);
                 } else {
                   syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
                   send(cfd, "ERROR zone not found\n", 21, 0);
@@ -4529,6 +4570,14 @@ static void run_frontend_router(pid_t backend_pid) {
     for (int i = 0; i < n; i++) {
       uintptr_t ud = (uintptr_t)ev_list[i].udata;
       if (ud == 1000) {
+        ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), MSG_DONTWAIT);
+        if (len >= (ssize_t)sizeof(udp_ipc_t)) {
+          udp_ipc_t *msg = (udp_ipc_t *)buffer;
+          if (msg->sock_fd_idx == -2) {
+            syslog(LOG_NOTICE, "[Frontend] Received stop command from backend. Shutting down cleanly.");
+            exit(0);
+          }
+        }
         syslog(LOG_CRIT, "[Frontend] Backend process (pid=%d) exited unexpectedly. Shutting down.", backend_pid);
         exit(1);
       }
