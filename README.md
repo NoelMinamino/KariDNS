@@ -1,6 +1,10 @@
 # KariDNS
 **(Kqueue Arena-based RCU Immoral DNS)**
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform: FreeBSD](https://img.shields.io/badge/Platform-FreeBSD-red.svg)](https://www.freebsd.org/)
+[![Build CI](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml/badge.svg)](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml)
+
 KariDNS is a high-performance, lightweight, and modern authoritative DNS server designed specifically for FreeBSD. It focuses on extreme concurrency and low-latency query processing by leveraging advanced system-level features.
 
 ## Key Features
