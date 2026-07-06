@@ -8,10 +8,10 @@ TARGET = karidns
 SRCS = dns_server_core.c dns_wire.c
 OBJS = $(SRCS:.c=.o)
 
-DOG_TARGET = dog
-DOG_SRCS = tools/dog.c dns_wire.c
+DAG_TARGET = dag
+DAG_SRCS = tools/dag.c dns_wire.c
 
-DOG_OBJS = $(DOG_SRCS:.c=.o)
+DAG_OBJS = $(DAG_SRCS:.c=.o)
 
 KARICTL_TARGET = karictl
 KARICTL_SRCS = tools/karictl.c
@@ -25,7 +25,7 @@ FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c
 
 .PHONY: all clean run fuzz fuzz_core clean-fuzz
 
-all: $(TARGET) $(DOG_TARGET) $(KARICTL_TARGET)
+all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -33,14 +33,14 @@ $(TARGET): $(OBJS)
 $(KARICTL_TARGET): $(KARICTL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lcrypto
 
-$(DOG_TARGET): $(DOG_OBJS)
+$(DAG_TARGET): $(DAG_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean: clean-fuzz
-	rm -f $(TARGET) $(DOG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DOG_OBJS) $(KARICTL_OBJS)
+	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 
 run: $(TARGET)
 	./$(TARGET)

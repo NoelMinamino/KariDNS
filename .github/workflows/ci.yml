@@ -33,12 +33,12 @@ jobs:
             make fuzz fuzz_core
             echo "::endgroup::"
 
-            echo "::group::🔍 [Smoke Test] Test dog client against Google DNS"
+            echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
             echo "Testing UDP query..."
-            ./dog www.google.com A @8.8.8.8
+            ./dag www.google.com A @8.8.8.8
             
             echo "Testing TCP query..."
-            ./dog google.com TXT @8.8.8.8 +tcp
+            ./dag google.com TXT @8.8.8.8 +tcp
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Run Fuzzers (10 seconds each)"

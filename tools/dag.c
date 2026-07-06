@@ -1,8 +1,8 @@
 /*
- * dog - DNS test client / protocol fuzzer
+ * dag - DNS Anomaly Generator (test client / protocol fuzzer)
  *
  * Usage:
- *   dog <name> <type> @<server> [-p <port>] [+tcp] [+ldnsz]
+ *   dag <name> <type> @<server> [-p <port>] [+tcp] [+ldnsz]
  *       [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie] [+subnet=addr[/prefix]]
  *       [--break <kind>[=<param>] ...]
  *
@@ -26,20 +26,20 @@
 #include "../dns_wire.h"
 
 /* ========================================================================
- * 1. Arena (dog only ever bump-allocates scratch strings; never freed)
+ * 1. Arena (dag only ever bump-allocates scratch strings; never freed)
  * ==================================================================== */
-#define DOG_ARENA_SIZE (256 * 1024)
-static char g_arena_buf[DOG_ARENA_SIZE];
+#define DAG_ARENA_SIZE (256 * 1024)
+static char g_arena_buf[DAG_ARENA_SIZE];
 static size_t g_arena_pos = 0;
 
 struct zone_arena_s {
-    char pad[1]; /* dog doesn't need real zone_arena_t internals */
+    char pad[1]; /* dag doesn't need real zone_arena_t internals */
 };
 
 void *arena_alloc(zone_arena_t *arena, size_t size) {
     (void)arena;
     size_t aligned = (size + 7) & ~((size_t)7);
-    if (g_arena_pos + aligned > DOG_ARENA_SIZE) return NULL;
+    if (g_arena_pos + aligned > DAG_ARENA_SIZE) return NULL;
     void *p = &g_arena_buf[g_arena_pos];
     g_arena_pos += aligned;
     return p;
@@ -322,6 +322,9 @@ typedef struct {
     int subnet_family;      /* 1 = IPv4, 2 = IPv6 */
     uint8_t subnet_addr[16];
     int subnet_prefix;
+
+    bool is_ixfr;
+    uint32_t ixfr_serial;
 } query_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -479,6 +482,28 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         }
         pkt[offset++] = qtype >> 8; pkt[offset++] = qtype & 0xFF;
         pkt[offset++] = 0x00; pkt[offset++] = 0x01;
+    }
+
+    if (qo->is_ixfr) {
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        if (write_dns_name_str(pkt, &offset, qname, &comp_ctx) == 0) {
+            pkt[offset++] = 0x00; pkt[offset++] = 0x06; /* Type SOA */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x01; /* Class IN */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x16; /* RDLEN 22 */
+            pkt[offset++] = 0x00; /* MNAME (.) */
+            pkt[offset++] = 0x00; /* RNAME (.) */
+            pkt[offset++] = (qo->ixfr_serial >> 24) & 0xFF;
+            pkt[offset++] = (qo->ixfr_serial >> 16) & 0xFF;
+            pkt[offset++] = (qo->ixfr_serial >> 8) & 0xFF;
+            pkt[offset++] = qo->ixfr_serial & 0xFF; /* SERIAL */
+            for (int i = 0; i < 16; i++) pkt[offset++] = 0; /* REFRESH, RETRY, EXPIRE, MINIMUM */
+            
+            uint16_t nscount = (pkt[8] << 8) | pkt[9];
+            nscount++;
+            pkt[8] = nscount >> 8; pkt[9] = nscount & 0xFF;
+        }
     }
 
     long opt_rdlen_override = 0; bool want_opt_rdlen_break = has_break(BRK_OPT_RDLEN, &opt_rdlen_override, NULL);
@@ -919,7 +944,7 @@ fallback:
  * ==================================================================== */
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <name> <type> @<server> [-p <port>] [+tcp]\n"
+        "Usage: %s <name> <type|IXFR=serial> @<server> [-p <port>] [+tcp]\n"
         "          [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie]\n"
         "          [+subnet=addr[/prefix]] [+ldnsz] [--break <kind>[=<param>] ...]\n"
         "\n"
@@ -995,7 +1020,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    uint16_t qtype = parse_qtype(qtype_s);
+    uint16_t qtype = 0;
+    if (strncasecmp(qtype_s, "IXFR=", 5) == 0) {
+        qtype = 251;
+        qo.is_ixfr = true;
+        qo.ixfr_serial = strtoul(qtype_s + 5, NULL, 10);
+        use_tcp = true;
+    } else {
+        qtype = parse_qtype(qtype_s);
+    }
 
     static uint8_t pkt[65535];
     size_t pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, &qo);
@@ -1005,7 +1038,7 @@ int main(int argc, char **argv) {
     do {
         retry_tcp = false;
 
-        printf("; <<>> dog <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
+        printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
         printf("Query (%zu bytes):\n", pkt_len);
         hexdump(pkt, pkt_len);
         printf("\n");
