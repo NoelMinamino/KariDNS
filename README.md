@@ -45,6 +45,25 @@ To reload the configuration and zone files dynamically without restarting the se
 ./karictl reload
 ```
 
+### DNS Anomaly Generator (`dag`)
+
+Included with KariDNS is `dag`, a versatile DNS test client and protocol fuzzer. It allows you to construct custom DNS queries (including EDNS, Cookie, Subnet, and IXFR, etc.), generate web links (`+ldnsz`) for wire-format workbench, and intentionally malform packets using the `--break` flag to test server resilience.
+
+> [!WARNING]
+> **Intended for Local Testing Only**
+> We strongly advise against using this tool (especially the `--break` fuzzing options) against external or public DNS servers that you do not own or manage.
+
+```sh
+# Normal query
+./dag example.com A @127.0.0.1 -p 53
+
+# IXFR query over TCP (automatically adds SOA record)
+./dag example.com IXFR=2026070603 @127.0.0.1
+
+# Test server handling of structural packet errors
+./dag example.com A @127.0.0.1 --break label-too-long
+```
+
 ## Control Channel & Configuration Format
 
 KariDNS supports an administrative control channel similar to BIND's `rndc`. 
