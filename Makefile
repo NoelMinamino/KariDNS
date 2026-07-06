@@ -10,13 +10,20 @@ OBJS = $(SRCS:.c=.o)
 
 DOG_TARGET = dog
 DOG_SRCS = tools/dog.c dns_wire.c
+
 DOG_OBJS = $(DOG_SRCS:.c=.o)
 
 KARICTL_TARGET = karictl
 KARICTL_SRCS = tools/karictl.c
 KARICTL_OBJS = $(KARICTL_SRCS:.c=.o)
 
-.PHONY: all clean run
+FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
+FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c
+
+FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
+FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c
+
+.PHONY: all clean run fuzz fuzz_core clean-fuzz
 
 all: $(TARGET) $(DOG_TARGET) $(KARICTL_TARGET)
 
@@ -32,8 +39,17 @@ $(DOG_TARGET): $(DOG_OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-clean:
+clean: clean-fuzz
 	rm -f $(TARGET) $(DOG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DOG_OBJS) $(KARICTL_OBJS)
 
 run: $(TARGET)
 	./$(TARGET)
+
+fuzz: $(FUZZ_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_TARGET) $(FUZZ_SRCS) $(LDFLAGS)
+
+fuzz_core: $(FUZZ_CORE_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS) $(LDFLAGS)
+
+clean-fuzz:
+	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET)

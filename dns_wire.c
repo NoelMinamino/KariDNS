@@ -139,7 +139,7 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             if (written >= 256) return -1; 
             buf[written++] = '.'; 
         }
-        if (written + len >= 256) return -1;
+        if (written + len >= 256 || p + len > packet_len) return -1;
         memcpy(&buf[written], &packet[p], len); written += len; p += len;
     }
     *next_offset = jumped ? jumped_offset : p; 
