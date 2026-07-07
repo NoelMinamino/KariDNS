@@ -60,6 +60,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (config.control.algorithm) free(config.control.algorithm);
         if (config.control.secret) free(config.control.secret);
         free_logging_channels(&config);
+        if (config.user) free(config.user);
+        if (config.group) free(config.group);
+        free_rate_limit_config(&config.rrl);
     } 
     else if (selector % 3 == 1) {
         // 2. Fuzz parse_zone_fast (Zone file parser)

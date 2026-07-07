@@ -676,6 +676,7 @@ static void limit_client_socket_rights(int fd) {
 }
 
 static void enter_capsicum_sandbox(void) {
+#ifndef SANITIZER_BUILD
   int trapmode = PROC_TRAPCAP_CTL_ENABLE;
   procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);
   if (cap_enter() != 0) {
@@ -683,6 +684,7 @@ static void enter_capsicum_sandbox(void) {
       return;
     exit(EXIT_FAILURE);
   }
+#endif
   atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);
 }
 
@@ -1144,6 +1146,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           if (strcmp(key, "port") == 0) {
             int p = atoi(val);
             if (p > 0 && p <= 65535) config->port = p;
+            free(val);
           } else if (strcmp(key, "user") == 0)
             config->user = val;
           else
@@ -5420,8 +5423,19 @@ int main(int argc, char **argv) {
   uint8_t dummy_cookie[16];
   generate_server_cookie("127.0.0.1", (const uint8_t *)"12345678", dummy_cookie, time(NULL));
 
-  if (argc < 2) {
-    syslog(LOG_ERR, "Usage: %s <config_file>", argv[0]);
+  bool foreground = false;
+  const char *config_file = NULL;
+
+  for (int i = 1; i < argc; i++) {
+      if (strcmp(argv[i], "-f") == 0) {
+          foreground = true;
+      } else {
+          config_file = argv[i];
+      }
+  }
+
+  if (!config_file) {
+    syslog(LOG_ERR, "Usage: %s [-f] <config_file>", argv[0]);
     return 1;
   }
   signal(SIGPIPE, SIG_IGN);
@@ -5435,10 +5449,12 @@ int main(int argc, char **argv) {
     cap_rights_limit(g_cwd_fd, &cwd_rights);
   }
 
-  g_config_path = argv[1];
+  g_config_path = config_file;
   openlog("KariDNS", LOG_PID | LOG_NDELAY, LOG_DAEMON);
   start_connect_broker();
-  daemonize();
+  if (!foreground) {
+    daemonize();
+  }
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGHUP);

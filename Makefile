@@ -23,7 +23,7 @@ FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
 FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c
 
-.PHONY: all clean run fuzz fuzz_core clean-fuzz
+.PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET)
 
@@ -41,6 +41,7 @@ $(DAG_TARGET): $(DAG_OBJS)
 
 clean: clean-fuzz
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
+	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o
 
 run: $(TARGET)
 	./$(TARGET)
@@ -53,3 +54,30 @@ fuzz_core: $(FUZZ_CORE_SRCS)
 
 clean-fuzz:
 	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET)
+
+ASAN_TARGET = karidns-asan
+ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer
+ASAN_OBJS = $(SRCS:.c=.asan.o)
+
+asan: $(ASAN_TARGET)
+
+$(ASAN_TARGET): $(ASAN_OBJS)
+	$(CC) $(ASAN_CFLAGS) -o $@ $^ $(LDFLAGS)
+
+.SUFFIXES: .asan.o .c
+.c.asan.o:
+	$(CC) $(ASAN_CFLAGS) -c $< -o $@
+
+TSAN_TARGET = karidns-tsan
+TSAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=thread -fPIE
+TSAN_LDFLAGS = -fsanitize=thread -pie
+TSAN_OBJS = $(SRCS:.c=.tsan.o)
+
+tsan: $(TSAN_TARGET)
+
+$(TSAN_TARGET): $(TSAN_OBJS)
+	$(CC) $(TSAN_CFLAGS) -o $@ $^ $(LDFLAGS) $(TSAN_LDFLAGS)
+
+.SUFFIXES: .tsan.o .c
+.c.tsan.o:
+	$(CC) $(TSAN_CFLAGS) -c $< -o $@
