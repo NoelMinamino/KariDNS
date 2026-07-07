@@ -22,6 +22,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <zlib.h>
+#include <strings.h>
 
 #include "../dns_wire.h"
 
@@ -122,7 +123,12 @@ static void print_ldnsz_url(const uint8_t *buf, size_t len) {
     if (!out_buf) { deflateEnd(&strm); return; }
     strm.next_out = out_buf;
     strm.avail_out = out_cap;
-    deflate(&strm, Z_FINISH);
+    if (deflate(&strm, Z_FINISH) != Z_STREAM_END) {
+        printf(";; compression did not complete\n");
+        free(out_buf);
+        deflateEnd(&strm);
+        return;
+    }
     size_t comp_len = out_cap - strm.avail_out;
     deflateEnd(&strm);
 
@@ -1145,9 +1151,12 @@ static bool make_reverse_name(const char *ip_str, char *out_name, size_t out_len
         uint8_t *p = a6.s6_addr;
         char *ptr = out_name;
         for (int i = 15; i >= 0; i--) {
-            ptr += snprintf(ptr, out_len - (ptr - out_name), "%x.%x.", p[i] & 0x0F, p[i] >> 4);
+            int n = snprintf(ptr, out_len - (ptr - out_name), "%x.%x.", p[i] & 0x0F, p[i] >> 4);
+            if (n < 0 || (size_t)n >= out_len - (ptr - out_name)) return false;
+            ptr += n;
         }
-        snprintf(ptr, out_len - (ptr - out_name), "ip6.arpa");
+        int n = snprintf(ptr, out_len - (ptr - out_name), "ip6.arpa");
+        if (n < 0 || (size_t)n >= out_len - (ptr - out_name)) return false;
         return true;
     }
     return false;
