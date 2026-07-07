@@ -117,11 +117,11 @@ typedef struct {
   char domain[256];
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
-  uint32_t serial;
-  uint32_t refresh;
-  uint32_t retry;
-  uint32_t expire;
-  time_t next_check;
+  _Atomic(uint32_t) serial;
+  _Atomic(uint32_t) refresh;
+  _Atomic(uint32_t) retry;
+  _Atomic(uint32_t) expire;
+  _Atomic(time_t) next_check;
   _Atomic bool refresh_now;
   _Atomic bool notify_now;
   _Atomic bool is_transferring;
@@ -5037,7 +5037,7 @@ void *control_thread_func(void *arg) {
               zone_db_entry_t *entry = get_zone(canon_arg);
               if (entry) {
                 char smsg[256];
-                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", entry->serial, entry->refresh);
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)entry->serial, (uint32_t)entry->refresh);
                 send(cfd, smsg, slen, 0);
               } else {
                 syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
