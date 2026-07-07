@@ -3116,6 +3116,20 @@ static void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *
     }
 }
 
+static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount) {
+    size_t offset = 12;
+    for (int k = 0; k < qdcount; k++) {
+        while (offset < len) {
+            uint8_t l = pkt[offset];
+            if (l == 0) { offset++; break; }
+            if ((l & 0xC0) == 0xC0) { offset += 2; break; }
+            offset += l + 1;
+        }
+        offset += 4; // QTYPE, QCLASS
+    }
+    return (offset <= len) ? offset : len;
+}
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
@@ -3204,20 +3218,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
     add_ede(&edns, cfg_for_ede->send_extended_errors, 21, "This opcode is not supported by this server");
     
-    uint16_t offset = 12;
-    size_t q_offset = 12;
-    for (int k = 0; k < qdcount; k++) {
-      while (q_offset < copy_len) {
-        uint8_t len = res[q_offset];
-        if (len == 0) { q_offset++; break; }
-        if ((len & 0xC0) == 0xC0) { q_offset += 2; break; }
-        q_offset += len + 1;
-      }
-      q_offset += 4;
-    }
-    if (q_offset <= copy_len) offset = q_offset;
-    else offset = copy_len;
-    
+    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
@@ -3233,7 +3234,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[2] |= 0x80;
     res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
-    uint16_t offset = copy_len;
+    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
@@ -3291,7 +3292,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       res[3] |= 0x05;
       add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
     }
-    uint16_t offset = copy_len;
+    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
@@ -4630,6 +4631,20 @@ worker_startup_success:;
               if (tsig_error) {
                 res_buf[2] |= 0x84;
                 res_buf[3] |= 0x09;
+                add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
+                
+                uint16_t qd = (msg[4] << 8) | msg[5];
+                uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
+                uint16_t arcount = 0;
+                if (edns.present) {
+                  assemble_edns_opt(res_buf, sizeof(res_buf), &offset, &arcount, &edns, 0);
+                }
+                res_buf[6] = 0; res_buf[7] = 0;
+                res_buf[8] = 0; res_buf[9] = 0;
+                res_buf[10] = arcount >> 8;
+                res_buf[11] = arcount & 0xFF;
+                copy_len = offset;
+
                 if (matched_key)
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
                                    matched_key, tsig_error, NULL, NULL);
@@ -4644,13 +4659,17 @@ worker_startup_success:;
                 res_buf[2] |= 0x84;
                 res_buf[3] |= 0x05;
                 add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
-                uint16_t offset = copy_len;
+                
+                uint16_t qd = (msg[4] << 8) | msg[5];
+                uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
                 uint16_t arcount = 0;
                 if (edns.present) {
                   assemble_edns_opt(res_buf, sizeof(res_buf), &offset, &arcount, &edns, 0);
-                  res_buf[10] = arcount >> 8;
-                  res_buf[11] = arcount & 0xFF;
                 }
+                res_buf[6] = 0; res_buf[7] = 0;
+                res_buf[8] = 0; res_buf[9] = 0;
+                res_buf[10] = arcount >> 8;
+                res_buf[11] = arcount & 0xFF;
                 copy_len = offset;
               }
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
