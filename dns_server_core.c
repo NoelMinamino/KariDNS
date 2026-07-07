@@ -222,6 +222,7 @@ typedef struct {
   logging_config_t logging;
   control_channel_config_t control;
   rate_limit_config_t rrl;
+  bool send_extended_errors;
 } server_config_t;
 
 typedef enum {
@@ -273,6 +274,10 @@ static rrl_bucket_t g_rrl_table[RRL_TABLE_SIZE];
 
 _Atomic uint64_t g_rrl_dropped_total = 0;
 _Atomic uint64_t g_rrl_slip_total = 0;
+_Atomic uint64_t g_ede_prohibited_total = 0;
+_Atomic uint64_t g_ede_not_authoritative_total = 0;
+_Atomic uint64_t g_ede_not_supported_total = 0;
+_Atomic uint64_t g_ede_other_total = 0;
 
 static bool match_cidr(const char *client_ip_str, const char *cidr_str);
 
@@ -1088,6 +1093,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->zones = NULL;
   config->user = NULL;
   config->group = NULL;
+  config->send_extended_errors = true;
   zone_config_t *last_zone = NULL;
   while (1) {
     conf_token_t tok = get_next_token(&ctx);
@@ -1177,6 +1183,25 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             free(key);
             return -1;
           }
+        } else if (strcmp(key, "send-extended-errors") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->send_extended_errors = true;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->send_extended_errors = false;
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
         } else
           skip_unknown_block(&ctx);
         free(key);
@@ -3070,6 +3095,27 @@ static void generate_server_cookie(const char *client_ip, const uint8_t client_c
     memcpy(server_cookie + 8, hash, 8);
 }
 
+static void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
+    if (!enabled || !edns->present) return;
+    if (edns->ede_count >= MAX_EDE_COUNT) return;
+
+    edns->ede_list[edns->ede_count].code = code;
+    if (text) {
+        strncpy(edns->ede_list[edns->ede_count].text, text, sizeof(edns->ede_list[0].text) - 1);
+        edns->ede_list[edns->ede_count].text[sizeof(edns->ede_list[0].text) - 1] = '\0';
+    } else {
+        edns->ede_list[edns->ede_count].text[0] = '\0';
+    }
+    edns->ede_count++;
+
+    switch (code) {
+        case 18: atomic_fetch_add_explicit(&g_ede_prohibited_total, 1, memory_order_relaxed); break;
+        case 20: atomic_fetch_add_explicit(&g_ede_not_authoritative_total, 1, memory_order_relaxed); break;
+        case 21: atomic_fetch_add_explicit(&g_ede_not_supported_total, 1, memory_order_relaxed); break;
+        case 0:  atomic_fetch_add_explicit(&g_ede_other_total, 1, memory_order_relaxed); break;
+    }
+}
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
@@ -3127,7 +3173,77 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  if (req_len >= 12 && ((req[2] >> 3) & 0x0F) == 4) { // NOTIFY
+  if (req_len < 12) {
+    return -1;
+  }
+  
+  uint16_t qdcount = (req[4] << 8) | req[5],
+           ancount_req = (req[6] << 8) | req[7],
+           nscount_req = (req[8] << 8) | req[9],
+           arcount_req = (req[10] << 8) | req[11];
+
+  edns_info_t edns;
+  memset(&edns, 0, sizeof(edns));
+  edns.present = false;
+  if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
+    memcpy(res, req, 12);
+    res[2] |= 0x80;
+    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
+    memset(&res[4], 0, 8); // qdcount, ancount, nscount, arcount = 0
+    return 12;
+  }
+  edns.ede_count = 0; // 反射防止
+
+  server_config_t *cfg_for_ede = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+
+  uint8_t opcode = (req[2] >> 3) & 0x0F;
+  if (opcode != 0 && opcode != 4) {
+    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+    memcpy(res, req, copy_len);
+    res[2] |= 0x80;
+    res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
+    add_ede(&edns, cfg_for_ede->send_extended_errors, 21, "This opcode is not supported by this server");
+    
+    uint16_t offset = 12;
+    size_t q_offset = 12;
+    for (int k = 0; k < qdcount; k++) {
+      while (q_offset < copy_len) {
+        uint8_t len = res[q_offset];
+        if (len == 0) { q_offset++; break; }
+        if ((len & 0xC0) == 0xC0) { q_offset += 2; break; }
+        q_offset += len + 1;
+      }
+      q_offset += 4;
+    }
+    if (q_offset <= copy_len) offset = q_offset;
+    else offset = copy_len;
+    
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+    }
+    res[10] = arcount >> 8;
+    res[11] = arcount & 0xFF;
+    return offset;
+  }
+
+  if (qdcount != 1) {
+    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+    memcpy(res, req, copy_len);
+    res[2] |= 0x80;
+    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
+    add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
+    uint16_t offset = copy_len;
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+    }
+    res[10] = arcount >> 8;
+    res[11] = arcount & 0xFF;
+    return offset;
+  }
+
+  if (opcode == 4) { // NOTIFY
     bool auth = false;
     if (db_entry) {
       server_config_t *cfg =
@@ -3171,9 +3287,18 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
         EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
         kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
       }
-    } else
+    } else {
       res[3] |= 0x05;
-    return copy_len;
+      add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
+    }
+    uint16_t offset = copy_len;
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+    }
+    res[10] = arcount >> 8;
+    res[11] = arcount & 0xFF;
+    return offset;
   }
 
   if (db_entry) {
@@ -3190,39 +3315,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     } while (1);
   }
   compress_ctx_init_packet(comp_ctx);
-  if (req_len < 12) {
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                memory_order_release);
-    return -1;
-  }
-  uint16_t qdcount = (req[4] << 8) | req[5],
-           ancount_req = (req[6] << 8) | req[7],
-           nscount_req = (req[8] << 8) | req[9],
-           arcount_req = (req[10] << 8) | req[11];
-  if (qdcount != 1) {
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                memory_order_release);
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01;
-    return copy_len;
-  }
-
-  edns_info_t edns;
-  if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
-    memcpy(res, req, 12);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
-    memset(&res[4], 0, 8); // qdcount, ancount, nscount, arcount = 0
-    return 12;
-  }
-  // Do not echo client EDEs
-  edns.ede_count = 0;
 
   if (edns.present && max_res_len == 512) {
     if (edns.udp_payload_size > 1232)
@@ -3284,7 +3376,15 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
     res[3] = (res[3] & 0x0F) | 0x01;
-    return copy_len;
+    add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
+    uint16_t offset = copy_len;
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+    }
+    res[10] = arcount >> 8;
+    res[11] = arcount & 0xFF;
+    return offset;
   }
   uint16_t qclass = (req[q_offset + 2] << 8) | req[q_offset + 3];
   if (qclass != 1 && qclass != 255) {
@@ -3295,7 +3395,15 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
     res[3] = (res[3] & 0x0F) | 0x05;
-    return copy_len;
+    add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
+    uint16_t offset = copy_len;
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+    }
+    res[10] = arcount >> 8;
+    res[11] = arcount & 0xFF;
+    return offset;
   }
   q_offset += 4;
   memcpy(res, req, q_offset);
@@ -3316,13 +3424,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   if (!current_zone) {
     res[3] |= 5;
+    add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not authoritative for the queried zone");
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
     if (edns.present) {
-      edns.ede_count = 1;
-      edns.ede_list[0].code = 20; // Not Authoritative
-      strncpy(edns.ede_list[0].text, "recursion disabled", sizeof(edns.ede_list[0].text) - 1);
-      edns.ede_list[0].text[sizeof(edns.ede_list[0].text) - 1] = '\0';
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);
       *res_arcount = htons(arcount);
     }
@@ -4420,9 +4525,10 @@ worker_startup_success:;
             client_port =
                 ntohs(((struct sockaddr_in6 *)&client_addr)->sin6_port);
           uint16_t qclass = 1;
-          bool has_edns = false;
-          bool dnssec_ok = false;
-          if (msg_len > 12) {
+          edns_info_t edns;
+          memset(&edns, 0, sizeof(edns));
+          edns.present = false;
+          if (msg_len >= 12) {
             size_t offset = 12;
             while (offset < msg_len) {
               uint8_t len = msg[offset];
@@ -4434,48 +4540,17 @@ worker_startup_success:;
             }
             if (offset + 3 < msg_len)
               qclass = (msg[offset + 2] << 8) | msg[offset + 3];
-            uint16_t arcount = (msg[10] << 8) | msg[11];
-            if (arcount > 0) {
-              size_t o = 12;
-              uint16_t qd = (msg[4] << 8) | msg[5];
-              uint16_t an = (msg[6] << 8) | msg[7];
-              uint16_t ns = (msg[8] << 8) | msg[9];
-              for (int k = 0; k < qd; k++) {
-                while (o < msg_len && msg[o] != 0 && (msg[o] & 0xC0) != 0xC0)
-                  o += msg[o] + 1;
-                if (o < msg_len && (msg[o] & 0xC0) == 0xC0)
-                  o += 2;
-                else
-                  o++;
-                o += 4;
-              }
-              for (int k = 0; k < an + ns + arcount; k++) {
-                if (o >= msg_len)
-                  break;
-                while (o < msg_len && msg[o] != 0 && (msg[o] & 0xC0) != 0xC0)
-                  o += msg[o] + 1;
-                if (o < msg_len && (msg[o] & 0xC0) == 0xC0)
-                  o += 2;
-                else
-                  o++;
-                if (o + 10 <= msg_len) {
-                  uint16_t rt = (msg[o] << 8) | msg[o + 1];
-                  uint32_t ttl = ((uint32_t)msg[o + 4] << 24) |
-                                 ((uint32_t)msg[o + 5] << 16) |
-                                 ((uint32_t)msg[o + 6] << 8) | msg[o + 7];
-                  uint16_t rdl = (msg[o + 8] << 8) | msg[o + 9];
-                  if (rt == 41) {
-                    has_edns = true;
-                    if (ttl & 0x00008000)
-                      dnssec_ok = true;
-                    break;
-                  }
-                  o += 10 + rdl;
-                } else
-                  break;
-              }
+
+            uint16_t qd = (msg[4] << 8) | msg[5];
+            uint16_t an = (msg[6] << 8) | msg[7];
+            uint16_t ns = (msg[8] << 8) | msg[9];
+            uint16_t ar = (msg[10] << 8) | msg[11];
+            if (parse_edns_opt(msg, msg_len, qd, an, ns, ar, &edns) == 0) {
+              edns.ede_count = 0; // 反射防止
             }
           }
+          bool has_edns = edns.present;
+          bool dnssec_ok = edns.dnssec_ok;
           write_query_log(ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                           has_edns, dnssec_ok);
 
@@ -4568,6 +4643,15 @@ worker_startup_success:;
               } else {
                 res_buf[2] |= 0x84;
                 res_buf[3] |= 0x05;
+                add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
+                uint16_t offset = copy_len;
+                uint16_t arcount = 0;
+                if (edns.present) {
+                  assemble_edns_opt(res_buf, sizeof(res_buf), &offset, &arcount, &edns, 0);
+                  res_buf[10] = arcount >> 8;
+                  res_buf[11] = arcount & 0xFF;
+                }
+                copy_len = offset;
               }
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               send(client_fd, len_prefix, 2, 0);
@@ -4915,12 +4999,16 @@ void *control_thread_func(void *arg) {
               send(cfd, "OK stopping\n", 12, 0);
               exit(0);
             } else if (strcmp(cmd, "status") == 0) {
-              char smsg[256];
+              char smsg[512];
               bool frontend_alive = atomic_load(&g_frontend_alive);
               uint64_t dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
               uint64_t slipped = atomic_load_explicit(&g_rrl_slip_total, memory_order_relaxed);
-              int slen = snprintf(smsg, sizeof(smsg), "OK frontend_alive=%d pid=%d RRL_Dropped=%" PRIu64 " RRL_Slipped=%" PRIu64 "\n", 
-                                  frontend_alive, getpid(), dropped, slipped);
+              uint64_t ede_proh = atomic_load_explicit(&g_ede_prohibited_total, memory_order_relaxed);
+              uint64_t ede_na = atomic_load_explicit(&g_ede_not_authoritative_total, memory_order_relaxed);
+              uint64_t ede_ns = atomic_load_explicit(&g_ede_not_supported_total, memory_order_relaxed);
+              uint64_t ede_oth = atomic_load_explicit(&g_ede_other_total, memory_order_relaxed);
+              int slen = snprintf(smsg, sizeof(smsg), "OK frontend_alive=%d pid=%d RRL_Dropped=%" PRIu64 " RRL_Slipped=%" PRIu64 " EDE_Prohibited=%" PRIu64 " EDE_NotAuthoritative=%" PRIu64 " EDE_NotSupported=%" PRIu64 " EDE_Other=%" PRIu64 "\n", 
+                                  frontend_alive, getpid(), dropped, slipped, ede_proh, ede_na, ede_ns, ede_oth);
               send(cfd, smsg, slen, 0);
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
