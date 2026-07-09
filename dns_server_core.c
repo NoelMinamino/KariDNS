@@ -2494,7 +2494,10 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
 
 static void reload_master_zone(zone_db_entry_t *entry, const char *file) {
   char *buf = read_entire_file(file);
-  if (!buf) return;
+  if (!buf) {
+    syslog(LOG_ERR, "[Zone] Failed to read file '%s' for zone '%s'.", file, entry->domain);
+    return;
+  }
   pthread_mutex_lock(&entry->writer_lock);
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
