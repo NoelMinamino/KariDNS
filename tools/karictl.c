@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
     }
     if (optind >= argc) {
         fprintf(stderr, "Usage: %s [-f config_path] <command> [args...]\n", argv[0]);
-        fprintf(stderr, "Commands: status, reload [zone], stop, notify <zone>, retransfer <zone>, zonestatus <zone>, tsig-keygen [keyname]\n");
+        fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, tsig-keygen [keyname]\n");
         return 1;
     }
 

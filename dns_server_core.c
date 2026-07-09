@@ -4793,6 +4793,30 @@ static ctrl_client_t *get_ctrl_client(int fd) {
   return NULL;
 }
 
+static void reload_all_zones(void) {
+  zone_db_snapshot_t *snap = acquire_zone_snapshot();
+  server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  
+  for (size_t i = 0; i < snap->count; i++) {
+    zone_db_entry_t *entry = snap->entries[i];
+    zone_config_t *zcfg = active_cfg->zones;
+    while (zcfg) {
+      if (strcasecmp(zcfg->domain, entry->domain) == 0) {
+        if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0) && zcfg->file) {
+          syslog(LOG_NOTICE, "[Control] Reloading master zone: %s", entry->domain);
+          reload_master_zone(entry, zcfg->file);
+        } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
+          syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
+          atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+        }
+        break;
+      }
+      zcfg = zcfg->next;
+    }
+  }
+  release_zone_snapshot(snap);
+}
+
 static void perform_config_reload(void) {
   char *config_str = read_entire_file(g_config_path);
   if (!config_str)
@@ -5054,9 +5078,13 @@ void *control_thread_func(void *arg) {
                 }
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
-                perform_config_reload();
+                reload_all_zones();
                 send(cfd, "OK reloaded\n", 12, 0);
               }
+            } else if (strcmp(cmd, "reconfig") == 0) {
+              syslog(LOG_NOTICE, "[Control] Received reconfig command");
+              perform_config_reload();
+              send(cfd, "OK\n", 3, 0);
             } else if (strcmp(cmd, "stop") == 0) {
               syslog(LOG_NOTICE, "[Control] Received stop command");
               udp_ipc_t msg;
