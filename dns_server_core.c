@@ -126,6 +126,7 @@ typedef struct {
   _Atomic bool notify_now;
   _Atomic bool is_transferring;
   _Atomic(int) active_axfr;
+  _Atomic int snapshot_refs;
   ixfr_history_t ixfr_history;
 } zone_db_entry_t;
 
@@ -2238,7 +2239,7 @@ void build_zone_index(zone_arena_t *arena) {
   }
 }
 
-zone_db_entry_t *get_zone(const char *domain) {
+zone_db_snapshot_t *acquire_zone_snapshot(void) {
   zone_db_snapshot_t *snap = NULL;
   do {
     snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
@@ -2247,17 +2248,23 @@ zone_db_entry_t *get_zone(const char *domain) {
     atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
     if (snap == atomic_load_explicit(&g_zone_db_active, memory_order_acquire))
       break;
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
   } while (1);
-  zone_db_entry_t *result = NULL;
+  return snap;
+}
+
+void release_zone_snapshot(zone_db_snapshot_t *snap) {
+  if (snap)
+    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+}
+
+zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain) {
+  if (!snap) return NULL;
   for (size_t i = 0; i < snap->count; i++) {
     if (strcasecmp(snap->entries[i]->domain, domain) == 0) {
-      result = snap->entries[i];
-      break;
+      return snap->entries[i];
     }
   }
-  atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
-  return result;
+  return NULL;
 }
 
 static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
@@ -2269,36 +2276,13 @@ static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
   }
 }
 
-zone_db_entry_t *get_or_create_zone(const char *domain) {
-  zone_db_snapshot_t *snap = NULL;
-  do {
-    snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
-    if (snap) {
-      atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
-      if (snap == atomic_load_explicit(&g_zone_db_active, memory_order_acquire))
-        break;
-      atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
-    } else
-      break;
-  } while (1);
-  if (snap) {
-    zone_db_entry_t *result = NULL;
-    for (size_t i = 0; i < snap->count; i++) {
-      if (strcasecmp(snap->entries[i]->domain, domain) == 0) {
-        result = snap->entries[i];
-        break;
-      }
-    }
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
-    if (result)
-      return result;
-  }
+static zone_db_entry_t *create_new_zone_entry(const char *domain) {
   zone_db_entry_t *z = calloc(1, sizeof(zone_db_entry_t));
-  if (!z)
-    return NULL;
+  if (!z) return NULL;
   atomic_init(&z->active_axfr, 0);
+  atomic_init(&z->snapshot_refs, 1);
   strncpy(z->domain, domain, sizeof(z->domain) - 1);
-  z->domain[sizeof(z->domain) - 1] = '\0';
+  z->domain[sizeof(z->domain) - 1] = 0;
   pthread_mutex_init(&z->writer_lock, NULL);
   pthread_mutex_init(&z->ixfr_history.lock, NULL);
   z->ixfr_history.count = 0;
@@ -2306,21 +2290,6 @@ zone_db_entry_t *get_or_create_zone(const char *domain) {
   zone_arena_init(&z->rcu.arena_a);
   zone_arena_init(&z->rcu.arena_b);
   atomic_init(&z->rcu.active, &z->rcu.arena_a);
-  zone_db_snapshot_t *new_snap = calloc(1, sizeof(zone_db_snapshot_t));
-  new_snap->count = snap ? snap->count + 1 : 1;
-  new_snap->entries = calloc(new_snap->count, sizeof(zone_db_entry_t *));
-  if (snap) {
-    for (size_t i = 0; i < snap->count; i++)
-      new_snap->entries[i] = snap->entries[i];
-  }
-  new_snap->entries[new_snap->count - 1] = z;
-  atomic_init(&new_snap->reader_count, 0);
-  atomic_store_explicit(&g_zone_db_active, new_snap, memory_order_release);
-  if (snap) {
-    wait_for_snapshot_readers(snap);
-    free(snap->entries);
-    free(snap);
-  }
   return z;
 }
 
@@ -2331,6 +2300,54 @@ static void wait_for_readers(zone_arena_t *arena) {
     if (++retries % 1000 == 0)
       syslog(LOG_WARNING, "[RCU] wait_for_readers stalled");
   }
+}
+
+void free_zone_db_entry(zone_db_entry_t *entry) {
+  if (!entry) return;
+  while (atomic_load(&entry->active_axfr) > 0) {
+    usleep(1000);
+  }
+  wait_for_readers(&entry->rcu.arena_a);
+  wait_for_readers(&entry->rcu.arena_b);
+  pthread_mutex_destroy(&entry->writer_lock);
+  pthread_mutex_destroy(&entry->ixfr_history.lock);
+  for (int i = 0; i < entry->ixfr_history.count; i++) {
+    int idx = (entry->ixfr_history.head + MAX_IXFR_HISTORY - entry->ixfr_history.count + i) % MAX_IXFR_HISTORY;
+    ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
+    if (txn) {
+      if (txn->deleted) free(txn->deleted);
+      if (txn->added) free(txn->added);
+      free(txn);
+    }
+  }
+  zone_arena_t *arenas[2] = {&entry->rcu.arena_a, &entry->rcu.arena_b};
+  for (int i = 0; i < 2; i++) {
+    zone_arena_t *a = arenas[i];
+    for (int p = 0; p < a->data_pool_count; p++) {
+      if (a->data_pools[p]) free(a->data_pools[p]);
+    }
+    for (int p = 0; p < a->file_buf_count; p++) {
+      if (a->file_bufs[p]) free(a->file_bufs[p]);
+    }
+    if (a->records) free(a->records);
+    if (a->hash_table) free(a->hash_table);
+  }
+  free(entry);
+}
+
+static void *gc_snapshot_thread(void *arg) {
+  zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
+  wait_for_snapshot_readers(snap);
+  for (size_t i = 0; i < snap->count; i++) {
+    zone_db_entry_t *entry = snap->entries[i];
+    if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
+      syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
+      free_zone_db_entry(entry);
+    }
+  }
+  free(snap->entries);
+  free(snap);
+  return NULL;
 }
 
 static char *arena_strdup(zone_arena_t *arena, const char *str);
@@ -2462,8 +2479,7 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
   if (entry->ixfr_history.count == MAX_IXFR_HISTORY) {
     ixfr_txn_t *old_txn = entry->ixfr_history.entries[new_head];
     if (old_txn) {
-      if (atomic_fetch_sub_explicit(&old_txn->ref_count, 1, memory_order_release) == 1) {
-        atomic_thread_fence(memory_order_acquire);
+      if (atomic_fetch_sub_explicit(&old_txn->ref_count, 1, memory_order_acq_rel) == 1) {
         free_ixfr_txn(old_txn);
       }
     }
@@ -2476,60 +2492,82 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
   pthread_mutex_unlock(&entry->ixfr_history.lock);
 }
 
-void load_zones_from_config(server_config_t *config) {
-  zone_config_t *z = config->zones;
-  while (z) {
-    if (z->type &&
-        (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) &&
-        z->file) {
-      zone_db_entry_t *entry = get_or_create_zone(z->domain);
-      if (!entry) {
-        z = z->next;
-        continue;
-      }
-      char *buf = read_entire_file(z->file);
-      if (buf) {
-        pthread_mutex_lock(&entry->writer_lock);
-        zone_arena_t *z_active =
-            atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-        zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a)
-                                      ? &entry->rcu.arena_b
-                                      : &entry->rcu.arena_a;
-        wait_for_readers(z_standby);
-        for (int i = 0; i < z_standby->file_buf_count; i++)
-          free(z_standby->file_bufs[i]);
-        z_standby->count = 0;
-        z_standby->data_pool_count = 0;
-        z_standby->current_pool_cap = 0;
-        z_standby->current_pool_idx = 0;
-        z_standby->file_buf_count = 0;
-        z_standby->file_bufs[z_standby->file_buf_count++] = buf;
-        char *prev_owner = NULL, *origin = z->domain, *default_ttl_str = NULL;
-        int count = parse_zone_fast(buf, strlen(buf), z_standby, &prev_owner,
-                                    &origin, &default_ttl_str);
-        if (count >= 0) {
-          build_zone_index(z_standby);
-          bool has_soa = false;
-          uint32_t hash = calc_fnv1a_str(z->domain);
-          size_t idx = hash & (z_standby->hash_size - 1);
-          for (int i = z_standby->hash_table[idx]; i != -1;
-               i = z_standby->records[i].next_record) {
-            if (z_standby->records[i].type_code == 6 &&
-                strcasecmp(z_standby->records[i].name, z->domain) == 0) {
-              has_soa = true;
-              break;
-            }
-          }
-          if (has_soa) {
-            compute_ixfr_diff(entry, z_active, z_standby);
-            atomic_store_explicit(&entry->rcu.active, z_standby,
-                                  memory_order_release);
-          }
-        }
-        pthread_mutex_unlock(&entry->writer_lock);
+static void reload_master_zone(zone_db_entry_t *entry, const char *file) {
+  char *buf = read_entire_file(file);
+  if (!buf) return;
+  pthread_mutex_lock(&entry->writer_lock);
+  zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
+  wait_for_readers(z_standby);
+  for (int i = 0; i < z_standby->file_buf_count; i++) free(z_standby->file_bufs[i]);
+  z_standby->count = 0;
+  z_standby->data_pool_count = 0;
+  z_standby->current_pool_cap = 0;
+  z_standby->current_pool_idx = 0;
+  z_standby->file_buf_count = 0;
+  z_standby->file_bufs[z_standby->file_buf_count++] = buf;
+  char *prev_owner = NULL, *origin = entry->domain, *default_ttl_str = NULL;
+  int count = parse_zone_fast(buf, strlen(buf), z_standby, &prev_owner, &origin, &default_ttl_str);
+  if (count >= 0) {
+    build_zone_index(z_standby);
+    bool has_soa = false;
+    uint32_t hash = calc_fnv1a_str(entry->domain);
+    size_t idx = hash & (z_standby->hash_size - 1);
+    for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
+      if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, entry->domain) == 0) {
+        has_soa = true;
+        break;
       }
     }
-    z = z->next;
+    if (has_soa) {
+      compute_ixfr_diff(entry, z_active, z_standby);
+      atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+    }
+  }
+  pthread_mutex_unlock(&entry->writer_lock);
+}
+
+void rebuild_zone_db_from_config(server_config_t *config) {
+  int new_count = 0;
+  for (zone_config_t *z = config->zones; z; z = z->next) new_count++;
+  zone_db_snapshot_t *new_snap = calloc(1, sizeof(zone_db_snapshot_t));
+  new_snap->count = new_count;
+  new_snap->entries = calloc(new_count, sizeof(zone_db_entry_t *));
+  atomic_init(&new_snap->reader_count, 0);
+
+  zone_db_snapshot_t *old_snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
+  
+  int idx = 0;
+  for (zone_config_t *z = config->zones; z; z = z->next) {
+    zone_db_entry_t *entry = NULL;
+    if (old_snap) {
+      for (size_t i = 0; i < old_snap->count; i++) {
+        if (strcasecmp(old_snap->entries[i]->domain, z->domain) == 0) {
+          entry = old_snap->entries[i];
+          atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+          break;
+        }
+      }
+    }
+    if (!entry) {
+      entry = create_new_zone_entry(z->domain);
+    }
+    new_snap->entries[idx++] = entry;
+    
+    if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
+      reload_master_zone(entry, z->file);
+    }
+  }
+
+  atomic_store_explicit(&g_zone_db_active, new_snap, memory_order_release);
+
+  if (old_snap) {
+    pthread_t gc_tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&gc_tid, &attr, gc_snapshot_thread, old_snap);
+    pthread_attr_destroy(&attr);
   }
 }
 
@@ -3136,7 +3174,8 @@ static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t q
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
-                      bool is_tcp, rate_limit_config_t **out_rrl_cfg) {
+                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                      zone_db_snapshot_t *snap) {
   char current_qname[256];
   strncpy(current_qname, qname, 255);
   current_qname[255] = '\0';
@@ -3144,16 +3183,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   zone_arena_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
   size_t longest_match_len = 0;
-  zone_db_snapshot_t *snap = NULL;
-  do {
-    snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
-    if (!snap)
-      break;
-    atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
-    if (snap == atomic_load_explicit(&g_zone_db_active, memory_order_acquire))
-      break;
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
-  } while (1);
+
   if (snap) {
     for (size_t i = 0; i < snap->count; i++) {
       size_t z_len = strlen(snap->entries[i]->domain);
@@ -3170,7 +3200,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
         db_entry = snap->entries[i];
       }
     }
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
   }
 
   if (out_rrl_cfg) {
@@ -3830,6 +3859,8 @@ typedef struct {
   uint8_t req[512];
   uint16_t req_len;
   tsig_key_t *tsig_key;
+  zone_db_entry_t *entry;
+  zone_db_snapshot_t *snap;
 } axfr_worker_args_t;
 
 static ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
@@ -3852,9 +3883,8 @@ static ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
   return sent;
 }
 
-void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
-                        uint16_t req_len, tsig_key_t *tsig_key) {
-  zone_db_entry_t *entry = get_zone(qname);
+void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
+                        uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry) {
   if (!entry) {
     uint8_t res_buf[512];
     size_t copy_len = req_len > 512 ? 512 : req_len;
@@ -3975,13 +4005,15 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
 
   if (is_ixfr && client_serial == current_serial) {
     send_ixfr = true;
-  } else if (is_ixfr && entry->ixfr_history.count > 0) {
+  } else if (is_ixfr) {
     pthread_mutex_lock(&entry->ixfr_history.lock);
+    if (entry->ixfr_history.count > 0) {
     int start_idx = (entry->ixfr_history.head + MAX_IXFR_HISTORY - entry->ixfr_history.count) % MAX_IXFR_HISTORY;
     int found_idx = -1;
     for (int i = 0; i < entry->ixfr_history.count; i++) {
       int idx = (start_idx + i) % MAX_IXFR_HISTORY;
       ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
+      //syslog(LOG_NOTICE, "[DEBUG-IXFR] history[%d] old_serial: %u", i, txn->old_serial);
       if (txn && txn->old_serial == client_serial) {
         found_idx = i;
         break;
@@ -4009,6 +4041,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
             txn_list[txn_count++] = txn;
           }
         }
+      }
       }
     }
     pthread_mutex_unlock(&entry->ixfr_history.lock);
@@ -4101,8 +4134,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
   }
 
   for (int t = 0; t < txn_count; t++) {
-    if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release) == 1) {
-       atomic_thread_fence(memory_order_acquire);
+    if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) {
        free_ixfr_txn(txn_list[t]);
     }
   }
@@ -4112,8 +4144,7 @@ void send_axfr_response(int client_fd, const char *qname, uint8_t *req,
 
 axfr_error:
   for (int t = 0; t < txn_count; t++) {
-    if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_release) == 1) {
-       atomic_thread_fence(memory_order_acquire);
+    if (atomic_fetch_sub_explicit(&txn_list[t]->ref_count, 1, memory_order_acq_rel) == 1) {
        free_ixfr_txn(txn_list[t]);
     }
   }
@@ -4123,13 +4154,15 @@ axfr_error:
 
 void *axfr_worker_thread(void *arg) {
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
-  zone_db_entry_t *entry = get_zone(args->qname);
+  zone_db_entry_t *entry = args->entry;
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
-                     args->tsig_key);
+                     args->tsig_key, entry);
   close(args->client_fd);
+  zone_db_snapshot_t *worker_snap = args->snap;
   free(args);
   if (entry)
     atomic_fetch_sub(&entry->active_axfr, 1);
+  release_zone_snapshot(worker_snap);
   pthread_exit(NULL);
 }
 
@@ -4401,9 +4434,11 @@ worker_startup_success:;
           uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
           uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
           rate_limit_config_t *rrl_cfg = NULL;
+          zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int res_len =
               process_dns_query(req_buf, payload_received, res_buf, 512, qname,
-                                qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg);
+                                qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
+          release_zone_snapshot(snap);
           if (res_len > 0) {
             bool slip_triggered = false;
             rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
@@ -4558,6 +4593,7 @@ worker_startup_success:;
           write_query_log(ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                           has_edns, dnssec_ok);
 
+          zone_db_snapshot_t *snap = acquire_zone_snapshot();
           if (qtype == 252 || qtype == 251) {
             server_config_t *cfg =
                 atomic_load_explicit(&g_config_db.active, memory_order_acquire);
@@ -4598,7 +4634,7 @@ worker_startup_success:;
                 }
               }
             }
-            zone_db_entry_t *entry = get_zone(qname);
+            zone_db_entry_t *entry = snapshot_get_zone(snap, qname);
             if (allowed && entry) {
               if (atomic_fetch_add(&entry->active_axfr, 1) >= MAX_ZONE_AXFR) {
                 atomic_fetch_sub(&entry->active_axfr, 1);
@@ -4612,6 +4648,9 @@ worker_startup_success:;
                   args->req_len = msg_len > 512 ? 512 : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   args->tsig_key = matched_key;
+                  args->entry = entry;
+                  args->snap = snap;
+                  atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
                   int cflags = fcntl(client_fd, F_GETFL, 0);
                   fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
                   pthread_t t;
@@ -4675,10 +4714,13 @@ worker_startup_success:;
                 res_buf[11] = arcount & 0xFF;
                 copy_len = offset;
               }
+              release_zone_snapshot(snap);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               send(client_fd, len_prefix, 2, 0);
               send(client_fd, res_buf, copy_len, 0);
               close(client_fd);
+            } else {
+              release_zone_snapshot(snap);
             }
             free(ctx_tcp);
           } else {
@@ -4686,13 +4728,16 @@ worker_startup_success:;
             if (tcp_res) {
               int res_len = process_dns_query(msg, msg_len, tcp_res, 65535,
                                               qname, qtype, ctx_tcp->client_ip,
-                                              &thread_compress_ctx, true, NULL);
+                                              &thread_compress_ctx, true, NULL, snap);
+              release_zone_snapshot(snap);
               if (res_len > 0) {
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
                 send(client_fd, len_prefix, 2, 0);
                 send(client_fd, tcp_res, res_len, 0);
               }
               free(tcp_res);
+            } else {
+              release_zone_snapshot(snap);
             }
             close(client_fd);
             free(ctx_tcp);
@@ -4787,7 +4832,7 @@ static void perform_config_reload(void) {
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
-    load_zones_from_config(standby);
+    rebuild_zone_db_from_config(standby);
     syslog(LOG_NOTICE, "Configuration and zones reloaded successfully.");
   } else {
     syslog(LOG_ERR, "Failed to reload configuration: parse error.");
@@ -4947,7 +4992,8 @@ void *control_thread_func(void *arg) {
                 }
                 if (zcfg) {
                   syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
-                  zone_db_entry_t *entry = get_or_create_zone(zcfg->domain);
+                  zone_db_snapshot_t *snap = acquire_zone_snapshot();
+                  zone_db_entry_t *entry = snapshot_get_zone(snap, zcfg->domain);
                   if (entry) {
                     if (zcfg->type && (strcmp(zcfg->type, "master") == 0 || strcmp(zcfg->type, "primary") == 0)) {
                       char *buf = read_entire_file(zcfg->file);
@@ -5001,6 +5047,7 @@ void *control_thread_func(void *arg) {
                       send(cfd, "ERROR unknown zone type\n", 24, 0);
                     }
                   }
+                  release_zone_snapshot(snap);
                 } else {
                   syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
                   send(cfd, "ERROR zone not found\n", 21, 0);
@@ -5034,7 +5081,8 @@ void *control_thread_func(void *arg) {
               send(cfd, smsg, slen, 0);
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
-              zone_db_entry_t *entry = get_zone(canon_arg);
+              zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
               if (entry) {
                 char smsg[256];
                 int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)entry->serial, (uint32_t)entry->refresh);
@@ -5043,9 +5091,11 @@ void *control_thread_func(void *arg) {
                 syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
-              zone_db_entry_t *entry = get_zone(canon_arg);
+              zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
               if (entry) {
                 syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s", canon_arg);
                 atomic_store_explicit(&entry->notify_now, true, memory_order_release);
@@ -5054,9 +5104,11 @@ void *control_thread_func(void *arg) {
                 syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_zone_snapshot(snap);
             } else if (strcmp(cmd, "retransfer") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
-              zone_db_entry_t *entry = get_zone(canon_arg);
+              zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
               if (entry) {
                 syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
                 atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
@@ -5065,6 +5117,7 @@ void *control_thread_func(void *arg) {
                 syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_zone_snapshot(snap);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
               send(cfd, "ERROR unknown command\n", 22, 0);
@@ -5086,8 +5139,14 @@ void *control_thread_func(void *arg) {
         server_config_t *active =
             atomic_load_explicit(&g_config_db.active, memory_order_acquire);
         zone_config_t *zone = active->zones;
+        zone_db_snapshot_t *snap = acquire_zone_snapshot();
+        int check_count = 0;
         while (zone) {
-          zone_db_entry_t *entry = get_or_create_zone(zone->domain);
+          if (++check_count % 50 == 0) {
+            release_zone_snapshot(snap);
+            snap = acquire_zone_snapshot();
+          }
+          zone_db_entry_t *entry = snapshot_get_zone(snap, zone->domain);
           if (entry) {
             if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
               syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
@@ -5145,6 +5204,7 @@ void *control_thread_func(void *arg) {
           }
           zone = zone->next;
         }
+        release_zone_snapshot(snap);
       }
     }
   }
@@ -5470,7 +5530,7 @@ int main(int argc, char **argv) {
   free(config_str);
   init_logging_channels(&g_config_db.config_a);
   atomic_init(&g_config_db.active, &g_config_db.config_a);
-  load_zones_from_config(&g_config_db.config_a);
+  rebuild_zone_db_from_config(&g_config_db.config_a);
 
   int num_workers = sysconf(_SC_NPROCESSORS_ONLN);
   if (num_workers <= 0)
