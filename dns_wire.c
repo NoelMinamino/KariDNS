@@ -64,7 +64,7 @@ static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, con
     return *p == 0;
 }
 
-int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx) {
+int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx, size_t max_len) {
     const uint8_t *s = name;
     while (*s != 0) {
         if (*offset >= 0x3FFF) return -1;
@@ -73,6 +73,7 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
             compress_entry_t *entry = &ctx->table[(idx + i) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) break;
             if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, s)) {
+                if (*offset + 2 > max_len) return -1;
                 uint16_t ptr = 0xC000 | entry->offset;
                 packet_buf[(*offset)++] = ptr >> 8; packet_buf[(*offset)++] = ptr & 0xFF;
                 return 0;
@@ -84,9 +85,12 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
                 entry->generation = ctx->current_generation; entry->hash = hash; entry->offset = *offset; break;
             }
         }
-        uint8_t len = *s; packet_buf[(*offset)++] = *s++;
+        uint8_t len = *s; 
+        if (*offset + 1 + len > max_len) return -1;
+        packet_buf[(*offset)++] = *s++;
         for (uint8_t i = 0; i < len; i++) packet_buf[(*offset)++] = *s++;
     }
+    if (*offset + 1 > max_len) return -1;
     packet_buf[(*offset)++] = 0; return 0;
 }
 
@@ -258,29 +262,60 @@ int const_time_memcmp(const void *a, const void *b, size_t len) {
     return res == 0 ? 0 : 1;
 }
 
-size_t write_uncompressed_name(uint8_t *buf, const char *name) {
+long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name) {
     size_t w_len = 0;
     const char *p = name;
     while (*p) {
         const char *dot = strchr(p, '.');
-        if (!dot) {
-            size_t len = strlen(p);
-            if (len > 63 || w_len + len + 1 > 255) break;
-            buf[w_len++] = len;
-            for (size_t i = 0; i < len; i++) buf[w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
-            break;
-        } else {
-            size_t len = dot - p;
-            if (len > 0) {
-                if (len > 63 || w_len + len + 1 > 255) break;
-                buf[w_len++] = len;
-                for (size_t i = 0; i < len; i++) buf[w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
-            }
-            p = dot + 1;
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len > 63) break;
+        if (len > 0) {
+            if (offset + w_len + len + 1 > max_len) return -1;
+            buf[offset + w_len++] = len;
+            for (size_t i = 0; i < len; i++)
+                buf[offset + w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
         }
+        if (!dot) break;
+        p = dot + 1;
     }
-    buf[w_len++] = 0;
-    return w_len;
+    if (offset + w_len + 1 > max_len) return -1;
+    buf[offset + w_len++] = 0;
+    return (long)w_len;
+}
+
+static int hex_char_to_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap) {
+    size_t out_len = 0;
+    int high = -1;
+    for (const char *h = hex; *h; h++) {
+        int v = hex_char_to_val(*h);
+        if (v < 0) continue; // 空白/コロン等の区切り文字は無視
+        if (high < 0) { high = v; continue; }
+        if (out_len >= out_cap) return (size_t)-1; // 出力先超過
+        out[out_len++] = (uint8_t)((high << 4) | v);
+        high = -1;
+    }
+    return out_len;
+}
+
+static int cert_type_to_num(const char *s) {
+    if (strcasecmp(s, "PKIX") == 0) return 1;
+    if (strcasecmp(s, "SPKI") == 0) return 2;
+    if (strcasecmp(s, "PGP") == 0) return 3;
+    if (strcasecmp(s, "IPKIX") == 0) return 4;
+    if (strcasecmp(s, "ISPKI") == 0) return 5;
+    if (strcasecmp(s, "IPGP") == 0) return 6;
+    if (strcasecmp(s, "ACPKIX") == 0) return 7;
+    if (strcasecmp(s, "IACPKIX") == 0) return 8;
+    if (strcasecmp(s, "URI") == 0) return 253;
+    if (strcasecmp(s, "OID") == 0) return 254;
+    return atoi(s);
 }
 
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len) {
@@ -298,11 +333,16 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
-    offset += write_uncompressed_name(&pre_mac[offset], key->name);
-    pre_mac[offset++] = 0x00; pre_mac[offset++] = 0xFF; // CLASS ANY
-    pre_mac[offset++] = 0x00; pre_mac[offset++] = 0x00; pre_mac[offset++] = 0x00; pre_mac[offset++] = 0x00; // TTL 0
+    long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
+    if (w < 0) { free(pre_mac); return -1; }
+    offset += (size_t)w;
+    pre_mac[offset++] = 0; pre_mac[offset++] = 250;
+    pre_mac[offset++] = 0; pre_mac[offset++] = 255;
+    pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0;
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-    offset += write_uncompressed_name(&pre_mac[offset], alg);
+    w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, alg);
+    if (w < 0) { free(pre_mac); return -1; }
+    offset += (size_t)w;
     uint64_t now = time(NULL);
     pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
@@ -335,12 +375,16 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     
     size_t p_offset = *packet_len;
-    p_offset += write_uncompressed_name(&packet[p_offset], key->name);
-    packet[p_offset++] = 0x00; packet[p_offset++] = 250; // TSIG
-    packet[p_offset++] = 0x00; packet[p_offset++] = 0xFF; // ANY
-    packet[p_offset++] = 0x00; packet[p_offset++] = 0x00; packet[p_offset++] = 0x00; packet[p_offset++] = 0x00; // TTL
+    long w2 = write_uncompressed_name(packet, p_offset, max_len, key->name);
+    if (w2 < 0) return -1;
+    p_offset += (size_t)w2;
+    packet[p_offset++] = 0; packet[p_offset++] = 250; // TSIG
+    packet[p_offset++] = 0; packet[p_offset++] = 255; // ANY
+    packet[p_offset++] = 0; packet[p_offset++] = 0; packet[p_offset++] = 0; packet[p_offset++] = 0; // TTL
     size_t rdata_len_idx = p_offset; p_offset += 2;
-    p_offset += write_uncompressed_name(&packet[p_offset], alg);
+    w2 = write_uncompressed_name(packet, p_offset, max_len, alg);
+    if (w2 < 0) return -1;
+    p_offset += (size_t)w2;
     packet[p_offset++] = (now >> 40) & 0xFF; packet[p_offset++] = (now >> 32) & 0xFF;
     packet[p_offset++] = (now >> 24) & 0xFF; packet[p_offset++] = (now >> 16) & 0xFF;
     packet[p_offset++] = (now >> 8) & 0xFF; packet[p_offset++] = now & 0xFF;
@@ -439,11 +483,16 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     uint16_t new_arcount = arcount - 1;
     pre_mac[10] = new_arcount >> 8; pre_mac[11] = new_arcount & 0xFF;
     size_t p_offset = last_rr_offset;
-    p_offset += write_uncompressed_name(&pre_mac[p_offset], key->name);
-    pre_mac[p_offset++] = 0x00; pre_mac[p_offset++] = 0xFF;
-    pre_mac[p_offset++] = 0x00; pre_mac[p_offset++] = 0x00; pre_mac[p_offset++] = 0x00; pre_mac[p_offset++] = 0x00;
+    long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
+    if (w3 < 0) { free(pre_mac); return -1; }
+    p_offset += (size_t)w3;
+    pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 250;
+    pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
+    pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-    p_offset += write_uncompressed_name(&pre_mac[p_offset], alg);
+    w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, alg);
+    if (w3 < 0) { free(pre_mac); return -1; }
+    p_offset += (size_t)w3;
     memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8); p_offset += 8;
     pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
     pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
@@ -464,7 +513,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
 // 7. インメモリDNSパケット高速処理・統合スタブ
 // ============================================================================
 
-int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx) {
+int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len) {
     uint8_t wire[256];
     size_t w_len = 0;
     const char *p = name;
@@ -492,7 +541,7 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
     }
     if (w_len + 1 > 255) return -1;
     wire[w_len++] = 0;
-    return compress_name(packet_buf, offset, wire, ctx);
+    return compress_name(packet_buf, offset, wire, ctx, max_len);
 }
 
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
@@ -501,7 +550,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 
     if (offset + 12 > max_res_len) return -1; // TC bit needed
 
-    if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx) != 0) {
+    if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx, max_res_len) != 0) {
         return -1;
     }
 
@@ -530,13 +579,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         if (offset + 16 > max_res_len) return -1;
         struct in6_addr addr; inet_pton(AF_INET6, rec->rdata[0], &addr);
         memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
-    } else if ((rec_type == 2 || rec_type == 5 || rec_type == 12) && rec->rdata_count > 0) { // NS, CNAME, PTR
-        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx) != 0 || offset > max_res_len) return -1;
+    } else if ((rec_type == 2 || rec_type == 3 || rec_type == 4 || rec_type == 5 || rec_type == 7 || rec_type == 8 || rec_type == 9 || rec_type == 12 || rec_type == 39) && rec->rdata_count > 0) { // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
+        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
     } else if (rec_type == 15 && rec->rdata_count >= 2) { // MX
         if (offset + 2 > max_res_len) return -1;
         uint16_t pref = atoi(rec->rdata[0]);
         res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-        if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0 || offset > max_res_len) return -1;
+        if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
     } else if (rec_type == 33 && rec->rdata_count >= 4) { // SRV
         if (offset + 6 > max_res_len) return -1;
         uint16_t prio = atoi(rec->rdata[0]);
@@ -545,7 +594,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
         res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
         res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-        if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx) != 0 || offset > max_res_len) return -1;
+        if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
     } else if (rec_type == 257 && rec->rdata_count >= 3) { // CAA
         uint8_t flags = atoi(rec->rdata[0]);
         size_t tag_len = strlen(rec->rdata[1]);
@@ -558,14 +607,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         memcpy(&res[offset], rec->rdata[1], tag_len); offset += tag_len;
         memcpy(&res[offset], rec->rdata[2], val_len); offset += val_len;
     } else if (rec_type == 6 && rec->rdata_count >= 7) { // SOA
-        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx) != 0 ||
-            write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0) return -1;
+        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 ||
+            write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0) return -1;
         if (offset + 20 > max_res_len) return -1;
         for (int j = 2; j < 7; j++) {
             uint32_t val = strtoul(rec->rdata[j], NULL, 10);
             res[offset++] = val >> 24; res[offset++] = (val >> 16) & 0xFF; res[offset++] = (val >> 8) & 0xFF; res[offset++] = val & 0xFF;
         }
-    } else if (rec_type == 16 && rec->rdata_count > 0) { // TXT
+    } else if ((rec_type == 16 || rec_type == 99) && rec->rdata_count > 0) { // TXT, SPF
         size_t required = 0;
         for (int j = 0; j < rec->rdata_count; j++) {
             size_t len = strlen(rec->rdata[j]);
@@ -591,13 +640,93 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
             }
         }
+    } else if (rec_type == 44 && rec->rdata_count >= 3) { // SSHFP
+        uint8_t alg = atoi(rec->rdata[0]);
+        uint8_t fptype = atoi(rec->rdata[1]);
+        uint8_t fp[64]; 
+        size_t fp_len = hex_decode(rec->rdata[2], fp, sizeof(fp));
+        if (fp_len == (size_t)-1) return -1;
+        if (offset + 2 + fp_len > max_res_len) return -1;
+        res[offset++] = alg;
+        res[offset++] = fptype;
+        memcpy(&res[offset], fp, fp_len);
+        offset += fp_len;
+    } else if ((rec_type == 52 || rec_type == 53) && rec->rdata_count >= 4) { // TLSA / SMIMEA
+        uint8_t usage = atoi(rec->rdata[0]);
+        uint8_t selector = atoi(rec->rdata[1]);
+        uint8_t matching = atoi(rec->rdata[2]);
+        uint8_t cad[512]; 
+        size_t cad_len = hex_decode(rec->rdata[3], cad, sizeof(cad));
+        if (cad_len == (size_t)-1) return -1;
+        if (offset + 3 + cad_len > max_res_len) return -1;
+        res[offset++] = usage;
+        res[offset++] = selector;
+        res[offset++] = matching;
+        memcpy(&res[offset], cad, cad_len);
+        offset += cad_len;
+    } else if (rec_type == 37 && rec->rdata_count >= 4) { // CERT
+        uint16_t cert_type = cert_type_to_num(rec->rdata[0]);
+        uint16_t key_tag = atoi(rec->rdata[1]);
+        uint8_t algorithm = atoi(rec->rdata[2]);
+        const char *b64 = rec->rdata[3];
+        size_t b64_len = strlen(b64);
+        size_t decoded_upper_bound = (b64_len / 4) * 3;
+        if (offset + 5 + decoded_upper_bound > max_res_len) return -1;
+        if (offset + 5 > max_res_len) return -1;
+        res[offset++] = cert_type >> 8; res[offset++] = cert_type & 0xFF;
+        res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
+        res[offset++] = algorithm;
+        int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
+        if (declen < 0) return -1;
+        int padding = 0;
+        if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
+        if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
+        offset += (declen - padding);
+    } else if (rec_type == 35 && rec->rdata_count >= 6) { // NAPTR
+        if (offset + 4 > max_res_len) return -1;
+        uint16_t order = atoi(rec->rdata[0]);
+        uint16_t pref  = atoi(rec->rdata[1]);
+        res[offset++] = order >> 8; res[offset++] = order & 0xFF;
+        res[offset++] = pref >> 8;  res[offset++] = pref & 0xFF;
+        const char *cstrs[3] = { rec->rdata[2], rec->rdata[3], rec->rdata[4] };
+        for (int k = 0; k < 3; k++) {
+            size_t len = strlen(cstrs[k]);
+            if (len > 255) len = 255;
+            if (offset + 1 + len > max_res_len) return -1;
+            res[offset++] = (uint8_t)len;
+            memcpy(&res[offset], cstrs[k], len);
+            offset += len;
+        }
+        long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[5]);
+        if (w < 0) return -1;
+        offset += (size_t)w;
+    } else if (rec_type == 51 && rec->rdata_count >= 4) { // NSEC3PARAM
+        uint8_t halg = atoi(rec->rdata[0]);
+        uint8_t flags = atoi(rec->rdata[1]);
+        uint16_t iterations = atoi(rec->rdata[2]);
+        uint8_t salt[255];
+        size_t salt_len = 0;
+        if (strcmp(rec->rdata[3], "-") != 0) {
+            salt_len = hex_decode(rec->rdata[3], salt, sizeof(salt));
+            if (salt_len == (size_t)-1) return -1;
+        }
+        if (offset + 5 + salt_len > max_res_len) return -1;
+        res[offset++] = halg;
+        res[offset++] = flags;
+        res[offset++] = iterations >> 8; res[offset++] = iterations & 0xFF;
+        res[offset++] = (uint8_t)salt_len;
+        memcpy(&res[offset], salt, salt_len); offset += salt_len;
     } else if (rec_type == 64 || rec_type == 65) { // HTTPS / SVCB
         if (rec->rdata_count >= 2) {
             if (offset + 2 > max_res_len) return -1;
             uint16_t svc_prio = atoi(rec->rdata[0]);
             res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
-            if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0 || offset > max_res_len) return -1;
+            if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
         }
+    } else {
+        // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード
+        // 低レイヤー関数であるためログ出力は行わず、上位層にエラー状態のみを伝播させる
+        return -1;
     }
     
     uint16_t rdlength = offset - rdlength_idx - 2;

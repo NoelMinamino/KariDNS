@@ -516,7 +516,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     } else {
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
-        if (write_dns_name_str(pkt, &offset, qname, &comp_ctx) != 0) {
+        if (write_dns_name_str(pkt, &offset, qname, &comp_ctx, max_len) != 0) {
             fprintf(stderr, "write_dns_name_str failed (name too long?)\n");
             return 0;
         }
@@ -527,7 +527,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     if (qo->is_ixfr) {
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
-        if (write_dns_name_str(pkt, &offset, qname, &comp_ctx) == 0) {
+        if (write_dns_name_str(pkt, &offset, qname, &comp_ctx, max_len) == 0) {
             pkt[offset++] = 0x00; pkt[offset++] = 0x06; /* Type SOA */
             pkt[offset++] = 0x00; pkt[offset++] = 0x01; /* Class IN */
             pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */

@@ -61,5 +61,40 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     memset(&edns, 0, sizeof(edns));
     parse_edns_opt(data, size, qdcount, ancount, nscount, arcount, &edns);
 
+    // 4. Test serialize_dns_record
+    if (size >= 16) {
+        dns_record_t srec;
+        memset(&srec, 0, sizeof(srec));
+        srec.name = "fuzz.test.";
+        
+        int type_choices[] = {1, 28, 15, 33, 257, 6, 64, 35, 37, 44, 52, 53, 51};
+        srec.type_code = type_choices[data[12] % (sizeof(type_choices)/sizeof(int))];
+        
+        char rdata_buf[256];
+        size_t copy_len = (size - 13 < 255) ? size - 13 : 255;
+        memcpy(rdata_buf, data + 13, copy_len);
+        rdata_buf[copy_len] = '\0';
+        
+        for(size_t i=0; i<copy_len; i++) {
+            if (rdata_buf[i] < 32 || rdata_buf[i] > 126 || rdata_buf[i] == ' ') rdata_buf[i] = '\0';
+        }
+        
+        srec.rdata_count = 0;
+        char *p = rdata_buf;
+        while (p < rdata_buf + copy_len && srec.rdata_count < 10) {
+            if (*p) {
+                srec.rdata[srec.rdata_count++] = p;
+                p += strlen(p);
+            }
+            p++;
+        }
+
+        uint8_t out_buf[512];
+        uint16_t out_offset = 0;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        serialize_dns_record(out_buf, sizeof(out_buf), &out_offset, &srec, &comp_ctx, "fuzz.test.", 0);
+    }
+
     return 0; // Fuzzer must return 0
 }
