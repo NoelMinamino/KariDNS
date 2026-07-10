@@ -5,6 +5,7 @@
 #include <errno.h>
 #include "../dns_config_parser.h"
 #include "../dns_zone_parser.h"
+#include "../dns_utils.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -170,7 +171,13 @@ static int check_zone(const char *domain, const char *file_path, bool is_standal
     for (size_t i = 0; i < arena.count; i++) {
         if (arena.records[i].type_code == 6 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_soa = true;
-            break;
+        }
+        if (arena.records[i].type_code == 62) { // CSYNC
+            for (int j = 2; j < arena.records[i].rdata_count; j++) {
+                if (get_type_code(arena.records[i].rdata[j]) == 0) {
+                    fprintf(stderr, "[WARNING] CSYNC record contains unknown type '%s' in zone '%s' (%s)\n", arena.records[i].rdata[j], domain, file_path);
+                }
+            }
         }
     }
 

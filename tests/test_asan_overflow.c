@@ -241,6 +241,51 @@ int main() {
       printf("Test 3 Passed: All new records safely rejected small max_res_len\n");
     }
 
+    // Test 4: Local buffer overflow prevention (Input boundary checks)
+    {
+        uint8_t packet[2048]; // Large enough to hold valid packets
+        uint16_t offset = 0;
+        compress_ctx_t ctx;
+        compress_ctx_init_packet(&ctx);
+        char huge_hex[1100];
+        char huge_b64[1100];
+        for(int i=0; i<1099; i++) { huge_hex[i] = 'A'; huge_b64[i] = 'A'; }
+        huge_hex[1099] = '\0';
+        huge_b64[1099] = '\0';
+
+        // TLSA (Type 52) - huge hex string
+        offset = 0;
+        dns_record_t rec_tlsa = {0};
+        rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
+        rec_tlsa.rdata[0] = (char*)"3"; rec_tlsa.rdata[1] = (char*)"1"; rec_tlsa.rdata[2] = (char*)"1"; 
+        rec_tlsa.rdata[3] = huge_hex;
+        if (serialize_dns_record(packet, 2048, &offset, &rec_tlsa, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: TLSA with huge hex did not fail\n"); return 1;
+        }
+
+        // CERT (Type 37) - huge base64 string
+        offset = 0;
+        dns_record_t rec_cert = {0};
+        rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
+        rec_cert.rdata[0] = (char*)"PKIX"; rec_cert.rdata[1] = (char*)"12345"; rec_cert.rdata[2] = (char*)"8"; 
+        rec_cert.rdata[3] = huge_b64;
+        if (serialize_dns_record(packet, 2048, &offset, &rec_cert, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: CERT with huge base64 did not fail\n"); return 1;
+        }
+
+        // ZONEMD (Type 63) - huge hex string
+        offset = 0;
+        dns_record_t rec_zonemd = {0};
+        rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
+        rec_zonemd.rdata[0] = (char*)"2018031500"; rec_zonemd.rdata[1] = (char*)"1"; rec_zonemd.rdata[2] = (char*)"1";
+        rec_zonemd.rdata[3] = huge_hex;
+        if (serialize_dns_record(packet, 2048, &offset, &rec_zonemd, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: ZONEMD with huge hex did not fail\n"); return 1;
+        }
+
+        printf("Test 4 Passed: All input bound overflow tests safely rejected\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
