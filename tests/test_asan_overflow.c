@@ -123,7 +123,7 @@ int main() {
         // OPENPGPKEY
         dns_record_t rec_openpgpkey = {0};
         rec_openpgpkey.name = (char*)"example.com"; rec_openpgpkey.type_code = 61; rec_openpgpkey.rdata_count = 1;
-        rec_openpgpkey.rdata[0] = (char*)"mQENBFxJ0V4BCAD"; // Dummy base64 string
+        rec_openpgpkey.rdata[0] = (char*)"mQENBFxJ0V4BCADA"; // Dummy base64 string
         if (assert_bound_checked(&rec_openpgpkey)) return 1;
 
         // DHCID
@@ -207,17 +207,23 @@ int main() {
         uint16_t offset = 0;
         compress_ctx_t ctx;
         compress_ctx_init_packet(&ctx);
+
         char huge_hex[1100];
         char huge_b64[1100];
         for(int i=0; i<1099; i++) { huge_hex[i] = 'A'; huge_b64[i] = 'A'; }
         huge_hex[1099] = '\0';
         huge_b64[1099] = '\0';
+        
+        static char exact_hex_512[1025];
+        for (int i=0; i<1024; i++) exact_hex_512[i] = 'A';
+        exact_hex_512[1024] = '\0';
+
 
         // TLSA (Type 52) - huge hex string
         dns_record_t rec_tlsa = {0};
         rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
         rec_tlsa.rdata[0] = (char*)"3"; rec_tlsa.rdata[1] = (char*)"1"; rec_tlsa.rdata[2] = (char*)"1"; 
-        rec_tlsa.rdata[3] = huge_hex;
+        rec_tlsa.rdata[3] = exact_hex_512;
         if (assert_bound_checked(&rec_tlsa)) return 1;
 
         // CERT (Type 37) - huge base64 string
@@ -227,7 +233,19 @@ int main() {
         rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
         rec_cert.rdata[0] = (char*)"PKIX"; rec_cert.rdata[1] = (char*)"12345"; rec_cert.rdata[2] = (char*)"8"; 
         rec_cert.rdata[3] = huge_b64;
-        if (assert_bound_checked(&rec_cert)) return 1;
+        // Since huge_b64 has 1099 chars, (1099/4)*3 = 822. offset=13+10+12=35. Total 857.
+        // The generous buffer will pass length check, but EVP_DecodeBlock will return -1
+        // because 1099 is not a valid base64 length. So serialize_dns_record returns -1.
+        // assert_bound_checked expects generous buffer to return 0. So we can't use it here.
+        // We do it manually:
+        {
+            uint8_t packet[2048];
+            uint16_t offset = 0;
+            compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
+            if (serialize_dns_record(packet, 2048, &offset, &rec_cert, &ctx, NULL, 0) != -1) {
+                printf("Test 4 Failed: CERT with invalid base64 length did not fail\n"); return 1;
+            }
+        }
 
         // CERT: Valid Base64 that exceeds max_res_len (boundary check test)
         dns_record_t rec_cert2 = {0};
@@ -246,7 +264,7 @@ int main() {
         dns_record_t rec_zonemd = {0};
         rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
         rec_zonemd.rdata[0] = (char*)"2018031500"; rec_zonemd.rdata[1] = (char*)"1"; rec_zonemd.rdata[2] = (char*)"1";
-        rec_zonemd.rdata[3] = huge_hex;
+        rec_zonemd.rdata[3] = exact_hex_512;
         if (assert_bound_checked(&rec_zonemd)) return 1;
 
         // NID (Type 104)
@@ -271,21 +289,21 @@ int main() {
         dns_record_t rec_ipseckey1 = {0};
         rec_ipseckey1.name = (char*)"example.com"; rec_ipseckey1.type_code = 45; rec_ipseckey1.rdata_count = 5;
         rec_ipseckey1.rdata[0] = (char*)"10"; rec_ipseckey1.rdata[1] = (char*)"1"; rec_ipseckey1.rdata[2] = (char*)"2";
-        rec_ipseckey1.rdata[3] = (char*)"192.0.2.1"; rec_ipseckey1.rdata[4] = huge_b64;
+        rec_ipseckey1.rdata[3] = (char*)"192.0.2.1"; rec_ipseckey1.rdata[4] = valid_long_b64;
         if (assert_bound_checked(&rec_ipseckey1)) return 1;
 
         // IPSECKEY (Type 45) - GW Type 2 (IPv6)
         dns_record_t rec_ipseckey2 = {0};
         rec_ipseckey2.name = (char*)"example.com"; rec_ipseckey2.type_code = 45; rec_ipseckey2.rdata_count = 5;
         rec_ipseckey2.rdata[0] = (char*)"10"; rec_ipseckey2.rdata[1] = (char*)"2"; rec_ipseckey2.rdata[2] = (char*)"2";
-        rec_ipseckey2.rdata[3] = (char*)"2001:db8::1"; rec_ipseckey2.rdata[4] = huge_b64;
+        rec_ipseckey2.rdata[3] = (char*)"2001:db8::1"; rec_ipseckey2.rdata[4] = valid_long_b64;
         if (assert_bound_checked(&rec_ipseckey2)) return 1;
 
         // IPSECKEY (Type 45) - GW Type 3 (Domain Name)
         dns_record_t rec_ipseckey3 = {0};
         rec_ipseckey3.name = (char*)"example.com"; rec_ipseckey3.type_code = 45; rec_ipseckey3.rdata_count = 5;
         rec_ipseckey3.rdata[0] = (char*)"10"; rec_ipseckey3.rdata[1] = (char*)"3"; rec_ipseckey3.rdata[2] = (char*)"2";
-        rec_ipseckey3.rdata[3] = (char*)"gw.example.com"; rec_ipseckey3.rdata[4] = huge_b64;
+        rec_ipseckey3.rdata[3] = (char*)"gw.example.com"; rec_ipseckey3.rdata[4] = valid_long_b64;
         if (assert_bound_checked(&rec_ipseckey3)) return 1;
 
         // AMTRELAY (Type 260) - Type 1 (IPv4)
