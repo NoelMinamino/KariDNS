@@ -23,6 +23,12 @@ FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
 FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c
 
+FUZZ_ZONE_TARGET = tests/fuzz/fuzz_zone_parser
+FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c
+
+FUZZ_CONF_TARGET = tests/fuzz/fuzz_conf_parser
+FUZZ_CONF_SRCS = tests/fuzz/fuzz_conf_parser.c dns_config_parser.c
+
 .PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
@@ -59,8 +65,14 @@ fuzz: $(FUZZ_SRCS)
 fuzz_core: $(FUZZ_CORE_SRCS)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS) $(LDFLAGS)
 
+fuzz_zone: $(FUZZ_ZONE_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_SRCS) $(LDFLAGS)
+
+fuzz_conf: $(FUZZ_CONF_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_CONF_TARGET) $(FUZZ_CONF_SRCS) $(LDFLAGS)
+
 clean-fuzz:
-	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET)
+	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET)
 
 ASAN_TARGET = karidns-asan
 ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer

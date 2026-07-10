@@ -14,33 +14,34 @@
 static void skip_spaces_and_comments(token_ctx_t *ctx) {
   while (ctx->pos < ctx->len) {
     char c = ctx->src[ctx->pos];
-    if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+    if (c == '\0') break;
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
       ctx->pos++;
-    else if (c == '#')
-      while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '\n')
+    } else if (c == '#') {
+      while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '\n' && ctx->src[ctx->pos] != '\0')
         ctx->pos++;
-    else if (c == '/' && ctx->pos + 1 < ctx->len &&
-             ctx->src[ctx->pos + 1] == '/') {
+    } else if (c == '/' && ctx->pos + 1 < ctx->len && ctx->src[ctx->pos + 1] == '/') {
       ctx->pos += 2;
-      while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '\n')
+      while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '\n' && ctx->src[ctx->pos] != '\0')
         ctx->pos++;
-    } else if (c == '/' && ctx->pos + 1 < ctx->len &&
-               ctx->src[ctx->pos + 1] == '*') {
+    } else if (c == '/' && ctx->pos + 1 < ctx->len && ctx->src[ctx->pos + 1] == '*') {
       ctx->pos += 2;
-      while (ctx->pos + 1 < ctx->len &&
-             !(ctx->src[ctx->pos] == '*' && ctx->src[ctx->pos + 1] == '/'))
+      while (ctx->pos + 1 < ctx->len && !(ctx->src[ctx->pos] == '*' && ctx->src[ctx->pos + 1] == '/')) {
+        if (ctx->src[ctx->pos] == '\0') break;
         ctx->pos++;
-      if (ctx->pos + 1 < ctx->len)
+      }
+      if (ctx->pos + 1 < ctx->len && ctx->src[ctx->pos] == '*' && ctx->src[ctx->pos + 1] == '/')
         ctx->pos += 2;
-    } else
+    } else {
       break;
+    }
   }
 }
 
 conf_token_t get_next_token(token_ctx_t *ctx) {
   conf_token_t tok = {TOKEN_EOF, NULL};
   skip_spaces_and_comments(ctx);
-  if (ctx->pos >= ctx->len)
+  if (ctx->pos >= ctx->len || ctx->src[ctx->pos] == '\0')
     return tok;
   char c = ctx->src[ctx->pos];
   if (c == '{') {
@@ -61,7 +62,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
   if (c == '"') {
     ctx->pos++;
     size_t start = ctx->pos;
-    while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '"')
+    while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '"' && ctx->src[ctx->pos] != '\0')
       ctx->pos++;
     size_t str_len = ctx->pos - start;
     if (str_len > 4096)
@@ -77,7 +78,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
   size_t start = ctx->pos;
   while (ctx->pos < ctx->len) {
     char nc = ctx->src[ctx->pos];
-    if (nc == ' ' || nc == '\t' || nc == '\n' || nc == '\r' || nc == '{' ||
+    if (nc == '\0' || nc == ' ' || nc == '\t' || nc == '\n' || nc == '\r' || nc == '{' ||
         nc == '}' || nc == ';' || nc == '#')
       break;
     if (nc == '/' && ctx->pos + 1 < ctx->len &&
@@ -86,6 +87,10 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
     ctx->pos++;
   }
   size_t str_len = ctx->pos - start;
+  if (str_len == 0) {
+    ctx->pos++;
+    str_len = 1;
+  }
   if (str_len > 4096)
     str_len = 4096;
   tok.type = TOKEN_STRING;
@@ -704,6 +709,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               fprintf(stderr, "[ERROR] secret too long for algorithm\n");
               free(key_prop);
               free(val);
+              tsig->secret = NULL;
               free_token(&tok);
               return -1;
             }
@@ -713,6 +719,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             if (len < 0) {
               free(key_prop);
               free(val);
+              tsig->secret = NULL;
               free_token(&tok);
               return -1;
             }
@@ -785,6 +792,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               fprintf(stderr, "[ERROR] secret too long for algorithm\n");
               free(key_prop);
               free(val);
+              config->control.secret = NULL;
               free_token(&tok);
               return -1;
             }
@@ -794,6 +802,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             if (len < 0) {
               free(key_prop);
               free(val);
+              config->control.secret = NULL;
               free_token(&tok);
               return -1;
             }
@@ -875,8 +884,11 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               ch->file_path = strdup(tok.value);
               free_token(&tok);
               while (1) {
-                size_t saved = ctx.pos;
                 tok = get_next_token(&ctx);
+                if (tok.type == TOKEN_EOF) {
+                  free_token(&tok);
+                  break;
+                }
                 if (tok.type == TOKEN_SEMICOLON) {
                   free_token(&tok);
                   break;
@@ -916,13 +928,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
                     ch->suffix_timestamp = true;
                   free_token(&tok);
                 } else {
-                  ctx.pos = saved;
                   free_token(&tok);
-                  tok = get_next_token(&ctx);
-                  if (tok.type == TOKEN_SEMICOLON) {
-                    free_token(&tok);
-                    break;
-                  }
                 }
               }
             } else if (strcmp(opt, "print-time") == 0 ||
