@@ -166,6 +166,78 @@ int main() {
         if (serialize_dns_record(packet, 20, &offset, &rec_zonemd, &ctx, NULL, 0) != -1) {
             printf("Test 3 Failed: ZONEMD did not fail\n"); return 1;
         }
+
+        // MINFO
+        offset = 0;
+        dns_record_t rec_minfo = {0};
+        rec_minfo.name = (char*)"example.com"; rec_minfo.type_code = 14; rec_minfo.rdata_count = 2;
+        rec_minfo.rdata[0] = (char*)"rm.example.com"; rec_minfo.rdata[1] = (char*)"err.example.com";
+        if (serialize_dns_record(packet, 20, &offset, &rec_minfo, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: MINFO did not fail\n"); return 1;
+        }
+
+        // RP
+        offset = 0;
+        dns_record_t rec_rp = {0};
+        rec_rp.name = (char*)"example.com"; rec_rp.type_code = 17; rec_rp.rdata_count = 2;
+        rec_rp.rdata[0] = (char*)"admin.example.com"; rec_rp.rdata[1] = (char*)"txt.example.com";
+        if (serialize_dns_record(packet, 20, &offset, &rec_rp, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: RP did not fail\n"); return 1;
+        }
+
+        // AFSDB
+        offset = 0;
+        dns_record_t rec_afsdb = {0};
+        rec_afsdb.name = (char*)"example.com"; rec_afsdb.type_code = 18; rec_afsdb.rdata_count = 2;
+        rec_afsdb.rdata[0] = (char*)"1"; rec_afsdb.rdata[1] = (char*)"afs.example.com";
+        if (serialize_dns_record(packet, 20, &offset, &rec_afsdb, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: AFSDB did not fail\n"); return 1;
+        }
+
+        // KX
+        offset = 0;
+        dns_record_t rec_kx = {0};
+        rec_kx.name = (char*)"example.com"; rec_kx.type_code = 36; rec_kx.rdata_count = 2;
+        rec_kx.rdata[0] = (char*)"10"; rec_kx.rdata[1] = (char*)"kx.example.com";
+        if (serialize_dns_record(packet, 20, &offset, &rec_kx, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: KX did not fail\n"); return 1;
+        }
+
+        // PX
+        offset = 0;
+        dns_record_t rec_px = {0};
+        rec_px.name = (char*)"example.com"; rec_px.type_code = 26; rec_px.rdata_count = 3;
+        rec_px.rdata[0] = (char*)"10"; rec_px.rdata[1] = (char*)"px1.example.com"; rec_px.rdata[2] = (char*)"px2.example.com";
+        if (serialize_dns_record(packet, 20, &offset, &rec_px, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: PX did not fail\n"); return 1;
+        }
+
+        // RT
+        offset = 0;
+        dns_record_t rec_rt = {0};
+        rec_rt.name = (char*)"example.com"; rec_rt.type_code = 21; rec_rt.rdata_count = 2;
+        rec_rt.rdata[0] = (char*)"10"; rec_rt.rdata[1] = (char*)"rt.example.com";
+        if (serialize_dns_record(packet, 20, &offset, &rec_rt, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: RT did not fail\n"); return 1;
+        }
+
+        // LP
+        offset = 0;
+        dns_record_t rec_lp = {0};
+        rec_lp.name = (char*)"example.com"; rec_lp.type_code = 107; rec_lp.rdata_count = 2;
+        rec_lp.rdata[0] = (char*)"10"; rec_lp.rdata[1] = (char*)"lp.example.com";
+        if (serialize_dns_record(packet, 20, &offset, &rec_lp, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: LP did not fail\n"); return 1;
+        }
+
+        // CSYNC
+        offset = 0;
+        dns_record_t rec_csync = {0};
+        rec_csync.name = (char*)"example.com"; rec_csync.type_code = 62; rec_csync.rdata_count = 4;
+        rec_csync.rdata[0] = (char*)"123456"; rec_csync.rdata[1] = (char*)"1"; rec_csync.rdata[2] = (char*)"A"; rec_csync.rdata[3] = (char*)"AAAA";
+        if (serialize_dns_record(packet, 20, &offset, &rec_csync, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: CSYNC did not fail\n"); return 1;
+        }
       printf("Test 3 Passed: All new records safely rejected small max_res_len\n");
     }
 

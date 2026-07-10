@@ -15,6 +15,7 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/md5.h>
+#include "dns_utils.h"
 
 // ============================================================================
 // 5. 名前圧縮アルゴリズム (FNV-1a, Branchless, 無限ループ防御)
@@ -544,6 +545,68 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
     return compress_name(packet_buf, offset, wire, ctx, max_len);
 }
 
+
+// Type Bitmap (NSEC/NSEC3/CSYNC用) を構築するヘルパー
+static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset, char **types, int type_count) {
+    if (type_count == 0) return 0;
+    
+    uint16_t *codes = malloc(sizeof(uint16_t) * type_count);
+    if (!codes) return -1;
+    for (int i = 0; i < type_count; i++) {
+        codes[i] = get_type_code(types[i]);
+    }
+    
+    for (int i = 0; i < type_count - 1; i++) {
+        for (int j = i + 1; j < type_count; j++) {
+            if (codes[i] > codes[j]) {
+                uint16_t tmp = codes[i];
+                codes[i] = codes[j];
+                codes[j] = tmp;
+            }
+        }
+    }
+    
+    int current_window = -1;
+    uint8_t bitmap[32] = {0};
+    int max_bit_in_window = -1;
+    
+    for (int i = 0; i < type_count; i++) {
+        uint16_t code = codes[i];
+        if (code == 0) continue;
+        int window = code / 256;
+        int bit = code % 256;
+        
+        if (window != current_window) {
+            if (current_window != -1) {
+                size_t map_len = (max_bit_in_window / 8) + 1;
+                if (*offset + 2 + map_len > max_res_len) { free(codes); return -1; }
+                res[(*offset)++] = current_window;
+                res[(*offset)++] = (uint8_t)map_len;
+                memcpy(&res[*offset], bitmap, map_len);
+                *offset += map_len;
+            }
+            current_window = window;
+            memset(bitmap, 0, sizeof(bitmap));
+            max_bit_in_window = bit;
+        } else {
+            if (bit > max_bit_in_window) max_bit_in_window = bit;
+        }
+        bitmap[bit / 8] |= (1 << (7 - (bit % 8)));
+    }
+    
+    if (current_window != -1) {
+        size_t map_len = (max_bit_in_window / 8) + 1;
+        if (*offset + 2 + map_len > max_res_len) { free(codes); return -1; }
+        res[(*offset)++] = current_window;
+        res[(*offset)++] = (uint8_t)map_len;
+        memcpy(&res[*offset], bitmap, map_len);
+        *offset += map_len;
+    }
+    
+    free(codes);
+    return 0;
+}
+
 // 追加するヘルパー関数
 static int write_char_string(uint8_t *res, size_t max_res_len, uint16_t *offset, const char *str) {
     size_t len = strlen(str);
@@ -830,6 +893,57 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = halg;
                 memcpy(&res[offset], digest, digest_len);
                 offset += digest_len;
+                break;
+            }
+
+            case 14: { // MINFO
+                if (rec->rdata_count < 2) return -1;
+                if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                break;
+            }
+            case 17: { // RP
+                if (rec->rdata_count < 2) return -1;
+                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                if (w1 < 0) return -1;
+                offset += w1;
+                long w2 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                if (w2 < 0) return -1;
+                offset += w2;
+                break;
+            }
+            case 18: case 21: case 36: case 107: { // AFSDB, RT, KX, LP
+                if (rec->rdata_count < 2) return -1;
+                if (offset + 2 > max_res_len) return -1;
+                uint16_t pref = atoi(rec->rdata[0]);
+                res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                if (w < 0) return -1;
+                offset += w;
+                break;
+            }
+            case 26: { // PX
+                if (rec->rdata_count < 3) return -1;
+                if (offset + 2 > max_res_len) return -1;
+                uint16_t pref = atoi(rec->rdata[0]);
+                res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
+                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                if (w1 < 0) return -1;
+                offset += w1;
+                long w2 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[2]);
+                if (w2 < 0) return -1;
+                offset += w2;
+                break;
+            }
+            case 62: { // CSYNC
+                if (rec->rdata_count < 3) return -1; // Serial, Flags, at least one type
+                uint32_t serial = strtoul(rec->rdata[0], NULL, 10);
+                uint16_t flags = atoi(rec->rdata[1]);
+                if (offset + 6 > max_res_len) return -1;
+                res[offset++] = serial >> 24; res[offset++] = (serial >> 16) & 0xFF;
+                res[offset++] = (serial >> 8) & 0xFF; res[offset++] = serial & 0xFF;
+                res[offset++] = flags >> 8; res[offset++] = flags & 0xFF;
+                if (encode_type_bitmap(res, max_res_len, &offset, &rec->rdata[2], rec->rdata_count - 2) != 0) return -1;
                 break;
             }
             default: {
