@@ -264,6 +264,8 @@ int main() {
         }
 
         // CERT (Type 37) - huge base64 string
+        // Note: The following test with huge_b64 actually tests EVP_DecodeBlock rejecting
+        // invalid base64 lengths rather than the bound check itself.
         offset = 0;
         dns_record_t rec_cert = {0};
         rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
@@ -271,6 +273,22 @@ int main() {
         rec_cert.rdata[3] = huge_b64;
         if (serialize_dns_record(packet, 2048, &offset, &rec_cert, &ctx, NULL, 0) != -1) {
             printf("Test 4 Failed: CERT with huge base64 did not fail\n"); return 1;
+        }
+
+        // CERT: Valid Base64 that exceeds max_res_len (boundary check test)
+        offset = 0;
+        dns_record_t rec_cert2 = {0};
+        rec_cert2.name = (char*)"example.com"; rec_cert2.type_code = 37; rec_cert2.rdata_count = 4;
+        rec_cert2.rdata[0] = (char*)"PKIX"; rec_cert2.rdata[1] = (char*)"12345"; rec_cert2.rdata[2] = (char*)"8";
+        
+        static char valid_long_b64[1101];
+        for (int i = 0; i < 275; i++) memcpy(valid_long_b64 + i*4, "AAAA", 4);
+        valid_long_b64[1100] = '\0';
+        rec_cert2.rdata[3] = valid_long_b64;
+        
+        // max_res_len is intentionally small to trigger 'decoded_upper_bound > max_res_len'
+        if (serialize_dns_record(packet, 50, &offset, &rec_cert2, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: CERT bound check (valid b64, small max_res_len) did not fail\n"); return 1;
         }
 
         // ZONEMD (Type 63) - huge hex string
