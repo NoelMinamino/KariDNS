@@ -2023,7 +2023,8 @@ void send_notify_to_all(const char *domain) {
   req[4] = 0;
   req[5] = 1;
   size_t offset = 12;
-  offset += write_uncompressed_name(&req[offset], domain);
+  long w = write_uncompressed_name(req, offset, sizeof(req), domain);
+  if (w > 0) offset += (size_t)w;
   req[offset++] = 0;
   req[offset++] = 6;
   req[offset++] = 0;
