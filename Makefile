@@ -5,11 +5,11 @@ CFLAGS = -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE
 LDFLAGS = -pthread -lcrypto
 
 TARGET = karidns
-SRCS = dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c
+SRCS = dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_utils.c
 OBJS = $(SRCS:.c=.o)
 
 DAG_TARGET = dag
-DAG_SRCS = tools/dag.c dns_wire.c
+DAG_SRCS = tools/dag.c dns_wire.c dns_utils.c
 
 DAG_OBJS = $(DAG_SRCS:.c=.o)
 
@@ -18,16 +18,16 @@ KARICTL_SRCS = tools/karictl.c
 KARICTL_OBJS = $(KARICTL_SRCS:.c=.o)
 
 FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
-FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c
+FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c dns_utils.c
 
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
-FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c
+FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_utils.c
 
 FUZZ_ZONE_TARGET = tests/fuzz/fuzz_zone_parser
-FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c
+FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c dns_utils.c
 
 FUZZ_CONF_TARGET = tests/fuzz/fuzz_conf_parser
-FUZZ_CONF_SRCS = tests/fuzz/fuzz_conf_parser.c dns_config_parser.c
+FUZZ_CONF_SRCS = tests/fuzz/fuzz_conf_parser.c dns_config_parser.c dns_utils.c
 
 .PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan
 
@@ -42,14 +42,14 @@ $(KARICTL_TARGET): $(KARICTL_OBJS)
 $(DAG_TARGET): $(DAG_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz
 
-karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o
-	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o -o karicheck $(LDFLAGS) -lcrypto
+karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o
+	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o -o karicheck $(LDFLAGS) -lcrypto
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 asan_test: tests/test_asan_overflow.c dns_config_parser.o dns_zone_parser.o dns_wire.o
-	clang -fsanitize=address,undefined -O1 -g tests/test_asan_overflow.c dns_config_parser.c dns_zone_parser.c dns_wire.c -lcrypto -o test_asan_overflow
+	clang -fsanitize=address,undefined -O1 -g tests/test_asan_overflow.c dns_config_parser.c dns_zone_parser.c dns_wire.c dns_utils.c -lcrypto -o test_asan_overflow
 	./test_asan_overflow
 
 clean: clean-fuzz
