@@ -102,7 +102,71 @@ int main() {
             printf("Test 3 Failed: NSEC3PARAM did not fail\n"); return 1;
         }
 
-        printf("Test 3 Passed: All new records safely rejected small max_res_len\n");
+  
+        // HINFO
+        offset = 0;
+        dns_record_t rec_hinfo = {0};
+        rec_hinfo.name = (char*)"example.com"; rec_hinfo.type_code = 13; rec_hinfo.rdata_count = 2;
+        rec_hinfo.rdata[0] = (char*)"INTEL-386"; rec_hinfo.rdata[1] = (char*)"UNIX";
+        if (serialize_dns_record(packet, 20, &offset, &rec_hinfo, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: HINFO did not fail\n"); return 1;
+        }
+
+        // URI
+        offset = 0;
+        dns_record_t rec_uri = {0};
+        rec_uri.name = (char*)"example.com"; rec_uri.type_code = 256; rec_uri.rdata_count = 3;
+        rec_uri.rdata[0] = (char*)"10"; rec_uri.rdata[1] = (char*)"1"; rec_uri.rdata[2] = (char*)"ftp://ftp.example.com/public";
+        if (serialize_dns_record(packet, 20, &offset, &rec_uri, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: URI did not fail\n"); return 1;
+        }
+
+        // OPENPGPKEY
+        offset = 0;
+        dns_record_t rec_openpgpkey = {0};
+        rec_openpgpkey.name = (char*)"example.com"; rec_openpgpkey.type_code = 61; rec_openpgpkey.rdata_count = 1;
+        rec_openpgpkey.rdata[0] = (char*)"mQENBFxJ0V4BCAD..."; // Dummy long string for overflow test
+        if (serialize_dns_record(packet, 20, &offset, &rec_openpgpkey, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: OPENPGPKEY did not fail\n"); return 1;
+        }
+
+        // DHCID
+        offset = 0;
+        dns_record_t rec_dhcid = {0};
+        rec_dhcid.name = (char*)"example.com"; rec_dhcid.type_code = 49; rec_dhcid.rdata_count = 1;
+        rec_dhcid.rdata[0] = (char*)"AAIBY2/AuCccgoJbsaxcQc9TUapptP69lOjxfNuVAA2kjEA=";
+        if (serialize_dns_record(packet, 20, &offset, &rec_dhcid, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: DHCID did not fail\n"); return 1;
+        }
+
+        // EUI48
+        offset = 0;
+        dns_record_t rec_eui48 = {0};
+        rec_eui48.name = (char*)"example.com"; rec_eui48.type_code = 108; rec_eui48.rdata_count = 1;
+        rec_eui48.rdata[0] = (char*)"00-11-22-33-44-55";
+        if (serialize_dns_record(packet, 17, &offset, &rec_eui48, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: EUI48 did not fail\n"); return 1;
+        }
+
+        // EUI64
+        offset = 0;
+        dns_record_t rec_eui64 = {0};
+        rec_eui64.name = (char*)"example.com"; rec_eui64.type_code = 109; rec_eui64.rdata_count = 1;
+        rec_eui64.rdata[0] = (char*)"00-11-22-33-44-55-66-77";
+        if (serialize_dns_record(packet, 20, &offset, &rec_eui64, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: EUI64 did not fail\n"); return 1;
+        }
+
+        // ZONEMD
+        offset = 0;
+        dns_record_t rec_zonemd = {0};
+        rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
+        rec_zonemd.rdata[0] = (char*)"2018031500"; rec_zonemd.rdata[1] = (char*)"1"; rec_zonemd.rdata[2] = (char*)"1";
+        rec_zonemd.rdata[3] = (char*)"FEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFEFE";
+        if (serialize_dns_record(packet, 20, &offset, &rec_zonemd, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: ZONEMD did not fail\n"); return 1;
+        }
+      printf("Test 3 Passed: All new records safely rejected small max_res_len\n");
     }
 
     printf("All tests passed safely.\n");

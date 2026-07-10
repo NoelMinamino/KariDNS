@@ -544,6 +544,17 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
     return compress_name(packet_buf, offset, wire, ctx, max_len);
 }
 
+// 追加するヘルパー関数
+static int write_char_string(uint8_t *res, size_t max_res_len, uint16_t *offset, const char *str) {
+    size_t len = strlen(str);
+    if (len > 255) len = 255;
+    if (*offset + 1 + len > max_res_len) return -1;
+    res[(*offset)++] = (uint8_t)len;
+    memcpy(&res[*offset], str, len);
+    *offset += len;
+    return 0;
+}
+
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
@@ -571,162 +582,262 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         if (offset + rec->generic_len > max_res_len) return -1;
         memcpy(&res[offset], rec->generic_data, rec->generic_len);
         offset += rec->generic_len;
-    } else if (rec_type == 1 && rec->rdata_count > 0) { // A
-        if (offset + 4 > max_res_len) return -1;
-        struct in_addr addr; inet_pton(AF_INET, rec->rdata[0], &addr);
-        memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
-    } else if (rec_type == 28 && rec->rdata_count > 0) { // AAAA
-        if (offset + 16 > max_res_len) return -1;
-        struct in6_addr addr; inet_pton(AF_INET6, rec->rdata[0], &addr);
-        memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
-    } else if ((rec_type == 2 || rec_type == 3 || rec_type == 4 || rec_type == 5 || rec_type == 7 || rec_type == 8 || rec_type == 9 || rec_type == 12 || rec_type == 39) && rec->rdata_count > 0) { // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
-        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
-    } else if (rec_type == 15 && rec->rdata_count >= 2) { // MX
-        if (offset + 2 > max_res_len) return -1;
-        uint16_t pref = atoi(rec->rdata[0]);
-        res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-        if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
-    } else if (rec_type == 33 && rec->rdata_count >= 4) { // SRV
-        if (offset + 6 > max_res_len) return -1;
-        uint16_t prio = atoi(rec->rdata[0]);
-        uint16_t weight = atoi(rec->rdata[1]);
-        uint16_t port = atoi(rec->rdata[2]);
-        res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
-        res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
-        res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-        if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
-    } else if (rec_type == 257 && rec->rdata_count >= 3) { // CAA
-        uint8_t flags = atoi(rec->rdata[0]);
-        size_t tag_len = strlen(rec->rdata[1]);
-        if (tag_len > 255) tag_len = 255;
-        size_t val_len = strlen(rec->rdata[2]);
-        if (offset + 2 + tag_len + val_len > max_res_len) return -1;
-        
-        res[offset++] = flags;
-        res[offset++] = tag_len;
-        memcpy(&res[offset], rec->rdata[1], tag_len); offset += tag_len;
-        memcpy(&res[offset], rec->rdata[2], val_len); offset += val_len;
-    } else if (rec_type == 6 && rec->rdata_count >= 7) { // SOA
-        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 ||
-            write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0) return -1;
-        if (offset + 20 > max_res_len) return -1;
-        for (int j = 2; j < 7; j++) {
-            uint32_t val = strtoul(rec->rdata[j], NULL, 10);
-            res[offset++] = val >> 24; res[offset++] = (val >> 16) & 0xFF; res[offset++] = (val >> 8) & 0xFF; res[offset++] = val & 0xFF;
-        }
-    } else if ((rec_type == 16 || rec_type == 99) && rec->rdata_count > 0) { // TXT, SPF
-        size_t required = 0;
-        for (int j = 0; j < rec->rdata_count; j++) {
-            size_t len = strlen(rec->rdata[j]);
-            size_t chunks = (len + 254) / 255;
-            if (chunks == 0) chunks = 1;
-            required += chunks + len;
-        }
-        if (offset + required > max_res_len) return -1;
-        
-        for (int j = 0; j < rec->rdata_count; j++) {
-            size_t len = strlen(rec->rdata[j]);
-            const char *str = rec->rdata[j];
-            if (len == 0) {
-                res[offset++] = 0;
-            } else {
-                while (len > 0) {
-                    size_t chunk_len = (len > 255) ? 255 : len;
-                    res[offset++] = chunk_len;
-                    memcpy(&res[offset], str, chunk_len);
-                    offset += chunk_len;
-                    str += chunk_len;
-                    len -= chunk_len;
+    } else {
+        switch (rec_type) {
+            case 1: { // A
+                if (rec->rdata_count == 0) return -1;
+                if (offset + 4 > max_res_len) return -1;
+                struct in_addr addr; inet_pton(AF_INET, rec->rdata[0], &addr);
+                memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
+                break;
+            }
+            case 28: { // AAAA
+                if (rec->rdata_count == 0) return -1;
+                if (offset + 16 > max_res_len) return -1;
+                struct in6_addr addr; inet_pton(AF_INET6, rec->rdata[0], &addr);
+                memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
+                break;
+            }
+            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
+                if (rec->rdata_count == 0) return -1;
+                if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                break;
+            }
+            case 15: { // MX
+                if (rec->rdata_count < 2) return -1;
+                if (offset + 2 > max_res_len) return -1;
+                uint16_t pref = atoi(rec->rdata[0]);
+                res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
+                if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                break;
+            }
+            case 33: { // SRV
+                if (rec->rdata_count < 4) return -1;
+                if (offset + 6 > max_res_len) return -1;
+                uint16_t prio = atoi(rec->rdata[0]);
+                uint16_t weight = atoi(rec->rdata[1]);
+                uint16_t port = atoi(rec->rdata[2]);
+                res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
+                res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
+                res[offset++] = port >> 8; res[offset++] = port & 0xFF;
+                if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                break;
+            }
+            case 257: { // CAA
+                if (rec->rdata_count < 3) return -1;
+                uint8_t flags = atoi(rec->rdata[0]);
+                size_t tag_len = strlen(rec->rdata[1]);
+                if (tag_len > 255) tag_len = 255;
+                size_t val_len = strlen(rec->rdata[2]);
+                if (offset + 2 + tag_len + val_len > max_res_len) return -1;
+                
+                res[offset++] = flags;
+                res[offset++] = tag_len;
+                memcpy(&res[offset], rec->rdata[1], tag_len); offset += tag_len;
+                memcpy(&res[offset], rec->rdata[2], val_len); offset += val_len;
+                break;
+            }
+            case 6: { // SOA
+                if (rec->rdata_count < 7) return -1;
+                if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 ||
+                    write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0) return -1;
+                if (offset + 20 > max_res_len) return -1;
+                for (int j = 2; j < 7; j++) {
+                    uint32_t val = strtoul(rec->rdata[j], NULL, 10);
+                    res[offset++] = val >> 24; res[offset++] = (val >> 16) & 0xFF; res[offset++] = (val >> 8) & 0xFF; res[offset++] = val & 0xFF;
                 }
+                break;
+            }
+            case 16: case 99: case 258: { // TXT, SPF, AVC
+                if (rec->rdata_count == 0) return -1;
+                size_t required = 0;
+                for (int j = 0; j < rec->rdata_count; j++) {
+                    size_t len = strlen(rec->rdata[j]);
+                    size_t chunks = (len + 254) / 255;
+                    if (chunks == 0) chunks = 1;
+                    required += chunks + len;
+                }
+                if (offset + required > max_res_len) return -1;
+                
+                for (int j = 0; j < rec->rdata_count; j++) {
+                    size_t len = strlen(rec->rdata[j]);
+                    const char *str = rec->rdata[j];
+                    if (len == 0) {
+                        res[offset++] = 0;
+                    } else {
+                        while (len > 0) {
+                            size_t chunk_len = (len > 255) ? 255 : len;
+                            res[offset++] = chunk_len;
+                            memcpy(&res[offset], str, chunk_len);
+                            offset += chunk_len;
+                            str += chunk_len;
+                            len -= chunk_len;
+                        }
+                    }
+                }
+                break;
+            }
+            case 44: { // SSHFP
+                if (rec->rdata_count < 3) return -1;
+                uint8_t alg = atoi(rec->rdata[0]);
+                uint8_t fptype = atoi(rec->rdata[1]);
+                uint8_t fp[64]; 
+                size_t fp_len = hex_decode(rec->rdata[2], fp, sizeof(fp));
+                if (fp_len == (size_t)-1) return -1;
+                if (offset + 2 + fp_len > max_res_len) return -1;
+                res[offset++] = alg;
+                res[offset++] = fptype;
+                memcpy(&res[offset], fp, fp_len);
+                offset += fp_len;
+                break;
+            }
+            case 52: case 53: { // TLSA / SMIMEA
+                if (rec->rdata_count < 4) return -1;
+                uint8_t usage = atoi(rec->rdata[0]);
+                uint8_t selector = atoi(rec->rdata[1]);
+                uint8_t matching = atoi(rec->rdata[2]);
+                uint8_t cad[512]; 
+                size_t cad_len = hex_decode(rec->rdata[3], cad, sizeof(cad));
+                if (cad_len == (size_t)-1) return -1;
+                if (offset + 3 + cad_len > max_res_len) return -1;
+                res[offset++] = usage;
+                res[offset++] = selector;
+                res[offset++] = matching;
+                memcpy(&res[offset], cad, cad_len);
+                offset += cad_len;
+                break;
+            }
+            case 37: { // CERT
+                if (rec->rdata_count < 4) return -1;
+                uint16_t cert_type = cert_type_to_num(rec->rdata[0]);
+                uint16_t key_tag = atoi(rec->rdata[1]);
+                uint8_t algorithm = atoi(rec->rdata[2]);
+                const char *b64 = rec->rdata[3];
+                size_t b64_len = strlen(b64);
+                size_t decoded_upper_bound = (b64_len / 4) * 3;
+                if (offset + 5 + decoded_upper_bound > max_res_len) return -1;
+                res[offset++] = cert_type >> 8; res[offset++] = cert_type & 0xFF;
+                res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
+                res[offset++] = algorithm;
+                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
+                if (declen < 0) return -1;
+                int padding = 0;
+                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
+                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
+                offset += (declen - padding);
+                break;
+            }
+            case 35: { // NAPTR
+                if (rec->rdata_count < 6) return -1;
+                if (offset + 4 > max_res_len) return -1;
+                uint16_t order = atoi(rec->rdata[0]);
+                uint16_t pref  = atoi(rec->rdata[1]);
+                res[offset++] = order >> 8; res[offset++] = order & 0xFF;
+                res[offset++] = pref >> 8;  res[offset++] = pref & 0xFF;
+                const char *cstrs[3] = { rec->rdata[2], rec->rdata[3], rec->rdata[4] };
+                for (int k = 0; k < 3; k++) {
+                    if (write_char_string(res, max_res_len, &offset, cstrs[k]) != 0) return -1;
+                }
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[5]);
+                if (w < 0) return -1;
+                offset += (size_t)w;
+                break;
+            }
+            case 51: { // NSEC3PARAM
+                if (rec->rdata_count < 4) return -1;
+                uint8_t halg = atoi(rec->rdata[0]);
+                uint8_t flags = atoi(rec->rdata[1]);
+                uint16_t iterations = atoi(rec->rdata[2]);
+                uint8_t salt[255];
+                size_t salt_len = 0;
+                if (strcmp(rec->rdata[3], "-") != 0) {
+                    salt_len = hex_decode(rec->rdata[3], salt, sizeof(salt));
+                    if (salt_len == (size_t)-1) return -1;
+                }
+                if (offset + 5 + salt_len > max_res_len) return -1;
+                res[offset++] = halg;
+                res[offset++] = flags;
+                res[offset++] = iterations >> 8; res[offset++] = iterations & 0xFF;
+                res[offset++] = (uint8_t)salt_len;
+                memcpy(&res[offset], salt, salt_len); offset += salt_len;
+                break;
+            }
+            case 64: case 65: { // HTTPS / SVCB
+                if (rec->rdata_count >= 2) {
+                    if (offset + 2 > max_res_len) return -1;
+                    uint16_t svc_prio = atoi(rec->rdata[0]);
+                    res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
+                    if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                }
+                break;
+            }
+            case 13: { // HINFO
+                if (rec->rdata_count < 2) return -1;
+                if (write_char_string(res, max_res_len, &offset, rec->rdata[0]) != 0) return -1;
+                if (write_char_string(res, max_res_len, &offset, rec->rdata[1]) != 0) return -1;
+                break;
+            }
+            case 256: { // URI
+                if (rec->rdata_count < 3) return -1;
+                uint16_t prio = atoi(rec->rdata[0]);
+                uint16_t weight = atoi(rec->rdata[1]);
+                const char *target = rec->rdata[2];
+                size_t tlen = strlen(target);
+                if (offset + 4 + tlen > max_res_len) return -1;
+                res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
+                res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
+                memcpy(&res[offset], target, tlen);
+                offset += tlen;
+                break;
+            }
+            case 61: case 49: { // OPENPGPKEY, DHCID
+                if (rec->rdata_count < 1) return -1;
+                const char *b64 = rec->rdata[0];
+                size_t b64_len = strlen(b64);
+                size_t decoded_upper_bound = (b64_len / 4) * 3;
+                if (offset + decoded_upper_bound > max_res_len) return -1;
+                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
+                if (declen < 0) return -1;
+                int padding = 0;
+                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
+                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
+                offset += (declen - padding);
+                break;
+            }
+            case 108: case 109: { // EUI48, EUI64
+                if (rec->rdata_count < 1) return -1;
+                size_t expected = (rec_type == 108) ? 6 : 8;
+                if (offset + expected > max_res_len) return -1;
+                uint8_t eui[16];
+                size_t dec_len = hex_decode(rec->rdata[0], eui, sizeof(eui));
+                if (dec_len != expected) return -1;
+                memcpy(&res[offset], eui, expected);
+                offset += expected;
+                break;
+            }
+            case 63: { // ZONEMD
+                if (rec->rdata_count < 4) return -1;
+                uint32_t serial = strtoul(rec->rdata[0], NULL, 10);
+                uint8_t scheme = atoi(rec->rdata[1]);
+                uint8_t halg = atoi(rec->rdata[2]);
+                uint8_t digest[512];
+                size_t digest_len = hex_decode(rec->rdata[3], digest, sizeof(digest));
+                if (digest_len == (size_t)-1) return -1;
+                if (offset + 6 + digest_len > max_res_len) return -1;
+                res[offset++] = serial >> 24; res[offset++] = (serial >> 16) & 0xFF;
+                res[offset++] = (serial >> 8) & 0xFF; res[offset++] = serial & 0xFF;
+                res[offset++] = scheme;
+                res[offset++] = halg;
+                memcpy(&res[offset], digest, digest_len);
+                offset += digest_len;
+                break;
+            }
+            default: {
+                // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード
+                // 低レイヤー関数であるためログ出力は行わず、上位層にエラー状態のみを伝播させる
+                return -1;
             }
         }
-    } else if (rec_type == 44 && rec->rdata_count >= 3) { // SSHFP
-        uint8_t alg = atoi(rec->rdata[0]);
-        uint8_t fptype = atoi(rec->rdata[1]);
-        uint8_t fp[64]; 
-        size_t fp_len = hex_decode(rec->rdata[2], fp, sizeof(fp));
-        if (fp_len == (size_t)-1) return -1;
-        if (offset + 2 + fp_len > max_res_len) return -1;
-        res[offset++] = alg;
-        res[offset++] = fptype;
-        memcpy(&res[offset], fp, fp_len);
-        offset += fp_len;
-    } else if ((rec_type == 52 || rec_type == 53) && rec->rdata_count >= 4) { // TLSA / SMIMEA
-        uint8_t usage = atoi(rec->rdata[0]);
-        uint8_t selector = atoi(rec->rdata[1]);
-        uint8_t matching = atoi(rec->rdata[2]);
-        uint8_t cad[512]; 
-        size_t cad_len = hex_decode(rec->rdata[3], cad, sizeof(cad));
-        if (cad_len == (size_t)-1) return -1;
-        if (offset + 3 + cad_len > max_res_len) return -1;
-        res[offset++] = usage;
-        res[offset++] = selector;
-        res[offset++] = matching;
-        memcpy(&res[offset], cad, cad_len);
-        offset += cad_len;
-    } else if (rec_type == 37 && rec->rdata_count >= 4) { // CERT
-        uint16_t cert_type = cert_type_to_num(rec->rdata[0]);
-        uint16_t key_tag = atoi(rec->rdata[1]);
-        uint8_t algorithm = atoi(rec->rdata[2]);
-        const char *b64 = rec->rdata[3];
-        size_t b64_len = strlen(b64);
-        size_t decoded_upper_bound = (b64_len / 4) * 3;
-        if (offset + 5 + decoded_upper_bound > max_res_len) return -1;
-        if (offset + 5 > max_res_len) return -1;
-        res[offset++] = cert_type >> 8; res[offset++] = cert_type & 0xFF;
-        res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
-        res[offset++] = algorithm;
-        int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
-        if (declen < 0) return -1;
-        int padding = 0;
-        if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
-        if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
-        offset += (declen - padding);
-    } else if (rec_type == 35 && rec->rdata_count >= 6) { // NAPTR
-        if (offset + 4 > max_res_len) return -1;
-        uint16_t order = atoi(rec->rdata[0]);
-        uint16_t pref  = atoi(rec->rdata[1]);
-        res[offset++] = order >> 8; res[offset++] = order & 0xFF;
-        res[offset++] = pref >> 8;  res[offset++] = pref & 0xFF;
-        const char *cstrs[3] = { rec->rdata[2], rec->rdata[3], rec->rdata[4] };
-        for (int k = 0; k < 3; k++) {
-            size_t len = strlen(cstrs[k]);
-            if (len > 255) len = 255;
-            if (offset + 1 + len > max_res_len) return -1;
-            res[offset++] = (uint8_t)len;
-            memcpy(&res[offset], cstrs[k], len);
-            offset += len;
-        }
-        long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[5]);
-        if (w < 0) return -1;
-        offset += (size_t)w;
-    } else if (rec_type == 51 && rec->rdata_count >= 4) { // NSEC3PARAM
-        uint8_t halg = atoi(rec->rdata[0]);
-        uint8_t flags = atoi(rec->rdata[1]);
-        uint16_t iterations = atoi(rec->rdata[2]);
-        uint8_t salt[255];
-        size_t salt_len = 0;
-        if (strcmp(rec->rdata[3], "-") != 0) {
-            salt_len = hex_decode(rec->rdata[3], salt, sizeof(salt));
-            if (salt_len == (size_t)-1) return -1;
-        }
-        if (offset + 5 + salt_len > max_res_len) return -1;
-        res[offset++] = halg;
-        res[offset++] = flags;
-        res[offset++] = iterations >> 8; res[offset++] = iterations & 0xFF;
-        res[offset++] = (uint8_t)salt_len;
-        memcpy(&res[offset], salt, salt_len); offset += salt_len;
-    } else if (rec_type == 64 || rec_type == 65) { // HTTPS / SVCB
-        if (rec->rdata_count >= 2) {
-            if (offset + 2 > max_res_len) return -1;
-            uint16_t svc_prio = atoi(rec->rdata[0]);
-            res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
-            if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
-        }
-    } else {
-        // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード
-        // 低レイヤー関数であるためログ出力は行わず、上位層にエラー状態のみを伝播させる
-        return -1;
     }
     
     uint16_t rdlength = offset - rdlength_idx - 2;
