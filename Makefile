@@ -21,7 +21,7 @@ FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
 FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c
 
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
-FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c
+FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c
 
 .PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan
 

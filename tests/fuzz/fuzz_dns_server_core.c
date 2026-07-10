@@ -2,6 +2,8 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include "../../dns_config_parser.h"
+#include "../../dns_zone_parser.h"
 
 // Override syslog to prevent massive disk I/O and CPU usage during fuzzing
 void syslog(int priority, const char *format, ...) {
@@ -71,12 +73,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         arena.records_cap = 1024;
         arena.records = calloc(arena.records_cap, sizeof(dns_record_t));
 
-        char *prev_owner = NULL;
-        char *origin = arena_strdup(&arena, "fuzz.local.");
-        char *default_ttl = arena_strdup(&arena, "3600");
+        parse_context_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.default_origin = "fuzz.local.";
 
         // The parser operates in place on buf, so text_buf is modified
-        parse_zone_fast(text_buf, fuzz_size, &arena, &prev_owner, &origin, &default_ttl);
+        parse_zone_fast(text_buf, fuzz_size, &arena, &ctx);
 
         // Free arena memory
         for (int i = 0; i < arena.data_pool_count; i++) {
