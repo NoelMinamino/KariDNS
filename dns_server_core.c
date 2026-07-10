@@ -2325,6 +2325,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   uint16_t offset = q_offset;
   uint16_t answers = 0;
   uint16_t *res_ancount = (uint16_t *)&res[6];
+  memset(res, 0, 65535);
   memcpy(res, req, q_offset);
   res[2] |= 0x84;
   res[3] &= 0x0F;
@@ -2415,6 +2416,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if (send_tcp_robust(client_fd, res, prev_offset) < 0) goto axfr_error; \
     offset = q_offset; \
     answers = 0; \
+    memset(res, 0, 65535); \
     memcpy(res, req, q_offset); \
     res[2] |= 0x84; res[3] &= 0x0F; \
     res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
