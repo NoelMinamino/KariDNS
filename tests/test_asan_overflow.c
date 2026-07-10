@@ -64,6 +64,7 @@ int main() {
         }
         
         // TLSA
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_tlsa = {0};
         rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
@@ -73,6 +74,7 @@ int main() {
         }
 
         // CERT
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_cert = {0};
         rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
@@ -83,6 +85,7 @@ int main() {
         }
 
         // NAPTR
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_naptr = {0};
         rec_naptr.name = (char*)"example.com"; rec_naptr.type_code = 35; rec_naptr.rdata_count = 6;
@@ -93,6 +96,7 @@ int main() {
         }
 
         // NSEC3PARAM
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_nsec3param = {0};
         rec_nsec3param.name = (char*)"example.com"; rec_nsec3param.type_code = 51; rec_nsec3param.rdata_count = 4;
@@ -104,6 +108,7 @@ int main() {
 
   
         // HINFO
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_hinfo = {0};
         rec_hinfo.name = (char*)"example.com"; rec_hinfo.type_code = 13; rec_hinfo.rdata_count = 2;
@@ -113,6 +118,7 @@ int main() {
         }
 
         // URI
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_uri = {0};
         rec_uri.name = (char*)"example.com"; rec_uri.type_code = 256; rec_uri.rdata_count = 3;
@@ -122,6 +128,7 @@ int main() {
         }
 
         // OPENPGPKEY
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_openpgpkey = {0};
         rec_openpgpkey.name = (char*)"example.com"; rec_openpgpkey.type_code = 61; rec_openpgpkey.rdata_count = 1;
@@ -131,6 +138,7 @@ int main() {
         }
 
         // DHCID
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_dhcid = {0};
         rec_dhcid.name = (char*)"example.com"; rec_dhcid.type_code = 49; rec_dhcid.rdata_count = 1;
@@ -140,6 +148,7 @@ int main() {
         }
 
         // EUI48
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_eui48 = {0};
         rec_eui48.name = (char*)"example.com"; rec_eui48.type_code = 108; rec_eui48.rdata_count = 1;
@@ -149,6 +158,7 @@ int main() {
         }
 
         // EUI64
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_eui64 = {0};
         rec_eui64.name = (char*)"example.com"; rec_eui64.type_code = 109; rec_eui64.rdata_count = 1;
@@ -158,6 +168,7 @@ int main() {
         }
 
         // ZONEMD
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_zonemd = {0};
         rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
@@ -168,6 +179,7 @@ int main() {
         }
 
         // MINFO
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_minfo = {0};
         rec_minfo.name = (char*)"example.com"; rec_minfo.type_code = 14; rec_minfo.rdata_count = 2;
@@ -177,6 +189,7 @@ int main() {
         }
 
         // RP
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_rp = {0};
         rec_rp.name = (char*)"example.com"; rec_rp.type_code = 17; rec_rp.rdata_count = 2;
@@ -186,6 +199,7 @@ int main() {
         }
 
         // AFSDB
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_afsdb = {0};
         rec_afsdb.name = (char*)"example.com"; rec_afsdb.type_code = 18; rec_afsdb.rdata_count = 2;
@@ -195,6 +209,7 @@ int main() {
         }
 
         // KX
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_kx = {0};
         rec_kx.name = (char*)"example.com"; rec_kx.type_code = 36; rec_kx.rdata_count = 2;
@@ -204,6 +219,7 @@ int main() {
         }
 
         // PX
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_px = {0};
         rec_px.name = (char*)"example.com"; rec_px.type_code = 26; rec_px.rdata_count = 3;
@@ -213,6 +229,7 @@ int main() {
         }
 
         // RT
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_rt = {0};
         rec_rt.name = (char*)"example.com"; rec_rt.type_code = 21; rec_rt.rdata_count = 2;
@@ -222,6 +239,7 @@ int main() {
         }
 
         // LP
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_lp = {0};
         rec_lp.name = (char*)"example.com"; rec_lp.type_code = 107; rec_lp.rdata_count = 2;
@@ -231,6 +249,7 @@ int main() {
         }
 
         // CSYNC
+        compress_ctx_init_packet(&ctx);
         offset = 0;
         dns_record_t rec_csync = {0};
         rec_csync.name = (char*)"example.com"; rec_csync.type_code = 62; rec_csync.rdata_count = 4;
@@ -239,6 +258,73 @@ int main() {
             printf("Test 3 Failed: CSYNC did not fail\n"); return 1;
         }
       printf("Test 3 Passed: All new records safely rejected small max_res_len\n");
+    }
+
+    // Test 4: Local buffer overflow prevention (Input boundary checks)
+    {
+        uint8_t packet[2048]; // Large enough to hold valid packets
+        uint16_t offset = 0;
+        compress_ctx_t ctx;
+        compress_ctx_init_packet(&ctx);
+        char huge_hex[1100];
+        char huge_b64[1100];
+        for(int i=0; i<1099; i++) { huge_hex[i] = 'A'; huge_b64[i] = 'A'; }
+        huge_hex[1099] = '\0';
+        huge_b64[1099] = '\0';
+
+        // TLSA (Type 52) - huge hex string
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_tlsa = {0};
+        rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
+        rec_tlsa.rdata[0] = (char*)"3"; rec_tlsa.rdata[1] = (char*)"1"; rec_tlsa.rdata[2] = (char*)"1"; 
+        rec_tlsa.rdata[3] = huge_hex;
+        if (serialize_dns_record(packet, 2048, &offset, &rec_tlsa, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: TLSA with huge hex did not fail\n"); return 1;
+        }
+
+        // CERT (Type 37) - huge base64 string
+        // Note: The following test with huge_b64 actually tests EVP_DecodeBlock rejecting
+        // invalid base64 lengths rather than the bound check itself.
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_cert = {0};
+        rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
+        rec_cert.rdata[0] = (char*)"PKIX"; rec_cert.rdata[1] = (char*)"12345"; rec_cert.rdata[2] = (char*)"8"; 
+        rec_cert.rdata[3] = huge_b64;
+        if (serialize_dns_record(packet, 2048, &offset, &rec_cert, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: CERT with huge base64 did not fail\n"); return 1;
+        }
+
+        // CERT: Valid Base64 that exceeds max_res_len (boundary check test)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_cert2 = {0};
+        rec_cert2.name = (char*)"example.com"; rec_cert2.type_code = 37; rec_cert2.rdata_count = 4;
+        rec_cert2.rdata[0] = (char*)"PKIX"; rec_cert2.rdata[1] = (char*)"12345"; rec_cert2.rdata[2] = (char*)"8";
+        
+        static char valid_long_b64[1101];
+        for (int i = 0; i < 275; i++) memcpy(valid_long_b64 + i*4, "AAAA", 4);
+        valid_long_b64[1100] = '\0';
+        rec_cert2.rdata[3] = valid_long_b64;
+        
+        // max_res_len is intentionally small to trigger 'decoded_upper_bound > max_res_len'
+        if (serialize_dns_record(packet, 50, &offset, &rec_cert2, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: CERT bound check (valid b64, small max_res_len) did not fail\n"); return 1;
+        }
+
+        // ZONEMD (Type 63) - huge hex string
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_zonemd = {0};
+        rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
+        rec_zonemd.rdata[0] = (char*)"2018031500"; rec_zonemd.rdata[1] = (char*)"1"; rec_zonemd.rdata[2] = (char*)"1";
+        rec_zonemd.rdata[3] = huge_hex;
+        if (serialize_dns_record(packet, 2048, &offset, &rec_zonemd, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: ZONEMD with huge hex did not fail\n"); return 1;
+        }
+
+        printf("Test 4 Passed: All input bound overflow tests safely rejected\n");
     }
 
     printf("All tests passed safely.\n");

@@ -826,12 +826,11 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 64: case 65: { // HTTPS / SVCB
-                if (rec->rdata_count >= 2) {
-                    if (offset + 2 > max_res_len) return -1;
-                    uint16_t svc_prio = atoi(rec->rdata[0]);
-                    res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
-                    if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
-                }
+                if (rec->rdata_count < 2) return -1;
+                if (offset + 2 > max_res_len) return -1;
+                uint16_t svc_prio = atoi(rec->rdata[0]);
+                res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
+                if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
                 break;
             }
             case 13: { // HINFO
