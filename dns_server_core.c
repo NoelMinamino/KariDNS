@@ -2418,12 +2418,15 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     answers = 0; \
     memset(res, 0, 65535); \
     memcpy(res, req, q_offset); \
-    res[2] |= 0x84; res[3] &= 0x0F; \
-    res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
     memset(&comp_ctx, 0, sizeof(comp_ctx)); \
     compress_ctx_init_packet(&comp_ctx); \
-    if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) \
+    res[2] |= 0x84; res[3] &= 0x0F; \
+    res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
+    if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
+      memset(&comp_ctx, 0, sizeof(comp_ctx)); \
+      compress_ctx_init_packet(&comp_ctx); \
       continue; \
+    } \
   } \
   answers++; \
 } while (0)
