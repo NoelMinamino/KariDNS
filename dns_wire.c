@@ -741,7 +741,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 45: { // IPSECKEY
-                if (rec->rdata_count < 4) return -1;
+                if (rec->rdata_count < 3) return -1;
                 uint8_t prec = atoi(rec->rdata[0]);
                 uint8_t gw_type = atoi(rec->rdata[1]);
                 uint8_t alg = atoi(rec->rdata[2]);
@@ -754,14 +754,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     if (offset + 4 > max_res_len) return -1;
                     struct in_addr addr;
                     if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
-                    memcpy(&res[offset], &addr, 4); offset += 4;
+                    memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
                     pk_idx = 4;
                 } else if (gw_type == 2) { // IPv6
                     if (rec->rdata_count < 5) return -1;
                     if (offset + 16 > max_res_len) return -1;
                     struct in6_addr addr;
                     if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
-                    memcpy(&res[offset], &addr, 16); offset += 16;
+                    memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                     pk_idx = 4;
                 } else if (gw_type == 3) { // Domain name
                     if (rec->rdata_count < 5) return -1;
@@ -791,6 +791,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (rec->rdata_count < 3) return -1;
                 uint8_t prec = atoi(rec->rdata[0]);
                 uint8_t dbit = atoi(rec->rdata[1]);
+                if (dbit > 1) return -1;
                 uint8_t type = atoi(rec->rdata[2]);
                 if (offset + 2 > max_res_len) return -1;
                 res[offset++] = prec;
@@ -801,13 +802,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     if (offset + 4 > max_res_len) return -1;
                     struct in_addr addr;
                     if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
-                    memcpy(&res[offset], &addr, 4); offset += 4;
+                    memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
                 } else if (type == 2) { // IPv6
                     if (rec->rdata_count < 4) return -1;
                     if (offset + 16 > max_res_len) return -1;
                     struct in6_addr addr;
                     if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
-                    memcpy(&res[offset], &addr, 16); offset += 16;
+                    memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                 } else if (type == 3) { // Domain name
                     if (rec->rdata_count < 4) return -1;
                     long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
@@ -835,7 +836,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
                 struct in_addr addr;
                 if (inet_pton(AF_INET, rec->rdata[1], &addr) != 1) return -1;
-                memcpy(&res[offset], &addr, 4); offset += 4;
+                memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
                 break;
             }
             case 106: { // L64

@@ -352,7 +352,7 @@ PROCESS_RECORD:
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     } else if (rec->type_code == 260) { // AMTRELAY
-      if (rec->rdata_count > 3 && (atoi(rec->rdata[2]) & 0x7F) == 3) {
+      if (rec->rdata_count > 3 && atoi(rec->rdata[2]) == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     }
