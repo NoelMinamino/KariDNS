@@ -112,7 +112,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key);
 
 // DNSレスポンス組み立て
-size_t write_uncompressed_name(uint8_t *buf, const char *name);
+long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
 

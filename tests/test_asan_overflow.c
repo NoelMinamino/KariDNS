@@ -48,6 +48,63 @@ int main() {
         return 1;
     }
     
+    // Test 3: New record types boundary checks
+    {
+        uint8_t packet[20];
+        uint16_t offset = 0;
+        compress_ctx_t ctx;
+        compress_ctx_init_packet(&ctx);
+
+        // SSHFP
+        dns_record_t rec_sshfp = {0};
+        rec_sshfp.name = (char*)"example.com"; rec_sshfp.type_code = 44; rec_sshfp.rdata_count = 3;
+        rec_sshfp.rdata[0] = (char*)"2"; rec_sshfp.rdata[1] = (char*)"1"; rec_sshfp.rdata[2] = (char*)"1234567890abcdef";
+        if (serialize_dns_record(packet, 20, &offset, &rec_sshfp, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: SSHFP did not fail\n"); return 1;
+        }
+        
+        // TLSA
+        offset = 0;
+        dns_record_t rec_tlsa = {0};
+        rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
+        rec_tlsa.rdata[0] = (char*)"3"; rec_tlsa.rdata[1] = (char*)"1"; rec_tlsa.rdata[2] = (char*)"1"; rec_tlsa.rdata[3] = (char*)"abcdef";
+        if (serialize_dns_record(packet, 20, &offset, &rec_tlsa, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: TLSA did not fail\n"); return 1;
+        }
+
+        // CERT
+        offset = 0;
+        dns_record_t rec_cert = {0};
+        rec_cert.name = (char*)"example.com"; rec_cert.type_code = 37; rec_cert.rdata_count = 4;
+        rec_cert.rdata[0] = (char*)"PKIX"; rec_cert.rdata[1] = (char*)"12345"; rec_cert.rdata[2] = (char*)"8"; 
+        rec_cert.rdata[3] = (char*)"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB";
+        if (serialize_dns_record(packet, 20, &offset, &rec_cert, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: CERT did not fail\n"); return 1;
+        }
+
+        // NAPTR
+        offset = 0;
+        dns_record_t rec_naptr = {0};
+        rec_naptr.name = (char*)"example.com"; rec_naptr.type_code = 35; rec_naptr.rdata_count = 6;
+        rec_naptr.rdata[0] = (char*)"100"; rec_naptr.rdata[1] = (char*)"10"; rec_naptr.rdata[2] = (char*)"S";
+        rec_naptr.rdata[3] = (char*)"SIP+D2U"; rec_naptr.rdata[4] = (char*)""; rec_naptr.rdata[5] = (char*)"_sip._udp.example.com.";
+        if (serialize_dns_record(packet, 20, &offset, &rec_naptr, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: NAPTR did not fail\n"); return 1;
+        }
+
+        // NSEC3PARAM
+        offset = 0;
+        dns_record_t rec_nsec3param = {0};
+        rec_nsec3param.name = (char*)"example.com"; rec_nsec3param.type_code = 51; rec_nsec3param.rdata_count = 4;
+        rec_nsec3param.rdata[0] = (char*)"1"; rec_nsec3param.rdata[1] = (char*)"0"; rec_nsec3param.rdata[2] = (char*)"10";
+        rec_nsec3param.rdata[3] = (char*)"12345678";
+        if (serialize_dns_record(packet, 20, &offset, &rec_nsec3param, &ctx, NULL, 0) != -1) {
+            printf("Test 3 Failed: NSEC3PARAM did not fail\n"); return 1;
+        }
+
+        printf("Test 3 Passed: All new records safely rejected small max_res_len\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

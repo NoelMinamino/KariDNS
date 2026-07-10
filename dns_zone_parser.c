@@ -541,6 +541,9 @@ PROCESS_RECORD:
     } else if (rec->type_code == 33) {
       if (rec->rdata_count > 3)
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
+    } else if (rec->type_code == 35) { // NAPTR
+      if (rec->rdata_count > 5)
+        rec->rdata[5] = expand_domain_name(rec->rdata[5], *origin_io, arena);
     }
   }
   if (p < end)
