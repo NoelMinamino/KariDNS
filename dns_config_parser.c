@@ -697,9 +697,19 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             tsig->algorithm = val;
           else {
             tsig->secret = val;
+            size_t slen = strlen(tsig->secret);
+            size_t decoded_upper_bound = (slen / 4) * 3;
+            if (slen == 0 || decoded_upper_bound > sizeof(tsig->secret_decoded)) {
+              syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(tsig->secret_decoded));
+              fprintf(stderr, "[ERROR] secret too long for algorithm\n");
+              free(key_prop);
+              free(val);
+              free_token(&tok);
+              return -1;
+            }
             int len = EVP_DecodeBlock(tsig->secret_decoded,
                                       (const unsigned char *)tsig->secret,
-                                      strlen(tsig->secret));
+                                      slen);
             if (len < 0) {
               free(key_prop);
               free(val);
@@ -707,7 +717,6 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               return -1;
             }
             int padding = 0;
-            size_t slen = strlen(tsig->secret);
             if (slen > 0 && tsig->secret[slen - 1] == '=')
               padding++;
             if (slen > 1 && tsig->secret[slen - 2] == '=')
@@ -769,9 +778,19 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             config->control.algorithm = val;
           else {
             config->control.secret = val;
+            size_t slen = strlen(config->control.secret);
+            size_t decoded_upper_bound = (slen / 4) * 3;
+            if (slen == 0 || decoded_upper_bound > sizeof(config->control.secret_decoded)) {
+              syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(config->control.secret_decoded));
+              fprintf(stderr, "[ERROR] secret too long for algorithm\n");
+              free(key_prop);
+              free(val);
+              free_token(&tok);
+              return -1;
+            }
             int len = EVP_DecodeBlock(config->control.secret_decoded,
                                       (const unsigned char *)config->control.secret,
-                                      strlen(config->control.secret));
+                                      slen);
             if (len < 0) {
               free(key_prop);
               free(val);
@@ -779,7 +798,6 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               return -1;
             }
             int padding = 0;
-            size_t slen = strlen(config->control.secret);
             if (slen > 0 && config->control.secret[slen - 1] == '=')
               padding++;
             if (slen > 1 && config->control.secret[slen - 2] == '=')

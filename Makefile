@@ -42,6 +42,10 @@ karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+asan_test: tests/test_asan_overflow.c dns_config_parser.o dns_zone_parser.o dns_wire.o
+	clang -fsanitize=address,undefined -O1 -g tests/test_asan_overflow.c dns_config_parser.c dns_zone_parser.c dns_wire.c -lcrypto -o test_asan_overflow
+	./test_asan_overflow
+
 clean: clean-fuzz
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o

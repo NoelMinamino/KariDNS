@@ -64,7 +64,7 @@ static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, con
     return *p == 0;
 }
 
-int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx) {
+int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx, size_t max_len) {
     const uint8_t *s = name;
     while (*s != 0) {
         if (*offset >= 0x3FFF) return -1;
@@ -73,6 +73,7 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
             compress_entry_t *entry = &ctx->table[(idx + i) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) break;
             if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, s)) {
+                if (*offset + 2 > max_len) return -1;
                 uint16_t ptr = 0xC000 | entry->offset;
                 packet_buf[(*offset)++] = ptr >> 8; packet_buf[(*offset)++] = ptr & 0xFF;
                 return 0;
@@ -84,9 +85,12 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
                 entry->generation = ctx->current_generation; entry->hash = hash; entry->offset = *offset; break;
             }
         }
-        uint8_t len = *s; packet_buf[(*offset)++] = *s++;
+        uint8_t len = *s; 
+        if (*offset + 1 + len > max_len) return -1;
+        packet_buf[(*offset)++] = *s++;
         for (uint8_t i = 0; i < len; i++) packet_buf[(*offset)++] = *s++;
     }
+    if (*offset + 1 > max_len) return -1;
     packet_buf[(*offset)++] = 0; return 0;
 }
 
@@ -464,7 +468,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
 // 7. インメモリDNSパケット高速処理・統合スタブ
 // ============================================================================
 
-int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx) {
+int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len) {
     uint8_t wire[256];
     size_t w_len = 0;
     const char *p = name;
@@ -492,7 +496,7 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
     }
     if (w_len + 1 > 255) return -1;
     wire[w_len++] = 0;
-    return compress_name(packet_buf, offset, wire, ctx);
+    return compress_name(packet_buf, offset, wire, ctx, max_len);
 }
 
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
@@ -501,7 +505,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 
     if (offset + 12 > max_res_len) return -1; // TC bit needed
 
-    if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx) != 0) {
+    if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx, max_res_len) != 0) {
         return -1;
     }
 
@@ -531,12 +535,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         struct in6_addr addr; inet_pton(AF_INET6, rec->rdata[0], &addr);
         memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
     } else if ((rec_type == 2 || rec_type == 3 || rec_type == 4 || rec_type == 5 || rec_type == 7 || rec_type == 8 || rec_type == 9 || rec_type == 12 || rec_type == 39) && rec->rdata_count > 0) { // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
-        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx) != 0 || offset > max_res_len) return -1;
+        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
     } else if (rec_type == 15 && rec->rdata_count >= 2) { // MX
         if (offset + 2 > max_res_len) return -1;
         uint16_t pref = atoi(rec->rdata[0]);
         res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-        if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0 || offset > max_res_len) return -1;
+        if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
     } else if (rec_type == 33 && rec->rdata_count >= 4) { // SRV
         if (offset + 6 > max_res_len) return -1;
         uint16_t prio = atoi(rec->rdata[0]);
@@ -545,7 +549,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
         res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
         res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-        if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx) != 0 || offset > max_res_len) return -1;
+        if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
     } else if (rec_type == 257 && rec->rdata_count >= 3) { // CAA
         uint8_t flags = atoi(rec->rdata[0]);
         size_t tag_len = strlen(rec->rdata[1]);
@@ -558,8 +562,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         memcpy(&res[offset], rec->rdata[1], tag_len); offset += tag_len;
         memcpy(&res[offset], rec->rdata[2], val_len); offset += val_len;
     } else if (rec_type == 6 && rec->rdata_count >= 7) { // SOA
-        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx) != 0 ||
-            write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0) return -1;
+        if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 ||
+            write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0) return -1;
         if (offset + 20 > max_res_len) return -1;
         for (int j = 2; j < 7; j++) {
             uint32_t val = strtoul(rec->rdata[j], NULL, 10);
@@ -596,7 +600,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             if (offset + 2 > max_res_len) return -1;
             uint16_t svc_prio = atoi(rec->rdata[0]);
             res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
-            if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0 || offset > max_res_len) return -1;
+            if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
         }
     } else {
         // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード

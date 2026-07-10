@@ -481,6 +481,16 @@ PROCESS_RECORD:
   }
   while (i < field_idx && rec->rdata_count < MAX_RDATA)
     rec->rdata[rec->rdata_count++] = fields[i++];
+    
+  if (!rec->type) {
+    if (ctx && ctx->err_out) {
+      ctx->err_out->error_message = "Missing record type";
+      ctx->err_out->error_offset = field_idx > 0 ? (size_t)(fields[0] - buf) : (size_t)(p - buf);
+      ctx->err_out->token_length = 1;
+    }
+    return -1;
+  }
+  
   rec->type_code = get_type_code(rec->type);
   if (rec->type_code == 0) {
     if (ctx && ctx->err_out) {
