@@ -29,8 +29,12 @@ jobs:
             make all
             echo "::endgroup::"
 
+            echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
+            make asan_test
+            echo "::endgroup::"
+
             echo "::group::📦 [Build] Build Fuzzers"
-            make fuzz fuzz_core
+            make fuzz fuzz_core fuzz_zone fuzz_conf
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
@@ -41,12 +45,18 @@ jobs:
             ./dag google.com TXT @8.8.8.8 +tcp
             echo "::endgroup::"
 
-            echo "::group::🔍 [Smoke Test] Run Fuzzers (10 seconds each)"
-            echo "Running fuzz_dns_wire for 10 seconds..."
-            ./tests/fuzz/fuzz_dns_wire -max_total_time=10
+            echo "::group::🔍 [Smoke Test] Run Fuzzers (60 seconds each)"
+            echo "Running fuzz_dns_wire for 60 seconds..."
+            ./tests/fuzz/fuzz_dns_wire -max_total_time=60
 
-            echo "Running fuzz_dns_server_core for 10 seconds..."
-            ./tests/fuzz/fuzz_dns_server_core -max_total_time=10
+            echo "Running fuzz_dns_server_core for 60 seconds..."
+            ./tests/fuzz/fuzz_dns_server_core -max_total_time=60
+
+            echo "Running fuzz_zone_parser for 60 seconds..."
+            ./tests/fuzz/fuzz_zone_parser tests/fuzz/corpus/ -max_total_time=60
+
+            echo "Running fuzz_conf_parser for 60 seconds..."
+            ./tests/fuzz/fuzz_conf_parser tests/fuzz/corpus/ -max_total_time=60
             echo "::endgroup::"
 
             echo ""
