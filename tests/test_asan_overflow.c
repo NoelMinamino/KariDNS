@@ -219,12 +219,27 @@ int main() {
         exact_hex_512[1024] = '\0';
 
 
-        // TLSA (Type 52) - huge hex string
+        // TLSA (Type 52) - exact hex string for bound checking
         dns_record_t rec_tlsa = {0};
         rec_tlsa.name = (char*)"_443._tcp.example.com"; rec_tlsa.type_code = 52; rec_tlsa.rdata_count = 4;
         rec_tlsa.rdata[0] = (char*)"3"; rec_tlsa.rdata[1] = (char*)"1"; rec_tlsa.rdata[2] = (char*)"1"; 
         rec_tlsa.rdata[3] = exact_hex_512;
         if (assert_bound_checked(&rec_tlsa)) return 1;
+
+        // TLSA: hex_decode's local buffer (cad[512]) overflow test
+        {
+            uint8_t packet[2048];
+            uint16_t offset = 0;
+            compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
+            dns_record_t rec_tlsa_overflow = {0};
+            rec_tlsa_overflow.name = (char*)"_443._tcp.example.com";
+            rec_tlsa_overflow.type_code = 52; rec_tlsa_overflow.rdata_count = 4;
+            rec_tlsa_overflow.rdata[0] = (char*)"3"; rec_tlsa_overflow.rdata[1] = (char*)"1";
+            rec_tlsa_overflow.rdata[2] = (char*)"1"; rec_tlsa_overflow.rdata[3] = huge_hex;
+            if (serialize_dns_record(packet, 2048, &offset, &rec_tlsa_overflow, &ctx, NULL, 0) != -1) {
+                printf("Test 4 Failed: TLSA local-buffer overflow (hex_decode) did not fail\n"); return 1;
+            }
+        }
 
         // CERT (Type 37) - huge base64 string
         // Note: The following test with huge_b64 actually tests EVP_DecodeBlock rejecting
@@ -260,12 +275,27 @@ int main() {
         // max_res_len is intentionally small to trigger 'decoded_upper_bound > max_res_len'
         if (assert_bound_checked(&rec_cert2)) return 1;
 
-        // ZONEMD (Type 63) - huge hex string
+        // ZONEMD (Type 63) - exact hex string for bound checking
         dns_record_t rec_zonemd = {0};
         rec_zonemd.name = (char*)"example.com"; rec_zonemd.type_code = 63; rec_zonemd.rdata_count = 4;
         rec_zonemd.rdata[0] = (char*)"2018031500"; rec_zonemd.rdata[1] = (char*)"1"; rec_zonemd.rdata[2] = (char*)"1";
         rec_zonemd.rdata[3] = exact_hex_512;
         if (assert_bound_checked(&rec_zonemd)) return 1;
+
+        // ZONEMD: hex_decode's local buffer (digest[512]) overflow test
+        {
+            uint8_t packet[2048];
+            uint16_t offset = 0;
+            compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
+            dns_record_t rec_zonemd_overflow = {0};
+            rec_zonemd_overflow.name = (char*)"example.com";
+            rec_zonemd_overflow.type_code = 63; rec_zonemd_overflow.rdata_count = 4;
+            rec_zonemd_overflow.rdata[0] = (char*)"2018031500"; rec_zonemd_overflow.rdata[1] = (char*)"1";
+            rec_zonemd_overflow.rdata[2] = (char*)"1"; rec_zonemd_overflow.rdata[3] = huge_hex;
+            if (serialize_dns_record(packet, 2048, &offset, &rec_zonemd_overflow, &ctx, NULL, 0) != -1) {
+                printf("Test 4 Failed: ZONEMD local-buffer overflow (hex_decode) did not fail\n"); return 1;
+            }
+        }
 
         // NID (Type 104)
         dns_record_t rec_nid = {0};
