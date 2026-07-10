@@ -324,6 +324,80 @@ int main() {
             printf("Test 4 Failed: ZONEMD with huge hex did not fail\n"); return 1;
         }
 
+        // NID (Type 104)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_nid = {0};
+        rec_nid.name = (char*)"example.com"; rec_nid.type_code = 104; rec_nid.rdata_count = 2;
+        rec_nid.rdata[0] = (char*)"10"; rec_nid.rdata[1] = (char*)"0000:0000:0000:0000";
+        if (serialize_dns_record(packet, 20, &offset, &rec_nid, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: NID did not fail\n"); return 1;
+        }
+
+        // L32 (Type 105)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_l32 = {0};
+        rec_l32.name = (char*)"example.com"; rec_l32.type_code = 105; rec_l32.rdata_count = 2;
+        rec_l32.rdata[0] = (char*)"10"; rec_l32.rdata[1] = (char*)"192.0.2.1";
+        if (serialize_dns_record(packet, 20, &offset, &rec_l32, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: L32 did not fail\n"); return 1;
+        }
+
+        // L64 (Type 106)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_l64 = {0};
+        rec_l64.name = (char*)"example.com"; rec_l64.type_code = 106; rec_l64.rdata_count = 2;
+        rec_l64.rdata[0] = (char*)"10"; rec_l64.rdata[1] = (char*)"0000:0000:0000:0000";
+        if (serialize_dns_record(packet, 20, &offset, &rec_l64, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: L64 did not fail\n"); return 1;
+        }
+
+        // IPSECKEY (Type 45) - GW Type 1 (IPv4)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_ipseckey1 = {0};
+        rec_ipseckey1.name = (char*)"example.com"; rec_ipseckey1.type_code = 45; rec_ipseckey1.rdata_count = 5;
+        rec_ipseckey1.rdata[0] = (char*)"10"; rec_ipseckey1.rdata[1] = (char*)"1"; rec_ipseckey1.rdata[2] = (char*)"2";
+        rec_ipseckey1.rdata[3] = (char*)"192.0.2.1"; rec_ipseckey1.rdata[4] = huge_b64;
+        if (serialize_dns_record(packet, 20, &offset, &rec_ipseckey1, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: IPSECKEY gw1 did not fail\n"); return 1;
+        }
+
+        // IPSECKEY (Type 45) - GW Type 2 (IPv6)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_ipseckey2 = {0};
+        rec_ipseckey2.name = (char*)"example.com"; rec_ipseckey2.type_code = 45; rec_ipseckey2.rdata_count = 5;
+        rec_ipseckey2.rdata[0] = (char*)"10"; rec_ipseckey2.rdata[1] = (char*)"2"; rec_ipseckey2.rdata[2] = (char*)"2";
+        rec_ipseckey2.rdata[3] = (char*)"2001:db8::1"; rec_ipseckey2.rdata[4] = huge_b64;
+        if (serialize_dns_record(packet, 20, &offset, &rec_ipseckey2, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: IPSECKEY gw2 did not fail\n"); return 1;
+        }
+
+        // IPSECKEY (Type 45) - GW Type 3 (Domain Name)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_ipseckey3 = {0};
+        rec_ipseckey3.name = (char*)"example.com"; rec_ipseckey3.type_code = 45; rec_ipseckey3.rdata_count = 5;
+        rec_ipseckey3.rdata[0] = (char*)"10"; rec_ipseckey3.rdata[1] = (char*)"3"; rec_ipseckey3.rdata[2] = (char*)"2";
+        rec_ipseckey3.rdata[3] = (char*)"gw.example.com"; rec_ipseckey3.rdata[4] = huge_b64;
+        if (serialize_dns_record(packet, 20, &offset, &rec_ipseckey3, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: IPSECKEY gw3 did not fail\n"); return 1;
+        }
+
+        // AMTRELAY (Type 260) - Type 1 (IPv4)
+        compress_ctx_init_packet(&ctx);
+        offset = 0;
+        dns_record_t rec_amtrelay1 = {0};
+        rec_amtrelay1.name = (char*)"example.com"; rec_amtrelay1.type_code = 260; rec_amtrelay1.rdata_count = 4;
+        rec_amtrelay1.rdata[0] = (char*)"10"; rec_amtrelay1.rdata[1] = (char*)"0"; rec_amtrelay1.rdata[2] = (char*)"1";
+        rec_amtrelay1.rdata[3] = (char*)"192.0.2.1";
+        if (serialize_dns_record(packet, 20, &offset, &rec_amtrelay1, &ctx, NULL, 0) != -1) {
+            printf("Test 4 Failed: AMTRELAY type1 did not fail\n"); return 1;
+        }
+
         printf("Test 4 Passed: All input bound overflow tests safely rejected\n");
     }
 

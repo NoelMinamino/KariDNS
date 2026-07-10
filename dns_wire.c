@@ -740,6 +740,114 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 break;
             }
+            case 45: { // IPSECKEY
+                if (rec->rdata_count < 4) return -1;
+                uint8_t prec = atoi(rec->rdata[0]);
+                uint8_t gw_type = atoi(rec->rdata[1]);
+                uint8_t alg = atoi(rec->rdata[2]);
+                if (offset + 3 > max_res_len) return -1;
+                res[offset++] = prec; res[offset++] = gw_type; res[offset++] = alg;
+                
+                int pk_idx = 3;
+                if (gw_type == 1) { // IPv4
+                    if (rec->rdata_count < 5) return -1;
+                    if (offset + 4 > max_res_len) return -1;
+                    struct in_addr addr;
+                    if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
+                    memcpy(&res[offset], &addr, 4); offset += 4;
+                    pk_idx = 4;
+                } else if (gw_type == 2) { // IPv6
+                    if (rec->rdata_count < 5) return -1;
+                    if (offset + 16 > max_res_len) return -1;
+                    struct in6_addr addr;
+                    if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
+                    memcpy(&res[offset], &addr, 16); offset += 16;
+                    pk_idx = 4;
+                } else if (gw_type == 3) { // Domain name
+                    if (rec->rdata_count < 5) return -1;
+                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                    if (w < 0) return -1;
+                    offset += (size_t)w;
+                    pk_idx = 4;
+                } else if (gw_type != 0) {
+                    return -1;
+                }
+                
+                if (pk_idx < rec->rdata_count) {
+                    const char *b64 = rec->rdata[pk_idx];
+                    size_t b64_len = strlen(b64);
+                    size_t decoded_upper_bound = (b64_len / 4) * 3;
+                    if (offset + decoded_upper_bound > max_res_len) return -1;
+                    int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
+                    if (declen < 0) return -1;
+                    int padding = 0;
+                    if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
+                    if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
+                    offset += (declen - padding);
+                }
+                break;
+            }
+            case 260: { // AMTRELAY
+                if (rec->rdata_count < 3) return -1;
+                uint8_t prec = atoi(rec->rdata[0]);
+                uint8_t dbit = atoi(rec->rdata[1]);
+                uint8_t type = atoi(rec->rdata[2]);
+                if (offset + 2 > max_res_len) return -1;
+                res[offset++] = prec;
+                res[offset++] = (dbit << 7) | (type & 0x7F);
+                
+                if (type == 1) { // IPv4
+                    if (rec->rdata_count < 4) return -1;
+                    if (offset + 4 > max_res_len) return -1;
+                    struct in_addr addr;
+                    if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
+                    memcpy(&res[offset], &addr, 4); offset += 4;
+                } else if (type == 2) { // IPv6
+                    if (rec->rdata_count < 4) return -1;
+                    if (offset + 16 > max_res_len) return -1;
+                    struct in6_addr addr;
+                    if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
+                    memcpy(&res[offset], &addr, 16); offset += 16;
+                } else if (type == 3) { // Domain name
+                    if (rec->rdata_count < 4) return -1;
+                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                    if (w < 0) return -1;
+                    offset += (size_t)w;
+                } else if (type != 0) {
+                    return -1;
+                }
+                break;
+            }
+            case 104: { // NID
+                if (rec->rdata_count < 2) return -1;
+                if (offset + 10 > max_res_len) return -1;
+                uint16_t pref = atoi(rec->rdata[0]);
+                res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
+                uint8_t nodeid[8];
+                if (hex_decode(rec->rdata[1], nodeid, 8) != 8) return -1;
+                memcpy(&res[offset], nodeid, 8); offset += 8;
+                break;
+            }
+            case 105: { // L32
+                if (rec->rdata_count < 2) return -1;
+                if (offset + 6 > max_res_len) return -1;
+                uint16_t pref = atoi(rec->rdata[0]);
+                res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
+                struct in_addr addr;
+                if (inet_pton(AF_INET, rec->rdata[1], &addr) != 1) return -1;
+                memcpy(&res[offset], &addr, 4); offset += 4;
+                break;
+            }
+            case 106: { // L64
+                if (rec->rdata_count < 2) return -1;
+                if (offset + 10 > max_res_len) return -1;
+                uint16_t pref = atoi(rec->rdata[0]);
+                res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
+                uint8_t loc64[8];
+                if (hex_decode(rec->rdata[1], loc64, 8) != 8) return -1;
+                memcpy(&res[offset], loc64, 8); offset += 8;
+                break;
+            }
             case 44: { // SSHFP
                 if (rec->rdata_count < 3) return -1;
                 uint8_t alg = atoi(rec->rdata[0]);
