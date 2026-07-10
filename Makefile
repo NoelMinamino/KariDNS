@@ -5,7 +5,7 @@ CFLAGS = -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE
 LDFLAGS = -pthread -lcrypto
 
 TARGET = karidns
-SRCS = dns_server_core.c dns_wire.c
+SRCS = dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c
 OBJS = $(SRCS:.c=.o)
 
 DAG_TARGET = dag
@@ -25,7 +25,7 @@ FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c
 
 .PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan
 
-all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET)
+all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -35,6 +35,9 @@ $(KARICTL_TARGET): $(KARICTL_OBJS)
 
 $(DAG_TARGET): $(DAG_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz
+
+karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o
+	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o -o karicheck $(LDFLAGS) -lcrypto
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

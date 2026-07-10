@@ -530,7 +530,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
         if (offset + 16 > max_res_len) return -1;
         struct in6_addr addr; inet_pton(AF_INET6, rec->rdata[0], &addr);
         memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
-    } else if ((rec_type == 2 || rec_type == 5 || rec_type == 12) && rec->rdata_count > 0) { // NS, CNAME, PTR
+    } else if ((rec_type == 2 || rec_type == 3 || rec_type == 4 || rec_type == 5 || rec_type == 7 || rec_type == 8 || rec_type == 9 || rec_type == 12 || rec_type == 39) && rec->rdata_count > 0) { // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
         if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx) != 0 || offset > max_res_len) return -1;
     } else if (rec_type == 15 && rec->rdata_count >= 2) { // MX
         if (offset + 2 > max_res_len) return -1;
@@ -565,7 +565,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             uint32_t val = strtoul(rec->rdata[j], NULL, 10);
             res[offset++] = val >> 24; res[offset++] = (val >> 16) & 0xFF; res[offset++] = (val >> 8) & 0xFF; res[offset++] = val & 0xFF;
         }
-    } else if (rec_type == 16 && rec->rdata_count > 0) { // TXT
+    } else if ((rec_type == 16 || rec_type == 99) && rec->rdata_count > 0) { // TXT, SPF
         size_t required = 0;
         for (int j = 0; j < rec->rdata_count; j++) {
             size_t len = strlen(rec->rdata[j]);
@@ -598,6 +598,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
             if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx) != 0 || offset > max_res_len) return -1;
         }
+    } else {
+        // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード
+        // 低レイヤー関数であるためログ出力は行わず、上位層にエラー状態のみを伝播させる
+        return -1;
     }
     
     uint16_t rdlength = offset - rdlength_idx - 2;
