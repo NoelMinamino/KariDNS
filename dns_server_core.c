@@ -313,6 +313,7 @@ static _Atomic int g_bound_workers = 0;
 static int g_udp_fds[MAX_BIND_ADDRS];
 static int g_num_udp_fds = 0;
 static int (*g_ipc_fds)[2] = NULL;
+char g_startup_cwd[PATH_MAX] = "";
 static int g_num_ipc = 0;
 static int g_notify_ipc[2];
 static int g_control_sock = -1;
@@ -876,12 +877,21 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 
   char *root_ttl = NULL;
   char *visited_paths[16];
-  char *root_path = realpath(file, NULL);
-  if (!root_path) root_path = strdup(file);
+  
+  char abs_file[PATH_MAX];
+  if (file[0] != '/' && g_startup_cwd[0] != '\0') {
+      snprintf(abs_file, sizeof(abs_file), "%s/%s", g_startup_cwd, file);
+  } else {
+      snprintf(abs_file, sizeof(abs_file), "%s", file);
+  }
+  
+  char *root_path = realpath(abs_file, NULL);
+  if (!root_path) root_path = strdup(abs_file);
 
+  parse_error_t parse_err = {0};
   parse_context_t ctx = {0};
   ctx.default_origin = entry->domain;
-  ctx.base_dir = get_base_dir(file);
+  ctx.base_dir = get_base_dir(root_path);
   ctx.is_standalone_mode = false;
   ctx.load_file_cb = server_load_file_cb;
   ctx.shared_ttl_io = &root_ttl;
@@ -889,6 +899,7 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   ctx.visited_cap = 16;
   ctx.visited_count = 1;
   ctx.visited_paths[0] = root_path;
+  ctx.err_out = &parse_err;
 
   int count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   free((void*)ctx.base_dir);
@@ -896,7 +907,14 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 
   if (count < 0) {
       pthread_mutex_unlock(&entry->writer_lock);
-      syslog(LOG_ERR, "[Zone] Parse error reloading zone '%s' from '%s'", entry->domain, file);
+      if (parse_err.error_message) {
+          syslog(LOG_ERR, "[Zone] Parse error reloading zone '%s' from '%s': %s (offset=%zu, file=%s)",
+                 entry->domain, file, parse_err.error_message,
+                 parse_err.error_offset,
+                 parse_err.file_path ? parse_err.file_path : file);
+      } else {
+          syslog(LOG_ERR, "[Zone] Parse error reloading zone '%s' from '%s'", entry->domain, file);
+      }
       return RELOAD_ERR_PARSE;
   }
 
@@ -3916,6 +3934,9 @@ int main(int argc, char **argv) {
   if (!config_file) {
     syslog(LOG_ERR, "Usage: %s [-f] <config_file>", argv[0]);
     return 1;
+  }
+  if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
+    g_startup_cwd[0] = '\0';
   }
   signal(SIGPIPE, SIG_IGN);
   g_cwd_fd = open(".", O_DIRECTORY | O_CLOEXEC | O_RDONLY);

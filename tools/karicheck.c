@@ -133,7 +133,20 @@ static void print_error_context(const char *root_file_path, const char *root_buf
     fprintf(stderr, "\033[0m\n\n");
 }
 
-static int check_zone(const char *domain, const char *file_path, bool is_standalone) {
+static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone) {
+    // Normalize domain to FQDN: append trailing dot if missing.
+    // Without this, "example.com" wouldn't match records expanded to "example.com."
+    char domain_buf[256];
+    size_t dlen = strlen(domain_raw);
+    if (dlen > 0 && domain_raw[dlen - 1] != '.' && dlen + 1 < sizeof(domain_buf)) {
+        memcpy(domain_buf, domain_raw, dlen);
+        domain_buf[dlen] = '.';
+        domain_buf[dlen + 1] = '\0';
+    } else {
+        snprintf(domain_buf, sizeof(domain_buf), "%s", domain_raw);
+    }
+    const char *domain = domain_buf;
+
     if (is_standalone) {
         if (file_path[0] == '/' || strstr(file_path, "../")) {
             fprintf(stderr, "[WARNING] In standalone mode, absolute paths or '../' in $INCLUDE are tested using host filesystem, but will be rejected by KariDNS ECAPMODE sandbox!\n");
@@ -299,9 +312,20 @@ int main(int argc, char **argv) {
             memset(&cfg, 0, sizeof(cfg));
             if (check_config(cfg_path, &cfg) != 0) return 1;
 
+            // Normalize domain for comparison (config parser adds trailing dot)
+            char norm_domain[256];
+            size_t nd_len = strlen(domain);
+            if (nd_len > 0 && domain[nd_len - 1] != '.' && nd_len + 1 < sizeof(norm_domain)) {
+                memcpy(norm_domain, domain, nd_len);
+                norm_domain[nd_len] = '.';
+                norm_domain[nd_len + 1] = '\0';
+            } else {
+                snprintf(norm_domain, sizeof(norm_domain), "%s", domain);
+            }
+
             zone_config_t *z = cfg.zones;
             while (z) {
-                if (strcasecmp(z->domain, domain) == 0) {
+                if (strcasecmp(z->domain, norm_domain) == 0) {
                     return check_zone(z->domain, z->file, false);
                 }
                 z = z->next;
