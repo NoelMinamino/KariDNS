@@ -100,3 +100,19 @@ $(TSAN_TARGET): $(TSAN_OBJS)
 .SUFFIXES: .tsan.o .c
 .c.tsan.o:
 	$(CC) $(TSAN_CFLAGS) -c $< -o $@
+
+# --- ASan版ツール群 ---
+KARICHECK_ASAN_SRCS = tools/karicheck.c dns_config_parser.c dns_zone_parser.c dns_wire.c dns_utils.c
+karicheck-asan: $(KARICHECK_ASAN_SRCS)
+	$(CC) $(ASAN_CFLAGS) $(KARICHECK_ASAN_SRCS) -o $@ $(LDFLAGS)
+
+DAG_ASAN_SRCS = tools/dag.c dns_wire.c dns_utils.c
+dag-asan: $(DAG_ASAN_SRCS)
+	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lz
+
+KARICTL_ASAN_SRCS = tools/karictl.c
+karictl-asan: $(KARICTL_ASAN_SRCS)
+	$(CC) $(ASAN_CFLAGS) $(KARICTL_ASAN_SRCS) -o $@ -lcrypto -fsanitize=address,undefined
+
+.PHONY: tools-asan
+tools-asan: karicheck-asan dag-asan karictl-asan

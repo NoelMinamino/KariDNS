@@ -876,6 +876,9 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 
   char *root_ttl = NULL;
   char *visited_paths[16];
+  char *root_path = realpath(file, NULL);
+  if (!root_path) root_path = strdup(file);
+
   parse_context_t ctx = {0};
   ctx.default_origin = entry->domain;
   ctx.base_dir = get_base_dir(file);
@@ -884,10 +887,12 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   ctx.shared_ttl_io = &root_ttl;
   ctx.visited_paths = visited_paths;
   ctx.visited_cap = 16;
-  ctx.visited_count = 0;
+  ctx.visited_count = 1;
+  ctx.visited_paths[0] = root_path;
 
   int count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   free((void*)ctx.base_dir);
+  free(root_path);
 
   if (count < 0) {
       pthread_mutex_unlock(&entry->writer_lock);

@@ -162,23 +162,29 @@ static int check_zone(const char *domain, const char *file_path, bool is_standal
     parse_error_t err = {0};
     char *root_ttl = NULL;
     char *visited_paths[16];
+    char *root_path = realpath(file_path, NULL);
+    if (!root_path) root_path = strdup(file_path);
 
-    parse_context_t ctx = {0};
-    ctx.base_dir = get_base_dir(file_path);
-    ctx.default_origin = domain;
-    ctx.is_standalone_mode = is_standalone;
-    ctx.err_out = &err;
-    ctx.load_file_cb = karicheck_load_file_cb;
-    ctx.shared_ttl_io = &root_ttl;
-    ctx.visited_paths = visited_paths;
-    ctx.visited_cap = 16;
-    ctx.visited_count = 0;
+    parse_context_t ctx = {
+        .base_dir = get_base_dir(file_path),
+        .default_origin = domain,
+        .is_standalone_mode = is_standalone,
+        .err_out = &err,
+        .current_depth = 0,
+        .visited_paths = visited_paths,
+        .visited_count = 1,
+        .visited_cap = 16,
+        .load_file_cb = karicheck_load_file_cb,
+        .shared_ttl_io = &root_ttl
+    };
+    ctx.visited_paths[0] = root_path;
 
     int res = parse_zone_fast(mutable_buf, strlen(mutable_buf), &arena, &ctx);
     if (res < 0) {
         print_error_context(file_path, buf, &err, &arena);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
+        free(root_path);
         return 1;
     }
 
@@ -186,6 +192,7 @@ static int check_zone(const char *domain, const char *file_path, bool is_standal
         fprintf(stderr, "[ERROR] No records found in zone '%s' (%s)\n", domain, file_path);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
+        free(root_path);
         return 1;
     }
 
@@ -207,12 +214,14 @@ static int check_zone(const char *domain, const char *file_path, bool is_standal
         fprintf(stderr, "[ERROR] No SOA record found in zone '%s' (%s) at origin\n", domain, file_path);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
+        free(root_path);
         return 1;
     }
 
     printf("[OK] Zone '%s' is valid.\n", domain);
     free((void*)ctx.base_dir);
     zone_arena_destroy(&arena);
+    free(root_path);
     return 0;
 }
 

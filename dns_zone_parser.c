@@ -179,7 +179,11 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
         if (strcmp(ctx->visited_paths[i], resolved) == 0) {
             if (ctx->err_out) {
                 ctx->err_out->error_message = "Circular $INCLUDE detected";
-                ctx->err_out->file_path = resolved;
+                ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
+                ctx->err_out->token_length = strlen(fields[1]);
+                if (ctx->current_depth > 0) {
+                    ctx->err_out->file_path = ctx->visited_paths[ctx->visited_count - 1];
+                }
             }
             free(resolved);
             return -1;
@@ -195,7 +199,11 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     if (!file_content) {
         if (ctx->err_out) {
             ctx->err_out->error_message = "$INCLUDE file could not be read";
-            ctx->err_out->file_path = resolved;
+            ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
+            ctx->err_out->token_length = strlen(fields[1]);
+            if (ctx->current_depth > 0) {
+                ctx->err_out->file_path = ctx->visited_paths[ctx->visited_count - 1];
+            }
         }
         free(resolved);
         return -1;
