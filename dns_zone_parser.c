@@ -245,6 +245,217 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     return rc;
 }
 
+static dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf) {
+    if (arena->count >= arena->records_cap) {
+        size_t new_cap = arena->records_cap == 0 ? 16 : arena->records_cap * 2;
+        dns_record_t *new_records = realloc(arena->records, new_cap * sizeof(dns_record_t));
+        if (!new_records) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "Out of memory";
+                ctx->err_out->error_offset = (size_t)(err_pos - buf);
+                ctx->err_out->token_length = 1;
+            }
+            return NULL;
+        }
+        memset(new_records + arena->records_cap, 0, (new_cap - arena->records_cap) * sizeof(dns_record_t));
+        arena->records = new_records;
+        arena->records_cap = new_cap;
+    }
+    return &arena->records[arena->count++];
+}
+
+#define MAX_GENERATE_COUNT 100000
+
+typedef struct { uint64_t start, stop, step; } generate_range_t;
+
+static int parse_generate_range(const char *range_str, generate_range_t *out, parse_error_t *err_out) {
+    char *dash = strchr(range_str, '-');
+    if (!dash) {
+        if (err_out) err_out->error_message = "$GENERATE range must be start-stop[/step]";
+        return -1;
+    }
+    char *endptr;
+    uint64_t start = strtoull(range_str, &endptr, 10);
+    if (endptr != dash) {
+        if (err_out) err_out->error_message = "$GENERATE invalid start value";
+        return -1;
+    }
+    uint64_t stop = strtoull(dash + 1, &endptr, 10);
+    uint64_t step = 1;
+    if (*endptr == '/') {
+        step = strtoull(endptr + 1, &endptr, 10);
+    }
+    if (*endptr != '\0') {
+        if (err_out) err_out->error_message = "$GENERATE invalid range syntax";
+        return -1;
+    }
+
+    if (stop < start) {
+        if (err_out) err_out->error_message = "$GENERATE range: stop must be >= start";
+        return -1;
+    }
+    if (step == 0) {
+        if (err_out) err_out->error_message = "$GENERATE step must not be 0";
+        return -1;
+    }
+    if (start > 0xFFFFFFFFULL || stop > 0xFFFFFFFFULL) {
+        if (err_out) err_out->error_message = "$GENERATE range: values must fit in 32-bit";
+        return -1;
+    }
+
+    uint64_t count = (stop - start) / step + 1;
+    if (count > MAX_GENERATE_COUNT) {
+        if (err_out) err_out->error_message = "$GENERATE range exceeds maximum record count";
+        return -1;
+    }
+
+    out->start = start; out->stop = stop; out->step = step;
+    return 0;
+}
+
+static size_t expand_generate_template(const char *tmpl, uint64_t value, char *out, size_t out_cap, parse_error_t *err_out) {
+    size_t out_len = 0;
+    for (const char *p = tmpl; *p; ) {
+        if (*p == '$') {
+            p++;
+            if (*p == '$') {
+                if (out_len + 1 > out_cap) return (size_t)-1;
+                out[out_len++] = '$';
+                p++;
+                continue;
+            }
+            long offset = 0;
+            int width = 0;
+            char base = 'd';
+            if (*p == '{') {
+                char *end;
+                offset = strtol(p + 1, &end, 10);
+                p = end;
+                if (*p == ',') {
+                    width = (int)strtol(p + 1, &end, 10);
+                    p = end;
+                    if (width < 0 || width > 64) {
+                        if (err_out) err_out->error_message = "$GENERATE width out of range (0-64)";
+                        return (size_t)-1;
+                    }
+                    if (*p == ',') {
+                        base = *(p + 1);
+                        p += 2;
+                    }
+                }
+                if (*p != '}') {
+                    if (err_out) err_out->error_message = "$GENERATE malformed ${...} substitution";
+                    return (size_t)-1;
+                }
+                p++;
+            }
+            if (base != 'd' && base != 'o' && base != 'x' && base != 'X') {
+                if (err_out) err_out->error_message = "$GENERATE base must be one of d,o,x,X";
+                return (size_t)-1;
+            }
+
+            int64_t v = (int64_t)value + offset;
+            char numbuf[32];
+            const char *fmt = (base == 'd') ? "%0*lld" : (base == 'o') ? "%0*llo" : (base == 'x') ? "%0*llx" : "%0*llX";
+            int n = snprintf(numbuf, sizeof(numbuf), fmt, width, (long long)v);
+            if (n < 0 || (size_t)n >= sizeof(numbuf)) return (size_t)-1;
+            if (out_len + (size_t)n > out_cap) return (size_t)-1;
+            memcpy(out + out_len, numbuf, (size_t)n);
+            out_len += (size_t)n;
+        } else {
+            if (out_len + 1 > out_cap) return (size_t)-1;
+            out[out_len++] = *p++;
+        }
+    }
+    if (out_len + 1 > out_cap) return (size_t)-1;
+    out[out_len] = '\0';
+    return out_len;
+}
+
+static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
+                             parse_context_t *ctx, const char *origin,
+                             const char *default_ttl, const char *cur_buf) {
+    if (field_idx < 5) {
+        if (ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
+        return -1;
+    }
+    parse_error_t local_err = {0};
+    generate_range_t range;
+    if (parse_generate_range(fields[1], &range, &local_err) != 0) {
+        if (ctx->err_out) {
+            ctx->err_out->error_message = local_err.error_message;
+            ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
+            ctx->err_out->token_length = strlen(fields[1]);
+        }
+        return -1;
+    }
+
+    const char *lhs_tmpl = fields[2];
+    const char *type_str = fields[3];
+    const char *rhs_tmpl = fields[4];
+    const char *class_str = (field_idx > 5) ? fields[5] : "IN";
+
+    uint16_t type_code = get_type_code(type_str);
+    if (type_code != 1 && type_code != 28 && type_code != 2 &&
+        type_code != 5 && type_code != 12 && type_code != 39 &&
+        type_code != 16) {
+        if (ctx->err_out) {
+            ctx->err_out->error_message = "$GENERATE does not support this record type";
+            ctx->err_out->error_offset = (size_t)(fields[3] - cur_buf);
+            ctx->err_out->token_length = strlen(fields[3]);
+        }
+        return -1;
+    }
+
+    char name_buf[512], rdata_buf[512];
+    for (uint64_t v = range.start; v <= range.stop; v += range.step) {
+        size_t name_len = expand_generate_template(lhs_tmpl, v, name_buf, sizeof(name_buf), &local_err);
+        if (name_len == (size_t)-1) {
+            if (ctx->err_out) {
+                ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE lhs expansion failed";
+                ctx->err_out->error_offset = (size_t)(fields[2] - cur_buf);
+                ctx->err_out->token_length = strlen(fields[2]);
+            }
+            return -1;
+        }
+        size_t rdata_len = expand_generate_template(rhs_tmpl, v, rdata_buf, sizeof(rdata_buf), &local_err);
+        if (rdata_len == (size_t)-1) {
+            if (ctx->err_out) {
+                ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE rhs expansion failed";
+                ctx->err_out->error_offset = (size_t)(fields[4] - cur_buf);
+                ctx->err_out->token_length = strlen(fields[4]);
+            }
+            return -1;
+        }
+
+        dns_record_t *rec = arena_alloc_record(arena, ctx, fields[0], cur_buf);
+        if (!rec) return -1;
+
+        char *name_copy = arena_alloc(arena, name_len + 1);
+        if (!name_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
+        memcpy(name_copy, name_buf, name_len + 1);
+
+        char *rdata_copy = arena_alloc(arena, rdata_len + 1);
+        if (!rdata_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
+        memcpy(rdata_copy, rdata_buf, rdata_len + 1);
+
+        rec->name = expand_domain_name(name_copy, origin, arena);
+        rec->ttl = (char *)default_ttl;
+        rec->class_str = (char *)class_str;
+        rec->type = (char *)type_str;
+        rec->type_code = type_code;
+        rec->rdata_count = 1;
+        rec->rdata[0] = rdata_copy;
+
+        if (type_code == 2 || type_code == 5 || type_code == 12 || type_code == 39) {
+            rec->rdata[0] = expand_domain_name(rec->rdata[0], origin, arena);
+        }
+
+        if (v == UINT64_MAX) break;
+    }
+    return 0;
+}
+
 int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx) {
   char *prev_owner = NULL;
   char *origin = ctx ? (char *)ctx->default_origin : NULL;
@@ -373,13 +584,20 @@ PROCESS_RECORD:
       goto STATE_START_LINE;
     goto DONE;
   }
-  if (fields[0][0] == '$' && strcasecmp(fields[0], "$INCLUDE") == 0) {
-    if (process_include(fields, field_idx, arena, ctx, origin_io, buf) < 0)
-        return -1;
-    if (p < end)
-        goto STATE_START_LINE;
-    goto DONE;
-  }
+    if (fields[0][0] == '$' && strcasecmp(fields[0], "$INCLUDE") == 0) {
+        if (process_include(fields, field_idx, arena, ctx, origin_io, buf) != 0)
+            return -1;
+        if (p < end)
+            goto STATE_START_LINE;
+        goto DONE;
+    }
+    if (fields[0][0] == '$' && strcasecmp(fields[0], "$GENERATE") == 0) {
+        if (process_generate(fields, field_idx, arena, ctx, *origin_io, *default_ttl_str_io, buf) != 0)
+            return -1;
+        if (p < end)
+            goto STATE_START_LINE;
+        goto DONE;
+    }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$TTL") == 0) {
     if (field_idx > 1)
       *default_ttl_str_io = fields[1];
@@ -387,24 +605,8 @@ PROCESS_RECORD:
       goto STATE_START_LINE;
     goto DONE;
   }
-  if (arena->count >= arena->records_cap) {
-    size_t new_cap = arena->records_cap == 0 ? 16 : arena->records_cap * 2;
-    dns_record_t *new_records =
-        realloc(arena->records, new_cap * sizeof(dns_record_t));
-    if (!new_records) {
-      if (ctx && ctx->err_out) {
-        ctx->err_out->error_message = "Out of memory";
-        ctx->err_out->error_offset = p - buf;
-        ctx->err_out->token_length = 1;
-      }
-      return -1;
-    }
-    memset(new_records + arena->records_cap, 0,
-           (new_cap - arena->records_cap) * sizeof(dns_record_t));
-    arena->records = new_records;
-    arena->records_cap = new_cap;
-  }
-  dns_record_t *rec = &arena->records[arena->count++];
+    dns_record_t *rec = arena_alloc_record(arena, ctx, p, buf);
+    if (!rec) return -1;
   rec->name = expand_domain_name(fields[0], *origin_io, arena);
   *prev_owner_io = rec->name;
   rec->ttl = *default_ttl_str_io;
