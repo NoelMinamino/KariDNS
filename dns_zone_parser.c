@@ -391,9 +391,36 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     }
 
     const char *lhs_tmpl = fields[2];
-    const char *type_str = fields[3];
-    const char *rhs_tmpl = fields[4];
-    const char *class_str = (field_idx > 5) ? fields[5] : "IN";
+    const char *type_str = NULL;
+    const char *rhs_tmpl = NULL;
+    const char *class_str = "IN";
+    const char *ttl_str = default_ttl;
+
+    int i = 3;
+    while (i < field_idx) {
+        char first_char = fields[i][0];
+        if (first_char >= '0' && first_char <= '9') {
+            ttl_str = fields[i];
+        } else if (strcasecmp(fields[i], "IN") == 0 || strcasecmp(fields[i], "CH") == 0) {
+            class_str = fields[i];
+        } else {
+            type_str = fields[i];
+            if (i + 1 < field_idx) {
+                rhs_tmpl = fields[i + 1];
+            }
+            break;
+        }
+        i++;
+    }
+
+    if (!type_str || !rhs_tmpl) {
+        if (ctx->err_out) {
+            ctx->err_out->error_message = "$GENERATE requires range lhs [ttl] [class] type rhs";
+            ctx->err_out->error_offset = (size_t)(fields[0] - cur_buf);
+            ctx->err_out->token_length = strlen(fields[0]);
+        }
+        return -1;
+    }
 
     uint16_t type_code = get_type_code(type_str);
     if (type_code != 1 && type_code != 28 && type_code != 2 &&
@@ -440,7 +467,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         memcpy(rdata_copy, rdata_buf, rdata_len + 1);
 
         rec->name = expand_domain_name(name_copy, origin, arena);
-        rec->ttl = (char *)default_ttl;
+        rec->ttl = (char *)ttl_str;
         rec->class_str = (char *)class_str;
         rec->type = (char *)type_str;
         rec->type_code = type_code;
@@ -585,7 +612,7 @@ PROCESS_RECORD:
     goto DONE;
   }
     if (fields[0][0] == '$' && strcasecmp(fields[0], "$INCLUDE") == 0) {
-        if (process_include(fields, field_idx, arena, ctx, origin_io, buf) != 0)
+        if (process_include(fields, field_idx, arena, ctx, origin_io, buf) < 0)
             return -1;
         if (p < end)
             goto STATE_START_LINE;
