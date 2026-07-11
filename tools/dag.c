@@ -1215,6 +1215,7 @@ int main(int argc, char **argv) {
 
     int port = 53;
     bool use_tcp = false;
+    bool force_udp = false;
     bool use_ldnsz = false;
     bool short_mode = false;
     bool norecurse = false;
@@ -1241,6 +1242,8 @@ int main(int argc, char **argv) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--tcp") == 0 || strcmp(argv[i], "+tcp") == 0) {
             use_tcp = true;
+        } else if (strcmp(argv[i], "+udp") == 0) {
+            force_udp = true;
         } else if (strcmp(argv[i], "+ldnsz") == 0) {
             use_ldnsz = true;
         } else if (strcmp(argv[i], "+short") == 0) {
@@ -1329,6 +1332,11 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "warning: unrecognized argument '%s', ignoring\n", argv[i]);
         }
+    }
+
+    // AXFRの場合は自動的にTCPモードに昇格（+udpが明示されていない場合）
+    if (strcasecmp(qtype_s, "AXFR") == 0 && !force_udp) {
+        use_tcp = true;
     }
 
     for (int i = 0; i < g_break_count; i++) {
