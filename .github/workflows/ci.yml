@@ -45,18 +45,9 @@ jobs:
             ./dag google.com TXT @8.8.8.8 +tcp
             echo "::endgroup::"
 
-            echo "::group::🔍 [Smoke Test] Run Fuzzers (60 seconds each)"
-            echo "Running fuzz_dns_wire for 60 seconds..."
-            ./tests/fuzz/fuzz_dns_wire -max_total_time=60
-
-            echo "Running fuzz_dns_server_core for 60 seconds..."
-            ./tests/fuzz/fuzz_dns_server_core -max_total_time=60
-
-            echo "Running fuzz_zone_parser for 60 seconds..."
-            ./tests/fuzz/fuzz_zone_parser tests/fuzz/corpus/ -max_total_time=60
-
-            echo "Running fuzz_conf_parser for 60 seconds..."
-            ./tests/fuzz/fuzz_conf_parser tests/fuzz/corpus/ -max_total_time=60
+            echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
+            # ASan/TSan/UBSanテスト、ファジングテストをスクリプトで一括実行
+            ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"
 
             echo ""
