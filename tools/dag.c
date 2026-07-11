@@ -1044,7 +1044,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     }
 
     if (qo->want_tsig) {
-        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, NULL, 0) != 0) {
+        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, NULL, 0, false) != 0) {
             fprintf(stderr, "Error: tsig_sign_packet failed\n");
             return 1;
         }
