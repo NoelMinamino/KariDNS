@@ -337,7 +337,6 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
     if (w < 0) { free(pre_mac); return -1; }
     offset += (size_t)w;
-    pre_mac[offset++] = 0; pre_mac[offset++] = 250;
     pre_mac[offset++] = 0; pre_mac[offset++] = 255;
     pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0;
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
@@ -428,7 +427,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     }
     size_t last_rr_offset = 0;
     for (int i = 0; i < ancount + nscount + arcount; i++) {
-        if (i == qdcount + ancount + nscount + arcount - 1) last_rr_offset = offset;
+        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
         if (offset >= packet_len) return -1;
         int jump_count = 0;
         while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) {
@@ -487,7 +486,6 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
     if (w3 < 0) { free(pre_mac); return -1; }
     p_offset += (size_t)w3;
-    pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 250;
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
