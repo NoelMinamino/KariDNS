@@ -1,5 +1,6 @@
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
+#include "dns_utils.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -675,9 +676,7 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
     for (int p = 0; p < a->data_pool_count; p++) {
       if (a->data_pools[p]) free(a->data_pools[p]);
     }
-    for (int p = 0; p < a->file_buf_count; p++) {
-      if (a->file_bufs[p]) free(a->file_bufs[p]);
-    }
+    zone_arena_free_include_buffers(a);
     if (a->records) free(a->records);
     if (a->hash_table) free(a->hash_table);
   }
@@ -841,43 +840,81 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
   pthread_mutex_unlock(&entry->ixfr_history.lock);
 }
 
-static void reload_master_zone(zone_db_entry_t *entry, const char *file) {
+
+static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path) {
+    (void)ctx;
+    return read_entire_file(rel_path);
+}
+
+typedef enum {
+    RELOAD_OK = 0,
+    RELOAD_ERR_FILE_READ = -1,
+    RELOAD_ERR_PARSE = -2,
+    RELOAD_ERR_MISSING_SOA = -3,
+} reload_result_t;
+
+static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *file) {
   char *buf = read_entire_file(file);
   if (!buf) {
     syslog(LOG_ERR, "[Zone] Failed to read file '%s' for zone '%s'.", file, entry->domain);
-    return;
+    return RELOAD_ERR_FILE_READ;
   }
   pthread_mutex_lock(&entry->writer_lock);
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
   wait_for_readers(z_standby);
-  for (int i = 0; i < z_standby->file_buf_count; i++) free(z_standby->file_bufs[i]);
+
+  zone_arena_free_include_buffers(z_standby);
   z_standby->count = 0;
   z_standby->data_pool_count = 0;
   z_standby->current_pool_cap = 0;
   z_standby->current_pool_idx = 0;
   z_standby->file_buf_count = 0;
-  z_standby->file_bufs[z_standby->file_buf_count++] = buf;
+  z_standby->file_bufs[z_standby->file_buf_count] = buf;
+  z_standby->file_paths[z_standby->file_buf_count] = strdup(file);
+  z_standby->file_buf_count++;
+
+  char *root_ttl = NULL;
+  char *visited_paths[16];
   parse_context_t ctx = {0};
   ctx.default_origin = entry->domain;
+  ctx.base_dir = get_base_dir(file);
+  ctx.is_standalone_mode = false;
+  ctx.load_file_cb = server_load_file_cb;
+  ctx.shared_ttl_io = &root_ttl;
+  ctx.visited_paths = visited_paths;
+  ctx.visited_cap = 16;
+  ctx.visited_count = 0;
+
   int count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
-  if (count >= 0) {
-    build_zone_index(z_standby);
-    bool has_soa = false;
-    uint32_t hash = calc_fnv1a_str(entry->domain);
-    size_t idx = hash & (z_standby->hash_size - 1);
-    for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
-      if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, entry->domain) == 0) {
-        has_soa = true;
-        break;
-      }
-    }
-    if (has_soa) {
-      compute_ixfr_diff(entry, z_active, z_standby);
-      atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
-    }
+  free((void*)ctx.base_dir);
+
+  if (count < 0) {
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Parse error reloading zone '%s' from '%s'", entry->domain, file);
+      return RELOAD_ERR_PARSE;
   }
+
+  build_zone_index(z_standby);
+  bool has_soa = false;
+  uint32_t hash = calc_fnv1a_str(entry->domain);
+  size_t idx = hash & (z_standby->hash_size - 1);
+  for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
+      if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, entry->domain) == 0) {
+          has_soa = true; break;
+      }
+  }
+  if (!has_soa) {
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Missing SOA reloading zone '%s' from '%s'", entry->domain, file);
+      return RELOAD_ERR_MISSING_SOA;
+  }
+
+  compute_ixfr_diff(entry, z_active, z_standby);
+  atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
   pthread_mutex_unlock(&entry->writer_lock);
+  syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
+  return RELOAD_OK;
 }
 
 void rebuild_zone_db_from_config(server_config_t *config) {
@@ -3379,49 +3416,21 @@ void *control_thread_func(void *arg) {
                   zone_db_entry_t *entry = snapshot_get_zone(snap, zcfg->domain);
                   if (entry) {
                     if (zcfg->type && (strcmp(zcfg->type, "master") == 0 || strcmp(zcfg->type, "primary") == 0)) {
-                      char *buf = read_entire_file(zcfg->file);
-                      if (buf) {
-                        pthread_mutex_lock(&entry->writer_lock);
-                        zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-                        zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-                        wait_for_readers(z_standby);
-                        for (int i = 0; i < z_standby->file_buf_count; i++) free(z_standby->file_bufs[i]);
-                        z_standby->count = 0;
-                        z_standby->data_pool_count = 0;
-                        z_standby->current_pool_cap = 0;
-                        z_standby->current_pool_idx = 0;
-                        z_standby->file_buf_count = 0;
-                        z_standby->file_bufs[z_standby->file_buf_count++] = buf;
-                        parse_context_t ctx = {0};
-                        ctx.default_origin = zcfg->domain;
-                        int count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
-                        if (count >= 0) {
-                          build_zone_index(z_standby);
-                          bool has_soa = false;
-                          uint32_t hash = calc_fnv1a_str(zcfg->domain);
-                          size_t idx = hash & (z_standby->hash_size - 1);
-                          for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
-                            if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, zcfg->domain) == 0) {
-                              has_soa = true; break;
-                            }
-                          }
-                          if (has_soa) {
-                            compute_ixfr_diff(entry, z_active, z_standby);
-                            atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
-                            syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", zcfg->domain);
-                            send(cfd, "OK reloaded\n", 12, 0);
-                          } else {
-                            syslog(LOG_ERR, "[Control] Targeted reload failed for %s: missing SOA", zcfg->domain);
-                            send(cfd, "ERROR missing SOA\n", 18, 0);
-                          }
-                        } else {
-                          syslog(LOG_ERR, "[Control] Targeted reload failed for %s: parse error", zcfg->domain);
-                          send(cfd, "ERROR parse error\n", 18, 0);
-                        }
-                        pthread_mutex_unlock(&entry->writer_lock);
-                      } else {
-                        syslog(LOG_ERR, "[Control] Targeted reload failed for %s: file read error", zcfg->domain);
-                        send(cfd, "ERROR file read error\n", 22, 0);
+                      reload_result_t rr = reload_master_zone(entry, zcfg->file);
+                      switch (rr) {
+                          case RELOAD_OK:
+                              syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", zcfg->domain);
+                              send(cfd, "OK reloaded\n", 12, 0);
+                              break;
+                          case RELOAD_ERR_FILE_READ:
+                              send(cfd, "ERROR file read error\n", 22, 0);
+                              break;
+                          case RELOAD_ERR_PARSE:
+                              send(cfd, "ERROR parse error\n", 18, 0);
+                              break;
+                          case RELOAD_ERR_MISSING_SOA:
+                              send(cfd, "ERROR missing SOA\n", 18, 0);
+                              break;
                       }
                     } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
                       syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", zcfg->domain);
