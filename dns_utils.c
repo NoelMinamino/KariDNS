@@ -213,3 +213,14 @@ uint16_t get_type_code(const char *type_str) {
   }
   return 0;
 }
+
+char *get_base_dir(const char *path) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) return strdup(".");
+    size_t len = slash - path;
+    if (len == 0) len = 1; // "/"
+    char *base = malloc(len + 1);
+    memcpy(base, path, len);
+    base[len] = '\0';
+    return base;
+}

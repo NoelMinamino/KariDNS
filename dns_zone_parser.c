@@ -94,13 +94,156 @@ static char *expand_domain_name(char *name, const char *origin,
   return fqdn;
 }
 
+
+#include <limits.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static char *resolve_include_path(const char *base_dir, const char *rel_path,
+                                   bool is_standalone_mode, parse_error_t *err_out) {
+    if (rel_path[0] == '\0') return NULL;
+
+    char raw[4096];
+    if (rel_path[0] == '/') {
+        // 絶対パス: standaloneモード以外では常に拒否する
+        if (!is_standalone_mode) {
+            if (err_out) err_out->error_message = "Absolute path in $INCLUDE is not allowed";
+            return NULL;
+        }
+        snprintf(raw, sizeof(raw), "%s", rel_path);
+    } else {
+        snprintf(raw, sizeof(raw), "%s/%s", base_dir, rel_path);
+    }
+
+    char resolved[PATH_MAX];
+    if (!realpath(raw, resolved)) {
+        if (err_out) err_out->error_message = "$INCLUDE file not found";
+        return NULL;
+    }
+
+    if (!is_standalone_mode) {
+        // base_dir 自体も正規化した上で、resolved が base_dir 配下にあるかを確認する
+        char base_resolved[PATH_MAX];
+        if (!realpath(base_dir, base_resolved)) {
+            if (err_out) err_out->error_message = "Invalid base directory";
+            return NULL;
+        }
+        size_t blen = strlen(base_resolved);
+        if (strncmp(resolved, base_resolved, blen) != 0 ||
+            (resolved[blen] != '/' && resolved[blen] != '\0')) {
+            if (err_out) err_out->error_message = "$INCLUDE path escapes zone directory";
+            return NULL;
+        }
+    }
+    return strdup(resolved);
+}
+
+#define MAX_INCLUDE_DEPTH 16
+
+static int process_include(char **fields, int field_idx, zone_arena_t *arena,
+                            parse_context_t *ctx, char **origin_io, char *cur_buf) {
+    if (!ctx || !ctx->shared_ttl_io) {
+        if (ctx && ctx->err_out) {
+            ctx->err_out->error_message = "$INCLUDE requires shared_ttl_io to be configured by the caller";
+        }
+        return -1;
+    }
+    if (field_idx < 2) {
+        if (ctx->err_out) ctx->err_out->error_message = "$INCLUDE requires a filename";
+        return -1;
+    }
+    if (ctx->current_depth >= MAX_INCLUDE_DEPTH) {
+        if (ctx->err_out) ctx->err_out->error_message = "$INCLUDE nesting too deep";
+        return -1;
+    }
+    if (arena->file_buf_count >= 32) {
+        if (ctx->err_out) ctx->err_out->error_message = "Too many $INCLUDE files (max 32)";
+        return -1;
+    }
+
+    parse_error_t path_err = {0};
+    char *resolved = resolve_include_path(ctx->base_dir, fields[1], ctx->is_standalone_mode, &path_err);
+    if (!resolved) {
+        if (ctx->err_out) {
+            ctx->err_out->error_message = path_err.error_message;
+            ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
+            ctx->err_out->token_length = strlen(fields[1]);
+        }
+        return -1;
+    }
+
+    // --- 循環検出: 祖先スタックの中に同じ解決済みパスがあれば拒否 ---
+    for (int i = 0; i < ctx->visited_count; i++) {
+        if (strcmp(ctx->visited_paths[i], resolved) == 0) {
+            if (ctx->err_out) {
+                ctx->err_out->error_message = "Circular $INCLUDE detected";
+                ctx->err_out->file_path = resolved;
+            }
+            free(resolved);
+            return -1;
+        }
+    }
+    if (ctx->visited_count >= ctx->visited_cap) {
+        if (ctx->err_out) ctx->err_out->error_message = "Ancestor path stack exhausted";
+        free(resolved);
+        return -1;
+    }
+
+    char *file_content = ctx->load_file_cb ? ctx->load_file_cb(ctx, resolved) : NULL;
+    if (!file_content) {
+        if (ctx->err_out) {
+            ctx->err_out->error_message = "$INCLUDE file could not be read";
+            ctx->err_out->file_path = resolved;
+        }
+        free(resolved);
+        return -1;
+    }
+
+    char *display_copy = strdup(file_content);
+    if (!display_copy) {
+        free(file_content);
+        if (ctx->err_out) ctx->err_out->error_message = "Out of memory";
+        free(resolved);
+        return -1;
+    }
+
+    arena->file_bufs[arena->file_buf_count] = file_content;
+    arena->display_bufs[arena->file_buf_count] = display_copy;
+    arena->file_paths[arena->file_buf_count] = resolved;
+    arena->file_buf_count++;
+
+    char *saved_origin = *origin_io;
+    char *child_origin = (field_idx > 2) ? fields[2] : *origin_io;
+
+    ctx->visited_paths[ctx->visited_count++] = resolved;
+
+    parse_context_t child_ctx = *ctx; 
+    child_ctx.default_origin = child_origin;
+    child_ctx.current_depth = ctx->current_depth + 1;
+    child_ctx.shared_ttl_io = ctx->shared_ttl_io; 
+
+    int rc = parse_zone_fast(file_content, strlen(file_content), arena, &child_ctx);
+
+    if (rc < 0 && ctx && ctx->err_out && !ctx->err_out->file_path) {
+        ctx->err_out->file_path = resolved;
+    }
+
+    ctx->visited_count--;
+
+    *origin_io = saved_origin;
+
+    return rc;
+}
+
 int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx) {
   char *prev_owner = NULL;
   char *origin = ctx ? (char *)ctx->default_origin : NULL;
-  char *default_ttl_str = NULL;
+  char *local_ttl_storage = NULL;
   char **prev_owner_io = &prev_owner;
   char **origin_io = &origin;
-  char **default_ttl_str_io = &default_ttl_str;
+  char **default_ttl_str_io = (ctx && ctx->shared_ttl_io) ? ctx->shared_ttl_io : &local_ttl_storage;
   if (!buf || size == 0 || !arena)
     return -1;
   char *p = buf, *end = buf + size;
@@ -220,6 +363,13 @@ PROCESS_RECORD:
       *origin_io = fields[1];
     if (p < end)
       goto STATE_START_LINE;
+    goto DONE;
+  }
+  if (fields[0][0] == '$' && strcasecmp(fields[0], "$INCLUDE") == 0) {
+    if (process_include(fields, field_idx, arena, ctx, origin_io, buf) < 0)
+        return -1;
+    if (p < end)
+        goto STATE_START_LINE;
     goto DONE;
   }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$TTL") == 0) {
@@ -375,14 +525,21 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->hash_table = NULL;
   atomic_init(&arena->reader_count, 0);
 }
+void zone_arena_free_include_buffers(zone_arena_t *arena) {
+  for (int i = 0; i < arena->file_buf_count; i++) {
+    free(arena->file_bufs[i]);
+    free(arena->display_bufs[i]);
+    free(arena->file_paths[i]);
+  }
+  arena->file_buf_count = 0;
+}
+
 void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->records);
   for (int i = 0; i < arena->data_pool_count; i++)
     free(arena->data_pools[i]);
   free(arena->hash_table);
-  for (int i = 0; i < arena->file_buf_count; i++)
-    free(arena->file_bufs[i]);
-  arena->file_buf_count = 0;
+  zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {
   uint32_t hash = 2166136261u;

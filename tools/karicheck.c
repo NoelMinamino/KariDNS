@@ -48,20 +48,33 @@ static char *read_file_or_die(const char *path, bool *out_failed) {
     return buf;
 }
 
-// Extract base directory
-static char *get_base_dir(const char *path) {
-    const char *slash = strrchr(path, '/');
-    if (!slash) return strdup(".");
-    size_t len = slash - path;
-    if (len == 0) len = 1; // "/"
-    char *base = malloc(len + 1);
-    memcpy(base, path, len);
-    base[len] = '\0';
-    return base;
+static char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path) {
+    (void)ctx;
+    return read_file_or_die(rel_path, NULL);
 }
 
+
 // Print error context with caret
-static void print_error_context(const char *file_path, const char *buf, const parse_error_t *err) {
+static void print_error_context(const char *root_file_path, const char *root_buf, const parse_error_t *err, zone_arena_t *arena) {
+    const char *file_path = root_file_path;
+    const char *buf = root_buf;
+
+    if (err->file_path) {
+        bool found = false;
+        for (int i = 0; i < arena->file_buf_count; i++) {
+            if (arena->file_paths[i] && strcmp(arena->file_paths[i], err->file_path) == 0) {
+                file_path = err->file_path;
+                buf = arena->display_bufs[i];
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            file_path = root_file_path;
+            buf = root_buf;
+        }
+    }
+    if (!buf) return;
     size_t offset = err->error_offset;
     size_t buf_len = strlen(buf);
     if (offset > buf_len) offset = buf_len;
@@ -141,20 +154,31 @@ static int check_zone(const char *domain, const char *file_path, bool is_standal
     zone_arena_t arena;
     zone_arena_init(&arena);
 
+    arena.file_bufs[0] = mutable_buf;
+    arena.display_bufs[0] = (char*)buf;
+    arena.file_paths[0] = strdup(file_path);
+    arena.file_buf_count = 1;
+
     parse_error_t err = {0};
+    char *root_ttl = NULL;
+    char *visited_paths[16];
+
     parse_context_t ctx = {0};
     ctx.base_dir = get_base_dir(file_path);
     ctx.default_origin = domain;
     ctx.is_standalone_mode = is_standalone;
     ctx.err_out = &err;
+    ctx.load_file_cb = karicheck_load_file_cb;
+    ctx.shared_ttl_io = &root_ttl;
+    ctx.visited_paths = visited_paths;
+    ctx.visited_cap = 16;
+    ctx.visited_count = 0;
 
     int res = parse_zone_fast(mutable_buf, strlen(mutable_buf), &arena, &ctx);
     if (res < 0) {
-        print_error_context(file_path, buf, &err);
+        print_error_context(file_path, buf, &err, &arena);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
-        free(mutable_buf);
-        free(buf);
         return 1;
     }
 
@@ -162,8 +186,6 @@ static int check_zone(const char *domain, const char *file_path, bool is_standal
         fprintf(stderr, "[ERROR] No records found in zone '%s' (%s)\n", domain, file_path);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
-        free(mutable_buf);
-        free(buf);
         return 1;
     }
 
@@ -185,16 +207,12 @@ static int check_zone(const char *domain, const char *file_path, bool is_standal
         fprintf(stderr, "[ERROR] No SOA record found in zone '%s' (%s) at origin\n", domain, file_path);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
-        free(mutable_buf);
-        free(buf);
         return 1;
     }
 
     printf("[OK] Zone '%s' is valid.\n", domain);
     free((void*)ctx.base_dir);
     zone_arena_destroy(&arena);
-    free(mutable_buf);
-    free(buf);
     return 0;
 }
 
