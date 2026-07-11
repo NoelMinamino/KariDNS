@@ -1056,6 +1056,50 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (encode_type_bitmap(res, max_res_len, &offset, &rec->rdata[2], rec->rdata_count - 2) != 0) return -1;
                 break;
             }
+            case 43: case 59: { // DS, CDS
+                if (rec->rdata_count < 4) return -1;
+                uint16_t keytag = atoi(rec->rdata[0]);
+                uint8_t alg = atoi(rec->rdata[1]);
+                uint8_t dtype = atoi(rec->rdata[2]);
+                if (offset + 4 > max_res_len) return -1;
+                res[offset++] = keytag >> 8; res[offset++] = keytag & 0xFF;
+                res[offset++] = alg;
+                res[offset++] = dtype;
+                
+                char hex[1024] = "";
+                for (int i = 3; i < rec->rdata_count; i++) {
+                    if (strlen(hex) + strlen(rec->rdata[i]) < sizeof(hex)) strcat(hex, rec->rdata[i]);
+                }
+                size_t dec_len = hex_decode(hex, &res[offset], max_res_len - offset);
+                if (dec_len == (size_t)-1) return -1;
+                offset += dec_len;
+                break;
+            }
+            case 48: case 60: { // DNSKEY, CDNSKEY
+                if (rec->rdata_count < 4) return -1;
+                uint16_t flags = atoi(rec->rdata[0]);
+                uint8_t proto = atoi(rec->rdata[1]);
+                uint8_t alg = atoi(rec->rdata[2]);
+                if (offset + 4 > max_res_len) return -1;
+                res[offset++] = flags >> 8; res[offset++] = flags & 0xFF;
+                res[offset++] = proto;
+                res[offset++] = alg;
+                
+                char b64[2048] = "";
+                for (int i = 3; i < rec->rdata_count; i++) {
+                    if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) strcat(b64, rec->rdata[i]);
+                }
+                size_t b64_len = strlen(b64);
+                size_t decoded_upper_bound = (b64_len / 4) * 3;
+                if (offset + decoded_upper_bound > max_res_len) return -1;
+                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
+                if (declen < 0) return -1;
+                int padding = 0;
+                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
+                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
+                offset += (declen - padding);
+                break;
+            }
             default: {
                 // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード
                 // 低レイヤー関数であるためログ出力は行わず、上位層にエラー状態のみを伝播させる
