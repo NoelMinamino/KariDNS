@@ -109,7 +109,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 // TSIG
 int const_time_memcmp(const void *a, const void *b, size_t len);
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len);
-int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key);
+int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, uint8_t *mac_out, size_t *mac_len_out);
 
 // DNSレスポンス組み立て
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);

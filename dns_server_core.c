@@ -1205,7 +1205,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
     }
-    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key) != 0) {
+    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, NULL) != 0) {
       syslog(LOG_ERR, "[AXFR] TSIG failed");
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
@@ -1589,6 +1589,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       const char *client_ip, compress_ctx_t *comp_ctx,
                       bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap) {
+  uint8_t tsig_mac[64];
+  size_t tsig_mac_len = 0;
   char current_qname[256];
   strncpy(current_qname, qname, 255);
   current_qname[255] = '\0';
@@ -1717,7 +1719,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
             k = k->next;
           }
           if (!matched_key ||
-              tsig_verify_packet(req, req_len, matched_key) != 0)
+              tsig_verify_packet(req, req_len, matched_key, tsig_mac, &tsig_mac_len) != 0)
             auth = false;
         }
       }
@@ -2290,6 +2292,8 @@ typedef struct {
   uint8_t req[512];
   uint16_t req_len;
   tsig_key_t *tsig_key;
+  uint8_t tsig_mac[64];
+  size_t tsig_mac_len;
   zone_db_entry_t *entry;
   zone_db_snapshot_t *snap;
 } axfr_worker_args_t;
@@ -2315,7 +2319,8 @@ static ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
 }
 
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
-                        uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry) {
+                        uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
+                        uint8_t *req_mac, size_t req_mac_len) {
   if (!entry) {
     uint8_t res_buf[512];
     size_t copy_len = req_len > 512 ? 512 : req_len;
@@ -2413,8 +2418,9 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   compress_ctx_t comp_ctx;
   memset(&comp_ctx, 0, sizeof(comp_ctx));
   compress_ctx_init_packet(&comp_ctx);
-  uint8_t prior_mac[64] = {0};
-  size_t prior_mac_len = 0;
+  uint8_t tsig_mac[64];
+  size_t tsig_mac_len = req_mac_len;
+  if (req_mac_len > 0) memcpy(tsig_mac, req_mac, req_mac_len);
   int soa_idx = -1;
   for (size_t i = 0; i < current_zone->count; i++) {
     if (current_zone->records[i].type_code == 6 &&
@@ -2485,7 +2491,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     *res_ancount = htons(answers); \
     if (tsig_key) { \
       size_t sign_len = prev_offset; \
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, prior_mac, &prior_mac_len); \
+      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len); \
       prev_offset = sign_len; \
     } \
     uint8_t len_prefix[2] = {prev_offset >> 8, prev_offset & 0xFF}; \
@@ -2558,8 +2564,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     *res_ancount = htons(answers);
     if (tsig_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, prior_mac,
-                       &prior_mac_len);
+      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
+                       &tsig_mac_len);
       offset = sign_len;
     }
     uint8_t len_prefix[2] = {offset >> 8, offset & 0xFF};
@@ -2592,7 +2598,7 @@ void *axfr_worker_thread(void *arg) {
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
-                     args->tsig_key, entry);
+                     args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len);
   close(args->client_fd);
   zone_db_snapshot_t *worker_snap = args->snap;
   free(args);
@@ -3042,6 +3048,8 @@ worker_startup_success:;
             bool allowed = false;
             uint16_t tsig_error = 0;
             tsig_key_t *matched_key = NULL;
+            uint8_t tsig_mac[64];
+            size_t tsig_mac_len = 0;
             if (zcfg) {
               if (zcfg->tsig_key) {
                 tsig_key_t *k = cfg->keys;
@@ -3055,7 +3063,7 @@ worker_startup_success:;
                 if (!matched_key)
                   tsig_error = 17;
                 else {
-                  int err = tsig_verify_packet(msg, msg_len, matched_key);
+                  int err = tsig_verify_packet(msg, msg_len, matched_key, tsig_mac, &tsig_mac_len);
                   if (err != 0)
                     tsig_error = err > 0 ? err : 16;
                   else
@@ -3084,6 +3092,8 @@ worker_startup_success:;
                   args->req_len = msg_len > 512 ? 512 : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   args->tsig_key = matched_key;
+                  args->tsig_mac_len = tsig_mac_len;
+                  if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
                   args->snap = snap;
                   atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
@@ -3125,13 +3135,13 @@ worker_startup_success:;
 
                 if (matched_key)
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
-                                   matched_key, tsig_error, NULL, NULL);
+                                   matched_key, tsig_error, tsig_mac, &tsig_mac_len);
                 else {
                   tsig_key_t dummy = {0};
                   dummy.name = zcfg->tsig_key;
                   dummy.algorithm = "hmac-sha256";
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
-                                   17, NULL, NULL);
+                                   17, tsig_mac, &tsig_mac_len);
                 }
               } else {
                 res_buf[2] |= 0x84;

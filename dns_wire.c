@@ -410,7 +410,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     return 0;
 }
 
-int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key) {
+int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, uint8_t *mac_out, size_t *mac_len_out) {
     if (!key || packet_len < 12) return -1;
     uint16_t arcount = (packet[10] << 8) | packet[11];
     if (arcount == 0) return -1;
@@ -505,6 +505,10 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     free(pre_mac);
     if (calc_mac_len != mac_size) return 16; // BADSIG
     if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+    if (mac_out && mac_len_out) {
+        *mac_len_out = mac_size;
+        memcpy(mac_out, mac, mac_size);
+    }
     return 0;
 }
 
