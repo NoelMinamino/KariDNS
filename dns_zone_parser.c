@@ -375,7 +375,7 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
 static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
                              parse_context_t *ctx, const char *origin,
                              const char *default_ttl, const char *cur_buf) {
-    if (field_idx < 4) {
+    if (field_idx < 5) {
         if (ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
         return -1;
     }
