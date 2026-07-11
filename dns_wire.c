@@ -319,7 +319,7 @@ static int cert_type_to_num(const char *s) {
     return atoi(s);
 }
 
-int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len) {
+int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len, bool is_subsequent) {
     if (!key || *packet_len + 512 > max_len) return -1;
     size_t pre_mac_len = *packet_len;
     size_t pre_mac_cap = pre_mac_len + 512 + (key->algorithm ? strlen(key->algorithm) : 11) + strlen(key->name) + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0);
@@ -334,31 +334,34 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
-    long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
-    if (w < 0) { free(pre_mac); return -1; }
-    offset += (size_t)w;
-    pre_mac[offset++] = 0; pre_mac[offset++] = 250;
-    pre_mac[offset++] = 0; pre_mac[offset++] = 255;
-    pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0;
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-    w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, alg);
-    if (w < 0) { free(pre_mac); return -1; }
-    offset += (size_t)w;
+    if (!is_subsequent) {
+        long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
+        if (w < 0) { free(pre_mac); return -1; }
+        offset += (size_t)w;
+        pre_mac[offset++] = 0; pre_mac[offset++] = 255;
+        pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0;
+        w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, alg);
+        if (w < 0) { free(pre_mac); return -1; }
+        offset += (size_t)w;
+    }
     uint64_t now = time(NULL);
     pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
     pre_mac[offset++] = (now >> 8) & 0xFF; pre_mac[offset++] = now & 0xFF;
     uint16_t fudge = 300;
     pre_mac[offset++] = fudge >> 8; pre_mac[offset++] = fudge & 0xFF;
-    pre_mac[offset++] = tsig_error >> 8; pre_mac[offset++] = tsig_error & 0xFF; // Error
-    if (tsig_error == 18) {
-        pre_mac[offset++] = 0; pre_mac[offset++] = 6; // Other Len
-        uint64_t now_48 = time(NULL);
-        pre_mac[offset++] = (now_48 >> 40) & 0xFF; pre_mac[offset++] = (now_48 >> 32) & 0xFF;
-        pre_mac[offset++] = (now_48 >> 24) & 0xFF; pre_mac[offset++] = (now_48 >> 16) & 0xFF;
-        pre_mac[offset++] = (now_48 >> 8) & 0xFF; pre_mac[offset++] = now_48 & 0xFF;
-    } else {
-        pre_mac[offset++] = 0; pre_mac[offset++] = 0; // Other Len
+    if (!is_subsequent) {
+        pre_mac[offset++] = tsig_error >> 8; pre_mac[offset++] = tsig_error & 0xFF; // Error
+        if (tsig_error == 18) {
+            pre_mac[offset++] = 0; pre_mac[offset++] = 6; // Other Len
+            uint64_t now_48 = time(NULL);
+            pre_mac[offset++] = (now_48 >> 40) & 0xFF; pre_mac[offset++] = (now_48 >> 32) & 0xFF;
+            pre_mac[offset++] = (now_48 >> 24) & 0xFF; pre_mac[offset++] = (now_48 >> 16) & 0xFF;
+            pre_mac[offset++] = (now_48 >> 8) & 0xFF; pre_mac[offset++] = now_48 & 0xFF;
+        } else {
+            pre_mac[offset++] = 0; pre_mac[offset++] = 0; // Other Len
+        }
     }
     unsigned int mac_len = 0; unsigned char mac[EVP_MAX_MD_SIZE];
     if (key->secret_decoded_len > 0) {
@@ -411,7 +414,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     return 0;
 }
 
-int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key) {
+int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, uint8_t *mac_out, size_t *mac_len_out) {
     if (!key || packet_len < 12) return -1;
     uint16_t arcount = (packet[10] << 8) | packet[11];
     if (arcount == 0) return -1;
@@ -428,7 +431,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     }
     size_t last_rr_offset = 0;
     for (int i = 0; i < ancount + nscount + arcount; i++) {
-        if (i == qdcount + ancount + nscount + arcount - 1) last_rr_offset = offset;
+        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
         if (offset >= packet_len) return -1;
         int jump_count = 0;
         while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) {
@@ -487,7 +490,6 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
     if (w3 < 0) { free(pre_mac); return -1; }
     p_offset += (size_t)w3;
-    pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 250;
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
@@ -507,6 +509,10 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     free(pre_mac);
     if (calc_mac_len != mac_size) return 16; // BADSIG
     if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+    if (mac_out && mac_len_out) {
+        *mac_len_out = mac_size;
+        memcpy(mac_out, mac, mac_size);
+    }
     return 0;
 }
 
@@ -661,9 +667,16 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                 break;
             }
-            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
+            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: { // NS, MD, MF, CNAME, MB, MG, MR, PTR
                 if (rec->rdata_count == 0) return -1;
                 if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                break;
+            }
+            case 39: { // DNAME (RFC 6672: 圧縮禁止)
+                if (rec->rdata_count == 0) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                if (w < 0) return -1;
+                offset += w;
                 break;
             }
             case 15: { // MX
@@ -674,7 +687,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
                 break;
             }
-            case 33: { // SRV
+            case 33: { // SRV (RFC 2782: 圧縮禁止)
                 if (rec->rdata_count < 4) return -1;
                 if (offset + 6 > max_res_len) return -1;
                 uint16_t prio = atoi(rec->rdata[0]);
@@ -683,7 +696,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
                 res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
                 res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-                if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                if (w < 0) return -1;
+                offset += w;
                 break;
             }
             case 257: { // CAA
@@ -934,12 +949,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], salt, salt_len); offset += salt_len;
                 break;
             }
-            case 64: case 65: { // HTTPS / SVCB
+            case 64: case 65: { // HTTPS / SVCB (RFC 9460: 圧縮禁止)
                 if (rec->rdata_count < 2) return -1;
                 if (offset + 2 > max_res_len) return -1;
                 uint16_t svc_prio = atoi(rec->rdata[0]);
                 res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
-                if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                if (w < 0) return -1;
+                offset += w;
                 break;
             }
             case 13: { // HINFO
@@ -1052,6 +1069,50 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = (serial >> 8) & 0xFF; res[offset++] = serial & 0xFF;
                 res[offset++] = flags >> 8; res[offset++] = flags & 0xFF;
                 if (encode_type_bitmap(res, max_res_len, &offset, &rec->rdata[2], rec->rdata_count - 2) != 0) return -1;
+                break;
+            }
+            case 43: case 59: { // DS, CDS
+                if (rec->rdata_count < 4) return -1;
+                uint16_t keytag = atoi(rec->rdata[0]);
+                uint8_t alg = atoi(rec->rdata[1]);
+                uint8_t dtype = atoi(rec->rdata[2]);
+                if (offset + 4 > max_res_len) return -1;
+                res[offset++] = keytag >> 8; res[offset++] = keytag & 0xFF;
+                res[offset++] = alg;
+                res[offset++] = dtype;
+                
+                char hex[1024] = "";
+                for (int i = 3; i < rec->rdata_count; i++) {
+                    if (strlen(hex) + strlen(rec->rdata[i]) < sizeof(hex)) strcat(hex, rec->rdata[i]);
+                }
+                size_t dec_len = hex_decode(hex, &res[offset], max_res_len - offset);
+                if (dec_len == (size_t)-1) return -1;
+                offset += dec_len;
+                break;
+            }
+            case 48: case 60: { // DNSKEY, CDNSKEY
+                if (rec->rdata_count < 4) return -1;
+                uint16_t flags = atoi(rec->rdata[0]);
+                uint8_t proto = atoi(rec->rdata[1]);
+                uint8_t alg = atoi(rec->rdata[2]);
+                if (offset + 4 > max_res_len) return -1;
+                res[offset++] = flags >> 8; res[offset++] = flags & 0xFF;
+                res[offset++] = proto;
+                res[offset++] = alg;
+                
+                char b64[2048] = "";
+                for (int i = 3; i < rec->rdata_count; i++) {
+                    if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) strcat(b64, rec->rdata[i]);
+                }
+                size_t b64_len = strlen(b64);
+                size_t decoded_upper_bound = (b64_len / 4) * 3;
+                if (offset + decoded_upper_bound > max_res_len) return -1;
+                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
+                if (declen < 0) return -1;
+                int padding = 0;
+                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
+                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
+                offset += (declen - padding);
                 break;
             }
             default: {

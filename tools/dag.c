@@ -24,6 +24,7 @@
 #include <zlib.h>
 #include <strings.h>
 
+#include <openssl/evp.h>
 #include "../dns_wire.h"
 
 /* ========================================================================
@@ -344,6 +345,9 @@ typedef struct {
 
     bool is_ixfr;
     uint32_t ixfr_serial;
+
+    bool want_tsig;
+    tsig_key_t tsig_key;
 } query_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -1039,6 +1043,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         if (pkt_len == 0) return 1;
     }
 
+    if (qo->want_tsig) {
+        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, NULL, 0, false) != 0) {
+            fprintf(stderr, "Error: tsig_sign_packet failed\n");
+            return 1;
+        }
+    }
+
     if (norecurse) {
         pkt[2] &= ~0x01; // Clear RD bit
     }
@@ -1134,7 +1145,7 @@ static void usage(const char *prog) {
         "          [+subnet=addr[/prefix]] [+bufsize=N] [+adflag] [+cdflag]\n"
         "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]]\n"
         "          [+padding=N] [+timeout=N] [+tries=N] [+ldnsz]\n"
-        "          [--test-all] [--break <kind>[=<param>] ...]\n"
+        "          [+tsig=alg:name:secret] [--test-all] [--break <kind>[=<param>] ...]\n"
         "\n"
         "       %s --break-help    (list all --break kinds)\n",
         prog, prog);
@@ -1327,6 +1338,31 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "+nocookie") == 0) {
             qo.want_cookie = false;
+        } else if (strncmp(argv[i], "+tsig=", 6) == 0) {
+            qo.want_tsig = true;
+            char *tsig_str = strdup(argv[i] + 6);
+            char *colon1 = strchr(tsig_str, ':');
+            if (colon1) {
+                *colon1 = '\0';
+                qo.tsig_key.algorithm = tsig_str;
+                char *colon2 = strchr(colon1 + 1, ':');
+                if (colon2) {
+                    *colon2 = '\0';
+                    qo.tsig_key.name = colon1 + 1;
+                    char *secret_b64 = colon2 + 1;
+                    int b64_len = strlen(secret_b64);
+                    int pad = 0;
+                    if (b64_len > 0 && secret_b64[b64_len - 1] == '=') pad++;
+                    if (b64_len > 1 && secret_b64[b64_len - 2] == '=') pad++;
+                    int dec_len = EVP_DecodeBlock(qo.tsig_key.secret_decoded, (const unsigned char *)secret_b64, b64_len);
+                    if (dec_len > 0) {
+                        qo.tsig_key.secret_decoded_len = dec_len - pad;
+                    } else {
+                        fprintf(stderr, "warning: invalid tsig secret base64\n");
+                        qo.want_tsig = false;
+                    }
+                }
+            }
         } else if (strcmp(argv[i], "--test-all") == 0) {
             // Already handled earlier
         } else {
