@@ -1814,8 +1814,25 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[11] = arcount & 0xFF;
     return offset;
   }
-  uint16_t qclass = (req[q_offset + 2] << 8) | req[q_offset + 3];
-  if (qclass != 1 && qclass != 255) {
+    uint16_t qclass = (req[q_offset + 2] << 8) | req[q_offset + 3];
+
+    // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
+    if (!is_tcp && qtype == 252) {
+      if (current_zone)
+        atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
+                                  memory_order_release);
+      size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
+      memcpy(res, req, copy_len);
+      res[2] |= 0x80; // QR = 1
+      res[3] = (res[3] & 0xF0) | 1; // RCODE = 1 (FORMERR)
+      res[4] = 0; res[5] = 1; // QDCOUNT = 1
+      res[6] = 0; res[7] = 0; // ANCOUNT = 0
+      res[8] = 0; res[9] = 0; // NSCOUNT = 0
+      res[10] = 0; res[11] = 0; // ARCOUNT = 0
+      return copy_len;
+    }
+
+    if (qclass != 1 && qclass != 255) {
     if (current_zone)
       atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
                                 memory_order_release);
