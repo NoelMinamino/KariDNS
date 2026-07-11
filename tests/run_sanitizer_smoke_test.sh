@@ -17,9 +17,9 @@ export TSAN_OPTIONS=halt_on_error=1
 
 cd "$(dirname "$0")/.."
 
-CONF_FILE="karidns.conf.sample"
-CTL_CONF="karictl.conf"
-ZONE_FILE="tests/zones/stress.example.com.zone"
+CONF_FILE="tests/karidns-test.conf"
+CTL_CONF="tests/karictl-test.conf"
+ZONE_FILE="tests/zones/example.com.zone"
 ZONE_NAME="example.com"
 
 # $INCLUDE Test fixture (Use if present; if not, skip and issue a warning only)
@@ -34,7 +34,7 @@ GENERATE_NORMAL="tests/zones/generate_normal.zone"
 GENERATE_BAD_RANGE="tests/zones/generate_bad_range.zone"
 GENERATE_BAD_WIDTH="tests/zones/generate_bad_width.zone"
 
-FUZZ_SMOKE_SECONDS=20   # Time (in seconds) spent on each fuzz target. Keep it short since this is for routine checks
+FUZZ_SMOKE_SECONDS=60   # Time (in seconds) spent on each fuzz target. Keep it short since this is for routine checks
 
 FAILED=0
 log_fail() { echo "  -> FAIL: $1"; FAILED=1; }
@@ -126,10 +126,10 @@ for variant in asan tsan; do
         cat "$logf"
         continue
     fi
-    dig +short "@127.0.0.1" -p 10053 "$ZONE_NAME" A >/dev/null 2>&1
-    ./karictl -f "$CTL_CONF" reload >/dev/null 2>&1
-    dig +tcp +short "@127.0.0.1" -p 10053 "$ZONE_NAME" AXFR >/dev/null 2>&1
-    ./karictl -f "$CTL_CONF" stop >/dev/null 2>&1
+    ./dag-asan "$ZONE_NAME" A "@127.0.0.1" -p 10053 +short >/dev/null 2>&1
+    ./karictl-asan -f "$CTL_CONF" reload >/dev/null 2>&1
+    ./dag-asan "$ZONE_NAME" AXFR "@127.0.0.1" -p 10053 +tcp +short >/dev/null 2>&1
+    ./karictl-asan -f "$CTL_CONF" stop >/dev/null 2>&1
     sleep 1
     if kill -0 "$KARIDNS_PID" 2>/dev/null; then
         kill -9 "$KARIDNS_PID" 2>/dev/null

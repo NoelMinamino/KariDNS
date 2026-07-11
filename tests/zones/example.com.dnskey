@@ -1,0 +1,24 @@
+; ============================================================================
+; example.com.dnskey
+;
+; 通常このファイルは dnssec-keygen で生成される
+;   Kexample.com.+013+12345.key
+;   Kexample.com.+013+54321.key
+; のような鍵ファイルそのものであり、メインのゾーンファイルから
+; $INCLUDE example.com.dnskey; のように読み込むのが一般的な運用です。
+;
+; ここに記載する鍵データはあくまでフォーマットを示すためのサンプルであり、
+; 実際に暗号学的に有効な鍵ではありません。
+; ============================================================================
+
+$ORIGIN example.com.
+
+; KSK (Key Signing Key) の例
+@ 3600 IN DNSKEY 257 3 13 (
+    /mmBb9kd6M+grRhMKoS6bz+iMJ8aDmRFxa4JJm1acMAxTxYbALm3CF6TemSIKFfV
+    UZ9xmg9ITU6PoIJ0ca19ng== ) ; example KSK
+
+; ZSK (Zone Signing Key) の例
+@ 3600 IN DNSKEY 256 3 13 (
+    zKj/xXS5n9RIvV5Kl6HXwQ+o36WFlLmjffcKaaxK51eHR0kMBcDax7cXibNrRUjV
+    sub2e7CAcvLCilfp09TciQ== ) ; example ZSK
