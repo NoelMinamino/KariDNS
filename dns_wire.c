@@ -319,7 +319,7 @@ static int cert_type_to_num(const char *s) {
     return atoi(s);
 }
 
-int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len) {
+int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len, bool is_subsequent) {
     if (!key || *packet_len + 512 > max_len) return -1;
     size_t pre_mac_len = *packet_len;
     size_t pre_mac_cap = pre_mac_len + 512 + (key->algorithm ? strlen(key->algorithm) : 11) + strlen(key->name) + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0);
@@ -334,30 +334,34 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
-    long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
-    if (w < 0) { free(pre_mac); return -1; }
-    offset += (size_t)w;
-    pre_mac[offset++] = 0; pre_mac[offset++] = 255;
-    pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0;
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-    w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, alg);
-    if (w < 0) { free(pre_mac); return -1; }
-    offset += (size_t)w;
+    if (!is_subsequent) {
+        long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
+        if (w < 0) { free(pre_mac); return -1; }
+        offset += (size_t)w;
+        pre_mac[offset++] = 0; pre_mac[offset++] = 255;
+        pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0;
+        w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, alg);
+        if (w < 0) { free(pre_mac); return -1; }
+        offset += (size_t)w;
+    }
     uint64_t now = time(NULL);
     pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
     pre_mac[offset++] = (now >> 8) & 0xFF; pre_mac[offset++] = now & 0xFF;
     uint16_t fudge = 300;
     pre_mac[offset++] = fudge >> 8; pre_mac[offset++] = fudge & 0xFF;
-    pre_mac[offset++] = tsig_error >> 8; pre_mac[offset++] = tsig_error & 0xFF; // Error
-    if (tsig_error == 18) {
-        pre_mac[offset++] = 0; pre_mac[offset++] = 6; // Other Len
-        uint64_t now_48 = time(NULL);
-        pre_mac[offset++] = (now_48 >> 40) & 0xFF; pre_mac[offset++] = (now_48 >> 32) & 0xFF;
-        pre_mac[offset++] = (now_48 >> 24) & 0xFF; pre_mac[offset++] = (now_48 >> 16) & 0xFF;
-        pre_mac[offset++] = (now_48 >> 8) & 0xFF; pre_mac[offset++] = now_48 & 0xFF;
-    } else {
-        pre_mac[offset++] = 0; pre_mac[offset++] = 0; // Other Len
+    if (!is_subsequent) {
+        pre_mac[offset++] = tsig_error >> 8; pre_mac[offset++] = tsig_error & 0xFF; // Error
+        if (tsig_error == 18) {
+            pre_mac[offset++] = 0; pre_mac[offset++] = 6; // Other Len
+            uint64_t now_48 = time(NULL);
+            pre_mac[offset++] = (now_48 >> 40) & 0xFF; pre_mac[offset++] = (now_48 >> 32) & 0xFF;
+            pre_mac[offset++] = (now_48 >> 24) & 0xFF; pre_mac[offset++] = (now_48 >> 16) & 0xFF;
+            pre_mac[offset++] = (now_48 >> 8) & 0xFF; pre_mac[offset++] = now_48 & 0xFF;
+        } else {
+            pre_mac[offset++] = 0; pre_mac[offset++] = 0; // Other Len
+        }
     }
     unsigned int mac_len = 0; unsigned char mac[EVP_MAX_MD_SIZE];
     if (key->secret_decoded_len > 0) {

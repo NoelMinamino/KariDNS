@@ -2052,7 +2052,7 @@ void *axfr_bg_thread_func(void *arg) {
     if (ctx->tsig_key) {
       size_t p_len = req_len - 2;
       tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
-                       ctx->tsig_key, 0, NULL, NULL);
+                       ctx->tsig_key, 0, NULL, NULL, false);
       req_len = p_len + 2;
     }
     uint16_t msg_len = req_len - 2;
@@ -2421,6 +2421,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   uint8_t tsig_mac[64];
   size_t tsig_mac_len = req_mac_len;
   if (req_mac_len > 0) memcpy(tsig_mac, req_mac, req_mac_len);
+  bool is_subsequent = false;
   int soa_idx = -1;
   for (size_t i = 0; i < current_zone->count; i++) {
     if (current_zone->records[i].type_code == 6 &&
@@ -2491,7 +2492,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     *res_ancount = htons(answers); \
     if (tsig_key) { \
       size_t sign_len = prev_offset; \
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len); \
+      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, is_subsequent); \
+      is_subsequent = true; \
       prev_offset = sign_len; \
     } \
     uint8_t len_prefix[2] = {prev_offset >> 8, prev_offset & 0xFF}; \
@@ -2565,7 +2567,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if (tsig_key) {
       size_t sign_len = offset;
       tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
-                       &tsig_mac_len);
+                       &tsig_mac_len, is_subsequent);
       offset = sign_len;
     }
     uint8_t len_prefix[2] = {offset >> 8, offset & 0xFF};
@@ -3135,13 +3137,13 @@ worker_startup_success:;
 
                 if (matched_key)
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
-                                   matched_key, tsig_error, tsig_mac, &tsig_mac_len);
+                                   matched_key, tsig_error, tsig_mac, &tsig_mac_len, false);
                 else {
                   tsig_key_t dummy = {0};
                   dummy.name = zcfg->tsig_key;
                   dummy.algorithm = "hmac-sha256";
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
-                                   17, tsig_mac, &tsig_mac_len);
+                                   17, tsig_mac, &tsig_mac_len, false);
                 }
               } else {
                 res_buf[2] |= 0x84;
