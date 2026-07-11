@@ -29,7 +29,7 @@ INCLUDE_ERROR_ZONE="tests/include_tests/error_caret.zone"
 INCLUDE_MISSING_ZONE="tests/include_tests/missing_file.zone"
 INCLUDE_CYCLIC_3_ZONE="tests/include_tests/cyclic_3_a.zone"
 
-FUZZ_SMOKE_SECONDS=20   # Time (in seconds) spent on each fuzz target. Keep it short since this is for routine checks
+FUZZ_SMOKE_SECONDS=60   # Time (in seconds) spent on each fuzz target. Keep it short since this is for routine checks
 
 FAILED=0
 log_fail() { echo "  -> FAIL: $1"; FAILED=1; }
