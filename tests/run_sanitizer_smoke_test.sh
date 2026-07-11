@@ -29,6 +29,11 @@ INCLUDE_ERROR_ZONE="tests/include_tests/error_caret.zone"
 INCLUDE_MISSING_ZONE="tests/include_tests/missing_file.zone"
 INCLUDE_CYCLIC_3_ZONE="tests/include_tests/cyclic_3_a.zone"
 
+# $GENERATE Test fixture
+GENERATE_NORMAL="tests/zones/generate_normal.zone"
+GENERATE_BAD_RANGE="tests/zones/generate_bad_range.zone"
+GENERATE_BAD_WIDTH="tests/zones/generate_bad_width.zone"
+
 FUZZ_SMOKE_SECONDS=20   # Time (in seconds) spent on each fuzz target. Keep it short since this is for routine checks
 
 FAILED=0
@@ -82,7 +87,10 @@ for pair in "$ZONE_FILE:$ZONE_NAME:normal" \
             "$INCLUDE_CYCLIC_ZONE:$ZONE_NAME:\$INCLUDE circular (expect reject, not crash)" \
             "$INCLUDE_CYCLIC_3_ZONE:$ZONE_NAME:\$INCLUDE circular 3-level (expect reject, not crash)" \
             "$INCLUDE_ERROR_ZONE:$ZONE_NAME:\$INCLUDE child syntax error (expect reject, not crash)" \
-            "$INCLUDE_MISSING_ZONE:$ZONE_NAME:\$INCLUDE missing file (expect reject, not crash)"; do
+            "$INCLUDE_MISSING_ZONE:$ZONE_NAME:\$INCLUDE missing file (expect reject, not crash)" \
+            "$GENERATE_NORMAL:$ZONE_NAME:\$GENERATE valid" \
+            "$GENERATE_BAD_RANGE:$ZONE_NAME:\$GENERATE stop<start (expect reject)" \
+            "$GENERATE_BAD_WIDTH:$ZONE_NAME:\$GENERATE width out of bounds (expect reject)"; do
     zfile=$(echo "$pair" | cut -d: -f1)
     zname=$(echo "$pair" | cut -d: -f2)
     label=$(echo "$pair" | cut -d: -f3)

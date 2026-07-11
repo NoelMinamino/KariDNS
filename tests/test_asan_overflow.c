@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
+#include "../dns_zone_parser.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -344,6 +345,46 @@ int main() {
         if (assert_bound_checked(&rec_amtrelay1)) return 1;
 
         printf("Test 4 Passed: All input bound overflow tests safely rejected\n");
+    }
+
+    // Test 5: $GENERATE directive tests
+    {
+        printf("\n--- Test 5: $GENERATE directive ---\n");
+        
+        #define RUN_GEN_TEST(input, expect_fail) do { \
+            zone_arena_t arena = {0}; \
+            parse_context_t ctx = {0}; \
+            parse_error_t err = {0}; \
+            ctx.err_out = &err; \
+            char *buf = strdup(input); \
+            int res = parse_zone_fast(buf, strlen(buf), &arena, &ctx); \
+            if (expect_fail) { \
+                if (res != -1) { printf("FAIL: Expected error for '%s'\n", input); return 1; } \
+                else { printf("PASS: Expected error for '%s' -> %s\n", input, err.error_message); } \
+            } else { \
+                if (res == -1) { printf("FAIL: Expected success for '%s', got error: %s\n", input, err.error_message); return 1; } \
+                else { printf("PASS: Success for '%s'\n", input); } \
+            } \
+            zone_arena_destroy(&arena); \
+            free(buf); \
+        } while(0)
+
+        // 正常系: 1-5 
+        RUN_GEN_TEST("$GENERATE 1-5 host-$ A 10.0.0.$", false);
+        // 異常系: stop < start
+        RUN_GEN_TEST("$GENERATE 10-1 host-$ A 10.0.0.$", true);
+        // 異常系: step 0
+        RUN_GEN_TEST("$GENERATE 1-10/0 host-$ A 10.0.0.$", true);
+        // 異常系: MAX_GENERATE_COUNT 超え
+        RUN_GEN_TEST("$GENERATE 1-999999 host-$ A 10.0.0.$", true);
+        // 異常系: width異常
+        RUN_GEN_TEST("$GENERATE 1-10 host-${0,999,d} A 10.0.0.$", true);
+        // 異常系: base異常
+        RUN_GEN_TEST("$GENERATE 1-10 host-${0,3,q} A 10.0.0.$", true);
+        // 正常系: $$
+        RUN_GEN_TEST("$GENERATE 1-5 host-$$ A 10.0.0.$", false);
+        // 正常系: 負のoffset
+        RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
     }
 
     printf("All tests passed safely.\n");
