@@ -663,9 +663,16 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                 break;
             }
-            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, DNAME
+            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: { // NS, MD, MF, CNAME, MB, MG, MR, PTR
                 if (rec->rdata_count == 0) return -1;
                 if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                break;
+            }
+            case 39: { // DNAME (RFC 6672: 圧縮禁止)
+                if (rec->rdata_count == 0) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                if (w < 0) return -1;
+                offset += w;
                 break;
             }
             case 15: { // MX
@@ -676,7 +683,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
                 break;
             }
-            case 33: { // SRV
+            case 33: { // SRV (RFC 2782: 圧縮禁止)
                 if (rec->rdata_count < 4) return -1;
                 if (offset + 6 > max_res_len) return -1;
                 uint16_t prio = atoi(rec->rdata[0]);
@@ -685,7 +692,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
                 res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
                 res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-                if (write_dns_name_str(res, &offset, rec->rdata[3], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                if (w < 0) return -1;
+                offset += w;
                 break;
             }
             case 257: { // CAA
@@ -936,12 +945,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], salt, salt_len); offset += salt_len;
                 break;
             }
-            case 64: case 65: { // HTTPS / SVCB
+            case 64: case 65: { // HTTPS / SVCB (RFC 9460: 圧縮禁止)
                 if (rec->rdata_count < 2) return -1;
                 if (offset + 2 > max_res_len) return -1;
                 uint16_t svc_prio = atoi(rec->rdata[0]);
                 res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
-                if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                if (w < 0) return -1;
+                offset += w;
                 break;
             }
             case 13: { // HINFO
