@@ -11,6 +11,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <math.h>
+#include <ctype.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -624,6 +626,42 @@ static int write_char_string(uint8_t *res, size_t max_res_len, uint16_t *offset,
     return 0;
 }
 
+static int loc_parse_coord(char **rdata, int rdata_count, int *idx, double *out_seconds, char *dir_out) {
+    double parts[3] = {0, 0, 0};
+    int n = 0;
+    while (n < 3 && *idx < rdata_count) {
+        char *endptr;
+        double v = strtod(rdata[*idx], &endptr);
+        if (endptr == rdata[*idx] || *endptr != '\0') break; // 数値でなければ方角トークンとみなす
+        parts[n++] = v;
+        (*idx)++;
+    }
+    if (n == 0) return -1; // 度は必須
+    if (*idx >= rdata_count) return -1; // 方角が無い
+    char d = (char)toupper((unsigned char)rdata[*idx][0]);
+    if (d != 'N' && d != 'S' && d != 'E' && d != 'W') return -1;
+    (*idx)++;
+    *dir_out = d;
+    *out_seconds = parts[0] * 3600.0 + parts[1] * 60.0 + parts[2];
+    return 0;
+}
+
+static const uint32_t loc_poweroften[10] = {
+    1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000
+};
+
+static uint8_t loc_encode_precsize(double meters) {
+    if (meters < 0) meters = 0;
+    uint32_t cm = (uint32_t)llround(meters * 100.0);
+    int exponent;
+    for (exponent = 0; exponent < 9; exponent++) {
+        if (cm < loc_poweroften[exponent + 1]) break;
+    }
+    uint32_t mantissa = cm / loc_poweroften[exponent];
+    if (mantissa > 9) mantissa = 9;
+    return (uint8_t)((mantissa << 4) | exponent);
+}
+
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
@@ -699,6 +737,99 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
                 if (w < 0) return -1;
                 offset += w;
+                break;
+            }
+            case 29: { // LOC
+                if (offset + 16 > max_res_len) return -1;
+
+                int idx = 0;
+                double lat_sec, lon_sec;
+                char lat_dir, lon_dir;
+                if (loc_parse_coord(rec->rdata, rec->rdata_count, &idx, &lat_sec, &lat_dir) != 0) return -1;
+                if (lat_dir != 'N' && lat_dir != 'S') return -1; // 1つ目は南北のみ許可
+                if (loc_parse_coord(rec->rdata, rec->rdata_count, &idx, &lon_sec, &lon_dir) != 0) return -1;
+                if (lon_dir != 'E' && lon_dir != 'W') return -1; // 2つ目は東西のみ許可
+
+                // 度分秒の合計が範囲内か(緯度0-90度=0-324000秒、経度0-180度=0-648000秒)
+                if (lat_sec < 0 || lat_sec > 324000.0) return -1;
+                if (lon_sec < 0 || lon_sec > 648000.0) return -1;
+
+                double alt_m = 0, size_m = 1, hp_m = 10000, vp_m = 10;
+                if (idx < rec->rdata_count) alt_m  = strtod(rec->rdata[idx++], NULL);
+                if (idx < rec->rdata_count) size_m = strtod(rec->rdata[idx++], NULL);
+                if (idx < rec->rdata_count) hp_m   = strtod(rec->rdata[idx++], NULL);
+                if (idx < rec->rdata_count) vp_m   = strtod(rec->rdata[idx++], NULL);
+
+                uint8_t size_b = loc_encode_precsize(size_m);
+                uint8_t hp_b   = loc_encode_precsize(hp_m);
+                uint8_t vp_b   = loc_encode_precsize(vp_m);
+
+                int64_t lat_signed = (int64_t)llround(lat_sec * 1000.0) * (lat_dir == 'S' ? -1 : 1);
+                int64_t lon_signed = (int64_t)llround(lon_sec * 1000.0) * (lon_dir == 'W' ? -1 : 1);
+                uint32_t lat_wire = (uint32_t)(0x80000000LL + lat_signed);
+                uint32_t lon_wire = (uint32_t)(0x80000000LL + lon_signed);
+                uint32_t alt_wire = (uint32_t)(llround(alt_m * 100.0) + 10000000LL);
+
+                res[offset++] = 0; // VERSION
+                res[offset++] = size_b;
+                res[offset++] = hp_b;
+                res[offset++] = vp_b;
+                res[offset++] = lat_wire >> 24; res[offset++] = lat_wire >> 16;
+                res[offset++] = lat_wire >> 8;  res[offset++] = lat_wire;
+                res[offset++] = lon_wire >> 24; res[offset++] = lon_wire >> 16;
+                res[offset++] = lon_wire >> 8;  res[offset++] = lon_wire;
+                res[offset++] = alt_wire >> 24; res[offset++] = alt_wire >> 16;
+                res[offset++] = alt_wire >> 8;  res[offset++] = alt_wire;
+                break;
+            }
+            case 42: { // APL
+                for (int i = 0; i < rec->rdata_count; i++) {
+                    char item_buf[300];
+                    strncpy(item_buf, rec->rdata[i], sizeof(item_buf) - 1);
+                    item_buf[sizeof(item_buf) - 1] = '\0';
+
+                    char *p = item_buf;
+                    bool negate = false;
+                    if (*p == '!') { negate = true; p++; }
+
+                    char *colon = strchr(p, ':');
+                    if (!colon) return -1;
+                    int afi = atoi(p);
+                    char *addr_prefix = colon + 1;
+                    char *slash = strchr(addr_prefix, '/');
+                    if (!slash) return -1;
+                    *slash = '\0';
+                    int prefix = atoi(slash + 1);
+
+                    uint8_t addr_bytes[16];
+                    int addr_len;
+                    if (afi == 1) {
+                        struct in_addr a;
+                        if (inet_pton(AF_INET, addr_prefix, &a) != 1) return -1;
+                        if (prefix < 0 || prefix > 32) return -1;
+                        memcpy(addr_bytes, &a.s_addr, 4);
+                        addr_len = 4;
+                    } else if (afi == 2) {
+                        struct in6_addr a;
+                        if (inet_pton(AF_INET6, addr_prefix, &a) != 1) return -1;
+                        if (prefix < 0 || prefix > 128) return -1;
+                        memcpy(addr_bytes, &a.s6_addr, 16);
+                        addr_len = 16;
+                    } else {
+                        return -1; // 未対応のAddress Family
+                    }
+
+                    // 末尾ゼロバイトを省略
+                    int afdlength = addr_len;
+                    while (afdlength > 0 && addr_bytes[afdlength - 1] == 0) afdlength--;
+
+                    if (offset + 4 + (size_t)afdlength > max_res_len) return -1;
+                    res[offset++] = (afi >> 8) & 0xFF; res[offset++] = afi & 0xFF;
+                    res[offset++] = (uint8_t)prefix;
+                    res[offset++] = (uint8_t)((negate ? 0x80 : 0) | (afdlength & 0x7F));
+                    memcpy(&res[offset], addr_bytes, (size_t)afdlength);
+                    offset += afdlength;
+                }
                 break;
             }
             case 257: { // CAA

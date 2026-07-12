@@ -2,7 +2,7 @@
 
 CC = cc
 CFLAGS = -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE
-LDFLAGS = -pthread -lcrypto
+LDFLAGS = -pthread -lcrypto -lm
 
 TARGET = karidns
 SRCS = dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_utils.c

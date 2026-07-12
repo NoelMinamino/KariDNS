@@ -344,6 +344,21 @@ int main() {
         rec_amtrelay1.rdata[3] = (char*)"192.0.2.1";
         if (assert_bound_checked(&rec_amtrelay1)) return 1;
 
+        // LOC (Type 29)
+        dns_record_t rec_loc = {0};
+        rec_loc.name = (char*)"example.com"; rec_loc.type_code = 29; rec_loc.rdata_count = 10;
+        rec_loc.rdata[0] = (char*)"37"; rec_loc.rdata[1] = (char*)"26"; rec_loc.rdata[2] = (char*)"0.000"; rec_loc.rdata[3] = (char*)"N";
+        rec_loc.rdata[4] = (char*)"122"; rec_loc.rdata[5] = (char*)"8"; rec_loc.rdata[6] = (char*)"0.000"; rec_loc.rdata[7] = (char*)"W";
+        rec_loc.rdata[8] = (char*)"100.00m"; rec_loc.rdata[9] = (char*)"1m";
+        if (assert_bound_checked(&rec_loc)) return 1;
+
+        // APL (Type 42)
+        dns_record_t rec_apl = {0};
+        rec_apl.name = (char*)"example.com"; rec_apl.type_code = 42; rec_apl.rdata_count = 2;
+        rec_apl.rdata[0] = (char*)"1:192.168.0.0/24";
+        rec_apl.rdata[1] = (char*)"!2:2001:db8::/32";
+        if (assert_bound_checked(&rec_apl)) return 1;
+
         printf("Test 4 Passed: All input bound overflow tests safely rejected\n");
     }
 
@@ -385,6 +400,75 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-5 host-$$ A 10.0.0.$", false);
         // 正常系: 負のoffset
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
+    }
+
+    // Test 6: LOC and APL Validation Tests
+    {
+        printf("\n--- Test 6: LOC and APL Specific Validation ---\n");
+        uint8_t res_buf[512];
+        uint16_t offset = 0;
+        compress_ctx_t comp_ctx = {0};
+
+        // LOC: Invalid latitude (> 90 degrees = 324000 sec)
+        dns_record_t rec_loc_badlat = {0};
+        rec_loc_badlat.name = (char*)"example.com"; rec_loc_badlat.type_code = 29; rec_loc_badlat.rdata_count = 10;
+        rec_loc_badlat.rdata[0] = (char*)"91"; rec_loc_badlat.rdata[1] = (char*)"0"; rec_loc_badlat.rdata[2] = (char*)"0"; rec_loc_badlat.rdata[3] = (char*)"N";
+        rec_loc_badlat.rdata[4] = (char*)"0"; rec_loc_badlat.rdata[5] = (char*)"0"; rec_loc_badlat.rdata[6] = (char*)"0"; rec_loc_badlat.rdata[7] = (char*)"E";
+        rec_loc_badlat.rdata[8] = (char*)"0m"; rec_loc_badlat.rdata[9] = (char*)"0m";
+        offset = 0;
+        if (serialize_dns_record(res_buf, sizeof(res_buf), &offset, &rec_loc_badlat, &comp_ctx, NULL, 0) != -1) {
+            printf("FAIL: Expected failure for invalid latitude 91 N\n"); return 1;
+        }
+
+        // LOC: Invalid direction ('X')
+        dns_record_t rec_loc_baddir = {0};
+        rec_loc_baddir.name = (char*)"example.com"; rec_loc_baddir.type_code = 29; rec_loc_baddir.rdata_count = 10;
+        rec_loc_baddir.rdata[0] = (char*)"10"; rec_loc_baddir.rdata[1] = (char*)"0"; rec_loc_baddir.rdata[2] = (char*)"0"; rec_loc_baddir.rdata[3] = (char*)"X";
+        rec_loc_baddir.rdata[4] = (char*)"0"; rec_loc_baddir.rdata[5] = (char*)"0"; rec_loc_baddir.rdata[6] = (char*)"0"; rec_loc_baddir.rdata[7] = (char*)"E";
+        rec_loc_baddir.rdata[8] = (char*)"0m"; rec_loc_baddir.rdata[9] = (char*)"0m";
+        offset = 0;
+        if (serialize_dns_record(res_buf, sizeof(res_buf), &offset, &rec_loc_baddir, &comp_ctx, NULL, 0) != -1) {
+            printf("FAIL: Expected failure for invalid direction 'X'\n"); return 1;
+        }
+        
+        // LOC: Valid short form
+        dns_record_t rec_loc_short = {0};
+        rec_loc_short.name = (char*)"example.com"; rec_loc_short.type_code = 29; rec_loc_short.rdata_count = 5;
+        rec_loc_short.rdata[0] = (char*)"37"; rec_loc_short.rdata[1] = (char*)"N";
+        rec_loc_short.rdata[2] = (char*)"122"; rec_loc_short.rdata[3] = (char*)"W";
+        rec_loc_short.rdata[4] = (char*)"0m";
+        offset = 0;
+        if (serialize_dns_record(res_buf, sizeof(res_buf), &offset, &rec_loc_short, &comp_ctx, NULL, 0) == -1) {
+            printf("FAIL: Expected success for LOC short form\n"); return 1;
+        }
+
+        // APL: Invalid AFI (3)
+        dns_record_t rec_apl_badafi = {0};
+        rec_apl_badafi.name = (char*)"example.com"; rec_apl_badafi.type_code = 42; rec_apl_badafi.rdata_count = 1;
+        rec_apl_badafi.rdata[0] = (char*)"3:192.168.0.0/24";
+        offset = 0;
+        if (serialize_dns_record(res_buf, sizeof(res_buf), &offset, &rec_apl_badafi, &comp_ctx, NULL, 0) != -1) {
+            printf("FAIL: Expected failure for APL invalid AFI\n"); return 1;
+        }
+        
+        // APL: Invalid IPv4 Prefix (33)
+        dns_record_t rec_apl_badpfx = {0};
+        rec_apl_badpfx.name = (char*)"example.com"; rec_apl_badpfx.type_code = 42; rec_apl_badpfx.rdata_count = 1;
+        rec_apl_badpfx.rdata[0] = (char*)"1:192.168.0.0/33";
+        offset = 0;
+        if (serialize_dns_record(res_buf, sizeof(res_buf), &offset, &rec_apl_badpfx, &comp_ctx, NULL, 0) != -1) {
+            printf("FAIL: Expected failure for APL invalid IPv4 Prefix\n"); return 1;
+        }
+
+        // APL: Zero rdata (valid, 0 length)
+        dns_record_t rec_apl_zero = {0};
+        rec_apl_zero.name = (char*)"example.com"; rec_apl_zero.type_code = 42; rec_apl_zero.rdata_count = 0;
+        offset = 0;
+        if (serialize_dns_record(res_buf, sizeof(res_buf), &offset, &rec_apl_zero, &comp_ctx, NULL, 0) == -1) {
+            printf("FAIL: Expected success for APL 0 rdata\n"); return 1;
+        }
+
+        printf("PASS: LOC and APL validations\n");
     }
 
     printf("All tests passed safely.\n");
