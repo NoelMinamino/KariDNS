@@ -2306,15 +2306,8 @@ void *response_logger_thread_func(void *arg) {
                 else if (entry->qclass == 255) strcpy(class_str, "ANY");
                 else snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
                 
-                const char *type_str_tmp = get_type_str(entry->qtype, NULL);
                 char type_str[32];
-                if (type_str_tmp) {
-                    strncpy(type_str, type_str_tmp, sizeof(type_str) - 1);
-                    type_str[sizeof(type_str) - 1] = '\0';
-                    if (strncmp(type_str_tmp, "TYPE", 4) == 0) free((void *)type_str_tmp);
-                } else {
-                    snprintf(type_str, sizeof(type_str), "TYPE%d", entry->qtype);
-                }
+                const char *type_str_tmp = format_type_name(entry->qtype, type_str, sizeof(type_str));
 
                 // 3. EDNSとRCODEの文字列化
                 char edns_str[16] = "";
@@ -2335,7 +2328,7 @@ void *response_logger_thread_func(void *arg) {
                                    ch->print_category ? "responses: " : "",
                                    ch->print_severity ? "info: " : "", 
                                    entry->client_ip, entry->client_port,
-                                   entry->qname, entry->qname, class_str, type_str, edns_str, rcode_str, action_str);
+                                   entry->qname, entry->qname, class_str, type_str_tmp, edns_str, rcode_str, action_str);
                 
                 if (len > 0) {
                     if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
@@ -2384,15 +2377,8 @@ static void write_query_log(const char *client_ip, int client_port,
     strcpy(class_str, "ANY");
   else
     snprintf(class_str, sizeof(class_str), "CLASS%d", qclass);
-  const char *type_str_tmp = get_type_str(qtype, NULL);
   char type_str[32];
-  if (type_str_tmp) {
-    strncpy(type_str, type_str_tmp, sizeof(type_str) - 1);
-    type_str[sizeof(type_str) - 1] = '\0';
-    if (strncmp(type_str_tmp, "TYPE", 4) == 0)
-      free((void *)type_str_tmp);
-  } else
-    snprintf(type_str, sizeof(type_str), "TYPE%d", qtype);
+  const char *type_str_tmp = format_type_name(qtype, type_str, sizeof(type_str));
   char edns_str[16] = "";
   if (has_edns)
     snprintf(edns_str, sizeof(edns_str), "+E(0)%s", dnssec_ok ? "D" : "K");
@@ -2401,7 +2387,7 @@ static void write_query_log(const char *client_ip, int client_port,
                      "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
                      ch->print_category ? "queries: " : "",
                      ch->print_severity ? "info: " : "", client_ip, client_port,
-                     qname, qname, class_str, type_str, edns_str);
+                     qname, qname, class_str, type_str_tmp, edns_str);
   if (len <= 0)
     return;
   if (len >= (int)sizeof(log_buf))

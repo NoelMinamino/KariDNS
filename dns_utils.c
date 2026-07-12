@@ -224,3 +224,29 @@ char *get_base_dir(const char *path) {
     base[len] = '\0';
     return base;
 }
+
+const char *format_type_name(uint16_t type, char *buf, size_t buf_size) {
+    switch (type) {
+        case 1: return "A"; case 2: return "NS"; case 5: return "CNAME";
+        case 6: return "SOA"; case 12: return "PTR"; case 13: return "HINFO";
+        case 15: return "MX"; case 16: return "TXT"; case 17: return "RP";
+        case 18: return "AFSDB"; case 21: return "RT"; case 26: return "PX";
+        case 28: return "AAAA"; case 29: return "LOC"; case 33: return "SRV";
+        case 35: return "NAPTR"; case 36: return "KX"; case 37: return "CERT";
+        case 39: return "DNAME"; case 42: return "APL"; case 43: return "DS";
+        case 44: return "SSHFP"; case 45: return "IPSECKEY"; case 46: return "RRSIG";
+        case 47: return "NSEC"; case 48: return "DNSKEY"; case 49: return "DHCID";
+        case 50: return "NSEC3"; case 51: return "NSEC3PARAM"; case 52: return "TLSA";
+        case 53: return "SMIMEA"; case 55: return "HIP"; case 59: return "CDS";
+        case 60: return "CDNSKEY"; case 61: return "OPENPGPKEY"; case 62: return "CSYNC";
+        case 63: return "ZONEMD"; case 64: return "SVCB"; case 65: return "HTTPS";
+        case 99: return "SPF"; case 104: return "NID"; case 105: return "L32";
+        case 106: return "L64"; case 107: return "LP"; case 108: return "EUI48";
+        case 109: return "EUI64"; case 250: return "TSIG"; case 251: return "IXFR";
+        case 252: return "AXFR"; case 255: return "ANY"; case 256: return "URI";
+        case 257: return "CAA"; case 260: return "AMTRELAY";
+        default:
+            snprintf(buf, buf_size, "TYPE%u", type);
+            return buf;
+    }
+}
