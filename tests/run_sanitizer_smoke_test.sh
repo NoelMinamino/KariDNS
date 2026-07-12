@@ -128,8 +128,17 @@ for variant in asan tsan; do
     fi
     ./dag-asan "$ZONE_NAME" A "@127.0.0.1" -p 10053 +short >/dev/null 2>&1
     ./karictl-asan -f "$CTL_CONF" reload >/dev/null 2>&1
-    ./dag-asan "$ZONE_NAME" AXFR "@127.0.0.1" -p 10053 +tcp +short >/dev/null 2>&1
-    ./dag-asan "$ZONE_NAME" TYPE65280 "@127.0.0.1" -p 10053 +short >/dev/null 2>&1
+    ./dag-asan "$ZONE_NAME" AXFR "@127.0.0.1" -p 10053 +tcp +short >/dev/null 2>&1 &
+    PID1=$!
+    ./dag-asan "$ZONE_NAME" TYPE65280 "@127.0.0.1" -p 10053 +short >/dev/null 2>&1 &
+    PID2=$!
+    ./dag-asan "network.$ZONE_NAME" APL "@127.0.0.1" -p 10053 +short >/dev/null 2>&1 &
+    PID3=$!
+    ./dag-asan "office.$ZONE_NAME" LOC "@127.0.0.1" -p 10053 +short >/dev/null 2>&1 &
+    PID4=$!
+    ./dag-asan "$ZONE_NAME" AXFR "@127.0.0.1" -p 10053 +tcp +short >/dev/null 2>&1 &
+    PID5=$!
+    wait $PID1 $PID2 $PID3 $PID4 $PID5
     ./karictl-asan -f "$CTL_CONF" stop >/dev/null 2>&1
     sleep 1
     if kill -0 "$KARIDNS_PID" 2>/dev/null; then
