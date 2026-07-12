@@ -327,9 +327,16 @@ _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
 #define RESP_LOG_RING_SIZE 8192
 
+typedef enum {
+    LOG_ACT_SENT,
+    LOG_ACT_DROP_RRL,
+    LOG_ACT_DROP_MALFORMED
+} log_action_t;
+
 typedef struct {
     _Atomic bool ready;
     struct timespec ts;
+    log_action_t action;
     char client_ip[INET6_ADDRSTRLEN];
     int client_port;
     char qname[256];
@@ -2235,7 +2242,7 @@ static void free_logging_channels(server_config_t *cfg) {
   }
 }
 
-static void submit_response_log(const char *client_ip, int client_port, const char *qname, 
+static void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
                                 uint16_t qclass, uint16_t qtype, uint8_t rcode, 
                                 bool has_edns, bool dnssec_ok) {
     server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
@@ -2254,6 +2261,7 @@ static void submit_response_log(const char *client_ip, int client_port, const ch
     resp_log_entry_t *entry = &g_resp_log_ring[idx];
     
     clock_gettime(CLOCK_REALTIME, &entry->ts);
+    entry->action = action;
     strncpy(entry->client_ip, client_ip, INET6_ADDRSTRLEN - 1);
     entry->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
     entry->client_port = client_port;
@@ -2316,14 +2324,18 @@ void *response_logger_thread_func(void *arg) {
                 const char *rcode_str = (entry->rcode <= 10) ? rcode_strs[entry->rcode] : "UNKNOWN";
                 
                 // 4. BIND互換フォーマットへの組み立てと書き込み
+                const char *action_str = "";
+                if (entry->action == LOG_ACT_DROP_RRL) action_str = " [DROP:RRL]";
+                else if (entry->action == LOG_ACT_DROP_MALFORMED) action_str = " [DROP:MALFORMED]";
+
                 char log_buf[1024];
                 int len = snprintf(log_buf, sizeof(log_buf), 
-                                   "%s%s%sclient %s#%d (%s): response: %s %s %s %s -> %s\n", 
+                                   "%s%s%sclient %s#%d (%s): response: %s %s %s %s -> %s%s\n", 
                                    time_str,
                                    ch->print_category ? "responses: " : "",
                                    ch->print_severity ? "info: " : "", 
                                    entry->client_ip, entry->client_port,
-                                   entry->qname, entry->qname, class_str, type_str, edns_str, rcode_str);
+                                   entry->qname, entry->qname, class_str, type_str, edns_str, rcode_str, action_str);
                 
                 if (len > 0) {
                     if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
@@ -2763,7 +2775,7 @@ void *axfr_worker_thread(void *arg) {
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
                      args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len);
   
-  submit_response_log(args->client_ip, args->client_port, args->qname, 
+  submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname, 
                       args->qclass, args->qtype, 0, args->has_edns, args->dnssec_ok);
   
   close(args->client_fd);
@@ -3052,16 +3064,18 @@ worker_startup_success:;
                                 qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
           release_zone_snapshot(snap);
           if (res_len > 0) {
-            submit_response_log(client_ip, client_port, qname, qclass, qtype,
-                                res_buf[3] & 0x0F, has_edns, dnssec_ok);
             bool slip_triggered = false;
             rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
             if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
+              submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                  res_buf[3] & 0x0F, has_edns, dnssec_ok);
               udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
               *res_msg = *ipc_msg;
               res_msg->payload_len = res_len;
               send(active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0);
             } else if (slip_triggered) {
+              submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                  res_buf[3] & 0x0F, has_edns, dnssec_ok);
               res_buf[2] |= 0x02; // Set TC bit
               res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
               res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
@@ -3075,7 +3089,13 @@ worker_startup_success:;
               *res_msg = *ipc_msg;
               res_msg->payload_len = qlen;
               send(active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0);
+            } else {
+              submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
+                                  qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
             }
+          } else {
+            submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
+                                0, 0, 0, false, false);
           }
         }
       } else if (ev_list[i].udata == (void *)2) {
@@ -3349,7 +3369,7 @@ worker_startup_success:;
               send(client_fd, len_prefix, 2, 0);
               send(client_fd, res_buf, copy_len, 0);
               
-              submit_response_log(ctx_tcp->client_ip, client_port, qname, 
+              submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, 
                                   qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
 
               close(client_fd);
@@ -3366,11 +3386,14 @@ worker_startup_success:;
                                               &thread_compress_ctx, true, NULL, snap);
               release_zone_snapshot(snap);
               if (res_len > 0) {
-                submit_response_log(ctx_tcp->client_ip, client_port, qname, qclass, qtype,
+                submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                     tcp_res[3] & 0x0F, has_edns, dnssec_ok);
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
                 send(client_fd, len_prefix, 2, 0);
                 send(client_fd, tcp_res, res_len, 0);
+              } else {
+                submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>", 
+                                    0, 0, 0, false, false);
               }
               free(tcp_res);
             } else {
