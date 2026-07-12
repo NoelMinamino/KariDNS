@@ -44,11 +44,17 @@ struct zone_arena_s {
 
 void *arena_alloc(zone_arena_t *arena, size_t size) {
     (void)arena;
+    if (size > DAG_ARENA_SIZE) return NULL;
     size_t aligned = (size + 7) & ~((size_t)7);
-    if (g_arena_pos + aligned > DAG_ARENA_SIZE) return NULL;
+    if (aligned < size) return NULL; // Overflow
+    if (g_arena_pos + aligned > DAG_ARENA_SIZE || g_arena_pos + aligned < g_arena_pos) return NULL;
     void *p = &g_arena_buf[g_arena_pos];
     g_arena_pos += aligned;
     return p;
+}
+
+void reset_dag_arena(void) {
+    g_arena_pos = 0;
 }
 
 /* ========================================================================
@@ -819,7 +825,25 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             }
             break;
         }
+        case 17: { // RP
+            char *mbox = NULL, *txt = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &mbox) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, NULL, &txt) != 0) {
+                goto fallback;
+            }
+            printf("%s %s", mbox, txt);
+            break;
+        }
+        case 18: { // AFSDB
+            if (rdlen < 3) goto fallback;
+            uint16_t subtype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            char *hostname = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &hostname) != 0) goto fallback;
+            printf("%u %s", subtype, hostname);
+            break;
+        }
         default:
+        fallback:
             printf("\\# %u ", rdlen);
             for (uint16_t i = 0; i < rdlen && abs_offset + i < pkt_len; i++) printf("%02x", pkt[abs_offset + i]);
             break;
@@ -1127,6 +1151,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
         int msg_index = 1;
         do {
+            reset_dag_arena();
             if (!short_mode) {
                 if (use_tcp) {
                     printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
