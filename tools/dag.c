@@ -1125,8 +1125,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             if (use_tcp) {
                 tcp_sock = do_tcp_send_request(server, port, pkt, pkt_len, qo->timeout_sec);
                 if (tcp_sock >= 0) {
-                    n = 1; // connected
-                    break;
+                    n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+                    if (n > 0) {
+                        break; // connected and got first message
+                    }
+                    close(tcp_sock);
+                    tcp_sock = -1;
+                    n = -1;
                 }
             } else {
                 n = do_udp_exchange(server, port, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
@@ -1137,52 +1142,19 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         }
 
-        if (n < 0) {
+        if (n <= 0) {
             printf(";; no usable response received\n");
             return 1;
         }
 
-        if (use_tcp && tcp_sock >= 0) {
-            int msg_index = 0;
-            while (1) {
-                n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
-                if (n <= 0) break;
-                msg_index++;
-                if (!short_mode) {
-                    printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
-                    hexdump(resp, (size_t)n);
-                    if (use_ldnsz) {
-                        print_ldnsz_url(resp, (size_t)n);
-                    }
-                    printf("\n");
-                    print_response(resp, (size_t)n);
-                } else {
-                    uint16_t ancount = (resp[6] << 8) | resp[7];
-                    size_t off = 12;
-                    uint16_t qdcount = (resp[4] << 8) | resp[5];
-                    for (int k=0; k<qdcount; k++) {
-                        size_t nxt; if(skip_wire_name(resp, n, off, &nxt)==0) off = nxt + 4;
-                    }
-                    for (int k=0; k<ancount; k++) {
-                        size_t nxt; if(skip_wire_name(resp, n, off, &nxt)==0) {
-                            uint16_t type = (resp[nxt]<<8)|resp[nxt+1];
-                            uint16_t rdlen = (resp[nxt+8]<<8)|resp[nxt+9];
-                            print_rdata(resp, n, type, nxt+10, rdlen);
-                            printf("\n");
-                            off = nxt+10+rdlen;
-                        } else break;
-                    }
-                }
-            }
-            close(tcp_sock);
-            if (msg_index == 0) {
-                printf(";; no usable response received\n");
-                return 1;
-            }
-            n = 1; // set to valid value to avoid retry logic thinking it failed
-        } else if (!use_tcp) {
+        int msg_index = 1;
+        do {
             if (!short_mode) {
-                printf("Response (%zd bytes, UDP):\n", n);
+                if (use_tcp) {
+                    printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
+                } else {
+                    printf("Response (%zd bytes, UDP):\n", n);
+                }
                 hexdump(resp, (size_t)n);
                 if (use_ldnsz) {
                     print_ldnsz_url(resp, (size_t)n);
@@ -1206,7 +1178,17 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     } else break;
                 }
             }
-        }
+
+            if (use_tcp && tcp_sock >= 0) {
+                n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+                if (n > 0) msg_index++;
+            } else {
+                n = 0; // stop loop for UDP
+            }
+        } while (n > 0);
+
+        if (tcp_sock >= 0) close(tcp_sock);
+        n = 1; // set to valid value to avoid retry logic thinking it failed
 
         if (!use_tcp && n >= 12 && (resp[2] & 0x02) != 0) {
             printf("\n;; Truncated, retrying in TCP mode...\n\n");
