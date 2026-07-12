@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
             tm_info = localtime(&st.last_configured_time);
             strftime(config_str, sizeof(config_str), "%d-%b-%Y %H:%M:%S.%03d", tm_info);
             
-            printf("version: KariDNS 1.0.0 (Authoritative)\n");
+            printf("version: KariDNS 0.0.0 (Authoritative)\n");
             printf("running on %s: %s %s %s\n", un.nodename, un.sysname, un.machine, un.release);
             printf("boot time: %s\n", boot_str);
             printf("last configured: %s\n", config_str);
