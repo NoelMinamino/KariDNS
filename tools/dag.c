@@ -1207,7 +1207,8 @@ static void usage(const char *prog) {
         "          [+subnet=addr[/prefix]] [+bufsize=N] [+adflag] [+cdflag]\n"
         "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]]\n"
         "          [+padding=N] [+timeout=N] [+tries=N] [+ldnsz]\n"
-        "          [+tsig=alg:name:secret] [--test-all] [--break <kind>[=<param>] ...]\n"
+        "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
+        "          [--test-all] [--break <kind>[=<param>] ...]\n"
         "\n"
         "       %s --break-help    (list all --break kinds)\n",
         prog, prog);
@@ -1233,6 +1234,38 @@ static bool make_reverse_name(const char *ip_str, char *out_name, size_t out_len
         return true;
     }
     return false;
+}
+
+static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
+    qo->want_tsig = true;
+    char *colon1 = strchr(tsig_str, ':');
+    if (colon1) {
+        char *colon2 = strchr(colon1 + 1, ':');
+        char *alg, *name, *secret_b64;
+        if (colon2) {
+            *colon1 = '\0'; *colon2 = '\0';
+            alg = tsig_str; name = colon1 + 1; secret_b64 = colon2 + 1;
+        } else {
+            *colon1 = '\0';
+            alg = "hmac-sha256"; name = tsig_str; secret_b64 = colon1 + 1;
+        }
+        qo->tsig_key.algorithm = alg;
+        qo->tsig_key.name = name;
+        int b64_len = strlen(secret_b64);
+        int pad = 0;
+        if (b64_len > 0 && secret_b64[b64_len - 1] == '=') pad++;
+        if (b64_len > 1 && secret_b64[b64_len - 2] == '=') pad++;
+        int dec_len = EVP_DecodeBlock(qo->tsig_key.secret_decoded, (const unsigned char *)secret_b64, b64_len);
+        if (dec_len > 0) {
+            qo->tsig_key.secret_decoded_len = dec_len - pad;
+        } else {
+            fprintf(stderr, "warning: invalid tsig secret base64\n");
+            qo->want_tsig = false;
+        }
+    } else {
+        fprintf(stderr, "warning: invalid tsig format (expected [alg:]name:key)\n");
+        qo->want_tsig = false;
+    }
 }
 
 
@@ -1400,31 +1433,17 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "+nocookie") == 0) {
             qo.want_cookie = false;
-        } else if (strncmp(argv[i], "+tsig=", 6) == 0) {
-            qo.want_tsig = true;
-            char *tsig_str = strdup(argv[i] + 6);
-            char *colon1 = strchr(tsig_str, ':');
-            if (colon1) {
-                *colon1 = '\0';
-                qo.tsig_key.algorithm = tsig_str;
-                char *colon2 = strchr(colon1 + 1, ':');
-                if (colon2) {
-                    *colon2 = '\0';
-                    qo.tsig_key.name = colon1 + 1;
-                    char *secret_b64 = colon2 + 1;
-                    int b64_len = strlen(secret_b64);
-                    int pad = 0;
-                    if (b64_len > 0 && secret_b64[b64_len - 1] == '=') pad++;
-                    if (b64_len > 1 && secret_b64[b64_len - 2] == '=') pad++;
-                    int dec_len = EVP_DecodeBlock(qo.tsig_key.secret_decoded, (const unsigned char *)secret_b64, b64_len);
-                    if (dec_len > 0) {
-                        qo.tsig_key.secret_decoded_len = dec_len - pad;
-                    } else {
-                        fprintf(stderr, "warning: invalid tsig secret base64\n");
-                        qo.want_tsig = false;
-                    }
-                }
+        } else if (strcmp(argv[i], "-y") == 0) {
+            if (i + 1 < argc) {
+                i++;
+                char *tsig_str = strdup(argv[i]);
+                parse_tsig_str(tsig_str, &qo);
+            } else {
+                fprintf(stderr, "warning: -y requires an argument\n");
             }
+        } else if (strncmp(argv[i], "+tsig=", 6) == 0) {
+            char *tsig_str = strdup(argv[i] + 6);
+            parse_tsig_str(tsig_str, &qo);
         } else if (strcmp(argv[i], "--test-all") == 0) {
             // Already handled earlier
         } else {
