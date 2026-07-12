@@ -325,6 +325,25 @@ _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
+#define RESP_LOG_RING_SIZE 8192
+
+typedef struct {
+    _Atomic bool ready;
+    struct timespec ts;
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port;
+    char qname[256];
+    uint16_t qclass;
+    uint16_t qtype;
+    uint8_t rcode;
+    bool has_edns;
+    bool dnssec_ok;
+} resp_log_entry_t;
+
+static resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
+static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
+static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
+
 static inline void inc_tcp_clients(void) {
     int current = atomic_fetch_add_explicit(&g_tcp_clients, 1, memory_order_relaxed) + 1;
     int high = atomic_load_explicit(&g_tcp_high_water, memory_order_relaxed);
@@ -2209,6 +2228,119 @@ static void free_logging_channels(server_config_t *cfg) {
     free(cfg->logging.queries_channel_name);
     cfg->logging.queries_channel_name = NULL;
   }
+  cfg->logging.responses_channel = NULL;
+  if (cfg->logging.responses_channel_name) {
+    free(cfg->logging.responses_channel_name);
+    cfg->logging.responses_channel_name = NULL;
+  }
+}
+
+static void submit_response_log(const char *client_ip, int client_port, const char *qname, 
+                                uint16_t qclass, uint16_t qtype, uint8_t rcode, 
+                                bool has_edns, bool dnssec_ok) {
+    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    if (!cfg || !cfg->logging.responses_channel || cfg->logging.responses_channel->fd < 0) return;
+
+    uint64_t t = atomic_load_explicit(&g_resp_log_tail, memory_order_relaxed);
+    uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
+    
+    // ロックフリー CAS ループ (バッファフル時はDDoS状態とみなし、潔くログをドロップする)
+    do {
+        if (t - h >= RESP_LOG_RING_SIZE) return; 
+    } while (!atomic_compare_exchange_weak_explicit(&g_resp_log_tail, &t, t + 1, 
+                                                    memory_order_acq_rel, memory_order_relaxed));
+    
+    uint32_t idx = t & (RESP_LOG_RING_SIZE - 1);
+    resp_log_entry_t *entry = &g_resp_log_ring[idx];
+    
+    clock_gettime(CLOCK_REALTIME, &entry->ts);
+    strncpy(entry->client_ip, client_ip, INET6_ADDRSTRLEN - 1);
+    entry->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
+    entry->client_port = client_port;
+    strncpy(entry->qname, qname, 255);
+    entry->qname[255] = '\0';
+    entry->qclass = qclass;
+    entry->qtype = qtype;
+    entry->rcode = rcode;
+    entry->has_edns = has_edns;
+    entry->dnssec_ok = dnssec_ok;
+    
+    // データ書き込み完了をConsumerに通知
+    atomic_store_explicit(&entry->ready, true, memory_order_release);
+}
+
+void *response_logger_thread_func(void *arg) {
+    (void)arg;
+    while (1) {
+        uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_relaxed);
+        uint32_t idx = h & (RESP_LOG_RING_SIZE - 1);
+        
+        if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
+            resp_log_entry_t *entry = &g_resp_log_ring[idx];
+            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+            
+            if (cfg && cfg->logging.responses_channel && cfg->logging.responses_channel->fd >= 0) {
+                log_channel_t *ch = cfg->logging.responses_channel;
+                
+                // 1. 時刻のフォーマット (ミリ秒対応)
+                struct tm tm_info;
+                localtime_r(&entry->ts.tv_sec, &tm_info);
+                char time_str[64] = "";
+                if (ch->print_time) {
+                    char buf[32];
+                    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
+                    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf, entry->ts.tv_nsec / 1000000);
+                }
+
+                // 2. クラスとタイプの文字列化
+                char class_str[16];
+                if (entry->qclass == 1) strcpy(class_str, "IN");
+                else if (entry->qclass == 255) strcpy(class_str, "ANY");
+                else snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
+                
+                const char *type_str_tmp = get_type_str(entry->qtype, NULL);
+                char type_str[32];
+                if (type_str_tmp) {
+                    strncpy(type_str, type_str_tmp, sizeof(type_str) - 1);
+                    type_str[sizeof(type_str) - 1] = '\0';
+                    if (strncmp(type_str_tmp, "TYPE", 4) == 0) free((void *)type_str_tmp);
+                } else {
+                    snprintf(type_str, sizeof(type_str), "TYPE%d", entry->qtype);
+                }
+
+                // 3. EDNSとRCODEの文字列化
+                char edns_str[16] = "";
+                if (entry->has_edns) snprintf(edns_str, sizeof(edns_str), "+E(0)%s", entry->dnssec_ok ? "D" : "K");
+                
+                const char *rcode_strs[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};
+                const char *rcode_str = (entry->rcode <= 10) ? rcode_strs[entry->rcode] : "UNKNOWN";
+                
+                // 4. BIND互換フォーマットへの組み立てと書き込み
+                char log_buf[1024];
+                int len = snprintf(log_buf, sizeof(log_buf), 
+                                   "%s%s%sclient %s#%d (%s): response: %s %s %s %s -> %s\n", 
+                                   time_str,
+                                   ch->print_category ? "responses: " : "",
+                                   ch->print_severity ? "info: " : "", 
+                                   entry->client_ip, entry->client_port,
+                                   entry->qname, entry->qname, class_str, type_str, edns_str, rcode_str);
+                
+                if (len > 0) {
+                    if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
+                    pthread_mutex_lock(&ch->lock);
+                    write(ch->fd, log_buf, len);
+                    pthread_mutex_unlock(&ch->lock);
+                }
+            }
+            
+            // Consumerのポインタを進める
+            atomic_store_explicit(&entry->ready, false, memory_order_release);
+            atomic_fetch_add_explicit(&g_resp_log_head, 1, memory_order_release);
+        } else {
+            usleep(1000); // データ未着時は1msスリープしてCPU負荷を下げる
+        }
+    }
+    return NULL;
 }
 
 static void write_query_log(const char *client_ip, int client_port,
@@ -2910,6 +3042,8 @@ worker_startup_success:;
                                 qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
           release_zone_snapshot(snap);
           if (res_len > 0) {
+            submit_response_log(client_ip, client_port, qname, qclass, qtype,
+                                res_buf[3] & 0x0F, has_edns, dnssec_ok);
             bool slip_triggered = false;
             rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
             if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
@@ -3212,6 +3346,8 @@ worker_startup_success:;
                                               &thread_compress_ctx, true, NULL, snap);
               release_zone_snapshot(snap);
               if (res_len > 0) {
+                submit_response_log(ctx_tcp->client_ip, client_port, qname, qclass, qtype,
+                                    tcp_res[3] & 0x0F, has_edns, dnssec_ok);
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
                 send(client_fd, len_prefix, 2, 0);
                 send(client_fd, tcp_res, res_len, 0);
@@ -3573,7 +3709,7 @@ void *control_thread_func(void *arg) {
               
               server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
               st.query_logging = (active_cfg && active_cfg->logging.queries_channel != NULL);
-              st.response_logging = false;
+              st.response_logging = (active_cfg && active_cfg->logging.responses_channel != NULL);
               
               st.rrl_dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
               st.rrl_slipped = atomic_load_explicit(&g_rrl_slip_total, memory_order_relaxed);
@@ -4158,6 +4294,9 @@ int main(int argc, char **argv) {
   }
 
   tzset();
+  pthread_t response_logger_thread;
+  if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);
+  
   enter_capsicum_sandbox(); // サンドボックス突入！
 
   for (int i = 0; i < num_workers; i++)

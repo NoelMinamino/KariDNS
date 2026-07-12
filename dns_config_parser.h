@@ -61,6 +61,8 @@ typedef struct {
   log_channel_t *channels;
   char *queries_channel_name;
   log_channel_t *queries_channel;
+  char *responses_channel_name;
+  log_channel_t *responses_channel;
 } logging_config_t;
 
 typedef struct {
