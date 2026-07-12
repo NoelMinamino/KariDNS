@@ -2442,7 +2442,13 @@ static void write_query_log(const char *client_ip, int client_port,
 
 typedef struct {
   int client_fd;
+  char client_ip[INET6_ADDRSTRLEN];
+  int client_port;
   char qname[256];
+  uint16_t qclass;
+  uint16_t qtype;
+  bool has_edns;
+  bool dnssec_ok;
   uint8_t req[512];
   uint16_t req_len;
   tsig_key_t *tsig_key;
@@ -2756,6 +2762,10 @@ void *axfr_worker_thread(void *arg) {
   zone_db_entry_t *entry = args->entry;
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
                      args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len);
+  
+  submit_response_log(args->client_ip, args->client_port, args->qname, 
+                      args->qclass, args->qtype, 0, args->has_edns, args->dnssec_ok);
+  
   close(args->client_fd);
   dec_tcp_clients();
   zone_db_snapshot_t *worker_snap = args->snap;
@@ -3253,8 +3263,14 @@ worker_startup_success:;
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
                 if (args) {
                   args->client_fd = client_fd;
+                  strncpy(args->client_ip, ctx_tcp->client_ip, INET6_ADDRSTRLEN);
+                  args->client_port = client_port;
                   strncpy(args->qname, qname, 255);
                   args->qname[255] = '\0';
+                  args->qclass = qclass;
+                  args->qtype = qtype;
+                  args->has_edns = has_edns;
+                  args->dnssec_ok = dnssec_ok;
                   args->req_len = msg_len > 512 ? 512 : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   args->tsig_key = matched_key;
@@ -3332,6 +3348,10 @@ worker_startup_success:;
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               send(client_fd, len_prefix, 2, 0);
               send(client_fd, res_buf, copy_len, 0);
+              
+              submit_response_log(ctx_tcp->client_ip, client_port, qname, 
+                                  qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+
               close(client_fd);
               dec_tcp_clients();
             } else {
