@@ -219,14 +219,10 @@ int main(int argc, char **argv) {
             printf("CPUs found: %d\n", num_cpus);
             printf("worker threads: %d\n", st.worker_threads);
             printf("number of zones: %d (0 automatic)\n", st.num_zones);
-            printf("debug level: 0\n");
             printf("xfers running: %d\n", st.xfers_running);
-            printf("xfers deferred: %d\n", st.xfers_deferred);
-            printf("xfers first refresh: %d\n", st.xfers_first_refresh);
-            printf("soa queries in progress: %d\n", st.soa_queries_in_progress);
             printf("query logging is %s\n", st.query_logging ? "ON" : "OFF");
             printf("response logging is %s\n", st.response_logging ? "ON" : "OFF");
-            printf("tcp clients: %d/%d (High-water: %d)\n", st.tcp_clients, st.max_tcp_clients, st.tcp_high_water);
+            printf("tcp clients: %d (High-water: %d)\n", st.tcp_clients, st.tcp_high_water);
             printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
             
             printf("\n--- Security & Rate Limit Stats ---\n");

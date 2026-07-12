@@ -324,9 +324,6 @@ time_t g_last_configured_time = 0;
 _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
-_Atomic int g_xfers_deferred = ATOMIC_VAR_INIT(0);
-_Atomic int g_xfers_first_refresh = ATOMIC_VAR_INIT(0);
-_Atomic int g_soa_queries_in_progress = ATOMIC_VAR_INIT(0);
 
 static inline void inc_tcp_clients(void) {
     int current = atomic_fetch_add_explicit(&g_tcp_clients, 1, memory_order_relaxed) + 1;
@@ -3567,17 +3564,15 @@ void *control_thread_func(void *arg) {
               st.xfers_running = atomic_load_explicit(&g_xfers_running, memory_order_relaxed);
               st.tcp_clients = atomic_load_explicit(&g_tcp_clients, memory_order_relaxed);
               st.tcp_high_water = atomic_load_explicit(&g_tcp_high_water, memory_order_relaxed);
-              st.xfers_deferred = atomic_load_explicit(&g_xfers_deferred, memory_order_relaxed);
-              st.xfers_first_refresh = atomic_load_explicit(&g_xfers_first_refresh, memory_order_relaxed);
-              st.soa_queries_in_progress = atomic_load_explicit(&g_soa_queries_in_progress, memory_order_relaxed);
-              st.max_tcp_clients = 100;
               st.worker_threads = atomic_load(&g_bound_workers);
               
               if (g_config_path) {
                   strncpy(st.config_file, g_config_path, sizeof(st.config_file) - 1);
               }
               st.frontend_alive = atomic_load(&g_frontend_alive);
-              st.query_logging = false;
+              
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              st.query_logging = (active_cfg && active_cfg->logging.queries_channel != NULL);
               st.response_logging = false;
               
               st.rrl_dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);

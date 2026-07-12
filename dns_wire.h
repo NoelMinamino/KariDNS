@@ -16,7 +16,6 @@ typedef struct {
     int xfers_running;
     int tcp_clients;
     int tcp_high_water;
-    int max_tcp_clients;
     int worker_threads;
     char config_file[256];
     bool frontend_alive;
@@ -28,9 +27,6 @@ typedef struct {
     uint64_t ede_na;
     uint64_t ede_ns;
     uint64_t ede_oth;
-    int xfers_deferred;
-    int xfers_first_refresh;
-    int soa_queries_in_progress;
 } karidns_status_t;
 
 // ============================================================================
