@@ -11,6 +11,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -749,6 +750,33 @@ static const char *opcode_name(uint8_t opcode) {
 // dag.c: get_type_str(dns_wire.c, arena依存)を使わず、dag内で完結させる。
 // format_type_name is now in dns_utils.h
 
+static const uint8_t *read_char_string(const uint8_t *p, const uint8_t *end, char *out, size_t out_cap) {
+    if (p >= end) return NULL;
+    uint8_t len = *p++;
+    if (p + len > end) return NULL;
+    size_t copy_len = (len < out_cap - 1) ? len : out_cap - 1;
+    memcpy(out, p, copy_len);
+    out[copy_len] = '\0';
+    return p + len;
+}
+
+static double loc_decode_precsize(uint8_t b) {
+    uint8_t mantissa = b >> 4;
+    uint8_t exponent = b & 0x0F;
+    double cm = mantissa * pow(10, exponent);
+    return cm / 100.0;
+}
+
+static void loc_format_coord(uint32_t wire_val, bool is_lat, char *out, size_t out_cap) {
+    int64_t signed_val = (int64_t)wire_val - 0x80000000LL;
+    char dir = is_lat ? (signed_val < 0 ? 'S' : 'N') : (signed_val < 0 ? 'W' : 'E');
+    double total_sec = fabs((double)signed_val) / 1000.0;
+    int deg = (int)(total_sec / 3600.0);
+    int min = (int)(fmod(total_sec, 3600.0) / 60.0);
+    double sec = fmod(total_sec, 60.0);
+    snprintf(out, out_cap, "%d %d %.3f %c", deg, min, sec, dir);
+}
+
 static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                          size_t abs_offset, uint16_t rdlen) {
     switch (type) {
@@ -840,6 +868,260 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             char *hostname = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &hostname) != 0) goto fallback;
             printf("%u %s", subtype, hostname);
+            break;
+        }
+
+        case 13: { // HINFO
+            char cpu[256], os[256];
+            const uint8_t *p = &pkt[abs_offset];
+            const uint8_t *end = p + rdlen;
+            p = read_char_string(p, end, cpu, sizeof(cpu));
+            if (!p) goto fallback;
+            p = read_char_string(p, end, os, sizeof(os));
+            if (!p) goto fallback;
+            printf("\"%s\" \"%s\"", cpu, os);
+            break;
+        }
+        case 26: { // PX
+            if (rdlen < 2) goto fallback;
+            uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            char *map822 = NULL, *mapx400 = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &map822) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, NULL, &mapx400) != 0) {
+                goto fallback;
+            }
+            printf("%u %s %s", pref, map822, mapx400);
+            break;
+        }
+        case 29: { // LOC
+            if (rdlen != 16) goto fallback;
+            uint8_t size_b = pkt[abs_offset + 1], hp_b = pkt[abs_offset + 2], vp_b = pkt[abs_offset + 3];
+            uint32_t lat_wire = ((uint32_t)pkt[abs_offset + 4]<<24)|((uint32_t)pkt[abs_offset + 5]<<16)|((uint32_t)pkt[abs_offset + 6]<<8)|pkt[abs_offset + 7];
+            uint32_t lon_wire = ((uint32_t)pkt[abs_offset + 8]<<24)|((uint32_t)pkt[abs_offset + 9]<<16)|((uint32_t)pkt[abs_offset + 10]<<8)|pkt[abs_offset + 11];
+            uint32_t alt_wire = ((uint32_t)pkt[abs_offset + 12]<<24)|((uint32_t)pkt[abs_offset + 13]<<16)|((uint32_t)pkt[abs_offset + 14]<<8)|pkt[abs_offset + 15];
+            double alt_m = ((int64_t)alt_wire - 10000000LL) / 100.0;
+            char lat_buf[64], lon_buf[64];
+            loc_format_coord(lat_wire, true, lat_buf, sizeof(lat_buf));
+            loc_format_coord(lon_wire, false, lon_buf, sizeof(lon_buf));
+            printf("%s %s %.2fm %.2fm %.2fm %.2fm", lat_buf, lon_buf, alt_m,
+                   loc_decode_precsize(size_b), loc_decode_precsize(hp_b), loc_decode_precsize(vp_b));
+            break;
+        }
+        case 35: { // NAPTR
+            if (rdlen < 4) goto fallback;
+            uint16_t order = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            uint16_t pref = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
+            char flags[256], svcs[256], regexp[256];
+            const uint8_t *p = &pkt[abs_offset + 4];
+            const uint8_t *end = &pkt[abs_offset + rdlen];
+            p = read_char_string(p, end, flags, sizeof(flags)); if (!p) goto fallback;
+            p = read_char_string(p, end, svcs, sizeof(svcs)); if (!p) goto fallback;
+            p = read_char_string(p, end, regexp, sizeof(regexp)); if (!p) goto fallback;
+            char *repl = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &repl) != 0) goto fallback;
+            printf("%u %u \"%s\" \"%s\" \"%s\" %s", order, pref, flags, svcs, regexp, repl);
+            break;
+        }
+        case 21: case 36: case 107: { // RT / KX / LP
+            if (rdlen < 2) goto fallback;
+            uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            char *name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &name) != 0) goto fallback;
+            printf("%u %s", pref, name);
+            break;
+        }
+        case 37: { // CERT
+            if (rdlen < 5) goto fallback;
+            uint16_t ctype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            uint16_t keytag = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
+            uint8_t alg = pkt[abs_offset + 4];
+            printf("%u %u %u ", ctype, keytag, alg);
+            if (rdlen > 5) {
+                size_t b64_len = 4 * ((rdlen - 5 + 2) / 3) + 1;
+                char *b64 = malloc(b64_len);
+                if (!b64) goto fallback;
+                EVP_EncodeBlock((unsigned char *)b64, &pkt[abs_offset + 5], rdlen - 5);
+                printf("%s", b64);
+                free(b64);
+            }
+            break;
+        }
+        case 42: { // APL
+            size_t pos = 0;
+            bool first = true;
+            while (pos + 4 <= rdlen) {
+                uint16_t afi = (pkt[abs_offset + pos]<<8)|pkt[abs_offset + pos+1];
+                uint8_t prefix = pkt[abs_offset + pos+2];
+                uint8_t neg_len = pkt[abs_offset + pos+3];
+                bool negate = (neg_len & 0x80) != 0;
+                uint8_t afdlength = neg_len & 0x7F;
+                pos += 4;
+                if (pos + afdlength > rdlen) break;
+
+                uint8_t addr[16] = {0};
+                memcpy(addr, &pkt[abs_offset + pos], afdlength);
+                pos += afdlength;
+
+                char addr_str[64] = "?";
+                if (afi == 1) inet_ntop(AF_INET, addr, addr_str, sizeof(addr_str));
+                else if (afi == 2) inet_ntop(AF_INET6, addr, addr_str, sizeof(addr_str));
+
+                if (!first) printf(" ");
+                printf("%s%u:%s/%u", negate ? "!" : "", afi, addr_str, prefix);
+                first = false;
+            }
+            if (first && rdlen != 0 && pos != rdlen) goto fallback;
+            break;
+        }
+        case 43: { // DS
+            if (rdlen < 4) goto fallback;
+            uint16_t keytag = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            printf("%u %u %u ", keytag, pkt[abs_offset + 2], pkt[abs_offset + 3]);
+            for (size_t i = 4; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
+            break;
+        }
+        case 44: { // SSHFP
+            if (rdlen < 2) goto fallback;
+            printf("%u %u ", pkt[abs_offset], pkt[abs_offset + 1]);
+            for (size_t i = 2; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
+            break;
+        }
+        case 45: { // IPSECKEY
+            if (rdlen < 3) goto fallback;
+            uint8_t prec = pkt[abs_offset];
+            uint8_t gw_type = pkt[abs_offset + 1];
+            uint8_t alg = pkt[abs_offset + 2];
+            printf("%u %u %u ", prec, gw_type, alg);
+            const uint8_t *p = &pkt[abs_offset + 3];
+            const uint8_t *end = &pkt[abs_offset + rdlen];
+            if (gw_type == 0) {
+                printf(". ");
+            } else if (gw_type == 1) {
+                if (p + 4 > end) goto fallback;
+                printf("%d.%d.%d.%d ", p[0], p[1], p[2], p[3]);
+                p += 4;
+            } else if (gw_type == 2) {
+                if (p + 16 > end) goto fallback;
+                char buf[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, p, buf, sizeof(buf));
+                printf("%s ", buf);
+                p += 16;
+            } else if (gw_type == 3) {
+                char *gw = NULL; size_t next;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &gw) != 0) goto fallback;
+                printf("%s ", gw);
+                p = &pkt[next];
+            } else goto fallback;
+            if (p < end) {
+                size_t key_len = end - p;
+                size_t b64_len = 4 * ((key_len + 2) / 3) + 1;
+                char *b64 = malloc(b64_len);
+                if (!b64) goto fallback;
+                EVP_EncodeBlock((unsigned char *)b64, p, key_len);
+                printf("%s", b64);
+                free(b64);
+            }
+            break;
+        }
+        case 49: case 61: { // DHCID / OPENPGPKEY
+            if (rdlen == 0) break;
+            size_t b64_len = 4 * ((rdlen + 2) / 3) + 1;
+            char *b64 = malloc(b64_len);
+            if (!b64) goto fallback;
+            EVP_EncodeBlock((unsigned char *)b64, &pkt[abs_offset], rdlen);
+            printf("%s", b64);
+            free(b64);
+            break;
+        }
+        case 51: { // NSEC3PARAM
+            if (rdlen < 5) goto fallback;
+            uint8_t alg = pkt[abs_offset];
+            uint8_t flags = pkt[abs_offset + 1];
+            uint16_t iter = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
+            uint8_t salt_len = pkt[abs_offset + 4];
+            if (5 + salt_len > rdlen) goto fallback;
+            printf("%u %u %u ", alg, flags, iter);
+            if (salt_len == 0) printf("-");
+            else {
+                for (uint8_t i = 0; i < salt_len; i++) printf("%02X", pkt[abs_offset + 5 + i]);
+            }
+            break;
+        }
+        case 52: case 53: { // TLSA / SMIMEA
+            if (rdlen < 3) goto fallback;
+            printf("%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
+            for (size_t i = 3; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
+            break;
+        }
+        case 64: case 65: { // SVCB / HTTPS
+            if (rdlen < 2) goto fallback;
+            uint16_t prio = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            char *target = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &target) != 0) goto fallback;
+            printf("%u %s", prio, target);
+            if (next - abs_offset < rdlen) {
+                printf(" \\# %zu ", rdlen - (next - abs_offset));
+                for (size_t i = next - abs_offset; i < rdlen; i++) printf("%02x", pkt[abs_offset + i]);
+            }
+            break;
+        }
+        case 108: { // EUI48
+            if (rdlen != 6) goto fallback;
+            printf("%02x-%02x-%02x-%02x-%02x-%02x", 
+                pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2], 
+                pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5]);
+            break;
+        }
+        case 109: { // EUI64
+            if (rdlen != 8) goto fallback;
+            printf("%02x-%02x-%02x-%02x-%02x-%02x-%02x-%02x", 
+                pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2], pkt[abs_offset+3], 
+                pkt[abs_offset+4], pkt[abs_offset+5], pkt[abs_offset+6], pkt[abs_offset+7]);
+            break;
+        }
+        case 256: { // URI
+            if (rdlen < 4) goto fallback;
+            uint16_t prio = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            uint16_t weight = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
+            printf("%u %u \"%.*s\"", prio, weight, (int)(rdlen - 4), &pkt[abs_offset + 4]);
+            break;
+        }
+        case 257: { // CAA
+            if (rdlen < 2) goto fallback;
+            uint8_t flags = pkt[abs_offset];
+            uint8_t tag_len = pkt[abs_offset + 1];
+            if (2 + tag_len > rdlen) goto fallback;
+            printf("%u %.*s \"%.*s\"", flags, tag_len, &pkt[abs_offset + 2], (int)(rdlen - 2 - tag_len), &pkt[abs_offset + 2 + tag_len]);
+            break;
+        }
+        case 260: { // AMTRELAY
+            if (rdlen < 1) goto fallback;
+            uint8_t prec = pkt[abs_offset];
+            uint8_t d_opt = (prec & 0x80) != 0;
+            prec &= 0x7F;
+            if (rdlen < 2) {
+                printf("%u %u 0 .", prec, d_opt);
+                break;
+            }
+            uint8_t relay_type = pkt[abs_offset + 1];
+            const uint8_t *p = &pkt[abs_offset + 2];
+            const uint8_t *end = &pkt[abs_offset + rdlen];
+            printf("%u %u %u ", prec, d_opt, relay_type);
+            if (relay_type == 0) {
+                printf(".");
+            } else if (relay_type == 1) {
+                if (p + 4 > end) goto fallback;
+                printf("%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
+            } else if (relay_type == 2) {
+                if (p + 16 > end) goto fallback;
+                char buf[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, p, buf, sizeof(buf));
+                printf("%s", buf);
+            } else if (relay_type == 3) {
+                char *gw = NULL; size_t next;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &gw) != 0) goto fallback;
+                printf("%s", gw);
+            } else goto fallback;
             break;
         }
         default:
