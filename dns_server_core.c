@@ -319,6 +319,52 @@ static int g_notify_ipc[2];
 static int g_control_sock = -1;
 static _Atomic(bool) g_frontend_alive = true;
 
+time_t g_boot_time = 0;
+time_t g_last_configured_time = 0;
+_Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
+_Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
+_Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
+
+#define RESP_LOG_RING_SIZE 8192
+
+typedef enum {
+    LOG_ACT_SENT,
+    LOG_ACT_DROP_RRL,
+    LOG_ACT_DROP_MALFORMED
+} log_action_t;
+
+typedef struct {
+    _Atomic bool ready;
+    struct timespec ts;
+    log_action_t action;
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port;
+    char qname[256];
+    uint16_t qclass;
+    uint16_t qtype;
+    uint8_t rcode;
+    bool has_edns;
+    bool dnssec_ok;
+} resp_log_entry_t;
+
+static resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
+static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
+static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
+
+static inline void inc_tcp_clients(void) {
+    int current = atomic_fetch_add_explicit(&g_tcp_clients, 1, memory_order_relaxed) + 1;
+    int high = atomic_load_explicit(&g_tcp_high_water, memory_order_relaxed);
+    while (current > high) {
+        if (atomic_compare_exchange_weak_explicit(&g_tcp_high_water, &high, current, memory_order_relaxed, memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+static inline void dec_tcp_clients(void) {
+    atomic_fetch_sub_explicit(&g_tcp_clients, 1, memory_order_relaxed);
+}
+
+
 // Broker
 static int g_broker_sock = -1;
 static void start_connect_broker(void) {
@@ -1940,6 +1986,7 @@ typedef struct {
 } axfr_bg_ctx_t;
 
 void *axfr_bg_thread_func(void *arg) {
+  atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_bg_ctx_t *ctx = (axfr_bg_ctx_t *)arg;
   struct sockaddr_storage master_addr;
   memset(&master_addr, 0, sizeof(master_addr));
@@ -2075,6 +2122,7 @@ void *axfr_bg_thread_func(void *arg) {
     atomic_store_explicit(&ctx->entry->is_transferring, false,
                           memory_order_release);
   free(ctx);
+  atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
 }
 
@@ -2187,6 +2235,117 @@ static void free_logging_channels(server_config_t *cfg) {
     free(cfg->logging.queries_channel_name);
     cfg->logging.queries_channel_name = NULL;
   }
+  cfg->logging.responses_channel = NULL;
+  if (cfg->logging.responses_channel_name) {
+    free(cfg->logging.responses_channel_name);
+    cfg->logging.responses_channel_name = NULL;
+  }
+}
+
+static void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
+                                uint16_t qclass, uint16_t qtype, uint8_t rcode, 
+                                bool has_edns, bool dnssec_ok) {
+    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    if (!cfg || !cfg->logging.responses_channel || cfg->logging.responses_channel->fd < 0) return;
+
+    uint64_t t = atomic_load_explicit(&g_resp_log_tail, memory_order_relaxed);
+    uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
+    
+    // ロックフリー CAS ループ (バッファフル時はDDoS状態とみなし、潔くログをドロップする)
+    do {
+        if (t - h >= RESP_LOG_RING_SIZE) return; 
+    } while (!atomic_compare_exchange_weak_explicit(&g_resp_log_tail, &t, t + 1, 
+                                                    memory_order_acq_rel, memory_order_relaxed));
+    
+    uint32_t idx = t & (RESP_LOG_RING_SIZE - 1);
+    resp_log_entry_t *entry = &g_resp_log_ring[idx];
+    
+    clock_gettime(CLOCK_REALTIME, &entry->ts);
+    entry->action = action;
+    strncpy(entry->client_ip, client_ip, INET6_ADDRSTRLEN - 1);
+    entry->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
+    entry->client_port = client_port;
+    strncpy(entry->qname, qname, 255);
+    entry->qname[255] = '\0';
+    entry->qclass = qclass;
+    entry->qtype = qtype;
+    entry->rcode = rcode;
+    entry->has_edns = has_edns;
+    entry->dnssec_ok = dnssec_ok;
+    
+    // データ書き込み完了をConsumerに通知
+    atomic_store_explicit(&entry->ready, true, memory_order_release);
+}
+
+void *response_logger_thread_func(void *arg) {
+    (void)arg;
+    while (1) {
+        uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_relaxed);
+        uint32_t idx = h & (RESP_LOG_RING_SIZE - 1);
+        
+        if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
+            resp_log_entry_t *entry = &g_resp_log_ring[idx];
+            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+            
+            if (cfg && cfg->logging.responses_channel && cfg->logging.responses_channel->fd >= 0) {
+                log_channel_t *ch = cfg->logging.responses_channel;
+                
+                // 1. 時刻のフォーマット (ミリ秒対応)
+                struct tm tm_info;
+                localtime_r(&entry->ts.tv_sec, &tm_info);
+                char time_str[64] = "";
+                if (ch->print_time) {
+                    char buf[32];
+                    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
+                    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf, entry->ts.tv_nsec / 1000000);
+                }
+
+                // 2. クラスとタイプの文字列化
+                char class_str[16];
+                if (entry->qclass == 1) strcpy(class_str, "IN");
+                else if (entry->qclass == 255) strcpy(class_str, "ANY");
+                else snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
+                
+                char type_str[32];
+                const char *type_str_tmp = format_type_name(entry->qtype, type_str, sizeof(type_str));
+
+                // 3. EDNSとRCODEの文字列化
+                char edns_str[16] = "";
+                if (entry->has_edns) snprintf(edns_str, sizeof(edns_str), "+E(0)%s", entry->dnssec_ok ? "D" : "K");
+                
+                const char *rcode_strs[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};
+                const char *rcode_str = (entry->rcode <= 10) ? rcode_strs[entry->rcode] : "UNKNOWN";
+                
+                // 4. BIND互換フォーマットへの組み立てと書き込み
+                const char *action_str = "";
+                if (entry->action == LOG_ACT_DROP_RRL) action_str = " [DROP:RRL]";
+                else if (entry->action == LOG_ACT_DROP_MALFORMED) action_str = " [DROP:MALFORMED]";
+
+                char log_buf[1024];
+                int len = snprintf(log_buf, sizeof(log_buf), 
+                                   "%s%s%sclient %s#%d (%s): response: %s %s %s %s -> %s%s\n", 
+                                   time_str,
+                                   ch->print_category ? "responses: " : "",
+                                   ch->print_severity ? "info: " : "", 
+                                   entry->client_ip, entry->client_port,
+                                   entry->qname, entry->qname, class_str, type_str_tmp, edns_str, rcode_str, action_str);
+                
+                if (len > 0) {
+                    if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
+                    pthread_mutex_lock(&ch->lock);
+                    write(ch->fd, log_buf, len);
+                    pthread_mutex_unlock(&ch->lock);
+                }
+            }
+            
+            // Consumerのポインタを進める
+            atomic_store_explicit(&entry->ready, false, memory_order_release);
+            atomic_fetch_add_explicit(&g_resp_log_head, 1, memory_order_release);
+        } else {
+            usleep(1000); // データ未着時は1msスリープしてCPU負荷を下げる
+        }
+    }
+    return NULL;
 }
 
 static void write_query_log(const char *client_ip, int client_port,
@@ -2218,15 +2377,8 @@ static void write_query_log(const char *client_ip, int client_port,
     strcpy(class_str, "ANY");
   else
     snprintf(class_str, sizeof(class_str), "CLASS%d", qclass);
-  const char *type_str_tmp = get_type_str(qtype, NULL);
   char type_str[32];
-  if (type_str_tmp) {
-    strncpy(type_str, type_str_tmp, sizeof(type_str) - 1);
-    type_str[sizeof(type_str) - 1] = '\0';
-    if (strncmp(type_str_tmp, "TYPE", 4) == 0)
-      free((void *)type_str_tmp);
-  } else
-    snprintf(type_str, sizeof(type_str), "TYPE%d", qtype);
+  const char *type_str_tmp = format_type_name(qtype, type_str, sizeof(type_str));
   char edns_str[16] = "";
   if (has_edns)
     snprintf(edns_str, sizeof(edns_str), "+E(0)%s", dnssec_ok ? "D" : "K");
@@ -2235,7 +2387,7 @@ static void write_query_log(const char *client_ip, int client_port,
                      "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
                      ch->print_category ? "queries: " : "",
                      ch->print_severity ? "info: " : "", client_ip, client_port,
-                     qname, qname, class_str, type_str, edns_str);
+                     qname, qname, class_str, type_str_tmp, edns_str);
   if (len <= 0)
     return;
   if (len >= (int)sizeof(log_buf))
@@ -2288,7 +2440,13 @@ static void write_query_log(const char *client_ip, int client_port,
 
 typedef struct {
   int client_fd;
+  char client_ip[INET6_ADDRSTRLEN];
+  int client_port;
   char qname[256];
+  uint16_t qclass;
+  uint16_t qtype;
+  bool has_edns;
+  bool dnssec_ok;
   uint8_t req[512];
   uint16_t req_len;
   tsig_key_t *tsig_key;
@@ -2597,16 +2755,23 @@ axfr_error:
 }
 
 void *axfr_worker_thread(void *arg) {
+  atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
                      args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len);
+  
+  submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname, 
+                      args->qclass, args->qtype, 0, args->has_edns, args->dnssec_ok);
+  
   close(args->client_fd);
+  dec_tcp_clients();
   zone_db_snapshot_t *worker_snap = args->snap;
   free(args);
   if (entry)
     atomic_fetch_sub(&entry->active_axfr, 1);
   release_zone_snapshot(worker_snap);
+  atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
 }
 
@@ -2734,6 +2899,7 @@ worker_startup_success:;
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
         close(client_fd);
+        dec_tcp_clients();
         free(ctx_tcp);
       } else if (ev_list[i].udata == (void *)1) {
         // UDP (IPC経由)
@@ -2887,11 +3053,15 @@ worker_startup_success:;
             bool slip_triggered = false;
             rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
             if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
+              submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                  res_buf[3] & 0x0F, has_edns, dnssec_ok);
               udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
               *res_msg = *ipc_msg;
               res_msg->payload_len = res_len;
               send(active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0);
             } else if (slip_triggered) {
+              submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                  res_buf[3] & 0x0F, has_edns, dnssec_ok);
               res_buf[2] |= 0x02; // Set TC bit
               res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
               res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
@@ -2905,7 +3075,13 @@ worker_startup_success:;
               *res_msg = *ipc_msg;
               res_msg->payload_len = qlen;
               send(active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0);
+            } else {
+              submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
+                                  qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
             }
+          } else {
+            submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
+                                0, 0, 0, false, false);
           }
         }
       } else if (ev_list[i].udata == (void *)2) {
@@ -2919,12 +3095,15 @@ worker_startup_success:;
           if (client_fd < 0)
             break;
 
+          inc_tcp_clients();
+
           limit_client_socket_rights(client_fd);
           int cflags = fcntl(client_fd, F_GETFL, 0);
           fcntl(client_fd, F_SETFL, cflags | O_NONBLOCK);
           tcp_stream_ctx_t *ctx_tcp = calloc(1, sizeof(tcp_stream_ctx_t));
           if (!ctx_tcp) {
             close(client_fd);
+            dec_tcp_clients();
             continue;
           }
           struct kevent ev_timeout;
@@ -2956,6 +3135,7 @@ worker_startup_success:;
           EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
           kevent(kq, &ev_del, 1, NULL, 0, NULL);
           close(client_fd);
+          dec_tcp_clients();
           free(ctx_tcp);
         } else if (ret == 1) {
           struct kevent ev_del;
@@ -3089,8 +3269,14 @@ worker_startup_success:;
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
                 if (args) {
                   args->client_fd = client_fd;
+                  strncpy(args->client_ip, ctx_tcp->client_ip, INET6_ADDRSTRLEN);
+                  args->client_port = client_port;
                   strncpy(args->qname, qname, 255);
                   args->qname[255] = '\0';
+                  args->qclass = qclass;
+                  args->qtype = qtype;
+                  args->has_edns = has_edns;
+                  args->dnssec_ok = dnssec_ok;
                   args->req_len = msg_len > 512 ? 512 : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   args->tsig_key = matched_key;
@@ -3106,11 +3292,13 @@ worker_startup_success:;
                     free(args);
                     atomic_fetch_sub(&entry->active_axfr, 1);
                     close(client_fd);
+                    dec_tcp_clients();
                   } else
                     pthread_detach(t);
                 } else {
                   atomic_fetch_sub(&entry->active_axfr, 1);
                   close(client_fd);
+                  dec_tcp_clients();
                 }
               }
             }
@@ -3166,7 +3354,12 @@ worker_startup_success:;
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               send(client_fd, len_prefix, 2, 0);
               send(client_fd, res_buf, copy_len, 0);
+              
+              submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, 
+                                  qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+
               close(client_fd);
+              dec_tcp_clients();
             } else {
               release_zone_snapshot(snap);
             }
@@ -3179,15 +3372,21 @@ worker_startup_success:;
                                               &thread_compress_ctx, true, NULL, snap);
               release_zone_snapshot(snap);
               if (res_len > 0) {
+                submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
+                                    tcp_res[3] & 0x0F, has_edns, dnssec_ok);
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
                 send(client_fd, len_prefix, 2, 0);
                 send(client_fd, tcp_res, res_len, 0);
+              } else {
+                submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>", 
+                                    0, 0, 0, false, false);
               }
               free(tcp_res);
             } else {
               release_zone_snapshot(snap);
             }
             close(client_fd);
+            dec_tcp_clients();
             free(ctx_tcp);
           }
         }
@@ -3266,6 +3465,7 @@ static void reload_all_zones(void) {
 }
 
 static void perform_config_reload(void) {
+  g_last_configured_time = time(NULL);
   char *config_str = read_entire_file(g_config_path);
   if (!config_str)
     return;
@@ -3517,17 +3717,47 @@ void *control_thread_func(void *arg) {
               send(cfd, "OK stopping\n", 12, 0);
               exit(0);
             } else if (strcmp(cmd, "status") == 0) {
-              char smsg[512];
-              bool frontend_alive = atomic_load(&g_frontend_alive);
-              uint64_t dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
-              uint64_t slipped = atomic_load_explicit(&g_rrl_slip_total, memory_order_relaxed);
-              uint64_t ede_proh = atomic_load_explicit(&g_ede_prohibited_total, memory_order_relaxed);
-              uint64_t ede_na = atomic_load_explicit(&g_ede_not_authoritative_total, memory_order_relaxed);
-              uint64_t ede_ns = atomic_load_explicit(&g_ede_not_supported_total, memory_order_relaxed);
-              uint64_t ede_oth = atomic_load_explicit(&g_ede_other_total, memory_order_relaxed);
-              int slen = snprintf(smsg, sizeof(smsg), "OK frontend_alive=%d pid=%d RRL_Dropped=%" PRIu64 " RRL_Slipped=%" PRIu64 " EDE_Prohibited=%" PRIu64 " EDE_NotAuthoritative=%" PRIu64 " EDE_NotSupported=%" PRIu64 " EDE_Other=%" PRIu64 "\n", 
-                                  frontend_alive, getpid(), dropped, slipped, ede_proh, ede_na, ede_ns, ede_oth);
-              send(cfd, smsg, slen, 0);
+              karidns_status_t st;
+              memset(&st, 0, sizeof(st));
+              st.boot_time = g_boot_time;
+              st.last_configured_time = g_last_configured_time;
+              
+              zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              st.num_zones = snap ? snap->count : 0;
+              release_zone_snapshot(snap);
+
+              st.xfers_running = atomic_load_explicit(&g_xfers_running, memory_order_relaxed);
+              st.tcp_clients = atomic_load_explicit(&g_tcp_clients, memory_order_relaxed);
+              st.tcp_high_water = atomic_load_explicit(&g_tcp_high_water, memory_order_relaxed);
+              st.worker_threads = atomic_load(&g_bound_workers);
+              
+              if (g_config_path) {
+                  strncpy(st.config_file, g_config_path, sizeof(st.config_file) - 1);
+              }
+              st.frontend_alive = atomic_load(&g_frontend_alive);
+              
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              st.query_logging = (active_cfg && active_cfg->logging.queries_channel != NULL);
+              st.response_logging = (active_cfg && active_cfg->logging.responses_channel != NULL);
+              
+              st.rrl_dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
+              st.rrl_slipped = atomic_load_explicit(&g_rrl_slip_total, memory_order_relaxed);
+              st.ede_proh = atomic_load_explicit(&g_ede_prohibited_total, memory_order_relaxed);
+              st.ede_na = atomic_load_explicit(&g_ede_not_authoritative_total, memory_order_relaxed);
+              st.ede_ns = atomic_load_explicit(&g_ede_not_supported_total, memory_order_relaxed);
+              st.ede_oth = atomic_load_explicit(&g_ede_other_total, memory_order_relaxed);
+              
+              struct iovec iov[2];
+              iov[0].iov_base = "OK ";
+              iov[0].iov_len = 3;
+              iov[1].iov_base = &st;
+              iov[1].iov_len = sizeof(st);
+              
+              struct msghdr msg;
+              memset(&msg, 0, sizeof(msg));
+              msg.msg_iov = iov;
+              msg.msg_iovlen = 2;
+              sendmsg(cfd, &msg, 0);
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
@@ -3927,6 +4157,8 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
 int main(int argc, char **argv) {
   arc4random_buf(g_server_cookie_secret, sizeof(g_server_cookie_secret));
   tzset();
+  g_boot_time = time(NULL);
+  g_last_configured_time = g_boot_time;
   
   // Force OpenSSL lazy initialization before entering Capsicum sandbox
   uint8_t dummy_cookie[16];
@@ -4091,6 +4323,9 @@ int main(int argc, char **argv) {
   }
 
   tzset();
+  pthread_t response_logger_thread;
+  if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);
+  
   enter_capsicum_sandbox(); // サンドボックス突入！
 
   for (int i = 0; i < num_workers; i++)

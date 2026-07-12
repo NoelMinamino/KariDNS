@@ -971,6 +971,8 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             tok = get_next_token(&ctx);
             if (strcmp(cat_name, "queries") == 0 && tok.type == TOKEN_STRING)
               config->logging.queries_channel_name = strdup(tok.value);
+            else if (strcmp(cat_name, "responses") == 0 && tok.type == TOKEN_STRING)
+              config->logging.responses_channel_name = strdup(tok.value);
             free_token(&tok);
             tok = get_next_token(&ctx);
             if (tok.type == TOKEN_SEMICOLON)
@@ -998,6 +1000,16 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         while (ch) {
           if (strcmp(ch->name, config->logging.queries_channel_name) == 0) {
             config->logging.queries_channel = ch;
+            break;
+          }
+          ch = ch->next;
+        }
+      }
+      if (config->logging.responses_channel_name) {
+        log_channel_t *ch = config->logging.channels;
+        while (ch) {
+          if (strcmp(ch->name, config->logging.responses_channel_name) == 0) {
+            config->logging.responses_channel = ch;
             break;
           }
           ch = ch->next;

@@ -4,6 +4,30 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <time.h>
+
+// ============================================================================
+// ステータス構造体 (IPC用)
+// ============================================================================
+typedef struct {
+    time_t boot_time;
+    time_t last_configured_time;
+    int num_zones;
+    int xfers_running;
+    int tcp_clients;
+    int tcp_high_water;
+    int worker_threads;
+    char config_file[256];
+    bool frontend_alive;
+    bool query_logging;
+    bool response_logging;
+    uint64_t rrl_dropped;
+    uint64_t rrl_slipped;
+    uint64_t ede_proh;
+    uint64_t ede_na;
+    uint64_t ede_ns;
+    uint64_t ede_oth;
+} karidns_status_t;
 
 // ============================================================================
 // 定数 (dns_server_core.c から移動)
