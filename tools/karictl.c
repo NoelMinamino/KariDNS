@@ -6,9 +6,15 @@
 #include <sys/un.h>
 #include <sys/ucred.h>
 #include <fcntl.h>
+#include <stdbool.h>
+#include <time.h>
+#include <sys/utsname.h>
+#include <sys/sysctl.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+
+#include "../dns_wire.h"
 
 char *read_entire_file(const char *path) {
   FILE *f = fopen(path, "r");
@@ -177,13 +183,73 @@ int main(int argc, char **argv) {
 
     send(sock, cmd_msg, strlen(cmd_msg), 0);
 
-    r = recv(sock, buf, sizeof(buf) - 1, 0);
-    if (r > 0) {
-        buf[r] = '\0';
-        printf("%s", buf);
-        if (strncmp(buf, "ERROR", 5) == 0) {
-            close(sock);
-            return 3;
+    if (strcmp(argv[optind], "status") == 0) {
+        size_t expected_len = 3 + sizeof(karidns_status_t);
+        size_t total = 0;
+        while (total < expected_len) {
+            r = recv(sock, buf + total, sizeof(buf) - total, 0);
+            if (r <= 0) break;
+            total += r;
+        }
+        if (total >= expected_len && strncmp(buf, "OK ", 3) == 0) {
+            karidns_status_t st;
+            memcpy(&st, buf + 3, sizeof(st));
+            
+            struct utsname un;
+            uname(&un);
+            
+            int num_cpus = 1;
+            int mib[2] = { CTL_HW, HW_NCPU };
+            size_t clen = sizeof(num_cpus);
+            sysctl(mib, 2, &num_cpus, &clen, NULL, 0);
+            
+            char boot_str[64], config_str[64];
+            struct tm *tm_info;
+            tm_info = localtime(&st.boot_time);
+            strftime(boot_str, sizeof(boot_str), "%d-%b-%Y %H:%M:%S.%03d", tm_info);
+            
+            tm_info = localtime(&st.last_configured_time);
+            strftime(config_str, sizeof(config_str), "%d-%b-%Y %H:%M:%S.%03d", tm_info);
+            
+            printf("version: KariDNS 1.0.0 (Authoritative)\n");
+            printf("running on %s: %s %s %s\n", un.nodename, un.sysname, un.machine, un.release);
+            printf("boot time: %s\n", boot_str);
+            printf("last configured: %s\n", config_str);
+            printf("configuration file: %s\n", st.config_file[0] ? st.config_file : "(unknown)");
+            printf("CPUs found: %d\n", num_cpus);
+            printf("worker threads: %d\n", st.worker_threads);
+            printf("number of zones: %d (0 automatic)\n", st.num_zones);
+            printf("debug level: 0\n");
+            printf("xfers running: %d\n", st.xfers_running);
+            printf("xfers deferred: %d\n", st.xfers_deferred);
+            printf("xfers first refresh: %d\n", st.xfers_first_refresh);
+            printf("soa queries in progress: %d\n", st.soa_queries_in_progress);
+            printf("query logging is %s\n", st.query_logging ? "ON" : "OFF");
+            printf("response logging is %s\n", st.response_logging ? "ON" : "OFF");
+            printf("tcp clients: %d/%d (High-water: %d)\n", st.tcp_clients, st.max_tcp_clients, st.tcp_high_water);
+            printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
+            
+            printf("\n--- Security & Rate Limit Stats ---\n");
+            printf("RRL dropped: %lu\n", st.rrl_dropped);
+            printf("RRL slipped: %lu\n", st.rrl_slipped);
+            printf("EDE Prohibited (18): %lu\n", st.ede_proh);
+            printf("EDE NotAuthoritative (20): %lu\n", st.ede_na);
+            printf("EDE NotSupported (21): %lu\n", st.ede_ns);
+            printf("EDE Other: %lu\n", st.ede_oth);
+            printf("-----------------------------------\n");
+        } else {
+            buf[total] = '\0';
+            printf("%s", buf);
+        }
+    } else {
+        r = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (r > 0) {
+            buf[r] = '\0';
+            printf("%s", buf);
+            if (strncmp(buf, "ERROR", 5) == 0) {
+                close(sock);
+                return 3;
+            }
         }
     }
 
