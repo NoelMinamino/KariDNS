@@ -777,6 +777,118 @@ static void loc_format_coord(uint32_t wire_val, bool is_lat, char *out, size_t o
     snprintf(out, out_cap, "%d %d %.3f %c", deg, min, sec, dir);
 }
 
+static const char *cert_type_name(uint16_t type, char *buf, size_t buf_size) {
+    switch (type) {
+        case 1: return "PKIX"; case 2: return "SPKI"; case 3: return "PGP";
+        case 4: return "IPKIX"; case 5: return "ISPKI"; case 6: return "IPGP";
+        case 7: return "ACPKIX"; case 8: return "IACPKIX";
+        case 253: return "URI"; case 254: return "OID";
+        default: snprintf(buf, buf_size, "%u", type); return buf;
+    }
+}
+
+static void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len, char *out, size_t out_cap) {
+    size_t pos = 0, out_len = 0;
+    out[0] = '\0';
+    while (pos + 2 <= bitmap_len) {
+        uint8_t window = bitmap[pos];
+        uint8_t block_len = bitmap[pos + 1];
+        pos += 2;
+        if (pos + block_len > bitmap_len) break;
+        for (int byte_idx = 0; byte_idx < block_len; byte_idx++) {
+            uint8_t b = bitmap[pos + byte_idx];
+            for (int bit = 0; bit < 8; bit++) {
+                if (b & (0x80 >> bit)) {
+                    uint16_t type_code = (window << 8) | (byte_idx * 8 + bit);
+                    char tbuf[32];
+                    const char *tname = format_type_name(type_code, tbuf, sizeof(tbuf));
+                    int n = snprintf(out + out_len, out_cap - out_len, "%s%s",
+                                      (out_len > 0) ? " " : "", tname);
+                    if (n < 0 || (size_t)n >= out_cap - out_len) return;
+                    out_len += (size_t)n;
+                }
+            }
+        }
+        pos += block_len;
+    }
+}
+
+static void print_dnskey_like(const uint8_t *rdata, size_t rdlen) {
+    if (rdlen < 4) { printf("(malformed)"); return; }
+    uint16_t flags = (rdata[0]<<8)|rdata[1];
+    uint8_t protocol = rdata[2];
+    uint8_t algorithm = rdata[3];
+    size_t b64_cap = ((rdlen - 4) * 4 / 3) + 8;
+    char *b64 = malloc(b64_cap);
+    if (!b64) { printf("(oom)"); return; }
+    int n = EVP_EncodeBlock((unsigned char*)b64, &rdata[4], (int)(rdlen - 4));
+    printf("%u %u %u %.*s", flags, protocol, algorithm, n, b64);
+    free(b64);
+}
+
+static void print_ds_like(const uint8_t *rdata, size_t rdlen) {
+    if (rdlen < 4) { printf("(malformed)"); return; }
+    uint16_t keytag = (rdata[0]<<8)|rdata[1];
+    uint8_t algorithm = rdata[2];
+    uint8_t digest_type = rdata[3];
+    printf("%u %u %u ", keytag, algorithm, digest_type);
+    for (size_t i = 4; i < rdlen; i++) printf("%02X", rdata[i]);
+}
+
+static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
+    static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    size_t out_len = 0;
+    int buffer = 0, bits_left = 0;
+    for (size_t i = 0; i < len; i++) {
+        buffer = (buffer << 8) | data[i];
+        bits_left += 8;
+        while (bits_left >= 5) {
+            if (out_len + 1 >= out_cap) { out[out_len] = '\0'; return; }
+            out[out_len++] = alphabet[(buffer >> (bits_left - 5)) & 0x1F];
+            bits_left -= 5;
+        }
+    }
+    if (bits_left > 0 && out_len + 1 < out_cap) {
+        out[out_len++] = alphabet[(buffer << (5 - bits_left)) & 0x1F];
+    }
+    out[out_len] = '\0';
+}
+
+static void format_rrsig_time(uint32_t t, char *out, size_t out_cap) {
+    time_t tt = (time_t)t;
+    struct tm tm_buf;
+    gmtime_r(&tt, &tm_buf);
+    strftime(out, out_cap, "%Y%m%d%H%M%S", &tm_buf);
+}
+
+static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_hash) {
+    if (rdlen < 5) { printf("(malformed)"); return; }
+    uint8_t hash_alg = rdata[0];
+    uint8_t flags = rdata[1];
+    uint16_t iterations = (rdata[2]<<8)|rdata[3];
+    uint8_t salt_len = rdata[4];
+    if (5 + salt_len > rdlen) { printf("(malformed)"); return; }
+    char salt_hex[512] = "-";
+    if (salt_len > 0) {
+        size_t p2 = 0;
+        for (int i = 0; i < salt_len; i++) p2 += snprintf(salt_hex + p2, sizeof(salt_hex) - p2, "%02X", rdata[5 + i]);
+    }
+    printf("%u %u %u %s", hash_alg, flags, iterations, salt_hex);
+
+    if (with_hash) { // NSEC3 specific
+        if (5 + salt_len + 1 > rdlen) { printf(" (malformed)"); return; }
+        size_t pos = 5 + salt_len;
+        uint8_t hash_len = rdata[pos++];
+        if (pos + hash_len > rdlen) { printf(" (malformed)"); return; }
+        char hash_b32[128];
+        base32hex_encode(&rdata[pos], hash_len, hash_b32, sizeof(hash_b32));
+        pos += hash_len;
+        char types_buf[512];
+        decode_type_bitmap(&rdata[pos], rdlen - pos, types_buf, sizeof(types_buf));
+        printf(" %s %s", hash_b32, types_buf);
+    }
+}
+
 static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                          size_t abs_offset, uint16_t rdlen) {
     switch (type) {
@@ -935,7 +1047,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t ctype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             uint16_t keytag = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
             uint8_t alg = pkt[abs_offset + 4];
-            printf("%u %u %u ", ctype, keytag, alg);
+            char cbuf[32];
+            printf("%s %u %u ", cert_type_name(ctype, cbuf, sizeof(cbuf)), keytag, alg);
             if (rdlen > 5) {
                 size_t b64_len = 4 * ((rdlen - 5 + 2) / 3) + 1;
                 char *b64 = malloc(b64_len);
@@ -971,13 +1084,6 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 first = false;
             }
             if (first && rdlen != 0 && pos != rdlen) goto fallback;
-            break;
-        }
-        case 43: { // DS
-            if (rdlen < 4) goto fallback;
-            uint16_t keytag = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
-            printf("%u %u %u ", keytag, pkt[abs_offset + 2], pkt[abs_offset + 3]);
-            for (size_t i = 4; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
             break;
         }
         case 44: { // SSHFP
@@ -1034,17 +1140,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         }
         case 51: { // NSEC3PARAM
-            if (rdlen < 5) goto fallback;
-            uint8_t alg = pkt[abs_offset];
-            uint8_t flags = pkt[abs_offset + 1];
-            uint16_t iter = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
-            uint8_t salt_len = pkt[abs_offset + 4];
-            if (5 + salt_len > rdlen) goto fallback;
-            printf("%u %u %u ", alg, flags, iter);
-            if (salt_len == 0) printf("-");
-            else {
-                for (uint8_t i = 0; i < salt_len; i++) printf("%02X", pkt[abs_offset + 5 + i]);
-            }
+            print_nsec3_params(&pkt[abs_offset], rdlen, false);
             break;
         }
         case 52: case 53: { // TLSA / SMIMEA
@@ -1122,6 +1218,101 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &gw) != 0) goto fallback;
                 printf("%s", gw);
             } else goto fallback;
+            break;
+        }
+
+        case 46: { // RRSIG
+            if (rdlen < 18) goto fallback;
+            uint16_t type_covered = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
+            uint8_t algorithm = pkt[abs_offset+2];
+            uint8_t labels = pkt[abs_offset+3];
+            uint32_t original_ttl = ((uint32_t)pkt[abs_offset+4]<<24)|((uint32_t)pkt[abs_offset+5]<<16)|((uint32_t)pkt[abs_offset+6]<<8)|pkt[abs_offset+7];
+            uint32_t sig_exp = ((uint32_t)pkt[abs_offset+8]<<24)|((uint32_t)pkt[abs_offset+9]<<16)|((uint32_t)pkt[abs_offset+10]<<8)|pkt[abs_offset+11];
+            uint32_t sig_inc = ((uint32_t)pkt[abs_offset+12]<<24)|((uint32_t)pkt[abs_offset+13]<<16)|((uint32_t)pkt[abs_offset+14]<<8)|pkt[abs_offset+15];
+            uint16_t key_tag = (pkt[abs_offset+16]<<8)|pkt[abs_offset+17];
+
+            char *signer_name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, NULL, &signer_name) != 0) goto fallback;
+            size_t sig_offset_in_rdata = (next - abs_offset);
+            if (sig_offset_in_rdata >= rdlen) goto fallback;
+
+            char covered_buf[32];
+            const char *covered_name = format_type_name(type_covered, covered_buf, sizeof(covered_buf));
+            char exp_str[32], inc_str[32];
+            format_rrsig_time(sig_exp, exp_str, sizeof(exp_str));
+            format_rrsig_time(sig_inc, inc_str, sizeof(inc_str));
+
+            size_t sig_len = rdlen - sig_offset_in_rdata;
+            size_t b64_cap = (sig_len * 4 / 3) + 8;
+            char *b64 = malloc(b64_cap);
+            if (!b64) goto fallback;
+            int n = EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset + sig_offset_in_rdata], (int)sig_len);
+
+            printf("%s %u %u %u %s %s %u %s %.*s", covered_name, algorithm, labels,
+                   original_ttl, exp_str, inc_str, key_tag, signer_name, n, b64);
+            free(b64);
+            break;
+        }
+        case 47: { // NSEC
+            char *next_name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &next_name) != 0) goto fallback;
+            size_t name_consumed = next - abs_offset;
+            if (name_consumed >= rdlen) goto fallback;
+            char types_buf[512];
+            decode_type_bitmap(&pkt[abs_offset + name_consumed], rdlen - name_consumed, types_buf, sizeof(types_buf));
+            printf("%s %s", next_name, types_buf);
+            break;
+        }
+        case 48: case 60: { // DNSKEY / CDNSKEY
+            print_dnskey_like(&pkt[abs_offset], rdlen);
+            break;
+        }
+        case 50: { // NSEC3
+            print_nsec3_params(&pkt[abs_offset], rdlen, true);
+            break;
+        }
+        case 43: case 59: { // DS / CDS
+            print_ds_like(&pkt[abs_offset], rdlen);
+            break;
+        }
+        case 62: { // CSYNC
+            if (rdlen < 6) goto fallback;
+            uint32_t serial = ((uint32_t)pkt[abs_offset]<<24)|((uint32_t)pkt[abs_offset+1]<<16)|((uint32_t)pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
+            uint16_t flags = (pkt[abs_offset+4]<<8)|pkt[abs_offset+5];
+            char types_buf[512];
+            decode_type_bitmap(&pkt[abs_offset+6], rdlen - 6, types_buf, sizeof(types_buf));
+            printf("%u %u %s", serial, flags, types_buf);
+            break;
+        }
+        case 250: { // TSIG
+            char *alg_name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &alg_name) != 0) goto fallback;
+            size_t pos = next - abs_offset;
+            if (pos + 10 > rdlen) goto fallback;
+
+            uint64_t time_signed = ((uint64_t)pkt[abs_offset+pos] << 40) | ((uint64_t)pkt[abs_offset+pos+1] << 32) |
+                                    ((uint64_t)pkt[abs_offset+pos+2] << 24) | ((uint64_t)pkt[abs_offset+pos+3] << 16) |
+                                    ((uint64_t)pkt[abs_offset+pos+4] << 8) | pkt[abs_offset+pos+5];
+            uint16_t fudge = (pkt[abs_offset+pos+6]<<8)|pkt[abs_offset+pos+7];
+            uint16_t mac_size = (pkt[abs_offset+pos+8]<<8)|pkt[abs_offset+pos+9];
+            pos += 10;
+            if (pos + mac_size + 6 > rdlen) goto fallback;
+
+            size_t b64_cap = (mac_size * 4 / 3) + 8;
+            char *mac_b64 = malloc(b64_cap);
+            int n = mac_b64 ? EVP_EncodeBlock((unsigned char*)mac_b64, &pkt[abs_offset+pos], (int)mac_size) : 0;
+            pos += mac_size;
+
+            uint16_t original_id = (pkt[abs_offset+pos]<<8)|pkt[abs_offset+pos+1];
+            uint16_t tsig_error = (pkt[abs_offset+pos+2]<<8)|pkt[abs_offset+pos+3];
+            uint16_t other_len = (pkt[abs_offset+pos+4]<<8)|pkt[abs_offset+pos+5];
+            
+            const char *err_str = rcode_name(tsig_error);
+
+            printf("%s. %llu %u %u %.*s %u %s %u", alg_name, (unsigned long long)time_signed,
+                   fudge, mac_size, n, mac_b64 ? mac_b64 : "", original_id,
+                   err_str, other_len);
+            if (mac_b64) free(mac_b64);
             break;
         }
         default:
