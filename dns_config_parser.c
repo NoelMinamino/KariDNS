@@ -595,11 +595,112 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
         } else if (strcmp(key, "allow-transfer") == 0) {
-          if (parse_string_list(&ctx, &zone->allow_transfer,
-                                &zone->allow_transfer_count) != 0) {
-            free(key);
-            free_zone_config(zone);
-            return -1;
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_LBRACE) {
+            free(key); free_zone_config(zone); free_token(&tok); return -1;
+          }
+          free_token(&tok);
+          
+          int brace_depth = 1;
+          bool in_negated_block = false;
+          
+          while (brace_depth > 0) {
+            tok = get_next_token(&ctx);
+            if (tok.type == TOKEN_EOF) {
+              free(key); free_zone_config(zone); free_token(&tok); return -1;
+            }
+            if (tok.type == TOKEN_RBRACE) {
+              brace_depth--;
+              in_negated_block = false; // Exiting any block resets negated block state
+              free_token(&tok);
+              if (brace_depth > 0) {
+                  // Inside a nested block, BIND requires a semicolon after the block '};'
+                  tok = get_next_token(&ctx);
+                  if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+                  free_token(&tok);
+              } else {
+                  // End of the entire allow-transfer block, consume the outer semicolon '};'
+                  tok = get_next_token(&ctx);
+                  if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+                  free_token(&tok);
+              }
+              continue;
+            }
+            if (tok.type == TOKEN_LBRACE) {
+              brace_depth++;
+              free_token(&tok);
+              continue;
+            }
+            if (tok.type == TOKEN_SEMICOLON) {
+              free_token(&tok);
+              continue;
+            }
+            if (tok.type != TOKEN_STRING) {
+              free(key); free_zone_config(zone); free_token(&tok); return -1;
+            }
+            
+            if (strcmp(tok.value, "key") == 0) {
+              free_token(&tok);
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              if (zone->tsig_key) free(zone->tsig_key);
+              zone->tsig_key = strdup(tok.value);
+              free_token(&tok);
+              
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              free_token(&tok);
+            } else if (strcmp(tok.value, "!") == 0) {
+              free_token(&tok);
+              tok = get_next_token(&ctx);
+              if (tok.type == TOKEN_LBRACE) {
+                  brace_depth++;
+                  in_negated_block = true;
+                  free_token(&tok);
+                  continue;
+              }
+              if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              
+              if (in_negated_block) {
+                  if (strcmp(tok.value, "any") != 0) {
+                      char *val = strdup(tok.value);
+                      zone->allow_transfer = realloc(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
+                      zone->allow_transfer[zone->allow_transfer_count++] = val;
+                  }
+              } else {
+                  char buf[256];
+                  snprintf(buf, sizeof(buf), "!%s", tok.value);
+                  zone->allow_transfer = realloc(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
+                  zone->allow_transfer[zone->allow_transfer_count++] = strdup(buf);
+              }
+              free_token(&tok);
+              
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              free_token(&tok);
+            } else {
+              char *val = strdup(tok.value);
+              free_token(&tok);
+              
+              // Handle combined "!ip"
+              if (in_negated_block && val[0] == '!') {
+                  // e.g. "!192.168.1.11" inside "!{ ... }" -> remove '!'
+                  char *uncursed = strdup(val + 1);
+                  free(val);
+                  val = uncursed;
+              }
+              
+              if (in_negated_block && strcmp(val, "any") == 0) {
+                  free(val);
+              } else {
+                  zone->allow_transfer = realloc(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
+                  zone->allow_transfer[zone->allow_transfer_count++] = val;
+              }
+              
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              free_token(&tok);
+            }
           }
         } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
                    strcmp(key, "tsig-key") == 0 ||

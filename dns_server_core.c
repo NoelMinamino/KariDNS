@@ -2775,6 +2775,18 @@ void *axfr_worker_thread(void *arg) {
   pthread_exit(NULL);
 }
 
+static bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
+    for (int i = 0; i < acl_count; i++) {
+        char *rule = acl_list[i];
+        bool is_deny = (rule[0] == '!');
+        const char *target = is_deny ? rule + 1 : rule;
+        if (match_cidr(client_ip, target)) {
+            return !is_deny;
+        }
+    }
+    return false;
+}
+
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
   cpuset_t cpuset;
@@ -3233,7 +3245,13 @@ worker_startup_success:;
             uint8_t tsig_mac[64];
             size_t tsig_mac_len = 0;
             if (zcfg) {
-              if (zcfg->tsig_key) {
+              bool has_acl = (zcfg->allow_transfer_count > 0);
+              bool has_tsig = (zcfg->tsig_key != NULL);
+              
+              bool acl_ok = has_acl ? check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count) : false;
+              bool tsig_ok = false;
+              
+              if (has_tsig) {
                 tsig_key_t *k = cfg->keys;
                 while (k) {
                   if (strcmp(k->name, zcfg->tsig_key) == 0) {
@@ -3242,22 +3260,24 @@ worker_startup_success:;
                   }
                   k = k->next;
                 }
-                if (!matched_key)
+                if (!matched_key) {
                   tsig_error = 17;
-                else {
+                } else {
                   int err = tsig_verify_packet(msg, msg_len, matched_key, tsig_mac, &tsig_mac_len);
-                  if (err != 0)
+                  if (err != 0) {
                     tsig_error = err > 0 ? err : 16;
-                  else
-                    allowed = true;
-                }
-              } else if (zcfg->allow_transfer_count > 0) {
-                for (int k = 0; k < zcfg->allow_transfer_count; k++) {
-                  if (match_cidr(ctx_tcp->client_ip, zcfg->allow_transfer[k])) {
-                    allowed = true;
-                    break;
+                  } else {
+                    tsig_ok = true;
                   }
                 }
+              }
+              
+              if (has_acl && has_tsig) {
+                  allowed = (acl_ok && tsig_ok);
+              } else if (has_acl) {
+                  allowed = acl_ok;
+              } else if (has_tsig) {
+                  allowed = tsig_ok;
               }
             }
             zone_db_entry_t *entry = snapshot_get_zone(snap, qname);
