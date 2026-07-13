@@ -1391,6 +1391,34 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (mac_b64) free(mac_b64);
             break;
         }
+        case 55: { // HIP
+            if (rdlen < 4) goto fallback;
+            uint8_t hit_len = pkt[abs_offset];
+            uint8_t pk_algorithm = pkt[abs_offset+1];
+            uint16_t pk_len = (pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
+            size_t pos = 4;
+            if (pos + hit_len + pk_len > rdlen) goto fallback;
+
+            printf("%u ", pk_algorithm);
+            for (int i = 0; i < hit_len; i++) printf("%02X", pkt[abs_offset + pos + i]);
+            pos += hit_len;
+
+            size_t b64_cap = (pk_len * 4 / 3) + 8;
+            char *b64 = malloc(b64_cap);
+            if (!b64) goto fallback;
+            int n = EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset + pos], (int)pk_len);
+            printf(" %.*s", n, b64);
+            free(b64);
+            pos += pk_len;
+
+            while (pos < rdlen) {
+                char *rvs_name = NULL; size_t next;
+                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, NULL, &rvs_name) != 0) break;
+                printf(" %s", rvs_name);
+                pos = next - abs_offset;
+            }
+            break;
+        }
         default:
         fallback:
             printf("\\# %u ", rdlen);
