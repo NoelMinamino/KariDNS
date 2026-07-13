@@ -146,7 +146,10 @@ for variant in asan tsan; do
     fi
     unset KARIDNS_PID
     if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)|WARNING: ThreadSanitizer" "$logf"; then
-        log_fail "$variant quick smoke (see $logf)"
+        log_fail "$variant quick smoke (Sanitizer error, see $logf)"
+        cat "$logf"
+    elif grep -q "Failed to read file" "$logf" || grep -q "failed to load" "$logf"; then
+        log_fail "$variant quick smoke (Zone reload failed in capability mode, see $logf)"
         cat "$logf"
     else
         log_ok "$variant quick smoke (start / query / reload / AXFR / stop)"

@@ -105,39 +105,34 @@ static char *resolve_include_path(const char *base_dir, const char *rel_path,
                                    bool is_standalone_mode, parse_error_t *err_out) {
     if (rel_path[0] == '\0') return NULL;
 
-    char raw[4096];
+    // Reject absolute paths unless in standalone mode
     if (rel_path[0] == '/') {
-        // 絶対パス: standaloneモード以外では常に拒否する
         if (!is_standalone_mode) {
             if (err_out) err_out->error_message = "Absolute path in $INCLUDE is not allowed";
             return NULL;
         }
+    }
+
+    // Completely reject any directory traversal attempts (../)
+    if (strstr(rel_path, "../") != NULL ||
+        (strlen(rel_path) >= 2 && strcmp(rel_path + strlen(rel_path) - 2, "..") == 0)) {
+        if (err_out) err_out->error_message = "Directory traversal (..) in $INCLUDE is not allowed";
+        return NULL;
+    }
+
+    // Strip leading "./" to help with simple circular detection
+    while (strncmp(rel_path, "./", 2) == 0) {
+        rel_path += 2;
+    }
+
+    char raw[PATH_MAX];
+    if (rel_path[0] == '/') {
         snprintf(raw, sizeof(raw), "%s", rel_path);
     } else {
         snprintf(raw, sizeof(raw), "%s/%s", base_dir, rel_path);
     }
 
-    char resolved[PATH_MAX];
-    if (!realpath(raw, resolved)) {
-        if (err_out) err_out->error_message = "$INCLUDE file not found";
-        return NULL;
-    }
-
-    if (!is_standalone_mode) {
-        // base_dir 自体も正規化した上で、resolved が base_dir 配下にあるかを確認する
-        char base_resolved[PATH_MAX];
-        if (!realpath(base_dir, base_resolved)) {
-            if (err_out) err_out->error_message = "Invalid base directory";
-            return NULL;
-        }
-        size_t blen = strlen(base_resolved);
-        if (strncmp(resolved, base_resolved, blen) != 0 ||
-            (resolved[blen] != '/' && resolved[blen] != '\0')) {
-            if (err_out) err_out->error_message = "$INCLUDE path escapes zone directory";
-            return NULL;
-        }
-    }
-    return strdup(resolved);
+    return strdup(raw);
 }
 
 #define MAX_INCLUDE_DEPTH 16

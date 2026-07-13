@@ -569,6 +569,10 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
   return fd;
 }
 
+#ifndef O_RESOLVE_BENEATH
+#define O_RESOLVE_BENEATH 0
+#endif
+
 int open_via_dir_cache(const char *path, int flags, mode_t mode,
                               bool writable) {
   char dirbuf[PATH_MAX], basebuf[PATH_MAX];
@@ -580,7 +584,7 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   int dfd = get_or_open_dir_fd(dirbuf, writable);
   if (dfd < 0)
     return -1;
-  return openat(dfd, basebuf, flags, mode);
+  return openat(dfd, basebuf, flags | O_RESOLVE_BENEATH, mode);
 }
 
 static int renameat_via_dir_cache(const char *old_path, const char *new_path) {
@@ -931,8 +935,7 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
       snprintf(abs_file, sizeof(abs_file), "%s", file);
   }
   
-  char *root_path = realpath(abs_file, NULL);
-  if (!root_path) root_path = strdup(abs_file);
+  char *root_path = strdup(abs_file);
 
   parse_error_t parse_err = {0};
   parse_context_t ctx = {0};
