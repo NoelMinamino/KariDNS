@@ -1385,7 +1385,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             
             const char *err_str = rcode_name(tsig_error);
 
-            printf("%s. %llu %u %u %.*s %u %s %u", alg_name, (unsigned long long)time_signed,
+            printf("%s %llu %u %u %.*s %u %s %u", alg_name, (unsigned long long)time_signed,
                    fudge, mac_size, n, mac_b64 ? mac_b64 : "", original_id,
                    err_str, other_len);
             if (mac_b64) free(mac_b64);
