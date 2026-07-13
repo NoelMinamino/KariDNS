@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
@@ -889,6 +890,83 @@ static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_has
     }
 }
 
+static void print_svcparam_alpn(const uint8_t *value, uint16_t value_len) {
+    printf("alpn=\"");
+    size_t pos = 0;
+    bool first = true;
+    while (pos < value_len) {
+        uint8_t len = value[pos++];
+        if (pos + len > value_len) break;
+        if (!first) printf(",");
+        printf("%.*s", len, &value[pos]);
+        pos += len;
+        first = false;
+    }
+    printf("\"");
+}
+
+static void print_svcparam_ipvXhint(const uint8_t *value, uint16_t value_len, bool is_v6) {
+    printf("%s=", is_v6 ? "ipv6hint" : "ipv4hint");
+    size_t addr_size = is_v6 ? 16 : 4;
+    size_t pos = 0;
+    bool first = true;
+    while (pos + addr_size <= value_len) {
+        char buf[64];
+        inet_ntop(is_v6 ? AF_INET6 : AF_INET, &value[pos], buf, sizeof(buf));
+        if (!first) printf(",");
+        printf("%s", buf);
+        pos += addr_size;
+        first = false;
+    }
+}
+
+static void print_svcparams(const uint8_t *rdata, size_t offset, size_t rdlen) {
+    while (offset + 4 <= rdlen) {
+        uint16_t key = (rdata[offset]<<8)|rdata[offset+1];
+        uint16_t vlen = (rdata[offset+2]<<8)|rdata[offset+3];
+        offset += 4;
+        if (offset + vlen > rdlen) break;
+        printf(" ");
+        const uint8_t *value = &rdata[offset];
+        switch (key) {
+            case 0: { // mandatory
+                printf("mandatory=");
+                for (size_t i = 0; i + 2 <= vlen; i += 2) {
+                    uint16_t mkey = (value[i]<<8)|value[i+1];
+                    printf("%s%u", (i>0)?",":"", mkey);
+                }
+                break;
+            }
+            case 1: print_svcparam_alpn(value, vlen); break;
+            case 2: printf("no-default-alpn"); break;
+            case 3: { // port
+                uint16_t port = (vlen>=2) ? ((value[0]<<8)|value[1]) : 0;
+                printf("port=%u", port);
+                break;
+            }
+            case 4: print_svcparam_ipvXhint(value, vlen, false); break;
+            case 5: { // ech
+                size_t b64_cap = (vlen * 4 / 3) + 8;
+                char *b64 = malloc(b64_cap);
+                if (b64) {
+                    int n = EVP_EncodeBlock((unsigned char*)b64, value, (int)vlen);
+                    printf("ech=\"%.*s\"", n, b64);
+                    free(b64);
+                }
+                break;
+            }
+            case 6: print_svcparam_ipvXhint(value, vlen, true); break;
+            default: { // unknown
+                printf("key%u=\"", key);
+                for (uint16_t i = 0; i < vlen; i++) printf("%02x", value[i]);
+                printf("\"");
+                break;
+            }
+        }
+        offset += vlen;
+    }
+}
+
 static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                          size_t abs_offset, uint16_t rdlen) {
     switch (type) {
@@ -1151,14 +1229,12 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 64: case 65: { // SVCB / HTTPS
             if (rdlen < 2) goto fallback;
-            uint16_t prio = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
             char *target = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &target) != 0) goto fallback;
-            printf("%u %s", prio, target);
-            if (next - abs_offset < rdlen) {
-                printf(" \\# %zu ", rdlen - (next - abs_offset));
-                for (size_t i = next - abs_offset; i < rdlen; i++) printf("%02x", pkt[abs_offset + i]);
-            }
+            size_t target_len = next - abs_offset - 2;
+            printf("%u %s", priority, (target[0] == '\0') ? "." : target);
+            print_svcparams(&pkt[abs_offset], 2 + target_len, rdlen);
             break;
         }
         case 108: { // EUI48
@@ -1581,6 +1657,8 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     bool retry_tcp = false;
     do {
         retry_tcp = false;
+        struct timeval start_tv;
+        gettimeofday(&start_tv, NULL);
 
         if (!short_mode) {
             printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
@@ -1623,7 +1701,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
 
         int msg_index = 1;
+        int total_records = 0;
+        size_t total_bytes = 0;
         do {
+            total_bytes += (size_t)n;
+            if (n >= 12) {
+                total_records += (resp[6] << 8) | resp[7];
+            }
             reset_dag_arena();
             if (!short_mode) {
                 if (use_tcp) {
@@ -1662,6 +1746,22 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 n = 0; // stop loop for UDP
             }
         } while (n > 0);
+
+        struct timeval end_tv;
+        gettimeofday(&end_tv, NULL);
+        long elapsed_ms = (end_tv.tv_sec - start_tv.tv_sec) * 1000 +
+                          (end_tv.tv_usec - start_tv.tv_usec) / 1000;
+
+        time_t now = time(NULL);
+        char time_buf[64];
+        strftime(time_buf, sizeof(time_buf), "%a %b %e %H:%M:%S %Z %Y", localtime(&now));
+
+        printf("\n;; Query time: %ld msec\n", elapsed_ms);
+        printf(";; SERVER: %s#%d(%s) (%s)\n", server, port, server, use_tcp ? "TCP" : "UDP");
+        printf(";; WHEN: %s\n", time_buf);
+        if (qtype == 252 || qtype == 251) {
+            printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_index, total_bytes);
+        }
 
         if (tcp_sock >= 0) close(tcp_sock);
         n = 1; // set to valid value to avoid retry logic thinking it failed
