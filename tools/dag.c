@@ -1399,7 +1399,51 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
     }
 }
 
-static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset) {
+typedef struct {
+    bool is_axfr;
+    char first_soa_name[256];
+    uint8_t first_soa_norm[512];
+    size_t first_soa_norm_len;
+    int soa_seen_count;
+    bool axfr_complete;
+} axfr_state_t;
+
+static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_len, const char *name, const uint8_t *hdr, uint16_t rdlen) {
+    if (!state || !state->is_axfr) return;
+    const uint8_t *rdata = hdr + 10;
+    
+    char *mname = NULL, *rname = NULL;
+    size_t next1, next2;
+    if (expand_wire_name(pkt, pkt_len, rdata - pkt, &next1, NULL, &mname) != 0) return;
+    if (expand_wire_name(pkt, pkt_len, next1, &next2, NULL, &rname) != 0) return;
+    if (next2 + 20 > (size_t)(rdata - pkt) + rdlen) return;
+
+    size_t mlen = strlen(mname);
+    size_t rlen = strlen(rname);
+    size_t norm_len = mlen + 1 + rlen + 1 + 20;
+    if (norm_len > sizeof(state->first_soa_norm)) return;
+
+    uint8_t norm[512];
+    memcpy(norm, mname, mlen + 1);
+    memcpy(norm + mlen + 1, rname, rlen + 1);
+    memcpy(norm + mlen + 1 + rlen + 1, pkt + next2, 20);
+
+    if (state->soa_seen_count == 0) {
+        snprintf(state->first_soa_name, sizeof(state->first_soa_name), "%s", name);
+        memcpy(state->first_soa_norm, norm, norm_len);
+        state->first_soa_norm_len = norm_len;
+        state->soa_seen_count = 1;
+    } else {
+        if (strcmp(state->first_soa_name, name) == 0 &&
+            norm_len == state->first_soa_norm_len &&
+            memcmp(norm, state->first_soa_norm, norm_len) == 0) {
+            state->axfr_complete = true;
+        }
+        state->soa_seen_count++;
+    }
+}
+
+static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state) {
     char *name = NULL; size_t next;
     if (expand_wire_name(pkt, pkt_len, *offset, &next, NULL, &name) != 0) return false;
     size_t hdr = next;
@@ -1418,6 +1462,10 @@ static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset) {
     }
 
     char tname_buf[32];
+    if (type == 6) {
+        check_axfr_soa(axfr_state, pkt, pkt_len, name, &pkt[hdr], rdlen);
+    }
+
     const char *tname = format_type_name(type, tname_buf, sizeof(tname_buf));
     const char *cname = (klass == 1) ? "IN" : (klass == 255) ? "ANY" : "CH";
     printf("%-24s %-6u %-4s %-8s ", name, ttl, cname, tname);
@@ -1482,7 +1530,7 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
     }
 }
 
-static void print_response(const uint8_t *pkt, size_t pkt_len) {
+static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state) {
     if (pkt_len < 12) {
         printf(";; response too short to contain a header (%zu bytes)\n", pkt_len);
         return;
@@ -1526,15 +1574,15 @@ static void print_response(const uint8_t *pkt, size_t pkt_len) {
 
     if (ancount > 0) {
         printf("\n;; ANSWER SECTION:\n");
-        for (int i = 0; i < ancount; i++) if (!print_one_rr(pkt, pkt_len, &offset)) { printf(";; (failed to parse answer record %d, stopping here)\n", i); goto fallback; }
+        for (int i = 0; i < ancount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state)) { printf(";; (failed to parse answer record %d, stopping here)\n", i); goto fallback; }
     }
     if (nscount > 0) {
         printf("\n;; AUTHORITY SECTION:\n");
-        for (int i = 0; i < nscount; i++) if (!print_one_rr(pkt, pkt_len, &offset)) { printf(";; (failed to parse authority record %d, stopping here)\n", i); goto fallback; }
+        for (int i = 0; i < nscount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state)) { printf(";; (failed to parse authority record %d, stopping here)\n", i); goto fallback; }
     }
     if (arcount > 0) {
         printf("\n;; ADDITIONAL SECTION:\n");
-        for (int i = 0; i < arcount; i++) if (!print_one_rr(pkt, pkt_len, &offset)) { printf(";; (failed to parse additional record %d, stopping here)\n", i); goto fallback; }
+        for (int i = 0; i < arcount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state)) { printf(";; (failed to parse additional record %d, stopping here)\n", i); goto fallback; }
     }
 
     {
@@ -1658,6 +1706,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     do {
         retry_tcp = false;
         struct timeval start_tv;
+        
+        axfr_state_t axfr_state = {0};
+        axfr_state.is_axfr = (qtype == 252 || qtype == 251);
         gettimeofday(&start_tv, NULL);
 
         if (!short_mode) {
@@ -1720,7 +1771,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     print_ldnsz_url(resp, (size_t)n);
                 }
                 printf("\n");
-                print_response(resp, (size_t)n);
+                print_response(resp, (size_t)n, &axfr_state);
             } else {
                 uint16_t ancount = (resp[6] << 8) | resp[7];
                 size_t off = 12;
@@ -1729,9 +1780,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     size_t nxt; if(skip_wire_name(resp, n, off, &nxt)==0) off = nxt + 4;
                 }
                 for (int k=0; k<ancount; k++) {
-                    size_t nxt; if(skip_wire_name(resp, n, off, &nxt)==0) {
+                    char *name = NULL;
+                    size_t nxt; if(expand_wire_name(resp, n, off, &nxt, NULL, &name)==0) {
                         uint16_t type = (resp[nxt]<<8)|resp[nxt+1];
                         uint16_t rdlen = (resp[nxt+8]<<8)|resp[nxt+9];
+                        if (type == 6) {
+                            check_axfr_soa(&axfr_state, resp, n, name, &resp[nxt], rdlen);
+                        }
                         print_rdata(resp, n, type, nxt+10, rdlen);
                         printf("\n");
                         off = nxt+10+rdlen;
@@ -1739,6 +1794,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
             }
 
+            if (axfr_state.is_axfr && axfr_state.axfr_complete) break;
             if (use_tcp && tcp_sock >= 0) {
                 n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
                 if (n > 0) msg_index++;
