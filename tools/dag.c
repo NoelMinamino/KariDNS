@@ -94,9 +94,6 @@ static const char *get_ede_error_string(uint16_t code) {
 }
 
 static uint16_t parse_qtype(const char *s) {
-    if (strncasecmp(s, "TYPE", 4) == 0) {
-        return (uint16_t)atoi(s + 4);
-    }
     static const struct { const char *name; uint16_t type; } types[] = {
         {"A", 1}, {"NS", 2}, {"MD", 3}, {"MF", 4}, {"CNAME", 5}, {"SOA", 6},
         {"MB", 7}, {"MG", 8}, {"MR", 9}, {"NULL", 10}, {"WKS", 11}, {"PTR", 12},
@@ -119,7 +116,13 @@ static uint16_t parse_qtype(const char *s) {
     for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
         if (strcasecmp(s, types[i].name) == 0) return types[i].type;
     }
-    return (uint16_t)atoi(s);
+    if (strncasecmp(s, "TYPE", 4) == 0 && s[4] != '\0') {
+        char *end;
+        long v = strtol(s + 4, &end, 10);
+        if (*end == '\0' && v >= 0 && v <= 65535) return (uint16_t)v;
+    }
+    fprintf(stderr, "dag: unknown query type '%s'\n", s);
+    exit(1);
 }
 
 static void print_ldnsz_url(const uint8_t *buf, size_t len) {
@@ -1778,6 +1781,34 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             printf(";; no usable response received\n");
             return 1;
         }
+
+        if (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0) {
+            if (!short_mode) {
+                reset_dag_arena();
+                printf("Response (%zd bytes, UDP):\n", n);
+                hexdump(resp, (size_t)n);
+                if (use_ldnsz) {
+                    print_ldnsz_url(resp, (size_t)n);
+                }
+                printf("\n");
+                print_response(resp, (size_t)n, &axfr_state);
+            }
+            fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
+            use_tcp = true;
+            tcp_sock = do_tcp_send_request(server, port, pkt, pkt_len, qo->timeout_sec);
+            if (tcp_sock < 0) {
+                fprintf(stderr, "dag: TCP retry failed\n");
+                return 1;
+            }
+            n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+            if (n <= 0) {
+                printf(";; no usable response received on TCP retry\n");
+                return 1;
+            }
+            memset(&axfr_state, 0, sizeof(axfr_state));
+            axfr_state.is_axfr = (qtype == 252 || qtype == 251);
+        }
+
 
         int msg_index = 1;
         int total_records = 0;
