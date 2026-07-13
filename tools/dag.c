@@ -982,7 +982,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 printf("%s", buf);
             } else printf("(malformed AAAA, rdlen=%u)", rdlen);
             break;
-        case 2: case 5: case 12: {
+        case 2: case 5: case 12: case 39: { // NS / CNAME / PTR / DNAME
             char *name = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &name) == 0) printf("%s", name);
             else printf("(unparsable name)");
