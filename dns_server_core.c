@@ -158,11 +158,11 @@ typedef enum {
   RRL_RESP_ERROR
 } rrl_response_class_t;
 
-#define RRL_TABLE_SIZE 4096
+#define RRL_TABLE_SIZE 65536
 
 typedef struct {
   atomic_flag lock;
-  _Atomic uint32_t client_hash;
+  _Atomic uint64_t client_hash;
   _Atomic int64_t last_refill_ms[4];
   _Atomic int32_t tokens[4];
   _Atomic uint32_t slip_counter;
@@ -176,7 +176,42 @@ _Atomic uint64_t g_ede_not_authoritative_total = 0;
 _Atomic uint64_t g_ede_not_supported_total = 0;
 _Atomic uint64_t g_ede_other_total = 0;
 
+static uint64_t g_rrl_hash_key[2];
 
+#define ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
+#define SIPROUND do { \
+    v0 += v1; v1 = ROTL(v1, 13); v1 ^= v0; v0 = ROTL(v0, 32); \
+    v2 += v3; v3 = ROTL(v3, 16); v3 ^= v2; \
+    v0 += v3; v3 = ROTL(v3, 21); v3 ^= v0; \
+    v2 += v1; v1 = ROTL(v1, 17); v1 ^= v2; v2 = ROTL(v2, 32); \
+} while (0)
+
+static uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]) {
+    uint64_t v0 = 0x736f6d6570736575ULL ^ k[0];
+    uint64_t v1 = 0x646f72616e646f6dULL ^ k[1];
+    uint64_t v2 = 0x6c7967656e657261ULL ^ k[0];
+    uint64_t v3 = 0x7465646279746573ULL ^ k[1];
+    uint64_t b = ((uint64_t)inlen) << 56;
+    const uint8_t *end = in + (inlen & ~7);
+    for (; in != end; in += 8) {
+        uint64_t m; memcpy(&m, in, 8);
+        v3 ^= m; SIPROUND; SIPROUND; v0 ^= m;
+    }
+    uint64_t t = 0;
+    switch (inlen & 7) {
+        case 7: t |= ((uint64_t)in[6]) << 48; // fallthrough
+        case 6: t |= ((uint64_t)in[5]) << 40; // fallthrough
+        case 5: t |= ((uint64_t)in[4]) << 32; // fallthrough
+        case 4: t |= ((uint64_t)in[3]) << 24; // fallthrough
+        case 3: t |= ((uint64_t)in[2]) << 16; // fallthrough
+        case 2: t |= ((uint64_t)in[1]) << 8;  // fallthrough
+        case 1: t |= ((uint64_t)in[0]);
+    }
+    b |= t;
+    v3 ^= b; SIPROUND; SIPROUND; v0 ^= b;
+    v2 ^= 0xff; SIPROUND; SIPROUND; SIPROUND; SIPROUND;
+    return v0 ^ v1 ^ v2 ^ v3;
+}
 
 static rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len) {
   if (res_len < 12) return RRL_RESP_ERROR;
@@ -216,19 +251,19 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
     }
   }
 
-  uint32_t hash = 0;
-  uint32_t full_hash = 0;
+  uint64_t hash = 0;
+  uint64_t full_hash = 0;
   if (client_addr->ss_family == AF_INET) {
     uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr;
     ip &= htonl(0xFFFFFF00); // /24 mask
-    full_hash = ip;
-    hash = ip ^ (ip >> 16);
+    hash = siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
+    full_hash = hash;
   } else if (client_addr->ss_family == AF_INET6) {
-    const uint32_t *w = (const uint32_t *)((const struct sockaddr_in6 *)client_addr)->sin6_addr.s6_addr;
-    uint32_t w0 = w[0], w1 = w[1];
-    w1 &= htonl(0xFFFFFF00); // /56 mask
-    full_hash = w0 ^ w1;
-    hash = w0 ^ w1 ^ (w1 >> 16);
+    uint8_t ip6[16];
+    memcpy(ip6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, 16);
+    memset(&ip6[7], 0, 9); // /56 mask (7 bytes)
+    hash = siphash24(ip6, 16, g_rrl_hash_key);
+    full_hash = hash;
   }
 
   size_t idx = hash & (RRL_TABLE_SIZE - 1);
@@ -240,15 +275,22 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {}
 
   if (b->client_hash != full_hash) {
-    b->client_hash = full_hash;
-    for (int i = 0; i < 4; i++) {
-        b->last_refill_ms[i] = now_ms;
+    // Hash collision or new entry
+    // Only reset if it's older than 1 second to prevent hash-collision DoS
+    if (now_ms - b->last_refill_ms[cls] > 1000) {
+      b->client_hash = full_hash;
+      for (int i = 0; i < 4; i++) {
+          b->last_refill_ms[i] = now_ms;
+      }
+      b->tokens[0] = cfg->responses_per_second;
+      b->tokens[1] = cfg->responses_per_second;
+      b->tokens[2] = cfg->nxdomains_per_second;
+      b->tokens[3] = cfg->errors_per_second;
+      b->slip_counter = 0;
+    } else {
+      // It's a recent collision. Share the limit instead of resetting.
+      // This mitigates spoofed IPs from resetting other users' buckets.
     }
-    b->tokens[0] = cfg->responses_per_second;
-    b->tokens[1] = cfg->responses_per_second;
-    b->tokens[2] = cfg->nxdomains_per_second;
-    b->tokens[3] = cfg->errors_per_second;
-    b->slip_counter = 0;
   } else {
     uint32_t rates[4] = {
       cfg->responses_per_second,
@@ -751,12 +793,14 @@ static void *gc_snapshot_thread(void *arg) {
 
 static char *arena_strdup(zone_arena_t *arena, const char *str);
 
-static bool compare_records(const dns_record_t *a, const dns_record_t *b) {
+static bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl) {
   if (a->type_code != b->type_code) return false;
   if ((a->name == NULL) != (b->name == NULL)) return false;
   if (a->name && b->name && strcasecmp(a->name, b->name) != 0) return false;
-  if ((a->ttl == NULL) != (b->ttl == NULL)) return false;
-  if (a->ttl && b->ttl && strcmp(a->ttl, b->ttl) != 0) return false;
+  if (!ignore_ttl) {
+    if ((a->ttl == NULL) != (b->ttl == NULL)) return false;
+    if (a->ttl && b->ttl && strcmp(a->ttl, b->ttl) != 0) return false;
+  }
   if (a->rdata_count != b->rdata_count) return false;
   for (int i = 0; i < a->rdata_count; i++) {
     if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
@@ -773,7 +817,7 @@ static bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *targ
   uint32_t hash = calc_fnv1a_str(target->name);
   size_t idx = hash & (arena->hash_size - 1);
   for (int i = arena->hash_table[idx]; i != -1; i = arena->records[i].next_record) {
-    if (compare_records(&arena->records[i], target)) return true;
+    if (compare_records(&arena->records[i], target, false)) return true;
   }
   return false;
 }
@@ -1209,20 +1253,9 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       if (session->is_ixfr && session->is_deleting) {
         standby->count--;
         for (size_t k = 0; k < standby->count; k++) {
-          dns_record_t *s = &standby->records[k];
-          if (s->type_code == type && strcasecmp(s->name, rec->name) == 0 &&
-              s->rdata_count == rec->rdata_count) {
-            bool rdata_match = true;
-            for (int r = 0; r < s->rdata_count; r++) {
-              if (strcmp(s->rdata[r], rec->rdata[r]) != 0) {
-                rdata_match = false;
-                break;
-              }
-            }
-            if (rdata_match) {
-              standby->records[k] = standby->records[--standby->count];
-              break;
-            }
+          if (compare_records(&standby->records[k], rec, true)) {
+            standby->records[k] = standby->records[--standby->count];
+            break;
           }
         }
       }
@@ -4194,6 +4227,21 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
 
 int main(int argc, char **argv) {
   arc4random_buf(g_server_cookie_secret, sizeof(g_server_cookie_secret));
+  arc4random_buf(g_rrl_hash_key, sizeof(g_rrl_hash_key));
+  // SipHash-2-4 self-test against official reference test vector
+  // Key: 00010203...0f, Message: 000102...0e (15 bytes)
+  // Expected output: 0xa129ca6149be45e5
+  {
+    static const uint64_t tv_key[2] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL};
+    uint8_t tv_msg[15];
+    for (int i = 0; i < 15; i++) tv_msg[i] = (uint8_t)i;
+    uint64_t tv_result = siphash24(tv_msg, sizeof(tv_msg), tv_key);
+    if (tv_result != 0xa129ca6149be45e5ULL) {
+      syslog(LOG_CRIT, "FATAL: SipHash-2-4 self-test failed (got %016llx, expected a129ca6149be45e5)",
+             (unsigned long long)tv_result);
+      abort();
+    }
+  }
   tzset();
   g_boot_time = time(NULL);
   g_last_configured_time = g_boot_time;
