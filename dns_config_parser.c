@@ -11,6 +11,16 @@
 #include <netinet/in.h>
 #include <openssl/evp.h>
 
+
+static void *safe_realloc_or_die(void *ptr, size_t size) {
+  void *p = realloc(ptr, size);
+  if (!p && size > 0) {
+    syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", size);
+    exit(1);
+  }
+  return p;
+}
+
 static void skip_spaces_and_comments(token_ctx_t *ctx) {
   while (ctx->pos < ctx->len) {
     char c = ctx->src[ctx->pos];
@@ -253,7 +263,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
       free_token(&tok);
       return -1;
     }
-    *list = realloc(*list, sizeof(char *) * (*count + 1));
+    *list = safe_realloc_or_die(*list, sizeof(char *) * (*count + 1));
     (*list)[*count] = strdup(tok.value);
     (*count)++;
     free_token(&tok);
@@ -290,7 +300,7 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
       free_token(&tok);
       return -1;
     }
-    *list = realloc(*list, sizeof(ip_port_t) * (*count + 1));
+    *list = safe_realloc_or_die(*list, sizeof(ip_port_t) * (*count + 1));
     (*list)[*count].ip = strdup(tok.value);
     (*list)[*count].port = 53;
     free_token(&tok);
@@ -488,7 +498,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             }
           } else if (tok.type == TOKEN_STRING) {
             config->bind_addresses =
-                realloc(config->bind_addresses,
+                safe_realloc_or_die(config->bind_addresses,
                         sizeof(char *) * (config->bind_address_count + 1));
             config->bind_addresses[config->bind_address_count++] =
                 strdup(tok.value);
@@ -664,13 +674,13 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               if (in_negated_block) {
                   if (strcmp(tok.value, "any") != 0) {
                       char *val = strdup(tok.value);
-                      zone->allow_transfer = realloc(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
+                      zone->allow_transfer = safe_realloc_or_die(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
                       zone->allow_transfer[zone->allow_transfer_count++] = val;
                   }
               } else {
                   char buf[256];
                   snprintf(buf, sizeof(buf), "!%s", tok.value);
-                  zone->allow_transfer = realloc(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
+                  zone->allow_transfer = safe_realloc_or_die(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
                   zone->allow_transfer[zone->allow_transfer_count++] = strdup(buf);
               }
               free_token(&tok);
@@ -693,7 +703,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               if (in_negated_block && strcmp(val, "any") == 0) {
                   free(val);
               } else {
-                  zone->allow_transfer = realloc(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
+                  zone->allow_transfer = safe_realloc_or_die(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
                   zone->allow_transfer[zone->allow_transfer_count++] = val;
               }
               

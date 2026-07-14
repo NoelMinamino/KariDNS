@@ -2709,9 +2709,9 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     res[2] |= 0x84; res[3] &= 0x0F; \
     res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
     if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
-      memset(&comp_ctx, 0, sizeof(comp_ctx)); \
-      compress_ctx_init_packet(&comp_ctx); \
-      continue; \
+      syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer", \
+             (rec_ptr)->name ? (rec_ptr)->name : "(null)", (rec_ptr)->type_code); \
+      goto axfr_error; \
     } \
   } \
   answers++; \

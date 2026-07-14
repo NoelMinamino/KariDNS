@@ -1152,10 +1152,20 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 pos += 4;
                 if (pos + afdlength > rdlen) break;
 
+                // RFC 3123: afdlength for AFI=1 must be <=4, AFI=2 must be <=16
+                uint8_t max_len = (afi == 1) ? 4 : (afi == 2) ? 16 : 0;
+                bool afd_invalid = (max_len == 0 || afdlength > max_len);
                 uint8_t addr[16] = {0};
-                memcpy(addr, &pkt[abs_offset + pos], afdlength);
-                pos += afdlength;
+                size_t copy_len = (afdlength > sizeof(addr)) ? sizeof(addr) : afdlength;
+                memcpy(addr, &pkt[abs_offset + pos], copy_len);
+                pos += afdlength; // rdlen上の位置は仕様通りに進める
 
+                if (afd_invalid) {
+                    if (!first) printf(" ");
+                    printf("[APL afdlength=%u invalid for AFI=%u]", afdlength, afi);
+                    first = false;
+                    continue;
+                }
                 char addr_str[64] = "?";
                 if (afi == 1) inet_ntop(AF_INET, addr, addr_str, sizeof(addr_str));
                 else if (afi == 2) inet_ntop(AF_INET6, addr, addr_str, sizeof(addr_str));
