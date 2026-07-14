@@ -25,6 +25,18 @@ KariDNS is a high-performance, lightweight, and modern authoritative DNS server 
 - **BIND-compatible Query Logging:** Thread-safe query logging with automatic rotation by size or date.
 - **RNDC-style Control Channel (`karictl`):** Secure local administration using a UNIX domain socket and HMAC-SHA256 challenge-response authentication.
 
+
+## Supported Record Types
+
+Record types supported for parsing zone files and serializing them to wire format:
+
+`A`, `AAAA`, `NS`, `CNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `DNAME`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `X25`, `ISDN`, `NSAP`, `GPOS`, `NID`, `L32`, `L64`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `NAPTR`, `NSEC3PARAM`, `HTTPS`, `SVCB`, `OPENPGPKEY`, `DHCID`, `EUI48`, `EUI64`, `ZONEMD`, `CSYNC`, `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `IPSECKEY`, `AMTRELAY`, `AVC`
+
+DNSSEC signature validation and dynamic updates (RFC 2136) are not supported.
+
+Zone file directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (Capsicum support, up to 32 files, nesting depth of 8), `$GENERATE`
+
+
 ## Building and Running
 
 ### Prerequisites
