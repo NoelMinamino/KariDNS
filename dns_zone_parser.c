@@ -553,10 +553,19 @@ STATE_FIND_TOKEN:
     }
     p++;
   }
-  if (field_idx < MAX_FIELDS)
-    fields[field_idx++] = token_start;
-  if (p >= end)
-    goto PROCESS_RECORD;
+          if (field_idx < MAX_FIELDS)
+            fields[field_idx++] = token_start;
+          
+          // ファイル末尾に到達した場合でも、最後のトークンのクォートを除去する
+          if (p >= end) {
+            if (field_idx > 0 && fields[field_idx - 1][0] == '"') {
+              fields[field_idx - 1]++;
+              size_t t_len = strlen(fields[field_idx - 1]);
+              if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
+                fields[field_idx - 1][t_len - 1] = '\0';
+            }
+            goto PROCESS_RECORD;
+          }
   char delimiter = *p;
   *p++ = '\0';
   if (field_idx > 0 && fields[field_idx - 1][0] == '"') {
@@ -737,6 +746,53 @@ PROCESS_RECORD:
       if (rec->rdata_count > 3 && atoi(rec->rdata[2]) == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
+    } else if (rec->type_code == 22) { // NSAP
+      if (rec->rdata_count > 0) {
+        char *raw = rec->rdata[0];
+        // "0x" または "0X" で始まっていればスキップ
+        if (raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
+            raw += 2;
+        }
+        size_t len = strlen(raw);
+        char *clean = arena_alloc(arena, len + 1);
+        if (clean) {
+          size_t c_idx = 0;
+          for (size_t k = 0; k < len; k++) {
+            if (raw[k] != '.') { // ドットを除去
+              clean[c_idx++] = raw[k];
+            }
+          }
+          clean[c_idx] = '\0';
+          rec->rdata[0] = clean; // 正規化された純粋なHex文字列に置き換え
+        }
+      }
+    } else if (rec->type_code == 19) { // X25
+        if (rec->rdata_count != 1) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "X25 requires exactly 1 parameter";
+                ctx->err_out->error_offset = rec->type - buf;
+                ctx->err_out->token_length = strlen(rec->type);
+            }
+            return -1;
+        }
+    } else if (rec->type_code == 20) { // ISDN
+        if (rec->rdata_count < 1 || rec->rdata_count > 2) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "ISDN requires 1 or 2 parameters";
+                ctx->err_out->error_offset = rec->type - buf;
+                ctx->err_out->token_length = strlen(rec->type);
+            }
+            return -1;
+        }
+    } else if (rec->type_code == 27) { // GPOS
+        if (rec->rdata_count != 3) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "GPOS requires exactly 3 parameters";
+                ctx->err_out->error_offset = rec->type - buf;
+                ctx->err_out->token_length = strlen(rec->type);
+            }
+            return -1;
+        }
     }
   }
   if (p < end)

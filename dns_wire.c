@@ -757,18 +757,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 22: { // NSAP
                 if (rec->rdata_count < 1) return -1;
-                const char *nsap_str = rec->rdata[0];
-                // "0x" プレフィックスがあればスキップする
-                if (nsap_str[0] == '0' && (nsap_str[1] == 'x' || nsap_str[1] == 'X')) {
-                    nsap_str += 2;
-                }
-                // NSAPは最大255バイト程度のバイナリ
                 uint8_t nsap_bin[255];
-                size_t dec_len = hex_decode(nsap_str, nsap_bin, sizeof(nsap_bin));
-                if (dec_len == (size_t)-1) return -1;
-                if (offset + dec_len > max_res_len) return -1;
-                memcpy(&res[offset], nsap_bin, dec_len);
-                offset += dec_len;
+                // parser側ですでに "0x" と "." は除去されているので、純粋にデコードするだけ
+                int dec_len = hex_decode(rec->rdata[0], nsap_bin, sizeof(nsap_bin));
+                if (dec_len < 0) return -1;
+                if (offset + (size_t)dec_len > max_res_len) return -1;
+                memcpy(&res[offset], nsap_bin, (size_t)dec_len);
+                offset += (size_t)dec_len;
                 break;
             }
             case 27: { // GPOS

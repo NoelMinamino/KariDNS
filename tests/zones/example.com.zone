@@ -261,4 +261,12 @@ $GENERATE 0-9 wifi-$ IN A 192.0.3.$
 office  IN LOC  37 26 0.000 N 122 8 0.000 W 100.00m 1m 10000m 10m
 hq      IN LOC  35 N 139 E 0m
 network IN APL  1:192.168.0.0/24 !1:192.168.1.0/24 2:2001:db8::/32
+; 経度(longitude), 緯度(latitude), 高度(altitude: メートル)
+site.example.com.    3600  IN  GPOS  "-32.6866" "-70.1509" "12.0"
+osi.example.com.     3600  IN  NSAP  0x47.0005.80.005a00.0000.0001.e133.ffffff000161.00
+; サブアドレスなし
+relay.example.com.   3600  IN  ISDN  "150862028003217"
 
+; サブアドレス（004）あり
+pbx.example.com.     3600  IN  ISDN  "150862028003217" "004"
+route1.example.com.  3600  IN  X25   "311061700956"
