@@ -740,6 +740,45 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += w;
                 break;
             }
+            case 19: { // X25
+                if (rec->rdata_count < 1) return -1;
+                if (write_char_string(res, max_res_len, &offset, rec->rdata[0]) != 0) return -1;
+                break;
+            }
+            case 20: { // ISDN
+                if (rec->rdata_count < 1) return -1;
+                // ISDN-address
+                if (write_char_string(res, max_res_len, &offset, rec->rdata[0]) != 0) return -1;
+                // SA (Subaddress, オプション)
+                if (rec->rdata_count > 1) {
+                    if (write_char_string(res, max_res_len, &offset, rec->rdata[1]) != 0) return -1;
+                }
+                break;
+            }
+            case 22: { // NSAP
+                if (rec->rdata_count < 1) return -1;
+                const char *nsap_str = rec->rdata[0];
+                // "0x" プレフィックスがあればスキップする
+                if (nsap_str[0] == '0' && (nsap_str[1] == 'x' || nsap_str[1] == 'X')) {
+                    nsap_str += 2;
+                }
+                // NSAPは最大255バイト程度のバイナリ
+                uint8_t nsap_bin[255];
+                size_t dec_len = hex_decode(nsap_str, nsap_bin, sizeof(nsap_bin));
+                if (dec_len == (size_t)-1) return -1;
+                if (offset + dec_len > max_res_len) return -1;
+                memcpy(&res[offset], nsap_bin, dec_len);
+                offset += dec_len;
+                break;
+            }
+            case 27: { // GPOS
+                // Longitude, Latitude, Altitude の3つの文字列が必要
+                if (rec->rdata_count < 3) return -1;
+                for (int i = 0; i < 3; i++) {
+                    if (write_char_string(res, max_res_len, &offset, rec->rdata[i]) != 0) return -1;
+                }
+                break;
+            }
             case 29: { // LOC
                 if (offset + 16 > max_res_len) return -1;
 
