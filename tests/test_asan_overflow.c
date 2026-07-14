@@ -199,6 +199,31 @@ int main() {
         rec_csync.name = (char*)"example.com"; rec_csync.type_code = 62; rec_csync.rdata_count = 4;
         rec_csync.rdata[0] = (char*)"123456"; rec_csync.rdata[1] = (char*)"1"; rec_csync.rdata[2] = (char*)"A"; rec_csync.rdata[3] = (char*)"AAAA";
         if (assert_bound_checked(&rec_csync)) return 1;
+        // X25 (Type 19)
+        dns_record_t rec_x25 = {0};
+        rec_x25.name = (char*)"example.com"; rec_x25.type_code = 19; rec_x25.rdata_count = 1;
+        rec_x25.rdata[0] = (char*)"311061700956";
+        if (assert_bound_checked(&rec_x25)) return 1;
+
+        // ISDN (Type 20)
+        dns_record_t rec_isdn = {0};
+        rec_isdn.name = (char*)"example.com"; rec_isdn.type_code = 20; rec_isdn.rdata_count = 2;
+        rec_isdn.rdata[0] = (char*)"150862028003217"; rec_isdn.rdata[1] = (char*)"004";
+        if (assert_bound_checked(&rec_isdn)) return 1;
+
+        // NSAP (Type 22)
+        // ゾーンパーサーで0xとドットが除去された後の正規化されたHex文字列を想定
+        dns_record_t rec_nsap = {0};
+        rec_nsap.name = (char*)"example.com"; rec_nsap.type_code = 22; rec_nsap.rdata_count = 1;
+        rec_nsap.rdata[0] = (char*)"47000580005a0000000001e133ffffff00016100";
+        if (assert_bound_checked(&rec_nsap)) return 1;
+
+        // GPOS (Type 27)
+        dns_record_t rec_gpos = {0};
+        rec_gpos.name = (char*)"example.com"; rec_gpos.type_code = 27; rec_gpos.rdata_count = 3;
+        rec_gpos.rdata[0] = (char*)"-32.6866"; rec_gpos.rdata[1] = (char*)"-70.1509"; rec_gpos.rdata[2] = (char*)"12.0";
+        if (assert_bound_checked(&rec_gpos)) return 1;
+
       printf("Test 3 Passed: All new records safely rejected small max_res_len\n");
     }
 
