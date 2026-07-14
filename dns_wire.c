@@ -230,7 +230,8 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;
     } else if (type == 16) {
         size_t rdata_p = *offset;
-        while (rdata_p < *offset + rdlen && rec->rdata_count < 16) {
+        while (rdata_p < *offset + rdlen) {
+            if (rec->rdata_count >= MAX_RDATA) return -1;
             uint8_t len = packet[rdata_p++];
             if (rdata_p + len > *offset + rdlen) break;
             char *txt = arena_alloc(arena, len + 1); if (!txt) return -1;
@@ -271,7 +272,7 @@ long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const 
     while (*p) {
         const char *dot = strchr(p, '.');
         size_t len = dot ? (size_t)(dot - p) : strlen(p);
-        if (len > 63) break;
+        if (len > 63) return -1;
         if (len > 0) {
             if (offset + w_len + len + 1 > max_len) return -1;
             buf[offset + w_len++] = len;
@@ -1281,6 +1282,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
             uint8_t len = req[scan_offset];
             if (len == 0) { scan_offset++; break; }
             if ((len & 0xC0) == 0xC0) { scan_offset += 2; break; }
+            if (scan_offset + len + 1 > req_len) return -1;
             scan_offset += len + 1;
         }
         

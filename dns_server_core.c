@@ -1863,6 +1863,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       q_offset += 2;
       break;
     }
+    if (q_offset + len + 1 > req_len) return -1;
     q_offset += len + 1;
   }
   if (q_offset + 4 > req_len) {
@@ -2249,7 +2250,7 @@ static void submit_response_log(log_action_t action, const char *client_ip, int 
                                 uint16_t qclass, uint16_t qtype, uint8_t rcode, 
                                 bool has_edns, bool dnssec_ok) {
     server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-    if (!cfg || !cfg->logging.responses_channel || cfg->logging.responses_channel->fd < 0) return;
+    if (!cfg || !cfg->logging.responses_channel) return;
 
     uint64_t t = atomic_load_explicit(&g_resp_log_tail, memory_order_relaxed);
     uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
@@ -2290,7 +2291,7 @@ void *response_logger_thread_func(void *arg) {
             resp_log_entry_t *entry = &g_resp_log_ring[idx];
             server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
             
-            if (cfg && cfg->logging.responses_channel && cfg->logging.responses_channel->fd >= 0) {
+            if (cfg && cfg->logging.responses_channel) {
                 log_channel_t *ch = cfg->logging.responses_channel;
                 
                 // 1. 時刻のフォーマット (ミリ秒対応)
@@ -2336,7 +2337,9 @@ void *response_logger_thread_func(void *arg) {
                 if (len > 0) {
                     if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
                     pthread_mutex_lock(&ch->lock);
-                    write(ch->fd, log_buf, len);
+                    if (ch->fd >= 0) {
+                        write(ch->fd, log_buf, len);
+                    }
                     pthread_mutex_unlock(&ch->lock);
                 }
             }
@@ -2356,8 +2359,7 @@ static void write_query_log(const char *client_ip, int client_port,
                             bool has_edns, bool dnssec_ok) {
   server_config_t *cfg =
       atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  if (!cfg || !cfg->logging.queries_channel ||
-      cfg->logging.queries_channel->fd < 0)
+  if (!cfg || !cfg->logging.queries_channel)
     return;
   log_channel_t *ch = cfg->logging.queries_channel;
   struct timespec ts;
@@ -2527,6 +2529,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if ((len & 0xC0) == 0xC0) {
       q_offset += 2;
       break;
+    }
+    if (q_offset + len + 1 > req_len) {
+      free(res);
+      atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+      return;
     }
     q_offset += len + 1;
   }
@@ -2958,6 +2965,7 @@ worker_startup_success:;
                 offset += (len == 0) ? 1 : 2;
                 break;
               }
+              if (offset + len + 1 > recv_len) break;
               offset++;
               if (written > 0 && qname[written - 1] != '.') {
                 if (written < 255)
@@ -3003,6 +3011,7 @@ worker_startup_success:;
                 offset += (len == 0) ? 1 : 2;
                 break;
               }
+              if (offset + len + 1 > (size_t)payload_received) break;
               offset += len + 1;
             }
             question_end = offset + 4;
@@ -3016,8 +3025,10 @@ worker_startup_success:;
               uint16_t ns = (req_buf[8] << 8) | req_buf[9];
               for (int k = 0; k < qd; k++) {
                 while (o < (size_t)payload_received && req_buf[o] != 0 &&
-                       (req_buf[o] & 0xC0) != 0xC0)
+                       (req_buf[o] & 0xC0) != 0xC0) {
+                  if (o + req_buf[o] + 1 > (size_t)payload_received) break;
                   o += req_buf[o] + 1;
+                }
                 if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
                   o += 2;
                 else
@@ -3028,8 +3039,10 @@ worker_startup_success:;
                 if (o >= (size_t)payload_received)
                   break;
                 while (o < (size_t)payload_received && req_buf[o] != 0 &&
-                       (req_buf[o] & 0xC0) != 0xC0)
+                       (req_buf[o] & 0xC0) != 0xC0) {
+                  if (o + req_buf[o] + 1 > (size_t)payload_received) break;
                   o += req_buf[o] + 1;
+                }
                 if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
                   o += 2;
                 else
@@ -3214,6 +3227,7 @@ worker_startup_success:;
                 offset += (len == 0) ? 1 : 2;
                 break;
               }
+              if (offset + len + 1 > msg_len) break;
               offset += len + 1;
             }
             if (offset + 3 < msg_len)
@@ -3316,6 +3330,7 @@ worker_startup_success:;
                     atomic_fetch_sub(&entry->active_axfr, 1);
                     close(client_fd);
                     dec_tcp_clients();
+                    release_zone_snapshot(snap);
                   } else
                     pthread_detach(t);
                 } else {
