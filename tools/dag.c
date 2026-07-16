@@ -1719,6 +1719,7 @@ static size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
 static int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
                     bool use_tcp, bool use_ldnsz, bool short_mode, bool norecurse,
                     bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
+                    bool no_hexdump_query, bool no_hexdump_response,
                     query_opts_t *qo, const char *hex_payload) {
     if (test_name) {
         printf("=========================================================\n");
@@ -1788,7 +1789,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         if (!short_mode) {
             printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
             printf("Query (%zu bytes):\n", pkt_len);
-            hexdump(pkt, pkt_len);
+            if (!no_hexdump_query) {
+                hexdump(pkt, pkt_len);
+            } else {
+                printf("(hexdump suppressed)\n");
+            }
             printf("\n");
         }
 
@@ -1829,7 +1834,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             if (!short_mode) {
                 reset_dag_arena();
                 printf("Response (%zd bytes, UDP):\n", n);
-                hexdump(resp, (size_t)n);
+                if (!no_hexdump_response) {
+                    hexdump(resp, (size_t)n);
+                } else {
+                    printf("(hexdump suppressed)\n");
+                }
                 if (use_ldnsz) {
                     print_ldnsz_url(resp, (size_t)n);
                 }
@@ -1868,7 +1877,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 } else {
                     printf("Response (%zd bytes, UDP):\n", n);
                 }
-                hexdump(resp, (size_t)n);
+                if (!no_hexdump_response) {
+                    hexdump(resp, (size_t)n);
+                } else {
+                    printf("(hexdump suppressed)\n");
+                }
                 if (use_ldnsz) {
                     print_ldnsz_url(resp, (size_t)n);
                 }
@@ -1947,6 +1960,7 @@ static void usage(const char *prog) {
         "          [+padding=N] [+timeout=N] [+tries=N] [+ldnsz]\n"
         "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
         "          [--test-all] [--break <kind>[=<param>] ...]\n"
+        "          [+nohexdump] [+nohexdump-query] [+nohexdump-response]\n"
         "\n"
         "  <server> may be an IPv4/IPv6 literal or an FQDN (resolved via the\n"
         "  system resolver), e.g. @8.8.8.8, @2001:4860:4860::8888, @dns.google\n"
@@ -2102,6 +2116,8 @@ int main(int argc, char **argv) {
     bool tcflag = false;
     bool zflag = false;
     bool test_all = false;
+    bool no_hexdump_query = false;
+    bool no_hexdump_response = false;
 
     query_opts_t qo;
     memset(&qo, 0, sizeof(qo));
@@ -2127,6 +2143,13 @@ int main(int argc, char **argv) {
             short_mode = true;
         } else if (strcmp(argv[i], "+norec") == 0 || strcmp(argv[i], "+norecurse") == 0) {
             norecurse = true;
+        } else if (strcmp(argv[i], "+nohexdump") == 0) {
+            no_hexdump_query = true;
+            no_hexdump_response = true;
+        } else if (strcmp(argv[i], "+nohexdump-query") == 0) {
+            no_hexdump_query = true;
+        } else if (strcmp(argv[i], "+nohexdump-response") == 0) {
+            no_hexdump_response = true;
         } else if (strcmp(argv[i], "--break") == 0 && i + 1 < argc) {
             char *brk = argv[++i];
             if (strcmp(brk, "all") == 0) {
@@ -2304,12 +2327,14 @@ int main(int argc, char **argv) {
             run_test(all_tests[t].name, qname, qtype_s, server, port,
                      use_tcp || all_tests[t].tcp, use_ldnsz, short_mode, norecurse,
                      adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
+                     no_hexdump_query, no_hexdump_response,
                      &t_qo, hex_payload);
         }
 
         } else {
             run_test(NULL, qname, qtype_s, server, port, use_tcp, use_ldnsz, short_mode, norecurse,
-                     adflag, cdflag, aaflag, tcflag, zflag, &qo, hex_payload);
+                     adflag, cdflag, aaflag, tcflag, zflag,
+                     no_hexdump_query, no_hexdump_response, &qo, hex_payload);
         }
     }
 
