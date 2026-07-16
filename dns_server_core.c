@@ -3369,15 +3369,14 @@ worker_startup_success:;
                   if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
                     free(args);
                     atomic_fetch_sub(&entry->active_axfr, 1);
-                    close(client_fd);
-                    dec_tcp_clients();
-                    release_zone_snapshot(snap);
-                  } else
+                    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+                    allowed = false;
+                  } else {
                     pthread_detach(t);
+                  }
                 } else {
                   atomic_fetch_sub(&entry->active_axfr, 1);
-                  close(client_fd);
-                  dec_tcp_clients();
+                  allowed = false;
                 }
               }
             }
