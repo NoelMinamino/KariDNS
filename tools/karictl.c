@@ -234,6 +234,7 @@ int main(int argc, char **argv) {
             printf("EDE Other: %lu\n", st.ede_oth);
             printf("-----------------------------------\n");
         } else {
+            if (total >= sizeof(buf)) total = sizeof(buf) - 1;
             buf[total] = '\0';
             printf("%s", buf);
         }
