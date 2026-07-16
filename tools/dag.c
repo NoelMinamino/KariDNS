@@ -2037,10 +2037,24 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 static void print_multi_server_summary(void) {
     if (g_server_count <= 1) return;
 
+    // 1. サーバー名の最大長を計算 (最低18文字は確保)
+    int max_server_len = 18;
+    for (int i = 0; i < g_server_count; i++) {
+        int len = strlen(g_results[i].server_ip);
+        if (len > max_server_len) {
+            max_server_len = len;
+        }
+    }
+
     printf("\n;; === MULTI-SERVER COMPARISON SUMMARY ===\n");
-    printf("%-18s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
-           "SERVER", "RCODE", "ANS", "AUT", "ADD", "SEM_HASH", "TIME", "MATCH STATUS");
-    printf("-------------------+---------+-----+-----+-----+------------+--------+------------------------\n");
+    
+    // 2. ヘッダの出力 ( %-*s を使って動的幅を指定 )
+    printf("%-*s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
+           max_server_len, "SERVER", "RCODE", "ANS", "AUT", "ADD", "SEM_HASH", "TIME", "MATCH STATUS");
+    
+    // 3. 区切り線の出力 ( max_server_len の分だけ '-' を出力 )
+    for (int i = 0; i < max_server_len; i++) printf("-");
+    printf("-+---------+-----+-----+-----+------------+--------+------------------------\n");
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
@@ -2065,12 +2079,16 @@ static void print_multi_server_summary(void) {
             }
         }
 
-        printf("%-18s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
-               r->server_ip, rcode_name(r->rcode),
+        // 4. データ行の出力 ( %-*s を使って動的幅を指定 )
+        printf("%-*s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
+               max_server_len, r->server_ip, rcode_name(r->rcode),
                r->ancount, r->nscount, r->arcount,
                r->semantic_hash, r->elapsed_ms, status_str);
     }
-    printf("-------------------+---------+-----+-----+-----+------------+--------+------------------------\n");
+    
+    // 5. フッター区切り線の出力
+    for (int i = 0; i < max_server_len; i++) printf("-");
+    printf("-+---------+-----+-----+-----+------------+--------+------------------------\n");
     
     // URL出力 (+ldnsz-diff が指定された場合のみ)
     if (g_want_ldnsz_diff) {
