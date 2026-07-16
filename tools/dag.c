@@ -2104,7 +2104,12 @@ static void print_multi_server_summary(bool use_ldnsz) {
     if (use_ldnsz) {
         printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
         for (int i = 0; i < g_server_count; i++) {
-            printf("%s%s:", (i > 0) ? "," : "", g_results[i].server_ip);
+            const char *proto = strstr(g_results[i].server_ip, "(TCP)") ? "TCP" : "UDP";
+            printf("%s%s|%s|%ld:", 
+                   (i > 0) ? "," : "", 
+                   g_results[i].server_ip, 
+                   proto, 
+                   g_results[i].elapsed_ms);
             print_ldnsz_payload(g_results[i].resp_buf, g_results[i].resp_len);
         }
         printf("\n");
