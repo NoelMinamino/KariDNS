@@ -691,6 +691,7 @@ zone_db_snapshot_t *acquire_zone_snapshot(void) {
     atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
     if (snap == atomic_load_explicit(&g_zone_db_active, memory_order_acquire))
       break;
+    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
   } while (1);
   return snap;
 }
@@ -714,8 +715,15 @@ static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
   int retries = 0;
   while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
     usleep(1000);
-    if (++retries % 1000 == 0)
+    if (++retries % 1000 == 0) {
       syslog(LOG_WARNING, "[RCU] wait_for_snapshot_readers stalled");
+    }
+#if defined(SANITIZER_BUILD) || !defined(NDEBUG)
+    if (retries > 5000) {
+      syslog(LOG_ERR, "[RCU] FATAL: reader_count leak detected (stalled > 5s). Aborting.");
+      abort();
+    }
+#endif
   }
 }
 
