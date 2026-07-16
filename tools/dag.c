@@ -65,7 +65,6 @@ typedef struct {
 
 static server_result_t g_results[MAX_DAG_SERVERS];
 static int g_server_count = 0;
-static bool g_want_ldnsz_diff = false;
 static bool g_want_allcompare = false;
 static char g_arena_buf[DAG_ARENA_SIZE];
 static size_t g_arena_pos = 0;
@@ -2044,7 +2043,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     return 0;
 }
 
-static void print_multi_server_summary(void) {
+static void print_multi_server_summary(bool use_ldnsz) {
     if (g_server_count <= 1) return;
 
     // 1. サーバー名の最大長を計算 (最低18文字は確保)
@@ -2101,9 +2100,9 @@ static void print_multi_server_summary(void) {
     for (int i = 0; i < max_server_len; i++) printf("-");
     printf("-+---------+-----+-----+-----+------------+--------+------------------------\n");
     
-    // URL出力 (+ldnsz-diff が指定された場合のみ)
-    if (g_want_ldnsz_diff) {
-        printf(";; Compare details in browser:\n;; https://ldns.jp/diff/?c=");
+    // URL出力 (+ldnsz が指定された場合のみ)
+    if (use_ldnsz) {
+        printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
         for (int i = 0; i < g_server_count; i++) {
             printf("%s%s:", (i > 0) ? "," : "", g_results[i].server_ip);
             print_ldnsz_payload(g_results[i].resp_buf, g_results[i].resp_len);
@@ -2123,7 +2122,7 @@ static void usage(const char *prog) {
         "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
         "          [--test-all] [--break <kind>[=<param>] ...]\n"
         "          [+nohexdump] [+nohexdump-query] [+nohexdump-response]\n"
-        "          [+ldnsz-diff] [+allcompare]\n"
+        "          [+ldnsz] [+allcompare]\n"
         "\n"
         "  <server> may be an IPv4/IPv6 literal or an FQDN (resolved via the\n"
         "  system resolver), e.g. @8.8.8.8, @2001:4860:4860::8888, @dns.google\n"
@@ -2302,8 +2301,6 @@ int main(int argc, char **argv) {
             force_udp = true;
         } else if (strcmp(argv[i], "+ldnsz") == 0) {
             use_ldnsz = true;
-        } else if (strcmp(argv[i], "+ldnsz-diff") == 0) {
-            g_want_ldnsz_diff = true;
         } else if (strcmp(argv[i], "+allcompare") == 0) {
             g_want_allcompare = true;
         } else if (strcmp(argv[i], "+short") == 0) {
@@ -2426,6 +2423,9 @@ int main(int argc, char **argv) {
 
     for (int si = 0; si < server_count; si++) {
         const char *server = servers[si];
+        
+        bool pass_ldnsz_to_run_test = (server_count == 1) ? use_ldnsz : false;
+
         if (server_count > 1) {
             printf("\n;; ===============================================\n");
             printf(";; Server: %s\n", server);
@@ -2492,20 +2492,20 @@ int main(int argc, char **argv) {
             }
 
             run_test(all_tests[t].name, qname, qtype_s, server, port,
-                     use_tcp || all_tests[t].tcp, use_ldnsz, short_mode, norecurse,
+                     use_tcp || all_tests[t].tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
                      adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
                      no_hexdump_query, no_hexdump_response,
                      &t_qo, hex_payload);
         }
 
         } else {
-            run_test(NULL, qname, qtype_s, server, port, use_tcp, use_ldnsz, short_mode, norecurse,
+            run_test(NULL, qname, qtype_s, server, port, use_tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
                      adflag, cdflag, aaflag, tcflag, zflag,
                      no_hexdump_query, no_hexdump_response, &qo, hex_payload);
         }
     }
     
-    print_multi_server_summary();
+    print_multi_server_summary(use_ldnsz);
 
     free(server_list_buf);
     return 0;
