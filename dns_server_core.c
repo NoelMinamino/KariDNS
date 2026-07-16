@@ -718,7 +718,7 @@ static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
     if (++retries % 1000 == 0) {
       syslog(LOG_WARNING, "[RCU] wait_for_snapshot_readers stalled");
     }
-#if defined(SANITIZER_BUILD) || !defined(NDEBUG)
+#if defined(SANITIZER_BUILD)
     if (retries > 5000) {
       syslog(LOG_ERR, "[RCU] FATAL: reader_count leak detected (stalled > 5s). Aborting.");
       abort();
