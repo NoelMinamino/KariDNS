@@ -66,6 +66,7 @@ typedef struct {
 static server_result_t g_results[MAX_DAG_SERVERS];
 static int g_server_count = 0;
 static bool g_want_ldnsz_diff = false;
+static bool g_want_allcompare = false;
 static char g_arena_buf[DAG_ARENA_SIZE];
 static size_t g_arena_pos = 0;
 
@@ -1544,7 +1545,7 @@ static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_l
     }
 }
 
-static uint32_t calc_rr_hash(const char *name, uint16_t type, uint16_t klass, const uint8_t *rdata, uint16_t rdlen) {
+static uint32_t calc_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
     uint32_t h = 2166136261u;
     for (int i = 0; name && name[i]; i++) {
         h ^= tolower((unsigned char)name[i]);
@@ -1554,6 +1555,14 @@ static uint32_t calc_rr_hash(const char *name, uint16_t type, uint16_t klass, co
     h ^= (type & 0xFF); h *= 16777619u;
     h ^= (klass >> 8); h *= 16777619u;
     h ^= (klass & 0xFF); h *= 16777619u;
+
+    if (g_want_allcompare) {
+        h ^= (ttl >> 24) & 0xFF; h *= 16777619u;
+        h ^= (ttl >> 16) & 0xFF; h *= 16777619u;
+        h ^= (ttl >> 8)  & 0xFF; h *= 16777619u;
+        h ^= (ttl & 0xFF);       h *= 16777619u;
+    }
+
     for (uint16_t i = 0; i < rdlen; i++) {
         h ^= rdata[i];
         h *= 16777619u;
@@ -1585,12 +1594,13 @@ static uint32_t calculate_packet_semantic_hash(const uint8_t *pkt, size_t pkt_le
         if (next + 10 > pkt_len) break;
         uint16_t type = (pkt[next] << 8) | pkt[next+1];
         uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
+        uint32_t ttl = ((uint32_t)pkt[next+4] << 24) | ((uint32_t)pkt[next+5] << 16) | ((uint32_t)pkt[next+6] << 8) | pkt[next+7];
         uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
         size_t rdata_start = next + 10;
         if (rdata_start + rdlen > pkt_len) break;
         
         if (type != 41) { // Skip OPT
-            total_hash += calc_rr_hash(name, type, klass, &pkt[rdata_start], rdlen);
+            total_hash += calc_rr_hash(name, type, klass, ttl, &pkt[rdata_start], rdlen);
         }
         offset = rdata_start + rdlen;
     }
@@ -2050,7 +2060,8 @@ static void print_multi_server_summary(void) {
     
     // 2. ヘッダの出力 ( %-*s を使って動的幅を指定 )
     printf("%-*s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
-           max_server_len, "SERVER", "RCODE", "ANS", "AUT", "ADD", "SEM_HASH", "TIME", "MATCH STATUS");
+           max_server_len, "SERVER", "RCODE", "ANS", "AUT", "ADD", 
+           g_want_allcompare ? "STR_HASH" : "SEM_HASH", "TIME", "MATCH STATUS");
     
     // 3. 区切り線の出力 ( max_server_len の分だけ '-' を出力 )
     for (int i = 0; i < max_server_len; i++) printf("-");
@@ -2112,7 +2123,7 @@ static void usage(const char *prog) {
         "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
         "          [--test-all] [--break <kind>[=<param>] ...]\n"
         "          [+nohexdump] [+nohexdump-query] [+nohexdump-response]\n"
-        "          [+ldnsz-diff]\n"
+        "          [+ldnsz-diff] [+allcompare]\n"
         "\n"
         "  <server> may be an IPv4/IPv6 literal or an FQDN (resolved via the\n"
         "  system resolver), e.g. @8.8.8.8, @2001:4860:4860::8888, @dns.google\n"
@@ -2293,6 +2304,8 @@ int main(int argc, char **argv) {
             use_ldnsz = true;
         } else if (strcmp(argv[i], "+ldnsz-diff") == 0) {
             g_want_ldnsz_diff = true;
+        } else if (strcmp(argv[i], "+allcompare") == 0) {
+            g_want_allcompare = true;
         } else if (strcmp(argv[i], "+short") == 0) {
             short_mode = true;
         } else if (strcmp(argv[i], "+norec") == 0 || strcmp(argv[i], "+norecurse") == 0) {
