@@ -684,7 +684,12 @@ PROCESS_RECORD:
   rec->generic_len = 0;
   rec->generic_data = NULL;
   if (rec->rdata_count >= 2 && strcmp(rec->rdata[0], "\\#") == 0) {
-    rec->generic_len = atoi(rec->rdata[1]);
+    long declared_len = atol(rec->rdata[1]);
+    if (declared_len < 0 || declared_len > 65535) {
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) out of range (0-65535)";
+      return -1;
+    }
+    rec->generic_len = (uint16_t)declared_len;
     if (rec->generic_len > 0 && rec->rdata_count > 2) {
       uint8_t *blob = (uint8_t *)arena_alloc(arena, rec->generic_len);
       if (blob) {
@@ -745,6 +750,12 @@ PROCESS_RECORD:
     } else if (rec->type_code == 260) { // AMTRELAY
       if (rec->rdata_count > 3 && atoi(rec->rdata[2]) == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
+      }
+    } else if (rec->type_code == 64 || rec->type_code == 65) { // SVCB / HTTPS
+      if (rec->rdata_count > 1) {
+        if (strcmp(rec->rdata[1], ".") != 0) {
+          rec->rdata[1] = expand_domain_name(rec->rdata[1], *origin_io, arena);
+        }
       }
     } else if (rec->type_code == 22) { // NSAP
       if (rec->rdata_count > 0) {

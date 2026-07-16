@@ -221,6 +221,17 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                 }
             }
         }
+        if (arena.records[i].type_code == 64 || arena.records[i].type_code == 65) { // SVCB / HTTPS
+            if (arena.records[i].rdata_count > 1) {
+                const char *target = arena.records[i].rdata[1];
+                size_t len = strlen(target);
+                if (len > 0 && target[len - 1] != '.' && strcmp(target, ".") != 0) {
+                    fprintf(stderr, "[WARNING] %s record TargetName '%s' does not end with a dot in zone '%s' (%s)\n",
+                            arena.records[i].type_code == 64 ? "SVCB" : "HTTPS",
+                            target, domain, file_path);
+                }
+            }
+        }
     }
 
     if (!has_soa) {
