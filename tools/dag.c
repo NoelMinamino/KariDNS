@@ -1897,6 +1897,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
 
             if (axfr_state.is_axfr && axfr_state.axfr_complete) break;
+            
+            // AXFR/IXFR 以外の通常クエリは応答が1メッセージで終わるため、次を待たずに抜ける
+            if (!axfr_state.is_axfr) break;
+
             if (use_tcp && tcp_sock >= 0) {
                 n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
                 if (n > 0) msg_index++;
