@@ -2,9 +2,13 @@
  * dag - DNS Anomaly Generator (test client / protocol fuzzer)
  *
  * Usage:
- *   dag <name> <type> @<server> [-p <port>] [+tcp] [+ldnsz]
+ *   dag <name> <type> @<server>[,<server>...] [-p <port>] [+tcp] [+ldnsz]
  *       [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie] [+subnet=addr[/prefix]]
  *       [--break <kind>[=<param>] ...]
+ *
+ * <server> accepts IPv4/IPv6 literals or FQDNs (resolved via getaddrinfo()),
+ * and a comma-separated list to query multiple servers in a single run, e.g.
+ * @8.8.8.8,9.9.9.9,1.1.1.1
  *
  * Builds a DNS query, sends it over UDP/TCP, and pretty-prints the response
  * with a hexdump. Supports intentional packet malformation via --break.
@@ -23,6 +27,7 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <zlib.h>
 #include <strings.h>
 #include <ctype.h>
@@ -37,6 +42,7 @@
  * 1. Arena (dag only ever bump-allocates scratch strings; never freed)
  * ==================================================================== */
 #define DAG_ARENA_SIZE (256 * 1024)
+#define MAX_DAG_SERVERS 16
 static char g_arena_buf[DAG_ARENA_SIZE];
 static size_t g_arena_pos = 0;
 
@@ -593,42 +599,69 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
 /* ========================================================================
  * 6. Networking
  * ==================================================================== */
-static int connect_udp(const char *server, int port, struct sockaddr_storage *dest, socklen_t *dest_len) {
+/*
+ * server引数(IPv4リテラル / IPv6リテラル / FQDN)をsockaddr_storageへ解決する。
+ * まずinet_pton()でIPリテラルとしての解釈を試み(DNS解決を伴わない高速パス)、
+ * どちらにも一致しなければFQDNとみなしgetaddrinfo()でシステムリゾルバに問い合わせる。
+ */
+static bool resolve_server_addr(const char *server, int port,
+                                 struct sockaddr_storage *dest, socklen_t *dest_len,
+                                 int *family_out) {
     memset(dest, 0, sizeof(*dest));
     struct sockaddr_in *d4 = (struct sockaddr_in *)dest;
     struct sockaddr_in6 *d6 = (struct sockaddr_in6 *)dest;
-    int family = AF_INET;
+
     if (inet_pton(AF_INET, server, &d4->sin_addr) == 1) {
         d4->sin_family = AF_INET; d4->sin_port = htons((uint16_t)port);
-        *dest_len = sizeof(*d4); family = AF_INET;
-    } else if (inet_pton(AF_INET6, server, &d6->sin6_addr) == 1) {
-        d6->sin6_family = AF_INET6; d6->sin6_port = htons((uint16_t)port);
-        *dest_len = sizeof(*d6); family = AF_INET6;
-    } else {
-        fprintf(stderr, "Invalid server address: %s\n", server);
-        return -1;
+        *dest_len = sizeof(*d4);
+        if (family_out) *family_out = AF_INET;
+        return true;
     }
+    if (inet_pton(AF_INET6, server, &d6->sin6_addr) == 1) {
+        d6->sin6_family = AF_INET6; d6->sin6_port = htons((uint16_t)port);
+        *dest_len = sizeof(*d6);
+        if (family_out) *family_out = AF_INET6;
+        return true;
+    }
+
+    /* IPリテラルとして解釈できなかった場合はFQDNとみなし、システムリゾルバへ問い合わせる */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM; /* UDP/TCPどちらでも使うアドレスなので0でも良いが、重複エントリ抑制のため指定 */
+    char portbuf[16];
+    snprintf(portbuf, sizeof(portbuf), "%d", port);
+    int rc = getaddrinfo(server, portbuf, &hints, &res);
+    if (rc != 0 || !res) {
+        fprintf(stderr, "Cannot resolve server '%s': %s\n", server,
+                rc != 0 ? gai_strerror(rc) : "no addresses returned");
+        if (res) freeaddrinfo(res);
+        return false;
+    }
+    if (res->ai_addrlen > sizeof(*dest)) {
+        fprintf(stderr, "Resolved address for '%s' is unexpectedly large\n", server);
+        freeaddrinfo(res);
+        return false;
+    }
+    /* 複数レコードが返る場合もあるが、digやBIND互換ツールと同様に先頭(リゾルバの優先順位)を採用する */
+    memcpy(dest, res->ai_addr, res->ai_addrlen);
+    *dest_len = (socklen_t)res->ai_addrlen;
+    if (family_out) *family_out = res->ai_family;
+    freeaddrinfo(res);
+    return true;
+}
+
+static int connect_udp(const char *server, int port, struct sockaddr_storage *dest, socklen_t *dest_len) {
+    int family = AF_INET;
+    if (!resolve_server_addr(server, port, dest, dest_len, &family)) return -1;
     int sock = socket(family, SOCK_DGRAM, 0);
     if (sock < 0) perror("socket");
     return sock;
 }
 
 static int connect_tcp(const char *server, int port) {
-    struct sockaddr_storage dest; socklen_t dest_len;
-    memset(&dest, 0, sizeof(dest));
-    struct sockaddr_in *d4 = (struct sockaddr_in *)&dest;
-    struct sockaddr_in6 *d6 = (struct sockaddr_in6 *)&dest;
-    int family = AF_INET;
-    if (inet_pton(AF_INET, server, &d4->sin_addr) == 1) {
-        d4->sin_family = AF_INET; d4->sin_port = htons((uint16_t)port);
-        dest_len = sizeof(*d4); family = AF_INET;
-    } else if (inet_pton(AF_INET6, server, &d6->sin6_addr) == 1) {
-        d6->sin6_family = AF_INET6; d6->sin6_port = htons((uint16_t)port);
-        dest_len = sizeof(*d6); family = AF_INET6;
-    } else {
-        fprintf(stderr, "Invalid server address: %s\n", server);
-        return -1;
-    }
+    struct sockaddr_storage dest; socklen_t dest_len; int family = AF_INET;
+    if (!resolve_server_addr(server, port, &dest, &dest_len, &family)) return -1;
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
     if (connect(sock, (struct sockaddr *)&dest, dest_len) != 0) {
@@ -1903,7 +1936,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <name> <type|IXFR=serial> @<server> [-p <port>] [+tcp]\n"
+        "Usage: %s <name> <type|IXFR=serial> @<server>[,<server>...] [-p <port>] [+tcp]\n"
         "          [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie]\n"
         "          [+subnet=addr[/prefix]] [+bufsize=N] [+adflag] [+cdflag]\n"
         "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]]\n"
@@ -1911,8 +1944,13 @@ static void usage(const char *prog) {
         "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
         "          [--test-all] [--break <kind>[=<param>] ...]\n"
         "\n"
+        "  <server> may be an IPv4/IPv6 literal or an FQDN (resolved via the\n"
+        "  system resolver), e.g. @8.8.8.8, @2001:4860:4860::8888, @dns.google\n"
+        "  Multiple servers can be queried in one run with a comma-separated list:\n"
+        "    %s example.com A @8.8.8.8,9.9.9.9,1.1.1.1\n"
+        "\n"
         "       %s --break-help    (list all --break kinds)\n",
-        prog, prog);
+        prog, prog, prog);
 }
 
 static bool make_reverse_name(const char *ip_str, char *out_name, size_t out_len) {
@@ -2018,7 +2056,35 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char *server = server_arg + 1;
+    /*
+     * @8.8.8.8,9.9.9.9 のようにカンマ区切りで複数サーバーを指定できるようにする。
+     * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
+     * (resolve_server_addr()がgetaddrinfo()で解決する)。
+     */
+    char *server_list_buf = strdup(server_arg + 1);
+    if (!server_list_buf) { perror("strdup"); return 1; }
+    const char *servers[MAX_DAG_SERVERS];
+    int server_count = 0;
+    {
+        char *save = NULL;
+        char *tok = strtok_r(server_list_buf, ",", &save);
+        while (tok) {
+            if (*tok == '\0') {
+                fprintf(stderr, "warning: skipping empty server entry\n");
+            } else if (server_count >= MAX_DAG_SERVERS) {
+                fprintf(stderr, "warning: too many servers specified, only the first %d will be used\n", MAX_DAG_SERVERS);
+                break;
+            } else {
+                servers[server_count++] = tok;
+            }
+            tok = strtok_r(NULL, ",", &save);
+        }
+    }
+    if (server_count == 0) {
+        fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1 or @192.0.2.1,192.0.2.2,1.1.1.1\n");
+        free(server_list_buf);
+        return 1;
+    }
 
     int port = 53;
     bool use_tcp = false;
@@ -2164,7 +2230,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (test_all) {
+    for (int si = 0; si < server_count; si++) {
+        const char *server = servers[si];
+        if (server_count > 1) {
+            printf("\n;; ===============================================\n");
+            printf(";; Server: %s\n", server);
+            printf(";; ===============================================\n");
+        }
+
+        if (test_all) {
         struct {
             const char *name; break_kind_t kind; long param; bool tcp;
             bool cdflag; bool zflag; bool aaflag; bool tcflag;
@@ -2229,9 +2303,12 @@ int main(int argc, char **argv) {
                      &t_qo, hex_payload);
         }
 
-    } else {
-        run_test(NULL, qname, qtype_s, server, port, use_tcp, use_ldnsz, short_mode, norecurse,
-                 adflag, cdflag, aaflag, tcflag, zflag, &qo, hex_payload);
+        } else {
+            run_test(NULL, qname, qtype_s, server, port, use_tcp, use_ldnsz, short_mode, norecurse,
+                     adflag, cdflag, aaflag, tcflag, zflag, &qo, hex_payload);
+        }
     }
+
+    free(server_list_buf);
     return 0;
 }
