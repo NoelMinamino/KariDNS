@@ -42,7 +42,7 @@
  * 1. Arena (dag only ever bump-allocates scratch strings; never freed)
  * ==================================================================== */
 #define DAG_ARENA_SIZE (256 * 1024)
-#define MAX_DAG_SERVERS 16
+#define MAX_DAG_SERVERS 32
 
 typedef enum {
     MATCH_BASE = 0,
@@ -1910,36 +1910,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             return 1;
         }
 
-        if (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0) {
-            if (!short_mode) {
-                reset_dag_arena();
-                printf("Response (%zd bytes, UDP):\n", n);
-                if (!no_hexdump_response) {
-                    hexdump(resp, (size_t)n);
-                } else {
-                    printf("(hexdump suppressed)\n");
-                }
-                if (use_ldnsz) {
-                    print_ldnsz_url(resp, (size_t)n);
-                }
-                printf("\n");
-                print_response(resp, (size_t)n, &axfr_state);
-            }
-            fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
-            use_tcp = true;
-            tcp_sock = do_tcp_send_request(server, port, pkt, pkt_len, qo->timeout_sec);
-            if (tcp_sock < 0) {
-                fprintf(stderr, "dag: TCP retry failed\n");
-                return 1;
-            }
-            n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
-            if (n <= 0) {
-                printf(";; no usable response received on TCP retry\n");
-                return 1;
-            }
-            memset(&axfr_state, 0, sizeof(axfr_state));
-            axfr_state.is_axfr = (qtype == 252 || qtype == 251);
-        }
+        bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
 
 
         int msg_index = 1;
@@ -1951,7 +1922,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             sres = &g_results[g_server_count];
             if (msg_index == 1) {
                 memset(sres, 0, sizeof(*sres));
-                strncpy(sres->server_ip, server, sizeof(sres->server_ip) - 1);
+                snprintf(sres->server_ip, sizeof(sres->server_ip), "%s (%s)", server, use_tcp ? "TCP" : "UDP");
             }
         }
 
@@ -2037,6 +2008,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                           
         if (g_server_count < MAX_DAG_SERVERS) {
             g_results[g_server_count].elapsed_ms = elapsed_ms;
+            g_server_count++;
         }
 
         time_t now = time(NULL);
@@ -2051,18 +2023,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
 
         if (tcp_sock >= 0) close(tcp_sock);
-        n = 1; // set to valid value to avoid retry logic thinking it failed
 
-        if (!use_tcp && n >= 12 && (resp[2] & 0x02) != 0) {
-            printf("\n;; Truncated, retrying in TCP mode...\n\n");
+        if (is_truncated) {
+            fprintf(stderr, "\n;; Truncated, retrying in TCP mode...\n\n");
             use_tcp = true;
             retry_tcp = true;
         }
     } while (retry_tcp);
-
-    if (g_server_count < MAX_DAG_SERVERS) {
-        g_server_count++;
-    }
 
     return 0;
 }
@@ -2071,9 +2038,9 @@ static void print_multi_server_summary(void) {
     if (g_server_count <= 1) return;
 
     printf("\n;; === MULTI-SERVER COMPARISON SUMMARY ===\n");
-    printf("%-15s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
+    printf("%-18s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
            "SERVER", "RCODE", "ANS", "AUT", "ADD", "SEM_HASH", "TIME", "MATCH STATUS");
-    printf("----------------+---------+-----+-----+-----+------------+--------+------------------------\n");
+    printf("-------------------+---------+-----+-----+-----+------------+--------+------------------------\n");
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
@@ -2098,12 +2065,12 @@ static void print_multi_server_summary(void) {
             }
         }
 
-        printf("%-15s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
+        printf("%-18s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
                r->server_ip, rcode_name(r->rcode),
                r->ancount, r->nscount, r->arcount,
                r->semantic_hash, r->elapsed_ms, status_str);
     }
-    printf("----------------+---------+-----+-----+-----+------------+--------+------------------------\n");
+    printf("-------------------+---------+-----+-----+-----+------------+--------+------------------------\n");
     
     // URL出力 (+ldnsz-diff が指定された場合のみ)
     if (g_want_ldnsz_diff) {
