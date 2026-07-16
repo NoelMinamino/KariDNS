@@ -59,6 +59,7 @@ typedef struct {
     ssize_t resp_len;
     uint8_t resp_buf[65535];
     uint32_t semantic_hash; // 順不同ハッシュの合計値
+    long elapsed_ms;
     match_status_t match_status;
 } server_result_t;
 
@@ -2033,6 +2034,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         gettimeofday(&end_tv, NULL);
         long elapsed_ms = (end_tv.tv_sec - start_tv.tv_sec) * 1000 +
                           (end_tv.tv_usec - start_tv.tv_usec) / 1000;
+                          
+        if (g_server_count < MAX_DAG_SERVERS) {
+            g_results[g_server_count].elapsed_ms = elapsed_ms;
+        }
 
         time_t now = time(NULL);
         char time_buf[64];
@@ -2066,9 +2071,9 @@ static void print_multi_server_summary(void) {
     if (g_server_count <= 1) return;
 
     printf("\n;; === MULTI-SERVER COMPARISON SUMMARY ===\n");
-    printf("%-15s | %-7s | %3s | %3s | %3s | %-10s | %s\n", 
-           "SERVER", "RCODE", "ANS", "AUT", "ADD", "SEM_HASH", "MATCH STATUS");
-    printf("----------------+---------+-----+-----+-----+------------+------------------------\n");
+    printf("%-15s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
+           "SERVER", "RCODE", "ANS", "AUT", "ADD", "SEM_HASH", "TIME", "MATCH STATUS");
+    printf("----------------+---------+-----+-----+-----+------------+--------+------------------------\n");
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
@@ -2093,12 +2098,12 @@ static void print_multi_server_summary(void) {
             }
         }
 
-        printf("%-15s | %-7s | %3d | %3d | %3d | 0x%08X | %s\n",
+        printf("%-15s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
                r->server_ip, rcode_name(r->rcode),
                r->ancount, r->nscount, r->arcount,
-               r->semantic_hash, status_str);
+               r->semantic_hash, r->elapsed_ms, status_str);
     }
-    printf("----------------+---------+-----+-----+-----+------------+------------------------\n");
+    printf("----------------+---------+-----+-----+-----+------------+--------+------------------------\n");
     
     // URL出力 (+ldnsz-diff が指定された場合のみ)
     if (g_want_ldnsz_diff) {
