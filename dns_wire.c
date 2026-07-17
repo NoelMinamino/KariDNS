@@ -955,7 +955,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 
                 if (pk_idx < rec->rdata_count) {
-                    const char *b64 = rec->rdata[pk_idx];
+                    char b64[2048] = "";
+                    for (int i = pk_idx; i < rec->rdata_count; i++) {
+                        if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) {
+                            strcat(b64, rec->rdata[i]);
+                        }
+                    }
                     size_t b64_len = strlen(b64);
                     size_t decoded_upper_bound = (b64_len / 4) * 3;
                     if (offset + decoded_upper_bound > max_res_len) return -1;
