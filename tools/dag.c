@@ -1492,6 +1492,50 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             }
             break;
         }
+        case 19: { // X25
+            char psdn[256];
+            const uint8_t *p = &pkt[abs_offset];
+            const uint8_t *end = p + rdlen;
+            p = read_char_string(p, end, psdn, sizeof(psdn));
+            if (!p) goto fallback;
+            printf("\"%s\"", psdn);
+            break;
+        }
+        case 20: { // ISDN
+            char isdn_addr[256], sub_addr[256];
+            const uint8_t *p = &pkt[abs_offset];
+            const uint8_t *end = p + rdlen;
+            p = read_char_string(p, end, isdn_addr, sizeof(isdn_addr));
+            if (!p) goto fallback;
+            if (p < end) {
+                p = read_char_string(p, end, sub_addr, sizeof(sub_addr));
+                if (!p) goto fallback;
+                printf("\"%s\" \"%s\"", isdn_addr, sub_addr);
+            } else {
+                printf("\"%s\"", isdn_addr);
+            }
+            break;
+        }
+        case 22: { // NSAP
+            printf("0x");
+            for (uint16_t i = 0; i < rdlen; i++) {
+                printf("%02x", pkt[abs_offset + i]);
+            }
+            break;
+        }
+        case 27: { // GPOS
+            char lon[256], lat[256], alt[256];
+            const uint8_t *p = &pkt[abs_offset];
+            const uint8_t *end = p + rdlen;
+            p = read_char_string(p, end, lon, sizeof(lon));
+            if (!p) goto fallback;
+            p = read_char_string(p, end, lat, sizeof(lat));
+            if (!p) goto fallback;
+            p = read_char_string(p, end, alt, sizeof(alt));
+            if (!p) goto fallback;
+            printf("\"%s\" \"%s\" \"%s\"", lon, lat, alt);
+            break;
+        }
         default:
         fallback:
             printf("\\# %u ", rdlen);
