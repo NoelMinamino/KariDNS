@@ -2184,10 +2184,17 @@ static void print_multi_server_summary(bool use_ldnsz) {
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
+        if (!g_results[i].tc) {
+            base = &g_results[i];
+            break;
+        }
+    }
+
+    for (int i = 0; i < g_server_count; i++) {
         server_result_t *r = &g_results[i];
         
         const char *status_str = "";
-        if (i == 0) {
+        if (r == base) {
             status_str = "[BASE]";
         } else {
             // クエリID (2バイト) を除外してバイナリ比較

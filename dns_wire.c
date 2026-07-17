@@ -1207,6 +1207,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 const char *comma = strchr(p, ',');
                                 size_t len = comma ? (size_t)(comma - p) : strlen(p);
                                 if (len > 255) return -1;
+                                if (val_len + 1 + len > sizeof(val_wire)) return -1;
                                 val_wire[val_len++] = (uint8_t)len;
                                 memcpy(&val_wire[val_len], p, len);
                                 val_len += len;
@@ -1227,6 +1228,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 memcpy(buf, p, len); buf[len] = '\0';
                                 struct in_addr a;
                                 if (inet_pton(AF_INET, buf, &a) != 1) return -1;
+                                if (val_len + 4 > sizeof(val_wire)) return -1;
                                 memcpy(&val_wire[val_len], &a.s_addr, 4);
                                 val_len += 4;
                                 if (!comma) break;
@@ -1242,6 +1244,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 memcpy(buf, p, len); buf[len] = '\0';
                                 struct in6_addr a;
                                 if (inet_pton(AF_INET6, buf, &a) != 1) return -1;
+                                if (val_len + 16 > sizeof(val_wire)) return -1;
                                 memcpy(&val_wire[val_len], &a.s6_addr, 16);
                                 val_len += 16;
                                 if (!comma) break;
@@ -1249,6 +1252,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                             }
                         } else if (key == 5) { // ech
                             size_t blen = strlen(val_str);
+                            size_t decoded_upper_bound = ((blen + 3) / 4) * 3;
+                            if (val_len + decoded_upper_bound > sizeof(val_wire)) return -1;
                             int declen = EVP_DecodeBlock(&val_wire[val_len], (const unsigned char *)val_str, blen);
                             if (declen > 0) {
                                 int pad = 0;
