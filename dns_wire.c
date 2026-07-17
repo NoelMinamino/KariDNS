@@ -706,7 +706,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                 break;
             }
-            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: { // NS, MD, MF, CNAME, MB, MG, MR, PTR
+            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR
                 if (rec->rdata_count == 0) return -1;
                 if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
                 break;
@@ -1228,6 +1228,39 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
 
+            case 11: { // WKS
+                if (rec->rdata_count < 2) return -1;
+                if (offset + 5 > max_res_len) return -1;
+                struct in_addr addr;
+                if (inet_pton(AF_INET, rec->rdata[0], &addr) != 1) return -1;
+                memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
+                
+                // Protocol
+                uint8_t proto = 0;
+                if (strcasecmp(rec->rdata[1], "TCP") == 0) proto = 6;
+                else if (strcasecmp(rec->rdata[1], "UDP") == 0) proto = 17;
+                else proto = atoi(rec->rdata[1]);
+                res[offset++] = proto;
+                
+                // Port Bitmap
+                uint8_t bitmap[8192] = {0}; // Max port 65535 / 8 = 8192 bytes
+                int max_port = -1;
+                for (int i = 2; i < rec->rdata_count; i++) {
+                    int port = atoi(rec->rdata[i]); // ポート番号は数値指定を前提
+                    if (port >= 0 && port <= 65535) {
+                        bitmap[port / 8] |= (1 << (7 - (port % 8)));
+                        if (port > max_port) max_port = port;
+                    }
+                }
+                if (max_port >= 0) {
+                    size_t map_len = (max_port / 8) + 1;
+                    if (offset + map_len > max_res_len) return -1;
+                    memcpy(&res[offset], bitmap, map_len);
+                    offset += map_len;
+                }
+                break;
+            }
+
             case 14: { // MINFO
                 if (rec->rdata_count < 2) return -1;
                 if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
@@ -1278,7 +1311,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (encode_type_bitmap(res, max_res_len, &offset, &rec->rdata[2], rec->rdata_count - 2) != 0) return -1;
                 break;
             }
-            case 43: case 59: { // DS, CDS
+            case 43: case 59: case 32768: case 32769: { // DS, CDS, TA, DLV
                 if (rec->rdata_count < 4) return -1;
                 uint16_t keytag = atoi(rec->rdata[0]);
                 uint8_t alg = atoi(rec->rdata[1]);
@@ -1297,7 +1330,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += dec_len;
                 break;
             }
-            case 48: case 60: { // DNSKEY, CDNSKEY
+            case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
                 if (rec->rdata_count < 4) return -1;
                 uint16_t flags = atoi(rec->rdata[0]);
                 uint8_t proto = atoi(rec->rdata[1]);

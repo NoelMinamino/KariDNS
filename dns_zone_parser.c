@@ -713,7 +713,10 @@ PROCESS_RECORD:
       }
     }
   } else if (rec->type) {
-    if (rec->type_code == 5 || rec->type_code == 12 || rec->type_code == 2) {
+    if (rec->type_code == 5 || rec->type_code == 12 || rec->type_code == 2 ||
+        rec->type_code == 39 || rec->type_code == 23 || 
+        (rec->type_code >= 3 && rec->type_code <= 4) || 
+        (rec->type_code >= 7 && rec->type_code <= 9)) {
       if (rec->rdata_count > 0)
         rec->rdata[0] = expand_domain_name(rec->rdata[0], *origin_io, arena);
     } else if (rec->type_code == 6) {
