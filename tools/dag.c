@@ -53,6 +53,7 @@ typedef enum {
 
 typedef struct {
     char server_ip[64];
+    char proto[8];
     uint8_t rcode;
     uint16_t qdcount, ancount, nscount, arcount;
     bool qr, aa, tc, rd, ra, ad, cd;
@@ -2031,7 +2032,8 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         if (sres) {
             if (msg_index == 1) {
                 memset(sres, 0, sizeof(*sres));
-                snprintf(sres->server_ip, sizeof(sres->server_ip), "%s (%s)", server, use_tcp ? "TCP" : "UDP");
+                snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", server);
+                snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
             }
         }
 
@@ -2135,16 +2137,24 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
         if (tcp_sock >= 0) close(tcp_sock);
 
+        if (sres) {
+            g_server_count++;
+        }
+
         if (is_truncated) {
             fprintf(stderr, "\n;; Truncated, retrying in TCP mode...\n\n");
             use_tcp = true;
             retry_tcp = true;
         }
-    } while (retry_tcp);
 
-    if (sres) {
-        g_server_count++;
-    }
+        if (retry_tcp) {
+            if (g_server_count < MAX_DAG_SERVERS) {
+                sres = &g_results[g_server_count];
+            } else {
+                sres = NULL;
+            }
+        }
+    } while (retry_tcp);
 
     return 0;
 }
@@ -2164,13 +2174,13 @@ static void print_multi_server_summary(bool use_ldnsz) {
     printf("\n;; === MULTI-SERVER COMPARISON SUMMARY ===\n");
     
     // 2. ヘッダの出力 ( %-*s を使って動的幅を指定 )
-    printf("%-*s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
-           max_server_len, "SERVER", "RCODE", "ANS", "AUT", "ADD", 
+    printf("%-*s | %-5s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
+           max_server_len, "SERVER", "PROTO", "RCODE", "ANS", "AUT", "ADD", 
            g_want_allcompare ? "STR_HASH" : "SEM_HASH", "TIME", "MATCH STATUS");
     
     // 3. 区切り線の出力 ( max_server_len の分だけ '-' を出力 )
     for (int i = 0; i < max_server_len; i++) printf("-");
-    printf("-+---------+-----+-----+-----+------------+--------+------------------------\n");
+    printf("-+-------+---------+-----+-----+-----+------------+--------+------------------------\n");
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
@@ -2196,25 +2206,24 @@ static void print_multi_server_summary(bool use_ldnsz) {
         }
 
         // 4. データ行の出力 ( %-*s を使って動的幅を指定 )
-        printf("%-*s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
-               max_server_len, r->server_ip, rcode_name(r->rcode),
+        printf("%-*s | %-5s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
+               max_server_len, r->server_ip, r->proto, rcode_name(r->rcode),
                r->ancount, r->nscount, r->arcount,
                r->semantic_hash, r->elapsed_ms, status_str);
     }
     
     // 5. フッター区切り線の出力
     for (int i = 0; i < max_server_len; i++) printf("-");
-    printf("-+---------+-----+-----+-----+------------+--------+------------------------\n");
+    printf("-+-------+---------+-----+-----+-----+------------+--------+------------------------\n");
     
     // URL出力 (+ldnsz が指定された場合のみ)
     if (use_ldnsz) {
         printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
         for (int i = 0; i < g_server_count; i++) {
-            const char *proto = strstr(g_results[i].server_ip, "(TCP)") ? "TCP" : "UDP";
             printf("%s%s|%s|%ld:", 
                    (i > 0) ? "," : "", 
                    g_results[i].server_ip, 
-                   proto, 
+                   g_results[i].proto, 
                    g_results[i].elapsed_ms);
             print_ldnsz_payload(g_results[i].resp_buf, g_results[i].resp_len);
         }
