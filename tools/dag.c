@@ -1045,7 +1045,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 printf("%s", buf);
             } else printf("(malformed AAAA, rdlen=%u)", rdlen);
             break;
-        case 2: case 5: case 12: case 39: { // NS / CNAME / PTR / DNAME
+        case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS / CNAME / PTR / DNAME
             char *name = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &name) == 0) printf("%s", name);
             else printf("(unparsable name)");
@@ -1086,7 +1086,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             else printf("%u %u %u (unparsable name)", prio, weight, port);
             break;
         }
-        case 16: {
+        case 16: case 99: case 258: { // TXT, SPF, AVC
             size_t p = abs_offset, end = abs_offset + rdlen;
             bool first = true;
             while (p < end) {
@@ -1370,7 +1370,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         }
 
-        case 46: { // RRSIG
+        case 24: case 46: { // SIG, RRSIG
             if (rdlen < 18) goto fallback;
             uint16_t type_covered = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
             uint8_t algorithm = pkt[abs_offset+2];
@@ -1412,7 +1412,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             printf("%s %s", next_name, types_buf);
             break;
         }
-        case 48: case 60: { // DNSKEY / CDNSKEY
+        case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
             print_dnskey_like(&pkt[abs_offset], rdlen);
             break;
         }
@@ -1420,7 +1420,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             print_nsec3_params(&pkt[abs_offset], rdlen, true);
             break;
         }
-        case 43: case 59: { // DS / CDS
+        case 43: case 59: case 32768: case 32769: { // DS, CDS, TA, DLV
             print_ds_like(&pkt[abs_offset], rdlen);
             break;
         }
@@ -1490,6 +1490,59 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 printf(" %s", rvs_name);
                 pos = next - abs_offset;
             }
+            break;
+        }
+        case 11: { // WKS
+            if (rdlen < 5) goto fallback;
+            printf("%d.%d.%d.%d %u", pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4]);
+            for (uint16_t i = 5; i < rdlen; i++) {
+                uint8_t b = pkt[abs_offset+i];
+                for (int bit = 0; bit < 8; bit++) {
+                    if (b & (0x80 >> bit)) printf(" %d", (i - 5) * 8 + bit);
+                }
+            }
+            break;
+        }
+        case 14: { // MINFO
+            char *rmailbx = NULL, *emailbx = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &rmailbx) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, NULL, &emailbx) != 0) {
+                goto fallback;
+            }
+            printf("%s %s", rmailbx, emailbx);
+            break;
+        }
+        case 63: { // ZONEMD
+            if (rdlen < 6) goto fallback;
+            uint32_t serial = ((uint32_t)pkt[abs_offset]<<24) | ((uint32_t)pkt[abs_offset+1]<<16) |
+                              ((uint32_t)pkt[abs_offset+2]<<8)  | pkt[abs_offset+3];
+            uint8_t scheme = pkt[abs_offset+4];
+            uint8_t halg = pkt[abs_offset+5];
+            printf("%u %u %u ", serial, scheme, halg);
+            for (uint16_t i = 6; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
+            break;
+        }
+        case 104: { // NID
+            if (rdlen != 10) goto fallback;
+            uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
+            printf("%u %02x%02x:%02x%02x:%02x%02x:%02x%02x", pref,
+                pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5],
+                pkt[abs_offset+6], pkt[abs_offset+7], pkt[abs_offset+8], pkt[abs_offset+9]);
+            break;
+        }
+        case 105: { // L32
+            if (rdlen != 6) goto fallback;
+            uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
+            printf("%u %d.%d.%d.%d", pref,
+                pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5]);
+            break;
+        }
+        case 106: { // L64
+            if (rdlen != 10) goto fallback;
+            uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
+            printf("%u %02x%02x:%02x%02x:%02x%02x:%02x%02x", pref,
+                pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5],
+                pkt[abs_offset+6], pkt[abs_offset+7], pkt[abs_offset+8], pkt[abs_offset+9]);
             break;
         }
         case 19: { // X25
