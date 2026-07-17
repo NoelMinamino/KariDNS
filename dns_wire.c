@@ -1156,7 +1156,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 break;
             }
-            case 64: case 65: { // HTTPS / SVCB (RFC 9460: 圧縮禁止)
+            case 64: case 65: { // HTTPS / SVCB (RFC 9460)
                 if (rec->rdata_count < 2) return -1;
                 if (offset + 2 > max_res_len) return -1;
                 uint16_t svc_prio = atoi(rec->rdata[0]);
@@ -1164,6 +1164,104 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
                 if (w < 0) return -1;
                 offset += w;
+                
+                // SvcParamsのシリアライズ
+                for (int i = 2; i < rec->rdata_count; i++) {
+                    const char *param = rec->rdata[i];
+                    char *eq = strchr(param, '=');
+                    char key_str[64];
+                    const char *val_str = NULL;
+                    if (eq) {
+                        size_t klen = eq - param;
+                        if (klen >= sizeof(key_str)) klen = sizeof(key_str) - 1;
+                        memcpy(key_str, param, klen);
+                        key_str[klen] = '\0';
+                        val_str = eq + 1;
+                    } else {
+                        strncpy(key_str, param, sizeof(key_str) - 1);
+                        key_str[sizeof(key_str) - 1] = '\0';
+                    }
+                    
+                    uint16_t key = 0;
+                    if (strcasecmp(key_str, "mandatory") == 0) key = 0;
+                    else if (strcasecmp(key_str, "alpn") == 0) key = 1;
+                    else if (strcasecmp(key_str, "no-default-alpn") == 0) key = 2;
+                    else if (strcasecmp(key_str, "port") == 0) key = 3;
+                    else if (strcasecmp(key_str, "ipv4hint") == 0) key = 4;
+                    else if (strcasecmp(key_str, "ech") == 0) key = 5;
+                    else if (strcasecmp(key_str, "ipv6hint") == 0) key = 6;
+                    else if (strncasecmp(key_str, "key", 3) == 0) key = atoi(key_str + 3);
+                    else continue;
+                    
+                    uint8_t val_wire[8192];
+                    uint16_t val_len = 0;
+                    if (val_str) {
+                        if (key == 1) { // alpn
+                            const char *p = val_str;
+                            while (*p) {
+                                const char *comma = strchr(p, ',');
+                                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                                if (len > 255) return -1;
+                                val_wire[val_len++] = (uint8_t)len;
+                                memcpy(&val_wire[val_len], p, len);
+                                val_len += len;
+                                if (!comma) break;
+                                p = comma + 1;
+                            }
+                        } else if (key == 3) { // port
+                            uint16_t p = atoi(val_str);
+                            val_wire[val_len++] = p >> 8;
+                            val_wire[val_len++] = p & 0xFF;
+                        } else if (key == 4) { // ipv4hint
+                            const char *p = val_str;
+                            while (*p) {
+                                char buf[64];
+                                const char *comma = strchr(p, ',');
+                                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                                if (len >= sizeof(buf)) return -1;
+                                memcpy(buf, p, len); buf[len] = '\0';
+                                struct in_addr a;
+                                if (inet_pton(AF_INET, buf, &a) != 1) return -1;
+                                memcpy(&val_wire[val_len], &a.s_addr, 4);
+                                val_len += 4;
+                                if (!comma) break;
+                                p = comma + 1;
+                            }
+                        } else if (key == 6) { // ipv6hint
+                            const char *p = val_str;
+                            while (*p) {
+                                char buf[64];
+                                const char *comma = strchr(p, ',');
+                                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                                if (len >= sizeof(buf)) return -1;
+                                memcpy(buf, p, len); buf[len] = '\0';
+                                struct in6_addr a;
+                                if (inet_pton(AF_INET6, buf, &a) != 1) return -1;
+                                memcpy(&val_wire[val_len], &a.s6_addr, 16);
+                                val_len += 16;
+                                if (!comma) break;
+                                p = comma + 1;
+                            }
+                        } else if (key == 5) { // ech
+                            size_t blen = strlen(val_str);
+                            int declen = EVP_DecodeBlock(&val_wire[val_len], (const unsigned char *)val_str, blen);
+                            if (declen > 0) {
+                                int pad = 0;
+                                if (blen > 0 && val_str[blen-1] == '=') pad++;
+                                if (blen > 1 && val_str[blen-2] == '=') pad++;
+                                val_len += (declen - pad);
+                            }
+                        }
+                    }
+                    
+                    if (offset + 4 + val_len > max_res_len) return -1;
+                    res[offset++] = key >> 8; res[offset++] = key & 0xFF;
+                    res[offset++] = val_len >> 8; res[offset++] = val_len & 0xFF;
+                    if (val_len > 0) {
+                        memcpy(&res[offset], val_wire, val_len);
+                        offset += val_len;
+                    }
+                }
                 break;
             }
             case 13: { // HINFO
