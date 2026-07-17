@@ -1115,6 +1115,47 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 memcpy(&res[offset], salt, salt_len); offset += salt_len;
                 break;
             }
+            case 55: { // HIP
+                if (rec->rdata_count < 3) return -1;
+                uint8_t pk_alg = atoi(rec->rdata[0]);
+                uint8_t hit[255];
+                size_t hit_len = hex_decode(rec->rdata[1], hit, sizeof(hit));
+                if (hit_len == (size_t)-1) return -1;
+                
+                const char *pk_b64 = rec->rdata[2];
+                size_t pk_b64_len = strlen(pk_b64);
+                size_t decoded_upper_bound = ((pk_b64_len + 3) / 4) * 3;
+                
+                if (offset + 4 + hit_len + decoded_upper_bound > max_res_len) return -1;
+                
+                res[offset++] = (uint8_t)hit_len;
+                res[offset++] = pk_alg;
+                
+                int pk_len_offset = offset;
+                offset += 2;
+                
+                memcpy(&res[offset], hit, hit_len);
+                offset += hit_len;
+                
+                int pk_declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)pk_b64, pk_b64_len);
+                if (pk_declen < 0) return -1;
+                
+                int padding = 0;
+                if (pk_b64_len > 0 && pk_b64[pk_b64_len - 1] == '=') padding++;
+                if (pk_b64_len > 1 && pk_b64[pk_b64_len - 2] == '=') padding++;
+                
+                uint16_t pk_len = pk_declen - padding;
+                res[pk_len_offset] = pk_len >> 8;
+                res[pk_len_offset + 1] = pk_len & 0xFF;
+                offset += pk_len;
+                
+                for (int i = 3; i < rec->rdata_count; i++) {
+                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[i]);
+                    if (w < 0) return -1;
+                    offset += w;
+                }
+                break;
+            }
             case 64: case 65: { // HTTPS / SVCB (RFC 9460: 圧縮禁止)
                 if (rec->rdata_count < 2) return -1;
                 if (offset + 2 > max_res_len) return -1;

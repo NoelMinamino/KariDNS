@@ -751,6 +751,12 @@ PROCESS_RECORD:
       if (rec->rdata_count > 3 && atoi(rec->rdata[2]) == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
+    } else if (rec->type_code == 55) { // HIP
+      if (rec->rdata_count >= 4) {
+        for (int i = 3; i < rec->rdata_count; i++) {
+          rec->rdata[i] = expand_domain_name(rec->rdata[i], *origin_io, arena);
+        }
+      }
     } else if (rec->type_code == 64 || rec->type_code == 65) { // SVCB / HTTPS
       if (rec->rdata_count > 1) {
         if (strcmp(rec->rdata[1], ".") != 0) {
