@@ -1866,6 +1866,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         pkt[3] |= 0x40;  // Set Z bit
     }
 
+    server_result_t *sres = NULL;
+    if (g_server_count < MAX_DAG_SERVERS) {
+        sres = &g_results[g_server_count];
+    }
+
     bool retry_tcp = false;
     do {
         retry_tcp = false;
@@ -1926,9 +1931,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         int total_records = 0;
         size_t total_bytes = 0;
         
-        server_result_t *sres = NULL;
-        if (g_server_count < MAX_DAG_SERVERS) {
-            sres = &g_results[g_server_count];
+        if (sres) {
             if (msg_index == 1) {
                 memset(sres, 0, sizeof(*sres));
                 snprintf(sres->server_ip, sizeof(sres->server_ip), "%s (%s)", server, use_tcp ? "TCP" : "UDP");
@@ -1950,10 +1953,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     sres->qr = resp[2] & 0x80; sres->aa = resp[2] & 0x04; sres->tc = resp[2] & 0x02; sres->rd = resp[2] & 0x01;
                     sres->ra = resp[3] & 0x80; sres->ad = resp[3] & 0x20; sres->cd = resp[3] & 0x10;
                 }
-                if (sres->resp_len + n <= (ssize_t)sizeof(sres->resp_buf)) {
-                    memcpy(sres->resp_buf + sres->resp_len, resp, n);
+                size_t room = (sres->resp_len < (ssize_t)sizeof(sres->resp_buf))
+                              ? sizeof(sres->resp_buf) - (size_t)sres->resp_len : 0;
+                size_t to_copy = ((size_t)n < room) ? (size_t)n : room;
+                if (to_copy > 0) {
+                    memcpy(sres->resp_buf + sres->resp_len, resp, to_copy);
                 }
-                sres->resp_len += n;
+                sres->resp_len += to_copy;
             }
             reset_dag_arena();
             if (sres) {
@@ -2015,9 +2021,8 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         long elapsed_ms = (end_tv.tv_sec - start_tv.tv_sec) * 1000 +
                           (end_tv.tv_usec - start_tv.tv_usec) / 1000;
                           
-        if (g_server_count < MAX_DAG_SERVERS) {
-            g_results[g_server_count].elapsed_ms = elapsed_ms;
-            g_server_count++;
+        if (sres) {
+            sres->elapsed_ms = elapsed_ms;
         }
 
         time_t now = time(NULL);
@@ -2039,6 +2044,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             retry_tcp = true;
         }
     } while (retry_tcp);
+
+    if (sres) {
+        g_server_count++;
+    }
 
     return 0;
 }
