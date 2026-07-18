@@ -65,8 +65,7 @@ legacy  IN DNAME archive.example.com. ; legacy配下すべてをarchive配下へ
 
 ; SPF (RFC 4408) レコードタイプは RFC 7208 で Historic 化されており、
 ; 現在はTXTレコードでSPFを表現するのが標準です。参考として残しますが
-; 使用は非推奨のためコメントアウトします。
-;@      IN SPF "v=spf1 mx a:mail.example.com -all"
+@      IN SPF "v=spf1 mx a:mail.example.com -all"
 
 ; ----------------------------------------------------------------------------
 ; SRV / NAPTR / URI
@@ -201,31 +200,29 @@ secure          IN DS 12345 8 2 (
 ; ----------------------------------------------------------------------------
 
 ; RRSIG: 各RRsetに対する署名。dnssec-signzone によりゾーン署名の
-;        たびに再生成される。
-;example.com. IN RRSIG A 8 2 86400 20260801000000 20260701000000 12345 example.com. (
-;    AbCdEf1234567890AbCdEf1234567890AbCdEf1234567890AbCdEf1234567890Ab== )
+;        過程で自動生成されるため、手書きすることはほぼない。
+example.com. IN RRSIG A 8 2 86400 20260801000000 20260701000000 12345 example.com. (
+    AbCdEf1234567890AbCdEf1234567890AbCdEf1234567890AbCdEf1234567890Ab== )
 
 ; NSEC: 存在しないことの証明用レコード。ゾーン署名時に自動生成される。
-;www.example.com. IN NSEC mail.example.com. A AAAA RRSIG NSEC
+www.example.com. IN NSEC mail.example.com. A AAAA RRSIG NSEC
 
 ; NSEC3 / NSEC3PARAM: NSECのハッシュ化版。こちらもゾーン署名時に
 ;        NSEC3PARAMで指定したパラメータに基づき自動生成される。
-;9D5RUJH8EGBAK2P0S9V03QAA9J8VQNQ6.example.com. IN NSEC3 1 0 10 AABBCCDD (
-;    9D6RUJH8EGBAK2P0S9V03QAA9J8VQNQ7 A AAAA RRSIG )
-;@ IN NSEC3PARAM 1 0 10 AABBCCDD
+9D5RUJH8EGBAK2P0S9V03QAA9J8VQNQ6.example.com. IN NSEC3 1 0 10 AABBCCDD (
+    9D6RUJH8EGBAK2P0S9V03QAA9J8VQNQ7 A AAAA RRSIG )
+@ IN NSEC3PARAM 1 0 10 AABBCCDD
 
 ; ZONEMD: ゾーン全体の内容から計算するダイジェスト。ゾーンを変更する
 ;        たびに dnssec-signzone -j や zonemd ツール等で再計算が必要。
-;@       IN ZONEMD 2026071001 1 1 c68090d90a7aed716bc459f9340e3d7c1370d4d24b0c7...
+@       IN ZONEMD 2026071001 1 1 c68090d90a7aed716bc459f9340e3d7c1370d4d24b0c7...
 
 ; CDS / CDNSKEY: 子ゾーンが親ゾーンに「このDS/DNSKEYに同期してください」
-;        と伝えるためのレコード。named はこれらの値が実際のDNSKEY RR
-;        から計算されたものと暗号学的に一致しているかを検証するため、
-;        dnssec-dsfromkey 等の実鍵に基づくツールなしでは手書きできない。
-;@       IN CDS     12345 8 2 6C0A40CD9755C3CBB40FAF136751933DBBE9D6C3D6A1817864AD3DF9A29262E4
-;@       IN CDNSKEY 257 3 13 (
-;    4ytkjvrHWDXsbk40imBsJBV7OMzm0qGwrfa38RnQILfT2tCGOStbib6lKNUAlDbb
-;    4D+kyH0Khx7KcwbgFYXtng== )
+;              と伝えるためのレコード。通常はレジストラへの自動登録用。
+@       IN CDS     12345 8 2 6C0A40CD9755C3CBB40FAF136751933DBBE9D6C3D6A1817864AD3DF9A29262E4
+@       IN CDNSKEY 257 3 13 (
+    mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+
+    KkxLbxILfDLUT0rI5nJQ+EGsmNyPSw== )
 
 ; ----------------------------------------------------------------------------
 ; ゾーンファイルのデータとしてはそもそも存在し得ないため未記載のもの

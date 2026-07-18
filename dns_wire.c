@@ -308,6 +308,58 @@ static size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap) {
     return out_len;
 }
 
+static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
+    static const int8_t map[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+         0, 1, 2, 3, 4, 5, 6, 7, 8, 9,-1,-1,-1,-1,-1,-1,
+        -1,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,
+        25,26,27,28,29,30,31,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,
+        25,26,27,28,29,30,31,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    };
+    size_t in_len = strlen(in);
+    size_t out_len = 0;
+    uint32_t buffer = 0;
+    int bits_left = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        uint8_t c = (uint8_t)in[i];
+        if (c == '=') break;
+        int val = map[c];
+        if (val == -1) continue; // Skip invalid or whitespace
+        buffer = (buffer << 5) | val;
+        bits_left += 5;
+        if (bits_left >= 8) {
+            if (out_len >= out_cap) return (size_t)-1;
+            out[out_len++] = (buffer >> (bits_left - 8)) & 0xFF;
+            bits_left -= 8;
+        }
+    }
+    return out_len;
+}
+
+static uint32_t parse_dnssec_time(const char *str) {
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    if (sscanf(str, "%4d%2d%2d%2d%2d%2d", 
+               &t.tm_year, &t.tm_mon, &t.tm_mday,
+               &t.tm_hour, &t.tm_min, &t.tm_sec) == 6) {
+        t.tm_year -= 1900;
+        t.tm_mon -= 1;
+        return (uint32_t)timegm(&t);
+    }
+    return 0;
+}
+
 static int cert_type_to_num(const char *s) {
     if (strcasecmp(s, "PKIX") == 0) return 1;
     if (strcasecmp(s, "SPKI") == 0) return 2;
@@ -962,7 +1014,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                         }
                     }
                     size_t b64_len = strlen(b64);
-                    size_t decoded_upper_bound = (b64_len / 4) * 3;
+                    size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
                     if (offset + decoded_upper_bound > max_res_len) return -1;
                     int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
                     if (declen < 0) return -1;
@@ -1049,6 +1101,86 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += fp_len;
                 break;
             }
+            case 46: { // RRSIG
+                if (rec->rdata_count < 9) return -1;
+                uint16_t type_covered = get_type_code(rec->rdata[0]);
+                uint8_t algorithm = atoi(rec->rdata[1]);
+                uint8_t labels = atoi(rec->rdata[2]);
+                uint32_t orig_ttl = strtoul(rec->rdata[3], NULL, 10);
+                uint32_t sig_exp = parse_dnssec_time(rec->rdata[4]);
+                uint32_t sig_inc = parse_dnssec_time(rec->rdata[5]);
+                uint16_t key_tag = atoi(rec->rdata[6]);
+                const char *signer = rec->rdata[7];
+
+                if (offset + 18 > max_res_len) return -1;
+                res[offset++] = type_covered >> 8; res[offset++] = type_covered & 0xFF;
+                res[offset++] = algorithm;
+                res[offset++] = labels;
+                res[offset++] = orig_ttl >> 24; res[offset++] = (orig_ttl >> 16) & 0xFF;
+                res[offset++] = (orig_ttl >> 8) & 0xFF; res[offset++] = orig_ttl & 0xFF;
+                res[offset++] = sig_exp >> 24; res[offset++] = (sig_exp >> 16) & 0xFF;
+                res[offset++] = (sig_exp >> 8) & 0xFF; res[offset++] = sig_exp & 0xFF;
+                res[offset++] = sig_inc >> 24; res[offset++] = (sig_inc >> 16) & 0xFF;
+                res[offset++] = (sig_inc >> 8) & 0xFF; res[offset++] = sig_inc & 0xFF;
+                res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
+
+                long w = write_uncompressed_name(res, offset, max_res_len, signer);
+                if (w < 0) return -1;
+                offset += w;
+
+                char b64[2048] = "";
+                for (int i = 8; i < rec->rdata_count; i++) {
+                    if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) {
+                        strcat(b64, rec->rdata[i]);
+                    }
+                }
+                size_t b64_len = strlen(b64);
+                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
+                if (offset + decoded_upper_bound > max_res_len) return -1;
+                
+                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
+                if (declen < 0) return -1;
+                int padding = 0;
+                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
+                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
+                offset += (declen - padding);
+                break;
+            }
+            case 47: { // NSEC
+                if (rec->rdata_count < 2) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                if (w < 0) return -1;
+                offset += w;
+                if (encode_type_bitmap(res, max_res_len, &offset, &rec->rdata[1], rec->rdata_count - 1) != 0) return -1;
+                break;
+            }
+            case 50: { // NSEC3
+                if (rec->rdata_count < 6) return -1;
+                uint8_t halg = atoi(rec->rdata[0]);
+                uint8_t flags = atoi(rec->rdata[1]);
+                uint16_t iterations = atoi(rec->rdata[2]);
+                uint8_t salt[255];
+                size_t salt_len = 0;
+                if (strcmp(rec->rdata[3], "-") != 0) {
+                    salt_len = hex_decode(rec->rdata[3], salt, sizeof(salt));
+                    if (salt_len == (size_t)-1) return -1;
+                }
+                uint8_t next_hash[255];
+                size_t next_hash_len = base32hex_decode(rec->rdata[4], next_hash, sizeof(next_hash));
+                if (next_hash_len == (size_t)-1) return -1;
+
+                if (offset + 5 + salt_len + 1 + next_hash_len > max_res_len) return -1;
+                res[offset++] = halg;
+                res[offset++] = flags;
+                res[offset++] = iterations >> 8; res[offset++] = iterations & 0xFF;
+                res[offset++] = (uint8_t)salt_len;
+                memcpy(&res[offset], salt, salt_len); offset += salt_len;
+                res[offset++] = (uint8_t)next_hash_len;
+                memcpy(&res[offset], next_hash, next_hash_len); offset += next_hash_len;
+
+                if (encode_type_bitmap(res, max_res_len, &offset, &rec->rdata[5], rec->rdata_count - 5) != 0) return -1;
+                break;
+            }
             case 52: case 53: { // TLSA / SMIMEA
                 if (rec->rdata_count < 4) return -1;
                 uint8_t usage = atoi(rec->rdata[0]);
@@ -1072,7 +1204,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint8_t algorithm = atoi(rec->rdata[2]);
                 const char *b64 = rec->rdata[3];
                 size_t b64_len = strlen(b64);
-                size_t decoded_upper_bound = (b64_len / 4) * 3;
+                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
                 if (offset + 5 + decoded_upper_bound > max_res_len) return -1;
                 res[offset++] = cert_type >> 8; res[offset++] = cert_type & 0xFF;
                 res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
@@ -1297,7 +1429,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (rec->rdata_count < 1) return -1;
                 const char *b64 = rec->rdata[0];
                 size_t b64_len = strlen(b64);
-                size_t decoded_upper_bound = (b64_len / 4) * 3;
+                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
                 if (offset + decoded_upper_bound > max_res_len) return -1;
                 int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
                 if (declen < 0) return -1;
@@ -1453,7 +1585,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) strcat(b64, rec->rdata[i]);
                 }
                 size_t b64_len = strlen(b64);
-                size_t decoded_upper_bound = (b64_len / 4) * 3;
+                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
                 if (offset + decoded_upper_bound > max_res_len) return -1;
                 int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
                 if (declen < 0) return -1;
