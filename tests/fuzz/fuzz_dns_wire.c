@@ -67,7 +67,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&srec, 0, sizeof(srec));
         srec.name = "fuzz.test.";
         
-        int type_choices[] = {1, 28, 15, 33, 257, 6, 64, 35, 37, 44, 52, 53, 51};
+        int type_choices[] = {1, 28, 15, 33, 257, 6, 64, 65, 35, 37, 44, 52, 53, 51,
+                            55, 11, 46, 47, 50, 59, 60, 63, 27, 19, 20, 42, 62, 45, 29, 48, 43};
+        // 既存 + HTTPS, HIP, WKS, RRSIG, NSEC, NSEC3, CDS, CDNSKEY, ZONEMD,
+        //        GPOS, X25, ISDN, APL, CSYNC, IPSECKEY, LOC, DNSKEY, DS
         srec.type_code = type_choices[data[12] % (sizeof(type_choices)/sizeof(int))];
         
         char rdata_buf[256];
