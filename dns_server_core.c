@@ -1756,6 +1756,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     add_ede(&edns, cfg_for_ede->send_extended_errors, 21, "This opcode is not supported by this server");
     
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+    res[6] = 0; res[7] = 0; // ANCOUNT = 0
+    res[8] = 0; res[9] = 0; // NSCOUNT = 0
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
@@ -1772,6 +1774,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+    res[6] = 0; res[7] = 0; // ANCOUNT = 0
+    res[8] = 0; res[9] = 0; // NSCOUNT = 0
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
@@ -1830,6 +1834,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
     }
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+    res[6] = 0; res[7] = 0; // ANCOUNT = 0
+    res[8] = 0; res[9] = 0; // NSCOUNT = 0
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
@@ -1918,6 +1924,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = copy_len;
     uint16_t arcount = 0;
+    res[6] = 0; res[7] = 0; // ANCOUNT = 0
+    res[8] = 0; res[9] = 0; // NSCOUNT = 0
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
     }
@@ -1954,6 +1962,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = copy_len;
     uint16_t arcount = 0;
+    res[6] = 0; res[7] = 0; // ANCOUNT = 0
+    res[8] = 0; res[9] = 0; // NSCOUNT = 0
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
     }
