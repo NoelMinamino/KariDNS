@@ -9,7 +9,7 @@ SRCS = dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_ut
 OBJS = $(SRCS:.c=.o)
 
 DAG_TARGET = dag
-DAG_SRCS = tools/dag.c dns_wire.c dns_utils.c
+DAG_SRCS = tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 DAG_OBJS = $(DAG_SRCS:.c=.o)
 
@@ -18,7 +18,7 @@ KARICTL_SRCS = tools/karictl.c
 KARICTL_OBJS = $(KARICTL_SRCS:.c=.o)
 
 FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
-FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c dns_utils.c
+FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
 FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_utils.c
@@ -106,7 +106,7 @@ KARICHECK_ASAN_SRCS = tools/karicheck.c dns_config_parser.c dns_zone_parser.c dn
 karicheck-asan: $(KARICHECK_ASAN_SRCS)
 	$(CC) $(ASAN_CFLAGS) $(KARICHECK_ASAN_SRCS) -o $@ $(LDFLAGS)
 
-DAG_ASAN_SRCS = tools/dag.c dns_wire.c dns_utils.c
+DAG_ASAN_SRCS = tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c
 dag-asan: $(DAG_ASAN_SRCS)
 	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lz
 

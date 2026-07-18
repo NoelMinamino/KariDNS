@@ -37,6 +37,7 @@
 #include <openssl/evp.h>
 #include "../dns_wire.h"
 #include "../dns_utils.h"
+#include "../dns_zone_parser.h"
 
 /* ========================================================================
  * 1. Arena (dag only ever bump-allocates scratch strings; never freed)
@@ -67,26 +68,11 @@ typedef struct {
 static server_result_t g_results[MAX_DAG_SERVERS];
 static int g_server_count = 0;
 static bool g_want_allcompare = false;
-static char g_arena_buf[DAG_ARENA_SIZE];
-static size_t g_arena_pos = 0;
+static zone_arena_t g_dag_arena;
 
-struct zone_arena_s {
-    char pad[1]; /* dag doesn't need real zone_arena_t internals */
-};
-
-void *arena_alloc(zone_arena_t *arena, size_t size) {
-    (void)arena;
-    if (size > DAG_ARENA_SIZE) return NULL;
-    size_t aligned = (size + 7) & ~((size_t)7);
-    if (aligned < size) return NULL; // Overflow
-    if (g_arena_pos + aligned > DAG_ARENA_SIZE || g_arena_pos + aligned < g_arena_pos) return NULL;
-    void *p = &g_arena_buf[g_arena_pos];
-    g_arena_pos += aligned;
-    return p;
-}
-
-void reset_dag_arena(void) {
-    g_arena_pos = 0;
+static void reset_dag_arena(void) {
+    zone_arena_destroy(&g_dag_arena);
+    zone_arena_init(&g_dag_arena);
 }
 
 /* ========================================================================
@@ -1049,7 +1035,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS / CNAME / PTR / DNAME
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &name) == 0) printf("%s", name);
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0) printf("%s", name);
             else printf("(unparsable name)");
             break;
         }
@@ -1057,16 +1043,16 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 3) { printf("(malformed MX)"); break; }
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &name) == 0)
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0)
                 printf("%u %s", pref, name);
             else printf("%u (unparsable name)", pref);
             break;
         }
         case 6: {
             char *mname = NULL, *rname = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &mname) != 0) { printf("(unparsable SOA)"); break; }
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mname) != 0) { printf("(unparsable SOA)"); break; }
             size_t after_mname = next;
-            if (expand_wire_name(pkt, pkt_len, after_mname, &next, NULL, &rname) != 0) { printf("(unparsable SOA)"); break; }
+            if (expand_wire_name(pkt, pkt_len, after_mname, &next, &g_dag_arena, &rname) != 0) { printf("(unparsable SOA)"); break; }
             size_t nums_off = next;
             if (nums_off + 20 > pkt_len) { printf("(truncated SOA)"); break; }
             uint32_t serial  = ((uint32_t)pkt[nums_off]<<24)|((uint32_t)pkt[nums_off+1]<<16)|((uint32_t)pkt[nums_off+2]<<8)|pkt[nums_off+3];
@@ -1083,7 +1069,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t weight = (pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
             uint16_t port = (pkt[abs_offset+4]<<8)|pkt[abs_offset+5];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, NULL, &name) == 0)
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0)
                 printf("%u %u %u %s", prio, weight, port, name);
             else printf("%u %u %u (unparsable name)", prio, weight, port);
             break;
@@ -1110,8 +1096,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 17: { // RP
             char *mbox = NULL, *txt = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &mbox) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, NULL, &txt) != 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) != 0) {
                 goto fallback;
             }
             printf("%s %s", mbox, txt);
@@ -1121,7 +1107,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 3) goto fallback;
             uint16_t subtype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *hostname = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &hostname) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &hostname) != 0) goto fallback;
             printf("%u %s", subtype, hostname);
             break;
         }
@@ -1141,8 +1127,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 2) goto fallback;
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *map822 = NULL, *mapx400 = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &map822) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, NULL, &mapx400) != 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &map822) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &mapx400) != 0) {
                 goto fallback;
             }
             printf("%u %s %s", pref, map822, mapx400);
@@ -1173,7 +1159,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             p = read_char_string(p, end, svcs, sizeof(svcs)); if (!p) goto fallback;
             p = read_char_string(p, end, regexp, sizeof(regexp)); if (!p) goto fallback;
             char *repl = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &repl) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) != 0) goto fallback;
             printf("%u %u \"%s\" \"%s\" \"%s\" %s", order, pref, flags, svcs, regexp, repl);
             break;
         }
@@ -1181,7 +1167,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 2) goto fallback;
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) != 0) goto fallback;
             printf("%u %s", pref, name);
             break;
         }
@@ -1267,7 +1253,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 p += 16;
             } else if (gw_type == 3) {
                 char *gw = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &gw) != 0) goto fallback;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0) goto fallback;
                 printf("%s ", gw);
                 p = &pkt[next];
             } else goto fallback;
@@ -1306,7 +1292,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 2) goto fallback;
             uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
             char *target = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &target) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &target) != 0) goto fallback;
             size_t target_len = next - abs_offset - 2;
             printf("%u %s", priority, (target[0] == '\0') ? "." : target);
             print_svcparams(&pkt[abs_offset], 2 + target_len, rdlen);
@@ -1366,7 +1352,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 printf("%s", buf);
             } else if (relay_type == 3) {
                 char *gw = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &gw) != 0) goto fallback;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0) goto fallback;
                 printf("%s", gw);
             } else goto fallback;
             break;
@@ -1383,7 +1369,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t key_tag = (pkt[abs_offset+16]<<8)|pkt[abs_offset+17];
 
             char *signer_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, NULL, &signer_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer_name) != 0) goto fallback;
             size_t sig_offset_in_rdata = (next - abs_offset);
             if (sig_offset_in_rdata >= rdlen) goto fallback;
 
@@ -1406,7 +1392,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 47: { // NSEC
             char *next_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &next_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) != 0) goto fallback;
             size_t name_consumed = next - abs_offset;
             if (name_consumed >= rdlen) goto fallback;
             char types_buf[512];
@@ -1437,7 +1423,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 250: { // TSIG
             char *alg_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &alg_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) != 0) goto fallback;
             size_t pos = next - abs_offset;
             if (pos + 10 > rdlen) goto fallback;
 
@@ -1488,7 +1474,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
 
             while (pos < rdlen) {
                 char *rvs_name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, NULL, &rvs_name) != 0) break;
+                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0) break;
                 printf(" %s", rvs_name);
                 pos = next - abs_offset;
             }
@@ -1507,8 +1493,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 14: { // MINFO
             char *rmailbx = NULL, *emailbx = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &rmailbx) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, NULL, &emailbx) != 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &rmailbx) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &emailbx) != 0) {
                 goto fallback;
             }
             printf("%s %s", rmailbx, emailbx);
@@ -1614,8 +1600,8 @@ static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_l
     
     char *mname = NULL, *rname = NULL;
     size_t next1, next2;
-    if (expand_wire_name(pkt, pkt_len, rdata - pkt, &next1, NULL, &mname) != 0) return;
-    if (expand_wire_name(pkt, pkt_len, next1, &next2, NULL, &rname) != 0) return;
+    if (expand_wire_name(pkt, pkt_len, rdata - pkt, &next1, &g_dag_arena, &mname) != 0) return;
+    if (expand_wire_name(pkt, pkt_len, next1, &next2, &g_dag_arena, &rname) != 0) return;
     if (next2 + 20 > (size_t)(rdata - pkt) + rdlen) return;
 
     size_t mlen = strlen(mname);
@@ -1688,7 +1674,7 @@ static uint32_t calculate_packet_semantic_hash(const uint8_t *pkt, size_t pkt_le
     for (int i = 0; i < total_rr; i++) {
         char *name = NULL;
         size_t next;
-        if (expand_wire_name(pkt, pkt_len, offset, &next, NULL, &name) != 0) break;
+        if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
         if (next + 10 > pkt_len) break;
         uint16_t type = (pkt[next] << 8) | pkt[next+1];
         uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
@@ -1707,7 +1693,7 @@ static uint32_t calculate_packet_semantic_hash(const uint8_t *pkt, size_t pkt_le
 
 static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state) {
     char *name = NULL; size_t next;
-    if (expand_wire_name(pkt, pkt_len, *offset, &next, NULL, &name) != 0) return false;
+    if (expand_wire_name(pkt, pkt_len, *offset, &next, &g_dag_arena, &name) != 0) return false;
     size_t hdr = next;
     if (hdr + 10 > pkt_len) return false;
 
@@ -1820,7 +1806,7 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         printf("\n;; QUESTION SECTION:\n");
         for (int i = 0; i < qdcount; i++) {
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, offset, &next, NULL, &name) != 0) {
+            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) {
                 printf(";; (unparsable question, stopping here)\n");
                 goto fallback;
             }
@@ -2090,7 +2076,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
                 for (int k=0; k<ancount; k++) {
                     char *name = NULL;
-                    size_t nxt; if(expand_wire_name(resp, n, off, &nxt, NULL, &name)==0) {
+                    size_t nxt; if(expand_wire_name(resp, n, off, &nxt, &g_dag_arena, &name)==0) {
                         uint16_t type = (resp[nxt]<<8)|resp[nxt+1];
                         uint16_t rdlen = (resp[nxt+8]<<8)|resp[nxt+9];
                         if (type == 6) {
@@ -2317,6 +2303,7 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
 
 
 int main(int argc, char **argv) {
+    zone_arena_init(&g_dag_arena);
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
     if (argc < 3) { usage(argv[0]); return 1; }
 
@@ -2636,5 +2623,6 @@ int main(int argc, char **argv) {
     print_multi_server_summary(use_ldnsz);
 
     free(server_list_buf);
+    zone_arena_destroy(&g_dag_arena);
     return 0;
 }

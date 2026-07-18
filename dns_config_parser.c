@@ -144,6 +144,9 @@ void free_zone_config(zone_config_t *zone) {
   for (int i = 0; i < zone->allow_transfer_count; i++)
     free(zone->allow_transfer[i]);
   free(zone->allow_transfer);
+  for (int i = 0; i < zone->allow_update_count; i++)
+    free(zone->allow_update[i]);
+  free(zone->allow_update);
   free_rate_limit_config(&zone->rrl);
   free(zone);
 }
@@ -706,6 +709,91 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
                   zone->allow_transfer = safe_realloc_or_die(zone->allow_transfer, sizeof(char *) * (zone->allow_transfer_count + 1));
                   zone->allow_transfer[zone->allow_transfer_count++] = val;
               }
+              
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              free_token(&tok);
+            }
+          }
+        } else if (strcmp(key, "allow-update") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_LBRACE) {
+            free(key); free_zone_config(zone); free_token(&tok); return -1;
+          }
+          free_token(&tok);
+          
+          int brace_depth = 1;
+          bool in_negated_block = false;
+          (void)in_negated_block; // TODO: 将来のネガティブACL拡張で使用予定
+          
+          while (brace_depth > 0) {
+            tok = get_next_token(&ctx);
+            if (tok.type == TOKEN_EOF) {
+              free(key); free_zone_config(zone); free_token(&tok); return -1;
+            }
+            if (tok.type == TOKEN_RBRACE) {
+              brace_depth--;
+              in_negated_block = false;
+              free_token(&tok);
+              if (brace_depth > 0) {
+                  tok = get_next_token(&ctx);
+                  if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+                  free_token(&tok);
+              } else {
+                  tok = get_next_token(&ctx);
+                  if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+                  free_token(&tok);
+              }
+              continue;
+            }
+            if (tok.type == TOKEN_LBRACE) {
+              brace_depth++;
+              free_token(&tok);
+              continue;
+            }
+            if (tok.type == TOKEN_SEMICOLON) {
+              free_token(&tok);
+              continue;
+            }
+            if (tok.type != TOKEN_STRING) {
+              free(key); free_zone_config(zone); free_token(&tok); return -1;
+            }
+            
+            if (strcmp(tok.value, "key") == 0) {
+              free_token(&tok);
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              char *val = strdup(tok.value);
+              zone->allow_update = safe_realloc_or_die(zone->allow_update, sizeof(char *) * (zone->allow_update_count + 1));
+              zone->allow_update[zone->allow_update_count++] = val;
+              free_token(&tok);
+              
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              free_token(&tok);
+            } else if (strcmp(tok.value, "!") == 0) {
+              free_token(&tok);
+              tok = get_next_token(&ctx);
+              if (tok.type == TOKEN_LBRACE) {
+                  brace_depth++;
+                  in_negated_block = true;
+                  free_token(&tok);
+                  continue;
+              }
+              if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              char buf[256];
+              snprintf(buf, sizeof(buf), "!%s", tok.value);
+              zone->allow_update = safe_realloc_or_die(zone->allow_update, sizeof(char *) * (zone->allow_update_count + 1));
+              zone->allow_update[zone->allow_update_count++] = strdup(buf);
+              free_token(&tok);
+              tok = get_next_token(&ctx);
+              if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+              free_token(&tok);
+            } else {
+              char *val = strdup(tok.value);
+              free_token(&tok);
+              zone->allow_update = safe_realloc_or_die(zone->allow_update, sizeof(char *) * (zone->allow_update_count + 1));
+              zone->allow_update[zone->allow_update_count++] = val;
               
               tok = get_next_token(&ctx);
               if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }

@@ -49,6 +49,47 @@ void *arena_alloc(zone_arena_t *arena, size_t size) {
   return ptr;
 }
 
+char *arena_strdup(zone_arena_t *arena, const char *str) {
+  if (!str)
+    return NULL;
+  size_t len = strlen(str);
+  char *dup = arena_alloc(arena, len + 1);
+  if (dup) {
+    memcpy(dup, str, len);
+    dup[len] = '\0';
+  }
+  return dup;
+}
+
+bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl) {
+  if (a->type_code != b->type_code) return false;
+  if ((a->name == NULL) != (b->name == NULL)) return false;
+  if (a->name && b->name && strcasecmp(a->name, b->name) != 0) return false;
+  if (!ignore_ttl) {
+    if ((a->ttl == NULL) != (b->ttl == NULL)) return false;
+    if (a->ttl && b->ttl && strcmp(a->ttl, b->ttl) != 0) return false;
+  }
+  if (a->rdata_count != b->rdata_count) return false;
+  for (int i = 0; i < a->rdata_count; i++) {
+    if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
+    if (a->rdata[i] && b->rdata[i] && strcmp(a->rdata[i], b->rdata[i]) != 0) return false;
+  }
+  if (a->generic_len != b->generic_len) return false;
+  if (a->generic_len > 0 && memcmp(a->generic_data, b->generic_data, a->generic_len) != 0) return false;
+  return true;
+}
+
+bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
+  if (!arena->hash_table) return false;
+  if (!target->name) return false;
+  uint32_t hash = calc_fnv1a_str(target->name);
+  size_t idx = hash & (arena->hash_size - 1);
+  for (int i = arena->hash_table[idx]; i != -1; i = arena->records[i].next_record) {
+    if (compare_records(&arena->records[i], target, false)) return true;
+  }
+  return false;
+}
+
 static char *expand_domain_name(char *name, const char *origin,
                                 zone_arena_t *arena) {
   if (!name)

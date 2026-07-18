@@ -54,7 +54,10 @@ void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
 void *arena_alloc(zone_arena_t *arena, size_t size);
+char *arena_strdup(zone_arena_t *arena, const char *str);
 void build_zone_index(zone_arena_t *arena);
+bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
+bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);
 
 #endif

@@ -99,5 +99,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         serialize_dns_record(out_buf, sizeof(out_buf), &out_offset, &srec, &comp_ctx, "fuzz.test.", 0);
     }
 
+    // 5. Test process_update_sections
+    // Since we just need to test parsing bounds, we can pass dummy standby arena.
+    // The arena was already initialized above (dummy_arena).
+    process_update_sections(data, size, "fuzz.test.", &dummy_arena);
+
     return 0; // Fuzzer must return 0
 }
