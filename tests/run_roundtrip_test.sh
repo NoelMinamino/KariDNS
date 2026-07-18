@@ -43,7 +43,4 @@ fi
 
 echo "[OK] Round-trip test passed: all record types present, server did not crash."
 
-if kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill -9 "$SERVER_PID" 2>/dev/null
-fi
-unset SERVER_PID
+trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
