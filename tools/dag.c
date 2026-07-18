@@ -383,6 +383,9 @@ typedef struct {
 
     bool want_tsig;
     tsig_key_t tsig_key;
+
+    const char *update_add_str;
+    const char *update_del_str;
 } query_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -507,11 +510,19 @@ done:
 static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                                   const char *qname, uint16_t qtype,
                                   const query_opts_t *qo) {
+    if (qo->update_add_str || qo->update_del_str) {
+        qtype = 6; /* SOA for Zone section */
+    }
+
     memset(pkt, 0, 12);
     uint16_t id = (uint16_t)(time(NULL) ^ getpid());
     pkt[0] = id >> 8; pkt[1] = id & 0xFF;
     pkt[2] = 0x01; /* RD=1 */
     pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT=1 (may be overridden below) */
+
+    if (qo->update_add_str || qo->update_del_str) {
+        pkt[2] = (pkt[2] & 0x87) | (5 << 3); /* OPCODE=5 (UPDATE) */
+    }
 
     break_kind_t structural = BRK_NONE;
     bool has_structural = any_structural_break(&structural);
@@ -582,6 +593,93 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
             uint16_t nscount = (pkt[8] << 8) | pkt[9];
             nscount++;
             pkt[8] = nscount >> 8; pkt[9] = nscount & 0xFF;
+        }
+    }
+
+    if (qo->update_add_str || qo->update_del_str) {
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        
+        if (qo->update_add_str) {
+            char *buf = strdup(qo->update_add_str);
+            char *tokens[32];
+            int token_count = 0;
+            bool in_quote = false;
+            char *p = buf;
+            char *tok_start = NULL;
+            char *out = buf;
+
+            while (*p && token_count < 32) {
+                if (*p == '"') {
+                    in_quote = !in_quote;
+                    if (!tok_start) tok_start = out;
+                    p++;
+                } else if (*p == ' ' && !in_quote) {
+                    if (tok_start) {
+                        *out++ = '\0';
+                        tokens[token_count++] = tok_start;
+                        tok_start = NULL;
+                    }
+                    p++;
+                } else {
+                    if (!tok_start) tok_start = out;
+                    if (*p == '\\' && *(p+1) == '"') {
+                        p++; /* skip backslash */
+                        *out++ = *p++;
+                    } else {
+                        *out++ = *p++;
+                    }
+                }
+            }
+            if (tok_start && token_count < 32) {
+                *out = '\0';
+                tokens[token_count++] = tok_start;
+            }
+
+            if (token_count >= 4) {
+                dns_record_t rec;
+                memset(&rec, 0, sizeof(rec));
+                rec.name = tokens[0];
+                rec.ttl = tokens[1];
+                rec.type_code = parse_qtype(tokens[2]);
+                rec.class_str = "IN";
+                rec.rdata_count = token_count - 3;
+                for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
+
+                uint16_t out_offset = offset;
+                if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
+                    offset = out_offset;
+                    uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                    upcount++;
+                    pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                } else {
+                    fprintf(stderr, "Failed to serialize update-add record\n");
+                }
+            } else {
+                fprintf(stderr, "Invalid update-add string format\n");
+            }
+            free(buf);
+        } else if (qo->update_del_str) {
+            char *buf = strdup(qo->update_del_str);
+            char *name = strtok(buf, " ");
+            char *type_str = strtok(NULL, " ");
+            if (name && type_str) {
+                if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
+                    uint16_t type = parse_qtype(type_str);
+                    pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
+                    pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
+                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+                    uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                    upcount++;
+                    pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                } else {
+                    fprintf(stderr, "Failed to serialize update-del name\n");
+                }
+            } else {
+                fprintf(stderr, "Invalid update-del string format\n");
+            }
+            free(buf);
         }
     }
 
@@ -2410,6 +2508,10 @@ int main(int argc, char **argv) {
     for (int i = arg_idx; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--update-add") == 0 && i + 1 < argc) {
+            qo.update_add_str = argv[++i];
+        } else if (strcmp(argv[i], "--update-del") == 0 && i + 1 < argc) {
+            qo.update_del_str = argv[++i];
         } else if (strcmp(argv[i], "--tcp") == 0 || strcmp(argv[i], "+tcp") == 0) {
             use_tcp = true;
         } else if (strcmp(argv[i], "+udp") == 0) {
