@@ -47,7 +47,8 @@ jobs:
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
             # AXFRテストとASan/TSan/UBSanテスト、ファジングテストをスクリプトで一括実行
-            ./tests/run_roundtrip_test.sh
+            sh ./tests/run_capsicum_axfr_test.sh
+            sh ./tests/run_roundtrip_test.sh
             ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"
 

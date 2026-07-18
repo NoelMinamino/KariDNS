@@ -4415,6 +4415,12 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
   }
 
+  // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から
+  // 呼ばれるコードで、tzset()が内部的に別のTZ設定を要求する関数
+  // (timegm()や、明示的にsetenv("TZ",...)する処理など)を新たに追加しないこと。
+  // サンドボックス下でのタイムゾーンDBへの追加アクセスはECAPMODEでクラッシュする。
+  // UTC固定の日時変換が必要な場合は、タイムゾーンDBに依存しない純計算
+  // (parse_dnssec_time()のような日数計算アルゴリズム)を使うこと。
   tzset();
   pthread_t response_logger_thread;
   if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);

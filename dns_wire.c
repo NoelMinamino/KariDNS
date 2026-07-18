@@ -348,16 +348,22 @@ static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
 }
 
 static uint32_t parse_dnssec_time(const char *str) {
-    struct tm t;
-    memset(&t, 0, sizeof(t));
-    if (sscanf(str, "%4d%2d%2d%2d%2d%2d", 
-               &t.tm_year, &t.tm_mon, &t.tm_mday,
-               &t.tm_hour, &t.tm_min, &t.tm_sec) == 6) {
-        t.tm_year -= 1900;
-        t.tm_mon -= 1;
-        return (uint32_t)timegm(&t);
+    int year, month, day, hour, min, sec;
+    if (sscanf(str, "%4d%2d%2d%2d%2d%2d", &year, &month, &day, &hour, &min, &sec) != 6) {
+        return 0;
     }
-    return 0;
+    // "days from civil" algorithm (Howard Hinnant)
+    int64_t y = year;
+    if (month <= 2) y -= 1;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned mp = (unsigned)((month + 9) % 12);
+    unsigned doy = (153 * mp + 2) / 5 + (unsigned)day - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days_since_epoch = era * 146097 + (int64_t)doe - 719468;
+
+    int64_t total_seconds = days_since_epoch * 86400LL + hour * 3600LL + min * 60LL + sec;
+    return (uint32_t)total_seconds;
 }
 
 static int cert_type_to_num(const char *s) {
