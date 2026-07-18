@@ -215,14 +215,14 @@ www.example.com. IN NSEC mail.example.com. A AAAA RRSIG NSEC
 
 ; ZONEMD: ゾーン全体の内容から計算するダイジェスト。ゾーンを変更する
 ;        たびに dnssec-signzone -j や zonemd ツール等で再計算が必要。
-@       IN ZONEMD 2026071001 1 1 c68090d90a7aed716bc459f9340e3d7c1370d4d24b0c7a5f8e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d
+@       IN ZONEMD 2026071001 1 1 4ba7dc5aab05911764e3a23f4b04ec850bba5d4da9391c2cfa2eca47ad1c1407628c2893906cfe702b9a73d3f3082aa9
 
 ; CDS / CDNSKEY: 子ゾーンが親ゾーンに「このDS/DNSKEYに同期してください」
 ;              と伝えるためのレコード。通常はレジストラへの自動登録用。
-@       IN CDS     12345 8 2 6C0A40CD9755C3CBB40FAF136751933DBBE9D6C3D6A1817864AD3DF9A29262E4
+@       IN CDS     23534 13 2 fcdb742c06b9a17cd02ccd070f9b8f4a9376e1f1a34b960bfab565fbea4e01d8
 @       IN CDNSKEY 257 3 13 (
-    mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+
-    KkxLbxILfDLUT0rI5nJQ+EGsmNyPSw== )
+    Gt5VRfB9PU4fsMAgkp+4Lux7ikef1M2e/ZtbggoiyDxZ
+    hKunv9246kZG2JSyg3VHgWpLeQLV+eIQ8NlePcXJUg== )
 
 ; ----------------------------------------------------------------------------
 ; ゾーンファイルのデータとしてはそもそも存在し得ないため未記載のもの

@@ -15,8 +15,8 @@ $ORIGIN example.com.
 
 ; KSK (Key Signing Key) の例
 @ 3600 IN DNSKEY 257 3 13 (
-    /mmBb9kd6M+grRhMKoS6bz+iMJ8aDmRFxa4JJm1acMAxTxYbALm3CF6TemSIKFfV
-    UZ9xmg9ITU6PoIJ0ca19ng== ) ; example KSK
+    Gt5VRfB9PU4fsMAgkp+4Lux7ikef1M2e/ZtbggoiyDxZ
+    hKunv9246kZG2JSyg3VHgWpLeQLV+eIQ8NlePcXJUg== ) ; example KSK
 
 ; ZSK (Zone Signing Key) の例
 @ 3600 IN DNSKEY 256 3 13 (
