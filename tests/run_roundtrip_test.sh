@@ -42,3 +42,8 @@ if [ -n "$missing" ]; then
 fi
 
 echo "[OK] Round-trip test passed: all record types present, server did not crash."
+
+if kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill -9 "$SERVER_PID" 2>/dev/null
+fi
+unset SERVER_PID
