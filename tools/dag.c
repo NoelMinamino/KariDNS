@@ -386,6 +386,10 @@ typedef struct {
 
     const char *update_add_str;
     const char *update_del_str;
+    const char *prereq_nxdomain_str;
+    const char *prereq_yxdomain_str;
+    const char *prereq_nxrrset_str;
+    const char *prereq_yxrrset_str;
 } query_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -510,7 +514,7 @@ done:
 static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                                   const char *qname, uint16_t qtype,
                                   const query_opts_t *qo) {
-    if (qo->update_add_str || qo->update_del_str) {
+    if (qo->update_add_str || qo->update_del_str || qo->prereq_nxdomain_str || qo->prereq_yxdomain_str || qo->prereq_nxrrset_str || qo->prereq_yxrrset_str) {
         qtype = 6; /* SOA for Zone section */
     }
 
@@ -520,7 +524,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     pkt[2] = 0x01; /* RD=1 */
     pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT=1 (may be overridden below) */
 
-    if (qo->update_add_str || qo->update_del_str) {
+    if (qo->update_add_str || qo->update_del_str || qo->prereq_nxdomain_str || qo->prereq_yxdomain_str || qo->prereq_nxrrset_str || qo->prereq_yxrrset_str) {
         pkt[2] = (pkt[2] & 0x87) | (5 << 3); /* OPCODE=5 (UPDATE) */
     }
 
@@ -596,6 +600,67 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         }
     }
 
+    if (qo->prereq_nxdomain_str || qo->prereq_yxdomain_str || qo->prereq_nxrrset_str || qo->prereq_yxrrset_str) {
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        if (qo->prereq_nxdomain_str) {
+            if (write_dns_name_str(pkt, &offset, qo->prereq_nxdomain_str, &comp_ctx, max_len) == 0) {
+                pkt[offset++] = 0x00; pkt[offset++] = 255; /* Type ANY */
+                pkt[offset++] = 0x00; pkt[offset++] = 254; /* Class NONE */
+                pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+                pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+                uint16_t prcount = (pkt[6] << 8) | pkt[7];
+                prcount++;
+                pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+            }
+        } else if (qo->prereq_yxdomain_str) {
+            if (write_dns_name_str(pkt, &offset, qo->prereq_yxdomain_str, &comp_ctx, max_len) == 0) {
+                pkt[offset++] = 0x00; pkt[offset++] = 255; /* Type ANY */
+                pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
+                pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+                pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+                uint16_t prcount = (pkt[6] << 8) | pkt[7];
+                prcount++;
+                pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+            }
+        } else if (qo->prereq_nxrrset_str) {
+            char *buf = strdup(qo->prereq_nxrrset_str);
+            char *name = strtok(buf, " ");
+            char *type_str = strtok(NULL, " ");
+            if (name && type_str) {
+                if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
+                    uint16_t type = parse_qtype(type_str);
+                    pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
+                    pkt[offset++] = 0x00; pkt[offset++] = 254; /* Class NONE */
+                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+                    uint16_t prcount = (pkt[6] << 8) | pkt[7];
+                    prcount++;
+                    pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+                }
+            }
+            free(buf);
+        } else if (qo->prereq_yxrrset_str) {
+            char *buf = strdup(qo->prereq_yxrrset_str);
+            char *name = strtok(buf, " ");
+            char *type_str = strtok(NULL, " ");
+            if (name && type_str) {
+                if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
+                    uint16_t type = parse_qtype(type_str);
+                    pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
+                    pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
+                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+                    uint16_t prcount = (pkt[6] << 8) | pkt[7];
+                    prcount++;
+                    pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+                }
+            }
+            free(buf);
+        }
+    }
+
     if (qo->update_add_str || qo->update_del_str) {
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
@@ -642,6 +707,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 rec.name = tokens[0];
                 rec.ttl = tokens[1];
                 rec.type_code = parse_qtype(tokens[2]);
+                rec.type = tokens[2];
                 rec.class_str = "IN";
                 rec.rdata_count = token_count - 3;
                 for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
@@ -2512,6 +2578,14 @@ int main(int argc, char **argv) {
             qo.update_add_str = argv[++i];
         } else if (strcmp(argv[i], "--update-del") == 0 && i + 1 < argc) {
             qo.update_del_str = argv[++i];
+        } else if (strcmp(argv[i], "--prereq-nxdomain") == 0 && i + 1 < argc) {
+            qo.prereq_nxdomain_str = argv[++i];
+        } else if (strcmp(argv[i], "--prereq-yxdomain") == 0 && i + 1 < argc) {
+            qo.prereq_yxdomain_str = argv[++i];
+        } else if (strcmp(argv[i], "--prereq-nxrrset") == 0 && i + 1 < argc) {
+            qo.prereq_nxrrset_str = argv[++i];
+        } else if (strcmp(argv[i], "--prereq-yxrrset") == 0 && i + 1 < argc) {
+            qo.prereq_yxrrset_str = argv[++i];
         } else if (strcmp(argv[i], "--tcp") == 0 || strcmp(argv[i], "+tcp") == 0) {
             use_tcp = true;
         } else if (strcmp(argv[i], "+udp") == 0) {
