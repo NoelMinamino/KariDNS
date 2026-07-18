@@ -6,6 +6,7 @@
 #include "../dns_config_parser.h"
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
+#include "../dns_wire.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -210,32 +211,102 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     }
 
     bool has_soa = false;
+    bool error_found = false;
     for (size_t i = 0; i < arena.count; i++) {
-        if (arena.records[i].type_code == 6 && strcasecmp(arena.records[i].name, domain) == 0) {
+        uint16_t tcode = arena.records[i].type_code;
+        int rcount = arena.records[i].rdata_count;
+        char **rdata = arena.records[i].rdata;
+
+        if (tcode == 6 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_soa = true;
         }
-        if (arena.records[i].type_code == 62) { // CSYNC
-            for (int j = 2; j < arena.records[i].rdata_count; j++) {
-                if (get_type_code(arena.records[i].rdata[j]) == 0) {
-                    fprintf(stderr, "[WARNING] CSYNC record contains unknown type '%s' in zone '%s' (%s)\n", arena.records[i].rdata[j], domain, file_path);
+        if (tcode == 62) { // CSYNC
+            for (int j = 2; j < rcount; j++) {
+                if (get_type_code(rdata[j]) == 0) {
+                    fprintf(stderr, "[WARNING] CSYNC record contains unknown type '%s' in zone '%s' (%s)\n", rdata[j], domain, file_path);
                 }
             }
         }
-        if (arena.records[i].type_code == 64 || arena.records[i].type_code == 65) { // SVCB / HTTPS
-            if (arena.records[i].rdata_count > 1) {
-                const char *target = arena.records[i].rdata[1];
+        if (tcode == 64 || tcode == 65) { // SVCB / HTTPS
+            if (rcount > 1) {
+                const char *target = rdata[1];
                 size_t len = strlen(target);
                 if (len > 0 && target[len - 1] != '.' && strcmp(target, ".") != 0) {
                     fprintf(stderr, "[WARNING] %s record TargetName '%s' does not end with a dot in zone '%s' (%s)\n",
-                            arena.records[i].type_code == 64 ? "SVCB" : "HTTPS",
+                            tcode == 64 ? "SVCB" : "HTTPS",
                             target, domain, file_path);
                 }
             }
+        }
+        
+        // --- Add specific field validations ---
+        if (tcode == 55) { // HIP
+            if (rcount < 3) {
+                fprintf(stderr, "[WARNING] HIP record requires at least 3 fields: HIT algorithm, HIT (hex), and public key (base64) for name '%s'\n", arena.records[i].name);
+            }
+        }
+        if (tcode == 11) { // WKS
+            if (rcount >= 2) {
+                int proto = atoi(rdata[1]);
+                if (proto == 0 && strcmp(rdata[1], "0") != 0) {
+                    fprintf(stderr, "[WARNING] WKS record protocol '%s' is not a valid number for name '%s'\n", rdata[1], arena.records[i].name);
+                }
+            }
+        }
+        if (tcode == 27 && rcount < 3) { // GPOS
+            fprintf(stderr, "[WARNING] GPOS record requires exactly 3 fields (Longitude, Latitude, Altitude) for name '%s'\n", arena.records[i].name);
+        }
+        if (tcode == 19 && rcount < 1) { // X25
+            fprintf(stderr, "[WARNING] X25 record requires at least 1 field for name '%s'\n", arena.records[i].name);
+        }
+        if (tcode == 20 && (rcount < 1 || rcount > 2)) { // ISDN
+            fprintf(stderr, "[WARNING] ISDN record requires 1 or 2 fields for name '%s'\n", arena.records[i].name);
+        }
+        if (tcode == 108 || tcode == 109) { // EUI48 / EUI64
+            if (rcount >= 1) {
+                int dashes = 0;
+                for (const char *p = rdata[0]; *p; p++) {
+                    if (*p == '-') dashes++;
+                }
+                if (tcode == 108 && dashes != 5) {
+                    fprintf(stderr, "[WARNING] EUI48 requires 6 octets (5 dashes) for name '%s'\n", arena.records[i].name);
+                } else if (tcode == 109 && dashes != 7) {
+                    fprintf(stderr, "[WARNING] EUI64 requires 8 octets (7 dashes) for name '%s'\n", arena.records[i].name);
+                }
+            }
+        }
+
+        // --- Dry-run serialize_dns_record ---
+        uint8_t scratch[65535];
+        uint16_t scratch_offset = 0;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        int wire_result = serialize_dns_record(
+            scratch, sizeof(scratch), &scratch_offset,
+            &arena.records[i], &comp_ctx,
+            NULL,          // owner_name: NULL
+            0xFFFFFFFF     // override_ttl: use record TTL
+        );
+        if (wire_result < 0) {
+            fprintf(stderr,
+                "[ERROR] Record '%s %s' at index %zu cannot be serialized to wire format "
+                "(this record would fail or be dropped when the server answers a real query). "
+                "Check field count and value ranges for this record type.\n",
+                arena.records[i].name, arena.records[i].type, i);
+            error_found = true;
         }
     }
 
     if (!has_soa) {
         fprintf(stderr, "[ERROR] No SOA record found in zone '%s' (%s) at origin\n", domain, file_path);
+        free((void*)ctx.base_dir);
+        zone_arena_destroy(&arena);
+        free(root_path);
+        return 1;
+    }
+
+    if (error_found) {
+        fprintf(stderr, "[FAIL] Zone '%s' contains invalid records.\n", domain);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
         free(root_path);

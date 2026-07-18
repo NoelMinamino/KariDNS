@@ -903,7 +903,8 @@ static void print_ds_like(const uint8_t *rdata, size_t rdlen) {
 static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
     static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
     size_t out_len = 0;
-    int buffer = 0, bits_left = 0;
+    uint32_t buffer = 0;
+    int bits_left = 0;
     for (size_t i = 0; i < len; i++) {
         buffer = (buffer << 8) | data[i];
         bits_left += 8;
