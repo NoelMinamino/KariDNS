@@ -381,8 +381,43 @@ static int cert_type_to_num(const char *s) {
     return atoi(s);
 }
 
+static size_t wire_name_length(const char *name) {
+    if (!name) return (size_t)-1;
+    size_t w_len = 0;
+    const char *p = name;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len > 63) return (size_t)-1;
+        if (len > 0) {
+            w_len += len + 1;
+        }
+        if (!dot) break;
+        p = dot + 1;
+    }
+    w_len += 1;
+    return w_len;
+}
+
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len, bool is_subsequent) {
-    if (!key || *packet_len + 256 > max_len) return -1;
+    if (!key) return -1;
+
+    const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
+    size_t keyname_wire_len = wire_name_length(key->name);
+    size_t alg_wire_len = wire_name_length(alg);
+
+    if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
+
+    size_t needed = keyname_wire_len
+                  + 8   /* TYPE(2)+CLASS(2)+TTL(4) */
+                  + 2   /* RDLENGTH */
+                  + alg_wire_len
+                  + 10  /* Time Signed(6)+Fudge(2)+MAC Size(2) */
+                  + EVP_MAX_MD_SIZE /* MAC本体。実際のアルゴリズムに関わらず最大値で安全側に見積もる */
+                  + 6   /* Original ID(2)+Error(2)+Other Len(2) */
+                  + (tsig_error == 18 ? 6 : 0); /* Other Data (BADTIMEの場合のみ6バイト) */
+
+    if (*packet_len + needed > max_len) return -1;
     size_t pre_mac_len = *packet_len;
     size_t pre_mac_cap = pre_mac_len + 512 + (key->algorithm ? strlen(key->algorithm) : 11) + strlen(key->name) + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0);
     uint8_t *pre_mac = malloc(pre_mac_cap);
@@ -396,7 +431,6 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
-    const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
     if (!is_subsequent) {
         long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
         if (w < 0) { free(pre_mac); return -1; }

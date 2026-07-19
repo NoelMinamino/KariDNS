@@ -37,6 +37,7 @@ typedef struct {
 #define COMPRESS_HASH_SIZE 4096
 #define COMPRESS_HASH_MASK (COMPRESS_HASH_SIZE - 1)
 #define MAX_PROBE_DEPTH 8
+#define UDP_DEFAULT_MAX_RES_LEN 512
 
 // ============================================================================
 // 前方宣言 (zone_arena_t は dns_server_core.c 側で定義)

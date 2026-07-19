@@ -1941,10 +1941,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
-  if (edns.present && max_res_len == 512) {
+  if (edns.present && max_res_len == UDP_DEFAULT_MAX_RES_LEN) {
     if (edns.udp_payload_size > 1232)
       edns.udp_payload_size = 1232;
-    if (edns.udp_payload_size > 512)
+    if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
       max_res_len = edns.udp_payload_size;
   }
 
@@ -2180,7 +2180,7 @@ void *axfr_bg_thread_func(void *arg) {
       size_t len = dot ? (size_t)(dot - d) : strlen(d);
       if (len > 63)
         len = 63;
-      if (req_len + len + 2 > sizeof(axfr_req) - 512)
+      if (req_len + len + 2 > sizeof(axfr_req) - UDP_DEFAULT_MAX_RES_LEN)
         break;
       axfr_req[req_len++] = (uint8_t)len;
       memcpy(&axfr_req[req_len], d, len);
@@ -2276,7 +2276,7 @@ void send_notify_to_all(const char *domain) {
   if (!zone || zone->also_notify_count == 0)
     return;
 
-  uint8_t req[512];
+  uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   memset(req, 0, 12);
   uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
   req[0] = id >> 8;
@@ -2584,7 +2584,7 @@ typedef struct {
   uint16_t qtype;
   bool has_edns;
   bool dnssec_ok;
-  uint8_t req[512];
+  uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   uint16_t req_len;
   tsig_key_t *tsig_key;
   uint8_t tsig_mac[64];
@@ -2617,8 +2617,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
                         uint8_t *req_mac, size_t req_mac_len) {
   if (!entry) {
-    uint8_t res_buf[512];
-    size_t copy_len = req_len > 512 ? 512 : req_len;
+    uint8_t res_buf[UDP_DEFAULT_MAX_RES_LEN];
+    size_t copy_len = req_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : req_len;
     memcpy(res_buf, req, copy_len);
     res_buf[2] |= 0x84;
     res_buf[3] |= 0x05;
@@ -3206,7 +3206,7 @@ worker_startup_success:;
           rate_limit_config_t *rrl_cfg = NULL;
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int res_len =
-              process_dns_query(req_buf, payload_received, res_buf, 512, qname,
+              process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
                                 qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
           release_zone_snapshot(snap);
           if (res_len > 0) {
@@ -3446,7 +3446,7 @@ worker_startup_success:;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
-                  args->req_len = msg_len > 512 ? 512 : msg_len;
+                  args->req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   args->tsig_key = matched_key;
                   args->tsig_mac_len = tsig_mac_len;
@@ -3473,7 +3473,7 @@ worker_startup_success:;
             }
             if (!allowed || !entry) {
               uint8_t res_buf[1024];
-              size_t copy_len = msg_len > 512 ? 512 : msg_len;
+              size_t copy_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
               memcpy(res_buf, msg, copy_len);
               if (tsig_error) {
                 res_buf[2] |= 0x84;
