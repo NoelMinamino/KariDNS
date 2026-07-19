@@ -713,7 +713,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
 
                 uint16_t out_offset = offset;
-                if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
+                if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
                     offset = out_offset;
                     uint16_t upcount = (pkt[8] << 8) | pkt[9];
                     upcount++;
