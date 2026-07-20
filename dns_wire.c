@@ -18,6 +18,7 @@
 #include <openssl/sha.h>
 #include <openssl/md5.h>
 #include "dns_utils.h"
+#include "dns_zone_parser.h"
 
 // ============================================================================
 // 5. 名前圧縮アルゴリズム (FNV-1a, Branchless, 無限ループ防御)
@@ -380,8 +381,43 @@ static int cert_type_to_num(const char *s) {
     return atoi(s);
 }
 
+static size_t wire_name_length(const char *name) {
+    if (!name) return (size_t)-1;
+    size_t w_len = 0;
+    const char *p = name;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len > 63) return (size_t)-1;
+        if (len > 0) {
+            w_len += len + 1;
+        }
+        if (!dot) break;
+        p = dot + 1;
+    }
+    w_len += 1;
+    return w_len;
+}
+
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len, bool is_subsequent) {
-    if (!key || *packet_len + 512 > max_len) return -1;
+    if (!key) return -1;
+
+    const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
+    size_t keyname_wire_len = wire_name_length(key->name);
+    size_t alg_wire_len = wire_name_length(alg);
+
+    if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
+
+    size_t needed = keyname_wire_len
+                  + 8   /* TYPE(2)+CLASS(2)+TTL(4) */
+                  + 2   /* RDLENGTH */
+                  + alg_wire_len
+                  + 10  /* Time Signed(6)+Fudge(2)+MAC Size(2) */
+                  + EVP_MAX_MD_SIZE /* MAC本体。実際のアルゴリズムに関わらず最大値で安全側に見積もる */
+                  + 6   /* Original ID(2)+Error(2)+Other Len(2) */
+                  + (tsig_error == 18 ? 6 : 0); /* Other Data (BADTIMEの場合のみ6バイト) */
+
+    if (*packet_len + needed > max_len) return -1;
     size_t pre_mac_len = *packet_len;
     size_t pre_mac_cap = pre_mac_len + 512 + (key->algorithm ? strlen(key->algorithm) : 11) + strlen(key->name) + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0);
     uint8_t *pre_mac = malloc(pre_mac_cap);
@@ -395,7 +431,6 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
-    const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
     if (!is_subsequent) {
         long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
         if (w < 0) { free(pre_mac); return -1; }
@@ -1767,4 +1802,144 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
         (*arcount_inout)++;
     }
     *offset_inout = offset;
+}
+
+int process_update_sections(const uint8_t *req, size_t req_len,
+                             const char *zone_name,
+                             zone_arena_t *standby) {
+    if (req_len < 12) return 1; // FORMERR
+    uint16_t zocount = (req[4] << 8) | req[5];
+    uint16_t prcount = (req[6] << 8) | req[7];
+    uint16_t upcount = (req[8] << 8) | req[9];
+
+    if (zocount != 1) return 1; // FORMERR
+
+    size_t offset = 12;
+    // Skip Zone Section
+    char *zname;
+    if (expand_wire_name(req, req_len, offset, &offset, standby, &zname) != 0) return 1;
+    if (offset + 4 > req_len) return 1;
+    uint16_t ztype = (req[offset] << 8) | req[offset + 1];
+    offset += 4;
+
+    if (ztype != 6) return 1; // SOA
+    if (strcasecmp(zname, zone_name) != 0) return 9; // NOTAUTH
+
+    // Prerequisite Section (3.2)
+    for (int i = 0; i < prcount; i++) {
+        size_t rec_start_offset = offset;
+        char *name;
+        if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
+        if (offset + 10 > req_len) return 1;
+        uint16_t type = (req[offset] << 8) | req[offset + 1];
+        uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
+        uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];
+        offset += 10 + rdlen;
+        if (offset > req_len) return 1;
+
+        bool name_exists = false;
+        bool rrset_exists = false;
+        for (size_t k = 0; k < standby->count; k++) {
+            if (strcasecmp(standby->records[k].name, name) == 0) {
+                name_exists = true;
+                if (type == 255 || standby->records[k].type_code == type) {
+                    rrset_exists = true;
+                }
+            }
+        }
+
+        if (class_val == 255) { // ANY
+            if (rdlen != 0) return 1;
+            if (type == 255) {
+                if (!name_exists) return 3; // NXDOMAIN
+            } else {
+                if (!rrset_exists) return 8; // NXRRSET
+            }
+        } else if (class_val == 254) { // NONE
+            if (rdlen != 0) return 1;
+            if (type == 255) {
+                if (name_exists) return 6; // YXDOMAIN
+            } else {
+                if (rrset_exists) return 7; // YXRRSET
+            }
+        } else {
+            // zone class
+            if (!rrset_exists) return 8; // NXRRSET
+            size_t temp_offset = rec_start_offset; 
+            dns_record_t parsed_rec;
+            memset(&parsed_rec, 0, sizeof(parsed_rec));
+            uint16_t dummy_type;
+            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
+            
+            bool found_exact = false;
+            for (size_t k = 0; k < standby->count; k++) {
+                if (compare_records(&standby->records[k], &parsed_rec, true)) {
+                    found_exact = true;
+                    break;
+                }
+            }
+            if (!found_exact) return 8; // NXRRSET
+        }
+    }
+
+    // Update Section (3.4)
+    for (int i = 0; i < upcount; i++) {
+        size_t rec_start_offset = offset;
+        char *name;
+        if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
+        if (offset + 10 > req_len) return 1;
+        uint16_t type = (req[offset] << 8) | req[offset + 1];
+        uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
+        uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];
+        offset += 10 + rdlen;
+        if (offset > req_len) return 1;
+
+        if (class_val == 255) { // ANY (Delete RRset/Domain)
+            if (rdlen != 0) return 1;
+            if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
+            
+            for (size_t k = 0; k < standby->count; ) {
+                if (strcasecmp(standby->records[k].name, name) == 0) {
+                    if (type == 255 || standby->records[k].type_code == type) {
+                        if (standby->records[k].type_code == 6) { k++; continue; } // protect SOA
+                        standby->records[k] = standby->records[--standby->count];
+                        continue;
+                    }
+                }
+                k++;
+            }
+        } else if (class_val == 254) { // NONE (Delete exact RR)
+            if (type == 6) return 5; // REFUSED
+            
+            size_t temp_offset = rec_start_offset;
+            dns_record_t parsed_rec;
+            memset(&parsed_rec, 0, sizeof(parsed_rec));
+            uint16_t dummy_type;
+            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
+            
+            for (size_t k = 0; k < standby->count; ) {
+                if (compare_records(&standby->records[k], &parsed_rec, true)) {
+                    standby->records[k] = standby->records[--standby->count];
+                    continue;
+                }
+                k++;
+            }
+        } else { // ADD
+            if (standby->count >= standby->records_cap) {
+                size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
+                dns_record_t *new_arr = realloc(standby->records, new_cap * sizeof(dns_record_t));
+                if (!new_arr) return 2;
+                standby->records = new_arr;
+                standby->records_cap = new_cap;
+            }
+            size_t temp_offset = rec_start_offset;
+            uint16_t dummy_type;
+            dns_record_t *new_rec = &standby->records[standby->count];
+            memset(new_rec, 0, sizeof(*new_rec));
+            if (parse_resource_record(req, req_len, &temp_offset, standby, new_rec, &dummy_type) != 0) return 1;
+            standby->count++;
+        }
+    }
+
+    return 0; // NOERROR
 }

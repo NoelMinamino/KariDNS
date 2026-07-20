@@ -26,7 +26,7 @@ jobs:
             set -e
 
             echo "::group::📦 [Build] Build KariDNS and Tools"
-            make all
+            make all asan tsan tools-asan
             echo "::endgroup::"
 
             echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
@@ -34,7 +34,7 @@ jobs:
             echo "::endgroup::"
 
             echo "::group::📦 [Build] Build Fuzzers"
-            make fuzz fuzz_core fuzz_zone fuzz_conf
+            make fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
@@ -48,6 +48,7 @@ jobs:
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
             # AXFRテストとASan/TSan/UBSanテスト、ファジングテストをスクリプトで一括実行
             sh ./tests/run_capsicum_axfr_test.sh
+            sh ./tests/run_dynamic_update_test.sh
             sh ./tests/run_roundtrip_test.sh
             ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"

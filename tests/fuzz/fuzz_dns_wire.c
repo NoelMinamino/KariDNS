@@ -10,34 +10,16 @@ void syslog(int priority, const char *format, ...) {
 }
 
 #include "../../dns_wire.h"
-
-// Fixed-size buffer acting as a simple arena for the fuzzer
-// to avoid memory exhaustion across thousands of iterations per second.
-#define FUZZ_ARENA_SIZE (1024 * 1024)
-static char g_arena_buf[FUZZ_ARENA_SIZE];
-static size_t g_arena_pos = 0;
-
-struct zone_arena_s {
-    char pad[1];
-};
-
-void *arena_alloc(zone_arena_t *arena, size_t size) {
-    (void)arena;
-    if (g_arena_pos + size > FUZZ_ARENA_SIZE) return NULL;
-    void *p = &g_arena_buf[g_arena_pos];
-    g_arena_pos += size;
-    return p;
-}
+#include "../../dns_zone_parser.h"
 
 // LLVM libFuzzer entry point
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    // Reset arena position on every execution
-    g_arena_pos = 0;
-
     // Minimum packet size is 12 bytes (DNS Header)
     if (size < 12) return 0;
 
     zone_arena_t dummy_arena;
+    memset(&dummy_arena, 0, sizeof(dummy_arena));
+    zone_arena_init(&dummy_arena);
 
     // 1. Test expand_wire_name
     size_t offset = 12;
@@ -99,5 +81,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         serialize_dns_record(out_buf, sizeof(out_buf), &out_offset, &srec, &comp_ctx, "fuzz.test.", 0);
     }
 
+    // 5. Test process_update_sections
+    // Since we just need to test parsing bounds, we can pass dummy standby arena.
+    // The arena was already initialized above (dummy_arena).
+    process_update_sections(data, size, "fuzz.test.", &dummy_arena);
+
+    zone_arena_destroy(&dummy_arena);
     return 0; // Fuzzer must return 0
 }

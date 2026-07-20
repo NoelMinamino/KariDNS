@@ -799,36 +799,9 @@ static void *gc_snapshot_thread(void *arg) {
   return NULL;
 }
 
-static char *arena_strdup(zone_arena_t *arena, const char *str);
 
-static bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl) {
-  if (a->type_code != b->type_code) return false;
-  if ((a->name == NULL) != (b->name == NULL)) return false;
-  if (a->name && b->name && strcasecmp(a->name, b->name) != 0) return false;
-  if (!ignore_ttl) {
-    if ((a->ttl == NULL) != (b->ttl == NULL)) return false;
-    if (a->ttl && b->ttl && strcmp(a->ttl, b->ttl) != 0) return false;
-  }
-  if (a->rdata_count != b->rdata_count) return false;
-  for (int i = 0; i < a->rdata_count; i++) {
-    if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
-    if (a->rdata[i] && b->rdata[i] && strcmp(a->rdata[i], b->rdata[i]) != 0) return false;
-  }
-  if (a->generic_len != b->generic_len) return false;
-  if (a->generic_len > 0 && memcmp(a->generic_data, b->generic_data, a->generic_len) != 0) return false;
-  return true;
-}
 
-static bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
-  if (!arena->hash_table) return false;
-  if (!target->name) return false;
-  uint32_t hash = calc_fnv1a_str(target->name);
-  size_t idx = hash & (arena->hash_size - 1);
-  for (int i = arena->hash_table[idx]; i != -1; i = arena->records[i].next_record) {
-    if (compare_records(&arena->records[i], target, false)) return true;
-  }
-  return false;
-}
+
 
 static void free_ixfr_txn(ixfr_txn_t *txn) {
   if (!txn) return;
@@ -1127,17 +1100,6 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
   }
 }
 
-static char *arena_strdup(zone_arena_t *arena, const char *str) {
-  if (!str)
-    return NULL;
-  size_t len = strlen(str);
-  char *dup = arena_alloc(arena, len + 1);
-  if (dup) {
-    memcpy(dup, str, len);
-    dup[len] = '\0';
-  }
-  return dup;
-}
 static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
   for (int i = 0; i < dst->data_pool_count; i++) {
     if (dst->data_pools[i])
@@ -1674,6 +1636,59 @@ static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t q
     return (offset <= len) ? offset : len;
 }
 
+static void bump_soa_serial_in_arena(zone_arena_t *arena) {
+  for (size_t i = 0; i < arena->count; i++) {
+    if (arena->records[i].type_code == 6 && arena->records[i].rdata_count >= 3) {
+      if (arena->records[i].rdata[2]) {
+        uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
+        serial++;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%u", serial);
+        arena->records[i].rdata[2] = arena_strdup(arena, buf);
+      }
+      break;
+    }
+  }
+}
+
+static int handle_dynamic_update(const uint8_t *req, size_t req_len,
+                                  zone_db_entry_t *entry) {
+  pthread_mutex_lock(&entry->writer_lock);
+
+  zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
+  wait_for_readers(z_standby);
+
+  clone_zone_arena(z_active, z_standby);
+
+  int rcode = process_update_sections(req, req_len, entry->domain, z_standby);
+  if (rcode != 0) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    return rcode;
+  }
+
+  bump_soa_serial_in_arena(z_standby);
+
+  build_zone_index(z_standby);
+
+  compute_ixfr_diff(entry, z_active, z_standby);
+
+  atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+  pthread_mutex_unlock(&entry->writer_lock);
+
+  atomic_store_explicit(&entry->notify_now, true, memory_order_release);
+  if (g_control_kq != -1) {
+    struct kevent ev;
+    EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
+  }
+
+  syslog(LOG_NOTICE, "[Update] Applied dynamic update to zone '%s' (in-memory only, will revert on reload)",
+         entry->domain);
+
+  return 0; // NOERROR
+}
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
@@ -1748,7 +1763,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   server_config_t *cfg_for_ede = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
 
   uint8_t opcode = (req[2] >> 3) & 0x0F;
-  if (opcode != 0 && opcode != 4) {
+  if (opcode != 0 && opcode != 4 && opcode != 5) {
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
@@ -1845,6 +1860,72 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     return offset;
   }
 
+  if (opcode == 5) { // UPDATE
+    bool auth = false;
+    tsig_key_t *matched_key = NULL;
+    if (db_entry) {
+      server_config_t *cfg =
+          atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      zone_config_t *zcfg = cfg->zones;
+      while (zcfg) {
+        if (strcasecmp(zcfg->domain, db_entry->domain) == 0)
+          break;
+        zcfg = zcfg->next;
+      }
+      if (zcfg && zcfg->allow_update_count > 0) {
+        tsig_key_t *k = cfg->keys;
+        while (k) {
+          bool key_allowed = false;
+          for (int i = 0; i < zcfg->allow_update_count; i++) {
+            if (strcmp(k->name, zcfg->allow_update[i]) == 0) {
+              key_allowed = true;
+              break;
+            }
+          }
+          if (key_allowed) {
+            if (tsig_verify_packet(req, req_len, k, tsig_mac, &tsig_mac_len) == 0) {
+              matched_key = k;
+              auth = true;
+              break;
+            }
+          }
+          k = k->next;
+        }
+      }
+    }
+    
+    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+    memcpy(res, req, copy_len);
+    res[2] |= 0x80; // QR=1
+    
+    int rcode = 5; // REFUSED
+    if (auth) {
+      rcode = handle_dynamic_update(req, req_len, db_entry);
+    } else {
+      add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control or invalid TSIG");
+    }
+    
+    // Some rcodes like FORMERR (1) shouldn't leak the RCODE logic into res[3] directly without properly mapping
+    res[3] = (res[3] & 0xF0) | (rcode & 0x0F);
+    
+    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+    res[6] = 0; res[7] = 0; // ANCOUNT = 0
+    res[8] = 0; res[9] = 0; // NSCOUNT = 0
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+    }
+    res[10] = arcount >> 8;
+    res[11] = arcount & 0xFF;
+    
+    if (matched_key) {
+      size_t copy_len = offset;
+      tsig_sign_packet(res, &copy_len, max_res_len, matched_key, 0, tsig_mac, &tsig_mac_len, false);
+      offset = copy_len;
+    }
+    return offset;
+  }
+
   if (db_entry) {
     do {
       current_zone =
@@ -1860,10 +1941,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
-  if (edns.present && max_res_len == 512) {
+  if (edns.present && max_res_len == UDP_DEFAULT_MAX_RES_LEN) {
     if (edns.udp_payload_size > 1232)
       edns.udp_payload_size = 1232;
-    if (edns.udp_payload_size > 512)
+    if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
       max_res_len = edns.udp_payload_size;
   }
 
@@ -2099,7 +2180,7 @@ void *axfr_bg_thread_func(void *arg) {
       size_t len = dot ? (size_t)(dot - d) : strlen(d);
       if (len > 63)
         len = 63;
-      if (req_len + len + 2 > sizeof(axfr_req) - 512)
+      if (req_len + len + 2 > sizeof(axfr_req) - UDP_DEFAULT_MAX_RES_LEN)
         break;
       axfr_req[req_len++] = (uint8_t)len;
       memcpy(&axfr_req[req_len], d, len);
@@ -2195,7 +2276,7 @@ void send_notify_to_all(const char *domain) {
   if (!zone || zone->also_notify_count == 0)
     return;
 
-  uint8_t req[512];
+  uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   memset(req, 0, 12);
   uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
   req[0] = id >> 8;
@@ -2503,7 +2584,7 @@ typedef struct {
   uint16_t qtype;
   bool has_edns;
   bool dnssec_ok;
-  uint8_t req[512];
+  uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   uint16_t req_len;
   tsig_key_t *tsig_key;
   uint8_t tsig_mac[64];
@@ -2536,8 +2617,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
                         uint8_t *req_mac, size_t req_mac_len) {
   if (!entry) {
-    uint8_t res_buf[512];
-    size_t copy_len = req_len > 512 ? 512 : req_len;
+    uint8_t res_buf[UDP_DEFAULT_MAX_RES_LEN];
+    size_t copy_len = req_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : req_len;
     memcpy(res_buf, req, copy_len);
     res_buf[2] |= 0x84;
     res_buf[3] |= 0x05;
@@ -3125,7 +3206,7 @@ worker_startup_success:;
           rate_limit_config_t *rrl_cfg = NULL;
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int res_len =
-              process_dns_query(req_buf, payload_received, res_buf, 512, qname,
+              process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
                                 qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
           release_zone_snapshot(snap);
           if (res_len > 0) {
@@ -3365,7 +3446,7 @@ worker_startup_success:;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
-                  args->req_len = msg_len > 512 ? 512 : msg_len;
+                  args->req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   args->tsig_key = matched_key;
                   args->tsig_mac_len = tsig_mac_len;
@@ -3392,7 +3473,7 @@ worker_startup_success:;
             }
             if (!allowed || !entry) {
               uint8_t res_buf[1024];
-              size_t copy_len = msg_len > 512 ? 512 : msg_len;
+              size_t copy_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
               memcpy(res_buf, msg, copy_len);
               if (tsig_error) {
                 res_buf[2] |= 0x84;
@@ -4297,7 +4378,7 @@ int main(int argc, char **argv) {
   }
 
   g_config_path = config_file;
-  openlog("KariDNS", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+  openlog("KariDNS", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
   start_connect_broker();
   if (!foreground) {
     daemonize();

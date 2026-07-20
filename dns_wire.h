@@ -37,6 +37,7 @@ typedef struct {
 #define COMPRESS_HASH_SIZE 4096
 #define COMPRESS_HASH_MASK (COMPRESS_HASH_SIZE - 1)
 #define MAX_PROBE_DEPTH 8
+#define UDP_DEFAULT_MAX_RES_LEN 512
 
 // ============================================================================
 // 前方宣言 (zone_arena_t は dns_server_core.c 側で定義)
@@ -148,5 +149,9 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
 void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                        uint16_t *offset_inout, uint16_t *arcount_inout,
                        edns_info_t *edns, uint8_t rcode_ext);
+
+int process_update_sections(const uint8_t *req, size_t req_len,
+                             const char *zone_name,
+                             zone_arena_t *standby);
 
 #endif // DNS_WIRE_H

@@ -37,6 +37,7 @@
 #include <openssl/evp.h>
 #include "../dns_wire.h"
 #include "../dns_utils.h"
+#include "../dns_zone_parser.h"
 
 /* ========================================================================
  * 1. Arena (dag only ever bump-allocates scratch strings; never freed)
@@ -67,26 +68,11 @@ typedef struct {
 static server_result_t g_results[MAX_DAG_SERVERS];
 static int g_server_count = 0;
 static bool g_want_allcompare = false;
-static char g_arena_buf[DAG_ARENA_SIZE];
-static size_t g_arena_pos = 0;
+static zone_arena_t g_dag_arena;
 
-struct zone_arena_s {
-    char pad[1]; /* dag doesn't need real zone_arena_t internals */
-};
-
-void *arena_alloc(zone_arena_t *arena, size_t size) {
-    (void)arena;
-    if (size > DAG_ARENA_SIZE) return NULL;
-    size_t aligned = (size + 7) & ~((size_t)7);
-    if (aligned < size) return NULL; // Overflow
-    if (g_arena_pos + aligned > DAG_ARENA_SIZE || g_arena_pos + aligned < g_arena_pos) return NULL;
-    void *p = &g_arena_buf[g_arena_pos];
-    g_arena_pos += aligned;
-    return p;
-}
-
-void reset_dag_arena(void) {
-    g_arena_pos = 0;
+static void reset_dag_arena(void) {
+    zone_arena_destroy(&g_dag_arena);
+    zone_arena_init(&g_dag_arena);
 }
 
 /* ========================================================================
@@ -362,6 +348,12 @@ static void print_break_help(void) {
 /* ========================================================================
  * 4. Query options (EDNS request side) -- built entirely in this file
  * ==================================================================== */
+typedef enum { PREREQ_NXDOMAIN, PREREQ_YXDOMAIN, PREREQ_NXRRSET, PREREQ_YXRRSET } prereq_kind_t;
+typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL } update_op_kind_t;
+
+#define MAX_PREREQS 16
+#define MAX_UPDATE_OPS 16
+
 typedef struct {
     bool want_opt;
     uint16_t udp_payload_size;
@@ -397,6 +389,18 @@ typedef struct {
 
     bool want_tsig;
     tsig_key_t tsig_key;
+
+    struct {
+        update_op_kind_t kind;
+        char raw[512];
+    } update_ops[MAX_UPDATE_OPS];
+    int update_op_count;
+    struct {
+        prereq_kind_t kind;
+        char name[256];
+        char type_str[32];
+    } prereqs[MAX_PREREQS];
+    int prereq_count;
 } query_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -521,11 +525,19 @@ done:
 static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                                   const char *qname, uint16_t qtype,
                                   const query_opts_t *qo) {
+    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
+        qtype = 6; /* SOA for Zone section */
+    }
+
     memset(pkt, 0, 12);
     uint16_t id = (uint16_t)(time(NULL) ^ getpid());
     pkt[0] = id >> 8; pkt[1] = id & 0xFF;
     pkt[2] = 0x01; /* RD=1 */
     pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT=1 (may be overridden below) */
+
+    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
+        pkt[2] = (pkt[2] & 0x87) | (5 << 3); /* OPCODE=5 (UPDATE) */
+    }
 
     break_kind_t structural = BRK_NONE;
     bool has_structural = any_structural_break(&structural);
@@ -596,6 +608,139 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
             uint16_t nscount = (pkt[8] << 8) | pkt[9];
             nscount++;
             pkt[8] = nscount >> 8; pkt[9] = nscount & 0xFF;
+        }
+    }
+
+    if (qo->prereq_count > 0) {
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        for (int pi = 0; pi < qo->prereq_count; pi++) {
+            const char *name = qo->prereqs[pi].name;
+            uint16_t type, class_val;
+
+            switch (qo->prereqs[pi].kind) {
+                case PREREQ_NXDOMAIN: type = 255; class_val = 254; break; // ANY, NONE
+                case PREREQ_YXDOMAIN: type = 255; class_val = 255; break; // ANY, ANY
+                case PREREQ_NXRRSET:  type = parse_qtype(qo->prereqs[pi].type_str); class_val = 254; break; // <type>, NONE
+                case PREREQ_YXRRSET:  type = parse_qtype(qo->prereqs[pi].type_str); class_val = 255; break; // <type>, ANY
+                default: continue;
+            }
+
+            if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) != 0) {
+                fprintf(stderr, "warning: failed to encode prereq name '%s', skipping\n", name);
+                continue;
+            }
+            if (offset + 10 > max_len) {
+                fprintf(stderr, "warning: packet buffer full, dropping remaining prereqs\n");
+                break;
+            }
+            pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
+            pkt[offset++] = class_val >> 8; pkt[offset++] = class_val & 0xFF;
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+
+            uint16_t prcount = (pkt[6] << 8) | pkt[7];
+            prcount++;
+            pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+        }
+    }
+
+    if (qo->update_op_count > 0) {
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        for (int oi = 0; oi < qo->update_op_count; oi++) {
+            const char *raw = qo->update_ops[oi].raw;
+
+            if (qo->update_ops[oi].kind == UPDATE_OP_ADD) {
+                char *buf = strdup(raw);
+                char *tokens[32];
+                int token_count = 0;
+                bool in_quote = false;
+                char *p = buf;
+                char *tok_start = NULL;
+                char *out = buf;
+
+                while (*p && token_count < 32) {
+                    if (*p == '"') {
+                        in_quote = !in_quote;
+                        if (!tok_start) tok_start = out;
+                        p++;
+                    } else if (*p == ' ' && !in_quote) {
+                        if (tok_start) {
+                            *out++ = '\0';
+                            tokens[token_count++] = tok_start;
+                            tok_start = NULL;
+                        }
+                        p++;
+                    } else {
+                        if (!tok_start) tok_start = out;
+                        if (*p == '\\' && *(p+1) == '"') {
+                            p++;
+                            *out++ = *p++;
+                        } else {
+                            *out++ = *p++;
+                        }
+                    }
+                }
+                if (tok_start && token_count < 32) {
+                    *out = '\0';
+                    tokens[token_count++] = tok_start;
+                }
+
+                if (token_count >= 4) {
+                    dns_record_t rec;
+                    memset(&rec, 0, sizeof(rec));
+                    rec.name = tokens[0];
+                    rec.ttl = tokens[1];
+                    rec.type_code = parse_qtype(tokens[2]);
+                    rec.type = tokens[2];
+                    rec.class_str = "IN";
+                    rec.rdata_count = token_count - 3;
+                    for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
+
+                    uint16_t out_offset = offset;
+                    if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
+                        offset = out_offset;
+                        uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                        upcount++;
+                        pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                    } else {
+                        fprintf(stderr, "Failed to serialize update-add record: %s\n", raw);
+                    }
+                } else {
+                    fprintf(stderr, "Invalid update-add string format: %s\n", raw);
+                }
+                free(buf);
+
+            } else { // UPDATE_OP_DEL
+                char *buf = strdup(raw);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                if (name && type_str) {
+                    if (offset + 10 > max_len) {
+                        fprintf(stderr, "warning: packet buffer full, dropping remaining update ops\n");
+                        free(buf);
+                        break;
+                    }
+                    if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
+                        uint16_t type = parse_qtype(type_str);
+                        pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
+                        pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
+                        pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+                        pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+                        uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                        upcount++;
+                        pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                    } else {
+                        fprintf(stderr, "Failed to serialize update-del name: %s\n", raw);
+                    }
+                } else {
+                    fprintf(stderr, "Invalid update-del string format: %s\n", raw);
+                }
+                free(buf);
+            }
         }
     }
 
@@ -1049,7 +1194,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS / CNAME / PTR / DNAME
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &name) == 0) printf("%s", name);
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0) printf("%s", name);
             else printf("(unparsable name)");
             break;
         }
@@ -1057,16 +1202,16 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 3) { printf("(malformed MX)"); break; }
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &name) == 0)
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0)
                 printf("%u %s", pref, name);
             else printf("%u (unparsable name)", pref);
             break;
         }
         case 6: {
             char *mname = NULL, *rname = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &mname) != 0) { printf("(unparsable SOA)"); break; }
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mname) != 0) { printf("(unparsable SOA)"); break; }
             size_t after_mname = next;
-            if (expand_wire_name(pkt, pkt_len, after_mname, &next, NULL, &rname) != 0) { printf("(unparsable SOA)"); break; }
+            if (expand_wire_name(pkt, pkt_len, after_mname, &next, &g_dag_arena, &rname) != 0) { printf("(unparsable SOA)"); break; }
             size_t nums_off = next;
             if (nums_off + 20 > pkt_len) { printf("(truncated SOA)"); break; }
             uint32_t serial  = ((uint32_t)pkt[nums_off]<<24)|((uint32_t)pkt[nums_off+1]<<16)|((uint32_t)pkt[nums_off+2]<<8)|pkt[nums_off+3];
@@ -1083,7 +1228,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t weight = (pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
             uint16_t port = (pkt[abs_offset+4]<<8)|pkt[abs_offset+5];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, NULL, &name) == 0)
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0)
                 printf("%u %u %u %s", prio, weight, port, name);
             else printf("%u %u %u (unparsable name)", prio, weight, port);
             break;
@@ -1110,8 +1255,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 17: { // RP
             char *mbox = NULL, *txt = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &mbox) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, NULL, &txt) != 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) != 0) {
                 goto fallback;
             }
             printf("%s %s", mbox, txt);
@@ -1121,7 +1266,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 3) goto fallback;
             uint16_t subtype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *hostname = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &hostname) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &hostname) != 0) goto fallback;
             printf("%u %s", subtype, hostname);
             break;
         }
@@ -1141,8 +1286,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 2) goto fallback;
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *map822 = NULL, *mapx400 = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &map822) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, NULL, &mapx400) != 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &map822) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &mapx400) != 0) {
                 goto fallback;
             }
             printf("%u %s %s", pref, map822, mapx400);
@@ -1173,7 +1318,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             p = read_char_string(p, end, svcs, sizeof(svcs)); if (!p) goto fallback;
             p = read_char_string(p, end, regexp, sizeof(regexp)); if (!p) goto fallback;
             char *repl = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &repl) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) != 0) goto fallback;
             printf("%u %u \"%s\" \"%s\" \"%s\" %s", order, pref, flags, svcs, regexp, repl);
             break;
         }
@@ -1181,7 +1326,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 2) goto fallback;
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) != 0) goto fallback;
             printf("%u %s", pref, name);
             break;
         }
@@ -1267,7 +1412,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 p += 16;
             } else if (gw_type == 3) {
                 char *gw = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &gw) != 0) goto fallback;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0) goto fallback;
                 printf("%s ", gw);
                 p = &pkt[next];
             } else goto fallback;
@@ -1306,7 +1451,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 2) goto fallback;
             uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
             char *target = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, NULL, &target) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &target) != 0) goto fallback;
             size_t target_len = next - abs_offset - 2;
             printf("%u %s", priority, (target[0] == '\0') ? "." : target);
             print_svcparams(&pkt[abs_offset], 2 + target_len, rdlen);
@@ -1366,7 +1511,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 printf("%s", buf);
             } else if (relay_type == 3) {
                 char *gw = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, NULL, &gw) != 0) goto fallback;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0) goto fallback;
                 printf("%s", gw);
             } else goto fallback;
             break;
@@ -1383,7 +1528,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t key_tag = (pkt[abs_offset+16]<<8)|pkt[abs_offset+17];
 
             char *signer_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, NULL, &signer_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer_name) != 0) goto fallback;
             size_t sig_offset_in_rdata = (next - abs_offset);
             if (sig_offset_in_rdata >= rdlen) goto fallback;
 
@@ -1406,7 +1551,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 47: { // NSEC
             char *next_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &next_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) != 0) goto fallback;
             size_t name_consumed = next - abs_offset;
             if (name_consumed >= rdlen) goto fallback;
             char types_buf[512];
@@ -1437,7 +1582,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 250: { // TSIG
             char *alg_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &alg_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) != 0) goto fallback;
             size_t pos = next - abs_offset;
             if (pos + 10 > rdlen) goto fallback;
 
@@ -1488,7 +1633,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
 
             while (pos < rdlen) {
                 char *rvs_name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, NULL, &rvs_name) != 0) break;
+                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0) break;
                 printf(" %s", rvs_name);
                 pos = next - abs_offset;
             }
@@ -1507,8 +1652,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 14: { // MINFO
             char *rmailbx = NULL, *emailbx = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, NULL, &rmailbx) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, NULL, &emailbx) != 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &rmailbx) != 0 ||
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &emailbx) != 0) {
                 goto fallback;
             }
             printf("%s %s", rmailbx, emailbx);
@@ -1614,8 +1759,8 @@ static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_l
     
     char *mname = NULL, *rname = NULL;
     size_t next1, next2;
-    if (expand_wire_name(pkt, pkt_len, rdata - pkt, &next1, NULL, &mname) != 0) return;
-    if (expand_wire_name(pkt, pkt_len, next1, &next2, NULL, &rname) != 0) return;
+    if (expand_wire_name(pkt, pkt_len, rdata - pkt, &next1, &g_dag_arena, &mname) != 0) return;
+    if (expand_wire_name(pkt, pkt_len, next1, &next2, &g_dag_arena, &rname) != 0) return;
     if (next2 + 20 > (size_t)(rdata - pkt) + rdlen) return;
 
     size_t mlen = strlen(mname);
@@ -1688,7 +1833,7 @@ static uint32_t calculate_packet_semantic_hash(const uint8_t *pkt, size_t pkt_le
     for (int i = 0; i < total_rr; i++) {
         char *name = NULL;
         size_t next;
-        if (expand_wire_name(pkt, pkt_len, offset, &next, NULL, &name) != 0) break;
+        if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
         if (next + 10 > pkt_len) break;
         uint16_t type = (pkt[next] << 8) | pkt[next+1];
         uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
@@ -1707,7 +1852,7 @@ static uint32_t calculate_packet_semantic_hash(const uint8_t *pkt, size_t pkt_le
 
 static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state) {
     char *name = NULL; size_t next;
-    if (expand_wire_name(pkt, pkt_len, *offset, &next, NULL, &name) != 0) return false;
+    if (expand_wire_name(pkt, pkt_len, *offset, &next, &g_dag_arena, &name) != 0) return false;
     size_t hdr = next;
     if (hdr + 10 > pkt_len) return false;
 
@@ -1820,7 +1965,7 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         printf("\n;; QUESTION SECTION:\n");
         for (int i = 0; i < qdcount; i++) {
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, offset, &next, NULL, &name) != 0) {
+            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) {
                 printf(";; (unparsable question, stopping here)\n");
                 goto fallback;
             }
@@ -2090,7 +2235,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
                 for (int k=0; k<ancount; k++) {
                     char *name = NULL;
-                    size_t nxt; if(expand_wire_name(resp, n, off, &nxt, NULL, &name)==0) {
+                    size_t nxt; if(expand_wire_name(resp, n, off, &nxt, &g_dag_arena, &name)==0) {
                         uint16_t type = (resp[nxt]<<8)|resp[nxt+1];
                         uint16_t rdlen = (resp[nxt+8]<<8)|resp[nxt+9];
                         if (type == 6) {
@@ -2317,6 +2462,7 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
 
 
 int main(int argc, char **argv) {
+    zone_arena_init(&g_dag_arena);
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
     if (argc < 3) { usage(argv[0]); return 1; }
 
@@ -2423,6 +2569,92 @@ int main(int argc, char **argv) {
     for (int i = arg_idx; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--update-add") == 0 && i + 1 < argc) {
+            if (qo.update_op_count < MAX_UPDATE_OPS) {
+                qo.update_ops[qo.update_op_count].kind = UPDATE_OP_ADD;
+                snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
+                qo.update_op_count++;
+            } else {
+                fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
+                i++;
+            }
+        } else if (strcmp(argv[i], "--update-del") == 0 && i + 1 < argc) {
+            if (qo.update_op_count < MAX_UPDATE_OPS) {
+                qo.update_ops[qo.update_op_count].kind = UPDATE_OP_DEL;
+                snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
+                qo.update_op_count++;
+            } else {
+                fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
+                i++;
+            }
+        } else if (strncmp(argv[i], "--prereq=", 9) == 0) {
+            if (qo.prereq_count >= MAX_PREREQS) {
+                fprintf(stderr, "warning: too many --prereq options, ignoring '%s' (max %d)\n", argv[i], MAX_PREREQS);
+            } else {
+                char *spec = strdup(argv[i] + 9);
+                char *kind_str = strtok(spec, ":");
+                char *name = strtok(NULL, ":");
+                char *type_str = strtok(NULL, ":");
+                prereq_kind_t kind = PREREQ_NXDOMAIN; // initialize
+                bool needs_type = false;
+                if (kind_str && strcasecmp(kind_str, "nxdomain") == 0) kind = PREREQ_NXDOMAIN;
+                else if (kind_str && strcasecmp(kind_str, "yxdomain") == 0) kind = PREREQ_YXDOMAIN;
+                else if (kind_str && strcasecmp(kind_str, "nxrrset") == 0) { kind = PREREQ_NXRRSET; needs_type = true; }
+                else if (kind_str && strcasecmp(kind_str, "yxrrset") == 0) { kind = PREREQ_YXRRSET; needs_type = true; }
+                else { fprintf(stderr, "error: unknown prereq kind '%s'\n", kind_str ? kind_str : "(null)"); free(spec); return 1; }
+
+                if (!name || (needs_type && !type_str)) {
+                    fprintf(stderr, "error: --prereq=%s requires a name%s\n", kind_str, needs_type ? " and a type" : "");
+                    free(spec);
+                    return 1;
+                }
+
+                struct { prereq_kind_t kind; char name[256]; char type_str[32]; } *pr = (void*)&qo.prereqs[qo.prereq_count++];
+                pr->kind = kind;
+                snprintf(pr->name, sizeof(pr->name), "%s", name);
+                snprintf(pr->type_str, sizeof(pr->type_str), "%s", needs_type ? type_str : "");
+                free(spec);
+            }
+        } else if (strcmp(argv[i], "--prereq-nxdomain") == 0 && i + 1 < argc) {
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_NXDOMAIN;
+                snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", argv[++i]);
+                qo.prereqs[qo.prereq_count].type_str[0] = '\0';
+                qo.prereq_count++;
+            }
+        } else if (strcmp(argv[i], "--prereq-yxdomain") == 0 && i + 1 < argc) {
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_YXDOMAIN;
+                snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", argv[++i]);
+                qo.prereqs[qo.prereq_count].type_str[0] = '\0';
+                qo.prereq_count++;
+            }
+        } else if (strcmp(argv[i], "--prereq-nxrrset") == 0 && i + 1 < argc) {
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_NXRRSET;
+                char *buf = strdup(argv[++i]);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                if (name && type_str) {
+                    snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", name);
+                    snprintf(qo.prereqs[qo.prereq_count].type_str, sizeof(qo.prereqs[0].type_str), "%s", type_str);
+                    qo.prereq_count++;
+                }
+                free(buf);
+            }
+        } else if (strcmp(argv[i], "--prereq-yxrrset") == 0 && i + 1 < argc) {
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_YXRRSET;
+                char *buf = strdup(argv[++i]);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                if (name && type_str) {
+                    snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", name);
+                    snprintf(qo.prereqs[qo.prereq_count].type_str, sizeof(qo.prereqs[0].type_str), "%s", type_str);
+                    qo.prereq_count++;
+                }
+                free(buf);
+            }
         } else if (strcmp(argv[i], "--tcp") == 0 || strcmp(argv[i], "+tcp") == 0) {
             use_tcp = true;
         } else if (strcmp(argv[i], "+udp") == 0) {
@@ -2636,5 +2868,6 @@ int main(int argc, char **argv) {
     print_multi_server_summary(use_ldnsz);
 
     free(server_list_buf);
+    zone_arena_destroy(&g_dag_arena);
     return 0;
 }

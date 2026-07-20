@@ -37,6 +37,8 @@ typedef struct zone_config {
   char *notify_source;
   char **allow_transfer;
   int allow_transfer_count;
+  char **allow_update;
+  int allow_update_count;
   rate_limit_config_t rrl;
   struct zone_config *next;
 } zone_config_t;
