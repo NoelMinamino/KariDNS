@@ -1737,6 +1737,8 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                     break;
                 }
                 scan_offset += 10 + rdlen;
+            } else {
+                break; // パケットが切り詰められている場合は安全に抜ける
             }
         }
     }

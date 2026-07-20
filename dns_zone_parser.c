@@ -680,6 +680,14 @@ PROCESS_RECORD:
     dns_record_t *rec = arena_alloc_record(arena, ctx, p, buf);
     if (!rec) return -1;
   rec->name = expand_domain_name(fields[0], *origin_io, arena);
+  if (!rec->name) {
+      if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "Failed to allocate memory for domain name";
+          ctx->err_out->error_offset = (size_t)(fields[0] - buf);
+          ctx->err_out->token_length = strlen(fields[0]);
+      }
+      return -1;
+  }
   *prev_owner_io = rec->name;
   rec->ttl = *default_ttl_str_io;
   rec->class_str = NULL;

@@ -902,7 +902,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else {
             tsig->secret = val;
             size_t slen = strlen(tsig->secret);
-            size_t decoded_upper_bound = (slen / 4) * 3;
+            size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
             if (slen == 0 || decoded_upper_bound > sizeof(tsig->secret_decoded)) {
               syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(tsig->secret_decoded));
               fprintf(stderr, "[ERROR] secret too long for algorithm\n");
@@ -985,7 +985,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else {
             config->control.secret = val;
             size_t slen = strlen(config->control.secret);
-            size_t decoded_upper_bound = (slen / 4) * 3;
+            size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
             if (slen == 0 || decoded_upper_bound > sizeof(config->control.secret_decoded)) {
               syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(config->control.secret_decoded));
               fprintf(stderr, "[ERROR] secret too long for algorithm\n");
