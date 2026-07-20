@@ -348,6 +348,12 @@ static void print_break_help(void) {
 /* ========================================================================
  * 4. Query options (EDNS request side) -- built entirely in this file
  * ==================================================================== */
+typedef enum { PREREQ_NXDOMAIN, PREREQ_YXDOMAIN, PREREQ_NXRRSET, PREREQ_YXRRSET } prereq_kind_t;
+typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL } update_op_kind_t;
+
+#define MAX_PREREQS 16
+#define MAX_UPDATE_OPS 16
+
 typedef struct {
     bool want_opt;
     uint16_t udp_payload_size;
@@ -384,12 +390,17 @@ typedef struct {
     bool want_tsig;
     tsig_key_t tsig_key;
 
-    const char *update_add_str;
-    const char *update_del_str;
-    const char *prereq_nxdomain_str;
-    const char *prereq_yxdomain_str;
-    const char *prereq_nxrrset_str;
-    const char *prereq_yxrrset_str;
+    struct {
+        update_op_kind_t kind;
+        char raw[512];
+    } update_ops[MAX_UPDATE_OPS];
+    int update_op_count;
+    struct {
+        prereq_kind_t kind;
+        char name[256];
+        char type_str[32];
+    } prereqs[MAX_PREREQS];
+    int prereq_count;
 } query_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -514,7 +525,7 @@ done:
 static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                                   const char *qname, uint16_t qtype,
                                   const query_opts_t *qo) {
-    if (qo->update_add_str || qo->update_del_str || qo->prereq_nxdomain_str || qo->prereq_yxdomain_str || qo->prereq_nxrrset_str || qo->prereq_yxrrset_str) {
+    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
         qtype = 6; /* SOA for Zone section */
     }
 
@@ -524,7 +535,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     pkt[2] = 0x01; /* RD=1 */
     pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT=1 (may be overridden below) */
 
-    if (qo->update_add_str || qo->update_del_str || qo->prereq_nxdomain_str || qo->prereq_yxdomain_str || qo->prereq_nxrrset_str || qo->prereq_yxrrset_str) {
+    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
         pkt[2] = (pkt[2] & 0x87) | (5 << 3); /* OPCODE=5 (UPDATE) */
     }
 
@@ -600,152 +611,136 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         }
     }
 
-    if (qo->prereq_nxdomain_str || qo->prereq_yxdomain_str || qo->prereq_nxrrset_str || qo->prereq_yxrrset_str) {
+    if (qo->prereq_count > 0) {
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
 
-        if (qo->prereq_nxdomain_str) {
-            if (write_dns_name_str(pkt, &offset, qo->prereq_nxdomain_str, &comp_ctx, max_len) == 0) {
-                pkt[offset++] = 0x00; pkt[offset++] = 255; /* Type ANY */
-                pkt[offset++] = 0x00; pkt[offset++] = 254; /* Class NONE */
-                pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
-                pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
-                uint16_t prcount = (pkt[6] << 8) | pkt[7];
-                prcount++;
-                pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+        for (int pi = 0; pi < qo->prereq_count; pi++) {
+            const char *name = qo->prereqs[pi].name;
+            uint16_t type, class_val;
+
+            switch (qo->prereqs[pi].kind) {
+                case PREREQ_NXDOMAIN: type = 255; class_val = 254; break; // ANY, NONE
+                case PREREQ_YXDOMAIN: type = 255; class_val = 255; break; // ANY, ANY
+                case PREREQ_NXRRSET:  type = parse_qtype(qo->prereqs[pi].type_str); class_val = 254; break; // <type>, NONE
+                case PREREQ_YXRRSET:  type = parse_qtype(qo->prereqs[pi].type_str); class_val = 255; break; // <type>, ANY
+                default: continue;
             }
-        } else if (qo->prereq_yxdomain_str) {
-            if (write_dns_name_str(pkt, &offset, qo->prereq_yxdomain_str, &comp_ctx, max_len) == 0) {
-                pkt[offset++] = 0x00; pkt[offset++] = 255; /* Type ANY */
-                pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
-                pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
-                pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
-                uint16_t prcount = (pkt[6] << 8) | pkt[7];
-                prcount++;
-                pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+
+            if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) != 0) {
+                fprintf(stderr, "warning: failed to encode prereq name '%s', skipping\n", name);
+                continue;
             }
-        } else if (qo->prereq_nxrrset_str) {
-            char *buf = strdup(qo->prereq_nxrrset_str);
-            char *name = strtok(buf, " ");
-            char *type_str = strtok(NULL, " ");
-            if (name && type_str) {
-                if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
-                    uint16_t type = parse_qtype(type_str);
-                    pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
-                    pkt[offset++] = 0x00; pkt[offset++] = 254; /* Class NONE */
-                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
-                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
-                    uint16_t prcount = (pkt[6] << 8) | pkt[7];
-                    prcount++;
-                    pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
-                }
+            if (offset + 10 > max_len) {
+                fprintf(stderr, "warning: packet buffer full, dropping remaining prereqs\n");
+                break;
             }
-            free(buf);
-        } else if (qo->prereq_yxrrset_str) {
-            char *buf = strdup(qo->prereq_yxrrset_str);
-            char *name = strtok(buf, " ");
-            char *type_str = strtok(NULL, " ");
-            if (name && type_str) {
-                if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
-                    uint16_t type = parse_qtype(type_str);
-                    pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
-                    pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
-                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
-                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
-                    uint16_t prcount = (pkt[6] << 8) | pkt[7];
-                    prcount++;
-                    pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
-                }
-            }
-            free(buf);
+            pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
+            pkt[offset++] = class_val >> 8; pkt[offset++] = class_val & 0xFF;
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+
+            uint16_t prcount = (pkt[6] << 8) | pkt[7];
+            prcount++;
+            pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
         }
     }
 
-    if (qo->update_add_str || qo->update_del_str) {
+    if (qo->update_op_count > 0) {
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
-        
-        if (qo->update_add_str) {
-            char *buf = strdup(qo->update_add_str);
-            char *tokens[32];
-            int token_count = 0;
-            bool in_quote = false;
-            char *p = buf;
-            char *tok_start = NULL;
-            char *out = buf;
 
-            while (*p && token_count < 32) {
-                if (*p == '"') {
-                    in_quote = !in_quote;
-                    if (!tok_start) tok_start = out;
-                    p++;
-                } else if (*p == ' ' && !in_quote) {
-                    if (tok_start) {
-                        *out++ = '\0';
-                        tokens[token_count++] = tok_start;
-                        tok_start = NULL;
-                    }
-                    p++;
-                } else {
-                    if (!tok_start) tok_start = out;
-                    if (*p == '\\' && *(p+1) == '"') {
-                        p++; /* skip backslash */
-                        *out++ = *p++;
+        for (int oi = 0; oi < qo->update_op_count; oi++) {
+            const char *raw = qo->update_ops[oi].raw;
+
+            if (qo->update_ops[oi].kind == UPDATE_OP_ADD) {
+                char *buf = strdup(raw);
+                char *tokens[32];
+                int token_count = 0;
+                bool in_quote = false;
+                char *p = buf;
+                char *tok_start = NULL;
+                char *out = buf;
+
+                while (*p && token_count < 32) {
+                    if (*p == '"') {
+                        in_quote = !in_quote;
+                        if (!tok_start) tok_start = out;
+                        p++;
+                    } else if (*p == ' ' && !in_quote) {
+                        if (tok_start) {
+                            *out++ = '\0';
+                            tokens[token_count++] = tok_start;
+                            tok_start = NULL;
+                        }
+                        p++;
                     } else {
-                        *out++ = *p++;
+                        if (!tok_start) tok_start = out;
+                        if (*p == '\\' && *(p+1) == '"') {
+                            p++;
+                            *out++ = *p++;
+                        } else {
+                            *out++ = *p++;
+                        }
                     }
                 }
-            }
-            if (tok_start && token_count < 32) {
-                *out = '\0';
-                tokens[token_count++] = tok_start;
-            }
-
-            if (token_count >= 4) {
-                dns_record_t rec;
-                memset(&rec, 0, sizeof(rec));
-                rec.name = tokens[0];
-                rec.ttl = tokens[1];
-                rec.type_code = parse_qtype(tokens[2]);
-                rec.type = tokens[2];
-                rec.class_str = "IN";
-                rec.rdata_count = token_count - 3;
-                for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
-
-                uint16_t out_offset = offset;
-                if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
-                    offset = out_offset;
-                    uint16_t upcount = (pkt[8] << 8) | pkt[9];
-                    upcount++;
-                    pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
-                } else {
-                    fprintf(stderr, "Failed to serialize update-add record\n");
+                if (tok_start && token_count < 32) {
+                    *out = '\0';
+                    tokens[token_count++] = tok_start;
                 }
-            } else {
-                fprintf(stderr, "Invalid update-add string format\n");
-            }
-            free(buf);
-        } else if (qo->update_del_str) {
-            char *buf = strdup(qo->update_del_str);
-            char *name = strtok(buf, " ");
-            char *type_str = strtok(NULL, " ");
-            if (name && type_str) {
-                if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
-                    uint16_t type = parse_qtype(type_str);
-                    pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
-                    pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
-                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
-                    pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
-                    uint16_t upcount = (pkt[8] << 8) | pkt[9];
-                    upcount++;
-                    pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+
+                if (token_count >= 4) {
+                    dns_record_t rec;
+                    memset(&rec, 0, sizeof(rec));
+                    rec.name = tokens[0];
+                    rec.ttl = tokens[1];
+                    rec.type_code = parse_qtype(tokens[2]);
+                    rec.type = tokens[2];
+                    rec.class_str = "IN";
+                    rec.rdata_count = token_count - 3;
+                    for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
+
+                    uint16_t out_offset = offset;
+                    if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
+                        offset = out_offset;
+                        uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                        upcount++;
+                        pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                    } else {
+                        fprintf(stderr, "Failed to serialize update-add record: %s\n", raw);
+                    }
                 } else {
-                    fprintf(stderr, "Failed to serialize update-del name\n");
+                    fprintf(stderr, "Invalid update-add string format: %s\n", raw);
                 }
-            } else {
-                fprintf(stderr, "Invalid update-del string format\n");
+                free(buf);
+
+            } else { // UPDATE_OP_DEL
+                char *buf = strdup(raw);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                if (name && type_str) {
+                    if (offset + 10 > max_len) {
+                        fprintf(stderr, "warning: packet buffer full, dropping remaining update ops\n");
+                        free(buf);
+                        break;
+                    }
+                    if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
+                        uint16_t type = parse_qtype(type_str);
+                        pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
+                        pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
+                        pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
+                        pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* RDLEN 0 */
+                        uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                        upcount++;
+                        pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                    } else {
+                        fprintf(stderr, "Failed to serialize update-del name: %s\n", raw);
+                    }
+                } else {
+                    fprintf(stderr, "Invalid update-del string format: %s\n", raw);
+                }
+                free(buf);
             }
-            free(buf);
         }
     }
 
@@ -2575,17 +2570,91 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--update-add") == 0 && i + 1 < argc) {
-            qo.update_add_str = argv[++i];
+            if (qo.update_op_count < MAX_UPDATE_OPS) {
+                qo.update_ops[qo.update_op_count].kind = UPDATE_OP_ADD;
+                snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
+                qo.update_op_count++;
+            } else {
+                fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
+                i++;
+            }
         } else if (strcmp(argv[i], "--update-del") == 0 && i + 1 < argc) {
-            qo.update_del_str = argv[++i];
+            if (qo.update_op_count < MAX_UPDATE_OPS) {
+                qo.update_ops[qo.update_op_count].kind = UPDATE_OP_DEL;
+                snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
+                qo.update_op_count++;
+            } else {
+                fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
+                i++;
+            }
+        } else if (strncmp(argv[i], "--prereq=", 9) == 0) {
+            if (qo.prereq_count >= MAX_PREREQS) {
+                fprintf(stderr, "warning: too many --prereq options, ignoring '%s' (max %d)\n", argv[i], MAX_PREREQS);
+            } else {
+                char *spec = strdup(argv[i] + 9);
+                char *kind_str = strtok(spec, ":");
+                char *name = strtok(NULL, ":");
+                char *type_str = strtok(NULL, ":");
+                prereq_kind_t kind = PREREQ_NXDOMAIN; // initialize
+                bool needs_type = false;
+                if (kind_str && strcasecmp(kind_str, "nxdomain") == 0) kind = PREREQ_NXDOMAIN;
+                else if (kind_str && strcasecmp(kind_str, "yxdomain") == 0) kind = PREREQ_YXDOMAIN;
+                else if (kind_str && strcasecmp(kind_str, "nxrrset") == 0) { kind = PREREQ_NXRRSET; needs_type = true; }
+                else if (kind_str && strcasecmp(kind_str, "yxrrset") == 0) { kind = PREREQ_YXRRSET; needs_type = true; }
+                else { fprintf(stderr, "error: unknown prereq kind '%s'\n", kind_str ? kind_str : "(null)"); free(spec); return 1; }
+
+                if (!name || (needs_type && !type_str)) {
+                    fprintf(stderr, "error: --prereq=%s requires a name%s\n", kind_str, needs_type ? " and a type" : "");
+                    free(spec);
+                    return 1;
+                }
+
+                struct { prereq_kind_t kind; char name[256]; char type_str[32]; } *pr = (void*)&qo.prereqs[qo.prereq_count++];
+                pr->kind = kind;
+                snprintf(pr->name, sizeof(pr->name), "%s", name);
+                snprintf(pr->type_str, sizeof(pr->type_str), "%s", needs_type ? type_str : "");
+                free(spec);
+            }
         } else if (strcmp(argv[i], "--prereq-nxdomain") == 0 && i + 1 < argc) {
-            qo.prereq_nxdomain_str = argv[++i];
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_NXDOMAIN;
+                snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", argv[++i]);
+                qo.prereqs[qo.prereq_count].type_str[0] = '\0';
+                qo.prereq_count++;
+            }
         } else if (strcmp(argv[i], "--prereq-yxdomain") == 0 && i + 1 < argc) {
-            qo.prereq_yxdomain_str = argv[++i];
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_YXDOMAIN;
+                snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", argv[++i]);
+                qo.prereqs[qo.prereq_count].type_str[0] = '\0';
+                qo.prereq_count++;
+            }
         } else if (strcmp(argv[i], "--prereq-nxrrset") == 0 && i + 1 < argc) {
-            qo.prereq_nxrrset_str = argv[++i];
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_NXRRSET;
+                char *buf = strdup(argv[++i]);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                if (name && type_str) {
+                    snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", name);
+                    snprintf(qo.prereqs[qo.prereq_count].type_str, sizeof(qo.prereqs[0].type_str), "%s", type_str);
+                    qo.prereq_count++;
+                }
+                free(buf);
+            }
         } else if (strcmp(argv[i], "--prereq-yxrrset") == 0 && i + 1 < argc) {
-            qo.prereq_yxrrset_str = argv[++i];
+            if (qo.prereq_count < MAX_PREREQS) {
+                qo.prereqs[qo.prereq_count].kind = PREREQ_YXRRSET;
+                char *buf = strdup(argv[++i]);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                if (name && type_str) {
+                    snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", name);
+                    snprintf(qo.prereqs[qo.prereq_count].type_str, sizeof(qo.prereqs[0].type_str), "%s", type_str);
+                    qo.prereq_count++;
+                }
+                free(buf);
+            }
         } else if (strcmp(argv[i], "--tcp") == 0 || strcmp(argv[i], "+tcp") == 0) {
             use_tcp = true;
         } else if (strcmp(argv[i], "+udp") == 0) {
