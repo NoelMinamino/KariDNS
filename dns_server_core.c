@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/capsicum.h> // Capsicum capability mode / rights
 #include <sys/cpuset.h>   // cpuset
+#include <sys/file.h>     // flock
 #include <sys/event.h>    // kqueue
 #include <sys/param.h>    // cpuset
 #include <sys/procctl.h>  // PROC_TRAPCAP
@@ -4411,6 +4412,25 @@ int main(int argc, char **argv) {
   if (!foreground) {
     daemonize();
   }
+
+  // Prevent multiple instances using a pidfile lock
+  mkdir("/var/run/karidns", 0755);
+  int pid_fd = open("/var/run/karidns/karidns.pid", O_RDWR | O_CREAT, 0644);
+  if (pid_fd < 0) {
+    syslog(LOG_ERR, "Failed to open pidfile /var/run/karidns/karidns.pid: %s", strerror(errno));
+    return 1;
+  }
+  if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {
+    syslog(LOG_ERR, "Another KariDNS instance is already running (pidfile locked)");
+    fprintf(stderr, "Another KariDNS instance is already running.\n");
+    return 1;
+  }
+  ftruncate(pid_fd, 0);
+  char pid_str[32];
+  snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
+  write(pid_fd, pid_str, strlen(pid_str));
+  // Keep pid_fd open; the lock will be automatically released upon process exit.
+
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGHUP);
