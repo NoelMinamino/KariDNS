@@ -1652,7 +1652,9 @@ static void bump_soa_serial_in_arena(zone_arena_t *arena) {
 }
 
 static int handle_dynamic_update(const uint8_t *req, size_t req_len,
-                                  zone_db_entry_t *entry) {
+                                  zone_db_entry_t *entry,
+                                  const char *client_ip,
+                                  const char *matched_key_name) {
   pthread_mutex_lock(&entry->writer_lock);
 
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
@@ -1661,7 +1663,8 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   clone_zone_arena(z_active, z_standby);
 
-  int rcode = process_update_sections(req, req_len, entry->domain, z_standby);
+  int prcount = 0, upcount = 0;
+  int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &prcount, &upcount);
   if (rcode != 0) {
     pthread_mutex_unlock(&entry->writer_lock);
     return rcode;
@@ -1683,8 +1686,10 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
     kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
   }
 
-  syslog(LOG_NOTICE, "[Update] Applied dynamic update to zone '%s' (in-memory only, will revert on reload)",
-         entry->domain);
+  syslog(LOG_NOTICE,
+         "[Update] client=%s key=%s zone='%s' prcount=%d upcount=%d "
+         "(in-memory only, will revert on reload)",
+         client_ip, matched_key_name, entry->domain, prcount, upcount);
 
   return 0; // NOERROR
 }
@@ -1900,7 +1905,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     
     int rcode = 5; // REFUSED
     if (auth) {
-      rcode = handle_dynamic_update(req, req_len, db_entry);
+      rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key->name);
     } else {
       add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control or invalid TSIG");
     }

@@ -84,7 +84,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // 5. Test process_update_sections
     // Since we just need to test parsing bounds, we can pass dummy standby arena.
     // The arena was already initialized above (dummy_arena).
-    process_update_sections(data, size, "fuzz.test.", &dummy_arena);
+    process_update_sections(data, size, "fuzz.test.", &dummy_arena, NULL, NULL);
 
     zone_arena_destroy(&dummy_arena);
     return 0; // Fuzzer must return 0

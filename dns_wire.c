@@ -1808,11 +1808,15 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
 
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
-                             zone_arena_t *standby) {
+                             zone_arena_t *standby,
+                             int *out_prcount, int *out_upcount) {
     if (req_len < 12) return 1; // FORMERR
     uint16_t zocount = (req[4] << 8) | req[5];
     uint16_t prcount = (req[6] << 8) | req[7];
     uint16_t upcount = (req[8] << 8) | req[9];
+
+    if (out_prcount) *out_prcount = prcount;
+    if (out_upcount) *out_upcount = upcount;
 
     if (zocount != 1) return 1; // FORMERR
 

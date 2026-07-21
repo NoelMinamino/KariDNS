@@ -152,6 +152,7 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
 
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
-                             zone_arena_t *standby);
+                             zone_arena_t *standby,
+                             int *out_prcount, int *out_upcount);
 
 #endif // DNS_WIRE_H
