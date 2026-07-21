@@ -2766,10 +2766,15 @@ int main(int argc, char **argv) {
      * @8.8.8.8,9.9.9.9 のようにカンマ区切りで複数サーバーを指定できるようにする。
      * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
      * (resolve_server_addr()がgetaddrinfo()で解決する)。
+     *
+     * Per-server port: IPv4は host:port、IPv6は [addr]:port 記法を許可。
+     * 例: @172.31.15.3:10053,172.31.15.5,[fe80::1]:5353
+     * ポート未指定時は -p のグローバル値 (デフォルト53) を使用。
      */
     char *server_list_buf = strdup(server_arg + 1);
     if (!server_list_buf) { perror("strdup"); return 1; }
     const char *servers[MAX_DAG_SERVERS];
+    int server_ports[MAX_DAG_SERVERS];
     int server_count = 0;
     {
         char *save = NULL;
@@ -2781,13 +2786,36 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "warning: too many servers specified, only the first %d will be used\n", MAX_DAG_SERVERS);
                 break;
             } else {
-                servers[server_count++] = tok;
+                int srv_port = port; // -p のデフォルト値
+                if (tok[0] == '[') {
+                    // [IPv6]:port 記法
+                    char *close = strchr(tok, ']');
+                    if (close) {
+                        *close = '\0';
+                        tok++; // '[' をスキップ
+                        if (close[1] == ':' && close[2] != '\0') {
+                            srv_port = atoi(close + 2);
+                        }
+                    }
+                } else {
+                    // IPv4/FQDN: 最後の ':' をポート区切りとして扱う
+                    // ただし ':' が2つ以上ある場合はIPv6と見なしポート解析しない
+                    char *first_colon = strchr(tok, ':');
+                    if (first_colon && !strchr(first_colon + 1, ':')) {
+                        // ':' が1つだけ → IPv4:port
+                        *first_colon = '\0';
+                        srv_port = atoi(first_colon + 1);
+                    }
+                }
+                servers[server_count] = tok;
+                server_ports[server_count] = srv_port;
+                server_count++;
             }
             tok = strtok_r(NULL, ",", &save);
         }
     }
     if (server_count == 0) {
-        fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1 or @192.0.2.1,192.0.2.2,1.1.1.1\n");
+        fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1 or @192.0.2.1:10053,192.0.2.2\n");
         free(server_list_buf);
         return 1;
     }
@@ -2807,6 +2835,7 @@ int main(int argc, char **argv) {
 
     for (int si = 0; si < server_count; si++) {
         const char *server = servers[si];
+        int srv_port = server_ports[si];
         
         bool pass_ldnsz_to_run_test = (server_count == 1) ? use_ldnsz : false;
 
@@ -2875,7 +2904,7 @@ int main(int argc, char **argv) {
                 t_qo.padding_size = all_tests[t].padding;
             }
 
-            run_test(all_tests[t].name, qname, qtype_s, server, port,
+            run_test(all_tests[t].name, qname, qtype_s, server, srv_port,
                      use_tcp || all_tests[t].tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
                      adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
                      no_hexdump_query, no_hexdump_response,
@@ -2883,7 +2912,7 @@ int main(int argc, char **argv) {
         }
 
         } else {
-            run_test(NULL, qname, qtype_s, server, port, use_tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
+            run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
                      adflag, cdflag, aaflag, tcflag, zflag,
                      no_hexdump_query, no_hexdump_response, &qo, hex_payload);
         }
