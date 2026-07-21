@@ -109,7 +109,7 @@ static const char *get_ede_error_string(uint16_t code) {
     }
 }
 
-static uint16_t parse_qtype(const char *s) {
+static bool resolve_qtype(const char *s, uint16_t *out_type) {
     static const struct { const char *name; uint16_t type; } types[] = {
         {"A", 1}, {"NS", 2}, {"MD", 3}, {"MF", 4}, {"CNAME", 5}, {"SOA", 6},
         {"MB", 7}, {"MG", 8}, {"MR", 9}, {"NULL", 10}, {"WKS", 11}, {"PTR", 12},
@@ -130,13 +130,33 @@ static uint16_t parse_qtype(const char *s) {
         {"TA", 32768}, {"DLV", 32769}
     };
     for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
-        if (strcasecmp(s, types[i].name) == 0) return types[i].type;
+        if (strcasecmp(s, types[i].name) == 0) {
+            if (out_type) *out_type = types[i].type;
+            return true;
+        }
     }
     if (strncasecmp(s, "TYPE", 4) == 0 && s[4] != '\0') {
         char *end;
         long v = strtol(s + 4, &end, 10);
-        if (*end == '\0' && v >= 0 && v <= 65535) return (uint16_t)v;
+        if (*end == '\0' && v >= 0 && v <= 65535) {
+            if (out_type) *out_type = (uint16_t)v;
+            return true;
+        }
     }
+    if (strncasecmp(s, "IXFR=", 5) == 0) {
+        if (out_type) *out_type = 251; // IXFR
+        return true;
+    }
+    return false;
+}
+
+static bool is_known_qtype(const char *s) {
+    return resolve_qtype(s, NULL);
+}
+
+static uint16_t parse_qtype(const char *s) {
+    uint16_t t;
+    if (resolve_qtype(s, &t)) return t;
     fprintf(stderr, "dag: unknown query type '%s'\n", s);
     exit(1);
 }
@@ -2274,11 +2294,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         char time_buf[64];
         strftime(time_buf, sizeof(time_buf), "%a %b %e %H:%M:%S %Z %Y", localtime(&now));
 
-        printf("\n;; Query time: %ld msec\n", elapsed_ms);
-        printf(";; SERVER: %s#%d(%s) (%s)\n", server, port, server, use_tcp ? "TCP" : "UDP");
-        printf(";; WHEN: %s\n", time_buf);
-        if (qtype == 252 || qtype == 251) {
-            printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_index, total_bytes);
+        if (!short_mode) {
+            printf("\n;; Query time: %ld msec\n", elapsed_ms);
+            printf(";; SERVER: %s#%d(%s) (%s)\n", server, port, server, use_tcp ? "TCP" : "UDP");
+            printf(";; WHEN: %s\n", time_buf);
+            if (qtype == 252 || qtype == 251) {
+                printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_index, total_bytes);
+            }
         }
 
         if (tcp_sock >= 0) close(tcp_sock);
@@ -2460,85 +2482,47 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
     }
 }
 
+/*
+ * /etc/resolv.conf から最初の nameserver を読み取って返す。
+ * 見つからなければ "127.0.0.1" をフォールバックとして使用。
+ */
+static const char *get_system_resolver(void) {
+    static char resolver[256];
+    FILE *fp = fopen("/etc/resolv.conf", "r");
+    if (!fp) {
+        snprintf(resolver, sizeof(resolver), "127.0.0.1");
+        return resolver;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == ';' || *p == '\n') continue;
+        if (strncmp(p, "nameserver", 10) == 0 && (p[10] == ' ' || p[10] == '\t')) {
+            p += 10;
+            while (*p == ' ' || *p == '\t') p++;
+            char *end = p + strlen(p) - 1;
+            while (end > p && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) *end-- = '\0';
+            snprintf(resolver, sizeof(resolver), "%s", p);
+            fclose(fp);
+            return resolver;
+        }
+    }
+    fclose(fp);
+    snprintf(resolver, sizeof(resolver), "127.0.0.1");
+    return resolver;
+}
 
 int main(int argc, char **argv) {
     zone_arena_init(&g_dag_arena);
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
-    if (argc < 3) { usage(argv[0]); return 1; }
+    if (argc < 2) { usage(argv[0]); return 1; }
 
-    int arg_idx = 1;
     char rev_name[128];
     const char *qname = NULL;
     const char *qtype_s = NULL;
     const char *server_arg = NULL;
     const char *hex_payload = NULL;
-
-    if (strcmp(argv[arg_idx], "--hex") == 0) {
-        if (arg_idx + 1 >= argc) { usage(argv[0]); return 1; }
-        hex_payload = argv[arg_idx + 1];
-        arg_idx += 2;
-        qname = "(hex)";
-        qtype_s = "ANY";
-    } else if (strncmp(argv[arg_idx], "--hex=", 6) == 0) {
-        hex_payload = argv[arg_idx] + 6;
-        arg_idx++;
-        qname = "(hex)";
-        qtype_s = "ANY";
-    } else if (strcmp(argv[arg_idx], "-x") == 0) {
-        arg_idx++;
-        if (arg_idx >= argc) { usage(argv[0]); return 1; }
-        if (!make_reverse_name(argv[arg_idx], rev_name, sizeof(rev_name))) {
-            fprintf(stderr, "Invalid IP address for -x\n");
-            return 1;
-        }
-        qname = rev_name;
-        qtype_s = "PTR";
-        arg_idx++;
-    } else {
-        qname = argv[arg_idx++];
-        if (arg_idx < argc && argv[arg_idx][0] != '@' && argv[arg_idx][0] != '+' && argv[arg_idx][0] != '-') {
-            qtype_s = argv[arg_idx++];
-        } else {
-            qtype_s = "A";
-        }
-    }
-
-    if (arg_idx < argc && argv[arg_idx][0] == '@') {
-        server_arg = argv[arg_idx++];
-    } else {
-        fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1\n");
-        return 1;
-    }
-
-    /*
-     * @8.8.8.8,9.9.9.9 のようにカンマ区切りで複数サーバーを指定できるようにする。
-     * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
-     * (resolve_server_addr()がgetaddrinfo()で解決する)。
-     */
-    char *server_list_buf = strdup(server_arg + 1);
-    if (!server_list_buf) { perror("strdup"); return 1; }
-    const char *servers[MAX_DAG_SERVERS];
-    int server_count = 0;
-    {
-        char *save = NULL;
-        char *tok = strtok_r(server_list_buf, ",", &save);
-        while (tok) {
-            if (*tok == '\0') {
-                fprintf(stderr, "warning: skipping empty server entry\n");
-            } else if (server_count >= MAX_DAG_SERVERS) {
-                fprintf(stderr, "warning: too many servers specified, only the first %d will be used\n", MAX_DAG_SERVERS);
-                break;
-            } else {
-                servers[server_count++] = tok;
-            }
-            tok = strtok_r(NULL, ",", &save);
-        }
-    }
-    if (server_count == 0) {
-        fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1 or @192.0.2.1,192.0.2.2,1.1.1.1\n");
-        free(server_list_buf);
-        return 1;
-    }
 
     int port = 53;
     bool use_tcp = false;
@@ -2561,12 +2545,27 @@ int main(int argc, char **argv) {
     qo.timeout_sec = 5;
     qo.tries = 1;
 
+    // dig互換: 引数の順序非依存な1パススキャン
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--test-all") == 0) test_all = true;
-        if (strcmp(argv[i], "--break") == 0 && i + 1 < argc && strcmp(argv[i+1], "all") == 0) test_all = true;
-    }
-
-    for (int i = arg_idx; i < argc; i++) {
+        if (argv[i][0] == '@') {
+            server_arg = argv[i];
+        } else if (strcmp(argv[i], "--hex") == 0 && i + 1 < argc) {
+            hex_payload = argv[++i];
+            qname = "(hex)";
+            qtype_s = "ANY";
+        } else if (strncmp(argv[i], "--hex=", 6) == 0) {
+            hex_payload = argv[i] + 6;
+            qname = "(hex)";
+            qtype_s = "ANY";
+        } else if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
+            if (!make_reverse_name(argv[++i], rev_name, sizeof(rev_name))) {
+                fprintf(stderr, "Invalid IP address for -x\n");
+                return 1;
+            }
+            qname = rev_name;
+            qtype_s = "PTR";
+        } else if (argv[i][0] == '-' || argv[i][0] == '+') {
+            // --- オプション引数（既存ハンドラをそのまま移植） ---
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--update-add") == 0 && i + 1 < argc) {
@@ -2677,7 +2676,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--break") == 0 && i + 1 < argc) {
             char *brk = argv[++i];
             if (strcmp(brk, "all") == 0) {
-                // Already handled in the first loop
+                test_all = true;
             } else {
                 parse_break_arg(brk);
             }
@@ -2763,11 +2762,100 @@ int main(int argc, char **argv) {
             char *tsig_str = strdup(argv[i] + 6);
             parse_tsig_str(tsig_str, &qo);
         } else if (strcmp(argv[i], "--test-all") == 0) {
-            // Already handled earlier
+            test_all = true;
         } else {
             fprintf(stderr, "warning: unrecognized argument '%s', ignoring\n", argv[i]);
         }
+        } else {
+            // Positional 引数（ドメイン名 or レコードタイプ）の柔軟な割り当て
+            if (is_known_qtype(argv[i])) {
+                if (!qtype_s) {
+                    qtype_s = argv[i];
+                } else if (!qname) {
+                    qname = argv[i]; // 既にタイプが指定済みならドメイン名として扱う
+                }
+            } else {
+                if (!qname) {
+                    qname = argv[i];
+                } else if (!qtype_s) {
+                    qtype_s = argv[i]; // 既に名前が指定済みならタイプとして扱う
+                }
+            }
+        }
     }
+
+    if (!qtype_s) qtype_s = "A"; // デフォルトのクエリタイプ
+    if (!qname) qname = "."; // デフォルトのクエリ名（dig互換: ルート）
+
+    // @server 未指定時はシステムリゾルバにフォールバック
+    static char resolv_server_buf[260];
+    if (!server_arg) {
+        const char *sys_resolver = get_system_resolver();
+        snprintf(resolv_server_buf, sizeof(resolv_server_buf), "@%s", sys_resolver);
+        server_arg = resolv_server_buf;
+        if (!short_mode) {
+            fprintf(stderr, ";; Using system resolver: %s\n", sys_resolver);
+        }
+    }
+
+    /*
+     * @8.8.8.8,9.9.9.9 のようにカンマ区切りで複数サーバーを指定できるようにする。
+     * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
+     * (resolve_server_addr()がgetaddrinfo()で解決する)。
+     *
+     * Per-server port: IPv4は host:port、IPv6は [addr]:port 記法を許可。
+     * 例: @172.31.15.3:10053,172.31.15.5,[fe80::1]:5353
+     * ポート未指定時は -p のグローバル値 (デフォルト53) を使用。
+     */
+    char *server_list_buf = strdup(server_arg + 1);
+    if (!server_list_buf) { perror("strdup"); return 1; }
+    const char *servers[MAX_DAG_SERVERS];
+    int server_ports[MAX_DAG_SERVERS];
+    int server_count = 0;
+    {
+        char *save = NULL;
+        char *tok = strtok_r(server_list_buf, ",", &save);
+        while (tok) {
+            if (*tok == '\0') {
+                fprintf(stderr, "warning: skipping empty server entry\n");
+            } else if (server_count >= MAX_DAG_SERVERS) {
+                fprintf(stderr, "warning: too many servers specified, only the first %d will be used\n", MAX_DAG_SERVERS);
+                break;
+            } else {
+                int srv_port = port; // -p のデフォルト値
+                if (tok[0] == '[') {
+                    // [IPv6]:port 記法
+                    char *close = strchr(tok, ']');
+                    if (close) {
+                        *close = '\0';
+                        tok++; // '[' をスキップ
+                        if (close[1] == ':' && close[2] != '\0') {
+                            srv_port = atoi(close + 2);
+                        }
+                    }
+                } else {
+                    // IPv4/FQDN: 最後の ':' をポート区切りとして扱う
+                    // ただし ':' が2つ以上ある場合はIPv6と見なしポート解析しない
+                    char *first_colon = strchr(tok, ':');
+                    if (first_colon && !strchr(first_colon + 1, ':')) {
+                        // ':' が1つだけ → IPv4:port
+                        *first_colon = '\0';
+                        srv_port = atoi(first_colon + 1);
+                    }
+                }
+                servers[server_count] = tok;
+                server_ports[server_count] = srv_port;
+                server_count++;
+            }
+            tok = strtok_r(NULL, ",", &save);
+        }
+    }
+    if (server_count == 0) {
+        fprintf(stderr, "Server must start with '@', e.g. @192.0.2.1 or @192.0.2.1:10053,192.0.2.2\n");
+        free(server_list_buf);
+        return 1;
+    }
+
 
     // AXFRの場合は自動的にTCPモードに昇格（+udpが明示されていない場合）
     if (strcasecmp(qtype_s, "AXFR") == 0 && !force_udp) {
@@ -2783,6 +2871,7 @@ int main(int argc, char **argv) {
 
     for (int si = 0; si < server_count; si++) {
         const char *server = servers[si];
+        int srv_port = server_ports[si];
         
         bool pass_ldnsz_to_run_test = (server_count == 1) ? use_ldnsz : false;
 
@@ -2793,6 +2882,8 @@ int main(int argc, char **argv) {
         }
 
         if (test_all) {
+        // --test-all で qname が '.' のままだとテスト対象にならないので上書き
+        if (strcmp(qname, ".") == 0) qname = "example.com";
         struct {
             const char *name; break_kind_t kind; long param; bool tcp;
             bool cdflag; bool zflag; bool aaflag; bool tcflag;
@@ -2851,7 +2942,7 @@ int main(int argc, char **argv) {
                 t_qo.padding_size = all_tests[t].padding;
             }
 
-            run_test(all_tests[t].name, qname, qtype_s, server, port,
+            run_test(all_tests[t].name, qname, qtype_s, server, srv_port,
                      use_tcp || all_tests[t].tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
                      adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
                      no_hexdump_query, no_hexdump_response,
@@ -2859,7 +2950,7 @@ int main(int argc, char **argv) {
         }
 
         } else {
-            run_test(NULL, qname, qtype_s, server, port, use_tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
+            run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
                      adflag, cdflag, aaflag, tcflag, zflag,
                      no_hexdump_query, no_hexdump_response, &qo, hex_payload);
         }
