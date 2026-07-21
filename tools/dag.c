@@ -109,27 +109,7 @@ static const char *get_ede_error_string(uint16_t code) {
     }
 }
 
-static bool is_known_qtype(const char *s) {
-    static const char *types[] = {
-        "A", "NS", "MD", "MF", "CNAME", "SOA", "MB", "MG", "MR", "NULL", "WKS", "PTR",
-        "HINFO", "MINFO", "MX", "TXT", "RP", "AFSDB", "X25", "ISDN", "RT", "NSAP",
-        "NSAP-PTR", "SIG", "KEY", "PX", "GPOS", "AAAA", "LOC", "NXT", "EID", "NIMLOC",
-        "SRV", "ATMA", "NAPTR", "KX", "CERT", "A6", "DNAME", "SINK", "OPT", "APL",
-        "DS", "SSHFP", "IPSECKEY", "RRSIG", "NSEC", "DNSKEY", "DHCID", "NSEC3", "NSEC3PARAM",
-        "TLSA", "SMIMEA", "HIP", "CDS", "CDNSKEY", "OPENPGPKEY", "CSYNC", "ZONEMD", "SVCB",
-        "HTTPS", "SPF", "NID", "L32", "L64", "LP", "EUI48", "EUI64", "TKEY", "TSIG",
-        "IXFR", "AXFR", "MAILB", "MAILA", "ANY", "URI", "CAA", "AVC", "DOA", "AMTRELAY",
-        "TA", "DLV"
-    };
-    for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
-        if (strcasecmp(s, types[i]) == 0) return true;
-    }
-    if (strncasecmp(s, "TYPE", 4) == 0 && s[4] != '\0') return true;
-    if (strncasecmp(s, "IXFR=", 5) == 0) return true;
-    return false;
-}
-
-static uint16_t parse_qtype(const char *s) {
+static bool resolve_qtype(const char *s, uint16_t *out_type) {
     static const struct { const char *name; uint16_t type; } types[] = {
         {"A", 1}, {"NS", 2}, {"MD", 3}, {"MF", 4}, {"CNAME", 5}, {"SOA", 6},
         {"MB", 7}, {"MG", 8}, {"MR", 9}, {"NULL", 10}, {"WKS", 11}, {"PTR", 12},
@@ -150,13 +130,33 @@ static uint16_t parse_qtype(const char *s) {
         {"TA", 32768}, {"DLV", 32769}
     };
     for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
-        if (strcasecmp(s, types[i].name) == 0) return types[i].type;
+        if (strcasecmp(s, types[i].name) == 0) {
+            if (out_type) *out_type = types[i].type;
+            return true;
+        }
     }
     if (strncasecmp(s, "TYPE", 4) == 0 && s[4] != '\0') {
         char *end;
         long v = strtol(s + 4, &end, 10);
-        if (*end == '\0' && v >= 0 && v <= 65535) return (uint16_t)v;
+        if (*end == '\0' && v >= 0 && v <= 65535) {
+            if (out_type) *out_type = (uint16_t)v;
+            return true;
+        }
     }
+    if (strncasecmp(s, "IXFR=", 5) == 0) {
+        if (out_type) *out_type = 251; // IXFR
+        return true;
+    }
+    return false;
+}
+
+static bool is_known_qtype(const char *s) {
+    return resolve_qtype(s, NULL);
+}
+
+static uint16_t parse_qtype(const char *s) {
+    uint16_t t;
+    if (resolve_qtype(s, &t)) return t;
     fprintf(stderr, "dag: unknown query type '%s'\n", s);
     exit(1);
 }
