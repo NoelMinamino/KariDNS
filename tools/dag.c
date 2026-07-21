@@ -2482,6 +2482,36 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
     }
 }
 
+/*
+ * /etc/resolv.conf から最初の nameserver を読み取って返す。
+ * 見つからなければ "127.0.0.1" をフォールバックとして使用。
+ */
+static const char *get_system_resolver(void) {
+    static char resolver[256];
+    FILE *fp = fopen("/etc/resolv.conf", "r");
+    if (!fp) {
+        snprintf(resolver, sizeof(resolver), "127.0.0.1");
+        return resolver;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == ';' || *p == '\n') continue;
+        if (strncmp(p, "nameserver", 10) == 0 && (p[10] == ' ' || p[10] == '\t')) {
+            p += 10;
+            while (*p == ' ' || *p == '\t') p++;
+            char *end = p + strlen(p) - 1;
+            while (end > p && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) *end-- = '\0';
+            snprintf(resolver, sizeof(resolver), "%s", p);
+            fclose(fp);
+            return resolver;
+        }
+    }
+    fclose(fp);
+    snprintf(resolver, sizeof(resolver), "127.0.0.1");
+    return resolver;
+}
 
 int main(int argc, char **argv) {
     zone_arena_init(&g_dag_arena);
@@ -2755,11 +2785,17 @@ int main(int argc, char **argv) {
     }
 
     if (!qtype_s) qtype_s = "A"; // デフォルトのクエリタイプ
-    if (!qname) qname = "example.com"; // デフォルトのクエリ名（dig互換）
+    if (!qname) qname = "."; // デフォルトのクエリ名（dig互換: ルート）
 
+    // @server 未指定時はシステムリゾルバにフォールバック
+    static char resolv_server_buf[260];
     if (!server_arg) {
-        fprintf(stderr, "Server must be specified with '@', e.g. @8.8.8.8\n");
-        return 1;
+        const char *sys_resolver = get_system_resolver();
+        snprintf(resolv_server_buf, sizeof(resolv_server_buf), "@%s", sys_resolver);
+        server_arg = resolv_server_buf;
+        if (!short_mode) {
+            fprintf(stderr, ";; Using system resolver: %s\n", sys_resolver);
+        }
     }
 
     /*
@@ -2846,6 +2882,8 @@ int main(int argc, char **argv) {
         }
 
         if (test_all) {
+        // --test-all で qname が '.' のままだとテスト対象にならないので上書き
+        if (strcmp(qname, ".") == 0) qname = "example.com";
         struct {
             const char *name; break_kind_t kind; long param; bool tcp;
             bool cdflag; bool zflag; bool aaflag; bool tcflag;
