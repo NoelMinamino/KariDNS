@@ -1765,6 +1765,29 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   edns.ede_count = 0; // 反射防止
 
+  if (edns.present && edns.version > 0) {
+    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+    memcpy(res, req, copy_len);
+    res[2] |= 0x80; // QR=1
+    res[3] &= 0xF0; // RCODE=0 (Base RCODE)
+    
+    // 質問セクション以降をクリア
+    res[6] = 0; res[7] = 0; // ANCOUNT=0
+    res[8] = 0; res[9] = 0; // NSCOUNT=0
+    
+    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+    uint16_t arcount = 0;
+    
+    // RFC 6891: 応答にはサーバーがサポートする最大のバージョン(0)をセットする
+    edns.version = 0;
+    
+    // rcode_ext = 1 (1 << 4 | Base 0 = 16 = BADVERS)
+    assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 1);
+    res[10] = arcount >> 8;
+    res[11] = arcount & 0xFF;
+    return offset;
+  }
+
   server_config_t *cfg_for_ede = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
 
   uint8_t opcode = (req[2] >> 3) & 0x0F;
