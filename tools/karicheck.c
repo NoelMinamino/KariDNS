@@ -134,18 +134,22 @@ static void print_error_context(const char *root_file_path, const char *root_buf
     fprintf(stderr, "\033[0m\n\n");
 }
 
+static void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
+    size_t len = strlen(in);
+    if (len > 0 && in[len - 1] != '.' && len + 1 < out_cap) {
+        memcpy(out, in, len);
+        out[len] = '.';
+        out[len + 1] = '\0';
+    } else {
+        snprintf(out, out_cap, "%s", in);
+    }
+}
+
 static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
     char domain_buf[256];
-    size_t dlen = strlen(domain_raw);
-    if (dlen > 0 && domain_raw[dlen - 1] != '.' && dlen + 1 < sizeof(domain_buf)) {
-        memcpy(domain_buf, domain_raw, dlen);
-        domain_buf[dlen] = '.';
-        domain_buf[dlen + 1] = '\0';
-    } else {
-        snprintf(domain_buf, sizeof(domain_buf), "%s", domain_raw);
-    }
+    normalize_domain_fqdn(domain_raw, domain_buf, sizeof(domain_buf));
     const char *domain = domain_buf;
 
     if (is_standalone) {
@@ -396,14 +400,7 @@ int main(int argc, char **argv) {
 
             // Normalize domain for comparison (config parser adds trailing dot)
             char norm_domain[256];
-            size_t nd_len = strlen(domain);
-            if (nd_len > 0 && domain[nd_len - 1] != '.' && nd_len + 1 < sizeof(norm_domain)) {
-                memcpy(norm_domain, domain, nd_len);
-                norm_domain[nd_len] = '.';
-                norm_domain[nd_len + 1] = '\0';
-            } else {
-                snprintf(norm_domain, sizeof(norm_domain), "%s", domain);
-            }
+            normalize_domain_fqdn(domain, norm_domain, sizeof(norm_domain));
 
             zone_config_t *z = cfg.zones;
             while (z) {

@@ -2047,27 +2047,9 @@ fallback:
  * 8. main
  * ==================================================================== */
 
-static int hex_char_to_int(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
 
 static size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
-    size_t out_len = 0;
-    while (*hex) {
-        int h1 = hex_char_to_int(*hex++);
-        if (h1 < 0) continue;
-        int h2 = -1;
-        while (*hex) {
-            h2 = hex_char_to_int(*hex++);
-            if (h2 >= 0) break;
-        }
-        if (h2 < 0) break;
-        if (out_len < out_cap) out[out_len++] = (uint8_t)((h1 << 4) | h2);
-    }
-    return out_len;
+    return hex_decode(hex, out, out_cap);
 }
 static int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
                     bool use_tcp, bool use_ldnsz, bool short_mode, bool norecurse,

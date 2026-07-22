@@ -13,16 +13,6 @@
 #define MAX_FIELDS 64
 
 
-int hex_char_to_val(char c) {
-  if (c >= '0' && c <= '9')
-    return c - '0';
-  if (c >= 'a' && c <= 'f')
-    return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F')
-    return c - 'A' + 10;
-  return -1;
-}
-
 void *arena_alloc(zone_arena_t *arena, size_t size) {
   if (arena->current_pool_idx + size > arena->current_pool_cap ||
       arena->data_pool_count == 0) {

@@ -324,3 +324,24 @@ const char *format_type_name(uint16_t type, char *buf, size_t buf_size) {
     snprintf(buf, buf_size, "TYPE%u", type);
     return buf;
 }
+
+int hex_char_to_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap) {
+    size_t out_len = 0;
+    int high = -1;
+    for (const char *h = hex; *h; h++) {
+        int v = hex_char_to_val(*h);
+        if (v < 0) continue; // 空白/コロン等の区切り文字は無視
+        if (high < 0) { high = v; continue; }
+        if (out_len >= out_cap) return (size_t)-1; // 出力先超過
+        out[out_len++] = (uint8_t)((high << 4) | v);
+        high = -1;
+    }
+    return out_len;
+}
