@@ -225,37 +225,101 @@ char *get_base_dir(const char *path) {
     return base;
 }
 
-const char *format_type_name(uint16_t type, char *buf, size_t buf_size) {
-    switch (type) {
-        case 1: return "A"; case 2: return "NS"; case 3: return "MD";
-        case 4: return "MF"; case 5: return "CNAME"; case 6: return "SOA";
-        case 7: return "MB"; case 8: return "MG"; case 9: return "MR";
-        case 10: return "NULL"; case 11: return "WKS"; case 12: return "PTR";
-        case 13: return "HINFO"; case 14: return "MINFO"; case 15: return "MX";
-        case 16: return "TXT"; case 17: return "RP"; case 18: return "AFSDB";
-        case 19: return "X25"; case 20: return "ISDN"; case 21: return "RT";
-        case 22: return "NSAP"; case 23: return "NSAP-PTR"; case 24: return "SIG";
-        case 25: return "KEY"; case 26: return "PX"; case 27: return "GPOS";
-        case 28: return "AAAA"; case 29: return "LOC"; case 30: return "NXT";
-        case 31: return "EID"; case 32: return "NIMLOC"; case 33: return "SRV";
-        case 34: return "ATMA"; case 35: return "NAPTR"; case 36: return "KX";
-        case 37: return "CERT"; case 38: return "A6"; case 39: return "DNAME";
-        case 40: return "SINK"; case 42: return "APL"; case 43: return "DS";
-        case 44: return "SSHFP"; case 45: return "IPSECKEY"; case 46: return "RRSIG";
-        case 47: return "NSEC"; case 48: return "DNSKEY"; case 49: return "DHCID";
-        case 50: return "NSEC3"; case 51: return "NSEC3PARAM"; case 52: return "TLSA";
-        case 53: return "SMIMEA"; case 55: return "HIP"; case 59: return "CDS";
-        case 60: return "CDNSKEY"; case 61: return "OPENPGPKEY"; case 62: return "CSYNC";
-        case 63: return "ZONEMD"; case 64: return "SVCB"; case 65: return "HTTPS";
-        case 99: return "SPF"; case 104: return "NID"; case 105: return "L32";
-        case 106: return "L64"; case 107: return "LP"; case 108: return "EUI48";
-        case 109: return "EUI64"; case 249: return "TKEY"; case 250: return "TSIG";
-        case 251: return "IXFR"; case 252: return "AXFR"; case 253: return "MAILB";
-        case 254: return "MAILA"; case 255: return "ANY"; case 256: return "URI";
-        case 257: return "CAA"; case 258: return "AVC"; case 259: return "DOA";
-        case 260: return "AMTRELAY"; case 32768: return "TA"; case 32769: return "DLV";
-        default:
-            snprintf(buf, buf_size, "TYPE%u", type);
-            return buf;
+typedef struct { uint16_t type; const char *name; } type_name_entry_t;
+static const type_name_entry_t TYPE_NAMES[] = {
+    {1, "A"},
+    {2, "NS"},
+    {3, "MD"},
+    {4, "MF"},
+    {5, "CNAME"},
+    {6, "SOA"},
+    {7, "MB"},
+    {8, "MG"},
+    {9, "MR"},
+    {10, "NULL"},
+    {11, "WKS"},
+    {12, "PTR"},
+    {13, "HINFO"},
+    {14, "MINFO"},
+    {15, "MX"},
+    {16, "TXT"},
+    {17, "RP"},
+    {18, "AFSDB"},
+    {19, "X25"},
+    {20, "ISDN"},
+    {21, "RT"},
+    {22, "NSAP"},
+    {23, "NSAP-PTR"},
+    {24, "SIG"},
+    {25, "KEY"},
+    {26, "PX"},
+    {27, "GPOS"},
+    {28, "AAAA"},
+    {29, "LOC"},
+    {30, "NXT"},
+    {31, "EID"},
+    {32, "NIMLOC"},
+    {33, "SRV"},
+    {34, "ATMA"},
+    {35, "NAPTR"},
+    {36, "KX"},
+    {37, "CERT"},
+    {38, "A6"},
+    {39, "DNAME"},
+    {40, "SINK"},
+    {42, "APL"},
+    {43, "DS"},
+    {44, "SSHFP"},
+    {45, "IPSECKEY"},
+    {46, "RRSIG"},
+    {47, "NSEC"},
+    {48, "DNSKEY"},
+    {49, "DHCID"},
+    {50, "NSEC3"},
+    {51, "NSEC3PARAM"},
+    {52, "TLSA"},
+    {53, "SMIMEA"},
+    {55, "HIP"},
+    {59, "CDS"},
+    {60, "CDNSKEY"},
+    {61, "OPENPGPKEY"},
+    {62, "CSYNC"},
+    {63, "ZONEMD"},
+    {64, "SVCB"},
+    {65, "HTTPS"},
+    {99, "SPF"},
+    {104, "NID"},
+    {105, "L32"},
+    {106, "L64"},
+    {107, "LP"},
+    {108, "EUI48"},
+    {109, "EUI64"},
+    {249, "TKEY"},
+    {250, "TSIG"},
+    {251, "IXFR"},
+    {252, "AXFR"},
+    {253, "MAILB"},
+    {254, "MAILA"},
+    {255, "ANY"},
+    {256, "URI"},
+    {257, "CAA"},
+    {258, "AVC"},
+    {259, "DOA"},
+    {260, "AMTRELAY"},
+    {32768, "TA"},
+    {32769, "DLV"},
+};
+
+static const char *lookup_type_name(uint16_t type) {
+    for (size_t i = 0; i < sizeof(TYPE_NAMES)/sizeof(TYPE_NAMES[0]); i++) {
+        if (TYPE_NAMES[i].type == type) return TYPE_NAMES[i].name;
     }
+    return NULL;
+}
+
+const char *format_type_name(uint16_t type, char *buf, size_t buf_size) {
+    const char *n = lookup_type_name(type);
+    if (n) return n;
+    snprintf(buf, buf_size, "TYPE%u", type);
+    return buf;
 }

@@ -102,6 +102,21 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
 // 6. AXFR クライアント & ワイヤーデシリアライザ (スタック安全・バグ修正済)
 // ============================================================================
 
+
+int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) {
+    while (1) {
+        if (*offset >= packet_len) return -1;
+        uint8_t len = packet[*offset];
+        if (len == 0) { (*offset)++; break; }
+        if ((len & 0xC0) == 0xC0) {
+            if (*offset + 2 > packet_len) return -1;
+            *offset += 2; break;
+        }
+        *offset += 1 + len;
+    }
+    return 0;
+}
+
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset) {
     size_t p = current_offset; int jump_count = 0; bool jumped = false; size_t jumped_offset = 0;
     while (1) {
@@ -158,34 +173,12 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
 }
 
 const char *get_type_str(uint16_t type, zone_arena_t *arena) {
-    switch (type) {
-        case 1: return "A"; case 2: return "NS"; case 3: return "MD"; case 4: return "MF";
-        case 5: return "CNAME"; case 6: return "SOA"; case 7: return "MB"; case 8: return "MG";
-        case 9: return "MR"; case 10: return "NULL"; case 11: return "WKS"; case 12: return "PTR";
-        case 13: return "HINFO"; case 14: return "MINFO"; case 15: return "MX"; case 16: return "TXT";
-        case 17: return "RP"; case 18: return "AFSDB"; case 19: return "X25"; case 20: return "ISDN";
-        case 21: return "RT"; case 22: return "NSAP"; case 23: return "NSAP-PTR"; case 24: return "SIG";
-        case 25: return "KEY"; case 26: return "PX"; case 27: return "GPOS"; case 28: return "AAAA";
-        case 29: return "LOC"; case 30: return "NXT"; case 31: return "EID"; case 32: return "NIMLOC";
-        case 33: return "SRV"; case 34: return "ATMA"; case 35: return "NAPTR"; case 36: return "KX";
-        case 37: return "CERT"; case 38: return "A6"; case 39: return "DNAME"; case 40: return "SINK";
-        case 41: return "OPT"; case 42: return "APL"; case 43: return "DS"; case 44: return "SSHFP";
-        case 45: return "IPSECKEY"; case 46: return "RRSIG"; case 47: return "NSEC"; case 48: return "DNSKEY";
-        case 49: return "DHCID"; case 50: return "NSEC3"; case 51: return "NSEC3PARAM"; case 52: return "TLSA";
-        case 53: return "SMIMEA"; case 55: return "HIP"; case 59: return "CDS"; case 60: return "CDNSKEY";
-        case 61: return "OPENPGPKEY"; case 62: return "CSYNC"; case 63: return "ZONEMD"; case 64: return "SVCB";
-        case 65: return "HTTPS"; case 99: return "SPF"; case 104: return "NID"; case 105: return "L32";
-        case 106: return "L64"; case 107: return "LP"; case 108: return "EUI48"; case 109: return "EUI64";
-        case 249: return "TKEY"; case 250: return "TSIG"; case 251: return "IXFR"; case 252: return "AXFR";
-        case 253: return "MAILB"; case 254: return "MAILA"; case 255: return "ANY"; case 256: return "URI";
-        case 257: return "CAA"; case 258: return "AVC"; case 259: return "DOA"; case 260: return "AMTRELAY";
-        case 32768: return "TA"; case 32769: return "DLV";
-        default: {
-            char *buf = arena ? arena_alloc(arena, 16) : malloc(16);
-            if (buf) snprintf(buf, 16, "TYPE%d", type);
-            return buf;
-        }
-    }
+    char tmp[16];
+    const char *n = format_type_name(type, tmp, sizeof(tmp));
+    if (n != tmp) return n;
+    char *buf = arena ? arena_alloc(arena, 16) : malloc(16);
+    if (buf) memcpy(buf, tmp, strlen(tmp) + 1);
+    return buf;
 }
 
 int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
@@ -517,47 +510,31 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     size_t offset = 12;
     uint16_t qdcount = (packet[4] << 8) | packet[5], ancount = (packet[6] << 8) | packet[7], nscount = (packet[8] << 8) | packet[9];
     for (int i = 0; i < qdcount; i++) {
-        int jump_count = 0;
-        while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) {
-            offset += packet[offset] + 1;
-            if (++jump_count > 128) return -1;
-        }
-        if (offset < packet_len && (packet[offset] & 0xC0) == 0xC0) offset += 2; else offset++;
+        if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
+
         offset += 4;
     }
     size_t last_rr_offset = 0;
     for (int i = 0; i < ancount + nscount + arcount; i++) {
         if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
         if (offset >= packet_len) return -1;
-        int jump_count = 0;
-        while (offset < packet_len && packet[offset] != 0 && (packet[offset] & 0xC0) != 0xC0) {
-            offset += packet[offset] + 1;
-            if (++jump_count > 128) return -1;
-        }
-        if (offset < packet_len && (packet[offset] & 0xC0) == 0xC0) offset += 2; else offset++;
+        if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
+
         if (offset + 10 > packet_len) return -1;
         uint16_t rdlen = (packet[offset+8] << 8) | packet[offset+9];
         offset += 10 + rdlen;
     }
     if (last_rr_offset == 0 || offset > packet_len) return -1;
     size_t tsig_p = last_rr_offset;
-    int jump_count = 0;
-    while (tsig_p < packet_len && packet[tsig_p] != 0 && (packet[tsig_p] & 0xC0) != 0xC0) {
-        tsig_p += packet[tsig_p] + 1;
-        if (++jump_count > 128) return -1;
-    }
-    if (tsig_p < packet_len && (packet[tsig_p] & 0xC0) == 0xC0) tsig_p += 2; else tsig_p++;
+    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return -1;
+
     if (tsig_p + 10 > packet_len) return -1;
     uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p+1];
     if (type != 250) return -1;
     tsig_p += 10;
     size_t alg_start = tsig_p; (void)alg_start;
-    jump_count = 0;
-    while (tsig_p < packet_len && packet[tsig_p] != 0) {
-        tsig_p += packet[tsig_p] + 1;
-        if (++jump_count > 128) return -1;
-    }
-    tsig_p++;
+    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return -1;
+
     if (tsig_p + 16 > packet_len) return -1;
     size_t time_fudge_start = tsig_p;
     uint64_t time_signed = 
@@ -754,6 +731,47 @@ static uint8_t loc_encode_precsize(double meters) {
     uint32_t mantissa = cm / loc_poweroften[exponent];
     if (mantissa > 9) mantissa = 9;
     return (uint8_t)((mantissa << 4) | exponent);
+}
+
+
+static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
+                                    size_t max_res_len, size_t *offset) {
+    char b64[2048] = "";
+    size_t b64_len = 0;
+    for (int i = 0; i < count; i++) {
+        size_t flen = strlen(fields[i]);
+        if (b64_len + flen >= sizeof(b64)) return -1;
+        memcpy(b64 + b64_len, fields[i], flen);
+        b64_len += flen;
+        b64[b64_len] = '\0';
+    }
+    size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
+    if (*offset + decoded_upper_bound > max_res_len) return -1;
+    int declen = EVP_DecodeBlock(&res[*offset], (const unsigned char *)b64, b64_len);
+    if (declen < 0) return -1;
+    int padding = (b64_len > 0 && b64[b64_len-1]=='=') + (b64_len > 1 && b64[b64_len-2]=='=');
+    *offset += (size_t)(declen - padding);
+    return 0;
+}
+
+static int decode_concat_hex_rdata(char **fields, int count, uint8_t *res,
+                                    size_t max_res_len, size_t *offset) {
+    char hex[2048] = "";
+    size_t hex_len = 0;
+    for (int i = 0; i < count; i++) {
+        size_t flen = strlen(fields[i]);
+        if (hex_len + flen >= sizeof(hex)) return -1;
+        memcpy(hex + hex_len, fields[i], flen);
+        hex_len += flen;
+        hex[hex_len] = '\0';
+    }
+    if (hex_len % 2 != 0) return -1;
+    if (*offset + hex_len / 2 > max_res_len) return -1;
+    for (size_t i = 0; i < hex_len; i += 2) {
+        char buf[3] = { hex[i], hex[i+1], '\0' };
+        res[(*offset)++] = (uint8_t)strtol(buf, NULL, 16);
+    }
+    return 0;
 }
 
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
@@ -1048,21 +1066,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 
                 if (pk_idx < rec->rdata_count) {
-                    char b64[2048] = "";
-                    for (int i = pk_idx; i < rec->rdata_count; i++) {
-                        if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) {
-                            strcat(b64, rec->rdata[i]);
-                        }
-                    }
-                    size_t b64_len = strlen(b64);
-                    size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-                    if (offset + decoded_upper_bound > max_res_len) return -1;
-                    int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
-                    if (declen < 0) return -1;
-                    int padding = 0;
-                    if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
-                    if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
-                    offset += (declen - padding);
+                    size_t off = offset;
+                    if (decode_concat_b64_rdata(&rec->rdata[pk_idx], rec->rdata_count - pk_idx, res, max_res_len, &off) != 0) return -1;
+                    offset = off;
                 }
                 break;
             }
@@ -1169,22 +1175,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (w < 0) return -1;
                 offset += w;
 
-                char b64[2048] = "";
-                for (int i = 8; i < rec->rdata_count; i++) {
-                    if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) {
-                        strcat(b64, rec->rdata[i]);
-                    }
-                }
-                size_t b64_len = strlen(b64);
-                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-                if (offset + decoded_upper_bound > max_res_len) return -1;
-                
-                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
-                if (declen < 0) return -1;
-                int padding = 0;
-                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
-                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
-                offset += (declen - padding);
+                size_t off = offset;
+                if (decode_concat_b64_rdata(&rec->rdata[8], rec->rdata_count - 8, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
             case 47: { // NSEC
@@ -1602,13 +1595,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = alg;
                 res[offset++] = dtype;
                 
-                char hex[1024] = "";
-                for (int i = 3; i < rec->rdata_count; i++) {
-                    if (strlen(hex) + strlen(rec->rdata[i]) < sizeof(hex)) strcat(hex, rec->rdata[i]);
-                }
-                size_t dec_len = hex_decode(hex, &res[offset], max_res_len - offset);
-                if (dec_len == (size_t)-1) return -1;
-                offset += dec_len;
+                size_t off = offset;
+                if (decode_concat_hex_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
             case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
@@ -1621,19 +1610,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = proto;
                 res[offset++] = alg;
                 
-                char b64[2048] = "";
-                for (int i = 3; i < rec->rdata_count; i++) {
-                    if (strlen(b64) + strlen(rec->rdata[i]) < sizeof(b64)) strcat(b64, rec->rdata[i]);
-                }
-                size_t b64_len = strlen(b64);
-                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-                if (offset + decoded_upper_bound > max_res_len) return -1;
-                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
-                if (declen < 0) return -1;
-                int padding = 0;
-                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
-                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
-                offset += (declen - padding);
+                size_t off = offset;
+                if (decode_concat_b64_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
             default: {

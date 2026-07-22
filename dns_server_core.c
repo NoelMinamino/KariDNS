@@ -2469,6 +2469,51 @@ static void submit_response_log(log_action_t action, const char *client_ip, int 
     atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
 
+
+static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
+    int today = (tm_info->tm_year + 1900) * 10000 + (tm_info->tm_mon + 1) * 100 + tm_info->tm_mday;
+    pthread_mutex_lock(&ch->lock);
+    bool rotate = false;
+    if (ch->size_limit > 0 && ch->current_size + len > ch->size_limit)
+        rotate = true;
+    else if (ch->suffix_timestamp && ch->current_date != today)
+        rotate = true;
+    if (rotate) {
+        if (ch->fd >= 0) {
+            close(ch->fd);
+        }
+        ch->fd = -1;
+        int reopen_flags = O_WRONLY | O_CREAT | O_APPEND;
+        if (ch->suffix_timestamp) {
+            char new_name[600];
+            int r = snprintf(new_name, sizeof(new_name), "%s.%08d", ch->file_path, ch->current_date);
+            if (r > 0 && r < (int)sizeof(new_name))
+                renameat_via_dir_cache(ch->file_path, new_name);
+        } else if (ch->versions > 0) {
+            for (int i = ch->versions - 1; i >= 0; i--) {
+                char old_name[600], new_name[600];
+                int r1 = (i == 0)
+                             ? snprintf(old_name, sizeof(old_name), "%s", ch->file_path)
+                             : snprintf(old_name, sizeof(old_name), "%s.%d", ch->file_path, i - 1);
+                int r2 = snprintf(new_name, sizeof(new_name), "%s.%d", ch->file_path, i);
+                if (r1 > 0 && r2 > 0)
+                    renameat_via_dir_cache(old_name, new_name);
+            }
+        } else {
+            reopen_flags |= O_TRUNC;
+        }
+        ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
+        ch->current_size = 0;
+        ch->current_date = today;
+    }
+    if (ch->fd >= 0) {
+        ssize_t w = write(ch->fd, log_buf, len);
+        if (w > 0)
+            ch->current_size += w;
+    }
+    pthread_mutex_unlock(&ch->lock);
+}
+
 void *response_logger_thread_func(void *arg) {
     (void)arg;
     while (1) {
@@ -2524,11 +2569,7 @@ void *response_logger_thread_func(void *arg) {
                 
                 if (len > 0) {
                     if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
-                    pthread_mutex_lock(&ch->lock);
-                    if (ch->fd >= 0) {
-                        write(ch->fd, log_buf, len);
-                    }
-                    pthread_mutex_unlock(&ch->lock);
+                    log_write_rotated(ch, log_buf, len, &tm_info);
                 }
             }
             
@@ -2554,8 +2595,7 @@ static void write_query_log(const char *client_ip, int client_port,
   clock_gettime(CLOCK_REALTIME, &ts);
   struct tm tm_info;
   localtime_r(&ts.tv_sec, &tm_info);
-  int today = (tm_info.tm_year + 1900) * 10000 + (tm_info.tm_mon + 1) * 100 +
-              tm_info.tm_mday;
+  
   char time_str[64] = "";
   if (ch->print_time) {
     char buf[32];
@@ -2585,46 +2625,7 @@ static void write_query_log(const char *client_ip, int client_port,
     return;
   if (len >= (int)sizeof(log_buf))
     len = sizeof(log_buf) - 1;
-  pthread_mutex_lock(&ch->lock);
-  bool rotate = false;
-  if (ch->size_limit > 0 && ch->current_size + len > ch->size_limit)
-    rotate = true;
-  else if (ch->suffix_timestamp && ch->current_date != today)
-    rotate = true;
-  if (rotate) {
-    close(ch->fd);
-    ch->fd = -1;
-    int reopen_flags = O_WRONLY | O_CREAT | O_APPEND;
-    if (ch->suffix_timestamp) {
-      char new_name[600];
-      int r = snprintf(new_name, sizeof(new_name), "%s.%08d", ch->file_path,
-                       ch->current_date);
-      if (r > 0 && r < (int)sizeof(new_name))
-        renameat_via_dir_cache(ch->file_path, new_name);
-    } else if (ch->versions > 0) {
-      for (int i = ch->versions - 1; i >= 0; i--) {
-        char old_name[600], new_name[600];
-        int r1 = (i == 0)
-                     ? snprintf(old_name, sizeof(old_name), "%s", ch->file_path)
-                     : snprintf(old_name, sizeof(old_name), "%s.%d",
-                                ch->file_path, i - 1);
-        int r2 =
-            snprintf(new_name, sizeof(new_name), "%s.%d", ch->file_path, i);
-        if (r1 > 0 && r2 > 0)
-          renameat_via_dir_cache(old_name, new_name);
-      }
-    } else
-      reopen_flags |= O_TRUNC;
-    ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
-    ch->current_size = 0;
-    ch->current_date = today;
-  }
-  if (ch->fd >= 0) {
-    ssize_t w = write(ch->fd, log_buf, len);
-    if (w > 0)
-      ch->current_size += w;
-  }
-  pthread_mutex_unlock(&ch->lock);
+  log_write_rotated(ch, log_buf, len, &tm_info);
 }
 
 // ============================================================================
