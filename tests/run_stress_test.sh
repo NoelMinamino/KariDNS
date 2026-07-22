@@ -10,9 +10,9 @@ export TSAN_OPTIONS=halt_on_error=1
 # スクリプトのディレクトリを基準にプロジェクトルートへ移動
 cd "$(dirname "$0")/.."
 
-CONF_FILE="karidns.conf.sample"
-CTL_CONF="karictl.conf"
-ZONE_FILE="tests/zones/stress.example.com.zone"
+CONF_FILE="tests/karidns-test.conf"
+CTL_CONF="tests/karictl-test.conf"
+ZONE_FILE="tests/zones/example.com.zone"
 ZONE_NAME="example.com"
 
 if [ ! -f "$CONF_FILE" ]; then
@@ -52,7 +52,7 @@ TSAN_PID=$!
 sleep 2
 
 # バックグラウンドで猛烈なクエリ負荷をかける
-dnsperf -s 127.0.0.1 -p 10053 -d tests/test_queries.txt -l 60 -o dnsperf_tsan.log &
+dnsperf -s 127.0.0.1 -p 10053 -d tests/test_queries.txt -l 60 > dnsperf_tsan.log 2>&1
 DNSPERF_PID=$!
 
 # 並行してIXFR/AXFRを要求するクライアント（dig）を回す
@@ -73,6 +73,8 @@ while kill -0 $DNSPERF_PID 2>/dev/null; do
     OLD_HOST="stress-$((n - 1))"
     NEW_HOST="stress-$n"
 
+    # FreeBSDネイティブの sed (-i '' と拡張正規表現 -E) を使用してインプレース置換
+    #sed -i '' -E -e "s/^[0-9]{10} ; serial/${NEW_SERIAL} ; serial/" "$ZONE_FILE"
     sed -i '' -E -e "s/^([[:space:]]*)[0-9]{10}([[:space:]]*;.*serial.*)/\1${NEW_SERIAL}\2/" "$ZONE_FILE"
     sed -i '' -E -e "/^${OLD_HOST} /d" "$ZONE_FILE"
     echo "${NEW_HOST} IN A 10.0.0.$((n % 255))" >> "$ZONE_FILE"
@@ -134,7 +136,7 @@ sleep 2
 
 # Fuzzingツールの呼び出しを `dag` に修正済み
 for BREAK_CASE in compression-loop label-too-long tcp-length-overclaim \
-                  oversized-udp truncated-tsig malformed-edns-cookie; do
+                  oversized-qname truncated-question opt-rdlen=100; do
     EXTRA_FLAGS=""
     case "$BREAK_CASE" in
         tcp-length-overclaim) EXTRA_FLAGS="--tcp" ;;
