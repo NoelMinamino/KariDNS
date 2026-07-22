@@ -294,7 +294,10 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
   return 0;
 }
 
-static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count) {
+typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD } acl_key_mode_t;
+
+static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
+                           acl_key_mode_t key_mode, char **tsig_key_out) {
     conf_token_t tok = get_next_token(ctx);
     if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
     free_token(&tok);
@@ -323,8 +326,12 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count) {
             free_token(&tok);
             tok = get_next_token(ctx);
             if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
-            char *val = strdup(tok.value);
-            APPEND_STR(*list, *count, val);
+            if (key_mode == ACL_KEY_AS_TSIG_FIELD && tsig_key_out) {
+                if (*tsig_key_out) free(*tsig_key_out);
+                *tsig_key_out = strdup(tok.value);
+            } else {
+                APPEND_STR(*list, *count, strdup(tok.value));
+            }
             free_token(&tok);
         } else if (strcmp(tok.value, "!") == 0) {
             free_token(&tok);
@@ -687,11 +694,11 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
         } else if (strcmp(key, "allow-transfer") == 0) {
-          if (parse_acl_list(&ctx, &zone->allow_transfer, &zone->allow_transfer_count) != 0) {
+          if (parse_acl_list(&ctx, &zone->allow_transfer, &zone->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &zone->tsig_key) != 0) {
             free(key); free_zone_config(zone); return -1;
           }
         } else if (strcmp(key, "allow-update") == 0) {
-          if (parse_acl_list(&ctx, &zone->allow_update, &zone->allow_update_count) != 0) {
+          if (parse_acl_list(&ctx, &zone->allow_update, &zone->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
             free(key); free_zone_config(zone); return -1;
           }
         } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||

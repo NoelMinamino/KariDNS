@@ -68,6 +68,23 @@ int main() {
         return 1;
     }
     
+
+    // Test 4: allow-transfer key correctly sets zone->tsig_key
+    memset(&cfg, 0, sizeof(cfg));
+    char conf_acl[1024];
+    strcpy(conf_acl, "zone \"example.com\" { type master; file \"dummy\"; allow-transfer { key \"mykey\"; }; };");
+    char* copy_acl = strdup(conf_acl);
+    int res_acl = parse_named_conf(copy_acl, &cfg);
+    free(copy_acl);
+    if (res_acl == 0 && cfg.zones && cfg.zones->tsig_key && strcmp(cfg.zones->tsig_key, "mykey") == 0 && cfg.zones->allow_transfer_count == 0) {
+        printf("Test 4 Passed: allow-transfer key correctly parsed as tsig_key\n");
+    } else {
+        printf("Test 4 Failed: allow-transfer key parsing failed! res_acl=%d, tsig_key=%s, count=%d\n",
+               res_acl, cfg.zones ? (cfg.zones->tsig_key ? cfg.zones->tsig_key : "NULL") : "NO ZONE",
+               cfg.zones ? cfg.zones->allow_transfer_count : -1);
+        return 1;
+    }
+
     // Test 3: New record types boundary checks
     {
         uint8_t packet[20];
