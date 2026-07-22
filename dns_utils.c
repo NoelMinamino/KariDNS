@@ -267,6 +267,7 @@ static const type_name_entry_t TYPE_NAMES[] = {
     {38, "A6"},
     {39, "DNAME"},
     {40, "SINK"},
+    {41, "OPT"},
     {42, "APL"},
     {43, "DS"},
     {44, "SSHFP"},

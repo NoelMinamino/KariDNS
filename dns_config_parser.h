@@ -1,6 +1,9 @@
 #ifndef DNS_CONFIG_PARSER_H
 #define DNS_CONFIG_PARSER_H
 
+#define KARIDNS_MAX_CONFIG_FILE_SIZE (256 * 1024 * 1024)
+
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>

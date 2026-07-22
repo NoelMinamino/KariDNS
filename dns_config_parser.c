@@ -163,7 +163,7 @@ char *read_entire_file(const char *path) {
   fseek(f, 0, SEEK_END);
   long fsize = ftell(f);
   fseek(f, 0, SEEK_SET);
-  if (fsize < 0 || fsize > 256 * 1024 * 1024) {
+  if (fsize < 0 || fsize > KARIDNS_MAX_CONFIG_FILE_SIZE) {
     fclose(f);
     return NULL;
   }

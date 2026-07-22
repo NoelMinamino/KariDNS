@@ -934,7 +934,7 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path) {
     }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
-    if (len < 0) {
+    if (len < 0 || len > KARIDNS_MAX_CONFIG_FILE_SIZE) {
         fclose(f);
         return NULL;
     }

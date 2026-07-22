@@ -765,12 +765,9 @@ static int decode_concat_hex_rdata(char **fields, int count, uint8_t *res,
         hex_len += flen;
         hex[hex_len] = '\0';
     }
-    if (hex_len % 2 != 0) return -1;
-    if (*offset + hex_len / 2 > max_res_len) return -1;
-    for (size_t i = 0; i < hex_len; i += 2) {
-        char buf[3] = { hex[i], hex[i+1], '\0' };
-        res[(*offset)++] = (uint8_t)strtol(buf, NULL, 16);
-    }
+    size_t dec_len = hex_decode(hex, &res[*offset], max_res_len - *offset);
+    if (dec_len == (size_t)-1) return -1;
+    *offset += dec_len;
     return 0;
 }
 
