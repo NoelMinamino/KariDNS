@@ -43,4 +43,10 @@ fi
 
 echo "[OK] Round-trip test passed: all record types present, server did not crash."
 
+if killall -0 karidns-asan 2>/dev/null; then
+    killall -9 karidns-asan 2>/dev/null
+fi
+
 trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
+
+
