@@ -600,6 +600,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         return offset;
     } else {
         compress_ctx_t comp_ctx;
+        memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
         if (write_dns_name_str(pkt, &offset, qname, &comp_ctx, max_len) != 0) {
             fprintf(stderr, "write_dns_name_str failed (name too long?)\n");
@@ -611,6 +612,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
 
     if (qo->is_ixfr) {
         compress_ctx_t comp_ctx;
+        memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
         if (write_dns_name_str(pkt, &offset, qname, &comp_ctx, max_len) == 0) {
             pkt[offset++] = 0x00; pkt[offset++] = 0x06; /* Type SOA */
@@ -633,6 +635,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
 
     if (qo->prereq_count > 0) {
         compress_ctx_t comp_ctx;
+        memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
 
         for (int pi = 0; pi < qo->prereq_count; pi++) {
@@ -668,6 +671,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
 
     if (qo->update_op_count > 0) {
         compress_ctx_t comp_ctx;
+        memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
 
         for (int oi = 0; oi < qo->update_op_count; oi++) {
