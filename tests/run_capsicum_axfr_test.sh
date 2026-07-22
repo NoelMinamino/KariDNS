@@ -60,6 +60,6 @@ fi
 
 echo "[OK] Capsicum round-trip test passed: no ECAPMODE/TRAP_CAP violations, all record types present, server did not crash."
 
-if kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill -9 "$SERVER_PID" 2>/dev/null
+if killall -0 karidns; then
+    killall -9 karidns >/dev/null
 fi
