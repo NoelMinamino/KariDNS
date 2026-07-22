@@ -1,8 +1,9 @@
 # Makefile for karidns (FreeBSD)
 
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE
-LDFLAGS = -pthread -lcrypto -lm
+CFLAGS = -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
+HARDEN_LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+LDFLAGS = -pthread -lcrypto -lm $(HARDEN_LDFLAGS)
 
 TARGET = karidns
 SRCS = dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_utils.c
@@ -40,7 +41,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(KARICTL_TARGET): $(KARICTL_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ -lcrypto
+	$(CC) $(CFLAGS) -o $@ $^ -lcrypto $(HARDEN_LDFLAGS)
 
 $(DAG_TARGET): $(DAG_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz
@@ -63,25 +64,25 @@ run: $(TARGET)
 	./$(TARGET)
 
 fuzz: $(FUZZ_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_TARGET) $(FUZZ_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TARGET) $(FUZZ_SRCS) $(LDFLAGS)
 
 fuzz_core: $(FUZZ_CORE_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS) $(LDFLAGS)
 
 fuzz_zone: $(FUZZ_ZONE_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_SRCS) $(LDFLAGS)
 
 fuzz_conf: $(FUZZ_CONF_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_CONF_TARGET) $(FUZZ_CONF_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CONF_TARGET) $(FUZZ_CONF_SRCS) $(LDFLAGS)
 
 fuzz_tsig: $(FUZZ_TSIG_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -o $(FUZZ_TSIG_TARGET) $(FUZZ_TSIG_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_TARGET) $(FUZZ_TSIG_SRCS) $(LDFLAGS)
 
 clean-fuzz:
 	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET) $(FUZZ_TSIG_TARGET)
 
 ASAN_TARGET = karidns-asan
-ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer
+ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE
 ASAN_OBJS = $(SRCS:.c=.asan.o)
 
 asan: $(ASAN_TARGET)

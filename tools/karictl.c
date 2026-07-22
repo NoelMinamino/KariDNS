@@ -145,12 +145,21 @@ int main(int argc, char **argv) {
 
     char *challenge = buf + 10;
     char *nl = strchr(challenge, '\n');
+    size_t challenge_len = (size_t)(nl ? (nl - challenge) : (buf + r - challenge));
+
+#define EXPECTED_CHALLENGE_LEN 64
+    if (challenge_len != EXPECTED_CHALLENGE_LEN) {
+        fprintf(stderr, "Invalid challenge length: %zu\n", challenge_len);
+        close(sock);
+        return 2;
+    }
+
     if (nl) *nl = '\0';
 
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int md_len;
     HMAC(EVP_sha256(), secret_decoded, secret_decoded_len, 
-         (unsigned char*)challenge, 64, md, &md_len);
+         (unsigned char*)challenge, challenge_len, md, &md_len);
     
     char auth_msg[256];
     char expected[65];

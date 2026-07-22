@@ -920,7 +920,34 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
 
 static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path) {
     (void)ctx;
-    return read_entire_file(rel_path);
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
+    int fd = open_via_dir_cache(rel_path, O_RDONLY | O_NOFOLLOW, 0, false);
+    if (fd < 0) {
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "rb");
+    if (!f) {
+        close(fd);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    if (len < 0) {
+        fclose(f);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t read_len = fread(buf, 1, len, f);
+    buf[read_len] = '\0';
+    fclose(f);
+    return buf;
 }
 
 typedef enum {
