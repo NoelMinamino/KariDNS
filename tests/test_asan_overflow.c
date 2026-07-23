@@ -562,6 +562,26 @@ int main() {
             return 1;
         }
 
+        // 4. Unterminated quote at EOF (no trailing newline, no closing quote)
+        char buf4[] = "example.com. 3600 IN TXT \"hello";
+        int r4 = parse_zone_fast(buf4, strlen(buf4), &arena, &ctx);
+        if (r4 == 0) {
+            printf("FAIL: Test 4 (Unterminated quote at EOF) incorrectly succeeded.\n");
+            return 1;
+        }
+        if (!err.error_message || !strstr(err.error_message, "Unterminated quoted string")) {
+            printf("FAIL: Test 4 (Unterminated quote at EOF) bad error message: %s\n", err.error_message ? err.error_message : "NULL");
+            return 1;
+        }
+
+        // 5. Properly closed quote at EOF (no trailing newline, but valid closing quote)
+        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 末尾に改行なし、ただし正しく閉じている
+        int r5 = parse_zone_fast(buf5, strlen(buf5), &arena, &ctx);
+        if (r5 < 0) {
+            printf("FAIL: Test 5 (properly closed quote at EOF) failed. err=%s\n", err.error_message ? err.error_message : "NULL");
+            return 1;
+        }
+
         printf("PASS: dns_zone_parser tests\n");
         zone_arena_destroy(&arena);
     }

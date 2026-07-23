@@ -54,8 +54,6 @@
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 4096
 
-#define IS_SPACE(c) ((c) == ' ' || (c) == '\t')
-#define IS_NEWLINE(c) ((c) == '\n' || (c) == '\r')
 
 #define MAX_BIND_ADDRS 32
 

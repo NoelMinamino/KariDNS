@@ -590,6 +590,16 @@ STATE_FIND_TOKEN:
     }
     p++;
   }
+
+  if (p >= end && in_quotes) {
+    if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Unterminated quoted string (missing closing '\"' at end of file)";
+        ctx->err_out->error_offset = token_start - buf;
+        ctx->err_out->token_length = (size_t)(p - token_start);
+    }
+    return -1;
+  }
+
           if (field_idx < MAX_FIELDS) {
             fields[field_idx++] = token_start;
           } else {
