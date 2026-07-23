@@ -10,7 +10,7 @@
 
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t')
 #define IS_NEWLINE(c) ((c) == '\n' || (c) == '\r')
-#define MAX_FIELDS 64
+#define MAX_FIELDS 100
 
 
 void *arena_alloc(zone_arena_t *arena, size_t size) {
@@ -579,13 +579,27 @@ STATE_FIND_TOKEN:
       if (IS_SPACE(*p) || IS_NEWLINE(*p) || *p == ';' || *p == '(' || *p == ')')
         break;
     } else {
-      if (IS_NEWLINE(*p))
-        break;
+      if (IS_NEWLINE(*p)) {
+        if (ctx && ctx->err_out) {
+            ctx->err_out->error_message = "Unterminated quoted string (closing '\"' missing before end of line)";
+            ctx->err_out->error_offset = token_start - buf;
+            ctx->err_out->token_length = (size_t)(p - token_start);
+        }
+        return -1;
+      }
     }
     p++;
   }
-          if (field_idx < MAX_FIELDS)
+          if (field_idx < MAX_FIELDS) {
             fields[field_idx++] = token_start;
+          } else {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "Too many fields in a single record (exceeds MAX_FIELDS)";
+                ctx->err_out->error_offset = token_start - buf;
+                ctx->err_out->token_length = (size_t)(p - token_start);
+            }
+            return -1;
+          }
           
           // ファイル末尾に到達した場合でも、最後のトークンのクォートを除去する
           if (p >= end) {

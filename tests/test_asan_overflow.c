@@ -513,6 +513,59 @@ int main() {
         printf("PASS: LOC and APL validations\n");
     }
 
+    // Test: dns_zone_parser.c edge cases
+    {
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        parse_error_t err = {0};
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "example.com.",
+            .is_standalone_mode = true,
+            .err_out = &err,
+        };
+
+        // 1. Normal quotes
+        char buf1[] = "example.com. 3600 IN TXT \"hello world\"\n";
+        int r1 = parse_zone_fast(buf1, strlen(buf1), &arena, &ctx);
+        if (r1 < 0) {
+            printf("FAIL: Test 1 (Normal quotes) failed. err=%s\n", err.error_message);
+            return 1;
+        }
+
+        // 2. Unterminated quote
+        char buf2[] = "example.com. 3600 IN TXT ( \"hello\nworld\" )\n";
+        int r2 = parse_zone_fast(buf2, strlen(buf2), &arena, &ctx);
+        if (r2 == 0) {
+            printf("FAIL: Test 2 (Unterminated quote) incorrectly succeeded.\n");
+            return 1;
+        }
+        if (!err.error_message || !strstr(err.error_message, "Unterminated quoted string")) {
+            printf("FAIL: Test 2 (Unterminated quote) bad error message: %s\n", err.error_message ? err.error_message : "NULL");
+            return 1;
+        }
+
+        // 3. Exceeds MAX_FIELDS
+        char buf3[4096];
+        strcpy(buf3, "example.com. 3600 IN TXT ( ");
+        for (int i = 0; i < 120; i++) {
+            strcat(buf3, "\"field\" ");
+        }
+        strcat(buf3, ")\n");
+        int r3 = parse_zone_fast(buf3, strlen(buf3), &arena, &ctx);
+        if (r3 == 0) {
+            printf("FAIL: Test 3 (MAX_FIELDS exceeded) incorrectly succeeded.\n");
+            return 1;
+        }
+        if (!err.error_message || !strstr(err.error_message, "Too many fields")) {
+            printf("FAIL: Test 3 (MAX_FIELDS exceeded) bad error message: %s\n", err.error_message ? err.error_message : "NULL");
+            return 1;
+        }
+
+        printf("PASS: dns_zone_parser tests\n");
+        zone_arena_destroy(&arena);
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
