@@ -154,7 +154,11 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
     if (is_standalone) {
         if (file_path[0] == '/' || strstr(file_path, "../")) {
-            fprintf(stderr, "[WARNING] In standalone mode, absolute paths or '../' in $INCLUDE are tested using host filesystem, but will be rejected by KariDNS ECAPMODE sandbox!\n");
+            fprintf(stderr, "[WARNING] The zone file path given on the command line is absolute "
+                             "or contains '../'. This is resolved directly against the host "
+                             "filesystem in standalone karicheck, but the real server resolves "
+                             "zone 'file' paths relative to its sandboxed base directory under "
+                             "KariDNS's Capsicum sandbox — behavior may differ there.\n");
         }
     }
 
@@ -284,6 +288,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         uint8_t scratch[65535];
         uint16_t scratch_offset = 0;
         compress_ctx_t comp_ctx;
+        memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
         int wire_result = serialize_dns_record(
             scratch, sizeof(scratch), &scratch_offset,
