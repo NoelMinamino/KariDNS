@@ -50,6 +50,7 @@ trap cleanup EXIT INT TERM
 echo "=========================================="
 echo "Step 0: Build"
 echo "=========================================="
+make all >/dev/null || { log_fail "make all"; exit 1; } 
 make asan >/dev/null || { log_fail "make asan"; exit 1; }
 make tsan >/dev/null || { log_fail "make tsan"; exit 1; }
 make tools-asan >/dev/null || { log_fail "make tools-asan (karicheck-asan/dag-asan/karictl-asan)"; exit 1; }
