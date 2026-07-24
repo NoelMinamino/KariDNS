@@ -165,8 +165,10 @@ make fuzz_core >/dev/null 2>&1
 make fuzz_zone >/dev/null 2>&1
 make fuzz_conf >/dev/null 2>&1
 make fuzz_tsig >/dev/null 2>&1
+make fuzz_dag >/dev/null 2>&1
+make fuzz_tsig_verify >/dev/null 2>&1
 
-for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig; do
+for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_dag_response fuzz_tsig_verify; do
     bin="tests/fuzz/$target"
     corpus="tests/fuzz/corpus_$target"
     if [ ! -x "$bin" ]; then
