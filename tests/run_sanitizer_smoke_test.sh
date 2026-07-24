@@ -57,6 +57,17 @@ log_ok "build"
 
 echo ""
 echo "=========================================="
+echo "Step 0.5: karictl tsig-keygen"
+echo "=========================================="
+./karictl tsig-keygen smoke-test-key > tsig_keygen.log 2>&1
+if ! grep -q 'key "smoke-test-key"' tsig_keygen.log || ! grep -q "algorithm hmac-sha256" tsig_keygen.log; then
+    log_fail "karictl tsig-keygen produced unexpected output (see tsig_keygen.log)"
+else
+    log_ok "karictl tsig-keygen"
+fi
+
+echo ""
+echo "=========================================="
 echo "Step 1: Unit-level ASan/UBSan (dns_wire / dns_zone_parser / dns_config_parser)"
 echo "=========================================="
 make asan_test > unit_asan.log 2>&1
@@ -128,6 +139,31 @@ for variant in asan tsan; do
     fi
     ./dag-asan "$ZONE_NAME" A "@127.0.0.1" -p 10053 +short >/dev/null 2>&1
     ./karictl-asan -f "$CTL_CONF" reload >/dev/null 2>&1
+
+    # status/notify/retransfer/zonestatus のIPCコマンドも一通り実行しておく
+    ./karictl-asan -f "$CTL_CONF" status > "karictl_status_${variant}.log" 2>&1
+    if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" "karictl_status_${variant}.log"; then
+        log_fail "$variant karictl status (see karictl_status_${variant}.log)"
+    fi
+    if ! grep -q "version: KariDNS" "karictl_status_${variant}.log"; then
+        log_fail "$variant karictl status did not return expected output"
+        cat "karictl_status_${variant}.log"
+    fi
+
+    ./karictl-asan -f "$CTL_CONF" zonestatus "$ZONE_NAME" > "karictl_zonestatus_${variant}.log" 2>&1
+    if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" "karictl_zonestatus_${variant}.log"; then
+        log_fail "$variant karictl zonestatus (see karictl_zonestatus_${variant}.log)"
+    fi
+
+    ./karictl-asan -f "$CTL_CONF" notify "$ZONE_NAME" > "karictl_notify_${variant}.log" 2>&1
+    if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" "karictl_notify_${variant}.log"; then
+        log_fail "$variant karictl notify (see karictl_notify_${variant}.log)"
+    fi
+
+    ./karictl-asan -f "$CTL_CONF" retransfer "$ZONE_NAME" > "karictl_retransfer_${variant}.log" 2>&1
+    if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" "karictl_retransfer_${variant}.log"; then
+        log_fail "$variant karictl retransfer (see karictl_retransfer_${variant}.log)"
+    fi
     ./dag-asan "$ZONE_NAME" AXFR "@127.0.0.1" -p 10053 +tcp +short >/dev/null 2>&1 &
     PID1=$!
     ./dag-asan "$ZONE_NAME" TYPE65280 "@127.0.0.1" -p 10053 +short >/dev/null 2>&1 &
@@ -136,7 +172,7 @@ for variant in asan tsan; do
     PID3=$!
     ./dag-asan "office.$ZONE_NAME" LOC "@127.0.0.1" -p 10053 +short >/dev/null 2>&1 &
     PID4=$!
-    ./dag-asan "$ZONE_NAME" AXFR "@127.0.0.1" -p 10053 +tcp +short >/dev/null 2>&1 &
+    ./dag-asan "$ZONE_NAME" AXFR "@127.0.0.1" -p 10053 -y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +tcp +short >/dev/null 2>&1 &
     PID5=$!
     wait $PID1 $PID2 $PID3 $PID4 $PID5
     ./karictl-asan -f "$CTL_CONF" stop >/dev/null 2>&1

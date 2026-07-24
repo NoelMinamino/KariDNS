@@ -62,6 +62,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+check_asan_log() {
+    if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" server.log; then
+        echo "[FAIL] AddressSanitizer/UndefinedBehaviorSanitizer error detected in server.log:"
+        cat server.log
+        exit 1
+    fi
+}
+
+
 echo "[*] Initial query check..."
 $DAG test.dynupdate.com. TXT @127.0.0.1 -p 10053 +short > out.txt || true
 if ! grep -q "initial" out.txt; then
@@ -97,6 +106,7 @@ if ! grep -q "1.2.3.7" res.txt; then
     echo "[FAIL] Authorized UPDATE failed to add record."
     exit 1
 fi
+check_asan_log
 
 echo "[*] 4. Prerequisite Failure (NXDOMAIN)..."
 $DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "test.dynupdate.com" --update-add 'new2.dynupdate.com 300 A 2.3.4.5' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
@@ -108,6 +118,7 @@ if grep -q "2.3.4.5" res.txt; then
     echo "[FAIL] Prerequisite was ignored!"
     exit 1
 fi
+check_asan_log
 
 echo "[*] 5. Authorized UPDATE (Delete Record)..."
 $DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "new-host.example.com" --update-del 'new.dynupdate.com A' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
@@ -116,6 +127,7 @@ if grep -q "1.2.3.7" res.txt; then
     echo "[FAIL] Authorized UPDATE failed to delete record."
     exit 1
 fi
+check_asan_log
 
 echo "[*] 6. Authorized UPDATE (Add Record for ephemeral test)..."
 $DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.4' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
@@ -130,7 +142,9 @@ if grep -q "1.2.3.4" res.txt; then
     echo "[FAIL] Record persisted after reload! It should be ephemeral."
     exit 1
 fi
+check_asan_log
 
+check_asan_log
 if killall -0 karidns-asan 2>/dev/null; then
     killall -9 karidns-asan 2>/dev/null
 fi

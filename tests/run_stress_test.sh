@@ -60,6 +60,7 @@ DNSPERF_PID=$!
   i=0
   while kill -0 $DNSPERF_PID 2>/dev/null; do
     OLD_SERIAL=$((2024010100 + (i % 40)))
+    # NOTE: 意図的に外部の `dig` を使い、自作 `dag` との相互検証を行っている
     dig +tcp "@127.0.0.1" -p 10053 "$ZONE_NAME" "ixfr=$OLD_SERIAL" >/dev/null 2>&1
     i=$((i + 1))
   done

@@ -19,7 +19,18 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
 fi
 
 # 4. dagでAXFRを実行し、応答中に出現したレコードタイプを集計
-echo "Running AXFR transfer..."
+# ゾーン設定にてTSIGが必須(tsig-key "transfer-key";)となっているため、
+# まずはTSIG無しでREFUSEDされることを確認し、次にTSIGありで正常応答を得る。
+echo "Running AXFR transfer without TSIG (expect REFUSED)..."
+noauth_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 2>&1 || true)
+if ! echo "$noauth_output" | grep -qE "REFUSED|NOTAUTH"; then
+    echo "[FAIL] AXFR without TSIG was not refused! TSIG-required ACL may be broken."
+    echo "$noauth_output"
+    exit 1
+fi
+echo "[OK] AXFR without TSIG correctly refused."
+
+echo "Running AXFR transfer with TSIG..."
 axfr_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 -y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl)
 actual_types=$(echo "$axfr_output" | grep -oE '[[:space:]]IN[[:space:]]+[A-Z0-9]+[[:space:]]' | awk '{print $2}' | sort -u)
 
@@ -60,6 +71,6 @@ fi
 
 echo "[OK] Capsicum round-trip test passed: no ECAPMODE/TRAP_CAP violations, all record types present, server did not crash."
 
-if killall -0 karidns; then
+if killall -0 karidns 2>/dev/null; then
     killall -9 karidns >/dev/null
 fi
