@@ -533,7 +533,13 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     uint16_t err = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     uint16_t other_len = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     if (tsig_p + other_len > packet_len) return -1;
-    size_t pre_mac_cap = last_rr_offset + 512 + other_len;
+    
+    const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
+    size_t keyname_wire_len = wire_name_length(key->name);
+    size_t alg_wire_len = wire_name_length(alg);
+    if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
+    size_t pre_mac_cap = last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
+    
     uint8_t *pre_mac = malloc(pre_mac_cap);
     if (!pre_mac) return -1;
     memcpy(pre_mac, packet, last_rr_offset);
@@ -544,12 +550,16 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
     if (w3 < 0) { free(pre_mac); return -1; }
     p_offset += (size_t)w3;
+    
+    if (p_offset + 6 > pre_mac_cap) { free(pre_mac); return -1; }
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
-    const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
+    
     w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, alg);
     if (w3 < 0) { free(pre_mac); return -1; }
     p_offset += (size_t)w3;
+    
+    if (p_offset + 12 + other_len > pre_mac_cap) { free(pre_mac); return -1; }
     memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8); p_offset += 8;
     pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
     pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;

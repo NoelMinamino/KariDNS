@@ -796,10 +796,6 @@ static void *gc_snapshot_thread(void *arg) {
   return NULL;
 }
 
-
-
-
-
 static void free_ixfr_txn(ixfr_txn_t *txn) {
   if (!txn) return;
   zone_arena_destroy(&txn->arena);
@@ -840,6 +836,10 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
   if (!txn) return;
   memset(txn, 0, sizeof(ixfr_txn_t));
 
+  if (del_count > SIZE_MAX / sizeof(dns_record_t) || add_count > SIZE_MAX / sizeof(dns_record_t)) {
+      free(txn);
+      return;
+  }
   if (del_count > 0) {
     txn->deleted = malloc(sizeof(dns_record_t) * del_count);
     if (!txn->deleted) { free(txn); return; }
@@ -1136,6 +1136,7 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
   for (size_t i = 0; i < src->count; i++) {
     if (dst->count >= dst->records_cap) {
       size_t new_cap = dst->records_cap == 0 ? 16 : dst->records_cap * 2;
+      if (new_cap > SIZE_MAX / sizeof(dns_record_t)) break;
       dns_record_t *new_records =
           realloc(dst->records, new_cap * sizeof(dns_record_t));
       if (!new_records)
@@ -1186,6 +1187,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     if (standby->count >= standby->records_cap) {
       size_t new_cap =
           standby->records_cap == 0 ? 16 : standby->records_cap * 2;
+      if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return -1;
       dns_record_t *new_records =
           realloc(standby->records, new_cap * sizeof(dns_record_t));
       if (!new_records)

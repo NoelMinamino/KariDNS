@@ -2732,7 +2732,7 @@ int main(int argc, char **argv) {
                     for (int k = 0; k < 8; k++) qo.client_cookie[k] = (uint8_t)(k + 1);
                 }
             } else {
-                for (int k = 0; k < 8; k++) qo.client_cookie[k] = (uint8_t)(rand() & 0xFF);
+                for (int k = 0; k < 8; k++) qo.client_cookie[k] = (uint8_t)(arc4random() & 0xFF);
             }
         } else if (strcmp(argv[i], "+nocookie") == 0) {
             qo.want_cookie = false;

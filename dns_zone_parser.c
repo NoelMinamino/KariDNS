@@ -274,6 +274,14 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
 static dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf) {
     if (arena->count >= arena->records_cap) {
         size_t new_cap = arena->records_cap == 0 ? 16 : arena->records_cap * 2;
+        if (new_cap > SIZE_MAX / sizeof(dns_record_t)) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "Out of memory / Integer overflow";
+                ctx->err_out->error_offset = (size_t)(err_pos - buf);
+                ctx->err_out->token_length = 1;
+            }
+            return NULL;
+        }
         dns_record_t *new_records = realloc(arena->records, new_cap * sizeof(dns_record_t));
         if (!new_records) {
             if (ctx && ctx->err_out) {
