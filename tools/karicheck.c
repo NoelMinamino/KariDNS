@@ -179,6 +179,10 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     arena.file_bufs[0] = mutable_buf;
     arena.display_bufs[0] = (char*)buf;
     arena.file_paths[0] = strdup(file_path);
+    if (!arena.file_paths[0]) {
+        free(mutable_buf);
+        return 1;
+    }
     arena.file_buf_count = 1;
 
     parse_error_t err = {0};

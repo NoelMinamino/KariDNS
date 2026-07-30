@@ -485,10 +485,10 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
 }
 
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, uint8_t *mac_out, size_t *mac_len_out) {
-    if (!key || packet_len < 12) return -1;
+    if (!key || packet_len < DNS_HEADER_SIZE) return -1;
     uint16_t arcount = (packet[10] << 8) | packet[11];
     if (arcount == 0) return -1;
-    size_t offset = 12;
+    size_t offset = DNS_HEADER_SIZE;
     uint16_t qdcount = (packet[4] << 8) | packet[5], ancount = (packet[6] << 8) | packet[7], nscount = (packet[8] << 8) | packet[9];
     for (int i = 0; i < qdcount; i++) {
         if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
@@ -559,7 +559,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     if (w3 < 0) { free(pre_mac); return -1; }
     p_offset += (size_t)w3;
     
-    if (p_offset + 12 + other_len > pre_mac_cap) { free(pre_mac); return -1; }
+    if (p_offset + DNS_HEADER_SIZE + other_len > pre_mac_cap) { free(pre_mac); return -1; }
     memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8); p_offset += 8;
     pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
     pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
@@ -766,7 +766,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
 
-    if (offset + 12 > max_res_len) return -1; // TC bit needed
+    if (offset + DNS_HEADER_SIZE > max_res_len) return -1; // TC bit needed
 
     if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx, max_res_len) != 0) {
         return -1;
@@ -1654,7 +1654,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
     memset(edns, 0, sizeof(edns_info_t));
     edns->udp_payload_size = 512;
 
-    size_t scan_offset = 12;
+    size_t scan_offset = DNS_HEADER_SIZE;
     for (int i = 0; i < qdcount + ancount_req + nscount_req + arcount_req; i++) {
         if (scan_offset >= req_len) break;
         bool is_opt = (i >= qdcount + ancount_req + nscount_req);
@@ -1802,7 +1802,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
                              int *out_prcount, int *out_upcount) {
-    if (req_len < 12) return 1; // FORMERR
+    if (req_len < DNS_HEADER_SIZE) return 1; // FORMERR
     uint16_t zocount = (req[4] << 8) | req[5];
     uint16_t prcount = (req[6] << 8) | req[7];
     uint16_t upcount = (req[8] << 8) | req[9];
@@ -1812,7 +1812,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
 
     if (zocount != 1) return 1; // FORMERR
 
-    size_t offset = 12;
+    size_t offset = DNS_HEADER_SIZE;
     // Skip Zone Section
     char *zname;
     if (expand_wire_name(req, req_len, offset, &offset, standby, &zname) != 0) return 1;

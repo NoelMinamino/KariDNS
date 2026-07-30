@@ -46,6 +46,10 @@ char* extract_secret_from_config(const char* path) {
             if (end) {
                 *end = '\0';
                 secret = strdup(p);
+                if (!secret) {
+                    free(cfg);
+                    return NULL;
+                }
             }
         }
     }

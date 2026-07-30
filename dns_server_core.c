@@ -211,7 +211,7 @@ static uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]) 
 }
 
 static rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len) {
-  if (res_len < 12) return RRL_RESP_ERROR;
+  if (res_len < DNS_HEADER_SIZE) return RRL_RESP_ERROR;
   uint8_t rcode = res_buf[3] & 0x0F;
   uint16_t ancount = (res_buf[6] << 8) | res_buf[7];
   if (rcode == 3) return RRL_RESP_NXDOMAIN;
@@ -1171,11 +1171,11 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
                      zone_arena_t *standby, zone_arena_t *active,
                      axfr_session_t *session, const char *domain) {
-  if (packet_len < 12)
+  if (packet_len < DNS_HEADER_SIZE)
     return -1;
   uint16_t qdcount = (packet[4] << 8) | packet[5],
            ancount = (packet[6] << 8) | packet[7];
-  size_t offset = 12;
+  size_t offset = DNS_HEADER_SIZE;
   for (int i = 0; i < qdcount; i++) {
     size_t next_offset;
     if (skip_wire_name(packet, packet_len, offset, &next_offset) != 0)
@@ -1649,7 +1649,7 @@ static void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *
 }
 
 static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount) {
-    size_t offset = 12;
+    size_t offset = DNS_HEADER_SIZE;
     for (int k = 0; k < qdcount; k++) {
         while (offset < len) {
             uint8_t l = pkt[offset];
@@ -1770,7 +1770,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  if (req_len < 12) {
+  if (req_len < DNS_HEADER_SIZE) {
     return -1;
   }
   
@@ -1783,11 +1783,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   memset(&edns, 0, sizeof(edns));
   edns.present = false;
   if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
-    memcpy(res, req, 12);
+    memcpy(res, req, DNS_HEADER_SIZE);
     res[2] |= 0x80;
     res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
     memset(&res[4], 0, 8); // qdcount, ancount, nscount, arcount = 0
-    return 12;
+    return DNS_HEADER_SIZE;
   }
   edns.ede_count = 0; // 反射防止
 
@@ -1865,7 +1865,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[3] &= 0xF0; // NOERROR
     res[6] = 0; res[7] = 0; // ANCOUNT=0
     res[8] = 0; res[9] = 0; // NSCOUNT=0
-    uint16_t offset0 = 12;
+    uint16_t offset0 = DNS_HEADER_SIZE;
     uint16_t arcount0 = 0;
     if (edns.present) {
       if (edns.has_cookie) {
@@ -1999,9 +1999,9 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[11] = arcount & 0xFF;
     
     if (matched_key) {
-      size_t copy_len = offset;
-      tsig_sign_packet(res, &copy_len, max_res_len, matched_key, 0, tsig_mac, &tsig_mac_len, false);
-      offset = copy_len;
+      size_t sign_len = offset;
+      tsig_sign_packet(res, &sign_len, max_res_len, matched_key, 0, tsig_mac, &tsig_mac_len, false);
+      offset = sign_len;
     }
     return offset;
   }
@@ -2060,20 +2060,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       }
   }
 
-  size_t q_offset = 12;
-  while (q_offset < req_len) {
-    uint8_t len = req[q_offset];
-    if (len == 0) {
-      q_offset++;
-      break;
-    }
-    if ((len & 0xC0) == 0xC0) {
-      q_offset += 2;
-      break;
-    }
-    if (q_offset + len + 1 > req_len) return -1;
-    q_offset += len + 1;
-  }
+  size_t q_offset = DNS_HEADER_SIZE;
+  if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) return -1;
   if (q_offset + 4 > req_len) {
     if (current_zone)
       atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
@@ -2251,7 +2239,7 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[9] = 0x00;
     axfr_req[10] = 0x00;
     axfr_req[11] = 0x00;
-    axfr_req[12] = 0x00;
+    axfr_req[DNS_HEADER_SIZE] = 0x00;
     axfr_req[13] = 0x01;
     req_len = 14;
     const char *d = ctx->domain;
@@ -2357,7 +2345,7 @@ void send_notify_to_all(const char *domain) {
     return;
 
   uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
-  memset(req, 0, 12);
+  memset(req, 0, DNS_HEADER_SIZE);
   uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
   req[0] = id >> 8;
   req[1] = id & 0xFF;
@@ -2365,7 +2353,7 @@ void send_notify_to_all(const char *domain) {
   req[3] = 0;
   req[4] = 0;
   req[5] = 1;
-  size_t offset = 12;
+  size_t offset = DNS_HEADER_SIZE;
   long w = write_uncompressed_name(req, offset, sizeof(req), domain);
   if (w > 0) offset += (size_t)w;
   req[offset++] = 0;
@@ -2563,8 +2551,8 @@ void *response_logger_thread_func(void *arg) {
 
                 // 2. クラスとタイプの文字列化
                 char class_str[16];
-                if (entry->qclass == 1) strcpy(class_str, "IN");
-                else if (entry->qclass == 255) strcpy(class_str, "ANY");
+                if (entry->qclass == 1) snprintf(class_str, sizeof(class_str), "IN");
+                else if (entry->qclass == 255) snprintf(class_str, sizeof(class_str), "ANY");
                 else snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
                 
                 char type_str[32];
@@ -2629,9 +2617,9 @@ static void write_query_log(const char *client_ip, int client_port,
   }
   char class_str[16];
   if (qclass == 1)
-    strcpy(class_str, "IN");
+    snprintf(class_str, sizeof(class_str), "IN");
   else if (qclass == 255)
-    strcpy(class_str, "ANY");
+    snprintf(class_str, sizeof(class_str), "ANY");
   else
     snprintf(class_str, sizeof(class_str), "CLASS%d", qclass);
   char type_str[32];
@@ -2732,23 +2720,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                               memory_order_release);
     return;
   }
-  size_t q_offset = 12;
-  while (q_offset < req_len) {
-    uint8_t len = req[q_offset];
-    if (len == 0) {
-      q_offset++;
-      break;
-    }
-    if ((len & 0xC0) == 0xC0) {
-      q_offset += 2;
-      break;
-    }
-    if (q_offset + len + 1 > req_len) {
+  size_t q_offset = DNS_HEADER_SIZE;
+  if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) {
       free(res);
       atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
       return;
-    }
-    q_offset += len + 1;
   }
   if (q_offset + 4 > req_len) {
     q_offset = req_len;
@@ -3168,8 +3144,8 @@ worker_startup_success:;
 
           char qname[256] = "";
           uint16_t qtype = 0;
-          if (payload_received > 12) {
-            size_t offset = 12;
+          if (payload_received > DNS_HEADER_SIZE) {
+            size_t offset = DNS_HEADER_SIZE;
             size_t recv_len = (size_t)payload_received;
             size_t written = 0;
             while (offset < recv_len) {
@@ -3215,9 +3191,9 @@ worker_startup_success:;
           uint16_t qclass = 1;
           bool has_edns = false;
           bool dnssec_ok = false;
-          size_t question_end = 12; // default fallback
-          if (payload_received > 12) {
-            size_t offset = 12;
+          size_t question_end = DNS_HEADER_SIZE; // default fallback
+          if (payload_received > DNS_HEADER_SIZE) {
+            size_t offset = DNS_HEADER_SIZE;
             while (offset < (size_t)payload_received) {
               uint8_t len = req_buf[offset];
               if (len == 0 || (len & 0xC0) == 0xC0) {
@@ -3232,7 +3208,7 @@ worker_startup_success:;
               qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
             uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
             if (arcount > 0) {
-              size_t o = 12;
+              size_t o = DNS_HEADER_SIZE;
               uint16_t qd = (req_buf[4] << 8) | req_buf[5];
               uint16_t an = (req_buf[6] << 8) | req_buf[7];
               uint16_t ns = (req_buf[8] << 8) | req_buf[9];
@@ -3384,8 +3360,8 @@ worker_startup_success:;
           kevent(kq, &ev_del, 1, NULL, 0, NULL);
           char qname[256] = "";
           uint16_t qtype = 0;
-          if (msg_len > 12) {
-            size_t offset = 12;
+          if (msg_len > DNS_HEADER_SIZE) {
+            size_t offset = DNS_HEADER_SIZE;
             size_t written = 0;
             while (offset < msg_len) {
               uint8_t len = msg[offset];
@@ -3432,8 +3408,8 @@ worker_startup_success:;
           edns_info_t edns;
           memset(&edns, 0, sizeof(edns));
           edns.present = false;
-          if (msg_len >= 12) {
-            size_t offset = 12;
+          if (msg_len >= DNS_HEADER_SIZE) {
+            size_t offset = DNS_HEADER_SIZE;
             while (offset < msg_len) {
               uint8_t len = msg[offset];
               if (len == 0 || (len & 0xC0) == 0xC0) {

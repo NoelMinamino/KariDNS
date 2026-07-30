@@ -87,6 +87,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
       str_len = 4096;
     tok.type = TOKEN_STRING;
     tok.value = malloc(str_len + 1);
+    if (!tok.value) return tok;
     memcpy(tok.value, &ctx->src[start], str_len);
     tok.value[str_len] = '\0';
     if (ctx->pos < ctx->len && ctx->src[ctx->pos] == '"')
@@ -113,6 +114,7 @@ conf_token_t get_next_token(token_ctx_t *ctx) {
     str_len = 4096;
   tok.type = TOKEN_STRING;
   tok.value = malloc(str_len + 1);
+    if (!tok.value) return tok;
   memcpy(tok.value, &ctx->src[start], str_len);
   tok.value[str_len] = '\0';
   return tok;
