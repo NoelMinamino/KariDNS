@@ -205,6 +205,7 @@ make fuzz_tsig >/dev/null 2>&1
 make fuzz_dag >/dev/null 2>&1
 make fuzz_tsig_verify >/dev/null 2>&1
 
+pids=""
 for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_dag_response fuzz_tsig_verify; do
     bin="tests/fuzz/$target"
     corpus="tests/fuzz/corpus_$target"
@@ -213,7 +214,14 @@ for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_pars
         continue
     fi
     mkdir -p "$corpus"
-    "$bin" -max_total_time="$FUZZ_SMOKE_SECONDS" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1
+    "$bin" -max_total_time="$FUZZ_SMOKE_SECONDS" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+    pids="$pids $target:$!"
+done
+
+for tp in $pids; do
+    target="${tp%%:*}"
+    pid="${tp##*:}"
+    wait $pid
     if [ $? -ne 0 ]; then
         log_fail "$target (see fuzz_${target}.log)"
         tail -n 40 "fuzz_${target}.log"
