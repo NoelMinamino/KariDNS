@@ -822,7 +822,7 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
   if (old_serial == 0 || new_serial == 0) return;
   if ((int32_t)(new_serial - old_serial) <= 0) return;
 
-  int del_count = 0, add_count = 0;
+  size_t del_count = 0, add_count = 0;
   for (size_t i = 0; i < old_arena->count; i++) {
     if (!record_exists_in_arena(new_arena, &old_arena->records[i])) del_count++;
   }
@@ -1836,7 +1836,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     return offset;
   }
 
-  if (qdcount != 1) {
+  // RFC 9619: OPCODE=0(QUERY) allows QDCOUNT 0 or 1; only QDCOUNT>1 is FORMERR.
+  // OPCODE=4(NOTIFY)/5(UPDATE) still require QDCOUNT==1.
+  bool qdcount_invalid = (opcode == 0) ? (qdcount > 1) : (qdcount != 1);
+  if (qdcount_invalid) {
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
@@ -1852,6 +1855,29 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[10] = arcount >> 8;
     res[11] = arcount & 0xFF;
     return offset;
+  }
+
+  // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.
+  if (opcode == 0 && qdcount == 0) {
+    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+    memcpy(res, req, copy_len);
+    res[2] |= 0x80; // QR=1
+    res[3] &= 0xF0; // NOERROR
+    res[6] = 0; res[7] = 0; // ANCOUNT=0
+    res[8] = 0; res[9] = 0; // NSCOUNT=0
+    uint16_t offset0 = 12;
+    uint16_t arcount0 = 0;
+    if (edns.present) {
+      if (edns.has_cookie) {
+        // Refresh server cookie for cookie-only probes (RFC 7873 §5.4)
+        edns.server_cookie_len = 16;
+        generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL));
+      }
+      assemble_edns_opt(res, max_res_len, &offset0, &arcount0, &edns, 0);
+    }
+    res[10] = arcount0 >> 8;
+    res[11] = arcount0 & 0xFF;
+    return offset0;
   }
 
   if (opcode == 4) { // NOTIFY

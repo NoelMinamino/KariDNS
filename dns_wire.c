@@ -1428,6 +1428,31 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 break;
             }
+
+            case 66: { // DSYNC (RFC 9859)
+                if (rec->rdata_count < 4) return -1;
+                uint16_t notify_rrtype = get_type_code(rec->rdata[0]);
+                if (notify_rrtype == 0) return -1; // unknown RRtype mnemonic
+
+                uint8_t scheme;
+                if (strcasecmp(rec->rdata[1], "NOTIFY") == 0) {
+                    scheme = 1;
+                } else {
+                    scheme = (uint8_t)atoi(rec->rdata[1]);
+                }
+
+                uint16_t port = (uint16_t)atoi(rec->rdata[2]);
+
+                if (offset + 5 > max_res_len) return -1;
+                res[offset++] = notify_rrtype >> 8; res[offset++] = notify_rrtype & 0xFF;
+                res[offset++] = scheme;
+                res[offset++] = port >> 8; res[offset++] = port & 0xFF;
+
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                if (w < 0) return -1;
+                offset += w;
+                break;
+            }
             case 13: { // HINFO
                 if (rec->rdata_count < 2) return -1;
                 if (write_char_string(res, max_res_len, &offset, rec->rdata[0]) != 0) return -1;

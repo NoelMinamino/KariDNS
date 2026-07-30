@@ -53,6 +53,8 @@ uint16_t get_type_code(const char *type_str) {
       return 259;
     if (strcmp(type_str, "DLV") == 0)
       return 32769;
+    if (strcmp(type_str, "DSYNC") == 0)
+      return 66;
     break;
   case 'E':
     if (strcmp(type_str, "EID") == 0)
@@ -131,6 +133,8 @@ uint16_t get_type_code(const char *type_str) {
       return 30;
     if (strcmp(type_str, "NIMLOC") == 0)
       return 32;
+    if (strcmp(type_str, "NXNAME") == 0)
+      return 128;
     if (strcmp(type_str, "NAPTR") == 0)
       return 35;
     if (strcmp(type_str, "NSEC") == 0)
@@ -288,7 +292,9 @@ static const type_name_entry_t TYPE_NAMES[] = {
     {63, "ZONEMD"},
     {64, "SVCB"},
     {65, "HTTPS"},
+    {66, "DSYNC"},
     {99, "SPF"},
+    {128, "NXNAME"},
     {104, "NID"},
     {105, "L32"},
     {106, "L64"},

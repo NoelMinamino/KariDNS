@@ -284,6 +284,21 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
             }
         }
 
+        // NXNAME (128, RFC 9824) is a Meta-Type: must NOT appear as standalone RRset.
+        if (tcode == 128) {
+            fprintf(stderr, "[ERROR] NXNAME (128) is a meta-type (RFC 9824) and must not appear "
+                    "as a standalone RRset in zone '%s' (name '%s')\n", domain, arena.records[i].name);
+            error_found = true;
+        }
+
+        // DSYNC (66, RFC 9859): validate RRtype mnemonic
+        if (tcode == 66 && rcount >= 1) {
+            if (get_type_code(rdata[0]) == 0) {
+                fprintf(stderr, "[WARNING] DSYNC record has unknown RRtype mnemonic '%s' for name '%s'\n",
+                        rdata[0], arena.records[i].name);
+            }
+        }
+
         // --- Dry-run serialize_dns_record ---
         uint8_t scratch[65535];
         uint16_t scratch_offset = 0;
