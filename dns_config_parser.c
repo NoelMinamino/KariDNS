@@ -521,6 +521,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->user = NULL;
   config->group = NULL;
   config->send_extended_errors = true;
+  config->minimal_responses = false;
   zone_config_t *last_zone = NULL;
   while (1) {
     conf_token_t tok = get_next_token(&ctx);
@@ -622,6 +623,25 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             config->send_extended_errors = true;
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->send_extended_errors = false;
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "minimal-responses") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->minimal_responses = true;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->minimal_responses = false;
           free_token(&tok);
           tok = get_next_token(&ctx);
           if (tok.type != TOKEN_SEMICOLON) {

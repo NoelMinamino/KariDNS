@@ -1320,6 +1320,34 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   }
 }
 
+static bool append_glue_records(zone_arena_t *current_zone, const char *target,
+                                const char *zone_apex, uint8_t *res,
+                                size_t max_res_len, uint16_t *offset,
+                                compress_ctx_t *comp_ctx, uint16_t *arcount) {
+  size_t t_len = strlen(target), a_len = strlen(zone_apex);
+  if (t_len >= a_len &&
+      strcasecmp(target + t_len - a_len, zone_apex) == 0 &&
+      (t_len == a_len || target[t_len - a_len - 1] == '.')) {
+    uint32_t tgt_hash = calc_fnv1a_str(target);
+    size_t tgt_idx = tgt_hash & (current_zone->hash_size - 1);
+    for (int j = current_zone->hash_table[tgt_idx]; j != -1;
+         j = current_zone->records[j].next_record) {
+      if ((current_zone->records[j].type_code == 1 ||
+           current_zone->records[j].type_code == 28) &&
+          strcasecmp(current_zone->records[j].name, target) == 0) {
+        if (serialize_dns_record(res, max_res_len, offset,
+                                 &current_zone->records[j], comp_ctx,
+                                 NULL, 0xFFFFFFFF) < 0) {
+          res[2] |= 0x02;
+          return false;
+        } else
+          (*arcount)++;
+      }
+    }
+  }
+  return true;
+}
+
 static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             const char *zone_apex, uint8_t *res,
                             size_t max_res_len, uint16_t *offset,
@@ -1355,26 +1383,9 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
             strcasecmp(current_zone->records[i].name, name) == 0 &&
             current_zone->records[i].rdata_count > 0) {
           const char *target = current_zone->records[i].rdata[0];
-          size_t t_len = strlen(target), a_len = strlen(zone_apex);
-          if (t_len >= a_len &&
-              strcasecmp(target + t_len - a_len, zone_apex) == 0 &&
-              (t_len == a_len || target[t_len - a_len - 1] == '.')) {
-            uint32_t tgt_hash = calc_fnv1a_str(target);
-            size_t tgt_idx = tgt_hash & (current_zone->hash_size - 1);
-            for (int j = current_zone->hash_table[tgt_idx]; j != -1;
-                 j = current_zone->records[j].next_record) {
-              if ((current_zone->records[j].type_code == 1 ||
-                   current_zone->records[j].type_code == 28) &&
-                  strcasecmp(current_zone->records[j].name, target) == 0) {
-                if (serialize_dns_record(res, max_res_len, offset,
-                                         &current_zone->records[j], comp_ctx,
-                                         NULL, 0xFFFFFFFF) < 0) {
-                  res[2] |= 0x02;
-                  return true;
-                } else
-                  (*arcount)++;
-              }
-            }
+          if (!append_glue_records(current_zone, target, zone_apex, res,
+                                   max_res_len, offset, comp_ctx, arcount)) {
+            return true;
           }
         }
       }
@@ -1392,7 +1403,8 @@ static void resolve_name(const char *qname, uint16_t qtype,
                          zone_arena_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
-                         uint16_t *nscount, uint16_t *arcount) {
+                         uint16_t *nscount, uint16_t *arcount,
+                         bool minimal_responses) {
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
   current_qname[255] = '\0';
@@ -1576,6 +1588,30 @@ static void resolve_name(const char *qname, uint16_t qtype,
           } else
             (*nscount)++;
           break;
+        }
+      }
+    } else if (!minimal_responses && qtype != 2 && qtype != 255) {
+      uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
+      size_t apex_idx = apex_hash & (current_zone->hash_size - 1);
+      for (int i = current_zone->hash_table[apex_idx]; i != -1;
+           i = current_zone->records[i].next_record) {
+        dns_record_t *rec = &current_zone->records[i];
+        if (rec->type_code == 2 &&
+            strcasecmp(rec->name, db_entry->domain) == 0) {
+          if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                                   NULL, 0xFFFFFFFF) < 0) {
+            res[2] |= 0x02;
+            return;
+          } else {
+            (*nscount)++;
+            if (rec->rdata_count > 0) {
+              const char *target = rec->rdata[0];
+              if (!append_glue_records(current_zone, target, db_entry->domain, res,
+                                       max_res_len, offset, comp_ctx, arcount)) {
+                return;
+              }
+            }
+          }
         }
       }
     }
@@ -2163,7 +2199,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   resolve_name(current_qname, qtype, &db_entry, &current_zone, res, max_res_len,
-               &offset, comp_ctx, &ancount, &nscount, &arcount);
+               &offset, comp_ctx, &ancount, &nscount, &arcount,
+               cfg_for_ede ? cfg_for_ede->minimal_responses : false);
 
   if (edns.present) {
     assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);

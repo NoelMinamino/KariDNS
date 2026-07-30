@@ -90,6 +90,7 @@ typedef struct {
   control_channel_config_t control;
   rate_limit_config_t rrl;
   bool send_extended_errors;
+  bool minimal_responses;
 } server_config_t;
 
 typedef enum {
