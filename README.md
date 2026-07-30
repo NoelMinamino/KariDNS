@@ -5,32 +5,32 @@
 [![Platform: FreeBSD](https://img.shields.io/badge/Platform-FreeBSD-red.svg)](https://www.freebsd.org/)
 [![Build CI](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml/badge.svg)](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml)
 
-KariDNS is a high-performance, lightweight, and modern authoritative DNS server designed specifically for FreeBSD. It focuses on extreme concurrency and low-latency query processing by leveraging advanced system-level features.
+KariDNS is an authoritative DNS server for FreeBSD. It uses system-level features for concurrency and query processing.
 
 ## Key Features
 
-- **Kqueue-based Event Loop:** Highly optimized asynchronous I/O using FreeBSD's native `kqueue`, ensuring scalable handling of thousands of concurrent TCP and UDP connections.
-- **Arena-based Memory Management:** Zero-allocation in the hot path. Zone data is loaded into memory arenas, minimizing fragmentation and providing lightning-fast memory access during query resolution.
-- **RCU (Read-Copy-Update) Architecture:** Lock-free, concurrent data structure swaps. Configuration and zone files can be hot-reloaded instantly without dropping a single query or blocking worker threads.
+- **Kqueue-based Event Loop:** Asynchronous I/O using FreeBSD's native `kqueue` for TCP and UDP connections.
+- **Arena-based Memory Management:** Zone data is loaded into memory arenas, avoiding dynamic allocation during query resolution.
+- **RCU (Read-Copy-Update) Architecture:** Lock-free concurrent data structure swaps. Configuration and zone files can be reloaded without blocking worker threads.
 - **Master/Slave Support:** Built-in support for AXFR (Authoritative Zone Transfer), handling both master (sending) and slave (receiving) roles concurrently with background workers.
 - **Security & Reliability:**
-- **Advanced Capsicum Sandboxing & Dual-Process Architecture:** 
-  - KariDNS adopts a strictly isolated two-process model (Frontend Router and Backend Workers). The Frontend binds privileged ports and routes UDP traffic while remaining outside the sandbox. The Backend drops privileges, enters the Capsicum sandbox (`cap_enter()`), and securely processes DNS logic without any filesystem or network socket creation rights.
+- **Capsicum Sandboxing & Dual-Process Architecture:** 
+  - KariDNS adopts a two-process model (Frontend Router and Backend Workers). The Frontend binds privileged ports and routes UDP traffic while remaining outside the sandbox. The Backend drops privileges, enters the Capsicum sandbox (`cap_enter()`), and processes DNS logic without any filesystem or network socket creation rights.
   - Configuration reloading inside the sandbox is achieved safely using pre-opened directory file descriptors (`openat`/`renameat`).
-- **Robust TSIG (Transaction Signature):** Verification for zone transfers and NOTIFY messages.
+- **TSIG (Transaction Signature):** Verification for zone transfers and NOTIFY messages.
 - **DNS Cookies (RFC 7873/9018):** Mitigates IP spoofing and amplification attacks by issuing and verifying client/server cookies.
-- **Extended DNS Errors (EDE, RFC 8914):** Provides enhanced troubleshooting by returning specific error codes (e.g., Not Authoritative, Unsupported DNSKEY Algorithm, DNSSEC Bogus) when appropriate.
+- **Extended DNS Errors (EDE, RFC 8914):** Returns specific error codes (e.g., Not Authoritative, Unsupported DNSKEY Algorithm, DNSSEC Bogus) when appropriate.
 - **Privilege Dropping:** Supports `user` / `group` directives to run with least privilege.
 - **RRL (Response Rate Limiting):** Protects against DNS reflection and amplification attacks with BIND9-compatible configuration, precise response classification, CIDR aggregations, and `slip` (truncation) fallback logic.
 - **BIND-compatible Query Logging:** Thread-safe query logging with automatic rotation by size or date.
-- **RNDC-style Control Channel (`karictl`):** Secure local administration using a UNIX domain socket and HMAC-SHA256 challenge-response authentication.
+- **RNDC-style Control Channel (`karictl`):** Local administration using a UNIX domain socket and HMAC-SHA256 authentication.
 
 
 ## Supported Record Types
 
 Record types supported for parsing zone files and serializing them to wire format:
 
-`A`, `AAAA`, `NS`, `CNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `DNAME`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `X25`, `ISDN`, `NSAP`, `GPOS`, `NID`, `L32`, `L64`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `NAPTR`, `NSEC3PARAM`, `HTTPS`, `SVCB`, `OPENPGPKEY`, `DHCID`, `EUI48`, `EUI64`, `ZONEMD`, `CSYNC`, `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `IPSECKEY`, `AMTRELAY`, `AVC`
+`A`, `AAAA`, `NS`, `CNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `DNAME`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `X25`, `ISDN`, `NSAP`, `GPOS`, `NID`, `L32`, `L64`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `NAPTR`, `NSEC3PARAM`, `HTTPS`, `SVCB`, `OPENPGPKEY`, `DHCID`, `EUI48`, `EUI64`, `ZONEMD`, `CSYNC`, `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `IPSECKEY`, `AMTRELAY`, `AVC`, `DSYNC`, `NXNAME`
 
 DNSSEC signature validation and dynamic updates (RFC 2136) are not supported.
 
@@ -140,7 +140,7 @@ key "karictl" {
 
 ## Logging
 
-KariDNS provides thread-safe, high-performance logging capabilities that are compatible with BIND9 formats. Logging is entirely asynchronous and utilizes a lock-free Multi-Producer Single-Consumer (MPSC) ring buffer to ensure the hot path (query processing) is never blocked.
+KariDNS provides thread-safe logging capabilities compatible with BIND9 formats. Logging is asynchronous and utilizes a lock-free Multi-Producer Single-Consumer (MPSC) ring buffer to avoid blocking query processing.
 
 You can configure separate channels for `queries` and `responses`, and apply them in your configuration.
 
@@ -166,7 +166,7 @@ logging {
 ```
 
 - **Query Logging (`category queries`)**: Logs incoming DNS requests.
-- **Response Logging (`category responses`)**: Logs the exact responses generated by the server, including RCODEs, EDNS statuses, and DNSSEC validation results, without degrading query throughput.
+- **Response Logging (`category responses`)**: Logs the exact responses generated by the server, including RCODEs, EDNS statuses, and DNSSEC validation results.
 
 Both file size (`size`) and date-based rotation (`suffix-timestamp`) are supported.
 
