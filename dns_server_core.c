@@ -1320,6 +1320,44 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   }
 }
 
+static bool attach_covering_rrsig(zone_arena_t *zone, size_t hash_idx,
+                                  const char *match_name,
+                                  const char *owner_name_override,
+                                  uint16_t type_covered, uint8_t *res,
+                                  size_t max_res_len, uint16_t *offset,
+                                  compress_ctx_t *comp_ctx, uint16_t *count) {
+  for (int i = zone->hash_table[hash_idx]; i != -1;
+       i = zone->records[i].next_record) {
+    dns_record_t *rec = &zone->records[i];
+    if (rec->type_code != 46 /* RRSIG */ ||
+        strcasecmp(rec->name, match_name) != 0)
+      continue;
+    if (rec->rdata_count < 9) // Type Covered..Signatureまでの必須フィールド数
+      continue; // 壊れたRRSIGは無視してスキップ(致命的にしない)
+    if (get_type_code(rec->rdata[0]) != type_covered)
+      continue;
+    if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                             owner_name_override, 0xFFFFFFFF) < 0)
+      return false; // バッファ溢れのみ呼び出し元に伝える
+    (*count)++;
+    // 鍵ロールオーバー中は同一タイプに複数のRRSIGが存在し得るためbreakしない
+  }
+  return true;
+}
+
+static bool zone_uses_nsec3(zone_arena_t *zone, const char *apex_name) {
+  uint32_t apex_hash = calc_fnv1a_str(apex_name);
+  size_t apex_idx = apex_hash & (zone->hash_size - 1);
+  for (int i = zone->hash_table[apex_idx]; i != -1;
+       i = zone->records[i].next_record) {
+    dns_record_t *rec = &zone->records[i];
+    if (rec->type_code == 51 /* NSEC3PARAM */ &&
+        strcasecmp(rec->name, apex_name) == 0)
+      return true;
+  }
+  return false;
+}
+
 static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 const char *zone_apex, uint8_t *res,
                                 size_t max_res_len, uint16_t *offset,
@@ -1472,6 +1510,13 @@ static void resolve_name(const char *qname, uint16_t qtype,
             return;
           } else
             (*ancount)++;
+          if (dnssec_ok) {
+            if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 5,
+                                      res, max_res_len, offset, comp_ctx, ancount)) {
+              res[2] |= 0x02;
+              return;
+            }
+          }
           if (rec->rdata_count > 0) {
             strncpy(current_qname, rec->rdata[0], sizeof(current_qname));
             current_qname[255] = '\0';
@@ -1486,6 +1531,13 @@ static void resolve_name(const char *qname, uint16_t qtype,
             return;
           }
           (*ancount)++;
+          if (dnssec_ok && qtype != 255) {
+            if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
+                                      res, max_res_len, offset, comp_ctx, ancount)) {
+              res[2] |= 0x02;
+              return;
+            }
+          }
         }
       }
     }
@@ -1514,6 +1566,13 @@ static void resolve_name(const char *qname, uint16_t qtype,
                 return;
               } else
                 (*ancount)++;
+              if (dnssec_ok) {
+                if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, 5,
+                                          res, max_res_len, offset, comp_ctx, ancount)) {
+                  res[2] |= 0x02;
+                  return;
+                }
+              }
               if (rec->rdata_count > 0) {
                 strncpy(current_qname, rec->rdata[0], sizeof(current_qname));
                 current_qname[255] = '\0';
@@ -1528,6 +1587,13 @@ static void resolve_name(const char *qname, uint16_t qtype,
                 return;
               } else
                 (*ancount)++;
+              if (dnssec_ok && qtype != 255) {
+                if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
+                                          res, max_res_len, offset, comp_ctx, ancount)) {
+                  res[2] |= 0x02;
+                  return;
+                }
+              }
             }
           }
         }
@@ -1624,6 +1690,28 @@ static void resolve_name(const char *qname, uint16_t qtype,
           } else
             (*nscount)++;
           break;
+        }
+      }
+      if (found && dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
+        for (int i = current_zone->hash_table[idx]; i != -1;
+             i = current_zone->records[i].next_record) {
+          dns_record_t *rec = &current_zone->records[i];
+          if (rec->type_code == 47 /* NSEC */ &&
+              strcasecmp(rec->name, current_qname) == 0) {
+            if (rec->rdata_count < 1) break; // 壊れたNSECは無視
+            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                                     NULL, 0xFFFFFFFF) < 0) {
+              res[2] |= 0x02;
+              return;
+            }
+            (*nscount)++;
+            if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 47,
+                                       res, max_res_len, offset, comp_ctx, nscount)) {
+              res[2] |= 0x02;
+              return;
+            }
+            break;
+          }
         }
       }
     } else if (!minimal_responses && qtype != 2 && qtype != 255) {
