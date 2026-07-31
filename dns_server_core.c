@@ -2166,13 +2166,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   *res_ancount = 0;
   *res_nscount = 0;
   *res_arcount = 0;
-  if (!is_tcp && qtype == 255) {
-    res[2] |= 0x02;
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                memory_order_release);
-    return q_offset;
-  }
   if (!current_zone) {
     res[3] |= 5;
     add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not authoritative for the queried zone");
