@@ -1404,7 +1404,8 @@ static void resolve_name(const char *qname, uint16_t qtype,
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
-                         bool minimal_responses) {
+                         bool minimal_responses,
+                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok) {
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
   current_qname[255] = '\0';
@@ -1423,6 +1424,41 @@ static void resolve_name(const char *qname, uint16_t qtype,
     bool found = false, type_matched = false, cname_followed = false;
     uint32_t hash = calc_fnv1a_str(current_qname);
     size_t idx = hash & (current_zone->hash_size - 1);
+    if (qtype == 255 && minimal_any) {
+      bool name_exists = false, has_cname = false, has_rrsig = false;
+      for (int i = current_zone->hash_table[idx]; i != -1;
+           i = current_zone->records[i].next_record) {
+        dns_record_t *rec = &current_zone->records[i];
+        if (strcasecmp(rec->name, current_qname) == 0) {
+          name_exists = true;
+          if (rec->type_code == 5) has_cname = true;   // CNAME
+          if (rec->type_code == 46) has_rrsig = true;  // RRSIG
+        }
+      }
+      bool skip_synthesis = dnssec_ok && has_rrsig;
+      if (name_exists && !has_cname && !skip_synthesis) {
+        dns_record_t hinfo_rec;
+        memset(&hinfo_rec, 0, sizeof(hinfo_rec));
+        hinfo_rec.name = (char *)current_qname;
+        hinfo_rec.type_code = 13; // HINFO
+        char ttl_str[32];
+        snprintf(ttl_str, sizeof(ttl_str), "%u", minimal_any_ttl);
+        hinfo_rec.ttl = ttl_str;
+        hinfo_rec.rdata[0] = "RFC8482";
+        hinfo_rec.rdata[1] = "";
+        hinfo_rec.rdata_count = 2;
+        if (serialize_dns_record(res, max_res_len, offset, &hinfo_rec, comp_ctx,
+                                 NULL, 0xFFFFFFFF) < 0) {
+          res[2] |= 0x02;
+          return;
+        }
+        (*ancount)++;
+        found = true;
+        chain_exhausted = false;
+        break;
+      }
+    }
+
     for (int i = current_zone->hash_table[idx]; i != -1;
          i = current_zone->records[i].next_record) {
       dns_record_t *rec = &current_zone->records[i];
@@ -2193,7 +2229,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   resolve_name(current_qname, qtype, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
-               cfg_for_ede ? cfg_for_ede->minimal_responses : false);
+               cfg_for_ede ? cfg_for_ede->minimal_responses : false,
+               cfg_for_ede ? cfg_for_ede->minimal_any : false,
+               cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
+               edns.dnssec_ok);
 
   if (edns.present) {
     assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);

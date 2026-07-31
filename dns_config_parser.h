@@ -91,6 +91,8 @@ typedef struct {
   rate_limit_config_t rrl;
   bool send_extended_errors;
   bool minimal_responses;
+  bool minimal_any;
+  uint32_t minimal_any_ttl;
 } server_config_t;
 
 typedef enum {
