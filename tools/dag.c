@@ -123,7 +123,7 @@ static bool resolve_qtype(const char *s, uint16_t *out_type) {
         {"DNSKEY", 48}, {"DHCID", 49}, {"NSEC3", 50}, {"NSEC3PARAM", 51},
         {"TLSA", 52}, {"SMIMEA", 53}, {"HIP", 55}, {"CDS", 59}, {"CDNSKEY", 60},
         {"OPENPGPKEY", 61}, {"CSYNC", 62}, {"ZONEMD", 63}, {"SVCB", 64},
-        {"HTTPS", 65}, {"DSYNC", 66}, {"NXNAME", 128}, {"DSYNC", 66}, {"NXNAME", 128}, {"SPF", 99}, {"NID", 104}, {"L32", 105}, {"L64", 106},
+        {"HTTPS", 65}, {"DSYNC", 66}, {"NXNAME", 128}, {"SPF", 99}, {"NID", 104}, {"L32", 105}, {"L64", 106},
         {"LP", 107}, {"EUI48", 108}, {"EUI64", 109}, {"TKEY", 249}, {"TSIG", 250},
         {"IXFR", 251}, {"AXFR", 252}, {"MAILB", 253}, {"MAILA", 254}, {"ANY", 255},
         {"URI", 256}, {"CAA", 257}, {"AVC", 258}, {"DOA", 259}, {"AMTRELAY", 260},
