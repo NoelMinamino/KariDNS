@@ -375,6 +375,7 @@ typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL } update_op_kind_t;
 #define MAX_UPDATE_OPS 16
 
 typedef struct {
+    uint16_t qclass;
     bool want_opt;
     uint16_t udp_payload_size;
     bool dnssec_ok;
@@ -607,7 +608,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
             return 0;
         }
         pkt[offset++] = qtype >> 8; pkt[offset++] = qtype & 0xFF;
-        pkt[offset++] = 0x00; pkt[offset++] = 0x01;
+        pkt[offset++] = qo->qclass >> 8; pkt[offset++] = qo->qclass & 0xFF;
     }
 
     if (qo->is_ixfr) {
@@ -1874,6 +1875,19 @@ static uint32_t calculate_packet_semantic_hash(const uint8_t *pkt, size_t pkt_le
     return total_hash;
 }
 
+static const char *format_class_name(uint16_t klass, char *buf, size_t buf_size) {
+    switch (klass) {
+        case 1: return "IN";
+        case 3: return "CH";
+        case 4: return "HS";
+        case 254: return "NONE";
+        case 255: return "ANY";
+        default:
+            snprintf(buf, buf_size, "CLASS%u", klass);
+            return buf;
+    }
+}
+
 static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state) {
     char *name = NULL; size_t next;
     if (expand_wire_name(pkt, pkt_len, *offset, &next, &g_dag_arena, &name) != 0) return false;
@@ -1898,7 +1912,8 @@ static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axf
     }
 
     const char *tname = format_type_name(type, tname_buf, sizeof(tname_buf));
-    const char *cname = (klass == 1) ? "IN" : (klass == 255) ? "ANY" : "CH";
+    char cname_buf[16];
+    const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
     printf("%-24s %-6u %-4s %-8s ", name, ttl, cname, tname);
     print_rdata(pkt, pkt_len, type, rdata_start, rdlen);
     printf("\n");
@@ -1998,7 +2013,9 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
             uint16_t qclass = (pkt[next+2] << 8) | pkt[next+3];
             char qtname_buf[32];
             const char *qtname = format_type_name(qtype, qtname_buf, sizeof(qtname_buf));
-            printf(";%-24s %-4s %s\n", name, (qclass == 1) ? "IN" : (qclass == 255) ? "ANY" : "CH", qtname);
+            char qcname_buf[16];
+            const char *qcname = format_class_name(qclass, qcname_buf, sizeof(qcname_buf));
+            printf(";%-24s %-4s %s\n", name, qcname, qtname);
             offset = next + 4;
         }
     }
@@ -2527,6 +2544,7 @@ int main(int argc, char **argv) {
 
     query_opts_t qo;
     memset(&qo, 0, sizeof(qo));
+    qo.qclass = 1;
     qo.udp_payload_size = 1232;
     qo.timeout_sec = 5;
     qo.tries = 1;
@@ -2753,8 +2771,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "warning: unrecognized argument '%s', ignoring\n", argv[i]);
         }
         } else {
-            // Positional 引数（ドメイン名 or レコードタイプ）の柔軟な割り当て
-            if (is_known_qtype(argv[i])) {
+            // クラス指定 (dig互換: IN/CH/CHAOS/HS のいずれか。大文字小文字は区別しない)
+            if (strcasecmp(argv[i], "CH") == 0 || strcasecmp(argv[i], "CHAOS") == 0) {
+                qo.qclass = 3;
+            } else if (strcasecmp(argv[i], "HS") == 0) {
+                qo.qclass = 4;
+            } else if (strcasecmp(argv[i], "IN") == 0) {
+                qo.qclass = 1;
+            } else if (is_known_qtype(argv[i])) {
                 if (!qtype_s) {
                     qtype_s = argv[i];
                 } else if (!qname) {

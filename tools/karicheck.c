@@ -303,6 +303,34 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
             }
         }
 
+        if (tcode == 50 || tcode == 51) { // NSEC3 / NSEC3PARAM
+            if (rcount >= 3) {
+                int algo = atoi(rdata[0]);
+                int flags = atoi(rdata[1]);
+                int iterations = atoi(rdata[2]);
+                if (algo != 1) {
+                    fprintf(stderr, "[WARNING] NSEC3/NSEC3PARAM hash algorithm should be 1 (SHA-1); other values are undefined (RFC 5155) for name '%s'\n", arena.records[i].name);
+                }
+                if (flags & ~0x01) {
+                    fprintf(stderr, "[WARNING] NSEC3/NSEC3PARAM flags field has reserved bits set; only bit 0 (opt-out) is defined (RFC 5155 Section 3.1.2) for name '%s'\n", arena.records[i].name);
+                }
+                if (tcode == 50 && (flags & 0x01)) {
+                    fprintf(stderr, "[WARNING] NSEC3 opt-out is set; RFC 9276 recommends opt-out only for large, sparsely-signed zones for name '%s'\n", arena.records[i].name);
+                }
+                if (tcode == 51 && (flags & 0x01)) {
+                    fprintf(stderr, "[ERROR] NSEC3PARAM must not have the opt-out flag set (RFC 5155 Section 11); it is only meaningful on NSEC3 records for name '%s'\n", arena.records[i].name);
+                    error_found = true;
+                }
+                if (iterations > 0) {
+                    fprintf(stderr, "[WARNING] NSEC3/NSEC3PARAM iterations should be 0 (RFC 9276); non-zero iterations increase CPU-exhaustion DoS risk with little security benefit for name '%s'\n", arena.records[i].name);
+                }
+                if (iterations > 100) {
+                    fprintf(stderr, "[ERROR] NSEC3/NSEC3PARAM iterations value is excessively high and may cause severe performance/DoS issues for name '%s'\n", arena.records[i].name);
+                    error_found = true;
+                }
+            }
+        }
+
         // --- Dry-run serialize_dns_record ---
         uint8_t scratch[65535];
         uint16_t scratch_offset = 0;
