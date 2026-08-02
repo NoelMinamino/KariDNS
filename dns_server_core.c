@@ -721,6 +721,50 @@ static zone_config_t *find_zone_config_in_view(server_config_t *cfg,
   return NULL;
 }
 
+typedef struct {
+  zone_db_entry_t *entry;
+  zone_config_t *zcfg;
+  const char *view_name;
+} zone_lookup_result_t;
+
+// domainに一致するゾーンを、view_nameが指定されていればそのview内だけを、
+// NULLなら全view横断で検索する。戻り値は一致したview数(0/1/2以上)。
+// 1件のみ一致した場合にresultへ結果を格納する。
+static int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
+                                    const char *domain, const char *view_name,
+                                    zone_lookup_result_t *result) {
+  int matches = 0;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    if (view_name && strcasecmp(v->name, view_name) != 0) continue;
+    zone_config_t *zcfg = NULL;
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (strcasecmp(z->domain, domain) == 0) { zcfg = z; break; }
+    }
+    if (!zcfg) continue;
+
+    zone_db_entry_t *entry = NULL;
+    if (snap) {
+      for (size_t sv = 0; sv < snap->view_count; sv++) {
+        if (strcasecmp(snap->views[sv].name, v->name) != 0) continue;
+        for (size_t i = 0; i < snap->views[sv].zone_count; i++) {
+          if (strcasecmp(snap->views[sv].entries[i]->domain, domain) == 0) {
+            entry = snap->views[sv].entries[i];
+            break;
+          }
+        }
+        break;
+      }
+    }
+    matches++;
+    if (matches == 1) {
+      result->entry = entry;
+      result->zcfg = zcfg;
+      result->view_name = v->name;
+    }
+  }
+  return matches;
+}
+
 zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain) {
   if (!snap) return NULL;
   for (size_t v = 0; v < snap->view_count; v++) {
@@ -1979,16 +2023,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (out_rrl_cfg) {
     server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
     *out_rrl_cfg = &cfg->rrl;
-    if (db_entry) {
-      zone_config_t *zcfg = cfg->zones;
-      while (zcfg) {
-        if (strcasecmp(zcfg->domain, db_entry->domain) == 0) {
-          if (zcfg->rrl.configured) {
-            *out_rrl_cfg = &zcfg->rrl;
-          }
-          break;
-        }
-        zcfg = zcfg->next;
+    if (db_entry && view) {
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      if (zcfg && zcfg->rrl.configured) {
+        *out_rrl_cfg = &zcfg->rrl;
       }
     }
   }
@@ -4131,50 +4169,59 @@ void *control_thread_func(void *arg) {
             char *arg = strchr(cmd, ' ');
             if (arg) { *arg = '\0'; arg++; }
             
+            char *view_arg = NULL;
+            if (arg) {
+              char *sp = strchr(arg, ' ');
+              if (sp) {
+                *sp = '\0';
+                view_arg = sp + 1;
+                while (*view_arg == ' ') view_arg++;
+                if (*view_arg == '\0') view_arg = NULL;
+              }
+            }
+            
             if (strcmp(cmd, "reload") == 0) {
               if (arg && strlen(arg) > 0) {
                 const char *canon_arg = find_configured_domain(arg);
+                zone_db_snapshot_t *snap = acquire_zone_snapshot();
                 server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-                zone_config_t *zcfg = active->zones;
-                while (zcfg) {
-                  if (strcasecmp(zcfg->domain, canon_arg) == 0) break;
-                  zcfg = zcfg->next;
-                }
-                if (zcfg) {
-                  syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
-                  zone_db_snapshot_t *snap = acquire_zone_snapshot();
-                  zone_db_entry_t *entry = snapshot_get_zone(snap, zcfg->domain);
-                  if (entry) {
-                    if (zcfg->type && (strcmp(zcfg->type, "master") == 0 || strcmp(zcfg->type, "primary") == 0)) {
-                      reload_result_t rr = reload_master_zone(entry, zcfg->file);
-                      switch (rr) {
-                          case RELOAD_OK:
-                              syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", zcfg->domain);
-                              send(cfd, "OK reloaded\n", 12, 0);
-                              break;
-                          case RELOAD_ERR_FILE_READ:
-                              send(cfd, "ERROR file read error\n", 22, 0);
-                              break;
-                          case RELOAD_ERR_PARSE:
-                              send(cfd, "ERROR parse error\n", 18, 0);
-                              break;
-                          case RELOAD_ERR_MISSING_SOA:
-                              send(cfd, "ERROR missing SOA\n", 18, 0);
-                              break;
-                      }
-                    } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
-                      syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", zcfg->domain);
-                      atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
-                      send(cfd, "OK reloaded (slave)\n", 20, 0);
-                    } else {
-                      send(cfd, "ERROR unknown zone type\n", 24, 0);
-                    }
-                  }
-                  release_zone_snapshot(snap);
-                } else {
+                zone_lookup_result_t lr = {0};
+                int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
+                if (nmatches == 0) {
                   syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
                   send(cfd, "ERROR zone not found\n", 21, 0);
+                } else if (nmatches > 1) {
+                  send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n", 82, 0);
+                } else if (lr.entry && lr.zcfg) {
+                  syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
+                  if (lr.zcfg->type && (strcmp(lr.zcfg->type, "master") == 0 || strcmp(lr.zcfg->type, "primary") == 0)) {
+                    reload_result_t rr = reload_master_zone(lr.entry, lr.zcfg->file);
+                    switch (rr) {
+                        case RELOAD_OK:
+                            syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", lr.zcfg->domain);
+                            send(cfd, "OK reloaded\n", 12, 0);
+                            break;
+                        case RELOAD_ERR_FILE_READ:
+                            send(cfd, "ERROR file read error\n", 22, 0);
+                            break;
+                        case RELOAD_ERR_PARSE:
+                            send(cfd, "ERROR parse error\n", 18, 0);
+                            break;
+                        case RELOAD_ERR_MISSING_SOA:
+                            send(cfd, "ERROR missing SOA\n", 18, 0);
+                            break;
+                    }
+                  } else if (lr.zcfg->type && strcasecmp(lr.zcfg->type, "slave") == 0) {
+                    syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", lr.zcfg->domain);
+                    atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
+                    send(cfd, "OK reloaded (slave)\n", 20, 0);
+                  } else {
+                    send(cfd, "ERROR unknown zone type\n", 24, 0);
+                  }
+                } else {
+                  send(cfd, "ERROR zone not found\n", 21, 0);
                 }
+                release_zone_snapshot(snap);
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
                 reload_all_zones();
@@ -4245,39 +4292,57 @@ void *control_thread_func(void *arg) {
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
-              if (entry) {
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              zone_lookup_result_t lr = {0};
+              int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
+              if (nmatches == 0) {
+                syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              } else if (nmatches > 1) {
+                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86, 0);
+              } else if (lr.entry) {
                 char smsg[256];
-                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)entry->serial, (uint32_t)entry->refresh);
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)lr.entry->serial, (uint32_t)lr.entry->refresh);
                 send(cfd, smsg, slen, 0);
               } else {
-                syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
-              if (entry) {
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              zone_lookup_result_t lr = {0};
+              int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
+              if (nmatches == 0) {
+                syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              } else if (nmatches > 1) {
+                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82, 0);
+              } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s", canon_arg);
-                atomic_store_explicit(&entry->notify_now, true, memory_order_release);
+                atomic_store_explicit(&lr.entry->notify_now, true, memory_order_release);
                 send(cfd, "OK\n", 3, 0);
               } else {
-                syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "retransfer") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
-              if (entry) {
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              zone_lookup_result_t lr = {0};
+              int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
+              if (nmatches == 0) {
+                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              } else if (nmatches > 1) {
+                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
+              } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
-                atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+                atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
                 send(cfd, "OK\n", 3, 0);
               } else {
-                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
               release_zone_snapshot(snap);
