@@ -512,6 +512,118 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   return 0;
 }
 
+static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING) {
+    free_token(&tok);
+    return -1;
+  }
+  zone_config_t *zone = calloc(1, sizeof(zone_config_t));
+  zone->domain = strdup(tok.value);
+  free_token(&tok);
+  size_t dl = strlen(zone->domain);
+  if (dl > 0 && zone->domain[dl - 1] != '.') {
+    char *norm = malloc(dl + 2);
+    if (norm) {
+      memcpy(norm, zone->domain, dl);
+      norm[dl] = '.';
+      norm[dl + 1] = '\0';
+      free(zone->domain);
+      zone->domain = norm;
+    }
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    free_zone_config(zone);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING) {
+      free_zone_config(zone);
+      free_token(&tok);
+      return -1;
+    }
+    char *key = strdup(tok.value);
+    free_token(&tok);
+    if (strcmp(key, "masters") == 0) {
+      if (parse_ip_port_list(ctx, &zone->masters, &zone->masters_count) !=
+          0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+    } else if (strcmp(key, "also-notify") == 0) {
+      if (parse_ip_port_list(ctx, &zone->also_notify,
+                             &zone->also_notify_count) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+    } else if (strcmp(key, "allow-transfer") == 0) {
+      if (parse_acl_list(ctx, &zone->allow_transfer, &zone->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &zone->tsig_key) != 0) {
+        free(key); free_zone_config(zone); return -1;
+      }
+    } else if (strcmp(key, "allow-update") == 0) {
+      if (parse_acl_list(ctx, &zone->allow_update, &zone->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
+        free(key); free_zone_config(zone); return -1;
+      }
+    } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
+               strcmp(key, "tsig-key") == 0 ||
+               strcmp(key, "notify-source") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      char *val = strdup(tok.value);
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free(val);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+      if (strcmp(key, "type") == 0)
+        zone->type = val;
+      else if (strcmp(key, "file") == 0)
+        zone->file = val;
+      else if (strcmp(key, "tsig-key") == 0)
+        zone->tsig_key = val;
+      else
+        zone->notify_source = val;
+    } else if (strcmp(key, "rate-limit") == 0) {
+      if (parse_rate_limit_config(ctx, &zone->rrl) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+    } else
+      skip_unknown_block(ctx);
+    free(key);
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    free_zone_config(zone);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  *zone_out = zone;
+  return 0;
+}
+
 int parse_named_conf(const char *config_str, server_config_t *config) {
   token_ctx_t ctx = {config_str, 0, strlen(config_str)};
   config->port = 53;
@@ -524,6 +636,9 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
+  bool saw_view_block = false;
+  bool saw_top_level_zone = false;
+  view_config_t *last_view = NULL;
   zone_config_t *last_zone = NULL;
   while (1) {
     conf_token_t tok = get_next_token(&ctx);
@@ -697,115 +812,49 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         return -1;
       }
       free_token(&tok);
-    } else if (strcmp(tok.value, "zone") == 0) {
+    } else if (strcmp(tok.value, "view") == 0) {
       free_token(&tok);
       tok = get_next_token(&ctx);
-      if (tok.type != TOKEN_STRING) {
-        free_token(&tok);
-        return -1;
-      }
-      zone_config_t *zone = calloc(1, sizeof(zone_config_t));
-      zone->domain = strdup(tok.value);
+      if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+      view_config_t *view = calloc(1, sizeof(view_config_t));
+      view->name = strdup(tok.value);
       free_token(&tok);
-      size_t dl = strlen(zone->domain);
-      if (dl > 0 && zone->domain[dl - 1] != '.') {
-        char *norm = malloc(dl + 2);
-        if (norm) {
-          memcpy(norm, zone->domain, dl);
-          norm[dl] = '.';
-          norm[dl + 1] = '\0';
-          free(zone->domain);
-          zone->domain = norm;
-        }
-      }
       tok = get_next_token(&ctx);
-      if (tok.type != TOKEN_LBRACE) {
-        free_zone_config(zone);
-        free_token(&tok);
-        return -1;
-      }
+      if (tok.type != TOKEN_LBRACE) { free(view->name); free(view); free_token(&tok); return -1; }
       free_token(&tok);
+      zone_config_t *last_view_zone = NULL;
       while (1) {
         tok = get_next_token(&ctx);
-        if (tok.type == TOKEN_RBRACE) {
+        if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
+        if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+        if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
-          break;
-        }
-        if (tok.type != TOKEN_STRING) {
-          free_zone_config(zone);
+          if (parse_acl_list(&ctx, &view->match_clients, &view->match_clients_count,
+                             ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
+            return -1;
+          }
+        } else if (strcmp(tok.value, "zone") == 0) {
           free_token(&tok);
-          return -1;
-        }
-        char *key = strdup(tok.value);
-        free_token(&tok);
-        if (strcmp(key, "masters") == 0) {
-          if (parse_ip_port_list(&ctx, &zone->masters, &zone->masters_count) !=
-              0) {
-            free(key);
-            free_zone_config(zone);
-            return -1;
-          }
-        } else if (strcmp(key, "also-notify") == 0) {
-          if (parse_ip_port_list(&ctx, &zone->also_notify,
-                                 &zone->also_notify_count) != 0) {
-            free(key);
-            free_zone_config(zone);
-            return -1;
-          }
-        } else if (strcmp(key, "allow-transfer") == 0) {
-          if (parse_acl_list(&ctx, &zone->allow_transfer, &zone->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &zone->tsig_key) != 0) {
-            free(key); free_zone_config(zone); return -1;
-          }
-        } else if (strcmp(key, "allow-update") == 0) {
-          if (parse_acl_list(&ctx, &zone->allow_update, &zone->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
-            free(key); free_zone_config(zone); return -1;
-          }
-        } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
-                   strcmp(key, "tsig-key") == 0 ||
-                   strcmp(key, "notify-source") == 0) {
-          tok = get_next_token(&ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_zone_config(zone);
-            free_token(&tok);
-            return -1;
-          }
-          char *val = strdup(tok.value);
+          zone_config_t *z = NULL;
+          if (parse_zone_block(&ctx, &z) != 0) return -1;
+          if (!view->zones) view->zones = z; else last_view_zone->next = z;
+          last_view_zone = z;
+        } else {
           free_token(&tok);
-          tok = get_next_token(&ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
-            free(key);
-            free(val);
-            free_zone_config(zone);
-            free_token(&tok);
-            return -1;
-          }
-          free_token(&tok);
-          if (strcmp(key, "type") == 0)
-            zone->type = val;
-          else if (strcmp(key, "file") == 0)
-            zone->file = val;
-          else if (strcmp(key, "tsig-key") == 0)
-            zone->tsig_key = val;
-          else
-            zone->notify_source = val;
-        } else if (strcmp(key, "rate-limit") == 0) {
-          if (parse_rate_limit_config(&ctx, &zone->rrl) != 0) {
-            free(key);
-            free_zone_config(zone);
-            return -1;
-          }
-        } else
           skip_unknown_block(&ctx);
-        free(key);
+        }
       }
       tok = get_next_token(&ctx);
-      if (tok.type != TOKEN_SEMICOLON) {
-        free_zone_config(zone);
-        free_token(&tok);
-        return -1;
-      }
+      if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
       free_token(&tok);
+      saw_view_block = true;
+      if (!config->views) config->views = view; else last_view->next = view;
+      last_view = view;
+    } else if (strcmp(tok.value, "zone") == 0) {
+      free_token(&tok);
+      zone_config_t *zone = NULL;
+      if (parse_zone_block(&ctx, &zone) != 0) return -1;
+      saw_top_level_zone = true;
       if (!config->zones)
         config->zones = zone;
       else
@@ -1179,6 +1228,40 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       skip_unknown_block(&ctx);
     }
   }
+  if (saw_view_block && saw_top_level_zone) {
+    syslog(LOG_ERR, "Cannot mix top-level zone and view blocks");
+    return -1;
+  }
+  if (!saw_view_block) {
+    view_config_t *default_view = calloc(1, sizeof(view_config_t));
+    default_view->name = strdup("__default__");
+    default_view->match_clients = calloc(1, sizeof(char *));
+    default_view->match_clients[0] = strdup("any");
+    default_view->match_clients_count = 1;
+    default_view->zones = config->zones;
+    config->views = default_view;
+  }
+
+  // Create a flattened list of zones in config->zones for backward compatibility
+  // (AXFR, RRL, control-channel etc)
+  zone_config_t *flat_zones = NULL;
+  zone_config_t *flat_tail = NULL;
+  for (view_config_t *v = config->views; v; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      zone_config_t *dup_z = calloc(1, sizeof(zone_config_t));
+      *dup_z = *z;
+      dup_z->next = NULL;
+      if (!flat_zones) {
+        flat_zones = dup_z;
+        flat_tail = dup_z;
+      } else {
+        flat_tail->next = dup_z;
+        flat_tail = dup_z;
+      }
+    }
+  }
+  config->zones = flat_zones;
+
   return 0;
 }
 

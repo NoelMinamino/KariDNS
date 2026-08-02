@@ -101,6 +101,7 @@ typedef struct {
 
 typedef struct {
   char domain[256];
+  char view_name[64];
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
@@ -336,8 +337,16 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
 }
 
 typedef struct {
+  char *name;
+  char **match_clients;
+  int match_clients_count;
   zone_db_entry_t **entries;
-  size_t count;
+  size_t zone_count;
+} view_snapshot_t;
+
+typedef struct {
+  view_snapshot_t *views;
+  size_t view_count;
   _Atomic(int) reader_count;
 } zone_db_snapshot_t;
 static _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
@@ -698,11 +707,71 @@ void release_zone_snapshot(zone_db_snapshot_t *snap) {
     atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
 }
 
+static zone_config_t *find_zone_config_in_view(server_config_t *cfg,
+                                               const char *view_name,
+                                               const char *domain) {
+  if (!cfg || !view_name || !domain) return NULL;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    if (strcasecmp(v->name, view_name) != 0) continue;
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (strcasecmp(z->domain, domain) == 0) return z;
+    }
+    return NULL;
+  }
+  return NULL;
+}
+
+typedef struct {
+  zone_db_entry_t *entry;
+  zone_config_t *zcfg;
+  const char *view_name;
+} zone_lookup_result_t;
+
+// domainに一致するゾーンを、view_nameが指定されていればそのview内だけを、
+// NULLなら全view横断で検索する。戻り値は一致したview数(0/1/2以上)。
+// 1件のみ一致した場合にresultへ結果を格納する。
+static int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
+                                    const char *domain, const char *view_name,
+                                    zone_lookup_result_t *result) {
+  int matches = 0;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    if (view_name && strcasecmp(v->name, view_name) != 0) continue;
+    zone_config_t *zcfg = NULL;
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (strcasecmp(z->domain, domain) == 0) { zcfg = z; break; }
+    }
+    if (!zcfg) continue;
+
+    zone_db_entry_t *entry = NULL;
+    if (snap) {
+      for (size_t sv = 0; sv < snap->view_count; sv++) {
+        if (strcasecmp(snap->views[sv].name, v->name) != 0) continue;
+        for (size_t i = 0; i < snap->views[sv].zone_count; i++) {
+          if (strcasecmp(snap->views[sv].entries[i]->domain, domain) == 0) {
+            entry = snap->views[sv].entries[i];
+            break;
+          }
+        }
+        break;
+      }
+    }
+    matches++;
+    if (matches == 1) {
+      result->entry = entry;
+      result->zcfg = zcfg;
+      result->view_name = v->name;
+    }
+  }
+  return matches;
+}
+
 zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain) {
   if (!snap) return NULL;
-  for (size_t i = 0; i < snap->count; i++) {
-    if (strcasecmp(snap->entries[i]->domain, domain) == 0) {
-      return snap->entries[i];
+  for (size_t v = 0; v < snap->view_count; v++) {
+    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
+      if (strcasecmp(snap->views[v].entries[i]->domain, domain) == 0) {
+        return snap->views[v].entries[i];
+      }
     }
   }
   return NULL;
@@ -724,13 +793,15 @@ static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
   }
 }
 
-static zone_db_entry_t *create_new_zone_entry(const char *domain) {
+static zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name) {
   zone_db_entry_t *z = calloc(1, sizeof(zone_db_entry_t));
   if (!z) return NULL;
   atomic_init(&z->active_axfr, 0);
   atomic_init(&z->snapshot_refs, 1);
   strncpy(z->domain, domain, sizeof(z->domain) - 1);
   z->domain[sizeof(z->domain) - 1] = 0;
+  strncpy(z->view_name, view_name, sizeof(z->view_name) - 1);
+  z->view_name[sizeof(z->view_name) - 1] = 0;
   pthread_mutex_init(&z->writer_lock, NULL);
   pthread_mutex_init(&z->ixfr_history.lock, NULL);
   z->ixfr_history.count = 0;
@@ -784,14 +855,24 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
 static void *gc_snapshot_thread(void *arg) {
   zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
   wait_for_snapshot_readers(snap);
-  for (size_t i = 0; i < snap->count; i++) {
-    zone_db_entry_t *entry = snap->entries[i];
-    if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
-      syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
-      free_zone_db_entry(entry);
+  for (size_t v = 0; v < snap->view_count; v++) {
+    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
+      zone_db_entry_t *entry = snap->views[v].entries[i];
+      if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
+        syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
+        free_zone_db_entry(entry);
+      }
+    }
+    free(snap->views[v].entries);
+    free(snap->views[v].name);
+    if (snap->views[v].match_clients) {
+      for (int i = 0; i < snap->views[v].match_clients_count; i++) {
+        free(snap->views[v].match_clients[i]);
+      }
+      free(snap->views[v].match_clients);
     }
   }
-  free(snap->entries);
+  free(snap->views);
   free(snap);
   return NULL;
 }
@@ -1039,34 +1120,59 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 }
 
 void rebuild_zone_db_from_config(server_config_t *config) {
-  int new_count = 0;
-  for (zone_config_t *z = config->zones; z; z = z->next) new_count++;
+  int view_count = 0;
+  for (view_config_t *v = config->views; v; v = v->next) view_count++;
   zone_db_snapshot_t *new_snap = calloc(1, sizeof(zone_db_snapshot_t));
-  new_snap->count = new_count;
-  new_snap->entries = calloc(new_count, sizeof(zone_db_entry_t *));
+  new_snap->view_count = view_count;
+  new_snap->views = calloc(view_count, sizeof(view_snapshot_t));
   atomic_init(&new_snap->reader_count, 0);
 
   zone_db_snapshot_t *old_snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
-  
-  int idx = 0;
-  for (zone_config_t *z = config->zones; z; z = z->next) {
-    zone_db_entry_t *entry = NULL;
-    if (old_snap) {
-      for (size_t i = 0; i < old_snap->count; i++) {
-        if (strcasecmp(old_snap->entries[i]->domain, z->domain) == 0) {
-          entry = old_snap->entries[i];
-          atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+
+  int vidx = 0;
+  for (view_config_t *v = config->views; v; v = v->next, vidx++) {
+    view_snapshot_t *vs = &new_snap->views[vidx];
+    vs->name = strdup(v->name);
+    
+    vs->match_clients_count = v->match_clients_count;
+    if (v->match_clients_count > 0) {
+      vs->match_clients = calloc(v->match_clients_count, sizeof(char *));
+      for (int i = 0; i < v->match_clients_count; i++) {
+        vs->match_clients[i] = strdup(v->match_clients[i]);
+      }
+    } else {
+      vs->match_clients = NULL;
+    }
+
+    int zone_count = 0;
+    for (zone_config_t *z = v->zones; z; z = z->next) zone_count++;
+    vs->zone_count = zone_count;
+    vs->entries = calloc(zone_count, sizeof(zone_db_entry_t *));
+
+    int zidx = 0;
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      zone_db_entry_t *entry = NULL;
+      if (old_snap) {
+        for (size_t ov = 0; ov < old_snap->view_count; ov++) {
+          if (strcasecmp(old_snap->views[ov].name, v->name) != 0) continue;
+          for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
+            if (strcasecmp(old_snap->views[ov].entries[oi]->domain, z->domain) == 0) {
+              entry = old_snap->views[ov].entries[oi];
+              atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+              break;
+            }
+          }
           break;
         }
       }
-    }
-    if (!entry) {
-      entry = create_new_zone_entry(z->domain);
-    }
-    new_snap->entries[idx++] = entry;
-    
-    if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
-      reload_master_zone(entry, z->file);
+      if (!entry) {
+        entry = create_new_zone_entry(z->domain, v->name);
+      }
+      vs->entries[zidx++] = entry;
+      
+      if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
+        reload_master_zone(entry, z->file);
+      }
     }
   }
 
@@ -1311,8 +1417,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         atomic_store_explicit(&entry->rcu.active, standby,
                               memory_order_release);
         wait_for_readers(active);
-        void send_notify_to_all(const char *domain);
-        send_notify_to_all(entry->domain);
+        void send_notify_to_all(const char *domain, const char *view_name);
+        send_notify_to_all(entry->domain, entry->view_name);
       }
       pthread_mutex_unlock(&entry->writer_lock);
       return 1;
@@ -1443,7 +1549,8 @@ static void resolve_name(const char *qname, uint16_t qtype,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
                          bool minimal_responses,
-                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok) {
+                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
+                         view_snapshot_t *view) {
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
   current_qname[255] = '\0';
@@ -1613,38 +1720,23 @@ static void resolve_name(const char *qname, uint16_t qtype,
       else {
         zone_db_entry_t *new_db_entry = NULL;
         size_t longest_match_len = 0;
-        zone_db_snapshot_t *snap = NULL;
-        do {
-          snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
-          if (!snap)
-            break;
-          atomic_fetch_add_explicit(&snap->reader_count, 1,
-                                    memory_order_acquire);
-          if (snap ==
-              atomic_load_explicit(&g_zone_db_active, memory_order_acquire))
-            break;
-          atomic_fetch_sub_explicit(&snap->reader_count, 1,
-                                    memory_order_release);
-        } while (1);
-        if (snap) {
-          for (size_t i = 0; i < snap->count; i++) {
-            size_t check_z_len = strlen(snap->entries[i]->domain);
+        if (view) {
+          for (size_t i = 0; i < view->zone_count; i++) {
+            size_t check_z_len = strlen(view->entries[i]->domain);
             bool match = false;
             if (cq_len == check_z_len &&
-                strcasecmp(current_qname, snap->entries[i]->domain) == 0)
+                strcasecmp(current_qname, view->entries[i]->domain) == 0)
               match = true;
             else if (cq_len > check_z_len &&
                      current_qname[cq_len - check_z_len - 1] == '.' &&
                      strcasecmp(current_qname + cq_len - check_z_len,
-                                snap->entries[i]->domain) == 0)
+                                view->entries[i]->domain) == 0)
               match = true;
             if (match && check_z_len > longest_match_len) {
               longest_match_len = check_z_len;
-              new_db_entry = snap->entries[i];
+              new_db_entry = view->entries[i];
             }
           }
-          atomic_fetch_sub_explicit(&snap->reader_count, 1,
-                                    memory_order_release);
         }
         if (new_db_entry) {
           zone_arena_t *new_zone = NULL;
@@ -1880,6 +1972,17 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
   return 0; // NOERROR
 }
 
+static bool check_acl(const char *client_ip, char **acl_list, int acl_count);
+
+static view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
+  for (size_t i = 0; i < snap->view_count; i++) {
+    if (check_acl(client_ip, snap->views[i].match_clients, snap->views[i].match_clients_count)) {
+      return &snap->views[i];
+    }
+  }
+  return NULL;
+}
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
@@ -1894,21 +1997,25 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   zone_arena_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
   size_t longest_match_len = 0;
+  view_snapshot_t *view = NULL;
 
   if (snap) {
-    for (size_t i = 0; i < snap->count; i++) {
-      size_t z_len = strlen(snap->entries[i]->domain);
-      bool match = false;
-      if (q_len == z_len &&
-          strcasecmp(current_qname, snap->entries[i]->domain) == 0)
-        match = true;
-      else if (q_len > z_len && current_qname[q_len - z_len - 1] == '.' &&
-               strcasecmp(current_qname + q_len - z_len,
-                          snap->entries[i]->domain) == 0)
-        match = true;
-      if (match && z_len > longest_match_len) {
-        longest_match_len = z_len;
-        db_entry = snap->entries[i];
+    view = select_view(snap, client_ip);
+    if (view) {
+      for (size_t i = 0; i < view->zone_count; i++) {
+        size_t z_len = strlen(view->entries[i]->domain);
+        bool match = false;
+        if (q_len == z_len &&
+            strcasecmp(current_qname, view->entries[i]->domain) == 0)
+          match = true;
+        else if (q_len > z_len && current_qname[q_len - z_len - 1] == '.' &&
+                 strcasecmp(current_qname + q_len - z_len,
+                            view->entries[i]->domain) == 0)
+          match = true;
+        if (match && z_len > longest_match_len) {
+          longest_match_len = z_len;
+          db_entry = view->entries[i];
+        }
       }
     }
   }
@@ -1916,16 +2023,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (out_rrl_cfg) {
     server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
     *out_rrl_cfg = &cfg->rrl;
-    if (db_entry) {
-      zone_config_t *zcfg = cfg->zones;
-      while (zcfg) {
-        if (strcasecmp(zcfg->domain, db_entry->domain) == 0) {
-          if (zcfg->rrl.configured) {
-            *out_rrl_cfg = &zcfg->rrl;
-          }
-          break;
-        }
-        zcfg = zcfg->next;
+    if (db_entry && view) {
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      if (zcfg && zcfg->rrl.configured) {
+        *out_rrl_cfg = &zcfg->rrl;
       }
     }
   }
@@ -2042,15 +2143,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     bool auth = false;
-    if (db_entry) {
+    if (db_entry && view) {
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-      zone_config_t *zcfg = cfg->zones;
-      while (zcfg) {
-        if (strcasecmp(zcfg->domain, db_entry->domain) == 0)
-          break;
-        zcfg = zcfg->next;
-      }
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->masters_count > 0) {
         for (int k = 0; k < zcfg->masters_count; k++) {
           if (strcmp(client_ip, zcfg->masters[k].ip) == 0) {
@@ -2103,15 +2199,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 5) { // UPDATE
     bool auth = false;
     tsig_key_t *matched_key = NULL;
-    if (db_entry) {
+    if (db_entry && view) {
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-      zone_config_t *zcfg = cfg->zones;
-      while (zcfg) {
-        if (strcasecmp(zcfg->domain, db_entry->domain) == 0)
-          break;
-        zcfg = zcfg->next;
-      }
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->allow_update_count > 0) {
         tsig_key_t *k = cfg->keys;
         while (k) {
@@ -2292,7 +2383,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   *res_arcount = 0;
   if (!current_zone) {
     res[3] |= 5;
-    add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not authoritative for the queried zone");
+    if (!view) {
+      add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control (no view matched)");
+    } else {
+      add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not authoritative for the queried zone");
+    }
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
     if (edns.present) {
@@ -2320,7 +2415,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
                cfg_for_ede ? cfg_for_ede->minimal_any : false,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
-               edns.dnssec_ok);
+               edns.dnssec_ok, view);
 
   if (edns.present) {
     assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);
@@ -2487,17 +2582,12 @@ void *axfr_bg_thread_func(void *arg) {
   pthread_exit(NULL);
 }
 
-void send_notify_to_all(const char *domain) {
+void send_notify_to_all(const char *domain, const char *view_name) {
   server_config_t *active =
       atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   if (!active)
     return;
-  zone_config_t *zone = active->zones;
-  while (zone) {
-    if (strcasecmp(zone->domain, domain) == 0)
-      break;
-    zone = zone->next;
-  }
+  zone_config_t *zone = find_zone_config_in_view(active, view_name, domain);
   if (!zone || zone->also_notify_count == 0)
     return;
 
@@ -3594,14 +3684,12 @@ worker_startup_success:;
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           if (qtype == 252 || qtype == 251) {
+            view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
             server_config_t *cfg =
                 atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-            zone_config_t *zcfg = cfg->zones;
-            while (zcfg) {
-              if (strcasecmp(zcfg->domain, qname) == 0)
-                break;
-              zcfg = zcfg->next;
-            }
+            zone_config_t *zcfg = xfr_view
+                ? find_zone_config_in_view(cfg, xfr_view->name, qname)
+                : NULL;
             bool allowed = false;
             uint16_t tsig_error = 0;
             tsig_key_t *matched_key = NULL;
@@ -3643,7 +3731,15 @@ worker_startup_success:;
                   allowed = tsig_ok;
               }
             }
-            zone_db_entry_t *entry = snapshot_get_zone(snap, qname);
+            zone_db_entry_t *entry = NULL;
+            if (xfr_view) {
+              for (size_t i = 0; i < xfr_view->zone_count; i++) {
+                if (strcasecmp(xfr_view->entries[i]->domain, qname) == 0) {
+                  entry = xfr_view->entries[i];
+                  break;
+                }
+              }
+            }
             if (allowed && entry) {
               if (atomic_fetch_add(&entry->active_axfr, 1) >= MAX_ZONE_AXFR) {
                 atomic_fetch_sub(&entry->active_axfr, 1);
@@ -3827,24 +3923,85 @@ static void reload_all_zones(void) {
   zone_db_snapshot_t *snap = acquire_zone_snapshot();
   server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   
-  for (size_t i = 0; i < snap->count; i++) {
-    zone_db_entry_t *entry = snap->entries[i];
-    zone_config_t *zcfg = active_cfg->zones;
-    while (zcfg) {
-      if (strcasecmp(zcfg->domain, entry->domain) == 0) {
-        if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0) && zcfg->file) {
-          syslog(LOG_NOTICE, "[Control] Reloading master zone: %s", entry->domain);
-          reload_master_zone(entry, zcfg->file);
-        } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
-          syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
-          atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+  for (size_t v = 0; v < snap->view_count; v++) {
+    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
+      zone_db_entry_t *entry = snap->views[v].entries[i];
+      zone_config_t *zcfg = NULL;
+      view_config_t *vcfg = NULL;
+      for (view_config_t *vc = active_cfg->views; vc; vc = vc->next) {
+        if (strcasecmp(vc->name, snap->views[v].name) == 0) {
+          vcfg = vc;
+          break;
         }
-        break;
       }
-      zcfg = zcfg->next;
+      if (vcfg) {
+        zcfg = vcfg->zones;
+        while (zcfg) {
+          if (strcasecmp(zcfg->domain, entry->domain) == 0) {
+            if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0) && zcfg->file) {
+              syslog(LOG_NOTICE, "[Control] Reloading master zone: %s", entry->domain);
+              reload_master_zone(entry, zcfg->file);
+            } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
+              syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
+              atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+            }
+            break;
+          }
+          zcfg = zcfg->next;
+        }
+      }
     }
   }
   release_zone_snapshot(snap);
+}
+
+static void free_server_config_fields(server_config_t *cfg) {
+  for (int j = 0; j < cfg->bind_address_count; j++)
+    free(cfg->bind_addresses[j]);
+  free(cfg->bind_addresses);
+  cfg->bind_addresses = NULL;
+  cfg->bind_address_count = 0;
+
+  zone_config_t *curr_flat = cfg->zones;
+  while (curr_flat) {
+    zone_config_t *next = curr_flat->next;
+    free(curr_flat);
+    curr_flat = next;
+  }
+  cfg->zones = NULL;
+
+  view_config_t *v = cfg->views;
+  while (v) {
+    view_config_t *next_v = v->next;
+    if (v->name) free(v->name);
+    for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
+    if (v->match_clients) free(v->match_clients);
+    zone_config_t *curr = v->zones;
+    while (curr) {
+      zone_config_t *next = curr->next;
+      free_zone_config(curr);
+      curr = next;
+    }
+    free(v);
+    v = next_v;
+  }
+  cfg->views = NULL;
+
+  tsig_key_t *k = cfg->keys;
+  while (k) {
+    tsig_key_t *next_k = k->next;
+    free(k->name); free(k->algorithm); free(k->secret);
+    free(k);
+    k = next_k;
+  }
+  cfg->keys = NULL;
+
+  if (cfg->control.algorithm) free(cfg->control.algorithm);
+  if (cfg->control.secret) free(cfg->control.secret);
+  memset(&cfg->control, 0, sizeof(control_channel_config_t));
+  free_rate_limit_config(&cfg->rrl);
+  memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
+  free_logging_channels(cfg);
 }
 
 static void perform_config_reload(void) {
@@ -3857,32 +4014,8 @@ static void perform_config_reload(void) {
   server_config_t *standby = (active == &g_config_db.config_a)
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
-  for (int j = 0; j < standby->bind_address_count; j++)
-    free(standby->bind_addresses[j]);
-  free(standby->bind_addresses);
-  standby->bind_addresses = NULL;
-  standby->bind_address_count = 0;
-  zone_config_t *curr = standby->zones;
-  while (curr) {
-    zone_config_t *next = curr->next;
-    free_zone_config(curr);
-    curr = next;
-  }
-  tsig_key_t *k = standby->keys;
-  while (k) {
-    tsig_key_t *next_k = k->next;
-    free(k->name); free(k->algorithm); free(k->secret);
-    free(k);
-    k = next_k;
-  }
-  standby->zones = NULL;
-  standby->keys = NULL;
-  if (standby->control.algorithm) free(standby->control.algorithm);
-  if (standby->control.secret) free(standby->control.secret);
-  memset(&standby->control, 0, sizeof(control_channel_config_t));
-  free_rate_limit_config(&standby->rrl);
-  memset(&standby->rrl, 0, sizeof(rate_limit_config_t));
-  free_logging_channels(standby);
+  
+  free_server_config_fields(standby);
   if (parse_named_conf(config_str, standby) == 0) {
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
@@ -4036,50 +4169,59 @@ void *control_thread_func(void *arg) {
             char *arg = strchr(cmd, ' ');
             if (arg) { *arg = '\0'; arg++; }
             
+            char *view_arg = NULL;
+            if (arg) {
+              char *sp = strchr(arg, ' ');
+              if (sp) {
+                *sp = '\0';
+                view_arg = sp + 1;
+                while (*view_arg == ' ') view_arg++;
+                if (*view_arg == '\0') view_arg = NULL;
+              }
+            }
+            
             if (strcmp(cmd, "reload") == 0) {
               if (arg && strlen(arg) > 0) {
                 const char *canon_arg = find_configured_domain(arg);
+                zone_db_snapshot_t *snap = acquire_zone_snapshot();
                 server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-                zone_config_t *zcfg = active->zones;
-                while (zcfg) {
-                  if (strcasecmp(zcfg->domain, canon_arg) == 0) break;
-                  zcfg = zcfg->next;
-                }
-                if (zcfg) {
-                  syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
-                  zone_db_snapshot_t *snap = acquire_zone_snapshot();
-                  zone_db_entry_t *entry = snapshot_get_zone(snap, zcfg->domain);
-                  if (entry) {
-                    if (zcfg->type && (strcmp(zcfg->type, "master") == 0 || strcmp(zcfg->type, "primary") == 0)) {
-                      reload_result_t rr = reload_master_zone(entry, zcfg->file);
-                      switch (rr) {
-                          case RELOAD_OK:
-                              syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", zcfg->domain);
-                              send(cfd, "OK reloaded\n", 12, 0);
-                              break;
-                          case RELOAD_ERR_FILE_READ:
-                              send(cfd, "ERROR file read error\n", 22, 0);
-                              break;
-                          case RELOAD_ERR_PARSE:
-                              send(cfd, "ERROR parse error\n", 18, 0);
-                              break;
-                          case RELOAD_ERR_MISSING_SOA:
-                              send(cfd, "ERROR missing SOA\n", 18, 0);
-                              break;
-                      }
-                    } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
-                      syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", zcfg->domain);
-                      atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
-                      send(cfd, "OK reloaded (slave)\n", 20, 0);
-                    } else {
-                      send(cfd, "ERROR unknown zone type\n", 24, 0);
-                    }
-                  }
-                  release_zone_snapshot(snap);
-                } else {
+                zone_lookup_result_t lr = {0};
+                int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
+                if (nmatches == 0) {
                   syslog(LOG_ERR, "[Control] Command 'reload' failed: zone '%s' not found", canon_arg);
                   send(cfd, "ERROR zone not found\n", 21, 0);
+                } else if (nmatches > 1) {
+                  send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'reload <zone> <view>')\n", 82, 0);
+                } else if (lr.entry && lr.zcfg) {
+                  syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
+                  if (lr.zcfg->type && (strcmp(lr.zcfg->type, "master") == 0 || strcmp(lr.zcfg->type, "primary") == 0)) {
+                    reload_result_t rr = reload_master_zone(lr.entry, lr.zcfg->file);
+                    switch (rr) {
+                        case RELOAD_OK:
+                            syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", lr.zcfg->domain);
+                            send(cfd, "OK reloaded\n", 12, 0);
+                            break;
+                        case RELOAD_ERR_FILE_READ:
+                            send(cfd, "ERROR file read error\n", 22, 0);
+                            break;
+                        case RELOAD_ERR_PARSE:
+                            send(cfd, "ERROR parse error\n", 18, 0);
+                            break;
+                        case RELOAD_ERR_MISSING_SOA:
+                            send(cfd, "ERROR missing SOA\n", 18, 0);
+                            break;
+                    }
+                  } else if (lr.zcfg->type && strcasecmp(lr.zcfg->type, "slave") == 0) {
+                    syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", lr.zcfg->domain);
+                    atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
+                    send(cfd, "OK reloaded (slave)\n", 20, 0);
+                  } else {
+                    send(cfd, "ERROR unknown zone type\n", 24, 0);
+                  }
+                } else {
+                  send(cfd, "ERROR zone not found\n", 21, 0);
                 }
+                release_zone_snapshot(snap);
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
                 reload_all_zones();
@@ -4106,7 +4248,13 @@ void *control_thread_func(void *arg) {
               st.last_configured_time = g_last_configured_time;
               
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              st.num_zones = snap ? snap->count : 0;
+              if (snap) {
+                for (size_t v = 0; v < snap->view_count; v++) {
+                  st.num_zones += snap->views[v].zone_count;
+                }
+              } else {
+                st.num_zones = 0;
+              }
               release_zone_snapshot(snap);
 
               st.xfers_running = atomic_load_explicit(&g_xfers_running, memory_order_relaxed);
@@ -4144,39 +4292,57 @@ void *control_thread_func(void *arg) {
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
-              if (entry) {
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              zone_lookup_result_t lr = {0};
+              int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
+              if (nmatches == 0) {
+                syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              } else if (nmatches > 1) {
+                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n", 86, 0);
+              } else if (lr.entry) {
                 char smsg[256];
-                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)entry->serial, (uint32_t)entry->refresh);
+                int slen = snprintf(smsg, sizeof(smsg), "OK serial=%u refresh=%u\n", (uint32_t)lr.entry->serial, (uint32_t)lr.entry->refresh);
                 send(cfd, smsg, slen, 0);
               } else {
-                syslog(LOG_ERR, "[Control] Command 'zonestatus' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
-              if (entry) {
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              zone_lookup_result_t lr = {0};
+              int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
+              if (nmatches == 0) {
+                syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              } else if (nmatches > 1) {
+                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'notify <zone> <view>')\n", 82, 0);
+              } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received notify command for zone: %s", canon_arg);
-                atomic_store_explicit(&entry->notify_now, true, memory_order_release);
+                atomic_store_explicit(&lr.entry->notify_now, true, memory_order_release);
                 send(cfd, "OK\n", 3, 0);
               } else {
-                syslog(LOG_ERR, "[Control] Command 'notify' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "retransfer") == 0 && arg) {
               const char *canon_arg = find_configured_domain(arg);
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              zone_db_entry_t *entry = snapshot_get_zone(snap, canon_arg);
-              if (entry) {
+              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              zone_lookup_result_t lr = {0};
+              int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
+              if (nmatches == 0) {
+                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
+                send(cfd, "ERROR zone not found\n", 21, 0);
+              } else if (nmatches > 1) {
+                send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
+              } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
-                atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
+                atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
                 send(cfd, "OK\n", 3, 0);
               } else {
-                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' not found", canon_arg);
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
               release_zone_snapshot(snap);
@@ -4212,7 +4378,7 @@ void *control_thread_func(void *arg) {
           if (entry) {
             if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
               syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
-              send_notify_to_all(entry->domain);
+              send_notify_to_all(entry->domain, entry->view_name);
             }
           }
           if (zone->type && strcasecmp(zone->type, "slave") == 0 &&
@@ -4757,15 +4923,6 @@ int main(int argc, char **argv) {
 
   server_config_t *active =
       atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  for (int i = 0; i < active->bind_address_count; i++)
-    free(active->bind_addresses[i]);
-  free(active->bind_addresses);
-  active->bind_address_count = 0;
-  zone_config_t *curr = active->zones;
-  while (curr) {
-    zone_config_t *next = curr->next;
-    free_zone_config(curr);
-    curr = next;
-  }
+  free_server_config_fields(active);
   return 0;
 }

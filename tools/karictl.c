@@ -188,7 +188,9 @@ int main(int argc, char **argv) {
     }
 
     char cmd_msg[512];
-    if (optind + 1 < argc) {
+    if (optind + 2 < argc) {
+        snprintf(cmd_msg, sizeof(cmd_msg), "%s %s %s\n", argv[optind], argv[optind + 1], argv[optind + 2]);
+    } else if (optind + 1 < argc) {
         snprintf(cmd_msg, sizeof(cmd_msg), "%s %s\n", argv[optind], argv[optind + 1]);
     } else {
         snprintf(cmd_msg, sizeof(cmd_msg), "%s\n", argv[optind]);

@@ -78,12 +78,21 @@ typedef struct {
   size_t secret_decoded_len;
 } control_channel_config_t;
 
+typedef struct view_config {
+  char *name;
+  char **match_clients;
+  int match_clients_count;
+  zone_config_t *zones;
+  struct view_config *next;
+} view_config_t;
+
 typedef struct {
   int port;
   char **bind_addresses;
   int bind_address_count;
   char *user;
   char *group;
+  view_config_t *views;
   zone_config_t *zones;
   tsig_key_t *keys;
   logging_config_t logging;
