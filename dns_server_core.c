@@ -101,6 +101,7 @@ typedef struct {
 
 typedef struct {
   char domain[256];
+  char view_name[64];
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
@@ -706,6 +707,20 @@ void release_zone_snapshot(zone_db_snapshot_t *snap) {
     atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
 }
 
+static zone_config_t *find_zone_config_in_view(server_config_t *cfg,
+                                               const char *view_name,
+                                               const char *domain) {
+  if (!cfg || !view_name || !domain) return NULL;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    if (strcasecmp(v->name, view_name) != 0) continue;
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (strcasecmp(z->domain, domain) == 0) return z;
+    }
+    return NULL;
+  }
+  return NULL;
+}
+
 zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain) {
   if (!snap) return NULL;
   for (size_t v = 0; v < snap->view_count; v++) {
@@ -734,13 +749,15 @@ static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
   }
 }
 
-static zone_db_entry_t *create_new_zone_entry(const char *domain) {
+static zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name) {
   zone_db_entry_t *z = calloc(1, sizeof(zone_db_entry_t));
   if (!z) return NULL;
   atomic_init(&z->active_axfr, 0);
   atomic_init(&z->snapshot_refs, 1);
   strncpy(z->domain, domain, sizeof(z->domain) - 1);
   z->domain[sizeof(z->domain) - 1] = 0;
+  strncpy(z->view_name, view_name, sizeof(z->view_name) - 1);
+  z->view_name[sizeof(z->view_name) - 1] = 0;
   pthread_mutex_init(&z->writer_lock, NULL);
   pthread_mutex_init(&z->ixfr_history.lock, NULL);
   z->ixfr_history.count = 0;
@@ -1105,7 +1122,7 @@ void rebuild_zone_db_from_config(server_config_t *config) {
         }
       }
       if (!entry) {
-        entry = create_new_zone_entry(z->domain);
+        entry = create_new_zone_entry(z->domain, v->name);
       }
       vs->entries[zidx++] = entry;
       
@@ -1356,8 +1373,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         atomic_store_explicit(&entry->rcu.active, standby,
                               memory_order_release);
         wait_for_readers(active);
-        void send_notify_to_all(const char *domain);
-        send_notify_to_all(entry->domain);
+        void send_notify_to_all(const char *domain, const char *view_name);
+        send_notify_to_all(entry->domain, entry->view_name);
       }
       pthread_mutex_unlock(&entry->writer_lock);
       return 1;
@@ -2088,15 +2105,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     bool auth = false;
-    if (db_entry) {
+    if (db_entry && view) {
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-      zone_config_t *zcfg = cfg->zones;
-      while (zcfg) {
-        if (strcasecmp(zcfg->domain, db_entry->domain) == 0)
-          break;
-        zcfg = zcfg->next;
-      }
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->masters_count > 0) {
         for (int k = 0; k < zcfg->masters_count; k++) {
           if (strcmp(client_ip, zcfg->masters[k].ip) == 0) {
@@ -2149,15 +2161,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 5) { // UPDATE
     bool auth = false;
     tsig_key_t *matched_key = NULL;
-    if (db_entry) {
+    if (db_entry && view) {
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-      zone_config_t *zcfg = cfg->zones;
-      while (zcfg) {
-        if (strcasecmp(zcfg->domain, db_entry->domain) == 0)
-          break;
-        zcfg = zcfg->next;
-      }
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->allow_update_count > 0) {
         tsig_key_t *k = cfg->keys;
         while (k) {
@@ -2537,17 +2544,12 @@ void *axfr_bg_thread_func(void *arg) {
   pthread_exit(NULL);
 }
 
-void send_notify_to_all(const char *domain) {
+void send_notify_to_all(const char *domain, const char *view_name) {
   server_config_t *active =
       atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   if (!active)
     return;
-  zone_config_t *zone = active->zones;
-  while (zone) {
-    if (strcasecmp(zone->domain, domain) == 0)
-      break;
-    zone = zone->next;
-  }
+  zone_config_t *zone = find_zone_config_in_view(active, view_name, domain);
   if (!zone || zone->also_notify_count == 0)
     return;
 
@@ -3644,14 +3646,12 @@ worker_startup_success:;
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           if (qtype == 252 || qtype == 251) {
+            view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
             server_config_t *cfg =
                 atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-            zone_config_t *zcfg = cfg->zones;
-            while (zcfg) {
-              if (strcasecmp(zcfg->domain, qname) == 0)
-                break;
-              zcfg = zcfg->next;
-            }
+            zone_config_t *zcfg = xfr_view
+                ? find_zone_config_in_view(cfg, xfr_view->name, qname)
+                : NULL;
             bool allowed = false;
             uint16_t tsig_error = 0;
             tsig_key_t *matched_key = NULL;
@@ -3693,7 +3693,15 @@ worker_startup_success:;
                   allowed = tsig_ok;
               }
             }
-            zone_db_entry_t *entry = snapshot_get_zone(snap, qname);
+            zone_db_entry_t *entry = NULL;
+            if (xfr_view) {
+              for (size_t i = 0; i < xfr_view->zone_count; i++) {
+                if (strcasecmp(xfr_view->entries[i]->domain, qname) == 0) {
+                  entry = xfr_view->entries[i];
+                  break;
+                }
+              }
+            }
             if (allowed && entry) {
               if (atomic_fetch_add(&entry->active_axfr, 1) >= MAX_ZONE_AXFR) {
                 atomic_fetch_sub(&entry->active_axfr, 1);
@@ -4305,7 +4313,7 @@ void *control_thread_func(void *arg) {
           if (entry) {
             if (atomic_exchange_explicit(&entry->notify_now, false, memory_order_acquire)) {
               syslog(LOG_INFO, "[Control] Executing manual NOTIFY for %s", entry->domain);
-              send_notify_to_all(entry->domain);
+              send_notify_to_all(entry->domain, entry->view_name);
             }
           }
           if (zone->type && strcasecmp(zone->type, "slave") == 0 &&
