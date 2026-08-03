@@ -80,6 +80,8 @@ typedef struct {
 } zone_rcu_t;
 
 #define MAX_IXFR_HISTORY 32
+#define MAX_ZONE_AXFR 4
+#define MAX_TCP_CLIENTS 1000
 
 typedef struct {
   uint32_t old_serial;
@@ -3551,13 +3553,25 @@ worker_startup_success:;
       } else if (ev_list[i].udata == (void *)2) {
         // TCP
         int active_tcp_fd = ev_list[i].ident;
-        while (1) {
+        int accept_count = 0;
+        while (accept_count < 100) {
           struct sockaddr_storage client_addr;
           socklen_t client_len = sizeof(client_addr);
           int client_fd = accept(active_tcp_fd, (struct sockaddr *)&client_addr,
                                  &client_len);
-          if (client_fd < 0)
+          if (client_fd < 0) {
+            if (errno == EMFILE || errno == ENFILE) {
+              // FD exhaustion: backoff to prevent accept storm
+              usleep(10000); // 10ms
+            }
             break;
+          }
+          accept_count++;
+
+          if (atomic_load_explicit(&g_tcp_clients, memory_order_acquire) >= MAX_TCP_CLIENTS) {
+            close(client_fd);
+            continue;
+          }
 
           inc_tcp_clients();
 
