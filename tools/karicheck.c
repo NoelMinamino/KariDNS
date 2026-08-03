@@ -216,8 +216,6 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
     if (arena.count == 0) {
         fprintf(stderr, "[ERROR] No records found in zone '%s' (%s)\n", domain, file_path);
-        free(buf);
-        free(mutable_buf);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
         free(root_path);
@@ -227,8 +225,6 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     build_zone_index(&arena);
     if (validate_zone_dname(&arena, &err) < 0) {
         print_error_context(file_path, buf, &err, &arena);
-        free(buf);
-        free(mutable_buf);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
         free(root_path);
