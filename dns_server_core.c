@@ -1115,6 +1115,12 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   }
 
   build_zone_index(z_standby);
+  if (validate_zone_dname(z_standby, &parse_err) < 0) {
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] DNAME validation error reloading zone '%s' from '%s': %s",
+             entry->domain, file, parse_err.error_message);
+      return RELOAD_ERR_PARSE;
+  }
   bool has_soa = false;
   uint32_t hash = calc_fnv1a_str(entry->domain);
   size_t idx = hash & (z_standby->hash_size - 1);
@@ -1666,10 +1672,50 @@ static void resolve_name(const char *qname, uint16_t qtype,
       }
     }
     if (!found) {
-      const char *parent = current_qname;
-      char wc_name[256];
-      while ((parent = strchr(parent, '.')) != NULL) {
-        parent++;
+      bool dname_found = false;
+      const char *dname_parent = current_qname;
+      while ((dname_parent = strchr(dname_parent, '.')) != NULL) {
+        dname_parent++;
+        if (*dname_parent == '\0') break;
+        uint32_t p_hash = calc_fnv1a_str(dname_parent);
+        size_t p_idx = p_hash & (current_zone->hash_size - 1);
+        for (int i = current_zone->hash_table[p_idx]; i != -1; i = current_zone->records[i].next_record) {
+          dns_record_t *rec = &current_zone->records[i];
+          if (rec->type_code == 39 && strcasecmp(rec->name, dname_parent) == 0) {
+            dname_found = true;
+            size_t prefix_len = dname_parent - current_qname;
+            if (rec->rdata_count == 0) break;
+            size_t target_len = strlen(rec->rdata[0]);
+            if (prefix_len + target_len > 255) { res[3] |= 6; return; }
+            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
+            (*ancount)++;
+            if (dnssec_ok) {
+              if (!attach_covering_rrsig(current_zone, p_idx, dname_parent, NULL, 39, res, max_res_len, offset, comp_ctx, ancount)) { res[2] |= 0x02; return; }
+            }
+            char synth_name[256];
+            memcpy(synth_name, current_qname, prefix_len);
+            strcpy(synth_name + prefix_len, rec->rdata[0]);
+            dns_record_t synth_cname;
+            memset(&synth_cname, 0, sizeof(synth_cname));
+            synth_cname.name = (char *)current_qname;
+            synth_cname.type_code = 5;
+            synth_cname.ttl = rec->ttl;
+            synth_cname.rdata_count = 1;
+            synth_cname.rdata[0] = synth_name;
+            if (serialize_dns_record(res, max_res_len, offset, &synth_cname, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
+            (*ancount)++;
+            strncpy(current_qname, synth_name, sizeof(current_qname));
+            current_qname[255] = '\0';
+            cname_followed = true; found = true; break;
+          }
+        }
+        if (dname_found) break;
+      }
+      if (!dname_found) {
+        const char *parent = current_qname;
+        char wc_name[256];
+        while ((parent = strchr(parent, '.')) != NULL) {
+          parent++;
         if (*parent == '\0')
           break;
         snprintf(wc_name, sizeof(wc_name), "*.%s", parent);
@@ -1723,6 +1769,7 @@ static void resolve_name(const char *qname, uint16_t qtype,
         }
         if (wc_found)
           break;
+        }
       }
     }
     if (cname_followed) {

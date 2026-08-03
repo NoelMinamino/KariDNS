@@ -957,3 +957,31 @@ void build_zone_index(zone_arena_t *arena) {
   }
 }
 
+int validate_zone_dname(zone_arena_t *arena, parse_error_t *err) {
+  if (!arena || !arena->hash_table) return 0;
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *rec = &arena->records[i];
+    if (!rec->name) continue;
+    const char *parent = rec->name;
+    while ((parent = strchr(parent, '.')) != NULL) {
+      parent++;
+      if (*parent == '\0') break;
+      uint32_t p_hash = calc_fnv1a_str(parent);
+      size_t p_idx = p_hash & (arena->hash_size - 1);
+      for (int j = arena->hash_table[p_idx]; j != -1; j = arena->records[j].next_record) {
+        if (arena->records[j].type_code == 39 && strcasecmp(arena->records[j].name, parent) == 0) {
+          if (err) {
+            err->error_message = "Record exists under a DNAME (RFC 6672 violation)";
+            // Approximate offset/length for error reporting if possible, else 0
+            err->error_offset = 0;
+            err->token_length = 0;
+            err->file_path = NULL;
+          }
+          return -1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
