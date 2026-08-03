@@ -10,7 +10,7 @@
 
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t')
 #define IS_NEWLINE(c) ((c) == '\n' || (c) == '\r')
-#define MAX_FIELDS 100
+#define MAX_FIELDS 512
 
 
 void *arena_alloc(zone_arena_t *arena, size_t size) {

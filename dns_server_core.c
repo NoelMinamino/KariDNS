@@ -273,7 +273,13 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   clock_gettime(CLOCK_MONOTONIC, &ts);
   int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
-  while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {}
+  while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+      __asm__ volatile("pause" ::: "memory");
+#else
+      sched_yield();
+#endif
+  }
 
   if (b->client_hash != full_hash) {
     // Hash collision or new entry
@@ -1714,12 +1720,15 @@ static void resolve_name(const char *qname, uint16_t qtype,
       if (!dname_found) {
         const char *parent = current_qname;
         char wc_name[256];
+        wc_name[0] = '*';
+        wc_name[1] = '.';
         while ((parent = strchr(parent, '.')) != NULL) {
           parent++;
-        if (*parent == '\0')
-          break;
-        snprintf(wc_name, sizeof(wc_name), "*.%s", parent);
-        uint32_t wc_hash = calc_fnv1a_str(wc_name);
+          if (*parent == '\0') break;
+          size_t parent_len = strlen(parent);
+          if (parent_len + 3 > sizeof(wc_name)) break;
+          memcpy(&wc_name[2], parent, parent_len + 1);
+          uint32_t wc_hash = calc_fnv1a_str(wc_name);
         size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
         bool wc_found = false;
         for (int i = current_zone->hash_table[wc_idx]; i != -1;

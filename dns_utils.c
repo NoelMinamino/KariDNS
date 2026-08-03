@@ -318,8 +318,18 @@ static const type_name_entry_t TYPE_NAMES[] = {
 };
 
 static const char *lookup_type_name(uint16_t type) {
-    for (size_t i = 0; i < sizeof(TYPE_NAMES)/sizeof(TYPE_NAMES[0]); i++) {
-        if (TYPE_NAMES[i].type == type) return TYPE_NAMES[i].name;
+    int left = 0;
+    int right = sizeof(TYPE_NAMES) / sizeof(TYPE_NAMES[0]) - 1;
+    while (left <= right) {
+        int mid = left + (right - left) / 2;
+        if (TYPE_NAMES[mid].type == type) {
+            return TYPE_NAMES[mid].name;
+        }
+        if (TYPE_NAMES[mid].type < type) {
+            left = mid + 1;
+        } else {
+            right = mid - 1;
+        }
     }
     return NULL;
 }
