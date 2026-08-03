@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
+#include <assert.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -173,10 +174,11 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
 }
 
 const char *get_type_str(uint16_t type, zone_arena_t *arena) {
+    assert(arena != NULL && "arena must be provided. malloc fallback is removed.");
     char tmp[16];
     const char *n = format_type_name(type, tmp, sizeof(tmp));
     if (n != tmp) return n;
-    char *buf = arena ? arena_alloc(arena, 16) : malloc(16);
+    char *buf = arena_alloc(arena, 16);
     if (buf) memcpy(buf, tmp, strlen(tmp) + 1);
     return buf;
 }
@@ -1701,7 +1703,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         if (rdata_offset + opt_len > rdata_end) break;
                         
                         if (opt_code == 10) { // DNS Cookie
-                            if (opt_len >= 8) {
+                            if (opt_len == 8 || (opt_len >= 16 && opt_len <= 40)) {
                                 edns->has_cookie = true;
                                 memcpy(edns->client_cookie, req + rdata_offset, 8);
                                 if (opt_len > 8) {
