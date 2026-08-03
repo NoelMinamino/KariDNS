@@ -71,7 +71,7 @@ static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, con
 int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx, size_t max_len) {
     const uint8_t *s = name;
     while (*s != 0) {
-        if (*offset >= 0x3FFF) return -1;
+        if (*offset >= 0x4000) return -1;
         uint32_t hash = calc_fnv1a_suffix(s), idx = hash & COMPRESS_HASH_MASK;
         for (int i = 0; i < MAX_PROBE_DEPTH; i++) {
             compress_entry_t *entry = &ctx->table[(idx + i) & COMPRESS_HASH_MASK];
@@ -197,7 +197,9 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     if (type == 6) {
         size_t rdata_p = *offset; char *mname, *rname;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &mname) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA mname expand failed"); return -1; }
+        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA mname exceeds rdlen"); return -1; }
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &rname) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA rname expand failed"); return -1; }
+        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA rname exceeds rdlen"); return -1; }
         rec->rdata[0] = mname; rec->rdata[1] = rname; rec->rdata_count = 2;
         for (int j = 0; j < 5; j++) {
             if (rdata_p + 4 > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: SOA numbers out of bounds"); return -1; }
@@ -212,6 +214,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     } else if (type == 2 || type == 5 || type == 12) {
         size_t rdata_p = *offset; char *target;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: NAME expand failed"); return -1; }
+        if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: NAME exceeds rdlen"); return -1; }
         rec->rdata[0] = target; rec->rdata_count = 1;
     } else if (type == 15) {
         if (rdlen < 3) return -1;
@@ -219,6 +222,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         uint16_t pref = (packet[rdata_p] << 8) | packet[rdata_p+1];
         rdata_p += 2;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
         char *pref_buf = arena_alloc(arena, 16); if (!pref_buf) return -1;
         snprintf(pref_buf, 16, "%u", pref);
         rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;

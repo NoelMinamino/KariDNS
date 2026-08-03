@@ -294,13 +294,13 @@ static const type_name_entry_t TYPE_NAMES[] = {
     {65, "HTTPS"},
     {66, "DSYNC"},
     {99, "SPF"},
-    {128, "NXNAME"},
     {104, "NID"},
     {105, "L32"},
     {106, "L64"},
     {107, "LP"},
     {108, "EUI48"},
     {109, "EUI64"},
+    {128, "NXNAME"},
     {249, "TKEY"},
     {250, "TSIG"},
     {251, "IXFR"},
@@ -346,6 +346,19 @@ int hex_char_to_val(char c) {
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
+}
+
+__attribute__((constructor))
+static void verify_type_names_sorted(void) {
+    size_t n = sizeof(TYPE_NAMES) / sizeof(TYPE_NAMES[0]);
+    for (size_t i = 1; i < n; i++) {
+        if (TYPE_NAMES[i - 1].type >= TYPE_NAMES[i].type) {
+            fprintf(stderr,
+                "FATAL: TYPE_NAMES is not strictly sorted at index %zu (%u >= %u)\n",
+                i, TYPE_NAMES[i - 1].type, TYPE_NAMES[i].type);
+            abort();
+        }
+    }
 }
 
 size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap) {

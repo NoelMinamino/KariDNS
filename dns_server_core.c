@@ -4213,7 +4213,14 @@ void *control_thread_func(void *arg) {
           free_ctrl_client(cfd);
           continue;
         }
-        ssize_t r = recv(cfd, c->buf + c->buf_len, sizeof(c->buf) - c->buf_len - 1, 0);
+        size_t space_left = sizeof(c->buf) - c->buf_len - 1;
+        if (space_left == 0) {
+            send(cfd, "ERROR buffer overflow\n", 22, 0);
+            syslog(LOG_ERR, "[Control] Command buffer overflow, dropping client");
+            free_ctrl_client(cfd);
+            continue;
+        }
+        ssize_t r = recv(cfd, c->buf + c->buf_len, space_left, 0);
         if (r <= 0) {
           free_ctrl_client(cfd);
           continue;

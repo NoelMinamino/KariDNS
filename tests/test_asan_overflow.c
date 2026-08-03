@@ -4,6 +4,7 @@
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
 #include "../dns_zone_parser.h"
+#include "../dns_utils.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -546,9 +547,9 @@ int main() {
         }
 
         // 3. Exceeds MAX_FIELDS
-        char buf3[4096];
+        char buf3[8192];
         strcpy(buf3, "example.com. 3600 IN TXT ( ");
-        for (int i = 0; i < 120; i++) {
+        for (int i = 0; i < 520; i++) {
             strcat(buf3, "\"field\" ");
         }
         strcat(buf3, ")\n");
@@ -584,6 +585,24 @@ int main() {
 
         printf("PASS: dns_zone_parser tests\n");
         zone_arena_destroy(&arena);
+    }
+
+    {
+        printf("\n--- Test 7: Type Name Formatting ---\n");
+        struct { uint16_t type; const char *expected; } tests[] = {
+            {104, "NID"}, {105, "L32"}, {106, "L64"}, {107, "LP"},
+            {108, "EUI48"}, {109, "EUI64"}, {128, "NXNAME"},
+            {0, NULL}
+        };
+        char buf[32];
+        for (int i = 0; tests[i].type != 0; i++) {
+            const char *res = format_type_name(tests[i].type, buf, sizeof(buf));
+            if (!res || strcmp(res, tests[i].expected) != 0) {
+                printf("FAIL: Test 7 type %u expected '%s', got '%s'\n", tests[i].type, tests[i].expected, res ? res : "NULL");
+                return 1;
+            }
+        }
+        printf("PASS: Type name formatting tests\n");
     }
 
     printf("All tests passed safely.\n");
