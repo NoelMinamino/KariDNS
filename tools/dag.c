@@ -2472,6 +2472,12 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
         int pad = 0;
         if (b64_len > 0 && secret_b64[b64_len - 1] == '=') pad++;
         if (b64_len > 1 && secret_b64[b64_len - 2] == '=') pad++;
+        size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
+        if (b64_len == 0 || decoded_upper_bound > sizeof(qo->tsig_key.secret_decoded)) {
+            fprintf(stderr, "warning: tsig secret base64 too long or empty\n");
+            qo->want_tsig = false;
+            return;
+        }
         int dec_len = EVP_DecodeBlock(qo->tsig_key.secret_decoded, (const unsigned char *)secret_b64, b64_len);
         if (dec_len > 0) {
             qo->tsig_key.secret_decoded_len = dec_len - pad;
