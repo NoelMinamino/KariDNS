@@ -13,6 +13,7 @@
 #include <openssl/sha.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -779,15 +780,26 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
   return NULL;
 }
 
+static inline void rcu_exponential_backoff(int *retries, useconds_t *sleep_time) {
+  if (*retries < 100) {
+    sched_yield();
+  } else {
+    usleep(*sleep_time);
+    if (*sleep_time < 100000) *sleep_time *= 2;
+  }
+  (*retries)++;
+}
+
 static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
   int retries = 0;
+  useconds_t sleep_time = 1;
   while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
-    usleep(1000);
-    if (++retries % 1000 == 0) {
+    rcu_exponential_backoff(&retries, &sleep_time);
+    if (sleep_time >= 100000 && (retries % 10) == 0) {
       syslog(LOG_WARNING, "[RCU] wait_for_snapshot_readers stalled");
     }
 #if defined(SANITIZER_BUILD)
-    if (retries > 5000) {
+    if (retries > 170) {
       syslog(LOG_ERR, "[RCU] FATAL: reader_count leak detected (stalled > 5s). Aborting.");
       abort();
     }
@@ -816,17 +828,20 @@ static zone_db_entry_t *create_new_zone_entry(const char *domain, const char *vi
 
 static void wait_for_readers(zone_arena_t *arena) {
   int retries = 0;
+  useconds_t sleep_time = 1;
   while (atomic_load_explicit(&arena->reader_count, memory_order_acquire) > 0) {
-    usleep(1000);
-    if (++retries % 1000 == 0)
+    rcu_exponential_backoff(&retries, &sleep_time);
+    if (sleep_time >= 100000 && (retries % 10) == 0)
       syslog(LOG_WARNING, "[RCU] wait_for_readers stalled");
   }
 }
 
 void free_zone_db_entry(zone_db_entry_t *entry) {
   if (!entry) return;
+  int axfr_retries = 0;
+  useconds_t axfr_sleep = 1;
   while (atomic_load(&entry->active_axfr) > 0) {
-    usleep(1000);
+    rcu_exponential_backoff(&axfr_retries, &axfr_sleep);
   }
   wait_for_readers(&entry->rcu.arena_a);
   wait_for_readers(&entry->rcu.arena_b);
