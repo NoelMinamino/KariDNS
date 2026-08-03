@@ -32,6 +32,7 @@ typedef struct zone_config {
   char *domain;
   char *file;
   char *type;
+  bool is_catalog;
   ip_port_t *masters;
   int masters_count;
   char *tsig_key;

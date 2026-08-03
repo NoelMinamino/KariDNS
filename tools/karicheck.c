@@ -145,7 +145,7 @@ static void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
     }
 }
 
-static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone) {
+static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
     char domain_buf[256];
@@ -371,6 +371,24 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         return 1;
     }
 
+    if (is_catalog) {
+        char version_txt[256];
+        snprintf(version_txt, sizeof(version_txt), "version.%s", domain);
+        bool found_version = false;
+        for (size_t i = 0; i < arena.count; i++) {
+            if (arena.records[i].type_code == 16 && strcasecmp(arena.records[i].name, version_txt) == 0) {
+                if (arena.records[i].rdata_count > 0 && strcmp(arena.records[i].rdata[0], "2") == 0) {
+                    found_version = true;
+                    break;
+                }
+            }
+        }
+        if (!found_version) {
+            fprintf(stderr, "[ERROR] Catalog zone '%s' is missing '%s TXT \"2\"'\n", domain, version_txt);
+            error_found = true;
+        }
+    }
+
     if (error_found) {
         fprintf(stderr, "[FAIL] Zone '%s' contains invalid records.\n", domain);
         free((void*)ctx.base_dir);
@@ -435,7 +453,7 @@ int main(int argc, char **argv) {
         zone_config_t *z = cfg.zones;
         while (z) {
             if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
-                if (check_zone(z->domain, z->file, false) != 0) {
+                if (check_zone(z->domain, z->file, false, z->is_catalog) != 0) {
                     error_count++;
                 }
                 checked++;
@@ -452,7 +470,7 @@ int main(int argc, char **argv) {
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL && strstr(argv[3], "/") != NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
-            return check_zone(domain, argv[3], true);
+            return check_zone(domain, argv[3], true, false);
         } else {
             // From config: karicheck zone <domain> [config_path]
             const char *cfg_path = (argc >= 4) ? argv[3] : default_config;
@@ -467,7 +485,7 @@ int main(int argc, char **argv) {
             zone_config_t *z = cfg.zones;
             while (z) {
                 if (strcasecmp(z->domain, norm_domain) == 0) {
-                    return check_zone(z->domain, z->file, false);
+                    return check_zone(z->domain, z->file, false, z->is_catalog);
                 }
                 z = z->next;
             }

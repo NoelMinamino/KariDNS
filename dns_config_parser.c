@@ -576,7 +576,8 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       }
     } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
                strcmp(key, "tsig-key") == 0 ||
-               strcmp(key, "notify-source") == 0) {
+               strcmp(key, "notify-source") == 0 ||
+               strcmp(key, "catalog-zone") == 0) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) {
         free(key);
@@ -601,8 +602,13 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         zone->file = val;
       else if (strcmp(key, "tsig-key") == 0)
         zone->tsig_key = val;
-      else
+      else if (strcmp(key, "notify-source") == 0)
         zone->notify_source = val;
+      else if (strcmp(key, "catalog-zone") == 0) {
+        if (strcasecmp(val, "yes") == 0)
+          zone->is_catalog = true;
+        free(val);
+      }
     } else if (strcmp(key, "rate-limit") == 0) {
       if (parse_rate_limit_config(ctx, &zone->rrl) != 0) {
         free(key);
