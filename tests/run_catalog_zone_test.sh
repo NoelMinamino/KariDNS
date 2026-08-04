@@ -36,6 +36,7 @@ control-channel {
 };
 
 view "default" {
+    match-clients { any; };
     zone "catalog.example.com" {
         type master;
         file "${TEST_DIR_ABS}/catalog.zone";
@@ -67,6 +68,17 @@ echo "[+] Checking if initial catalog members are resolvable..."
 echo "Checking logs to see if membership was processed..."
 grep "Processed membership for 'catalog.example.com.', desired members: 2" karidns.log || { echo "Failed to process membership"; kill $SERVER_PID; exit 1; }
 
+echo "[+] Checking dag resolution for example.net (should be SERVFAIL because empty member)"
+../dag -p 53530 @127.0.0.1 example.net. SOA > dag_output.txt 2>&1
+cat dag_output.txt
+grep "status: SERVFAIL" dag_output.txt || { echo "Failed: example.net did not return SERVFAIL"; kill $SERVER_PID; exit 1; }
+
+echo "[+] Checking dag resolution for example.org (should be SERVFAIL)"
+../dag -p 53530 @127.0.0.1 example.org. SOA | grep "status: SERVFAIL" || { echo "Failed: example.org did not return SERVFAIL"; kill $SERVER_PID; exit 1; }
+
+echo "[+] Checking dag resolution for example.edu (should be REFUSED because it's not a member yet)"
+../dag -p 53530 @127.0.0.1 example.edu. SOA | grep "status: REFUSED" || { echo "Failed: example.edu did not return REFUSED"; kill $SERVER_PID; exit 1; }
+
 # Now let's update the catalog zone (add zone3, remove zone1)
 cat << 'EOF' > catalog.zone
 $ORIGIN catalog.example.com.
@@ -82,6 +94,14 @@ EOF
 sleep 1
 grep "Processed membership for 'catalog.example.com.', desired members: 2" karidns.log || { echo "Failed to process membership after reload"; kill $SERVER_PID; exit 1; }
 
+echo "[+] Checking dag resolution after update"
+OUT=$(../dag -p 53530 @127.0.0.1 example.net. SOA)
+echo "$OUT" | grep "status: REFUSED" || { echo "Failed: example.net should be REFUSED now"; echo "$OUT"; cat karidns.log; kill $SERVER_PID; exit 1; }
+OUT=$(../dag -p 53530 @127.0.0.1 example.org. SOA)
+echo "$OUT" | grep "status: SERVFAIL" || { echo "Failed: example.org should still be SERVFAIL"; echo "$OUT"; kill $SERVER_PID; exit 1; }
+OUT=$(../dag -p 53530 @127.0.0.1 example.edu. SOA)
+echo "$OUT" | grep "status: SERVFAIL" || { echo "Failed: example.edu should be SERVFAIL now"; echo "$OUT"; kill $SERVER_PID; exit 1; }
+
 # Run concurrent reload + something else to test race conditions
 echo "[+] Testing race condition (concurrent full reload vs catalog delta update)"
 PIDS=""
@@ -91,6 +111,9 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
 done
 wait $PIDS
 sleep 1
+
+# Check resolution still intact after race condition test
+../dag -p 53530 @127.0.0.1 example.edu. SOA | grep "status: SERVFAIL" || { echo "Failed: example.edu broken after race test"; kill $SERVER_PID; exit 1; }
 
 # Test catalog removal
 cat << EOF > karidns.conf
@@ -107,6 +130,7 @@ control-channel {
 };
 
 view "default" {
+    match-clients { any; };
     zone "catalog.example.com" {
         type master;
         file "${TEST_DIR_ABS}/catalog.zone";
@@ -115,7 +139,7 @@ view "default" {
 };
 EOF
 
-../karictl -f karictl.conf reload
+../karictl -f karictl.conf reconfig
 sleep 1
 
 echo "[+] Catalog removed (downgraded to catalog-zone no). Validating cascading removal..."
@@ -127,6 +151,10 @@ else
     echo "[-] Server crashed during cascading removal!"
     exit 1
 fi
+
+echo "[+] Verifying dag resolution (all former members should be REFUSED)"
+../dag -p 53530 @127.0.0.1 example.org. SOA | grep "status: REFUSED" || { echo "Failed: example.org should be REFUSED"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 example.edu. SOA | grep "status: REFUSED" || { echo "Failed: example.edu should be REFUSED"; kill $SERVER_PID; exit 1; }
 
 kill $SERVER_PID
 wait $SERVER_PID || true

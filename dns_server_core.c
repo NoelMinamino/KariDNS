@@ -1157,6 +1157,15 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 }
 
 
+
+static void free_string_array(char **arr, int count) {
+    if (!arr) return;
+    for (int i = 0; i < count; i++) {
+        free(arr[i]);
+    }
+    free(arr);
+}
+
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
@@ -1196,7 +1205,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                 valid_members[valid_member_count++] = entry->catalog_members[k];
                             }
                         } else {
-                            free(entry->catalog_members);
+                            free_string_array(entry->catalog_members, entry->catalog_member_count);
                             entry->catalog_members = NULL;
                             entry->catalog_member_count = 0;
                         }
@@ -1281,6 +1290,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (!entry) {
                     zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
                     entry = create_new_zone_entry(z->domain, v->name);
+                    if (entry && z->type && (strcasecmp(z->type, "master") == 0 || strcasecmp(z->type, "primary") == 0) && z->file) {
+                        reload_master_zone(entry, z->file);
+                    }
                 }
                 vs->entries[zidx++] = entry;
             }
@@ -1427,7 +1439,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         free(new_entries);
 
         if (catalog_entry_to_update) {
-            free(catalog_entry_to_update->catalog_members);
+            free_string_array(catalog_entry_to_update->catalog_members, catalog_entry_to_update->catalog_member_count);
             catalog_entry_to_update->catalog_members = new_desired_members;
             catalog_entry_to_update->catalog_member_count = new_desired_count;
         }
@@ -1467,6 +1479,8 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     zone_arena_t *arena = atomic_load_explicit(&catalog_entry->rcu.active, memory_order_acquire);
     if (!arena) return;
 
+    atomic_fetch_add_explicit(&arena->reader_count, 1, memory_order_acquire);
+
     // Verify version.<catalog_zone>. TXT "2"
     char version_txt[256];
     snprintf(version_txt, sizeof(version_txt), "version.%s", catalog_entry->domain);
@@ -1482,6 +1496,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
 
     if (!found_version) {
         syslog(LOG_ERR, "[Catalog] Zone '%s' is missing '%s TXT \"2\"', aborting catalog update", catalog_entry->domain, version_txt);
+        atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
         return;
     }
 
@@ -1527,6 +1542,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         new_desired = NULL;
     }
 
+    atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
     rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
     syslog(LOG_INFO, "[Catalog] Processed membership for '%s', desired members: %d", catalog_entry->domain, new_desired_count);
 }
@@ -2416,6 +2432,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       for (size_t i = 0; i < view->zone_count; i++) {
         size_t z_len = strlen(view->entries[i]->domain);
         bool match = false;
+        
         if (q_len == z_len &&
             strcasecmp(current_qname, view->entries[i]->domain) == 0)
           match = true;
@@ -2799,6 +2816,18 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     } else {
       add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not authoritative for the queried zone");
     }
+    uint16_t offset = q_offset;
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);
+      *res_arcount = htons(arcount);
+    }
+    return offset;
+  }
+
+  if (current_zone->count == 0) {
+    res[3] |= 2; // SERVFAIL
+    add_ede(&edns, cfg_for_ede->send_extended_errors, 14, "Zone not ready (empty)");
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
     if (edns.present) {
@@ -4363,7 +4392,11 @@ static void reload_all_zones(void) {
           if (strcasecmp(zcfg->domain, entry->domain) == 0) {
             if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0) && zcfg->file) {
               syslog(LOG_NOTICE, "[Control] Reloading master zone: %s", entry->domain);
-              reload_master_zone(entry, zcfg->file);
+              reload_result_t rr = reload_master_zone(entry, zcfg->file);
+              if (rr == RELOAD_OK && zcfg->is_catalog) {
+                void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+                catalog_process_membership(entry, zcfg, vcfg->name);
+              }
             } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
               syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
               atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
@@ -4629,6 +4662,10 @@ void *control_thread_func(void *arg) {
                     switch (rr) {
                         case RELOAD_OK:
                             syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", lr.zcfg->domain);
+                            if (lr.zcfg->is_catalog) {
+                                void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+                                catalog_process_membership(lr.entry, lr.zcfg, lr.view_name);
+                            }
                             send(cfd, "OK reloaded\n", 12, 0);
                             break;
                         case RELOAD_ERR_FILE_READ:
