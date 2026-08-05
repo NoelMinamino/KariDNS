@@ -132,7 +132,7 @@ echo 'group.orphan.zones IN TXT "testgroup"' >> catalog.zone
 grep "Orphaned group TXT record" karicheck_out.txt || { echo "Failed: karicheck did not detect orphaned group TXT record"; cat karicheck_out.txt; kill $SERVER_PID; exit 1; }
 echo "[+] karicheck properly detected orphaned group."
 
-# Test catalog removal
+echo "[+] Phase 2 CoO Test: Setting up two catalog zones for transfer..."
 cat << EOF > karidns.conf
 options {
     port 53530;
@@ -148,20 +148,95 @@ control-channel {
 
 view "default" {
     match-clients { any; };
-    zone "catalog.example.com" {
+    zone "catalog1.example.com" {
         type master;
-        file "${TEST_DIR_ABS}/catalog.zone";
-        catalog-zone no;
+        file "${TEST_DIR_ABS}/catalog1.zone";
+        catalog-zone yes;
+    };
+    zone "catalog2.example.com" {
+        type master;
+        file "${TEST_DIR_ABS}/catalog2.zone";
+        catalog-zone yes;
     };
 };
+EOF
+
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+abc.zones IN PTR coo-test.com.
+EOF
+
+cat << EOF > catalog2.zone
+\$ORIGIN catalog2.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
 EOF
 
 ../karictl -f karictl.conf reconfig
 sleep 1
 
-echo "[+] Catalog removed (downgraded to catalog-zone no). Validating cascading removal..."
-# Since it's no longer a catalog zone, all dynamically spawned members should be unresolvable and freed
-# We can't directly query the slaves since they were empty, but we can check if it crashed.
+# Verify coo-test.com is loaded (returns SERVFAIL instead of REFUSED because it has no records)
+../dag -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com not loaded by catalog1"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+
+echo "[+] CoO Test: catalog2 tries to steal coo-test.com (collision expected)..."
+cat << EOF > catalog2.zone
+\$ORIGIN catalog2.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 2 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+xyz.zones IN PTR coo-test.com.
+EOF
+
+../karictl -f karictl.conf reload catalog2.example.com
+sleep 1
+
+echo "[+] CoO Test: Initiating valid transfer (adding coo PTR to catalog1)..."
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 2 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+abc.zones IN PTR coo-test.com.
+coo.abc.zones IN PTR catalog2.example.com.
+EOF
+
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+
+echo "[+] CoO Test: Triggering evaluation on catalog2 (transfer should succeed)..."
+cat << EOF > catalog2.zone
+\$ORIGIN catalog2.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 3 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+xyz.zones IN PTR coo-test.com.
+EOF
+
+../karictl -f karictl.conf reload catalog2.example.com
+sleep 1
+
+echo "[+] CoO Test: Verifying transfer... Removing from catalog1 should NOT delete the zone."
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 3 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+EOF
+
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+
+# If the zone was correctly transferred to catalog2, removing it from catalog1 shouldn't kill it.
+../dag -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com was deleted even though catalog2 should own it"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+echo "[+] CoO transfer successfully verified!"
+
+# Clean up
 if kill -0 $SERVER_PID 2>/dev/null; then
     echo "[+] Server is still running, cascading removal didn't crash."
 else

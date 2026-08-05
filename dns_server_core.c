@@ -107,6 +107,7 @@ typedef struct {
   char domain[256];
   char **groups;
   int group_count;
+  char coo_target[256];
 } catalog_member_id_t;
 
 typedef struct {
@@ -134,6 +135,10 @@ typedef struct {
   char cached_master_ip[64];
   int cached_master_port;
   char cached_tsig_key_name[64];
+  // LOCK-ONLY FIELD: 読み書きは g_zone_db_rebuild_lock 保持区間内でのみ行うこと。
+  // クエリ処理・バックグラウンドスケジューラなど、スナップショットをロックフリーで
+  // 読む経路からは絶対に参照しないこと(catalog_members/groups と同じ規約)。
+  char owning_catalog_domain[256];
 } zone_db_entry_t;
 
 // TCPストリーム解析ステート
@@ -169,6 +174,17 @@ typedef struct {
 } config_rcu_t;
 
 pthread_mutex_t g_zone_db_rebuild_lock = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    char domain[256];
+    char old_catalog[256];
+    char new_catalog[256];
+} pending_coo_t;
+
+// Protected by g_zone_db_rebuild_lock
+pending_coo_t *g_pending_coo = NULL;
+int g_pending_coo_count = 0;
+int g_pending_coo_capacity = 0;
 
 typedef enum {
   RRL_RESP_NOERROR,
@@ -1185,6 +1201,43 @@ void free_catalog_member_ids(catalog_member_id_t *arr, int count) {
   free(arr);
 }
 
+zone_db_entry_t *find_catalog_parent_in_snapshot(view_snapshot_t *view, const char *catalog_domain) {
+    if (!view || !catalog_domain) return NULL;
+    for (size_t i = 0; i < view->zone_count; i++) {
+        if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
+            return view->entries[i];
+        }
+    }
+    return NULL;
+}
+
+void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, const char *unique_id, const char *domain) {
+    if (!catalog_entry || !catalog_entry->catalog_members) return;
+    for (int i = 0; i < catalog_entry->catalog_member_count; i++) {
+        if (strcasecmp(catalog_entry->catalog_members[i].domain, domain) == 0 && 
+            strcmp(catalog_entry->catalog_members[i].unique_id, unique_id) == 0) {
+            
+            // Explicitly free the dynamically allocated `groups` strings of the targeted element
+            if (catalog_entry->catalog_members[i].groups) {
+                for (int g = 0; g < catalog_entry->catalog_members[i].group_count; g++) {
+                    free(catalog_entry->catalog_members[i].groups[g]);
+                }
+                free(catalog_entry->catalog_members[i].groups);
+            }
+            
+            // Shift the remaining elements forward
+            int elements_after = catalog_entry->catalog_member_count - i - 1;
+            if (elements_after > 0) {
+                memmove(&catalog_entry->catalog_members[i], 
+                        &catalog_entry->catalog_members[i + 1], 
+                        elements_after * sizeof(catalog_member_id_t));
+            }
+            catalog_entry->catalog_member_count--;
+            break;
+        }
+    }
+}
+
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
@@ -1227,6 +1280,18 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                             free_catalog_member_ids(entry->catalog_members, entry->catalog_member_count);
                             entry->catalog_members = NULL;
                             entry->catalog_member_count = 0;
+                            
+                            int p = 0;
+                            while (p < g_pending_coo_count) {
+                                if (strcasecmp(g_pending_coo[p].old_catalog, entry->domain) == 0) {
+                                    if (p < g_pending_coo_count - 1) {
+                                        g_pending_coo[p] = g_pending_coo[g_pending_coo_count - 1];
+                                    }
+                                    g_pending_coo_count--;
+                                } else {
+                                    p++;
+                                }
+                            }
                         }
                     }
                 }
@@ -1353,10 +1418,49 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
     } else {
         // MODE: Catalog Delta Update
+        
+        // Step A: Update Pending CoO Intentions (acting as $OLDCATZ)
+        if (catalog_entry_to_update) {
+            int p = 0;
+            while (p < g_pending_coo_count) {
+                if (strcasecmp(g_pending_coo[p].old_catalog, catalog_entry_to_update->domain) == 0) {
+                    if (p < g_pending_coo_count - 1) {
+                        g_pending_coo[p] = g_pending_coo[g_pending_coo_count - 1];
+                    }
+                    g_pending_coo_count--;
+                } else {
+                    p++;
+                }
+            }
+            for (int i = 0; i < new_desired_count; i++) {
+                if (strlen(new_desired_members[i].coo_target) > 0) {
+                    if (g_pending_coo_count >= g_pending_coo_capacity) {
+                        g_pending_coo_capacity = g_pending_coo_capacity == 0 ? 16 : g_pending_coo_capacity * 2;
+                        g_pending_coo = realloc(g_pending_coo, g_pending_coo_capacity * sizeof(pending_coo_t));
+                    }
+                    strncpy(g_pending_coo[g_pending_coo_count].domain, new_desired_members[i].domain, 255);
+                    strncpy(g_pending_coo[g_pending_coo_count].old_catalog, catalog_entry_to_update->domain, 255);
+                    strncpy(g_pending_coo[g_pending_coo_count].new_catalog, new_desired_members[i].coo_target, 255);
+                    g_pending_coo_count++;
+                }
+            }
+        }
+
         int added_count = 0;
         int removed_count = 0;
         catalog_member_id_t *added_members = calloc(new_desired_count > 0 ? new_desired_count : 1, sizeof(catalog_member_id_t));
         catalog_member_id_t *removed_members = calloc(catalog_entry_to_update->catalog_member_count > 0 ? catalog_entry_to_update->catalog_member_count : 1, sizeof(catalog_member_id_t));
+
+        int filtered_count = 0;
+        view_snapshot_t *target_view = NULL;
+        if (old_snap) {
+            for (size_t v = 0; v < old_snap->view_count; v++) {
+                if (strcasecmp(old_snap->views[v].name, catalog_view_name) == 0) {
+                    target_view = &old_snap->views[v];
+                    break;
+                }
+            }
+        }
 
         for (int i = 0; i < new_desired_count; i++) {
             bool found = false;
@@ -1376,8 +1480,79 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
-            if (!found) added_members[added_count++] = new_desired_members[i];
+            
+            bool member_accepted = true;
+            bool needs_creation = true;
+
+            if (!found) {
+                if (target_view) {
+                    zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
+                    if (existing && existing->is_catalog_member) {
+                        if (strcasecmp(existing->owning_catalog_domain, catalog_entry_to_update->domain) != 0) {
+                            bool valid_coo = false;
+                            for (int p = 0; p < g_pending_coo_count; p++) {
+                                if (strcasecmp(g_pending_coo[p].domain, new_desired_members[i].domain) == 0 &&
+                                    strcasecmp(g_pending_coo[p].old_catalog, existing->owning_catalog_domain) == 0 &&
+                                    strcasecmp(g_pending_coo[p].new_catalog, catalog_entry_to_update->domain) == 0) {
+                                    valid_coo = true; break;
+                                }
+                            }
+                            if (valid_coo) {
+                                zone_db_entry_t *old_catalog_entry = find_catalog_parent_in_snapshot(target_view, existing->owning_catalog_domain);
+                                if (old_catalog_entry) {
+                                    remove_member_from_catalog_bookkeeping(old_catalog_entry, existing->catalog_member_unique_id, new_desired_members[i].domain);
+                                }
+                                if (strcmp(existing->catalog_member_unique_id, new_desired_members[i].unique_id) == 0) {
+                                    // Retain state
+                                    strncpy(existing->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(existing->owning_catalog_domain) - 1);
+                                    
+                                    // Deep copy new groups in-place
+                                    if (existing->groups) {
+                                        for (int g = 0; g < existing->group_count; g++) {
+                                            free(existing->groups[g]);
+                                        }
+                                        free(existing->groups);
+                                        existing->groups = NULL;
+                                    }
+                                    existing->group_count = new_desired_members[i].group_count;
+                                    if (existing->group_count > 0) {
+                                        existing->groups = calloc(existing->group_count, sizeof(char*));
+                                        for (int g = 0; g < existing->group_count; g++) {
+                                            existing->groups[g] = strdup(new_desired_members[i].groups[g]);
+                                        }
+                                    }
+                                    needs_creation = false;
+                                }
+                            } else {
+                                syslog(LOG_WARNING, "[Catalog] Name collision for '%s' between '%s' and '%s'. Ignoring.", 
+                                       new_desired_members[i].domain, existing->owning_catalog_domain, catalog_entry_to_update->domain);
+                                member_accepted = false;
+                            }
+                        }
+                    }
+                }
+            } else {
+                needs_creation = false; // Already existed exactly in our catalog
+            }
+
+            if (member_accepted) {
+                if (filtered_count != i) {
+                    new_desired_members[filtered_count] = new_desired_members[i];
+                }
+                filtered_count++;
+                if (needs_creation) {
+                    added_members[added_count++] = new_desired_members[i];
+                }
+            } else {
+                if (new_desired_members[i].groups) {
+                    for (int g = 0; g < new_desired_members[i].group_count; g++) {
+                        free(new_desired_members[i].groups[g]);
+                    }
+                    free(new_desired_members[i].groups);
+                }
+            }
         }
+        new_desired_count = filtered_count;
 
         for (int i = 0; i < catalog_entry_to_update->catalog_member_count; i++) {
             bool found = false;
@@ -1406,7 +1581,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         for (int i = 0; i < added_count; i++) {
             zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
             zone_db_entry_t *entry = create_new_zone_entry(added_members[i].domain, catalog_view_name);
-            syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s)", added_members[i].domain, added_members[i].unique_id);
+            strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
+            syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
             strncpy(entry->catalog_member_unique_id, added_members[i].unique_id, sizeof(entry->catalog_member_unique_id) - 1);
             if (added_members[i].group_count > 0) {
@@ -1626,6 +1802,28 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                     }
                 }
             }
+        }
+        char coo_name[512];
+        snprintf(coo_name, sizeof(coo_name), "coo.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
+        
+        int coo_count = 0;
+        char coo_rdata[256] = {0};
+        for (size_t i = 0; i < arena->count; i++) {
+            if (arena->records[i].type_code == 12 && strcasecmp(arena->records[i].name, coo_name) == 0) {
+                if (arena->records[i].rdata_count > 0) {
+                    strncpy(coo_rdata, arena->records[i].rdata[0], sizeof(coo_rdata) - 1);
+                }
+                coo_count++;
+            }
+        }
+        
+        if (coo_count == 1) {
+            normalize_domain_fqdn_local(coo_rdata, new_desired[d].coo_target, sizeof(new_desired[d].coo_target));
+        } else if (coo_count > 1) {
+            syslog(LOG_WARNING, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'. Ignoring coo property.", new_desired[d].domain, catalog_entry->domain);
+            new_desired[d].coo_target[0] = '\0';
+        } else {
+            new_desired[d].coo_target[0] = '\0';
         }
     }
 
