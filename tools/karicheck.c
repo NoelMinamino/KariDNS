@@ -222,7 +222,13 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         return 1;
     }
 
-    build_zone_index(&arena);
+    if (build_zone_index(&arena) != 0) {
+        fprintf(stderr, "[ERROR] Memory allocation failed during index build for '%s'\n", domain);
+        free((void*)ctx.base_dir);
+        zone_arena_destroy(&arena);
+        free(root_path);
+        return 1;
+    }
     if (validate_zone_dname(&arena, &err) < 0) {
         print_error_context(file_path, buf, &err, &arena);
         free((void*)ctx.base_dir);

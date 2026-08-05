@@ -132,6 +132,18 @@ check_asan_log
 echo "[*] 6. Authorized UPDATE (Add Record for ephemeral test)..."
 $DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.4' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 
+echo "[*] 6.5. In-flight ADD and Tombstone Logic test (3RR)..."
+# 3RR test: Delete ALL -> Add -> Delete EXACT
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-del 'inflight.dynupdate.com ANY' --update-add 'inflight.dynupdate.com 300 A 10.0.0.1' --update-del-exact 'inflight.dynupdate.com 0 A 10.0.0.1' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+
+# Verify it was successfully deleted (or never became visible)
+$DAG inflight.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
+if grep -q "10.0.0.1" res.txt; then
+    echo "[FAIL] In-flight ADD or Tombstone logic failed. Record persisted."
+    exit 1
+fi
+check_asan_log
+
 echo "[*] 7. Reload Server to check ephemeral behavior..."
 $KARICTL -f "$CTL_CONF" reload
 sleep 1

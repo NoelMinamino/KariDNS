@@ -1160,7 +1160,11 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
       return RELOAD_ERR_PARSE;
   }
 
-  build_zone_index(z_standby);
+  if (build_zone_index(z_standby) != 0) {
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after reload for '%s'", entry->domain);
+      return RELOAD_ERR_PARSE;
+  }
   if (validate_zone_dname(z_standby, &parse_err) < 0) {
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] DNAME validation error reloading zone '%s' from '%s': %s",
@@ -1902,8 +1906,14 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
       ctx->accumulated += n;
       if (ctx->accumulated == 2) {
         ctx->msg_len = (ctx->buf[0] << 8) | ctx->buf[1];
-        ctx->state = TCP_STATE_READ_BODY;
         ctx->accumulated = 0;
+        if (ctx->msg_len == 0) {
+          *msg_out = &ctx->buf[2];
+          *len_out = 0;
+          ctx->state = TCP_STATE_READ_LEN;
+          return 1;
+        }
+        ctx->state = TCP_STATE_READ_BODY;
       }
     }
     if (ctx->state == TCP_STATE_READ_BODY) {
@@ -2110,7 +2120,11 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
             break;
           }
         }
-        build_zone_index(standby);
+        if (build_zone_index(standby) != 0) {
+            pthread_mutex_unlock(&entry->writer_lock);
+            syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
+            return -1;
+        }
         compute_ixfr_diff(entry, active, standby);
         atomic_store_explicit(&entry->rcu.active, standby,
                               memory_order_release);
@@ -2700,7 +2714,11 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   bump_soa_serial_in_arena(z_standby);
 
-  build_zone_index(z_standby);
+  if (build_zone_index(z_standby) != 0) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
+    return 2; // SERVFAIL
+  }
 
   compute_ixfr_diff(entry, z_active, z_standby);
 
@@ -5262,21 +5280,39 @@ static void run_frontend_router(pid_t backend_pid) {
   server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   if (cfg->user) {
     struct passwd *pwd = getpwnam(cfg->user);
-    if (pwd) {
-      gid_t target_gid = pwd->pw_gid;
-      if (cfg->group) {
-        struct group *grp = getgrnam(cfg->group);
-        if (grp) target_gid = grp->gr_gid;
+    if (!pwd) {
+      syslog(LOG_ERR, "[Frontend] user '%s' not found, aborting privilege drop", cfg->user);
+      exit(EXIT_FAILURE);
+    }
+    gid_t target_gid = pwd->pw_gid;
+    if (cfg->group) {
+      struct group *grp = getgrnam(cfg->group);
+      if (!grp) {
+        syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+        exit(EXIT_FAILURE);
       }
-      setgroups(0, NULL);
-      setgid(target_gid);
-      setuid(pwd->pw_uid);
+      target_gid = grp->gr_gid;
+    }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); exit(EXIT_FAILURE); }
+    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); exit(EXIT_FAILURE); }
+    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend] setuid failed: %m"); exit(EXIT_FAILURE); }
+    
+    if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid || getgid() != target_gid || getegid() != target_gid) {
+      syslog(LOG_ERR, "[Frontend] privilege drop verification failed");
+      exit(EXIT_FAILURE);
     }
   } else if (cfg->group) {
     struct group *grp = getgrnam(cfg->group);
-    if (grp) {
-      setgroups(0, NULL);
-      setgid(grp->gr_gid);
+    if (!grp) {
+      syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+      exit(EXIT_FAILURE);
+    }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); exit(EXIT_FAILURE); }
+    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); exit(EXIT_FAILURE); }
+    
+    if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
+      syslog(LOG_ERR, "[Frontend] privilege drop verification failed (group only)");
+      exit(EXIT_FAILURE);
     }
   }
 

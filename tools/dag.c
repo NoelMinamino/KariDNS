@@ -369,7 +369,7 @@ static void print_break_help(void) {
  * 4. Query options (EDNS request side) -- built entirely in this file
  * ==================================================================== */
 typedef enum { PREREQ_NXDOMAIN, PREREQ_YXDOMAIN, PREREQ_NXRRSET, PREREQ_YXRRSET } prereq_kind_t;
-typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL } update_op_kind_t;
+typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL, UPDATE_OP_DEL_EXACT } update_op_kind_t;
 
 #define MAX_PREREQS 16
 #define MAX_UPDATE_OPS 16
@@ -739,7 +739,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 }
                 free(buf);
 
-            } else { // UPDATE_OP_DEL
+            } else if (qo->update_ops[oi].kind == UPDATE_OP_DEL) { // UPDATE_OP_DEL
                 char *buf = strdup(raw);
                 char *name = strtok(buf, " ");
                 char *type_str = strtok(NULL, " ");
@@ -763,6 +763,66 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                     }
                 } else {
                     fprintf(stderr, "Invalid update-del string format: %s\n", raw);
+                }
+                free(buf);
+            } else if (qo->update_ops[oi].kind == UPDATE_OP_DEL_EXACT) {
+                char *buf = strdup(raw);
+                char *tokens[32];
+                int token_count = 0;
+                bool in_quote = false;
+                char *p = buf;
+                char *tok_start = NULL;
+                char *out = buf;
+
+                while (*p && token_count < 32) {
+                    if (*p == '"') {
+                        in_quote = !in_quote;
+                        if (!tok_start) tok_start = out;
+                        p++;
+                    } else if (*p == ' ' && !in_quote) {
+                        if (tok_start) {
+                            *out++ = '\0';
+                            tokens[token_count++] = tok_start;
+                            tok_start = NULL;
+                        }
+                        p++;
+                    } else {
+                        if (!tok_start) tok_start = out;
+                        if (*p == '\\' && *(p+1) == '"') {
+                            p++;
+                            *out++ = *p++;
+                        } else {
+                            *out++ = *p++;
+                        }
+                    }
+                }
+                if (tok_start && token_count < 32) {
+                    *out = '\0';
+                    tokens[token_count++] = tok_start;
+                }
+
+                if (token_count >= 4) {
+                    dns_record_t rec;
+                    memset(&rec, 0, sizeof(rec));
+                    rec.name = tokens[0];
+                    rec.ttl = "0"; // TTL must be 0 for exact match delete
+                    rec.type_code = parse_qtype(tokens[2]);
+                    rec.type = tokens[2];
+                    rec.class_str = "NONE"; // Class NONE for exact match delete
+                    rec.rdata_count = token_count - 3;
+                    for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
+
+                    uint16_t out_offset = offset;
+                    if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
+                        offset = out_offset;
+                        uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                        upcount++;
+                        pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                    } else {
+                        fprintf(stderr, "Failed to serialize update-del-exact record: %s\n", raw);
+                    }
+                } else {
+                    fprintf(stderr, "Invalid update-del-exact string format: %s\n", raw);
                 }
                 free(buf);
             }
@@ -2594,6 +2654,15 @@ int main(int argc, char **argv) {
                 qo.update_op_count++;
             } else {
                 fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
+                i++;
+            }
+        } else if (strcmp(argv[i], "--update-del-exact") == 0 && i + 1 < argc) {
+            if (qo.update_op_count < MAX_UPDATE_OPS) {
+                qo.update_ops[qo.update_op_count].kind = UPDATE_OP_DEL_EXACT;
+                snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
+                qo.update_op_count++;
+            } else {
+                fprintf(stderr, "warning: too many update options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
                 i++;
             }
         } else if (strncmp(argv[i], "--prereq=", 9) == 0) {

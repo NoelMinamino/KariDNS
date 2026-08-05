@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <syslog.h>
 #include "dns_utils.h"
 #include <string.h>
 #include <strings.h>
@@ -937,13 +938,18 @@ static size_t next_pow2(size_t n) {
     p <<= 1;
   return p;
 }
-void build_zone_index(zone_arena_t *arena) {
+int build_zone_index(zone_arena_t *arena) {
   if (arena->hash_table) {
     free(arena->hash_table);
     arena->hash_table = NULL;
   }
   arena->hash_size = next_pow2(arena->count * 2);
+  if (arena->hash_size == 0) arena->hash_size = 1;
   arena->hash_table = malloc(sizeof(int) * arena->hash_size);
+  if (!arena->hash_table) {
+    syslog(LOG_ERR, "[Zone] build_zone_index: OOM during hash_table allocation");
+    return -1;
+  }
   for (size_t i = 0; i < arena->hash_size; i++)
     arena->hash_table[i] = -1;
   for (int i = (int)arena->count - 1; i >= 0; i--) {
@@ -955,6 +961,7 @@ void build_zone_index(zone_arena_t *arena) {
     rec->next_record = arena->hash_table[idx];
     arena->hash_table[idx] = i;
   }
+  return 0;
 }
 
 int validate_zone_dname(zone_arena_t *arena, parse_error_t *err) {

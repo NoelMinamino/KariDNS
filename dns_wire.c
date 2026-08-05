@@ -781,7 +781,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     if (offset + 10 > max_res_len) return -1;
 
     res[offset++] = rec_type >> 8; res[offset++] = rec_type & 0xFF;
-    res[offset++] = 0; res[offset++] = 1; // IN
+    uint16_t class_val = 1;
+    if (rec->class_str) {
+        if (strcasecmp(rec->class_str, "CH") == 0) class_val = 3;
+        else if (strcasecmp(rec->class_str, "NONE") == 0) class_val = 254;
+        else if (strcasecmp(rec->class_str, "ANY") == 0) class_val = 255;
+    }
+    res[offset++] = class_val >> 8; res[offset++] = class_val & 0xFF;
     
     uint32_t ttl = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
     if (override_ttl != 0xFFFFFFFF && override_ttl < ttl) ttl = override_ttl;
@@ -1818,6 +1824,11 @@ int process_update_sections(const uint8_t *req, size_t req_len,
 
     if (zocount != 1) return 1; // FORMERR
 
+    // Prevent DoS: Hard limit on number of updates per message
+    if ((size_t)prcount + (size_t)upcount > 1000) {
+        return 5; // REFUSED
+    }
+
     size_t offset = DNS_HEADER_SIZE;
     // Skip Zone Section
     char *zname;
@@ -1830,6 +1841,8 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     if (strcasecmp(zname, zone_name) != 0) return 9; // NOTAUTH
 
     // Prerequisite Section (3.2)
+    if (build_zone_index(standby) != 0) return 2; // SERVFAIL on OOM
+
     for (int i = 0; i < prcount; i++) {
         size_t rec_start_offset = offset;
         char *name;
@@ -1843,7 +1856,10 @@ int process_update_sections(const uint8_t *req, size_t req_len,
 
         bool name_exists = false;
         bool rrset_exists = false;
-        for (size_t k = 0; k < standby->count; k++) {
+        uint32_t h = calc_fnv1a_str(name);
+        size_t hidx = h & (standby->hash_size - 1);
+        for (int k = standby->hash_table[hidx]; k != -1; k = standby->records[k].next_record) {
+            if (!standby->records[k].name) continue; // Skip tombstones
             if (strcasecmp(standby->records[k].name, name) == 0) {
                 name_exists = true;
                 if (type == 255 || standby->records[k].type_code == type) {
@@ -1876,7 +1892,10 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
             
             bool found_exact = false;
-            for (size_t k = 0; k < standby->count; k++) {
+            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
+            size_t phidx = ph & (standby->hash_size - 1);
+            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
+                if (!standby->records[k].name) continue; // Skip tombstones
                 if (compare_records(&standby->records[k], &parsed_rec, true)) {
                     found_exact = true;
                     break;
@@ -1902,15 +1921,16 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             if (rdlen != 0) return 1;
             if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
             
-            for (size_t k = 0; k < standby->count; ) {
+            uint32_t h = calc_fnv1a_str(name);
+            size_t hidx = h & (standby->hash_size - 1);
+            for (int k = standby->hash_table[hidx]; k != -1; k = standby->records[k].next_record) {
+                if (!standby->records[k].name) continue; // Skip tombstones
                 if (strcasecmp(standby->records[k].name, name) == 0) {
                     if (type == 255 || standby->records[k].type_code == type) {
-                        if (standby->records[k].type_code == 6) { k++; continue; } // protect SOA
-                        standby->records[k] = standby->records[--standby->count];
-                        continue;
+                        if (standby->records[k].type_code == 6) { continue; } // protect SOA
+                        standby->records[k].name = NULL; // Tombstone delete
                     }
                 }
-                k++;
             }
         } else if (class_val == 254) { // NONE (Delete exact RR)
             if (type == 6) return 5; // REFUSED
@@ -1921,12 +1941,13 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             uint16_t dummy_type;
             if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
             
-            for (size_t k = 0; k < standby->count; ) {
+            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
+            size_t phidx = ph & (standby->hash_size - 1);
+            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
+                if (!standby->records[k].name) continue; // Skip tombstones
                 if (compare_records(&standby->records[k], &parsed_rec, true)) {
-                    standby->records[k] = standby->records[--standby->count];
-                    continue;
+                    standby->records[k].name = NULL; // Tombstone delete
                 }
-                k++;
             }
         } else { // ADD
             if (standby->count >= standby->records_cap) {
@@ -1941,9 +1962,28 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             dns_record_t *new_rec = &standby->records[standby->count];
             memset(new_rec, 0, sizeof(*new_rec));
             if (parse_resource_record(req, req_len, &temp_offset, standby, new_rec, &dummy_type) != 0) return 1;
+
+            // In-flight chain linking
+            uint32_t h = calc_fnv1a_str(new_rec->name);
+            size_t hidx = h & (standby->hash_size - 1);
+            new_rec->next_record = standby->hash_table[hidx];
+            standby->hash_table[hidx] = (int)standby->count;
+
             standby->count++;
         }
     }
+
+    // Compaction pass: remove tombstoned records
+    size_t write_idx = 0;
+    for (size_t read_idx = 0; read_idx < standby->count; read_idx++) {
+        if (standby->records[read_idx].name != NULL) {
+            if (write_idx != read_idx) {
+                standby->records[write_idx] = standby->records[read_idx];
+            }
+            write_idx++;
+        }
+    }
+    standby->count = write_idx;
 
     return 0; // NOERROR
 }
