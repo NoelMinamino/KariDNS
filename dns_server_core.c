@@ -1450,6 +1450,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         int removed_count = 0;
         catalog_member_id_t *added_members = calloc(new_desired_count > 0 ? new_desired_count : 1, sizeof(catalog_member_id_t));
         catalog_member_id_t *removed_members = calloc(catalog_entry_to_update->catalog_member_count > 0 ? catalog_entry_to_update->catalog_member_count : 1, sizeof(catalog_member_id_t));
+        catalog_member_id_t *coo_evicted_members = calloc(new_desired_count > 0 ? new_desired_count : 1, sizeof(catalog_member_id_t));
+        int coo_evicted_count = 0;
 
         int filtered_count = 0;
         view_snapshot_t *target_view = NULL;
@@ -1504,6 +1506,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                 }
                                 if (strcmp(existing->catalog_member_unique_id, new_desired_members[i].unique_id) == 0) {
                                     // Retain state
+                                    syslog(LOG_INFO, "[Catalog] CoO transfer: retained state for '%s' (unique-id: %s), owner %s -> %s",
+                                           existing->domain, existing->catalog_member_unique_id, existing->owning_catalog_domain, catalog_entry_to_update->domain);
                                     strncpy(existing->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(existing->owning_catalog_domain) - 1);
                                     
                                     // Deep copy new groups in-place
@@ -1522,6 +1526,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                         }
                                     }
                                     needs_creation = false;
+                                } else {
+                                    // State reset
+                                    syslog(LOG_INFO, "[Catalog] CoO transfer: evicted old state for '%s' (old unique-id: %s, new unique-id: %s)",
+                                           existing->domain, existing->catalog_member_unique_id, new_desired_members[i].unique_id);
+                                    strncpy(coo_evicted_members[coo_evicted_count].unique_id, existing->catalog_member_unique_id, sizeof(coo_evicted_members[coo_evicted_count].unique_id) - 1);
+                                    strncpy(coo_evicted_members[coo_evicted_count].domain, existing->domain, sizeof(coo_evicted_members[coo_evicted_count].domain) - 1);
+                                    coo_evicted_count++;
                                 }
                             } else {
                                 syslog(LOG_WARNING, "[Catalog] Name collision for '%s' between '%s' and '%s'. Ignoring.", 
@@ -1629,6 +1640,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                 is_removed = true; break;
                             }
                         }
+                        if (!is_removed) {
+                            for (int j = 0; j < coo_evicted_count; j++) {
+                                if (strcasecmp(old_snap->views[v].entries[i]->domain, coo_evicted_members[j].domain) == 0 &&
+                                    strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                                    is_removed = true; break;
+                                }
+                            }
+                        }
                         if (!is_removed) keep_count++;
                     }
                     
@@ -1642,6 +1661,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                             if (strcasecmp(old_snap->views[v].entries[i]->domain, removed_members[j].domain) == 0 &&
                                 strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
                                 is_removed = true; break;
+                            }
+                        }
+                        if (!is_removed) {
+                            for (int j = 0; j < coo_evicted_count; j++) {
+                                if (strcasecmp(old_snap->views[v].entries[i]->domain, coo_evicted_members[j].domain) == 0 &&
+                                    strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                                    is_removed = true; break;
+                                }
                             }
                         }
                         if (!is_removed) {
@@ -1668,6 +1695,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
         free(added_members);
         free(removed_members);
+        free(coo_evicted_members);
         free(new_entries);
 
         if (catalog_entry_to_update) {

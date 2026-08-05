@@ -234,7 +234,55 @@ sleep 1
 # If the zone was correctly transferred to catalog2, removing it from catalog1 shouldn't kill it.
 ../dag -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
 grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com was deleted even though catalog2 should own it"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
-echo "[+] CoO transfer successfully verified!"
+
+# Verify that State Reset was properly executed (unique-ids changed)
+grep "evicted old state for 'coo-test.com.' (old unique-id: abc, new unique-id: xyz)" karidns.log || { echo "Failed: State reset eviction log missing"; cat karidns.log; kill $SERVER_PID; exit 1; }
+echo "[+] CoO transfer (State Reset) successfully verified!"
+
+echo "[+] Phase 3 CoO State Retention Test: Transferring with identical unique-id..."
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 4 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+retain.zones IN PTR state-retain.com.
+coo.retain.zones IN PTR catalog2.example.com.
+EOF
+
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+
+# Trigger transfer on catalog2 with SAME unique-id 'retain'
+cat << EOF > catalog2.zone
+\$ORIGIN catalog2.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 4 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+xyz.zones IN PTR coo-test.com.
+retain.zones IN PTR state-retain.com.
+EOF
+
+../karictl -f karictl.conf reload catalog2.example.com
+sleep 1
+
+# Verify retention log
+grep "retained state for 'state-retain.com.' (unique-id: retain), owner catalog1.example.com. -> catalog2.example.com." karidns.log || { echo "Failed: State retention log missing"; cat karidns.log; kill $SERVER_PID; exit 1; }
+
+# Remove from catalog1 to confirm it doesn't drop
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 5 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+EOF
+
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+
+../dag -p 53530 @127.0.0.1 state-retain.com. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: state-retain.com dropped after retention transfer"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+
+echo "[+] CoO transfer (State Retention) successfully verified!"
 
 # Clean up
 if kill -0 $SERVER_PID 2>/dev/null; then
