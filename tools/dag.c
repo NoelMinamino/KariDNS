@@ -63,10 +63,40 @@ typedef struct {
     uint32_t semantic_hash; // 順不同ハッシュの合計値
     long elapsed_ms;
     match_status_t match_status;
+    int msg_index;
+    int msg_total;
 } server_result_t;
 
-static server_result_t g_results[MAX_DAG_SERVERS];
-static int g_server_count = 0;
+#define MAX_DAG_RESULT_ROWS 4096
+
+static server_result_t *g_results = NULL;
+static int g_result_cap = 0;
+static int g_server_count = 0; // Number of registered rows
+
+static server_result_t *alloc_result_row(void) {
+    if (g_server_count >= MAX_DAG_RESULT_ROWS) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, ";; warning: result row limit (%d) reached; further messages will not be recorded\n", MAX_DAG_RESULT_ROWS);
+            warned = true;
+        }
+        return NULL;
+    }
+    if (g_server_count >= g_result_cap) {
+        int new_cap = g_result_cap == 0 ? 64 : g_result_cap * 2;
+        if (new_cap > MAX_DAG_RESULT_ROWS) new_cap = MAX_DAG_RESULT_ROWS;
+        server_result_t *tmp = realloc(g_results, sizeof(server_result_t) * new_cap);
+        if (!tmp) {
+            fprintf(stderr, ";; warning: out of memory allocating result rows\n");
+            return NULL;
+        }
+        g_results = tmp;
+        g_result_cap = new_cap;
+    }
+    server_result_t *row = &g_results[g_server_count];
+    memset(row, 0, sizeof(*row));
+    return row;
+}
 static bool g_want_allcompare = false;
 static zone_arena_t g_dag_arena;
 
@@ -196,12 +226,6 @@ static void print_ldnsz_payload(const uint8_t *buf, size_t len) {
         if (i + 2 < comp_len) printf("%c", b64url_table[val & 0x3F]);
     }
     free(out_buf);
-}
-
-static void print_ldnsz_url(const uint8_t *buf, size_t len) {
-    printf(";; View in browser: https://ldns.jp/?dnsz=");
-    print_ldnsz_payload(buf, len);
-    printf("\n");
 }
 
 static void hexdump(const uint8_t *buf, size_t len) {
@@ -1506,7 +1530,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 size_t b64_len = 4 * ((key_len + 2) / 3) + 1;
                 char *b64 = malloc(b64_len);
                 if (!b64) goto fallback;
-                EVP_EncodeBlock((unsigned char *)b64, p, key_len);
+                EVP_EncodeBlock((unsigned char*)b64, p, key_len);
                 printf("%s", b64);
                 free(b64);
             }
@@ -1517,7 +1541,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             size_t b64_len = 4 * ((rdlen + 2) / 3) + 1;
             char *b64 = malloc(b64_len);
             if (!b64) goto fallback;
-            EVP_EncodeBlock((unsigned char *)b64, &pkt[abs_offset], rdlen);
+            EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset], rdlen);
             printf("%s", b64);
             free(b64);
             break;
@@ -2133,7 +2157,7 @@ static size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
     return hex_decode(hex, out, out_cap);
 }
 static int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
-                    bool use_tcp, bool use_ldnsz, bool short_mode, bool norecurse,
+                    bool use_tcp, bool short_mode, bool norecurse,
                     bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
                     bool no_hexdump_query, bool no_hexdump_response,
                     query_opts_t *qo, const char *hex_payload) {
@@ -2194,9 +2218,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     }
 
     server_result_t *sres = NULL;
-    if (g_server_count < MAX_DAG_SERVERS) {
-        sres = &g_results[g_server_count];
-    }
 
     bool retry_tcp = false;
     do {
@@ -2258,41 +2279,34 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         int total_records = 0;
         size_t total_bytes = 0;
         
-        if (sres) {
-            if (msg_index == 1) {
-                memset(sres, 0, sizeof(*sres));
-                snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", server);
-                snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
-            }
-        }
+        int start_index = g_server_count;
+        sres = alloc_result_row();
 
         do {
             total_bytes += (size_t)n;
             if (n >= 12) {
                 total_records += (resp[6] << 8) | resp[7];
             }
-            if (sres) {
-                if (msg_index == 1 && n >= 12) {
-                    sres->rcode = resp[3] & 0x0F;
-                    sres->qdcount = (resp[4] << 8) | resp[5];
-                    sres->ancount = (resp[6] << 8) | resp[7];
-                    sres->nscount = (resp[8] << 8) | resp[9];
-                    sres->arcount = (resp[10] << 8) | resp[11];
-                    sres->qr = resp[2] & 0x80; sres->aa = resp[2] & 0x04; sres->tc = resp[2] & 0x02; sres->rd = resp[2] & 0x01;
-                    sres->ra = resp[3] & 0x80; sres->ad = resp[3] & 0x20; sres->cd = resp[3] & 0x10;
-                }
-                size_t room = (sres->resp_len < (ssize_t)sizeof(sres->resp_buf))
-                              ? sizeof(sres->resp_buf) - (size_t)sres->resp_len : 0;
-                size_t to_copy = ((size_t)n < room) ? (size_t)n : room;
-                if (to_copy > 0) {
-                    memcpy(sres->resp_buf + sres->resp_len, resp, to_copy);
-                }
-                sres->resp_len += to_copy;
+            if (sres && n >= 12) {
+                sres->rcode = resp[3] & 0x0F;
+                sres->qdcount = (resp[4] << 8) | resp[5];
+                sres->ancount = (resp[6] << 8) | resp[7];
+                sres->nscount = (resp[8] << 8) | resp[9];
+                sres->arcount = (resp[10] << 8) | resp[11];
+                sres->qr = resp[2] & 0x80; sres->aa = resp[2] & 0x04; sres->tc = resp[2] & 0x02; sres->rd = resp[2] & 0x01;
+                sres->ra = resp[3] & 0x80; sres->ad = resp[3] & 0x20; sres->cd = resp[3] & 0x10;
+                sres->msg_index = msg_index;
+                sres->msg_total = 0;
+
+                size_t to_copy = (size_t)n < sizeof(sres->resp_buf) ? (size_t)n : sizeof(sres->resp_buf);
+                memcpy(sres->resp_buf, resp, to_copy);
+                sres->resp_len = (ssize_t)to_copy;
+                sres->semantic_hash = calculate_packet_semantic_hash(resp, n);
+                snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", server);
+                snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
             }
             reset_dag_arena();
-            if (sres) {
-                sres->semantic_hash += calculate_packet_semantic_hash(resp, n);
-            }
+            
             if (!short_mode) {
                 if (use_tcp) {
                     printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
@@ -2303,9 +2317,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     hexdump(resp, (size_t)n);
                 } else {
                     printf("(hexdump suppressed)\n");
-                }
-                if (use_ldnsz) {
-                    print_ldnsz_url(resp, (size_t)n);
                 }
                 printf("\n");
                 print_response(resp, (size_t)n, &axfr_state);
@@ -2331,26 +2342,33 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
             }
 
-            if (axfr_state.is_axfr && axfr_state.axfr_complete) break;
-            
-            // AXFR/IXFR 以外の通常クエリは応答が1メッセージで終わるため、次を待たずに抜ける
-            if (!axfr_state.is_axfr) break;
+            bool has_more = axfr_state.is_axfr && !axfr_state.axfr_complete && use_tcp && tcp_sock >= 0;
 
-            if (use_tcp && tcp_sock >= 0) {
+            if (has_more) {
+                if (sres) g_server_count++;
                 n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
-                if (n > 0) msg_index++;
+                if (n <= 0) {
+                    sres = NULL;
+                    break;
+                }
+                msg_index++;
+                sres = alloc_result_row();
             } else {
-                n = 0; // stop loop for UDP
+                break;
             }
-        } while (n > 0);
+        } while (true);
+
+        if (sres && !is_truncated) g_server_count++;
 
         struct timeval end_tv;
         gettimeofday(&end_tv, NULL);
         long elapsed_ms = (end_tv.tv_sec - start_tv.tv_sec) * 1000 +
                           (end_tv.tv_usec - start_tv.tv_usec) / 1000;
                           
-        if (sres) {
-            sres->elapsed_ms = elapsed_ms;
+        int end_index = g_server_count;
+        for (int idx = start_index; idx < end_index; idx++) {
+            g_results[idx].msg_total = end_index - start_index;
+            g_results[idx].elapsed_ms = elapsed_ms;
         }
 
         time_t now = time(NULL);
@@ -2368,22 +2386,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
         if (tcp_sock >= 0) close(tcp_sock);
 
-        if (sres) {
-            g_server_count++;
-        }
-
         if (is_truncated) {
             fprintf(stderr, "\n;; Truncated, retrying in TCP mode...\n\n");
             use_tcp = true;
             retry_tcp = true;
-        }
-
-        if (retry_tcp) {
-            if (g_server_count < MAX_DAG_SERVERS) {
-                sres = &g_results[g_server_count];
-            } else {
-                sres = NULL;
-            }
         }
     } while (retry_tcp);
 
@@ -2391,12 +2397,18 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 }
 
 static void print_multi_server_summary(bool use_ldnsz) {
-    if (g_server_count <= 1) return;
+    if (g_server_count == 0) return;
+    
+    if (g_server_count > 1) {
 
-    // 1. サーバー名の最大長を計算 (最低18文字は確保)
     int max_server_len = 18;
     for (int i = 0; i < g_server_count; i++) {
         int len = strlen(g_results[i].server_ip);
+        if (g_results[i].msg_total > 1) {
+            char tmp[80];
+            snprintf(tmp, sizeof(tmp), "%s (msg %d/%d)", g_results[i].server_ip, g_results[i].msg_index, g_results[i].msg_total);
+            len = strlen(tmp);
+        }
         if (len > max_server_len) {
             max_server_len = len;
         }
@@ -2444,8 +2456,14 @@ static void print_multi_server_summary(bool use_ldnsz) {
         }
 
         // 4. データ行の出力 ( %-*s を使って動的幅を指定 )
+        char label[80];
+        if (r->msg_total > 1) {
+            snprintf(label, sizeof(label), "%s (msg %d/%d)", r->server_ip, r->msg_index, r->msg_total);
+        } else {
+            snprintf(label, sizeof(label), "%s", r->server_ip);
+        }
         printf("%-*s | %-5s | %-7s | %3d | %3d | %3d | 0x%08X | %4ldms | %s\n",
-               max_server_len, r->server_ip, r->proto, rcode_name(r->rcode),
+               max_server_len, label, r->proto, rcode_name(r->rcode),
                r->ancount, r->nscount, r->arcount,
                r->semantic_hash, r->elapsed_ms, status_str);
     }
@@ -2453,17 +2471,22 @@ static void print_multi_server_summary(bool use_ldnsz) {
     // 5. フッター区切り線の出力
     for (int i = 0; i < max_server_len; i++) printf("-");
     printf("-+-------+---------+-----+-----+-----+------------+--------+------------------------\n");
+    }
     
     // URL出力 (+ldnsz が指定された場合のみ)
     if (use_ldnsz) {
-        printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
-        for (int i = 0; i < g_server_count; i++) {
-            printf("%s%s|%s|%ld:", 
-                   (i > 0) ? "," : "", 
-                   g_results[i].server_ip, 
-                   g_results[i].proto, 
-                   g_results[i].elapsed_ms);
-            print_ldnsz_payload(g_results[i].resp_buf, g_results[i].resp_len);
+        if (g_server_count > 1) {
+            printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
+            for (int i = 0; i < g_server_count; i++) {
+                server_result_t *r = &g_results[i];
+                printf("%s%s", (i > 0) ? "," : "", r->server_ip);
+                if (r->msg_total > 1) printf("/%d-%d", r->msg_index, r->msg_total);
+                printf("|%s|%ld:", r->proto, r->elapsed_ms);
+                print_ldnsz_payload(r->resp_buf, r->resp_len);
+            }
+        } else {
+            printf(";; View details in browser:\n;; https://ldns.jp/?dnsz=");
+            print_ldnsz_payload(g_results[0].resp_buf, g_results[0].resp_len);
         }
         printf("\n");
     }
@@ -2958,7 +2981,7 @@ int main(int argc, char **argv) {
         const char *server = servers[si];
         int srv_port = server_ports[si];
         
-        bool pass_ldnsz_to_run_test = (server_count == 1) ? use_ldnsz : false;
+
 
         if (server_count > 1) {
             printf("\n;; ===============================================\n");
@@ -3028,14 +3051,14 @@ int main(int argc, char **argv) {
             }
 
             run_test(all_tests[t].name, qname, qtype_s, server, srv_port,
-                     use_tcp || all_tests[t].tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
+                     use_tcp || all_tests[t].tcp, short_mode, norecurse,
                      adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
                      no_hexdump_query, no_hexdump_response,
                      &t_qo, hex_payload);
         }
 
         } else {
-            run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, pass_ldnsz_to_run_test, short_mode, norecurse,
+            run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, short_mode, norecurse,
                      adflag, cdflag, aaflag, tcflag, zflag,
                      no_hexdump_query, no_hexdump_response, &qo, hex_payload);
         }
@@ -3045,5 +3068,6 @@ int main(int argc, char **argv) {
 
     free(server_list_buf);
     zone_arena_destroy(&g_dag_arena);
+    if (g_results) free(g_results);
     return 0;
 }
