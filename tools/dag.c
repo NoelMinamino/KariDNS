@@ -2358,7 +2358,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         } while (true);
 
-        if (sres && !is_truncated) g_server_count++;
+        if (sres) g_server_count++;
 
         struct timeval end_tv;
         gettimeofday(&end_tv, NULL);
