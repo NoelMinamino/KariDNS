@@ -387,6 +387,36 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
             fprintf(stderr, "[ERROR] Catalog zone '%s' is missing '%s TXT \"2\"'\n", domain, version_txt);
             error_found = true;
         }
+
+        // Check for orphaned group TXT records
+        char group_prefix[10] = "group.";
+        char zones_suffix[256];
+        snprintf(zones_suffix, sizeof(zones_suffix), ".zones.%s", domain);
+        size_t zones_suffix_len = strlen(zones_suffix);
+        for (size_t i = 0; i < arena.count; i++) {
+            if (arena.records[i].type_code == 16) { // TXT
+                size_t name_len = strlen(arena.records[i].name);
+                if (name_len > 6 && strncasecmp(arena.records[i].name, group_prefix, 6) == 0) {
+                    if (name_len > zones_suffix_len && strcasecmp(arena.records[i].name + name_len - zones_suffix_len, zones_suffix) == 0) {
+                        // This is a group.<unique-N>.zones.$CATZ record. Check if PTR exists for <unique-N>.zones.$CATZ
+                        char ptr_name[512];
+                        strncpy(ptr_name, arena.records[i].name + 6, name_len - 6);
+                        ptr_name[name_len - 6] = '\0';
+                        
+                        bool has_ptr = false;
+                        for (size_t j = 0; j < arena.count; j++) {
+                            if (arena.records[j].type_code == 12 && strcasecmp(arena.records[j].name, ptr_name) == 0) {
+                                has_ptr = true;
+                                break;
+                            }
+                        }
+                        if (!has_ptr) {
+                            fprintf(stderr, "[WARNING] Orphaned group TXT record '%s' (no corresponding PTR record '%s')\n", arena.records[i].name, ptr_name);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (error_found) {
@@ -460,6 +490,18 @@ int main(int argc, char **argv) {
             }
             z = z->next;
         }
+        for (view_config_t *v = cfg.views; v; v = v->next) {
+            z = v->zones;
+            while (z) {
+                if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
+                    if (check_zone(z->domain, z->file, false, z->is_catalog) != 0) {
+                        error_count++;
+                    }
+                    checked++;
+                }
+                z = z->next;
+            }
+        }
         printf("[INFO] Checked %d zones. Errors: %d\n", checked, error_count);
         return (error_count > 0) ? 1 : 0;
     } else if (strcmp(cmd, "zone") == 0) {
@@ -488,6 +530,15 @@ int main(int argc, char **argv) {
                     return check_zone(z->domain, z->file, false, z->is_catalog);
                 }
                 z = z->next;
+            }
+            for (view_config_t *v = cfg.views; v; v = v->next) {
+                z = v->zones;
+                while (z) {
+                    if (strcasecmp(z->domain, norm_domain) == 0) {
+                        return check_zone(z->domain, z->file, false, z->is_catalog);
+                    }
+                    z = z->next;
+                }
             }
             fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
             return 1;

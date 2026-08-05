@@ -115,6 +115,23 @@ sleep 1
 # Check resolution still intact after race condition test
 ../dag -p 53530 @127.0.0.1 example.edu. SOA | grep "status: SERVFAIL" || { echo "Failed: example.edu broken after race test"; kill $SERVER_PID; exit 1; }
 
+
+echo "[+] Phase 0 Unique-ID Test: Changing unique-id of example.org..."
+perl -pi -e 's/zone2\.zones/zone2_new\.zones/' catalog.zone
+../karictl -f karictl.conf reload
+sleep 1
+grep "Added new member 'example.org.' (unique-id: zone2_new)" karidns.log || {
+    echo "Failed: example.org was not added correctly as a new member after unique-id change"; cat karidns.log; kill $SERVER_PID; exit 1; 
+}
+../dag -p 53530 @127.0.0.1 example.org. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: example.org broke after unique-id change"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+
+echo "[+] Phase 1 Group Test: Adding an orphaned group to catalog.zone and testing karicheck..."
+echo 'group.orphan.zones IN TXT "testgroup"' >> catalog.zone
+../karicheck zones karidns.conf > karicheck_out.txt 2>&1
+grep "Orphaned group TXT record" karicheck_out.txt || { echo "Failed: karicheck did not detect orphaned group TXT record"; cat karicheck_out.txt; kill $SERVER_PID; exit 1; }
+echo "[+] karicheck properly detected orphaned group."
+
 # Test catalog removal
 cat << EOF > karidns.conf
 options {
