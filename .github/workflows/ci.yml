@@ -43,6 +43,12 @@ jobs:
             
             echo "Testing TCP query..."
             ./dag google.com TXT @8.8.8.8 +tcp
+
+            echo "Testing mutiple UDP query..."
+            ./dag www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
+
+            echo "Testing multiple TCP query..."
+            ./dag google.com TXT @8.8.8.8,9.9.9.9,1.1.1.1 +tcp
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
