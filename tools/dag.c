@@ -2283,6 +2283,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         sres = alloc_result_row();
 
         do {
+            reset_dag_arena();
             total_bytes += (size_t)n;
             if (n >= 12) {
                 total_records += (resp[6] << 8) | resp[7];
@@ -2305,7 +2306,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", server);
                 snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
             }
-            reset_dag_arena();
             
             if (!short_mode) {
                 if (use_tcp) {
@@ -2405,7 +2405,7 @@ static void print_multi_server_summary(bool use_ldnsz) {
     for (int i = 0; i < g_server_count; i++) {
         int len = strlen(g_results[i].server_ip);
         if (g_results[i].msg_total > 1) {
-            char tmp[80];
+            char tmp[128];
             snprintf(tmp, sizeof(tmp), "%s (msg %d/%d)", g_results[i].server_ip, g_results[i].msg_index, g_results[i].msg_total);
             len = strlen(tmp);
         }
@@ -2456,7 +2456,7 @@ static void print_multi_server_summary(bool use_ldnsz) {
         }
 
         // 4. データ行の出力 ( %-*s を使って動的幅を指定 )
-        char label[80];
+        char label[128];
         if (r->msg_total > 1) {
             snprintf(label, sizeof(label), "%s (msg %d/%d)", r->server_ip, r->msg_index, r->msg_total);
         } else {
