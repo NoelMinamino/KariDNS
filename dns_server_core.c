@@ -3161,7 +3161,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                 memcpy(res, req, copy_len);
                 res[2] |= 0x80;
                 res[3] = (res[3] & 0x0F) | 0x02; // SERVFAIL
-                add_ede(&edns, cfg_for_ede->send_extended_errors, 7, "Zone expired (SOA EXPIRE exceeded)");
+                add_ede(&edns, cfg_for_ede->send_extended_errors, 3, "Zone expired (SOA EXPIRE exceeded)");
                 uint16_t offset = copy_len;
                 uint16_t arcount = 0;
                 res[6] = 0; res[7] = 0; // ANCOUNT = 0
