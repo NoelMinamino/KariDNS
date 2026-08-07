@@ -135,6 +135,11 @@ static const char *get_ede_error_string(uint16_t code) {
         case 22: return "No Reachable Authority";
         case 23: return "Network Error";
         case 24: return "Invalid Data";
+        case 25: return "Signature Expired before Valid";
+        case 26: return "Too Early";
+        case 27: return "Unsupported NSEC3 Iterations Value";
+        case 28: return "Unable to conform to policy";
+        case 29: return "Synthesized";
         default: return "Unassigned";
     }
 }

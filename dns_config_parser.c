@@ -222,7 +222,13 @@ bool match_cidr(const char *client_ip_str, const char *cidr_str) {
   int prefix = -1;
   if (slash) {
     *slash = '\0';
-    prefix = atoi(slash + 1);
+    char *endptr = NULL;
+    long val = strtol(slash + 1, &endptr, 10);
+    if (endptr == slash + 1 || *endptr != '\0' || val < 0 || val > 128) {
+        syslog(LOG_WARNING, "[Config] Invalid CIDR prefix in ACL entry: '%s' (rejecting, no match)", cidr_str);
+        return false;
+    }
+    prefix = (int)val;
   }
   struct in_addr client_addr_v4, net_addr_v4;
   struct in6_addr client_addr_v6, net_addr_v6;
@@ -355,11 +361,21 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
         } else {
             char *val = strdup(tok.value);
             free_token(&tok);
+            bool double_negated = false;
             if (in_negated_block && val[0] == '!') {
                 char *unbanged = strdup(val + 1);
                 free(val); val = unbanged;
+                double_negated = true; // !{ !X; } => X
             }
             if (in_negated_block && strcmp(val, "any") == 0) {
+                free(val);
+            } else if (in_negated_block && !double_negated) {
+                size_t buflen = strlen(val) + 2;
+                char *negated = malloc(buflen);
+                if (negated) {
+                    snprintf(negated, buflen, "!%s", val);
+                    APPEND_STR(*list, *count, negated);
+                }
                 free(val);
             } else {
                 APPEND_STR(*list, *count, val);
@@ -638,6 +654,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->zones = NULL;
   config->user = NULL;
   config->group = NULL;
+  config->serve_stale = true;
   config->send_extended_errors = true;
   config->minimal_responses = false;
   config->minimal_any = false;
@@ -746,6 +763,24 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             config->send_extended_errors = true;
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->send_extended_errors = false;
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "serve-stale") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->serve_stale = true;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->serve_stale = false;
           free_token(&tok);
           tok = get_next_token(&ctx);
           if (tok.type != TOKEN_SEMICOLON) {

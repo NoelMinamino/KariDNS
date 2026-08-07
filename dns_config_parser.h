@@ -99,6 +99,7 @@ typedef struct {
   logging_config_t logging;
   control_channel_config_t control;
   rate_limit_config_t rrl;
+  bool serve_stale;
   bool send_extended_errors;
   bool minimal_responses;
   bool minimal_any;

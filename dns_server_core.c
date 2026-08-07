@@ -139,6 +139,8 @@ typedef struct {
   // クエリ処理・バックグラウンドスケジューラなど、スナップショットをロックフリーで
   // 読む経路からは絶対に参照しないこと(catalog_members/groups と同じ規約)。
   char owning_catalog_domain[256];
+  _Atomic(time_t) last_successful_transfer;
+  _Atomic(time_t) last_stale_log_time;
 } zone_db_entry_t;
 
 // TCPストリーム解析ステート
@@ -1738,6 +1740,19 @@ static void normalize_domain_fqdn_local(const char *in, char *out, size_t out_ca
     }
 }
 
+static void free_catalog_desired_list(catalog_member_id_t *list, int count) {
+    if (!list) return;
+    for (int i = 0; i < count; i++) {
+        if (list[i].groups) {
+            for (int j = 0; j < list[i].group_count; j++) {
+                if (list[i].groups[j]) free(list[i].groups[j]);
+            }
+            free(list[i].groups);
+        }
+    }
+    free(list);
+}
+
 void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name) {
     if (!catalog_entry || !catalog_cfg) return;
 
@@ -1768,6 +1783,11 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     // Build desired members list
     int max_possible = arena->count;
     catalog_member_id_t *new_desired = calloc(max_possible, sizeof(catalog_member_id_t));
+    if (!new_desired) {
+        syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building member list", catalog_entry->domain);
+        atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+        return;
+    }
     int new_desired_count = 0;
 
     char suffix[256];
@@ -1817,11 +1837,24 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         
         if (grp_count > 0) {
             new_desired[d].groups = calloc(grp_count, sizeof(char *));
+            if (!new_desired[d].groups) {
+                syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building group list for member '%s'", catalog_entry->domain, new_desired[d].domain);
+                free_catalog_desired_list(new_desired, new_desired_count);
+                atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+                return;
+            }
             new_desired[d].group_count = 0;
             for (size_t i = 0; i < arena->count; i++) {
                 if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, group_name) == 0) {
                     if (arena->records[i].rdata_count > 0) {
-                        new_desired[d].groups[new_desired[d].group_count++] = strdup(arena->records[i].rdata[0]);
+                        char *g = strdup(arena->records[i].rdata[0]);
+                        if (!g) {
+                            syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory duplicating group string", catalog_entry->domain);
+                            free_catalog_desired_list(new_desired, new_desired_count);
+                            atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+                            return;
+                        }
+                        new_desired[d].groups[new_desired[d].group_count++] = g;
                     }
                 }
             }
@@ -1861,6 +1894,12 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
 
     if (new_desired_count > 0) {
         catalog_member_id_t *shrunk = calloc(new_desired_count, sizeof(catalog_member_id_t));
+        if (!shrunk) {
+            syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory finalizing member list", catalog_entry->domain);
+            free_catalog_desired_list(new_desired, new_desired_count);
+            atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+            return;
+        }
         for (int i = 0; i < new_desired_count; i++) shrunk[i] = new_desired[i];
         free(new_desired);
         new_desired = shrunk;
@@ -2108,6 +2147,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       return -1;
     }
     if (session->is_finished) {
+      int ret_code = 1;
       if (standby->count > 0) {
         for (size_t k = 0; k < standby->count; k++) {
           if (standby->records[k].type_code == 6 &&
@@ -2116,7 +2156,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
             entry->refresh = strtoul(standby->records[k].rdata[3], NULL, 10);
             entry->retry = strtoul(standby->records[k].rdata[4], NULL, 10);
             entry->expire = strtoul(standby->records[k].rdata[5], NULL, 10);
-            entry->next_check = time(NULL) + entry->refresh;
+            atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
+            atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
             break;
           }
         }
@@ -2131,17 +2172,21 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         wait_for_readers(active);
         void send_notify_to_all(const char *domain, const char *view_name);
         send_notify_to_all(entry->domain, entry->view_name);
+      } else {
+        atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
+        atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
+        ret_code = 2;
       }
       pthread_mutex_unlock(&entry->writer_lock);
 
       // Hook for catalog zone processing
-      server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-      zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
+      server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
       if (zcfg && zcfg->is_catalog) {
           void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
           catalog_process_membership(entry, zcfg, entry->view_name);
       }
-      return 1;
+      return ret_code;
     }
   }
 }
@@ -3106,6 +3151,33 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[11] = arcount & 0xFF;
     return offset;
   }
+    if (db_entry && db_entry->expire > 0) {
+        time_t last_ok = atomic_load_explicit(&db_entry->last_successful_transfer, memory_order_acquire);
+        if (last_ok > 0 && (time(NULL) - last_ok) > (time_t)db_entry->expire) {
+            if (!cfg_for_ede->serve_stale) {
+                if (current_zone)
+                    atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+                size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
+                memcpy(res, req, copy_len);
+                res[2] |= 0x80;
+                res[3] = (res[3] & 0x0F) | 0x02; // SERVFAIL
+                add_ede(&edns, cfg_for_ede->send_extended_errors, 7, "Zone expired (SOA EXPIRE exceeded)");
+                uint16_t offset = copy_len;
+                uint16_t arcount = 0;
+                res[6] = 0; res[7] = 0; // ANCOUNT = 0
+                res[8] = 0; res[9] = 0; // NSCOUNT = 0
+                if (edns.present) {
+                    assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+                }
+                res[10] = arcount >> 8;
+                res[11] = arcount & 0xFF;
+                return offset;
+            } else {
+                add_ede(&edns, cfg_for_ede->send_extended_errors, 3, "Stale Answer (Zone EXPIRED)");
+            }
+        }
+    }
+
     uint16_t qclass = (req[q_offset + 2] << 8) | req[q_offset + 3];
 
     // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
@@ -3247,7 +3319,11 @@ void *axfr_bg_thread_func(void *arg) {
     ((struct sockaddr_in6 *)&master_addr)->sin6_port =
         htons(ctx->master_port > 0 ? ctx->master_port : 53);
   } else {
+    syslog(LOG_ERR, "[AXFR] Invalid master IP address format: '%s'", ctx->master_ip);
+    if (ctx->entry)
+      atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
     free(ctx);
+    atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
     pthread_exit(NULL);
   }
 
@@ -3348,8 +3424,11 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[0] = msg_len >> 8;
     axfr_req[1] = msg_len & 0xFF;
     if (send(tcp_fd, axfr_req, req_len, 0) == req_len) {
-      if (handle_axfr_event(tcp_fd, ctx->entry, &stream_ctx, &session, ctx->tsig_key) > 0) {
+      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, &stream_ctx, &session, ctx->tsig_key);
+      if (axfr_res == 1) {
         syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
+      } else if (axfr_res == 2) {
+        // Zone is up to date. Do not log to avoid spam on short refresh intervals.
       } else {
         syslog(LOG_ERR, "[AXFR] Failed to transfer zone %s from %s", ctx->domain, ctx->master_ip);
       }
@@ -5214,6 +5293,20 @@ void *control_thread_func(void *arg) {
                     }
 
                     if (is_slave && master_ip[0] != '\0') {
+                        time_t last_ok = atomic_load_explicit(&entry->last_successful_transfer, memory_order_acquire);
+                        uint32_t expire = atomic_load_explicit(&entry->expire, memory_order_acquire);
+                        if (last_ok > 0 && expire > 0 && (now - last_ok) > expire) {
+                            time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
+                            if (now - last_log > 900) {
+                                if (active->serve_stale) {
+                                    syslog(LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
+                                } else {
+                                    syslog(LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
+                                }
+                                atomic_store_explicit(&entry->last_stale_log_time, now, memory_order_release);
+                            }
+                        }
+
                         bool force = atomic_exchange_explicit(&entry->refresh_now, false, memory_order_acquire);
                         time_t entry_next_check = atomic_load_explicit(&entry->next_check, memory_order_acquire);
                         if (force || entry_next_check == 0 || (entry_next_check > 0 && now >= entry_next_check)) {
