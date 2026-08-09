@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <openssl/evp.h>
+#include "dns_wire.h"
 
 
 static void *safe_realloc_or_die(void *ptr, size_t size) {
@@ -947,9 +948,20 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
           free_token(&tok);
-          if (strcmp(key_prop, "algorithm") == 0)
+          if (strcmp(key_prop, "algorithm") == 0) {
+            if (!tsig_algorithm_is_supported(val)) {
+              syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm: %s", val);
+              fprintf(stderr, "[ERROR] Unsupported TSIG algorithm: %s\n", val);
+              free(key_prop);
+              free(val);
+              free_token(&tok);
+              return -1;
+            }
+            if (strstr(val, "md5") || strstr(val, "sha1")) {
+              syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
+            }
             tsig->algorithm = val;
-          else {
+          } else {
             tsig->secret = val;
             size_t slen = strlen(tsig->secret);
             size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
@@ -1030,9 +1042,20 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
           free_token(&tok);
-          if (strcmp(key_prop, "algorithm") == 0)
+          if (strcmp(key_prop, "algorithm") == 0) {
+            if (!tsig_algorithm_is_supported(val)) {
+              syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm in controls: %s", val);
+              fprintf(stderr, "[ERROR] Unsupported TSIG algorithm in controls: %s\n", val);
+              free(key_prop);
+              free(val);
+              free_token(&tok);
+              return -1;
+            }
+            if (strstr(val, "md5") || strstr(val, "sha1")) {
+              syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
+            }
             config->control.algorithm = val;
-          else {
+          } else {
             config->control.secret = val;
             size_t slen = strlen(config->control.secret);
             size_t decoded_upper_bound = ((slen + 3) / 4) * 3;

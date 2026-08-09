@@ -2957,6 +2957,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     bool auth = false;
+    tsig_key_t *matched_key = NULL;
+    tsig_key_t *attempted_key = NULL;
+    int tsig_error_code = 0;
+    
     if (db_entry && view) {
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
@@ -2968,8 +2972,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
             break;
           }
         }
-        if (auth && zcfg->tsig_key) {
-          tsig_key_t *k = cfg->keys, *matched_key = NULL;
+        if (auth && zcfg->tsig_key && zcfg->tsig_key[0] != '\0') {
+          tsig_key_t *k = cfg->keys;
           while (k) {
             if (strcmp(k->name, zcfg->tsig_key) == 0) {
               matched_key = k;
@@ -2977,15 +2981,24 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
             }
             k = k->next;
           }
-          if (!matched_key ||
-              tsig_verify_packet(req, req_len, matched_key, tsig_mac, &tsig_mac_len) != 0)
+          if (!matched_key) {
             auth = false;
+          } else {
+            attempted_key = matched_key;
+            int err = tsig_verify_packet(req, req_len, matched_key, tsig_mac, &tsig_mac_len);
+            if (err != 0) {
+              auth = false;
+              tsig_error_code = err > 0 ? err : 16;
+            }
+          }
         }
       }
     }
+      
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
-    res[2] |= 0x84;
+    res[2] |= 0x84; // QR=1, AA=1
+    
     if (auth) {
       res[3] &= 0x0F;
       atomic_store_explicit(&db_entry->refresh_now, true, memory_order_release);
@@ -2995,8 +3008,13 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
         kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
       }
     } else {
-      res[3] |= 0x05;
-      add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
+      if (attempted_key) {
+          res[3] = (res[3] & 0xF0) | 9; // NOTAUTH
+          add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Invalid TSIG");
+      } else {
+          res[3] = (res[3] & 0xF0) | 5; // REFUSED
+          add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
+      }
     }
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     res[6] = 0; res[7] = 0; // ANCOUNT = 0
@@ -3007,12 +3025,21 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     }
     res[10] = arcount >> 8;
     res[11] = arcount & 0xFF;
+    
+    tsig_key_t *sign_key = auth ? matched_key : attempted_key;
+    if (sign_key) {
+      size_t sign_len = offset;
+      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, false);
+      offset = sign_len;
+    }
     return offset;
   }
 
   if (opcode == 5) { // UPDATE
     bool auth = false;
     tsig_key_t *matched_key = NULL;
+    tsig_key_t *attempted_key = NULL;
+    int tsig_error_code = 0;
     if (db_entry && view) {
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
@@ -3028,10 +3055,14 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
             }
           }
           if (key_allowed) {
-            if (tsig_verify_packet(req, req_len, k, tsig_mac, &tsig_mac_len) == 0) {
+            attempted_key = k;
+            int err = tsig_verify_packet(req, req_len, k, tsig_mac, &tsig_mac_len);
+            if (err == 0) {
               matched_key = k;
               auth = true;
               break;
+            } else {
+              tsig_error_code = err > 0 ? err : 16;
             }
           }
           k = k->next;
@@ -3047,7 +3078,12 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     if (auth) {
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key->name);
     } else {
-      add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control or invalid TSIG");
+      if (attempted_key) {
+        rcode = 9; // NOTAUTH
+        add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Invalid TSIG");
+      } else {
+        add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
+      }
     }
     
     // Some rcodes like FORMERR (1) shouldn't leak the RCODE logic into res[3] directly without properly mapping
@@ -3063,9 +3099,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[10] = arcount >> 8;
     res[11] = arcount & 0xFF;
     
-    if (matched_key) {
+    tsig_key_t *sign_key = auth ? matched_key : attempted_key;
+    if (sign_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, max_res_len, matched_key, 0, tsig_mac, &tsig_mac_len, false);
+      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, false);
       offset = sign_len;
     }
     return offset;

@@ -379,6 +379,61 @@ static size_t wire_name_length(const char *name) {
     return w_len;
 }
 
+static int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size) {
+    size_t p = current_offset;
+    size_t written = 0;
+    while (1) {
+        if (p >= packet_len) return -1;
+        uint8_t len = packet[p];
+        if ((len & 0xC0) != 0) {
+            return -1; // RFC 8945 TSIG algorithm names MUST NOT be compressed (and reject extended labels)
+        }
+        p++;
+        if (len == 0) {
+            if (written == 0 || buf[written - 1] != '.') { 
+                if (written >= buf_size) return -1; 
+                buf[written++] = '.'; 
+            } 
+            if (written >= buf_size) return -1;
+            buf[written++] = '\0'; 
+            break; 
+        }
+        if (written > 0 && buf[written - 1] != '.') { 
+            if (written >= buf_size) return -1; 
+            buf[written++] = '.'; 
+        }
+        if (written + len >= buf_size || p + len > packet_len) return -1;
+        memcpy(&buf[written], &packet[p], len); written += len; p += len;
+    }
+    *next_offset = p; 
+    return 0;
+}
+
+static const EVP_MD *tsig_algorithm_from_name(const char *alg) {
+    if (!alg) return NULL;
+    size_t len = strlen(alg);
+    if (len > 0 && alg[len - 1] == '.') len--;
+    struct { const char *name; const EVP_MD *(*fn)(void); } table[] = {
+        { "hmac-md5.sig-alg.reg.int", EVP_md5 },
+        { "hmac-md5",    EVP_md5    },
+        { "hmac-sha1",   EVP_sha1   },
+        { "hmac-sha224", EVP_sha224 },
+        { "hmac-sha256", EVP_sha256 },
+        { "hmac-sha384", EVP_sha384 },
+        { "hmac-sha512", EVP_sha512 },
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        if (strncasecmp(alg, table[i].name, len) == 0 && strlen(table[i].name) == len) {
+            return table[i].fn();
+        }
+    }
+    return NULL;
+}
+
+bool tsig_algorithm_is_supported(const char *alg) {
+    return tsig_algorithm_from_name(alg) != NULL;
+}
+
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len, bool is_subsequent) {
     if (!key) return -1;
 
@@ -441,10 +496,11 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     unsigned int mac_len = 0; unsigned char mac[EVP_MAX_MD_SIZE];
     if (key->secret_decoded_len > 0) {
-        const EVP_MD *evp_md = EVP_sha256();
-        if (strstr(alg, "sha1")) evp_md = EVP_sha1();
-        else if (strstr(alg, "sha512")) evp_md = EVP_sha512();
-        else if (strstr(alg, "md5")) evp_md = EVP_md5();
+        const EVP_MD *evp_md = tsig_algorithm_from_name(alg);
+        if (!evp_md) {
+            free(pre_mac);
+            return -1;
+        }
         HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, offset, mac, &mac_len);
     }
     free(pre_mac);
@@ -519,8 +575,9 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p+1];
     if (type != 250) return -1;
     tsig_p += 10;
-    size_t alg_start = tsig_p; (void)alg_start;
-    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return -1;
+    size_t alg_start = tsig_p;
+    char wire_alg_name[256];
+    if (extract_wire_name_to_buffer(packet, packet_len, alg_start, &tsig_p, wire_alg_name, sizeof(wire_alg_name)) != 0) return -1;
 
     if (tsig_p + 16 > packet_len) return -1;
     size_t time_fudge_start = tsig_p;
@@ -541,8 +598,12 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     if (tsig_p + other_len > packet_len) return -1;
     
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
+    const EVP_MD *evp_md = tsig_algorithm_from_name(wire_alg_name);
+    if (!evp_md) return 21; // BADALG
+    if (evp_md != tsig_algorithm_from_name(alg)) return 21; // BADALG
+    
     size_t keyname_wire_len = wire_name_length(key->name);
-    size_t alg_wire_len = wire_name_length(alg);
+    size_t alg_wire_len = wire_name_length(wire_alg_name);
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
     size_t pre_mac_cap = last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
     
@@ -561,7 +622,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
     
-    w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, alg);
+    w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, wire_alg_name);
     if (w3 < 0) { free(pre_mac); return -1; }
     p_offset += (size_t)w3;
     
@@ -571,14 +632,14 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
     if (other_len > 0) { memcpy(&pre_mac[p_offset], &packet[tsig_p], other_len); p_offset += other_len; }
     unsigned int calc_mac_len = 0; unsigned char calc_mac[EVP_MAX_MD_SIZE];
-    const EVP_MD *evp_md = EVP_sha256();
-    if (strstr(alg, "sha1")) evp_md = EVP_sha1();
-    else if (strstr(alg, "sha512")) evp_md = EVP_sha512();
-    else if (strstr(alg, "md5")) evp_md = EVP_md5();
     HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, p_offset, calc_mac, &calc_mac_len);
     free(pre_mac);
-    if (calc_mac_len != mac_size) return 16; // BADSIG
-    if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+    if (mac_size != calc_mac_len) {
+        if (mac_size < 10 || mac_size < calc_mac_len / 2 || mac_size > calc_mac_len) return 16; // BADSIG (Truncated too much or invalid size)
+        if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+    } else {
+        if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+    }
     if (mac_out && mac_len_out) {
         *mac_len_out = mac_size;
         memcpy(mac_out, mac, mac_size);
