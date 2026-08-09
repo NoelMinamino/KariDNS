@@ -1796,8 +1796,10 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                     }
                                 }
                             }
-                        } else if (opt_code == 20 || opt_code == 21) {
-                            if (opt_code == 20) edns->has_mqtype_query = true;
+                        } else if (opt_code == 21) {
+                            edns->saw_invalid_mqtype_response_in_query = true;
+                        } else if (opt_code == 20) {
+                            edns->has_mqtype_query = true;
                             if (opt_len % 2 == 0) {
                                 int count = opt_len / 2;
                                 edns->mqtype_count = 0;

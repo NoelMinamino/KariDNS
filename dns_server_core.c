@@ -2229,6 +2229,36 @@ static bool zone_uses_nsec3(zone_arena_t *zone, const char *apex_name) {
   return false;
 }
 
+static bool is_non_data_rrtype(uint16_t t) {
+    switch (t) {
+        case 41: case 249: case 250: case 251: case 252: case 253: case 254: case 255:
+            return true;
+        default:
+            return false;
+    }
+}
+
+typedef struct {
+    uint16_t offset;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+} resolve_checkpoint_t;
+
+static resolve_checkpoint_t save_checkpoint(uint16_t *offset, uint16_t *ancount,
+                                             uint16_t *nscount, uint16_t *arcount) {
+    resolve_checkpoint_t cp = { *offset, *ancount, *nscount, *arcount };
+    return cp;
+}
+
+static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
+                                uint16_t *ancount, uint16_t *nscount, uint16_t *arcount) {
+    *offset = cp->offset;
+    *ancount = cp->ancount;
+    *nscount = cp->nscount;
+    *arcount = cp->arcount;
+}
+
 static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 const char *zone_apex, uint8_t *res,
                                 size_t max_res_len, uint16_t *offset,
@@ -2315,7 +2345,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                          uint16_t *nscount, uint16_t *arcount,
                          bool minimal_responses,
                          bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
-                         view_snapshot_t *view) {
+                         view_snapshot_t *view, uint32_t *qtx_included_out) {
+  if (qtx_included_out) *qtx_included_out = 0;
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
   current_qname[255] = '\0';
@@ -2332,11 +2363,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                         max_res_len, offset, comp_ctx, nscount, arcount))
       return;
     bool found = false, type_matched = false, cname_followed = false;
-    bool matched_qtypes[17] = {false};
     uint32_t hash = calc_fnv1a_str(current_qname);
     size_t idx = hash & (current_zone->hash_size - 1);
-    bool has_any = false;
-    for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == 255) { has_any = true; break; } }
+    bool has_any = (qtypes[0] == 255);
     if (has_any && minimal_any) {
       bool name_exists = false, has_cname = false, has_rrsig = false;
       for (int i = current_zone->hash_table[idx]; i != -1;
@@ -2380,9 +2409,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         uint16_t rec_type = rec->type_code;
         bool follow_cname = false;
         if (rec_type == 5) {
-          for (int j = 0; j < num_qtypes; j++) {
-            if (qtypes[j] != 5 && qtypes[j] != 255) { follow_cname = true; break; }
-          }
+          if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
         }
         if (follow_cname) {
           if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
@@ -2405,14 +2432,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           }
           break;
         } else {
-          bool matched_this_rec = false;
-          for (int j = 0; j < num_qtypes; j++) {
-            if (qtypes[j] == 255 || qtypes[j] == rec_type) {
-              matched_qtypes[j] = true;
-              matched_this_rec = true;
-            }
-          }
-          if (matched_this_rec) {
+          if (qtypes[0] == 255 || qtypes[0] == rec_type) {
             type_matched = true;
             if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
                                      NULL, 0xFFFFFFFF) < 0) {
@@ -2420,7 +2440,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               return;
             }
             (*ancount)++;
-            if (dnssec_ok && rec_type != 46 && !has_any) {
+            if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
               if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
                                         res, max_res_len, offset, comp_ctx, ancount)) {
                 res[2] |= 0x02;
@@ -2494,9 +2514,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             uint16_t rec_type = rec->type_code;
             bool follow_cname = false;
             if (rec_type == 5) {
-              for (int j = 0; j < num_qtypes; j++) {
-                if (qtypes[j] != 5 && qtypes[j] != 255) { follow_cname = true; break; }
-              }
+              if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
             }
             if (follow_cname) {
               if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
@@ -2519,14 +2537,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               }
               break;
             } else {
-              bool matched_this_rec = false;
-              for (int j = 0; j < num_qtypes; j++) {
-                if (qtypes[j] == 255 || qtypes[j] == rec_type) {
-                  matched_qtypes[j] = true;
-                  matched_this_rec = true;
-                }
-              }
-              if (matched_this_rec) {
+              if (qtypes[0] == 255 || qtypes[0] == rec_type) {
                 type_matched = true;
                 if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
                                          current_qname, 0xFFFFFFFF) < 0) {
@@ -2534,7 +2545,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                   return;
                 } else
                   (*ancount)++;
-                if (dnssec_ok && rec_type != 46 && !has_any) {
+                if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
                   if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
                                             res, max_res_len, offset, comp_ctx, ancount)) {
                     res[2] |= 0x02;
@@ -2602,11 +2613,75 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           return;
       }
     }
-    bool all_matched = true;
-    for (int j = 0; j < num_qtypes; j++) {
-      if (!matched_qtypes[j]) { all_matched = false; break; }
+    bool all_matched = type_matched;
+    uint32_t included_mask = 0;
+    if (found && num_qtypes > 1) {
+      uint32_t final_hash = calc_fnv1a_str(current_qname);
+      size_t final_idx = final_hash & (current_zone->hash_size - 1);
+      for (int j = 1; j < num_qtypes; j++) {
+        uint16_t qtx = qtypes[j];
+        bool this_qtx_failed = false;
+        bool qtx_matched = false;
+        resolve_checkpoint_t cp = save_checkpoint(offset, ancount, nscount, arcount);
+
+        for (int i = current_zone->hash_table[final_idx]; i != -1; i = current_zone->records[i].next_record) {
+          dns_record_t *rec = &current_zone->records[i];
+          if (strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
+            qtx_matched = true;
+            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+              this_qtx_failed = true; break;
+            }
+            (*ancount)++;
+            if (dnssec_ok && qtx != 46) {
+              if (!attach_covering_rrsig(current_zone, final_idx, current_qname, NULL, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
+                this_qtx_failed = true; break;
+              }
+            }
+          }
+        }
+
+        if (!qtx_matched && !this_qtx_failed) {
+          const char *parent = current_qname;
+          char wc_name[256];
+          wc_name[0] = '*'; wc_name[1] = '.';
+          while ((parent = strchr(parent, '.')) != NULL) {
+            parent++; if (*parent == '\0') break;
+            size_t parent_len = strlen(parent);
+            if (parent_len + 3 > sizeof(wc_name)) break;
+            memcpy(&wc_name[2], parent, parent_len + 1);
+            uint32_t wc_hash = calc_fnv1a_str(wc_name);
+            size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
+            bool wc_found = false;
+            for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
+              dns_record_t *rec = &current_zone->records[i];
+              if (strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
+                wc_found = true; qtx_matched = true;
+                if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
+                  this_qtx_failed = true; break;
+                }
+                (*ancount)++;
+                if (dnssec_ok && qtx != 46) {
+                  if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
+                    this_qtx_failed = true; break;
+                  }
+                }
+              }
+            }
+            if (wc_found || this_qtx_failed) break;
+          }
+        }
+
+        if (this_qtx_failed) {
+          restore_checkpoint(&cp, offset, ancount, nscount, arcount);
+          break;
+        } else {
+          if (!qtx_matched) all_matched = false;
+          included_mask |= (1 << j);
+        }
+      }
     }
-    
+    if (qtx_included_out) *qtx_included_out = included_mask;
+
     if (!found || !type_matched) {
       if (!found)
         res[3] |= 3;
@@ -2633,6 +2708,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       }
     }
     
+    resolve_checkpoint_t nsec_cp = save_checkpoint(offset, ancount, nscount, arcount);
+    bool nsec_failed = false;
     if (found && !all_matched && dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
       for (int i = current_zone->hash_table[idx]; i != -1;
            i = current_zone->records[i].next_record) {
@@ -2643,24 +2720,24 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           if (rec->rdata_count < 1) break; // 壊れたNSECは無視
           if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {
-            res[2] |= 0x02;
-            return;
+            nsec_failed = true; break;
           }
           (*nscount)++;
           if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 47,
                                      res, max_res_len, offset, comp_ctx, nscount)) {
-            res[2] |= 0x02;
-            return;
+            nsec_failed = true; break;
           }
           break;
         }
       }
     }
     
-    bool needs_ns = false;
-    for (int j = 0; j < num_qtypes; j++) {
-      if (qtypes[j] != 2 && qtypes[j] != 255) { needs_ns = true; break; }
+    if (nsec_failed) {
+      restore_checkpoint(&nsec_cp, offset, ancount, nscount, arcount);
     }
+    
+    bool needs_ns = false;
+    if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
     if (type_matched && !minimal_responses && needs_ns) {
       uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
       size_t apex_idx = apex_hash & (current_zone->hash_size - 1);
@@ -2912,6 +2989,17 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   edns.ede_count = 0; // 反射防止
 
+  if (edns.saw_invalid_mqtype_response_in_query) {
+    res[2] |= 0x80;
+    res[3] = (res[3] & 0xF0) | 1; // FORMERR
+    res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
+    uint16_t offset = DNS_HEADER_SIZE;
+    uint16_t arcount = 0;
+    if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+    res[10] = arcount >> 8; res[11] = arcount & 0xFF;
+    return offset;
+  }
+
   if (edns.present && edns.version > 0) {
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
@@ -3002,6 +3090,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (opcode == 4) { // NOTIFY
+    if (edns.has_mqtype_query) {
+      res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
+      return DNS_HEADER_SIZE;
+    }
     bool auth = false;
     tsig_key_t *matched_key = NULL;
     tsig_key_t *attempted_key = NULL;
@@ -3082,6 +3174,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (opcode == 5) { // UPDATE
+    if (edns.has_mqtype_query) {
+      res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
+      return DNS_HEADER_SIZE;
+    }
     bool auth = false;
     tsig_key_t *matched_key = NULL;
     tsig_key_t *attempted_key = NULL;
@@ -3356,7 +3452,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   qtypes[0] = qtype;
 
   if (edns.has_mqtype_query) {
-    if (edns.mqtype_count == 0 || qtype == 255 || qtype == 251 || qtype == 252) {
+    if (edns.mqtype_count == 0 || is_non_data_rrtype(qtype)) {
       if (current_zone)
         atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
       res[2] |= 0x80;
@@ -3372,7 +3468,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     int limit = cfg_for_ede ? cfg_for_ede->max_mqtypes : 4;
     for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
        uint16_t mq = edns.mqtypes[i];
-       if (mq == 255 || mq == 251 || mq == 252) {
+       if (is_non_data_rrtype(mq)) {
           if (current_zone)
             atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
           res[2] |= 0x80;
@@ -3402,15 +3498,26 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     for (int i = 0; i < edns.mqtype_count; i++) edns.mqtypes[i] = qtypes[i+1];
   }
 
+  uint32_t qtx_included = 0;
   resolve_name(current_qname, qtypes, num_qtypes, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
                cfg_for_ede ? cfg_for_ede->minimal_any : false,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
-               edns.dnssec_ok, view);
+               edns.dnssec_ok, view, &qtx_included);
 
-  if (edns.has_mqtype_query && (res[2] & 0x02)) {
+  if (edns.has_mqtype_query) {
+    if (res[2] & 0x02) {
       edns.mqtype_count = 0;
+    } else {
+      int new_count = 0;
+      for (int i = 1; i < num_qtypes; i++) {
+        if (qtx_included & (1 << i)) {
+          edns.mqtypes[new_count++] = qtypes[i];
+        }
+      }
+      edns.mqtype_count = new_count;
+    }
   }
 
   if (edns.present) {
