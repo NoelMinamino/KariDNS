@@ -2307,7 +2307,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
   return false;
 }
 
-static void resolve_name(const char *qname, uint16_t qtype,
+static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_arena_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
@@ -2332,9 +2332,12 @@ static void resolve_name(const char *qname, uint16_t qtype,
                         max_res_len, offset, comp_ctx, nscount, arcount))
       return;
     bool found = false, type_matched = false, cname_followed = false;
+    bool matched_qtypes[17] = {false};
     uint32_t hash = calc_fnv1a_str(current_qname);
     size_t idx = hash & (current_zone->hash_size - 1);
-    if (qtype == 255 && minimal_any) {
+    bool has_any = false;
+    for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == 255) { has_any = true; break; } }
+    if (has_any && minimal_any) {
       bool name_exists = false, has_cname = false, has_rrsig = false;
       for (int i = current_zone->hash_table[idx]; i != -1;
            i = current_zone->records[i].next_record) {
@@ -2375,7 +2378,13 @@ static void resolve_name(const char *qname, uint16_t qtype,
       if (strcasecmp(rec->name, current_qname) == 0) {
         found = true;
         uint16_t rec_type = rec->type_code;
-        if (rec_type == 5 && qtype != 5 && qtype != 255) {
+        bool follow_cname = false;
+        if (rec_type == 5) {
+          for (int j = 0; j < num_qtypes; j++) {
+            if (qtypes[j] != 5 && qtypes[j] != 255) { follow_cname = true; break; }
+          }
+        }
+        if (follow_cname) {
           if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {
             res[2] |= 0x02;
@@ -2395,19 +2404,28 @@ static void resolve_name(const char *qname, uint16_t qtype,
             cname_followed = true;
           }
           break;
-        } else if (qtype == 255 || qtype == rec_type) {
-          type_matched = true;
-          if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
-                                   NULL, 0xFFFFFFFF) < 0) {
-            res[2] |= 0x02;
-            return;
+        } else {
+          bool matched_this_rec = false;
+          for (int j = 0; j < num_qtypes; j++) {
+            if (qtypes[j] == 255 || qtypes[j] == rec_type) {
+              matched_qtypes[j] = true;
+              matched_this_rec = true;
+            }
           }
-          (*ancount)++;
-          if (dnssec_ok && qtype != 255) {
-            if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
-                                      res, max_res_len, offset, comp_ctx, ancount)) {
+          if (matched_this_rec) {
+            type_matched = true;
+            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                                     NULL, 0xFFFFFFFF) < 0) {
               res[2] |= 0x02;
               return;
+            }
+            (*ancount)++;
+            if (dnssec_ok && rec_type != 46 && !has_any) {
+              if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
+                                        res, max_res_len, offset, comp_ctx, ancount)) {
+                res[2] |= 0x02;
+                return;
+              }
             }
           }
         }
@@ -2474,7 +2492,13 @@ static void resolve_name(const char *qname, uint16_t qtype,
             found = true;
             wc_found = true;
             uint16_t rec_type = rec->type_code;
-            if (rec_type == 5 && qtype != 5 && qtype != 255) {
+            bool follow_cname = false;
+            if (rec_type == 5) {
+              for (int j = 0; j < num_qtypes; j++) {
+                if (qtypes[j] != 5 && qtypes[j] != 255) { follow_cname = true; break; }
+              }
+            }
+            if (follow_cname) {
               if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
                                        current_qname, 0xFFFFFFFF) < 0) {
                 res[2] |= 0x02;
@@ -2494,19 +2518,28 @@ static void resolve_name(const char *qname, uint16_t qtype,
                 cname_followed = true;
               }
               break;
-            } else if (qtype == 255 || qtype == rec_type) {
-              type_matched = true;
-              if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
-                                       current_qname, 0xFFFFFFFF) < 0) {
-                res[2] |= 0x02;
-                return;
-              } else
-                (*ancount)++;
-              if (dnssec_ok && qtype != 255) {
-                if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
-                                          res, max_res_len, offset, comp_ctx, ancount)) {
+            } else {
+              bool matched_this_rec = false;
+              for (int j = 0; j < num_qtypes; j++) {
+                if (qtypes[j] == 255 || qtypes[j] == rec_type) {
+                  matched_qtypes[j] = true;
+                  matched_this_rec = true;
+                }
+              }
+              if (matched_this_rec) {
+                type_matched = true;
+                if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                                         current_qname, 0xFFFFFFFF) < 0) {
                   res[2] |= 0x02;
                   return;
+                } else
+                  (*ancount)++;
+                if (dnssec_ok && rec_type != 46 && !has_any) {
+                  if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
+                                            res, max_res_len, offset, comp_ctx, ancount)) {
+                    res[2] |= 0x02;
+                    return;
+                  }
                 }
               }
             }
@@ -2569,6 +2602,11 @@ static void resolve_name(const char *qname, uint16_t qtype,
           return;
       }
     }
+    bool all_matched = true;
+    for (int j = 0; j < num_qtypes; j++) {
+      if (!matched_qtypes[j]) { all_matched = false; break; }
+    }
+    
     if (!found || !type_matched) {
       if (!found)
         res[3] |= 3;
@@ -2593,29 +2631,37 @@ static void resolve_name(const char *qname, uint16_t qtype,
           break;
         }
       }
-      if (found && dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
-        for (int i = current_zone->hash_table[idx]; i != -1;
-             i = current_zone->records[i].next_record) {
-          dns_record_t *rec = &current_zone->records[i];
-          if (rec->type_code == 47 /* NSEC */ &&
-              strcasecmp(rec->name, current_qname) == 0) {
-            if (rec->rdata_count < 1) break; // 壊れたNSECは無視
-            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
-                                     NULL, 0xFFFFFFFF) < 0) {
-              res[2] |= 0x02;
-              return;
-            }
-            (*nscount)++;
-            if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 47,
-                                       res, max_res_len, offset, comp_ctx, nscount)) {
-              res[2] |= 0x02;
-              return;
-            }
-            break;
+    }
+    
+    if (found && !all_matched && dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
+      for (int i = current_zone->hash_table[idx]; i != -1;
+           i = current_zone->records[i].next_record) {
+        dns_record_t *rec = &current_zone->records[i];
+        if (rec->type_code == 47 /* NSEC */ &&
+            strcasecmp(rec->name, current_qname) == 0) {
+          printf("DEBUG: Found NSEC record!\\n");
+          if (rec->rdata_count < 1) break; // 壊れたNSECは無視
+          if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                                   NULL, 0xFFFFFFFF) < 0) {
+            res[2] |= 0x02;
+            return;
           }
+          (*nscount)++;
+          if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 47,
+                                     res, max_res_len, offset, comp_ctx, nscount)) {
+            res[2] |= 0x02;
+            return;
+          }
+          break;
         }
       }
-    } else if (!minimal_responses && qtype != 2 && qtype != 255) {
+    }
+    
+    bool needs_ns = false;
+    for (int j = 0; j < num_qtypes; j++) {
+      if (qtypes[j] != 2 && qtypes[j] != 255) { needs_ns = true; break; }
+    }
+    if (type_matched && !minimal_responses && needs_ns) {
       uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
       size_t apex_idx = apex_hash & (current_zone->hash_size - 1);
       for (int i = current_zone->hash_table[apex_idx]; i != -1;
@@ -3305,12 +3351,67 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     return offset;
   }
 
-  resolve_name(current_qname, qtype, &db_entry, &current_zone, res, max_res_len,
+  uint16_t qtypes[17];
+  int num_qtypes = 1;
+  qtypes[0] = qtype;
+
+  if (edns.has_mqtype_query) {
+    if (edns.mqtype_count == 0 || qtype == 255 || qtype == 251 || qtype == 252) {
+      if (current_zone)
+        atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+      res[2] |= 0x80;
+      res[3] = (res[3] & 0xF0) | 1; // FORMERR
+      res[6] = 0; res[7] = 0;
+      res[8] = 0; res[9] = 0;
+      offset = q_offset;
+      arcount = 0;
+      if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+      *res_arcount = htons(arcount);
+      return offset;
+    }
+    int limit = cfg_for_ede ? cfg_for_ede->max_mqtypes : 4;
+    for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
+       uint16_t mq = edns.mqtypes[i];
+       if (mq == 255 || mq == 251 || mq == 252) {
+          if (current_zone)
+            atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+          res[2] |= 0x80;
+          res[3] = (res[3] & 0xF0) | 1;
+          res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
+          offset = q_offset; arcount = 0;
+          if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+          *res_arcount = htons(arcount);
+          return offset;
+       }
+       bool dup = false;
+       for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == mq) { dup = true; break; } }
+       if (dup) {
+          if (current_zone)
+            atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+          res[2] |= 0x80;
+          res[3] = (res[3] & 0xF0) | 1;
+          res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
+          offset = q_offset; arcount = 0;
+          if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0);
+          *res_arcount = htons(arcount);
+          return offset;
+       }
+       qtypes[num_qtypes++] = mq;
+    }
+    edns.mqtype_count = num_qtypes - 1;
+    for (int i = 0; i < edns.mqtype_count; i++) edns.mqtypes[i] = qtypes[i+1];
+  }
+
+  resolve_name(current_qname, qtypes, num_qtypes, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
                cfg_for_ede ? cfg_for_ede->minimal_any : false,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
                edns.dnssec_ok, view);
+
+  if (edns.has_mqtype_query && (res[2] & 0x02)) {
+      edns.mqtype_count = 0;
+  }
 
   if (edns.present) {
     assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out);

@@ -115,6 +115,11 @@ typedef struct {
     // Extended DNS Errors (EDE)
     uint16_t ede_count;
     parsed_ede_t ede_list[MAX_EDE_COUNT];
+    
+    // Multiple QTYPEs (RFC 10029)
+    bool has_mqtype_query;
+    uint16_t mqtypes[16];
+    uint16_t mqtype_count;
 } edns_info_t;
 
 // ============================================================================

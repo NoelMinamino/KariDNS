@@ -1796,6 +1796,15 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                     }
                                 }
                             }
+                        } else if (opt_code == 20 || opt_code == 21) {
+                            if (opt_code == 20) edns->has_mqtype_query = true;
+                            if (opt_len % 2 == 0) {
+                                int count = opt_len / 2;
+                                edns->mqtype_count = 0;
+                                for (int k = 0; k < count && edns->mqtype_count < 16; k++) {
+                                    edns->mqtypes[edns->mqtype_count++] = (req[rdata_offset + k*2] << 8) | req[rdata_offset + k*2 + 1];
+                                }
+                            }
                         }
                         rdata_offset += opt_len;
                     }
@@ -1825,6 +1834,9 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                 rdlen += strlen(edns->ede_list[i].text);
             }
         }
+    }
+    if (edns && edns->has_mqtype_query) {
+        rdlen += 4 + (edns->mqtype_count * 2);
     }
 
     if (offset + 11 + rdlen <= max_res_len) {
@@ -1863,6 +1875,16 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                     memcpy(res + offset, edns->ede_list[i].text, text_len);
                     offset += text_len;
                 }
+            }
+        }
+        
+        if (edns && edns->has_mqtype_query) {
+            res[offset++] = 0; res[offset++] = 21; // Option Code: 21 (MQTYPE-Response)
+            uint16_t olen = edns->mqtype_count * 2;
+            res[offset++] = olen >> 8; res[offset++] = olen & 0xFF; // Option Length
+            for (uint16_t i = 0; i < edns->mqtype_count; i++) {
+                res[offset++] = edns->mqtypes[i] >> 8;
+                res[offset++] = edns->mqtypes[i] & 0xFF;
             }
         }
         
