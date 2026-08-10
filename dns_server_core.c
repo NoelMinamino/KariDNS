@@ -2988,6 +2988,14 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   edns.ede_count = 0; // 反射防止
 
+  server_config_t *cfg_for_ede = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  
+  if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
+    edns.has_mqtype_query = false;
+    edns.saw_invalid_mqtype_response_in_query = false;
+    edns.mqtype_count = 0;
+  }
+
   if (edns.saw_invalid_mqtype_response_in_query) {
     res[2] |= 0x80;
     res[3] = (res[3] & 0xF0) | 1; // FORMERR
@@ -3021,8 +3029,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[11] = arcount & 0xFF;
     return offset;
   }
-
-  server_config_t *cfg_for_ede = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
 
   uint8_t opcode = (req[2] >> 3) & 0x0F;
   if (opcode != 0 && opcode != 4 && opcode != 5) {
