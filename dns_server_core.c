@@ -2277,7 +2277,6 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
         if (serialize_dns_record(res, max_res_len, offset,
                                  &current_zone->records[j], comp_ctx,
                                  NULL, 0xFFFFFFFF) < 0) {
-          res[2] |= 0x02;
           return false;
         } else
           (*arcount)++;
@@ -3092,6 +3091,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 4) { // NOTIFY
     if (edns.has_mqtype_query) {
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
+      res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
     }
     bool auth = false;
@@ -3176,6 +3176,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (opcode == 5) { // UPDATE
     if (edns.has_mqtype_query) {
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
+      res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
     }
     bool auth = false;
