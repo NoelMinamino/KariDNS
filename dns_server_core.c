@@ -2277,6 +2277,7 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
         if (serialize_dns_record(res, max_res_len, offset,
                                  &current_zone->records[j], comp_ctx,
                                  NULL, 0xFFFFFFFF) < 0) {
+          res[2] |= 0x02;
           return false;
         } else
           (*arcount)++;
