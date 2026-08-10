@@ -2056,6 +2056,22 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
                     if (family == 1) inet_ntop(AF_INET, addr, abuf, sizeof(abuf));
                     else if (family == 2) inet_ntop(AF_INET6, addr, abuf, sizeof(abuf));
                     printf("; CLIENT-SUBNET: %s/%u/%u\n", abuf, src_prefix, scope_prefix);
+                } else if (code == 20 || code == 21) {
+                    printf("; MQTYPE: ");
+                    if (olen % 2 != 0) {
+                        printf("(malformed, length %u is not even)\n", olen);
+                    } else if (olen == 0) {
+                        printf("(empty)\n");
+                    } else {
+                        for (uint16_t j = 0; j < olen; j += 2) {
+                            uint16_t mq = (pkt[p + j] << 8) | pkt[p + j + 1];
+                            char tbuf[16];
+                            const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
+                            if (j > 0) printf(", ");
+                            printf("%s", mq_name);
+                        }
+                        printf("\n");
+                    }
                 }
                 p += olen;
             }
@@ -2503,7 +2519,7 @@ static void usage(const char *prog) {
         "Usage: %s <name> <type|IXFR=serial> @<server>[,<server>...] [-p <port>] [+tcp]\n"
         "          [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie]\n"
         "          [+subnet=addr[/prefix]] [+bufsize=N] [+adflag] [+cdflag]\n"
-        "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]]\n"
+        "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]] [+mqtype=TYPE[,TYPE...]]\n"
         "          [+padding=N] [+timeout=N] [+tries=N] [+ldnsz]\n"
         "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
         "          [--test-all] [--break <kind>[=<param>] ...]\n"
@@ -2812,6 +2828,26 @@ int main(int argc, char **argv) {
         } else if (strncmp(argv[i], "+padding=", 9) == 0) {
             qo.want_opt = true; qo.want_padding = true;
             qo.padding_size = atoi(argv[i] + 9);
+        } else if (strncmp(argv[i], "+mqtype=", 8) == 0) {
+            qo.want_opt = true;
+            if (qo.custom_edns_opt_count < 8) {
+                char *mqstr = strdup(argv[i] + 8);
+                char *token = strtok(mqstr, ",");
+                uint16_t mqtypes[16];
+                int mq_count = 0;
+                while (token && mq_count < 16) {
+                    mqtypes[mq_count++] = parse_qtype(token);
+                    token = strtok(NULL, ",");
+                }
+                qo.custom_edns_opts[qo.custom_edns_opt_count].code = 20; // MQTYPE
+                qo.custom_edns_opts[qo.custom_edns_opt_count].len = mq_count * 2;
+                for (int m = 0; m < mq_count; m++) {
+                    qo.custom_edns_opts[qo.custom_edns_opt_count].data[m*2] = mqtypes[m] >> 8;
+                    qo.custom_edns_opts[qo.custom_edns_opt_count].data[m*2+1] = mqtypes[m] & 0xFF;
+                }
+                qo.custom_edns_opt_count++;
+                free(mqstr);
+            }
         } else if (strncmp(argv[i], "+ednsopt=", 9) == 0) {
             qo.want_opt = true;
             if (qo.custom_edns_opt_count < 8) {

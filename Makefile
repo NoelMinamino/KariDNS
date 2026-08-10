@@ -28,7 +28,7 @@ FUZZ_ZONE_TARGET = tests/fuzz/fuzz_zone_parser
 FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c dns_utils.c
 
 FUZZ_CONF_TARGET = tests/fuzz/fuzz_conf_parser
-FUZZ_CONF_SRCS = tests/fuzz/fuzz_conf_parser.c dns_config_parser.c dns_utils.c
+FUZZ_CONF_SRCS = tests/fuzz/fuzz_conf_parser.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_utils.c
 
 FUZZ_TSIG_TARGET = tests/fuzz/fuzz_tsig_sign
 FUZZ_TSIG_SRCS = tests/fuzz/fuzz_tsig_sign.c dns_wire.c dns_utils.c dns_zone_parser.c

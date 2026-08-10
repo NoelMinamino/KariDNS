@@ -104,6 +104,8 @@ typedef struct {
   bool minimal_responses;
   bool minimal_any;
   uint32_t minimal_any_ttl;
+  int max_mqtypes;
+  bool rfc10029_mqtype_enable;
 } server_config_t;
 
 typedef enum {

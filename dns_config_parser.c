@@ -660,6 +660,8 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
+  config->max_mqtypes = 4;
+  config->rfc10029_mqtype_enable = false;
   bool saw_view_block = false;
   bool saw_top_level_zone = false;
   view_config_t *last_view = NULL;
@@ -790,6 +792,25 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "rfc10029-mqtype") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->rfc10029_mqtype_enable = true;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->rfc10029_mqtype_enable = false;
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
         } else if (strcmp(key, "minimal-responses") == 0) {
           tok = get_next_token(&ctx);
           if (tok.type != TOKEN_STRING) {
@@ -820,6 +841,24 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             config->minimal_any = true;
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->minimal_any = false;
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "max-mqtypes") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          config->max_mqtypes = atoi(tok.value);
+          if (config->max_mqtypes < 0) config->max_mqtypes = 0;
+          if (config->max_mqtypes > 16) config->max_mqtypes = 16;
           free_token(&tok);
           tok = get_next_token(&ctx);
           if (tok.type != TOKEN_SEMICOLON) {
