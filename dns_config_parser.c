@@ -658,7 +658,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->serve_stale = true;
   config->send_extended_errors = true;
   config->tcp_connection_reuse = false;
-  config->tcp_idle_timeout = 15000;
+  config->tcp_idle_timeout = 10000;
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;

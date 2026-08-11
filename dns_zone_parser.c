@@ -1,4 +1,29 @@
 #include "dns_zone_parser.h"
+#include "dns_utils.h"
+
+static void unescape_string_in_place(char *str) {
+    if (!str) return;
+    char *read = str;
+    char *write = str;
+    while (*read) {
+        if (*read == '\\' && *(read + 1)) {
+            read++;
+            if (*read >= '0' && *read <= '9' && *(read+1) >= '0' && *(read+1) <= '9' && *(read+2) >= '0' && *(read+2) <= '9') {
+                int val = (*read - '0') * 100 + (*(read+1) - '0') * 10 + (*(read+2) - '0');
+                if (val <= 255) {
+                    *write++ = (char)val;
+                    read += 3;
+                    continue;
+                }
+            }
+            *write++ = *read++;
+        } else {
+            *write++ = *read++;
+        }
+    }
+    *write = '\0';
+}
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -622,21 +647,27 @@ STATE_FIND_TOKEN:
           
           // ファイル末尾に到達した場合でも、最後のトークンのクォートを除去する
           if (p >= end) {
-            if (field_idx > 0 && fields[field_idx - 1][0] == '"') {
-              fields[field_idx - 1]++;
-              size_t t_len = strlen(fields[field_idx - 1]);
-              if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
-                fields[field_idx - 1][t_len - 1] = '\0';
+            if (field_idx > 0) {
+                if (fields[field_idx - 1][0] == '"') {
+                    fields[field_idx - 1]++;
+                    size_t t_len = strlen(fields[field_idx - 1]);
+                    if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
+                        fields[field_idx - 1][t_len - 1] = '\0';
+                }
+                unescape_string_in_place(fields[field_idx - 1]);
             }
             goto PROCESS_RECORD;
           }
   char delimiter = *p;
   *p++ = '\0';
-  if (field_idx > 0 && fields[field_idx - 1][0] == '"') {
-    fields[field_idx - 1]++;
-    size_t t_len = strlen(fields[field_idx - 1]);
-    if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
-      fields[field_idx - 1][t_len - 1] = '\0';
+  if (field_idx > 0) {
+      if (fields[field_idx - 1][0] == '"') {
+          fields[field_idx - 1]++;
+          size_t t_len = strlen(fields[field_idx - 1]);
+          if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
+              fields[field_idx - 1][t_len - 1] = '\0';
+      }
+      unescape_string_in_place(fields[field_idx - 1]);
   }
   if (IS_SPACE(delimiter))
     goto SKIP_WHITESPACE;

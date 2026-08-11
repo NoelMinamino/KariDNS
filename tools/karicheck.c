@@ -209,7 +209,30 @@ static int cmp_canonical_rr(const void *a, const void *b) {
     if (c != 0) return c;
     
     if (r1->type_code != r2->type_code) return r1->type_code - r2->type_code;
-    return 0; 
+    
+    // Same name and type, sort by RDATA canonical format
+    uint8_t w1[65535];
+    uint8_t w2[65535];
+    uint16_t o1 = 0, o2 = 0;
+    serialize_dns_record(w1, sizeof(w1), &o1, r1, NULL, NULL, 0xFFFFFFFF);
+    serialize_dns_record(w2, sizeof(w2), &o2, r2, NULL, NULL, 0xFFFFFFFF);
+    
+    // Find RDATA offset by skipping the uncompressed name
+    uint16_t idx = 0;
+    while(idx < o1 && w1[idx] != 0) {
+        idx += w1[idx] + 1;
+    }
+    idx++; // skip null byte
+    idx += 10; // skip Type, Class, TTL, RDLEN
+    
+    int len1 = o1 > idx ? o1 - idx : 0;
+    int len2 = o2 > idx ? o2 - idx : 0;
+    int min_len = len1 < len2 ? len1 : len2;
+    if (min_len > 0) {
+        int mem_c = memcmp(w1 + idx, w2 + idx, min_len);
+        if (mem_c != 0) return mem_c;
+    }
+    return len1 - len2;
 }
 
 static void verify_zonemd(const char *domain, zone_arena_t *arena) {
@@ -225,8 +248,11 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
     dns_record_t **sorted = malloc(arena->count * sizeof(dns_record_t *));
     size_t valid_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 63 && strcasecmp(arena->records[i].name, domain) == 0) continue;
-        sorted[valid_count++] = &arena->records[i];
+        dns_record_t *r = &arena->records[i];
+        if (r->type_code == 63 && strcasecmp(r->name, domain) == 0) continue;
+        if (r->type_code == 46 && strcasecmp(r->name, domain) == 0 &&
+            r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
+        sorted[valid_count++] = r;
     }
     
     qsort(sorted, valid_count, sizeof(dns_record_t *), cmp_canonical_rr);
@@ -246,12 +272,22 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
         EVP_DigestInit_ex(mdctx, md_type, NULL);
         
         uint8_t wire_buf[65535];
+        uint8_t prev_wire_buf[65535];
+        uint16_t prev_offset = 0;
+        FILE *debug_f = fopen("c:\\git\\my_dns\\scratch\\canonical_zone.bin", "wb");
         for (size_t i = 0; i < valid_count; i++) {
             uint16_t offset = 0;
             if (serialize_dns_record(wire_buf, sizeof(wire_buf), &offset, sorted[i], NULL, NULL, 0xFFFFFFFF) == 0) {
+                if (prev_offset > 0 && prev_offset == offset && memcmp(prev_wire_buf, wire_buf, offset) == 0) {
+                    continue;
+                }
                 EVP_DigestUpdate(mdctx, wire_buf, offset);
+                if (debug_f) fwrite(wire_buf, 1, offset, debug_f);
+                memcpy(prev_wire_buf, wire_buf, offset);
+                prev_offset = offset;
             }
         }
+        if (debug_f) fclose(debug_f);
         
         uint8_t hash_out[EVP_MAX_MD_SIZE];
         unsigned int hash_len = 0;

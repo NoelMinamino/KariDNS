@@ -4702,7 +4702,7 @@ worker_startup_success:;
           }
           struct kevent ev_timeout;
           EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
-                 15000, ctx_tcp);
+                 10000, ctx_tcp);
           kevent(kq, &ev_timeout, 1, NULL, 0, NULL);
 
           if (client_addr.ss_family == AF_INET)
@@ -5002,7 +5002,7 @@ worker_startup_success:;
               
               struct kevent ev_timeout;
               EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
-                     cfg->tcp_idle_timeout > 0 ? cfg->tcp_idle_timeout : 15000, ctx_tcp);
+                     cfg->tcp_idle_timeout > 0 ? cfg->tcp_idle_timeout : 10000, ctx_tcp);
               kevent(kq, &ev_timeout, 1, NULL, 0, NULL);
               
               // Event EVFILT_READ is already added with EV_ADD | EV_CLEAR
