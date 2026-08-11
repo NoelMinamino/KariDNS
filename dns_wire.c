@@ -652,6 +652,12 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
 // ============================================================================
 
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len) {
+    if (!ctx) {
+        long w = write_uncompressed_name(packet_buf, *offset, max_len, name);
+        if (w < 0) return -1;
+        *offset += w;
+        return 0;
+    }
     uint8_t wire[256];
     size_t w_len = 0;
     const char *p = name;
@@ -851,6 +857,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     res[offset++] = class_val >> 8; res[offset++] = class_val & 0xFF;
     
     uint32_t ttl = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
+    if (ttl > 0x7FFFFFFF) ttl = 0; // RFC 2181 §8: TTL >= 2^31 is treated as 0
     if (override_ttl != 0xFFFFFFFF && override_ttl < ttl) ttl = override_ttl;
     
     res[offset++] = ttl >> 24; res[offset++] = (ttl >> 16) & 0xFF; res[offset++] = (ttl >> 8) & 0xFF; res[offset++] = ttl & 0xFF;
