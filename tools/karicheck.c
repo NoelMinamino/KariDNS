@@ -391,7 +391,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     if (!base_dir) {
         fprintf(stderr, "[ERROR] Out of memory allocating base_dir\n");
         free(root_path);
-        return false;
+        return 1;
     }
 
     parse_context_t ctx = {

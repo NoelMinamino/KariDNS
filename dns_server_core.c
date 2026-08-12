@@ -1139,9 +1139,8 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   ctx.base_dir = get_base_dir(root_path);
   if (!ctx.base_dir) {
       syslog(LOG_ERR, "[ZoneLoader] Out of memory allocating base_dir for zone '%s'", entry->domain);
-      zone_arena_destroy(z_standby);
       free(root_path);
-      free(z_standby);
+      pthread_mutex_unlock(&entry->writer_lock);
       return RELOAD_ERR_PARSE;
   }
   ctx.is_standalone_mode = false;
