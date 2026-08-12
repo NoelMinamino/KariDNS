@@ -22,9 +22,10 @@ Legend:
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
 | RFC 1034 | Domain Names - Concepts and Facilities | ✅ Full | Core namespace model |
-| RFC 1035 | Domain Names - Implementation and Specification | ✅ Full | Zone file syntax, wire format, base record types (`dns_zone_parser.c`, `dns_wire.c`) |
+| RFC 1035 | Domain Names - Implementation and Specification | ✅ Full | Zone file syntax, wire format, base record types. Text string escaping (`\DDD`, `\X`) is fully supported per §5.1 (`dns_zone_parser.c`, `dns_wire.c`) |
 | RFC 1123 | Requirements for Internet Hosts (applicable parts) | ✅ Full | General hostname rules |
 | RFC 1912 | Common DNS Operational and Configuration Errors | ✅ Full | `karicheck` now warns when MX/NS/SOA(MNAME) targets point to a CNAME, and when a CNAME co-exists with non-DNSSEC record types at the same owner name (`tools/karicheck.c`, `is_cname()` and related checks) |
+| RFC 1982 | Serial Number Arithmetic | ✅ Full | Serial number arithmetic is used to evaluate SOA serial increments during IXFR/NOTIFY (`dns_server_core.c`, e.g., `(int32_t)(new_serial - old_serial) <= 0`) |
 | RFC 1995 | Incremental Zone Transfer (IXFR) | ✅ Full | `ixfr_history_t`, `compute_ixfr_diff` (`dns_server_core.c`) |
 | RFC 1996 | A Mechanism for Prompt Notification of Zone Changes (NOTIFY) | ✅ Full | Send and receive supported. Inbound NOTIFY authenticated via `masters` IP match, plus optional TSIG (`dns_server_core.c`) |
 | RFC 2181 | Clarifications to the DNS Specification | ✅ Full | TTL values with the high bit set (≥ 2^31) are now capped to 0 at the single conversion point in `serialize_dns_record` (`dns_wire.c`), per §8 |
@@ -33,6 +34,7 @@ Legend:
 | RFC 3596 | DNS Extensions to Support IP Version 6 (AAAA) | ✅ Full | AAAA supported (`dns_utils.c`) |
 | RFC 3597 | Handling of Unknown DNS Resource Record (RR) Types | ✅ Full | `TYPE<n>` syntax supported (`dns_utils.c`, `get_type_code`) |
 | RFC 4343 | DNS Case Insensitivity Clarification | ✅ Full | Name comparisons consistently use `strcasecmp` throughout (`dns_server_core.c`, `dns_zone_parser.c`) |
+| RFC 4592 | The Definition of Phrases with Wildcards in the Domain Name System | ✅ Full | Wildcard expansion/synthesis (e.g., `*.example.com`) is fully implemented in the resolution path (`dns_server_core.c`) |
 | RFC 6672 | DNAME Redirection in the DNS | ✅ Full | DNAME→CNAME synthesis logic present (`dns_server_core.c`, `synth_name`) |
 | RFC 6698 | DANE TLSA | ✅ Full | TLSA supported (`dns_utils.c`) |
 | RFC 6891 | Extension Mechanisms for DNS (EDNS(0)) | ✅ Full | OPT pseudo-RR parsing and assembly (`dns_wire.c`) |
