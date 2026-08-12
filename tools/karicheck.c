@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <errno.h>
 #include "../dns_config_parser.h"
 #include "../dns_zone_parser.h"
@@ -248,7 +249,15 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
     }
     if (zonemd_count == 0) return;
     
+    if (arena->count > SIZE_MAX / sizeof(dns_record_t *)) {
+        fprintf(stderr, "[ERROR] Record count too large for ZONEMD verification (zone '%s')\n", domain);
+        return;
+    }
     dns_record_t **sorted = malloc(arena->count * sizeof(dns_record_t *));
+    if (!sorted) {
+        fprintf(stderr, "[ERROR] Out of memory while sorting records for ZONEMD verification (zone '%s', %zu records)\n", domain, arena->count);
+        return;
+    }
     size_t valid_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *r = &arena->records[i];
