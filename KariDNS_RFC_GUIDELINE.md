@@ -31,8 +31,10 @@ Legend:
 | RFC 2181 | Clarifications to the DNS Specification | ✅ Full | TTL values with the high bit set (≥ 2^31) are now capped to 0 at the single conversion point in `serialize_dns_record` (`dns_wire.c`), per §8 |
 | RFC 2308 | Negative Caching of DNS Queries | ✅ Full | On NXDOMAIN/NODATA, the SOA MINIMUM field is used as the TTL override for the authority-section SOA (`dns_server_core.c`, ~line 2697) |
 | RFC 2782 | A DNS RR for specifying the location of services (SRV) | ✅ Full | SRV supported in the record-type table (`dns_utils.c`) |
+| RFC 3403 | Dynamic Delegation Discovery System (DDDS) Part Three: The Domain Name System (DNS) Database (NAPTR) | ✅ Full | NAPTR supported in the record-type table (`dns_utils.c`) |
 | RFC 3596 | DNS Extensions to Support IP Version 6 (AAAA) | ✅ Full | AAAA supported (`dns_utils.c`) |
 | RFC 3597 | Handling of Unknown DNS Resource Record (RR) Types | ✅ Full | `TYPE<n>` syntax supported (`dns_utils.c`, `get_type_code`) |
+| RFC 4255 | Using DNS to Securely Publish Secure Shell (SSH) Key Fingerprints (SSHFP) | ✅ Full | SSHFP supported in the record-type table (`dns_utils.c`) |
 | RFC 4343 | DNS Case Insensitivity Clarification | ✅ Full | Name comparisons consistently use `strcasecmp` throughout (`dns_server_core.c`, `dns_zone_parser.c`) |
 | RFC 4592 | The Definition of Phrases with Wildcards in the Domain Name System | ✅ Full | Wildcard expansion/synthesis (e.g., `*.example.com`) is fully implemented in the resolution path (`dns_server_core.c`) |
 | RFC 6672 | DNAME Redirection in the DNS | ✅ Full | DNAME→CNAME synthesis logic present (`dns_server_core.c`, `synth_name`) |
@@ -40,6 +42,7 @@ Legend:
 | RFC 6891 | Extension Mechanisms for DNS (EDNS(0)) | ✅ Full | OPT pseudo-RR parsing and assembly (`dns_wire.c`) |
 | RFC 7766 | DNS Transport over TCP - Implementation Requirements | ✅ Full (opt-in, default OFF) | TCP connection reuse/pipelining is now supported, gated behind `tcp-connection-reuse yes;` (default `no`, preserving the original one-query-per-connection behavior unless explicitly enabled). Idle timeout defaults to 10s per RFC 9210 §4.5 and is configurable via `tcp-idle-timeout` (`dns_server_core.c`, `dns_config_parser.c`/`.h`) |
 | RFC 8482 | Providing Minimal-Sized Responses to ANY Queries | ✅ Full | `minimal_any` / `minimal_any_ttl` settings (`dns_config_parser.h`) |
+| RFC 8659 | DNS Certification Authority Authorization (CAA) Resource Record | ✅ Full | CAA supported in the record-type table (`dns_utils.c`) |
 | RFC 8767 | Serving Stale Data to Improve DNS Resiliency | 🟡 Partial | This RFC targets recursive resolver caches; KariDNS repurposes the term for a `serve-stale` toggle controlling whether a secondary keeps serving its last-known zone data after the SOA EXPIRE interval has passed without a successful refresh. Scope differs from the RFC's original target (recursive caching) |
 | RFC 8906 | A Common Operational Problem in DNS Servers: Failure to Communicate (Fragmentation) | ✅ Full | EDNS UDP payload size is force-clamped to 1232 bytes (avoids IP fragmentation, matches the 2020 DNS Flag Day recommendation) |
 | RFC 9210 | DNS Transport over TCP - Operational Requirements | ✅ Full (opt-in, default OFF) | Same mechanism as RFC 7766 above; default idle timeout (10s) matches §4.5's recommendation |
@@ -65,6 +68,7 @@ Legend:
 | RFC 8624 | Algorithm Implementation Requirements and Usage Guidance for DNSSEC | ✅ Full | `karicheck` now maintains a table of DNSSEC algorithm numbers and their RFC 8624 status, and emits a warning (non-fatal) when a DNSKEY/CDNSKEY/RRSIG uses an algorithm marked MUST NOT or NOT RECOMMENDED (e.g., RSAMD5, DSA, RSASHA1) (`tools/karicheck.c`). The server itself remains algorithm-agnostic by design (static DNSSEC); this is an advisory check only |
 | RFC 8901 | Multi-Signer DNSSEC Models | ➖ N/A | Not applicable — this server does not perform online signing, so multi-signer coordination models don't apply |
 | RFC 8976 | Message Digest for DNS Zones (ZONEMD) | ✅ Full | `karicheck --verify-zonemd` implements the full RFC 8976 §3 digest algorithm: canonical RRset ordering (owner name → type → RDATA per RFC 4034 §6.3), canonical (uncompressed, lowercased per §6.2/RFC 6840) wire-form serialization, exclusion of the apex ZONEMD RRset **and** its covering RRSIG from the digest input, and deduplication of identical RRs. **Verified against the official RFC 8976 Appendix A test vectors, including the most complex signed example (Appendix A.4, `uri.arpa.`), which passes end-to-end** (independently reproduced during this review) |
+| RFC 9276 | Guidance for NSEC3 Parameter Settings | ✅ Full | `karicheck` enforces RFC 9276 guidance by emitting warnings if NSEC3/NSEC3PARAM iterations are greater than 0, or if the opt-out flag is set unnecessarily (`tools/karicheck.c`) |
 
 ## 4. Dynamic Update / Authentication
 
