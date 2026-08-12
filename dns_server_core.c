@@ -4995,6 +4995,7 @@ worker_startup_success:;
               release_zone_snapshot(snap);
             }
             
+            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
             if (cfg && cfg->tcp_connection_reuse) {
               ctx_tcp->state = TCP_STATE_READ_LEN;
               ctx_tcp->accumulated = 0;
