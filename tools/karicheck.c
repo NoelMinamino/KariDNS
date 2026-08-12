@@ -10,6 +10,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
@@ -384,8 +387,15 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     char *root_path = realpath(file_path, NULL);
     if (!root_path) root_path = strdup(file_path);
 
+    char *base_dir = get_base_dir(file_path);
+    if (!base_dir) {
+        fprintf(stderr, "[ERROR] Out of memory allocating base_dir\n");
+        free(root_path);
+        return false;
+    }
+
     parse_context_t ctx = {
-        .base_dir = get_base_dir(file_path),
+        .base_dir = base_dir,
         .default_origin = domain,
         .is_standalone_mode = is_standalone,
         .err_out = &err,

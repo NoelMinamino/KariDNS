@@ -224,6 +224,7 @@ char *get_base_dir(const char *path) {
     size_t len = slash - path;
     if (len == 0) len = 1; // "/"
     char *base = malloc(len + 1);
+    if (!base) return NULL;
     memcpy(base, path, len);
     base[len] = '\0';
     return base;

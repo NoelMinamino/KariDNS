@@ -400,6 +400,7 @@ int g_control_kq = -1;
 int g_cwd_fd = -1;
 static const char *g_config_path = NULL;
 static _Atomic int g_bound_workers = 0;
+static _Atomic bool g_privilege_drop_complete = false;
 #define MAX_ZONE_AXFR 4
 
 // Frontend/Backend IPC用グローバル変数
@@ -1136,6 +1137,13 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   parse_context_t ctx = {0};
   ctx.default_origin = entry->domain;
   ctx.base_dir = get_base_dir(root_path);
+  if (!ctx.base_dir) {
+      syslog(LOG_ERR, "[ZoneLoader] Out of memory allocating base_dir for zone '%s'", entry->domain);
+      zone_arena_destroy(z_standby);
+      free(root_path);
+      free(z_standby);
+      return RELOAD_ERR_PARSE;
+  }
   ctx.is_standalone_mode = false;
   ctx.load_file_cb = server_load_file_cb;
   ctx.shared_ttl_io = &root_ttl;
@@ -4463,6 +4471,10 @@ worker_startup_failed:
   pthread_exit(NULL);
 
 worker_startup_success:;
+  // 特権分離(setuid/setgid/Capsicum)が完了するまで、
+  // イベントループ(=信頼できないネットワーク入力の処理)を開始しない。
+  while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
+    sched_yield();
   compress_ctx_t thread_compress_ctx = {0};
   struct kevent ev_list[MAX_EVENTS];
 
@@ -5638,6 +5650,11 @@ void *control_thread_func(void *arg) {
 // ============================================================================
 
 static void run_frontend_router(pid_t backend_pid) {
+  // 注意: Frontend側は現状workerスレッドを持たないため、この関数内で
+  // 順次 setuid してからネットワーク処理ループに入る設計となっており、
+  // Backend側のようなレースウィンドウは存在しない。
+  // 将来マルチスレッド化する場合は「bind→バリア待機→特権drop→処理開始許可」
+  // のパターンを踏襲すること。
   if (g_control_sock >= 0) {
     close(g_control_sock);
     g_control_sock = -1;
@@ -6126,7 +6143,10 @@ int main(int argc, char **argv) {
   pthread_t response_logger_thread;
   if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);
   
-  enter_capsicum_sandbox(); // サンドボックス突入！
+  enter_capsicum_sandbox(); // サンドボックス突入
+
+  // 特権分離(setuid+Capsicum)が完了したため、各Workerスレッドにクエリ処理の開始を許可する
+  atomic_store_explicit(&g_privilege_drop_complete, true, memory_order_release);
 
   for (int i = 0; i < num_workers; i++)
     pthread_join(threads[i], NULL);
