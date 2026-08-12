@@ -38,6 +38,7 @@ Legend:
 | RFC 8482 | Providing Minimal-Sized Responses to ANY Queries | ✅ Full | `minimal_any` / `minimal_any_ttl` settings (`dns_config_parser.h`) |
 | RFC 8767 | Serving Stale Data to Improve DNS Resiliency | 🟡 Partial | This RFC targets recursive resolver caches; KariDNS repurposes the term for a `serve-stale` toggle controlling whether a secondary keeps serving its last-known zone data after the SOA EXPIRE interval has passed without a successful refresh. Scope differs from the RFC's original target (recursive caching) |
 | RFC 8906 | A Common Operational Problem in DNS Servers: Failure to Communicate (Fragmentation) | ✅ Full | EDNS UDP payload size is force-clamped to 1232 bytes (avoids IP fragmentation, matches the 2020 DNS Flag Day recommendation) |
+| RFC 9619 | In the DNS, QDCOUNT Is (Usually) One | ✅ Full | For OPCODE=0 (QUERY), QDCOUNT > 1 returns FORMERR and QDCOUNT = 0 returns a minimal response with no question section, per the RFC's normative requirements. OPCODE=4 (NOTIFY) and OPCODE=5 (UPDATE) continue to require QDCOUNT == 1 (`dns_server_core.c`, ~line 3065) |
 | RFC 9210 | DNS Transport over TCP - Operational Requirements | ✅ Full (opt-in, default OFF) | Same mechanism as RFC 7766 above; default idle timeout (10s) matches §4.5's recommendation |
 | RFC 9471 | DNS Glue Requirements in Referral Responses | ✅ Full | `append_glue_records` adds both A(1) and AAAA(28) glue (`dns_server_core.c`) |
 
@@ -49,6 +50,7 @@ Legend:
 | RFC 1995 | IXFR | ✅ Full | See section 1 above |
 | RFC 9432 | DNS Catalog Zones | ✅ Full | `catalog_process_membership`, `is_catalog` (`dns_server_core.c`, `dns_config_parser.h`) |
 | RFC 7477 | Child-to-Parent Synchronization in DNS (CSYNC) | ✅ Full | Supported and serialized (`dns_wire.c`, case 62) |
+| RFC 9859 | Generalized DNS Notifications (DSYNC) | ✅ Full | DSYNC(66) is fully serialized in the wire-format path (`dns_wire.c`, case 66), including the notify-RRtype, scheme (`NOTIFY` or numeric), port, and target fields. `karicheck` additionally validates that the DSYNC RRtype mnemonic is a recognized type (`tools/karicheck.c`) |
 
 ## 3. DNSSEC
 
@@ -61,6 +63,7 @@ Legend:
 | RFC 8080 | EdDSA for DNSSEC | 🟡 Partial | The DNSKEY/RRSIG Algorithm field is passed through opaquely with no algorithm-specific logic (confirmed in `dns_wire.c`'s `serialize_dns_record`). Ed25519(15)/Ed448(16) can therefore be served, but this is a byproduct of algorithm-agnostic passthrough rather than dedicated EdDSA support |
 | RFC 8624 | Algorithm Implementation Requirements and Usage Guidance for DNSSEC | ✅ Full | `karicheck` now maintains a table of DNSSEC algorithm numbers and their RFC 8624 status, and emits a warning (non-fatal) when a DNSKEY/CDNSKEY/RRSIG uses an algorithm marked MUST NOT or NOT RECOMMENDED (e.g., RSAMD5, DSA, RSASHA1) (`tools/karicheck.c`). The server itself remains algorithm-agnostic by design (static DNSSEC); this is an advisory check only |
 | RFC 8901 | Multi-Signer DNSSEC Models | ➖ N/A | Not applicable — this server does not perform online signing, so multi-signer coordination models don't apply |
+| RFC 9824 | Compact Denial of Existence in DNSSEC (NXNAME) | ➖ N/A (mechanism) / 🟡 Partial (validation) | The Compact DoE *mechanism* itself requires online signing and is out of scope for this static-DNSSEC server. However, `karicheck` enforces the RFC's own requirement that NXNAME(128) — a synthetic meta-type — must never appear as a standalone RRset in zone-file data, flagging it as an error if found (`tools/karicheck.c`). The NXNAME(128) type mnemonic is also recognized by the record-type table (`dns_utils.c`) |
 | RFC 8976 | Message Digest for DNS Zones (ZONEMD) | ✅ Full | `karicheck --verify-zonemd` implements the full RFC 8976 §3 digest algorithm: canonical RRset ordering (owner name → type → RDATA per RFC 4034 §6.3), canonical (uncompressed, lowercased per §6.2/RFC 6840) wire-form serialization, exclusion of the apex ZONEMD RRset **and** its covering RRSIG from the digest input, and deduplication of identical RRs. **Verified against the official RFC 8976 Appendix A test vectors, including the most complex signed example (Appendix A.4, `uri.arpa.`), which passes end-to-end** (independently reproduced during this review) |
 | RFC 9276 | Guidance for NSEC3 Parameter Settings | ✅ Full | `karicheck` enforces RFC 9276 guidance by emitting warnings if NSEC3/NSEC3PARAM iterations are greater than 0, or if the opt-out flag is set unnecessarily (`tools/karicheck.c`) |
 
