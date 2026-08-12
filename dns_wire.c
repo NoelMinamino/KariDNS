@@ -1248,7 +1248,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = (sig_inc >> 8) & 0xFF; res[offset++] = sig_inc & 0xFF;
                 res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
 
-                long w = write_uncompressed_name_ext(res, offset, max_res_len, signer, false);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, signer, true);
                 if (w < 0) return -1;
                 offset += w;
 

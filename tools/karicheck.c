@@ -274,7 +274,6 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
         uint8_t wire_buf[65535];
         uint8_t prev_wire_buf[65535];
         uint16_t prev_offset = 0;
-        FILE *debug_f = fopen("c:\\git\\my_dns\\scratch\\canonical_zone.bin", "wb");
         for (size_t i = 0; i < valid_count; i++) {
             uint16_t offset = 0;
             if (serialize_dns_record(wire_buf, sizeof(wire_buf), &offset, sorted[i], NULL, NULL, 0xFFFFFFFF) == 0) {
@@ -282,12 +281,10 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
                     continue;
                 }
                 EVP_DigestUpdate(mdctx, wire_buf, offset);
-                if (debug_f) fwrite(wire_buf, 1, offset, debug_f);
                 memcpy(prev_wire_buf, wire_buf, offset);
                 prev_offset = offset;
             }
         }
-        if (debug_f) fclose(debug_f);
         
         uint8_t hash_out[EVP_MAX_MD_SIZE];
         unsigned int hash_len = 0;
