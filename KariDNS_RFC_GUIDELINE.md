@@ -30,19 +30,12 @@ Legend:
 | RFC 1996 | A Mechanism for Prompt Notification of Zone Changes (NOTIFY) | ✅ Full | Send and receive supported. Inbound NOTIFY authenticated via `masters` IP match, plus optional TSIG (`dns_server_core.c`) |
 | RFC 2181 | Clarifications to the DNS Specification | ✅ Full | TTL values with the high bit set (≥ 2^31) are now capped to 0 at the single conversion point in `serialize_dns_record` (`dns_wire.c`), per §8 |
 | RFC 2308 | Negative Caching of DNS Queries | ✅ Full | On NXDOMAIN/NODATA, the SOA MINIMUM field is used as the TTL override for the authority-section SOA (`dns_server_core.c`, ~line 2697) |
-| RFC 2782 | A DNS RR for specifying the location of services (SRV) | ✅ Full | SRV supported in the record-type table (`dns_utils.c`) |
-| RFC 3403 | Dynamic Delegation Discovery System (DDDS) Part Three: The Domain Name System (DNS) Database (NAPTR) | ✅ Full | NAPTR supported in the record-type table (`dns_utils.c`) |
-| RFC 3596 | DNS Extensions to Support IP Version 6 (AAAA) | ✅ Full | AAAA supported (`dns_utils.c`) |
 | RFC 3597 | Handling of Unknown DNS Resource Record (RR) Types | ✅ Full | `TYPE<n>` syntax supported (`dns_utils.c`, `get_type_code`) |
-| RFC 4255 | Using DNS to Securely Publish Secure Shell (SSH) Key Fingerprints (SSHFP) | ✅ Full | SSHFP supported in the record-type table (`dns_utils.c`) |
 | RFC 4343 | DNS Case Insensitivity Clarification | ✅ Full | Name comparisons consistently use `strcasecmp` throughout (`dns_server_core.c`, `dns_zone_parser.c`) |
 | RFC 4592 | The Definition of Phrases with Wildcards in the Domain Name System | ✅ Full | Wildcard expansion/synthesis (e.g., `*.example.com`) is fully implemented in the resolution path (`dns_server_core.c`) |
-| RFC 6672 | DNAME Redirection in the DNS | ✅ Full | DNAME→CNAME synthesis logic present (`dns_server_core.c`, `synth_name`) |
-| RFC 6698 | DANE TLSA | ✅ Full | TLSA supported (`dns_utils.c`) |
 | RFC 6891 | Extension Mechanisms for DNS (EDNS(0)) | ✅ Full | OPT pseudo-RR parsing and assembly (`dns_wire.c`) |
 | RFC 7766 | DNS Transport over TCP - Implementation Requirements | ✅ Full (opt-in, default OFF) | TCP connection reuse/pipelining is now supported, gated behind `tcp-connection-reuse yes;` (default `no`, preserving the original one-query-per-connection behavior unless explicitly enabled). Idle timeout defaults to 10s per RFC 9210 §4.5 and is configurable via `tcp-idle-timeout` (`dns_server_core.c`, `dns_config_parser.c`/`.h`) |
 | RFC 8482 | Providing Minimal-Sized Responses to ANY Queries | ✅ Full | `minimal_any` / `minimal_any_ttl` settings (`dns_config_parser.h`) |
-| RFC 8659 | DNS Certification Authority Authorization (CAA) Resource Record | ✅ Full | CAA supported in the record-type table (`dns_utils.c`) |
 | RFC 8767 | Serving Stale Data to Improve DNS Resiliency | 🟡 Partial | This RFC targets recursive resolver caches; KariDNS repurposes the term for a `serve-stale` toggle controlling whether a secondary keeps serving its last-known zone data after the SOA EXPIRE interval has passed without a successful refresh. Scope differs from the RFC's original target (recursive caching) |
 | RFC 8906 | A Common Operational Problem in DNS Servers: Failure to Communicate (Fragmentation) | ✅ Full | EDNS UDP payload size is force-clamped to 1232 bytes (avoids IP fragmentation, matches the 2020 DNS Flag Day recommendation) |
 | RFC 9210 | DNS Transport over TCP - Operational Requirements | ✅ Full (opt-in, default OFF) | Same mechanism as RFC 7766 above; default idle timeout (10s) matches §4.5's recommendation |
@@ -55,6 +48,7 @@ Legend:
 | RFC 5936 | DNS Zone Transfer Protocol (AXFR) | ✅ Full | `handle_axfr_event` (`dns_server_core.c`) |
 | RFC 1995 | IXFR | ✅ Full | See section 1 above |
 | RFC 9432 | DNS Catalog Zones | ✅ Full | `catalog_process_membership`, `is_catalog` (`dns_server_core.c`, `dns_config_parser.h`) |
+| RFC 7477 | Child-to-Parent Synchronization in DNS (CSYNC) | ✅ Full | Supported and serialized (`dns_wire.c`, case 62) |
 
 ## 3. DNSSEC
 
@@ -96,7 +90,33 @@ Legend:
 | RFC 10029 | DNS Multiple QTYPEs (MQTYPE) | ✅ Full (opt-in, default OFF) | Implemented and hardened over multiple review rounds during this engagement, including strict truncation-avoidance semantics (additional QTYPEs must never force truncation of the primary response) and full FORMERR coverage. Disabled unless `rfc10029-mqtype yes;` is explicitly set (`dns_server_core.c`, `dns_wire.c`, `dns_config_parser.c`) |
 | RFC 9460 | Service Binding and Parameter Specification via the DNS (SVCB/HTTPS) | ✅ Full | A complete server-side serialization implementation exists in `dns_wire.c`'s `serialize_dns_record`, correctly encoding `alpn`, `port`, `ipv4hint`/`ipv6hint`, `ech`, `mandatory`, and generic `keyNNN` SvcParams from zone-file text syntax into wire format |
 
-## 7. Out of Scope
+
+## 7. Specific Resource Records
+
+| RFC | Title | Status | Evidence / Notes |
+|---|---|---|---|
+| RFC 1183 | New DNS RR Definitions (AFSDB, RT, RP, X25, ISDN) | ✅ Full | Custom wire serialization logic is implemented for all these types (`dns_wire.c`, cases 17-21) |
+| RFC 1876 | A Means for Expressing Location Information in the Domain Name System (LOC) | ✅ Full | Supported and serialized (`dns_wire.c`, case 29) |
+| RFC 2782 | A DNS RR for specifying the location of services (SRV) | ✅ Full | SRV supported in the record-type table (`dns_utils.c`) |
+| RFC 3123 | A DNS RR Type for Lists of Address Prefixes (APL) | ✅ Full | Supported and serialized (`dns_wire.c`, case 42) |
+| RFC 3403 | Dynamic Delegation Discovery System (DNS) Database (NAPTR) | ✅ Full | NAPTR supported in the record-type table (`dns_utils.c`) |
+| RFC 3596 | DNS Extensions to Support IP Version 6 (AAAA) | ✅ Full | AAAA supported (`dns_utils.c`) |
+| RFC 4025 | A Method for Storing IPsec Keying Material in DNS (IPSECKEY) | ✅ Full | Supported and serialized (`dns_wire.c`, case 45) |
+| RFC 4255 | Using DNS to Securely Publish Secure Shell (SSH) Key Fingerprints (SSHFP) | ✅ Full | SSHFP supported in the record-type table (`dns_utils.c`) |
+| RFC 4398 | Storing Certificates in the Domain Name System (CERT) | ✅ Full | Supported and serialized (`dns_wire.c`, case 37) |
+| RFC 4701 | Encoding Dynamic Host Configuration Protocol (DHCP) Information (DHCID) | ✅ Full | Supported and serialized (`dns_wire.c`, case 49) |
+| RFC 6672 | DNAME Redirection in the DNS | ✅ Full | DNAME→CNAME synthesis logic present (`dns_server_core.c`, `synth_name`) |
+| RFC 6698 | DANE TLSA | ✅ Full | TLSA supported (`dns_utils.c`) |
+| RFC 6742 | DNS Resource Records for ILNP (NID, L32, L64, LP) | ✅ Full | Supported and serialized (`dns_wire.c`, cases 104-107) |
+| RFC 7043 | Resource Records for EUI-48 and EUI-64 Addresses in the DNS | ✅ Full | Supported and serialized (`dns_wire.c`, cases 108-109) |
+| RFC 7553 | The Uniform Resource Identifier (URI) DNS Resource Record | ✅ Full | Supported and serialized (`dns_wire.c`, case 256) |
+| RFC 7929 | DNS-Based Authentication of Named Entities Bindings for OpenPGP | ✅ Full | Supported and serialized (`dns_wire.c`, case 61) |
+| RFC 8005 | Host Identity Protocol (HIP) Domain Name System (DNS) Extension | ✅ Full | Supported and serialized (`dns_wire.c`, case 55) |
+| RFC 8162 | Using Secure DNS to Associate Certificates for S/MIME (SMIMEA) | ✅ Full | Supported and serialized (`dns_wire.c`, case 53) |
+| RFC 8659 | DNS Certification Authority Authorization (CAA) Resource Record | ✅ Full | CAA supported in the record-type table (`dns_utils.c`) |
+| RFC 8777 | DNS Reverse IP Automatic Multicast Tunneling (AMT) Discovery (AMTRELAY) | ✅ Full | Supported and serialized (`dns_wire.c`, case 260) |
+
+## 8. Out of Scope
 
 | RFC | Title | Status | Notes |
 |---|---|---|---|
