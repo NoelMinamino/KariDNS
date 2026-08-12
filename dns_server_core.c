@@ -2474,7 +2474,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             }
             char synth_name[256];
             memcpy(synth_name, current_qname, prefix_len);
-            strcpy(synth_name + prefix_len, rec->rdata[0]);
+            int written = snprintf(synth_name + prefix_len, sizeof(synth_name) - prefix_len, "%s", rec->rdata[0]);
+            if (written < 0 || (size_t)written >= sizeof(synth_name) - prefix_len) {
+                res[3] |= 6; // YXDomain/error for truncation
+                return;
+            }
             dns_record_t synth_cname;
             memset(&synth_cname, 0, sizeof(synth_cname));
             synth_cname.name = (char *)current_qname;

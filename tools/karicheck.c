@@ -438,6 +438,31 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         int rcount = arena.records[i].rdata_count;
         char **rdata = arena.records[i].rdata;
 
+        if (tcode == 1) { // A
+            if (rcount != 1) {
+                fprintf(stderr, "[ERROR] A record must have exactly 1 parameter for name '%s' in zone '%s'\n", arena.records[i].name, domain);
+                error_found = true;
+            } else {
+                struct in_addr tmp;
+                if (inet_pton(AF_INET, rdata[0], &tmp) != 1) {
+                    fprintf(stderr, "[ERROR] Invalid IPv4 address '%s' for name '%s' in zone '%s'\n", rdata[0], arena.records[i].name, domain);
+                    error_found = true;
+                }
+            }
+        }
+        if (tcode == 28) { // AAAA
+            if (rcount != 1) {
+                fprintf(stderr, "[ERROR] AAAA record must have exactly 1 parameter for name '%s' in zone '%s'\n", arena.records[i].name, domain);
+                error_found = true;
+            } else {
+                struct in6_addr tmp;
+                if (inet_pton(AF_INET6, rdata[0], &tmp) != 1) {
+                    fprintf(stderr, "[ERROR] Invalid IPv6 address '%s' for name '%s' in zone '%s'\n", rdata[0], arena.records[i].name, domain);
+                    error_found = true;
+                }
+            }
+        }
+
         if (tcode == 6 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_soa = true;
         }

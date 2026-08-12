@@ -883,14 +883,16 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 1: { // A
                 if (rec->rdata_count == 0) return -1;
                 if (offset + 4 > max_res_len) return -1;
-                struct in_addr addr; inet_pton(AF_INET, rec->rdata[0], &addr);
+                struct in_addr addr;
+                if (inet_pton(AF_INET, rec->rdata[0], &addr) != 1) return -1;
                 memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
                 break;
             }
             case 28: { // AAAA
                 if (rec->rdata_count == 0) return -1;
                 if (offset + 16 > max_res_len) return -1;
-                struct in6_addr addr; inet_pton(AF_INET6, rec->rdata[0], &addr);
+                struct in6_addr addr;
+                if (inet_pton(AF_INET6, rec->rdata[0], &addr) != 1) return -1;
                 memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                 break;
             }

@@ -27,6 +27,8 @@ static void unescape_string_in_place(char *str) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <syslog.h>
 #include "dns_utils.h"
@@ -889,6 +891,42 @@ PROCESS_RECORD:
           rec->rdata[0] = clean; // 正規化された純粋なHex文字列に置き換え
         }
       }
+    } else if (rec->type_code == 1) { // A
+        if (rec->rdata_count != 1) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "A record requires exactly 1 parameter";
+                ctx->err_out->error_offset = rec->type - buf;
+                ctx->err_out->token_length = strlen(rec->type);
+            }
+            return -1;
+        }
+        struct in_addr tmp;
+        if (inet_pton(AF_INET, rec->rdata[0], &tmp) != 1) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "invalid IPv4 address literal in A record";
+                ctx->err_out->error_offset = rec->type - buf;
+                ctx->err_out->token_length = strlen(rec->type);
+            }
+            return -1;
+        }
+    } else if (rec->type_code == 28) { // AAAA
+        if (rec->rdata_count != 1) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "AAAA record requires exactly 1 parameter";
+                ctx->err_out->error_offset = rec->type - buf;
+                ctx->err_out->token_length = strlen(rec->type);
+            }
+            return -1;
+        }
+        struct in6_addr tmp;
+        if (inet_pton(AF_INET6, rec->rdata[0], &tmp) != 1) {
+            if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "invalid IPv6 address literal in AAAA record";
+                ctx->err_out->error_offset = rec->type - buf;
+                ctx->err_out->token_length = strlen(rec->type);
+            }
+            return -1;
+        }
     } else if (rec->type_code == 19) { // X25
         if (rec->rdata_count != 1) {
             if (ctx && ctx->err_out) {
