@@ -10,6 +10,39 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+
+typedef struct { int alg_num; const char *name; const char *status; } dnssec_alg_info_t;
+
+static const dnssec_alg_info_t KNOWN_DNSSEC_ALGS[] = {
+    {1,  "RSAMD5",              "MUST NOT (非推奨・危殆化)"},
+    {3,  "DSA",                 "MUST NOT (非推奨)"},
+    {5,  "RSASHA1",             "NOT RECOMMENDED"},
+    {6,  "DSA-NSEC3-SHA1",      "MUST NOT (非推奨)"},
+    {7,  "RSASHA1-NSEC3-SHA1",  "NOT RECOMMENDED"},
+    {8,  "RSASHA256",           "RECOMMENDED"},
+    {10, "RSASHA512",           "RECOMMENDED"},
+    {12, "ECC-GOST",            "MUST NOT (非推奨)"},
+    {13, "ECDSAP256SHA256",     "RECOMMENDED"},
+    {14, "ECDSAP384SHA384",     "MAY"},
+    {15, "ED25519",             "RECOMMENDED"},
+    {16, "ED448",               "MAY"},
+};
+
+static void check_dnssec_algorithm(int alg_num, const char *rec_name, const char *rec_type) {
+    for (size_t i = 0; i < sizeof(KNOWN_DNSSEC_ALGS)/sizeof(KNOWN_DNSSEC_ALGS[0]); i++) {
+        if (KNOWN_DNSSEC_ALGS[i].alg_num == alg_num) {
+            if (strstr(KNOWN_DNSSEC_ALGS[i].status, "MUST NOT") ||
+                strstr(KNOWN_DNSSEC_ALGS[i].status, "NOT RECOMMENDED")) {
+                fprintf(stderr, "[WARNING] %s '%s': DNSSEC algorithm %d (%s) is %s (RFC 8624)\n",
+                        rec_type, rec_name, alg_num, KNOWN_DNSSEC_ALGS[i].name, KNOWN_DNSSEC_ALGS[i].status);
+            }
+            return;
+        }
+    }
+    fprintf(stderr, "[WARNING] %s '%s': unknown DNSSEC algorithm number %d\n", rec_type, rec_name, alg_num);
+}
 
 // Stub for open_via_dir_cache used by dns_config_parser.c
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
@@ -132,6 +165,166 @@ static void print_error_context(const char *root_file_path, const char *root_buf
     fprintf(stderr, "\033[1;31m^");
     for (size_t i = 1; i < err->token_length && i < 20; i++) fputc('~', stderr);
     fprintf(stderr, "\033[0m\n\n");
+}
+
+static int compare_canonical_name(const char *name1, const char *name2) {
+    int len1 = strlen(name1), len2 = strlen(name2);
+    if (len1 > 0 && name1[len1-1] == '.') len1--;
+    if (len2 > 0 && name2[len2-1] == '.') len2--;
+    
+    int p1 = len1, p2 = len2;
+    while (p1 > 0 || p2 > 0) {
+        int d1 = p1 - 1;
+        while (d1 >= 0 && name1[d1] != '.') d1--;
+        int d2 = p2 - 1;
+        while (d2 >= 0 && name2[d2] != '.') d2--;
+        
+        int label_len1 = p1 - d1 - 1;
+        int label_len2 = p2 - d2 - 1;
+        
+        int min_len = label_len1 < label_len2 ? label_len1 : label_len2;
+        int cmp = 0;
+        if (min_len > 0) {
+            for(int i=0; i<min_len; i++) {
+                char c1 = name1[d1 + 1 + i];
+                char c2 = name2[d2 + 1 + i];
+                if (c1 >= 'A' && c1 <= 'Z') c1 |= 0x20;
+                if (c2 >= 'A' && c2 <= 'Z') c2 |= 0x20;
+                if (c1 != c2) { cmp = c1 - c2; break; }
+            }
+        }
+        if (cmp != 0) return cmp;
+        if (label_len1 != label_len2) return label_len1 - label_len2;
+        
+        p1 = d1; p2 = d2;
+    }
+    return 0;
+}
+
+static int cmp_canonical_rr(const void *a, const void *b) {
+    dns_record_t *r1 = *(dns_record_t **)a;
+    dns_record_t *r2 = *(dns_record_t **)b;
+    
+    int c = compare_canonical_name(r1->name, r2->name);
+    if (c != 0) return c;
+    
+    if (r1->type_code != r2->type_code) return r1->type_code - r2->type_code;
+    
+    // Same name and type, sort by RDATA canonical format
+    uint8_t w1[65535];
+    uint8_t w2[65535];
+    uint16_t o1 = 0, o2 = 0;
+    serialize_dns_record(w1, sizeof(w1), &o1, r1, NULL, NULL, 0xFFFFFFFF);
+    serialize_dns_record(w2, sizeof(w2), &o2, r2, NULL, NULL, 0xFFFFFFFF);
+    
+    // Find RDATA offset by skipping the uncompressed name
+    uint16_t idx = 0;
+    while(idx < o1 && w1[idx] != 0) {
+        idx += w1[idx] + 1;
+    }
+    idx++; // skip null byte
+    idx += 10; // skip Type, Class, TTL, RDLEN
+    
+    int len1 = o1 > idx ? o1 - idx : 0;
+    int len2 = o2 > idx ? o2 - idx : 0;
+    int min_len = len1 < len2 ? len1 : len2;
+    if (min_len > 0) {
+        int mem_c = memcmp(w1 + idx, w2 + idx, min_len);
+        if (mem_c != 0) return mem_c;
+    }
+    return len1 - len2;
+}
+
+static void verify_zonemd(const char *domain, zone_arena_t *arena) {
+    int zonemd_count = 0;
+    dns_record_t *zonemds[10];
+    for (size_t i = 0; i < arena->count; i++) {
+        if (arena->records[i].type_code == 63 && strcasecmp(arena->records[i].name, domain) == 0) {
+            if (zonemd_count < 10) zonemds[zonemd_count++] = &arena->records[i];
+        }
+    }
+    if (zonemd_count == 0) return;
+    
+    dns_record_t **sorted = malloc(arena->count * sizeof(dns_record_t *));
+    size_t valid_count = 0;
+    for (size_t i = 0; i < arena->count; i++) {
+        dns_record_t *r = &arena->records[i];
+        if (r->type_code == 63 && strcasecmp(r->name, domain) == 0) continue;
+        if (r->type_code == 46 && strcasecmp(r->name, domain) == 0 &&
+            r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
+        sorted[valid_count++] = r;
+    }
+    
+    qsort(sorted, valid_count, sizeof(dns_record_t *), cmp_canonical_rr);
+    
+    for (int z = 0; z < zonemd_count; z++) {
+        dns_record_t *zm = zonemds[z];
+        if (zm->rdata_count < 4) continue;
+        
+        uint8_t scheme = atoi(zm->rdata[1]);
+        uint8_t halg = atoi(zm->rdata[2]);
+        
+        if (scheme != 1) continue; 
+        if (halg != 1 && halg != 2) continue; 
+        
+        const EVP_MD *md_type = (halg == 1) ? EVP_sha384() : EVP_sha512();
+        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(mdctx, md_type, NULL);
+        
+        uint8_t wire_buf[65535];
+        uint8_t prev_wire_buf[65535];
+        uint16_t prev_offset = 0;
+        for (size_t i = 0; i < valid_count; i++) {
+            uint16_t offset = 0;
+            if (serialize_dns_record(wire_buf, sizeof(wire_buf), &offset, sorted[i], NULL, NULL, 0xFFFFFFFF) == 0) {
+                if (prev_offset > 0 && prev_offset == offset && memcmp(prev_wire_buf, wire_buf, offset) == 0) {
+                    continue;
+                }
+                EVP_DigestUpdate(mdctx, wire_buf, offset);
+                memcpy(prev_wire_buf, wire_buf, offset);
+                prev_offset = offset;
+            }
+        }
+        
+        uint8_t hash_out[EVP_MAX_MD_SIZE];
+        unsigned int hash_len = 0;
+        EVP_DigestFinal_ex(mdctx, hash_out, &hash_len);
+        EVP_MD_CTX_free(mdctx);
+        
+        uint8_t expected[EVP_MAX_MD_SIZE];
+        char hex[2048] = "";
+        size_t hex_len = 0;
+        for (int i = 3; i < zm->rdata_count; i++) {
+            size_t flen = strlen(zm->rdata[i]);
+            if (hex_len + flen >= sizeof(hex)) break;
+            memcpy(hex + hex_len, zm->rdata[i], flen);
+            hex_len += flen;
+            hex[hex_len] = '\0';
+        }
+        
+        size_t exp_len = hex_decode(hex, expected, sizeof(expected));
+        
+        if (exp_len == hash_len && memcmp(hash_out, expected, hash_len) == 0) {
+            fprintf(stdout, "[OK] ZONEMD (Scheme %d, Hash %d) for '%s' is VALID.\n", scheme, halg, domain);
+        } else {
+            fprintf(stderr, "[FAIL] ZONEMD (Scheme %d, Hash %d) for '%s' is INVALID.\n", scheme, halg, domain);
+            fprintf(stderr, "       Expected: %s\n", hex);
+            fprintf(stderr, "       Computed: ");
+            for (unsigned int j = 0; j < hash_len; j++) fprintf(stderr, "%02x", hash_out[j]);
+            fprintf(stderr, "\n");
+        }
+    }
+    
+    free(sorted);
+}
+
+static bool is_cname(zone_arena_t *arena, const char *name) {
+    for (size_t i = 0; i < arena->count; i++) {
+        if (arena->records[i].type_code == 5 && strcasecmp(arena->records[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
@@ -268,6 +461,16 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
         
         // --- Add specific field validations ---
+        if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
+            if (rcount >= 3) {
+                check_dnssec_algorithm(atoi(rdata[2]), arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY");
+            }
+        }
+        if (tcode == 46) { // RRSIG
+            if (rcount >= 2) {
+                check_dnssec_algorithm(atoi(rdata[1]), arena.records[i].name, "RRSIG");
+            }
+        }
         if (tcode == 55) { // HIP
             if (rcount < 3) {
                 fprintf(stderr, "[WARNING] HIP record requires at least 3 fields: HIT algorithm, HIT (hex), and public key (base64) for name '%s'\n", arena.records[i].name);
@@ -287,6 +490,36 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         if (tcode == 19 && rcount < 1) { // X25
             fprintf(stderr, "[WARNING] X25 record requires at least 1 field for name '%s'\n", arena.records[i].name);
         }
+
+        // --- RFC 1912 Operational Checks ---
+        if (tcode == 15 && rcount >= 2) { // MX
+            if (is_cname(&arena, rdata[1])) {
+                fprintf(stderr, "[WARNING] MX record for '%s' points to a CNAME '%s' (RFC 1912)\n", arena.records[i].name, rdata[1]);
+            }
+        }
+        if (tcode == 2 && rcount >= 1) { // NS
+            if (is_cname(&arena, rdata[0])) {
+                fprintf(stderr, "[WARNING] NS record for '%s' points to a CNAME '%s' (RFC 1912)\n", arena.records[i].name, rdata[0]);
+            }
+        }
+        if (tcode == 6 && rcount >= 2) { // SOA
+            if (is_cname(&arena, rdata[0])) {
+                fprintf(stderr, "[WARNING] SOA MNAME for '%s' points to a CNAME '%s' (RFC 1912)\n", arena.records[i].name, rdata[0]);
+            }
+        }
+        if (tcode == 5) { // CNAME
+            for (size_t j = 0; j < arena.count; j++) {
+                if (i != j && strcasecmp(arena.records[j].name, arena.records[i].name) == 0) {
+                    uint16_t other = arena.records[j].type_code;
+                    // Ignore DNSSEC records
+                    if (other != 5 && other != 46 && other != 47 && other != 50) {
+                        fprintf(stderr, "[WARNING] CNAME '%s' co-exists with other records (type %d) (RFC 1912)\n", arena.records[i].name, other);
+                        break;
+                    }
+                }
+            }
+        }
+        
         if (tcode == 20 && (rcount < 1 || rcount > 2)) { // ISDN
             fprintf(stderr, "[WARNING] ISDN record requires 1 or 2 fields for name '%s'\n", arena.records[i].name);
         }
@@ -430,8 +663,11 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
         free(root_path);
+        free(mutable_buf);
         return 1;
     }
+
+    verify_zonemd(domain, &arena);
 
     printf("[OK] Zone '%s' is valid.\n", domain);
     free((void*)ctx.base_dir);

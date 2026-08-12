@@ -106,6 +106,8 @@ typedef struct {
   uint32_t minimal_any_ttl;
   int max_mqtypes;
   bool rfc10029_mqtype_enable;
+  bool tcp_connection_reuse;
+  uint32_t tcp_idle_timeout;
 } server_config_t;
 
 typedef enum {

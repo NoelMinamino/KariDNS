@@ -266,7 +266,7 @@ int const_time_memcmp(const void *a, const void *b, size_t len) {
     return res == 0 ? 0 : 1;
 }
 
-long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name) {
+long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase) {
     size_t w_len = 0;
     const char *p = name;
     while (*p) {
@@ -276,8 +276,13 @@ long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const 
         if (len > 0) {
             if (offset + w_len + len + 1 > max_len) return -1;
             buf[offset + w_len++] = len;
-            for (size_t i = 0; i < len; i++)
-                buf[offset + w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
+            for (size_t i = 0; i < len; i++) {
+                if (downcase) {
+                    buf[offset + w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
+                } else {
+                    buf[offset + w_len++] = p[i];
+                }
+            }
         }
         if (!dot) break;
         p = dot + 1;
@@ -285,6 +290,10 @@ long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const 
     if (offset + w_len + 1 > max_len) return -1;
     buf[offset + w_len++] = 0;
     return (long)w_len;
+}
+
+long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name) {
+    return write_uncompressed_name_ext(buf, offset, max_len, name, true);
 }
 
 
@@ -652,6 +661,12 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
 // ============================================================================
 
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len) {
+    if (!ctx) {
+        long w = write_uncompressed_name(packet_buf, *offset, max_len, name);
+        if (w < 0) return -1;
+        *offset += w;
+        return 0;
+    }
     uint8_t wire[256];
     size_t w_len = 0;
     const char *p = name;
@@ -851,6 +866,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     res[offset++] = class_val >> 8; res[offset++] = class_val & 0xFF;
     
     uint32_t ttl = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
+    if (ttl > 0x7FFFFFFF) ttl = 0; // RFC 2181 §8: TTL >= 2^31 is treated as 0
     if (override_ttl != 0xFFFFFFFF && override_ttl < ttl) ttl = override_ttl;
     
     res[offset++] = ttl >> 24; res[offset++] = (ttl >> 16) & 0xFF; res[offset++] = (ttl >> 8) & 0xFF; res[offset++] = ttl & 0xFF;
@@ -1232,7 +1248,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = (sig_inc >> 8) & 0xFF; res[offset++] = sig_inc & 0xFF;
                 res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
 
-                long w = write_uncompressed_name(res, offset, max_res_len, signer);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, signer, true);
                 if (w < 0) return -1;
                 offset += w;
 
@@ -1243,7 +1259,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 47: { // NSEC
                 if (rec->rdata_count < 2) return -1;
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);
                 if (w < 0) return -1;
                 offset += w;
                 if (encode_type_bitmap(res, max_res_len, &offset, &rec->rdata[1], rec->rdata_count - 1) != 0) return -1;
@@ -1323,7 +1339,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 for (int k = 0; k < 3; k++) {
                     if (write_char_string(res, max_res_len, &offset, cstrs[k]) != 0) return -1;
                 }
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[5]);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[5], true);
                 if (w < 0) return -1;
                 offset += (size_t)w;
                 break;
@@ -1393,7 +1409,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (offset + 2 > max_res_len) return -1;
                 uint16_t svc_prio = atoi(rec->rdata[0]);
                 res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);
                 if (w < 0) return -1;
                 offset += w;
                 

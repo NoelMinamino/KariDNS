@@ -1,0 +1,16 @@
+$TTL 3600
+$ORIGIN dnssec.test.
+
+@   IN SOA  ns1.dnssec.test. admin.dnssec.test. 1 3600 900 1209600 86400
+    IN NS   ns1.dnssec.test.
+
+ns1 IN A 127.0.0.1
+
+; RSAMD5 (MUST NOT)
+@ IN DNSKEY 256 3 1 AwEAAbC...
+; RSASHA1 (NOT RECOMMENDED)
+@ IN DNSKEY 256 3 5 AwEAAbC...
+; RSASHA256 (RECOMMENDED) - Should NOT warn
+@ IN DNSKEY 256 3 8 AwEAAbC...
+; RRSIG with RSAMD5 (MUST NOT)
+@ IN RRSIG A 1 1 3600 20260101000000 20260101000000 12345 dnssec.test. signature...
