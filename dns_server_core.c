@@ -5266,6 +5266,11 @@ void *control_thread_func(void *arg) {
           cap_rights_limit(cfd, &rights);
           
           ctrl_client_t *c = calloc(1, sizeof(ctrl_client_t));
+          if (!c) {
+              syslog(LOG_ERR, "[Control] OOM allocating ctrl_client_t; dropping connection");
+              close(cfd);
+              continue;
+          }
           c->fd = cfd;
           c->state = CTRL_STATE_NEW;
           c->next = g_ctrl_clients;
