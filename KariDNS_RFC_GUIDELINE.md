@@ -41,6 +41,9 @@ Legend:
 | RFC 9619 | In the DNS, QDCOUNT Is (Usually) One | ✅ Full | For OPCODE=0 (QUERY), QDCOUNT > 1 returns FORMERR and QDCOUNT = 0 returns a minimal response with no question section, per the RFC's normative requirements. OPCODE=4 (NOTIFY) and OPCODE=5 (UPDATE) continue to require QDCOUNT == 1 (`dns_server_core.c`, ~line 3065) |
 | RFC 9210 | DNS Transport over TCP - Operational Requirements | ✅ Full (opt-in, default OFF) | Same mechanism as RFC 7766 above; default idle timeout (10s) matches §4.5's recommendation |
 | RFC 9471 | DNS Glue Requirements in Referral Responses | ✅ Full | `append_glue_records` adds both A(1) and AAAA(28) glue (`dns_server_core.c`) |
+| RFC 7314 | Extension Mechanisms for DNS (EDNS) EXPIRE Option | ❌ No | No corresponding EDNS option code (9) handling found. Distinct from the SOA EXPIRE field itself (which IS implemented via `entry->expire`/`last_successful_transfer`) — this RFC concerns propagating an expire countdown via EDNS during AXFR/IXFR, primarily valuable for multi-tier secondary chains (secondary-of-a-secondary). Deliberately deprioritized: current deployments are single-tier (direct master → KariDNS), where this adds no value. Revisit if KariDNS is ever used as an intermediate distribution point |
+| RFC 5001 | DNS Name Server Identifier (NSID) Option | ✅ Full (requires `nsid` config) | Server responds with a configured identifier string via EDNS option code 3 when queried with an empty NSID option, provided `nsid "<value>";` is set. No response is sent if unconfigured (`dns_wire.c`, `dns_config_parser.c`/`.h`) |
+| RFC 7828 | The edns-tcp-keepalive EDNS0 Extension | ✅ Full (opt-in, tied to `tcp-connection-reuse`) | When `tcp-connection-reuse yes;` is set and a client requests the option over TCP, the server echoes its configured idle timeout (`tcp-idle-timeout`, encoded in 100ms units per §3.2). Never included in UDP responses (RFC 7828 §3.2.1) or when connection reuse is disabled (`dns_wire.c`, `dns_server_core.c`) |
 
 ## 2. Zone Transfer / Redundancy
 
@@ -128,9 +131,7 @@ Legend:
 | RFC 9250 | DNS over QUIC (DoQ) | ➖ N/A | Same as above |
 | RFC 9498 | Fully Encrypted Authority | ➖ N/A | Depends on encrypted-transport infrastructure outside the current design's scope |
 | RFC 7871 | Client Subnet in DNS Queries (ECS) | ❌ No | No corresponding code in the EDNS option parser. Deliberately deprioritized — `view`/`match-clients` (source-IP-based split-horizon) already covers this deployment's needs, since ECS specifically solves the "query arrives via a third-party recursive resolver, true client subnet unknown" problem, which does not apply when clients query KariDNS directly |
-| RFC 7828 | The edns-tcp-keepalive EDNS0 Extension | ❌ No | No corresponding code |
 | RFC 7830 | The EDNS(0) Padding Option | ❌ No | No corresponding code |
-| RFC 5001 | DNS Name Server Identifier (NSID) Option | ❌ No | No corresponding code |
 | RFC 8020 | NXDOMAIN: There Really Is Nothing Underneath | ➖ N/A | Recursive-resolver caching guidance; does not apply to an authoritative server |
 | RFC 8499 | DNS Terminology | ➖ N/A | Glossary; not an implementation target |
 | RFC 6895 | DNS IANA Considerations | ➖ N/A | Registry operating procedures; not an implementation target |
@@ -141,13 +142,15 @@ Legend:
 ## Verification Status Note
 
 Items marked ✅ Full for changes made during this review round (RFC 8624, RFC 2181, RFC 8976/ZONEMD,
-RFC 7766/9210, RFC 1912, RFC 5452) have been confirmed to compile cleanly (all touched files rebuilt
-individually with zero errors) and, where feasible from this reviewer's Linux-based sandbox, verified
+RFC 7766/9210, RFC 1912, RFC 5452, RFC 9619, RFC 9859, RFC 9824) have been confirmed to compile
+cleanly (all touched files rebuilt individually with zero errors) and, where feasible, verified
 functionally:
 - ZONEMD verification was independently re-run against the official RFC 8976 Appendix A.4 test vector
   and confirmed VALID.
 - `karicheck` was rebuilt as a real binary and run against every existing test zone in the repository
   with no crashes or parsing regressions attributable to the `unescape_string_in_place` fix.
+- RFC 9619/9859/9824 additions were confirmed present and consistent with their documented evidence
+  via direct source inspection.
 
 **Full-stack runtime verification (server startup, live AXFR, TCP connection-reuse behavior under
 load, ASan/UBSan smoke tests) requires a FreeBSD environment and has not yet been independently

@@ -6,6 +6,9 @@
 #include <stddef.h>
 #include <time.h>
 
+// Forward declarations
+struct server_config_s;
+
 #define DNS_HEADER_SIZE 12
 
 // ============================================================================
@@ -116,6 +119,10 @@ typedef struct {
     uint16_t ede_count;
     parsed_ede_t ede_list[MAX_EDE_COUNT];
     
+    // NSID and Keepalive
+    bool has_nsid_query;
+    bool has_keepalive_query;
+    
     // Multiple QTYPEs (RFC 10029)
     bool has_mqtype_query;
     bool saw_invalid_mqtype_response_in_query;
@@ -152,12 +159,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 
 // EDNS
 int parse_edns_opt(const uint8_t *req, size_t req_len,
-                    uint16_t qdcount, uint16_t ancount_req,
-                    uint16_t nscount_req, uint16_t arcount_req,
-                    edns_info_t *edns);
+                   uint16_t qdcount, uint16_t ancount, uint16_t nscount, uint16_t arcount,
+                   edns_info_t *edns);
 void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                        uint16_t *offset_inout, uint16_t *arcount_inout,
-                       edns_info_t *edns, uint8_t rcode_ext);
+                       edns_info_t *edns, uint8_t rcode_ext, bool is_tcp,
+                       struct server_config_s *cfg);
 
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
