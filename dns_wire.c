@@ -1,4 +1,5 @@
 #include "dns_wire.h"
+#include "dns_config_parser.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1814,6 +1815,10 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                     }
                                 }
                             }
+                        } else if (opt_code == 3) { // NSID
+                            edns->has_nsid_query = true;
+                        } else if (opt_code == 11) { // edns-tcp-keepalive
+                            edns->has_keepalive_query = true;
                         } else if (opt_code == 21) {
                             edns->saw_invalid_mqtype_response_in_query = true;
                         } else if (opt_code == 20) {
@@ -1841,7 +1846,8 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
 
 void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                        uint16_t *offset_inout, uint16_t *arcount_inout,
-                       edns_info_t *edns, uint8_t rcode_ext) {
+                       edns_info_t *edns, uint8_t rcode_ext, bool is_tcp,
+                       struct server_config_s *cfg) {
     uint16_t offset = *offset_inout;
     uint16_t rdlen = 0;
     if (edns && edns->has_cookie) {
@@ -1857,6 +1863,21 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     }
     if (edns && edns->has_mqtype_query) {
         rdlen += 4 + (edns->mqtype_count * 2);
+    }
+    
+    uint16_t nsid_len = 0;
+    if (edns && edns->has_nsid_query && cfg && cfg->nsid_string) {
+        nsid_len = (uint16_t)strlen(cfg->nsid_string);
+        rdlen += 4 + nsid_len;
+    }
+    
+    uint16_t keepalive_val = 0;
+    bool include_keepalive = false;
+    if (is_tcp && edns && edns->has_keepalive_query && cfg && cfg->tcp_connection_reuse) {
+        int timeout_sec = cfg->tcp_idle_timeout > 0 ? (int)(cfg->tcp_idle_timeout / 1000) : 10;
+        keepalive_val = (uint16_t)(timeout_sec * 10);
+        include_keepalive = true;
+        rdlen += 4 + 2;
     }
 
     if (offset + 11 + rdlen <= max_res_len) {
@@ -1906,6 +1927,19 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                 res[offset++] = edns->mqtypes[i] >> 8;
                 res[offset++] = edns->mqtypes[i] & 0xFF;
             }
+        }
+        
+        if (edns && edns->has_nsid_query && cfg && cfg->nsid_string) {
+            res[offset++] = 0; res[offset++] = 3; // Option Code: 3 (NSID)
+            res[offset++] = nsid_len >> 8; res[offset++] = nsid_len & 0xFF;
+            memcpy(res + offset, cfg->nsid_string, nsid_len);
+            offset += nsid_len;
+        }
+        
+        if (include_keepalive) {
+            res[offset++] = 0; res[offset++] = 11; // Option Code: 11
+            res[offset++] = 0; res[offset++] = 2;  // Option Length: 2
+            res[offset++] = keepalive_val >> 8; res[offset++] = keepalive_val & 0xFF;
         }
         
         (*arcount_inout)++;

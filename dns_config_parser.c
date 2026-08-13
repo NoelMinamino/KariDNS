@@ -658,6 +658,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->serve_stale = true;
   config->send_extended_errors = true;
   config->tcp_connection_reuse = false;
+  config->nsid_string = NULL;
   config->tcp_idle_timeout = 10000;
   config->minimal_responses = false;
   config->minimal_any = false;
@@ -826,6 +827,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           tok = get_next_token(&ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
           config->tcp_idle_timeout = strtoul(tok.value, NULL, 10);
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
+          free_token(&tok);
+        } else if (strcmp(key, "nsid") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
+          config->nsid_string = strdup(tok.value);
           free_token(&tok);
           tok = get_next_token(&ctx);
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }

@@ -87,7 +87,7 @@ typedef struct view_config {
   struct view_config *next;
 } view_config_t;
 
-typedef struct {
+typedef struct server_config_s {
   int port;
   char **bind_addresses;
   int bind_address_count;
@@ -108,6 +108,7 @@ typedef struct {
   bool rfc10029_mqtype_enable;
   bool tcp_connection_reuse;
   uint32_t tcp_idle_timeout;
+  char *nsid_string;
 } server_config_t;
 
 typedef enum {
