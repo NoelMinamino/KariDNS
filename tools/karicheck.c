@@ -205,6 +205,11 @@ static int compare_canonical_name(const char *name1, const char *name2) {
     return 0;
 }
 
+// Full transitive total order over (canonical name, type, canonical RDATA bytes).
+// Because this is a true total order, RRs that compare equal (i.e. true duplicates)
+// are guaranteed to be contiguous after qsort(), regardless of qsort's stability.
+// Adjacent-after-sort duplicate detection in verify_zonemd() is therefore complete,
+// not merely a common-case heuristic. See KariDNS_RFC_GUIDELINE.md, RFC 8976 entry.
 static int cmp_canonical_rr(const void *a, const void *b) {
     dns_record_t *r1 = *(dns_record_t **)a;
     dns_record_t *r2 = *(dns_record_t **)b;
