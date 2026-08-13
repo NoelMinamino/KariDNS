@@ -22,7 +22,7 @@ Legend:
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
 | RFC 1034 | Domain Names - Concepts and Facilities | ✅ Full | Core namespace model |
-| RFC 1035 | Domain Names - Implementation and Specification | ✅ Full | Zone file syntax, wire format, base record types. Text string escaping (`\DDD`, `\X`) is fully supported per §5.1 (`dns_zone_parser.c`, `dns_wire.c`) |
+| RFC 1035 | Domain Names - Implementation and Specification | ✅ Full | Zone file syntax, wire format, base record types. Text string escaping (`\DDD`, `\X`) is fully supported for both domain names and character strings per §5.1 (`dns_zone_parser.c`, `dns_wire.c`) |
 | RFC 1123 | Requirements for Internet Hosts (applicable parts) | ✅ Full | General hostname rules |
 | RFC 1912 | Common DNS Operational and Configuration Errors | ✅ Full | `karicheck` now warns when MX/NS/SOA(MNAME) targets point to a CNAME, and when a CNAME co-exists with non-DNSSEC record types at the same owner name (`tools/karicheck.c`, `is_cname()` and related checks) |
 | RFC 1982 | Serial Number Arithmetic | ✅ Full | Serial number arithmetic is used to evaluate SOA serial increments during IXFR/NOTIFY (`dns_server_core.c`, e.g., `(int32_t)(new_serial - old_serial) <= 0`) |
@@ -74,11 +74,11 @@ Legend:
 
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
-| RFC 2136 | Dynamic Updates in the Domain Name System (DNS UPDATE) | ✅ Full | Ephemeral UPDATE (no persistence). `process_update_sections`, `handle_dynamic_update` (`dns_wire.c`, `dns_server_core.c`) |
+| RFC 2136 | Dynamic Updates in the Domain Name System (DNS UPDATE) | ✅ Full | Ephemeral UPDATE (no persistence). Includes strict validation for meta-types, class matching, bailiwick, and exact-match deduplication in `process_update_sections`, `handle_dynamic_update` (`dns_wire.c`, `dns_server_core.c`) |
 | RFC 3007 | Secure Domain Name System (DNS) Dynamic Update | ✅ Full | Effectively satisfied by the combination of RFC 2136 (UPDATE) and RFC 8945 (TSIG); no dedicated code path, but the requirements are met |
 | RFC 8945 | Secret Key Transaction Authentication for DNS (TSIG) | ✅ Full | Extensively hardened during this review: exact-match algorithm dispatch (MD5/SHA1/SHA224/SHA256/SHA384/SHA512), BADALG handling, RFC 4635-compliant MAC truncation, and NOTAUTH + TSIG RR responses on both UPDATE and NOTIFY failure paths (`dns_wire.c`, `dns_server_core.c`) |
 | RFC 2930 | Secret Key Establishment for DNS (TKEY) | ❌ No | Not implemented (explicitly out of scope) |
-| RFC 7873 | Domain Name System (DNS) Cookies | ✅ Full | Client/server cookie parsing and generation (`dns_wire.c`) |
+| RFC 7873 | Domain Name System (DNS) Cookies | ✅ Full | Client/server cookie parsing and generation, including FORMERR for malformed OPTION-LENGTH (`dns_wire.c`, `dns_server_core.c`) |
 | RFC 9018 | Interoperable Domain Name System (DNS) Server Cookies | ✅ Full | `generate_server_cookie()` implements the interoperable 16-byte format (Version(1) + Reserved(3) + Timestamp(4) + Hash(8)) recommended by RFC 9018 (`dns_server_core.c`, ~line 2778) |
 
 ## 5. Rate Limiting / Operations

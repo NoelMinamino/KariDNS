@@ -2991,7 +2991,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   edns_info_t edns;
   memset(&edns, 0, sizeof(edns));
   edns.present = false;
-  if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
+  if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0 || edns.has_malformed_cookie) {
     memcpy(res, req, DNS_HEADER_SIZE);
     res[2] |= 0x80;
     res[3] = (res[3] & 0x0F) | 0x01; // FORMERR

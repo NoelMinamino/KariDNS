@@ -113,8 +113,16 @@ static char *expand_domain_name(char *name, const char *origin,
   if (!name)
     return name;
   size_t n_len = strlen(name);
-  if (n_len > 0 && name[n_len - 1] == '.')
-    return name;
+  if (n_len > 0 && name[n_len - 1] == '.') {
+    // Check if the dot is escaped by counting preceding backslashes
+    int bs_count = 0;
+    for (int i = (int)n_len - 2; i >= 0 && name[i] == '\\'; i--) {
+        bs_count++;
+    }
+    if (bs_count % 2 == 0) {
+        return name; // FQDN
+    }
+  }
   if (strcmp(name, "@") == 0) {
     if (!origin)
       return name;
@@ -139,7 +147,16 @@ static char *expand_domain_name(char *name, const char *origin,
     return fqdn;
   }
   size_t o_len = strlen(origin);
-  bool origin_has_dot = (o_len > 0 && origin[o_len - 1] == '.');
+  bool origin_has_dot = false;
+  if (o_len > 0 && origin[o_len - 1] == '.') {
+      int bs_count = 0;
+      for (int i = (int)o_len - 2; i >= 0 && origin[i] == '\\'; i--) {
+          bs_count++;
+      }
+      if (bs_count % 2 == 0) {
+          origin_has_dot = true;
+      }
+  }
   size_t total_len = n_len + 1 + o_len + (origin_has_dot ? 0 : 1);
   char *fqdn = (char *)arena_alloc(arena, total_len + 1);
   if (!fqdn)
@@ -656,7 +673,6 @@ STATE_FIND_TOKEN:
                     if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
                         fields[field_idx - 1][t_len - 1] = '\0';
                 }
-                unescape_string_in_place(fields[field_idx - 1]);
             }
             goto PROCESS_RECORD;
           }
@@ -669,7 +685,6 @@ STATE_FIND_TOKEN:
           if (t_len > 0 && fields[field_idx - 1][t_len - 1] == '"')
               fields[field_idx - 1][t_len - 1] = '\0';
       }
-      unescape_string_in_place(fields[field_idx - 1]);
   }
   if (IS_SPACE(delimiter))
     goto SKIP_WHITESPACE;
@@ -786,6 +801,51 @@ PROCESS_RECORD:
     }
     return -1;
   }
+  
+  rec->ttl_value = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
+  rec->class_val = 1; // Default to IN
+  if (rec->class_str && strcasecmp(rec->class_str, "CH") == 0) {
+      rec->class_val = 3;
+  }
+  
+  // A-1: Unescape fields appropriately
+  // Owner name, type, class, ttl are handled without unescaping.
+  // RDATA fields are unescaped UNLESS they are domain name fields.
+  for (int j = 0; j < rec->rdata_count; j++) {
+      bool is_domain_name = false;
+      switch (rec->type_code) {
+          case 2: case 5: case 12: case 39: // NS, CNAME, PTR, DNAME
+              if (j == 0) is_domain_name = true;
+              break;
+          case 15: // MX
+              if (j == 1) is_domain_name = true;
+              break;
+          case 6: // SOA
+              if (j == 0 || j == 1) is_domain_name = true;
+              break;
+          case 33: // SRV
+              if (j == 3) is_domain_name = true;
+              break;
+          case 35: // NAPTR
+              if (j == 5) is_domain_name = true;
+              break;
+          case 14: case 17: // MINFO, RP
+              if (j == 0 || j == 1) is_domain_name = true;
+              break;
+          case 18: case 36: case 21: case 107: // AFSDB, KX, RT, LP
+              if (j == 1) is_domain_name = true;
+              break;
+          case 26: // PX
+              if (j == 1 || j == 2) is_domain_name = true;
+              break;
+          default:
+              break;
+      }
+      if (!is_domain_name) {
+          unescape_string_in_place(rec->rdata[j]);
+      }
+  }
+
   rec->generic_len = 0;
   rec->generic_data = NULL;
   if (rec->rdata_count >= 2 && strcmp(rec->rdata[0], "\\#") == 0) {

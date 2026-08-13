@@ -30,17 +30,7 @@ void compress_ctx_init_packet(compress_ctx_t *ctx) {
     if (ctx->current_generation == 0) { memset(ctx->table, 0, sizeof(ctx->table)); ctx->current_generation = 1; }
 }
 
-static inline uint32_t calc_fnv1a_suffix(const uint8_t *name) {
-    uint32_t hash = 2166136261u; const uint8_t *p = name;
-    while (*p != 0) {
-        uint8_t len = *p++; hash ^= len; hash *= 16777619u;
-        for (uint8_t i = 0; i < len; i++) {
-            uint8_t c = *p++; if (c >= 'A' && c <= 'Z') c |= 0x20;
-            hash ^= c; hash *= 16777619u;
-        }
-    }
-    return hash;
-}
+
 
 static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, const uint8_t *name) {
     const uint8_t *p = packet_buf + offset, *n = name; int jump_count = 0;
@@ -71,33 +61,78 @@ static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, con
 }
 
 int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx, size_t max_len) {
+    const uint8_t *labels[128];
+    int label_count = 0;
     const uint8_t *s = name;
+    
     while (*s != 0) {
+        if (label_count >= 127) return -1;
+        labels[label_count++] = s;
+        s += 1 + *s;
+    }
+    
+    uint32_t hashes[128];
+    uint32_t current_hash = 2166136261u;
+    
+    for (int i = label_count - 1; i >= 0; i--) {
+        const uint8_t *label = labels[i];
+        uint8_t len = *label;
+        
+        for (int j = len; j > 0; j--) {
+            uint8_t c = label[j];
+            if (c >= 'A' && c <= 'Z') c |= 0x20;
+            current_hash ^= c;
+            current_hash *= 16777619u;
+        }
+        current_hash ^= len;
+        current_hash *= 16777619u;
+        
+        hashes[i] = current_hash;
+    }
+    
+    for (int i = 0; i < label_count; i++) {
+        const uint8_t *label = labels[i];
+        uint32_t hash = hashes[i];
+        size_t idx = hash & COMPRESS_HASH_MASK;
+        
+        bool compressed = false;
         if (*offset >= 0x4000) return -1;
-        uint32_t hash = calc_fnv1a_suffix(s), idx = hash & COMPRESS_HASH_MASK;
-        for (int i = 0; i < MAX_PROBE_DEPTH; i++) {
-            compress_entry_t *entry = &ctx->table[(idx + i) & COMPRESS_HASH_MASK];
+        
+        for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
+            compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) break;
-            if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, s)) {
+            if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, label)) {
                 if (*offset + 2 > max_len) return -1;
                 uint16_t ptr = 0xC000 | entry->offset;
-                packet_buf[(*offset)++] = ptr >> 8; packet_buf[(*offset)++] = ptr & 0xFF;
-                return 0;
+                packet_buf[(*offset)++] = ptr >> 8;
+                packet_buf[(*offset)++] = ptr & 0xFF;
+                compressed = true;
+                break;
             }
         }
-        for (int i = 0; i < MAX_PROBE_DEPTH; i++) {
-            compress_entry_t *entry = &ctx->table[(idx + i) & COMPRESS_HASH_MASK];
+        if (compressed) return 0;
+        
+        for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
+            compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) {
-                entry->generation = ctx->current_generation; entry->hash = hash; entry->offset = *offset; break;
+                entry->generation = ctx->current_generation;
+                entry->hash = hash;
+                entry->offset = *offset;
+                break;
             }
         }
-        uint8_t len = *s; 
+        
+        uint8_t len = *label;
         if (*offset + 1 + len > max_len) return -1;
-        packet_buf[(*offset)++] = *s++;
-        for (uint8_t i = 0; i < len; i++) packet_buf[(*offset)++] = *s++;
+        packet_buf[(*offset)++] = len;
+        for (uint8_t k = 1; k <= len; k++) {
+            packet_buf[(*offset)++] = label[k];
+        }
     }
+    
     if (*offset + 1 > max_len) return -1;
-    packet_buf[(*offset)++] = 0; return 0;
+    packet_buf[(*offset)++] = 0;
+    return 0;
 }
 
 // ============================================================================
@@ -164,8 +199,24 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             if (written >= 256) return -1; 
             buf[written++] = '.'; 
         }
-        if (written + len >= 256 || p + len > packet_len) return -1;
-        memcpy(&buf[written], &packet[p], len); written += len; p += len;
+        if (written + (len * 4) >= 256 || p + len > packet_len) return -1;
+        for (int i = 0; i < len; i++) {
+            uint8_t c = packet[p++];
+            if (c == '.' || c == '\\') {
+                if (written + 2 > 256) return -1;
+                buf[written++] = '\\';
+                buf[written++] = (char)c;
+            } else if (c < 0x21 || c >= 0x7F) {
+                if (written + 4 > 256) return -1;
+                buf[written++] = '\\';
+                buf[written++] = '0' + (c / 100);
+                buf[written++] = '0' + ((c / 10) % 10);
+                buf[written++] = '0' + (c % 10);
+            } else {
+                if (written + 1 > 256) return -1;
+                buf[written++] = (char)c;
+            }
+        }
     }
     *next_offset = jumped ? jumped_offset : p; 
     char *dst = arena_alloc(arena, written);
@@ -194,6 +245,8 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     if (*offset + rdlen > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: rdlen %u goes out of bounds (len=%zu)", rdlen, packet_len); return -1; }
 
     *type_out = type; rec->type_code = type; rec->class_str = (class_val == 1) ? "IN" : "CH"; rec->type = (char *)get_type_str(type, arena);
+    rec->ttl_value = ttl;
+    rec->class_val = class_val;
     char *ttl_buf = arena_alloc(arena, 16); if (!ttl_buf) return -1; snprintf(ttl_buf, 16, "%u", ttl); rec->ttl = ttl_buf;
     rec->rdata_count = 0;
 
@@ -234,7 +287,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         while (rdata_p < *offset + rdlen) {
             if (rec->rdata_count >= MAX_RDATA) return -1;
             uint8_t len = packet[rdata_p++];
-            if (rdata_p + len > *offset + rdlen) break;
+            if (rdata_p + len > *offset + rdlen) return -1;
             char *txt = arena_alloc(arena, len + 1); if (!txt) return -1;
             memcpy(txt, &packet[rdata_p], len); txt[len] = '\0';
             rec->rdata[rec->rdata_count++] = txt;
@@ -267,26 +320,59 @@ int const_time_memcmp(const void *a, const void *b, size_t len) {
     return res == 0 ? 0 : 1;
 }
 
+static int parse_label(const char *name, uint8_t *label_out, const char **next_p) {
+    int len = 0;
+    const char *p = name;
+    while (*p) {
+        if (*p == '\\') {
+            p++;
+            if (!*p) return -1; // dangling backslash
+            if (*p >= '0' && *p <= '9') {
+                int val = 0;
+                for (int i = 0; i < 3 && *p >= '0' && *p <= '9'; i++) {
+                    val = val * 10 + (*p - '0');
+                    p++;
+                }
+                if (val > 255) return -1;
+                if (len >= 63) return -1;
+                label_out[len++] = (uint8_t)val;
+            } else {
+                if (len >= 63) return -1;
+                label_out[len++] = (uint8_t)*p++;
+            }
+        } else if (*p == '.') {
+            p++;
+            *next_p = p;
+            return len;
+        } else {
+            if (len >= 63) return -1;
+            label_out[len++] = (uint8_t)*p++;
+        }
+    }
+    *next_p = NULL;
+    return len;
+}
+
 long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase) {
     size_t w_len = 0;
     const char *p = name;
-    while (*p) {
-        const char *dot = strchr(p, '.');
-        size_t len = dot ? (size_t)(dot - p) : strlen(p);
-        if (len > 63) return -1;
+    uint8_t label[64];
+    while (p) {
+        const char *next_p = NULL;
+        int len = parse_label(p, label, &next_p);
+        if (len < 0) return -1;
         if (len > 0) {
             if (offset + w_len + len + 1 > max_len) return -1;
-            buf[offset + w_len++] = len;
-            for (size_t i = 0; i < len; i++) {
+            buf[offset + w_len++] = (uint8_t)len;
+            for (int i = 0; i < len; i++) {
                 if (downcase) {
-                    buf[offset + w_len++] = (p[i] >= 'A' && p[i] <= 'Z') ? (p[i] | 0x20) : p[i];
+                    buf[offset + w_len++] = (label[i] >= 'A' && label[i] <= 'Z') ? (label[i] | 0x20) : label[i];
                 } else {
-                    buf[offset + w_len++] = p[i];
+                    buf[offset + w_len++] = label[i];
                 }
             }
         }
-        if (!dot) break;
-        p = dot + 1;
+        p = next_p;
     }
     if (offset + w_len + 1 > max_len) return -1;
     buf[offset + w_len++] = 0;
@@ -375,15 +461,15 @@ static size_t wire_name_length(const char *name) {
     if (!name) return (size_t)-1;
     size_t w_len = 0;
     const char *p = name;
-    while (*p) {
-        const char *dot = strchr(p, '.');
-        size_t len = dot ? (size_t)(dot - p) : strlen(p);
-        if (len > 63) return (size_t)-1;
+    uint8_t label[64];
+    while (p) {
+        const char *next_p = NULL;
+        int len = parse_label(p, label, &next_p);
+        if (len < 0) return (size_t)-1;
         if (len > 0) {
             w_len += len + 1;
         }
-        if (!dot) break;
-        p = dot + 1;
+        p = next_p;
     }
     w_len += 1;
     return w_len;
@@ -412,8 +498,24 @@ static int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len,
             if (written >= buf_size) return -1; 
             buf[written++] = '.'; 
         }
-        if (written + len >= buf_size || p + len > packet_len) return -1;
-        memcpy(&buf[written], &packet[p], len); written += len; p += len;
+        if (written + (len * 4) >= buf_size || p + len > packet_len) return -1;
+        for (int i = 0; i < len; i++) {
+            uint8_t c = packet[p++];
+            if (c == '.' || c == '\\') {
+                if (written + 2 > buf_size) return -1;
+                buf[written++] = '\\';
+                buf[written++] = (char)c;
+            } else if (c < 0x21 || c >= 0x7F) {
+                if (written + 4 > buf_size) return -1;
+                buf[written++] = '\\';
+                buf[written++] = '0' + (c / 100);
+                buf[written++] = '0' + ((c / 10) % 10);
+                buf[written++] = '0' + (c % 10);
+            } else {
+                if (written + 1 > buf_size) return -1;
+                buf[written++] = (char)c;
+            }
+        }
     }
     *next_offset = p; 
     return 0;
@@ -858,15 +960,18 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     if (offset + 10 > max_res_len) return -1;
 
     res[offset++] = rec_type >> 8; res[offset++] = rec_type & 0xFF;
-    uint16_t class_val = 1;
-    if (rec->class_str) {
-        if (strcasecmp(rec->class_str, "CH") == 0) class_val = 3;
-        else if (strcasecmp(rec->class_str, "NONE") == 0) class_val = 254;
-        else if (strcasecmp(rec->class_str, "ANY") == 0) class_val = 255;
+    uint16_t class_val = rec->class_val;
+    if (class_val == 0) {
+        class_val = 1;
+        if (rec->class_str) {
+            if (strcasecmp(rec->class_str, "CH") == 0) class_val = 3;
+            else if (strcasecmp(rec->class_str, "NONE") == 0) class_val = 254;
+            else if (strcasecmp(rec->class_str, "ANY") == 0) class_val = 255;
+        }
     }
     res[offset++] = class_val >> 8; res[offset++] = class_val & 0xFF;
     
-    uint32_t ttl = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
+    uint32_t ttl = rec->ttl_value;
     if (ttl > 0x7FFFFFFF) ttl = 0; // RFC 2181 §8: TTL >= 2^31 is treated as 0
     if (override_ttl != 0xFFFFFFFF && override_ttl < ttl) ttl = override_ttl;
     
@@ -1798,6 +1903,8 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                         edns->server_cookie_len = sizeof(edns->server_cookie);
                                     memcpy(edns->server_cookie, req + rdata_offset + 8, edns->server_cookie_len);
                                 }
+                            } else {
+                                edns->has_malformed_cookie = true;
                             }
                         } else if (opt_code == 15) { // Extended DNS Error
                             if (opt_len >= 2) {
@@ -1947,6 +2054,22 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     *offset_inout = offset;
 }
 
+static bool name_is_in_zone(const char *name, const char *zone_name) {
+    if (!name || !zone_name) return false;
+    size_t n_len = strlen(name);
+    size_t z_len = strlen(zone_name);
+    if (n_len < z_len) return false;
+    if (strcasecmp(name + n_len - z_len, zone_name) != 0) return false;
+    if (n_len > z_len) {
+        if (name[n_len - z_len - 1] != '.') return false;
+        // Verify the dot is not escaped
+        int bs = 0;
+        for (int i = (int)(n_len - z_len - 2); i >= 0 && name[i] == '\\'; i--) bs++;
+        if (bs % 2 != 0) return false;
+    }
+    return true;
+}
+
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
@@ -1972,6 +2095,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     if (expand_wire_name(req, req_len, offset, &offset, standby, &zname) != 0) return 1;
     if (offset + 4 > req_len) return 1;
     uint16_t ztype = (req[offset] << 8) | req[offset + 1];
+    uint16_t zone_class = (req[offset + 2] << 8) | req[offset + 3];
     offset += 4;
 
     if (ztype != 6) return 1; // SOA
@@ -2087,6 +2211,38 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 }
             }
         } else { // ADD
+            // (a) メタタイプの拒否 (RFC 2136 §3.4.2.2)
+            if (type == 0 || (type >= 128 && type <= 254) || type == 249 || type == 250 ||
+                type == 251 || type == 252 || type == 255) {
+                return 1; // FORMERR
+            }
+            // (b) クラスの一致確認 (RFC 2136 §3.4.1.3)
+            if (class_val != zone_class) {
+                return 1; // FORMERR
+            }
+            // (c) owner name のゾーン内包含チェック
+            if (!name_is_in_zone(name, zone_name)) {
+                return 5; // REFUSED
+            }
+
+            size_t temp_offset = rec_start_offset;
+            dns_record_t parsed_rec;
+            memset(&parsed_rec, 0, sizeof(parsed_rec));
+            uint16_t dummy_type;
+            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
+
+            bool found_exact = false;
+            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
+            size_t phidx = ph & (standby->hash_size - 1);
+            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
+                if (!standby->records[k].name) continue;
+                if (compare_records(&standby->records[k], &parsed_rec, true)) {
+                    found_exact = true;
+                    break;
+                }
+            }
+            if (found_exact) continue; // no-op
+
             if (standby->count >= standby->records_cap) {
                 size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
                 dns_record_t *new_arr = realloc(standby->records, new_cap * sizeof(dns_record_t));
@@ -2094,8 +2250,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 standby->records = new_arr;
                 standby->records_cap = new_cap;
             }
-            size_t temp_offset = rec_start_offset;
-            uint16_t dummy_type;
+            temp_offset = rec_start_offset;
             dns_record_t *new_rec = &standby->records[standby->count];
             memset(new_rec, 0, sizeof(*new_rec));
             if (parse_resource_record(req, req_len, &temp_offset, standby, new_rec, &dummy_type) != 0) return 1;

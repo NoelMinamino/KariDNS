@@ -60,8 +60,10 @@ typedef struct {
     char *name;
     char *ttl;
     char *class_str;
+    uint16_t class_val;
     char *type;
     uint16_t type_code;
+    uint32_t ttl_value;
     char *rdata[MAX_RDATA];
     int rdata_count;
     uint16_t generic_len;
@@ -111,6 +113,7 @@ typedef struct {
     
     // DNS Cookie
     bool has_cookie;
+    bool has_malformed_cookie;
     uint8_t client_cookie[8];
     uint8_t server_cookie[32];
     uint16_t server_cookie_len;
