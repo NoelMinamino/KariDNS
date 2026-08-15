@@ -604,6 +604,106 @@ int main() {
         }
         printf("PASS: Type name formatting tests\n");
     }
+    // Test 8: Wire parsing robustness (forward pointers, cycles, zero-length RDATA, TSIG Malloc fallback)
+    {
+        printf("\n--- Test 8: Wire parsing robustness ---\n");
+
+        // 1. Forward Reference Pointers
+        uint8_t pkt1[] = {
+            3, 'w', 'w', 'w', 0xC0, 0x08, // offset 0: "www.google.com", ptr to 8
+            0, 0, // offset 6-7
+            6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0 // offset 8
+        };
+        zone_arena_t arena = {0};
+        zone_arena_init(&arena);
+        char *name = NULL;
+        size_t next_off = 0;
+        int r = expand_wire_name(pkt1, sizeof(pkt1), 0, &next_off, &arena, &name);
+        if (r == -1) {
+            printf("FAIL: Forward reference pointer rejected\n");
+            return 1;
+        } else if (strcmp(name, "www.google.com.") != 0) {
+            printf("FAIL: Forward reference parsed incorrectly: %s\n", name);
+            return 1;
+        }
+        
+        // 2. Cycle Detection (Self-referential)
+        uint8_t pkt2[] = {
+            3, 'w', 'w', 'w', 0xC0, 0x04 // offset 0, ptr to 4
+        };
+        r = expand_wire_name(pkt2, sizeof(pkt2), 0, &next_off, &arena, &name);
+        if (r != -1) {
+            printf("FAIL: Self-referential cycle not rejected\n");
+            return 1;
+        }
+        
+        // 2b. Cycle Detection (A -> B -> A)
+        uint8_t pkt3[] = {
+            3, 'w', 'w', 'w', 0xC0, 0x06, // offset 0, ptr to 6
+            0xC0, 0x00 // offset 6, ptr to 0
+        };
+        r = expand_wire_name(pkt3, sizeof(pkt3), 0, &next_off, &arena, &name);
+        if (r != -1) {
+            printf("FAIL: A->B->A cycle not rejected\n");
+            return 1;
+        }
+
+        // 3. Zero-length RDATA
+        uint8_t pkt4[] = {
+            3, 'w', 'w', 'w', 0, // name
+            0, 41, // type OPT (generic branch fallback)
+            0, 1,  // class
+            0, 0, 0, 0, // TTL
+            0, 0 // rdlen = 0
+        };
+        size_t off4 = 0;
+        dns_record_t rec4 = {0};
+        uint16_t type4 = 0;
+        r = parse_resource_record(pkt4, sizeof(pkt4), &off4, &arena, &rec4, &type4);
+        if (r == -1) {
+            printf("FAIL: Zero-length RDATA rejected\n");
+            return 1;
+        }
+        if (rec4.generic_data != NULL || rec4.generic_len != 0) {
+            printf("FAIL: Zero-length RDATA badly parsed\n");
+            return 1;
+        }
+        
+        // 4. TSIG Malloc Fallback (buffer > 68000)
+        uint8_t *pkt5 = malloc(75000);
+        if (!pkt5) return 1;
+        memset(pkt5, 0, 75000);
+        
+        // Valid DNS Header setup so arcount update doesn't crash
+        pkt5[0] = 0xAA; pkt5[1] = 0xBB; // ID
+        pkt5[10] = 0; pkt5[11] = 0; // arcount
+        
+        size_t pkt5_len = 69000;
+        
+        char huge_keyname[255];
+        memset(huge_keyname, 'a', 250);
+        huge_keyname[250] = '\0';
+        for(int i=0;i<250;i+=60){ if(i>0) huge_keyname[i]='.'; }
+
+        tsig_key_t key = {0};
+        key.name = huge_keyname;
+        key.algorithm = "hmac-sha256";
+        key.secret_decoded_len = 32;
+        memset(key.secret_decoded, 0xAA, 32);
+
+        uint8_t prior_mac[64];
+        size_t prior_mac_len = 0;
+        r = tsig_sign_packet(pkt5, &pkt5_len, 75000, &key, 0, prior_mac, &prior_mac_len, false);
+        if (r == -1) {
+            printf("FAIL: TSIG malloc fallback failed\n");
+            free(pkt5);
+            return 1;
+        }
+        free(pkt5);
+
+        zone_arena_destroy(&arena);
+        printf("PASS: Wire parsing robustness\n");
+    }
 
     printf("All tests passed safely.\n");
     return 0;

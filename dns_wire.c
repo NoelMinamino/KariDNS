@@ -156,15 +156,19 @@ int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) 
 
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset) {
     size_t p = current_offset; int jump_count = 0; bool jumped = false; size_t jumped_offset = 0;
+    uint16_t visited[MAX_JUMPS];
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t len = packet[p];
         if ((len & 0xC0) == 0xC0) {
             if (p + 1 >= packet_len) return -1;
-            if (++jump_count > MAX_JUMPS) return -1;
             uint16_t ptr = ((len & 0x3F) << 8) | packet[p+1];
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
-            if (ptr >= p && jumped) return -1;
+            if (jump_count >= MAX_JUMPS) return -1;
+            for (int i = 0; i < jump_count; i++) {
+                if (visited[i] == ptr) return -1;
+            }
+            visited[jump_count++] = ptr;
             p = ptr; continue;
         }
         if (len == 0) { p++; break; }
@@ -175,15 +179,20 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
 
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
     size_t p = current_offset, jumped_offset = 0; bool jumped = false; int jump_count = 0;
+    uint16_t visited[MAX_JUMPS];
     char buf[257]; size_t written = 0;
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t len = packet[p];
         if ((len & 0xC0) == 0xC0) {
-            if (p + 1 >= packet_len || ++jump_count > MAX_JUMPS) return -1;
+            if (p + 1 >= packet_len) return -1;
             uint16_t ptr = ((len & 0x3F) << 8) | packet[p+1];
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
-            if (ptr >= p && jumped) return -1;
+            if (jump_count >= MAX_JUMPS) return -1;
+            for (int i = 0; i < jump_count; i++) {
+                if (visited[i] == ptr) return -1;
+            }
+            visited[jump_count++] = ptr;
             p = ptr; continue;
         }
         p++;
@@ -299,9 +308,12 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         inet_ntop(AF_INET6, &packet[*offset], ip6_buf, INET6_ADDRSTRLEN);
         rec->rdata[0] = ip6_buf; rec->rdata_count = 1;
     } else {
-        uint8_t *blob = (uint8_t *)arena_alloc(arena, rdlen);
-        if (!blob) return -1;
-        memcpy(blob, &packet[*offset], rdlen);
+        uint8_t *blob = NULL;
+        if (rdlen > 0) {
+            blob = (uint8_t *)arena_alloc(arena, rdlen);
+            if (!blob) return -1;
+            memcpy(blob, &packet[*offset], rdlen);
+        }
         rec->generic_data = blob;
         rec->generic_len = rdlen;
         rec->rdata_count = 0;
@@ -312,6 +324,8 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 // ============================================================================
 // TSIG ヘルパー
 // ============================================================================
+
+static _Thread_local uint8_t g_tsig_pre_mac_buf[68000];
 
 int const_time_memcmp(const void *a, const void *b, size_t len) {
     const unsigned char *p1 = a; const unsigned char *p2 = b;
@@ -566,8 +580,17 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
 
     if (*packet_len + needed > max_len) return -1;
     size_t pre_mac_len = *packet_len;
-    size_t pre_mac_cap = pre_mac_len + 512 + (key->algorithm ? strlen(key->algorithm) : 11) + strlen(key->name) + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0);
-    uint8_t *pre_mac = malloc(pre_mac_cap);
+    size_t pre_mac_cap = pre_mac_len
+                       + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0)
+                       + keyname_wire_len + 6 + alg_wire_len
+                       + 8 /* time+fudge */
+                       + 4 /* error+otherlen */
+                       + (tsig_error == 18 ? 6 : 0);
+
+    uint8_t *pre_mac = NULL;
+    bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
+    if (use_malloc) pre_mac = malloc(pre_mac_cap);
+    else pre_mac = g_tsig_pre_mac_buf;
     if (!pre_mac) return -1;
     size_t offset = 0;
     if (prior_mac_len && *prior_mac_len > 0) {
@@ -580,12 +603,12 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     offset += pre_mac_len;
     if (!is_subsequent) {
         long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
-        if (w < 0) { free(pre_mac); return -1; }
+        if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
         pre_mac[offset++] = 0; pre_mac[offset++] = 255;
         pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0; pre_mac[offset++] = 0;
         w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, alg);
-        if (w < 0) { free(pre_mac); return -1; }
+        if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
     }
     uint64_t now = time(NULL);
@@ -610,12 +633,12 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     if (key->secret_decoded_len > 0) {
         const EVP_MD *evp_md = tsig_algorithm_from_name(alg);
         if (!evp_md) {
-            free(pre_mac);
+            if (use_malloc) free(pre_mac);
             return -1;
         }
         HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, offset, mac, &mac_len);
     }
-    free(pre_mac);
+    if (use_malloc) free(pre_mac);
     
     if (prior_mac_len && prior_mac) {
         *prior_mac_len = mac_len;
@@ -699,7 +722,9 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         ((uint64_t)packet[time_fudge_start+4] << 8)  |  (uint64_t)packet[time_fudge_start+5];
     uint16_t fudge = (packet[time_fudge_start+6] << 8) | packet[time_fudge_start+7];
     uint64_t now = time(NULL);
-    if (now > time_signed + fudge || now + fudge < time_signed) return 18; // BADTIME
+    uint64_t upper = (UINT64_MAX - fudge < time_signed) ? UINT64_MAX : time_signed + fudge;
+    uint64_t lower = (time_signed < fudge) ? 0 : time_signed - fudge;
+    if (now > upper || now < lower) return 18; // BADTIME
     tsig_p += 8;
     uint16_t mac_size = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     if (tsig_p + mac_size + 6 > packet_len) return -1;
@@ -719,7 +744,10 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
     size_t pre_mac_cap = last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
     
-    uint8_t *pre_mac = malloc(pre_mac_cap);
+    uint8_t *pre_mac = NULL;
+    bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
+    if (use_malloc) pre_mac = malloc(pre_mac_cap);
+    else pre_mac = g_tsig_pre_mac_buf;
     if (!pre_mac) return -1;
     memcpy(pre_mac, packet, last_rr_offset);
     pre_mac[0] = orig_id >> 8; pre_mac[1] = orig_id & 0xFF;
@@ -727,25 +755,25 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     pre_mac[10] = new_arcount >> 8; pre_mac[11] = new_arcount & 0xFF;
     size_t p_offset = last_rr_offset;
     long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
-    if (w3 < 0) { free(pre_mac); return -1; }
+    if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
     p_offset += (size_t)w3;
     
-    if (p_offset + 6 > pre_mac_cap) { free(pre_mac); return -1; }
+    if (p_offset + 6 > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
     pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
     
     w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, wire_alg_name);
-    if (w3 < 0) { free(pre_mac); return -1; }
+    if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
     p_offset += (size_t)w3;
     
-    if (p_offset + DNS_HEADER_SIZE + other_len > pre_mac_cap) { free(pre_mac); return -1; }
+    if (p_offset + DNS_HEADER_SIZE + other_len > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
     memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8); p_offset += 8;
     pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
     pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
     if (other_len > 0) { memcpy(&pre_mac[p_offset], &packet[tsig_p], other_len); p_offset += other_len; }
     unsigned int calc_mac_len = 0; unsigned char calc_mac[EVP_MAX_MD_SIZE];
     HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, p_offset, calc_mac, &calc_mac_len);
-    free(pre_mac);
+    if (use_malloc) free(pre_mac);
     if (mac_size != calc_mac_len) {
         if (mac_size < 10 || mac_size < calc_mac_len / 2 || mac_size > calc_mac_len) return 16; // BADSIG (Truncated too much or invalid size)
         if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
