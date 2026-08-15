@@ -209,21 +209,35 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             buf[written++] = '.'; 
         }
         if (written + (len * 4) >= 256 || p + len > packet_len) return -1;
+        bool needs_escape = false;
         for (int i = 0; i < len; i++) {
-            uint8_t c = packet[p++];
-            if (c == '.' || c == '\\') {
-                if (written + 2 > 256) return -1;
-                buf[written++] = '\\';
-                buf[written++] = (char)c;
-            } else if (c < 0x21 || c >= 0x7F) {
-                if (written + 4 > 256) return -1;
-                buf[written++] = '\\';
-                buf[written++] = '0' + (c / 100);
-                buf[written++] = '0' + ((c / 10) % 10);
-                buf[written++] = '0' + (c % 10);
-            } else {
-                if (written + 1 > 256) return -1;
-                buf[written++] = (char)c;
+            uint8_t c = packet[p + i];
+            if (c == '.' || c == '\\' || c < 0x21 || c >= 0x7F) {
+                needs_escape = true;
+                break;
+            }
+        }
+        if (!needs_escape) {
+            memcpy(&buf[written], &packet[p], len);
+            written += len;
+            p += len;
+        } else {
+            for (int i = 0; i < len; i++) {
+                uint8_t c = packet[p++];
+                if (c == '.' || c == '\\') {
+                    if (written + 2 > 256) return -1;
+                    buf[written++] = '\\';
+                    buf[written++] = (char)c;
+                } else if (c < 0x21 || c >= 0x7F) {
+                    if (written + 4 > 256) return -1;
+                    buf[written++] = '\\';
+                    buf[written++] = '0' + (c / 100);
+                    buf[written++] = '0' + ((c / 10) % 10);
+                    buf[written++] = '0' + (c % 10);
+                } else {
+                    if (written + 1 > 256) return -1;
+                    buf[written++] = (char)c;
+                }
             }
         }
     }
