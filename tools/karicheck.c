@@ -453,6 +453,13 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         free(root_path);
         return 1;
     }
+    if (validate_zone_name_lengths(&arena, &err) < 0) {
+        print_error_context(file_path, buf, &err, &arena);
+        free((void*)ctx.base_dir);
+        zone_arena_destroy(&arena);
+        free(root_path);
+        return 1;
+    }
 
     fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
     bool has_soa = false;
@@ -687,9 +694,17 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                 if (name_len > 6 && strncasecmp(arena.records[i].name, group_prefix, 6) == 0) {
                     if (name_len > zones_suffix_len && strcasecmp(arena.records[i].name + name_len - zones_suffix_len, zones_suffix) == 0) {
                         // This is a group.<unique-N>.zones.$CATZ record. Check if PTR exists for <unique-N>.zones.$CATZ
+                        size_t ptr_name_len = name_len - 6;
                         char ptr_name[512];
-                        strncpy(ptr_name, arena.records[i].name + 6, name_len - 6);
-                        ptr_name[name_len - 6] = '\0';
+                        if (ptr_name_len >= sizeof(ptr_name)) {
+                            fprintf(stderr,
+                                    "[ERROR] Catalog zone '%s': owner name '%s' is too long to process (unique-id part exceeds %zu bytes); skipping orphan check for this record\n",
+                                    domain, arena.records[i].name, sizeof(ptr_name) - 1);
+                            error_found = true;
+                            continue; // このTXTレコードについてはスキップし、境界外書き込みを回避
+                        }
+                        strncpy(ptr_name, arena.records[i].name + 6, ptr_name_len);
+                        ptr_name[ptr_name_len] = '\0';
                         
                         bool has_ptr = false;
                         for (size_t j = 0; j < arena.count; j++) {
@@ -710,9 +725,8 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     if (error_found) {
         fprintf(stderr, "[FAIL] Zone '%s' contains invalid records.\n", domain);
         free((void*)ctx.base_dir);
-        zone_arena_destroy(&arena);
+        zone_arena_destroy(&arena); // frees mutable_buf via arena.file_bufs[0]; do not free() it again here
         free(root_path);
-        free(mutable_buf);
         return 1;
     }
 

@@ -125,6 +125,7 @@ int main(int argc, char **argv) {
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
     strncpy(un.sun_path, "/var/run/karidns/control.sock", sizeof(un.sun_path) - 1);
+    un.sun_path[sizeof(un.sun_path) - 1] = '\0';
 
     if (connect(sock, (struct sockaddr *)&un, sizeof(un)) < 0) {
         perror("connect");

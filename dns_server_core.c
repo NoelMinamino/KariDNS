@@ -847,17 +847,40 @@ static inline void rcu_exponential_backoff(int *retries, useconds_t *sleep_time)
 static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
   int retries = 0;
   useconds_t sleep_time = 1;
-  while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
+  int stall_count = 0;
+  int last_reader_count = -1;
+  int total_seconds = 0;
+
+  while (true) {
+    int current_readers = atomic_load_explicit(&snap->reader_count, memory_order_acquire);
+    if (current_readers <= 0) break;
+
     rcu_exponential_backoff(&retries, &sleep_time);
+
+    // After exponential backoff maxes out at 100000us (0.1s), we check progress every 1s (10 retries)
     if (sleep_time >= 100000 && (retries % 10) == 0) {
-      syslog(LOG_WARNING, "[RCU] wait_for_snapshot_readers stalled");
-    }
+      total_seconds++;
+      syslog(LOG_WARNING, "[RCU] wait_for_snapshot_readers stalled (readers=%d, no_progress=%ds, total=%ds)",
+             current_readers, stall_count, total_seconds);
+
+      if (last_reader_count == current_readers) {
+        stall_count++;
+      } else {
+        stall_count = 0; // Progress made
+      }
+      last_reader_count = current_readers;
+
 #if defined(SANITIZER_BUILD)
-    if (retries > 170) {
-      syslog(LOG_ERR, "[RCU] FATAL: reader_count leak detected (stalled > 5s). Aborting.");
-      abort();
-    }
+      if (stall_count >= 10) {
+        syslog(LOG_ERR, "[RCU] FATAL: reader_count leak detected (stalled > 10s with no progress). Aborting.");
+        abort();
+      }
+      if (total_seconds >= 60) {
+        syslog(LOG_ERR, "[RCU] FATAL: absolute timeout reached (60s). Aborting.");
+        abort();
+      }
 #endif
+    }
   }
 }
 
@@ -1189,6 +1212,12 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   if (validate_zone_dname(z_standby, &parse_err) < 0) {
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] DNAME validation error reloading zone '%s' from '%s': %s",
+             entry->domain, file, parse_err.error_message);
+      return RELOAD_ERR_PARSE;
+  }
+  if (validate_zone_name_lengths(z_standby, &parse_err) < 0) {
+      pthread_mutex_unlock(&entry->writer_lock);
+      syslog(LOG_ERR, "[Zone] Name length validation error reloading zone '%s' from '%s': %s",
              entry->domain, file, parse_err.error_message);
       return RELOAD_ERR_PARSE;
   }
@@ -4949,7 +4978,8 @@ worker_startup_success:;
                 axfr_worker_args_t *args = malloc(sizeof(axfr_worker_args_t));
                 if (args) {
                   args->client_fd = client_fd;
-                  strncpy(args->client_ip, ctx_tcp->client_ip, INET6_ADDRSTRLEN);
+                  strncpy(args->client_ip, ctx_tcp->client_ip, INET6_ADDRSTRLEN - 1);
+                  args->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
                   args->client_port = client_port;
                   strncpy(args->qname, qname, 255);
                   args->qname[255] = '\0';

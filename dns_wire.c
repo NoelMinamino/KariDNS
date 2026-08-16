@@ -815,27 +815,18 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
     uint8_t wire[256];
     size_t w_len = 0;
     const char *p = name;
-    while (*p) {
-        const char *dot = strchr(p, '.');
-        if (!dot) {
-            size_t len = strlen(p);
-            if (len > 63) return -1;
+    uint8_t label[64];
+    while (p) {
+        const char *next_p = NULL;
+        int len = parse_label(p, label, &next_p);
+        if (len < 0) return -1;
+        if (len > 0) {
             if (w_len + len + 1 > 255) return -1;
-            wire[w_len++] = len;
-            memcpy(&wire[w_len], p, len);
+            wire[w_len++] = (uint8_t)len;
+            memcpy(&wire[w_len], label, len);
             w_len += len;
-            break;
-        } else {
-            size_t len = dot - p;
-            if (len > 63) return -1;
-            if (len > 0) {
-                if (w_len + len + 1 > 255) return -1;
-                wire[w_len++] = len;
-                memcpy(&wire[w_len], p, len);
-                w_len += len;
-            }
-            p = dot + 1;
         }
+        p = next_p;
     }
     if (w_len + 1 > 255) return -1;
     wire[w_len++] = 0;

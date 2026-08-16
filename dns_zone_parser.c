@@ -1121,3 +1121,64 @@ int validate_zone_dname(zone_arena_t *arena, parse_error_t *err) {
   return 0;
 }
 
+int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err) {
+  if (!arena || !arena->hash_table) return 0;
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *rec = &arena->records[i];
+    
+    // Check owner name
+    if (rec->name && strlen(rec->name) > 1024) {
+        if (err) {
+            err->error_message = "Owner name exceeds maximum supported length (1024 bytes)";
+            err->error_offset = 0;
+            err->token_length = 0;
+            err->file_path = NULL;
+        }
+        return -1;
+    }
+    
+    // Check RDATA domain names based on type
+    for (int j = 0; j < rec->rdata_count; j++) {
+        bool is_domain_name = false;
+        switch (rec->type_code) {
+            case 2: case 5: case 12: case 39: // NS, CNAME, PTR, DNAME
+                if (j == 0) is_domain_name = true;
+                break;
+            case 15: // MX
+                if (j == 1) is_domain_name = true;
+                break;
+            case 6: // SOA
+                if (j == 0 || j == 1) is_domain_name = true;
+                break;
+            case 33: // SRV
+                if (j == 3) is_domain_name = true;
+                break;
+            case 35: // NAPTR
+                if (j == 5) is_domain_name = true;
+                break;
+            case 14: case 17: // MINFO, RP
+                if (j == 0 || j == 1) is_domain_name = true;
+                break;
+            case 18: case 36: case 21: case 107: // AFSDB, KX, RT, LP
+                if (j == 1) is_domain_name = true;
+                break;
+            case 26: // PX
+                if (j == 1 || j == 2) is_domain_name = true;
+                break;
+            default:
+                break;
+        }
+        if (is_domain_name && rec->rdata[j] && strlen(rec->rdata[j]) > 1024) {
+            if (err) {
+                err->error_message = "RDATA domain name exceeds maximum supported length (1024 bytes)";
+                err->error_offset = 0;
+                err->token_length = 0;
+                err->file_path = NULL;
+            }
+            return -1;
+        }
+    }
+  }
+  return 0;
+}
+

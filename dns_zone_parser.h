@@ -60,5 +60,6 @@ bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_t
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);
 int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
+int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);
 
 #endif
