@@ -387,6 +387,9 @@ typedef struct {
   int match_clients_count;
   zone_db_entry_t **entries;
   size_t zone_count;
+  int *hash_table;
+  int *chain_next;
+  size_t hash_size;
 } view_snapshot_t;
 
 typedef struct {
@@ -792,10 +795,14 @@ static int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *c
     if (snap) {
       for (size_t sv = 0; sv < snap->view_count; sv++) {
         if (strcasecmp(snap->views[sv].name, v->name) != 0) continue;
-        for (size_t i = 0; i < snap->views[sv].zone_count; i++) {
-          if (strcasecmp(snap->views[sv].entries[i]->domain, domain) == 0) {
-            entry = snap->views[sv].entries[i];
-            break;
+        if (snap->views[sv].hash_size > 0 && snap->views[sv].hash_table) {
+          uint32_t hash = calc_fnv1a_str(domain);
+          size_t idx = hash & (snap->views[sv].hash_size - 1);
+          for (int i = snap->views[sv].hash_table[idx]; i != -1; i = snap->views[sv].chain_next[i]) {
+            if (strcasecmp(snap->views[sv].entries[i]->domain, domain) == 0) {
+              entry = snap->views[sv].entries[i];
+              break;
+            }
           }
         }
         break;
@@ -814,9 +821,13 @@ static int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *c
 zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain) {
   if (!snap) return NULL;
   for (size_t v = 0; v < snap->view_count; v++) {
-    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
-      if (strcasecmp(snap->views[v].entries[i]->domain, domain) == 0) {
-        return snap->views[v].entries[i];
+    if (snap->views[v].hash_size > 0 && snap->views[v].hash_table) {
+      uint32_t hash = calc_fnv1a_str(domain);
+      size_t idx = hash & (snap->views[v].hash_size - 1);
+      for (int i = snap->views[v].hash_table[idx]; i != -1; i = snap->views[v].chain_next[i]) {
+        if (strcasecmp(snap->views[v].entries[i]->domain, domain) == 0) {
+          return snap->views[v].entries[i];
+        }
       }
     }
   }
@@ -896,8 +907,7 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   wait_for_readers(&entry->rcu.arena_b);
   pthread_mutex_destroy(&entry->writer_lock);
   pthread_mutex_destroy(&entry->ixfr_history.lock);
-  for (int i = 0; i < entry->ixfr_history.count; i++) {
-    int idx = (entry->ixfr_history.head + MAX_IXFR_HISTORY - entry->ixfr_history.count + i) % MAX_IXFR_HISTORY;
+  for (int idx = 0; idx < MAX_IXFR_HISTORY; idx++) {
     ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
     if (txn) {
       if (txn->deleted) free(txn->deleted);
@@ -937,6 +947,8 @@ static void *gc_snapshot_thread(void *arg) {
       }
       free(snap->views[v].match_clients);
     }
+    if (snap->views[v].hash_table) free(snap->views[v].hash_table);
+    if (snap->views[v].chain_next) free(snap->views[v].chain_next);
   }
   free(snap->views);
   free(snap);
@@ -1719,6 +1731,42 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
     }
 
+    for (size_t v = 0; v < new_snap->view_count; v++) {
+        view_snapshot_t *vs = &new_snap->views[v];
+        size_t p = 256;
+        while (p < vs->zone_count * 2) p <<= 1;
+        vs->hash_size = p;
+        if (vs->hash_size > 0) {
+            vs->hash_table = malloc(vs->hash_size * sizeof(int));
+            if (vs->hash_table) {
+                for (size_t i = 0; i < vs->hash_size; i++) vs->hash_table[i] = -1;
+            }
+        }
+        if (vs->zone_count > 0) {
+            vs->chain_next = malloc(vs->zone_count * sizeof(int));
+            if (vs->chain_next) {
+                for (size_t i = 0; i < vs->zone_count; i++) vs->chain_next[i] = -1;
+            }
+        }
+        
+        if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next)) {
+            syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name);
+            void *gc_snapshot_thread(void *arg);
+            gc_snapshot_thread(new_snap); // Clean up the new snapshot cleanly
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            return NULL;
+        }
+
+        if (vs->hash_table && vs->chain_next) {
+            for (size_t i = 0; i < vs->zone_count; i++) {
+                uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
+                size_t idx = hash & (vs->hash_size - 1);
+                vs->chain_next[i] = vs->hash_table[idx];
+                vs->hash_table[idx] = i;
+            }
+        }
+    }
+
     atomic_store_explicit(&g_zone_db_active, new_snap, memory_order_release);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 
@@ -1916,11 +1964,19 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     }
 
     atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-    rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
+    zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
+    if (!new_snap) {
+        syslog(LOG_ERR, "[Catalog] Failed to rebuild zone DB snapshot; catalog membership update skipped for '%s'", catalog_entry->domain);
+        return;
+    }
     syslog(LOG_INFO, "[Catalog] Processed membership for '%s', desired members: %d", catalog_entry->domain, new_desired_count);
 }
 void rebuild_zone_db_from_config(server_config_t *config) {
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
+    if (!new_snap) {
+        syslog(LOG_ERR, "[Core] Failed to rebuild zone DB snapshot from config due to allocation failure. Reload aborted.");
+        return;
+    }
 
     for (view_config_t *v = config->views; v; v = v->next) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
