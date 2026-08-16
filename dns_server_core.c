@@ -1749,6 +1749,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
         }
         
+        if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next)) {
+            syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name);
+            void *gc_snapshot_thread(void *arg);
+            gc_snapshot_thread(new_snap); // Clean up the new snapshot cleanly
+            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            return NULL;
+        }
+
         if (vs->hash_table && vs->chain_next) {
             for (size_t i = 0; i < vs->zone_count; i++) {
                 uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
