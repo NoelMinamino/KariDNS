@@ -772,6 +772,48 @@ int main() {
         printf("PASS: expand_wire_name Fast-path Output Equivalence\n");
     }
 
+    // Test 10: arena_alloc Overflow Prevention
+    {
+        printf("\n--- Test 10: arena_alloc Overflow Prevention ---\n");
+        zone_arena_t arena = {0};
+        zone_arena_init(&arena);
+
+        // 1. Single allocation limit (64MB)
+        // size自体が上限(64MB)を超えるケース。1つ目のガード
+        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。
+        void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
+        if (p1 != NULL) {
+            printf("FAIL: arena_alloc accepted allocation > 64MB\n");
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: arena_alloc Single Allocation Limit (64MB)\n");
+    }
+
+    // Test 10b: arena_alloc Addition Overflow Prevention (strict)
+    {
+        printf("\n--- Test 10b: arena_alloc Addition Overflow Prevention (strict) ---\n");
+        // current_pool_idx を SIZE_MAX 近傍まで意図的に進めた状態を偽装し、
+        // size自体は64MB未満だが current_pool_idx + size が size_t の範囲で
+        // オーバーフローするケースを作る。これにより1つ目のガードをすり抜けて
+        // 2つ目のガード (current_pool_idx > SIZE_MAX - size) を確実に踏ませる。
+        zone_arena_t arena2 = {0};
+        zone_arena_init(&arena2);
+        arena2.current_pool_idx = SIZE_MAX - 100;
+
+        void *p2 = arena_alloc(&arena2, 200);
+        if (p2 != NULL) {
+            printf("FAIL: arena_alloc accepted allocation causing addition overflow\n");
+            return 1;
+        }
+
+        // このガードは data_pools / data_pool_count へアクセスする前に
+        // 評価される設計のため、data_pool_count==0 のまま destroy しても安全。
+        zone_arena_destroy(&arena2);
+        printf("PASS: arena_alloc Addition Overflow Prevention (strict)\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
