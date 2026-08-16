@@ -29,7 +29,7 @@ Legend:
 | RFC 1995 | Incremental Zone Transfer (IXFR) | ✅ Full | `ixfr_history_t`, `compute_ixfr_diff` (`dns_server_core.c`) |
 | RFC 1996 | A Mechanism for Prompt Notification of Zone Changes (NOTIFY) | ✅ Full | Send and receive supported. Inbound NOTIFY authenticated via `masters` IP match, plus optional TSIG (`dns_server_core.c`) |
 | RFC 2181 | Clarifications to the DNS Specification | ✅ Full | TTL values with the high bit set (≥ 2^31) are now capped to 0 at the single conversion point in `serialize_dns_record` (`dns_wire.c`), per §8 |
-| RFC 2308 | Negative Caching of DNS Queries | ✅ Full | On NXDOMAIN/NODATA, the SOA MINIMUM field is used as the TTL override for the authority-section SOA (`dns_server_core.c`, ~line 2697) |
+| RFC 2308 | Negative Caching of DNS Queries | ✅ Full | On NXDOMAIN/NODATA, the SOA MINIMUM field is used as the TTL override for the authority-section SOA (`dns_server_core.c`, ~line 2766) |
 | RFC 3597 | Handling of Unknown DNS Resource Record (RR) Types | ✅ Full | `TYPE<n>` syntax supported (`dns_utils.c`, `get_type_code`) |
 | RFC 4343 | DNS Case Insensitivity Clarification | ✅ Full | Name comparisons consistently use `strcasecmp` throughout (`dns_server_core.c`, `dns_zone_parser.c`) |
 | RFC 4592 | The Definition of Phrases with Wildcards in the Domain Name System | ✅ Full | Wildcard expansion/synthesis (e.g., `*.example.com`) is fully implemented in the resolution path (`dns_server_core.c`) |
@@ -38,7 +38,7 @@ Legend:
 | RFC 8482 | Providing Minimal-Sized Responses to ANY Queries | ✅ Full | `minimal_any` / `minimal_any_ttl` settings (`dns_config_parser.h`) |
 | RFC 8767 | Serving Stale Data to Improve DNS Resiliency | 🟡 Partial | This RFC targets recursive resolver caches; KariDNS repurposes the term for a `serve-stale` toggle controlling whether a secondary keeps serving its last-known zone data after the SOA EXPIRE interval has passed without a successful refresh. Scope differs from the RFC's original target (recursive caching) |
 | RFC 8906 | A Common Operational Problem in DNS Servers: Failure to Communicate (Fragmentation) | ✅ Full | EDNS UDP payload size is force-clamped to 1232 bytes (avoids IP fragmentation, matches the 2020 DNS Flag Day recommendation) |
-| RFC 9619 | In the DNS, QDCOUNT Is (Usually) One | ✅ Full | For OPCODE=0 (QUERY), QDCOUNT > 1 returns FORMERR and QDCOUNT = 0 returns a minimal response with no question section, per the RFC's normative requirements. OPCODE=4 (NOTIFY) and OPCODE=5 (UPDATE) continue to require QDCOUNT == 1 (`dns_server_core.c`, ~line 3065) |
+| RFC 9619 | In the DNS, QDCOUNT Is (Usually) One | ✅ Full | For OPCODE=0 (QUERY), QDCOUNT > 1 returns FORMERR and QDCOUNT = 0 returns a minimal response with no question section, per the RFC's normative requirements. OPCODE=4 (NOTIFY) and OPCODE=5 (UPDATE) continue to require QDCOUNT == 1 (`dns_server_core.c`, ~line 3123) |
 | RFC 9210 | DNS Transport over TCP - Operational Requirements | ✅ Full (opt-in, default OFF) | Same mechanism as RFC 7766 above; default idle timeout (10s) matches §4.5's recommendation |
 | RFC 9471 | DNS Glue Requirements in Referral Responses | ✅ Full | `append_glue_records` adds both A(1) and AAAA(28) glue (`dns_server_core.c`) |
 | RFC 7314 | Extension Mechanisms for DNS (EDNS) EXPIRE Option | ❌ No | No corresponding EDNS option code (9) handling found. Distinct from the SOA EXPIRE field itself (which IS implemented via `entry->expire`/`last_successful_transfer`) — this RFC concerns propagating an expire countdown via EDNS during AXFR/IXFR, primarily valuable for multi-tier secondary chains (secondary-of-a-secondary). Deliberately deprioritized: current deployments are single-tier (direct master → KariDNS), where this adds no value. Revisit if KariDNS is ever used as an intermediate distribution point |
@@ -74,12 +74,12 @@ Legend:
 
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
-| RFC 2136 | Dynamic Updates in the Domain Name System (DNS UPDATE) | ✅ Full | Ephemeral UPDATE (no persistence). Includes strict validation for meta-types, class matching, bailiwick, and exact-match deduplication in `process_update_sections`, `handle_dynamic_update` (`dns_wire.c`, `dns_server_core.c`) |
+| RFC 2136 | Dynamic Updates in the Domain Name System (DNS UPDATE) | ✅ Full | Ephemeral UPDATE (no persistence). Includes strict validation for meta-types, class matching, bailiwick, and exact-match deduplication in `process_update_sections` (`dns_wire.c`, ~line 2115), `handle_dynamic_update` (`dns_server_core.c`) |
 | RFC 3007 | Secure Domain Name System (DNS) Dynamic Update | ✅ Full | Effectively satisfied by the combination of RFC 2136 (UPDATE) and RFC 8945 (TSIG); no dedicated code path, but the requirements are met |
 | RFC 8945 | Secret Key Transaction Authentication for DNS (TSIG) | ✅ Full | Extensively hardened during this review: exact-match algorithm dispatch (MD5/SHA1/SHA224/SHA256/SHA384/SHA512), BADALG handling, RFC 4635-compliant MAC truncation, and NOTAUTH + TSIG RR responses on both UPDATE and NOTIFY failure paths (`dns_wire.c`, `dns_server_core.c`) |
 | RFC 2930 | Secret Key Establishment for DNS (TKEY) | ❌ No | Not implemented (explicitly out of scope) |
 | RFC 7873 | Domain Name System (DNS) Cookies | ✅ Full | Client/server cookie parsing and generation, including FORMERR for malformed OPTION-LENGTH (`dns_wire.c`, `dns_server_core.c`) |
-| RFC 9018 | Interoperable Domain Name System (DNS) Server Cookies | ✅ Full | `generate_server_cookie()` implements the interoperable 16-byte format (Version(1) + Reserved(3) + Timestamp(4) + Hash(8)) recommended by RFC 9018 (`dns_server_core.c`, ~line 2778) |
+| RFC 9018 | Interoperable Domain Name System (DNS) Server Cookies | ✅ Full | `generate_server_cookie()` implements the interoperable 16-byte format (Version(1) + Reserved(3) + Timestamp(4) + Hash(8)) recommended by RFC 9018 (`dns_server_core.c`, ~line 2845) |
 
 ## 5. Rate Limiting / Operations
 
