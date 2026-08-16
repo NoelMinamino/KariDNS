@@ -779,9 +779,7 @@ int main() {
         zone_arena_init(&arena);
         // 1. Single allocation limit (64MB)
         // size自体が上限(64MB)を超えるケース。1つ目のガード
-        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。
-=======
-        
+        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。       
         // 1. Single allocation limit (64MB)
         void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
         if (p1 != NULL) {
@@ -810,8 +808,8 @@ int main() {
             return 1;
         }
 
-        zone_arena_destroy(&arena);
-        printf("PASS: arena_alloc Overflow Prevention\n");
+        zone_arena_destroy(&arena2);
+        printf("PASS: arena_alloc Addition Overflow Prevention (strict)\n");
     }
 
     printf("All tests passed safely.\n");
