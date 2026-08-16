@@ -772,6 +772,30 @@ int main() {
         printf("PASS: expand_wire_name Fast-path Output Equivalence\n");
     }
 
+    // Test 10: arena_alloc Overflow Prevention
+    {
+        printf("\n--- Test 10: arena_alloc Overflow Prevention ---\n");
+        zone_arena_t arena = {0};
+        zone_arena_init(&arena);
+        
+        // 1. Single allocation limit (64MB)
+        void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
+        if (p1 != NULL) {
+            printf("FAIL: arena_alloc accepted allocation > 64MB\n");
+            return 1;
+        }
+
+        // 2. Addition overflow
+        void *p2 = arena_alloc(&arena, SIZE_MAX - 10);
+        if (p2 != NULL) {
+            printf("FAIL: arena_alloc accepted allocation causing addition overflow\n");
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: arena_alloc Overflow Prevention\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

@@ -42,6 +42,10 @@ static void unescape_string_in_place(char *str) {
 
 
 void *arena_alloc(zone_arena_t *arena, size_t size) {
+  // 追加: sizeそのものへの上限、および加算オーバーフローチェック
+  if (size == 0 || size > (64 * 1024 * 1024)) return NULL; // 単一アロケーション上限
+  if (arena->current_pool_idx > SIZE_MAX - size) return NULL; // 加算オーバーフロー防止
+
   if (arena->current_pool_idx + size > arena->current_pool_cap ||
       arena->data_pool_count == 0) {
     if (arena->data_pool_count >= 128)
@@ -1081,7 +1085,7 @@ int build_zone_index(zone_arena_t *arena) {
   }
   for (size_t i = 0; i < arena->hash_size; i++)
     arena->hash_table[i] = -1;
-  for (int i = (int)arena->count - 1; i >= 0; i--) {
+  for (size_t i = arena->count; i-- > 0; ) {
     dns_record_t *rec = &arena->records[i];
     if (!rec->name)
       continue;

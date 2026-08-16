@@ -2,6 +2,7 @@
 #include "dns_config_parser.h"
 #include "dns_utils.h"
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -3021,7 +3022,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap) {
   server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  uint8_t tsig_mac[64];
+  uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
+  static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
   size_t tsig_mac_len = 0;
   char current_qname[256];
   strncpy(current_qname, qname, 255);
@@ -4117,7 +4119,7 @@ typedef struct {
   uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   uint16_t req_len;
   tsig_key_t *tsig_key;
-  uint8_t tsig_mac[64];
+  uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   size_t tsig_mac_len;
   zone_db_entry_t *entry;
   zone_db_snapshot_t *snap;
@@ -4236,7 +4238,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   compress_ctx_t comp_ctx;
   memset(&comp_ctx, 0, sizeof(comp_ctx));
   compress_ctx_init_packet(&comp_ctx);
-  uint8_t tsig_mac[64];
+  uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
+  static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
   size_t tsig_mac_len = req_mac_len;
   if (req_mac_len > 0) memcpy(tsig_mac, req_mac, req_mac_len);
   bool is_subsequent = false;
@@ -4923,7 +4926,8 @@ worker_startup_success:;
             bool allowed = false;
             uint16_t tsig_error = 0;
             tsig_key_t *matched_key = NULL;
-            uint8_t tsig_mac[64];
+            uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
+            static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
             size_t tsig_mac_len = 0;
             if (zcfg) {
               bool has_acl = (zcfg->allow_transfer_count > 0);

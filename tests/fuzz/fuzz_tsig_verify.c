@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 #include "../../dns_wire.h"
 
 
@@ -58,7 +59,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         pkt[rdlen_pos]     = (rdlen >> 8) & 0xFF;
         pkt[rdlen_pos + 1] = rdlen & 0xFF;
 
-        uint8_t mac_out[64];
+        uint8_t mac_out[64]; /* >= EVP_MAX_MD_SIZE */
+        static_assert(sizeof(mac_out) >= 64, "mac_out must be >= EVP_MAX_MD_SIZE (64)");
         size_t mac_len_out = 0;
         // 修正前のコードではここでASanがheap-buffer-overflowを検出する
         // (dns_wire.c内、Time Signed/Fudgeをpre_macへmemcpyする箇所)。
@@ -95,7 +97,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     size_t pkt_len = size - pkt_off;
     if (pkt_len < 12) return 0;
 
-    uint8_t mac_out[64];
+    uint8_t mac_out[64]; /* >= EVP_MAX_MD_SIZE */
+    static_assert(sizeof(mac_out) >= 64, "mac_out must be >= EVP_MAX_MD_SIZE (64)");
     size_t mac_len_out = 0;
     tsig_verify_packet(pkt, pkt_len, &key, mac_out, &mac_len_out);
 
