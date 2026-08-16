@@ -2813,7 +2813,6 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         dns_record_t *rec = &current_zone->records[i];
         if (rec->type_code == 47 /* NSEC */ &&
             strcasecmp(rec->name, current_qname) == 0) {
-          printf("DEBUG: Found NSEC record!\\n");
           if (rec->rdata_count < 1) break; // 壊れたNSECは無視
           if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {

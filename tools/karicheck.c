@@ -244,7 +244,7 @@ static int cmp_canonical_rr(const void *a, const void *b) {
     return len1 - len2;
 }
 
-static void verify_zonemd(const char *domain, zone_arena_t *arena) {
+static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     int zonemd_count = 0;
     dns_record_t *zonemds[10];
     for (size_t i = 0; i < arena->count; i++) {
@@ -252,16 +252,16 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
             if (zonemd_count < 10) zonemds[zonemd_count++] = &arena->records[i];
         }
     }
-    if (zonemd_count == 0) return;
+    if (zonemd_count == 0) return true;
     
     if (arena->count > SIZE_MAX / sizeof(dns_record_t *)) {
         fprintf(stderr, "[ERROR] Record count too large for ZONEMD verification (zone '%s')\n", domain);
-        return;
+        return false;
     }
     dns_record_t **sorted = malloc(arena->count * sizeof(dns_record_t *));
     if (!sorted) {
         fprintf(stderr, "[ERROR] Out of memory while sorting records for ZONEMD verification (zone '%s', %zu records)\n", domain, arena->count);
-        return;
+        return false;
     }
     size_t valid_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
@@ -269,11 +269,25 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
         if (r->type_code == 63 && strcasecmp(r->name, domain) == 0) continue;
         if (r->type_code == 46 && strcasecmp(r->name, domain) == 0 &&
             r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
+
+        size_t name_len = strlen(r->name);
+        size_t domain_len = strlen(domain);
+        bool in_bailiwick =
+            (name_len == domain_len && strcasecmp(r->name, domain) == 0) ||
+            (name_len > domain_len &&
+             strcasecmp(r->name + (name_len - domain_len), domain) == 0 &&
+             r->name[name_len - domain_len - 1] == '.');
+        if (!in_bailiwick) {
+            fprintf(stderr, "[WARNING] Zone '%s': out-of-zone record '%s' excluded from ZONEMD digest calculation (RFC 8976 SIMPLE scheme)\n", domain, r->name);
+            continue;
+        }
+
         sorted[valid_count++] = r;
     }
     
     qsort(sorted, valid_count, sizeof(dns_record_t *), cmp_canonical_rr);
     
+    bool all_valid = true;
     for (int z = 0; z < zonemd_count; z++) {
         dns_record_t *zm = zonemds[z];
         if (zm->rdata_count < 4) continue;
@@ -329,10 +343,12 @@ static void verify_zonemd(const char *domain, zone_arena_t *arena) {
             fprintf(stderr, "       Computed: ");
             for (unsigned int j = 0; j < hash_len; j++) fprintf(stderr, "%02x", hash_out[j]);
             fprintf(stderr, "\n");
+            all_valid = false;
         }
     }
     
     free(sorted);
+    return all_valid;
 }
 
 static bool is_cname(zone_arena_t *arena, const char *name) {
@@ -730,7 +746,13 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         return 1;
     }
 
-    verify_zonemd(domain, &arena);
+    if (!verify_zonemd(domain, &arena)) {
+        fprintf(stderr, "[FAIL] Zone '%s' failed ZONEMD verification.\n", domain);
+        free((void*)ctx.base_dir);
+        zone_arena_destroy(&arena);
+        free(root_path);
+        return 1;
+    }
 
     printf("[OK] Zone '%s' is valid.\n", domain);
     free((void*)ctx.base_dir);

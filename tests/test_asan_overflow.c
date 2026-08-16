@@ -270,18 +270,26 @@ int main() {
         rec_tlsa.rdata[3] = exact_hex_512;
         if (assert_bound_checked(&rec_tlsa)) return 1;
 
-        // TLSA: hex_decode's local buffer (cad[512]) overflow test
+        // TLSA: Multi-line hex concatenation test
         {
             uint8_t packet[2048];
             uint16_t offset = 0;
             compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
-            dns_record_t rec_tlsa_overflow = {0};
-            rec_tlsa_overflow.name = (char*)"_443._tcp.example.com";
-            rec_tlsa_overflow.type_code = 52; rec_tlsa_overflow.rdata_count = 4;
-            rec_tlsa_overflow.rdata[0] = (char*)"3"; rec_tlsa_overflow.rdata[1] = (char*)"1";
-            rec_tlsa_overflow.rdata[2] = (char*)"1"; rec_tlsa_overflow.rdata[3] = huge_hex;
-            if (serialize_dns_record(packet, 2048, &offset, &rec_tlsa_overflow, &ctx, NULL, 0) != -1) {
-                printf("Test 4 Failed: TLSA local-buffer overflow (hex_decode) did not fail\n"); return 1;
+            dns_record_t rec_tlsa_multi = {0};
+            rec_tlsa_multi.name = (char*)"_443._tcp.example.com";
+            rec_tlsa_multi.type_code = 52; rec_tlsa_multi.rdata_count = 7;
+            rec_tlsa_multi.rdata[0] = (char*)"3"; rec_tlsa_multi.rdata[1] = (char*)"1";
+            rec_tlsa_multi.rdata[2] = (char*)"1"; 
+            rec_tlsa_multi.rdata[3] = (char*)"0123456789abcdef";
+            rec_tlsa_multi.rdata[4] = (char*)"0123456789abcdef";
+            rec_tlsa_multi.rdata[5] = (char*)"0123456789abcdef";
+            rec_tlsa_multi.rdata[6] = (char*)"0123456789abcdef";
+            if (serialize_dns_record(packet, 2048, &offset, &rec_tlsa_multi, &ctx, NULL, 0) == -1) {
+                printf("Test 4 Failed: TLSA multi-line serialization failed\n"); return 1;
+            }
+            uint16_t rdlen = (packet[offset - 35 - 2] << 8) | packet[offset - 35 - 1];
+            if (rdlen != 35) {
+                printf("Test 4 Failed: TLSA multi-line RDLENGTH incorrect (rdlen %d)\n", rdlen); return 1;
             }
         }
 
@@ -326,18 +334,28 @@ int main() {
         rec_zonemd.rdata[3] = exact_hex_512;
         if (assert_bound_checked(&rec_zonemd)) return 1;
 
-        // ZONEMD: hex_decode's local buffer (digest[512]) overflow test
+        // ZONEMD: Multi-line hex concatenation test
         {
             uint8_t packet[2048];
             uint16_t offset = 0;
             compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
-            dns_record_t rec_zonemd_overflow = {0};
-            rec_zonemd_overflow.name = (char*)"example.com";
-            rec_zonemd_overflow.type_code = 63; rec_zonemd_overflow.rdata_count = 4;
-            rec_zonemd_overflow.rdata[0] = (char*)"2018031500"; rec_zonemd_overflow.rdata[1] = (char*)"1";
-            rec_zonemd_overflow.rdata[2] = (char*)"1"; rec_zonemd_overflow.rdata[3] = huge_hex;
-            if (serialize_dns_record(packet, 2048, &offset, &rec_zonemd_overflow, &ctx, NULL, 0) != -1) {
-                printf("Test 4 Failed: ZONEMD local-buffer overflow (hex_decode) did not fail\n"); return 1;
+            dns_record_t rec_zonemd_multi = {0};
+            rec_zonemd_multi.name = (char*)"example.com";
+            rec_zonemd_multi.type_code = 63; rec_zonemd_multi.rdata_count = 9;
+            rec_zonemd_multi.rdata[0] = (char*)"2018031500"; rec_zonemd_multi.rdata[1] = (char*)"1";
+            rec_zonemd_multi.rdata[2] = (char*)"1"; 
+            rec_zonemd_multi.rdata[3] = (char*)"0123456789abcdef";
+            rec_zonemd_multi.rdata[4] = (char*)"0123456789abcdef";
+            rec_zonemd_multi.rdata[5] = (char*)"0123456789abcdef";
+            rec_zonemd_multi.rdata[6] = (char*)"0123456789abcdef";
+            rec_zonemd_multi.rdata[7] = (char*)"0123456789abcdef";
+            rec_zonemd_multi.rdata[8] = (char*)"0123456789abcdef";
+            if (serialize_dns_record(packet, 2048, &offset, &rec_zonemd_multi, &ctx, NULL, 0) == -1) {
+                printf("Test 4 Failed: ZONEMD multi-line serialization failed\n"); return 1;
+            }
+            uint16_t rdlen = (packet[offset - 54 - 2] << 8) | packet[offset - 54 - 1];
+            if (rdlen != 54) {
+                printf("Test 4 Failed: ZONEMD multi-line RDLENGTH incorrect (rdlen %d)\n", rdlen); return 1;
             }
         }
 

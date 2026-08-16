@@ -1438,15 +1438,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint8_t usage = atoi(rec->rdata[0]);
                 uint8_t selector = atoi(rec->rdata[1]);
                 uint8_t matching = atoi(rec->rdata[2]);
-                uint8_t cad[512]; 
-                size_t cad_len = hex_decode(rec->rdata[3], cad, sizeof(cad));
-                if (cad_len == (size_t)-1) return -1;
-                if (offset + 3 + cad_len > max_res_len) return -1;
+                if (offset + 3 > max_res_len) return -1;
                 res[offset++] = usage;
                 res[offset++] = selector;
                 res[offset++] = matching;
-                memcpy(&res[offset], cad, cad_len);
-                offset += cad_len;
+                size_t off = offset;
+                if (decode_concat_hex_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
             case 37: { // CERT
@@ -1732,16 +1730,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint32_t serial = strtoul(rec->rdata[0], NULL, 10);
                 uint8_t scheme = atoi(rec->rdata[1]);
                 uint8_t halg = atoi(rec->rdata[2]);
-                uint8_t digest[512];
-                size_t digest_len = hex_decode(rec->rdata[3], digest, sizeof(digest));
-                if (digest_len == (size_t)-1) return -1;
-                if (offset + 6 + digest_len > max_res_len) return -1;
+                if (offset + 6 > max_res_len) return -1;
                 res[offset++] = serial >> 24; res[offset++] = (serial >> 16) & 0xFF;
                 res[offset++] = (serial >> 8) & 0xFF; res[offset++] = serial & 0xFF;
                 res[offset++] = scheme;
                 res[offset++] = halg;
-                memcpy(&res[offset], digest, digest_len);
-                offset += digest_len;
+                size_t off = offset;
+                if (decode_concat_hex_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
 
