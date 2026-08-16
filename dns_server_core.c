@@ -1964,11 +1964,19 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     }
 
     atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-    rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
+    zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
+    if (!new_snap) {
+        syslog(LOG_ERR, "[Catalog] Failed to rebuild zone DB snapshot; catalog membership update skipped for '%s'", catalog_entry->domain);
+        return;
+    }
     syslog(LOG_INFO, "[Catalog] Processed membership for '%s', desired members: %d", catalog_entry->domain, new_desired_count);
 }
 void rebuild_zone_db_from_config(server_config_t *config) {
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
+    if (!new_snap) {
+        syslog(LOG_ERR, "[Core] Failed to rebuild zone DB snapshot from config due to allocation failure. Reload aborted.");
+        return;
+    }
 
     for (view_config_t *v = config->views; v; v = v->next) {
         for (zone_config_t *z = v->zones; z; z = z->next) {

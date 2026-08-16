@@ -77,7 +77,15 @@ zone_db_snapshot_t *build_test_snapshot(const char **domains, size_t count, bool
         vs->hash_table = NULL;
         vs->chain_next = NULL;
         // In the real code, rebuild_zone_db_snapshot aborts and cleans up if malloc fails.
-        // We simulate a failed build returning NULL.
+        // We simulate a failed build returning NULL, but must free what we allocated for the test.
+        for (size_t i = 0; i < count; i++) {
+            free(vs->entries[i]->domain);
+            free(vs->entries[i]);
+        }
+        free(vs->entries);
+        free(vs->name);
+        free(snap->views);
+        free(snap);
         return NULL; 
     }
     
