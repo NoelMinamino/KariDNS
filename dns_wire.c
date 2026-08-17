@@ -742,6 +742,8 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     if (tsig_p + 10 > packet_len) return -1;
     uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p+1];
     if (type != 250) return -1;
+    uint16_t class = (packet[tsig_p+2] << 8) | packet[tsig_p+3];
+    if (class != 255) return -1;
     tsig_p += 10;
     size_t alg_start = tsig_p;
     char wire_alg_name[256];
