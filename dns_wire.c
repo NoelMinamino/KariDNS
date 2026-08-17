@@ -143,13 +143,19 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
 int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) {
     while (1) {
         if (*offset >= packet_len) return -1;
-        uint8_t len = packet[*offset];
-        if (len == 0) { (*offset)++; break; }
-        if ((len & 0xC0) == 0xC0) {
+        uint8_t raw = packet[*offset];
+        uint8_t label_type = raw & 0xC0;
+        if (label_type == 0xC0) {
             if (*offset + 2 > packet_len) return -1;
             *offset += 2; break;
+        } else if (label_type == 0x00) {
+            uint8_t len = raw;
+            if (len > 63) return -1;
+            if (len == 0) { (*offset)++; break; }
+            *offset += 1 + len;
+        } else {
+            return -1;
         }
-        *offset += 1 + len;
     }
     return 0;
 }
@@ -159,10 +165,11 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
     uint16_t visited[MAX_JUMPS];
     while (1) {
         if (p >= packet_len) return -1;
-        uint8_t len = packet[p];
-        if ((len & 0xC0) == 0xC0) {
+        uint8_t raw = packet[p];
+        uint8_t label_type = raw & 0xC0;
+        if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
-            uint16_t ptr = ((len & 0x3F) << 8) | packet[p+1];
+            uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
             if (jump_count >= MAX_JUMPS) return -1;
             for (int i = 0; i < jump_count; i++) {
@@ -170,9 +177,14 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
             }
             visited[jump_count++] = ptr;
             p = ptr; continue;
+        } else if (label_type == 0x00) {
+            uint8_t len = raw;
+            if (len > 63) return -1;
+            if (len == 0) { p++; break; }
+            p += 1 + len;
+        } else {
+            return -1;
         }
-        if (len == 0) { p++; break; }
-        p += 1 + len;
     }
     *next_offset = jumped ? jumped_offset : p; return 0;
 }
@@ -183,10 +195,12 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
     char buf[257]; size_t written = 0;
     while (1) {
         if (p >= packet_len) return -1;
-        uint8_t len = packet[p];
-        if ((len & 0xC0) == 0xC0) {
+        uint8_t raw = packet[p];
+        uint8_t label_type = raw & 0xC0;
+        uint8_t len;
+        if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
-            uint16_t ptr = ((len & 0x3F) << 8) | packet[p+1];
+            uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
             if (jump_count >= MAX_JUMPS) return -1;
             for (int i = 0; i < jump_count; i++) {
@@ -194,6 +208,11 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             }
             visited[jump_count++] = ptr;
             p = ptr; continue;
+        } else if (label_type == 0x00) {
+            len = raw;
+            if (len > 63) return -1;
+        } else {
+            return -1;
         }
         p++;
         if (len == 0) {
@@ -1886,11 +1905,18 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
         bool is_opt = (i >= qdcount + ancount_req + nscount_req);
         
         while (scan_offset < req_len) {
-            uint8_t len = req[scan_offset];
-            if (len == 0) { scan_offset++; break; }
-            if ((len & 0xC0) == 0xC0) { scan_offset += 2; break; }
-            if (scan_offset + len + 1 > req_len) return -1;
-            scan_offset += len + 1;
+            uint8_t raw = req[scan_offset];
+            uint8_t label_type = raw & 0xC0;
+            if (label_type == 0xC0) { scan_offset += 2; break; }
+            else if (label_type == 0x00) {
+                uint8_t len = raw;
+                if (len > 63) return -1;
+                if (len == 0) { scan_offset++; break; }
+                if (scan_offset + len + 1 > req_len) return -1;
+                scan_offset += len + 1;
+            } else {
+                return -1;
+            }
         }
         
         if (i < qdcount) {
