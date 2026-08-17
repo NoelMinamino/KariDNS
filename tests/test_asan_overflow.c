@@ -88,11 +88,6 @@ int main() {
 
     // Test 3: New record types boundary checks
     {
-        uint8_t packet[20];
-        uint16_t offset = 0;
-        compress_ctx_t ctx;
-        compress_ctx_init_packet(&ctx);
-
         // SSHFP
         dns_record_t rec_sshfp = {0};
         rec_sshfp.name = (char*)"example.com"; rec_sshfp.type_code = 44; rec_sshfp.rdata_count = 3;
@@ -247,11 +242,6 @@ int main() {
 
     // Test 4: Local buffer overflow prevention (Input boundary checks)
     {
-        uint8_t packet[2048]; // Large enough to hold valid packets
-        uint16_t offset = 0;
-        compress_ctx_t ctx;
-        compress_ctx_init_packet(&ctx);
-
         char huge_hex[1100];
         char huge_b64[1100];
         for(int i=0; i<1099; i++) { huge_hex[i] = 'A'; huge_b64[i] = 'A'; }
@@ -279,7 +269,7 @@ int main() {
             rec_tlsa_multi.name = (char*)"_443._tcp.example.com";
             rec_tlsa_multi.type_code = 52; rec_tlsa_multi.rdata_count = 7;
             rec_tlsa_multi.rdata[0] = (char*)"3"; rec_tlsa_multi.rdata[1] = (char*)"1";
-            rec_tlsa_multi.rdata[2] = (char*)"1"; 
+            rec_tlsa_multi.rdata[2] = (char*)"1";
             rec_tlsa_multi.rdata[3] = (char*)"0123456789abcdef";
             rec_tlsa_multi.rdata[4] = (char*)"0123456789abcdef";
             rec_tlsa_multi.rdata[5] = (char*)"0123456789abcdef";
@@ -343,7 +333,7 @@ int main() {
             rec_zonemd_multi.name = (char*)"example.com";
             rec_zonemd_multi.type_code = 63; rec_zonemd_multi.rdata_count = 9;
             rec_zonemd_multi.rdata[0] = (char*)"2018031500"; rec_zonemd_multi.rdata[1] = (char*)"1";
-            rec_zonemd_multi.rdata[2] = (char*)"1"; 
+            rec_zonemd_multi.rdata[2] = (char*)"1";
             rec_zonemd_multi.rdata[3] = (char*)"0123456789abcdef";
             rec_zonemd_multi.rdata[4] = (char*)"0123456789abcdef";
             rec_zonemd_multi.rdata[5] = (char*)"0123456789abcdef";
@@ -797,8 +787,7 @@ int main() {
         zone_arena_init(&arena);
         // 1. Single allocation limit (64MB)
         // size自体が上限(64MB)を超えるケース。1つ目のガード
-        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。       
-        // 1. Single allocation limit (64MB)
+        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。
         void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
         if (p1 != NULL) {
             printf("FAIL: arena_alloc accepted allocation > 64MB\n");
