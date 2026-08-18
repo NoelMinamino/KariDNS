@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <openssl/evp.h>
+#include <sys/stat.h>
 #include "dns_wire.h"
 
 
@@ -162,10 +163,19 @@ void free_zone_config(zone_config_t *zone) {
   free(zone);
 }
 
-char *read_entire_file(const char *path) {
+char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino) {
   int fd = open_via_dir_cache(path, O_RDONLY, 0, false);
   if (fd < 0)
     return NULL;
+  
+  if (out_dev || out_ino) {
+    struct stat st;
+    if (fstat(fd, &st) == 0) {
+      if (out_dev) *out_dev = st.st_dev;
+      if (out_ino) *out_ino = st.st_ino;
+    }
+  }
+
   FILE *f = fdopen(fd, "rb");
   if (!f) {
     close(fd);

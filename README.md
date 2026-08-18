@@ -34,7 +34,7 @@ Record types supported for parsing zone files and serializing them to wire forma
 
 DNSSEC signature validation and dynamic updates (RFC 2136) are not supported.
 
-Zone file directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (Capsicum support, up to 32 files, nesting depth of 8), `$GENERATE`
+Zone file directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (Capsicum support, up to 32 files, nesting depth of 16), `$GENERATE`
 
 
 ## Building and Running

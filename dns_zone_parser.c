@@ -249,39 +249,38 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
         return -1;
     }
 
-    // --- 循環検出: 祖先スタックの中に同じ解決済みパスがあれば拒否 ---
-    for (int i = 0; i < ctx->visited_count; i++) {
-        if (strcmp(ctx->visited_paths[i], resolved) == 0) {
-            if (ctx->err_out) {
-                ctx->err_out->error_message = "Circular $INCLUDE detected";
-                ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
-                ctx->err_out->token_length = strlen(fields[1]);
-                if (ctx->current_depth > 0) {
-                    ctx->err_out->file_path = ctx->visited_paths[ctx->visited_count - 1];
-                }
-            }
-            free(resolved);
-            return -1;
-        }
-    }
     if (ctx->visited_count >= ctx->visited_cap) {
         if (ctx->err_out) ctx->err_out->error_message = "Ancestor path stack exhausted";
         free(resolved);
         return -1;
     }
 
-    char *file_content = ctx->load_file_cb ? ctx->load_file_cb(ctx, resolved) : NULL;
+    dev_t cur_dev = 0;
+    ino_t cur_ino = 0;
+    char *file_content = ctx->load_file_cb ? ctx->load_file_cb(ctx, resolved, &cur_dev, &cur_ino) : NULL;
     if (!file_content) {
         if (ctx->err_out) {
-            ctx->err_out->error_message = "$INCLUDE file could not be read";
+            ctx->err_out->error_message = "$INCLUDE file could not be read or fstat failed";
             ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
             ctx->err_out->token_length = strlen(fields[1]);
-            if (ctx->current_depth > 0) {
-                ctx->err_out->file_path = ctx->visited_paths[ctx->visited_count - 1];
-            }
         }
         free(resolved);
         return -1;
+    }
+
+    // --- 循環検出: 祖先スタックの中に同じinode(dev, ino)があれば拒否 ---
+    for (int i = 0; i < ctx->visited_count; i++) {
+        if (ctx->visited_devs && ctx->visited_inos && 
+            ctx->visited_devs[i] == cur_dev && ctx->visited_inos[i] == cur_ino) {
+            if (ctx->err_out) {
+                ctx->err_out->error_message = "Circular $INCLUDE detected";
+                ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
+                ctx->err_out->token_length = strlen(fields[1]);
+            }
+            free(file_content);
+            free(resolved);
+            return -1;
+        }
     }
 
     char *display_copy = strdup(file_content);
@@ -300,7 +299,10 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     char *saved_origin = *origin_io;
     char *child_origin = (field_idx > 2) ? fields[2] : *origin_io;
 
-    ctx->visited_paths[ctx->visited_count++] = resolved;
+    ctx->visited_paths[ctx->visited_count] = resolved;
+    if (ctx->visited_devs) ctx->visited_devs[ctx->visited_count] = cur_dev;
+    if (ctx->visited_inos) ctx->visited_inos[ctx->visited_count] = cur_ino;
+    ctx->visited_count++;
 
     parse_context_t child_ctx = *ctx; 
     child_ctx.default_origin = child_origin;

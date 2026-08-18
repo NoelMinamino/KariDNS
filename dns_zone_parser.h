@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <sys/types.h>
 #include "dns_wire.h"
 
 typedef struct {
@@ -20,7 +21,7 @@ typedef struct parse_context_s {
     bool is_standalone_mode;
     parse_error_t *err_out;
     int current_depth;
-    char* (*load_file_cb)(struct parse_context_s *ctx, const char *rel_path);
+    char* (*load_file_cb)(struct parse_context_s *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino);
     void *user_data;
 
     // --- $INCLUDE 用に追加 ---
@@ -28,6 +29,8 @@ typedef struct parse_context_s {
                             //   自分のスタック変数のアドレスをセットし、以降の再帰
                             //   呼び出し全てで「同じポインタ」を使い回すこと。
     char **visited_paths;   // 祖先スタック(現在の呼び出しチェーンのみ、訪問済み集合ではない)
+    dev_t *visited_devs;
+    ino_t *visited_inos;
     int visited_count;      // スタックの現在の深さ
     int visited_cap;        // visited_paths配列の容量
 } parse_context_t;

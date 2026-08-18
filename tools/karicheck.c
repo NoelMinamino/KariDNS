@@ -8,6 +8,7 @@
 #include "../dns_zone_parser.h"
 #include "../dns_utils.h"
 #include "../dns_wire.h"
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -86,8 +87,19 @@ static char *read_file_or_die(const char *path, bool *out_failed) {
     return buf;
 }
 
-static char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path) {
+static char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
+    
+    if (out_dev || out_ino) {
+        struct stat st;
+        if (stat(rel_path, &st) == 0) {
+            if (out_dev) *out_dev = st.st_dev;
+            if (out_ino) *out_ino = st.st_ino;
+        } else {
+            return NULL; // fstat failed, fail-closed
+        }
+    }
+    
     return read_file_or_die(rel_path, NULL);
 }
 
@@ -352,8 +364,11 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
 }
 
 static bool is_cname(zone_arena_t *arena, const char *name) {
-    for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 5 && strcasecmp(arena->records[i].name, name) == 0) {
+    if (!arena->hash_table || arena->hash_size == 0) return false;
+    uint32_t hash = calc_fnv1a_str(name);
+    size_t idx = hash & (arena->hash_size - 1);
+    for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
+        if (arena->records[j].type_code == 5 && strcasecmp(arena->records[j].name, name) == 0) {
             return true;
         }
     }
@@ -414,12 +429,27 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     parse_error_t err = {0};
     char *root_ttl = NULL;
     char *visited_paths[16];
+    dev_t visited_devs[16];
+    ino_t visited_inos[16];
     char *root_path = realpath(file_path, NULL);
     if (!root_path) root_path = strdup(file_path);
 
     char *base_dir = get_base_dir(file_path);
     if (!base_dir) {
         fprintf(stderr, "[ERROR] Out of memory allocating base_dir\n");
+        free(root_path);
+        return 1;
+    }
+    
+    dev_t root_dev = 0;
+    ino_t root_ino = 0;
+    struct stat root_st;
+    if (stat(file_path, &root_st) == 0) {
+        root_dev = root_st.st_dev;
+        root_ino = root_st.st_ino;
+    } else {
+        fprintf(stderr, "Failed to stat root zone file: %s\n", file_path);
+        free((void*)base_dir);
         free(root_path);
         return 1;
     }
@@ -431,12 +461,16 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         .err_out = &err,
         .current_depth = 0,
         .visited_paths = visited_paths,
+        .visited_devs = visited_devs,
+        .visited_inos = visited_inos,
         .visited_count = 1,
         .visited_cap = 16,
         .load_file_cb = karicheck_load_file_cb,
         .shared_ttl_io = &root_ttl
     };
     ctx.visited_paths[0] = root_path;
+    ctx.visited_devs[0] = root_dev;
+    ctx.visited_inos[0] = root_ino;
 
     int res = parse_zone_fast(mutable_buf, strlen(mutable_buf), &arena, &ctx);
     if (res < 0) {
@@ -580,13 +614,17 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
             }
         }
         if (tcode == 5) { // CNAME
-            for (size_t j = 0; j < arena.count; j++) {
-                if (i != j && strcasecmp(arena.records[j].name, arena.records[i].name) == 0) {
-                    uint16_t other = arena.records[j].type_code;
-                    // Ignore DNSSEC records
-                    if (other != 5 && other != 46 && other != 47 && other != 50) {
-                        fprintf(stderr, "[WARNING] CNAME '%s' co-exists with other records (type %d) (RFC 1912)\n", arena.records[i].name, other);
-                        break;
+            if (arena.hash_table && arena.hash_size > 0) {
+                uint32_t hash = calc_fnv1a_str(arena.records[i].name);
+                size_t idx = hash & (arena.hash_size - 1);
+                for (int j = arena.hash_table[idx]; j != -1; j = arena.records[j].next_record) {
+                    if (i != (size_t)j && strcasecmp(arena.records[j].name, arena.records[i].name) == 0) {
+                        uint16_t other = arena.records[j].type_code;
+                        // Ignore DNSSEC records
+                        if (other != 5 && other != 46 && other != 47 && other != 50) {
+                            fprintf(stderr, "[WARNING] CNAME '%s' co-exists with other records (type %d) (RFC 1912)\n", arena.records[i].name, other);
+                            break;
+                        }
                     }
                 }
             }

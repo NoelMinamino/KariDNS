@@ -306,10 +306,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
 
   size_t idx = hash & (RRL_TABLE_SIZE - 1);
   rrl_bucket_t *b = &g_rrl_table[idx];
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-
   while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
 #if defined(__x86_64__) || defined(__i386__)
       __asm__ volatile("pause" ::: "memory");
@@ -317,6 +313,10 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       sched_yield();
 #endif
   }
+
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
   if (b->client_hash != full_hash) {
     // Hash collision or new entry
@@ -1097,7 +1097,7 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
 }
 
 
-static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path) {
+static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
@@ -1106,6 +1106,18 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path) {
     if (fd < 0) {
         return NULL;
     }
+    
+    if (out_dev || out_ino) {
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            if (out_dev) *out_dev = st.st_dev;
+            if (out_ino) *out_ino = st.st_ino;
+        } else {
+            close(fd);
+            return NULL; // fstat failed, fail-closed
+        }
+    }
+
     FILE *f = fdopen(fd, "rb");
     if (!f) {
         close(fd);
@@ -1137,7 +1149,9 @@ typedef enum {
 } reload_result_t;
 
 static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *file) {
-  char *buf = read_entire_file(file);
+  dev_t root_dev = 0;
+  ino_t root_ino = 0;
+  char *buf = read_entire_file(file, &root_dev, &root_ino);
   if (!buf) {
     syslog(LOG_ERR, "[Zone] Failed to read file '%s' for zone '%s'.", file, entry->domain);
     return RELOAD_ERR_FILE_READ;
@@ -1159,6 +1173,8 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 
   char *root_ttl = NULL;
   char *visited_paths[16];
+  dev_t visited_devs[16];
+  ino_t visited_inos[16];
   
   char abs_file[PATH_MAX];
   if (file[0] != '/' && g_startup_cwd[0] != '\0') {
@@ -1183,9 +1199,13 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   ctx.load_file_cb = server_load_file_cb;
   ctx.shared_ttl_io = &root_ttl;
   ctx.visited_paths = visited_paths;
+  ctx.visited_devs = visited_devs;
+  ctx.visited_inos = visited_inos;
   ctx.visited_cap = 16;
   ctx.visited_count = 1;
   ctx.visited_paths[0] = root_path;
+  ctx.visited_devs[0] = root_dev;
+  ctx.visited_inos[0] = root_ino;
   ctx.err_out = &parse_err;
 
   int count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
@@ -5259,7 +5279,7 @@ static void free_server_config_fields(server_config_t *cfg) {
 
 static void perform_config_reload(void) {
   g_last_configured_time = time(NULL);
-  char *config_str = read_entire_file(g_config_path);
+  char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
     return;
   server_config_t *active =
@@ -6108,7 +6128,7 @@ int main(int argc, char **argv) {
   sigaddset(&set, SIGHUP);
   sigprocmask(SIG_BLOCK, &set, NULL);
 
-  char *config_str = read_entire_file(g_config_path);
+  char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
     return 1;
   if (parse_named_conf(config_str, &g_config_db.config_a) != 0) {

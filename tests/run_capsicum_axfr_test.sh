@@ -2,8 +2,20 @@
 set -e
 
 # 1. 本番ビルドでサーバーとdagを構築 (Capsicumを有効にするため)
+git checkout tests/zones/example.com.zone || true
+rm -rf tests/zones/capsicum_include_test || true
 make clean
-make karidns dag
+make karidns dag karictl
+
+# 1.5. テスト用ディレクトリを事前に作成・キャッシュさせるための準備
+mkdir -p tests/zones/capsicum_include_test/dir1
+echo "; empty" > tests/zones/capsicum_include_test/dir1/empty.inc
+ln -sfn dir1 tests/zones/capsicum_include_test/dir2
+# 起動時に dir2 をアクセスさせてキャッシュに乗せる
+echo "\$INCLUDE capsicum_include_test/dir2/empty.inc" > tests/zones/capsicum_include_test/dir1/init.inc
+
+cp tests/zones/example.com.zone tests/zones/example.com.zone.bak
+echo "\$INCLUDE capsicum_include_test/dir1/init.inc" >> tests/zones/example.com.zone
 
 # 2. ktrace を用いてシステムコールをトレースしながらサーバーを起動
 ktrace -f karidns.trace ./karidns -f tests/karidns-test.conf > server_capsicum.log 2>&1 &
@@ -70,6 +82,29 @@ if [ -n "$missing" ]; then
 fi
 
 echo "[OK] Capsicum round-trip test passed: no ECAPMODE/TRAP_CAP violations, all record types present, server did not crash."
+
+# 7. SIGHUPによるゾーンリロード時の $INCLUDE 循環検出 (シンボリックリンク経由)
+echo "Testing circular \$INCLUDE via symlink in Capsicum mode..."
+
+# dir1/common.inc に、dir2/common.incをインクルードさせる(これで循環が発生する)
+echo "\$INCLUDE capsicum_include_test/dir2/common.inc" > tests/zones/capsicum_include_test/dir1/common.inc
+
+# root zoneに $INCLUDE dir1/common.inc を追記
+echo "\$INCLUDE capsicum_include_test/dir1/common.inc" >> tests/zones/example.com.zone
+
+./karictl -f tests/karictl-test.conf reload example.com. || true
+sleep 1
+
+# server_capsicum.log で "Circular $INCLUDE detected" を確認
+if ! grep -q "Circular \$INCLUDE detected" server_capsicum.log; then
+    echo "[FAIL] Circular \$INCLUDE via symlink was not detected in Capsicum mode."
+    exit 1
+fi
+echo "[OK] Circular \$INCLUDE correctly detected."
+
+# 後始末
+mv tests/zones/example.com.zone.bak tests/zones/example.com.zone
+rm -rf tests/zones/capsicum_include_test
 
 if killall -0 karidns 2>/dev/null; then
     killall -9 karidns >/dev/null
