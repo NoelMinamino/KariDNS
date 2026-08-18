@@ -1054,6 +1054,8 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
          txn->deleted[d_idx].generic_data = arena_alloc(&txn->arena, old_arena->records[i].generic_len);
          memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
       }
+      txn->deleted[d_idx].is_cached = false;
+      dns_record_preparse_cache(&txn->arena, &txn->deleted[d_idx]);
       d_idx++;
     }
   }
@@ -1073,6 +1075,8 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
          txn->added[a_idx].generic_data = arena_alloc(&txn->arena, new_arena->records[i].generic_len);
          memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
       }
+      txn->added[a_idx].is_cached = false;
+      dns_record_preparse_cache(&txn->arena, &txn->added[a_idx]);
       a_idx++;
     }
   }
@@ -2131,6 +2135,8 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     } else
       d_rec->generic_data = NULL;
     d_rec->next_record = -1;
+    d_rec->is_cached = false;
+    dns_record_preparse_cache(dst, d_rec);
   }
 }
 
@@ -2971,6 +2977,8 @@ static void bump_soa_serial_in_arena(zone_arena_t *arena) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%u", serial);
         arena->records[i].rdata[2] = arena_strdup(arena, buf);
+        arena->records[i].is_cached = false;
+        dns_record_preparse_cache(arena, &arena->records[i]);
       }
       break;
     }

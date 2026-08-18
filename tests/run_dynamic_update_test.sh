@@ -108,6 +108,20 @@ if ! grep -q "1.2.3.7" res.txt; then
 fi
 check_asan_log
 
+echo "[*] 3.5. Authorized UPDATE Double (Slot Reuse Cache Validation)..."
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new.dynupdate.com 300 A 1.2.3.8' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG new.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
+if ! grep -q "1.2.3.8" res.txt; then
+    echo "[FAIL] Authorized UPDATE (Double) failed to update record or cache corrupted."
+    exit 1
+fi
+$DAG dynupdate.com. SOA @127.0.0.1 -p 10053 +short > res.txt
+if ! grep -q "ns1.dynupdate.com." res.txt; then
+    echo "[FAIL] SOA record corrupted after double update!"
+    exit 1
+fi
+check_asan_log
+
 echo "[*] 4. Prerequisite Failure (NXDOMAIN)..."
 $DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "test.dynupdate.com" --update-add 'new2.dynupdate.com 300 A 2.3.4.5' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 if ! grep -q "YXDOMAIN" out.txt; then
