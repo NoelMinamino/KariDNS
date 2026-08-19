@@ -1054,9 +1054,14 @@ static ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
  * 7. Response pretty-printing (dig-style)
  * ==================================================================== */
 static const char *rcode_name(uint8_t rcode) {
+    // Note: RCODEs 6 (YXDOMAIN), 7 (YXRRSET), 8 (NXRRSET) are only meaningful in
+    // RFC 2136 DNS UPDATE responses (opcode_name(opcode) == "UPDATE"). In normal 
+    // QUERY responses, they are undefined. We unconditionally return their UPDATE
+    // names here since they rarely appear otherwise.
     switch (rcode) {
         case 0: return "NOERROR"; case 1: return "FORMERR"; case 2: return "SERVFAIL";
         case 3: return "NXDOMAIN"; case 4: return "NOTIMP"; case 5: return "REFUSED";
+        case 6: return "YXDOMAIN"; case 7: return "YXRRSET"; case 8: return "NXRRSET";
         case 9: return "NOTAUTH"; case 16: return "BADVERS/BADSIG"; case 17: return "BADKEY";
         case 18: return "BADTIME";
         default: return "UNKNOWN";
