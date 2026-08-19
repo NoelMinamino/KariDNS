@@ -822,6 +822,86 @@ int main() {
         printf("PASS: arena_alloc Addition Overflow Prevention (strict)\n");
     }
 
+    // Test 11: RFC 2136 process_update_sections CLASS validation
+    {
+        printf("\n--- Test 11: RFC 2136 process_update_sections CLASS validation ---\n");
+        zone_arena_t arena = {0};
+        zone_arena_init(&arena);
+
+        parse_error_t err = {0};
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "dynupdate.com.",
+            .is_standalone_mode = true,
+            .err_out = &err,
+        };
+        char zone_text[] = "dynupdate.com. 3600 IN SOA ns1.dynupdate.com. admin.dynupdate.com. 1 3600 1800 604800 86400\n"
+                           "dynupdate.com. 3600 IN NS ns1.dynupdate.com.\n"
+                           "ns1.dynupdate.com. 3600 IN A 127.0.0.1\n"
+                           "test.dynupdate.com. 3600 IN TXT \"initial\"\n";
+        int prc_res = parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx);
+        if (prc_res < 0) {
+            printf("FAIL: Test 11 parse_zone_fast failed: %s\n", err.error_message);
+            return 1;
+        }
+
+        // 1. Prereq with Invalid CLASS (e.g. CLASS CH = 3, Value-Dependent RR) -> MUST return FORMERR (1)
+        uint8_t pkt[512] = {0};
+        pkt[0] = 0x12; pkt[1] = 0x34; // ID
+        pkt[2] = 0x28; pkt[3] = 0x00; // Opcode=5 (UPDATE)
+        pkt[4] = 0x00; pkt[5] = 0x01; // ZOCOUNT = 1
+        pkt[6] = 0x00; pkt[7] = 0x01; // PRCOUNT = 1
+        pkt[8] = 0x00; pkt[9] = 0x00; // UPCOUNT = 0
+        pkt[10] = 0x00; pkt[11] = 0x00; // ARCOUNT = 0
+
+        size_t off = 12;
+        // Zone: dynupdate.com., TYPE=SOA(6), CLASS=IN(1)
+        const char *zname = "\x09" "dynupdate" "\x03" "com" "\x00";
+        memcpy(&pkt[off], zname, 15);
+        off += 15;
+        pkt[off++] = 0x00; pkt[off++] = 0x06; // SOA
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // IN (zone_class = 1)
+
+        // Prereq: test.dynupdate.com., TYPE=TXT(16), CLASS=CH(3) [INVALID], TTL=0, RDLEN=8, RDATA="\x07initial"
+        const char *pname = "\x04" "test" "\x09" "dynupdate" "\x03" "com" "\x00";
+        memcpy(&pkt[off], pname, 20);
+        off += 20;
+        pkt[off++] = 0x00; pkt[off++] = 0x10; // TXT
+        size_t class_offset = off;
+        pkt[off++] = 0x00; pkt[off++] = 0x03; // CLASS = 3 (CH - Invalid)
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; // TTL=0
+        pkt[off++] = 0x00; pkt[off++] = 0x08; // RDLEN = 8
+        size_t rdata_offset = off;
+        memcpy(&pkt[off], "\x07initial", 8);
+        off += 8;
+
+        int prc = 0, upc = 0;
+        int res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        if (res != 1) { // Expected FORMERR (1)
+            printf("FAIL: process_update_sections returned %d instead of 1 (FORMERR) for invalid Prereq CLASS\n", res);
+            return 1;
+        }
+
+        // 2. Prereq with valid Zone CLASS (IN = 1) matching existing record -> MUST succeed (0)
+        pkt[class_offset] = 0x00; pkt[class_offset + 1] = 0x01; // CLASS = 1 (IN)
+        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        if (res != 0) {
+            printf("FAIL: process_update_sections returned %d instead of 0 for valid Prereq CLASS IN\n", res);
+            return 1;
+        }
+
+        // 3. Prereq with valid Zone CLASS (IN = 1) but non-matching RDATA -> MUST return NXRRSET (8)
+        memcpy(&pkt[rdata_offset], "\x07wrongval", 8);
+        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        if (res != 8) {
+            printf("FAIL: process_update_sections returned %d instead of 8 (NXRRSET) for non-matching RDATA\n", res);
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: RFC 2136 process_update_sections CLASS validation\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

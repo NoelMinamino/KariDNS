@@ -96,8 +96,11 @@ static conf_token_t get_raw_token_from_frame(config_file_frame_t *frame) {
     while (frame->pos < frame->len && frame->src[frame->pos] != '"' && frame->src[frame->pos] != '\0')
       frame->pos++;
     size_t str_len = frame->pos - start;
-    if (str_len > 4096)
+    if (str_len > 4096) {
+      syslog(LOG_WARNING, "[Config] Token length (%zu bytes) exceeds maximum limit (4096 bytes), truncating in '%s'",
+             str_len, frame->file_path ? frame->file_path : "<string>");
       str_len = 4096;
+    }
     tok.type = TOKEN_STRING;
     tok.is_quoted = true;
     tok.value = malloc(str_len + 1);
@@ -125,8 +128,11 @@ static conf_token_t get_raw_token_from_frame(config_file_frame_t *frame) {
     frame->pos++;
     str_len = 1;
   }
-  if (str_len > 4096)
+  if (str_len > 4096) {
+    syslog(LOG_WARNING, "[Config] Token length (%zu bytes) exceeds maximum limit (4096 bytes), truncating in '%s'",
+           str_len, frame->file_path ? frame->file_path : "<string>");
     str_len = 4096;
+  }
   tok.type = TOKEN_STRING;
   tok.is_quoted = false;
   tok.value = malloc(str_len + 1);

@@ -158,6 +158,31 @@ if grep -q "10.0.0.1" res.txt; then
 fi
 check_asan_log
 
+echo "[*] 6.8. RFC 2136 Invalid CLASS in Prerequisite (FORMERR validation)..."
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import socket
+hdr = b"\xbe\xef\x28\x00\x00\x01\x00\x01\x00\x00\x00\x00"
+zone = b"\x0a\x64\x79\x6e\x75\x70\x64\x61\x74\x65\x03\x63\x6f\x6d\x00\x00\x06\x00\x01"
+prereq = b"\x04\x74\x65\x73\x74\x0a\x64\x79\x6e\x75\x70\x64\x61\x74\x65\x03\x63\x6f\x6d\x00\x00\x10\x00\x03\x00\x00\x00\x00\x00\x00"
+pkt = hdr + zone + prereq
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2.0)
+s.sendto(pkt, ("127.0.0.1", 10053))
+resp, _ = s.recvfrom(512)
+rcode = resp[3] & 0x0F
+if rcode != 1:
+    print(f"FAIL: Expected FORMERR (rcode=1), got rcode={rcode}")
+    exit(1)
+print("PASS: Got FORMERR for invalid CLASS")
+' > out.txt 2>&1 || {
+        echo "[FAIL] RFC 2136 Invalid CLASS test failed:"
+        cat out.txt
+        exit 1
+    }
+fi
+check_asan_log
+
 echo "[*] 7. Reload Server to check ephemeral behavior..."
 $KARICTL -f "$CTL_CONF" reload
 sleep 1

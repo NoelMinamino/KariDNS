@@ -2283,6 +2283,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
         } else {
             // zone class
+            if (class_val != zone_class) return 1; // FORMERR
             if (!rrset_exists) return 8; // NXRRSET
             size_t temp_offset = rec_start_offset; 
             dns_record_t parsed_rec;
