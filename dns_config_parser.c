@@ -23,6 +23,15 @@ static void *safe_realloc_or_die(void *ptr, size_t size) {
   return p;
 }
 
+static void *safe_calloc_or_die(size_t nmemb, size_t size) {
+  void *p = calloc(nmemb, size);
+  if (!p && nmemb > 0 && size > 0) {
+    syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", nmemb * size);
+    exit(1);
+  }
+  return p;
+}
+
 #define APPEND_STR(arr, cnt, val) \
     do { \
         (arr) = safe_realloc_or_die((arr), sizeof(char *) * ((cnt) + 1)); \
@@ -545,7 +554,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     free_token(&tok);
     return -1;
   }
-  zone_config_t *zone = calloc(1, sizeof(zone_config_t));
+  zone_config_t *zone = safe_calloc_or_die(1, sizeof(zone_config_t));
   zone->domain = strdup(tok.value);
   free_token(&tok);
   size_t dl = strlen(zone->domain);
@@ -935,7 +944,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       free_token(&tok);
       tok = get_next_token(&ctx);
       if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
-      view_config_t *view = calloc(1, sizeof(view_config_t));
+      view_config_t *view = safe_calloc_or_die(1, sizeof(view_config_t));
       view->name = strdup(tok.value);
       free_token(&tok);
       tok = get_next_token(&ctx);
@@ -986,7 +995,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         free_token(&tok);
         return -1;
       }
-      tsig_key_t *tsig = calloc(1, sizeof(tsig_key_t));
+      tsig_key_t *tsig = safe_calloc_or_die(1, sizeof(tsig_key_t));
       tsig->name = strdup(tok.value);
       free_token(&tok);
       tok = get_next_token(&ctx);
@@ -1199,7 +1208,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             free_token(&tok);
             return -1;
           }
-          log_channel_t *ch = calloc(1, sizeof(log_channel_t));
+          log_channel_t *ch = safe_calloc_or_die(1, sizeof(log_channel_t));
           ch->name = strdup(tok.value);
           free_token(&tok);
           ch->fd = -1;
@@ -1374,9 +1383,9 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
     return -1;
   }
   if (!saw_view_block) {
-    view_config_t *default_view = calloc(1, sizeof(view_config_t));
+    view_config_t *default_view = safe_calloc_or_die(1, sizeof(view_config_t));
     default_view->name = strdup("__default__");
-    default_view->match_clients = calloc(1, sizeof(char *));
+    default_view->match_clients = safe_calloc_or_die(1, sizeof(char *));
     default_view->match_clients[0] = strdup("any");
     default_view->match_clients_count = 1;
     default_view->zones = config->zones;
@@ -1389,7 +1398,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   zone_config_t *flat_tail = NULL;
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
-      zone_config_t *dup_z = calloc(1, sizeof(zone_config_t));
+      zone_config_t *dup_z = safe_calloc_or_die(1, sizeof(zone_config_t));
       *dup_z = *z;
       dup_z->next = NULL;
       if (!flat_zones) {
