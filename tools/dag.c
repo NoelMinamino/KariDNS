@@ -4065,8 +4065,10 @@ int main(int argc, char **argv) {
                            no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
         }
     }
-
-    print_multi_server_summary(use_ldnsz);
+    bool used_nofail_failover = qo.nofail && (!test_all) && (!do_trace) && (!do_nssearch) && (!batch_file) && (server_arg && strchr(server_arg, ',') != NULL);
+    if (!used_nofail_failover) {
+        print_multi_server_summary(use_ldnsz);
+    }
 
     zone_arena_destroy(&g_dag_arena);
     if (g_results) free(g_results);
