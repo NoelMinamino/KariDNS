@@ -42,29 +42,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         parse_named_conf(text_buf, &config);
 
         // Free the allocations made by parse_named_conf
-        for (int j = 0; j < config.bind_address_count; j++) {
-            free(config.bind_addresses[j]);
-        }
-        if (config.bind_addresses) free(config.bind_addresses);
-        zone_config_t *curr = config.zones;
-        while (curr) {
-            zone_config_t *next = curr->next;
-            free_zone_config(curr);
-            curr = next;
-        }
-        tsig_key_t *k = config.keys;
-        while (k) {
-            tsig_key_t *next_k = k->next;
-            free(k->name); free(k->algorithm); free(k->secret);
-            free(k);
-            k = next_k;
-        }
-        if (config.control.algorithm) free(config.control.algorithm);
-        if (config.control.secret) free(config.control.secret);
-        free_logging_channels(&config);
-        if (config.user) free(config.user);
-        if (config.group) free(config.group);
-        free_rate_limit_config(&config.rrl);
+        free_server_config_fields(&config);
     } 
     else if (selector % 3 == 1) {
         // 2. Fuzz parse_zone_fast (Zone file parser)
