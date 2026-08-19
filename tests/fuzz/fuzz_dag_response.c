@@ -25,7 +25,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // print_response() は recv() で受信した生パケットをそのまま解釈・表示する
     // エントリポイントであり、dag.c が実際にネットワークから受け取るデータと
     // 同じ経路をそのまま辿る。
-    print_response(data, size, &axfr_state);
+    display_opts_t dopt;
+    memset(&dopt, 0, sizeof(dopt));
+    dopt.show_question = true;
+    dopt.show_answer = true;
+    dopt.show_authority = true;
+    dopt.show_additional = true;
+
+    print_response(data, size, &axfr_state, &dopt);
 
     return 0;
 }

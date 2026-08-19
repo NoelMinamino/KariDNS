@@ -65,7 +65,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         // 修正前のコードではここでASanがheap-buffer-overflowを検出する
         // (dns_wire.c内、Time Signed/Fudgeをpre_macへmemcpyする箇所)。
         // 修正後は安全に完走する。
-        tsig_verify_packet(pkt, off, &key, mac_out, &mac_len_out);
+        tsig_verify_packet(pkt, off, &key, NULL, 0, mac_out, &mac_len_out);
     }
 
     if (size < 10) return 0;
@@ -100,7 +100,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     uint8_t mac_out[64]; /* >= EVP_MAX_MD_SIZE */
     static_assert(sizeof(mac_out) >= 64, "mac_out must be >= EVP_MAX_MD_SIZE (64)");
     size_t mac_len_out = 0;
-    tsig_verify_packet(pkt, pkt_len, &key, mac_out, &mac_len_out);
+    tsig_verify_packet(pkt, pkt_len, &key, NULL, 0, mac_out, &mac_len_out);
 
     return 0;
 }

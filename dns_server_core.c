@@ -306,10 +306,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
 
   size_t idx = hash & (RRL_TABLE_SIZE - 1);
   rrl_bucket_t *b = &g_rrl_table[idx];
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-
   while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
 #if defined(__x86_64__) || defined(__i386__)
       __asm__ volatile("pause" ::: "memory");
@@ -317,6 +313,10 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       sched_yield();
 #endif
   }
+
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
   if (b->client_hash != full_hash) {
     // Hash collision or new entry
@@ -1054,6 +1054,8 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
          txn->deleted[d_idx].generic_data = arena_alloc(&txn->arena, old_arena->records[i].generic_len);
          memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
       }
+      txn->deleted[d_idx].is_cached = false;
+      dns_record_preparse_cache(&txn->arena, &txn->deleted[d_idx]);
       d_idx++;
     }
   }
@@ -1073,6 +1075,8 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
          txn->added[a_idx].generic_data = arena_alloc(&txn->arena, new_arena->records[i].generic_len);
          memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
       }
+      txn->added[a_idx].is_cached = false;
+      dns_record_preparse_cache(&txn->arena, &txn->added[a_idx]);
       a_idx++;
     }
   }
@@ -1097,7 +1101,7 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
 }
 
 
-static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path) {
+static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
@@ -1106,6 +1110,18 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path) {
     if (fd < 0) {
         return NULL;
     }
+    
+    if (out_dev || out_ino) {
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            if (out_dev) *out_dev = st.st_dev;
+            if (out_ino) *out_ino = st.st_ino;
+        } else {
+            close(fd);
+            return NULL; // fstat failed, fail-closed
+        }
+    }
+
     FILE *f = fdopen(fd, "rb");
     if (!f) {
         close(fd);
@@ -1137,7 +1153,9 @@ typedef enum {
 } reload_result_t;
 
 static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *file) {
-  char *buf = read_entire_file(file);
+  dev_t root_dev = 0;
+  ino_t root_ino = 0;
+  char *buf = read_entire_file(file, &root_dev, &root_ino);
   if (!buf) {
     syslog(LOG_ERR, "[Zone] Failed to read file '%s' for zone '%s'.", file, entry->domain);
     return RELOAD_ERR_FILE_READ;
@@ -1159,6 +1177,8 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 
   char *root_ttl = NULL;
   char *visited_paths[16];
+  dev_t visited_devs[16];
+  ino_t visited_inos[16];
   
   char abs_file[PATH_MAX];
   if (file[0] != '/' && g_startup_cwd[0] != '\0') {
@@ -1183,9 +1203,13 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   ctx.load_file_cb = server_load_file_cb;
   ctx.shared_ttl_io = &root_ttl;
   ctx.visited_paths = visited_paths;
+  ctx.visited_devs = visited_devs;
+  ctx.visited_inos = visited_inos;
   ctx.visited_cap = 16;
   ctx.visited_count = 1;
   ctx.visited_paths[0] = root_path;
+  ctx.visited_devs[0] = root_dev;
+  ctx.visited_inos[0] = root_ino;
   ctx.err_out = &parse_err;
 
   int count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
@@ -2111,6 +2135,8 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     } else
       d_rec->generic_data = NULL;
     d_rec->next_record = -1;
+    d_rec->is_cached = false;
+    dns_record_preparse_cache(dst, d_rec);
   }
 }
 
@@ -2229,7 +2255,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
     }
-    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, NULL) != 0) {
+    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, 0, NULL, NULL) != 0) {
       syslog(LOG_ERR, "[AXFR] TSIG failed");
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
@@ -2452,9 +2478,13 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       res[3] |= 0x02;
       return;
     }
+    
+    // ==== フェーズ1: 委任判定 ====
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
                         max_res_len, offset, comp_ctx, nscount, arcount))
       return;
+      
+    // ==== フェーズ2: QNAME完全一致検索 ====
     bool found = false, type_matched = false, cname_followed = false;
     uint32_t hash = calc_fnv1a_str(current_qname);
     size_t idx = hash & (current_zone->hash_size - 1);
@@ -2544,6 +2574,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
       }
     }
+    
+    // ==== フェーズ3: DNAME合成 ====
     if (!found) {
       bool dname_found = false;
       const char *dname_parent = current_qname;
@@ -2588,6 +2620,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
         if (dname_found) break;
       }
+      
+      // ==== フェーズ4: ワイルドカード合成 ====
       if (!dname_found) {
         const char *parent = current_qname;
         char wc_name[256];
@@ -2658,6 +2692,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
       }
     }
+    
+    // ==== フェーズ5: CNAMEチェーン処理・クロスゾーン切り替え ====
     if (cname_followed) {
       size_t cq_len = strlen(current_qname), z_len = strlen(db_entry->domain);
       bool in_zone = false;
@@ -2710,6 +2746,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           return;
       }
     }
+    
+    // ==== フェーズ6: 複数QTYPE追加解決 ====
     bool all_matched = type_matched;
     uint32_t included_mask = 0;
     if (found && num_qtypes > 1) {
@@ -2779,6 +2817,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     }
     if (qtx_included_out) *qtx_included_out = included_mask;
 
+    // ==== フェーズ7: ネガティブ応答(SOA)付加 ====
     if (!found || !type_matched) {
       if (!found)
         res[3] |= 3;
@@ -2805,6 +2844,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       }
     }
     
+    // ==== フェーズ8: NSEC付加 ====
     resolve_checkpoint_t nsec_cp = save_checkpoint(offset, ancount, nscount, arcount);
     bool nsec_failed = false;
     if (found && !all_matched && dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
@@ -2832,6 +2872,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       restore_checkpoint(&nsec_cp, offset, ancount, nscount, arcount);
     }
     
+    // ==== フェーズ9: Authority NS/Glue付加 ====
     bool needs_ns = false;
     if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
     if (type_matched && !minimal_responses && needs_ns) {
@@ -2951,6 +2992,8 @@ static void bump_soa_serial_in_arena(zone_arena_t *arena) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%u", serial);
         arena->records[i].rdata[2] = arena_strdup(arena, buf);
+        arena->records[i].is_cached = false;
+        dns_record_preparse_cache(arena, &arena->records[i]);
       }
       break;
     }
@@ -3227,7 +3270,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
             auth = false;
           } else {
             attempted_key = matched_key;
-            int err = tsig_verify_packet(req, req_len, matched_key, tsig_mac, &tsig_mac_len);
+            int err = tsig_verify_packet(req, req_len, matched_key, NULL, 0, tsig_mac, &tsig_mac_len);
             if (err != 0) {
               auth = false;
               tsig_error_code = err > 0 ? err : 16;
@@ -3303,7 +3346,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
           }
           if (key_allowed) {
             attempted_key = k;
-            int err = tsig_verify_packet(req, req_len, k, tsig_mac, &tsig_mac_len);
+            int err = tsig_verify_packet(req, req_len, k, NULL, 0, tsig_mac, &tsig_mac_len);
             if (err == 0) {
               matched_key = k;
               auth = true;
@@ -4947,7 +4990,7 @@ worker_startup_success:;
                 if (!matched_key) {
                   tsig_error = 17;
                 } else {
-                  int err = tsig_verify_packet(msg, msg_len, matched_key, tsig_mac, &tsig_mac_len);
+                  int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, tsig_mac, &tsig_mac_len);
                   if (err != 0) {
                     tsig_error = err > 0 ? err : 16;
                   } else {
@@ -5259,7 +5302,7 @@ static void free_server_config_fields(server_config_t *cfg) {
 
 static void perform_config_reload(void) {
   g_last_configured_time = time(NULL);
-  char *config_str = read_entire_file(g_config_path);
+  char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
     return;
   server_config_t *active =
@@ -6108,7 +6151,7 @@ int main(int argc, char **argv) {
   sigaddset(&set, SIGHUP);
   sigprocmask(SIG_BLOCK, &set, NULL);
 
-  char *config_str = read_entire_file(g_config_path);
+  char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
     return 1;
   if (parse_named_conf(config_str, &g_config_db.config_a) != 0) {

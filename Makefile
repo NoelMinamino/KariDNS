@@ -1,7 +1,15 @@
 # Makefile for karidns (FreeBSD)
 
+HAS_LIBIDN2 != pkg info -e libidn2 >/dev/null 2>&1 && echo yes || echo no
+.if "${HAS_LIBIDN2}" == "yes"
+CFLAGS += -DHAVE_LIBIDN2 -I/usr/local/include
+IDN_LDFLAGS = -L/usr/local/lib -lidn2
+.else
+IDN_LDFLAGS =
+.endif
+
 CC = cc
-CFLAGS = -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
+CFLAGS += -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
 HARDEN_LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 LDFLAGS = -pthread -lcrypto -lm $(HARDEN_LDFLAGS)
 
@@ -25,7 +33,7 @@ FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
 FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_utils.c
 
 FUZZ_ZONE_TARGET = tests/fuzz/fuzz_zone_parser
-FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c dns_utils.c
+FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c dns_utils.c dns_wire.c
 
 FUZZ_CONF_TARGET = tests/fuzz/fuzz_conf_parser
 FUZZ_CONF_SRCS = tests/fuzz/fuzz_conf_parser.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_utils.c
@@ -50,7 +58,7 @@ $(KARICTL_TARGET): $(KARICTL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lcrypto $(HARDEN_LDFLAGS)
 
 $(DAG_TARGET): $(DAG_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz $(IDN_LDFLAGS)
 
 karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o
 	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o -o karicheck $(LDFLAGS) -lcrypto
@@ -131,7 +139,7 @@ karicheck-asan: $(KARICHECK_ASAN_SRCS)
 
 DAG_ASAN_SRCS = tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c
 dag-asan: $(DAG_ASAN_SRCS)
-	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lz
+	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lz $(IDN_LDFLAGS)
 
 KARICTL_ASAN_SRCS = tools/karictl.c
 karictl-asan: $(KARICTL_ASAN_SRCS)

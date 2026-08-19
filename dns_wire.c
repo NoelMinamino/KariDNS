@@ -143,13 +143,19 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
 int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) {
     while (1) {
         if (*offset >= packet_len) return -1;
-        uint8_t len = packet[*offset];
-        if (len == 0) { (*offset)++; break; }
-        if ((len & 0xC0) == 0xC0) {
+        uint8_t raw = packet[*offset];
+        uint8_t label_type = raw & 0xC0;
+        if (label_type == 0xC0) {
             if (*offset + 2 > packet_len) return -1;
             *offset += 2; break;
+        } else if (label_type == 0x00) {
+            uint8_t len = raw;
+            if (len > 63) return -1;
+            if (len == 0) { (*offset)++; break; }
+            *offset += 1 + len;
+        } else {
+            return -1;
         }
-        *offset += 1 + len;
     }
     return 0;
 }
@@ -159,10 +165,11 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
     uint16_t visited[MAX_JUMPS];
     while (1) {
         if (p >= packet_len) return -1;
-        uint8_t len = packet[p];
-        if ((len & 0xC0) == 0xC0) {
+        uint8_t raw = packet[p];
+        uint8_t label_type = raw & 0xC0;
+        if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
-            uint16_t ptr = ((len & 0x3F) << 8) | packet[p+1];
+            uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
             if (jump_count >= MAX_JUMPS) return -1;
             for (int i = 0; i < jump_count; i++) {
@@ -170,9 +177,14 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
             }
             visited[jump_count++] = ptr;
             p = ptr; continue;
+        } else if (label_type == 0x00) {
+            uint8_t len = raw;
+            if (len > 63) return -1;
+            if (len == 0) { p++; break; }
+            p += 1 + len;
+        } else {
+            return -1;
         }
-        if (len == 0) { p++; break; }
-        p += 1 + len;
     }
     *next_offset = jumped ? jumped_offset : p; return 0;
 }
@@ -183,10 +195,12 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
     char buf[257]; size_t written = 0;
     while (1) {
         if (p >= packet_len) return -1;
-        uint8_t len = packet[p];
-        if ((len & 0xC0) == 0xC0) {
+        uint8_t raw = packet[p];
+        uint8_t label_type = raw & 0xC0;
+        uint8_t len;
+        if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
-            uint16_t ptr = ((len & 0x3F) << 8) | packet[p+1];
+            uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
             if (jump_count >= MAX_JUMPS) return -1;
             for (int i = 0; i < jump_count; i++) {
@@ -194,6 +208,11 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             }
             visited[jump_count++] = ptr;
             p = ptr; continue;
+        } else if (label_type == 0x00) {
+            len = raw;
+            if (len > 63) return -1;
+        } else {
+            return -1;
         }
         p++;
         if (len == 0) {
@@ -332,6 +351,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         rec->generic_len = rdlen;
         rec->rdata_count = 0;
     }
+    dns_record_preparse_cache(arena, rec);
     *offset += rdlen; return 0;
 }
 
@@ -695,7 +715,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     return 0;
 }
 
-int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, uint8_t *mac_out, size_t *mac_len_out) {
+int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, const uint8_t *prior_mac, size_t prior_mac_len, uint8_t *mac_out, size_t *mac_len_out) {
     if (!key || packet_len < DNS_HEADER_SIZE) return -1;
     uint16_t arcount = (packet[10] << 8) | packet[11];
     if (arcount == 0) return -1;
@@ -723,6 +743,8 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     if (tsig_p + 10 > packet_len) return -1;
     uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p+1];
     if (type != 250) return -1;
+    uint16_t class = (packet[tsig_p+2] << 8) | packet[tsig_p+3];
+    if (class != 255) return -1;
     tsig_p += 10;
     size_t alg_start = tsig_p;
     char wire_alg_name[256];
@@ -756,18 +778,27 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     size_t keyname_wire_len = wire_name_length(key->name);
     size_t alg_wire_len = wire_name_length(wire_alg_name);
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
-    size_t pre_mac_cap = last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
+    size_t pre_mac_cap = prior_mac_len + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
     
     uint8_t *pre_mac = NULL;
     bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
     if (use_malloc) pre_mac = malloc(pre_mac_cap);
     else pre_mac = g_tsig_pre_mac_buf;
     if (!pre_mac) return -1;
-    memcpy(pre_mac, packet, last_rr_offset);
-    pre_mac[0] = orig_id >> 8; pre_mac[1] = orig_id & 0xFF;
+    
+    size_t p_offset = 0;
+    if (prior_mac && prior_mac_len > 0) {
+        pre_mac[p_offset++] = prior_mac_len >> 8;
+        pre_mac[p_offset++] = prior_mac_len & 0xFF;
+        memcpy(&pre_mac[p_offset], prior_mac, prior_mac_len);
+        p_offset += prior_mac_len;
+    }
+    
+    memcpy(&pre_mac[p_offset], packet, last_rr_offset);
+    pre_mac[p_offset + 0] = orig_id >> 8; pre_mac[p_offset + 1] = orig_id & 0xFF;
     uint16_t new_arcount = arcount - 1;
-    pre_mac[10] = new_arcount >> 8; pre_mac[11] = new_arcount & 0xFF;
-    size_t p_offset = last_rr_offset;
+    pre_mac[p_offset + 10] = new_arcount >> 8; pre_mac[p_offset + 11] = new_arcount & 0xFF;
+    p_offset += last_rr_offset;
     long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
     if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
     p_offset += (size_t)w3;
@@ -1022,17 +1053,27 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 1: { // A
                 if (rec->rdata_count == 0) return -1;
                 if (offset + 4 > max_res_len) return -1;
-                struct in_addr addr;
-                if (inet_pton(AF_INET, rec->rdata[0], &addr) != 1) return -1;
-                memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
+                if (rec->is_cached) {
+                    memcpy(&res[offset], &rec->cache.a.addr.s_addr, 4);
+                } else {
+                    struct in_addr addr;
+                    if (inet_pton(AF_INET, rec->rdata[0], &addr) != 1) return -1;
+                    memcpy(&res[offset], &addr.s_addr, 4);
+                }
+                offset += 4;
                 break;
             }
             case 28: { // AAAA
                 if (rec->rdata_count == 0) return -1;
                 if (offset + 16 > max_res_len) return -1;
-                struct in6_addr addr;
-                if (inet_pton(AF_INET6, rec->rdata[0], &addr) != 1) return -1;
-                memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
+                if (rec->is_cached) {
+                    memcpy(&res[offset], &rec->cache.aaaa.addr.s6_addr, 16);
+                } else {
+                    struct in6_addr addr;
+                    if (inet_pton(AF_INET6, rec->rdata[0], &addr) != 1) return -1;
+                    memcpy(&res[offset], &addr.s6_addr, 16);
+                }
+                offset += 16;
                 break;
             }
             case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR
@@ -1050,21 +1091,39 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 15: { // MX
                 if (rec->rdata_count < 2) return -1;
                 if (offset + 2 > max_res_len) return -1;
-                uint16_t pref = atoi(rec->rdata[0]);
+                uint16_t pref;
+                const char *target;
+                if (rec->is_cached) {
+                    pref = rec->cache.mx.pref;
+                    target = rec->cache.mx.target;
+                } else {
+                    pref = atoi(rec->rdata[0]);
+                    target = rec->rdata[1];
+                }
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-                if (write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                if (write_dns_name_str(res, &offset, target, comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
                 break;
             }
             case 33: { // SRV (RFC 2782: 圧縮禁止)
                 if (rec->rdata_count < 4) return -1;
                 if (offset + 6 > max_res_len) return -1;
-                uint16_t prio = atoi(rec->rdata[0]);
-                uint16_t weight = atoi(rec->rdata[1]);
-                uint16_t port = atoi(rec->rdata[2]);
+                uint16_t prio, weight, port;
+                const char *target;
+                if (rec->is_cached) {
+                    prio = rec->cache.srv.priority;
+                    weight = rec->cache.srv.weight;
+                    port = rec->cache.srv.port;
+                    target = rec->cache.srv.target;
+                } else {
+                    prio = atoi(rec->rdata[0]);
+                    weight = atoi(rec->rdata[1]);
+                    port = atoi(rec->rdata[2]);
+                    target = rec->rdata[3];
+                }
                 res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
                 res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
                 res[offset++] = port >> 8; res[offset++] = port & 0xFF;
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                long w = write_uncompressed_name(res, offset, max_res_len, target);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -1212,11 +1271,29 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 6: { // SOA
                 if (rec->rdata_count < 7) return -1;
-                if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 ||
-                    write_dns_name_str(res, &offset, rec->rdata[1], comp_ctx, max_res_len) != 0) return -1;
+                const char *mname;
+                const char *rname;
+                uint32_t numbers[5];
+                if (rec->is_cached) {
+                    mname = rec->cache.soa.mname;
+                    rname = rec->cache.soa.rname;
+                    numbers[0] = rec->cache.soa.serial;
+                    numbers[1] = rec->cache.soa.refresh;
+                    numbers[2] = rec->cache.soa.retry;
+                    numbers[3] = rec->cache.soa.expire;
+                    numbers[4] = rec->cache.soa.minimum;
+                } else {
+                    mname = rec->rdata[0];
+                    rname = rec->rdata[1];
+                    for (int j = 0; j < 5; j++) {
+                        numbers[j] = strtoul(rec->rdata[j + 2], NULL, 10);
+                    }
+                }
+                if (write_dns_name_str(res, &offset, mname, comp_ctx, max_res_len) != 0 ||
+                    write_dns_name_str(res, &offset, rname, comp_ctx, max_res_len) != 0) return -1;
                 if (offset + 20 > max_res_len) return -1;
-                for (int j = 2; j < 7; j++) {
-                    uint32_t val = strtoul(rec->rdata[j], NULL, 10);
+                for (int j = 0; j < 5; j++) {
+                    uint32_t val = numbers[j];
                     res[offset++] = val >> 24; res[offset++] = (val >> 16) & 0xFF; res[offset++] = (val >> 8) & 0xFF; res[offset++] = val & 0xFF;
                 }
                 break;
@@ -1368,14 +1445,33 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 46: { // RRSIG
                 if (rec->rdata_count < 9) return -1;
-                uint16_t type_covered = get_type_code(rec->rdata[0]);
-                uint8_t algorithm = atoi(rec->rdata[1]);
-                uint8_t labels = atoi(rec->rdata[2]);
-                uint32_t orig_ttl = strtoul(rec->rdata[3], NULL, 10);
-                uint32_t sig_exp = parse_dnssec_time(rec->rdata[4]);
-                uint32_t sig_inc = parse_dnssec_time(rec->rdata[5]);
-                uint16_t key_tag = atoi(rec->rdata[6]);
-                const char *signer = rec->rdata[7];
+                uint16_t type_covered;
+                uint8_t algorithm;
+                uint8_t labels;
+                uint32_t orig_ttl;
+                uint32_t sig_exp;
+                uint32_t sig_inc;
+                uint16_t key_tag;
+                const char *signer;
+                if (rec->is_cached) {
+                    type_covered = rec->cache.rrsig.type_covered;
+                    algorithm = rec->cache.rrsig.algorithm;
+                    labels = rec->cache.rrsig.labels;
+                    orig_ttl = rec->cache.rrsig.orig_ttl;
+                    sig_exp = rec->cache.rrsig.sig_exp;
+                    sig_inc = rec->cache.rrsig.sig_inc;
+                    key_tag = rec->cache.rrsig.key_tag;
+                    signer = rec->cache.rrsig.signer;
+                } else {
+                    type_covered = get_type_code(rec->rdata[0]);
+                    algorithm = atoi(rec->rdata[1]);
+                    labels = atoi(rec->rdata[2]);
+                    orig_ttl = strtoul(rec->rdata[3], NULL, 10);
+                    sig_exp = parse_dnssec_time(rec->rdata[4]);
+                    sig_inc = parse_dnssec_time(rec->rdata[5]);
+                    key_tag = atoi(rec->rdata[6]);
+                    signer = rec->rdata[7];
+                }
 
                 if (offset + 18 > max_res_len) return -1;
                 res[offset++] = type_covered >> 8; res[offset++] = type_covered & 0xFF;
@@ -1393,9 +1489,15 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (w < 0) return -1;
                 offset += w;
 
-                size_t off = offset;
-                if (decode_concat_b64_rdata(&rec->rdata[8], rec->rdata_count - 8, res, max_res_len, &off) != 0) return -1;
-                offset = off;
+                if (rec->is_cached && rec->cache.rrsig.signature) {
+                    if (offset + rec->cache.rrsig.signature_len > max_res_len) return -1;
+                    memcpy(&res[offset], rec->cache.rrsig.signature, rec->cache.rrsig.signature_len);
+                    offset += rec->cache.rrsig.signature_len;
+                } else {
+                    size_t off = offset;
+                    if (decode_concat_b64_rdata(&rec->rdata[8], rec->rdata_count - 8, res, max_res_len, &off) != 0) return -1;
+                    offset = off;
+                }
                 break;
             }
             case 47: { // NSEC
@@ -1886,11 +1988,18 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
         bool is_opt = (i >= qdcount + ancount_req + nscount_req);
         
         while (scan_offset < req_len) {
-            uint8_t len = req[scan_offset];
-            if (len == 0) { scan_offset++; break; }
-            if ((len & 0xC0) == 0xC0) { scan_offset += 2; break; }
-            if (scan_offset + len + 1 > req_len) return -1;
-            scan_offset += len + 1;
+            uint8_t raw = req[scan_offset];
+            uint8_t label_type = raw & 0xC0;
+            if (label_type == 0xC0) { scan_offset += 2; break; }
+            else if (label_type == 0x00) {
+                uint8_t len = raw;
+                if (len > 63) return -1;
+                if (len == 0) { scan_offset++; break; }
+                if (scan_offset + len + 1 > req_len) return -1;
+                scan_offset += len + 1;
+            } else {
+                return -1;
+            }
         }
         
         if (i < qdcount) {
@@ -2307,4 +2416,81 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     standby->count = write_idx;
 
     return 0; // NOERROR
+}
+
+// ============================================================================
+// dns_record_preparse_cache
+// ============================================================================
+void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
+    if (!rec || !rec->rdata_count) return;
+    
+    rec->is_cached = false;
+    
+    switch (rec->type_code) {
+        case 1: // A
+            if (inet_pton(AF_INET, rec->rdata[0], &rec->cache.a.addr) == 1) rec->is_cached = true;
+            break;
+        case 28: // AAAA
+            if (inet_pton(AF_INET6, rec->rdata[0], &rec->cache.aaaa.addr) == 1) rec->is_cached = true;
+            break;
+        case 6: // SOA
+            if (rec->rdata_count >= 7) {
+                rec->cache.soa.mname = rec->rdata[0];
+                rec->cache.soa.rname = rec->rdata[1];
+                rec->cache.soa.serial = strtoul(rec->rdata[2], NULL, 10);
+                rec->cache.soa.refresh = strtoul(rec->rdata[3], NULL, 10);
+                rec->cache.soa.retry = strtoul(rec->rdata[4], NULL, 10);
+                rec->cache.soa.expire = strtoul(rec->rdata[5], NULL, 10);
+                rec->cache.soa.minimum = strtoul(rec->rdata[6], NULL, 10);
+                rec->is_cached = true;
+            }
+            break;
+        case 15: // MX
+            if (rec->rdata_count >= 2) {
+                rec->cache.mx.pref = atoi(rec->rdata[0]);
+                rec->cache.mx.target = rec->rdata[1];
+                rec->is_cached = true;
+            }
+            break;
+        case 46: // RRSIG
+            if (rec->rdata_count >= 9) {
+                rec->cache.rrsig.type_covered = get_type_code(rec->rdata[0]);
+                rec->cache.rrsig.algorithm = atoi(rec->rdata[1]);
+                rec->cache.rrsig.labels = atoi(rec->rdata[2]);
+                rec->cache.rrsig.orig_ttl = strtoul(rec->rdata[3], NULL, 10);
+                rec->cache.rrsig.sig_exp = parse_dnssec_time(rec->rdata[4]);
+                rec->cache.rrsig.sig_inc = parse_dnssec_time(rec->rdata[5]);
+                rec->cache.rrsig.key_tag = atoi(rec->rdata[6]);
+                rec->cache.rrsig.signer = rec->rdata[7];
+                rec->cache.rrsig.signature = NULL; 
+                rec->cache.rrsig.signature_len = 0;
+                
+                if (arena) {
+                    size_t b64_len = strlen(rec->rdata[8]);
+                    for (int i = 9; i < rec->rdata_count; i++) {
+                        b64_len += strlen(rec->rdata[i]);
+                    }
+                    size_t max_dec_len = b64_len * 3 / 4 + 4;
+                    uint8_t *dec_buf = arena_alloc(arena, max_dec_len);
+                    if (dec_buf) {
+                        size_t real_len;
+                        if (decode_concat_b64_rdata(&rec->rdata[8], rec->rdata_count - 8, dec_buf, max_dec_len, &real_len) == 0) {
+                            rec->cache.rrsig.signature = dec_buf;
+                            rec->cache.rrsig.signature_len = real_len;
+                        }
+                    }
+                }
+                rec->is_cached = true;
+            }
+            break;
+        case 33: // SRV
+            if (rec->rdata_count >= 4) {
+                rec->cache.srv.priority = atoi(rec->rdata[0]);
+                rec->cache.srv.weight = atoi(rec->rdata[1]);
+                rec->cache.srv.port = atoi(rec->rdata[2]);
+                rec->cache.srv.target = rec->rdata[3];
+                rec->is_cached = true;
+            }
+            break;
+    }
 }

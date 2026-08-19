@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 // Forward declarations
 struct server_config_s;
@@ -69,7 +71,51 @@ typedef struct {
     uint16_t generic_len;
     uint8_t *generic_data;
     int next_record; // Index of next record with same hash, -1 if none
+    
+    bool is_cached;
+    union {
+        struct {
+            struct in_addr addr;
+        } a;
+        struct {
+            struct in6_addr addr;
+        } aaaa;
+        struct {
+            char *mname;
+            char *rname;
+            uint32_t serial;
+            uint32_t refresh;
+            uint32_t retry;
+            uint32_t expire;
+            uint32_t minimum;
+        } soa;
+        struct {
+            uint16_t pref;
+            char *target;
+        } mx;
+        struct {
+            uint16_t type_covered;
+            uint8_t algorithm;
+            uint8_t labels;
+            uint32_t orig_ttl;
+            uint32_t sig_exp;
+            uint32_t sig_inc;
+            uint16_t key_tag;
+            char *signer;
+            uint8_t *signature;
+            size_t signature_len;
+        } rrsig;
+        struct {
+            uint16_t priority;
+            uint16_t weight;
+            uint16_t port;
+            char *target;
+        } srv;
+    } cache;
 } dns_record_t;
+
+// Cache preparse function
+void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec);
 
 // 名前圧縮用ハッシュエントリ
 typedef struct {
@@ -156,6 +202,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
 // 注意: mac_out は最低 EVP_MAX_MD_SIZE (64) バイトを確保すること。
 // mac_len_out には実際にコピーされたバイト数（<= EVP_MAX_MD_SIZE）が返る。
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
+                       const uint8_t *prior_mac, size_t prior_mac_len,
                        uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
                        size_t *mac_len_out);
 
