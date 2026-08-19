@@ -49,10 +49,10 @@ view "default" {
 EOF
 
 # Build the OOM wrapper
-cc -shared -fPIC -o oom_coo_wrapper.so ../tests/oom_coo_wrapper.c -ldl
+cc -shared -fPIC -o oom_coo_wrapper.so ../tests/oom_coo_wrapper.c -ldl -lexecinfo
 
 echo "[+] Starting KariDNS with OOM wrapper..."
-LD_PRELOAD=./oom_coo_wrapper.so ../karidns -c karidns.conf -d > karidns.log 2>&1 &
+OOM_FAIL_AFTER_NTH_MATCHING_CALL=1 LD_PRELOAD=./oom_coo_wrapper.so ../karidns -f karidns.conf  > karidns.log 2>&1 &
 KARIDNS_PID=$!
 
 sleep 2
