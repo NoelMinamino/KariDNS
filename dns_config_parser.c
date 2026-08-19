@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <openssl/evp.h>
 #include <sys/stat.h>
+#include <limits.h>
 #include "dns_wire.h"
 
 
@@ -666,6 +667,20 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   return 0;
 }
 
+static int parse_buffer_size_value(const char *str) {
+  if (!str || !*str) return 0;
+  char *endptr = NULL;
+  long long val = strtoll(str, &endptr, 10);
+  if (val <= 0) return 0;
+  if (endptr && *endptr) {
+    if (*endptr == 'k' || *endptr == 'K') val *= 1024;
+    else if (*endptr == 'm' || *endptr == 'M') val *= 1024 * 1024;
+    else if (*endptr == 'g' || *endptr == 'G') val *= 1024 * 1024 * 1024;
+  }
+  if (val > INT_MAX) val = INT_MAX;
+  return (int)val;
+}
+
 int parse_named_conf(const char *config_str, server_config_t *config) {
   token_ctx_t ctx = {config_str, 0, strlen(config_str)};
   config->port = 53;
@@ -684,6 +699,8 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   config->minimal_any_ttl = 86400;
   config->max_mqtypes = 4;
   config->rfc10029_mqtype_enable = false;
+  config->udp_recvbuf_size = 4 * 1024 * 1024;
+  config->udp_sndbuf_size = 4 * 1024 * 1024;
   bool saw_view_block = false;
   bool saw_top_level_zone = false;
   view_config_t *last_view = NULL;
@@ -922,6 +939,40 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
           config->minimal_any_ttl = strtoul(tok.value, NULL, 10);
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "udp-recvbuf-size") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          int sz = parse_buffer_size_value(tok.value);
+          if (sz > 0) config->udp_recvbuf_size = sz;
+          free_token(&tok);
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "udp-sndbuf-size") == 0) {
+          tok = get_next_token(&ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          int sz = parse_buffer_size_value(tok.value);
+          if (sz > 0) config->udp_sndbuf_size = sz;
           free_token(&tok);
           tok = get_next_token(&ctx);
           if (tok.type != TOKEN_SEMICOLON) {

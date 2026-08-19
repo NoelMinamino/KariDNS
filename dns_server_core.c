@@ -5991,6 +5991,41 @@ static void daemonize(void) {
     cap_rights_limit(stdio_fd, &io_rights);
 }
 
+static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
+  if (desired_rcv > 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
+      syslog(LOG_WARNING, "[Network] Failed to set SO_RCVBUF to %d: %m", desired_rcv);
+    } else {
+      int actual_rcv = 0;
+      socklen_t optlen = sizeof(actual_rcv);
+      if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) == 0) {
+        if (actual_rcv < desired_rcv) {
+          syslog(LOG_WARNING,
+                 "[Network] UDP SO_RCVBUF truncated by OS: requested %d bytes, got %d bytes "
+                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
+                 desired_rcv, actual_rcv);
+        }
+      }
+    }
+  }
+  if (desired_snd > 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &desired_snd, sizeof(desired_snd)) != 0) {
+      syslog(LOG_WARNING, "[Network] Failed to set SO_SNDBUF to %d: %m", desired_snd);
+    } else {
+      int actual_snd = 0;
+      socklen_t optlen = sizeof(actual_snd);
+      if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) == 0) {
+        if (actual_snd < desired_snd) {
+          syslog(LOG_WARNING,
+                 "[Network] UDP SO_SNDBUF truncated by OS: requested %d bytes, got %d bytes "
+                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
+                 desired_snd, actual_snd);
+        }
+      }
+    }
+  }
+}
+
 static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
   g_num_ipc = num_workers;
   g_ipc_fds = calloc(num_workers, sizeof(int[2]));
@@ -6021,6 +6056,8 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int bind_count = cfg->bind_address_count;
   int opt = 1;
+  int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
+  int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
 
   for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
     struct sockaddr_in addr4;
@@ -6054,6 +6091,7 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
     if (is_v4 && g_num_udp_fds < MAX_BIND_ADDRS) {
       int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
       if (udp_fd >= 0) {
+        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
         fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
         if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0)
           g_udp_fds[g_num_udp_fds++] = udp_fd;
@@ -6064,6 +6102,7 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
     if (is_v6 && g_num_udp_fds < MAX_BIND_ADDRS) {
       int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
       if (udp_fd >= 0) {
+        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
         fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
         setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
         if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0)

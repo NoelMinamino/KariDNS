@@ -109,6 +109,8 @@ typedef struct server_config_s {
   bool tcp_connection_reuse;
   uint32_t tcp_idle_timeout;
   char *nsid_string;
+  int udp_recvbuf_size;
+  int udp_sndbuf_size;
 } server_config_t;
 
 typedef enum {

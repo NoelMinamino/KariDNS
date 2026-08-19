@@ -8,6 +8,11 @@ options {
     user "named";
     group "named";
 
+    // UDPソケットバッファサイズ (未指定時のデフォルト: 4M)
+    // OSの上限値(kern.ipc.maxsockbuf sysctl)を超えると切り詰められます
+    udp-recvbuf-size 4M;
+    udp-sndbuf-size 4M;
+
     // Response Rate Limiting (RRL) - DNSリフレクション攻撃対策
     // 指定しない場合はRRLは無効（制限なし）となります
     rate-limit {
