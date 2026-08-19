@@ -2561,7 +2561,7 @@ static void usage(const char *prog) {
         "          [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie]\n"
         "          [+subnet=addr[/prefix]] [+bufsize=N] [+adflag] [+cdflag]\n"
         "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]] [+mqtype=TYPE[,TYPE...]]\n"
-        "          [+padding=N] [+timeout=N] [+tries=N] [+ldnsz]\n"
+        "          [+padding=N] [+timeout=N] [+tries=N] [+retry=N] [+ldnsz]\n"
         "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
         "          [--test-all] [--break <kind>[=<param>] ...]\n"
         "          [+nohexdump] [+nohexdump-query] [+nohexdump-response]\n"
@@ -2866,6 +2866,8 @@ int main(int argc, char **argv) {
             qo.timeout_sec = atoi(argv[i] + 9);
         } else if (strncmp(argv[i], "+tries=", 7) == 0) {
             qo.tries = atoi(argv[i] + 7);
+        } else if (strncmp(argv[i], "+retry=", 7) == 0) {
+            qo.tries = atoi(argv[i] + 7) + 1;
         } else if (strncmp(argv[i], "+padding=", 9) == 0) {
             qo.want_opt = true; qo.want_padding = true;
             qo.padding_size = atoi(argv[i] + 9);
