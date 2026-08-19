@@ -1053,7 +1053,7 @@ static ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
 /* ========================================================================
  * 7. Response pretty-printing (dig-style)
  * ==================================================================== */
-static const char *rcode_name(uint8_t rcode) {
+static const char *rcode_name(uint16_t rcode) {
     // Note: RCODEs 6 (YXDOMAIN), 7 (YXRRSET), 8 (NXRRSET) are only meaningful in
     // RFC 2136 DNS UPDATE responses (opcode_name(opcode) == "UPDATE"). In normal 
     // QUERY responses, they are undefined. We unconditionally return their UPDATE
@@ -1063,7 +1063,7 @@ static const char *rcode_name(uint8_t rcode) {
         case 3: return "NXDOMAIN"; case 4: return "NOTIMP"; case 5: return "REFUSED";
         case 6: return "YXDOMAIN"; case 7: return "YXRRSET"; case 8: return "NXRRSET";
         case 9: return "NOTAUTH"; case 16: return "BADVERS/BADSIG"; case 17: return "BADKEY";
-        case 18: return "BADTIME";
+        case 18: return "BADTIME"; case 23: return "BADCOOKIE";
         default: return "UNKNOWN";
     }
 }
@@ -2102,7 +2102,12 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
     uint16_t nscount = (pkt[8] << 8) | pkt[9];
     uint16_t arcount = (pkt[10] << 8) | pkt[11];
 
-    printf(";; ->>HEADER<<- opcode: %s, status: %s, id: %u\n", opcode_name(opcode), rcode_name(rcode), qid);
+    edns_info_t edns;
+    parse_edns_opt(pkt, pkt_len, qdcount, ancount, nscount, arcount, &edns);
+
+    uint16_t full_rcode = edns.present ? (((uint16_t)edns.ext_rcode << 4) | rcode) : rcode;
+
+    printf(";; ->>HEADER<<- opcode: %s, status: %s, id: %u\n", opcode_name(opcode), rcode_name(full_rcode), qid);
     printf(";; flags:%s%s%s%s%s%s; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n",
            qr ? " qr" : "", aa ? " aa" : "", tc ? " tc" : "", rd ? " rd" : "",
            ra ? " ra" : "", ad ? " ad" : "",
@@ -2144,8 +2149,6 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
     }
 
     {
-        edns_info_t edns;
-        parse_edns_opt(pkt, pkt_len, qdcount, ancount, nscount, arcount, &edns);
         if (edns.present) {
             printf("\n;; OPT PSEUDOSECTION:\n");
             printf("; EDNS: version: %d, flags:%s; udp: %d\n", edns.version, edns.dnssec_ok ? " do" : "", edns.udp_payload_size);
