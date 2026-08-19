@@ -2478,9 +2478,13 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       res[3] |= 0x02;
       return;
     }
+    
+    // ==== フェーズ1: 委任判定 ====
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
                         max_res_len, offset, comp_ctx, nscount, arcount))
       return;
+      
+    // ==== フェーズ2: QNAME完全一致検索 ====
     bool found = false, type_matched = false, cname_followed = false;
     uint32_t hash = calc_fnv1a_str(current_qname);
     size_t idx = hash & (current_zone->hash_size - 1);
@@ -2570,6 +2574,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
       }
     }
+    
+    // ==== フェーズ3: DNAME合成 ====
     if (!found) {
       bool dname_found = false;
       const char *dname_parent = current_qname;
@@ -2614,6 +2620,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
         if (dname_found) break;
       }
+      
+      // ==== フェーズ4: ワイルドカード合成 ====
       if (!dname_found) {
         const char *parent = current_qname;
         char wc_name[256];
@@ -2684,6 +2692,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
       }
     }
+    
+    // ==== フェーズ5: CNAMEチェーン処理・クロスゾーン切り替え ====
     if (cname_followed) {
       size_t cq_len = strlen(current_qname), z_len = strlen(db_entry->domain);
       bool in_zone = false;
@@ -2736,6 +2746,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           return;
       }
     }
+    
+    // ==== フェーズ6: 複数QTYPE追加解決 ====
     bool all_matched = type_matched;
     uint32_t included_mask = 0;
     if (found && num_qtypes > 1) {
@@ -2805,6 +2817,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     }
     if (qtx_included_out) *qtx_included_out = included_mask;
 
+    // ==== フェーズ7: ネガティブ応答(SOA)付加 ====
     if (!found || !type_matched) {
       if (!found)
         res[3] |= 3;
@@ -2831,6 +2844,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       }
     }
     
+    // ==== フェーズ8: NSEC付加 ====
     resolve_checkpoint_t nsec_cp = save_checkpoint(offset, ancount, nscount, arcount);
     bool nsec_failed = false;
     if (found && !all_matched && dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
@@ -2858,6 +2872,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       restore_checkpoint(&nsec_cp, offset, ancount, nscount, arcount);
     }
     
+    // ==== フェーズ9: Authority NS/Glue付加 ====
     bool needs_ns = false;
     if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
     if (type_matched && !minimal_responses && needs_ns) {
