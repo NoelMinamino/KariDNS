@@ -715,7 +715,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     return 0;
 }
 
-int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, uint8_t *mac_out, size_t *mac_len_out) {
+int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, const uint8_t *prior_mac, size_t prior_mac_len, uint8_t *mac_out, size_t *mac_len_out) {
     if (!key || packet_len < DNS_HEADER_SIZE) return -1;
     uint16_t arcount = (packet[10] << 8) | packet[11];
     if (arcount == 0) return -1;
@@ -778,18 +778,27 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     size_t keyname_wire_len = wire_name_length(key->name);
     size_t alg_wire_len = wire_name_length(wire_alg_name);
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
-    size_t pre_mac_cap = last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
+    size_t pre_mac_cap = prior_mac_len + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
     
     uint8_t *pre_mac = NULL;
     bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
     if (use_malloc) pre_mac = malloc(pre_mac_cap);
     else pre_mac = g_tsig_pre_mac_buf;
     if (!pre_mac) return -1;
-    memcpy(pre_mac, packet, last_rr_offset);
-    pre_mac[0] = orig_id >> 8; pre_mac[1] = orig_id & 0xFF;
+    
+    size_t p_offset = 0;
+    if (prior_mac && prior_mac_len > 0) {
+        pre_mac[p_offset++] = prior_mac_len >> 8;
+        pre_mac[p_offset++] = prior_mac_len & 0xFF;
+        memcpy(&pre_mac[p_offset], prior_mac, prior_mac_len);
+        p_offset += prior_mac_len;
+    }
+    
+    memcpy(&pre_mac[p_offset], packet, last_rr_offset);
+    pre_mac[p_offset + 0] = orig_id >> 8; pre_mac[p_offset + 1] = orig_id & 0xFF;
     uint16_t new_arcount = arcount - 1;
-    pre_mac[10] = new_arcount >> 8; pre_mac[11] = new_arcount & 0xFF;
-    size_t p_offset = last_rr_offset;
+    pre_mac[p_offset + 10] = new_arcount >> 8; pre_mac[p_offset + 11] = new_arcount & 0xFF;
+    p_offset += last_rr_offset;
     long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
     if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
     p_offset += (size_t)w3;

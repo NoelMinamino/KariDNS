@@ -2255,7 +2255,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
     }
-    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, NULL) != 0) {
+    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, 0, NULL, NULL) != 0) {
       syslog(LOG_ERR, "[AXFR] TSIG failed");
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
@@ -3255,7 +3255,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
             auth = false;
           } else {
             attempted_key = matched_key;
-            int err = tsig_verify_packet(req, req_len, matched_key, tsig_mac, &tsig_mac_len);
+            int err = tsig_verify_packet(req, req_len, matched_key, NULL, 0, tsig_mac, &tsig_mac_len);
             if (err != 0) {
               auth = false;
               tsig_error_code = err > 0 ? err : 16;
@@ -3331,7 +3331,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
           }
           if (key_allowed) {
             attempted_key = k;
-            int err = tsig_verify_packet(req, req_len, k, tsig_mac, &tsig_mac_len);
+            int err = tsig_verify_packet(req, req_len, k, NULL, 0, tsig_mac, &tsig_mac_len);
             if (err == 0) {
               matched_key = k;
               auth = true;
@@ -4975,7 +4975,7 @@ worker_startup_success:;
                 if (!matched_key) {
                   tsig_error = 17;
                 } else {
-                  int err = tsig_verify_packet(msg, msg_len, matched_key, tsig_mac, &tsig_mac_len);
+                  int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, tsig_mac, &tsig_mac_len);
                   if (err != 0) {
                     tsig_error = err > 0 ? err : 16;
                   } else {

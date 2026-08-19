@@ -2220,8 +2220,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         if (pkt_len == 0) return 1;
     }
 
+    uint8_t request_mac[64];
+    size_t request_mac_len = 0;
+
     if (qo->want_tsig) {
-        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, NULL, 0, false) != 0) {
+        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, false) != 0) {
             fprintf(stderr, "Error: tsig_sign_packet failed\n");
             return 1;
         }
@@ -2370,6 +2373,29 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     } else break;
                 }
             }
+
+            if (qo->want_tsig) {
+                uint8_t resp_mac[64];
+                size_t resp_mac_len = 0;
+                int err = tsig_verify_packet(resp, (size_t)n, &qo->tsig_key, request_mac, request_mac_len, resp_mac, &resp_mac_len);
+                if (err == 0) {
+                    if (!short_mode) printf(";; TSIG verified.\n");
+                    // Update prior_mac for subsequent AXFR messages
+                    if (resp_mac_len > 0 && resp_mac_len <= sizeof(request_mac)) {
+                        memcpy(request_mac, resp_mac, resp_mac_len);
+                        request_mac_len = resp_mac_len;
+                    }
+                } else {
+                    const char *reason = "unknown";
+                    if (err == -1) reason = "no TSIG record or malformed packet";
+                    else if (err == 16) reason = "BADSIG (signature mismatch)";
+                    else if (err == 17) reason = "BADKEY (key mismatch)";
+                    else if (err == 18) reason = "BADTIME (time out of window)";
+                    else if (err == 21) reason = "BADALG (unsupported algorithm)";
+                    fprintf(stderr, ";; WARNING: TSIG verification FAILED (%s)\n", reason);
+                }
+            }
+
 
             bool has_more = axfr_state.is_axfr && !axfr_state.axfr_complete && use_tcp && tcp_sock >= 0;
 
