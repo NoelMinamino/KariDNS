@@ -451,6 +451,7 @@ typedef struct {
         char type_str[32];
     } prereqs[MAX_PREREQS];
     int prereq_count;
+    uint16_t query_id;
 } query_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -580,7 +581,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     }
 
     memset(pkt, 0, 12);
-    uint16_t id = (uint16_t)(time(NULL) ^ getpid());
+    uint16_t id = qo->query_id;
     pkt[0] = id >> 8; pkt[1] = id & 0xFF;
     pkt[2] = 0x01; /* RD=1 */
     pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT=1 (may be overridden below) */
@@ -3051,6 +3052,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    qo.query_id = (uint16_t)(arc4random() & 0xFFFF);
 
     for (int si = 0; si < server_count; si++) {
         const char *server = servers[si];
