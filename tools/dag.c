@@ -2316,6 +2316,12 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         sres = alloc_result_row();
 
         do {
+            if (n >= 2) {
+                uint16_t resp_id = (resp[0] << 8) | resp[1];
+                if (resp_id != qo->query_id) {
+                    fprintf(stderr, ";; Warning: ID mismatch: expected %u, got %u\n", qo->query_id, resp_id);
+                }
+            }
             reset_dag_arena();
             total_bytes += (size_t)n;
             if (n >= 12) {
