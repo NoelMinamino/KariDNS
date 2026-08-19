@@ -454,6 +454,9 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-5 host-$$ A 10.0.0.$", false);
         // 正常系: 負のoffset
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
+        // 正常系: width 32-64
+        RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${0,64,d} A 10.0.0.$", false);
     }
 
     // Test 6: LOC and APL Validation Tests
@@ -900,6 +903,59 @@ int main() {
 
         zone_arena_destroy(&arena);
         printf("PASS: RFC 2136 process_update_sections CLASS validation\n");
+    }
+
+    // Test 12: RFC 10029 MQTYPE-Query duplicate option detection
+    {
+        printf("\n--- Test 12: RFC 10029 MQTYPE-Query duplicate option detection ---\n");
+        uint8_t pkt[512] = {0};
+        pkt[0] = 0x56; pkt[1] = 0x78; // ID
+        pkt[2] = 0x01; pkt[3] = 0x00; // Standard Query (RD=1)
+        pkt[4] = 0x00; pkt[5] = 0x01; // QDCOUNT = 1
+        pkt[6] = 0x00; pkt[7] = 0x00; // ANCOUNT = 0
+        pkt[8] = 0x00; pkt[9] = 0x00; // NSCOUNT = 0
+        pkt[10] = 0x00; pkt[11] = 0x01; // ARCOUNT = 1 (OPT)
+
+        size_t off = 12;
+        // Question: example.com. IN A
+        const char *qname = "\x07" "example" "\x03" "com" "\x00";
+        memcpy(&pkt[off], qname, 13);
+        off += 13;
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // TYPE A
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // CLASS IN
+
+        // OPT RR (AR section)
+        pkt[off++] = 0x00; // Root name
+        pkt[off++] = 0x00; pkt[off++] = 0x29; // TYPE OPT (41)
+        pkt[off++] = 0x10; pkt[off++] = 0x00; // Payload size 4096
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; // Extended RCODE / Flags
+        
+        // RDATA with two MQTYPE-Query options (opt_code = 20)
+        // Option 1: code 20, len 2, type 16 (TXT)
+        // Option 2: code 20, len 2, type 28 (AAAA)
+        pkt[off++] = 0x00; pkt[off++] = 0x0C; // RDLEN = 12
+        pkt[off++] = 0x00; pkt[off++] = 0x14; // OptCode 20
+        pkt[off++] = 0x00; pkt[off++] = 0x02; // OptLen 2
+        pkt[off++] = 0x00; pkt[off++] = 0x10; // QTYPE TXT (16)
+        pkt[off++] = 0x00; pkt[off++] = 0x14; // OptCode 20 (Duplicate!)
+        pkt[off++] = 0x00; pkt[off++] = 0x02; // OptLen 2
+        pkt[off++] = 0x00; pkt[off++] = 0x1C; // QTYPE AAAA (28)
+
+        edns_info_t edns = {0};
+        int pr = parse_edns_opt(pkt, off, 1, 0, 0, 1, &edns);
+        if (pr != 0) {
+            printf("FAIL: parse_edns_opt returned error %d\n", pr);
+            return 1;
+        }
+        if (!edns.has_mqtype_query) {
+            printf("FAIL: parse_edns_opt did not detect has_mqtype_query\n");
+            return 1;
+        }
+        if (!edns.mqtype_query_duplicated) {
+            printf("FAIL: parse_edns_opt did not flag mqtype_query_duplicated on duplicate option\n");
+            return 1;
+        }
+        printf("PASS: RFC 10029 MQTYPE-Query duplicate option detected\n");
     }
 
     printf("All tests passed safely.\n");

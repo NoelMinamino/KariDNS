@@ -2067,12 +2067,16 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         } else if (opt_code == 21) {
                             edns->saw_invalid_mqtype_response_in_query = true;
                         } else if (opt_code == 20) {
-                            edns->has_mqtype_query = true;
-                            if (opt_len % 2 == 0) {
-                                int count = opt_len / 2;
-                                edns->mqtype_count = 0;
-                                for (int k = 0; k < count && edns->mqtype_count < 16; k++) {
-                                    edns->mqtypes[edns->mqtype_count++] = (req[rdata_offset + k*2] << 8) | req[rdata_offset + k*2 + 1];
+                            if (edns->has_mqtype_query) {
+                                edns->mqtype_query_duplicated = true;
+                            } else {
+                                edns->has_mqtype_query = true;
+                                if (opt_len % 2 == 0) {
+                                    int count = opt_len / 2;
+                                    edns->mqtype_count = 0;
+                                    for (int k = 0; k < count && edns->mqtype_count < 16; k++) {
+                                        edns->mqtypes[edns->mqtype_count++] = (req[rdata_offset + k*2] << 8) | req[rdata_offset + k*2 + 1];
+                                    }
                                 }
                             }
                         }

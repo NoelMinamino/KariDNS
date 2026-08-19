@@ -3287,10 +3287,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
     edns.has_mqtype_query = false;
     edns.saw_invalid_mqtype_response_in_query = false;
+    edns.mqtype_query_duplicated = false;
     edns.mqtype_count = 0;
   }
 
-  if (edns.saw_invalid_mqtype_response_in_query) {
+  if (edns.saw_invalid_mqtype_response_in_query || edns.mqtype_query_duplicated) {
     res[2] |= 0x80;
     res[3] = (res[3] & 0xF0) | 1; // FORMERR
     res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
