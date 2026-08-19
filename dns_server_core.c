@@ -4078,31 +4078,6 @@ static void init_logging_channels(server_config_t *cfg) {
   }
 }
 
-static void free_logging_channels(server_config_t *cfg) {
-  log_channel_t *ch = cfg->logging.channels;
-  while (ch) {
-    log_channel_t *next = ch->next;
-    if (ch->fd >= 0)
-      close(ch->fd);
-    if (ch->name)
-      free(ch->name);
-    if (ch->file_path)
-      free(ch->file_path);
-    free(ch);
-    ch = next;
-  }
-  cfg->logging.channels = NULL;
-  cfg->logging.queries_channel = NULL;
-  if (cfg->logging.queries_channel_name) {
-    free(cfg->logging.queries_channel_name);
-    cfg->logging.queries_channel_name = NULL;
-  }
-  cfg->logging.responses_channel = NULL;
-  if (cfg->logging.responses_channel_name) {
-    free(cfg->logging.responses_channel_name);
-    cfg->logging.responses_channel_name = NULL;
-  }
-}
 
 static void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
                                 uint16_t qclass, uint16_t qtype, uint8_t rcode, 
@@ -5404,55 +5379,6 @@ static void reload_all_zones(void) {
   release_zone_snapshot(snap);
 }
 
-static void free_server_config_fields(server_config_t *cfg) {
-  for (int j = 0; j < cfg->bind_address_count; j++)
-    free(cfg->bind_addresses[j]);
-  free(cfg->bind_addresses);
-  cfg->bind_addresses = NULL;
-  cfg->bind_address_count = 0;
-
-  zone_config_t *curr_flat = cfg->zones;
-  while (curr_flat) {
-    zone_config_t *next = curr_flat->next;
-    free(curr_flat);
-    curr_flat = next;
-  }
-  cfg->zones = NULL;
-
-  view_config_t *v = cfg->views;
-  while (v) {
-    view_config_t *next_v = v->next;
-    if (v->name) free(v->name);
-    for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
-    if (v->match_clients) free(v->match_clients);
-    zone_config_t *curr = v->zones;
-    while (curr) {
-      zone_config_t *next = curr->next;
-      free_zone_config(curr);
-      curr = next;
-    }
-    free(v);
-    v = next_v;
-  }
-  cfg->views = NULL;
-
-  tsig_key_t *k = cfg->keys;
-  while (k) {
-    tsig_key_t *next_k = k->next;
-    free(k->name); free(k->algorithm); free(k->secret);
-    free(k);
-    k = next_k;
-  }
-  cfg->keys = NULL;
-
-  if (cfg->control.algorithm) free(cfg->control.algorithm);
-  if (cfg->control.secret) free(cfg->control.secret);
-  memset(&cfg->control, 0, sizeof(control_channel_config_t));
-  free_rate_limit_config(&cfg->rrl);
-  memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
-  free_logging_channels(cfg);
-}
-
 static void perform_config_reload(void) {
   g_last_configured_time = time(NULL);
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
@@ -5465,7 +5391,7 @@ static void perform_config_reload(void) {
                                  : &g_config_db.config_a;
   
   free_server_config_fields(standby);
-  if (parse_named_conf(config_str, standby) == 0) {
+  if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
@@ -6346,7 +6272,7 @@ int main(int argc, char **argv) {
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
     return 1;
-  if (parse_named_conf(config_str, &g_config_db.config_a) != 0) {
+  if (parse_named_conf_ext(config_str, g_config_path, &g_config_db.config_a) != 0) {
     free(config_str);
     return 1;
   }

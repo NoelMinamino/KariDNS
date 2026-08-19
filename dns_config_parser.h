@@ -113,6 +113,8 @@ typedef struct server_config_s {
   int udp_sndbuf_size;
 } server_config_t;
 
+#define MAX_INCLUDE_DEPTH 16
+
 typedef enum {
   TOKEN_EOF,
   TOKEN_STRING,
@@ -120,17 +122,33 @@ typedef enum {
   TOKEN_RBRACE,
   TOKEN_SEMICOLON
 } token_type_t;
+
 typedef struct {
   token_type_t type;
   char *value;
+  bool is_quoted;
 } conf_token_t;
+
 typedef struct {
-  const char *src;
+  char *file_path;      // 解決済みファイルパス (or NULL)
+  char *src;            // バッファ
+  bool owns_src;        // read_entire_file等で動的確保されたか
   size_t pos;
   size_t len;
+  dev_t dev;            // 循環検出用
+  ino_t ino;            // 循環検出用
+} config_file_frame_t;
+
+typedef struct {
+  config_file_frame_t stack[MAX_INCLUDE_DEPTH];
+  int depth;            // 現在のスタック深さ (0 = トップレベル)
+  bool error_occurred;  // 循環/不存在等のエラーフラグ
 } token_ctx_t;
 
 int parse_named_conf(const char *config_str, server_config_t *config);
+int parse_named_conf_ext(const char *config_str, const char *initial_file_path, server_config_t *config);
+void config_lexer_cleanup(token_ctx_t *ctx);
+void free_server_config_fields(server_config_t *cfg);
 void free_zone_config(zone_config_t *z);
 void free_rate_limit_config(rate_limit_config_t *rrl);
 #include <sys/types.h>

@@ -1,4 +1,5 @@
 #include "dns_config_parser.h"
+#include "dns_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +14,6 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include "dns_wire.h"
-
 
 static void *safe_realloc_or_die(void *ptr, size_t size) {
   void *p = realloc(ptr, size);
@@ -39,103 +39,240 @@ static void *safe_calloc_or_die(size_t nmemb, size_t size) {
         (arr)[(cnt)++] = (val); \
     } while (0)
 
-
-
-static void skip_spaces_and_comments(token_ctx_t *ctx) {
-  while (ctx->pos < ctx->len) {
-    char c = ctx->src[ctx->pos];
+static void skip_spaces_and_comments_in_frame(config_file_frame_t *frame) {
+  while (frame->pos < frame->len) {
+    char c = frame->src[frame->pos];
     if (c == '\0') break;
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-      ctx->pos++;
+      frame->pos++;
     } else if (c == '#') {
-      while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '\n' && ctx->src[ctx->pos] != '\0')
-        ctx->pos++;
-    } else if (c == '/' && ctx->pos + 1 < ctx->len && ctx->src[ctx->pos + 1] == '/') {
-      ctx->pos += 2;
-      while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '\n' && ctx->src[ctx->pos] != '\0')
-        ctx->pos++;
-    } else if (c == '/' && ctx->pos + 1 < ctx->len && ctx->src[ctx->pos + 1] == '*') {
-      ctx->pos += 2;
-      while (ctx->pos + 1 < ctx->len && !(ctx->src[ctx->pos] == '*' && ctx->src[ctx->pos + 1] == '/')) {
-        if (ctx->src[ctx->pos] == '\0') break;
-        ctx->pos++;
+      while (frame->pos < frame->len && frame->src[frame->pos] != '\n' && frame->src[frame->pos] != '\0')
+        frame->pos++;
+    } else if (c == '/' && frame->pos + 1 < frame->len && frame->src[frame->pos + 1] == '/') {
+      frame->pos += 2;
+      while (frame->pos < frame->len && frame->src[frame->pos] != '\n' && frame->src[frame->pos] != '\0')
+        frame->pos++;
+    } else if (c == '/' && frame->pos + 1 < frame->len && frame->src[frame->pos + 1] == '*') {
+      frame->pos += 2;
+      while (frame->pos + 1 < frame->len && !(frame->src[frame->pos] == '*' && frame->src[frame->pos + 1] == '/')) {
+        if (frame->src[frame->pos] == '\0') break;
+        frame->pos++;
       }
-      if (ctx->pos + 1 < ctx->len && ctx->src[ctx->pos] == '*' && ctx->src[ctx->pos + 1] == '/')
-        ctx->pos += 2;
+      if (frame->pos + 1 < frame->len && frame->src[frame->pos] == '*' && frame->src[frame->pos + 1] == '/')
+        frame->pos += 2;
     } else {
       break;
     }
   }
 }
 
-conf_token_t get_next_token(token_ctx_t *ctx) {
-  conf_token_t tok = {TOKEN_EOF, NULL};
-  skip_spaces_and_comments(ctx);
-  if (ctx->pos >= ctx->len || ctx->src[ctx->pos] == '\0')
+static conf_token_t get_raw_token_from_frame(config_file_frame_t *frame) {
+  conf_token_t tok = {TOKEN_EOF, NULL, false};
+  if (!frame || !frame->src)
     return tok;
-  char c = ctx->src[ctx->pos];
+  skip_spaces_and_comments_in_frame(frame);
+  if (frame->pos >= frame->len || frame->src[frame->pos] == '\0')
+    return tok;
+
+  char c = frame->src[frame->pos];
   if (c == '{') {
     tok.type = TOKEN_LBRACE;
-    ctx->pos++;
+    frame->pos++;
     return tok;
   }
   if (c == '}') {
     tok.type = TOKEN_RBRACE;
-    ctx->pos++;
+    frame->pos++;
     return tok;
   }
   if (c == ';') {
     tok.type = TOKEN_SEMICOLON;
-    ctx->pos++;
+    frame->pos++;
     return tok;
   }
   if (c == '"') {
-    ctx->pos++;
-    size_t start = ctx->pos;
-    while (ctx->pos < ctx->len && ctx->src[ctx->pos] != '"' && ctx->src[ctx->pos] != '\0')
-      ctx->pos++;
-    size_t str_len = ctx->pos - start;
+    frame->pos++;
+    size_t start = frame->pos;
+    while (frame->pos < frame->len && frame->src[frame->pos] != '"' && frame->src[frame->pos] != '\0')
+      frame->pos++;
+    size_t str_len = frame->pos - start;
     if (str_len > 4096)
       str_len = 4096;
     tok.type = TOKEN_STRING;
+    tok.is_quoted = true;
     tok.value = malloc(str_len + 1);
     if (!tok.value) return tok;
-    memcpy(tok.value, &ctx->src[start], str_len);
+    memcpy(tok.value, &frame->src[start], str_len);
     tok.value[str_len] = '\0';
-    if (ctx->pos < ctx->len && ctx->src[ctx->pos] == '"')
-      ctx->pos++;
+    if (frame->pos < frame->len && frame->src[frame->pos] == '"')
+      frame->pos++;
     return tok;
   }
-  size_t start = ctx->pos;
-  while (ctx->pos < ctx->len) {
-    char nc = ctx->src[ctx->pos];
+
+  size_t start = frame->pos;
+  while (frame->pos < frame->len) {
+    char nc = frame->src[frame->pos];
     if (nc == '\0' || nc == ' ' || nc == '\t' || nc == '\n' || nc == '\r' || nc == '{' ||
         nc == '}' || nc == ';' || nc == '#')
       break;
-    if (nc == '/' && ctx->pos + 1 < ctx->len &&
-        (ctx->src[ctx->pos + 1] == '/' || ctx->src[ctx->pos + 1] == '*'))
+    if (nc == '/' && frame->pos + 1 < frame->len &&
+        (frame->src[frame->pos + 1] == '/' || frame->src[frame->pos + 1] == '*'))
       break;
-    ctx->pos++;
+    frame->pos++;
   }
-  size_t str_len = ctx->pos - start;
+  size_t str_len = frame->pos - start;
   if (str_len == 0) {
-    ctx->pos++;
+    frame->pos++;
     str_len = 1;
   }
   if (str_len > 4096)
     str_len = 4096;
   tok.type = TOKEN_STRING;
+  tok.is_quoted = false;
   tok.value = malloc(str_len + 1);
-    if (!tok.value) return tok;
-  memcpy(tok.value, &ctx->src[start], str_len);
+  if (!tok.value) return tok;
+  memcpy(tok.value, &frame->src[start], str_len);
   tok.value[str_len] = '\0';
   return tok;
+}
+
+void config_lexer_cleanup(token_ctx_t *ctx) {
+  if (!ctx) return;
+  for (int i = 0; i < MAX_INCLUDE_DEPTH; i++) {
+    if (ctx->stack[i].owns_src && ctx->stack[i].src) {
+      free(ctx->stack[i].src);
+      ctx->stack[i].src = NULL;
+    }
+    if (ctx->stack[i].file_path) {
+      free(ctx->stack[i].file_path);
+      ctx->stack[i].file_path = NULL;
+    }
+    ctx->stack[i].owns_src = false;
+    ctx->stack[i].src = NULL;
+    ctx->stack[i].pos = 0;
+    ctx->stack[i].len = 0;
+    ctx->stack[i].dev = 0;
+    ctx->stack[i].ino = 0;
+  }
+  ctx->depth = 0;
 }
 
 void free_token(conf_token_t *tok) {
   if (tok->value) {
     free(tok->value);
     tok->value = NULL;
+  }
+}
+
+conf_token_t get_next_token(token_ctx_t *ctx) {
+  while (1) {
+    if (ctx->error_occurred || ctx->depth < 0 || ctx->depth >= MAX_INCLUDE_DEPTH) {
+      return (conf_token_t){TOKEN_EOF, NULL, false};
+    }
+
+    config_file_frame_t *frame = &ctx->stack[ctx->depth];
+    conf_token_t tok = get_raw_token_from_frame(frame);
+
+    if (tok.type == TOKEN_EOF) {
+      if (ctx->depth > 0) {
+        if (frame->owns_src && frame->src) {
+          free(frame->src);
+          frame->src = NULL;
+        }
+        if (frame->file_path) {
+          free(frame->file_path);
+          frame->file_path = NULL;
+        }
+        frame->owns_src = false;
+        frame->pos = 0;
+        frame->len = 0;
+        frame->dev = 0;
+        frame->ino = 0;
+        ctx->depth--;
+        continue;
+      }
+      return tok;
+    }
+
+    if (tok.type == TOKEN_STRING && !tok.is_quoted && strcmp(tok.value, "include") == 0) {
+      free_token(&tok);
+
+      conf_token_t tok_file = get_raw_token_from_frame(frame);
+      if (tok_file.type != TOKEN_STRING) {
+        syslog(LOG_ERR, "[Config] syntax error: expected filename after 'include'");
+        free_token(&tok_file);
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
+
+      conf_token_t tok_semi = get_raw_token_from_frame(frame);
+      if (tok_semi.type != TOKEN_SEMICOLON) {
+        syslog(LOG_ERR, "[Config] syntax error: missing ';' after include filename '%s'", tok_file.value);
+        free_token(&tok_file);
+        free_token(&tok_semi);
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
+      free_token(&tok_semi);
+
+      const char *parent_path = frame->file_path;
+      char *base_dir = parent_path ? get_base_dir(parent_path) : strdup(".");
+      char resolved[PATH_MAX];
+      if (tok_file.value[0] == '/') {
+        snprintf(resolved, sizeof(resolved), "%s", tok_file.value);
+      } else {
+        snprintf(resolved, sizeof(resolved), "%s/%s", base_dir ? base_dir : ".", tok_file.value);
+      }
+      if (base_dir) free(base_dir);
+      free_token(&tok_file);
+
+      if (ctx->depth + 1 >= MAX_INCLUDE_DEPTH) {
+        syslog(LOG_ERR, "[Config] include depth exceeded (max %d): '%s'", MAX_INCLUDE_DEPTH, resolved);
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
+
+      dev_t inc_dev = 0;
+      ino_t inc_ino = 0;
+      char *content = read_entire_file(resolved, &inc_dev, &inc_ino);
+      if (!content) {
+        syslog(LOG_ERR, "[Config] failed to read include file '%s'", resolved);
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
+
+      bool circular = false;
+      for (int i = 0; i <= ctx->depth; i++) {
+        if (ctx->stack[i].dev != 0 && ctx->stack[i].ino != 0 &&
+            ctx->stack[i].dev == inc_dev && ctx->stack[i].ino == inc_ino) {
+          circular = true;
+          break;
+        }
+        if (ctx->stack[i].file_path && strcmp(ctx->stack[i].file_path, resolved) == 0) {
+          circular = true;
+          break;
+        }
+      }
+      if (circular) {
+        syslog(LOG_ERR, "[Config] circular include detected: '%s'", resolved);
+        free(content);
+        ctx->error_occurred = true;
+        return (conf_token_t){TOKEN_EOF, NULL, false};
+      }
+
+      ctx->depth++;
+      ctx->stack[ctx->depth].file_path = strdup(resolved);
+      ctx->stack[ctx->depth].src = content;
+      ctx->stack[ctx->depth].owns_src = true;
+      ctx->stack[ctx->depth].pos = 0;
+      ctx->stack[ctx->depth].len = strlen(content);
+      ctx->stack[ctx->depth].dev = inc_dev;
+      ctx->stack[ctx->depth].ino = inc_ino;
+
+      continue;
+    }
+
+    return tok;
   }
 }
 
@@ -171,6 +308,90 @@ void free_zone_config(zone_config_t *zone) {
   free(zone->allow_update);
   free_rate_limit_config(&zone->rrl);
   free(zone);
+}
+
+void free_server_config_fields(server_config_t *cfg) {
+  if (!cfg) return;
+  for (int j = 0; j < cfg->bind_address_count; j++)
+    free(cfg->bind_addresses[j]);
+  free(cfg->bind_addresses);
+  cfg->bind_addresses = NULL;
+  cfg->bind_address_count = 0;
+
+  if (cfg->user) { free(cfg->user); cfg->user = NULL; }
+  if (cfg->group) { free(cfg->group); cfg->group = NULL; }
+  if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
+
+  if (cfg->views != NULL) {
+    zone_config_t *curr_flat = cfg->zones;
+    while (curr_flat) {
+      zone_config_t *next = curr_flat->next;
+      free(curr_flat);
+      curr_flat = next;
+    }
+    cfg->zones = NULL;
+
+    view_config_t *v = cfg->views;
+    while (v) {
+      view_config_t *next_v = v->next;
+      if (v->name) free(v->name);
+      for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
+      if (v->match_clients) free(v->match_clients);
+      zone_config_t *curr = v->zones;
+      while (curr) {
+        zone_config_t *next = curr->next;
+        free_zone_config(curr);
+        curr = next;
+      }
+      free(v);
+      v = next_v;
+    }
+    cfg->views = NULL;
+  } else {
+    zone_config_t *curr = cfg->zones;
+    while (curr) {
+      zone_config_t *next = curr->next;
+      free_zone_config(curr);
+      curr = next;
+    }
+    cfg->zones = NULL;
+  }
+
+  tsig_key_t *k = cfg->keys;
+  while (k) {
+    tsig_key_t *next_k = k->next;
+    free(k->name); free(k->algorithm); free(k->secret);
+    free(k);
+    k = next_k;
+  }
+  cfg->keys = NULL;
+
+  if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
+  if (cfg->control.secret) { free(cfg->control.secret); cfg->control.secret = NULL; }
+  memset(&cfg->control, 0, sizeof(control_channel_config_t));
+  free_rate_limit_config(&cfg->rrl);
+  memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
+
+  log_channel_t *ch = cfg->logging.channels;
+  while (ch) {
+    log_channel_t *next_ch = ch->next;
+    if (ch->fd >= 0) close(ch->fd);
+    if (ch->name) free(ch->name);
+    if (ch->file_path) free(ch->file_path);
+    free(ch);
+    ch = next_ch;
+  }
+  cfg->logging.channels = NULL;
+  cfg->logging.queries_channel = NULL;
+  cfg->logging.responses_channel = NULL;
+  if (cfg->logging.queries_channel_name) {
+    free(cfg->logging.queries_channel_name);
+    cfg->logging.queries_channel_name = NULL;
+  }
+  if (cfg->logging.responses_channel_name) {
+    free(cfg->logging.responses_channel_name);
+    cfg->logging.responses_channel_name = NULL;
+  }
 }
 
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino) {
@@ -286,15 +507,9 @@ bool match_cidr(const char *client_ip_str, const char *cidr_str) {
   return false;
 }
 
-static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
-  conf_token_t tok = get_next_token(ctx);
-  if (tok.type != TOKEN_LBRACE) {
-    free_token(&tok);
-    return -1;
-  }
-  free_token(&tok);
+static int parse_string_list_inner(token_ctx_t *ctx, char ***list, int *count) {
   while (1) {
-    tok = get_next_token(ctx);
+    conf_token_t tok = get_next_token(ctx);
     if (tok.type == TOKEN_RBRACE) {
       free_token(&tok);
       break;
@@ -314,7 +529,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
     }
     free_token(&tok);
   }
-  tok = get_next_token(ctx);
+  conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_SEMICOLON) {
     free_token(&tok);
     return -1;
@@ -432,7 +647,6 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
     (*list)[*count].ip = strdup(tok.value);
     (*list)[*count].port = 53;
     free_token(&tok);
-    size_t saved_pos = ctx->pos;
     tok = get_next_token(ctx);
     if (tok.type == TOKEN_STRING && strcmp(tok.value, "port") == 0) {
       free_token(&tok);
@@ -443,10 +657,6 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
         free_token(&tok);
         return -1;
       }
-      free_token(&tok);
-      tok = get_next_token(ctx);
-    } else {
-      ctx->pos = saved_pos;
       free_token(&tok);
       tok = get_next_token(ctx);
     }
@@ -681,12 +891,14 @@ static int parse_buffer_size_value(const char *str) {
   return (int)val;
 }
 
-int parse_named_conf(const char *config_str, server_config_t *config) {
-  token_ctx_t ctx = {config_str, 0, strlen(config_str)};
+static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
+  memset(config, 0, sizeof(server_config_t));
   config->port = 53;
   config->bind_addresses = NULL;
   config->bind_address_count = 0;
   config->zones = NULL;
+  config->views = NULL;
+  config->keys = NULL;
   config->user = NULL;
   config->group = NULL;
   config->serve_stale = true;
@@ -706,7 +918,11 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   view_config_t *last_view = NULL;
   zone_config_t *last_zone = NULL;
   while (1) {
-    conf_token_t tok = get_next_token(&ctx);
+    conf_token_t tok = get_next_token(ctx);
+    if (ctx->error_occurred) {
+      free_token(&tok);
+      return -1;
+    }
     if (tok.type == TOKEN_EOF)
       break;
     if (tok.type != TOKEN_STRING) {
@@ -715,14 +931,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
     }
     if (strcmp(tok.value, "options") == 0) {
       free_token(&tok);
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) {
         free_token(&tok);
         return -1;
       }
       free_token(&tok);
       while (1) {
-        tok = get_next_token(&ctx);
+        tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) {
           free_token(&tok);
           break;
@@ -735,7 +951,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         free_token(&tok);
         if (strcmp(key, "port") == 0 || strcmp(key, "user") == 0 ||
             strcmp(key, "group") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -743,7 +959,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           }
           char *val = strdup(tok.value);
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
             free(val);
@@ -760,12 +976,10 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else
             config->group = val;
         } else if (strcmp(key, "bind-address") == 0) {
-          size_t saved_pos = ctx.pos;
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type == TOKEN_LBRACE) {
-            ctx.pos = saved_pos;
             free_token(&tok);
-            if (parse_string_list(&ctx, &config->bind_addresses,
+            if (parse_string_list_inner(ctx, &config->bind_addresses,
                                   &config->bind_address_count) != 0) {
               free(key);
               return -1;
@@ -777,7 +991,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             config->bind_addresses[config->bind_address_count++] =
                 strdup(tok.value);
             free_token(&tok);
-            tok = get_next_token(&ctx);
+            tok = get_next_token(ctx);
             if (tok.type != TOKEN_SEMICOLON) {
               free(key);
               free_token(&tok);
@@ -790,12 +1004,12 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             return -1;
           }
         } else if (strcmp(key, "rate-limit") == 0) {
-          if (parse_rate_limit_config(&ctx, &config->rrl) != 0) {
+          if (parse_rate_limit_config(ctx, &config->rrl) != 0) {
             free(key);
             return -1;
           }
         } else if (strcmp(key, "send-extended-errors") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -806,14 +1020,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->send_extended_errors = false;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "serve-stale") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -824,15 +1038,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->serve_stale = false;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "rfc10029-mqtype") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -843,40 +1056,39 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->rfc10029_mqtype_enable = false;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "tcp-connection-reuse") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
           if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0) config->tcp_connection_reuse = true;
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0) config->tcp_connection_reuse = false;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
           free_token(&tok);
         } else if (strcmp(key, "tcp-idle-timeout") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
           config->tcp_idle_timeout = strtoul(tok.value, NULL, 10);
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
           free_token(&tok);
         } else if (strcmp(key, "nsid") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
           config->nsid_string = strdup(tok.value);
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
           free_token(&tok);
         } else if (strcmp(key, "minimal-responses") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -887,15 +1099,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->minimal_responses = false;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "minimal-any") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -906,15 +1117,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->minimal_any = false;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "max-mqtypes") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -924,15 +1134,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           if (config->max_mqtypes < 0) config->max_mqtypes = 0;
           if (config->max_mqtypes > 16) config->max_mqtypes = 16;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "minimal-any-ttl") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -940,15 +1149,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           }
           config->minimal_any_ttl = strtoul(tok.value, NULL, 10);
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "udp-recvbuf-size") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -957,15 +1165,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           int sz = parse_buffer_size_value(tok.value);
           if (sz > 0) config->udp_recvbuf_size = sz;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else if (strcmp(key, "udp-sndbuf-size") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
             free_token(&tok);
@@ -974,18 +1181,17 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           int sz = parse_buffer_size_value(tok.value);
           if (sz > 0) config->udp_sndbuf_size = sz;
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
-            free_token(&tok);
             return -1;
           }
           free_token(&tok);
         } else
-          skip_unknown_block(&ctx);
+          skip_unknown_block(ctx);
         free(key);
       }
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) {
         free_token(&tok);
         return -1;
@@ -993,37 +1199,37 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       free_token(&tok);
     } else if (strcmp(tok.value, "view") == 0) {
       free_token(&tok);
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
       view_config_t *view = safe_calloc_or_die(1, sizeof(view_config_t));
       view->name = strdup(tok.value);
       free_token(&tok);
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) { free(view->name); free(view); free_token(&tok); return -1; }
       free_token(&tok);
       zone_config_t *last_view_zone = NULL;
       while (1) {
-        tok = get_next_token(&ctx);
+        tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
         if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
         if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
-          if (parse_acl_list(&ctx, &view->match_clients, &view->match_clients_count,
+          if (parse_acl_list(ctx, &view->match_clients, &view->match_clients_count,
                              ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
             return -1;
           }
         } else if (strcmp(tok.value, "zone") == 0) {
           free_token(&tok);
           zone_config_t *z = NULL;
-          if (parse_zone_block(&ctx, &z) != 0) return -1;
+          if (parse_zone_block(ctx, &z) != 0) return -1;
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
         } else {
           free_token(&tok);
-          skip_unknown_block(&ctx);
+          skip_unknown_block(ctx);
         }
       }
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
       free_token(&tok);
       saw_view_block = true;
@@ -1032,7 +1238,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
     } else if (strcmp(tok.value, "zone") == 0) {
       free_token(&tok);
       zone_config_t *zone = NULL;
-      if (parse_zone_block(&ctx, &zone) != 0) return -1;
+      if (parse_zone_block(ctx, &zone) != 0) return -1;
       saw_top_level_zone = true;
       if (!config->zones)
         config->zones = zone;
@@ -1041,7 +1247,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       last_zone = zone;
     } else if (strcmp(tok.value, "key") == 0) {
       free_token(&tok);
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) {
         free_token(&tok);
         return -1;
@@ -1049,14 +1255,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       tsig_key_t *tsig = safe_calloc_or_die(1, sizeof(tsig_key_t));
       tsig->name = strdup(tok.value);
       free_token(&tok);
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) {
         free_token(&tok);
         return -1;
       }
       free_token(&tok);
       while (1) {
-        tok = get_next_token(&ctx);
+        tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) {
           free_token(&tok);
           break;
@@ -1069,7 +1275,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         free_token(&tok);
         if (strcmp(key_prop, "algorithm") == 0 ||
             strcmp(key_prop, "secret") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key_prop);
             free_token(&tok);
@@ -1077,7 +1283,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           }
           char *val = strdup(tok.value);
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key_prop);
             free(val);
@@ -1129,10 +1335,10 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             tsig->secret_decoded_len = len - padding;
           }
         } else
-          skip_unknown_block(&ctx);
+          skip_unknown_block(ctx);
         free(key_prop);
       }
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) {
         free_token(&tok);
         return -1;
@@ -1142,7 +1348,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       config->keys = tsig;
     } else if (strcmp(tok.value, "control-channel") == 0) {
       free_token(&tok);
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) {
         free_token(&tok);
         return -1;
@@ -1150,7 +1356,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       free_token(&tok);
       config->control.enabled = true;
       while (1) {
-        tok = get_next_token(&ctx);
+        tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) {
           free_token(&tok);
           break;
@@ -1163,7 +1369,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         free_token(&tok);
         if (strcmp(key_prop, "algorithm") == 0 ||
             strcmp(key_prop, "secret") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key_prop);
             free_token(&tok);
@@ -1171,7 +1377,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           }
           char *val = strdup(tok.value);
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key_prop);
             free(val);
@@ -1223,10 +1429,10 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             config->control.secret_decoded_len = len - padding;
           }
         } else
-          skip_unknown_block(&ctx);
+          skip_unknown_block(ctx);
         free(key_prop);
       }
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) {
         free_token(&tok);
         return -1;
@@ -1234,14 +1440,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       free_token(&tok);
     } else if (strcmp(tok.value, "logging") == 0) {
       free_token(&tok);
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) {
         free_token(&tok);
         return -1;
       }
       free_token(&tok);
       while (1) {
-        tok = get_next_token(&ctx);
+        tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) {
           free_token(&tok);
           break;
@@ -1253,7 +1459,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
         char *dir = strdup(tok.value);
         free_token(&tok);
         if (strcmp(dir, "channel") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(dir);
             free_token(&tok);
@@ -1264,7 +1470,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           free_token(&tok);
           ch->fd = -1;
           pthread_mutex_init(&ch->lock, NULL);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_LBRACE) {
             free(dir);
             free_token(&tok);
@@ -1272,7 +1478,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           }
           free_token(&tok);
           while (1) {
-            tok = get_next_token(&ctx);
+            tok = get_next_token(ctx);
             if (tok.type == TOKEN_RBRACE) {
               free_token(&tok);
               break;
@@ -1284,7 +1490,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             char *opt = strdup(tok.value);
             free_token(&tok);
             if (strcmp(opt, "file") == 0) {
-              tok = get_next_token(&ctx);
+              tok = get_next_token(ctx);
               if (tok.type != TOKEN_STRING) {
                 free(opt);
                 free_token(&tok);
@@ -1293,7 +1499,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               ch->file_path = strdup(tok.value);
               free_token(&tok);
               while (1) {
-                tok = get_next_token(&ctx);
+                tok = get_next_token(ctx);
                 if (tok.type == TOKEN_EOF) {
                   free_token(&tok);
                   break;
@@ -1305,14 +1511,14 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
                 if (tok.type == TOKEN_STRING &&
                     strcmp(tok.value, "versions") == 0) {
                   free_token(&tok);
-                  tok = get_next_token(&ctx);
+                  tok = get_next_token(ctx);
                   if (tok.type == TOKEN_STRING)
                     ch->versions = atoi(tok.value);
                   free_token(&tok);
                 } else if (tok.type == TOKEN_STRING &&
                            strcmp(tok.value, "size") == 0) {
                   free_token(&tok);
-                  tok = get_next_token(&ctx);
+                  tok = get_next_token(ctx);
                   if (tok.type == TOKEN_STRING) {
                     size_t mult = 1;
                     size_t len = strlen(tok.value);
@@ -1331,7 +1537,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
                 } else if (tok.type == TOKEN_STRING &&
                            strcmp(tok.value, "suffix") == 0) {
                   free_token(&tok);
-                  tok = get_next_token(&ctx);
+                  tok = get_next_token(ctx);
                   if (tok.type == TOKEN_STRING &&
                       strcmp(tok.value, "timestamp") == 0)
                     ch->suffix_timestamp = true;
@@ -1343,11 +1549,11 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
             } else if (strcmp(opt, "print-time") == 0 ||
                        strcmp(opt, "print-category") == 0 ||
                        strcmp(opt, "print-severity") == 0) {
-              tok = get_next_token(&ctx);
+              tok = get_next_token(ctx);
               bool val =
                   (tok.type == TOKEN_STRING && strcmp(tok.value, "yes") == 0);
               free_token(&tok);
-              tok = get_next_token(&ctx);
+              tok = get_next_token(ctx);
               if (tok.type == TOKEN_SEMICOLON)
                 free_token(&tok);
               if (strcmp(opt, "print-time") == 0)
@@ -1357,16 +1563,16 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
               else
                 ch->print_severity = val;
             } else
-              skip_unknown_block(&ctx);
+              skip_unknown_block(ctx);
             free(opt);
           }
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type == TOKEN_SEMICOLON)
             free_token(&tok);
           ch->next = config->logging.channels;
           config->logging.channels = ch;
         } else if (strcmp(dir, "category") == 0) {
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(dir);
             free_token(&tok);
@@ -1374,31 +1580,31 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
           }
           char *cat_name = strdup(tok.value);
           free_token(&tok);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type == TOKEN_LBRACE) {
             free_token(&tok);
-            tok = get_next_token(&ctx);
+            tok = get_next_token(ctx);
             if (strcmp(cat_name, "queries") == 0 && tok.type == TOKEN_STRING)
               config->logging.queries_channel_name = strdup(tok.value);
             else if (strcmp(cat_name, "responses") == 0 && tok.type == TOKEN_STRING)
               config->logging.responses_channel_name = strdup(tok.value);
             free_token(&tok);
-            tok = get_next_token(&ctx);
+            tok = get_next_token(ctx);
             if (tok.type == TOKEN_SEMICOLON)
               free_token(&tok);
-            tok = get_next_token(&ctx);
+            tok = get_next_token(ctx);
             if (tok.type == TOKEN_RBRACE)
               free_token(&tok);
           }
           free(cat_name);
-          tok = get_next_token(&ctx);
+          tok = get_next_token(ctx);
           if (tok.type == TOKEN_SEMICOLON)
             free_token(&tok);
         } else
-          skip_unknown_block(&ctx);
+          skip_unknown_block(ctx);
         free(dir);
       }
-      tok = get_next_token(&ctx);
+      tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) {
         free_token(&tok);
         return -1;
@@ -1426,7 +1632,7 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
       }
     } else {
       free_token(&tok);
-      skip_unknown_block(&ctx);
+      skip_unknown_block(ctx);
     }
   }
   if (saw_view_block && saw_top_level_zone) {
@@ -1466,3 +1672,35 @@ int parse_named_conf(const char *config_str, server_config_t *config) {
   return 0;
 }
 
+int parse_named_conf_ext(const char *config_str, const char *initial_file_path, server_config_t *config) {
+  if (!config_str || !config) return -1;
+  token_ctx_t ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.stack[0].file_path = initial_file_path ? strdup(initial_file_path) : NULL;
+  ctx.stack[0].src = (char *)config_str;
+  ctx.stack[0].owns_src = false;
+  ctx.stack[0].pos = 0;
+  ctx.stack[0].len = strlen(config_str);
+  if (initial_file_path) {
+    struct stat st;
+    if (stat(initial_file_path, &st) == 0) {
+      ctx.stack[0].dev = st.st_dev;
+      ctx.stack[0].ino = st.st_ino;
+    }
+  }
+  ctx.depth = 0;
+  ctx.error_occurred = false;
+
+  int res = parse_named_conf_internal(&ctx, config);
+
+  config_lexer_cleanup(&ctx);
+  if (res != 0 || ctx.error_occurred) {
+    free_server_config_fields(config);
+    return -1;
+  }
+  return 0;
+}
+
+int parse_named_conf(const char *config_str, server_config_t *config) {
+  return parse_named_conf_ext(config_str, NULL, config);
+}
