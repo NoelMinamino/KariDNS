@@ -22,7 +22,7 @@ EOF
 for i in $(seq 1 20); do
     echo "zone${i}.zones IN PTR example${i}.net." >> catalog.zone
     # Adding a very long coo target
-    echo "zone${i}.zones IN PTR longcoo${i}.this-is-a-very-long-target-that-is-meant-to-test-strncpy-overflow-this-is-a-very-long-target-that-is-meant-to-test-strncpy-overflow-this-is-a-very-long-target-that-is-meant-to-test-strncpy-overflow-this-is-a-very-long-target-that-is-meant-to-test-overflow.com." >> catalog.zone
+    echo "coo.zone${i}.zones IN PTR longcoo${i}.this-is-a-very-long-target-that-is-meant-to-test-strncpy-overflow-this-is-a-very-long-target-that-is-meant-to-test-strncpy-overflow-this-is-a-very-long-target-that-is-meant-to-test-strncpy-overflow-this-is-a-very-long-target-that-is-meant-to-test-overflow.com." >> catalog.zone
 done
 
 cat << EOF > karidns.conf
@@ -49,10 +49,10 @@ view "default" {
 EOF
 
 # Build the OOM wrapper
-cc -shared -fPIC -o oom_coo_wrapper.so ../tests/oom_coo_wrapper.c -ldl -lexecinfo
+cc -shared -fPIC -o oom_coo_wrapper.so ../tests/oom_coo_wrapper.c -ldl
 
 echo "[+] Starting KariDNS with OOM wrapper..."
-OOM_FAIL_AFTER_NTH_MATCHING_CALL=1 LD_PRELOAD=./oom_coo_wrapper.so ../karidns -f karidns.conf  > karidns.log 2>&1 &
+OOM_FAIL_AFTER_NTH_MATCHING_CALL=0 LD_PRELOAD=./oom_coo_wrapper.so ../karidns -f karidns.conf > karidns.log 2>&1 &
 KARIDNS_PID=$!
 
 sleep 2
