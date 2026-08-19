@@ -1658,6 +1658,11 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
             char *target = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &target) != 0) goto fallback;
+            if (next < abs_offset + 2 || next > abs_offset + rdlen) {
+                // RFC 9460 §2.2 違反: TargetNameがこのRRのRDATA境界をはみ出している
+                printf("(malformed SVCB/HTTPS: TargetName exceeds RDLENGTH)");
+                break;
+            }
             size_t target_len = next - abs_offset - 2;
             printf("%u %s", priority, (target[0] == '\0') ? "." : target);
             print_svcparams(&pkt[abs_offset], 2 + target_len, rdlen);
