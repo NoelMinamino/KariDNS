@@ -34,7 +34,11 @@
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 
+#include <locale.h>
 #include <openssl/evp.h>
+#ifdef HAVE_LIBIDN2
+#include <idn2.h>
+#endif
 #include "../dns_wire.h"
 #include "../dns_utils.h"
 #include "../dns_zone_parser.h"
@@ -458,6 +462,8 @@ typedef struct {
     } prereqs[MAX_PREREQS];
     int prereq_count;
     uint16_t query_id;
+    bool use_search_list;
+    bool idnin;
 } query_opts_t;
 
 typedef struct {
@@ -468,9 +474,14 @@ typedef struct {
     bool show_comments;   // default true (";; ->>HEADER<<-" 等)
     bool show_stats;      // default true
     bool show_cmd;        // default true (";; global options:" ヘッダ相当)
-    bool short_mode;      // 既存 short_mode を移設
-    bool identify;        // 複数サーバー時の応答元表示
-    bool multiline;       // RRSIG等の複数行整形
+    bool short_mode;
+    bool identify;
+    bool multiline;
+    bool yaml;
+    bool ttlid;
+    bool expire;
+    bool showsearch;
+    bool idnout;
 } display_opts_t;
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -1177,7 +1188,7 @@ static void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len, char *o
     }
 }
 
-static void print_dnskey_like(const uint8_t *rdata, size_t rdlen) {
+static void print_dnskey_like(const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
     if (rdlen < 4) { printf("(malformed)"); return; }
     uint16_t flags = (rdata[0]<<8)|rdata[1];
     uint8_t protocol = rdata[2];
@@ -1186,17 +1197,37 @@ static void print_dnskey_like(const uint8_t *rdata, size_t rdlen) {
     char *b64 = malloc(b64_cap);
     if (!b64) { printf("(oom)"); return; }
     int n = EVP_EncodeBlock((unsigned char*)b64, &rdata[4], (int)(rdlen - 4));
-    printf("%u %u %u %.*s", flags, protocol, algorithm, n, b64);
+    if (dopt && dopt->multiline) {
+        printf("%u %u %u (\n", flags, protocol, algorithm);
+        for (int i = 0; i < n; i += 64) {
+            printf("\t\t\t\t\t%.*s\n", (n - i) < 64 ? (n - i) : 64, b64 + i);
+        }
+        printf("\t\t\t\t\t)");
+    } else {
+        printf("%u %u %u %.*s", flags, protocol, algorithm, n, b64);
+    }
     free(b64);
 }
 
-static void print_ds_like(const uint8_t *rdata, size_t rdlen) {
+static void print_ds_like(const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
     if (rdlen < 4) { printf("(malformed)"); return; }
     uint16_t keytag = (rdata[0]<<8)|rdata[1];
     uint8_t algorithm = rdata[2];
     uint8_t digest_type = rdata[3];
-    printf("%u %u %u ", keytag, algorithm, digest_type);
-    for (size_t i = 4; i < rdlen; i++) printf("%02X", rdata[i]);
+    if (dopt && dopt->multiline) {
+        printf("%u %u %u (\n", keytag, algorithm, digest_type);
+        for (size_t i = 4; i < rdlen; ) {
+            printf("\t\t\t\t\t");
+            size_t chunk = (rdlen - i) < 32 ? (rdlen - i) : 32;
+            for (size_t j = 0; j < chunk; j++) printf("%02X", rdata[i + j]);
+            printf("\n");
+            i += chunk;
+        }
+        printf("\t\t\t\t\t)");
+    } else {
+        printf("%u %u %u ", keytag, algorithm, digest_type);
+        for (size_t i = 4; i < rdlen; i++) printf("%02X", rdata[i]);
+    }
 }
 
 static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
@@ -1332,7 +1363,7 @@ static void print_svcparams(const uint8_t *rdata, size_t offset, size_t rdlen) {
 }
 
 static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
-                         size_t abs_offset, uint16_t rdlen) {
+                         size_t abs_offset, uint16_t rdlen, const display_opts_t *dopt) {
     switch (type) {
         case 1:
             if (rdlen == 4) {
@@ -1373,7 +1404,25 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint32_t retry   = ((uint32_t)pkt[nums_off+8]<<24)|((uint32_t)pkt[nums_off+9]<<16)|((uint32_t)pkt[nums_off+10]<<8)|pkt[nums_off+11];
             uint32_t expire  = ((uint32_t)pkt[nums_off+12]<<24)|((uint32_t)pkt[nums_off+13]<<16)|((uint32_t)pkt[nums_off+14]<<8)|pkt[nums_off+15];
             uint32_t minimum = ((uint32_t)pkt[nums_off+16]<<24)|((uint32_t)pkt[nums_off+17]<<16)|((uint32_t)pkt[nums_off+18]<<8)|pkt[nums_off+19];
-            printf("%s %s %u %u %u %u %u", mname, rname, serial, refresh, retry, expire, minimum);
+            if (dopt && dopt->multiline) {
+                printf("%s %s (\n", mname, rname);
+                printf("\t\t\t\t\t%u\t; serial\n", serial);
+                printf("\t\t\t\t\t%u\t; refresh\n", refresh);
+                printf("\t\t\t\t\t%u\t; retry\n", retry);
+                if (dopt->expire) {
+                    printf("\t\t\t\t\t\033[1;31m%u\033[0m\t; expire (HIGHLIGHTED)\n", expire);
+                } else {
+                    printf("\t\t\t\t\t%u\t; expire\n", expire);
+                }
+                printf("\t\t\t\t\t%u\t; minimum\n", minimum);
+                printf("\t\t\t\t\t)");
+            } else {
+                if (dopt && dopt->expire) {
+                    printf("%s %s %u %u %u \033[1;31m%u\033[0m %u", mname, rname, serial, refresh, retry, expire, minimum);
+                } else {
+                    printf("%s %s %u %u %u %u %u", mname, rname, serial, refresh, retry, expire, minimum);
+                }
+            }
             break;
         }
         case 33: {
@@ -1698,8 +1747,17 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (!b64) goto fallback;
             int n = EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset + sig_offset_in_rdata], (int)sig_len);
 
-            printf("%s %u %u %u %s %s %u %s %.*s", covered_name, algorithm, labels,
-                   original_ttl, exp_str, inc_str, key_tag, signer_name, n, b64);
+            if (dopt && dopt->multiline) {
+                printf("%s %u %u %u (\n", covered_name, algorithm, labels, original_ttl);
+                printf("\t\t\t\t\t%s %s %u %s\n", exp_str, inc_str, key_tag, signer_name);
+                for (int i = 0; i < n; i += 64) {
+                    printf("\t\t\t\t\t%.*s\n", (n - i) < 64 ? (n - i) : 64, b64 + i);
+                }
+                printf("\t\t\t\t\t)");
+            } else {
+                printf("%s %u %u %u %s %s %u %s %.*s", covered_name, algorithm, labels,
+                       original_ttl, exp_str, inc_str, key_tag, signer_name, n, b64);
+            }
             free(b64);
             break;
         }
@@ -1714,7 +1772,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         }
         case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
-            print_dnskey_like(&pkt[abs_offset], rdlen);
+            print_dnskey_like(&pkt[abs_offset], rdlen, dopt);
             break;
         }
         case 50: { // NSEC3
@@ -1722,7 +1780,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         }
         case 43: case 59: case 32768: case 32769: { // DS, CDS, TA, DLV
-            print_ds_like(&pkt[abs_offset], rdlen);
+            print_ds_like(&pkt[abs_offset], rdlen, dopt);
             break;
         }
         case 62: { // CSYNC
@@ -2017,7 +2075,30 @@ static const char *format_class_name(uint16_t klass, char *buf, size_t buf_size)
     }
 }
 
-static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state) {
+static const char *idn_to_ascii(const char *name) {
+#ifdef HAVE_LIBIDN2
+    char *p;
+    int rc = idn2_lookup_ul(name, &p, 0);
+    if (rc == IDN2_OK) return p;
+    fprintf(stderr, ";; IDN conversion failed: %s\n", idn2_strerror(rc));
+#endif
+    return name;
+}
+
+static const char *idn_to_unicode(const char *name, char *buf, size_t buf_size) {
+#ifdef HAVE_LIBIDN2
+    char *p;
+    if (idn2_to_unicode_8z8z(name, &p, 0) == IDN2_OK) {
+        snprintf(buf, buf_size, "%s", p);
+        idn2_free(p);
+        return buf;
+    }
+#endif
+    snprintf(buf, buf_size, "%s", name);
+    return buf;
+}
+
+static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state, const display_opts_t *dopt) {
     char *name = NULL; size_t next;
     if (expand_wire_name(pkt, pkt_len, *offset, &next, &g_dag_arena, &name) != 0) return false;
     size_t hdr = next;
@@ -2042,9 +2123,15 @@ static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axf
 
     const char *tname = format_type_name(type, tname_buf, sizeof(tname_buf));
     char cname_buf[16];
+    char idn_buf[512];
+    const char *display_name = dopt->idnout ? idn_to_unicode(name, idn_buf, sizeof(idn_buf)) : name;
     const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
-    printf("%-24s %-6u %-4s %-8s ", name, ttl, cname, tname);
-    print_rdata(pkt, pkt_len, type, rdata_start, rdlen);
+    if (dopt->ttlid) {
+        printf("%-24s %-6u %-4s %-8s ", display_name, ttl, cname, tname);
+    } else {
+        printf("%-24s %-4s %-8s ", display_name, cname, tname);
+    }
+    print_rdata(pkt, pkt_len, type, rdata_start, rdlen, dopt);
     printf("\n");
 
     *offset = rdata_start + rdlen;
@@ -2121,6 +2208,68 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
     }
 }
 
+static void print_response_yaml(const uint8_t *pkt, size_t pkt_len) {
+    if (pkt_len < 12) return;
+    uint16_t id = (pkt[0] << 8) | pkt[1];
+    uint16_t flags = (pkt[2] << 8) | pkt[3];
+    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+    uint16_t ancount = (pkt[6] << 8) | pkt[7];
+    uint16_t nscount = (pkt[8] << 8) | pkt[9];
+    uint16_t arcount = (pkt[10] << 8) | pkt[11];
+
+    printf("---\n");
+    printf("id: %u\n", id);
+    printf("opcode: %u\n", (flags >> 11) & 0xF);
+    printf("rcode: %u\n", flags & 0xF);
+    printf("flags: %04x\n", flags);
+    printf("qdcount: %u\n", qdcount);
+    printf("ancount: %u\n", ancount);
+    printf("nscount: %u\n", nscount);
+    printf("arcount: %u\n", arcount);
+
+    size_t offset = 12;
+    if (qdcount > 0) {
+        printf("question:\n");
+        for (int i = 0; i < qdcount; i++) {
+            char *name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
+            if (next + 4 > pkt_len) break;
+            uint16_t qtype = (pkt[next] << 8) | pkt[next+1];
+            uint16_t qclass = (pkt[next+2] << 8) | pkt[next+3];
+            char tname_buf[32];
+            printf("  - name: \"%s\"\n", name);
+            printf("    type: %s\n", format_type_name(qtype, tname_buf, sizeof(tname_buf)));
+            printf("    class: %u\n", qclass);
+            offset = next + 4;
+        }
+    }
+    
+    // Very basic answer section output
+    if (ancount > 0) {
+        printf("answer:\n");
+        for (int i = 0; i < ancount; i++) {
+            char *name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
+            if (next + 10 > pkt_len) break;
+            uint16_t type = (pkt[next] << 8) | pkt[next+1];
+            uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
+            uint32_t ttl = ((uint32_t)pkt[next+4]<<24)|((uint32_t)pkt[next+5]<<16)|((uint32_t)pkt[next+6]<<8)|pkt[next+7];
+            uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
+            if (next + 10 + rdlen > pkt_len) break;
+            
+            char tname_buf[32];
+            printf("  - name: \"%s\"\n", name);
+            printf("    type: %s\n", format_type_name(type, tname_buf, sizeof(tname_buf)));
+            printf("    class: %u\n", klass);
+            printf("    ttl: %u\n", ttl);
+            printf("    rdlen: %u\n", rdlen);
+            offset = next + 10 + rdlen;
+        }
+    }
+}
+
+
+
 static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state, const display_opts_t *dopt) {
     if (pkt_len < 12) {
         printf(";; response too short to contain a header (%zu bytes)\n", pkt_len);
@@ -2168,7 +2317,9 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
             const char *qtname = format_type_name(qtype, qtname_buf, sizeof(qtname_buf));
             char qcname_buf[16];
             const char *qcname = format_class_name(qclass, qcname_buf, sizeof(qcname_buf));
-            printf(";%-24s %-4s %s\n", name, qcname, qtname);
+            char idn_buf[512];
+            const char *display_name = dopt->idnout ? idn_to_unicode(name, idn_buf, sizeof(idn_buf)) : name;
+            printf(";%-24s %-4s %s\n", display_name, qcname, qtname);
             offset = next + 4;
         }
         g_dag_suppress_stdout = false;
@@ -2177,19 +2328,19 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
     if (ancount > 0) {
         if (dopt->show_comments && dopt->show_answer) printf("\n;; ANSWER SECTION:\n");
         if (!dopt->show_answer) g_dag_suppress_stdout = true;
-        for (int i = 0; i < ancount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state)) { printf(";; (failed to parse answer record %d, stopping here)\n", i); goto fallback; }
+        for (int i = 0; i < ancount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) { printf(";; (failed to parse answer record %d, stopping here)\n", i); goto fallback; }
         g_dag_suppress_stdout = false;
     }
     if (nscount > 0) {
         if (dopt->show_comments && dopt->show_authority) printf("\n;; AUTHORITY SECTION:\n");
         if (!dopt->show_authority) g_dag_suppress_stdout = true;
-        for (int i = 0; i < nscount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state)) { printf(";; (failed to parse authority record %d, stopping here)\n", i); goto fallback; }
+        for (int i = 0; i < nscount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) { printf(";; (failed to parse authority record %d, stopping here)\n", i); goto fallback; }
         g_dag_suppress_stdout = false;
     }
     if (arcount > 0) {
         if (dopt->show_comments && dopt->show_additional) printf("\n;; ADDITIONAL SECTION:\n");
         if (!dopt->show_additional) g_dag_suppress_stdout = true;
-        for (int i = 0; i < arcount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state)) { printf(";; (failed to parse additional record %d, stopping here)\n", i); goto fallback; }
+        for (int i = 0; i < arcount; i++) if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) { printf(";; (failed to parse additional record %d, stopping here)\n", i); goto fallback; }
         g_dag_suppress_stdout = false;
     }
 
@@ -2409,7 +2560,14 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     printf("(hexdump suppressed)\n");
                 }
                 printf("\n");
-                print_response(resp, (size_t)n, &axfr_state, dopt);
+                if (dopt->identify) {
+                    printf(";; ANSWER FROM: %s\n", server);
+                }
+                if (dopt->yaml) {
+                    print_response_yaml(resp, (size_t)n);
+                } else {
+                    print_response(resp, (size_t)n, &axfr_state, dopt);
+                }
             } else {
                 uint16_t ancount = (resp[6] << 8) | resp[7];
                 size_t off = 12;
@@ -2425,7 +2583,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                         if (type == 6) {
                             check_axfr_soa(&axfr_state, resp, n, name, &resp[nxt], rdlen);
                         }
-                        print_rdata(resp, n, type, nxt+10, rdlen);
+                        print_rdata(resp, n, type, nxt+10, rdlen, dopt);
                         printf("\n");
                         off = nxt+10+rdlen;
                     } else break;
@@ -2712,7 +2870,7 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
         if (*p == '"') {
             p++;
             char *end = strchr(p, '"');
-            if (end && end - p < sizeof(name)) {
+            if (end && (long)(end - p) < (long)sizeof(name)) {
                 memcpy(name, p, end - p);
                 name[end - p] = '\0';
             }
@@ -2728,7 +2886,7 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
         if (*p == '"') p++;
         char *end = p;
         while (*end && *end != ';' && *end != '"' && *end != ' ' && *end != '\n') end++;
-        if (end - p < sizeof(algo)) {
+        if ((long)(end - p) < (long)sizeof(algo)) {
             memcpy(algo, p, end - p);
             algo[end - p] = '\0';
         }
@@ -2741,7 +2899,7 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
         if (*p == '"') {
             p++;
             char *end = strchr(p, '"');
-            if (end && end - p < sizeof(secret)) {
+            if (end && (long)(end - p) < (long)sizeof(secret)) {
                 memcpy(secret, p, end - p);
                 secret[end - p] = '\0';
             }
@@ -2765,6 +2923,7 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
  * /etc/resolv.conf から最初の nameserver を読み取って返す。
  * 見つからなければ "127.0.0.1" をフォールバックとして使用。
  */
+
 static const char *get_system_resolver(void) {
     static char resolver[256];
     FILE *fp = fopen("/etc/resolv.conf", "r");
@@ -2792,11 +2951,67 @@ static const char *get_system_resolver(void) {
     return resolver;
 }
 
+static int get_system_search_domains(char domains[][256], int max_domains) {
+    int count = 0;
+    FILE *fp = fopen("/etc/resolv.conf", "r");
+    if (!fp) return 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == ';' || *p == '\n') continue;
+        if ((strncmp(p, "search", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) ||
+            (strncmp(p, "domain", 6) == 0 && (p[6] == ' ' || p[6] == '\t'))) {
+            p += 6;
+            char *tok = strtok(p, " \t\r\n");
+            while (tok && count < max_domains) {
+                snprintf(domains[count++], 256, "%s", tok);
+                tok = strtok(NULL, " \t\r\n");
+            }
+        }
+    }
+    fclose(fp);
+    return count;
+}
+
+static int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
+                          bool use_tcp, bool force_udp, bool use_ldnsz, bool test_all, bool norecurse,
+                          bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
+                          bool no_hexdump_query, bool no_hexdump_response,
+                          query_opts_t qo, const char *hex_payload, const display_opts_t *dopt);
+
+static void run_trace_query(const char *qname, const char *qtype_s, int port, bool use_tcp, bool force_udp, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
+    printf(";; TRACE: tracing %s from root servers...\n", qname);
+    // Naive implementation: just query root, then query the requested server.
+    // A full iterative resolver requires a complex state machine for glue parsing.
+    printf(";; (Full iterative trace requires glue parsing, falling back to basic query)\n");
+    run_single_job(qname, qtype_s, "@198.41.0.4", port, use_tcp, force_udp, false, false, true, false, false, false, false, false, false, false, qo, hex_payload, dopt);
+}
+
+static void run_nssearch(const char *qname, int port, bool use_tcp, bool force_udp, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
+    printf(";; NSSEARCH: finding nameservers for %s...\n", qname);
+    printf(";; (Full nssearch requires internal NS parsing, falling back to basic NS query)\n");
+    run_single_job(qname, "NS", NULL, port, use_tcp, force_udp, false, false, false, false, false, false, false, false, false, false, qo, hex_payload, dopt);
+}
+
 static int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
                           bool use_tcp, bool force_udp, bool use_ldnsz, bool test_all, bool norecurse,
                           bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
                           bool no_hexdump_query, bool no_hexdump_response,
                           query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
+    char expanded_qname[512];
+    if (qo.use_search_list && strchr(qname, '.') == NULL) {
+        char domains[4][256];
+        int count = get_system_search_domains(domains, 4);
+        if (count > 0) {
+            snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, domains[0]);
+            if (dopt && dopt->showsearch) {
+                printf(";; SEARCH: %s -> %s\n", qname, expanded_qname);
+            }
+            qname = expanded_qname;
+        }
+    }
+
     /*
      * @8.8.8.8,9.9.9.9 のようにカンマ区切りで複数サーバーを指定できるようにする。
      * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
@@ -2956,6 +3171,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
 }
 
 int main(int argc, char **argv) {
+    setlocale(LC_ALL, "");
     zone_arena_init(&g_dag_arena);
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
     if (argc < 2) { usage(argv[0]); return 1; }
@@ -2971,6 +3187,8 @@ int main(int argc, char **argv) {
     bool use_tcp = false;
     bool force_udp = false;
     bool use_ldnsz = false;
+    bool do_trace = false;
+    bool do_nssearch = false;
     display_opts_t dopt = {
         .show_question = true,
         .show_answer = true,
@@ -2980,8 +3198,12 @@ int main(int argc, char **argv) {
         .show_stats = true,
         .show_cmd = true,
         .short_mode = false,
-        .identify = false,
-        .multiline = false
+        .multiline = false,
+        .yaml = false,
+        .ttlid = true,
+        .expire = false,
+        .showsearch = false,
+        .idnout = false
     };
 
     bool norecurse = false;
@@ -3186,6 +3408,49 @@ int main(int argc, char **argv) {
             dopt.show_cmd = false;
         } else if (strcmp(argv[i], "+short") == 0) {
             dopt.short_mode = true;
+        } else if (strcmp(argv[i], "+identify") == 0) {
+            dopt.identify = true;
+        } else if (strcmp(argv[i], "+noidentify") == 0) {
+            dopt.identify = false;
+        } else if (strcmp(argv[i], "+multiline") == 0) {
+            dopt.multiline = true;
+        } else if (strcmp(argv[i], "+nomultiline") == 0) {
+            dopt.multiline = false;
+        } else if (strcmp(argv[i], "+yaml") == 0) {
+            dopt.yaml = true;
+        } else if (strcmp(argv[i], "+noyaml") == 0) {
+            dopt.yaml = false;
+        } else if (strcmp(argv[i], "+trace") == 0) {
+            do_trace = true;
+        } else if (strcmp(argv[i], "+nssearch") == 0) {
+            do_nssearch = true;
+        } else if (strcmp(argv[i], "+search") == 0) {
+            qo.use_search_list = true;
+        } else if (strcmp(argv[i], "+nosearch") == 0) {
+            qo.use_search_list = false;
+        } else if (strcmp(argv[i], "+ttlid") == 0) {
+            dopt.ttlid = true;
+        } else if (strcmp(argv[i], "+nottlid") == 0) {
+            dopt.ttlid = false;
+        } else if (strcmp(argv[i], "+expire") == 0) {
+            dopt.expire = true;
+        } else if (strcmp(argv[i], "+noexpire") == 0) {
+            dopt.expire = false;
+        } else if (strcmp(argv[i], "+showsearch") == 0) {
+            dopt.showsearch = true;
+        } else if (strcmp(argv[i], "+noshowsearch") == 0) {
+            dopt.showsearch = false;
+        } else if (strcmp(argv[i], "+idnin") == 0) {
+            qo.idnin = true;
+        } else if (strcmp(argv[i], "+noidnin") == 0) {
+            qo.idnin = false;
+        } else if (strcmp(argv[i], "+idnout") == 0) {
+            dopt.idnout = true;
+        } else if (strcmp(argv[i], "+noidnout") == 0) {
+            dopt.idnout = false;
+        } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("KariDNS dag v1.0\n");
+            exit(0);
         } else if (strcmp(argv[i], "+norec") == 0 || strcmp(argv[i], "+norecurse") == 0) {
             norecurse = true;
         } else if (strcmp(argv[i], "+nohexdump") == 0) {
@@ -3388,16 +3653,32 @@ int main(int argc, char **argv) {
             if (!b_qname) continue;
             if (!b_qtype) b_qtype = "A";
             
+            if (qo.idnin) b_qname = (char *)idn_to_ascii(b_qname);
+
             const char *eff_server = b_server ? b_server : server_arg;
-            run_single_job(b_qname, b_qtype, eff_server, port, use_tcp, force_udp, use_ldnsz, test_all, norecurse,
-                           adflag, cdflag, aaflag, tcflag, zflag,
-                           no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
+            if (do_trace) {
+                run_trace_query(b_qname, b_qtype, port, use_tcp, force_udp, qo, hex_payload, &dopt);
+            } else if (do_nssearch) {
+                run_nssearch(b_qname, port, use_tcp, force_udp, qo, hex_payload, &dopt);
+            } else {
+                run_single_job(b_qname, b_qtype, eff_server, port, use_tcp, force_udp, use_ldnsz, test_all, norecurse,
+                               adflag, cdflag, aaflag, tcflag, zflag,
+                               no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
+            }
         }
         fclose(bf);
     } else {
-        run_single_job(qname, qtype_s, server_arg, port, use_tcp, force_udp, use_ldnsz, test_all, norecurse,
-                       adflag, cdflag, aaflag, tcflag, zflag,
-                       no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
+        if (qo.idnin) qname = (char *)idn_to_ascii(qname);
+
+        if (do_trace) {
+            run_trace_query(qname, qtype_s, port, use_tcp, force_udp, qo, hex_payload, &dopt);
+        } else if (do_nssearch) {
+            run_nssearch(qname, port, use_tcp, force_udp, qo, hex_payload, &dopt);
+        } else {
+            run_single_job(qname, qtype_s, server_arg, port, use_tcp, force_udp, use_ldnsz, test_all, norecurse,
+                           adflag, cdflag, aaflag, tcflag, zflag,
+                           no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
+        }
     }
 
     zone_arena_destroy(&g_dag_arena);
