@@ -70,13 +70,17 @@ asan_test: tests/test_asan_overflow.c dns_config_parser.o dns_zone_parser.o dns_
 	clang -fsanitize=address,undefined -O1 -g tests/test_asan_overflow.c dns_config_parser.c dns_zone_parser.c dns_wire.c dns_utils.c -lcrypto -o test_asan_overflow
 	./test_asan_overflow
 
+include_test: tests/test_conf_include.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_utils.c
+	clang -fsanitize=address,undefined -O1 -g tests/test_conf_include.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_utils.c -lcrypto -o test_conf_include
+	./test_conf_include
+
 hash_test: tests/test_hash_table.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_hash_table.c -o test_hash_table
 	./test_hash_table
 
 clean: clean-fuzz
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
-	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o
+	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table
 
 run: $(TARGET)
 	./$(TARGET)

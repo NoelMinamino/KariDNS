@@ -52,6 +52,7 @@ int main() {
         printf("Test 1 Failed: Rejected 340 char secret!\n");
         return 1;
     }
+    free_server_config_fields(&cfg);
 
     // Test 2: 344 characters (rejected)
     memset(&cfg, 0, sizeof(cfg));
@@ -68,6 +69,7 @@ int main() {
         printf("Test 2 Failed: Accepted 344 char secret!\n");
         return 1;
     }
+    free_server_config_fields(&cfg);
     
 
     // Test 4: allow-transfer key correctly sets zone->tsig_key
@@ -85,6 +87,7 @@ int main() {
                cfg.zones ? cfg.zones->allow_transfer_count : -1);
         return 1;
     }
+    free_server_config_fields(&cfg);
 
     // Test 3: New record types boundary checks
     {

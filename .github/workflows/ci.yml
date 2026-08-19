@@ -32,6 +32,7 @@ jobs:
             echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
             make asan_test
             make hash_test
+            make include_test
             echo "::endgroup::"
 
             echo "::group::📦 [Build] Build Fuzzers"

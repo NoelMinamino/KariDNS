@@ -1267,6 +1267,17 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   return RELOAD_OK;
 }
 
+static inline uint32_t calc_catalog_member_hash(const char *domain, const char *unique_id) {
+  uint32_t hash = calc_fnv1a_str(domain);
+  if (unique_id) {
+    for (const char *p = unique_id; *p; p++) {
+      hash ^= (uint8_t)*p;
+      hash *= 16777619u;
+    }
+  }
+  return hash;
+}
+
 void free_catalog_member_ids(catalog_member_id_t *arr, int count) {
   if (!arr) return;
   for (int i = 0; i < count; i++) {
@@ -1282,6 +1293,16 @@ void free_catalog_member_ids(catalog_member_id_t *arr, int count) {
 
 zone_db_entry_t *find_catalog_parent_in_snapshot(view_snapshot_t *view, const char *catalog_domain) {
     if (!view || !catalog_domain) return NULL;
+    if (view->hash_size > 0 && view->hash_table && view->chain_next) {
+        uint32_t hash = calc_fnv1a_str(catalog_domain);
+        size_t idx = hash & (view->hash_size - 1);
+        for (int i = view->hash_table[idx]; i != -1; i = view->chain_next[i]) {
+            if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
+                return view->entries[i];
+            }
+        }
+        return NULL;
+    }
     for (size_t i = 0; i < view->zone_count; i++) {
         if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
             return view->entries[i];
@@ -1514,12 +1535,20 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (int i = 0; i < new_desired_count; i++) {
                 if (strlen(new_desired_members[i].coo_target) > 0) {
                     if (g_pending_coo_count >= g_pending_coo_capacity) {
-                        g_pending_coo_capacity = g_pending_coo_capacity == 0 ? 16 : g_pending_coo_capacity * 2;
-                        g_pending_coo = realloc(g_pending_coo, g_pending_coo_capacity * sizeof(pending_coo_t));
+                        size_t old_cap = g_pending_coo_capacity;
+                        size_t new_cap = old_cap == 0 ? 16 : old_cap * 2;
+                        pending_coo_t *tmp = realloc(g_pending_coo, new_cap * sizeof(pending_coo_t));
+                        if (!tmp) {
+                            syslog(LOG_ERR, "[Catalog] Failed to allocate memory for g_pending_coo (domain=%s); skipping CoO tracking for this member", new_desired_members[i].domain);
+                            continue;
+                        }
+                        g_pending_coo = tmp;
+                        g_pending_coo_capacity = new_cap;
+                        memset(&g_pending_coo[old_cap], 0, (new_cap - old_cap) * sizeof(pending_coo_t));
                     }
-                    strncpy(g_pending_coo[g_pending_coo_count].domain, new_desired_members[i].domain, 255);
-                    strncpy(g_pending_coo[g_pending_coo_count].old_catalog, catalog_entry_to_update->domain, 255);
-                    strncpy(g_pending_coo[g_pending_coo_count].new_catalog, new_desired_members[i].coo_target, 255);
+                    snprintf(g_pending_coo[g_pending_coo_count].domain, sizeof(g_pending_coo[0].domain), "%s", new_desired_members[i].domain);
+                    snprintf(g_pending_coo[g_pending_coo_count].old_catalog, sizeof(g_pending_coo[0].old_catalog), "%s", catalog_entry_to_update->domain);
+                    snprintf(g_pending_coo[g_pending_coo_count].new_catalog, sizeof(g_pending_coo[0].new_catalog), "%s", new_desired_members[i].coo_target);
                     g_pending_coo_count++;
                 }
             }
@@ -1543,21 +1572,69 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
         }
 
+        // Ephemeral hash table for catalog_entry_to_update->catalog_members
+        int *cur_hash_table = NULL;
+        int *cur_chain_next = NULL;
+        size_t cur_hash_size = 0;
+        int cur_count = catalog_entry_to_update->catalog_member_count;
+        if (cur_count > 0 && catalog_entry_to_update->catalog_members) {
+            size_t p = 256;
+            while (p < (size_t)cur_count * 2) p <<= 1;
+            cur_hash_size = p;
+            cur_hash_table = malloc(cur_hash_size * sizeof(int));
+            cur_chain_next = malloc(cur_count * sizeof(int));
+            if (cur_hash_table && cur_chain_next) {
+                for (size_t k = 0; k < cur_hash_size; k++) cur_hash_table[k] = -1;
+                for (int j = 0; j < cur_count; j++) {
+                    uint32_t h = calc_catalog_member_hash(catalog_entry_to_update->catalog_members[j].domain,
+                                                          catalog_entry_to_update->catalog_members[j].unique_id);
+                    size_t idx = h & (cur_hash_size - 1);
+                    cur_chain_next[j] = cur_hash_table[idx];
+                    cur_hash_table[idx] = j;
+                }
+            } else {
+                if (cur_hash_table) { free(cur_hash_table); cur_hash_table = NULL; }
+                if (cur_chain_next) { free(cur_chain_next); cur_chain_next = NULL; }
+                cur_hash_size = 0;
+            }
+        }
+
         for (int i = 0; i < new_desired_count; i++) {
             bool found = false;
-            for (int j = 0; j < catalog_entry_to_update->catalog_member_count; j++) {
-                if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
-                    strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
-                    bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
-                    if (groups_match) {
-                        for (int k = 0; k < new_desired_members[i].group_count; k++) {
-                            if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
-                                groups_match = false; break;
+            if (cur_hash_table && cur_chain_next) {
+                uint32_t h = calc_catalog_member_hash(new_desired_members[i].domain, new_desired_members[i].unique_id);
+                size_t idx = h & (cur_hash_size - 1);
+                for (int j = cur_hash_table[idx]; j != -1; j = cur_chain_next[j]) {
+                    if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
+                        strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
+                        bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
+                                if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
                             }
                         }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
-                    if (groups_match) {
-                        found = true; break;
+                }
+            } else {
+                for (int j = 0; j < catalog_entry_to_update->catalog_member_count; j++) {
+                    if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
+                        strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
+                        bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
+                                if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
+                            }
+                        }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
                 }
             }
@@ -1642,23 +1719,72 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
             }
         }
+        if (cur_hash_table) free(cur_hash_table);
+        if (cur_chain_next) free(cur_chain_next);
         new_desired_count = filtered_count;
+
+        // Ephemeral hash table for new_desired_members
+        int *des_hash_table = NULL;
+        int *des_chain_next = NULL;
+        size_t des_hash_size = 0;
+        if (new_desired_count > 0) {
+            size_t p = 256;
+            while (p < (size_t)new_desired_count * 2) p <<= 1;
+            des_hash_size = p;
+            des_hash_table = malloc(des_hash_size * sizeof(int));
+            des_chain_next = malloc(new_desired_count * sizeof(int));
+            if (des_hash_table && des_chain_next) {
+                for (size_t k = 0; k < des_hash_size; k++) des_hash_table[k] = -1;
+                for (int j = 0; j < new_desired_count; j++) {
+                    uint32_t h = calc_catalog_member_hash(new_desired_members[j].domain, new_desired_members[j].unique_id);
+                    size_t idx = h & (des_hash_size - 1);
+                    des_chain_next[j] = des_hash_table[idx];
+                    des_hash_table[idx] = j;
+                }
+            } else {
+                if (des_hash_table) { free(des_hash_table); des_hash_table = NULL; }
+                if (des_chain_next) { free(des_chain_next); des_chain_next = NULL; }
+                des_hash_size = 0;
+            }
+        }
 
         for (int i = 0; i < catalog_entry_to_update->catalog_member_count; i++) {
             bool found = false;
-            for (int j = 0; j < new_desired_count; j++) {
-                if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
-                    strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
-                    bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
-                    if (groups_match) {
-                        for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
-                            if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
-                                groups_match = false; break;
+            if (des_hash_table && des_chain_next) {
+                uint32_t h = calc_catalog_member_hash(catalog_entry_to_update->catalog_members[i].domain,
+                                                      catalog_entry_to_update->catalog_members[i].unique_id);
+                size_t idx = h & (des_hash_size - 1);
+                for (int j = des_hash_table[idx]; j != -1; j = des_chain_next[j]) {
+                    if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
+                        strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
+                        bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
+                                if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
                             }
                         }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
-                    if (groups_match) {
-                        found = true; break;
+                }
+            } else {
+                for (int j = 0; j < new_desired_count; j++) {
+                    if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
+                        strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
+                        bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
+                                if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
+                            }
+                        }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
                 }
             }
@@ -1666,6 +1792,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 removed_members[removed_count++] = catalog_entry_to_update->catalog_members[i];
             }
         }
+        if (des_hash_table) free(des_hash_table);
+        if (des_chain_next) free(des_chain_next);
 
         zone_db_entry_t **new_entries = calloc(added_count > 0 ? added_count : 1, sizeof(zone_db_entry_t*));
         for (int i = 0; i < added_count; i++) {
@@ -1698,6 +1826,34 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             new_snap->views = calloc(new_snap->view_count, sizeof(view_snapshot_t));
             atomic_init(&new_snap->reader_count, 0);
 
+            // Build ephemeral hash table for deleted members (removed + coo_evicted)
+            int total_deleted = removed_count + coo_evicted_count;
+            int *del_hash_table = NULL;
+            int *del_chain_next = NULL;
+            size_t del_hash_size = 0;
+            if (total_deleted > 0) {
+                size_t p = 256;
+                while (p < (size_t)total_deleted * 2) p <<= 1;
+                del_hash_size = p;
+                del_hash_table = malloc(del_hash_size * sizeof(int));
+                del_chain_next = malloc(total_deleted * sizeof(int));
+                if (del_hash_table && del_chain_next) {
+                    for (size_t k = 0; k < del_hash_size; k++) del_hash_table[k] = -1;
+                    for (int j = 0; j < total_deleted; j++) {
+                        const catalog_member_id_t *del = (j < removed_count) ? 
+                            &removed_members[j] : &coo_evicted_members[j - removed_count];
+                        uint32_t h = calc_catalog_member_hash(del->domain, del->unique_id);
+                        size_t idx = h & (del_hash_size - 1);
+                        del_chain_next[j] = del_hash_table[idx];
+                        del_hash_table[idx] = j;
+                    }
+                } else {
+                    if (del_hash_table) { free(del_hash_table); del_hash_table = NULL; }
+                    if (del_chain_next) { free(del_chain_next); del_chain_next = NULL; }
+                    del_hash_size = 0;
+                }
+            }
+
             for (size_t v = 0; v < old_snap->view_count; v++) {
                 view_snapshot_t *vs = &new_snap->views[v];
                 vs->name = strdup(old_snap->views[v].name);
@@ -1710,48 +1866,42 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
 
                 if (strcasecmp(vs->name, catalog_view_name) == 0) {
-                    int keep_count = 0;
-                    for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
-                        bool is_removed = false;
-                        for (int j = 0; j < removed_count; j++) {
-                            if (strcasecmp(old_snap->views[v].entries[i]->domain, removed_members[j].domain) == 0 &&
-                                strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
-                                is_removed = true; break;
-                            }
-                        }
-                        if (!is_removed) {
-                            for (int j = 0; j < coo_evicted_count; j++) {
-                                if (strcasecmp(old_snap->views[v].entries[i]->domain, coo_evicted_members[j].domain) == 0 &&
-                                    strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
-                                    is_removed = true; break;
-                                }
-                            }
-                        }
-                        if (!is_removed) keep_count++;
-                    }
-                    
-                    vs->zone_count = keep_count + added_count;
-                    vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+                    size_t max_zones = old_snap->views[v].zone_count + added_count;
+                    vs->entries = calloc(max_zones > 0 ? max_zones : 1, sizeof(zone_db_entry_t *));
                     
                     int zidx = 0;
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
+                        zone_db_entry_t *entry = old_snap->views[v].entries[i];
                         bool is_removed = false;
-                        for (int j = 0; j < removed_count; j++) {
-                            if (strcasecmp(old_snap->views[v].entries[i]->domain, removed_members[j].domain) == 0 &&
-                                strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
-                                is_removed = true; break;
+                        if (entry->is_catalog_member && del_hash_table && del_chain_next) {
+                            uint32_t h = calc_catalog_member_hash(entry->domain, entry->catalog_member_unique_id);
+                            size_t idx = h & (del_hash_size - 1);
+                            for (int j = del_hash_table[idx]; j != -1; j = del_chain_next[j]) {
+                                const catalog_member_id_t *del = (j < removed_count) ? 
+                                    &removed_members[j] : &coo_evicted_members[j - removed_count];
+                                if (strcasecmp(entry->domain, del->domain) == 0 &&
+                                    strcmp(entry->catalog_member_unique_id, del->unique_id) == 0) {
+                                    is_removed = true;
+                                    break;
+                                }
                             }
-                        }
-                        if (!is_removed) {
-                            for (int j = 0; j < coo_evicted_count; j++) {
-                                if (strcasecmp(old_snap->views[v].entries[i]->domain, coo_evicted_members[j].domain) == 0 &&
-                                    strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                        } else if (entry->is_catalog_member && total_deleted > 0) {
+                            for (int j = 0; j < removed_count; j++) {
+                                if (strcasecmp(entry->domain, removed_members[j].domain) == 0 &&
+                                    strcmp(entry->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
                                     is_removed = true; break;
+                                }
+                            }
+                            if (!is_removed) {
+                                for (int j = 0; j < coo_evicted_count; j++) {
+                                    if (strcasecmp(entry->domain, coo_evicted_members[j].domain) == 0 &&
+                                        strcmp(entry->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                                        is_removed = true; break;
+                                    }
                                 }
                             }
                         }
                         if (!is_removed) {
-                            zone_db_entry_t *entry = old_snap->views[v].entries[i];
                             atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
                             vs->entries[zidx++] = entry;
                         }
@@ -1760,9 +1910,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     for (int i = 0; i < added_count; i++) {
                         vs->entries[zidx++] = new_entries[i];
                     }
+                    vs->zone_count = zidx;
                 } else {
                     vs->zone_count = old_snap->views[v].zone_count;
-                    vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+                    vs->entries = calloc(vs->zone_count > 0 ? vs->zone_count : 1, sizeof(zone_db_entry_t *));
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                         zone_db_entry_t *entry = old_snap->views[v].entries[i];
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
@@ -1770,6 +1921,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
+            if (del_hash_table) free(del_hash_table);
+            if (del_chain_next) free(del_chain_next);
         }
 
         free(added_members);
@@ -3925,31 +4078,6 @@ static void init_logging_channels(server_config_t *cfg) {
   }
 }
 
-static void free_logging_channels(server_config_t *cfg) {
-  log_channel_t *ch = cfg->logging.channels;
-  while (ch) {
-    log_channel_t *next = ch->next;
-    if (ch->fd >= 0)
-      close(ch->fd);
-    if (ch->name)
-      free(ch->name);
-    if (ch->file_path)
-      free(ch->file_path);
-    free(ch);
-    ch = next;
-  }
-  cfg->logging.channels = NULL;
-  cfg->logging.queries_channel = NULL;
-  if (cfg->logging.queries_channel_name) {
-    free(cfg->logging.queries_channel_name);
-    cfg->logging.queries_channel_name = NULL;
-  }
-  cfg->logging.responses_channel = NULL;
-  if (cfg->logging.responses_channel_name) {
-    free(cfg->logging.responses_channel_name);
-    cfg->logging.responses_channel_name = NULL;
-  }
-}
 
 static void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
                                 uint16_t qclass, uint16_t qtype, uint8_t rcode, 
@@ -5251,55 +5379,6 @@ static void reload_all_zones(void) {
   release_zone_snapshot(snap);
 }
 
-static void free_server_config_fields(server_config_t *cfg) {
-  for (int j = 0; j < cfg->bind_address_count; j++)
-    free(cfg->bind_addresses[j]);
-  free(cfg->bind_addresses);
-  cfg->bind_addresses = NULL;
-  cfg->bind_address_count = 0;
-
-  zone_config_t *curr_flat = cfg->zones;
-  while (curr_flat) {
-    zone_config_t *next = curr_flat->next;
-    free(curr_flat);
-    curr_flat = next;
-  }
-  cfg->zones = NULL;
-
-  view_config_t *v = cfg->views;
-  while (v) {
-    view_config_t *next_v = v->next;
-    if (v->name) free(v->name);
-    for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
-    if (v->match_clients) free(v->match_clients);
-    zone_config_t *curr = v->zones;
-    while (curr) {
-      zone_config_t *next = curr->next;
-      free_zone_config(curr);
-      curr = next;
-    }
-    free(v);
-    v = next_v;
-  }
-  cfg->views = NULL;
-
-  tsig_key_t *k = cfg->keys;
-  while (k) {
-    tsig_key_t *next_k = k->next;
-    free(k->name); free(k->algorithm); free(k->secret);
-    free(k);
-    k = next_k;
-  }
-  cfg->keys = NULL;
-
-  if (cfg->control.algorithm) free(cfg->control.algorithm);
-  if (cfg->control.secret) free(cfg->control.secret);
-  memset(&cfg->control, 0, sizeof(control_channel_config_t));
-  free_rate_limit_config(&cfg->rrl);
-  memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
-  free_logging_channels(cfg);
-}
-
 static void perform_config_reload(void) {
   g_last_configured_time = time(NULL);
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
@@ -5312,7 +5391,7 @@ static void perform_config_reload(void) {
                                  : &g_config_db.config_a;
   
   free_server_config_fields(standby);
-  if (parse_named_conf(config_str, standby) == 0) {
+  if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
@@ -5983,6 +6062,41 @@ static void daemonize(void) {
     cap_rights_limit(stdio_fd, &io_rights);
 }
 
+static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
+  if (desired_rcv > 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
+      syslog(LOG_WARNING, "[Network] Failed to set SO_RCVBUF to %d: %m", desired_rcv);
+    } else {
+      int actual_rcv = 0;
+      socklen_t optlen = sizeof(actual_rcv);
+      if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) == 0) {
+        if (actual_rcv < desired_rcv) {
+          syslog(LOG_WARNING,
+                 "[Network] UDP SO_RCVBUF truncated by OS: requested %d bytes, got %d bytes "
+                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
+                 desired_rcv, actual_rcv);
+        }
+      }
+    }
+  }
+  if (desired_snd > 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &desired_snd, sizeof(desired_snd)) != 0) {
+      syslog(LOG_WARNING, "[Network] Failed to set SO_SNDBUF to %d: %m", desired_snd);
+    } else {
+      int actual_snd = 0;
+      socklen_t optlen = sizeof(actual_snd);
+      if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) == 0) {
+        if (actual_snd < desired_snd) {
+          syslog(LOG_WARNING,
+                 "[Network] UDP SO_SNDBUF truncated by OS: requested %d bytes, got %d bytes "
+                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
+                 desired_snd, actual_snd);
+        }
+      }
+    }
+  }
+}
+
 static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
   g_num_ipc = num_workers;
   g_ipc_fds = calloc(num_workers, sizeof(int[2]));
@@ -6013,6 +6127,8 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int bind_count = cfg->bind_address_count;
   int opt = 1;
+  int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
+  int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
 
   for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
     struct sockaddr_in addr4;
@@ -6046,6 +6162,7 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
     if (is_v4 && g_num_udp_fds < MAX_BIND_ADDRS) {
       int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
       if (udp_fd >= 0) {
+        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
         fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
         if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0)
           g_udp_fds[g_num_udp_fds++] = udp_fd;
@@ -6056,6 +6173,7 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
     if (is_v6 && g_num_udp_fds < MAX_BIND_ADDRS) {
       int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
       if (udp_fd >= 0) {
+        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
         fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
         setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
         if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0)
@@ -6154,7 +6272,7 @@ int main(int argc, char **argv) {
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
     return 1;
-  if (parse_named_conf(config_str, &g_config_db.config_a) != 0) {
+  if (parse_named_conf_ext(config_str, g_config_path, &g_config_db.config_a) != 0) {
     free(config_str);
     return 1;
   }

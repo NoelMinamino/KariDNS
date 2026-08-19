@@ -805,7 +805,7 @@ static int check_config(const char *config_path, server_config_t *cfg) {
     char *buf = read_file_or_die(config_path, &failed);
     if (failed || !buf) return 1;
 
-    if (parse_named_conf(buf, cfg) != 0) {
+    if (parse_named_conf_ext(buf, config_path, cfg) != 0) {
         fprintf(stderr, "[ERROR] Syntax error in config file: %s\n", config_path);
         free(buf);
         return 1;
