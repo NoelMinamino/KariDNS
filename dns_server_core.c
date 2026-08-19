@@ -1514,12 +1514,20 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (int i = 0; i < new_desired_count; i++) {
                 if (strlen(new_desired_members[i].coo_target) > 0) {
                     if (g_pending_coo_count >= g_pending_coo_capacity) {
-                        g_pending_coo_capacity = g_pending_coo_capacity == 0 ? 16 : g_pending_coo_capacity * 2;
-                        g_pending_coo = realloc(g_pending_coo, g_pending_coo_capacity * sizeof(pending_coo_t));
+                        size_t old_cap = g_pending_coo_capacity;
+                        size_t new_cap = old_cap == 0 ? 16 : old_cap * 2;
+                        pending_coo_t *tmp = realloc(g_pending_coo, new_cap * sizeof(pending_coo_t));
+                        if (!tmp) {
+                            syslog(LOG_ERR, "[Catalog] Failed to allocate memory for g_pending_coo (domain=%s); skipping CoO tracking for this member", new_desired_members[i].domain);
+                            continue;
+                        }
+                        g_pending_coo = tmp;
+                        g_pending_coo_capacity = new_cap;
+                        memset(&g_pending_coo[old_cap], 0, (new_cap - old_cap) * sizeof(pending_coo_t));
                     }
-                    strncpy(g_pending_coo[g_pending_coo_count].domain, new_desired_members[i].domain, 255);
-                    strncpy(g_pending_coo[g_pending_coo_count].old_catalog, catalog_entry_to_update->domain, 255);
-                    strncpy(g_pending_coo[g_pending_coo_count].new_catalog, new_desired_members[i].coo_target, 255);
+                    snprintf(g_pending_coo[g_pending_coo_count].domain, sizeof(g_pending_coo[0].domain), "%s", new_desired_members[i].domain);
+                    snprintf(g_pending_coo[g_pending_coo_count].old_catalog, sizeof(g_pending_coo[0].old_catalog), "%s", catalog_entry_to_update->domain);
+                    snprintf(g_pending_coo[g_pending_coo_count].new_catalog, sizeof(g_pending_coo[0].new_catalog), "%s", new_desired_members[i].coo_target);
                     g_pending_coo_count++;
                 }
             }
