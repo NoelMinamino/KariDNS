@@ -464,6 +464,8 @@ typedef struct {
     uint16_t query_id;
     bool use_search_list;
     bool idnin;
+    bool ignore_tc;
+    bool nofail;
 } query_opts_t;
 
 typedef struct {
@@ -2658,9 +2660,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         if (tcp_sock >= 0) close(tcp_sock);
 
         if (is_truncated) {
-            fprintf(stderr, "\n;; Truncated, retrying in TCP mode...\n\n");
-            use_tcp = true;
-            retry_tcp = true;
+            if (qo->ignore_tc) {
+                fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
+            } else {
+                fprintf(stderr, "\n;; Truncated, retrying in TCP mode...\n\n");
+                use_tcp = true;
+                retry_tcp = true;
+            }
         }
     } while (retry_tcp);
 
@@ -2774,7 +2780,7 @@ static void usage(const char *prog) {
         "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
         "          [--test-all] [--break <kind>[=<param>] ...]\n"
         "          [+nohexdump] [+nohexdump-query] [+nohexdump-response]\n"
-        "          [+ldnsz] [+allcompare]\n"
+        "          [+ldnsz] [+allcompare] [+ignore] [+noignore] [+fail] [+nofail]\n"
         "\n"
         "  <server> may be an IPv4/IPv6 literal or an FQDN (resolved via the\n"
         "  system resolver), e.g. @8.8.8.8, @2001:4860:4860::8888, @dns.google\n"
@@ -3425,88 +3431,111 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     }
     qo.query_id = (uint16_t)(arc4random() & 0xFFFF);
 
-    for (int si = 0; si < server_count; si++) {
-        const char *server = servers[si];
-        int srv_port = server_ports[si];
-        
-        if (server_count > 1) {
-            printf("\n;; ===============================================\n");
-            printf(";; Server: %s\n", server);
-            printf(";; ===============================================\n");
-        }
+    if (qo.nofail && server_count > 1 && !test_all) {
+        for (int si = 0; si < server_count; si++) {
+            const char *server = servers[si];
+            int srv_port = server_ports[si];
+            bool is_last = (si == server_count - 1);
 
-        if (test_all) {
-        // --test-all で qname が '.' のままだとテスト対象にならないので上書き
-        if (strcmp(qname, ".") == 0) qname = "example.com";
-        struct {
-            const char *name; break_kind_t kind; long param; bool tcp;
-            bool cdflag; bool zflag; bool aaflag; bool tcflag;
-            int padding; int edns_code;
-        } all_tests[] = {
-            {"Compression Loop", BRK_COMPRESSION_LOOP, 0, false, false,false,false,false, -1, -1},
-            {"Compression Forward", BRK_COMPRESSION_FORWARD, 0, false, false,false,false,false, -1, -1},
-            {"Label Too Long", BRK_LABEL_TOO_LONG, 100, false, false,false,false,false, -1, -1},
-            {"Reserved Length Bits", BRK_RESERVED_LENGTH_BITS, 0, false, false,false,false,false, -1, -1},
-            {"Oversized QNAME", BRK_OVERSIZED_QNAME, 0, false, false,false,false,false, -1, -1},
-            {"Override QDCOUNT", BRK_QDCOUNT, 2, false, false,false,false,false, -1, -1},
-            {"Truncated Question", BRK_TRUNCATED_QUESTION, 0, false, false,false,false,false, -1, -1},
-            {"Fake OPT RDLEN", BRK_OPT_RDLEN, 500, false, false,false,false,false, -1, -1},
-            {"Override ARCOUNT", BRK_ARCOUNT, 10, false, false,false,false,false, -1, -1},
-            {"Override OPCODE", BRK_OPCODE, 15, false, false,false,false,false, -1, -1},
-            {"Set QR Bit", BRK_QR_BIT, 0, false, false,false,false,false, -1, -1},
-            {"Notify No Question", BRK_NOTIFY_NO_QUESTION, 0, false, false,false,false,false, -1, -1},
-            {"Too Short Packet", BRK_TOO_SHORT, 0, false, false,false,false,false, -1, -1},
-            {"TCP Length Overclaim", BRK_TCP_LENGTH_OVERCLAIM, 50, true, false,false,false,false, -1, -1},
-            {"TCP Zero Length", BRK_TCP_ZERO_LENGTH, 0, true, false,false,false,false, -1, -1},
-            {"TCP Idle Hold", BRK_TCP_IDLE_HOLD, 2, true, false,false,false,false, -1, -1},
-            {"Bogus EDNS Option", BRK_NONE, 0, false, false,false,false,false, -1, 65535},
-            {"Z-Flag Set", BRK_NONE, 0, false, false,true,false,false, -1, -1},
-            {"AA-Flag Set", BRK_NONE, 0, false, false,false,true,false, -1, -1},
-            {"CD-Flag Set", BRK_NONE, 0, false, true,false,false,false, -1, -1},
-            {"TC-Flag Set", BRK_NONE, 0, false, false,false,false,true, -1, -1},
-            {"Massive Padding", BRK_NONE, 0, false, false,false,false,false, 2000, -1},
-        };
+            int rc = run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, norecurse,
+                              adflag, cdflag, aaflag, tcflag, zflag,
+                              no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
 
-        qo.timeout_sec = 1; // Faster fail for tests
-        qo.tries = 1;
-
-        for (size_t t = 0; t < sizeof(all_tests)/sizeof(all_tests[0]); t++) {
-            g_break_count = 0;
-            if (all_tests[t].kind != BRK_NONE) {
-                g_breaks[0].kind = all_tests[t].kind;
-                g_breaks[0].param = all_tests[t].param;
-                g_breaks[0].has_param = true;
-                g_break_count = 1;
+            uint8_t last_rcode = 2; // Default to SERVFAIL if no response
+            if (g_server_count > 0) {
+                last_rcode = g_results[g_server_count - 1].rcode;
             }
+
+            if (rc == 0 && last_rcode != 2) {
+                break;
+            }
+            if (!is_last) {
+                fprintf(stderr, ";; Server %s failed (SERVFAIL or no response), trying next server...\n", server);
+            }
+        }
+    } else {
+        for (int si = 0; si < server_count; si++) {
+            const char *server = servers[si];
+            int srv_port = server_ports[si];
             
-            query_opts_t t_qo = qo;
-            if (all_tests[t].edns_code >= 0) {
-                t_qo.want_opt = true;
-                t_qo.custom_edns_opts[0].code = all_tests[t].edns_code;
-                t_qo.custom_edns_opts[0].len = 4;
-                t_qo.custom_edns_opts[0].data[0] = 0xDE;
-                t_qo.custom_edns_opts[0].data[1] = 0xAD;
-                t_qo.custom_edns_opts[0].data[2] = 0xBE;
-                t_qo.custom_edns_opts[0].data[3] = 0xEF;
-                t_qo.custom_edns_opt_count = 1;
-            }
-            if (all_tests[t].padding >= 0) {
-                t_qo.want_opt = true;
-                t_qo.want_padding = true;
-                t_qo.padding_size = all_tests[t].padding;
+            if (server_count > 1) {
+                printf("\n;; ===============================================\n");
+                printf(";; Server: %s\n", server);
+                printf(";; ===============================================\n");
             }
 
-            run_test(all_tests[t].name, qname, qtype_s, server, srv_port,
-                     use_tcp || all_tests[t].tcp, norecurse,
-                     adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
-                     no_hexdump_query, no_hexdump_response,
-                     &t_qo, hex_payload, dopt);
-        }
+            if (test_all) {
+            if (strcmp(qname, ".") == 0) qname = "example.com";
+            struct {
+                const char *name; break_kind_t kind; long param; bool tcp;
+                bool cdflag; bool zflag; bool aaflag; bool tcflag;
+                int padding; int edns_code;
+            } all_tests[] = {
+                {"Compression Loop", BRK_COMPRESSION_LOOP, 0, false, false,false,false,false, -1, -1},
+                {"Compression Forward", BRK_COMPRESSION_FORWARD, 0, false, false,false,false,false, -1, -1},
+                {"Label Too Long", BRK_LABEL_TOO_LONG, 100, false, false,false,false,false, -1, -1},
+                {"Reserved Length Bits", BRK_RESERVED_LENGTH_BITS, 0, false, false,false,false,false, -1, -1},
+                {"Oversized QNAME", BRK_OVERSIZED_QNAME, 0, false, false,false,false,false, -1, -1},
+                {"Override QDCOUNT", BRK_QDCOUNT, 2, false, false,false,false,false, -1, -1},
+                {"Truncated Question", BRK_TRUNCATED_QUESTION, 0, false, false,false,false,false, -1, -1},
+                {"Fake OPT RDLEN", BRK_OPT_RDLEN, 500, false, false,false,false,false, -1, -1},
+                {"Override ARCOUNT", BRK_ARCOUNT, 10, false, false,false,false,false, -1, -1},
+                {"Override OPCODE", BRK_OPCODE, 15, false, false,false,false,false, -1, -1},
+                {"Set QR Bit", BRK_QR_BIT, 0, false, false,false,false,false, -1, -1},
+                {"Notify No Question", BRK_NOTIFY_NO_QUESTION, 0, false, false,false,false,false, -1, -1},
+                {"Too Short Packet", BRK_TOO_SHORT, 0, false, false,false,false,false, -1, -1},
+                {"TCP Length Overclaim", BRK_TCP_LENGTH_OVERCLAIM, 50, true, false,false,false,false, -1, -1},
+                {"TCP Zero Length", BRK_TCP_ZERO_LENGTH, 0, true, false,false,false,false, -1, -1},
+                {"TCP Idle Hold", BRK_TCP_IDLE_HOLD, 2, true, false,false,false,false, -1, -1},
+                {"Bogus EDNS Option", BRK_NONE, 0, false, false,false,false,false, -1, 65535},
+                {"Z-Flag Set", BRK_NONE, 0, false, false,true,false,false, -1, -1},
+                {"AA-Flag Set", BRK_NONE, 0, false, false,false,true,false, -1, -1},
+                {"CD-Flag Set", BRK_NONE, 0, false, true,false,false,false, -1, -1},
+                {"TC-Flag Set", BRK_NONE, 0, false, false,false,false,true, -1, -1},
+                {"Massive Padding", BRK_NONE, 0, false, false,false,false,false, 2000, -1},
+            };
 
-        } else {
-            run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, norecurse,
-                     adflag, cdflag, aaflag, tcflag, zflag,
-                     no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
+            qo.timeout_sec = 1;
+            qo.tries = 1;
+
+            for (size_t t = 0; t < sizeof(all_tests)/sizeof(all_tests[0]); t++) {
+                g_break_count = 0;
+                if (all_tests[t].kind != BRK_NONE) {
+                    g_breaks[0].kind = all_tests[t].kind;
+                    g_breaks[0].param = all_tests[t].param;
+                    g_breaks[0].has_param = true;
+                    g_break_count = 1;
+                }
+                
+                query_opts_t t_qo = qo;
+                if (all_tests[t].edns_code >= 0) {
+                    t_qo.want_opt = true;
+                    t_qo.custom_edns_opts[0].code = all_tests[t].edns_code;
+                    t_qo.custom_edns_opts[0].len = 4;
+                    t_qo.custom_edns_opts[0].data[0] = 0xDE;
+                    t_qo.custom_edns_opts[0].data[1] = 0xAD;
+                    t_qo.custom_edns_opts[0].data[2] = 0xBE;
+                    t_qo.custom_edns_opts[0].data[3] = 0xEF;
+                    t_qo.custom_edns_opt_count = 1;
+                }
+                if (all_tests[t].padding >= 0) {
+                    t_qo.want_opt = true;
+                    t_qo.want_padding = true;
+                    t_qo.padding_size = all_tests[t].padding;
+                }
+
+                run_test(all_tests[t].name, qname, qtype_s, server, srv_port,
+                         use_tcp || all_tests[t].tcp, norecurse,
+                         adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
+                         no_hexdump_query, no_hexdump_response,
+                         &t_qo, hex_payload, dopt);
+            }
+
+            } else {
+                run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, norecurse,
+                         adflag, cdflag, aaflag, tcflag, zflag,
+                         no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
+            }
         }
     }
     
@@ -3719,6 +3748,14 @@ int main(int argc, char **argv) {
             use_tcp = true;
         } else if (strcmp(argv[i], "+udp") == 0) {
             force_udp = true;
+        } else if (strcmp(argv[i], "+ignore") == 0) {
+            qo.ignore_tc = true;
+        } else if (strcmp(argv[i], "+noignore") == 0) {
+            qo.ignore_tc = false;
+        } else if (strcmp(argv[i], "+fail") == 0) {
+            qo.nofail = false;
+        } else if (strcmp(argv[i], "+nofail") == 0) {
+            qo.nofail = true;
         } else if (strcmp(argv[i], "+ldnsz") == 0) {
             use_ldnsz = true;
         } else if (strcmp(argv[i], "+allcompare") == 0) {
