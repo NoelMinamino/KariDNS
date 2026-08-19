@@ -3065,7 +3065,7 @@ static void run_trace_query(const char *qname, const char *server, const char *q
             dns_record_t rec; uint16_t type;
             if (parse_resource_record(root_resp, root_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
             if (type == 2 && rns_count < 32 && rec.rdata_count > 0) {
-                strncpy(rns_names[rns_count++], rec.rdata[0], 255);
+                snprintf(rns_names[rns_count++], sizeof(rns_names[0]), "%s", rec.rdata[0]);
             }
         }
         for (int i=0; i<r_ns; i++) {
@@ -3081,7 +3081,7 @@ static void run_trace_query(const char *qname, const char *server, const char *q
             if (want && rec.rdata_count > 0) {
                 for (int j=0; j<rns_count; j++) {
                     if (strcasecmp(rec.name, rns_names[j]) == 0 && target_count < 32) {
-                        strncpy(target_ips[target_count++], rec.rdata[0], 63);
+                        snprintf(target_ips[target_count++], sizeof(target_ips[0]), "%s", rec.rdata[0]);
                     }
                 }
             }
@@ -3153,7 +3153,7 @@ static void run_trace_query(const char *qname, const char *server, const char *q
             dns_record_t rec; uint16_t type;
             if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
             if (type == 2 && ns_count < 16 && rec.rdata_count > 0) {
-                strncpy(ns_names[ns_count++], rec.rdata[0], 255);
+                snprintf(ns_names[ns_count++], sizeof(ns_names[0]), "%s", rec.rdata[0]);
             }
         }
         
@@ -3171,7 +3171,7 @@ static void run_trace_query(const char *qname, const char *server, const char *q
                     if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
                 }
                 if (match && new_target_count < 16) {
-                    strncpy(new_target_ips[new_target_count++], rec.rdata[0], 63);
+                    snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
                 }
             }
         }
@@ -3182,6 +3182,7 @@ static void run_trace_query(const char *qname, const char *server, const char *q
         }
         
         target_count = new_target_count;
+        _Static_assert(sizeof(target_ips[0]) == sizeof(new_target_ips[0]), "buffer size mismatch");
         for(int i=0; i<target_count; i++) strcpy(target_ips[i], new_target_ips[i]);
     }
 }
@@ -3235,7 +3236,7 @@ static void run_nssearch(const char *qname, const char *server, int port, bool u
         dns_record_t rec; uint16_t type;
         if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
         if (type == 2 && ns_count < 32 && rec.rdata_count > 0) {
-            strncpy(ns_names[ns_count++], rec.rdata[0], 255);
+            snprintf(ns_names[ns_count++], sizeof(ns_names[0]), "%s", rec.rdata[0]);
         }
     }
     
@@ -3254,8 +3255,8 @@ static void run_nssearch(const char *qname, const char *server, int port, bool u
         if (want && rec.rdata_count > 0) {
             for (int j=0; j<ns_count; j++) {
                 if (strcasecmp(rec.name, ns_names[j]) == 0 && all_ns_count < 128) {
-                    strncpy(all_ns_ips[all_ns_count].ns_name, ns_names[j], 255);
-                    strncpy(all_ns_ips[all_ns_count].ip, rec.rdata[0], 63);
+                    snprintf(all_ns_ips[all_ns_count].ns_name, sizeof(all_ns_ips[all_ns_count].ns_name), "%s", ns_names[j]);
+                    snprintf(all_ns_ips[all_ns_count].ip, sizeof(all_ns_ips[all_ns_count].ip), "%s", rec.rdata[0]);
                     all_ns_count++;
                 }
             }
@@ -3296,8 +3297,8 @@ static void run_nssearch(const char *qname, const char *server, int port, bool u
                     dns_record_t rec; uint16_t rtype;
                     if (parse_resource_record(resp, rn, &roff, &g_dag_arena, &rec, &rtype) != 0) break;
                     if (rtype == missing_qtype && rec.rdata_count > 0 && all_ns_count < 128) {
-                        strncpy(all_ns_ips[all_ns_count].ns_name, ns_names[j], 255);
-                        strncpy(all_ns_ips[all_ns_count].ip, rec.rdata[0], 63);
+                        snprintf(all_ns_ips[all_ns_count].ns_name, sizeof(all_ns_ips[all_ns_count].ns_name), "%s", ns_names[j]);
+                        snprintf(all_ns_ips[all_ns_count].ip, sizeof(all_ns_ips[all_ns_count].ip), "%s", rec.rdata[0]);
                         all_ns_count++;
                     }
                 }
