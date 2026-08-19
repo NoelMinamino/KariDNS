@@ -1267,6 +1267,17 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   return RELOAD_OK;
 }
 
+static inline uint32_t calc_catalog_member_hash(const char *domain, const char *unique_id) {
+  uint32_t hash = calc_fnv1a_str(domain);
+  if (unique_id) {
+    for (const char *p = unique_id; *p; p++) {
+      hash ^= (uint8_t)*p;
+      hash *= 16777619u;
+    }
+  }
+  return hash;
+}
+
 void free_catalog_member_ids(catalog_member_id_t *arr, int count) {
   if (!arr) return;
   for (int i = 0; i < count; i++) {
@@ -1282,6 +1293,16 @@ void free_catalog_member_ids(catalog_member_id_t *arr, int count) {
 
 zone_db_entry_t *find_catalog_parent_in_snapshot(view_snapshot_t *view, const char *catalog_domain) {
     if (!view || !catalog_domain) return NULL;
+    if (view->hash_size > 0 && view->hash_table && view->chain_next) {
+        uint32_t hash = calc_fnv1a_str(catalog_domain);
+        size_t idx = hash & (view->hash_size - 1);
+        for (int i = view->hash_table[idx]; i != -1; i = view->chain_next[i]) {
+            if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
+                return view->entries[i];
+            }
+        }
+        return NULL;
+    }
     for (size_t i = 0; i < view->zone_count; i++) {
         if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
             return view->entries[i];
@@ -1551,21 +1572,69 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
         }
 
+        // Ephemeral hash table for catalog_entry_to_update->catalog_members
+        int *cur_hash_table = NULL;
+        int *cur_chain_next = NULL;
+        size_t cur_hash_size = 0;
+        int cur_count = catalog_entry_to_update->catalog_member_count;
+        if (cur_count > 0 && catalog_entry_to_update->catalog_members) {
+            size_t p = 256;
+            while (p < (size_t)cur_count * 2) p <<= 1;
+            cur_hash_size = p;
+            cur_hash_table = malloc(cur_hash_size * sizeof(int));
+            cur_chain_next = malloc(cur_count * sizeof(int));
+            if (cur_hash_table && cur_chain_next) {
+                for (size_t k = 0; k < cur_hash_size; k++) cur_hash_table[k] = -1;
+                for (int j = 0; j < cur_count; j++) {
+                    uint32_t h = calc_catalog_member_hash(catalog_entry_to_update->catalog_members[j].domain,
+                                                          catalog_entry_to_update->catalog_members[j].unique_id);
+                    size_t idx = h & (cur_hash_size - 1);
+                    cur_chain_next[j] = cur_hash_table[idx];
+                    cur_hash_table[idx] = j;
+                }
+            } else {
+                if (cur_hash_table) { free(cur_hash_table); cur_hash_table = NULL; }
+                if (cur_chain_next) { free(cur_chain_next); cur_chain_next = NULL; }
+                cur_hash_size = 0;
+            }
+        }
+
         for (int i = 0; i < new_desired_count; i++) {
             bool found = false;
-            for (int j = 0; j < catalog_entry_to_update->catalog_member_count; j++) {
-                if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
-                    strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
-                    bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
-                    if (groups_match) {
-                        for (int k = 0; k < new_desired_members[i].group_count; k++) {
-                            if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
-                                groups_match = false; break;
+            if (cur_hash_table && cur_chain_next) {
+                uint32_t h = calc_catalog_member_hash(new_desired_members[i].domain, new_desired_members[i].unique_id);
+                size_t idx = h & (cur_hash_size - 1);
+                for (int j = cur_hash_table[idx]; j != -1; j = cur_chain_next[j]) {
+                    if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
+                        strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
+                        bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
+                                if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
                             }
                         }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
-                    if (groups_match) {
-                        found = true; break;
+                }
+            } else {
+                for (int j = 0; j < catalog_entry_to_update->catalog_member_count; j++) {
+                    if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
+                        strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
+                        bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
+                                if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
+                            }
+                        }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
                 }
             }
@@ -1650,23 +1719,72 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
             }
         }
+        if (cur_hash_table) free(cur_hash_table);
+        if (cur_chain_next) free(cur_chain_next);
         new_desired_count = filtered_count;
+
+        // Ephemeral hash table for new_desired_members
+        int *des_hash_table = NULL;
+        int *des_chain_next = NULL;
+        size_t des_hash_size = 0;
+        if (new_desired_count > 0) {
+            size_t p = 256;
+            while (p < (size_t)new_desired_count * 2) p <<= 1;
+            des_hash_size = p;
+            des_hash_table = malloc(des_hash_size * sizeof(int));
+            des_chain_next = malloc(new_desired_count * sizeof(int));
+            if (des_hash_table && des_chain_next) {
+                for (size_t k = 0; k < des_hash_size; k++) des_hash_table[k] = -1;
+                for (int j = 0; j < new_desired_count; j++) {
+                    uint32_t h = calc_catalog_member_hash(new_desired_members[j].domain, new_desired_members[j].unique_id);
+                    size_t idx = h & (des_hash_size - 1);
+                    des_chain_next[j] = des_hash_table[idx];
+                    des_hash_table[idx] = j;
+                }
+            } else {
+                if (des_hash_table) { free(des_hash_table); des_hash_table = NULL; }
+                if (des_chain_next) { free(des_chain_next); des_chain_next = NULL; }
+                des_hash_size = 0;
+            }
+        }
 
         for (int i = 0; i < catalog_entry_to_update->catalog_member_count; i++) {
             bool found = false;
-            for (int j = 0; j < new_desired_count; j++) {
-                if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
-                    strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
-                    bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
-                    if (groups_match) {
-                        for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
-                            if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
-                                groups_match = false; break;
+            if (des_hash_table && des_chain_next) {
+                uint32_t h = calc_catalog_member_hash(catalog_entry_to_update->catalog_members[i].domain,
+                                                      catalog_entry_to_update->catalog_members[i].unique_id);
+                size_t idx = h & (des_hash_size - 1);
+                for (int j = des_hash_table[idx]; j != -1; j = des_chain_next[j]) {
+                    if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
+                        strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
+                        bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
+                                if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
                             }
                         }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
-                    if (groups_match) {
-                        found = true; break;
+                }
+            } else {
+                for (int j = 0; j < new_desired_count; j++) {
+                    if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
+                        strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
+                        bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
+                        if (groups_match) {
+                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
+                                if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
+                                    groups_match = false; break;
+                                }
+                            }
+                        }
+                        if (groups_match) {
+                            found = true; break;
+                        }
                     }
                 }
             }
@@ -1674,6 +1792,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 removed_members[removed_count++] = catalog_entry_to_update->catalog_members[i];
             }
         }
+        if (des_hash_table) free(des_hash_table);
+        if (des_chain_next) free(des_chain_next);
 
         zone_db_entry_t **new_entries = calloc(added_count > 0 ? added_count : 1, sizeof(zone_db_entry_t*));
         for (int i = 0; i < added_count; i++) {
@@ -1706,6 +1826,34 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             new_snap->views = calloc(new_snap->view_count, sizeof(view_snapshot_t));
             atomic_init(&new_snap->reader_count, 0);
 
+            // Build ephemeral hash table for deleted members (removed + coo_evicted)
+            int total_deleted = removed_count + coo_evicted_count;
+            int *del_hash_table = NULL;
+            int *del_chain_next = NULL;
+            size_t del_hash_size = 0;
+            if (total_deleted > 0) {
+                size_t p = 256;
+                while (p < (size_t)total_deleted * 2) p <<= 1;
+                del_hash_size = p;
+                del_hash_table = malloc(del_hash_size * sizeof(int));
+                del_chain_next = malloc(total_deleted * sizeof(int));
+                if (del_hash_table && del_chain_next) {
+                    for (size_t k = 0; k < del_hash_size; k++) del_hash_table[k] = -1;
+                    for (int j = 0; j < total_deleted; j++) {
+                        const catalog_member_id_t *del = (j < removed_count) ? 
+                            &removed_members[j] : &coo_evicted_members[j - removed_count];
+                        uint32_t h = calc_catalog_member_hash(del->domain, del->unique_id);
+                        size_t idx = h & (del_hash_size - 1);
+                        del_chain_next[j] = del_hash_table[idx];
+                        del_hash_table[idx] = j;
+                    }
+                } else {
+                    if (del_hash_table) { free(del_hash_table); del_hash_table = NULL; }
+                    if (del_chain_next) { free(del_chain_next); del_chain_next = NULL; }
+                    del_hash_size = 0;
+                }
+            }
+
             for (size_t v = 0; v < old_snap->view_count; v++) {
                 view_snapshot_t *vs = &new_snap->views[v];
                 vs->name = strdup(old_snap->views[v].name);
@@ -1718,48 +1866,42 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
 
                 if (strcasecmp(vs->name, catalog_view_name) == 0) {
-                    int keep_count = 0;
-                    for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
-                        bool is_removed = false;
-                        for (int j = 0; j < removed_count; j++) {
-                            if (strcasecmp(old_snap->views[v].entries[i]->domain, removed_members[j].domain) == 0 &&
-                                strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
-                                is_removed = true; break;
-                            }
-                        }
-                        if (!is_removed) {
-                            for (int j = 0; j < coo_evicted_count; j++) {
-                                if (strcasecmp(old_snap->views[v].entries[i]->domain, coo_evicted_members[j].domain) == 0 &&
-                                    strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
-                                    is_removed = true; break;
-                                }
-                            }
-                        }
-                        if (!is_removed) keep_count++;
-                    }
-                    
-                    vs->zone_count = keep_count + added_count;
-                    vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+                    size_t max_zones = old_snap->views[v].zone_count + added_count;
+                    vs->entries = calloc(max_zones > 0 ? max_zones : 1, sizeof(zone_db_entry_t *));
                     
                     int zidx = 0;
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
+                        zone_db_entry_t *entry = old_snap->views[v].entries[i];
                         bool is_removed = false;
-                        for (int j = 0; j < removed_count; j++) {
-                            if (strcasecmp(old_snap->views[v].entries[i]->domain, removed_members[j].domain) == 0 &&
-                                strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
-                                is_removed = true; break;
+                        if (entry->is_catalog_member && del_hash_table && del_chain_next) {
+                            uint32_t h = calc_catalog_member_hash(entry->domain, entry->catalog_member_unique_id);
+                            size_t idx = h & (del_hash_size - 1);
+                            for (int j = del_hash_table[idx]; j != -1; j = del_chain_next[j]) {
+                                const catalog_member_id_t *del = (j < removed_count) ? 
+                                    &removed_members[j] : &coo_evicted_members[j - removed_count];
+                                if (strcasecmp(entry->domain, del->domain) == 0 &&
+                                    strcmp(entry->catalog_member_unique_id, del->unique_id) == 0) {
+                                    is_removed = true;
+                                    break;
+                                }
                             }
-                        }
-                        if (!is_removed) {
-                            for (int j = 0; j < coo_evicted_count; j++) {
-                                if (strcasecmp(old_snap->views[v].entries[i]->domain, coo_evicted_members[j].domain) == 0 &&
-                                    strcmp(old_snap->views[v].entries[i]->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                        } else if (entry->is_catalog_member && total_deleted > 0) {
+                            for (int j = 0; j < removed_count; j++) {
+                                if (strcasecmp(entry->domain, removed_members[j].domain) == 0 &&
+                                    strcmp(entry->catalog_member_unique_id, removed_members[j].unique_id) == 0) {
                                     is_removed = true; break;
+                                }
+                            }
+                            if (!is_removed) {
+                                for (int j = 0; j < coo_evicted_count; j++) {
+                                    if (strcasecmp(entry->domain, coo_evicted_members[j].domain) == 0 &&
+                                        strcmp(entry->catalog_member_unique_id, coo_evicted_members[j].unique_id) == 0) {
+                                        is_removed = true; break;
+                                    }
                                 }
                             }
                         }
                         if (!is_removed) {
-                            zone_db_entry_t *entry = old_snap->views[v].entries[i];
                             atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
                             vs->entries[zidx++] = entry;
                         }
@@ -1768,9 +1910,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     for (int i = 0; i < added_count; i++) {
                         vs->entries[zidx++] = new_entries[i];
                     }
+                    vs->zone_count = zidx;
                 } else {
                     vs->zone_count = old_snap->views[v].zone_count;
-                    vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+                    vs->entries = calloc(vs->zone_count > 0 ? vs->zone_count : 1, sizeof(zone_db_entry_t *));
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                         zone_db_entry_t *entry = old_snap->views[v].entries[i];
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
@@ -1778,6 +1921,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
+            if (del_hash_table) free(del_hash_table);
+            if (del_chain_next) free(del_chain_next);
         }
 
         free(added_members);

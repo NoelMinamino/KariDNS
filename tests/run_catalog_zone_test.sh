@@ -284,6 +284,58 @@ grep "status: SERVFAIL" dag_out.txt || { echo "Failed: state-retain.com dropped 
 
 echo "[+] CoO transfer (State Retention) successfully verified!"
 
+echo "[+] Phase 4: Large Catalog Zone Benchmark (5,000 members)..."
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 10 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+EOF
+
+perl -e 'for ($i = 1; $i <= 5000; $i++) { print "m$i.zones IN PTR member$i.example.net.\n"; }' >> catalog1.zone
+
+START_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+../karictl -f karictl.conf reload catalog1.example.com
+END_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+echo "[Benchmark] Initial load (5,000 members): $((END_MS - START_MS)) ms"
+sleep 1
+
+../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member1 not loaded"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 member2500.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member2500 not loaded"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 member5000.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member5000 not loaded"; kill $SERVER_PID; exit 1; }
+echo "[+] Initial 5,000 members loaded successfully."
+
+# Delta update benchmark: replace 1,000 members
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 11 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+EOF
+
+perl -e 'for ($i = 1; $i <= 1000; $i++) { print "new_m$i.zones IN PTR new-member$i.example.net.\n"; } for ($i = 1001; $i <= 5000; $i++) { print "m$i.zones IN PTR member$i.example.net.\n"; }' >> catalog1.zone
+
+DELTA_START_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+../karictl -f karictl.conf reload catalog1.example.com
+DELTA_END_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+echo "[Benchmark] Delta update (1,000 member swap out of 5,000): $((DELTA_END_MS - DELTA_START_MS)) ms"
+sleep 1
+
+../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 was not removed"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 new-member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: new-member1 not loaded"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 member5000.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member5000 broken"; kill $SERVER_PID; exit 1; }
+echo "[+] Large catalog zone delta update (5,000 members) verified successfully!"
+
+# Clean up catalog1 before final checks
+cat << EOF > catalog1.zone
+\$ORIGIN catalog1.example.com.
+@ IN SOA ns1.example.com. admin.example.com. 12 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+EOF
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+
 # Clean up
 if kill -0 $SERVER_PID 2>/dev/null; then
     echo "[+] Server is still running, cascading removal didn't crash."
