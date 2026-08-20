@@ -1665,6 +1665,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint8_t val_storage[8192];
                 int param_count = 0;
                 uint16_t storage_offset = 0;
+                uint16_t mandatory_refs[64];
+                size_t mandatory_ref_count = 0;
+                bool has_mandatory_param = false;
 
                 for (int i = 2; i < rec->rdata_count; i++) {
                     const char *param = rec->rdata[i];
@@ -1690,8 +1693,15 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     else if (strcasecmp(key_str, "ipv4hint") == 0) key = 4;
                     else if (strcasecmp(key_str, "ech") == 0) key = 5;
                     else if (strcasecmp(key_str, "ipv6hint") == 0) key = 6;
-                    else if (strncasecmp(key_str, "key", 3) == 0) key = atoi(key_str + 3);
-                    else continue;
+                    else if (strncasecmp(key_str, "key", 3) == 0) {
+                        char *endptr;
+                        long kval = strtol(key_str + 3, &endptr, 10);
+                        if (*endptr != '\0' || kval < 0 || kval > 65535) return -1; // 不正なkeyNNN
+                        key = (uint16_t)kval;
+                    } else continue;
+
+                    // RFC 9460 §14.3.2: 65535 は "Invalid key" として予約されており使用不可
+                    if (key == 65535) return -1;
                     
                     if (param_count >= 64) return -1;
                     // RFC 9460 §2.1: keys MUST NOT be repeated
@@ -1720,8 +1730,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 else if (strcasecmp(mkey_str, "ipv4hint") == 0) mkey = 4;
                                 else if (strcasecmp(mkey_str, "ech") == 0) mkey = 5;
                                 else if (strcasecmp(mkey_str, "ipv6hint") == 0) mkey = 6;
-                                else if (strncasecmp(mkey_str, "key", 3) == 0) mkey = atoi(mkey_str + 3);
-                                else return -1; // 未知のキー名は不正
+                                else if (strncasecmp(mkey_str, "key", 3) == 0) {
+                                    char *endptr;
+                                    long kval = strtol(mkey_str + 3, &endptr, 10);
+                                    if (*endptr != '\0' || kval <= 0 || kval >= 65535) return -1;
+                                    mkey = (uint16_t)kval;
+                                } else return -1; // 未知のキー名は不正
 
                                 if (mkey == 0 || mkey_count >= 64) return -1;
                                 for (size_t j = 0; j < mkey_count; j++) {
@@ -1731,6 +1745,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 if (!comma) break;
                                 p = comma + 1;
                             }
+                            has_mandatory_param = true;
+                            mandatory_ref_count = mkey_count;
+                            memcpy(mandatory_refs, mkeys, sizeof(uint16_t) * mkey_count);
+
                             // RFC 9460 §8: mandatory値リストも昇順ソート
                             for (size_t a = 0; a + 1 < mkey_count; a++) {
                                 for (size_t b = a + 1; b < mkey_count; b++) {
@@ -1807,18 +1825,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 val_len += (declen - pad);
                             }
                         } else {
-                            // 汎用 keyNNN: 16進エンコードされたオクテット列として扱う
-                            const char *hexstr = val_str;
-                            if (strncmp(hexstr, "0x", 2) == 0 || strncmp(hexstr, "0X", 2) == 0) hexstr += 2;
-                            size_t hexlen = strlen(hexstr);
-                            if (hexlen % 2 != 0) return -1;
-                            if (val_len + (hexlen / 2) > sizeof(val_wire)) return -1;
-                            for (size_t k = 0; k < hexlen; k += 2) {
-                                int hi = hex_char_to_val(hexstr[k]);
-                                int lo = hex_char_to_val(hexstr[k+1]);
-                                if (hi < 0 || lo < 0) return -1;
-                                val_wire[val_len++] = (uint8_t)((hi << 4) | lo);
-                            }
+                            // 汎用 keyNNN (RFC 9460 §2.1, Appendix D.2 Figure 5/6):
+                            // val_str は既に dns_zone_parser.c の unescape_string_in_place() で
+                            // character-string decoding 済みであり、そのバイト列がそのまま
+                            // wire-format value になる。
+                            size_t vlen = strlen(val_str);
+                            if (val_len + vlen > sizeof(val_wire)) return -1;
+                            memcpy(&val_wire[val_len], val_str, vlen);
+                            val_len += vlen;
                         }
                     }
 
@@ -1831,6 +1845,18 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                         storage_offset += val_len;
                     }
                     param_count++;
+                }
+
+                // RFC 9460 §8: mandatoryの値リストに列挙されたキーは、
+                // 同じレコードのSvcParamsに実際に存在しなければならない
+                if (has_mandatory_param) {
+                    for (size_t m = 0; m < mandatory_ref_count; m++) {
+                        bool found = false;
+                        for (int p = 0; p < param_count; p++) {
+                            if (params[p].key == mandatory_refs[m]) { found = true; break; }
+                        }
+                        if (!found) return -1; // self-consistency違反
+                    }
                 }
 
                 // RFC 9460 §2.2: SvcParamKeys SHALL appear in increasing numeric order

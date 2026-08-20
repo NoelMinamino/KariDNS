@@ -1057,7 +1057,9 @@ int main() {
         mand_rec.rdata[0] = "1";
         mand_rec.rdata[1] = ".";
         mand_rec.rdata[2] = "mandatory=port,alpn"; // Key 0 with keys 3,1
-        mand_rec.rdata_count = 3;
+        mand_rec.rdata[3] = "alpn=h2";
+        mand_rec.rdata[4] = "port=443";
+        mand_rec.rdata_count = 5;
 
         offset = 0;
         ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &mand_rec, &comp_ctx, NULL, 0xFFFFFFFF);
@@ -1083,7 +1085,7 @@ int main() {
             return 1;
         }
 
-        // Case 4: Generic keyNNN (key7=0x0102) hex decoding
+        // Case 4: Generic keyNNN (key667=hello and key667=hello\xd2qoo) character-string encoding (RFC 9460 Appendix D.2)
         dns_record_t gen_rec;
         memset(&gen_rec, 0, sizeof(gen_rec));
         gen_rec.name = "example.com.";
@@ -1095,28 +1097,156 @@ int main() {
         gen_rec.class_val = 1;
         gen_rec.rdata[0] = "1";
         gen_rec.rdata[1] = ".";
-        gen_rec.rdata[2] = "key7=0x0102";
+        gen_rec.rdata[2] = "key667=hello";
         gen_rec.rdata_count = 3;
 
         offset = 0;
         ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &gen_rec, &comp_ctx, NULL, 0xFFFFFFFF);
         if (ret < 0) {
-            printf("FAIL: serialize_dns_record failed for generic keyNNN SvcParam\n");
+            printf("FAIL: serialize_dns_record failed for generic key667 SvcParam\n");
             return 1;
         }
         bool found_gen_val = false;
-        for (size_t i = 0; i + 6 <= offset; i++) {
+        for (size_t i = 0; i + 9 <= offset; i++) {
             uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
             uint16_t vlen = (res_buf[i+2] << 8) | res_buf[i+3];
-            if (k == 7 && vlen == 2) {
-                if (res_buf[i+4] == 0x01 && res_buf[i+5] == 0x02) {
+            if (k == 667 && vlen == 5) {
+                if (memcmp(&res_buf[i+4], "hello", 5) == 0) {
                     found_gen_val = true;
                     break;
                 }
             }
         }
         if (!found_gen_val) {
-            printf("FAIL: generic key7 did not encode 01 02 bytes\n");
+            printf("FAIL: generic key667 did not encode 'hello' bytes\n");
+            return 1;
+        }
+
+        // Case 4b: Generic key667 with unescaped byte (hello\xd2qoo)
+        dns_record_t gen_rec2;
+        memset(&gen_rec2, 0, sizeof(gen_rec2));
+        gen_rec2.name = "example.com.";
+        gen_rec2.type = "HTTPS";
+        gen_rec2.type_code = 65;
+        gen_rec2.ttl = "3600";
+        gen_rec2.ttl_value = 3600;
+        gen_rec2.class_str = "IN";
+        gen_rec2.class_val = 1;
+        gen_rec2.rdata[0] = "1";
+        gen_rec2.rdata[1] = ".";
+        gen_rec2.rdata[2] = "key667=hello\xd2qoo";
+        gen_rec2.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &gen_rec2, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for generic key667 with unescaped bytes\n");
+            return 1;
+        }
+        bool found_gen_val2 = false;
+        const uint8_t expected_bytes[9] = { 'h', 'e', 'l', 'l', 'o', 0xd2, 'q', 'o', 'o' };
+        for (size_t i = 0; i + 13 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            uint16_t vlen = (res_buf[i+2] << 8) | res_buf[i+3];
+            if (k == 667 && vlen == 9) {
+                if (memcmp(&res_buf[i+4], expected_bytes, 9) == 0) {
+                    found_gen_val2 = true;
+                    break;
+                }
+            }
+        }
+        if (!found_gen_val2) {
+            printf("FAIL: generic key667 did not encode expected 9 bytes\n");
+            return 1;
+        }
+
+        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 §8)
+        dns_record_t incomplete_mand_rec;
+        memset(&incomplete_mand_rec, 0, sizeof(incomplete_mand_rec));
+        incomplete_mand_rec.name = "example.com.";
+        incomplete_mand_rec.type = "HTTPS";
+        incomplete_mand_rec.type_code = 65;
+        incomplete_mand_rec.ttl = "3600";
+        incomplete_mand_rec.ttl_value = 3600;
+        incomplete_mand_rec.class_str = "IN";
+        incomplete_mand_rec.class_val = 1;
+        incomplete_mand_rec.rdata[0] = "1";
+        incomplete_mand_rec.rdata[1] = ".";
+        incomplete_mand_rec.rdata[2] = "mandatory=alpn,port"; // alpn/port are absent
+        incomplete_mand_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &incomplete_mand_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: Expected rejection of mandatory referencing absent SvcParam\n");
+            return 1;
+        }
+
+        // Case 5b: mandatory referencing present SvcParams must succeed
+        dns_record_t valid_mand_rec;
+        memset(&valid_mand_rec, 0, sizeof(valid_mand_rec));
+        valid_mand_rec.name = "example.com.";
+        valid_mand_rec.type = "HTTPS";
+        valid_mand_rec.type_code = 65;
+        valid_mand_rec.ttl = "3600";
+        valid_mand_rec.ttl_value = 3600;
+        valid_mand_rec.class_str = "IN";
+        valid_mand_rec.class_val = 1;
+        valid_mand_rec.rdata[0] = "1";
+        valid_mand_rec.rdata[1] = ".";
+        valid_mand_rec.rdata[2] = "mandatory=alpn,port";
+        valid_mand_rec.rdata[3] = "alpn=h2";
+        valid_mand_rec.rdata[4] = "port=443";
+        valid_mand_rec.rdata_count = 5;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &valid_mand_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for valid mandatory with present SvcParams\n");
+            return 1;
+        }
+
+        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 §14.3.2)
+        dns_record_t invalid_key_rec;
+        memset(&invalid_key_rec, 0, sizeof(invalid_key_rec));
+        invalid_key_rec.name = "example.com.";
+        invalid_key_rec.type = "HTTPS";
+        invalid_key_rec.type_code = 65;
+        invalid_key_rec.ttl = "3600";
+        invalid_key_rec.ttl_value = 3600;
+        invalid_key_rec.class_str = "IN";
+        invalid_key_rec.class_val = 1;
+        invalid_key_rec.rdata[0] = "1";
+        invalid_key_rec.rdata[1] = ".";
+        invalid_key_rec.rdata[2] = "key65535=foo";
+        invalid_key_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &invalid_key_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: key65535 should be rejected\n");
+            return 1;
+        }
+
+        // Case 7: Malformed "keyABC" must be rejected
+        dns_record_t malformed_key_rec;
+        memset(&malformed_key_rec, 0, sizeof(malformed_key_rec));
+        malformed_key_rec.name = "example.com.";
+        malformed_key_rec.type = "HTTPS";
+        malformed_key_rec.type_code = 65;
+        malformed_key_rec.ttl = "3600";
+        malformed_key_rec.ttl_value = 3600;
+        malformed_key_rec.class_str = "IN";
+        malformed_key_rec.class_val = 1;
+        malformed_key_rec.rdata[0] = "1";
+        malformed_key_rec.rdata[1] = ".";
+        malformed_key_rec.rdata[2] = "keyABC=foo";
+        malformed_key_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &malformed_key_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: malformed keyABC should be rejected\n");
             return 1;
         }
 
