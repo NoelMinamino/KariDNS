@@ -46,11 +46,15 @@ static void test_mqtype_truncation(void) {
     atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
 
     zone_db_entry_t *entries[1] = { &db_entry };
+    char *any_acl[1] = { (char *)"any" };
+
     view_snapshot_t view;
     memset(&view, 0, sizeof(view));
     view.name = "default";
     view.entries = entries;
     view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
 
     zone_db_snapshot_t snap;
     memset(&snap, 0, sizeof(snap));
@@ -94,14 +98,25 @@ static void test_mqtype_truncation(void) {
     uint8_t res[512] = {0};
     size_t small_res_len = 100;
     rate_limit_config_t *rrl = NULL;
-    int res_len = process_dns_query(req, off, res, small_res_len, "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
+    int res_len = process_dns_query(req, off, res, small_res_len, "example.com.", 1,
+                                     "127.0.0.1", &comp_ctx, false, &rrl, &snap);
 
     if (res_len > 0) {
-        // Verify RFC 10029 §3.4: MQTYPE failure MUST NOT trigger TC bit (res[2] & 0x02)
+        uint8_t rcode = res[3] & 0x0F;
         bool tc_set = (res[2] & 0x02) != 0;
         uint16_t ancount = (res[6] << 8) | res[7];
-        (void)tc_set;
-        (void)ancount;
+
+        if (rcode == 5 /* REFUSED */) {
+            abort();
+        }
+
+        // RFC 10029 §3.4: MQTYPE failure MUST NOT trigger TC bit
+        if (tc_set) {
+            abort();
+        }
+        if (ancount == 0) {
+            abort();
+        }
     }
 
     zone_arena_destroy(&arena);
