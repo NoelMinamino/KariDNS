@@ -973,6 +973,156 @@ int main() {
         printf("PASS: Mixed view/top-level zones safely rejected and cleaned up without leak\n");
     }
 
+    // --- Test 14: RFC 9460 SVCB/HTTPS SvcParamKey sort & duplicate rejection ---
+    {
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        // Case 1: Out-of-order SvcParamKeys (port=443 before alpn=h2) must be sorted in wire format
+        dns_record_t svcb_rec;
+        memset(&svcb_rec, 0, sizeof(svcb_rec));
+        svcb_rec.name = "example.com.";
+        svcb_rec.type = "HTTPS";
+        svcb_rec.type_code = 65;
+        svcb_rec.ttl = "3600";
+        svcb_rec.ttl_value = 3600;
+        svcb_rec.class_str = "IN";
+        svcb_rec.class_val = 1;
+        svcb_rec.rdata[0] = "1";
+        svcb_rec.rdata[1] = ".";
+        svcb_rec.rdata[2] = "port=443"; // Key 3
+        svcb_rec.rdata[3] = "alpn=h2";   // Key 1
+        svcb_rec.rdata_count = 4;
+
+        uint8_t res_buf[512] = {0};
+        uint16_t offset = 0;
+        int ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &svcb_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for valid out-of-order SvcParamKeys\n");
+            return 1;
+        }
+
+        // Locate RDATA in serialized output:
+        // Header: name (compressed/root) + type(2) + class(2) + ttl(4) + rdlen(2)
+        // Check that key 0x0001 (alpn) appears before key 0x0003 (port)
+        bool saw_alpn = false, saw_port = false, order_correct = false;
+        for (size_t i = 0; i + 4 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            if (k == 1 && !saw_port) {
+                saw_alpn = true;
+            } else if (k == 3 && saw_alpn) {
+                saw_port = true;
+                order_correct = true;
+            }
+        }
+        if (!order_correct) {
+            printf("FAIL: SvcParamKeys not sorted in increasing order in wire output\n");
+            return 1;
+        }
+
+        // Case 2: Duplicate SvcParamKeys (alpn=h2 and alpn=h3) must be rejected with error
+        dns_record_t dup_rec;
+        memset(&dup_rec, 0, sizeof(dup_rec));
+        dup_rec.name = "example.com.";
+        dup_rec.type = "HTTPS";
+        dup_rec.type_code = 65;
+        dup_rec.ttl = "3600";
+        dup_rec.ttl_value = 3600;
+        dup_rec.class_str = "IN";
+        dup_rec.class_val = 1;
+        dup_rec.rdata[0] = "1";
+        dup_rec.rdata[1] = ".";
+        dup_rec.rdata[2] = "alpn=h2";
+        dup_rec.rdata[3] = "port=443";
+        dup_rec.rdata[4] = "alpn=h3"; // Duplicate Key 1
+        dup_rec.rdata_count = 5;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &dup_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: Expected serialize_dns_record to reject duplicate SvcParamKeys\n");
+            return 1;
+        }
+
+        // Case 3: mandatory SvcParam (key=0) with unordered keys (port,alpn) must encode sorted list (00 01 00 03)
+        dns_record_t mand_rec;
+        memset(&mand_rec, 0, sizeof(mand_rec));
+        mand_rec.name = "example.com.";
+        mand_rec.type = "HTTPS";
+        mand_rec.type_code = 65;
+        mand_rec.ttl = "3600";
+        mand_rec.ttl_value = 3600;
+        mand_rec.class_str = "IN";
+        mand_rec.class_val = 1;
+        mand_rec.rdata[0] = "1";
+        mand_rec.rdata[1] = ".";
+        mand_rec.rdata[2] = "mandatory=port,alpn"; // Key 0 with keys 3,1
+        mand_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &mand_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for mandatory SvcParam\n");
+            return 1;
+        }
+        // Verify Key=0, Len=4, Value=00 01 00 03
+        bool found_mand_val = false;
+        for (size_t i = 0; i + 8 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            uint16_t vlen = (res_buf[i+2] << 8) | res_buf[i+3];
+            if (k == 0 && vlen == 4) {
+                if (res_buf[i+4] == 0x00 && res_buf[i+5] == 0x01 &&
+                    res_buf[i+6] == 0x00 && res_buf[i+7] == 0x03) {
+                    found_mand_val = true;
+                    break;
+                }
+            }
+        }
+        if (!found_mand_val) {
+            printf("FAIL: mandatory SvcParam did not encode sorted keys 00 01 00 03\n");
+            return 1;
+        }
+
+        // Case 4: Generic keyNNN (key7=0x0102) hex decoding
+        dns_record_t gen_rec;
+        memset(&gen_rec, 0, sizeof(gen_rec));
+        gen_rec.name = "example.com.";
+        gen_rec.type = "HTTPS";
+        gen_rec.type_code = 65;
+        gen_rec.ttl = "3600";
+        gen_rec.ttl_value = 3600;
+        gen_rec.class_str = "IN";
+        gen_rec.class_val = 1;
+        gen_rec.rdata[0] = "1";
+        gen_rec.rdata[1] = ".";
+        gen_rec.rdata[2] = "key7=0x0102";
+        gen_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &gen_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for generic keyNNN SvcParam\n");
+            return 1;
+        }
+        bool found_gen_val = false;
+        for (size_t i = 0; i + 6 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            uint16_t vlen = (res_buf[i+2] << 8) | res_buf[i+3];
+            if (k == 7 && vlen == 2) {
+                if (res_buf[i+4] == 0x01 && res_buf[i+5] == 0x02) {
+                    found_gen_val = true;
+                    break;
+                }
+            }
+        }
+        if (!found_gen_val) {
+            printf("FAIL: generic key7 did not encode 01 02 bytes\n");
+            return 1;
+        }
+
+        printf("PASS: RFC 9460 SVCB/HTTPS SvcParamKey sort, duplicate rejection, mandatory, and keyNNN\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

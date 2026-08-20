@@ -1654,7 +1654,18 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (w < 0) return -1;
                 offset += w;
                 
-                // SvcParamsのシリアライズ
+                // SvcParamsの収集 & ソート (RFC 9460 §2.1, §2.2, §8)
+                typedef struct {
+                    uint16_t key;
+                    uint16_t val_offset;
+                    uint16_t val_len;
+                } svcparam_entry_t;
+
+                svcparam_entry_t params[64];
+                uint8_t val_storage[8192];
+                int param_count = 0;
+                uint16_t storage_offset = 0;
+
                 for (int i = 2; i < rec->rdata_count; i++) {
                     const char *param = rec->rdata[i];
                     char *eq = strchr(param, '=');
@@ -1682,10 +1693,60 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     else if (strncasecmp(key_str, "key", 3) == 0) key = atoi(key_str + 3);
                     else continue;
                     
-                    uint8_t val_wire[8192];
+                    if (param_count >= 64) return -1;
+                    // RFC 9460 §2.1: keys MUST NOT be repeated
+                    for (int j = 0; j < param_count; j++) {
+                        if (params[j].key == key) return -1;
+                    }
+
+                    uint8_t val_wire[4096];
                     uint16_t val_len = 0;
                     if (val_str) {
-                        if (key == 1) { // alpn
+                        if (key == 0) { // mandatory (RFC 9460 §8)
+                            uint16_t mkeys[64];
+                            size_t mkey_count = 0;
+                            const char *p = val_str;
+                            while (*p) {
+                                const char *comma = strchr(p, ',');
+                                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                                char mkey_str[64];
+                                if (len >= sizeof(mkey_str)) return -1;
+                                memcpy(mkey_str, p, len); mkey_str[len] = '\0';
+
+                                uint16_t mkey = 0;
+                                if (strcasecmp(mkey_str, "alpn") == 0) mkey = 1;
+                                else if (strcasecmp(mkey_str, "no-default-alpn") == 0) mkey = 2;
+                                else if (strcasecmp(mkey_str, "port") == 0) mkey = 3;
+                                else if (strcasecmp(mkey_str, "ipv4hint") == 0) mkey = 4;
+                                else if (strcasecmp(mkey_str, "ech") == 0) mkey = 5;
+                                else if (strcasecmp(mkey_str, "ipv6hint") == 0) mkey = 6;
+                                else if (strncasecmp(mkey_str, "key", 3) == 0) mkey = atoi(mkey_str + 3);
+                                else return -1; // 未知のキー名は不正
+
+                                if (mkey == 0 || mkey_count >= 64) return -1;
+                                for (size_t j = 0; j < mkey_count; j++) {
+                                    if (mkeys[j] == mkey) return -1; // 重複不可
+                                }
+                                mkeys[mkey_count++] = mkey;
+                                if (!comma) break;
+                                p = comma + 1;
+                            }
+                            // RFC 9460 §8: mandatory値リストも昇順ソート
+                            for (size_t a = 0; a + 1 < mkey_count; a++) {
+                                for (size_t b = a + 1; b < mkey_count; b++) {
+                                    if (mkeys[b] < mkeys[a]) {
+                                        uint16_t tmp = mkeys[a];
+                                        mkeys[a] = mkeys[b];
+                                        mkeys[b] = tmp;
+                                    }
+                                }
+                            }
+                            if (val_len + mkey_count * 2 > sizeof(val_wire)) return -1;
+                            for (size_t k = 0; k < mkey_count; k++) {
+                                val_wire[val_len++] = mkeys[k] >> 8;
+                                val_wire[val_len++] = mkeys[k] & 0xFF;
+                            }
+                        } else if (key == 1) { // alpn
                             const char *p = val_str;
                             while (*p) {
                                 const char *comma = strchr(p, ',');
@@ -1745,15 +1806,51 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 if (blen > 1 && val_str[blen-2] == '=') pad++;
                                 val_len += (declen - pad);
                             }
+                        } else {
+                            // 汎用 keyNNN: 16進エンコードされたオクテット列として扱う
+                            const char *hexstr = val_str;
+                            if (strncmp(hexstr, "0x", 2) == 0 || strncmp(hexstr, "0X", 2) == 0) hexstr += 2;
+                            size_t hexlen = strlen(hexstr);
+                            if (hexlen % 2 != 0) return -1;
+                            if (val_len + (hexlen / 2) > sizeof(val_wire)) return -1;
+                            for (size_t k = 0; k < hexlen; k += 2) {
+                                int hi = hex_char_to_val(hexstr[k]);
+                                int lo = hex_char_to_val(hexstr[k+1]);
+                                if (hi < 0 || lo < 0) return -1;
+                                val_wire[val_len++] = (uint8_t)((hi << 4) | lo);
+                            }
                         }
                     }
-                    
-                    if (offset + 4 + val_len > max_res_len) return -1;
-                    res[offset++] = key >> 8; res[offset++] = key & 0xFF;
-                    res[offset++] = val_len >> 8; res[offset++] = val_len & 0xFF;
+
+                    if (storage_offset + val_len > sizeof(val_storage)) return -1;
+                    params[param_count].key = key;
+                    params[param_count].val_offset = storage_offset;
+                    params[param_count].val_len = val_len;
                     if (val_len > 0) {
-                        memcpy(&res[offset], val_wire, val_len);
-                        offset += val_len;
+                        memcpy(&val_storage[storage_offset], val_wire, val_len);
+                        storage_offset += val_len;
+                    }
+                    param_count++;
+                }
+
+                // RFC 9460 §2.2: SvcParamKeys SHALL appear in increasing numeric order
+                for (int a = 0; a < param_count - 1; a++) {
+                    for (int b = a + 1; b < param_count; b++) {
+                        if (params[b].key < params[a].key) {
+                            svcparam_entry_t tmp = params[a];
+                            params[a] = params[b];
+                            params[b] = tmp;
+                        }
+                    }
+                }
+
+                for (int i = 0; i < param_count; i++) {
+                    if (offset + 4 + params[i].val_len > max_res_len) return -1;
+                    res[offset++] = params[i].key >> 8; res[offset++] = params[i].key & 0xFF;
+                    res[offset++] = params[i].val_len >> 8; res[offset++] = params[i].val_len & 0xFF;
+                    if (params[i].val_len > 0) {
+                        memcpy(&res[offset], &val_storage[params[i].val_offset], params[i].val_len);
+                        offset += params[i].val_len;
                     }
                 }
                 break;
