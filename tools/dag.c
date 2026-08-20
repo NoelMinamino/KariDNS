@@ -2866,6 +2866,13 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
+
+    #define KARIDNS_MAX_TSIG_KEYFILE_SIZE (64 * 1024)
+    if (size < 0 || size > KARIDNS_MAX_TSIG_KEYFILE_SIZE) {
+        fprintf(stderr, "warning: TSIG key file '%s' is not a regular seekable file or exceeds size limit\n", path);
+        fclose(f);
+        return;
+    }
     
     char *buf = malloc((size_t)size + 1);
     if (!buf) { fclose(f); return; }
