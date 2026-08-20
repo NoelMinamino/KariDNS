@@ -1643,6 +1643,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   }
   if (saw_view_block && saw_top_level_zone) {
     syslog(LOG_ERR, "Cannot mix top-level zone and view blocks");
+    // トップレベル直付けの zone_config_t リストを完全解放してリークを防ぐ
+    zone_config_t *curr = config->zones;
+    while (curr) {
+      zone_config_t *next = curr->next;
+      free_zone_config(curr);
+      curr = next;
+    }
+    config->zones = NULL;
     return -1;
   }
   if (!saw_view_block) {
@@ -1656,7 +1664,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   }
 
   // Create a flattened list of zones in config->zones for backward compatibility
-  // (AXFR, RRL, control-channel etc)
+  // (AXFR, RRL, control-channel etc).
+  // ※ このリストは所有権を持たない走査・参照専用リストです。
+  //   各ノードはビュー内ゾーン(v->zones)の内部ポインタを共有しているため、
+  //   フィールドの書き込みや free_zone_config() の呼び出しは絶対に行わないこと。
+  //   解放時は free_server_config_fields() 内でノード構造体自体のみを free() すること。
   zone_config_t *flat_zones = NULL;
   zone_config_t *flat_tail = NULL;
   for (view_config_t *v = config->views; v; v = v->next) {

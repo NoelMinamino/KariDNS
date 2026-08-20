@@ -94,7 +94,7 @@ typedef struct server_config_s {
   char *user;
   char *group;
   view_config_t *views;
-  zone_config_t *zones;
+  zone_config_t *zones; /* 所有権を持たない参照専用フラットリスト。ビュー内ゾーンへのポインタを共有しており、フィールド書き込みや free_zone_config() は絶対に行わないこと */
   tsig_key_t *keys;
   logging_config_t logging;
   control_channel_config_t control;

@@ -958,6 +958,21 @@ int main() {
         printf("PASS: RFC 10029 MQTYPE-Query duplicate option detected\n");
     }
 
+    // --- Test 13: Mix of view and top-level zone error cleanup (no leak) ---
+    {
+        const char *mixed_cfg = "view \"external\" { match-clients { any; }; zone \"example.com\" { type master; file \"example.com.zone\"; }; };\n"
+                                "zone \"toplevel.com\" { type master; file \"toplevel.com.zone\"; };\n";
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        int res = parse_named_conf(mixed_cfg, &cfg);
+        if (res == 0) {
+            printf("FAIL: Expected parse_named_conf to fail for mixed view/top-level zones\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg);
+        printf("PASS: Mixed view/top-level zones safely rejected and cleaned up without leak\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
