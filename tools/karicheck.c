@@ -855,18 +855,6 @@ int main(int argc, char **argv) {
             }
             z = z->next;
         }
-        for (view_config_t *v = cfg.views; v; v = v->next) {
-            z = v->zones;
-            while (z) {
-                if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
-                    if (check_zone(z->domain, z->file, false, z->is_catalog) != 0) {
-                        error_count++;
-                    }
-                    checked++;
-                }
-                z = z->next;
-            }
-        }
         printf("[INFO] Checked %d zones. Errors: %d\n", checked, error_count);
         return (error_count > 0) ? 1 : 0;
     } else if (strcmp(cmd, "zone") == 0) {
@@ -895,15 +883,6 @@ int main(int argc, char **argv) {
                     return check_zone(z->domain, z->file, false, z->is_catalog);
                 }
                 z = z->next;
-            }
-            for (view_config_t *v = cfg.views; v; v = v->next) {
-                z = v->zones;
-                while (z) {
-                    if (strcasecmp(z->domain, norm_domain) == 0) {
-                        return check_zone(z->domain, z->file, false, z->is_catalog);
-                    }
-                    z = z->next;
-                }
             }
             fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
             return 1;
