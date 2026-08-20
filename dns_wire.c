@@ -2287,6 +2287,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
         } else {
             // zone class
+            syslog(LOG_INFO, "[DEBUG-UPDATE] process_update_sections: checking zone class: class_val=%u, zone_class=%u", class_val, zone_class);
             if (class_val != zone_class) return 1; // FORMERR
             if (!rrset_exists) return 8; // NXRRSET
             size_t temp_offset = rec_start_offset; 

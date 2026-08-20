@@ -3476,6 +3476,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 5) { // UPDATE
     if (edns.has_mqtype_query) {
+      syslog(LOG_INFO, "[DEBUG-UPDATE] FORMERR due to MQTYPE query");
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
@@ -3520,8 +3521,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     
     int rcode = 5; // REFUSED
     if (auth) {
+      syslog(LOG_INFO, "[DEBUG-UPDATE] auth=true, proceeding to handle_dynamic_update");
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key->name);
     } else {
+      syslog(LOG_INFO, "[DEBUG-UPDATE] auth=false, attempted_key=%s, rcode=%d",
+             attempted_key ? attempted_key->name : "none", attempted_key ? 9 : 5);
       if (attempted_key) {
         rcode = 9; // NOTAUTH
         add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Invalid TSIG");
