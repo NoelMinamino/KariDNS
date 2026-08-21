@@ -2086,6 +2086,47 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         }
     }
 
+    // RFC 9432 §5.1: 壊れたカタログゾーンの検出
+    // (1) 同一 <unique-N> に複数のPTRレコードが存在しないか
+    bool catalog_broken = false;
+    for (size_t i = 0; i < arena->count && !catalog_broken; i++) {
+        if (arena->records[i].type_code != 12) continue;
+        size_t name_len = strlen(arena->records[i].name);
+        if (name_len <= suffix_len ||
+            strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) != 0)
+            continue;
+        int count_for_this_name = 0;
+        for (size_t j = 0; j < arena->count; j++) {
+            if (arena->records[j].type_code == 12 &&
+                strcasecmp(arena->records[j].name, arena->records[i].name) == 0) {
+                count_for_this_name++;
+            }
+        }
+        if (count_for_this_name > 1) {
+            syslog(LOG_ERR, "[Catalog] Zone '%s': member node '%s' has %d PTR records (RFC 9432 requires exactly 1); catalog zone is broken and will NOT be processed",
+                   catalog_entry->domain, arena->records[i].name, count_for_this_name);
+            catalog_broken = true;
+        }
+    }
+
+    // (2) 異なる<unique-N>が同一ターゲットを指していないか
+    for (int a = 0; a < new_desired_count && !catalog_broken; a++) {
+        for (int b = a + 1; b < new_desired_count; b++) {
+            if (strcasecmp(new_desired[a].domain, new_desired[b].domain) == 0) {
+                syslog(LOG_ERR, "[Catalog] Zone '%s': member zone '%s' is referenced by both '%s' and '%s' labels; catalog zone is broken and will NOT be processed",
+                       catalog_entry->domain, new_desired[a].domain, new_desired[a].unique_id, new_desired[b].unique_id);
+                catalog_broken = true;
+                break;
+            }
+        }
+    }
+
+    if (catalog_broken) {
+        free_catalog_desired_list(new_desired, new_desired_count);
+        atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+        return; // カタログゾーン全体の更新を中止(既存の状態を維持)
+    }
+
     for (int d = 0; d < new_desired_count; d++) {
         char group_name[512];
         snprintf(group_name, sizeof(group_name), "group.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
@@ -2147,8 +2188,10 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         if (coo_count == 1) {
             normalize_domain_fqdn_local(coo_rdata, new_desired[d].coo_target, sizeof(new_desired[d].coo_target));
         } else if (coo_count > 1) {
-            syslog(LOG_WARNING, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'. Ignoring coo property.", new_desired[d].domain, catalog_entry->domain);
-            new_desired[d].coo_target[0] = '\0';
+            syslog(LOG_ERR, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'; catalog zone is broken and will NOT be processed", new_desired[d].domain, catalog_entry->domain);
+            free_catalog_desired_list(new_desired, new_desired_count);
+            atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+            return;
         } else {
             new_desired[d].coo_target[0] = '\0';
         }
@@ -2187,12 +2230,28 @@ void rebuild_zone_db_from_config(server_config_t *config) {
 
     for (view_config_t *v = config->views; v; v = v->next) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
-            zone_db_entry_t *entry = snapshot_get_zone(new_snap, z->domain);
-            if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
-                reload_master_zone(entry, z->file);
-                if (z->is_catalog) {
-                    void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
-                    catalog_process_membership(entry, z, v->name);
+            zone_db_snapshot_t *snap = acquire_zone_snapshot();
+            if (snap) {
+                zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
+                if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
+                    reload_master_zone(entry, z->file);
+                }
+                release_zone_snapshot(snap);
+            }
+        }
+    }
+
+    for (view_config_t *v = config->views; v; v = v->next) {
+        for (zone_config_t *z = v->zones; z; z = z->next) {
+            if (z->is_catalog && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
+                zone_db_snapshot_t *snap = acquire_zone_snapshot();
+                if (snap) {
+                    zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
+                    if (entry) {
+                        void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+                        catalog_process_membership(entry, z, v->name);
+                    }
+                    release_zone_snapshot(snap);
                 }
             }
         }

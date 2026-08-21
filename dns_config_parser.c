@@ -1700,10 +1700,14 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
   ctx.stack[0].pos = 0;
   ctx.stack[0].len = strlen(config_str);
   if (initial_file_path) {
-    struct stat st;
-    if (stat(initial_file_path, &st) == 0) {
-      ctx.stack[0].dev = st.st_dev;
-      ctx.stack[0].ino = st.st_ino;
+    int fd = open_via_dir_cache(initial_file_path, O_RDONLY, 0, false);
+    if (fd >= 0) {
+      struct stat st;
+      if (fstat(fd, &st) == 0) {
+        ctx.stack[0].dev = st.st_dev;
+        ctx.stack[0].ino = st.st_ino;
+      }
+      close(fd);
     }
   }
   ctx.depth = 0;

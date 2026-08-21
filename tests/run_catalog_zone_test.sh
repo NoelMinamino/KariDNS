@@ -10,6 +10,28 @@ mkdir -p $TEST_DIR
 cd $TEST_DIR
 TEST_DIR_ABS=$(pwd)
 
+# Trap for cleanup and automatic kdump on failure
+cleanup() {
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "[-] Test failed with exit code $EXIT_CODE"
+        if [ -n "$SERVER_PID" ]; then
+            kill -9 $SERVER_PID 2>/dev/null || true
+        fi
+        if [ -f ktrace.out ] && which kdump >/dev/null 2>&1; then
+            echo "=== [KDUMP TRACE (Last 100 lines)] ==="
+            kdump -f ktrace.out 2>/dev/null | tail -n 100 || true
+            echo "======================================"
+        fi
+        if [ -f karidns.log ]; then
+            echo "=== [KARIDNS LOG (Last 50 lines)] ==="
+            tail -n 50 karidns.log || true
+            echo "====================================="
+        fi
+    fi
+}
+trap cleanup EXIT INT TERM
+
 # Create a master catalog zone file
 cat << 'EOF' > catalog.zone
 $ORIGIN catalog.example.com.
@@ -52,8 +74,13 @@ key "karictl" {
 };
 EOF
 
-# Build (assume it's already built, we just run it)
-../karidns -f karidns.conf > karidns.log 2>&1 &
+# Build & Run with ktrace if available
+if which ktrace >/dev/null 2>&1; then
+    echo "[+] Running karidns under ktrace (-di)..."
+    ktrace -di -f ktrace.out ../karidns -f karidns.conf > karidns.log 2>&1 &
+else
+    ../karidns -f karidns.conf > karidns.log 2>&1 &
+fi
 SERVER_PID=$!
 sleep 1
 
@@ -326,10 +353,40 @@ sleep 1
 ../dag -p 53530 @127.0.0.1 member5000.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member5000 broken"; kill $SERVER_PID; exit 1; }
 echo "[+] Large catalog zone delta update (5,000 members) verified successfully!"
 
+echo "[+] Phase 5: RFC 9432 §5.1 Broken Catalog Zone Detection Tests..."
+# Test 5.1: Duplicate PTR records for the same unique-N
+cp ../zones/catalog_duplicate_ptr.zone catalog1.zone
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+grep "has 2 PTR records (RFC 9432 requires exactly 1); catalog zone is broken" karidns.log || {
+    echo "Failed: duplicate PTR on same unique-N was not detected as broken catalog zone"; cat karidns.log; kill $SERVER_PID; exit 1;
+}
+../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED on broken catalog"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member2 should be REFUSED on broken catalog"; kill $SERVER_PID; exit 1; }
+echo "[+] Test 5.1 (Duplicate PTR on same unique-N) successfully rejected."
+
+# Test 5.2: Different unique-N pointing to the same target domain
+cp ../zones/catalog_duplicate_target.zone catalog1.zone
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+grep "is referenced by both 'node1' and 'node2' labels; catalog zone is broken" karidns.log || {
+    echo "Failed: duplicate target domain across labels was not detected as broken catalog zone"; cat karidns.log; kill $SERVER_PID; exit 1;
+}
+../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED on duplicate target catalog"; kill $SERVER_PID; exit 1; }
+echo "[+] Test 5.2 (Duplicate target domain across unique-N) successfully rejected."
+
+# Test 5.3: Valid catalog zone regression test
+cp ../zones/catalog_valid.zone catalog1.zone
+../karictl -f karictl.conf reload catalog1.example.com
+sleep 1
+../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member1 should be loaded in valid catalog"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member2 should be loaded in valid catalog"; kill $SERVER_PID; exit 1; }
+echo "[+] Test 5.3 (Valid catalog zone) successfully loaded."
+
 # Clean up catalog1 before final checks
 cat << EOF > catalog1.zone
 \$ORIGIN catalog1.example.com.
-@ IN SOA ns1.example.com. admin.example.com. 12 3600 1800 604800 86400
+@ IN SOA ns1.example.com. admin.example.com. 20 3600 1800 604800 86400
 @ IN NS ns1.example.com.
 version IN TXT "2"
 EOF
@@ -345,8 +402,8 @@ else
 fi
 
 echo "[+] Verifying dag resolution (all former members should be REFUSED)"
-../dag -p 53530 @127.0.0.1 example.org. SOA | grep "status: REFUSED" || { echo "Failed: example.org should be REFUSED"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 example.edu. SOA | grep "status: REFUSED" || { echo "Failed: example.edu should be REFUSED"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED"; kill $SERVER_PID; exit 1; }
+../dag -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member2 should be REFUSED"; kill $SERVER_PID; exit 1; }
 
 kill $SERVER_PID
 wait $SERVER_PID || true
