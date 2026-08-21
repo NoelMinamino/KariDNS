@@ -6382,6 +6382,12 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     if (setuid(pwd->pw_uid) != 0)
       exit(EXIT_FAILURE);
+
+    if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid ||
+        getgid() != target_gid || getegid() != target_gid) {
+      syslog(LOG_ERR, "[Backend] privilege drop verification failed");
+      exit(EXIT_FAILURE);
+    }
   } else if (cfg->group) {
     struct group *grp = getgrnam(cfg->group);
     if (!grp)
@@ -6390,6 +6396,11 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     if (setgid(grp->gr_gid) != 0)
       exit(EXIT_FAILURE);
+
+    if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
+      syslog(LOG_ERR, "[Backend] privilege drop verification failed (group only)");
+      exit(EXIT_FAILURE);
+    }
   }
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から

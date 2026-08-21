@@ -1253,6 +1253,43 @@ int main() {
         printf("PASS: RFC 9460 SVCB/HTTPS SvcParamKey sort, duplicate rejection, mandatory, and keyNNN\n");
     }
 
+    // --- Test 15: Privilege drop verification logic ---
+    {
+        // 1. Current process sanity check
+        uid_t cur_u = getuid(), cur_eu = geteuid();
+        gid_t cur_g = getgid(), cur_eg = getegid();
+        if (cur_u != cur_eu || cur_g != cur_eg) {
+            printf("FAIL: Process running in inconsistent UID/EUID or GID/EGID state\n");
+            return 1;
+        }
+
+        // 2. Unit test for privilege drop verification condition (Backend & Frontend pattern)
+        // Ensure that any mismatch between real/effective UID/GID triggers failure detection
+        struct {
+            uid_t r_uid, e_uid, target_uid;
+            gid_t r_gid, e_gid, target_gid;
+            bool expected_success;
+        } cases[] = {
+            { 1000, 1000, 1000, 1000, 1000, 1000, true  }, // All dropped successfully
+            { 0,    1000, 1000, 1000, 1000, 1000, false }, // Real UID not dropped
+            { 1000, 0,    1000, 1000, 1000, 1000, false }, // Effective UID not dropped
+            { 1000, 1000, 1000, 0,    1000, 1000, false }, // Real GID not dropped
+            { 1000, 1000, 1000, 1000, 0,    1000, false }, // Effective GID not dropped
+        };
+
+        for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+            bool passed = !(cases[i].r_uid != cases[i].target_uid ||
+                            cases[i].e_uid != cases[i].target_uid ||
+                            cases[i].r_gid != cases[i].target_gid ||
+                            cases[i].e_gid != cases[i].target_gid);
+            if (passed != cases[i].expected_success) {
+                printf("FAIL: Privilege drop verification pattern test %zu failed\n", i);
+                return 1;
+            }
+        }
+        printf("PASS: Backend and Frontend privilege drop verification logic\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
