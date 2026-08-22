@@ -1560,6 +1560,62 @@ int main() {
         printf("PASS: View configuration partial parse error cleanup (no leak)\n");
     }
 
+    // --- Test 22: Zone parser parenthesis mismatch and nesting checks ---
+    {
+        // 1. Unclosed parenthesis
+        const char *z1 =
+            "$ORIGIN example.com.\n"
+            "@ IN SOA ns1.example.com. admin.example.com. ( 1 3600 1800 604800 86400\n"
+            "@ IN NS ns1.example.com.\n";
+        char *buf1 = strdup(z1);
+        zone_arena_t arena1; memset(&arena1, 0, sizeof(arena1)); zone_arena_init(&arena1);
+        parse_error_t err1 = {0};
+        parse_context_t ctx1 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err1 };
+        int pr1 = parse_zone_fast(buf1, strlen(buf1), &arena1, &ctx1);
+        free(buf1);
+        zone_arena_destroy(&arena1);
+        if (pr1 >= 0 || !err1.error_message || strstr(err1.error_message, "Unbalanced parenthesis") == NULL) {
+            printf("FAIL: Unclosed parenthesis was not detected properly: %s\n", err1.error_message ? err1.error_message : "none");
+            return 1;
+        }
+
+        // 2. Unmatched ')' with no preceding '('
+        const char *z2 =
+            "$ORIGIN example.com.\n"
+            "@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400 )\n"
+            "@ IN NS ns1.example.com.\n";
+        char *buf2 = strdup(z2);
+        zone_arena_t arena2; memset(&arena2, 0, sizeof(arena2)); zone_arena_init(&arena2);
+        parse_error_t err2 = {0};
+        parse_context_t ctx2 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err2 };
+        int pr2 = parse_zone_fast(buf2, strlen(buf2), &arena2, &ctx2);
+        free(buf2);
+        zone_arena_destroy(&arena2);
+        if (pr2 >= 0 || !err2.error_message || strstr(err2.error_message, "Unmatched ')'") == NULL) {
+            printf("FAIL: Unmatched ')' was not detected properly: %s\n", err2.error_message ? err2.error_message : "none");
+            return 1;
+        }
+
+        // 3. Nested parentheses
+        const char *z3 =
+            "$ORIGIN example.com.\n"
+            "@ IN SOA ns1.example.com. admin.example.com. ( 1 ( 3600 1800 604800 86400 ) )\n"
+            "@ IN NS ns1.example.com.\n";
+        char *buf3 = strdup(z3);
+        zone_arena_t arena3; memset(&arena3, 0, sizeof(arena3)); zone_arena_init(&arena3);
+        parse_error_t err3 = {0};
+        parse_context_t ctx3 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err3 };
+        int pr3 = parse_zone_fast(buf3, strlen(buf3), &arena3, &ctx3);
+        free(buf3);
+        zone_arena_destroy(&arena3);
+        if (pr3 >= 0 || !err3.error_message || strstr(err3.error_message, "Nested parentheses") == NULL) {
+            printf("FAIL: Nested parentheses was not detected properly: %s\n", err3.error_message ? err3.error_message : "none");
+            return 1;
+        }
+
+        printf("PASS: Zone parser parenthesis balance and nesting checks\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

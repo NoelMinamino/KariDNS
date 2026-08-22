@@ -593,8 +593,17 @@ STATE_START_LINE:
     goto SKIP_WHITESPACE;
   }
 STATE_FIND_TOKEN:
-  if (p >= end)
+  if (p >= end) {
+    if (in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Unbalanced parenthesis: '(' was never closed before end of file";
+        ctx->err_out->error_offset = (size_t)(buf ? (p - buf) : 0);
+        ctx->err_out->token_length = 0;
+      }
+      return -1;
+    }
     goto PROCESS_RECORD;
+  }
   if (IS_SPACE(*p))
     goto SKIP_WHITESPACE;
   if (IS_NEWLINE(*p)) {
@@ -613,11 +622,27 @@ STATE_FIND_TOKEN:
     goto STATE_FIND_TOKEN;
   }
   if (*p == '(') {
+    if (in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Nested parentheses are not allowed in zone file records";
+        ctx->err_out->error_offset = (size_t)(p - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 1;
     *p++ = '\0';
     goto STATE_FIND_TOKEN;
   }
   if (*p == ')') {
+    if (!in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Unmatched ')' with no preceding '(' in zone file record";
+        ctx->err_out->error_offset = (size_t)(p - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 0;
     *p++ = '\0';
     goto STATE_FIND_TOKEN;
@@ -673,6 +698,14 @@ STATE_FIND_TOKEN:
           
           // ファイル末尾に到達した場合でも、最後のトークンのクォートを除去する
           if (p >= end) {
+            if (in_parens) {
+              if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "Unbalanced parenthesis: '(' was never closed before end of file";
+                ctx->err_out->error_offset = (size_t)(buf ? (p - buf) : 0);
+                ctx->err_out->token_length = 0;
+              }
+              return -1;
+            }
             if (field_idx > 0) {
                 if (fields[field_idx - 1][0] == '"') {
                     fields[field_idx - 1]++;
@@ -701,10 +734,26 @@ STATE_FIND_TOKEN:
     goto PROCESS_RECORD;
   }
   if (delimiter == '(') {
+    if (in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Nested parentheses are not allowed in zone file records";
+        ctx->err_out->error_offset = (size_t)(p - 1 - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 1;
     goto STATE_FIND_TOKEN;
   }
   if (delimiter == ')') {
+    if (!in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Unmatched ')' with no preceding '(' in zone file record";
+        ctx->err_out->error_offset = (size_t)(p - 1 - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 0;
     goto STATE_FIND_TOKEN;
   }
