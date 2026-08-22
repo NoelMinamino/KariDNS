@@ -11,8 +11,12 @@ on:
 
 jobs:
   build-and-test:
-    name: Build and Test on FreeBSD VM
+    name: Build and Test on FreeBSD ${{ matrix.release }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.4', '15.1']
 
     steps:
       - name: Checkout code
@@ -21,7 +25,7 @@ jobs:
       - name: Build and Smoke Test inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
-          release: '15.1'
+          release: ${{ matrix.release }}
           run: |
             set -e
 
