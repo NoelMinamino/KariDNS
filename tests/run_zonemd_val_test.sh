@@ -43,5 +43,16 @@ else
     exit 1
 fi
 
+echo "[+] Testing DNSSEC-signed ZONEMD zone verification (RFC 8976 Appendix A.4 uri.arpa.)..."
+OUT_A4=$("$KARICHECK" zone uri.arpa. tests/zones/zonemd_a4.zone 2>&1)
+echo "$OUT_A4"
+
+if echo "$OUT_A4" | grep -q "is VALID"; then
+    echo "[+] DNSSEC-signed ZONEMD digest verified successfully."
+else
+    echo "[-] FAIL: ZONEMD digest verification failed for signed zone uri.arpa."
+    exit 1
+fi
+
 echo "[+] All ZONEMD validation tests passed successfully."
 exit 0

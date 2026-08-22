@@ -293,19 +293,24 @@ static int cmp_canonical_rr(const void *a, const void *b) {
     return len1 - len2;
 }
 
-static bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_scheme, uint8_t *out_halg) {
+static bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_scheme,
+                                        uint8_t *out_halg, bool warn) {
     if (!zm || zm->rdata_count < 3 || !zm->rdata[1] || !zm->rdata[2]) return false;
     char *scheme_endptr, *halg_endptr;
     long scheme_val = strtol(zm->rdata[1], &scheme_endptr, 10);
     long halg_val = strtol(zm->rdata[2], &halg_endptr, 10);
     if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
-        fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
-                zm->rdata[1], zm->name);
+        if (warn) {
+            fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
+                    zm->rdata[1], zm->name);
+        }
         return false;
     }
     if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
-        fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
-                zm->rdata[2], zm->name);
+        if (warn) {
+            fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
+                    zm->rdata[2], zm->name);
+        }
         return false;
     }
     if (out_scheme) *out_scheme = (uint8_t)scheme_val;
@@ -317,7 +322,7 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     dns_record_t *zonemds[16];
     int zonemd_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 63) {
+        if (arena->records[i].type_code == 63 && strcasecmp(arena->records[i].name, domain) == 0) {
             if (zonemd_count < 16) {
                 zonemds[zonemd_count++] = &arena->records[i];
             }
@@ -334,8 +339,8 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
         dns_record_t *r = &arena->records[i];
         if (r->type_code == 63) continue; // ZONEMD 自身は除外
         
-        // ZONEMD covered type in DSYNC or others
-        if (r->type_code == 66 && // DSYNC
+        // Exclude RRSIG covering ZONEMD at apex (RFC 8976 section 3.2)
+        if (r->type_code == 46 && strcasecmp(r->name, domain) == 0 &&
             r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
 
         size_t name_len = strlen(r->name);
@@ -359,12 +364,10 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     for (int z = 0; z < zonemd_count; z++) {
         dns_record_t *zm = zonemds[z];
         if (zm->rdata_count < 4) {
-            fprintf(stderr, "[WARNING] ZONEMD record for '%s' has fewer than 4 fields "
-                            "(serial, scheme, hash-algorithm, digest); skipping\n", zm->name);
             continue;
         }
         uint8_t scheme, halg;
-        if (!validate_zonemd_scheme_halg(zm, &scheme, &halg)) {
+        if (!validate_zonemd_scheme_halg(zm, &scheme, &halg, false)) {
             continue;
         }
         
@@ -629,11 +632,15 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         
         // --- Add specific field validations ---
         if (tcode == 63) { // ZONEMD
+            if (strcasecmp(arena.records[i].name, domain) != 0) {
+                fprintf(stderr, "[WARNING] ZONEMD record '%s' is not at the zone apex '%s' (RFC 8976 section 2.1)\n",
+                        arena.records[i].name, domain);
+            }
             if (rcount < 4) {
                 fprintf(stderr, "[WARNING] ZONEMD record for '%s' has fewer than 4 fields "
                                 "(serial, scheme, hash-algorithm, digest)\n", arena.records[i].name);
             } else {
-                validate_zonemd_scheme_halg(&arena.records[i], NULL, NULL);
+                validate_zonemd_scheme_halg(&arena.records[i], NULL, NULL, true);
             }
         }
         if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
