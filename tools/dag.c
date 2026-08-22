@@ -492,6 +492,7 @@ typedef struct {
     const char *explicit_qname;
     bool mem_debug;
     bool check_dns64prefix;
+    bool server_explicit;
 
     bool use_search_list;
     char *search_domain;
@@ -2896,7 +2897,7 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
                         }
                         printf("\n");
                     }
-                } else if (code != 10) {
+                } else if (code != 10 && code != 15) {
                     printf("; OPTION: %u", code);
                     if (olen > 0) {
                         printf(": ");
@@ -3087,6 +3088,24 @@ static bool check_packet_malformed(const uint8_t *pkt, size_t pkt_len, size_t *e
     return false;
 }
 
+static int count_non_opt_rrs(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount) {
+    int count = 0;
+    size_t cur = offset;
+    for (uint16_t i = 0; i < arcount; i++) {
+        size_t next;
+        if (skip_wire_name(pkt, pkt_len, cur, &next) != 0) break;
+        if (next + 10 > pkt_len) break;
+        uint16_t rtype = (pkt[next] << 8) | pkt[next + 1];
+        uint16_t rdlen = (pkt[next + 8] << 8) | pkt[next + 9];
+        if (rtype != 41) { // Type 41 is OPT
+            count++;
+        }
+        cur = next + 10 + rdlen;
+        if (cur > pkt_len) break;
+    }
+    return count;
+}
+
 static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state, const display_opts_t *dopt) {
     size_t extra_bytes = 0;
     bool is_malformed = (dopt && dopt->besteffort) ? check_packet_malformed(pkt, pkt_len, &extra_bytes) : false;
@@ -3146,9 +3165,8 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         if (cd) printf(";; (checking disabled)\n");
     }
 
-    if (edns.present) {
-        if (dopt->show_comments && dopt->show_additional) printf("\n;; OPT PSEUDOSECTION:\n");
-        if (!dopt->show_additional) g_dag_suppress_stdout = true;
+    if (edns.present && dopt->show_comments && dopt->show_additional) {
+        printf("\n;; OPT PSEUDOSECTION:\n");
         char flags_buf[32] = "";
         if (edns.dnssec_ok) strcat(flags_buf, " do");
         if (edns.compact_answers_ok) strcat(flags_buf, " co");
@@ -3169,7 +3187,6 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
             if (edns.ede_list[i].text[0]) printf("; EDE: %d (%s): (%s)\n", edns.ede_list[i].code, msg, edns.ede_list[i].text);
             else printf("; EDE: %d (%s)\n", edns.ede_list[i].code, msg);
         }
-        g_dag_suppress_stdout = false;
     }
 
     size_t offset = 12;
@@ -3244,21 +3261,24 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         g_dag_suppress_stdout = false;
     }
     if (arcount > 0) {
-        if (dopt->show_comments && dopt->show_additional) printf("\n;; ADDITIONAL SECTION:\n");
-        if (!dopt->show_additional) g_dag_suppress_stdout = true;
-        for (int i = 0; i < arcount; i++) {
-            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) {
-                if (dopt->besteffort) {
-                    g_dag_suppress_stdout = false;
-                    return;
-                } else {
-                    printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len);
-                    hexdump(pkt, pkt_len);
-                    return;
+        int non_opt_cnt = count_non_opt_rrs(pkt, pkt_len, offset, arcount);
+        if (non_opt_cnt > 0) {
+            if (dopt->show_comments && dopt->show_additional) printf("\n;; ADDITIONAL SECTION:\n");
+            if (!dopt->show_additional) g_dag_suppress_stdout = true;
+            for (int i = 0; i < arcount; i++) {
+                if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) {
+                    if (dopt->besteffort) {
+                        g_dag_suppress_stdout = false;
+                        return;
+                    } else {
+                        printf(";; Got bad packet: unexpected end of input\n%zu bytes\n", pkt_len);
+                        hexdump(pkt, pkt_len);
+                        return;
+                    }
                 }
             }
+            g_dag_suppress_stdout = false;
         }
-        g_dag_suppress_stdout = false;
     }
 }
 
@@ -3349,15 +3369,15 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         axfr_state.is_axfr = (qtype == 252 || qtype == 251);
 
 
-        if (dopt->show_query_message) {
-            print_sent_query(pkt, pkt_len, qo, dopt);
-        }
-
         if (!dopt->short_mode) {
             if (dopt->show_cmd) {
-                int found_cnt = get_server_addr_count(server, port, qo ? qo->pref_family : AF_UNSPEC);
-                printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
-                printf("; (%d server%s found)\n", found_cnt, found_cnt == 1 ? "" : "s");
+                if (qo && qo->server_explicit) {
+                    int found_cnt = get_server_addr_count(server, port, qo ? qo->pref_family : AF_UNSPEC);
+                    printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
+                    printf("; (%d server%s found)\n", found_cnt, found_cnt == 1 ? "" : "s");
+                } else {
+                    printf("; <<>> dag <<>> %s %s%s\n", qname, qtype_s, use_tcp ? " (tcp)" : "");
+                }
                 printf(";; global options: +cmd\n");
             }
             if (!no_hexdump_query) {
@@ -3365,6 +3385,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 hexdump(pkt, pkt_len);
                 printf("\n");
             }
+        }
+
+        if (dopt->show_query_message) {
+            print_sent_query(pkt, pkt_len, qo, dopt);
         }
 
         static uint8_t resp[65535];
@@ -3703,24 +3727,150 @@ static void print_multi_server_summary(bool use_ldnsz) {
 
 
 static void usage(const char *prog) {
-    fprintf(stderr,
-        "Usage: %s <name> <type|IXFR=serial> @<server>[,<server>...] [-p <port>] [+tcp]\n"
-        "          [+edns] [+dnssec] [+nsid] [+cookie[=hex]] [+nocookie]\n"
-        "          [+subnet=addr[/prefix]] [+bufsize=N] [+adflag] [+cdflag]\n"
-        "          [+aaflag] [+tcflag] [+zflag] [+ednsopt=CODE[:HEX]] [+mqtype=TYPE[,TYPE...]]\n"
-        "          [+padding=N] [+timeout=N] [+tries=N] [+retry=N] [+ldnsz]\n"
-        "          [-y [alg:]name:secret] [+tsig=alg:name:secret]\n"
-        "          [--test-all] [--break <kind>[=<param>] ...]\n"
-        "          [+nohexdump] [+nohexdump-query] [+nohexdump-response]\n"
-        "          [+ldnsz] [+allcompare] [+ignore] [+noignore] [+fail] [+nofail]\n"
+    (void)prog;
+    printf(
+        "Usage:  dag [@server] [-p port] [domain] [type] [options]\n"
         "\n"
-        "  <server> may be an IPv4/IPv6 literal or an FQDN (resolved via the\n"
-        "  system resolver), e.g. @8.8.8.8, @2001:4860:4860::8888, @dns.google\n"
-        "  Multiple servers can be queried in one run with a comma-separated list:\n"
-        "    %s example.com A @8.8.8.8,9.9.9.9,1.1.1.1\n"
+        "Query & Target Arguments:\n"
+        "  domain                       Domain name to query (default: '.')\n"
+        "  type                         Record type (default: 'NS' for root '.', 'A' otherwise)\n"
+        "                               (Use IXFR=serial for incremental zone transfer)\n"
+        "  @server[:port]               Target server IPv4/IPv6 address or FQDN (default: system resolver)\n"
+        "                               Supports direct port specification (e.g. @127.0.0.1:10053 or @[::1]:5353)\n"
+        "                               Accepts comma-separated list to query multiple servers (e.g. @8.8.8.8,9.9.9.9:5353,1.1.1.1)\n"
+        "  -p <port>                    Port number (default: 53)\n"
+        "  -x <addr>                    Shortcut for reverse DNS lookups (IPv4/IPv6)\n"
+        "  -c <class>                   Specify query class (IN, CH, HS, etc.) [default: IN]\n"
+        "  -q <name>                    Explicitly specify query name\n"
+        "  -t <type>                    Explicitly specify query type\n"
+        "  -y [alg:]name:secret         Specify TSIG key in base64 format (e.g. -y hmac-sha256:keyname:secret==)\n"
+        "  +tsig=[alg:]name:secret      Specify TSIG key (+tsig alternative for -y)\n"
+        "  -k <keyfile>                 Load TSIG key from BIND-format keyfile\n"
+        "  -4 / -6                      Force IPv4 or IPv6 query transport\n"
+        "  -b <addr>[#port]             Bind source IP address and optional port\n"
+        "  -f <file>                    Batch mode (read queries from file)\n"
+        "  -r                           Do not read ~/.digrc\n"
+        "  -m                           Enable memory allocation debugging\n"
+        "  -u                           Display query times in microseconds (usec)\n"
+        "  -h, --help                   Display this help message and exit\n"
+        "  -v, --version                Display version information and exit\n"
         "\n"
-        "       %s --break-help    (list all --break kinds)\n",
-        prog, prog, prog);
+        "Transport & Protocol Options:\n"
+        "  +[no]tcp                     Use TCP transport (+[no]vc)\n"
+        "  +[no]tls                     Use DNS-over-TLS (DoT) [default port: 853]\n"
+        "  +[no]tls-ca[=file]           Enable TLS certificate verification using system store or CA file\n"
+        "  +tls-certfile=file           Load client TLS certificate chain from file\n"
+        "  +tls-keyfile=file            Load client TLS private key from file\n"
+        "  +tls-hostname=host           Explicitly specify expected TLS Server Name Indication (SNI)\n"
+        "  +[no]https[=endpoint]        Use DNS-over-HTTPS (DoH) mode [default endpoint: /dns-query, port: 443]\n"
+        "  +[no]https-get[=endpoint]    Use GET method instead of POST for DoH\n"
+        "  +[no]https-post[=endpoint]   Use POST method for DoH\n"
+        "  +[no]http-plain[=endpoint]   Use plain HTTP DNS mode [default endpoint: /dns-query, port: 80]\n"
+        "  +[no]http-plain-get[=ep]     Use GET method for plain HTTP\n"
+        "  +[no]http-plain-post[=ep]    Use POST method for plain HTTP\n"
+        "  +[no]proxy[=spec]            Inject PROXYv2 transport header (e.g. +proxy=192.0.2.1#1234-192.0.2.2#53)\n"
+        "  +[no]proxy-plain[=spec]      Inject PROXYv2 header ahead of TLS encryption layer\n"
+        "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828)\n"
+        "  +[no]keepopen                Keep TCP socket open between consecutive queries\n"
+        "  +[no]dns64prefix             Query IPv4-only prefix from ipv4only.arpa (RFC 7050)\n"
+        "  +timeout=N                   Query timeout in seconds [5]\n"
+        "  +tries=N / +retry=N          Number of query attempts [1]\n"
+        "  +[no]recurse                 Set / clear RD (Recursion Desired) bit (+[no]rdflag)\n"
+        "  +[no]adflag                  Set / clear AD (Authenticated Data) bit in query\n"
+        "  +[no]cdflag                  Set / clear CD (Checking Disabled) bit in query\n"
+        "  +[no]aaflag                  Set / clear AA (Authoritative Answer) bit in query (+[no]aaonly)\n"
+        "  +[no]tcflag                  Set / clear TC (Truncated) bit in query\n"
+        "  +[no]raflag                  Set / clear RA (Recursion Available) bit in query\n"
+        "  +[no]zflag                   Set / clear Z (Reserved) bit in query\n"
+        "  +opcode=N                    Override DNS Opcode in query header (0=QUERY, 2=STATUS, 5=UPDATE, etc.)\n"
+        "  +qid=N                       Explicitly specify DNS query ID (0-65535)\n"
+        "  +[no]ignore                  Ignore TC flag and do not retry via TCP\n"
+        "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
+        "  +[no]trace                   Trace delegation hierarchy down from root servers\n"
+        "  +[no]nssearch                Search all authoritative nameservers for zone\n"
+        "  +[no]search / +[no]defname   Use search list defined in /etc/resolv.conf\n"
+        "  +domain=domain               Set default search domain\n"
+        "  +ndots=N                     Set search NDOTS threshold\n"
+        "\n"
+        "EDNS0 Extension Options:\n"
+        "  +[no]edns[=N]                Set EDNS version (0 to disable: +noedns) [0]\n"
+        "  +bufsize=N                   Set EDNS0 advertised UDP buffer size [1232]\n"
+        "  +[no]dnssec                  Request DNSSEC records by setting DO (DNSSEC OK) bit (+[no]do)\n"
+        "  +[no]cookie[=hex]            Send EDNS COOKIE option with optional client/server cookie hex\n"
+        "  +[no]badcookie               Automatically retry with returned server cookie on BADCOOKIE\n"
+        "  +[no]showbadcookie           Display diagnostic message when BADCOOKIE retry occurs\n"
+        "  +subnet=addr[/prefix]        Send EDNS Client Subnet (ECS) option (e.g. +subnet=192.0.2.0/24)\n"
+        "  +[no]nsid                    Request Name Server Identifier (NSID) option (RFC 5001)\n"
+        "  +padding[=N]                 Add EDNS padding option with block size N (RFC 7830/8467)\n"
+        "  +ednsopt=code[:hex]          Send custom EDNS option by code and hex payload (e.g. +ednsopt=65001:0102)\n"
+        "  +noednsopt                   Clear all configured custom EDNS options\n"
+        "  +ednsflags=N                 Set raw EDNS Z flag bits in OPT record\n"
+        "  +[no]coflag                  Set Compact Answers OK (CO) flag bit in OPT record (+[no]co)\n"
+        "  +[no]ednsnegotiation         Enable/disable EDNS version negotiation fallback on BADVERS\n"
+        "  +[no]showbadvers             Display diagnostic message when BADVERS fallback occurs\n"
+        "\n"
+        "Display & Formatting Options:\n"
+        "  +[no]short                   Display concise short-form answer data only\n"
+        "  +[no]multiline               Display multiline format for SOA, DNSKEY, and RRSIG records\n"
+        "  +[no]yaml                    Output parsed response in structured YAML format\n"
+        "  +[no]ttlunits                Display TTL values in human-readable time units (w/d/h/m/s)\n"
+        "  +[no]class                   Display / suppress CLASS field in resource records\n"
+        "  +[no]ttlid                   Display / suppress TTL field in resource records\n"
+        "  +[no]unknownformat           Format record RDATA using RFC 3597 unknown type syntax (\\#)\n"
+        "  +[no]crypto                  Display / suppress cryptographic key fields in DNSKEY/DS\n"
+        "  +[no]rrcomments              Display explanatory keytag comments on DNSKEY records\n"
+        "  +[no]comments                Toggle comment banners and section header comments\n"
+        "  +[no]cmd                     Toggle command line header banner (; <<>> dag <<>> ...)\n"
+        "  +[no]stats                   Toggle query timing and server statistics section\n"
+        "  +[no]question                Toggle QUESTION section display\n"
+        "  +[no]answer                  Toggle ANSWER section display\n"
+        "  +[no]authority               Toggle AUTHORITY section display\n"
+        "  +[no]additional              Toggle ADDITIONAL section display\n"
+        "  +[no]all                     Set or clear all display section flags at once\n"
+        "  +[no]qr                      Display outgoing query packet representation before sending\n"
+        "  +[no]identify                Display responding server IP in short-mode responses\n"
+        "  +[no]idn                     Convert Internationalized Domain Names (IDN) (+[no]idnin / +[no]idnout)\n"
+        "  +[no]onesoa                  Display only the first SOA record during AXFR transfers\n"
+        "  +[no]split=N                 Split long hex and base64 fields into N-character chunks [56]\n"
+        "  +[no]besteffort              Attempt to parse and display malformed/illegal DNS packets\n"
+        "  +[no]expire                  Request and highlight zone expiration TTL in SOA output\n"
+        "  +[no]showsearch              Display intermediate results during search list resolution\n"
+        "\n"
+        "Dynamic DNS Update Options (RFC 2136):\n"
+        "  --update-add <RR>            Add resource record (e.g. --update-add 'host.example.com 300 IN A 192.0.2.1')\n"
+        "  --update-del <name> [type]   Delete RRset or all records on name (e.g. --update-del 'host.example.com A')\n"
+        "  --update-del-exact <RR>      Delete specific RR matching full RDATA (e.g. --update-del-exact 'host.example.com 300 IN A 192.0.2.1')\n"
+        "  --prereq-yxdomain <name>     Prerequisite: Domain name must exist (in use)\n"
+        "  --prereq-nxdomain <name>     Prerequisite: Domain name must NOT exist (not in use)\n"
+        "  --prereq-yxrrset <name> <type> [rdata]\n"
+        "                               Prerequisite: RRset must exist (optionally matching specified RDATA value)\n"
+        "  --prereq-nxrrset <name> <type>\n"
+        "                               Prerequisite: RRset must NOT exist\n"
+        "  --prereq=<expr>              Specify prerequisite expression (e.g. --prereq='yxdomain:host.example.com')\n"
+        "  Example:\n"
+        "    dag example.com SOA @127.0.0.1 -k /etc/rndc.key --update-add 'web.example.com 3600 IN A 192.0.2.80'\n"
+        "\n"
+        "KariDNS / dag Unique Features & Protocol Fuzzing:\n"
+        "  +[no]ldnsz                   Enable LDNSZ extended query compression / format (RFC draft)\n"
+        "                               Example: dag example.com A @127.0.0.1 +ldnsz\n"
+        "  +[no]allcompare              Compare responses across all queried nameservers for consistency\n"
+        "                               Example: dag example.com A @8.8.8.8,1.1.1.1,9.9.9.9 +allcompare\n"
+        "  +mqtype=TYPE[,TYPE...]       Send Multiple QTYPE EDNS option (RFC 10029)\n"
+        "                               Example: dag example.com A @127.0.0.1 +mqtype=A,AAAA,HTTPS\n"
+        "  +[no]header-only             Send DNS query packet without a QUESTION section\n"
+        "  +[no]nohexdump               Suppress raw packet hex dumps for query and response\n"
+        "  +[no]nohexdump-query         Suppress raw query packet hex dump\n"
+        "  +[no]nohexdump-response      Suppress raw response packet hex dump\n"
+        "  --hex=<hex> | --hex <hex>    Send raw hex payload directly as DNS query packet\n"
+        "                               Example: dag @127.0.0.1 --hex '000101000001000000000000076578616d706c6503636f6d0000010001'\n"
+        "  --break <kind>[=<param>]     Inject deliberate protocol anomalies / mutations into query packet\n"
+        "                               Examples:\n"
+        "                                 dag example.com A @127.0.0.1 --break null_qname\n"
+        "                                 dag example.com A @127.0.0.1 --break dname_loop\n"
+        "                                 dag example.com A @127.0.0.1 --break tc_bit=1\n"
+        "                                 dag example.com A @127.0.0.1 --break all\n"
+        "  --break-help                 Display list of all supported --break anomaly mutation kinds\n"
+    );
 }
 
 static bool make_reverse_name(const char *ip_str, char *out_name, size_t out_len) {
@@ -4519,7 +4669,7 @@ int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
     zone_arena_init(&g_dag_arena);
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
-    if (argc < 2) { usage(argv[0]); return 1; }
+    if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) { usage(argv[0]); return 0; }
 
     bool skip_digrc = false;
     for (int i = 1; i < argc; i++) {
@@ -4637,6 +4787,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] == '@') {
             server_arg = argv[i] + 1;
+            qo.server_explicit = true;
         } else if (strcmp(argv[i], "--hex") == 0 && i + 1 < argc) {
             hex_payload = argv[++i];
             qname = "(hex)";
@@ -4665,7 +4816,7 @@ int main(int argc, char **argv) {
             dopt.time_unit_usec = true;
         } else if (strcmp(argv[i], "-m") == 0) {
             qo.mem_debug = true;
-        } else if (strcmp(argv[i], "-h") == 0) {
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
         } else if (strcmp(argv[i], "-r") == 0) {
@@ -5239,17 +5390,21 @@ int main(int argc, char **argv) {
     }
 
     if (qo.explicit_qname) qname = qo.explicit_qname;
-    if (!qtype_s) qtype_s = "A";
-    if (!qname) qname = ".";
+    if (!qname) {
+        qname = ".";
+        if (!qtype_s) qtype_s = "NS";
+    } else {
+        if (!qtype_s) {
+            if (strcmp(qname, ".") == 0) qtype_s = "NS";
+            else qtype_s = "A";
+        }
+    }
 
     static char resolv_server_buf[260];
     if (!server_arg) {
         const char *sys_resolver = get_system_resolver();
         snprintf(resolv_server_buf, sizeof(resolv_server_buf), "%s", sys_resolver);
         server_arg = resolv_server_buf;
-        if (!dopt.short_mode) {
-            fprintf(stderr, ";; Using system resolver: %s\n", sys_resolver);
-        }
     }
 
     if (batch_file) {
