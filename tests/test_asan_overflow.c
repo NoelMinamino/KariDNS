@@ -1616,6 +1616,74 @@ int main() {
         printf("PASS: Zone parser parenthesis balance and nesting checks\n");
     }
 
+    // --- Test 23: Out-of-bounds numeric fields in serialize_dns_record ---
+    {
+        uint8_t buf[1024];
+        uint16_t off = 0;
+        compress_ctx_t c; compress_ctx_init_packet(&c);
+
+        // 1. uint16_t overflow: MX preference = 70000 (> 65535)
+        dns_record_t mx_rec = {
+            .name = "example.com.",
+            .type = "MX",
+            .type_code = 15,
+            .ttl_value = 3600,
+            .rdata_count = 2,
+            .rdata = { "70000", "mail.example.com." }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: MX preference > 65535 was not rejected\n");
+            return 1;
+        }
+
+        // 2. uint8_t overflow: SSHFP algorithm = 300 (> 255)
+        off = 0;
+        dns_record_t sshfp_rec = {
+            .name = "example.com.",
+            .type = "SSHFP",
+            .type_code = 44,
+            .ttl_value = 3600,
+            .rdata_count = 3,
+            .rdata = { "300", "1", "123456789abcdef67890123456789abcdef67890" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &sshfp_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: SSHFP algorithm > 255 was not rejected\n");
+            return 1;
+        }
+
+        // 3. uint16_t overflow: SRV port = -1
+        off = 0;
+        dns_record_t srv_rec = {
+            .name = "_sip._tcp.example.com.",
+            .type = "SRV",
+            .type_code = 33,
+            .ttl_value = 3600,
+            .rdata_count = 4,
+            .rdata = { "10", "60", "-1", "sip.example.com." }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &srv_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: SRV port < 0 was not rejected\n");
+            return 1;
+        }
+
+        // 4. Non-numeric input: MX preference = "abc"
+        off = 0;
+        mx_rec.rdata[0] = "abc";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: Non-numeric MX preference 'abc' was not rejected\n");
+            return 1;
+        }
+
+        // 5. Valid records pass
+        off = 0;
+        mx_rec.rdata[0] = "10";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != 0) {
+            printf("FAIL: Valid MX record failed serialization\n");
+            return 1;
+        }
+        printf("PASS: Out-of-bounds numeric fields rejection (uint8_t/uint16_t bounds)\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
