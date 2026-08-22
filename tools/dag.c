@@ -1027,25 +1027,37 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                     tokens[token_count++] = tok_start;
                 }
 
-                if (token_count >= 4) {
-                    dns_record_t rec;
-                    memset(&rec, 0, sizeof(rec));
-                    rec.name = tokens[0];
-                    rec.ttl = tokens[1];
-                    rec.type_code = parse_qtype(tokens[2]);
-                    rec.type = tokens[2];
-                    rec.class_str = "IN";
-                    rec.rdata_count = token_count - 3;
-                    for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
+                if (token_count >= 3) {
+                    int type_idx = 2;
+                    char *class_str = (char *)"IN";
+                    if (token_count >= 4 && (strcasecmp(tokens[2], "IN") == 0 || strcasecmp(tokens[2], "CH") == 0 ||
+                                             strcasecmp(tokens[2], "ANY") == 0 || strcasecmp(tokens[2], "NONE") == 0 ||
+                                             strcasecmp(tokens[2], "HS") == 0)) {
+                        class_str = tokens[2];
+                        type_idx = 3;
+                    }
+                    if (token_count > type_idx) {
+                        dns_record_t rec;
+                        memset(&rec, 0, sizeof(rec));
+                        rec.name = tokens[0];
+                        rec.ttl = tokens[1];
+                        rec.type_code = parse_qtype(tokens[type_idx]);
+                        rec.type = tokens[type_idx];
+                        rec.class_str = class_str;
+                        rec.rdata_count = token_count - (type_idx + 1);
+                        for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[type_idx + 1 + i];
 
-                    uint16_t out_offset = offset;
-                    if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
-                        offset = out_offset;
-                        uint16_t upcount = (pkt[8] << 8) | pkt[9];
-                        upcount++;
-                        pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                        uint16_t out_offset = offset;
+                        if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0xFFFFFFFF) == 0) {
+                            offset = out_offset;
+                            uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                            upcount++;
+                            pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                        } else {
+                            fprintf(stderr, "Failed to serialize update-add record: %s\n", raw);
+                        }
                     } else {
-                        fprintf(stderr, "Failed to serialize update-add record: %s\n", raw);
+                        fprintf(stderr, "Invalid update-add string format: %s\n", raw);
                     }
                 } else {
                     fprintf(stderr, "Invalid update-add string format: %s\n", raw);
@@ -1114,25 +1126,35 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                     tokens[token_count++] = tok_start;
                 }
 
-                if (token_count >= 4) {
-                    dns_record_t rec;
-                    memset(&rec, 0, sizeof(rec));
-                    rec.name = tokens[0];
-                    rec.ttl = "0"; // TTL must be 0 for exact match delete
-                    rec.type_code = parse_qtype(tokens[2]);
-                    rec.type = tokens[2];
-                    rec.class_str = "NONE"; // Class NONE for exact match delete
-                    rec.rdata_count = token_count - 3;
-                    for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[3 + i];
+                if (token_count >= 3) {
+                    int type_idx = 1;
+                    if (token_count >= 3 && (strcasecmp(tokens[1], "NONE") == 0 || strcasecmp(tokens[1], "IN") == 0 || strcasecmp(tokens[1], "ANY") == 0)) {
+                        type_idx = 2;
+                    } else if (token_count >= 4 && isdigit((unsigned char)tokens[1][0]) && (strcasecmp(tokens[2], "NONE") == 0 || strcasecmp(tokens[2], "IN") == 0 || strcasecmp(tokens[2], "ANY") == 0)) {
+                        type_idx = 3;
+                    }
+                    if (token_count > type_idx) {
+                        dns_record_t rec;
+                        memset(&rec, 0, sizeof(rec));
+                        rec.name = tokens[0];
+                        rec.ttl = (char *)"0"; // TTL must be 0 for exact match delete
+                        rec.type_code = parse_qtype(tokens[type_idx]);
+                        rec.type = tokens[type_idx];
+                        rec.class_str = (char *)"NONE"; // Class NONE for exact match delete
+                        rec.rdata_count = token_count - (type_idx + 1);
+                        for (int i = 0; i < rec.rdata_count; i++) rec.rdata[i] = tokens[type_idx + 1 + i];
 
-                    uint16_t out_offset = offset;
-                    if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
-                        offset = out_offset;
-                        uint16_t upcount = (pkt[8] << 8) | pkt[9];
-                        upcount++;
-                        pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                        uint16_t out_offset = offset;
+                        if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
+                            offset = out_offset;
+                            uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                            upcount++;
+                            pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
+                        } else {
+                            fprintf(stderr, "Failed to serialize update-del-exact record: %s\n", raw);
+                        }
                     } else {
-                        fprintf(stderr, "Failed to serialize update-del-exact record: %s\n", raw);
+                        fprintf(stderr, "Invalid update-del-exact string format: %s\n", raw);
                     }
                 } else {
                     fprintf(stderr, "Invalid update-del-exact string format: %s\n", raw);
@@ -4188,14 +4210,22 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                           query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     char expanded_qname[512];
     if (qo.use_search_list && strchr(qname, '.') == NULL) {
-        char domains[4][256];
-        int count = get_system_search_domains(domains, 4);
-        if (count > 0) {
-            snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, domains[0]);
+        if (qo.search_domain && *qo.search_domain) {
+            snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, qo.search_domain);
             if (dopt && dopt->showsearch) {
                 printf(";; SEARCH: %s -> %s\n", qname, expanded_qname);
             }
             qname = expanded_qname;
+        } else {
+            char domains[4][256];
+            int count = get_system_search_domains(domains, 4);
+            if (count > 0) {
+                snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, domains[0]);
+                if (dopt && dopt->showsearch) {
+                    printf(";; SEARCH: %s -> %s\n", qname, expanded_qname);
+                }
+                qname = expanded_qname;
+            }
         }
     }
 
