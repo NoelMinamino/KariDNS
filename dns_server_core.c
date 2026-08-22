@@ -2687,7 +2687,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     zone_arena_t *current_zone = *current_zone_ptr;
     if (!current_zone || current_zone->hash_size == 0 ||
         !current_zone->hash_table) {
-      res[3] |= 0x02;
+      res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
       return;
     }
     
@@ -3116,7 +3116,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     break;
   }
   if (chain_exhausted)
-    res[3] |= 0x02;
+    res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
 }
 
 // ============================================================================
