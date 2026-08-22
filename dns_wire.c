@@ -2220,6 +2220,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                     edns->ext_rcode = (ttl >> 24) & 0xFF;
                     edns->version = (ttl >> 16) & 0xFF;
                     edns->dnssec_ok = (ttl & 0x00008000) != 0;
+                    edns->compact_answers_ok = (ttl & 0x00004000) != 0;
                     
                     size_t rdata_offset = scan_offset + 10;
                     size_t rdata_end = rdata_offset + rdlen;
