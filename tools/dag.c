@@ -1259,6 +1259,26 @@ static bool resolve_server_addr(const char *server, int port, int pref_family,
     return true;
 }
 
+static int get_server_addr_count(const char *server, int port, int pref_family) {
+    struct sockaddr_in d4;
+    struct sockaddr_in6 d6;
+    if (inet_pton(AF_INET, server, &d4.sin_addr) == 1) return 1;
+    if (inet_pton(AF_INET6, server, &d6.sin6_addr) == 1) return 1;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = pref_family;
+    hints.ai_socktype = SOCK_DGRAM;
+    char portbuf[16];
+    snprintf(portbuf, sizeof(portbuf), "%d", port);
+    if (getaddrinfo(server, portbuf, &hints, &res) == 0 && res != NULL) {
+        int cnt = 0;
+        for (struct addrinfo *p = res; p != NULL; p = p->ai_next) cnt++;
+        freeaddrinfo(res);
+        return cnt > 0 ? cnt : 1;
+    }
+    return 1;
+}
+
 static int connect_udp(const char *server, int port, int pref_family, const char *bind_addr, int bind_port, struct sockaddr_storage *dest, socklen_t *dest_len) {
     int family = AF_INET;
     if (!resolve_server_addr(server, port, pref_family, dest, dest_len, &family)) return -1;
@@ -3076,11 +3096,15 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
     uint16_t full_rcode = edns.present ? (((uint16_t)edns.ext_rcode << 4) | rcode) : rcode;
 
     if (dopt->show_comments) {
+        printf(";; Got answer:\n");
         printf(";; ->>HEADER<<- opcode: %s, status: %s, id: %u\n", opcode_name(opcode), rcode_name(full_rcode), qid);
         printf(";; flags:%s%s%s%s%s%s; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n",
                qr ? " qr" : "", aa ? " aa" : "", tc ? " tc" : "", rd ? " rd" : "",
                ra ? " ra" : "", ad ? " ad" : "",
                qdcount, ancount, nscount, arcount);
+        if (!ra && rd) {
+            printf(";; WARNING: recursion requested but not available\n");
+        }
         if (is_malformed && extra_bytes > 0) {
             printf(";; WARNING: Message has %zu extra bytes at end\n", extra_bytes);
         }
@@ -3295,14 +3319,17 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
 
         if (!dopt->short_mode) {
-            printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
-            printf("Query (%zu bytes):\n", pkt_len);
-            if (!no_hexdump_query) {
-                hexdump(pkt, pkt_len);
-            } else {
-                printf("(hexdump suppressed)\n");
+            if (dopt->show_cmd) {
+                int found_cnt = get_server_addr_count(server, port, qo ? qo->pref_family : AF_UNSPEC);
+                printf("; <<>> dag <<>> %s %s @%s%s\n", qname, qtype_s, server, use_tcp ? " (tcp)" : "");
+                printf("; (%d server%s found)\n", found_cnt, found_cnt == 1 ? "" : "s");
+                printf(";; global options: +cmd\n");
             }
-            printf("\n");
+            if (!no_hexdump_query) {
+                printf("Query (%zu bytes):\n", pkt_len);
+                hexdump(pkt, pkt_len);
+                printf("\n");
+            }
         }
 
         static uint8_t resp[65535];
@@ -3409,17 +3436,15 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
             
             if (!dopt->short_mode) {
-                if (use_tcp) {
-                    printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
-                } else {
-                    printf("Response (%zd bytes, UDP):\n", n);
-                }
                 if (!no_hexdump_response && dopt->show_comments) {
+                    if (use_tcp) {
+                        printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
+                    } else {
+                        printf("Response (%zd bytes, UDP):\n", n);
+                    }
                     hexdump(resp, (size_t)n);
-                } else {
-                    printf("(hexdump suppressed)\n");
+                    printf("\n");
                 }
-                printf("\n");
                 if (dopt->identify) {
                     printf(";; ANSWER FROM: %s\n", server);
                 }
@@ -4758,7 +4783,12 @@ int main(int argc, char **argv) {
                 g_want_allcompare = true;
             } else if (strcmp(argv[i], "+noall") == 0) {
                 dopt.show_question = dopt.show_answer = dopt.show_authority =
-                    dopt.show_additional = dopt.show_comments = dopt.show_stats = false;
+                    dopt.show_additional = dopt.show_comments = dopt.show_stats =
+                    dopt.show_cmd = false;
+            } else if (strcmp(argv[i], "+all") == 0) {
+                dopt.show_question = dopt.show_answer = dopt.show_authority =
+                    dopt.show_additional = dopt.show_comments = dopt.show_stats =
+                    dopt.show_cmd = true;
             } else if (strcmp(argv[i], "+answer") == 0) {
                 dopt.show_answer = true;
             } else if (strcmp(argv[i], "+noanswer") == 0) {
