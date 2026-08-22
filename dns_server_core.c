@@ -3665,7 +3665,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
               if ((now >= ts && now - ts <= 3600) || (now < ts && ts - now <= 300)) {
                   uint8_t expected_server_cookie[16];
                   generate_server_cookie(client_ip, edns.client_cookie, expected_server_cookie, ts);
-                  if (memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
+                  if (const_time_memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
                       valid = true;
                   }
               }
