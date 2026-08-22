@@ -341,8 +341,8 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
         dns_record_t *zm = zonemds[z];
         if (zm->rdata_count < 4) continue;
         
-        uint8_t scheme = atoi(zm->rdata[1]);
-        uint8_t halg = atoi(zm->rdata[2]);
+        uint8_t scheme = (uint8_t)strtol(zm->rdata[1], NULL, 10);
+        uint8_t halg = (uint8_t)strtol(zm->rdata[2], NULL, 10);
         
         if (scheme != 1) continue; 
         if (halg != 1 && halg != 2) continue; 
@@ -606,24 +606,24 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         // --- Add specific field validations ---
         if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
             if (rcount >= 3) {
-                int flags = atoi(rdata[0]);
-                int protocol = atoi(rdata[1]);
-                int alg = atoi(rdata[2]);
+                int flags = (int)strtol(rdata[0], NULL, 10);
+                int protocol = (int)strtol(rdata[1], NULL, 10);
+                int alg = (int)strtol(rdata[2], NULL, 10);
                 check_dnssec_algorithm(alg, arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY", flags, protocol);
             }
         }
         if (tcode == 43 || tcode == 59) { // DS / CDS
             if (rcount >= 4) {
-                int key_tag = atoi(rdata[0]);
-                int algorithm = atoi(rdata[1]);
-                int digest_type = atoi(rdata[2]);
+                int key_tag = (int)strtol(rdata[0], NULL, 10);
+                int algorithm = (int)strtol(rdata[1], NULL, 10);
+                int digest_type = (int)strtol(rdata[2], NULL, 10);
                 check_ds_digest_type(digest_type, algorithm, key_tag,
                                      arena.records[i].name, tcode == 43 ? "DS" : "CDS");
             }
         }
         if (tcode == 46) { // RRSIG
             if (rcount >= 2) {
-                check_dnssec_algorithm(atoi(rdata[1]), arena.records[i].name, "RRSIG", -1, -1);
+                check_dnssec_algorithm((int)strtol(rdata[1], NULL, 10), arena.records[i].name, "RRSIG", -1, -1);
             }
         }
         if (tcode == 55) { // HIP
@@ -633,9 +633,10 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
         if (tcode == 11) { // WKS
             if (rcount >= 2) {
-                int proto = atoi(rdata[1]);
-                if (proto == 0 && strcmp(rdata[1], "0") != 0) {
-                    fprintf(stderr, "[WARNING] WKS record protocol '%s' is not a valid number for name '%s'\n", rdata[1], arena.records[i].name);
+                char *endptr;
+                long proto = strtol(rdata[1], &endptr, 10);
+                if (*endptr != '\0' || proto < 0 || proto > 255) {
+                    fprintf(stderr, "[WARNING] WKS record protocol '%s' is not a valid number (0-255) for name '%s'\n", rdata[1], arena.records[i].name);
                 }
             }
         }
@@ -713,9 +714,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
         if (tcode == 50 || tcode == 51) { // NSEC3 / NSEC3PARAM
             if (rcount >= 3) {
-                int algo = atoi(rdata[0]);
-                int flags = atoi(rdata[1]);
-                int iterations = atoi(rdata[2]);
+                int algo = (int)strtol(rdata[0], NULL, 10);
+                int flags = (int)strtol(rdata[1], NULL, 10);
+                int iterations = (int)strtol(rdata[2], NULL, 10);
                 if (algo != 1) {
                     fprintf(stderr, "[WARNING] NSEC3/NSEC3PARAM hash algorithm should be 1 (SHA-1); other values are undefined (RFC 5155) for name '%s'\n", arena.records[i].name);
                 }

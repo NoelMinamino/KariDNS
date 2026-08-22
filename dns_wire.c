@@ -512,18 +512,19 @@ static uint32_t parse_dnssec_time(const char *str) {
     return (uint32_t)total_seconds;
 }
 
-static int cert_type_to_num(const char *s) {
-    if (strcasecmp(s, "PKIX") == 0) return 1;
-    if (strcasecmp(s, "SPKI") == 0) return 2;
-    if (strcasecmp(s, "PGP") == 0) return 3;
-    if (strcasecmp(s, "IPKIX") == 0) return 4;
-    if (strcasecmp(s, "ISPKI") == 0) return 5;
-    if (strcasecmp(s, "IPGP") == 0) return 6;
-    if (strcasecmp(s, "ACPKIX") == 0) return 7;
-    if (strcasecmp(s, "IACPKIX") == 0) return 8;
-    if (strcasecmp(s, "URI") == 0) return 253;
-    if (strcasecmp(s, "OID") == 0) return 254;
-    return atoi(s);
+static bool cert_type_to_num(const char *s, uint16_t *out) {
+    if (!s || !out) return false;
+    if (strcasecmp(s, "PKIX") == 0) { *out = 1; return true; }
+    if (strcasecmp(s, "SPKI") == 0) { *out = 2; return true; }
+    if (strcasecmp(s, "PGP") == 0) { *out = 3; return true; }
+    if (strcasecmp(s, "IPKIX") == 0) { *out = 4; return true; }
+    if (strcasecmp(s, "ISPKI") == 0) { *out = 5; return true; }
+    if (strcasecmp(s, "IPGP") == 0) { *out = 6; return true; }
+    if (strcasecmp(s, "ACPKIX") == 0) { *out = 7; return true; }
+    if (strcasecmp(s, "IACPKIX") == 0) { *out = 8; return true; }
+    if (strcasecmp(s, "URI") == 0) { *out = 253; return true; }
+    if (strcasecmp(s, "OID") == 0) { *out = 254; return true; }
+    return parse_u16(s, out);
 }
 
 static size_t wire_name_length(const char *name) {
@@ -1626,10 +1627,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 37: { // CERT
                 if (rec->rdata_count < 4) return -1;
-                uint16_t cert_type = cert_type_to_num(rec->rdata[0]);
-                uint16_t key_tag;
+                uint16_t cert_type, key_tag;
                 uint8_t algorithm;
-                if (!parse_u16(rec->rdata[1], &key_tag) ||
+                if (!cert_type_to_num(rec->rdata[0], &cert_type) ||
+                    !parse_u16(rec->rdata[1], &key_tag) ||
                     !parse_u8(rec->rdata[2], &algorithm)) return -1;
                 const char *b64 = rec->rdata[3];
                 size_t b64_len = strlen(b64);

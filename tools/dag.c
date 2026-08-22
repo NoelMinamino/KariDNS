@@ -491,7 +491,12 @@ static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
     strncpy(buf, arg, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
     char *slash = strchr(buf, '/');
     int prefix = -1;
-    if (slash) { *slash = '\0'; prefix = atoi(slash + 1); }
+    if (slash) {
+        *slash = '\0';
+        char *endptr;
+        long pfx_val = strtol(slash + 1, &endptr, 10);
+        if (*endptr == '\0' && pfx_val >= 0) prefix = (int)pfx_val;
+    }
 
     struct in_addr a4;
     struct in6_addr a6;
@@ -3422,7 +3427,9 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                         *close = '\0';
                         tok++; // '[' をスキップ
                         if (close[1] == ':' && close[2] != '\0') {
-                            srv_port = atoi(close + 2);
+                            char *endptr;
+                            long p = strtol(close + 2, &endptr, 10);
+                            if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
                         }
                     }
                 } else {
@@ -3431,7 +3438,9 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                     if (first_colon && !strchr(first_colon + 1, ':')) {
                         // ':' が1つだけ → IPv4:port
                         *first_colon = '\0';
-                        srv_port = atoi(first_colon + 1);
+                        char *endptr;
+                        long p = strtol(first_colon + 1, &endptr, 10);
+                        if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
                     }
                 }
                 servers[server_count] = tok;
@@ -3651,7 +3660,9 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] == '-' || argv[i][0] == '+') {
             // --- オプション引数（既存ハンドラをそのまま移植） ---
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            port = atoi(argv[++i]);
+            char *endptr;
+            long pval = strtol(argv[++i], &endptr, 10);
+            if (*endptr == '\0' && pval > 0 && pval <= 65535) port = (int)pval;
         } else if (strcmp(argv[i], "--update-add") == 0 && i + 1 < argc) {
             if (qo.update_op_count < MAX_UPDATE_OPS) {
                 qo.update_ops[qo.update_op_count].kind = UPDATE_OP_ADD;
@@ -3760,7 +3771,9 @@ int main(int argc, char **argv) {
                     if (len >= (int)sizeof(qo.bind_addr)) len = sizeof(qo.bind_addr) - 1;
                     memcpy(qo.bind_addr, arg, len);
                     qo.bind_addr[len] = '\0';
-                    qo.bind_port = atoi(hash + 1);
+                    char *endptr;
+                    long bp = strtol(hash + 1, &endptr, 10);
+                    if (*endptr == '\0' && bp > 0 && bp <= 65535) qo.bind_port = (int)bp;
                 } else {
                     snprintf(qo.bind_addr, sizeof(qo.bind_addr), "%s", arg);
                     qo.bind_port = 0;
@@ -3889,7 +3902,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "+nsid") == 0) {
             qo.want_opt = true; qo.want_nsid = true;
         } else if (strncmp(argv[i], "+bufsize=", 9) == 0) {
-            qo.want_opt = true; qo.udp_payload_size = (uint16_t)atoi(argv[i] + 9);
+            char *endptr;
+            long bsz = strtol(argv[i] + 9, &endptr, 10);
+            if (*endptr == '\0' && bsz >= 0 && bsz <= 65535) {
+                qo.want_opt = true; qo.udp_payload_size = (uint16_t)bsz;
+            }
         } else if (strcmp(argv[i], "+adflag") == 0) {
             adflag = true;
         } else if (strcmp(argv[i], "+cdflag") == 0) {
@@ -3901,14 +3918,24 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "+zflag") == 0) {
             zflag = true;
         } else if (strncmp(argv[i], "+timeout=", 9) == 0) {
-            qo.timeout_sec = atoi(argv[i] + 9);
+            char *endptr;
+            long to = strtol(argv[i] + 9, &endptr, 10);
+            if (*endptr == '\0' && to >= 0) qo.timeout_sec = (int)to;
         } else if (strncmp(argv[i], "+tries=", 7) == 0) {
-            qo.tries = atoi(argv[i] + 7);
+            char *endptr;
+            long tr = strtol(argv[i] + 7, &endptr, 10);
+            if (*endptr == '\0' && tr >= 0) qo.tries = (int)tr;
         } else if (strncmp(argv[i], "+retry=", 7) == 0) {
-            qo.tries = atoi(argv[i] + 7) + 1;
+            char *endptr;
+            long tr = strtol(argv[i] + 7, &endptr, 10);
+            if (*endptr == '\0' && tr >= 0) qo.tries = (int)tr + 1;
         } else if (strncmp(argv[i], "+padding=", 9) == 0) {
-            qo.want_opt = true; qo.want_padding = true;
-            qo.padding_size = atoi(argv[i] + 9);
+            char *endptr;
+            long pd = strtol(argv[i] + 9, &endptr, 10);
+            if (*endptr == '\0' && pd >= 0) {
+                qo.want_opt = true; qo.want_padding = true;
+                qo.padding_size = (int)pd;
+            }
         } else if (strncmp(argv[i], "+mqtype=", 8) == 0) {
             qo.want_opt = true;
             if (qo.custom_edns_opt_count < 8) {

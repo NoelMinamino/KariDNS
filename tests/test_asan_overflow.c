@@ -1674,7 +1674,22 @@ int main() {
             return 1;
         }
 
-        // 5. Valid records pass
+        // 5. uint16_t overflow: CERT cert_type = 99999 (> 65535)
+        off = 0;
+        dns_record_t cert_rec = {
+            .name = "example.com.",
+            .type = "CERT",
+            .type_code = 37,
+            .ttl_value = 3600,
+            .rdata_count = 4,
+            .rdata = { "99999", "12345", "8", "QUFB" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &cert_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: CERT type > 65535 was not rejected\n");
+            return 1;
+        }
+
+        // 6. Valid records pass
         off = 0;
         mx_rec.rdata[0] = "10";
         if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != 0) {
