@@ -58,10 +58,12 @@ $(KARICTL_TARGET): $(KARICTL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lcrypto $(HARDEN_LDFLAGS)
 
 $(DAG_TARGET): $(DAG_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lz $(IDN_LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lssl -lz $(IDN_LDFLAGS)
 
 karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o
 	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o -o karicheck $(LDFLAGS) -lcrypto
+
+$(OBJS) $(DAG_OBJS) $(KARICTL_OBJS): dns_wire.h dns_config_parser.h dns_zone_parser.h dns_utils.h
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -101,7 +103,7 @@ fuzz_tsig: $(FUZZ_TSIG_SRCS)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_TARGET) $(FUZZ_TSIG_SRCS) $(LDFLAGS)
 
 fuzz_dag: $(FUZZ_DAG_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TARGET) $(FUZZ_DAG_SRCS) $(LDFLAGS) -lz
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TARGET) $(FUZZ_DAG_SRCS) $(LDFLAGS) -lssl -lz $(IDN_LDFLAGS)
 
 fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS) $(LDFLAGS)
@@ -143,7 +145,7 @@ karicheck-asan: $(KARICHECK_ASAN_SRCS)
 
 DAG_ASAN_SRCS = tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c
 dag-asan: $(DAG_ASAN_SRCS)
-	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lz $(IDN_LDFLAGS)
+	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lssl -lz $(IDN_LDFLAGS)
 
 KARICTL_ASAN_SRCS = tools/karictl.c
 karictl-asan: $(KARICTL_ASAN_SRCS)

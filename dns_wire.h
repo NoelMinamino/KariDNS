@@ -178,6 +178,7 @@ typedef struct {
     uint8_t ext_rcode;
     uint8_t version;
     bool dnssec_ok;
+    bool compact_answers_ok;
     
     // DNS Cookie
     bool has_cookie;
