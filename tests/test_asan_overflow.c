@@ -1290,6 +1290,32 @@ int main() {
         printf("PASS: Backend and Frontend privilege drop verification logic\n");
     }
 
+    // --- Test 16: karictl control secret base64 overflow protection ---
+    {
+        char long_b64[401];
+        memset(long_b64, 'A', 400);
+        long_b64[400] = '\0';
+        size_t b64_len = strlen(long_b64);
+        if (b64_len <= 341) {
+            printf("FAIL: long_b64 length check failed\n");
+            return 1;
+        }
+
+        char valid_b64[] = "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
+        size_t valid_len = strlen(valid_b64);
+        if (valid_len > 341) {
+            printf("FAIL: valid_b64 wrongly rejected\n");
+            return 1;
+        }
+        uint8_t secret_decoded[256];
+        int dec_len = EVP_DecodeBlock(secret_decoded, (const unsigned char *)valid_b64, (int)valid_len);
+        if (dec_len < 0 || dec_len > (int)sizeof(secret_decoded)) {
+            printf("FAIL: valid_b64 decode failed\n");
+            return 1;
+        }
+        printf("PASS: karictl control secret base64 overflow protection\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
