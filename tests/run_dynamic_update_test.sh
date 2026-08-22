@@ -230,6 +230,77 @@ print("PASS: Got FORMERR for invalid CLASS with valid TSIG auth")
 fi
 check_asan_log
 
+echo "[*] 6.9. RFC 2136 Reject Meta-type TYPE=41 (OPT) in UPDATE ADD (FORMERR validation)..."
+if which python3 >/dev/null 2>&1; then
+    python3 -c '
+import socket
+import struct
+import time
+import hmac
+import hashlib
+import base64
+
+req_id = 0x8899
+flags = 0x2800 # Opcode=5 (UPDATE), RD=0
+zocount = 1
+prcount = 0
+upcount = 1
+arcount = 0
+
+hdr = struct.pack("!HHHHHH", req_id, flags, zocount, prcount, upcount, arcount)
+zone = b"\x09dynupdate\x03com\x00" + struct.pack("!HH", 6, 1) # SOA, IN
+
+# UPDATE ADD with TYPE=41 (OPT), CLASS=IN (1), TTL=0, RDLEN=0
+update_rr = b"\x03opt\x09dynupdate\x03com\x00" + struct.pack("!HHIH", 41, 1, 0, 0)
+
+raw_msg = hdr + zone + update_rr
+
+secret_key = base64.b64decode("C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y=")
+key_name = b"\x08test-key\x00"
+algo_name = b"\x0bhmac-sha256\x00"
+now = int(time.time())
+time_signed_high = (now >> 32) & 0xFFFF
+time_signed_low = now & 0xFFFFFFFF
+fudge = 300
+
+tsig_var = (key_name +
+            struct.pack("!HI", 255, 0) +
+            algo_name +
+            struct.pack("!HIHHH", time_signed_high, time_signed_low, fudge, 0, 0))
+
+mac = hmac.new(secret_key, raw_msg + tsig_var, hashlib.sha256).digest()
+
+tsig_rdata = (algo_name +
+              struct.pack("!HIH", time_signed_high, time_signed_low, fudge) +
+              struct.pack("!H", len(mac)) + mac +
+              struct.pack("!HHH", req_id, 0, 0))
+
+tsig_rr = key_name + struct.pack("!HHIH", 250, 255, 0, len(tsig_rdata)) + tsig_rdata
+
+final_hdr = struct.pack("!HHHHHH", req_id, flags, zocount, prcount, upcount, 1)
+pkt = final_hdr + zone + update_rr + tsig_rr
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2.0)
+s.sendto(pkt, ("127.0.0.1", 10053))
+resp, _ = s.recvfrom(512)
+
+resp_id, resp_flags, resp_qd, resp_an, resp_ns, resp_ar = struct.unpack("!HHHHHH", resp[:12])
+rcode = resp_flags & 0x0F
+print(f"Parsed: ID={resp_id:#06x}, Flags={resp_flags:#06x}, RCODE={rcode}")
+
+if rcode != 1:
+    print(f"FAIL: Expected FORMERR (rcode=1) for TYPE=41 in UPDATE ADD, got rcode={rcode}")
+    exit(1)
+print("PASS: Got FORMERR for TYPE=41 (OPT) in UPDATE ADD with valid TSIG auth")
+' > out.txt 2>&1 || {
+        echo "[FAIL] RFC 2136 TYPE=41 (OPT) in UPDATE ADD test failed:"
+        cat out.txt
+        exit 1
+    }
+fi
+check_asan_log
+
 echo "[*] 7. Reload Server to check ephemeral behavior..."
 $KARICTL -f "$CTL_CONF" reload
 sleep 1

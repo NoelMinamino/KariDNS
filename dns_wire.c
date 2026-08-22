@@ -2487,7 +2487,6 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
         } else {
             // zone class
-            syslog(LOG_INFO, "[DEBUG-UPDATE] process_update_sections: checking zone class: class_val=%u, zone_class=%u", class_val, zone_class);
             if (class_val != zone_class) return 1; // FORMERR
             if (!rrset_exists) return 8; // NXRRSET
             size_t temp_offset = rec_start_offset; 
@@ -2556,7 +2555,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
         } else { // ADD
             // (a) メタタイプの拒否 (RFC 2136 §3.4.2.2)
-            if (type == 0 || (type >= 128 && type <= 254) || type == 249 || type == 250 ||
+            if (type == 0 || type == 41 || (type >= 128 && type <= 254) || type == 249 || type == 250 ||
                 type == 251 || type == 252 || type == 255) {
                 return 1; // FORMERR
             }
@@ -2594,10 +2593,8 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 standby->records = new_arr;
                 standby->records_cap = new_cap;
             }
-            temp_offset = rec_start_offset;
             dns_record_t *new_rec = &standby->records[standby->count];
-            memset(new_rec, 0, sizeof(*new_rec));
-            if (parse_resource_record(req, req_len, &temp_offset, standby, new_rec, &dummy_type) != 0) return 1;
+            *new_rec = parsed_rec;
 
             // In-flight chain linking
             uint32_t h = calc_fnv1a_str(new_rec->name);

@@ -4516,7 +4516,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     for (int i = 0; i < entry->ixfr_history.count; i++) {
       int idx = (start_idx + i) % MAX_IXFR_HISTORY;
       ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
-      //syslog(LOG_NOTICE, "[DEBUG-IXFR] history[%d] old_serial: %u", i, txn->old_serial);
       if (txn && txn->old_serial == client_serial) {
         found_idx = i;
         break;
