@@ -5207,7 +5207,7 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[i], "+noidnout") == 0) {
                 dopt.idnout = false;
             } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
-                printf("KariDNS dag v1.0\n");
+                printf("KariDNS dag v0.0.1\n");
                 exit(0);
             } else if (strcmp(argv[i], "+norec") == 0 || strcmp(argv[i], "+norecurse") == 0 || strcmp(argv[i], "+nordflag") == 0 || strcmp(argv[i], "+norec") == 0) {
                 norecurse = true; qo.rd_flag = false;
