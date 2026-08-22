@@ -1,0 +1,5 @@
+$TTL 1D
+example.com.    IN  SOA  ns1.example.com. admin.example.com. ( 1 1h 15m 1w 1h )
+example.com.    3h  IN  NS   ns1.example.com.
+www.example.com. 90 IN  A    192.0.2.1
+mixed.example.com. 1h30m IN A 192.0.2.2

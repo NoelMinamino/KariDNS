@@ -1360,6 +1360,101 @@ int main() {
         printf("PASS: RFC 10029 §3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
     }
 
+    // --- Test 18: BIND-compatible TTL unit suffix parsing (w/d/h/m/s) ---
+    {
+        if (parse_ttl_value("1D") != 86400 || parse_ttl_value("1d") != 86400) {
+            printf("FAIL: parse_ttl_value('1D') != 86400\n");
+            return 1;
+        }
+        if (parse_ttl_value("3h") != 10800 || parse_ttl_value("3H") != 10800) {
+            printf("FAIL: parse_ttl_value('3h') != 10800\n");
+            return 1;
+        }
+        if (parse_ttl_value("90") != 90) {
+            printf("FAIL: parse_ttl_value('90') != 90\n");
+            return 1;
+        }
+        if (parse_ttl_value("1h30m") != 5400) {
+            printf("FAIL: parse_ttl_value('1h30m') != 5400\n");
+            return 1;
+        }
+        if (parse_ttl_value("1w") != 604800) {
+            printf("FAIL: parse_ttl_value('1w') != 604800\n");
+            return 1;
+        }
+        if (parse_ttl_value("15m") != 900) {
+            printf("FAIL: parse_ttl_value('15m') != 900\n");
+            return 1;
+        }
+        if (parse_ttl_value("1w2d3h4m5s") != 788645) {
+            printf("FAIL: parse_ttl_value('1w2d3h4m5s') != 788645\n");
+            return 1;
+        }
+        if (parse_ttl_value(NULL) != 3600 || parse_ttl_value("") != 3600) {
+            printf("FAIL: parse_ttl_value(NULL/empty) != 3600\n");
+            return 1;
+        }
+        if (parse_ttl_value("invalid") != 3600) {
+            printf("FAIL: parse_ttl_value('invalid') != 3600\n");
+            return 1;
+        }
+
+        // Test zone parsing with TTL units
+        zone_arena_t arena;
+        memset(&arena, 0, sizeof(arena));
+        zone_arena_init(&arena);
+
+        const char *zone_str =
+            "$TTL 1D\n"
+            "example.com.    IN  SOA  ns1.example.com. admin.example.com. ( 1 1h 15m 1w 1h )\n"
+            "example.com.    3h  IN  NS   ns1.example.com.\n"
+            "www.example.com. 90 IN  A    192.0.2.1\n"
+            "mixed.example.com. 1h30m IN A 192.0.2.2\n";
+
+        char *zone_buf = strdup(zone_str);
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "example.com.",
+            .is_standalone_mode = true,
+        };
+        int pr = parse_zone_fast(zone_buf, strlen(zone_buf), &arena, &ctx);
+        free(zone_buf);
+        if (pr < 0 || arena.count < 4) {
+            printf("FAIL: parse_zone_fast failed for TTL unit test zone (pr=%d, count=%zu)\n", pr, arena.count);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Check records:
+        // Record 0 (SOA): default TTL from $TTL 1D -> 86400
+        if (arena.records[0].ttl_value != 86400) {
+            printf("FAIL: SOA record TTL value expected 86400, got %u\n", arena.records[0].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        // Record 1 (NS): 3h -> 10800
+        if (arena.records[1].ttl_value != 10800) {
+            printf("FAIL: NS record TTL value expected 10800, got %u\n", arena.records[1].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        // Record 2 (www A): 90 -> 90
+        if (arena.records[2].ttl_value != 90) {
+            printf("FAIL: A record TTL value expected 90, got %u\n", arena.records[2].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        // Record 3 (mixed A): 1h30m -> 5400
+        if (arena.records[3].ttl_value != 5400) {
+            printf("FAIL: mixed A record TTL value expected 5400, got %u\n", arena.records[3].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: BIND-compatible TTL unit suffix parsing (w/d/h/m/s)\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

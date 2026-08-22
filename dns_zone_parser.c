@@ -553,6 +553,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
 
         rec->name = expand_domain_name(name_copy, origin, arena);
         rec->ttl = (char *)ttl_str;
+        rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
         rec->class_str = (char *)class_str;
         rec->type = (char *)type_str;
         rec->type_code = type_code;
@@ -808,7 +809,7 @@ PROCESS_RECORD:
     return -1;
   }
   
-  rec->ttl_value = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
+  rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
   rec->class_val = 1; // Default to IN
   if (rec->class_str && strcasecmp(rec->class_str, "CH") == 0) {
       rec->class_val = 3;

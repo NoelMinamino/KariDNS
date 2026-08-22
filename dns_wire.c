@@ -1011,6 +1011,46 @@ static int decode_concat_hex_rdata(char **fields, int count, uint8_t *res,
     return 0;
 }
 
+// RFC非公式だがBIND由来の事実上標準的なTTL表記(w/d/h/m/s)をパースする。
+// 例: "1h30m", "2D", "1W", "90" (単位なしは秒として扱う)
+uint32_t parse_ttl_value(const char *ttl_str) {
+    if (!ttl_str || !*ttl_str) return 3600;
+
+    // 純粋な数字のみの場合は従来通り10進数として扱う(高速経路 + 後方互換)
+    bool all_digits = true;
+    for (const char *p = ttl_str; *p; p++) {
+        if (!isdigit((unsigned char)*p)) { all_digits = false; break; }
+    }
+    if (all_digits) {
+        return (uint32_t)strtoul(ttl_str, NULL, 10);
+    }
+
+    uint64_t total = 0;
+    const char *p = ttl_str;
+    while (*p) {
+        char *endptr = NULL;
+        unsigned long num = strtoul(p, &endptr, 10);
+        if (endptr == p) return 3600; // 数字が続かない不正な表記 -> デフォルトへフォールバック
+        uint64_t multiplier = 1;
+        if (*endptr) {
+            switch (tolower((unsigned char)*endptr)) {
+                case 's': multiplier = 1; break;
+                case 'm': multiplier = 60; break;
+                case 'h': multiplier = 3600; break;
+                case 'd': multiplier = 86400; break;
+                case 'w': multiplier = 604800; break;
+                default: return 3600; // 未知の単位文字 -> デフォルトへフォールバック
+            }
+            endptr++;
+        }
+        total += (uint64_t)num * multiplier;
+        p = endptr;
+    }
+    // RFC 2181 §8: TTLは符号なし32bit、最上位ビットは立てない(実質最大2147483647)
+    if (total > 2147483647ULL) total = 2147483647ULL;
+    return (uint32_t)total;
+}
+
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
@@ -1285,8 +1325,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 } else {
                     mname = rec->rdata[0];
                     rname = rec->rdata[1];
-                    for (int j = 0; j < 5; j++) {
-                        numbers[j] = strtoul(rec->rdata[j + 2], NULL, 10);
+                    numbers[0] = strtoul(rec->rdata[2], NULL, 10);
+                    for (int j = 1; j < 5; j++) {
+                        numbers[j] = parse_ttl_value(rec->rdata[j + 2]);
                     }
                 }
                 if (write_dns_name_str(res, &offset, mname, comp_ctx, max_res_len) != 0 ||
@@ -2567,10 +2608,10 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                 rec->cache.soa.mname = rec->rdata[0];
                 rec->cache.soa.rname = rec->rdata[1];
                 rec->cache.soa.serial = strtoul(rec->rdata[2], NULL, 10);
-                rec->cache.soa.refresh = strtoul(rec->rdata[3], NULL, 10);
-                rec->cache.soa.retry = strtoul(rec->rdata[4], NULL, 10);
-                rec->cache.soa.expire = strtoul(rec->rdata[5], NULL, 10);
-                rec->cache.soa.minimum = strtoul(rec->rdata[6], NULL, 10);
+                rec->cache.soa.refresh = parse_ttl_value(rec->rdata[3]);
+                rec->cache.soa.retry = parse_ttl_value(rec->rdata[4]);
+                rec->cache.soa.expire = parse_ttl_value(rec->rdata[5]);
+                rec->cache.soa.minimum = parse_ttl_value(rec->rdata[6]);
                 rec->is_cached = true;
             }
             break;

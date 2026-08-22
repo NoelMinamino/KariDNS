@@ -2484,9 +2484,9 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           if (standby->records[k].type_code == 6 &&
               standby->records[k].rdata_count >= 7) {
             entry->serial = strtoul(standby->records[k].rdata[2], NULL, 10);
-            entry->refresh = strtoul(standby->records[k].rdata[3], NULL, 10);
-            entry->retry = strtoul(standby->records[k].rdata[4], NULL, 10);
-            entry->expire = strtoul(standby->records[k].rdata[5], NULL, 10);
+            entry->refresh = parse_ttl_value(standby->records[k].rdata[3]);
+            entry->retry = parse_ttl_value(standby->records[k].rdata[4]);
+            entry->expire = parse_ttl_value(standby->records[k].rdata[5]);
             atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
             atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
             break;
@@ -3044,7 +3044,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             strcasecmp(rec->name, db_entry->domain) == 0) {
           uint32_t minimum_ttl = 3600;
           if (rec->rdata_count >= 7)
-            minimum_ttl = strtoul(rec->rdata[6], NULL, 10);
+            minimum_ttl = parse_ttl_value(rec->rdata[6]);
           if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
                                    NULL, minimum_ttl) < 0) {
             res[2] |= 0x02;
