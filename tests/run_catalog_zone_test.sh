@@ -3,11 +3,15 @@ set -e
 
 echo "[+] Starting Catalog Zone tests..."
 
-# Setup workspace
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_DIR="$SCRIPT_DIR/.."
+ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="catalog_test_dir"
-rm -rf $TEST_DIR
-mkdir -p $TEST_DIR
-cd $TEST_DIR
+
+# Setup workspace
+rm -rf "$SCRIPT_DIR/$TEST_DIR"
+mkdir -p "$SCRIPT_DIR/$TEST_DIR"
+cd "$SCRIPT_DIR/$TEST_DIR"
 TEST_DIR_ABS=$(pwd)
 
 # Trap for cleanup and automatic kdump on failure
@@ -77,9 +81,9 @@ EOF
 # Build & Run with ktrace if available
 if which ktrace >/dev/null 2>&1; then
     echo "[+] Running karidns under ktrace (-di)..."
-    ktrace -di -f ktrace.out ../karidns -f karidns.conf > karidns.log 2>&1 &
+    ktrace -di -f ktrace.out "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 else
-    ../karidns -f karidns.conf > karidns.log 2>&1 &
+    "$BIN_DIR/karidns" -f karidns.conf > karidns.log 2>&1 &
 fi
 SERVER_PID=$!
 sleep 1
@@ -96,15 +100,15 @@ echo "Checking logs to see if membership was processed..."
 grep "Processed membership for 'catalog.example.com.', desired members: 2" karidns.log || { echo "Failed to process membership"; kill $SERVER_PID; exit 1; }
 
 echo "[+] Checking dag resolution for example.net (should be SERVFAIL because empty member)"
-../dag -p 53530 @127.0.0.1 example.net. SOA > dag_output.txt 2>&1
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 example.net. SOA > dag_output.txt 2>&1
 cat dag_output.txt
 grep "status: SERVFAIL" dag_output.txt || { echo "Failed: example.net did not return SERVFAIL"; kill $SERVER_PID; exit 1; }
 
 echo "[+] Checking dag resolution for example.org (should be SERVFAIL)"
-../dag -p 53530 @127.0.0.1 example.org. SOA | grep "status: SERVFAIL" || { echo "Failed: example.org did not return SERVFAIL"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 example.org. SOA | grep "status: SERVFAIL" || { echo "Failed: example.org did not return SERVFAIL"; kill $SERVER_PID; exit 1; }
 
 echo "[+] Checking dag resolution for example.edu (should be REFUSED because it's not a member yet)"
-../dag -p 53530 @127.0.0.1 example.edu. SOA | grep "status: REFUSED" || { echo "Failed: example.edu did not return REFUSED"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 example.edu. SOA | grep "status: REFUSED" || { echo "Failed: example.edu did not return REFUSED"; kill $SERVER_PID; exit 1; }
 
 # Now let's update the catalog zone (add zone3, remove zone1)
 cat << 'EOF' > catalog.zone
@@ -117,45 +121,45 @@ zone2.zones IN PTR example.org.
 zone3.zones IN PTR example.edu.
 EOF
 
-../karictl -f karictl.conf reload
+"$BIN_DIR/karictl" -f karictl.conf reload
 sleep 1
 grep "Processed membership for 'catalog.example.com.', desired members: 2" karidns.log || { echo "Failed to process membership after reload"; kill $SERVER_PID; exit 1; }
 
 echo "[+] Checking dag resolution after update"
-OUT=$(../dag -p 53530 @127.0.0.1 example.net. SOA)
+OUT=$("$BIN_DIR/dag" -p 53530 @127.0.0.1 example.net. SOA)
 echo "$OUT" | grep "status: REFUSED" || { echo "Failed: example.net should be REFUSED now"; echo "$OUT"; cat karidns.log; kill $SERVER_PID; exit 1; }
-OUT=$(../dag -p 53530 @127.0.0.1 example.org. SOA)
+OUT=$("$BIN_DIR/dag" -p 53530 @127.0.0.1 example.org. SOA)
 echo "$OUT" | grep "status: SERVFAIL" || { echo "Failed: example.org should still be SERVFAIL"; echo "$OUT"; kill $SERVER_PID; exit 1; }
-OUT=$(../dag -p 53530 @127.0.0.1 example.edu. SOA)
+OUT=$("$BIN_DIR/dag" -p 53530 @127.0.0.1 example.edu. SOA)
 echo "$OUT" | grep "status: SERVFAIL" || { echo "Failed: example.edu should be SERVFAIL now"; echo "$OUT"; kill $SERVER_PID; exit 1; }
 
 # Run concurrent reload + something else to test race conditions
 echo "[+] Testing race condition (concurrent full reload vs catalog delta update)"
 PIDS=""
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    ../karictl -f karictl.conf reload &
+    "$BIN_DIR/karictl" -f karictl.conf reload &
     PIDS="$PIDS $!"
 done
 wait $PIDS
 sleep 1
 
 # Check resolution still intact after race condition test
-../dag -p 53530 @127.0.0.1 example.edu. SOA | grep "status: SERVFAIL" || { echo "Failed: example.edu broken after race test"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 example.edu. SOA | grep "status: SERVFAIL" || { echo "Failed: example.edu broken after race test"; kill $SERVER_PID; exit 1; }
 
 
 echo "[+] Phase 0 Unique-ID Test: Changing unique-id of example.org..."
 perl -pi -e 's/zone2\.zones/zone2_new\.zones/' catalog.zone
-../karictl -f karictl.conf reload
+"$BIN_DIR/karictl" -f karictl.conf reload
 sleep 1
 grep "Added new member 'example.org.' (unique-id: zone2_new)" karidns.log || {
     echo "Failed: example.org was not added correctly as a new member after unique-id change"; cat karidns.log; kill $SERVER_PID; exit 1; 
 }
-../dag -p 53530 @127.0.0.1 example.org. SOA > dag_out.txt || true
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 example.org. SOA > dag_out.txt || true
 grep "status: SERVFAIL" dag_out.txt || { echo "Failed: example.org broke after unique-id change"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 
 echo "[+] Phase 1 Group Test: Adding an orphaned group to catalog.zone and testing karicheck..."
 echo 'group.orphan.zones IN TXT "testgroup"' >> catalog.zone
-../karicheck zones karidns.conf > karicheck_out.txt 2>&1
+"$BIN_DIR/karicheck" zones karidns.conf > karicheck_out.txt 2>&1
 grep "Orphaned group TXT record" karicheck_out.txt || { echo "Failed: karicheck did not detect orphaned group TXT record"; cat karicheck_out.txt; kill $SERVER_PID; exit 1; }
 echo "[+] karicheck properly detected orphaned group."
 
@@ -203,11 +207,11 @@ cat << EOF > catalog2.zone
 version IN TXT "2"
 EOF
 
-../karictl -f karictl.conf reconfig
+"$BIN_DIR/karictl" -f karictl.conf reconfig
 sleep 1
 
 # Verify coo-test.com is loaded (returns SERVFAIL instead of REFUSED because it has no records)
-../dag -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
 grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com not loaded by catalog1"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 
 echo "[+] CoO Test: catalog2 tries to steal coo-test.com (collision expected)..."
@@ -219,7 +223,7 @@ version IN TXT "2"
 xyz.zones IN PTR coo-test.com.
 EOF
 
-../karictl -f karictl.conf reload catalog2.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
 sleep 1
 
 echo "[+] CoO Test: Initiating valid transfer (adding coo PTR to catalog1)..."
@@ -232,7 +236,7 @@ abc.zones IN PTR coo-test.com.
 coo.abc.zones IN PTR catalog2.example.com.
 EOF
 
-../karictl -f karictl.conf reload catalog1.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 
 echo "[+] CoO Test: Triggering evaluation on catalog2 (transfer should succeed)..."
@@ -244,7 +248,7 @@ version IN TXT "2"
 xyz.zones IN PTR coo-test.com.
 EOF
 
-../karictl -f karictl.conf reload catalog2.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
 sleep 1
 
 echo "[+] CoO Test: Verifying transfer... Removing from catalog1 should NOT delete the zone."
@@ -255,11 +259,11 @@ cat << EOF > catalog1.zone
 version IN TXT "2"
 EOF
 
-../karictl -f karictl.conf reload catalog1.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 
 # If the zone was correctly transferred to catalog2, removing it from catalog1 shouldn't kill it.
-../dag -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
 grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com was deleted even though catalog2 should own it"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 
 # Verify that State Reset was properly executed (unique-ids changed)
@@ -276,7 +280,7 @@ retain.zones IN PTR state-retain.com.
 coo.retain.zones IN PTR catalog2.example.com.
 EOF
 
-../karictl -f karictl.conf reload catalog1.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 
 # Trigger transfer on catalog2 with SAME unique-id 'retain'
@@ -289,7 +293,7 @@ xyz.zones IN PTR coo-test.com.
 retain.zones IN PTR state-retain.com.
 EOF
 
-../karictl -f karictl.conf reload catalog2.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
 sleep 1
 
 # Verify retention log
@@ -303,10 +307,10 @@ cat << EOF > catalog1.zone
 version IN TXT "2"
 EOF
 
-../karictl -f karictl.conf reload catalog1.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 
-../dag -p 53530 @127.0.0.1 state-retain.com. SOA > dag_out.txt || true
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 state-retain.com. SOA > dag_out.txt || true
 grep "status: SERVFAIL" dag_out.txt || { echo "Failed: state-retain.com dropped after retention transfer"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
 
 echo "[+] CoO transfer (State Retention) successfully verified!"
@@ -322,14 +326,14 @@ EOF
 perl -e 'for ($i = 1; $i <= 5000; $i++) { print "m$i.zones IN PTR member$i.example.net.\n"; }' >> catalog1.zone
 
 START_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
-../karictl -f karictl.conf reload catalog1.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 END_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
 echo "[Benchmark] Initial load (5,000 members): $((END_MS - START_MS)) ms"
 sleep 1
 
-../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member1 not loaded"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 member2500.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member2500 not loaded"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 member5000.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member5000 not loaded"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member1 not loaded"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member2500.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member2500 not loaded"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member5000.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member5000 not loaded"; kill $SERVER_PID; exit 1; }
 echo "[+] Initial 5,000 members loaded successfully."
 
 # Delta update benchmark: replace 1,000 members
@@ -343,44 +347,44 @@ EOF
 perl -e 'for ($i = 1; $i <= 1000; $i++) { print "new_m$i.zones IN PTR new-member$i.example.net.\n"; } for ($i = 1001; $i <= 5000; $i++) { print "m$i.zones IN PTR member$i.example.net.\n"; }' >> catalog1.zone
 
 DELTA_START_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
-../karictl -f karictl.conf reload catalog1.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 DELTA_END_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
 echo "[Benchmark] Delta update (1,000 member swap out of 5,000): $((DELTA_END_MS - DELTA_START_MS)) ms"
 sleep 1
 
-../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 was not removed"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 new-member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: new-member1 not loaded"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 member5000.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member5000 broken"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 was not removed"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 new-member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: new-member1 not loaded"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member5000.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member5000 broken"; kill $SERVER_PID; exit 1; }
 echo "[+] Large catalog zone delta update (5,000 members) verified successfully!"
 
 echo "[+] Phase 5: RFC 9432 §5.1 Broken Catalog Zone Detection Tests..."
 # Test 5.1: Duplicate PTR records for the same unique-N
-cp ../zones/catalog_duplicate_ptr.zone catalog1.zone
-../karictl -f karictl.conf reload catalog1.example.com
+cp "$ZONES_DIR/catalog_duplicate_ptr.zone" catalog1.zone
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 grep "has 2 PTR records (RFC 9432 requires exactly 1); catalog zone is broken" karidns.log || {
     echo "Failed: duplicate PTR on same unique-N was not detected as broken catalog zone"; cat karidns.log; kill $SERVER_PID; exit 1;
 }
-../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED on broken catalog"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member2 should be REFUSED on broken catalog"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED on broken catalog"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member2 should be REFUSED on broken catalog"; kill $SERVER_PID; exit 1; }
 echo "[+] Test 5.1 (Duplicate PTR on same unique-N) successfully rejected."
 
 # Test 5.2: Different unique-N pointing to the same target domain
-cp ../zones/catalog_duplicate_target.zone catalog1.zone
-../karictl -f karictl.conf reload catalog1.example.com
+cp "$ZONES_DIR/catalog_duplicate_target.zone" catalog1.zone
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 grep "is referenced by both 'node1' and 'node2' labels; catalog zone is broken" karidns.log || {
     echo "Failed: duplicate target domain across labels was not detected as broken catalog zone"; cat karidns.log; kill $SERVER_PID; exit 1;
 }
-../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED on duplicate target catalog"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED on duplicate target catalog"; kill $SERVER_PID; exit 1; }
 echo "[+] Test 5.2 (Duplicate target domain across unique-N) successfully rejected."
 
 # Test 5.3: Valid catalog zone regression test
-cp ../zones/catalog_valid.zone catalog1.zone
-../karictl -f karictl.conf reload catalog1.example.com
+cp "$ZONES_DIR/catalog_valid.zone" catalog1.zone
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
-../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member1 should be loaded in valid catalog"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member2 should be loaded in valid catalog"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member1 should be loaded in valid catalog"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: SERVFAIL" || { echo "Failed: member2 should be loaded in valid catalog"; kill $SERVER_PID; exit 1; }
 echo "[+] Test 5.3 (Valid catalog zone) successfully loaded."
 
 # Clean up catalog1 before final checks
@@ -390,7 +394,7 @@ cat << EOF > catalog1.zone
 @ IN NS ns1.example.com.
 version IN TXT "2"
 EOF
-../karictl -f karictl.conf reload catalog1.example.com
+"$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
 sleep 1
 
 # Clean up
@@ -402,8 +406,8 @@ else
 fi
 
 echo "[+] Verifying dag resolution (all former members should be REFUSED)"
-../dag -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED"; kill $SERVER_PID; exit 1; }
-../dag -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member2 should be REFUSED"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member1.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member1 should be REFUSED"; kill $SERVER_PID; exit 1; }
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 member2.example.net. SOA | grep "status: REFUSED" || { echo "Failed: member2 should be REFUSED"; kill $SERVER_PID; exit 1; }
 
 kill $SERVER_PID
 wait $SERVER_PID || true
