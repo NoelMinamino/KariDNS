@@ -339,10 +339,21 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     bool all_valid = true;
     for (int z = 0; z < zonemd_count; z++) {
         dns_record_t *zm = zonemds[z];
-        if (zm->rdata_count < 4) continue;
-        
-        uint8_t scheme = (uint8_t)strtol(zm->rdata[1], NULL, 10);
-        uint8_t halg = (uint8_t)strtol(zm->rdata[2], NULL, 10);
+        char *scheme_endptr, *halg_endptr;
+        long scheme_val = strtol(zm->rdata[1], &scheme_endptr, 10);
+        long halg_val = strtol(zm->rdata[2], &halg_endptr, 10);
+        if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
+            fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
+                    zm->rdata[1], zm->name);
+            continue;
+        }
+        if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
+            fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
+                    zm->rdata[2], zm->name);
+            continue;
+        }
+        uint8_t scheme = (uint8_t)scheme_val;
+        uint8_t halg = (uint8_t)halg_val;
         
         if (scheme != 1) continue; 
         if (halg != 1 && halg != 2) continue; 
@@ -604,6 +615,21 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
         
         // --- Add specific field validations ---
+        if (tcode == 63) { // ZONEMD
+            if (rcount >= 3) {
+                char *scheme_endptr, *halg_endptr;
+                long scheme_val = strtol(rdata[1], &scheme_endptr, 10);
+                long halg_val = strtol(rdata[2], &halg_endptr, 10);
+                if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
+                    fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
+                            rdata[1], arena.records[i].name);
+                }
+                if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
+                    fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
+                            rdata[2], arena.records[i].name);
+                }
+            }
+        }
         if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
             if (rcount >= 3) {
                 int flags = (int)strtol(rdata[0], NULL, 10);
