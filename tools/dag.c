@@ -1794,6 +1794,18 @@ static void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len, char *o
     }
 }
 
+static char *base64_encode_alloc(const uint8_t *data, size_t len, int *out_len) {
+    size_t cap = 4 * ((len + 2) / 3) + 1;
+    char *buf = malloc(cap);
+    if (!buf) {
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+    int n = EVP_EncodeBlock((unsigned char *)buf, data, (int)len);
+    if (out_len) *out_len = n;
+    return buf;
+}
+
 static void print_dnskey_like(const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
     if (rdlen < 4) { printf("(malformed)"); return; }
     uint16_t flags = (rdata[0]<<8)|rdata[1];
@@ -1808,10 +1820,9 @@ static void print_dnskey_like(const uint8_t *rdata, size_t rdlen, const display_
         return;
     }
 
-    size_t b64_cap = ((rdlen - 4) * 4 / 3) + 8;
-    char *b64 = malloc(b64_cap);
+    int n = 0;
+    char *b64 = base64_encode_alloc(&rdata[4], rdlen - 4, &n);
     if (!b64) { printf("(oom)"); return; }
-    int n = EVP_EncodeBlock((unsigned char*)b64, &rdata[4], (int)(rdlen - 4));
 
     if (dopt && dopt->multiline) {
         printf("%u %u %u (\n", flags, protocol, algorithm);
@@ -1985,10 +1996,9 @@ static void print_svcparams(const uint8_t *rdata, size_t offset, size_t rdlen) {
             }
             case 4: print_svcparam_ipvXhint(value, vlen, false); break;
             case 5: { // ech
-                size_t b64_cap = (vlen * 4 / 3) + 8;
-                char *b64 = malloc(b64_cap);
+                int n = 0;
+                char *b64 = base64_encode_alloc(value, vlen, &n);
                 if (b64) {
-                    int n = EVP_EncodeBlock((unsigned char*)b64, value, (int)vlen);
                     printf("ech=\"%.*s\"", n, b64);
                     free(b64);
                 }
@@ -2205,10 +2215,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             char cbuf[32];
             printf("%s %u %u ", cert_type_name(ctype, cbuf, sizeof(cbuf)), keytag, alg);
             if (rdlen > 5) {
-                size_t b64_len = 4 * ((rdlen - 5 + 2) / 3) + 1;
-                char *b64 = malloc(b64_len);
+                char *b64 = base64_encode_alloc(&pkt[abs_offset + 5], rdlen - 5, NULL);
                 if (!b64) goto fallback;
-                EVP_EncodeBlock((unsigned char *)b64, &pkt[abs_offset + 5], rdlen - 5);
                 printf("%s", b64);
                 free(b64);
             }
@@ -2289,10 +2297,9 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             } else goto fallback;
             if (p < end) {
                 size_t key_len = end - p;
-                size_t b64_len = 4 * ((key_len + 2) / 3) + 1;
-                char *b64 = malloc(b64_len);
+                int n = 0;
+                char *b64 = base64_encode_alloc(p, key_len, &n);
                 if (!b64) goto fallback;
-                int n = EVP_EncodeBlock((unsigned char*)b64, p, key_len);
                 if (dopt && dopt->split_width > 0 && n > dopt->split_width) {
                     for (int i = 0; i < n; i += dopt->split_width) {
                         if (i > 0) printf(" ");
@@ -2307,10 +2314,9 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 49: case 61: { // DHCID / OPENPGPKEY
             if (rdlen == 0) break;
-            size_t b64_len = 4 * ((rdlen + 2) / 3) + 1;
-            char *b64 = malloc(b64_len);
+            int n = 0;
+            char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &n);
             if (!b64) goto fallback;
-            int n = EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset], rdlen);
             if (dopt && dopt->split_width > 0 && n > dopt->split_width) {
                 for (int i = 0; i < n; i += dopt->split_width) {
                     if (i > 0) printf(" ");
@@ -2439,10 +2445,9 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             }
 
             size_t sig_len = rdlen - sig_offset_in_rdata;
-            size_t b64_cap = (sig_len * 4 / 3) + 8;
-            char *b64 = malloc(b64_cap);
+            int n = 0;
+            char *b64 = base64_encode_alloc(&pkt[abs_offset + sig_offset_in_rdata], sig_len, &n);
             if (!b64) goto fallback;
-            int n = EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset + sig_offset_in_rdata], (int)sig_len);
 
             if (dopt && dopt->multiline) {
                 printf("%s %u %u %u (\n", covered_name, algorithm, labels, original_ttl);
@@ -2512,9 +2517,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             pos += 10;
             if (pos + mac_size + 6 > rdlen) goto fallback;
 
-            size_t b64_cap = (mac_size * 4 / 3) + 8;
-            char *mac_b64 = malloc(b64_cap);
-            int n = mac_b64 ? EVP_EncodeBlock((unsigned char*)mac_b64, &pkt[abs_offset+pos], (int)mac_size) : 0;
+            int n = 0;
+            char *mac_b64 = base64_encode_alloc(&pkt[abs_offset+pos], mac_size, &n);
             pos += mac_size;
 
             uint16_t original_id = (pkt[abs_offset+pos]<<8)|pkt[abs_offset+pos+1];
@@ -2541,10 +2545,9 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             for (int i = 0; i < hit_len; i++) printf("%02X", pkt[abs_offset + pos + i]);
             pos += hit_len;
 
-            size_t b64_cap = (pk_len * 4 / 3) + 8;
-            char *b64 = malloc(b64_cap);
+            int n = 0;
+            char *b64 = base64_encode_alloc(&pkt[abs_offset + pos], pk_len, &n);
             if (!b64) goto fallback;
-            int n = EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset + pos], (int)pk_len);
             printf(" %.*s", n, b64);
             free(b64);
             pos += pk_len;
