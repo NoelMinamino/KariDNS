@@ -1649,6 +1649,33 @@ static double loc_decode_precsize(uint8_t b) {
     return cm / 100.0;
 }
 
+static void format_loc_prec(double val, char *buf, size_t len) {
+    if (val == (long)val) {
+        snprintf(buf, len, "%.0fm", val);
+    } else {
+        snprintf(buf, len, "%.2fm", val);
+    }
+}
+
+static void format_time_comment(uint32_t sec, char *buf, size_t len) {
+    if (sec == 0) { snprintf(buf, len, " (0 seconds)"); return; }
+    if (sec % 604800 == 0) {
+        uint32_t w = sec / 604800;
+        snprintf(buf, len, " (%u %s)", w, w == 1 ? "week" : "weeks");
+    } else if (sec % 86400 == 0) {
+        uint32_t d = sec / 86400;
+        snprintf(buf, len, " (%u %s)", d, d == 1 ? "day" : "days");
+    } else if (sec % 3600 == 0) {
+        uint32_t h = sec / 3600;
+        snprintf(buf, len, " (%u %s)", h, h == 1 ? "hour" : "hours");
+    } else if (sec % 60 == 0) {
+        uint32_t m = sec / 60;
+        snprintf(buf, len, " (%u %s)", m, m == 1 ? "minute" : "minutes");
+    } else {
+        snprintf(buf, len, " (%u %s)", sec, sec == 1 ? "second" : "seconds");
+    }
+}
+
 static void loc_format_coord(uint32_t wire_val, bool is_lat, char *out, size_t out_cap) {
     int64_t signed_val = (int64_t)wire_val - 0x80000000LL;
     char dir = is_lat ? (signed_val < 0 ? 'S' : 'N') : (signed_val < 0 ? 'W' : 'E');
@@ -1958,16 +1985,21 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint32_t expire  = ((uint32_t)pkt[nums_off+12]<<24)|((uint32_t)pkt[nums_off+13]<<16)|((uint32_t)pkt[nums_off+14]<<8)|pkt[nums_off+15];
             uint32_t minimum = ((uint32_t)pkt[nums_off+16]<<24)|((uint32_t)pkt[nums_off+17]<<16)|((uint32_t)pkt[nums_off+18]<<8)|pkt[nums_off+19];
             if (dopt && dopt->multiline) {
+                char t_ref[32], t_ret[32], t_exp[32], t_min[32];
+                format_time_comment(refresh, t_ref, sizeof(t_ref));
+                format_time_comment(retry, t_ret, sizeof(t_ret));
+                format_time_comment(expire, t_exp, sizeof(t_exp));
+                format_time_comment(minimum, t_min, sizeof(t_min));
                 printf("%s %s (\n", mname, rname);
                 printf("\t\t\t\t\t%u\t; serial\n", serial);
-                printf("\t\t\t\t\t%u\t; refresh\n", refresh);
-                printf("\t\t\t\t\t%u\t; retry\n", retry);
+                printf("\t\t\t\t\t%u\t; refresh%s\n", refresh, t_ref);
+                printf("\t\t\t\t\t%u\t; retry%s\n", retry, t_ret);
                 if (dopt->expire) {
-                    printf("\t\t\t\t\t\033[1;31m%u\033[0m\t; expire (HIGHLIGHTED)\n", expire);
+                    printf("\t\t\t\t\t\033[1;31m%u\033[0m\t; expire%s (HIGHLIGHTED)\n", expire, t_exp);
                 } else {
-                    printf("\t\t\t\t\t%u\t; expire\n", expire);
+                    printf("\t\t\t\t\t%u\t; expire%s\n", expire, t_exp);
                 }
-                printf("\t\t\t\t\t%u\t; minimum\n", minimum);
+                printf("\t\t\t\t\t%u\t; minimum%s\n", minimum, t_min);
                 printf("\t\t\t\t\t)");
             } else {
                 if (dopt && dopt->expire) {
@@ -2059,8 +2091,11 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             char lat_buf[64], lon_buf[64];
             loc_format_coord(lat_wire, true, lat_buf, sizeof(lat_buf));
             loc_format_coord(lon_wire, false, lon_buf, sizeof(lon_buf));
-            printf("%s %s %.2fm %.2fm %.2fm %.2fm", lat_buf, lon_buf, alt_m,
-                   loc_decode_precsize(size_b), loc_decode_precsize(hp_b), loc_decode_precsize(vp_b));
+            char s_buf[32], hp_buf[32], vp_buf[32];
+            format_loc_prec(loc_decode_precsize(size_b), s_buf, sizeof(s_buf));
+            format_loc_prec(loc_decode_precsize(hp_b), hp_buf, sizeof(hp_buf));
+            format_loc_prec(loc_decode_precsize(vp_b), vp_buf, sizeof(vp_buf));
+            printf("%s %s %.2fm %s %s %s", lat_buf, lon_buf, alt_m, s_buf, hp_buf, vp_buf);
             break;
         }
         case 35: { // NAPTR
@@ -2143,7 +2178,11 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         case 44: { // SSHFP
             if (rdlen < 2) goto fallback;
             printf("%u %u ", pkt[abs_offset], pkt[abs_offset + 1]);
-            for (size_t i = 2; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
+            int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
+            for (size_t i = 2; i < rdlen; i++) {
+                if (sw > 0 && (i - 2) > 0 && ((i - 2) % sw) == 0) printf(" ");
+                printf("%02X", pkt[abs_offset + i]);
+            }
             break;
         }
         case 45: { // IPSECKEY
@@ -2200,7 +2239,11 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         case 52: case 53: { // TLSA / SMIMEA
             if (rdlen < 3) goto fallback;
             printf("%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
-            for (size_t i = 3; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
+            int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
+            for (size_t i = 3; i < rdlen; i++) {
+                if (sw > 0 && (i - 3) > 0 && ((i - 3) % sw) == 0) printf(" ");
+                printf("%02X", pkt[abs_offset + i]);
+            }
             break;
         }
         case 64: case 65: { // SVCB / HTTPS
@@ -3044,6 +3087,32 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         if (cd) printf(";; (checking disabled)\n");
     }
 
+    if (edns.present) {
+        if (dopt->show_comments && dopt->show_additional) printf("\n;; OPT PSEUDOSECTION:\n");
+        if (!dopt->show_additional) g_dag_suppress_stdout = true;
+        char flags_buf[32] = "";
+        if (edns.dnssec_ok) strcat(flags_buf, " do");
+        if (edns.compact_answers_ok) strcat(flags_buf, " co");
+        printf("; EDNS: version: %d, flags:%s; udp: %d\n", edns.version, flags_buf, edns.udp_payload_size);
+        if (edns.ext_rcode != 0) printf("; EXT RCODE: %d\n", edns.ext_rcode);
+        if (edns.has_cookie) {
+            printf("; COOKIE: ");
+            for (int i = 0; i < 8; i++) printf("%02x", edns.client_cookie[i]);
+            if (edns.server_cookie_len > 0) {
+                for (uint16_t i = 0; i < edns.server_cookie_len; i++) printf("%02x", edns.server_cookie[i]);
+                printf(" (good)");
+            }
+            printf("\n");
+        }
+        print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount);
+        for (uint16_t i = 0; i < edns.ede_count; i++) {
+            const char *msg = get_ede_error_string(edns.ede_list[i].code);
+            if (edns.ede_list[i].text[0]) printf("; EDE: %d (%s): (%s)\n", edns.ede_list[i].code, msg, edns.ede_list[i].text);
+            else printf("; EDE: %d (%s)\n", edns.ede_list[i].code, msg);
+        }
+        g_dag_suppress_stdout = false;
+    }
+
     size_t offset = 12;
     if (qdcount > 0) {
         if (dopt->show_comments && dopt->show_question) printf("\n;; QUESTION SECTION:\n");
@@ -3128,34 +3197,6 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
                     hexdump(pkt, pkt_len);
                     return;
                 }
-            }
-        }
-        g_dag_suppress_stdout = false;
-    }
-
-    {
-        if (edns.present) {
-            if (dopt->show_comments && dopt->show_additional) printf("\n;; OPT PSEUDOSECTION:\n");
-            if (!dopt->show_additional) g_dag_suppress_stdout = true;
-            char flags_buf[32] = "";
-            if (edns.dnssec_ok) strcat(flags_buf, " do");
-            if (edns.compact_answers_ok) strcat(flags_buf, " co");
-            printf("; EDNS: version: %d, flags:%s; udp: %d\n", edns.version, flags_buf, edns.udp_payload_size);
-            if (edns.ext_rcode != 0) printf("; EXT RCODE: %d\n", edns.ext_rcode);
-            if (edns.has_cookie) {
-                printf("; COOKIE: ");
-                for (int i = 0; i < 8; i++) printf("%02x", edns.client_cookie[i]);
-                if (edns.server_cookie_len > 0) {
-                    for (uint16_t i = 0; i < edns.server_cookie_len; i++) printf("%02x", edns.server_cookie[i]);
-                    printf(" (good)");
-                }
-                printf("\n");
-            }
-            print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount);
-            for (uint16_t i = 0; i < edns.ede_count; i++) {
-                const char *msg = get_ede_error_string(edns.ede_list[i].code);
-                if (edns.ede_list[i].text[0]) printf("; EDE: %d (%s): (%s)\n", edns.ede_list[i].code, msg, edns.ede_list[i].text);
-                else printf("; EDE: %d (%s)\n", edns.ede_list[i].code, msg);
             }
         }
         g_dag_suppress_stdout = false;
@@ -4973,8 +5014,10 @@ int main(int argc, char **argv) {
                 } else {
                     parse_break_arg(brk);
                 }
-            } else if (strcmp(argv[i], "+edns") == 0) {
+            } else if (strcmp(argv[i], "+edns") == 0 || strncmp(argv[i], "+edns=", 6) == 0) {
                 qo.want_opt = true;
+            } else if (strcmp(argv[i], "+noedns") == 0) {
+                qo.want_opt = false;
             } else if (strcmp(argv[i], "+dnssec") == 0 || strcmp(argv[i], "+do") == 0) {
                 qo.want_opt = true; qo.dnssec_ok = true;
             } else if (strcmp(argv[i], "+nodo") == 0) {
