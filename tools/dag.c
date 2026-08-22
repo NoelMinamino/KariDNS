@@ -279,7 +279,8 @@ typedef enum {
     BRK_TOO_SHORT,
     BRK_TCP_LENGTH_OVERCLAIM,
     BRK_TCP_ZERO_LENGTH,
-    BRK_TCP_IDLE_HOLD
+    BRK_TCP_IDLE_HOLD,
+    BRK_UPDATE_META_TYPE
 } break_kind_t;
 
 typedef struct {
@@ -366,6 +367,7 @@ static void parse_break_arg(const char *arg) {
     else if (strcmp(name, "tcp-length-overclaim") == 0)   { kind = BRK_TCP_LENGTH_OVERCLAIM; if (!has_param) { param = 10; has_param = true; } }
     else if (strcmp(name, "tcp-zero-length") == 0)        kind = BRK_TCP_ZERO_LENGTH;
     else if (strcmp(name, "tcp-idle-hold") == 0)          { kind = BRK_TCP_IDLE_HOLD; if (!has_param) { param = 20; has_param = true; } }
+    else if (strcmp(name, "update-meta-type") == 0)       { kind = BRK_UPDATE_META_TYPE; if (!has_param) { param = 41; has_param = true; } }
     else {
         fprintf(stderr, "warning: unknown --break kind '%s', ignoring\n", name);
         return;
@@ -397,6 +399,7 @@ static void print_break_help(void) {
         "  tcp-zero-length            (--tcp only) send a 0 length prefix\n"
         "  tcp-idle-hold[=SEC]        (--tcp only) send only the length prefix, hold the\n"
         "                             connection, report when/if the server disconnects\n"
+        "  update-meta-type[=N]       (UPDATE only) inject a meta-type RR (default 41) into Update Section\n"
     );
 }
 
@@ -613,7 +616,7 @@ done:
 static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                                   const char *qname, uint16_t qtype,
                                   const query_opts_t *qo) {
-    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
+    if (qo->update_op_count > 0 || qo->prereq_count > 0 || has_break(BRK_UPDATE_META_TYPE, NULL, NULL)) {
         qtype = 6; /* SOA for Zone section */
     }
 
@@ -623,7 +626,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     pkt[2] = 0x01; /* RD=1 */
     pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT=1 (may be overridden below) */
 
-    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
+    if (qo->update_op_count > 0 || qo->prereq_count > 0 || has_break(BRK_UPDATE_META_TYPE, NULL, NULL)) {
         pkt[2] = (pkt[2] & 0x87) | (5 << 3); /* OPCODE=5 (UPDATE) */
     }
 
@@ -737,7 +740,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         }
     }
 
-    if (qo->update_op_count > 0) {
+    if (qo->update_op_count > 0 || has_break(BRK_UPDATE_META_TYPE, NULL, NULL)) {
         compress_ctx_t comp_ctx;
         memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
@@ -892,6 +895,21 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                     fprintf(stderr, "Invalid update-del-exact string format: %s\n", raw);
                 }
                 free(buf);
+            }
+        }
+
+        long meta_type = 0; bool has_meta = false;
+        if (has_break(BRK_UPDATE_META_TYPE, &meta_type, &has_meta)) {
+            uint16_t fallback_offset = offset;
+            if (write_dns_name_str(pkt, &fallback_offset, qname, &comp_ctx, max_len) == 0 && fallback_offset + 10 <= max_len) {
+                pkt[fallback_offset++] = (uint16_t)meta_type >> 8; pkt[fallback_offset++] = (uint16_t)meta_type & 0xFF;
+                pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x01; /* Class IN */
+                pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; /* TTL 0 */
+                pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; /* RDLEN 0 */
+                offset = fallback_offset;
+                uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                upcount++;
+                pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
             }
         }
     }
