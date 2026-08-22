@@ -968,11 +968,13 @@ PROCESS_RECORD:
       if (rec->rdata_count > 2)
         rec->rdata[2] = expand_domain_name(rec->rdata[2], *origin_io, arena);
     } else if (rec->type_code == 45) { // IPSECKEY
-      if (rec->rdata_count > 3 && strcmp(rec->rdata[1], "3") == 0) {
+      uint8_t gw_type;
+      if (rec->rdata_count > 3 && parse_u8(rec->rdata[1], &gw_type) && gw_type == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     } else if (rec->type_code == 260) { // AMTRELAY
-      if (rec->rdata_count > 3 && strcmp(rec->rdata[2], "3") == 0) {
+      uint8_t gw_type;
+      if (rec->rdata_count > 3 && parse_u8(rec->rdata[2], &gw_type) && gw_type == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     } else if (rec->type_code == 55) { // HIP

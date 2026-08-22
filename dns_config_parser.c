@@ -759,16 +759,23 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
 
     char *endptr;
     long num_val = strtol(val, &endptr, 10);
+    bool valid = (*endptr == '\0' && num_val >= 0);
+
     if (strcmp(key, "responses-per-second") == 0) {
-      if (*endptr == '\0' && num_val >= 0) rrl->responses_per_second = (int)num_val;
+      if (valid) rrl->responses_per_second = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "nxdomains-per-second") == 0) {
-      if (*endptr == '\0' && num_val >= 0) rrl->nxdomains_per_second = (int)num_val;
+      if (valid) rrl->nxdomains_per_second = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "errors-per-second") == 0) {
-      if (*endptr == '\0' && num_val >= 0) rrl->errors_per_second = (int)num_val;
+      if (valid) rrl->errors_per_second = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "window") == 0) {
       if (*endptr == '\0' && num_val > 0) rrl->window_seconds = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "slip") == 0) {
-      if (*endptr == '\0' && num_val >= 0) rrl->slip = (int)num_val;
+      if (valid) rrl->slip = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "log-only") == 0) {
       rrl->log_only = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
     } else {

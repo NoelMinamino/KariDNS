@@ -1699,6 +1699,118 @@ int main() {
         printf("PASS: Out-of-bounds numeric fields rejection (uint8_t/uint16_t bounds)\n");
     }
 
+    // --- Test 24: Rate-limit config parsing with invalid numerical values ---
+    {
+        server_config_t rrl_cfg;
+        memset(&rrl_cfg, 0, sizeof(rrl_cfg));
+        const char *conf_invalid_rrl = 
+            "options {\n"
+            "    rate-limit {\n"
+            "        responses-per-second -5;\n"
+            "        nxdomains-per-second abc;\n"
+            "        window 0;\n"
+            "        slip invalid;\n"
+            "    };\n"
+            "};\n";
+        char *copy_rrl = strdup(conf_invalid_rrl);
+        int rrl_res = parse_named_conf(copy_rrl, &rrl_cfg);
+        free(copy_rrl);
+        if (rrl_res != 0) {
+            printf("FAIL: parse_named_conf failed on rate-limit config with invalid values\n");
+            return 1;
+        }
+        // Invalid values should be ignored, leaving defaults:
+        // responses_per_second default = 0, nxdomains default = 0, window default = 15, slip default = 2
+        if (rrl_cfg.rrl.responses_per_second != 0 ||
+            rrl_cfg.rrl.nxdomains_per_second != 0 ||
+            rrl_cfg.rrl.window_seconds != 15 ||
+            rrl_cfg.rrl.slip != 2) {
+            printf("FAIL: Rate-limit invalid values were not properly ignored (res_ps=%u, win=%u, slip=%u)\n",
+                   rrl_cfg.rrl.responses_per_second,
+                   rrl_cfg.rrl.window_seconds,
+                   rrl_cfg.rrl.slip);
+            return 1;
+        }
+
+        // Test valid rate-limit values
+        const char *conf_valid_rrl = 
+            "options {\n"
+            "    rate-limit {\n"
+            "        responses-per-second 100;\n"
+            "        nxdomains-per-second 50;\n"
+            "        window 30;\n"
+            "        slip 4;\n"
+            "    };\n"
+            "};\n";
+        char *copy_valid_rrl = strdup(conf_valid_rrl);
+        rrl_res = parse_named_conf(copy_valid_rrl, &rrl_cfg);
+        free(copy_valid_rrl);
+        if (rrl_res != 0 ||
+            rrl_cfg.rrl.responses_per_second != 100 ||
+            rrl_cfg.rrl.nxdomains_per_second != 50 ||
+            rrl_cfg.rrl.window_seconds != 30 ||
+            rrl_cfg.rrl.slip != 4) {
+            printf("FAIL: Rate-limit valid values were not properly applied\n");
+            return 1;
+        }
+        free_server_config_fields(&rrl_cfg);
+        printf("PASS: Rate-limit invalid value warning & fallback tests\n");
+    }
+
+    // --- Test 25: IPSECKEY and AMTRELAY gateway domain expansion with "03" ---
+    {
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        const char *zone_str =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "host1 IN IPSECKEY 10 03 2 gw AQIDBA==\n"
+            "host2 IN AMTRELAY 10 0 03 gw AQIDBA==\n";
+
+        char *zone_buf = strdup(zone_str);
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "example.com.",
+            .is_standalone_mode = true,
+        };
+        int pr = parse_zone_fast(zone_buf, strlen(zone_buf), &arena, &ctx);
+        free(zone_buf);
+        if (pr < 0 || arena.count < 4) {
+            printf("FAIL: parse_zone_fast failed for IPSECKEY/AMTRELAY test zone (pr=%d, count=%zu)\n", pr, arena.count);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Find host1 IPSECKEY and host2 AMTRELAY
+        dns_record_t *ipseckey_rec = NULL;
+        dns_record_t *amtrelay_rec = NULL;
+        for (size_t i = 0; i < arena.count; i++) {
+            if (arena.records[i].type_code == 45) ipseckey_rec = &arena.records[i];
+            if (arena.records[i].type_code == 260) amtrelay_rec = &arena.records[i];
+        }
+
+        if (!ipseckey_rec || ipseckey_rec->rdata_count < 4 ||
+            strcmp(ipseckey_rec->rdata[3], "gw.example.com.") != 0) {
+            printf("FAIL: IPSECKEY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
+                   (ipseckey_rec && ipseckey_rec->rdata_count >= 4) ? ipseckey_rec->rdata[3] : "null");
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (!amtrelay_rec || amtrelay_rec->rdata_count < 4 ||
+            strcmp(amtrelay_rec->rdata[3], "gw.example.com.") != 0) {
+            printf("FAIL: AMTRELAY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
+                   (amtrelay_rec && amtrelay_rec->rdata_count >= 4) ? amtrelay_rec->rdata[3] : "null");
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: IPSECKEY and AMTRELAY '03' gateway domain expansion test\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

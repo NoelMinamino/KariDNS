@@ -4,9 +4,31 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+// ============================================================================
+// 数値フィールド安全パースヘルパー (0-255, 0-65535 範囲検証付き)
+// ============================================================================
+static inline bool parse_u8(const char *s, uint8_t *out) {
+    if (!s || !*s) return false;
+    char *endptr;
+    long val = strtol(s, &endptr, 10);
+    if (*endptr != '\0' || val < 0 || val > 255) return false;
+    if (out) *out = (uint8_t)val;
+    return true;
+}
+
+static inline bool parse_u16(const char *s, uint16_t *out) {
+    if (!s || !*s) return false;
+    char *endptr;
+    long val = strtol(s, &endptr, 10);
+    if (*endptr != '\0' || val < 0 || val > 65535) return false;
+    if (out) *out = (uint16_t)val;
+    return true;
+}
 
 // Forward declarations
 struct server_config_s;
