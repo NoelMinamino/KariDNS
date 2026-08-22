@@ -17,11 +17,11 @@ TEST_DIR_ABS=$(pwd)
 # Trap for cleanup and automatic kdump on failure
 cleanup() {
     EXIT_CODE=$?
+    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
+    killall -9 karidns 2>/dev/null || true
+    killall -9 karidns-asan 2>/dev/null || true
     if [ $EXIT_CODE -ne 0 ]; then
         echo "[-] Test failed with exit code $EXIT_CODE"
-        if [ -n "$SERVER_PID" ]; then
-            kill -9 $SERVER_PID 2>/dev/null || true
-        fi
         if [ -f ktrace.out ] && which kdump >/dev/null 2>&1; then
             echo "=== [KDUMP TRACE (Last 100 lines)] ==="
             kdump -f ktrace.out 2>/dev/null | tail -n 100 || true
@@ -148,7 +148,7 @@ sleep 1
 
 
 echo "[+] Phase 0 Unique-ID Test: Changing unique-id of example.org..."
-perl -pi -e 's/zone2\.zones/zone2_new\.zones/' catalog.zone
+sed -i '' -e 's/zone2\.zones/zone2_new\.zones/' catalog.zone
 "$BIN_DIR/karictl" -f karictl.conf reload
 sleep 1
 grep "Added new member 'example.org.' (unique-id: zone2_new)" karidns.log || {
@@ -323,11 +323,11 @@ cat << EOF > catalog1.zone
 version IN TXT "2"
 EOF
 
-perl -e 'for ($i = 1; $i <= 5000; $i++) { print "m$i.zones IN PTR member$i.example.net.\n"; }' >> catalog1.zone
+awk 'BEGIN { for (i = 1; i <= 5000; i++) printf "m%d.zones IN PTR member%d.example.net.\n", i, i }' >> catalog1.zone
 
-START_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+START_MS=$(date +%s000)
 "$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
-END_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+END_MS=$(date +%s000)
 echo "[Benchmark] Initial load (5,000 members): $((END_MS - START_MS)) ms"
 sleep 1
 
@@ -344,11 +344,11 @@ cat << EOF > catalog1.zone
 version IN TXT "2"
 EOF
 
-perl -e 'for ($i = 1; $i <= 1000; $i++) { print "new_m$i.zones IN PTR new-member$i.example.net.\n"; } for ($i = 1001; $i <= 5000; $i++) { print "m$i.zones IN PTR member$i.example.net.\n"; }' >> catalog1.zone
+awk 'BEGIN { for (i = 1; i <= 1000; i++) printf "new_m%d.zones IN PTR new-member%d.example.net.\n", i, i; for (i = 1001; i <= 5000; i++) printf "m%d.zones IN PTR member%d.example.net.\n", i, i }' >> catalog1.zone
 
-DELTA_START_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+DELTA_START_MS=$(date +%s000)
 "$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
-DELTA_END_MS=$(perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)' 2>/dev/null || date +%s000)
+DELTA_END_MS=$(date +%s000)
 echo "[Benchmark] Delta update (1,000 member swap out of 5,000): $((DELTA_END_MS - DELTA_START_MS)) ms"
 sleep 1
 

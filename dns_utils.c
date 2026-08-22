@@ -195,8 +195,14 @@ uint16_t get_type_code(const char *type_str) {
       return 250;
     if (strcmp(type_str, "TA") == 0)
       return 32768;
-    if (strncmp(type_str, "TYPE", 4) == 0)
-      return (uint16_t)atoi(type_str + 4);
+    if (strncmp(type_str, "TYPE", 4) == 0) {
+      char *endptr;
+      long tval = strtol(type_str + 4, &endptr, 10);
+      if (*endptr == '\0' && tval > 0 && tval <= 65535) {
+        return (uint16_t)tval;
+      }
+      return 0;
+    }
     break;
   case 'U':
     if (strcmp(type_str, "URI") == 0)

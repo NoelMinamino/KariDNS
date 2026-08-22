@@ -2,8 +2,10 @@
 set -e
 
 # 1. 本番ビルドでサーバーとdagを構築 (Capsicumを有効にするため)
-git checkout tests/zones/example.com.zone || true
+[ -f tests/zones/example.com.zone.bak ] && mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true
 rm -rf tests/zones/capsicum_include_test || true
+killall -9 karidns karidns-asan 2>/dev/null || true
+sleep 1
 make clean
 make karidns dag karictl
 
@@ -17,10 +19,18 @@ echo "\$INCLUDE capsicum_include_test/dir2/empty.inc" > tests/zones/capsicum_inc
 cp tests/zones/example.com.zone tests/zones/example.com.zone.bak
 echo "\$INCLUDE capsicum_include_test/dir1/init.inc" >> tests/zones/example.com.zone
 
+cleanup() {
+    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
+    killall -9 karidns 2>/dev/null || true
+    killall -9 karidns-asan 2>/dev/null || true
+    [ -f tests/zones/example.com.zone.bak ] && mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true
+    rm -rf tests/zones/capsicum_include_test 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 # 2. ktrace を用いてシステムコールをトレースしながらサーバーを起動
 ktrace -f karidns.trace ./karidns -f tests/karidns-test.conf > server_capsicum.log 2>&1 &
 SERVER_PID=$!
-trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
 sleep 1 # 起動待ち
 
 # 3. サーバープロセスが正常に起動したか確認
@@ -34,7 +44,7 @@ fi
 # ゾーン設定にてTSIGが必須(tsig-key "transfer-key";)となっているため、
 # まずはTSIG無しでREFUSEDされることを確認し、次にTSIGありで正常応答を得る。
 echo "Running AXFR transfer without TSIG (expect REFUSED)..."
-noauth_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 2>&1 || true)
+noauth_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 +tcp 2>&1 || true)
 if ! echo "$noauth_output" | grep -qE "REFUSED|NOTAUTH"; then
     echo "[FAIL] AXFR without TSIG was not refused! TSIG-required ACL may be broken."
     echo "$noauth_output"
@@ -43,7 +53,7 @@ fi
 echo "[OK] AXFR without TSIG correctly refused."
 
 echo "Running AXFR transfer with TSIG..."
-axfr_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 -y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl)
+axfr_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 -y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +tcp)
 actual_types=$(echo "$axfr_output" | grep -oE '[[:space:]]IN[[:space:]]+[A-Z0-9]+[[:space:]]' | awk '{print $2}' | sort -u)
 
 # 5. サーバープロセスがまだ生きているか確認(クラッシュ検出)

@@ -316,6 +316,20 @@ void free_zone_config(zone_config_t *zone) {
   free(zone);
 }
 
+static void free_partial_view(view_config_t *view) {
+  if (!view) return;
+  if (view->name) free(view->name);
+  for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
+  if (view->match_clients) free(view->match_clients);
+  zone_config_t *z = view->zones;
+  while (z) {
+    zone_config_t *next = z->next;
+    free_zone_config(z);
+    z = next;
+  }
+  free(view);
+}
+
 void free_server_config_fields(server_config_t *cfg) {
   if (!cfg) return;
   for (int j = 0; j < cfg->bind_address_count; j++)
@@ -657,9 +671,15 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
     if (tok.type == TOKEN_STRING && strcmp(tok.value, "port") == 0) {
       free_token(&tok);
       tok = get_next_token(ctx);
-      if (tok.type == TOKEN_STRING)
-        (*list)[*count].port = atoi(tok.value);
-      else {
+      if (tok.type == TOKEN_STRING) {
+        char *endptr;
+        long pval = strtol(tok.value, &endptr, 10);
+        if (*endptr != '\0' || pval <= 0 || pval > 65535) {
+          free_token(&tok);
+          return -1;
+        }
+        (*list)[*count].port = (int)pval;
+      } else {
         free_token(&tok);
         return -1;
       }
@@ -737,16 +757,25 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     }
     free_token(&tok);
 
+    char *endptr;
+    long num_val = strtol(val, &endptr, 10);
+    bool valid = (*endptr == '\0' && num_val >= 0);
+
     if (strcmp(key, "responses-per-second") == 0) {
-      rrl->responses_per_second = atoi(val);
+      if (valid) rrl->responses_per_second = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "nxdomains-per-second") == 0) {
-      rrl->nxdomains_per_second = atoi(val);
+      if (valid) rrl->nxdomains_per_second = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "errors-per-second") == 0) {
-      rrl->errors_per_second = atoi(val);
+      if (valid) rrl->errors_per_second = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "window") == 0) {
-      rrl->window_seconds = atoi(val);
+      if (*endptr == '\0' && num_val > 0) rrl->window_seconds = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "slip") == 0) {
-      rrl->slip = atoi(val);
+      if (valid) rrl->slip = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "log-only") == 0) {
       rrl->log_only = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
     } else {
@@ -974,8 +1003,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           free_token(&tok);
           if (strcmp(key, "port") == 0) {
-            int p = atoi(val);
-            if (p > 0 && p <= 65535) config->port = p;
+            char *endptr;
+            long pval = strtol(val, &endptr, 10);
+            if (*endptr == '\0' && pval > 0 && pval <= 65535) config->port = (int)pval;
             free(val);
           } else if (strcmp(key, "user") == 0)
             config->user = val;
@@ -1136,9 +1166,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_token(&tok);
             return -1;
           }
-          config->max_mqtypes = atoi(tok.value);
-          if (config->max_mqtypes < 0) config->max_mqtypes = 0;
-          if (config->max_mqtypes > 16) config->max_mqtypes = 16;
+          char *endptr;
+          long mqval = strtol(tok.value, &endptr, 10);
+          if (*endptr == '\0') {
+            if (mqval < 0) mqval = 0;
+            if (mqval > 16) mqval = 16;
+            config->max_mqtypes = (int)mqval;
+          }
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
@@ -1217,17 +1251,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       while (1) {
         tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
-        if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+        if (tok.type != TOKEN_STRING) { free_partial_view(view); free_token(&tok); return -1; }
         if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
           if (parse_acl_list(ctx, &view->match_clients, &view->match_clients_count,
                              ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
+            free_partial_view(view);
             return -1;
           }
         } else if (strcmp(tok.value, "zone") == 0) {
           free_token(&tok);
           zone_config_t *z = NULL;
-          if (parse_zone_block(ctx, &z) != 0) return -1;
+          if (parse_zone_block(ctx, &z) != 0) {
+            free_partial_view(view);
+            return -1;
+          }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
         } else {
@@ -1236,7 +1274,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         }
       }
       tok = get_next_token(ctx);
-      if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+      if (tok.type != TOKEN_SEMICOLON) { free_partial_view(view); free_token(&tok); return -1; }
       free_token(&tok);
       saw_view_block = true;
       if (!config->views) config->views = view; else last_view->next = view;
@@ -1518,8 +1556,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                     strcmp(tok.value, "versions") == 0) {
                   free_token(&tok);
                   tok = get_next_token(ctx);
-                  if (tok.type == TOKEN_STRING)
-                    ch->versions = atoi(tok.value);
+                  if (tok.type == TOKEN_STRING) {
+                    char *endptr;
+                    long vval = strtol(tok.value, &endptr, 10);
+                    if (*endptr == '\0' && vval >= 0) ch->versions = (int)vval;
+                  }
                   free_token(&tok);
                 } else if (tok.type == TOKEN_STRING &&
                            strcmp(tok.value, "size") == 0) {

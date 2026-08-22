@@ -279,7 +279,8 @@ typedef enum {
     BRK_TOO_SHORT,
     BRK_TCP_LENGTH_OVERCLAIM,
     BRK_TCP_ZERO_LENGTH,
-    BRK_TCP_IDLE_HOLD
+    BRK_TCP_IDLE_HOLD,
+    BRK_UPDATE_META_TYPE
 } break_kind_t;
 
 typedef struct {
@@ -366,6 +367,7 @@ static void parse_break_arg(const char *arg) {
     else if (strcmp(name, "tcp-length-overclaim") == 0)   { kind = BRK_TCP_LENGTH_OVERCLAIM; if (!has_param) { param = 10; has_param = true; } }
     else if (strcmp(name, "tcp-zero-length") == 0)        kind = BRK_TCP_ZERO_LENGTH;
     else if (strcmp(name, "tcp-idle-hold") == 0)          { kind = BRK_TCP_IDLE_HOLD; if (!has_param) { param = 20; has_param = true; } }
+    else if (strcmp(name, "update-meta-type") == 0)       { kind = BRK_UPDATE_META_TYPE; if (!has_param) { param = 41; has_param = true; } }
     else {
         fprintf(stderr, "warning: unknown --break kind '%s', ignoring\n", name);
         return;
@@ -397,6 +399,7 @@ static void print_break_help(void) {
         "  tcp-zero-length            (--tcp only) send a 0 length prefix\n"
         "  tcp-idle-hold[=SEC]        (--tcp only) send only the length prefix, hold the\n"
         "                             connection, report when/if the server disconnects\n"
+        "  update-meta-type[=N]       (UPDATE only) inject a meta-type RR (default 41) into Update Section\n"
     );
 }
 
@@ -491,7 +494,12 @@ static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
     strncpy(buf, arg, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
     char *slash = strchr(buf, '/');
     int prefix = -1;
-    if (slash) { *slash = '\0'; prefix = atoi(slash + 1); }
+    if (slash) {
+        *slash = '\0';
+        char *endptr;
+        long pfx_val = strtol(slash + 1, &endptr, 10);
+        if (*endptr == '\0' && pfx_val >= 0) prefix = (int)pfx_val;
+    }
 
     struct in_addr a4;
     struct in6_addr a6;
@@ -608,7 +616,7 @@ done:
 static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                                   const char *qname, uint16_t qtype,
                                   const query_opts_t *qo) {
-    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
+    if (qo->update_op_count > 0 || qo->prereq_count > 0 || has_break(BRK_UPDATE_META_TYPE, NULL, NULL)) {
         qtype = 6; /* SOA for Zone section */
     }
 
@@ -618,7 +626,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     pkt[2] = 0x01; /* RD=1 */
     pkt[4] = 0x00; pkt[5] = 0x01; /* QDCOUNT=1 (may be overridden below) */
 
-    if (qo->update_op_count > 0 || qo->prereq_count > 0) {
+    if (qo->update_op_count > 0 || qo->prereq_count > 0 || has_break(BRK_UPDATE_META_TYPE, NULL, NULL)) {
         pkt[2] = (pkt[2] & 0x87) | (5 << 3); /* OPCODE=5 (UPDATE) */
     }
 
@@ -732,7 +740,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         }
     }
 
-    if (qo->update_op_count > 0) {
+    if (qo->update_op_count > 0 || has_break(BRK_UPDATE_META_TYPE, NULL, NULL)) {
         compress_ctx_t comp_ctx;
         memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
@@ -887,6 +895,21 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                     fprintf(stderr, "Invalid update-del-exact string format: %s\n", raw);
                 }
                 free(buf);
+            }
+        }
+
+        long meta_type = 0; bool has_meta = false;
+        if (has_break(BRK_UPDATE_META_TYPE, &meta_type, &has_meta)) {
+            uint16_t fallback_offset = offset;
+            if (write_dns_name_str(pkt, &fallback_offset, qname, &comp_ctx, max_len) == 0 && fallback_offset + 10 <= max_len) {
+                pkt[fallback_offset++] = (uint16_t)meta_type >> 8; pkt[fallback_offset++] = (uint16_t)meta_type & 0xFF;
+                pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x01; /* Class IN */
+                pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; /* TTL 0 */
+                pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; /* RDLEN 0 */
+                offset = fallback_offset;
+                uint16_t upcount = (pkt[8] << 8) | pkt[9];
+                upcount++;
+                pkt[8] = upcount >> 8; pkt[9] = upcount & 0xFF;
             }
         }
     }
@@ -3422,7 +3445,9 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                         *close = '\0';
                         tok++; // '[' をスキップ
                         if (close[1] == ':' && close[2] != '\0') {
-                            srv_port = atoi(close + 2);
+                            char *endptr;
+                            long p = strtol(close + 2, &endptr, 10);
+                            if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
                         }
                     }
                 } else {
@@ -3431,7 +3456,9 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                     if (first_colon && !strchr(first_colon + 1, ':')) {
                         // ':' が1つだけ → IPv4:port
                         *first_colon = '\0';
-                        srv_port = atoi(first_colon + 1);
+                        char *endptr;
+                        long p = strtol(first_colon + 1, &endptr, 10);
+                        if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
                     }
                 }
                 servers[server_count] = tok;
@@ -3651,7 +3678,9 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] == '-' || argv[i][0] == '+') {
             // --- オプション引数（既存ハンドラをそのまま移植） ---
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            port = atoi(argv[++i]);
+            char *endptr;
+            long pval = strtol(argv[++i], &endptr, 10);
+            if (*endptr == '\0' && pval > 0 && pval <= 65535) port = (int)pval;
         } else if (strcmp(argv[i], "--update-add") == 0 && i + 1 < argc) {
             if (qo.update_op_count < MAX_UPDATE_OPS) {
                 qo.update_ops[qo.update_op_count].kind = UPDATE_OP_ADD;
@@ -3760,7 +3789,9 @@ int main(int argc, char **argv) {
                     if (len >= (int)sizeof(qo.bind_addr)) len = sizeof(qo.bind_addr) - 1;
                     memcpy(qo.bind_addr, arg, len);
                     qo.bind_addr[len] = '\0';
-                    qo.bind_port = atoi(hash + 1);
+                    char *endptr;
+                    long bp = strtol(hash + 1, &endptr, 10);
+                    if (*endptr == '\0' && bp > 0 && bp <= 65535) qo.bind_port = (int)bp;
                 } else {
                     snprintf(qo.bind_addr, sizeof(qo.bind_addr), "%s", arg);
                     qo.bind_port = 0;
@@ -3889,7 +3920,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "+nsid") == 0) {
             qo.want_opt = true; qo.want_nsid = true;
         } else if (strncmp(argv[i], "+bufsize=", 9) == 0) {
-            qo.want_opt = true; qo.udp_payload_size = (uint16_t)atoi(argv[i] + 9);
+            char *endptr;
+            long bsz = strtol(argv[i] + 9, &endptr, 10);
+            if (*endptr == '\0' && bsz >= 0 && bsz <= 65535) {
+                qo.want_opt = true; qo.udp_payload_size = (uint16_t)bsz;
+            }
         } else if (strcmp(argv[i], "+adflag") == 0) {
             adflag = true;
         } else if (strcmp(argv[i], "+cdflag") == 0) {
@@ -3901,14 +3936,24 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "+zflag") == 0) {
             zflag = true;
         } else if (strncmp(argv[i], "+timeout=", 9) == 0) {
-            qo.timeout_sec = atoi(argv[i] + 9);
+            char *endptr;
+            long to = strtol(argv[i] + 9, &endptr, 10);
+            if (*endptr == '\0' && to >= 0) qo.timeout_sec = (int)to;
         } else if (strncmp(argv[i], "+tries=", 7) == 0) {
-            qo.tries = atoi(argv[i] + 7);
+            char *endptr;
+            long tr = strtol(argv[i] + 7, &endptr, 10);
+            if (*endptr == '\0' && tr >= 0) qo.tries = (int)tr;
         } else if (strncmp(argv[i], "+retry=", 7) == 0) {
-            qo.tries = atoi(argv[i] + 7) + 1;
+            char *endptr;
+            long tr = strtol(argv[i] + 7, &endptr, 10);
+            if (*endptr == '\0' && tr >= 0) qo.tries = (int)tr + 1;
         } else if (strncmp(argv[i], "+padding=", 9) == 0) {
-            qo.want_opt = true; qo.want_padding = true;
-            qo.padding_size = atoi(argv[i] + 9);
+            char *endptr;
+            long pd = strtol(argv[i] + 9, &endptr, 10);
+            if (*endptr == '\0' && pd >= 0) {
+                qo.want_opt = true; qo.want_padding = true;
+                qo.padding_size = (int)pd;
+            }
         } else if (strncmp(argv[i], "+mqtype=", 8) == 0) {
             qo.want_opt = true;
             if (qo.custom_edns_opt_count < 8) {

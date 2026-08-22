@@ -1360,6 +1360,457 @@ int main() {
         printf("PASS: RFC 10029 §3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
     }
 
+    // --- Test 18: BIND-compatible TTL unit suffix parsing (w/d/h/m/s) ---
+    {
+        if (parse_ttl_value("1D") != 86400 || parse_ttl_value("1d") != 86400) {
+            printf("FAIL: parse_ttl_value('1D') != 86400\n");
+            return 1;
+        }
+        if (parse_ttl_value("3h") != 10800 || parse_ttl_value("3H") != 10800) {
+            printf("FAIL: parse_ttl_value('3h') != 10800\n");
+            return 1;
+        }
+        if (parse_ttl_value("90") != 90) {
+            printf("FAIL: parse_ttl_value('90') != 90\n");
+            return 1;
+        }
+        if (parse_ttl_value("1h30m") != 5400) {
+            printf("FAIL: parse_ttl_value('1h30m') != 5400\n");
+            return 1;
+        }
+        if (parse_ttl_value("1w") != 604800) {
+            printf("FAIL: parse_ttl_value('1w') != 604800\n");
+            return 1;
+        }
+        if (parse_ttl_value("15m") != 900) {
+            printf("FAIL: parse_ttl_value('15m') != 900\n");
+            return 1;
+        }
+        if (parse_ttl_value("1w2d3h4m5s") != 788645) {
+            printf("FAIL: parse_ttl_value('1w2d3h4m5s') != 788645\n");
+            return 1;
+        }
+        if (parse_ttl_value(NULL) != 3600 || parse_ttl_value("") != 3600) {
+            printf("FAIL: parse_ttl_value(NULL/empty) != 3600\n");
+            return 1;
+        }
+        if (parse_ttl_value("invalid") != 3600) {
+            printf("FAIL: parse_ttl_value('invalid') != 3600\n");
+            return 1;
+        }
+
+        // Test zone parsing with TTL units
+        zone_arena_t arena;
+        memset(&arena, 0, sizeof(arena));
+        zone_arena_init(&arena);
+
+        const char *zone_str =
+            "$TTL 1D\n"
+            "example.com.    IN  SOA  ns1.example.com. admin.example.com. ( 1 1h 15m 1w 1h )\n"
+            "example.com.    3h  IN  NS   ns1.example.com.\n"
+            "www.example.com. 90 IN  A    192.0.2.1\n"
+            "mixed.example.com. 1h30m IN A 192.0.2.2\n";
+
+        char *zone_buf = strdup(zone_str);
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "example.com.",
+            .is_standalone_mode = true,
+        };
+        int pr = parse_zone_fast(zone_buf, strlen(zone_buf), &arena, &ctx);
+        free(zone_buf);
+        if (pr < 0 || arena.count < 4) {
+            printf("FAIL: parse_zone_fast failed for TTL unit test zone (pr=%d, count=%zu)\n", pr, arena.count);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Check records:
+        // Record 0 (SOA): default TTL from $TTL 1D -> 86400
+        if (arena.records[0].ttl_value != 86400) {
+            printf("FAIL: SOA record TTL value expected 86400, got %u\n", arena.records[0].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        // Record 1 (NS): 3h -> 10800
+        if (arena.records[1].ttl_value != 10800) {
+            printf("FAIL: NS record TTL value expected 10800, got %u\n", arena.records[1].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        // Record 2 (www A): 90 -> 90
+        if (arena.records[2].ttl_value != 90) {
+            printf("FAIL: A record TTL value expected 90, got %u\n", arena.records[2].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        // Record 3 (mixed A): 1h30m -> 5400
+        if (arena.records[3].ttl_value != 5400) {
+            printf("FAIL: mixed A record TTL value expected 5400, got %u\n", arena.records[3].ttl_value);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: BIND-compatible TTL unit suffix parsing (w/d/h/m/s)\n");
+    }
+
+    // --- Test 19: CAA Tag length bounds check (1-255 bytes, RFC 8659) ---
+    {
+        uint8_t buf[1024];
+        uint16_t off = 0;
+        compress_ctx_t c; compress_ctx_init_packet(&c);
+
+        char long_tag[300];
+        memset(long_tag, 'a', 256);
+        long_tag[256] = '\0';
+
+        dns_record_t caa_rec = {
+            .name = "example.com.",
+            .type = "CAA",
+            .type_code = 257,
+            .ttl_value = 3600,
+            .rdata_count = 3,
+            .rdata = { "0", long_tag, "letsencrypt.org" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: CAA tag_len > 255 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        caa_rec.rdata[1] = "";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: CAA tag_len == 0 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        caa_rec.rdata[1] = "issue";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != 0) {
+            printf("FAIL: Valid CAA record failed serialization\n");
+            return 1;
+        }
+        printf("PASS: CAA Tag length bounds check (1-255 bytes, RFC 8659)\n");
+    }
+
+    // --- Test 20: NSEC3PARAM iterations range check (0-65535, RFC 5155) ---
+    {
+        uint8_t buf[1024];
+        uint16_t off = 0;
+        compress_ctx_t c; compress_ctx_init_packet(&c);
+
+        dns_record_t nsec3param_rec = {
+            .name = "example.com.",
+            .type = "NSEC3PARAM",
+            .type_code = 51,
+            .ttl_value = 0,
+            .rdata_count = 4,
+            .rdata = { "1", "0", "70000", "-" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &nsec3param_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: NSEC3PARAM iterations > 65535 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        nsec3param_rec.rdata[2] = "-1";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &nsec3param_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: NSEC3PARAM iterations < 0 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        nsec3param_rec.rdata[2] = "0";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &nsec3param_rec, &c, NULL, 0) != 0) {
+            printf("FAIL: Valid NSEC3PARAM iterations=0 failed serialization\n");
+            return 1;
+        }
+        printf("PASS: NSEC3PARAM iterations range check (0-65535, RFC 5155)\n");
+    }
+
+    // --- Test 21: View configuration partial parse error cleanup (no leak) ---
+    {
+        const char *bad_view_acl =
+            "view \"external\" {\n"
+            "    match-clients { 192.0.2.1; 192.0.2.2 };\n"
+            "    zone \"example.com\" { type master; file \"example.com.zone\"; };\n"
+            "};\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        int res1 = parse_named_conf(bad_view_acl, &cfg1);
+        if (res1 == 0) {
+            printf("FAIL: Expected parse_named_conf to fail for bad_view_acl\n");
+            return 1;
+        }
+
+        const char *bad_view_zone =
+            "view \"internal\" {\n"
+            "    match-clients { any; };\n"
+            "    zone \"valid.com\" { type master; file \"valid.com.zone\"; };\n"
+            "    zone \"broken.com\" { type master; file; };\n"
+            "};\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        int res2 = parse_named_conf(bad_view_zone, &cfg2);
+        if (res2 == 0) {
+            printf("FAIL: Expected parse_named_conf to fail for bad_view_zone\n");
+            return 1;
+        }
+        printf("PASS: View configuration partial parse error cleanup (no leak)\n");
+    }
+
+    // --- Test 22: Zone parser parenthesis mismatch and nesting checks ---
+    {
+        // 1. Unclosed parenthesis
+        const char *z1 =
+            "$ORIGIN example.com.\n"
+            "@ IN SOA ns1.example.com. admin.example.com. ( 1 3600 1800 604800 86400\n"
+            "@ IN NS ns1.example.com.\n";
+        char *buf1 = strdup(z1);
+        zone_arena_t arena1; memset(&arena1, 0, sizeof(arena1)); zone_arena_init(&arena1);
+        parse_error_t err1 = {0};
+        parse_context_t ctx1 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err1 };
+        int pr1 = parse_zone_fast(buf1, strlen(buf1), &arena1, &ctx1);
+        free(buf1);
+        zone_arena_destroy(&arena1);
+        if (pr1 >= 0 || !err1.error_message || strstr(err1.error_message, "Unbalanced parenthesis") == NULL) {
+            printf("FAIL: Unclosed parenthesis was not detected properly: %s\n", err1.error_message ? err1.error_message : "none");
+            return 1;
+        }
+
+        // 2. Unmatched ')' with no preceding '('
+        const char *z2 =
+            "$ORIGIN example.com.\n"
+            "@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400 )\n"
+            "@ IN NS ns1.example.com.\n";
+        char *buf2 = strdup(z2);
+        zone_arena_t arena2; memset(&arena2, 0, sizeof(arena2)); zone_arena_init(&arena2);
+        parse_error_t err2 = {0};
+        parse_context_t ctx2 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err2 };
+        int pr2 = parse_zone_fast(buf2, strlen(buf2), &arena2, &ctx2);
+        free(buf2);
+        zone_arena_destroy(&arena2);
+        if (pr2 >= 0 || !err2.error_message || strstr(err2.error_message, "Unmatched ')'") == NULL) {
+            printf("FAIL: Unmatched ')' was not detected properly: %s\n", err2.error_message ? err2.error_message : "none");
+            return 1;
+        }
+
+        // 3. Nested parentheses
+        const char *z3 =
+            "$ORIGIN example.com.\n"
+            "@ IN SOA ns1.example.com. admin.example.com. ( 1 ( 3600 1800 604800 86400 ) )\n"
+            "@ IN NS ns1.example.com.\n";
+        char *buf3 = strdup(z3);
+        zone_arena_t arena3; memset(&arena3, 0, sizeof(arena3)); zone_arena_init(&arena3);
+        parse_error_t err3 = {0};
+        parse_context_t ctx3 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err3 };
+        int pr3 = parse_zone_fast(buf3, strlen(buf3), &arena3, &ctx3);
+        free(buf3);
+        zone_arena_destroy(&arena3);
+        if (pr3 >= 0 || !err3.error_message || strstr(err3.error_message, "Nested parentheses") == NULL) {
+            printf("FAIL: Nested parentheses was not detected properly: %s\n", err3.error_message ? err3.error_message : "none");
+            return 1;
+        }
+
+        printf("PASS: Zone parser parenthesis balance and nesting checks\n");
+    }
+
+    // --- Test 23: Out-of-bounds numeric fields in serialize_dns_record ---
+    {
+        uint8_t buf[1024];
+        uint16_t off = 0;
+        compress_ctx_t c; compress_ctx_init_packet(&c);
+
+        // 1. uint16_t overflow: MX preference = 70000 (> 65535)
+        dns_record_t mx_rec = {
+            .name = "example.com.",
+            .type = "MX",
+            .type_code = 15,
+            .ttl_value = 3600,
+            .rdata_count = 2,
+            .rdata = { "70000", "mail.example.com." }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: MX preference > 65535 was not rejected\n");
+            return 1;
+        }
+
+        // 2. uint8_t overflow: SSHFP algorithm = 300 (> 255)
+        off = 0;
+        dns_record_t sshfp_rec = {
+            .name = "example.com.",
+            .type = "SSHFP",
+            .type_code = 44,
+            .ttl_value = 3600,
+            .rdata_count = 3,
+            .rdata = { "300", "1", "123456789abcdef67890123456789abcdef67890" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &sshfp_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: SSHFP algorithm > 255 was not rejected\n");
+            return 1;
+        }
+
+        // 3. uint16_t overflow: SRV port = -1
+        off = 0;
+        dns_record_t srv_rec = {
+            .name = "_sip._tcp.example.com.",
+            .type = "SRV",
+            .type_code = 33,
+            .ttl_value = 3600,
+            .rdata_count = 4,
+            .rdata = { "10", "60", "-1", "sip.example.com." }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &srv_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: SRV port < 0 was not rejected\n");
+            return 1;
+        }
+
+        // 4. Non-numeric input: MX preference = "abc"
+        off = 0;
+        mx_rec.rdata[0] = "abc";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: Non-numeric MX preference 'abc' was not rejected\n");
+            return 1;
+        }
+
+        // 5. uint16_t overflow: CERT cert_type = 99999 (> 65535)
+        off = 0;
+        dns_record_t cert_rec = {
+            .name = "example.com.",
+            .type = "CERT",
+            .type_code = 37,
+            .ttl_value = 3600,
+            .rdata_count = 4,
+            .rdata = { "99999", "12345", "8", "QUFB" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &cert_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: CERT type > 65535 was not rejected\n");
+            return 1;
+        }
+
+        // 6. Valid records pass
+        off = 0;
+        mx_rec.rdata[0] = "10";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &mx_rec, &c, NULL, 0) != 0) {
+            printf("FAIL: Valid MX record failed serialization\n");
+            return 1;
+        }
+        printf("PASS: Out-of-bounds numeric fields rejection (uint8_t/uint16_t bounds)\n");
+    }
+
+    // --- Test 24: Rate-limit config parsing with invalid numerical values ---
+    {
+        server_config_t rrl_cfg;
+        memset(&rrl_cfg, 0, sizeof(rrl_cfg));
+        const char *conf_invalid_rrl = 
+            "options {\n"
+            "    rate-limit {\n"
+            "        responses-per-second -5;\n"
+            "        nxdomains-per-second abc;\n"
+            "        window 0;\n"
+            "        slip invalid;\n"
+            "    };\n"
+            "};\n";
+        char *copy_rrl = strdup(conf_invalid_rrl);
+        int rrl_res = parse_named_conf(copy_rrl, &rrl_cfg);
+        free(copy_rrl);
+        if (rrl_res != 0) {
+            printf("FAIL: parse_named_conf failed on rate-limit config with invalid values\n");
+            return 1;
+        }
+        // Invalid values should be ignored, leaving defaults:
+        // responses_per_second default = 0, nxdomains default = 0, window default = 15, slip default = 2
+        if (rrl_cfg.rrl.responses_per_second != 0 ||
+            rrl_cfg.rrl.nxdomains_per_second != 0 ||
+            rrl_cfg.rrl.window_seconds != 15 ||
+            rrl_cfg.rrl.slip != 2) {
+            printf("FAIL: Rate-limit invalid values were not properly ignored (res_ps=%u, win=%u, slip=%u)\n",
+                   rrl_cfg.rrl.responses_per_second,
+                   rrl_cfg.rrl.window_seconds,
+                   rrl_cfg.rrl.slip);
+            return 1;
+        }
+
+        // Test valid rate-limit values
+        const char *conf_valid_rrl = 
+            "options {\n"
+            "    rate-limit {\n"
+            "        responses-per-second 100;\n"
+            "        nxdomains-per-second 50;\n"
+            "        window 30;\n"
+            "        slip 4;\n"
+            "    };\n"
+            "};\n";
+        char *copy_valid_rrl = strdup(conf_valid_rrl);
+        rrl_res = parse_named_conf(copy_valid_rrl, &rrl_cfg);
+        free(copy_valid_rrl);
+        if (rrl_res != 0 ||
+            rrl_cfg.rrl.responses_per_second != 100 ||
+            rrl_cfg.rrl.nxdomains_per_second != 50 ||
+            rrl_cfg.rrl.window_seconds != 30 ||
+            rrl_cfg.rrl.slip != 4) {
+            printf("FAIL: Rate-limit valid values were not properly applied\n");
+            return 1;
+        }
+        free_server_config_fields(&rrl_cfg);
+        printf("PASS: Rate-limit invalid value warning & fallback tests\n");
+    }
+
+    // --- Test 25: IPSECKEY and AMTRELAY gateway domain expansion with "03" ---
+    {
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        const char *zone_str =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "host1 IN IPSECKEY 10 03 2 gw AQIDBA==\n"
+            "host2 IN AMTRELAY 10 0 03 gw AQIDBA==\n";
+
+        char *zone_buf = strdup(zone_str);
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "example.com.",
+            .is_standalone_mode = true,
+        };
+        int pr = parse_zone_fast(zone_buf, strlen(zone_buf), &arena, &ctx);
+        free(zone_buf);
+        if (pr < 0 || arena.count < 4) {
+            printf("FAIL: parse_zone_fast failed for IPSECKEY/AMTRELAY test zone (pr=%d, count=%zu)\n", pr, arena.count);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Find host1 IPSECKEY and host2 AMTRELAY
+        dns_record_t *ipseckey_rec = NULL;
+        dns_record_t *amtrelay_rec = NULL;
+        for (size_t i = 0; i < arena.count; i++) {
+            if (arena.records[i].type_code == 45) ipseckey_rec = &arena.records[i];
+            if (arena.records[i].type_code == 260) amtrelay_rec = &arena.records[i];
+        }
+
+        if (!ipseckey_rec || ipseckey_rec->rdata_count < 4 ||
+            strcmp(ipseckey_rec->rdata[3], "gw.example.com.") != 0) {
+            printf("FAIL: IPSECKEY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
+                   (ipseckey_rec && ipseckey_rec->rdata_count >= 4) ? ipseckey_rec->rdata[3] : "null");
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (!amtrelay_rec || amtrelay_rec->rdata_count < 4 ||
+            strcmp(amtrelay_rec->rdata[3], "gw.example.com.") != 0) {
+            printf("FAIL: AMTRELAY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
+                   (amtrelay_rec && amtrelay_rec->rdata_count >= 4) ? amtrelay_rec->rdata[3] : "null");
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: IPSECKEY and AMTRELAY '03' gateway domain expansion test\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

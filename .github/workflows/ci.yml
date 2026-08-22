@@ -11,8 +11,12 @@ on:
 
 jobs:
   build-and-test:
-    name: Build and Test on FreeBSD VM
+    name: Build and Test on FreeBSD ${{ matrix.release }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.4', '15.1']
 
     steps:
       - name: Checkout code
@@ -21,7 +25,7 @@ jobs:
       - name: Build and Smoke Test inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
-          release: '15.1'
+          release: ${{ matrix.release }}
           run: |
             set -e
 
@@ -53,11 +57,20 @@ jobs:
             ./dag google.com TXT @8.8.8.8,9.9.9.9,1.1.1.1 +tcp
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
-            # AXFRテストとASan/TSan/UBSanテスト、ファジングテストをスクリプトで一括実行
+            echo "::group::🛡️ [Functional & Protocol Tests]"
+            sh ./tests/run_paren_check_test.sh
+            sh ./tests/run_ttl_suffix_test.sh
+            sh ./tests/run_zonemd_val_test.sh
+            sh ./tests/run_glue_truncation_test.sh
+            sh ./tests/run_mqtype_qdcount0_test.sh
+            sh ./tests/run_ixfr_roundtrip_test.sh
+            sh ./tests/run_catalog_zone_test.sh
             sh ./tests/run_capsicum_axfr_test.sh
             sh ./tests/run_dynamic_update_test.sh
             sh ./tests/run_roundtrip_test.sh
+            echo "::endgroup::"
+
+            echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
             ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"
 

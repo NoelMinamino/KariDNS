@@ -293,29 +293,53 @@ static int cmp_canonical_rr(const void *a, const void *b) {
     return len1 - len2;
 }
 
+static bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_scheme,
+                                        uint8_t *out_halg, bool warn) {
+    if (!zm || zm->rdata_count < 3 || !zm->rdata[1] || !zm->rdata[2]) return false;
+    char *scheme_endptr, *halg_endptr;
+    long scheme_val = strtol(zm->rdata[1], &scheme_endptr, 10);
+    long halg_val = strtol(zm->rdata[2], &halg_endptr, 10);
+    if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
+        if (warn) {
+            fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
+                    zm->rdata[1], zm->name);
+        }
+        return false;
+    }
+    if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
+        if (warn) {
+            fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
+                    zm->rdata[2], zm->name);
+        }
+        return false;
+    }
+    if (out_scheme) *out_scheme = (uint8_t)scheme_val;
+    if (out_halg) *out_halg = (uint8_t)halg_val;
+    return true;
+}
+
 static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
+    dns_record_t *zonemds[16];
     int zonemd_count = 0;
-    dns_record_t *zonemds[10];
     for (size_t i = 0; i < arena->count; i++) {
         if (arena->records[i].type_code == 63 && strcasecmp(arena->records[i].name, domain) == 0) {
-            if (zonemd_count < 10) zonemds[zonemd_count++] = &arena->records[i];
+            if (zonemd_count < 16) {
+                zonemds[zonemd_count++] = &arena->records[i];
+            }
         }
     }
-    if (zonemd_count == 0) return true;
     
-    if (arena->count > SIZE_MAX / sizeof(dns_record_t *)) {
-        fprintf(stderr, "[ERROR] Record count too large for ZONEMD verification (zone '%s')\n", domain);
-        return false;
-    }
-    dns_record_t **sorted = malloc(arena->count * sizeof(dns_record_t *));
-    if (!sorted) {
-        fprintf(stderr, "[ERROR] Out of memory while sorting records for ZONEMD verification (zone '%s', %zu records)\n", domain, arena->count);
-        return false;
-    }
+    if (zonemd_count == 0) return true; // ZONEMD がなければ検証スキップ (OK)
+    
+    dns_record_t **sorted = malloc(sizeof(dns_record_t *) * arena->count);
+    if (!sorted) return false;
+    
     size_t valid_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *r = &arena->records[i];
-        if (r->type_code == 63 && strcasecmp(r->name, domain) == 0) continue;
+        if (r->type_code == 63) continue; // ZONEMD 自身は除外
+        
+        // Exclude RRSIG covering ZONEMD at apex (RFC 8976 section 3.2)
         if (r->type_code == 46 && strcasecmp(r->name, domain) == 0 &&
             r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
 
@@ -339,10 +363,13 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     bool all_valid = true;
     for (int z = 0; z < zonemd_count; z++) {
         dns_record_t *zm = zonemds[z];
-        if (zm->rdata_count < 4) continue;
-        
-        uint8_t scheme = atoi(zm->rdata[1]);
-        uint8_t halg = atoi(zm->rdata[2]);
+        if (zm->rdata_count < 4) {
+            continue;
+        }
+        uint8_t scheme, halg;
+        if (!validate_zonemd_scheme_halg(zm, &scheme, &halg, false)) {
+            continue;
+        }
         
         if (scheme != 1) continue; 
         if (halg != 1 && halg != 2) continue; 
@@ -604,26 +631,38 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
         
         // --- Add specific field validations ---
+        if (tcode == 63) { // ZONEMD
+            if (strcasecmp(arena.records[i].name, domain) != 0) {
+                fprintf(stderr, "[WARNING] ZONEMD record '%s' is not at the zone apex '%s' (RFC 8976 section 2.1)\n",
+                        arena.records[i].name, domain);
+            }
+            if (rcount < 4) {
+                fprintf(stderr, "[WARNING] ZONEMD record for '%s' has fewer than 4 fields "
+                                "(serial, scheme, hash-algorithm, digest)\n", arena.records[i].name);
+            } else {
+                validate_zonemd_scheme_halg(&arena.records[i], NULL, NULL, true);
+            }
+        }
         if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
             if (rcount >= 3) {
-                int flags = atoi(rdata[0]);
-                int protocol = atoi(rdata[1]);
-                int alg = atoi(rdata[2]);
+                int flags = (int)strtol(rdata[0], NULL, 10);
+                int protocol = (int)strtol(rdata[1], NULL, 10);
+                int alg = (int)strtol(rdata[2], NULL, 10);
                 check_dnssec_algorithm(alg, arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY", flags, protocol);
             }
         }
         if (tcode == 43 || tcode == 59) { // DS / CDS
             if (rcount >= 4) {
-                int key_tag = atoi(rdata[0]);
-                int algorithm = atoi(rdata[1]);
-                int digest_type = atoi(rdata[2]);
+                int key_tag = (int)strtol(rdata[0], NULL, 10);
+                int algorithm = (int)strtol(rdata[1], NULL, 10);
+                int digest_type = (int)strtol(rdata[2], NULL, 10);
                 check_ds_digest_type(digest_type, algorithm, key_tag,
                                      arena.records[i].name, tcode == 43 ? "DS" : "CDS");
             }
         }
         if (tcode == 46) { // RRSIG
             if (rcount >= 2) {
-                check_dnssec_algorithm(atoi(rdata[1]), arena.records[i].name, "RRSIG", -1, -1);
+                check_dnssec_algorithm((int)strtol(rdata[1], NULL, 10), arena.records[i].name, "RRSIG", -1, -1);
             }
         }
         if (tcode == 55) { // HIP
@@ -633,9 +672,10 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
         if (tcode == 11) { // WKS
             if (rcount >= 2) {
-                int proto = atoi(rdata[1]);
-                if (proto == 0 && strcmp(rdata[1], "0") != 0) {
-                    fprintf(stderr, "[WARNING] WKS record protocol '%s' is not a valid number for name '%s'\n", rdata[1], arena.records[i].name);
+                char *endptr;
+                long proto = strtol(rdata[1], &endptr, 10);
+                if (*endptr != '\0' || proto < 0 || proto > 255) {
+                    fprintf(stderr, "[WARNING] WKS record protocol '%s' is not a valid number (0-255) for name '%s'\n", rdata[1], arena.records[i].name);
                 }
             }
         }
@@ -713,9 +753,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
         if (tcode == 50 || tcode == 51) { // NSEC3 / NSEC3PARAM
             if (rcount >= 3) {
-                int algo = atoi(rdata[0]);
-                int flags = atoi(rdata[1]);
-                int iterations = atoi(rdata[2]);
+                int algo = (int)strtol(rdata[0], NULL, 10);
+                int flags = (int)strtol(rdata[1], NULL, 10);
+                int iterations = (int)strtol(rdata[2], NULL, 10);
                 if (algo != 1) {
                     fprintf(stderr, "[WARNING] NSEC3/NSEC3PARAM hash algorithm should be 1 (SHA-1); other values are undefined (RFC 5155) for name '%s'\n", arena.records[i].name);
                 }

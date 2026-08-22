@@ -4,9 +4,31 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+// ============================================================================
+// 数値フィールド安全パースヘルパー (0-255, 0-65535 範囲検証付き)
+// ============================================================================
+static inline bool parse_u8(const char *s, uint8_t *out) {
+    if (!s || !*s) return false;
+    char *endptr;
+    long val = strtol(s, &endptr, 10);
+    if (*endptr != '\0' || val < 0 || val > 255) return false;
+    if (out) *out = (uint8_t)val;
+    return true;
+}
+
+static inline bool parse_u16(const char *s, uint16_t *out) {
+    if (!s || !*s) return false;
+    char *endptr;
+    long val = strtol(s, &endptr, 10);
+    if (*endptr != '\0' || val < 0 || val > 65535) return false;
+    if (out) *out = (uint16_t)val;
+    return true;
+}
 
 // Forward declarations
 struct server_config_s;
@@ -211,6 +233,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
+uint32_t parse_ttl_value(const char *ttl_str);
 
 // EDNS
 int parse_edns_opt(const uint8_t *req, size_t req_len,

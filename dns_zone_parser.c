@@ -553,6 +553,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
 
         rec->name = expand_domain_name(name_copy, origin, arena);
         rec->ttl = (char *)ttl_str;
+        rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
         rec->class_str = (char *)class_str;
         rec->type = (char *)type_str;
         rec->type_code = type_code;
@@ -592,8 +593,17 @@ STATE_START_LINE:
     goto SKIP_WHITESPACE;
   }
 STATE_FIND_TOKEN:
-  if (p >= end)
+  if (p >= end) {
+    if (in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Unbalanced parenthesis: '(' was never closed before end of file";
+        ctx->err_out->error_offset = (size_t)(buf ? (p - buf) : 0);
+        ctx->err_out->token_length = 0;
+      }
+      return -1;
+    }
     goto PROCESS_RECORD;
+  }
   if (IS_SPACE(*p))
     goto SKIP_WHITESPACE;
   if (IS_NEWLINE(*p)) {
@@ -612,11 +622,27 @@ STATE_FIND_TOKEN:
     goto STATE_FIND_TOKEN;
   }
   if (*p == '(') {
+    if (in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Nested parentheses are not allowed in zone file records";
+        ctx->err_out->error_offset = (size_t)(p - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 1;
     *p++ = '\0';
     goto STATE_FIND_TOKEN;
   }
   if (*p == ')') {
+    if (!in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Unmatched ')' with no preceding '(' in zone file record";
+        ctx->err_out->error_offset = (size_t)(p - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 0;
     *p++ = '\0';
     goto STATE_FIND_TOKEN;
@@ -672,6 +698,14 @@ STATE_FIND_TOKEN:
           
           // ファイル末尾に到達した場合でも、最後のトークンのクォートを除去する
           if (p >= end) {
+            if (in_parens) {
+              if (ctx && ctx->err_out) {
+                ctx->err_out->error_message = "Unbalanced parenthesis: '(' was never closed before end of file";
+                ctx->err_out->error_offset = (size_t)(buf ? (p - buf) : 0);
+                ctx->err_out->token_length = 0;
+              }
+              return -1;
+            }
             if (field_idx > 0) {
                 if (fields[field_idx - 1][0] == '"') {
                     fields[field_idx - 1]++;
@@ -700,10 +734,26 @@ STATE_FIND_TOKEN:
     goto PROCESS_RECORD;
   }
   if (delimiter == '(') {
+    if (in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Nested parentheses are not allowed in zone file records";
+        ctx->err_out->error_offset = (size_t)(p - 1 - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 1;
     goto STATE_FIND_TOKEN;
   }
   if (delimiter == ')') {
+    if (!in_parens) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Unmatched ')' with no preceding '(' in zone file record";
+        ctx->err_out->error_offset = (size_t)(p - 1 - buf);
+        ctx->err_out->token_length = 1;
+      }
+      return -1;
+    }
     in_parens = 0;
     goto STATE_FIND_TOKEN;
   }
@@ -808,7 +858,7 @@ PROCESS_RECORD:
     return -1;
   }
   
-  rec->ttl_value = rec->ttl ? (uint32_t)strtoul(rec->ttl, NULL, 10) : 3600;
+  rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
   rec->class_val = 1; // Default to IN
   if (rec->class_str && strcasecmp(rec->class_str, "CH") == 0) {
       rec->class_val = 3;
@@ -918,11 +968,13 @@ PROCESS_RECORD:
       if (rec->rdata_count > 2)
         rec->rdata[2] = expand_domain_name(rec->rdata[2], *origin_io, arena);
     } else if (rec->type_code == 45) { // IPSECKEY
-      if (rec->rdata_count > 3 && atoi(rec->rdata[1]) == 3) {
+      uint8_t gw_type;
+      if (rec->rdata_count > 3 && parse_u8(rec->rdata[1], &gw_type) && gw_type == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     } else if (rec->type_code == 260) { // AMTRELAY
-      if (rec->rdata_count > 3 && atoi(rec->rdata[2]) == 3) {
+      uint8_t gw_type;
+      if (rec->rdata_count > 3 && parse_u8(rec->rdata[2], &gw_type) && gw_type == 3) {
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     } else if (rec->type_code == 55) { // HIP

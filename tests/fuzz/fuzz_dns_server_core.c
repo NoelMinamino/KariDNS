@@ -162,11 +162,81 @@ static void test_mqtype_qdcount0_formerr(void) {
     }
 }
 
+static void test_resolve_name_servfail_rcode_clearing(void) {
+    // 1. Test empty / uninitialized zone arena
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+
+    zone_arena_t *empty_zone = NULL;
+    zone_db_entry_t *db_entry_ptr = &db_entry;
+    zone_arena_t **zone_ptr = &empty_zone;
+
+    uint8_t res[512] = {0};
+    res[3] = 0x83; // Pre-set RCODE=3 (NXDOMAIN)
+    uint16_t offset = 12, ancount = 0, nscount = 0, arcount = 0;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init_packet(&comp_ctx);
+
+    uint16_t qtype = 1;
+    resolve_name("example.com.", &qtype, 1,
+                 &db_entry_ptr, zone_ptr, res,
+                 sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount,
+                 false, false, 0, false, NULL, NULL);
+    if ((res[3] & 0x0F) != 2) {
+        // Must be exactly SERVFAIL (2), not (3 | 2 = 3)
+        abort();
+    }
+
+    // 2. Test CNAME loop / chain exhaustion (> 16 hops)
+    zone_arena_t loop_arena;
+    memset(&loop_arena, 0, sizeof(loop_arena));
+    zone_arena_init(&loop_arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char loop_zone[] = "example.com. 3600 IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400\n"
+                       "example.com. 3600 IN NS ns1.example.com.\n"
+                       "loop.example.com. 3600 IN CNAME loop.example.com.\n";
+    if (parse_zone_fast(loop_zone, strlen(loop_zone), &loop_arena, &ctx) < 0) {
+        zone_arena_destroy(&loop_arena);
+        abort();
+    }
+    build_zone_index(&loop_arena);
+
+    zone_arena_t *current_zone = &loop_arena;
+    zone_ptr = &current_zone;
+
+    memset(res, 0, sizeof(res));
+    res[3] = 0x83; // Pre-set RCODE=3 (NXDOMAIN)
+    offset = 12; ancount = 0; nscount = 0; arcount = 0;
+    compress_ctx_init_packet(&comp_ctx);
+
+    resolve_name("loop.example.com.", &qtype, 1,
+                 &db_entry_ptr, zone_ptr, res,
+                 sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount,
+                 false, false, 0, false, NULL, NULL);
+    if ((res[3] & 0x0F) != 2) {
+        // Must be exactly SERVFAIL (2) on CNAME loop exhaustion
+        zone_arena_destroy(&loop_arena);
+        abort();
+    }
+    zone_arena_destroy(&loop_arena);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     static bool mqtype_trunc_tested = false;
     if (!mqtype_trunc_tested) {
         test_mqtype_truncation();
         test_mqtype_qdcount0_formerr();
+        test_resolve_name_servfail_rcode_clearing();
         mqtype_trunc_tested = true;
     }
 
