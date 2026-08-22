@@ -91,6 +91,8 @@ run_check "EDNS CO flag (+coflag)" "$DAG @127.0.0.1 -p $PORT example.com A +cofl
 
 # 5. Recovery & Error Handling
 run_check "BADCOOKIE auto retry (+badcookie)" "$DAG @127.0.0.1 -p $PORT badcookie.example A +badcookie" ";; BADCOOKIE, retrying\."
+run_check "BADVERS retry (+ednsnegotiation)" "$DAG @127.0.0.1 -p $PORT badvers.example A +edns=1 +ednsnegotiation" ";; BADVERS, retrying with EDNS version 0\."
+run_check "BADVERS no retry (+noednsnegotiation)" "$DAG @127.0.0.1 -p $PORT badvers.example A +edns=1 +noednsnegotiation" "status: BADVERS"
 run_check "Best effort parser (+besteffort)" "$DAG @127.0.0.1 -p $PORT malformed-trunc.example A +besteffort" ";; Warning: Message parser reports malformed message packet\."
 
 # 6. Header overrides & formatting

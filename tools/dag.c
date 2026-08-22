@@ -423,6 +423,7 @@ typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL, UPDATE_OP_DEL_EXACT } update_op_kin
 typedef struct {
     uint16_t qclass;
     bool want_opt;
+    uint8_t edns_version;
     uint16_t udp_payload_size;
     bool dnssec_ok;
     bool compact_answers_ok;
@@ -749,7 +750,7 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
     pkt[offset++] = 0x00; pkt[offset++] = 41; /* TYPE = OPT */
     pkt[offset++] = qo->udp_payload_size >> 8; pkt[offset++] = qo->udp_payload_size & 0xFF;
     pkt[offset++] = 0x00; /* extended RCODE */
-    pkt[offset++] = 0x00; /* version */
+    pkt[offset++] = qo->edns_version; /* version */
     uint16_t flags = 0;
     if (qo->dnssec_ok) flags |= 0x8000;
     if (qo->compact_answers_ok) flags |= 0x4000;
@@ -3504,6 +3505,40 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         }
 
+        if (n >= 12 && qo->edns_negotiation && qo->want_opt) {
+            uint16_t bv_qd = (resp[4] << 8) | resp[5];
+            uint16_t bv_an = (resp[6] << 8) | resp[7];
+            uint16_t bv_ns = (resp[8] << 8) | resp[9];
+            uint16_t bv_ar = (resp[10] << 8) | resp[11];
+            edns_info_t bv_edns;
+            parse_edns_opt(resp, n, bv_qd, bv_an, bv_ns, bv_ar, &bv_edns);
+            uint16_t bv_rcode = bv_edns.present
+                ? (((uint16_t)bv_edns.ext_rcode << 4) | (resp[3] & 0x0F))
+                : (resp[3] & 0x0F);
+            if (bv_rcode == 16 && qo->edns_version > 0) {
+                if (dopt->show_badvers_msg && !dopt->short_mode) {
+                    print_response(resp, (size_t)n, &axfr_state, dopt);
+                    printf("\n");
+                }
+                printf(";; BADVERS, retrying with EDNS version %d.\n", qo->edns_version - 1);
+                qo->edns_version -= 1;
+                pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
+                if (qo->use_doh) {
+                    n = do_doh_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                } else if (qo->use_tls) {
+                    n = do_tls_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                } else if (use_tcp) {
+                    int s = do_tcp_send_request(server, port, qo, pkt, pkt_len, qo->timeout_sec);
+                    if (s >= 0) {
+                        n = do_tcp_recv_response(s, resp, sizeof(resp));
+                        close(s);
+                    }
+                } else {
+                    n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                }
+            }
+        }
+
         bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
 
         int msg_index = 1;
@@ -5281,8 +5316,11 @@ int main(int argc, char **argv) {
                 } else {
                     parse_break_arg(brk);
                 }
-            } else if (strcmp(argv[i], "+edns") == 0 || strncmp(argv[i], "+edns=", 6) == 0) {
+            } else if (strcmp(argv[i], "+edns") == 0) {
                 qo.want_opt = true;
+            } else if (strncmp(argv[i], "+edns=", 6) == 0) {
+                qo.want_opt = true;
+                qo.edns_version = (uint8_t)strtoul(argv[i] + 6, NULL, 10);
             } else if (strcmp(argv[i], "+noedns") == 0) {
                 qo.want_opt = false;
             } else if (strcmp(argv[i], "+dnssec") == 0 || strcmp(argv[i], "+do") == 0) {
