@@ -660,7 +660,7 @@ static bool parse_proxy_arg(const char *arg, query_opts_t *qo) {
 }
 
 static size_t build_proxyv2_header(uint8_t *buf, size_t buf_cap, const query_opts_t *qo, bool is_tcp) {
-    if (!qo->use_proxy || buf_cap < 16) return 0;
+    if (!qo->use_proxy || buf_cap < 52) return 0;
     static const uint8_t v2sig[12] = {
         0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
     };
@@ -1495,9 +1495,11 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
 static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
-    (void)timeout_sec;
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port);
     if (sock < 0) return -1;
+    struct timeval tv = { .tv_sec = timeout_sec > 0 ? timeout_sec : 5, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (qo->use_proxy) {
         uint8_t pbuf[64];
         size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
@@ -1555,9 +1557,11 @@ static void base64url_encode(const uint8_t *data, size_t len, char *out, size_t 
 static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
-    (void)timeout_sec;
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port);
     if (sock < 0) return -1;
+    struct timeval tv = { .tv_sec = timeout_sec > 0 ? timeout_sec : 5, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (qo->use_proxy) {
         uint8_t pbuf[64];
         size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
@@ -1575,6 +1579,13 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
 
     if (qo->doh_method == DOH_GET) {
         char b64_dns[8192];
+        size_t b64_needed = ((pkt_len + 2) / 3) * 4 + 1;
+        if (b64_needed > sizeof(b64_dns)) {
+            fprintf(stderr, ";; Query too large for +https-get (use +https-post or +https instead)\n");
+            if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+            close(sock);
+            return -1;
+        }
         base64url_encode(pkt, pkt_len, b64_dns, sizeof(b64_dns));
         req_hdr_len = snprintf(req_hdr, sizeof(req_hdr),
             "GET %s?dns=%s HTTP/1.1\r\n"
@@ -1621,16 +1632,22 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     close(sock);
 
     if (http_len < 16) return -1;
-    char *hdr_end = strstr((char *)http_buf, "\r\n\r\n");
-    if (!hdr_end) return -1;
-    size_t body_offset = (uint8_t *)hdr_end + 4 - http_buf;
+    uint8_t *hdr_end_u8 = memmem(http_buf, http_len, "\r\n\r\n", 4);
+    if (!hdr_end_u8) return -1;
+    size_t header_len = hdr_end_u8 - http_buf;
+    size_t body_offset = header_len + 4;
     size_t body_len = http_len - body_offset;
 
-    char *cl = strcasestr((char *)http_buf, "Content-Length:");
-    if (cl && (char *)cl < hdr_end) {
-        size_t cl_val = (size_t)strtoul(cl + 15, NULL, 10);
-        if (cl_val < body_len) body_len = cl_val;
+    size_t cl_val = 0;
+    bool found_cl = false;
+    for (size_t i = 0; i + 15 <= header_len; i++) {
+        if (strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
+            cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
+            found_cl = true;
+            break;
+        }
     }
+    if (found_cl && cl_val < body_len) body_len = cl_val;
 
     if (body_len > resp_cap) body_len = resp_cap;
     memcpy(resp, http_buf + body_offset, body_len);
