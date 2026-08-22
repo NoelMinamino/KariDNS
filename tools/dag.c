@@ -2788,11 +2788,15 @@ static const char *format_class_name(uint16_t klass, char *buf, size_t buf_size)
     }
 }
 
-static const char *idn_to_ascii(const char *name) {
+static const char *idn_to_ascii(const char *name, bool *allocated) {
+    if (allocated) *allocated = false;
 #ifdef HAVE_LIBIDN2
-    char *p;
+    char *p = NULL;
     int rc = idn2_lookup_ul(name, &p, 0);
-    if (rc == IDN2_OK) return p;
+    if (rc == IDN2_OK) {
+        if (allocated) *allocated = true;
+        return p;
+    }
     fprintf(stderr, ";; IDN conversion failed: %s\n", idn2_strerror(rc));
 #endif
     return name;
@@ -5535,7 +5539,8 @@ int main(int argc, char **argv) {
             if (!b_qname) continue;
             if (!b_qtype) b_qtype = "A";
             
-            if (qo.idnin) b_qname = (char *)idn_to_ascii(b_qname);
+            bool b_allocated = false;
+            if (qo.idnin) b_qname = (char *)idn_to_ascii(b_qname, &b_allocated);
 
             const char *eff_server = b_server ? b_server : server_arg;
             if (do_trace) {
@@ -5547,10 +5552,14 @@ int main(int argc, char **argv) {
                                adflag, cdflag, aaflag, tcflag, zflag,
                                no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
             }
+#ifdef HAVE_LIBIDN2
+            if (b_allocated) idn2_free((void *)b_qname);
+#endif
         }
         fclose(bf);
     } else {
-        if (qo.idnin) qname = (char *)idn_to_ascii(qname);
+        bool q_allocated = false;
+        if (qo.idnin) qname = (char *)idn_to_ascii(qname, &q_allocated);
 
         int exit_code = 0;
         if (do_trace) {
@@ -5562,6 +5571,9 @@ int main(int argc, char **argv) {
                                        adflag, cdflag, aaflag, tcflag, zflag,
                                        no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
         }
+#ifdef HAVE_LIBIDN2
+        if (q_allocated) idn2_free((void *)qname);
+#endif
 
         bool used_nofail_failover = qo.nofail && (!test_all) && (!do_trace) && (!do_nssearch) && (!batch_file) && (server_arg && strchr(server_arg, ',') != NULL);
         if (!used_nofail_failover) {
@@ -5581,10 +5593,7 @@ int main(int argc, char **argv) {
         return exit_code;
     }
 
-    bool used_nofail_failover = qo.nofail && (!test_all) && (!do_trace) && (!do_nssearch) && (!batch_file) && (server_arg && strchr(server_arg, ',') != NULL);
-    if (!used_nofail_failover) {
-        print_multi_server_summary(use_ldnsz);
-    }
+    print_multi_server_summary(use_ldnsz);
 
 #ifndef _WIN32
     if (qo.mem_debug) {
