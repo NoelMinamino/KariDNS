@@ -289,6 +289,8 @@ echo "========================================================"
 if "$DAG" @1.1.1.1 example.com A +timeout=2 +tries=1 >/dev/null 2>&1; then
     echo "Internet connectivity detected. Running Live DoT & DoH tests..."
     run_check "Live DoT (RFC 7858) @8.8.8.8" "$DAG @8.8.8.8 www.google.com A +tls +timeout=4" "142\.25[0-9]\.[0-9]+"
+    run_check "Live DoT with default CA & SNI verification" "$DAG @8.8.8.8 www.google.com A +tls +tls-ca +tls-hostname=dns.google +timeout=4" "142\.25[0-9]\.[0-9]+"
+    run_check "Live DoT with mismatched hostname rejected" "$DAG @8.8.8.8 www.google.com A +tls +tls-ca +tls-hostname=mismatch.invalid +timeout=4" "(TLS peer certificate verification|hostname mismatch|verification failed)"
     run_check "Live DoH (RFC 8484) @1.1.1.1" "$DAG @1.1.1.1 www.cloudflare.com A +https +timeout=4" "104\.1[0-9]\.[0-9]+"
 else
     echo "No direct outbound internet connectivity. Skipping live DoT/DoH network tests."

@@ -42,6 +42,8 @@
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
 #ifdef HAVE_LIBIDN2
 #include <idn2.h>
 #endif
@@ -1449,10 +1451,40 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     SSL_set_fd(ssl, tcp_sock);
     const char *sni_host = qo->tls_hostname ? qo->tls_hostname : server;
     struct in_addr a4; struct in6_addr a6;
-    if (inet_pton(AF_INET, sni_host, &a4) != 1 && inet_pton(AF_INET6, sni_host, &a6) != 1) {
+    bool sni_is_ip = (inet_pton(AF_INET, sni_host, &a4) == 1 || inet_pton(AF_INET6, sni_host, &a6) == 1);
+    if (!sni_is_ip) {
         SSL_set_tlsext_host_name(ssl, sni_host);
     }
+
+    /* 証明書検証を行うモード(tls_ca_fileまたはtls_verify_default_store指定時)
+       のみ、ホスト名検証パラメータを明示的に設定する */
+    if (qo->tls_ca_file || qo->tls_verify_default_store) {
+        X509_VERIFY_PARAM *vpm = SSL_get0_param(ssl);
+        if (sni_is_ip) {
+            X509_VERIFY_PARAM_set1_ip_asc(vpm, sni_host);
+        } else {
+            X509_VERIFY_PARAM_set1_host(vpm, sni_host, 0);
+        }
+    }
+
     if (SSL_connect(ssl) <= 0) {
+        if (qo->tls_ca_file || qo->tls_verify_default_store) {
+            long vres = SSL_get_verify_result(ssl);
+            if (vres != X509_V_OK) {
+                fprintf(stderr, ";; TLS peer certificate verification for %s failed: %s\n",
+                        server, X509_verify_cert_error_string(vres));
+            }
+        }
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    /* ハンドシェイク成功後も、検証結果を明示的に再確認する */
+    if ((qo->tls_ca_file || qo->tls_verify_default_store) &&
+        SSL_get_verify_result(ssl) != X509_V_OK) {
+        fprintf(stderr, ";; TLS peer certificate verification for %s failed: %s\n",
+                server, X509_verify_cert_error_string(SSL_get_verify_result(ssl)));
+        SSL_shutdown(ssl);
         SSL_free(ssl);
         return NULL;
     }
