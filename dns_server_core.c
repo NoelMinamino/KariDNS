@@ -3351,6 +3351,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (edns.saw_invalid_mqtype_response_in_query || edns.mqtype_query_duplicated) {
+    memcpy(res, req, DNS_HEADER_SIZE);
     res[2] |= 0x80;
     res[3] = (res[3] & 0xF0) | 1; // FORMERR
     res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
@@ -3460,6 +3461,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     if (edns.has_mqtype_query) {
+      memcpy(res, req, DNS_HEADER_SIZE);
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
@@ -3545,7 +3547,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 5) { // UPDATE
     if (edns.has_mqtype_query) {
-      syslog(LOG_INFO, "[DEBUG-UPDATE] FORMERR due to MQTYPE query");
+      memcpy(res, req, DNS_HEADER_SIZE);
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;

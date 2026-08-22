@@ -1,5 +1,9 @@
 #!/bin/sh
-# Test RFC 10029 §3.3: MQTYPE-Query option with QDCOUNT=0 MUST return FORMERR.
+# Test RFC 10029 FORMERR cases and ID preservation:
+# 1. QDCOUNT=0 with MQTYPE-Query option (Opcode=0)
+# 2. QDCOUNT>=1 with MQTYPE-Response option in Query (Opcode=0)
+# 3. NOTIFY (Opcode=4) with MQTYPE-Query option
+# 4. UPDATE (Opcode=5) with MQTYPE-Query option
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -45,33 +49,45 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Send raw DNS query using dag --hex=
-# Packet breakdown:
-# 1234 : ID
-# 0000 : Opcode=0, Flags=0
-# 0000 : QDCOUNT=0
-# 0000 : ANCOUNT=0
-# 0000 : NSCOUNT=0
-# 0001 : ARCOUNT=1 (OPT)
-# 00   : Root name
-# 0029 : Type OPT (41)
-# 1000 : UDP payload size (4096)
-# 00000000 : Ext RCODE / Flags
-# 0006 : RDLEN = 6
-# 0014 : Option code 20 (MQTYPE-Query)
-# 0002 : Option length 2
-# 0010 : QTYPE TXT (16)
-HEX_PKT="1234000000000000000000010000291000000000000006001400020010"
+echo "========================================================"
+echo "Test 1: QDCOUNT=0 query with MQTYPE-Query option (Opcode=0)"
+echo "========================================================"
+HEX_PKT1="1234000000000000000000010000291000000000000006001400020010"
+"$BIN_DIR/dag" "--hex=$HEX_PKT1" @127.0.0.1 -p 53531 > dag_out1.txt 2>&1 || true
+cat dag_out1.txt
+grep "status: FORMERR" dag_out1.txt || { echo "FAIL: Test 1 status is not FORMERR"; cat karidns.log; exit 1; }
+grep "id: 4660" dag_out1.txt || { echo "FAIL: Test 1 transaction ID mismatch (expected 0x1234 = 4660)"; exit 1; }
+echo "[+] Test 1 passed: ID 0x1234 preserved on FORMERR."
 
-echo "[+] Sending QDCOUNT=0 query with MQTYPE-Query option via dag --hex=..."
-"$BIN_DIR/dag" "--hex=$HEX_PKT" @127.0.0.1 -p 53531 > dag_out.txt 2>&1 || true
-cat dag_out.txt
+echo "========================================================"
+echo "Test 2: QDCOUNT=1 query with MQTYPE-Response option (Opcode=0)"
+echo "========================================================"
+HEX_PKT2="234500000001000000000001076578616d706c6503636f6d00000100010000291000000000000006001500020010"
+"$BIN_DIR/dag" "--hex=$HEX_PKT2" @127.0.0.1 -p 53531 > dag_out2.txt 2>&1 || true
+cat dag_out2.txt
+grep "status: FORMERR" dag_out2.txt || { echo "FAIL: Test 2 status is not FORMERR"; cat karidns.log; exit 1; }
+grep "id: 9029" dag_out2.txt || { echo "FAIL: Test 2 transaction ID mismatch (expected 0x2345 = 9029)"; exit 1; }
+echo "[+] Test 2 passed: ID 0x2345 preserved on FORMERR."
 
-grep "status: FORMERR" dag_out.txt || {
-    echo "FAIL: Expected status: FORMERR for QDCOUNT=0 query with MQTYPE-Query"
-    cat karidns.log
-    exit 1
-}
+echo "========================================================"
+echo "Test 3: NOTIFY query with MQTYPE-Query option (Opcode=4)"
+echo "========================================================"
+HEX_PKT3="345620000001000000000001076578616d706c6503636f6d00000600010000291000000000000006001400020010"
+"$BIN_DIR/dag" "--hex=$HEX_PKT3" @127.0.0.1 -p 53531 > dag_out3.txt 2>&1 || true
+cat dag_out3.txt
+grep "status: FORMERR" dag_out3.txt || { echo "FAIL: Test 3 status is not FORMERR"; cat karidns.log; exit 1; }
+grep "id: 13398" dag_out3.txt || { echo "FAIL: Test 3 transaction ID mismatch (expected 0x3456 = 13398)"; exit 1; }
+echo "[+] Test 3 passed: ID 0x3456 preserved on FORMERR."
 
-echo "[+] RFC 10029 §3.3 QDCOUNT=0 MQTYPE test passed successfully (FORMERR verified)."
+echo "========================================================"
+echo "Test 4: UPDATE query with MQTYPE-Query option (Opcode=5)"
+echo "========================================================"
+HEX_PKT4="456728000001000000000001076578616d706c6503636f6d00000600010000291000000000000006001400020010"
+"$BIN_DIR/dag" "--hex=$HEX_PKT4" @127.0.0.1 -p 53531 > dag_out4.txt 2>&1 || true
+cat dag_out4.txt
+grep "status: FORMERR" dag_out4.txt || { echo "FAIL: Test 4 status is not FORMERR"; cat karidns.log; exit 1; }
+grep "id: 17767" dag_out4.txt || { echo "FAIL: Test 4 transaction ID mismatch (expected 0x4567 = 17767)"; exit 1; }
+echo "[+] Test 4 passed: ID 0x4567 preserved on FORMERR."
+
+echo "[+] All RFC 10029 FORMERR & ID preservation tests passed successfully!"
 exit 0
