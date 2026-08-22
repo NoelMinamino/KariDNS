@@ -293,30 +293,49 @@ static int cmp_canonical_rr(const void *a, const void *b) {
     return len1 - len2;
 }
 
+static bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_scheme, uint8_t *out_halg) {
+    if (!zm || zm->rdata_count < 3 || !zm->rdata[1] || !zm->rdata[2]) return false;
+    char *scheme_endptr, *halg_endptr;
+    long scheme_val = strtol(zm->rdata[1], &scheme_endptr, 10);
+    long halg_val = strtol(zm->rdata[2], &halg_endptr, 10);
+    if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
+        fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
+                zm->rdata[1], zm->name);
+        return false;
+    }
+    if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
+        fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
+                zm->rdata[2], zm->name);
+        return false;
+    }
+    if (out_scheme) *out_scheme = (uint8_t)scheme_val;
+    if (out_halg) *out_halg = (uint8_t)halg_val;
+    return true;
+}
+
 static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
+    dns_record_t *zonemds[16];
     int zonemd_count = 0;
-    dns_record_t *zonemds[10];
     for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 63 && strcasecmp(arena->records[i].name, domain) == 0) {
-            if (zonemd_count < 10) zonemds[zonemd_count++] = &arena->records[i];
+        if (arena->records[i].type_code == 63) {
+            if (zonemd_count < 16) {
+                zonemds[zonemd_count++] = &arena->records[i];
+            }
         }
     }
-    if (zonemd_count == 0) return true;
     
-    if (arena->count > SIZE_MAX / sizeof(dns_record_t *)) {
-        fprintf(stderr, "[ERROR] Record count too large for ZONEMD verification (zone '%s')\n", domain);
-        return false;
-    }
-    dns_record_t **sorted = malloc(arena->count * sizeof(dns_record_t *));
-    if (!sorted) {
-        fprintf(stderr, "[ERROR] Out of memory while sorting records for ZONEMD verification (zone '%s', %zu records)\n", domain, arena->count);
-        return false;
-    }
+    if (zonemd_count == 0) return true; // ZONEMD がなければ検証スキップ (OK)
+    
+    dns_record_t **sorted = malloc(sizeof(dns_record_t *) * arena->count);
+    if (!sorted) return false;
+    
     size_t valid_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *r = &arena->records[i];
-        if (r->type_code == 63 && strcasecmp(r->name, domain) == 0) continue;
-        if (r->type_code == 46 && strcasecmp(r->name, domain) == 0 &&
+        if (r->type_code == 63) continue; // ZONEMD 自身は除外
+        
+        // ZONEMD covered type in DSYNC or others
+        if (r->type_code == 66 && // DSYNC
             r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
 
         size_t name_len = strlen(r->name);
@@ -339,21 +358,15 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     bool all_valid = true;
     for (int z = 0; z < zonemd_count; z++) {
         dns_record_t *zm = zonemds[z];
-        char *scheme_endptr, *halg_endptr;
-        long scheme_val = strtol(zm->rdata[1], &scheme_endptr, 10);
-        long halg_val = strtol(zm->rdata[2], &halg_endptr, 10);
-        if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
-            fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
-                    zm->rdata[1], zm->name);
+        if (zm->rdata_count < 4) {
+            fprintf(stderr, "[WARNING] ZONEMD record for '%s' has fewer than 4 fields "
+                            "(serial, scheme, hash-algorithm, digest); skipping\n", zm->name);
             continue;
         }
-        if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
-            fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
-                    zm->rdata[2], zm->name);
+        uint8_t scheme, halg;
+        if (!validate_zonemd_scheme_halg(zm, &scheme, &halg)) {
             continue;
         }
-        uint8_t scheme = (uint8_t)scheme_val;
-        uint8_t halg = (uint8_t)halg_val;
         
         if (scheme != 1) continue; 
         if (halg != 1 && halg != 2) continue; 
@@ -616,18 +629,11 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         
         // --- Add specific field validations ---
         if (tcode == 63) { // ZONEMD
-            if (rcount >= 3) {
-                char *scheme_endptr, *halg_endptr;
-                long scheme_val = strtol(rdata[1], &scheme_endptr, 10);
-                long halg_val = strtol(rdata[2], &halg_endptr, 10);
-                if (*scheme_endptr != '\0' || scheme_val < 0 || scheme_val > 255) {
-                    fprintf(stderr, "[WARNING] ZONEMD scheme '%s' is not a valid number (0-255) for name '%s'\n",
-                            rdata[1], arena.records[i].name);
-                }
-                if (*halg_endptr != '\0' || halg_val < 0 || halg_val > 255) {
-                    fprintf(stderr, "[WARNING] ZONEMD hash algorithm '%s' is not a valid number (0-255) for name '%s'\n",
-                            rdata[2], arena.records[i].name);
-                }
+            if (rcount < 4) {
+                fprintf(stderr, "[WARNING] ZONEMD record for '%s' has fewer than 4 fields "
+                                "(serial, scheme, hash-algorithm, digest)\n", arena.records[i].name);
+            } else {
+                validate_zonemd_scheme_halg(&arena.records[i], NULL, NULL);
             }
         }
         if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
