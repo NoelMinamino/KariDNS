@@ -1654,7 +1654,21 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (w < 0) return -1;
                 offset += w;
                 
-                // SvcParamsのシリアライズ
+                // SvcParamsの収集 & ソート (RFC 9460 §2.1, §2.2, §8)
+                typedef struct {
+                    uint16_t key;
+                    uint16_t val_offset;
+                    uint16_t val_len;
+                } svcparam_entry_t;
+
+                svcparam_entry_t params[64];
+                uint8_t val_storage[8192];
+                int param_count = 0;
+                uint16_t storage_offset = 0;
+                uint16_t mandatory_refs[64];
+                size_t mandatory_ref_count = 0;
+                bool has_mandatory_param = false;
+
                 for (int i = 2; i < rec->rdata_count; i++) {
                     const char *param = rec->rdata[i];
                     char *eq = strchr(param, '=');
@@ -1679,13 +1693,78 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     else if (strcasecmp(key_str, "ipv4hint") == 0) key = 4;
                     else if (strcasecmp(key_str, "ech") == 0) key = 5;
                     else if (strcasecmp(key_str, "ipv6hint") == 0) key = 6;
-                    else if (strncasecmp(key_str, "key", 3) == 0) key = atoi(key_str + 3);
-                    else continue;
+                    else if (strncasecmp(key_str, "key", 3) == 0) {
+                        char *endptr;
+                        long kval = strtol(key_str + 3, &endptr, 10);
+                        if (*endptr != '\0' || kval < 0 || kval > 65535) return -1; // 不正なkeyNNN
+                        key = (uint16_t)kval;
+                    } else continue;
+
+                    // RFC 9460 §14.3.2: 65535 は "Invalid key" として予約されており使用不可
+                    if (key == 65535) return -1;
                     
-                    uint8_t val_wire[8192];
+                    if (param_count >= 64) return -1;
+                    // RFC 9460 §2.1: keys MUST NOT be repeated
+                    for (int j = 0; j < param_count; j++) {
+                        if (params[j].key == key) return -1;
+                    }
+
+                    uint8_t val_wire[4096];
                     uint16_t val_len = 0;
                     if (val_str) {
-                        if (key == 1) { // alpn
+                        if (key == 0) { // mandatory (RFC 9460 §8)
+                            uint16_t mkeys[64];
+                            size_t mkey_count = 0;
+                            const char *p = val_str;
+                            while (*p) {
+                                const char *comma = strchr(p, ',');
+                                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                                char mkey_str[64];
+                                if (len >= sizeof(mkey_str)) return -1;
+                                memcpy(mkey_str, p, len); mkey_str[len] = '\0';
+
+                                uint16_t mkey = 0;
+                                if (strcasecmp(mkey_str, "alpn") == 0) mkey = 1;
+                                else if (strcasecmp(mkey_str, "no-default-alpn") == 0) mkey = 2;
+                                else if (strcasecmp(mkey_str, "port") == 0) mkey = 3;
+                                else if (strcasecmp(mkey_str, "ipv4hint") == 0) mkey = 4;
+                                else if (strcasecmp(mkey_str, "ech") == 0) mkey = 5;
+                                else if (strcasecmp(mkey_str, "ipv6hint") == 0) mkey = 6;
+                                else if (strncasecmp(mkey_str, "key", 3) == 0) {
+                                    char *endptr;
+                                    long kval = strtol(mkey_str + 3, &endptr, 10);
+                                    if (*endptr != '\0' || kval <= 0 || kval >= 65535) return -1;
+                                    mkey = (uint16_t)kval;
+                                } else return -1; // 未知のキー名は不正
+
+                                if (mkey == 0 || mkey_count >= 64) return -1;
+                                for (size_t j = 0; j < mkey_count; j++) {
+                                    if (mkeys[j] == mkey) return -1; // 重複不可
+                                }
+                                mkeys[mkey_count++] = mkey;
+                                if (!comma) break;
+                                p = comma + 1;
+                            }
+                            has_mandatory_param = true;
+                            mandatory_ref_count = mkey_count;
+                            memcpy(mandatory_refs, mkeys, sizeof(uint16_t) * mkey_count);
+
+                            // RFC 9460 §8: mandatory値リストも昇順ソート
+                            for (size_t a = 0; a + 1 < mkey_count; a++) {
+                                for (size_t b = a + 1; b < mkey_count; b++) {
+                                    if (mkeys[b] < mkeys[a]) {
+                                        uint16_t tmp = mkeys[a];
+                                        mkeys[a] = mkeys[b];
+                                        mkeys[b] = tmp;
+                                    }
+                                }
+                            }
+                            if (val_len + mkey_count * 2 > sizeof(val_wire)) return -1;
+                            for (size_t k = 0; k < mkey_count; k++) {
+                                val_wire[val_len++] = mkeys[k] >> 8;
+                                val_wire[val_len++] = mkeys[k] & 0xFF;
+                            }
+                        } else if (key == 1) { // alpn
                             const char *p = val_str;
                             while (*p) {
                                 const char *comma = strchr(p, ',');
@@ -1745,15 +1824,59 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 if (blen > 1 && val_str[blen-2] == '=') pad++;
                                 val_len += (declen - pad);
                             }
+                        } else {
+                            // 汎用 keyNNN (RFC 9460 §2.1, Appendix D.2 Figure 5/6):
+                            // val_str は既に dns_zone_parser.c の unescape_string_in_place() で
+                            // character-string decoding 済みであり、そのバイト列がそのまま
+                            // wire-format value になる。
+                            size_t vlen = strlen(val_str);
+                            if (val_len + vlen > sizeof(val_wire)) return -1;
+                            memcpy(&val_wire[val_len], val_str, vlen);
+                            val_len += vlen;
                         }
                     }
-                    
-                    if (offset + 4 + val_len > max_res_len) return -1;
-                    res[offset++] = key >> 8; res[offset++] = key & 0xFF;
-                    res[offset++] = val_len >> 8; res[offset++] = val_len & 0xFF;
+
+                    if (storage_offset + val_len > sizeof(val_storage)) return -1;
+                    params[param_count].key = key;
+                    params[param_count].val_offset = storage_offset;
+                    params[param_count].val_len = val_len;
                     if (val_len > 0) {
-                        memcpy(&res[offset], val_wire, val_len);
-                        offset += val_len;
+                        memcpy(&val_storage[storage_offset], val_wire, val_len);
+                        storage_offset += val_len;
+                    }
+                    param_count++;
+                }
+
+                // RFC 9460 §8: mandatoryの値リストに列挙されたキーは、
+                // 同じレコードのSvcParamsに実際に存在しなければならない
+                if (has_mandatory_param) {
+                    for (size_t m = 0; m < mandatory_ref_count; m++) {
+                        bool found = false;
+                        for (int p = 0; p < param_count; p++) {
+                            if (params[p].key == mandatory_refs[m]) { found = true; break; }
+                        }
+                        if (!found) return -1; // self-consistency違反
+                    }
+                }
+
+                // RFC 9460 §2.2: SvcParamKeys SHALL appear in increasing numeric order
+                for (int a = 0; a < param_count - 1; a++) {
+                    for (int b = a + 1; b < param_count; b++) {
+                        if (params[b].key < params[a].key) {
+                            svcparam_entry_t tmp = params[a];
+                            params[a] = params[b];
+                            params[b] = tmp;
+                        }
+                    }
+                }
+
+                for (int i = 0; i < param_count; i++) {
+                    if (offset + 4 + params[i].val_len > max_res_len) return -1;
+                    res[offset++] = params[i].key >> 8; res[offset++] = params[i].key & 0xFF;
+                    res[offset++] = params[i].val_len >> 8; res[offset++] = params[i].val_len & 0xFF;
+                    if (params[i].val_len > 0) {
+                        memcpy(&res[offset], &val_storage[params[i].val_offset], params[i].val_len);
+                        offset += params[i].val_len;
                     }
                 }
                 break;
@@ -2067,12 +2190,16 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         } else if (opt_code == 21) {
                             edns->saw_invalid_mqtype_response_in_query = true;
                         } else if (opt_code == 20) {
-                            edns->has_mqtype_query = true;
-                            if (opt_len % 2 == 0) {
-                                int count = opt_len / 2;
-                                edns->mqtype_count = 0;
-                                for (int k = 0; k < count && edns->mqtype_count < 16; k++) {
-                                    edns->mqtypes[edns->mqtype_count++] = (req[rdata_offset + k*2] << 8) | req[rdata_offset + k*2 + 1];
+                            if (edns->has_mqtype_query) {
+                                edns->mqtype_query_duplicated = true;
+                            } else {
+                                edns->has_mqtype_query = true;
+                                if (opt_len % 2 == 0) {
+                                    int count = opt_len / 2;
+                                    edns->mqtype_count = 0;
+                                    for (int k = 0; k < count && edns->mqtype_count < 16; k++) {
+                                        edns->mqtypes[edns->mqtype_count++] = (req[rdata_offset + k*2] << 8) | req[rdata_offset + k*2 + 1];
+                                    }
                                 }
                             }
                         }
@@ -2283,6 +2410,8 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
         } else {
             // zone class
+            syslog(LOG_INFO, "[DEBUG-UPDATE] process_update_sections: checking zone class: class_val=%u, zone_class=%u", class_val, zone_class);
+            if (class_val != zone_class) return 1; // FORMERR
             if (!rrset_exists) return 8; // NXRRSET
             size_t temp_offset = rec_start_offset; 
             dns_record_t parsed_rec;

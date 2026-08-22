@@ -26,16 +26,20 @@ static const dnssec_alg_info_t KNOWN_DNSSEC_ALGS[] = {
     {5,  "RSASHA1",             "NOT RECOMMENDED"},
     {6,  "DSA-NSEC3-SHA1",      "MUST NOT (非推奨)"},
     {7,  "RSASHA1-NSEC3-SHA1",  "NOT RECOMMENDED"},
-    {8,  "RSASHA256",           "RECOMMENDED"},
-    {10, "RSASHA512",           "RECOMMENDED"},
+    {8,  "RSASHA256",           "MUST"},
+    {10, "RSASHA512",           "NOT RECOMMENDED"},
     {12, "ECC-GOST",            "MUST NOT (非推奨)"},
-    {13, "ECDSAP256SHA256",     "RECOMMENDED"},
+    {13, "ECDSAP256SHA256",     "MUST"},
     {14, "ECDSAP384SHA384",     "MAY"},
     {15, "ED25519",             "RECOMMENDED"},
     {16, "ED448",               "MAY"},
 };
 
-static void check_dnssec_algorithm(int alg_num, const char *rec_name, const char *rec_type) {
+static void check_dnssec_algorithm(int alg_num, const char *rec_name, const char *rec_type, int flags, int protocol) {
+    // RFC 8078 §4: CDNSKEY delete signal (flags=0, protocol=3, algorithm=0)
+    if (strcmp(rec_type, "CDNSKEY") == 0 && alg_num == 0 && flags == 0 && protocol == 3) {
+        return;
+    }
     for (size_t i = 0; i < sizeof(KNOWN_DNSSEC_ALGS)/sizeof(KNOWN_DNSSEC_ALGS[0]); i++) {
         if (KNOWN_DNSSEC_ALGS[i].alg_num == alg_num) {
             if (strstr(KNOWN_DNSSEC_ALGS[i].status, "MUST NOT") ||
@@ -47,6 +51,39 @@ static void check_dnssec_algorithm(int alg_num, const char *rec_name, const char
         }
     }
     fprintf(stderr, "[WARNING] %s '%s': unknown DNSSEC algorithm number %d\n", rec_type, rec_name, alg_num);
+}
+
+typedef struct { int digest_type; const char *name; const char *status; } ds_digest_info_t;
+static const ds_digest_info_t KNOWN_DS_DIGESTS[] = {
+    {1, "SHA-1",            "MUST NOT (非推奨・危殆化, RFC 8624 §3.3)"},
+    {2, "SHA-256",          "MUST"},
+    {3, "GOST R 34.11-94",  "MUST NOT (非推奨, RFC 8624 §3.3)"},
+    {4, "SHA-384",          "MAY"},
+};
+
+static void check_ds_digest_type(int digest_type, int algorithm, int key_tag,
+                                 const char *rec_name, const char *rec_type) {
+    // RFC 8078 §4: CDS delete signal (digest_type=0, algorithm=0, key_tag=0)
+    if (strcmp(rec_type, "CDS") == 0 && digest_type == 0 &&
+        algorithm == 0 && key_tag == 0) {
+        return; // RFC 8078 delete signal: 正当、警告不要
+    }
+    if (digest_type == 0) {
+        fprintf(stderr, "[WARNING] %s '%s': digest type 0 (NULL) is invalid outside of the RFC 8078 CDS delete signal\n",
+                rec_type, rec_name);
+        return;
+    }
+    for (size_t i = 0; i < sizeof(KNOWN_DS_DIGESTS)/sizeof(KNOWN_DS_DIGESTS[0]); i++) {
+        if (KNOWN_DS_DIGESTS[i].digest_type == digest_type) {
+            if (strstr(KNOWN_DS_DIGESTS[i].status, "MUST NOT")) {
+                fprintf(stderr, "[WARNING] %s '%s': DS digest type %d (%s) is %s\n",
+                        rec_type, rec_name, digest_type,
+                        KNOWN_DS_DIGESTS[i].name, KNOWN_DS_DIGESTS[i].status);
+            }
+            return;
+        }
+    }
+    fprintf(stderr, "[WARNING] %s '%s': unknown DS digest type %d\n", rec_type, rec_name, digest_type);
 }
 
 // Stub for open_via_dir_cache used by dns_config_parser.c
@@ -569,12 +606,24 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         // --- Add specific field validations ---
         if (tcode == 48 || tcode == 60) { // DNSKEY / CDNSKEY
             if (rcount >= 3) {
-                check_dnssec_algorithm(atoi(rdata[2]), arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY");
+                int flags = atoi(rdata[0]);
+                int protocol = atoi(rdata[1]);
+                int alg = atoi(rdata[2]);
+                check_dnssec_algorithm(alg, arena.records[i].name, tcode == 48 ? "DNSKEY" : "CDNSKEY", flags, protocol);
+            }
+        }
+        if (tcode == 43 || tcode == 59) { // DS / CDS
+            if (rcount >= 4) {
+                int key_tag = atoi(rdata[0]);
+                int algorithm = atoi(rdata[1]);
+                int digest_type = atoi(rdata[2]);
+                check_ds_digest_type(digest_type, algorithm, key_tag,
+                                     arena.records[i].name, tcode == 43 ? "DS" : "CDS");
             }
         }
         if (tcode == 46) { // RRSIG
             if (rcount >= 2) {
-                check_dnssec_algorithm(atoi(rdata[1]), arena.records[i].name, "RRSIG");
+                check_dnssec_algorithm(atoi(rdata[1]), arena.records[i].name, "RRSIG", -1, -1);
             }
         }
         if (tcode == 55) { // HIP
@@ -855,18 +904,6 @@ int main(int argc, char **argv) {
             }
             z = z->next;
         }
-        for (view_config_t *v = cfg.views; v; v = v->next) {
-            z = v->zones;
-            while (z) {
-                if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
-                    if (check_zone(z->domain, z->file, false, z->is_catalog) != 0) {
-                        error_count++;
-                    }
-                    checked++;
-                }
-                z = z->next;
-            }
-        }
         printf("[INFO] Checked %d zones. Errors: %d\n", checked, error_count);
         return (error_count > 0) ? 1 : 0;
     } else if (strcmp(cmd, "zone") == 0) {
@@ -895,15 +932,6 @@ int main(int argc, char **argv) {
                     return check_zone(z->domain, z->file, false, z->is_catalog);
                 }
                 z = z->next;
-            }
-            for (view_config_t *v = cfg.views; v; v = v->next) {
-                z = v->zones;
-                while (z) {
-                    if (strcasecmp(z->domain, norm_domain) == 0) {
-                        return check_zone(z->domain, z->file, false, z->is_catalog);
-                    }
-                    z = z->next;
-                }
             }
             fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
             return 1;

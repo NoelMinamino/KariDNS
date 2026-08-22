@@ -96,8 +96,11 @@ static conf_token_t get_raw_token_from_frame(config_file_frame_t *frame) {
     while (frame->pos < frame->len && frame->src[frame->pos] != '"' && frame->src[frame->pos] != '\0')
       frame->pos++;
     size_t str_len = frame->pos - start;
-    if (str_len > 4096)
+    if (str_len > 4096) {
+      syslog(LOG_WARNING, "[Config] Token length (%zu bytes) exceeds maximum limit (4096 bytes), truncating in '%s'",
+             str_len, frame->file_path ? frame->file_path : "<string>");
       str_len = 4096;
+    }
     tok.type = TOKEN_STRING;
     tok.is_quoted = true;
     tok.value = malloc(str_len + 1);
@@ -125,8 +128,11 @@ static conf_token_t get_raw_token_from_frame(config_file_frame_t *frame) {
     frame->pos++;
     str_len = 1;
   }
-  if (str_len > 4096)
+  if (str_len > 4096) {
+    syslog(LOG_WARNING, "[Config] Token length (%zu bytes) exceeds maximum limit (4096 bytes), truncating in '%s'",
+           str_len, frame->file_path ? frame->file_path : "<string>");
     str_len = 4096;
+  }
   tok.type = TOKEN_STRING;
   tok.is_quoted = false;
   tok.value = malloc(str_len + 1);
@@ -1637,6 +1643,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   }
   if (saw_view_block && saw_top_level_zone) {
     syslog(LOG_ERR, "Cannot mix top-level zone and view blocks");
+    // トップレベル直付けの zone_config_t リストを完全解放してリークを防ぐ
+    zone_config_t *curr = config->zones;
+    while (curr) {
+      zone_config_t *next = curr->next;
+      free_zone_config(curr);
+      curr = next;
+    }
+    config->zones = NULL;
     return -1;
   }
   if (!saw_view_block) {
@@ -1650,7 +1664,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   }
 
   // Create a flattened list of zones in config->zones for backward compatibility
-  // (AXFR, RRL, control-channel etc)
+  // (AXFR, RRL, control-channel etc).
+  // ※ このリストは所有権を持たない走査・参照専用リストです。
+  //   各ノードはビュー内ゾーン(v->zones)の内部ポインタを共有しているため、
+  //   フィールドの書き込みや free_zone_config() の呼び出しは絶対に行わないこと。
+  //   解放時は free_server_config_fields() 内でノード構造体自体のみを free() すること。
   zone_config_t *flat_zones = NULL;
   zone_config_t *flat_tail = NULL;
   for (view_config_t *v = config->views; v; v = v->next) {
@@ -1682,10 +1700,14 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
   ctx.stack[0].pos = 0;
   ctx.stack[0].len = strlen(config_str);
   if (initial_file_path) {
-    struct stat st;
-    if (stat(initial_file_path, &st) == 0) {
-      ctx.stack[0].dev = st.st_dev;
-      ctx.stack[0].ino = st.st_ino;
+    int fd = open_via_dir_cache(initial_file_path, O_RDONLY, 0, false);
+    if (fd >= 0) {
+      struct stat st;
+      if (fstat(fd, &st) == 0) {
+        ctx.stack[0].dev = st.st_dev;
+        ctx.stack[0].ino = st.st_ino;
+      }
+      close(fd);
     }
   }
   ctx.depth = 0;

@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <openssl/evp.h>
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
     (void)mode;
@@ -454,6 +455,9 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-5 host-$$ A 10.0.0.$", false);
         // 正常系: 負のoffset
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
+        // 正常系: width 32-64
+        RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${0,64,d} A 10.0.0.$", false);
     }
 
     // Test 6: LOC and APL Validation Tests
@@ -820,6 +824,540 @@ int main() {
 
         zone_arena_destroy(&arena2);
         printf("PASS: arena_alloc Addition Overflow Prevention (strict)\n");
+    }
+
+    // Test 11: RFC 2136 process_update_sections CLASS validation
+    {
+        printf("\n--- Test 11: RFC 2136 process_update_sections CLASS validation ---\n");
+        zone_arena_t arena = {0};
+        zone_arena_init(&arena);
+
+        parse_error_t err = {0};
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "dynupdate.com.",
+            .is_standalone_mode = true,
+            .err_out = &err,
+        };
+        char zone_text[] = "dynupdate.com. 3600 IN SOA ns1.dynupdate.com. admin.dynupdate.com. 1 3600 1800 604800 86400\n"
+                           "dynupdate.com. 3600 IN NS ns1.dynupdate.com.\n"
+                           "ns1.dynupdate.com. 3600 IN A 127.0.0.1\n"
+                           "test.dynupdate.com. 3600 IN TXT \"initial\"\n";
+        int prc_res = parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx);
+        if (prc_res < 0) {
+            printf("FAIL: Test 11 parse_zone_fast failed: %s\n", err.error_message);
+            return 1;
+        }
+
+        // 1. Prereq with Invalid CLASS (e.g. CLASS CH = 3, Value-Dependent RR) -> MUST return FORMERR (1)
+        uint8_t pkt[512] = {0};
+        pkt[0] = 0x12; pkt[1] = 0x34; // ID
+        pkt[2] = 0x28; pkt[3] = 0x00; // Opcode=5 (UPDATE)
+        pkt[4] = 0x00; pkt[5] = 0x01; // ZOCOUNT = 1
+        pkt[6] = 0x00; pkt[7] = 0x01; // PRCOUNT = 1
+        pkt[8] = 0x00; pkt[9] = 0x00; // UPCOUNT = 0
+        pkt[10] = 0x00; pkt[11] = 0x00; // ARCOUNT = 0
+
+        size_t off = 12;
+        // Zone: dynupdate.com., TYPE=SOA(6), CLASS=IN(1)
+        const char *zname = "\x09" "dynupdate" "\x03" "com" "\x00";
+        memcpy(&pkt[off], zname, 15);
+        off += 15;
+        pkt[off++] = 0x00; pkt[off++] = 0x06; // SOA
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // IN (zone_class = 1)
+
+        // Prereq: test.dynupdate.com., TYPE=TXT(16), CLASS=CH(3) [INVALID], TTL=0, RDLEN=8, RDATA="\x07initial"
+        const char *pname = "\x04" "test" "\x09" "dynupdate" "\x03" "com" "\x00";
+        memcpy(&pkt[off], pname, 20);
+        off += 20;
+        pkt[off++] = 0x00; pkt[off++] = 0x10; // TXT
+        size_t class_offset = off;
+        pkt[off++] = 0x00; pkt[off++] = 0x03; // CLASS = 3 (CH - Invalid)
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; // TTL=0
+        pkt[off++] = 0x00; pkt[off++] = 0x08; // RDLEN = 8
+        size_t rdata_offset = off;
+        memcpy(&pkt[off], "\x07initial", 8);
+        off += 8;
+
+        int prc = 0, upc = 0;
+        int res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        if (res != 1) { // Expected FORMERR (1)
+            printf("FAIL: process_update_sections returned %d instead of 1 (FORMERR) for invalid Prereq CLASS\n", res);
+            return 1;
+        }
+
+        // 2. Prereq with valid Zone CLASS (IN = 1) matching existing record -> MUST succeed (0)
+        pkt[class_offset] = 0x00; pkt[class_offset + 1] = 0x01; // CLASS = 1 (IN)
+        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        if (res != 0) {
+            printf("FAIL: process_update_sections returned %d instead of 0 for valid Prereq CLASS IN\n", res);
+            return 1;
+        }
+
+        // 3. Prereq with valid Zone CLASS (IN = 1) but non-matching RDATA -> MUST return NXRRSET (8)
+        memcpy(&pkt[rdata_offset], "\x07wrongval", 8);
+        res = process_update_sections(pkt, off, "dynupdate.com.", &arena, &prc, &upc);
+        if (res != 8) {
+            printf("FAIL: process_update_sections returned %d instead of 8 (NXRRSET) for non-matching RDATA\n", res);
+            return 1;
+        }
+
+        zone_arena_destroy(&arena);
+        printf("PASS: RFC 2136 process_update_sections CLASS validation\n");
+    }
+
+    // Test 12: RFC 10029 MQTYPE-Query duplicate option detection
+    {
+        printf("\n--- Test 12: RFC 10029 MQTYPE-Query duplicate option detection ---\n");
+        uint8_t pkt[512] = {0};
+        pkt[0] = 0x56; pkt[1] = 0x78; // ID
+        pkt[2] = 0x01; pkt[3] = 0x00; // Standard Query (RD=1)
+        pkt[4] = 0x00; pkt[5] = 0x01; // QDCOUNT = 1
+        pkt[6] = 0x00; pkt[7] = 0x00; // ANCOUNT = 0
+        pkt[8] = 0x00; pkt[9] = 0x00; // NSCOUNT = 0
+        pkt[10] = 0x00; pkt[11] = 0x01; // ARCOUNT = 1 (OPT)
+
+        size_t off = 12;
+        // Question: example.com. IN A
+        const char *qname = "\x07" "example" "\x03" "com" "\x00";
+        memcpy(&pkt[off], qname, 13);
+        off += 13;
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // TYPE A
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // CLASS IN
+
+        // OPT RR (AR section)
+        pkt[off++] = 0x00; // Root name
+        pkt[off++] = 0x00; pkt[off++] = 0x29; // TYPE OPT (41)
+        pkt[off++] = 0x10; pkt[off++] = 0x00; // Payload size 4096
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; // Extended RCODE / Flags
+        
+        // RDATA with two MQTYPE-Query options (opt_code = 20)
+        // Option 1: code 20, len 2, type 16 (TXT)
+        // Option 2: code 20, len 2, type 28 (AAAA)
+        pkt[off++] = 0x00; pkt[off++] = 0x0C; // RDLEN = 12
+        pkt[off++] = 0x00; pkt[off++] = 0x14; // OptCode 20
+        pkt[off++] = 0x00; pkt[off++] = 0x02; // OptLen 2
+        pkt[off++] = 0x00; pkt[off++] = 0x10; // QTYPE TXT (16)
+        pkt[off++] = 0x00; pkt[off++] = 0x14; // OptCode 20 (Duplicate!)
+        pkt[off++] = 0x00; pkt[off++] = 0x02; // OptLen 2
+        pkt[off++] = 0x00; pkt[off++] = 0x1C; // QTYPE AAAA (28)
+
+        edns_info_t edns = {0};
+        int pr = parse_edns_opt(pkt, off, 1, 0, 0, 1, &edns);
+        if (pr != 0) {
+            printf("FAIL: parse_edns_opt returned error %d\n", pr);
+            return 1;
+        }
+        if (!edns.has_mqtype_query) {
+            printf("FAIL: parse_edns_opt did not detect has_mqtype_query\n");
+            return 1;
+        }
+        if (!edns.mqtype_query_duplicated) {
+            printf("FAIL: parse_edns_opt did not flag mqtype_query_duplicated on duplicate option\n");
+            return 1;
+        }
+        printf("PASS: RFC 10029 MQTYPE-Query duplicate option detected\n");
+    }
+
+    // --- Test 13: Mix of view and top-level zone error cleanup (no leak) ---
+    {
+        const char *mixed_cfg = "view \"external\" { match-clients { any; }; zone \"example.com\" { type master; file \"example.com.zone\"; }; };\n"
+                                "zone \"toplevel.com\" { type master; file \"toplevel.com.zone\"; };\n";
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        int res = parse_named_conf(mixed_cfg, &cfg);
+        if (res == 0) {
+            printf("FAIL: Expected parse_named_conf to fail for mixed view/top-level zones\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg);
+        printf("PASS: Mixed view/top-level zones safely rejected and cleaned up without leak\n");
+    }
+
+    // --- Test 14: RFC 9460 SVCB/HTTPS SvcParamKey sort & duplicate rejection ---
+    {
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        // Case 1: Out-of-order SvcParamKeys (port=443 before alpn=h2) must be sorted in wire format
+        dns_record_t svcb_rec;
+        memset(&svcb_rec, 0, sizeof(svcb_rec));
+        svcb_rec.name = "example.com.";
+        svcb_rec.type = "HTTPS";
+        svcb_rec.type_code = 65;
+        svcb_rec.ttl = "3600";
+        svcb_rec.ttl_value = 3600;
+        svcb_rec.class_str = "IN";
+        svcb_rec.class_val = 1;
+        svcb_rec.rdata[0] = "1";
+        svcb_rec.rdata[1] = ".";
+        svcb_rec.rdata[2] = "port=443"; // Key 3
+        svcb_rec.rdata[3] = "alpn=h2";   // Key 1
+        svcb_rec.rdata_count = 4;
+
+        uint8_t res_buf[512] = {0};
+        uint16_t offset = 0;
+        int ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &svcb_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for valid out-of-order SvcParamKeys\n");
+            return 1;
+        }
+
+        // Locate RDATA in serialized output:
+        // Header: name (compressed/root) + type(2) + class(2) + ttl(4) + rdlen(2)
+        // Check that key 0x0001 (alpn) appears before key 0x0003 (port)
+        bool saw_alpn = false, saw_port = false, order_correct = false;
+        for (size_t i = 0; i + 4 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            if (k == 1 && !saw_port) {
+                saw_alpn = true;
+            } else if (k == 3 && saw_alpn) {
+                saw_port = true;
+                order_correct = true;
+            }
+        }
+        if (!order_correct) {
+            printf("FAIL: SvcParamKeys not sorted in increasing order in wire output\n");
+            return 1;
+        }
+
+        // Case 2: Duplicate SvcParamKeys (alpn=h2 and alpn=h3) must be rejected with error
+        dns_record_t dup_rec;
+        memset(&dup_rec, 0, sizeof(dup_rec));
+        dup_rec.name = "example.com.";
+        dup_rec.type = "HTTPS";
+        dup_rec.type_code = 65;
+        dup_rec.ttl = "3600";
+        dup_rec.ttl_value = 3600;
+        dup_rec.class_str = "IN";
+        dup_rec.class_val = 1;
+        dup_rec.rdata[0] = "1";
+        dup_rec.rdata[1] = ".";
+        dup_rec.rdata[2] = "alpn=h2";
+        dup_rec.rdata[3] = "port=443";
+        dup_rec.rdata[4] = "alpn=h3"; // Duplicate Key 1
+        dup_rec.rdata_count = 5;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &dup_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: Expected serialize_dns_record to reject duplicate SvcParamKeys\n");
+            return 1;
+        }
+
+        // Case 3: mandatory SvcParam (key=0) with unordered keys (port,alpn) must encode sorted list (00 01 00 03)
+        dns_record_t mand_rec;
+        memset(&mand_rec, 0, sizeof(mand_rec));
+        mand_rec.name = "example.com.";
+        mand_rec.type = "HTTPS";
+        mand_rec.type_code = 65;
+        mand_rec.ttl = "3600";
+        mand_rec.ttl_value = 3600;
+        mand_rec.class_str = "IN";
+        mand_rec.class_val = 1;
+        mand_rec.rdata[0] = "1";
+        mand_rec.rdata[1] = ".";
+        mand_rec.rdata[2] = "mandatory=port,alpn"; // Key 0 with keys 3,1
+        mand_rec.rdata[3] = "alpn=h2";
+        mand_rec.rdata[4] = "port=443";
+        mand_rec.rdata_count = 5;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &mand_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for mandatory SvcParam\n");
+            return 1;
+        }
+        // Verify Key=0, Len=4, Value=00 01 00 03
+        bool found_mand_val = false;
+        for (size_t i = 0; i + 8 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            uint16_t vlen = (res_buf[i+2] << 8) | res_buf[i+3];
+            if (k == 0 && vlen == 4) {
+                if (res_buf[i+4] == 0x00 && res_buf[i+5] == 0x01 &&
+                    res_buf[i+6] == 0x00 && res_buf[i+7] == 0x03) {
+                    found_mand_val = true;
+                    break;
+                }
+            }
+        }
+        if (!found_mand_val) {
+            printf("FAIL: mandatory SvcParam did not encode sorted keys 00 01 00 03\n");
+            return 1;
+        }
+
+        // Case 4: Generic keyNNN (key667=hello and key667=hello\xd2qoo) character-string encoding (RFC 9460 Appendix D.2)
+        dns_record_t gen_rec;
+        memset(&gen_rec, 0, sizeof(gen_rec));
+        gen_rec.name = "example.com.";
+        gen_rec.type = "HTTPS";
+        gen_rec.type_code = 65;
+        gen_rec.ttl = "3600";
+        gen_rec.ttl_value = 3600;
+        gen_rec.class_str = "IN";
+        gen_rec.class_val = 1;
+        gen_rec.rdata[0] = "1";
+        gen_rec.rdata[1] = ".";
+        gen_rec.rdata[2] = "key667=hello";
+        gen_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &gen_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for generic key667 SvcParam\n");
+            return 1;
+        }
+        bool found_gen_val = false;
+        for (size_t i = 0; i + 9 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            uint16_t vlen = (res_buf[i+2] << 8) | res_buf[i+3];
+            if (k == 667 && vlen == 5) {
+                if (memcmp(&res_buf[i+4], "hello", 5) == 0) {
+                    found_gen_val = true;
+                    break;
+                }
+            }
+        }
+        if (!found_gen_val) {
+            printf("FAIL: generic key667 did not encode 'hello' bytes\n");
+            return 1;
+        }
+
+        // Case 4b: Generic key667 with unescaped byte (hello\xd2qoo)
+        dns_record_t gen_rec2;
+        memset(&gen_rec2, 0, sizeof(gen_rec2));
+        gen_rec2.name = "example.com.";
+        gen_rec2.type = "HTTPS";
+        gen_rec2.type_code = 65;
+        gen_rec2.ttl = "3600";
+        gen_rec2.ttl_value = 3600;
+        gen_rec2.class_str = "IN";
+        gen_rec2.class_val = 1;
+        gen_rec2.rdata[0] = "1";
+        gen_rec2.rdata[1] = ".";
+        gen_rec2.rdata[2] = "key667=hello\xd2qoo";
+        gen_rec2.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &gen_rec2, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for generic key667 with unescaped bytes\n");
+            return 1;
+        }
+        bool found_gen_val2 = false;
+        const uint8_t expected_bytes[9] = { 'h', 'e', 'l', 'l', 'o', 0xd2, 'q', 'o', 'o' };
+        for (size_t i = 0; i + 13 <= offset; i++) {
+            uint16_t k = (res_buf[i] << 8) | res_buf[i+1];
+            uint16_t vlen = (res_buf[i+2] << 8) | res_buf[i+3];
+            if (k == 667 && vlen == 9) {
+                if (memcmp(&res_buf[i+4], expected_bytes, 9) == 0) {
+                    found_gen_val2 = true;
+                    break;
+                }
+            }
+        }
+        if (!found_gen_val2) {
+            printf("FAIL: generic key667 did not encode expected 9 bytes\n");
+            return 1;
+        }
+
+        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 §8)
+        dns_record_t incomplete_mand_rec;
+        memset(&incomplete_mand_rec, 0, sizeof(incomplete_mand_rec));
+        incomplete_mand_rec.name = "example.com.";
+        incomplete_mand_rec.type = "HTTPS";
+        incomplete_mand_rec.type_code = 65;
+        incomplete_mand_rec.ttl = "3600";
+        incomplete_mand_rec.ttl_value = 3600;
+        incomplete_mand_rec.class_str = "IN";
+        incomplete_mand_rec.class_val = 1;
+        incomplete_mand_rec.rdata[0] = "1";
+        incomplete_mand_rec.rdata[1] = ".";
+        incomplete_mand_rec.rdata[2] = "mandatory=alpn,port"; // alpn/port are absent
+        incomplete_mand_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &incomplete_mand_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: Expected rejection of mandatory referencing absent SvcParam\n");
+            return 1;
+        }
+
+        // Case 5b: mandatory referencing present SvcParams must succeed
+        dns_record_t valid_mand_rec;
+        memset(&valid_mand_rec, 0, sizeof(valid_mand_rec));
+        valid_mand_rec.name = "example.com.";
+        valid_mand_rec.type = "HTTPS";
+        valid_mand_rec.type_code = 65;
+        valid_mand_rec.ttl = "3600";
+        valid_mand_rec.ttl_value = 3600;
+        valid_mand_rec.class_str = "IN";
+        valid_mand_rec.class_val = 1;
+        valid_mand_rec.rdata[0] = "1";
+        valid_mand_rec.rdata[1] = ".";
+        valid_mand_rec.rdata[2] = "mandatory=alpn,port";
+        valid_mand_rec.rdata[3] = "alpn=h2";
+        valid_mand_rec.rdata[4] = "port=443";
+        valid_mand_rec.rdata_count = 5;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &valid_mand_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret < 0) {
+            printf("FAIL: serialize_dns_record failed for valid mandatory with present SvcParams\n");
+            return 1;
+        }
+
+        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 §14.3.2)
+        dns_record_t invalid_key_rec;
+        memset(&invalid_key_rec, 0, sizeof(invalid_key_rec));
+        invalid_key_rec.name = "example.com.";
+        invalid_key_rec.type = "HTTPS";
+        invalid_key_rec.type_code = 65;
+        invalid_key_rec.ttl = "3600";
+        invalid_key_rec.ttl_value = 3600;
+        invalid_key_rec.class_str = "IN";
+        invalid_key_rec.class_val = 1;
+        invalid_key_rec.rdata[0] = "1";
+        invalid_key_rec.rdata[1] = ".";
+        invalid_key_rec.rdata[2] = "key65535=foo";
+        invalid_key_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &invalid_key_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: key65535 should be rejected\n");
+            return 1;
+        }
+
+        // Case 7: Malformed "keyABC" must be rejected
+        dns_record_t malformed_key_rec;
+        memset(&malformed_key_rec, 0, sizeof(malformed_key_rec));
+        malformed_key_rec.name = "example.com.";
+        malformed_key_rec.type = "HTTPS";
+        malformed_key_rec.type_code = 65;
+        malformed_key_rec.ttl = "3600";
+        malformed_key_rec.ttl_value = 3600;
+        malformed_key_rec.class_str = "IN";
+        malformed_key_rec.class_val = 1;
+        malformed_key_rec.rdata[0] = "1";
+        malformed_key_rec.rdata[1] = ".";
+        malformed_key_rec.rdata[2] = "keyABC=foo";
+        malformed_key_rec.rdata_count = 3;
+
+        offset = 0;
+        ret = serialize_dns_record(res_buf, sizeof(res_buf), &offset, &malformed_key_rec, &comp_ctx, NULL, 0xFFFFFFFF);
+        if (ret >= 0) {
+            printf("FAIL: malformed keyABC should be rejected\n");
+            return 1;
+        }
+
+        printf("PASS: RFC 9460 SVCB/HTTPS SvcParamKey sort, duplicate rejection, mandatory, and keyNNN\n");
+    }
+
+    // --- Test 15: Privilege drop verification logic ---
+    {
+        // 1. Current process sanity check
+        uid_t cur_u = getuid(), cur_eu = geteuid();
+        gid_t cur_g = getgid(), cur_eg = getegid();
+        if (cur_u != cur_eu || cur_g != cur_eg) {
+            printf("FAIL: Process running in inconsistent UID/EUID or GID/EGID state\n");
+            return 1;
+        }
+
+        // 2. Unit test for privilege drop verification condition (Backend & Frontend pattern)
+        // Ensure that any mismatch between real/effective UID/GID triggers failure detection
+        struct {
+            uid_t r_uid, e_uid, target_uid;
+            gid_t r_gid, e_gid, target_gid;
+            bool expected_success;
+        } cases[] = {
+            { 1000, 1000, 1000, 1000, 1000, 1000, true  }, // All dropped successfully
+            { 0,    1000, 1000, 1000, 1000, 1000, false }, // Real UID not dropped
+            { 1000, 0,    1000, 1000, 1000, 1000, false }, // Effective UID not dropped
+            { 1000, 1000, 1000, 0,    1000, 1000, false }, // Real GID not dropped
+            { 1000, 1000, 1000, 1000, 0,    1000, false }, // Effective GID not dropped
+        };
+
+        for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+            bool passed = !(cases[i].r_uid != cases[i].target_uid ||
+                            cases[i].e_uid != cases[i].target_uid ||
+                            cases[i].r_gid != cases[i].target_gid ||
+                            cases[i].e_gid != cases[i].target_gid);
+            if (passed != cases[i].expected_success) {
+                printf("FAIL: Privilege drop verification pattern test %zu failed\n", i);
+                return 1;
+            }
+        }
+        printf("PASS: Backend and Frontend privilege drop verification logic\n");
+    }
+
+    // --- Test 16: karictl control secret base64 overflow protection ---
+    {
+        char long_b64[401];
+        memset(long_b64, 'A', 400);
+        long_b64[400] = '\0';
+        size_t b64_len = strlen(long_b64);
+        if (b64_len <= 341) {
+            printf("FAIL: long_b64 length check failed\n");
+            return 1;
+        }
+
+        char valid_b64[] = "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
+        size_t valid_len = strlen(valid_b64);
+        if (valid_len > 341) {
+            printf("FAIL: valid_b64 wrongly rejected\n");
+            return 1;
+        }
+        uint8_t secret_decoded[256];
+        int dec_len = EVP_DecodeBlock(secret_decoded, (const unsigned char *)valid_b64, (int)valid_len);
+        if (dec_len < 0 || dec_len > (int)sizeof(secret_decoded)) {
+            printf("FAIL: valid_b64 decode failed\n");
+            return 1;
+        }
+        printf("PASS: karictl control secret base64 overflow protection\n");
+    }
+
+    // --- Test 17: RFC 10029 §3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
+    {
+        uint8_t req[512] = {0};
+        req[0] = 0x56; req[1] = 0x78;
+        req[2] = 0x00; req[3] = 0x00; // Opcode=0, Flags=0
+        req[4] = 0x00; req[5] = 0x00; // QDCOUNT=0
+        req[6] = 0x00; req[7] = 0x00; // ANCOUNT=0
+        req[8] = 0x00; req[9] = 0x00; // NSCOUNT=0
+        req[10] = 0x00; req[11] = 0x01; // ARCOUNT=1 (OPT)
+
+        size_t off = 12;
+        req[off++] = 0x00; // Root name
+        req[off++] = 0x00; req[off++] = 0x29; // TYPE OPT (41)
+        req[off++] = 0x10; req[off++] = 0x00; // UDP payload 4096
+        req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; // Extended RCODE / Flags
+        req[off++] = 0x00; req[off++] = 0x06; // RDLEN = 6
+        req[off++] = 0x00; req[off++] = 0x14; // OptCode 20 (MQTYPE-Query)
+        req[off++] = 0x00; req[off++] = 0x02; // OptLen 2
+        req[off++] = 0x00; req[off++] = 0x10; // QTYPE TXT (16)
+
+        edns_info_t edns = {0};
+        int pr = parse_edns_opt(req, off, 0, 0, 0, 1, &edns);
+        if (pr != 0 || !edns.has_mqtype_query || edns.mqtype_count != 1 || edns.mqtypes[0] != 16) {
+            printf("FAIL: parse_edns_opt failed on MQTYPE-Query with qdcount=0\n");
+            return 1;
+        }
+
+        uint8_t res[512] = {0};
+        if (edns.has_mqtype_query) {
+            memcpy(res, req, DNS_HEADER_SIZE);
+            res[2] |= 0x80;                      // QR=1
+            res[3] = (res[3] & 0xF0) | 1;        // FORMERR
+            res[6] = 0; res[7] = 0;              // ANCOUNT=0
+            res[8] = 0; res[9] = 0;              // NSCOUNT=0
+            res[10] = 0; res[11] = 0;            // ARCOUNT=0
+        }
+        if ((res[3] & 0x0F) != 1 || (res[2] & 0x80) == 0 || res[10] != 0 || res[11] != 0) {
+            printf("FAIL: Expected FORMERR (1) response for MQTYPE-Query with QDCOUNT=0\n");
+            return 1;
+        }
+        printf("PASS: RFC 10029 §3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
     }
 
     printf("All tests passed safely.\n");

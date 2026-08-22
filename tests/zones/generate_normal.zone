@@ -1,3 +1,4 @@
 $ORIGIN example.com.
 $TTL 3600
 $GENERATE 1-5 host-$ A 10.0.0.$
+$GENERATE 1-2 wide-${0,40,d} A 10.0.0.$

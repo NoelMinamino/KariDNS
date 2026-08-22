@@ -2086,6 +2086,47 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         }
     }
 
+    // RFC 9432 §5.1: 壊れたカタログゾーンの検出
+    // (1) 同一 <unique-N> に複数のPTRレコードが存在しないか
+    bool catalog_broken = false;
+    for (size_t i = 0; i < arena->count && !catalog_broken; i++) {
+        if (arena->records[i].type_code != 12) continue;
+        size_t name_len = strlen(arena->records[i].name);
+        if (name_len <= suffix_len ||
+            strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) != 0)
+            continue;
+        int count_for_this_name = 0;
+        for (size_t j = 0; j < arena->count; j++) {
+            if (arena->records[j].type_code == 12 &&
+                strcasecmp(arena->records[j].name, arena->records[i].name) == 0) {
+                count_for_this_name++;
+            }
+        }
+        if (count_for_this_name > 1) {
+            syslog(LOG_ERR, "[Catalog] Zone '%s': member node '%s' has %d PTR records (RFC 9432 requires exactly 1); catalog zone is broken and will NOT be processed",
+                   catalog_entry->domain, arena->records[i].name, count_for_this_name);
+            catalog_broken = true;
+        }
+    }
+
+    // (2) 異なる<unique-N>が同一ターゲットを指していないか
+    for (int a = 0; a < new_desired_count && !catalog_broken; a++) {
+        for (int b = a + 1; b < new_desired_count; b++) {
+            if (strcasecmp(new_desired[a].domain, new_desired[b].domain) == 0) {
+                syslog(LOG_ERR, "[Catalog] Zone '%s': member zone '%s' is referenced by both '%s' and '%s' labels; catalog zone is broken and will NOT be processed",
+                       catalog_entry->domain, new_desired[a].domain, new_desired[a].unique_id, new_desired[b].unique_id);
+                catalog_broken = true;
+                break;
+            }
+        }
+    }
+
+    if (catalog_broken) {
+        free_catalog_desired_list(new_desired, new_desired_count);
+        atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+        return; // カタログゾーン全体の更新を中止(既存の状態を維持)
+    }
+
     for (int d = 0; d < new_desired_count; d++) {
         char group_name[512];
         snprintf(group_name, sizeof(group_name), "group.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
@@ -2147,8 +2188,10 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         if (coo_count == 1) {
             normalize_domain_fqdn_local(coo_rdata, new_desired[d].coo_target, sizeof(new_desired[d].coo_target));
         } else if (coo_count > 1) {
-            syslog(LOG_WARNING, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'. Ignoring coo property.", new_desired[d].domain, catalog_entry->domain);
-            new_desired[d].coo_target[0] = '\0';
+            syslog(LOG_ERR, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'; catalog zone is broken and will NOT be processed", new_desired[d].domain, catalog_entry->domain);
+            free_catalog_desired_list(new_desired, new_desired_count);
+            atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+            return;
         } else {
             new_desired[d].coo_target[0] = '\0';
         }
@@ -2187,12 +2230,28 @@ void rebuild_zone_db_from_config(server_config_t *config) {
 
     for (view_config_t *v = config->views; v; v = v->next) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
-            zone_db_entry_t *entry = snapshot_get_zone(new_snap, z->domain);
-            if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
-                reload_master_zone(entry, z->file);
-                if (z->is_catalog) {
-                    void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
-                    catalog_process_membership(entry, z, v->name);
+            zone_db_snapshot_t *snap = acquire_zone_snapshot();
+            if (snap) {
+                zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
+                if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
+                    reload_master_zone(entry, z->file);
+                }
+                release_zone_snapshot(snap);
+            }
+        }
+    }
+
+    for (view_config_t *v = config->views; v; v = v->next) {
+        for (zone_config_t *z = v->zones; z; z = z->next) {
+            if (z->is_catalog && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
+                zone_db_snapshot_t *snap = acquire_zone_snapshot();
+                if (snap) {
+                    zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
+                    if (entry) {
+                        void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+                        catalog_process_membership(entry, z, v->name);
+                    }
+                    release_zone_snapshot(snap);
                 }
             }
         }
@@ -3287,10 +3346,12 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
     edns.has_mqtype_query = false;
     edns.saw_invalid_mqtype_response_in_query = false;
+    edns.mqtype_query_duplicated = false;
     edns.mqtype_count = 0;
   }
 
-  if (edns.saw_invalid_mqtype_response_in_query) {
+  if (edns.saw_invalid_mqtype_response_in_query || edns.mqtype_query_duplicated) {
+    memcpy(res, req, DNS_HEADER_SIZE);
     res[2] |= 0x80;
     res[3] = (res[3] & 0xF0) | 1; // FORMERR
     res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
@@ -3367,6 +3428,16 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.
   if (opcode == 0 && qdcount == 0) {
+    if (edns.has_mqtype_query) {
+      // RFC 10029 §3.3: MQTYPE-Query option in a query with QDCOUNT=0 MUST be FORMERR.
+      memcpy(res, req, DNS_HEADER_SIZE);
+      res[2] |= 0x80;                      // QR=1
+      res[3] = (res[3] & 0xF0) | 1;        // FORMERR
+      res[6] = 0; res[7] = 0;              // ANCOUNT=0
+      res[8] = 0; res[9] = 0;              // NSCOUNT=0
+      res[10] = 0; res[11] = 0;            // ARCOUNT=0 (OPT自体は付けない。他のopcode==4/5分岐と挙動を合わせる)
+      return DNS_HEADER_SIZE;
+    }
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80; // QR=1
@@ -3390,6 +3461,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     if (edns.has_mqtype_query) {
+      memcpy(res, req, DNS_HEADER_SIZE);
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
@@ -3475,6 +3547,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 5) { // UPDATE
     if (edns.has_mqtype_query) {
+      memcpy(res, req, DNS_HEADER_SIZE);
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
@@ -3591,7 +3664,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
               if ((now >= ts && now - ts <= 3600) || (now < ts && ts - now <= 300)) {
                   uint8_t expected_server_cookie[16];
                   generate_server_cookie(client_ip, edns.client_cookie, expected_server_cookie, ts);
-                  if (memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
+                  if (const_time_memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
                       valid = true;
                   }
               }
@@ -6377,6 +6450,12 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     if (setuid(pwd->pw_uid) != 0)
       exit(EXIT_FAILURE);
+
+    if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid ||
+        getgid() != target_gid || getegid() != target_gid) {
+      syslog(LOG_ERR, "[Backend] privilege drop verification failed");
+      exit(EXIT_FAILURE);
+    }
   } else if (cfg->group) {
     struct group *grp = getgrnam(cfg->group);
     if (!grp)
@@ -6385,6 +6464,11 @@ int main(int argc, char **argv) {
       exit(EXIT_FAILURE);
     if (setgid(grp->gr_gid) != 0)
       exit(EXIT_FAILURE);
+
+    if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
+      syslog(LOG_ERR, "[Backend] privilege drop verification failed (group only)");
+      exit(EXIT_FAILURE);
+    }
   }
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から

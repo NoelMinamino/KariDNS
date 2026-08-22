@@ -174,6 +174,7 @@ typedef struct {
     
     // Multiple QTYPEs (RFC 10029)
     bool has_mqtype_query;
+    bool mqtype_query_duplicated;
     bool saw_invalid_mqtype_response_in_query;
     uint16_t mqtypes[16];
     uint16_t mqtype_count;

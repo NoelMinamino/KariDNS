@@ -158,6 +158,77 @@ if grep -q "10.0.0.1" res.txt; then
 fi
 check_asan_log
 
+echo "[*] 6.8. RFC 2136 Invalid CLASS in Prerequisite (FORMERR validation)..."
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import socket, struct, time, hmac, hashlib, base64
+
+# --- Test with TSIG signed packet to pass authentication and reach process_update_sections ---
+req_id = 0xbeef
+flags = 0x2800 # Opcode=5 (UPDATE)
+zocount = 1
+prcount = 1
+upcount = 0
+arcount = 0
+
+hdr = struct.pack("!HHHHHH", req_id, flags, zocount, prcount, upcount, arcount)
+zone = b"\x0a\x64\x79\x6e\x75\x70\x64\x61\x74\x65\x03\x63\x6f\x6d\x00\x00\x06\x00\x01"
+prereq = b"\x04\x74\x65\x73\x74\x0a\x64\x79\x6e\x75\x70\x64\x61\x74\x65\x03\x63\x6f\x6d\x00\x00\x10\x00\x03\x00\x00\x00\x00\x00\x00"
+
+raw_msg = hdr + zone + prereq
+
+# TSIG signing (test-key)
+key_name = b"\x08test-key\x00"
+algo_name = b"\x0bhmac-sha256\x00"
+secret_b64 = "C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y="
+secret_key = base64.b64decode(secret_b64)
+
+now = int(time.time())
+time_signed_high = (now >> 32) & 0xFFFF
+time_signed_low = now & 0xFFFFFFFF
+fudge = 300
+
+tsig_var = (key_name +
+            struct.pack("!HI", 255, 0) +
+            algo_name +
+            struct.pack("!HIHHH", time_signed_high, time_signed_low, fudge, 0, 0))
+
+mac = hmac.new(secret_key, raw_msg + tsig_var, hashlib.sha256).digest()
+
+tsig_rdata = (algo_name +
+              struct.pack("!HIH", time_signed_high, time_signed_low, fudge) +
+              struct.pack("!H", len(mac)) + mac +
+              struct.pack("!HHH", req_id, 0, 0))
+
+tsig_rr = key_name + struct.pack("!HHIH", 250, 255, 0, len(tsig_rdata)) + tsig_rdata
+assert len(tsig_rr) == len(key_name) + 10 + len(tsig_rdata)
+
+final_hdr = struct.pack("!HHHHHH", req_id, flags, zocount, prcount, upcount, 1)
+pkt = final_hdr + zone + prereq + tsig_rr
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2.0)
+s.sendto(pkt, ("127.0.0.1", 10053))
+resp, _ = s.recvfrom(512)
+
+print("=== Response Hex Dump ===")
+print(" ".join(f"{b:02x}" for b in resp))
+resp_id, resp_flags, resp_qd, resp_an, resp_ns, resp_ar = struct.unpack("!HHHHHH", resp[:12])
+rcode = resp_flags & 0x0F
+print(f"Parsed: ID={resp_id:#06x}, Flags={resp_flags:#06x}, QD={resp_qd}, AN={resp_an}, NS={resp_ns}, AR={resp_ar}, RCODE={rcode}")
+
+if rcode != 1:
+    print(f"FAIL: Expected FORMERR (rcode=1), got rcode={rcode}")
+    exit(1)
+print("PASS: Got FORMERR for invalid CLASS with valid TSIG auth")
+' > out.txt 2>&1 || {
+        echo "[FAIL] RFC 2136 Invalid CLASS test failed:"
+        cat out.txt
+        exit 1
+    }
+fi
+check_asan_log
+
 echo "[*] 7. Reload Server to check ephemeral behavior..."
 $KARICTL -f "$CTL_CONF" reload
 sleep 1

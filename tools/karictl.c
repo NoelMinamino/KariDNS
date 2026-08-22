@@ -44,8 +44,12 @@ char* extract_secret_from_config(const char* path) {
             p++;
             char *end = strchr(p, '"');
             if (end) {
+                size_t secret_len = end - p;
+                if (secret_len > 4096) {
+                    secret_len = 4096;
+                }
                 *end = '\0';
-                secret = strdup(p);
+                secret = strndup(p, secret_len);
                 if (!secret) {
                     free(cfg);
                     return NULL;
@@ -102,16 +106,23 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    size_t b64_len = strlen(secret_b64);
+    if (b64_len > 341) { // 256*4/3 safe upper bound to prevent stack-buffer-overflow
+        fprintf(stderr, "Secret in config too long (max ~341 base64 chars)\n");
+        free(secret_b64);
+        return 2;
+    }
+
     uint8_t secret_decoded[256];
-    int len = EVP_DecodeBlock(secret_decoded, (const unsigned char *)secret_b64, strlen(secret_b64));
+    int len = EVP_DecodeBlock(secret_decoded, (const unsigned char *)secret_b64, (int)b64_len);
     if (len < 0) {
         fprintf(stderr, "Failed to decode base64 secret\n");
+        free(secret_b64);
         return 2;
     }
     int padding = 0;
-    size_t slen = strlen(secret_b64);
-    if (slen > 0 && secret_b64[slen - 1] == '=') padding++;
-    if (slen > 1 && secret_b64[slen - 2] == '=') padding++;
+    if (b64_len > 0 && secret_b64[b64_len - 1] == '=') padding++;
+    if (b64_len > 1 && secret_b64[b64_len - 2] == '=') padding++;
     size_t secret_decoded_len = len - padding;
     free(secret_b64);
 

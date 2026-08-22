@@ -69,6 +69,29 @@ fi
 
 echo ""
 echo "=========================================="
+echo "Step 0.6: karictl-asan secret overflow protection (400+ chars base64 secret)"
+echo "=========================================="
+cat << 'EOF' > karictl_overflow_test.conf
+key "karictl" {
+    algorithm hmac-sha256;
+    secret "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+};
+EOF
+
+./karictl-asan -f karictl_overflow_test.conf status > karictl_overflow.log 2>&1 || true
+if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" karictl_overflow.log; then
+    log_fail "karictl-asan stack-buffer-overflow on oversized secret (see karictl_overflow.log)"
+    tail -n 30 karictl_overflow.log
+elif ! grep -q "Secret in config too long" karictl_overflow.log; then
+    log_fail "karictl-asan did not reject oversized secret properly (see karictl_overflow.log)"
+    cat karictl_overflow.log
+else
+    log_ok "karictl-asan oversized secret safely rejected without ASan error"
+fi
+rm -f karictl_overflow_test.conf karictl_overflow.log
+
+echo ""
+echo "=========================================="
 echo "Step 1: Unit-level ASan/UBSan (dns_wire / dns_zone_parser / dns_config_parser)"
 echo "=========================================="
 make asan_test > unit_asan.log 2>&1

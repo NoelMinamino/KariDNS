@@ -1658,6 +1658,11 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
             char *target = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &target) != 0) goto fallback;
+            if (next < abs_offset + 2 || next > abs_offset + rdlen) {
+                // RFC 9460 §2.2 違反: TargetNameがこのRRのRDATA境界をはみ出している
+                printf("(malformed SVCB/HTTPS: TargetName exceeds RDLENGTH)");
+                break;
+            }
             size_t target_len = next - abs_offset - 2;
             printf("%u %s", priority, (target[0] == '\0') ? "." : target);
             print_svcparams(&pkt[abs_offset], 2 + target_len, rdlen);
@@ -2861,6 +2866,13 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
+
+    #define KARIDNS_MAX_TSIG_KEYFILE_SIZE (64 * 1024)
+    if (size < 0 || size > KARIDNS_MAX_TSIG_KEYFILE_SIZE) {
+        fprintf(stderr, "warning: TSIG key file '%s' is not a regular seekable file or exceeds size limit\n", path);
+        fclose(f);
+        return;
+    }
     
     char *buf = malloc((size_t)size + 1);
     if (!buf) { fclose(f); return; }
@@ -2916,10 +2928,21 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
     free(buf);
     
     if (name[0] && secret[0]) {
-        // intentionally leak combined_copy so parse_tsig_str can retain pointers
-        char *combined_copy = malloc(strlen(name) + strlen(secret) + strlen(algo) + 3);
-        if (!algo[0]) strcpy(algo, "hmac-sha256");
-        sprintf(combined_copy, "%s:%s:%s", algo, name, secret);
+        if (!algo[0]) {
+            if (strlcpy(algo, "hmac-sha256", sizeof(algo)) >= sizeof(algo)) {
+                fprintf(stderr, "warning: algorithm name truncated\n");
+            }
+        }
+        size_t combined_len = strlen(name) + strlen(secret) + strlen(algo) + 3;
+        char *combined_copy = malloc(combined_len);
+        if (!combined_copy) {
+            fprintf(stderr, "error: out of memory for TSIG key string\n");
+            return;
+        }
+        int ret = snprintf(combined_copy, combined_len, "%s:%s:%s", algo, name, secret);
+        if (ret < 0 || (size_t)ret >= combined_len) {
+            fprintf(stderr, "warning: TSIG key string truncated\n");
+        }
         parse_tsig_str(combined_copy, qo);
     } else {
         fprintf(stderr, "warning: failed to parse TSIG key from '%s'\n", path);
@@ -3090,7 +3113,9 @@ static void run_trace_query(const char *qname, const char *server, const char *q
     
     if (target_count == 0) {
         printf(";; could not fetch root servers, falling back to 198.41.0.4\n");
-        strcpy(target_ips[0], "198.41.0.4");
+        if (strlcpy(target_ips[0], "198.41.0.4", sizeof(target_ips[0])) >= sizeof(target_ips[0])) {
+            fprintf(stderr, "warning: target IP truncated\n");
+        }
         target_count = 1;
     }
     
@@ -3183,7 +3208,11 @@ static void run_trace_query(const char *qname, const char *server, const char *q
         
         target_count = new_target_count;
         _Static_assert(sizeof(target_ips[0]) == sizeof(new_target_ips[0]), "buffer size mismatch");
-        for(int i=0; i<target_count; i++) strcpy(target_ips[i], new_target_ips[i]);
+        for(int i=0; i<target_count; i++) {
+            if (strlcpy(target_ips[i], new_target_ips[i], sizeof(target_ips[i])) >= sizeof(target_ips[i])) {
+                fprintf(stderr, "warning: target IP truncated\n");
+            }
+        }
     }
 }
 
