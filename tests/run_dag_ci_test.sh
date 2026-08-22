@@ -45,6 +45,7 @@ options {
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
+    rfc10029-mqtype yes;
 };
 
 control-channel {
@@ -194,7 +195,7 @@ run_check "Generic EDNS option (+ednsopt)" "$DAG @127.0.0.1 -p $PORT www.example
 if [ "$DAG" = "dig" ]; then
     run_skip "RFC 10029 Multi-QTYPE (+mqtype)"
 else
-    run_check "RFC 10029 Multi-QTYPE (+mqtype)" "$DAG @127.0.0.1 -p $PORT www.example.com A +mqtype=A,AAAA +qr" "MQTYPE:"
+    run_check "RFC 10029 Multi-QTYPE (+mqtype)" "$DAG @127.0.0.1 -p $PORT www.example.com A +mqtype=AAAA +qr" "2001:db8::10"
 fi
 
 echo "========================================================"
