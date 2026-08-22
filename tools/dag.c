@@ -1425,7 +1425,7 @@ static ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
 
 static SSL_CTX *g_ssl_ctx = NULL;
 
-static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *server) {
+static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *server, int port) {
     if (!g_ssl_ctx) {
         SSL_library_init();
         SSL_load_error_strings();
@@ -1449,6 +1449,7 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     SSL *ssl = SSL_new(g_ssl_ctx);
     if (!ssl) return NULL;
     SSL_set_fd(ssl, tcp_sock);
+
     const char *sni_host = qo->tls_hostname ? qo->tls_hostname : server;
     struct in_addr a4; struct in6_addr a6;
     bool sni_is_ip = (inet_pton(AF_INET, sni_host, &a4) == 1 || inet_pton(AF_INET6, sni_host, &a6) == 1);
@@ -1471,8 +1472,8 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
         if (qo->tls_ca_file || qo->tls_verify_default_store) {
             long vres = SSL_get_verify_result(ssl);
             if (vres != X509_V_OK) {
-                fprintf(stderr, ";; TLS peer certificate verification for %s failed: %s\n",
-                        server, X509_verify_cert_error_string(vres));
+                fprintf(stderr, ";; TLS peer certificate verification for %s#%d failed: %s\n",
+                        server, port, X509_verify_cert_error_string(vres));
             }
         }
         SSL_free(ssl);
@@ -1482,8 +1483,8 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     /* ハンドシェイク成功後も、検証結果を明示的に再確認する */
     if ((qo->tls_ca_file || qo->tls_verify_default_store) &&
         SSL_get_verify_result(ssl) != X509_V_OK) {
-        fprintf(stderr, ";; TLS peer certificate verification for %s failed: %s\n",
-                server, X509_verify_cert_error_string(SSL_get_verify_result(ssl)));
+        fprintf(stderr, ";; TLS peer certificate verification for %s#%d failed: %s\n",
+                server, port, X509_verify_cert_error_string(SSL_get_verify_result(ssl)));
         SSL_shutdown(ssl);
         SSL_free(ssl);
         return NULL;
@@ -1502,7 +1503,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
         if (plen > 0) send(sock, pbuf, plen, 0);
     }
-    SSL *ssl = establish_tls(sock, qo, server);
+    SSL *ssl = establish_tls(sock, qo, server, port);
     if (!ssl) {
         close(sock);
         return -1;
@@ -1564,7 +1565,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     }
     SSL *ssl = NULL;
     if (qo->doh_tls) {
-        ssl = establish_tls(sock, qo, server);
+        ssl = establish_tls(sock, qo, server, port);
         if (!ssl) { close(sock); return -1; }
     }
 
