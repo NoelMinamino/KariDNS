@@ -3117,7 +3117,7 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
 
     uint16_t full_rcode = edns.present ? (((uint16_t)edns.ext_rcode << 4) | rcode) : rcode;
 
-    if (axfr_state && axfr_state->is_axfr) {
+    if (axfr_state && axfr_state->is_axfr && full_rcode == 0) {
         size_t offset = 12;
         for (int i = 0; i < qdcount; i++) {
             size_t next;
