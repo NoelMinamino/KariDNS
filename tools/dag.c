@@ -3024,7 +3024,11 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len) {
     }
 }
 
-
+static void format_edns_flags(bool dnssec_ok, bool compact_answers_ok, char *buf, size_t buf_size) {
+    buf[0] = '\0';
+    if (dnssec_ok) strncat(buf, " do", buf_size - strlen(buf) - 1);
+    if (compact_answers_ok) strncat(buf, " co", buf_size - strlen(buf) - 1);
+}
 
 static void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opts_t *qo, const display_opts_t *dopt) {
     if (pkt_len < 12) return;
@@ -3051,11 +3055,10 @@ static void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opt
            qdcount, ancount, nscount, arcount);
 
     if (qo->want_opt) {
-        char flags_buf[32] = "";
-        if (qo->dnssec_ok) strcat(flags_buf, " do");
-        if (qo->compact_answers_ok) strcat(flags_buf, " co");
+        char flags_buf[32];
+        format_edns_flags(qo->dnssec_ok, qo->compact_answers_ok, flags_buf, sizeof(flags_buf));
         printf(";; OPT PSEUDOSECTION:\n");
-        printf("; EDNS: version: 0, flags:%s; udp: %u\n", flags_buf, qo->udp_payload_size);
+        printf("; EDNS: version: %d, flags:%s; udp: %u\n", qo->edns_version, flags_buf, qo->udp_payload_size);
         if (qo->want_cookie) {
             printf("; COOKIE: ");
             for (int i = 0; i < 8; i++) printf("%02x", qo->client_cookie[i]);
@@ -3218,9 +3221,8 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
 
     if (edns.present && dopt->show_comments && dopt->show_additional) {
         printf("\n;; OPT PSEUDOSECTION:\n");
-        char flags_buf[32] = "";
-        if (edns.dnssec_ok) strcat(flags_buf, " do");
-        if (edns.compact_answers_ok) strcat(flags_buf, " co");
+        char flags_buf[32];
+        format_edns_flags(edns.dnssec_ok, edns.compact_answers_ok, flags_buf, sizeof(flags_buf));
         printf("; EDNS: version: %d, flags:%s; udp: %d\n", edns.version, flags_buf, edns.udp_payload_size);
         if (edns.ext_rcode != 0) printf("; EXT RCODE: %d\n", edns.ext_rcode);
         if (edns.has_cookie) {
@@ -4780,7 +4782,9 @@ int main(int argc, char **argv) {
                         char **tmp = realloc(prepend_argv, sizeof(char*) * (prepend_count + 1));
                         if (!tmp) { fclose(f); exit(10); }
                         prepend_argv = tmp;
-                        prepend_argv[prepend_count++] = strdup(tok);
+                        char *dup = strdup(tok);
+                        if (!dup) { fclose(f); exit(10); }
+                        prepend_argv[prepend_count++] = dup;
                         tok = strtok_r(NULL, " \t\r\n", &saveptr);
                     }
                 }
