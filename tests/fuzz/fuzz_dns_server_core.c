@@ -122,10 +122,51 @@ static void test_mqtype_truncation(void) {
     zone_arena_destroy(&arena);
 }
 
+static void test_mqtype_qdcount0_formerr(void) {
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.rfc10029_mqtype_enable = true;
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+
+    // Build QDCOUNT=0 query with EDNS MQTYPE-Query (option-code 20)
+    uint8_t req[512] = {0};
+    req[0] = 0x12; req[1] = 0x34; // ID
+    req[2] = 0x00; req[3] = 0x00; // Opcode=0, QDCOUNT=0
+    req[4] = 0x00; req[5] = 0x00; // QDCOUNT=0
+    req[10] = 0x00; req[11] = 0x01; // ARCOUNT=1 (OPT)
+
+    size_t off = 12;
+    // OPT RR with MQTYPE-Query (TXT = 16)
+    req[off++] = 0x00; // Root name
+    req[off++] = 0x00; req[off++] = 0x29; // TYPE OPT (41)
+    req[off++] = 0x10; req[off++] = 0x00; // UDP payload 4096
+    req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; // Extended RCODE / Flags
+    req[off++] = 0x00; req[off++] = 0x06; // RDLEN = 6
+    req[off++] = 0x00; req[off++] = 0x14; // OptCode 20 (MQTYPE-Query)
+    req[off++] = 0x00; req[off++] = 0x02; // OptLen 2
+    req[off++] = 0x00; req[off++] = 0x10; // QTYPE TXT (16)
+
+    uint8_t res[512] = {0};
+    compress_ctx_t comp_ctx;
+    compress_ctx_init_packet(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+
+    int res_len = process_dns_query(req, off, res, sizeof(res), "", 0,
+                                    "127.0.0.1", &comp_ctx, false, &rrl, NULL);
+    if (res_len < 12) {
+        abort(); // Failed to respond
+    }
+    uint8_t rcode = res[3] & 0x0F;
+    if (rcode != 1) { // FORMERR (1)
+        abort(); // Expected FORMERR for QDCOUNT=0 with MQTYPE-Query (RFC 10029 §3.3)
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     static bool mqtype_trunc_tested = false;
     if (!mqtype_trunc_tested) {
         test_mqtype_truncation();
+        test_mqtype_qdcount0_formerr();
         mqtype_trunc_tested = true;
     }
 

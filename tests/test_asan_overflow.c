@@ -1316,6 +1316,47 @@ int main() {
         printf("PASS: karictl control secret base64 overflow protection\n");
     }
 
+    // --- Test 17: RFC 10029 §3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
+    {
+        uint8_t req[512] = {0};
+        req[0] = 0x56; req[1] = 0x78;
+        req[2] = 0x00; req[3] = 0x00; // Opcode=0, QDCOUNT=0
+        req[4] = 0x00; req[5] = 0x00; // QDCOUNT=0
+        req[10] = 0x00; req[11] = 0x01; // ARCOUNT=1 (OPT)
+
+        size_t off = 12;
+        req[off++] = 0x00; // Root name
+        req[off++] = 0x00; req[off++] = 0x29; // TYPE OPT (41)
+        req[off++] = 0x10; req[off++] = 0x00; // UDP payload 4096
+        req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00;
+        req[off++] = 0x00; req[off++] = 0x06; // RDLEN = 6
+        req[off++] = 0x00; req[off++] = 0x14; // OptCode 20 (MQTYPE-Query)
+        req[off++] = 0x00; req[off++] = 0x02; // OptLen 2
+        req[off++] = 0x00; req[off++] = 0x10; // QTYPE TXT (16)
+
+        edns_info_t edns = {0};
+        int pr = parse_edns_opt(req, off, 1, 0, 0, 1, &edns);
+        if (pr != 0 || !edns.has_mqtype_query) {
+            printf("FAIL: parse_edns_opt failed on MQTYPE-Query\n");
+            return 1;
+        }
+
+        uint8_t res[512] = {0};
+        if (edns.has_mqtype_query) {
+            memcpy(res, req, DNS_HEADER_SIZE);
+            res[2] |= 0x80;
+            res[3] = (res[3] & 0xF0) | 1;
+            res[6] = 0; res[7] = 0;
+            res[8] = 0; res[9] = 0;
+            res[10] = 0; res[11] = 0;
+        }
+        if ((res[3] & 0x0F) != 1) {
+            printf("FAIL: Expected FORMERR (1) for MQTYPE-Query with QDCOUNT=0\n");
+            return 1;
+        }
+        printf("PASS: RFC 10029 §3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

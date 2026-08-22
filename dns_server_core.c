@@ -3427,6 +3427,16 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.
   if (opcode == 0 && qdcount == 0) {
+    if (edns.has_mqtype_query) {
+      // RFC 10029 §3.3: MQTYPE-Query option in a query with QDCOUNT=0 MUST be FORMERR.
+      memcpy(res, req, DNS_HEADER_SIZE);
+      res[2] |= 0x80;                      // QR=1
+      res[3] = (res[3] & 0xF0) | 1;        // FORMERR
+      res[6] = 0; res[7] = 0;              // ANCOUNT=0
+      res[8] = 0; res[9] = 0;              // NSCOUNT=0
+      res[10] = 0; res[11] = 0;            // ARCOUNT=0 (OPT自体は付けない。他のopcode==4/5分岐と挙動を合わせる)
+      return DNS_HEADER_SIZE;
+    }
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80; // QR=1
