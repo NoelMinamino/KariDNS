@@ -1814,7 +1814,11 @@ static void print_ds_like(const uint8_t *rdata, size_t rdlen, const display_opts
         printf("\t\t\t\t\t)");
     } else {
         printf("%u %u %u ", keytag, algorithm, digest_type);
-        for (size_t i = 4; i < rdlen; i++) printf("%02X", rdata[i]);
+        int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
+        for (size_t i = 4; i < rdlen; i++) {
+            if (sw > 0 && (i - 4) > 0 && ((i - 4) % sw) == 0) printf(" ");
+            printf("%02X", rdata[i]);
+        }
     }
 }
 
@@ -2236,8 +2240,15 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 size_t b64_len = 4 * ((key_len + 2) / 3) + 1;
                 char *b64 = malloc(b64_len);
                 if (!b64) goto fallback;
-                EVP_EncodeBlock((unsigned char*)b64, p, key_len);
-                printf("%s", b64);
+                int n = EVP_EncodeBlock((unsigned char*)b64, p, key_len);
+                if (dopt && dopt->split_width > 0 && n > dopt->split_width) {
+                    for (int i = 0; i < n; i += dopt->split_width) {
+                        if (i > 0) printf(" ");
+                        printf("%.*s", (n - i) < dopt->split_width ? (n - i) : dopt->split_width, b64 + i);
+                    }
+                } else {
+                    printf("%s", b64);
+                }
                 free(b64);
             }
             break;
@@ -2247,8 +2258,15 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             size_t b64_len = 4 * ((rdlen + 2) / 3) + 1;
             char *b64 = malloc(b64_len);
             if (!b64) goto fallback;
-            EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset], rdlen);
-            printf("%s", b64);
+            int n = EVP_EncodeBlock((unsigned char*)b64, &pkt[abs_offset], rdlen);
+            if (dopt && dopt->split_width > 0 && n > dopt->split_width) {
+                for (int i = 0; i < n; i += dopt->split_width) {
+                    if (i > 0) printf(" ");
+                    printf("%.*s", (n - i) < dopt->split_width ? (n - i) : dopt->split_width, b64 + i);
+                }
+            } else {
+                printf("%s", b64);
+            }
             free(b64);
             break;
         }
@@ -2514,7 +2532,11 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint8_t scheme = pkt[abs_offset+4];
             uint8_t halg = pkt[abs_offset+5];
             printf("%u %u %u ", serial, scheme, halg);
-            for (uint16_t i = 6; i < rdlen; i++) printf("%02X", pkt[abs_offset + i]);
+            int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
+            for (uint16_t i = 6; i < rdlen; i++) {
+                if (sw > 0 && (i - 6) > 0 && ((i - 6) % sw) == 0) printf(" ");
+                printf("%02X", pkt[abs_offset + i]);
+            }
             break;
         }
         case 104: { // NID
@@ -3095,6 +3117,19 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
 
     uint16_t full_rcode = edns.present ? (((uint16_t)edns.ext_rcode << 4) | rcode) : rcode;
 
+    if (axfr_state && axfr_state->is_axfr) {
+        size_t offset = 12;
+        for (int i = 0; i < qdcount; i++) {
+            size_t next;
+            if (skip_wire_name(pkt, pkt_len, offset, &next) != 0 || next + 4 > pkt_len) return;
+            offset = next + 4;
+        }
+        for (int i = 0; i < ancount; i++) {
+            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
+        }
+        return;
+    }
+
     if (dopt->show_comments) {
         printf(";; Got answer:\n");
         printf(";; ->>HEADER<<- opcode: %s, status: %s, id: %u\n", opcode_name(opcode), rcode_name(full_rcode), qid);
@@ -3548,9 +3583,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
             printf(";; SERVER: %s#%d(%s) (%s)\n", server, port, server, proto_name);
             printf(";; WHEN: %s\n", time_buf);
-            printf(";; MSG SIZE  rcvd: %zd\n", (size_t)total_bytes);
             if (qtype == 252 || qtype == 251) {
                 printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_index, total_bytes);
+            } else {
+                printf(";; MSG SIZE  rcvd: %zd\n", (size_t)total_bytes);
             }
         }
         if (tcp_sock >= 0) close(tcp_sock);
