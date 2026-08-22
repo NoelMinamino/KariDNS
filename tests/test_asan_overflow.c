@@ -1455,6 +1455,111 @@ int main() {
         printf("PASS: BIND-compatible TTL unit suffix parsing (w/d/h/m/s)\n");
     }
 
+    // --- Test 19: CAA Tag length bounds check (1-255 bytes, RFC 8659) ---
+    {
+        uint8_t buf[1024];
+        uint16_t off = 0;
+        compress_ctx_t c; compress_ctx_init_packet(&c);
+
+        char long_tag[300];
+        memset(long_tag, 'a', 256);
+        long_tag[256] = '\0';
+
+        dns_record_t caa_rec = {
+            .name = "example.com.",
+            .type = "CAA",
+            .type_code = 257,
+            .ttl_value = 3600,
+            .rdata_count = 3,
+            .rdata = { "0", long_tag, "letsencrypt.org" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: CAA tag_len > 255 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        caa_rec.rdata[1] = "";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: CAA tag_len == 0 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        caa_rec.rdata[1] = "issue";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &caa_rec, &c, NULL, 0) != 0) {
+            printf("FAIL: Valid CAA record failed serialization\n");
+            return 1;
+        }
+        printf("PASS: CAA Tag length bounds check (1-255 bytes, RFC 8659)\n");
+    }
+
+    // --- Test 20: NSEC3PARAM iterations range check (0-65535, RFC 5155) ---
+    {
+        uint8_t buf[1024];
+        uint16_t off = 0;
+        compress_ctx_t c; compress_ctx_init_packet(&c);
+
+        dns_record_t nsec3param_rec = {
+            .name = "example.com.",
+            .type = "NSEC3PARAM",
+            .type_code = 51,
+            .ttl_value = 0,
+            .rdata_count = 4,
+            .rdata = { "1", "0", "70000", "-" }
+        };
+        if (serialize_dns_record(buf, sizeof(buf), &off, &nsec3param_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: NSEC3PARAM iterations > 65535 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        nsec3param_rec.rdata[2] = "-1";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &nsec3param_rec, &c, NULL, 0) != -1) {
+            printf("FAIL: NSEC3PARAM iterations < 0 was not rejected\n");
+            return 1;
+        }
+
+        off = 0;
+        nsec3param_rec.rdata[2] = "0";
+        if (serialize_dns_record(buf, sizeof(buf), &off, &nsec3param_rec, &c, NULL, 0) != 0) {
+            printf("FAIL: Valid NSEC3PARAM iterations=0 failed serialization\n");
+            return 1;
+        }
+        printf("PASS: NSEC3PARAM iterations range check (0-65535, RFC 5155)\n");
+    }
+
+    // --- Test 21: View configuration partial parse error cleanup (no leak) ---
+    {
+        const char *bad_view_acl =
+            "view \"external\" {\n"
+            "    match-clients { 192.0.2.1; 192.0.2.2 };\n"
+            "    zone \"example.com\" { type master; file \"example.com.zone\"; };\n"
+            "};\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        int res1 = parse_named_conf(bad_view_acl, &cfg1);
+        if (res1 == 0) {
+            printf("FAIL: Expected parse_named_conf to fail for bad_view_acl\n");
+            return 1;
+        }
+
+        const char *bad_view_zone =
+            "view \"internal\" {\n"
+            "    match-clients { any; };\n"
+            "    zone \"valid.com\" { type master; file \"valid.com.zone\"; };\n"
+            "    zone \"broken.com\" { type master; file; };\n"
+            "};\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        int res2 = parse_named_conf(bad_view_zone, &cfg2);
+        if (res2 == 0) {
+            printf("FAIL: Expected parse_named_conf to fail for bad_view_zone\n");
+            return 1;
+        }
+        printf("PASS: View configuration partial parse error cleanup (no leak)\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

@@ -316,6 +316,20 @@ void free_zone_config(zone_config_t *zone) {
   free(zone);
 }
 
+static void free_partial_view(view_config_t *view) {
+  if (!view) return;
+  if (view->name) free(view->name);
+  for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
+  if (view->match_clients) free(view->match_clients);
+  zone_config_t *z = view->zones;
+  while (z) {
+    zone_config_t *next = z->next;
+    free_zone_config(z);
+    z = next;
+  }
+  free(view);
+}
+
 void free_server_config_fields(server_config_t *cfg) {
   if (!cfg) return;
   for (int j = 0; j < cfg->bind_address_count; j++)
@@ -1217,17 +1231,21 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       while (1) {
         tok = get_next_token(ctx);
         if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
-        if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+        if (tok.type != TOKEN_STRING) { free_partial_view(view); free_token(&tok); return -1; }
         if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
           if (parse_acl_list(ctx, &view->match_clients, &view->match_clients_count,
                              ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
+            free_partial_view(view);
             return -1;
           }
         } else if (strcmp(tok.value, "zone") == 0) {
           free_token(&tok);
           zone_config_t *z = NULL;
-          if (parse_zone_block(ctx, &z) != 0) return -1;
+          if (parse_zone_block(ctx, &z) != 0) {
+            free_partial_view(view);
+            return -1;
+          }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
         } else {
@@ -1236,7 +1254,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         }
       }
       tok = get_next_token(ctx);
-      if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+      if (tok.type != TOKEN_SEMICOLON) { free_partial_view(view); free_token(&tok); return -1; }
       free_token(&tok);
       saw_view_block = true;
       if (!config->views) config->views = view; else last_view->next = view;

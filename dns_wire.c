@@ -1299,12 +1299,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (rec->rdata_count < 3) return -1;
                 uint8_t flags = atoi(rec->rdata[0]);
                 size_t tag_len = strlen(rec->rdata[1]);
-                if (tag_len > 255) tag_len = 255;
+                if (tag_len == 0 || tag_len > 255) return -1; // RFC 8659: Tagは1-255バイト
                 size_t val_len = strlen(rec->rdata[2]);
                 if (offset + 2 + tag_len + val_len > max_res_len) return -1;
                 
                 res[offset++] = flags;
-                res[offset++] = tag_len;
+                res[offset++] = (uint8_t)tag_len;
                 memcpy(&res[offset], rec->rdata[1], tag_len); offset += tag_len;
                 memcpy(&res[offset], rec->rdata[2], val_len); offset += val_len;
                 break;
@@ -1630,7 +1630,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (rec->rdata_count < 4) return -1;
                 uint8_t halg = atoi(rec->rdata[0]);
                 uint8_t flags = atoi(rec->rdata[1]);
-                uint16_t iterations = atoi(rec->rdata[2]);
+                long iterations_val = strtol(rec->rdata[2], NULL, 10);
+                if (iterations_val < 0 || iterations_val > 65535) return -1;
+                uint16_t iterations = (uint16_t)iterations_val;
                 uint8_t salt[255];
                 size_t salt_len = 0;
                 if (strcmp(rec->rdata[3], "-") != 0) {
