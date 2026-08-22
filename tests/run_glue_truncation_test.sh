@@ -4,8 +4,12 @@ set -e
 make karidns-asan dag-asan
 
 ./karidns-asan -f tests/karidns-test.conf > server_asan.log 2>&1 &
-SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
+cleanup() {
+    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
+    killall -9 karidns-asan 2>/dev/null || true
+    killall -9 karidns 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 sleep 1
 
 # Query for sub.glue.test A

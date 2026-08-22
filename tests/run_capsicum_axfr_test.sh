@@ -17,10 +17,18 @@ echo "\$INCLUDE capsicum_include_test/dir2/empty.inc" > tests/zones/capsicum_inc
 cp tests/zones/example.com.zone tests/zones/example.com.zone.bak
 echo "\$INCLUDE capsicum_include_test/dir1/init.inc" >> tests/zones/example.com.zone
 
+cleanup() {
+    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
+    killall -9 karidns 2>/dev/null || true
+    killall -9 karidns-asan 2>/dev/null || true
+    mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true
+    rm -rf tests/zones/capsicum_include_test 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 # 2. ktrace を用いてシステムコールをトレースしながらサーバーを起動
 ktrace -f karidns.trace ./karidns -f tests/karidns-test.conf > server_capsicum.log 2>&1 &
 SERVER_PID=$!
-trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
 sleep 1 # 起動待ち
 
 # 3. サーバープロセスが正常に起動したか確認

@@ -56,11 +56,12 @@ sleep 2
 
 cleanup() {
     echo "[*] Stopping KariDNS (PID $SERVER_PID)..."
-    kill -9 $SERVER_PID 2>/dev/null || true
-    echo "=== server.log ==="
-    cat server.log || true
+    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
+    killall -9 karidns-asan 2>/dev/null || true
+    killall -9 karidns 2>/dev/null || true
+    rm -f "$CONF" update.txt out.txt res.txt
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 check_asan_log() {
     if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" server.log; then

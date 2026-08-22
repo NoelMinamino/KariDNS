@@ -17,11 +17,11 @@ TEST_DIR_ABS=$(pwd)
 # Trap for cleanup and automatic kdump on failure
 cleanup() {
     EXIT_CODE=$?
+    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
+    killall -9 karidns 2>/dev/null || true
+    killall -9 karidns-asan 2>/dev/null || true
     if [ $EXIT_CODE -ne 0 ]; then
         echo "[-] Test failed with exit code $EXIT_CODE"
-        if [ -n "$SERVER_PID" ]; then
-            kill -9 $SERVER_PID 2>/dev/null || true
-        fi
         if [ -f ktrace.out ] && which kdump >/dev/null 2>&1; then
             echo "=== [KDUMP TRACE (Last 100 lines)] ==="
             kdump -f ktrace.out 2>/dev/null | tail -n 100 || true
