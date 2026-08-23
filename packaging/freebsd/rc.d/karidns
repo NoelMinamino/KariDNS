@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+# PROVIDE: karidns
+# REQUIRE: DAEMON NETWORKING
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf to enable karidns:
+#
+# karidns_enable="YES"
+# karidns_flags=""
+# karidns_config="/usr/local/etc/karidns/karidns.conf"
+#
+
+. /etc/rc.subr
+
+name="karidns"
+rcvar="karidns_enable"
+
+command="/usr/local/sbin/karidns"
+pidfile="/var/run/karidns/karidns.pid"
+
+load_rc_config "${name}"
+
+: ${karidns_enable:="NO"}
+: ${karidns_config:="/usr/local/etc/karidns/karidns.conf"}
+: ${karidns_flags:="-c ${karidns_config}"}
+: ${karidns_user:="named"}
+: ${karidns_group:="named"}
+
+required_files="${karidns_config}"
+extra_commands="reload checkconf"
+reload_cmd="karidns_reload"
+checkconf_cmd="karidns_checkconf"
+start_precmd="karidns_prestart"
+
+karidns_prestart()
+{
+    # Validate config with karicheck before starting
+    if [ -x /usr/local/bin/karicheck ]; then
+        /usr/local/bin/karicheck -c "${karidns_config}" || return 1
+    fi
+    # Ensure run / log directory exists
+    install -d -o "${karidns_user}" -g "${karidns_group}" -m 0755 /var/run/karidns
+    install -d -o "${karidns_user}" -g "${karidns_group}" -m 0755 /var/log/named
+}
+
+karidns_reload()
+{
+    if [ -x /usr/local/bin/karictl ]; then
+        echo "Reloading ${name} via karictl..."
+        /usr/local/bin/karictl reload
+    else
+        echo "Reloading ${name} via SIGHUP..."
+        kill -HUP $(cat "${pidfile}" 2>/dev/null)
+    fi
+}
+
+karidns_checkconf()
+{
+    if [ -x /usr/local/bin/karicheck ]; then
+        echo "Checking configuration: ${karidns_config}"
+        /usr/local/bin/karicheck -c "${karidns_config}"
+    else
+        echo "karicheck not found."
+    fi
+}
+
+run_rc_command "$1"

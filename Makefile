@@ -1,17 +1,23 @@
-# Makefile for karidns (FreeBSD)
+# Makefile for karidns & dag (FreeBSD, Linux, macOS)
 
-HAS_LIBIDN2 != pkg info -e libidn2 >/dev/null 2>&1 && echo yes || echo no
-.if "${HAS_LIBIDN2}" == "yes"
-CFLAGS += -DHAVE_LIBIDN2 -I/usr/local/include
-IDN_LDFLAGS = -L/usr/local/lib -lidn2
-.else
-IDN_LDFLAGS =
-.endif
+UNAME_S := $(shell uname -s 2>/dev/null || echo Unknown)
 
-CC = cc
-CFLAGS += -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
-HARDEN_LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
-LDFLAGS = -pthread -lcrypto -lm $(HARDEN_LDFLAGS)
+# OS-specific flags
+DARWIN_OPENSSL := $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl)
+DARWIN_CFLAGS  := $(shell [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && echo "-I$(DARWIN_OPENSSL)/include" || echo "-I/usr/local/include")
+DARWIN_LDFLAGS := $(shell [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && echo "-L$(DARWIN_OPENSSL)/lib" || echo "-L/usr/local/lib")
+
+# Hardening LDFLAGS (macOS ld does not support -z options)
+HARDEN_LDFLAGS := $(shell [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && echo "-pie" || echo "-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack")
+
+# libidn2 detection (portable for BSD make & GNU make)
+IDN_CFLAGS := $(shell (pkg-config --cflags libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2")) || true)
+IDN_LDFLAGS := $(shell (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true)
+
+CC ?= cc
+CFLAGS += -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+LDFLAGS = -pthread -lcrypto -lm $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
+
 
 TARGET = karidns
 SRCS = dns_server_core.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_utils.c
@@ -47,7 +53,7 @@ FUZZ_DAG_SRCS = tests/fuzz/fuzz_dag_response.c dns_wire.c dns_utils.c dns_zone_p
 FUZZ_TSIG_VERIFY_TARGET = tests/fuzz/fuzz_tsig_verify
 FUZZ_TSIG_VERIFY_SRCS = tests/fuzz/fuzz_tsig_verify.c dns_wire.c dns_utils.c dns_zone_parser.c
 
-.PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify
+.PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 

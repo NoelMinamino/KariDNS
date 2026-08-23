@@ -1,0 +1,118 @@
+# KariDNS & dag Distribution Guide
+
+This document describes how to install and use KariDNS and its accompanying toolset (`dag`, `karictl`, `karicheck`) across supported operating systems.
+
+---
+
+## 1. Distribution Matrix
+
+| OS / Platform | Artifact Format | Included Binaries / Assets | Installation Method |
+|---|---|---|---|
+| **FreeBSD** (14.x / 15.x) | `.pkg` | `karidns`, `karictl`, `karicheck`, `dag`, sample configs, rc.d script | `pkg install` / `pkg add` |
+| **Linux (RPM)** (RHEL/Fedora/Rocky) | `.rpm` | `dag` | `dnf install` / `rpm -ivh` |
+| **Linux (DEB)** (Ubuntu/Debian) | `.deb` | `dag` | `dpkg -i` / `apt install` |
+| **Linux (Generic)** | `.tar.gz` | `dag` (standalone binary) | Extract & copy to `/usr/local/bin` |
+| **macOS** | `.dmg`, `.tar.gz` | `dag` (Universal Binary: arm64 + x86_64) | Mount DMG / CLI install |
+| **Homebrew** | Formula (`dag.rb`) | `dag` | `brew install <user>/tap/dag` |
+
+---
+
+## 2. FreeBSD Installation (`pkg`)
+
+### 2.1 Installing from Pre-built Package
+Download the `karidns-<version>-<arch>.pkg` from GitHub Releases:
+```sh
+pkg add karidns-1.0.0.pkg
+```
+
+### 2.2 Installed Components
+- **Binaries:**
+  - `/usr/local/sbin/karidns` (Authoritative DNS daemon)
+  - `/usr/local/bin/karictl` (Dynamic control tool)
+  - `/usr/local/bin/karicheck` (Configuration & zone syntax checker)
+  - `/usr/local/bin/dag` (DNS query client & fuzzer)
+- **Configuration & Zones:**
+  - `/usr/local/etc/karidns/karidns.conf.sample`
+  - `/usr/local/etc/karidns/karictl.conf.sample`
+  - `/usr/local/etc/karidns/zones/example.local.zone.sample`
+- **Service Management:**
+  - `/usr/local/etc/rc.d/karidns`
+
+### 2.3 Starting the Service
+1. Copy configuration:
+   ```sh
+   cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
+   ```
+2. Enable and start:
+   ```sh
+   sysrc karidns_enable="YES"
+   service karidns start
+   ```
+
+---
+
+## 3. Linux Installation (`dag`)
+
+### 3.1 RPM-based (RHEL, Fedora, Rocky, AlmaLinux, openSUSE)
+```sh
+sudo rpm -ivh dag-1.0.0-1.x86_64.rpm
+```
+
+### 3.2 DEB-based (Ubuntu, Debian, Linux Mint)
+```sh
+sudo dpkg -i dag_1.0.0_amd64.deb
+```
+
+### 3.3 Tarball (Generic Linux)
+```sh
+tar -xzf dag-1.0.0-linux-x86_64.tar.gz
+sudo cp dag-1.0.0/dag /usr/local/bin/
+```
+
+---
+
+## 4. macOS Installation (`dag`)
+
+### 4.1 Homebrew (Recommended)
+You can install `dag` via Homebrew Tap:
+```sh
+# Tap repository and install
+brew tap NoelMinamino/tap
+brew install dag
+
+# Or in a single command
+brew install NoelMinamino/tap/dag
+```
+
+To install directly from local Formula or release asset:
+```sh
+brew install --build-from-source Formula/dag.rb
+```
+
+### 4.2 Standalone DMG
+1. Download `dag-<version>-macos.dmg` from GitHub Releases.
+2. Double click to mount `dag-<version>-macos.dmg`.
+3. Copy `bin/dag` to `/usr/local/bin`:
+   ```sh
+   sudo cp /Volumes/DAG/bin/dag /usr/local/bin/
+   ```
+
+---
+
+## 5. Using `dag` (DNS Anomaly Generator)
+
+`dag` is a lightweight, high-performance DNS test client and protocol inspector.
+
+```sh
+# Standard UDP Query
+dag example.local A @127.0.0.1
+
+# TCP Query with DNSSEC & EDNS
+dag example.local A @127.0.0.1 +tcp +dnssec +edns
+
+# Multi-server benchmark & verification
+dag example.local A @8.8.8.8,1.1.1.1,9.9.9.9
+
+# Anomaly testing / packet fuzzing
+dag example.local A @127.0.0.1 --break id_zero
+```
