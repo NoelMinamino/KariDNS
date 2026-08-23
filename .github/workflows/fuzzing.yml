@@ -2,14 +2,14 @@ name: KariDNS Continuous Fuzzing & Stress Test
 
 on:
   schedule:
-    # Run every night at 02:00 UTC (11:00 JST)
-    - cron: '0 2 * * *'
+    # Run every night at 19:00 UTC (04:00 JST next morning)
+    - cron: '0 19 * * *'
   workflow_dispatch:
     inputs:
       fuzz_seconds:
         description: 'Duration (in seconds) per fuzz target'
         required: true
-        default: '180'
+        default: '300'
       runs_target:
         description: 'Maximum runs per target (leave empty for time-based)'
         required: false
@@ -17,7 +17,7 @@ on:
 
 jobs:
   nightly-fuzz-freebsd:
-    name: Nightly Deep Fuzzing (FreeBSD 14.4)
+    name: Nightly Deep Fuzzing (FreeBSD 15.1)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -28,18 +28,18 @@ jobs:
         id: corpus-cache
         with:
           path: tests/fuzz/corpus_*
-          key: fuzzer-corpus-freebsd-14-${{ github.run_id }}
+          key: fuzzer-corpus-freebsd-15-${{ github.run_id }}
           restore-keys: |
-            fuzzer-corpus-freebsd-14-
+            fuzzer-corpus-freebsd-15-
             fuzzer-corpus-
 
       - name: Run Continuous Fuzzing in FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
-          release: '14.4'
+          release: '15.1'
           run: |
             set -e
-            FUZZ_TIME="${{ inputs.fuzz_seconds || '180' }}"
+            FUZZ_TIME="${{ inputs.fuzz_seconds || '300' }}"
             FUZZ_RUNS_INPUT="${{ inputs.runs_target || '' }}"
 
             echo "::group::📦 [Build] Build all libFuzzer targets in parallel"
@@ -85,4 +85,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: tests/fuzz/corpus_*
-          key: fuzzer-corpus-freebsd-14-${{ github.run_id }}
+          key: fuzzer-corpus-freebsd-15-${{ github.run_id }}
