@@ -1958,6 +1958,88 @@ int main() {
         printf("PASS: RFC 4034 §6.1 Canonical ordering & NSEC index tests\n");
     }
 
+    // --- Test 28: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests ---
+    {
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        const char *wc_zone_str =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026010101 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "*.example.com. IN A 192.0.2.1\n"
+            "b.c.example.com. IN A 192.0.2.2\n"
+            "_ssh._tcp.host1.example.com. IN SRV 0 0 22 host1.example.com.\n";
+
+        char *zone_copy = strdup(wc_zone_str);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        int pr = parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx);
+        if (pr < 0) {
+            printf("FAIL: parse_zone_fast failed on wildcard test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed on wildcard test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Helper lambda/block to test name_exists_in_zone logic
+        #define CHECK_NAME_EXISTS(test_name, expected_val) do { \
+            bool exists = false; \
+            size_t name_len = strlen(test_name); \
+            uint32_t h = calc_fnv1a_str(test_name); \
+            size_t idx = h & (arena.hash_size - 1); \
+            for (int i = arena.hash_table[idx]; i != -1; i = arena.records[i].next_record) { \
+                if (strcasecmp(arena.records[i].name, test_name) == 0) { exists = true; break; } \
+            } \
+            if (!exists) { \
+                for (size_t i = 0; i < arena.count; i++) { \
+                    const char *rn = arena.records[i].name; \
+                    if (!rn) continue; \
+                    size_t rn_len = strlen(rn); \
+                    if (rn_len > name_len && rn[rn_len - name_len - 1] == '.' && \
+                        strcasecmp(rn + rn_len - name_len, test_name) == 0) { \
+                        exists = true; break; \
+                    } \
+                } \
+            } \
+            if (exists != (expected_val)) { \
+                printf("FAIL: name_exists check failed for '%s' (expected %d, got %d)\n", test_name, (expected_val), exists); \
+                free(zone_copy); \
+                zone_arena_destroy(&arena); \
+                return 1; \
+            } \
+        } while(0)
+
+        // 1. Direct record existence
+        CHECK_NAME_EXISTS("example.com.", true);
+        CHECK_NAME_EXISTS("b.c.example.com.", true);
+        CHECK_NAME_EXISTS("_ssh._tcp.host1.example.com.", true);
+
+        // 2. Empty Non-Terminal (ENT) existence
+        CHECK_NAME_EXISTS("_tcp.host1.example.com.", true);
+        CHECK_NAME_EXISTS("host1.example.com.", true);
+        CHECK_NAME_EXISTS("c.example.com.", true);
+
+        // 3. Non-existent domains (neither direct record nor ENT)
+        CHECK_NAME_EXISTS("d.example.com.", false);
+        CHECK_NAME_EXISTS("nonexist.example.com.", false);
+        CHECK_NAME_EXISTS("nonexist.d.example.com.", false);
+        CHECK_NAME_EXISTS("host2.example.com.", false);
+
+        #undef CHECK_NAME_EXISTS
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

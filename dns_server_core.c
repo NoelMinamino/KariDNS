@@ -2759,6 +2759,31 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
   return zone_apex;
 }
 
+static bool name_exists_in_zone(zone_arena_t *zone, const char *name) {
+  if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
+  size_t name_len = strlen(name);
+
+  // (a) Exact match check via hash table
+  uint32_t h = calc_fnv1a_str(name);
+  size_t idx = h & (zone->hash_size - 1);
+  for (int i = zone->hash_table[idx]; i != -1; i = zone->records[i].next_record) {
+    if (strcasecmp(zone->records[i].name, name) == 0) return true;
+  }
+
+  // (b) Empty Non-Terminal (ENT) check: any record having name as a proper suffix on label boundary
+  for (size_t i = 0; i < zone->count; i++) {
+    const char *rn = zone->records[i].name;
+    if (!rn) continue;
+    size_t rn_len = strlen(rn);
+    if (rn_len > name_len &&
+        rn[rn_len - name_len - 1] == '.' &&
+        strcasecmp(rn + rn_len - name_len, name) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_arena_t **current_zone_ptr, uint8_t *res,
@@ -2992,6 +3017,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
         if (wc_found)
           break;
+
+        if (name_exists_in_zone(current_zone, parent))
+          break;
         }
       }
     }
@@ -3106,6 +3134,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               }
             }
             if (wc_found || this_qtx_failed) break;
+
+            if (name_exists_in_zone(current_zone, parent))
+              break;
           }
         }
 
