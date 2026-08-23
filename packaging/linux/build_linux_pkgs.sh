@@ -17,9 +17,13 @@ case "$ARCH" in
     *)       DEB_ARCH="$ARCH"; RPM_ARCH="$ARCH" ;;
 esac
 
-echo "==> Building dag binary for Linux (${ARCH}, version ${VERSION})..."
-make clean || true
-make dag
+if [ ! -f dag ]; then
+    echo "==> Building dag binary for Linux (${ARCH}, version ${VERSION})..."
+    make clean || true
+    make dag
+else
+    echo "==> Using existing dag binary for Linux (${ARCH}, version ${VERSION})..."
+fi
 
 mkdir -p "${OUT_DIR}"
 
