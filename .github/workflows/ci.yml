@@ -36,6 +36,10 @@ jobs:
           run: |
             set -e
 
+            echo "::group::📦 [Setup] Install test dependencies (perl5)"
+            pkg install -y perl5 || true
+            echo "::endgroup::"
+
             echo "::group::📦 [Build] Build KariDNS and Tools"
             make all asan tsan tools-asan
             echo "::endgroup::"

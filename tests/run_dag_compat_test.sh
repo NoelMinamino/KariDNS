@@ -19,6 +19,11 @@ if [ ! -x "$DAG" ]; then
     exit 1
 fi
 
+if ! command -v perl >/dev/null 2>&1; then
+    echo "[-] perl is not installed; skipping mock DNS compatibility test."
+    exit 0
+fi
+
 echo "=== Starting Mock DNS Server on port $PORT ==="
 perl "$MOCK_PL" --port="$PORT" &
 MOCK_PID=$!
