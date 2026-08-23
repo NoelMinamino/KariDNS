@@ -31,11 +31,21 @@ static void unescape_string_in_place(char *str) {
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#define LOG_EMERG   0
+#define LOG_ALERT   1
+#define LOG_CRIT    2
+#define LOG_ERR     3
+#define LOG_WARNING 4
+#define LOG_NOTICE  5
+#define LOG_INFO    6
+#define LOG_DEBUG   7
+#define syslog(prio, ...) ((void)0)
 #else
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <syslog.h>
 #include <strings.h>
 #endif
 #include "dns_utils.h"
