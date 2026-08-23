@@ -26,15 +26,19 @@ static void unescape_string_in_place(char *str) {
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <syslog.h>
-#include "dns_utils.h"
-#include <string.h>
 #include <strings.h>
-#include <ctype.h>
+#endif
+#include "dns_utils.h"
 
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t')
 #define IS_NEWLINE(c) ((c) == '\n' || (c) == '\r')

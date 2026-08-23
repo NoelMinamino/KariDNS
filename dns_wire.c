@@ -4,17 +4,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syslog.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
 #include <assert.h>
+#include <math.h>
+#include <ctype.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <math.h>
-#include <ctype.h>
+#endif
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
