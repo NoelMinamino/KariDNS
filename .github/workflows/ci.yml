@@ -112,6 +112,9 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install openssl@3 zlib libidn2
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          LIBIDN2_PREFIX=$(brew --prefix libidn2 2>/dev/null || echo "")
+          echo "PKG_CONFIG_PATH=${OPENSSL_PREFIX}/lib/pkgconfig:${LIBIDN2_PREFIX}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
 
       - name: Build dag
         run: |
