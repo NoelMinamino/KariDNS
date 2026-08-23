@@ -71,7 +71,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Output normalizer to mask only non-deterministic fields and tool banner
+# Output normalizer to mask only non-deterministic fields, tool banner, and dag-specific comparison summary
 normalize_output() {
     sed -E \
         -e '/^; <<>>/d' \
@@ -83,6 +83,7 @@ normalize_output() {
         -e 's/;; Query time: [0-9]+ (msec|usec)/;; Query time: <TIME>/g' \
         -e 's/;; WHEN: .*/;; WHEN: <DATE>/g' \
         -e '/;; (no usable response received|connection failed|no servers could be reached)/d' \
+        -e '/^;; === MULTI-SERVER COMPARISON SUMMARY ===/,$d' \
         -e 's/[[:space:]]+/ /g' \
         -e 's/[[:space:]]*$//' | \
     awk 'NF { print }'
@@ -97,9 +98,9 @@ compare_query() {
     ARGS="$2"
     TOTAL=$((TOTAL + 1))
 
-    # Run dig and dag (passing +nohexdump to dag by default)
+    # Run dig and dag (passing +nohexdump in global options to dag by default)
     dig @127.0.0.1 -p $PORT $ARGS 2>&1 | normalize_output > dig.out || true
-    "$DAG" @127.0.0.1 -p $PORT $ARGS +nohexdump 2>&1 | normalize_output > dag.out || true
+    "$DAG" @127.0.0.1 -p $PORT +nohexdump $ARGS 2>&1 | normalize_output > dag.out || true
 
     if diff -u dig.out dag.out > diff.out 2>&1; then
         echo "  [MATCH] $NAME"
@@ -225,6 +226,17 @@ else
     else
         echo "  [SKIP] Outbound DoT not reachable"
     fi
+
+    echo "--------------------------------------------------------"
+    echo "8. Multiple Queries & Argument Flexibility"
+    echo "--------------------------------------------------------"
+    compare_query "Multiple Queries (A and TXT)" "www.example.com A +noedns example.com TXT +noedns"
+    compare_query "Multiple Queries Short Mode" "www.example.com A +short example.com TXT +short"
+    compare_query "Positional Order: Name Class Type" "www.example.com IN A +noedns"
+    compare_query "Positional Order: Name Type Class" "www.example.com A IN +noedns"
+    compare_query "Positional Order: Type Name Class" "A www.example.com IN +noedns"
+    compare_query "Multiple Reverse (-x) and Forward" "-x 192.0.2.10 +noedns www.example.com A +noedns"
+    compare_query "Per-query flag override (+noanswer on second)" "www.example.com A +noedns example.com TXT +noanswer +noedns"
 fi
 
 echo "========================================================"
