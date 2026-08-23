@@ -44,12 +44,49 @@
 #include <openssl/err.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
+#include <openssl/rand.h>
 #ifdef HAVE_LIBIDN2
 #include <idn2.h>
 #endif
 #include "../dns_wire.h"
 #include "../dns_utils.h"
 #include "../dns_zone_parser.h"
+
+#if !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(__APPLE__)
+/* Portable strlcpy for Linux / non-BSD platforms */
+static inline size_t dag_strlcpy(char *dst, const char *src, size_t siz) {
+    char *d = dst;
+    const char *s = src;
+    size_t n = siz;
+
+    if (n != 0) {
+        while (--n != 0) {
+            if ((*d++ = *s++) == '\0')
+                break;
+        }
+    }
+    if (n == 0) {
+        if (siz != 0)
+            *d = '\0';
+        while (*s++)
+            ;
+    }
+    return (s - src - 1);
+}
+#undef strlcpy
+#define strlcpy dag_strlcpy
+
+/* Portable arc4random for Linux / non-BSD platforms */
+static inline uint32_t dag_arc4random(void) {
+    uint32_t val = 0;
+    if (RAND_bytes((unsigned char *)&val, sizeof(val)) == 1) {
+        return val;
+    }
+    return (uint32_t)rand();
+}
+#undef arc4random
+#define arc4random dag_arc4random
+#endif
 
 static bool g_dag_suppress_stdout = false;
 #define printf(...) do { if (!g_dag_suppress_stdout) { fprintf(stdout, __VA_ARGS__); } } while(0)

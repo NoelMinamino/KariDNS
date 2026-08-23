@@ -1206,7 +1206,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 29: { // LOC
-                if (offset + 16 > max_res_len) return -1;
+                if ((size_t)offset + 16 > max_res_len) return -1;
 
                 int idx = 0;
                 double lat_sec, lon_sec;
@@ -1630,7 +1630,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 35: { // NAPTR
                 if (rec->rdata_count < 6) return -1;
-                if (offset + 4 > max_res_len) return -1;
+                if ((size_t)offset + 4 > max_res_len) return -1;
                 uint16_t order, pref;
                 if (!parse_u16(rec->rdata[0], &order) ||
                     !parse_u16(rec->rdata[1], &pref)) return -1;
@@ -1658,7 +1658,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     salt_len = hex_decode(rec->rdata[3], salt, sizeof(salt));
                     if (salt_len == (size_t)-1) return -1;
                 }
-                if (offset + 5 + salt_len > max_res_len) return -1;
+                if ((size_t)offset + 5 + salt_len > max_res_len) return -1;
                 res[offset++] = halg;
                 res[offset++] = flags;
                 res[offset++] = iterations >> 8; res[offset++] = iterations & 0xFF;
@@ -1678,7 +1678,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 size_t pk_b64_len = strlen(pk_b64);
                 size_t decoded_upper_bound = ((pk_b64_len + 3) / 4) * 3;
                 
-                if (offset + 4 + hit_len + decoded_upper_bound > max_res_len) return -1;
+                if ((size_t)offset + 4 + hit_len + decoded_upper_bound > max_res_len) return -1;
                 
                 res[offset++] = (uint8_t)hit_len;
                 res[offset++] = pk_alg;
@@ -1710,7 +1710,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 64: case 65: { // HTTPS / SVCB (RFC 9460)
                 if (rec->rdata_count < 2) return -1;
-                if (offset + 2 > max_res_len) return -1;
+                if ((size_t)offset + 2 > max_res_len) return -1;
                 uint16_t svc_prio;
                 if (!parse_u16(rec->rdata[0], &svc_prio)) return -1;
                 res[offset++] = svc_prio >> 8; res[offset++] = svc_prio & 0xFF;
