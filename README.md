@@ -209,25 +209,26 @@ service karidns start
 
 ### 2. macOS Installation (`dag` only)
 
-#### Option A: Homebrew (Recommended)
+#### Option A: Generic Tarball (.tar.gz) [Fastest]
 ```sh
-# Method 1: Download Formula and install directly
-curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
-brew install --formula ./dag.rb
-
-# Method 2: Via Homebrew Tap (if tap repository is configured)
-brew install NoelMinamino/karidns/dag
-```
-
-#### Option B: Standalone DMG (.dmg)
-1. Download `dag-?.?.?-macos-arm64.dmg` from GitHub Releases.
-2. Double-click the DMG and drag `dag` to `/usr/local/bin` (or your preferred `$PATH`).
-
-#### Option C: Generic Tarball (.tar.gz)
-```sh
+# For Apple Silicon (M1/M2/M3/M4):
 curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-macos-arm64.tar.gz
 tar -xzf dag-?.?.?-macos-arm64.tar.gz
 sudo cp dag-?.?.?/dag /usr/local/bin/
+
+# For Intel Macs:
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-macos-x86_64.tar.gz
+tar -xzf dag-?.?.?-macos-x86_64.tar.gz
+sudo cp dag-?.?.?/dag /usr/local/bin/
+```
+
+#### Option B: Standalone DMG (.dmg)
+1. Download `dag-?.?.?-macos-arm64.dmg` (or `x86_64`) from GitHub Releases.
+2. Double-click the DMG and copy `dag` to `/usr/local/bin` (or your preferred `$PATH`).
+
+#### Option C: Homebrew Tap
+```sh
+brew install NoelMinamino/karidns/dag
 ```
 
 ---

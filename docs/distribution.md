@@ -84,22 +84,20 @@ sudo cp dag-?.?.?/dag /usr/local/bin/
 
 ## 4. macOS Installation (`dag`)
 
-### 4.1 Homebrew (Recommended)
-
+### 4.1 Generic Tarball (.tar.gz) [Fastest & Recommended]
 ```sh
-# Option 1: Direct install from downloaded Formula
-curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
-brew install --formula ./dag.rb
+# For Apple Silicon (M1/M2/M3/M4):
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-macos-arm64.tar.gz
+tar -xzf dag-?.?.?-macos-arm64.tar.gz
+sudo cp dag-?.?.?/dag /usr/local/bin/
 
-# Option 2: Via Homebrew Tap repository
-brew tap NoelMinamino/karidns
-brew install dag
-
-# Or in a single command
-brew install NoelMinamino/karidns/dag
+# For Intel:
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-macos-x86_64.tar.gz
+tar -xzf dag-?.?.?-macos-x86_64.tar.gz
+sudo cp dag-?.?.?/dag /usr/local/bin/
 ```
 
-### 4.2 Standalone DMG
+### 4.2 Standalone DMG (.dmg)
 1. Download the DMG for your architecture from GitHub Releases:
    - **Apple Silicon (M1/M2/M3/M4):** `dag-?.?.?-macos-arm64.dmg`
    - **Intel:** `dag-?.?.?-macos-x86_64.dmg`
@@ -108,6 +106,12 @@ brew install NoelMinamino/karidns/dag
    ```sh
    sudo cp /Volumes/DAG/bin/dag /usr/local/bin/
    ```
+
+### 4.3 Homebrew Tap
+If you configure a Homebrew tap repository (`homebrew-karidns`):
+```sh
+brew install NoelMinamino/karidns/dag
+```
 
 ---
 
