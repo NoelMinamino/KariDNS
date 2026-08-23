@@ -70,12 +70,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install Debian packaging tools on host
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm dpkg-dev libssl-dev zlib1g-dev libidn2-dev
+          sudo apt-get install -y dpkg-dev
 
-      - name: Build Linux packages
+      - name: Build binary and RPM in Rocky Linux 9 container (glibc 2.34 compatibility)
+        run: |
+          mkdir -p dist
+          TAG_VER="${{ env.RELEASE_VER }}"
+          docker run --rm -v "${GITHUB_WORKSPACE}:/src" -w /src rockylinux:9 sh -c "
+            set -e
+            dnf install -y gcc make openssl-devel zlib-devel libidn2-devel rpm-build
+            make clean
+            make dag
+            ./packaging/linux/build_linux_pkgs.sh \"$TAG_VER\" /src/dist
+          "
+
+      - name: Build DEB and Tarball packages on host
         run: |
           TAG_VER="${{ env.RELEASE_VER }}"
           chmod +x packaging/linux/build_linux_pkgs.sh
@@ -118,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-13, macos-14]
+        os: [macos-14, macos-15]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
