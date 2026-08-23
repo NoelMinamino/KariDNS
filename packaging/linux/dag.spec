@@ -1,3 +1,5 @@
+%global debug_package %{nil}
+
 Name:           dag
 Version:        %{?version}%{!?version:1.0.0}
 Release:        1%{?dist}
