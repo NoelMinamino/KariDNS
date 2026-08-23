@@ -2743,37 +2743,6 @@ static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
   return NULL;
 }
 
-static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex) {
-  if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
-    return zone_apex;
-  const char *parent = qname;
-  size_t apex_len = strlen(zone_apex);
-  while ((parent = strchr(parent, '.')) != NULL) {
-    parent++;
-    if (*parent == '\0') break;
-
-    size_t p_len = strlen(parent);
-    if (p_len < apex_len) break;
-    if (strcasecmp(parent, zone_apex) == 0)
-      return zone_apex;
-    if (p_len > apex_len) {
-      if (parent[p_len - apex_len - 1] != '.' ||
-          strcasecmp(parent + p_len - apex_len, zone_apex) != 0) {
-        break; // Outside zone apex
-      }
-    }
-
-    uint32_t p_hash = calc_fnv1a_str(parent);
-    size_t p_idx = p_hash & (zone->hash_size - 1);
-    for (int i = zone->hash_table[p_idx]; i != -1; i = zone->records[i].next_record) {
-      if (strcasecmp(zone->records[i].name, parent) == 0) {
-        return zone->records[i].name;
-      }
-    }
-  }
-  return zone_apex;
-}
-
 static bool name_exists_in_zone(zone_arena_t *zone, const char *name) {
   if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
   size_t name_len = strlen(name);
@@ -2797,6 +2766,33 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name) {
     }
   }
   return false;
+}
+
+static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex) {
+  if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
+    return zone_apex;
+  const char *parent = qname;
+  size_t apex_len = strlen(zone_apex);
+  while ((parent = strchr(parent, '.')) != NULL) {
+    parent++;
+    if (*parent == '\0') break;
+
+    size_t p_len = strlen(parent);
+    if (p_len < apex_len) break;
+    if (strcasecmp(parent, zone_apex) == 0)
+      return zone_apex;
+    if (p_len > apex_len) {
+      if (parent[p_len - apex_len - 1] != '.' ||
+          strcasecmp(parent + p_len - apex_len, zone_apex) != 0) {
+        break; // Outside zone apex
+      }
+    }
+
+    if (name_exists_in_zone(zone, parent)) {
+      return parent;
+    }
+  }
+  return zone_apex;
 }
 
 static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtypes,

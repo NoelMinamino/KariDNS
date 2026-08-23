@@ -2035,6 +2035,67 @@ int main() {
 
         #undef CHECK_NAME_EXISTS
 
+        // 4. Closest Encloser resolution tests (including ENT)
+        #define FIND_CLOSEST_ENCLOSER(qname, apex) ({ \
+            const char *res_encloser = (apex); \
+            const char *p = (qname); \
+            size_t a_len = strlen(apex); \
+            while ((p = strchr(p, '.')) != NULL) { \
+                p++; \
+                if (*p == '\0') break; \
+                size_t pl = strlen(p); \
+                if (pl < a_len) break; \
+                if (strcasecmp(p, (apex)) == 0) { res_encloser = (apex); break; } \
+                if (pl > a_len) { \
+                    if (p[pl - a_len - 1] != '.' || strcasecmp(p + pl - a_len, (apex)) != 0) break; \
+                } \
+                bool ex = false; \
+                uint32_t ph = calc_fnv1a_str(p); \
+                size_t pidx = ph & (arena.hash_size - 1); \
+                for (int i = arena.hash_table[pidx]; i != -1; i = arena.records[i].next_record) { \
+                    if (strcasecmp(arena.records[i].name, p) == 0) { ex = true; break; } \
+                } \
+                if (!ex) { \
+                    for (size_t i = 0; i < arena.count; i++) { \
+                        const char *rn = arena.records[i].name; \
+                        if (!rn) continue; \
+                        size_t rl = strlen(rn); \
+                        if (rl > pl && rn[rl - pl - 1] == '.' && strcasecmp(rn + rl - pl, p) == 0) { \
+                            ex = true; break; \
+                        } \
+                    } \
+                } \
+                if (ex) { res_encloser = p; break; } \
+            } \
+            res_encloser; \
+        })
+
+        const char *enc1 = FIND_CLOSEST_ENCLOSER("nonexist._tcp.host1.example.com.", "example.com.");
+        if (strcasecmp(enc1, "_tcp.host1.example.com.") != 0) {
+            printf("FAIL: find_closest_encloser should return ENT '_tcp.host1.example.com.', got '%s'\n", enc1);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        const char *enc2 = FIND_CLOSEST_ENCLOSER("nonexist.b.c.example.com.", "example.com.");
+        if (strcasecmp(enc2, "b.c.example.com.") != 0) {
+            printf("FAIL: find_closest_encloser should return 'b.c.example.com.', got '%s'\n", enc2);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        const char *enc3 = FIND_CLOSEST_ENCLOSER("nonexist.d.example.com.", "example.com.");
+        if (strcasecmp(enc3, "example.com.") != 0) {
+            printf("FAIL: find_closest_encloser should fall back to apex 'example.com.', got '%s'\n", enc3);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        #undef FIND_CLOSEST_ENCLOSER
+
         free(zone_copy);
         zone_arena_destroy(&arena);
         printf("PASS: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
