@@ -9,6 +9,7 @@ VERSION="${VERSION#v}" # Strip leading 'v' if present
 OUT_DIR="${2:-./dist}"
 
 ARCH=$(pkg config ABI 2>/dev/null || echo "FreeBSD:$(uname -r | cut -d. -f1):$(uname -m)")
+ABI_SUFFIX=$(echo "$ARCH" | tr ':' '-')
 STAGE_DIR="$(mktemp -d -t karidns-pkg-stage)"
 MANIFEST_DIR="$(mktemp -d -t karidns-pkg-manifest)"
 
@@ -44,6 +45,13 @@ sed -e "s/__VERSION__/${VERSION}/g" \
 
 echo "==> Creating FreeBSD pkg..."
 pkg create -m "${MANIFEST_DIR}" -r "${STAGE_DIR}" -o "${OUT_DIR}"
+
+# Rename pkg to include ABI suffix (e.g. karidns-1.0.0-FreeBSD-14-amd64.pkg / karidns-1.0.0-FreeBSD-15-amd64.pkg)
+PKG_DEFAULT="${OUT_DIR}/karidns-${VERSION}.pkg"
+PKG_TARGET="${OUT_DIR}/karidns-${VERSION}-${ABI_SUFFIX}.pkg"
+if [ -f "$PKG_DEFAULT" ]; then
+    mv "$PKG_DEFAULT" "$PKG_TARGET"
+fi
 
 # Cleanup
 rm -rf "${STAGE_DIR}" "${MANIFEST_DIR}"

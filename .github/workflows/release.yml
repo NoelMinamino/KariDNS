@@ -6,32 +6,39 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: 'Tag name for release (e.g. v1.0.0)'
+      version:
+        description: 'Release version (for debugging/testing)'
         required: true
-        default: 'v1.0.0'
+        default: '0.0.1'
+
+env:
+  RELEASE_VER: ${{ inputs.version || github.ref_name || '0.0.1' }}
 
 jobs:
   build-and-test-freebsd:
-    name: Build & Test FreeBSD Package (.pkg)
+    name: Build & Test FreeBSD ${{ matrix.release }} Package (.pkg)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.4', '15.1']
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build and Test FreeBSD pkg inside FreeBSD VM
+      - name: Build and Test FreeBSD pkg inside FreeBSD VM (${{ matrix.release }})
         uses: vmactions/freebsd-vm@v1.4.8
         with:
-          release: '14.4'
+          release: ${{ matrix.release }}
           run: |
             set -e
             pkg install -y openssl pkgconf libidn2
             mkdir -p dist
-            TAG_VER="${{ github.ref_name || github.event.inputs.tag_name }}"
+            TAG_VER="${{ env.RELEASE_VER }}"
             chmod +x packaging/freebsd/build_pkg.sh
             ./packaging/freebsd/build_pkg.sh "$TAG_VER" ./dist
 
-            echo "::group::🧪 [Verification] Test installing generated FreeBSD pkg"
+            echo "::group::🧪 [Verification] Test installing generated FreeBSD pkg on ${{ matrix.release }}"
             pkg install -y dist/karidns-*.pkg
             
             # Verify installed binaries and files
@@ -47,13 +54,13 @@ jobs:
             echo "Testing dag against Google DNS..."
             /usr/local/bin/dag www.google.com A @8.8.8.8
             /usr/local/bin/dag google.com TXT @8.8.8.8 +tcp
-            echo "FreeBSD package installation & verification test passed!"
+            echo "FreeBSD ${{ matrix.release }} package installation & verification test passed!"
             echo "::endgroup::"
 
-      - name: Upload FreeBSD Package Artifact
+      - name: Upload FreeBSD ${{ matrix.release }} Package Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: freebsd-packages
+          name: freebsd-${{ matrix.release }}-packages
           path: dist/karidns-*.pkg*
 
   build-and-test-linux:
@@ -70,7 +77,7 @@ jobs:
 
       - name: Build Linux packages
         run: |
-          TAG_VER="${{ github.ref_name || github.event.inputs.tag_name }}"
+          TAG_VER="${{ env.RELEASE_VER }}"
           chmod +x packaging/linux/build_linux_pkgs.sh
           ./packaging/linux/build_linux_pkgs.sh "$TAG_VER" ./dist
 
@@ -118,7 +125,7 @@ jobs:
 
       - name: Build macOS Universal Binary & DMG
         run: |
-          TAG_VER="${{ github.ref_name || github.event.inputs.tag_name }}"
+          TAG_VER="${{ env.RELEASE_VER }}"
           chmod +x packaging/macos/build_dmg.sh
           ./packaging/macos/build_dmg.sh "$TAG_VER" ./dist
 
@@ -174,7 +181,7 @@ jobs:
           mkdir -p release-assets
           cp all-dist/* release-assets/ 2>/dev/null || true
           
-          TAG_VER="${{ github.ref_name || github.event.inputs.tag_name }}"
+          TAG_VER="${{ env.RELEASE_VER }}"
           
           # Generate SHA256SUMS.txt
           cd release-assets
@@ -189,8 +196,8 @@ jobs:
       - name: Create Draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || github.event.inputs.tag_name }}
-          name: Release ${{ github.ref_name || github.event.inputs.tag_name }}
+          tag_name: ${{ env.RELEASE_VER }}
+          name: Release ${{ env.RELEASE_VER }}
           draft: true
           prerelease: false
           generate_release_notes: true
