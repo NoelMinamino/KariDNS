@@ -19,26 +19,36 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <ctype.h>
+#include <locale.h>
+#include <limits.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <io.h>
+#define close(s) closesocket(s)
+#ifndef MSG_WAITALL
+#define MSG_WAITALL 0
+#endif
+#else
+#include <unistd.h>
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/resource.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <zlib.h>
 #include <strings.h>
-#include <ctype.h>
+#endif
+
+#include <zlib.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
-
-#include <locale.h>
-#include <limits.h>
-#ifndef _WIN32
-#include <sys/resource.h>
-#endif
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -51,6 +61,19 @@
 #include "../dns_wire.h"
 #include "../dns_utils.h"
 #include "../dns_zone_parser.h"
+
+static inline void set_socket_timeouts(int sock, int timeout_sec) {
+    int tsec = timeout_sec > 0 ? timeout_sec : 5;
+#ifdef _WIN32
+    DWORD tv = (DWORD)(tsec * 1000);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#else
+    struct timeval tv = { .tv_sec = tsec, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
 
 #if !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(__APPLE__)
 /* Portable strlcpy for Linux / non-BSD platforms */
@@ -1377,8 +1400,7 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
         close(sock); return -1;
     }
 
-    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    set_socket_timeouts(sock, timeout_sec);
     ssize_t n = recv(sock, resp, resp_cap, 0);
     close(sock);
     return n;
@@ -1439,8 +1461,7 @@ static int do_tcp_send_request(const char *server, int port, const query_opts_t 
         if (send(sock, pkt, body_len, 0) < 0) { perror("send(body)"); close(sock); return -1; }
     }
 
-    struct timeval tv = { .tv_sec = timeout_sec, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    set_socket_timeouts(sock, timeout_sec);
 
     return sock;
 }
@@ -1535,9 +1556,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port);
     if (sock < 0) return -1;
-    struct timeval tv = { .tv_sec = timeout_sec > 0 ? timeout_sec : 5, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    set_socket_timeouts(sock, timeout_sec);
     if (qo->use_proxy) {
         uint8_t pbuf[64];
         size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
@@ -1597,9 +1616,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port);
     if (sock < 0) return -1;
-    struct timeval tv = { .tv_sec = timeout_sec > 0 ? timeout_sec : 5, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    set_socket_timeouts(sock, timeout_sec);
     if (qo->use_proxy) {
         uint8_t pbuf[64];
         size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
@@ -5718,6 +5735,13 @@ static int execute_query_spec(query_spec_t *spec) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
+#endif
     setlocale(LC_ALL, "");
     zone_arena_init(&g_dag_arena);
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
@@ -5942,5 +5966,8 @@ int main(int argc, char **argv) {
 
     zone_arena_destroy(&g_dag_arena);
     if (g_results) free(g_results);
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return last_exit_code;
 }

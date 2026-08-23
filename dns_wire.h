@@ -6,8 +6,13 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#endif
 
 // ============================================================================
 // 数値フィールド安全パースヘルパー (0-255, 0-65535 範囲検証付き)

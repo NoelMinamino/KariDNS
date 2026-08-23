@@ -174,7 +174,7 @@ KariDNS and its tools are distributed as pre-built packages for FreeBSD, Linux, 
 > [!IMPORTANT]
 > **Platform Support Scope:**
 > - **FreeBSD (Full Suite):** Includes the authoritative server daemon (`karidns`), management tool (`karictl`), syntax validator (`karicheck`), and DNS testing client (`dag`), along with sample configs and `rc.d` service scripts.
-> - **Linux & macOS (Client Only):** Since `karidns` relies on FreeBSD-native kernel features (`kqueue`, `Capsicum`), non-FreeBSD platforms distribute **`dag` only** (as an ultra-fast, feature-rich DNS query tool and fuzzer alternative to `dig`).
+> - **Linux, macOS & Windows (Client Only):** Since `karidns` relies on FreeBSD-native kernel features (`kqueue`, `Capsicum`), non-FreeBSD platforms distribute **`dag` only** (as an ultra-fast, feature-rich DNS query tool and fuzzer alternative to `dig`).
 
 ### 1. FreeBSD Installation (`karidns` Full Suite)
 
@@ -258,6 +258,19 @@ curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.
 tar -xzf dag-?.?.?-linux-x86_64.tar.gz
 sudo cp dag-?.?.?/dag /usr/local/bin/
 ```
+
+---
+
+### 4. Windows Installation (`dag.exe` only)
+
+Download `dag-?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
+
+1. Extract the ZIP archive.
+2. Place `dag.exe` in a directory registered in your system `%PATH%` (e.g., `C:\Windows\System32` or your local tools directory).
+3. Open Command Prompt or PowerShell:
+   ```cmd
+   dag.exe www.google.com A @8.8.8.8
+   ```
 
 For complete packaging details and checksum verification, see the **[Distribution Guide](docs/distribution.md)**.
 

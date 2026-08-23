@@ -14,6 +14,7 @@ This document describes how to install and use KariDNS and its accompanying tool
 | **Linux (Generic)** | `.tar.gz` | `dag` (standalone binary) | Extract & copy to `/usr/local/bin` |
 | **macOS** | `.dmg`, `.tar.gz` | `dag` (Universal Binary: arm64 + x86_64) | Mount DMG / CLI install |
 | **Homebrew** | Formula (`dag.rb`) | `dag` | `brew install <user>/tap/dag` |
+| **Windows** | `.zip` | `dag.exe` (x86_64 standalone executable) | Extract & copy to `%PATH%` |
 
 ---
 
@@ -110,7 +111,18 @@ brew install NoelMinamino/karidns/dag
 
 ---
 
-## 5. Using `dag` (DNS Anomaly Generator)
+## 5. Windows Installation (`dag.exe`)
+
+1. Download `dag-?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
+2. Extract the archive and copy `dag.exe` to a directory in your `%PATH%`.
+3. Test query in Command Prompt or PowerShell:
+   ```cmd
+   dag.exe www.google.com A @8.8.8.8
+   ```
+
+---
+
+## 6. Using `dag` (DNS Anomaly Generator)
 
 `dag` is a lightweight, high-performance DNS test client and protocol inspector.
 

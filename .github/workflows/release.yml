@@ -181,9 +181,55 @@ jobs:
           name: macos-${{ matrix.os }}-packages
           path: dist/dag*
 
+  build-and-test-windows:
+    name: Build & Test dag (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 and MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-libidn2
+            make
+            zip
+
+      - name: Build dag.exe and ZIP package in MSYS2
+        shell: msys2 {0}
+        run: |
+          TAG_VER="${{ env.RELEASE_VER }}"
+          mkdir -p dist
+          make clean
+          make dag
+          chmod +x packaging/windows/build_windows_zip.sh
+          ./packaging/windows/build_windows_zip.sh "$TAG_VER" ./dist
+
+      - name: Test dag.exe execution in MSYS2
+        shell: msys2 {0}
+        run: |
+          echo "::group::🧪 [Verification] Test running dag.exe on Windows"
+          ./dag.exe --help || true
+          ./dag.exe www.google.com A @8.8.8.8
+          ./dag.exe google.com TXT @8.8.8.8 +tcp
+          echo "Windows dag.exe execution test passed!"
+          echo "::endgroup::"
+
+      - name: Upload Windows Package Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: dist/dag-*-windows-x86_64.zip
+
   publish-draft-release:
     name: Publish Draft GitHub Release & Homebrew Formula
-    needs: [build-and-test-freebsd, build-and-test-linux, build-and-test-macos]
+    needs: [build-and-test-freebsd, build-and-test-linux, build-and-test-macos, build-and-test-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
