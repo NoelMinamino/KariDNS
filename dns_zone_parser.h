@@ -49,6 +49,8 @@ typedef struct zone_arena_s {
   int file_buf_count;
   int *hash_table;
   size_t hash_size;
+  dns_record_t **nsec_records;
+  size_t nsec_count;
   _Atomic int reader_count;
 } zone_arena_t;
 

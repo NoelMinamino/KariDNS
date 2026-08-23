@@ -381,3 +381,52 @@ size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap) {
     }
     return out_len;
 }
+
+int compare_canonical_name(const char *name1, const char *name2) {
+    if (!name1 && !name2) return 0;
+    if (!name1) return -1;
+    if (!name2) return 1;
+
+    int len1 = (int)strlen(name1);
+    int len2 = (int)strlen(name2);
+    if (len1 > 0 && name1[len1 - 1] == '.') len1--;
+    if (len2 > 0 && name2[len2 - 1] == '.') len2--;
+
+    int p1 = len1, p2 = len2;
+    while (p1 > 0 || p2 > 0) {
+        int d1 = p1 - 1;
+        while (d1 >= 0 && name1[d1] != '.') d1--;
+        int d2 = p2 - 1;
+        while (d2 >= 0 && name2[d2] != '.') d2--;
+
+        int label_len1 = (p1 > 0) ? (p1 - d1 - 1) : 0;
+        int label_len2 = (p2 > 0) ? (p2 - d2 - 1) : 0;
+
+        int min_len = label_len1 < label_len2 ? label_len1 : label_len2;
+        int cmp = 0;
+        if (min_len > 0) {
+            for (int i = 0; i < min_len; i++) {
+                char c1 = name1[d1 + 1 + i];
+                char c2 = name2[d2 + 1 + i];
+                if (c1 >= 'A' && c1 <= 'Z') c1 |= 0x20;
+                if (c2 >= 'A' && c2 <= 'Z') c2 |= 0x20;
+                if (c1 != c2) {
+                    cmp = (unsigned char)c1 - (unsigned char)c2;
+                    break;
+                }
+            }
+        }
+        if (cmp != 0) return cmp;
+        if (label_len1 != label_len2) return label_len1 - label_len2;
+
+        p1 = d1;
+        p2 = d2;
+    }
+    return 0;
+}
+
+bool serial_is_newer(uint32_t s1, uint32_t s2) {
+    return ((int32_t)(s1 - s2)) > 0;
+}
+
+

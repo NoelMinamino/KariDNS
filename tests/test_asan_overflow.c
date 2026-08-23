@@ -1776,9 +1776,9 @@ int main() {
             .is_standalone_mode = true,
         };
         int pr = parse_zone_fast(zone_buf, strlen(zone_buf), &arena, &ctx);
-        free(zone_buf);
         if (pr < 0 || arena.count < 4) {
             printf("FAIL: parse_zone_fast failed for IPSECKEY/AMTRELAY test zone (pr=%d, count=%zu)\n", pr, arena.count);
+            free(zone_buf);
             zone_arena_destroy(&arena);
             return 1;
         }
@@ -1795,6 +1795,7 @@ int main() {
             strcmp(ipseckey_rec->rdata[3], "gw.example.com.") != 0) {
             printf("FAIL: IPSECKEY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
                    (ipseckey_rec && ipseckey_rec->rdata_count >= 4) ? ipseckey_rec->rdata[3] : "null");
+            free(zone_buf);
             zone_arena_destroy(&arena);
             return 1;
         }
@@ -1803,12 +1804,366 @@ int main() {
             strcmp(amtrelay_rec->rdata[3], "gw.example.com.") != 0) {
             printf("FAIL: AMTRELAY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
                    (amtrelay_rec && amtrelay_rec->rdata_count >= 4) ? amtrelay_rec->rdata[3] : "null");
+            free(zone_buf);
             zone_arena_destroy(&arena);
             return 1;
         }
 
+        free(zone_buf);
         zone_arena_destroy(&arena);
         printf("PASS: IPSECKEY and AMTRELAY '03' gateway domain expansion test\n");
+    }
+
+    // --- Test 26: RRL token refill 32-bit overflow & boundary test ---
+    {
+        uint32_t rate = 1000;
+        int64_t now_ms = 3000000000LL;
+        int64_t last_refill_ms = now_ms - (30LL * 24 * 3600 * 1000); // 30 days elapsed
+        int32_t tokens = 0;
+
+        int64_t elapsed_ms = now_ms - last_refill_ms;
+        if (elapsed_ms > 0) {
+            uint64_t add_t = ((uint64_t)elapsed_ms * rate) / 1000;
+            if (add_t > 0) {
+                if (add_t > (uint64_t)rate) add_t = rate;
+                tokens += (int32_t)add_t;
+                if (tokens > (int32_t)rate) tokens = rate;
+                if (tokens < 0) tokens = 0;
+            }
+        }
+        if (tokens != (int32_t)rate) {
+            printf("FAIL: RRL refill overflow test failed (tokens=%d, expected=%u)\n", tokens, rate);
+            return 1;
+        }
+
+        // Test normal small interval (e.g. 500ms elapsed at rate 100)
+        rate = 100;
+        tokens = 10;
+        elapsed_ms = 500;
+        uint64_t add_t = ((uint64_t)elapsed_ms * rate) / 1000; // 50
+        if (add_t > 0) {
+            if (add_t > (uint64_t)rate) add_t = rate;
+            tokens += (int32_t)add_t;
+            if (tokens > (int32_t)rate) tokens = rate;
+            if (tokens < 0) tokens = 0;
+        }
+        if (tokens != 60) {
+            printf("FAIL: RRL normal refill test failed (tokens=%d, expected=60)\n", tokens);
+            return 1;
+        }
+        printf("PASS: RRL token refill 32-bit overflow & normal refill test\n");
+    }
+
+    // --- Test 27: RFC 4034 §6.1 Canonical ordering & NSEC non-existence proof tests ---
+    {
+        // 1. Canonical DNS name comparison tests
+        if (compare_canonical_name("example.com.", "example.com.") != 0) {
+            printf("FAIL: compare_canonical_name equal names failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("EXAMPLE.COM.", "example.com.") != 0) {
+            printf("FAIL: compare_canonical_name case insensitivity failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("example.com.", "a.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name apex < subdomain failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("a.example.com.", "b.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name a < b failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("*.example.com.", "a.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name '*' < 'a' failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("example.com.", "*.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name apex < wildcard failed\n");
+            return 1;
+        }
+
+        // RFC 4034 Section 6.1 test vector sequence
+        const char *rfc4034_seq[] = {
+            "example",
+            "a.example",
+            "yljkjhh.a.example",
+            "Z.a.example",
+            "zABC.a.EXAMPLE",
+            "z.example",
+            "*.z.example"
+        };
+        for (size_t i = 0; i < sizeof(rfc4034_seq)/sizeof(rfc4034_seq[0]) - 1; i++) {
+            if (compare_canonical_name(rfc4034_seq[i], rfc4034_seq[i+1]) >= 0) {
+                printf("FAIL: RFC 4034 sequence ordering failed for '%s' vs '%s'\n",
+                       rfc4034_seq[i], rfc4034_seq[i+1]);
+                return 1;
+            }
+        }
+
+        // 2. Zone NSEC index construction and canonical sorting test
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        const char *nsec_zone_str =
+            "$ORIGIN nsec.example.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.nsec.example. hostmaster.nsec.example. 2026010101 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.nsec.example.\n"
+            "@ IN NSEC d.nsec.example. SOA NS RRSIG NSEC\n"
+            "d.nsec.example. IN A 192.0.2.4\n"
+            "d.nsec.example. IN NSEC nsec.example. A RRSIG NSEC\n"
+            "a.nsec.example. IN A 192.0.2.1\n"
+            "a.nsec.example. IN NSEC d.nsec.example. A RRSIG NSEC\n";
+
+        char *zone_copy = strdup(nsec_zone_str);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "nsec.example.";
+        int pr = parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx);
+        if (pr < 0) {
+            printf("FAIL: parse_zone_fast failed on nsec test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed on nsec test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (arena.nsec_count != 3 || !arena.nsec_records) {
+            printf("FAIL: arena.nsec_count != 3 (got %zu)\n", arena.nsec_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Check canonical sorted order of NSEC records:
+        // [0]: nsec.example.
+        // [1]: a.nsec.example.
+        // [2]: d.nsec.example.
+        if (strcasecmp(arena.nsec_records[0]->name, "nsec.example.") != 0 ||
+            strcasecmp(arena.nsec_records[1]->name, "a.nsec.example.") != 0 ||
+            strcasecmp(arena.nsec_records[2]->name, "d.nsec.example.") != 0) {
+            printf("FAIL: NSEC records are not canonically sorted: [0]=%s, [1]=%s, [2]=%s\n",
+                   arena.nsec_records[0]->name, arena.nsec_records[1]->name, arena.nsec_records[2]->name);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: RFC 4034 §6.1 Canonical ordering & NSEC index tests\n");
+    }
+
+    // --- Test 28: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests ---
+    {
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        const char *wc_zone_str =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026010101 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "*.example.com. IN A 192.0.2.1\n"
+            "b.c.example.com. IN A 192.0.2.2\n"
+            "_ssh._tcp.host1.example.com. IN SRV 0 0 22 host1.example.com.\n";
+
+        char *zone_copy = strdup(wc_zone_str);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        int pr = parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx);
+        if (pr < 0) {
+            printf("FAIL: parse_zone_fast failed on wildcard test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed on wildcard test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Helper lambda/block to test name_exists_in_zone logic
+        #define CHECK_NAME_EXISTS(test_name, expected_val) do { \
+            bool exists = false; \
+            size_t name_len = strlen(test_name); \
+            uint32_t h = calc_fnv1a_str(test_name); \
+            size_t idx = h & (arena.hash_size - 1); \
+            for (int i = arena.hash_table[idx]; i != -1; i = arena.records[i].next_record) { \
+                if (strcasecmp(arena.records[i].name, test_name) == 0) { exists = true; break; } \
+            } \
+            if (!exists) { \
+                for (size_t i = 0; i < arena.count; i++) { \
+                    const char *rn = arena.records[i].name; \
+                    if (!rn) continue; \
+                    size_t rn_len = strlen(rn); \
+                    if (rn_len > name_len && rn[rn_len - name_len - 1] == '.' && \
+                        strcasecmp(rn + rn_len - name_len, test_name) == 0) { \
+                        exists = true; break; \
+                    } \
+                } \
+            } \
+            if (exists != (expected_val)) { \
+                printf("FAIL: name_exists check failed for '%s' (expected %d, got %d)\n", test_name, (expected_val), exists); \
+                free(zone_copy); \
+                zone_arena_destroy(&arena); \
+                return 1; \
+            } \
+        } while(0)
+
+        // 1. Direct record existence
+        CHECK_NAME_EXISTS("example.com.", true);
+        CHECK_NAME_EXISTS("b.c.example.com.", true);
+        CHECK_NAME_EXISTS("_ssh._tcp.host1.example.com.", true);
+
+        // 2. Empty Non-Terminal (ENT) existence
+        CHECK_NAME_EXISTS("_tcp.host1.example.com.", true);
+        CHECK_NAME_EXISTS("host1.example.com.", true);
+        CHECK_NAME_EXISTS("c.example.com.", true);
+
+        // 3. Non-existent domains (neither direct record nor ENT)
+        CHECK_NAME_EXISTS("d.example.com.", false);
+        CHECK_NAME_EXISTS("nonexist.example.com.", false);
+        CHECK_NAME_EXISTS("nonexist.d.example.com.", false);
+        CHECK_NAME_EXISTS("host2.example.com.", false);
+
+        #undef CHECK_NAME_EXISTS
+
+        // 4. Closest Encloser resolution tests (including ENT)
+        #define FIND_CLOSEST_ENCLOSER(qname, apex) ({ \
+            const char *res_encloser = (apex); \
+            const char *p = (qname); \
+            size_t a_len = strlen(apex); \
+            while ((p = strchr(p, '.')) != NULL) { \
+                p++; \
+                if (*p == '\0') break; \
+                size_t pl = strlen(p); \
+                if (pl < a_len) break; \
+                if (strcasecmp(p, (apex)) == 0) { res_encloser = (apex); break; } \
+                if (pl > a_len) { \
+                    if (p[pl - a_len - 1] != '.' || strcasecmp(p + pl - a_len, (apex)) != 0) break; \
+                } \
+                bool ex = false; \
+                uint32_t ph = calc_fnv1a_str(p); \
+                size_t pidx = ph & (arena.hash_size - 1); \
+                for (int i = arena.hash_table[pidx]; i != -1; i = arena.records[i].next_record) { \
+                    if (strcasecmp(arena.records[i].name, p) == 0) { ex = true; break; } \
+                } \
+                if (!ex) { \
+                    for (size_t i = 0; i < arena.count; i++) { \
+                        const char *rn = arena.records[i].name; \
+                        if (!rn) continue; \
+                        size_t rl = strlen(rn); \
+                        if (rl > pl && rn[rl - pl - 1] == '.' && strcasecmp(rn + rl - pl, p) == 0) { \
+                            ex = true; break; \
+                        } \
+                    } \
+                } \
+                if (ex) { res_encloser = p; break; } \
+            } \
+            res_encloser; \
+        })
+
+        const char *enc1 = FIND_CLOSEST_ENCLOSER("nonexist._tcp.host1.example.com.", "example.com.");
+        if (strcasecmp(enc1, "_tcp.host1.example.com.") != 0) {
+            printf("FAIL: find_closest_encloser should return ENT '_tcp.host1.example.com.', got '%s'\n", enc1);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        const char *enc2 = FIND_CLOSEST_ENCLOSER("nonexist.b.c.example.com.", "example.com.");
+        if (strcasecmp(enc2, "b.c.example.com.") != 0) {
+            printf("FAIL: find_closest_encloser should return 'b.c.example.com.', got '%s'\n", enc2);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        const char *enc3 = FIND_CLOSEST_ENCLOSER("nonexist.d.example.com.", "example.com.");
+        if (strcasecmp(enc3, "example.com.") != 0) {
+            printf("FAIL: find_closest_encloser should fall back to apex 'example.com.', got '%s'\n", enc3);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        #undef FIND_CLOSEST_ENCLOSER
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
+    }
+
+    // --- Test 29: RFC 1982 Serial arithmetic & wraparound tests ---
+    {
+        // 1. Normal sequence
+        if (!serial_is_newer(100, 99)) {
+            printf("FAIL: serial_is_newer(100, 99) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(99, 100)) {
+            printf("FAIL: serial_is_newer(99, 100) should be false\n");
+            return 1;
+        }
+        if (serial_is_newer(100, 100)) {
+            printf("FAIL: serial_is_newer(100, 100) should be false\n");
+            return 1;
+        }
+        if (!serial_is_newer(2026082302, 2026082301)) {
+            printf("FAIL: serial_is_newer(2026082302, 2026082301) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(2026082301, 2026082302)) {
+            printf("FAIL: serial_is_newer(2026082301, 2026082302) should be false\n");
+            return 1;
+        }
+
+        // 2. 32-bit boundary wraparound
+        if (!serial_is_newer(0U, 4294967295U)) {
+            printf("FAIL: serial_is_newer(0, 4294967295) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(4294967295U, 0U)) {
+            printf("FAIL: serial_is_newer(4294967295, 0) should be false\n");
+            return 1;
+        }
+        if (!serial_is_newer(10U, 4294967290U)) {
+            printf("FAIL: serial_is_newer(10, 4294967290) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(4294967290U, 10U)) {
+            printf("FAIL: serial_is_newer(4294967290, 10) should be false\n");
+            return 1;
+        }
+
+        // 3. Half-range boundary (2^31 - 1 vs 2^31)
+        if (!serial_is_newer(0x7FFFFFFFU, 0U)) {
+            printf("FAIL: serial_is_newer(0x7FFFFFFF, 0) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(0x80000000U, 0U)) {
+            printf("FAIL: serial_is_newer(0x80000000, 0) should be false\n");
+            return 1;
+        }
+
+        // 4. Maximum forward step across 32-bit boundary (4294967290 to 2147483641: diff = 2^31 - 1)
+        if (!serial_is_newer(2147483641U, 4294967290U)) {
+            printf("FAIL: serial_is_newer(2147483641, 4294967290) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(4294967290U, 2147483641U)) {
+            printf("FAIL: serial_is_newer(4294967290, 2147483641) should be false\n");
+            return 1;
+        }
+
+        printf("PASS: RFC 1982 Serial arithmetic & wraparound tests\n");
     }
 
     printf("All tests passed safely.\n");

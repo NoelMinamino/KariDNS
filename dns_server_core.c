@@ -348,8 +348,10 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       if (elapsed_ms > 0) {
         uint64_t add_t = ((uint64_t)elapsed_ms * rates[i]) / 1000;
         if (add_t > 0) {
+          if (add_t > (uint64_t)rates[i]) add_t = rates[i];
           b->tokens[i] += (int32_t)add_t;
           if (b->tokens[i] > (int32_t)rates[i]) b->tokens[i] = rates[i];
+          if (b->tokens[i] < 0) b->tokens[i] = 0;
           b->last_refill_ms[i] = now_ms;
         }
       }
@@ -2311,6 +2313,11 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     if (dst->data_pools[i])
       free(dst->data_pools[i]);
   }
+  if (dst->nsec_records) {
+    free(dst->nsec_records);
+    dst->nsec_records = NULL;
+    dst->nsec_count = 0;
+  }
   dst->count = 0;
   dst->data_pool_count = 0;
   dst->current_pool_cap = 0;
@@ -2405,6 +2412,21 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           session->is_finished = true;
           standby->count = 0;
           return 0;
+        }
+
+        if (session->client_serial != 0) {
+          if (current_serial == session->client_serial) {
+            session->is_finished = true;
+            standby->count = 0;
+            return 0;
+          }
+          if (!serial_is_newer(current_serial, session->client_serial)) {
+            syslog(LOG_WARNING,
+                   "[AXFR] Rejecting transfer for zone '%s': received serial %u is not newer "
+                   "than current serial %u (possible rollback or spoofed master)",
+                   domain, current_serial, session->client_serial);
+            return -1;
+          }
         }
       } else if (session->soa_count == 2 && session->is_ixfr) {
         standby->count = 0;
@@ -2668,6 +2690,111 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
   return false;
 }
 
+static bool nsec_covers_name(const dns_record_t *rec, const char *name) {
+  if (!rec || rec->type_code != 47 || rec->rdata_count < 1 || !rec->rdata[0] ||
+      !rec->name || !name)
+    return false;
+  const char *owner = rec->name;
+  const char *next = rec->rdata[0];
+  int cmp_wrap = compare_canonical_name(owner, next);
+  if (cmp_wrap < 0) {
+    return (compare_canonical_name(owner, name) <= 0 &&
+            compare_canonical_name(name, next) < 0);
+  } else {
+    return (compare_canonical_name(owner, name) <= 0 ||
+            compare_canonical_name(name, next) < 0);
+  }
+}
+
+static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
+  if (!zone || !name) return NULL;
+  if (zone->nsec_records && zone->nsec_count > 0) {
+    int low = 0, high = (int)zone->nsec_count - 1;
+    int best = -1;
+    while (low <= high) {
+      int mid = low + (high - low) / 2;
+      int cmp = compare_canonical_name(zone->nsec_records[mid]->name, name);
+      if (cmp <= 0) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    if (best >= 0) {
+      dns_record_t *rec = zone->nsec_records[best];
+      if (nsec_covers_name(rec, name))
+        return rec;
+    } else {
+      // name is strictly smaller than first NSEC owner, check last NSEC (wrap-around)
+      dns_record_t *rec = zone->nsec_records[zone->nsec_count - 1];
+      if (nsec_covers_name(rec, name))
+        return rec;
+    }
+    return NULL;
+  }
+
+  // Linear scan fallback
+  for (size_t i = 0; i < zone->count; i++) {
+    dns_record_t *rec = &zone->records[i];
+    if (rec->type_code == 47 && nsec_covers_name(rec, name))
+      return rec;
+  }
+  return NULL;
+}
+
+static bool name_exists_in_zone(zone_arena_t *zone, const char *name) {
+  if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
+  size_t name_len = strlen(name);
+
+  // (a) Exact match check via hash table
+  uint32_t h = calc_fnv1a_str(name);
+  size_t idx = h & (zone->hash_size - 1);
+  for (int i = zone->hash_table[idx]; i != -1; i = zone->records[i].next_record) {
+    if (strcasecmp(zone->records[i].name, name) == 0) return true;
+  }
+
+  // (b) Empty Non-Terminal (ENT) check: any record having name as a proper suffix on label boundary
+  for (size_t i = 0; i < zone->count; i++) {
+    const char *rn = zone->records[i].name;
+    if (!rn) continue;
+    size_t rn_len = strlen(rn);
+    if (rn_len > name_len &&
+        rn[rn_len - name_len - 1] == '.' &&
+        strcasecmp(rn + rn_len - name_len, name) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex) {
+  if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
+    return zone_apex;
+  const char *parent = qname;
+  size_t apex_len = strlen(zone_apex);
+  while ((parent = strchr(parent, '.')) != NULL) {
+    parent++;
+    if (*parent == '\0') break;
+
+    size_t p_len = strlen(parent);
+    if (p_len < apex_len) break;
+    if (strcasecmp(parent, zone_apex) == 0)
+      return zone_apex;
+    if (p_len > apex_len) {
+      if (parent[p_len - apex_len - 1] != '.' ||
+          strcasecmp(parent + p_len - apex_len, zone_apex) != 0) {
+        break; // Outside zone apex
+      }
+    }
+
+    if (name_exists_in_zone(zone, parent)) {
+      return parent;
+    }
+  }
+  return zone_apex;
+}
+
 static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_arena_t **current_zone_ptr, uint8_t *res,
@@ -2901,6 +3028,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
         if (wc_found)
           break;
+
+        if (name_exists_in_zone(current_zone, parent))
+          break;
         }
       }
     }
@@ -3015,6 +3145,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               }
             }
             if (wc_found || this_qtx_failed) break;
+
+            if (name_exists_in_zone(current_zone, parent))
+              break;
           }
         }
 
@@ -3059,23 +3192,68 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     // ==== フェーズ8: NSEC付加 ====
     resolve_checkpoint_t nsec_cp = save_checkpoint(offset, ancount, nscount, arcount);
     bool nsec_failed = false;
-    if (found && !all_matched && dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
-      for (int i = current_zone->hash_table[idx]; i != -1;
-           i = current_zone->records[i].next_record) {
-        dns_record_t *rec = &current_zone->records[i];
-        if (rec->type_code == 47 /* NSEC */ &&
-            strcasecmp(rec->name, current_qname) == 0) {
-          if (rec->rdata_count < 1) break; // 壊れたNSECは無視
-          if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+    if (dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
+      if (found && !all_matched) {
+        for (int i = current_zone->hash_table[idx]; i != -1;
+             i = current_zone->records[i].next_record) {
+          dns_record_t *rec = &current_zone->records[i];
+          if (rec->type_code == 47 /* NSEC */ &&
+              strcasecmp(rec->name, current_qname) == 0) {
+            if (rec->rdata_count < 1) break; // 壊れたNSECは無視
+            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                                     NULL, 0xFFFFFFFF) < 0) {
+              nsec_failed = true; break;
+            }
+            (*nscount)++;
+            if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 47,
+                                       res, max_res_len, offset, comp_ctx, nscount)) {
+              nsec_failed = true; break;
+            }
+            break;
+          }
+        }
+      } else if (!found) {
+        dns_record_t *cover = find_covering_nsec(current_zone, current_qname);
+        if (cover) {
+          if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {
-            nsec_failed = true; break;
+            nsec_failed = true;
+          } else {
+            (*nscount)++;
+            uint32_t c_hash = calc_fnv1a_str(cover->name);
+            size_t c_idx = c_hash & (current_zone->hash_size - 1);
+            if (!attach_covering_rrsig(current_zone, c_idx, cover->name, NULL, 47,
+                                       res, max_res_len, offset, comp_ctx, nscount)) {
+              nsec_failed = true;
+            }
           }
-          (*nscount)++;
-          if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 47,
-                                     res, max_res_len, offset, comp_ctx, nscount)) {
-            nsec_failed = true; break;
+        }
+
+        if (!nsec_failed) {
+          const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain);
+          if (encloser) {
+            char wc_name[256];
+            int written = snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
+            if (written > 0 && (size_t)written < sizeof(wc_name)) {
+              if (!cover || !nsec_covers_name(cover, wc_name)) {
+                dns_record_t *wc_cover = find_covering_nsec(current_zone, wc_name);
+                if (wc_cover && wc_cover != cover) {
+                  if (serialize_dns_record(res, max_res_len, offset, wc_cover, comp_ctx,
+                                           NULL, 0xFFFFFFFF) < 0) {
+                    nsec_failed = true;
+                  } else {
+                    (*nscount)++;
+                    uint32_t wc_hash = calc_fnv1a_str(wc_cover->name);
+                    size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
+                    if (!attach_covering_rrsig(current_zone, wc_idx, wc_cover->name, NULL, 47,
+                                               res, max_res_len, offset, comp_ctx, nscount)) {
+                      nsec_failed = true;
+                    }
+                  }
+                }
+              }
+            }
           }
-          break;
         }
       }
     }
