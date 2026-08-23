@@ -219,7 +219,11 @@ done
 
 echo ""
 echo "=========================================="
-echo "Step 4: Fuzzer smoke run (${FUZZ_SMOKE_SECONDS}s per target)"
+if [ -n "${FUZZ_RUNS:-}" ] && [ "$FUZZ_RUNS" -gt 0 ]; then
+    echo "Step 4: Fuzzer smoke run (${FUZZ_RUNS} runs per target)"
+else
+    echo "Step 4: Fuzzer smoke run (${FUZZ_SMOKE_SECONDS:-5}s per target)"
+fi
 echo "=========================================="
 make fuzz >/dev/null 2>&1
 make fuzz_core >/dev/null 2>&1
