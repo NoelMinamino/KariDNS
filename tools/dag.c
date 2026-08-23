@@ -107,6 +107,11 @@ static inline void set_socket_timeouts(int sock, int timeout_sec) {
 }
 
 #if !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(__APPLE__)
+#if defined(__linux__)
+#include <sys/random.h>
+#include <fcntl.h>
+#endif
+
 /* Portable strlcpy for Linux / non-BSD platforms */
 static inline size_t dag_strlcpy(char *dst, const char *src, size_t siz) {
     char *d = dst;
@@ -136,6 +141,17 @@ static inline uint32_t dag_arc4random(void) {
     if (RAND_bytes((unsigned char *)&val, sizeof(val)) == 1) {
         return val;
     }
+#if defined(__linux__)
+    if (getrandom(&val, sizeof(val), 0) == (ssize_t)sizeof(val)) {
+        return val;
+    }
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, &val, sizeof(val));
+        close(fd);
+        if (n == (ssize_t)sizeof(val)) return val;
+    }
+#endif
     return (uint32_t)rand();
 }
 #undef arc4random

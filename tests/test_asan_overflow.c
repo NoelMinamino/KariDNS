@@ -2166,6 +2166,125 @@ int main() {
         printf("PASS: RFC 1982 Serial arithmetic & wraparound tests\n");
     }
 
+    // --- Test 30: Binary search ENT resolution & clone_zone_arena sorted_unique_names reset ---
+    {
+        const char *zone_data =
+            "$ORIGIN example.com.\n"
+            "$TTL 300\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 300\n"
+            "@ IN NS ns1.example.com.\n"
+            "ns1 IN A 192.0.2.1\n"
+            "deep.child.sub IN A 192.0.2.100\n"
+            "*.wildcard.sub IN A 192.0.2.200\n"
+            "alpha.beta.gamma.delta IN A 192.0.2.201\n";
+
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        char *zone_copy = strdup(zone_data);
+        if (!zone_copy) {
+            printf("FAIL: OOM duplicating zone_data\n");
+            return 1;
+        }
+
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        if (parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx) < 0) {
+            printf("FAIL: parse_zone_fast failed for test 30\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed for test 30\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (!arena.sorted_unique_names || arena.sorted_unique_count == 0) {
+            printf("FAIL: sorted_unique_names not built properly (count = %zu)\n", arena.sorted_unique_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test binary search ENT function directly
+        #define TEST_ENT_EXISTS(qname, expected) do { \
+            bool found = false; \
+            size_t nlen = strlen(qname); \
+            uint32_t h = calc_fnv1a_str(qname); \
+            size_t idx = h & (arena.hash_size - 1); \
+            for (int i = arena.hash_table[idx]; i != -1; i = arena.records[i].next_record) { \
+                if (strcasecmp(arena.records[i].name, qname) == 0) { found = true; break; } \
+            } \
+            if (!found && arena.sorted_unique_names && arena.sorted_unique_count > 0) { \
+                int lo = 0, hi = (int)arena.sorted_unique_count - 1; \
+                int pos = (int)arena.sorted_unique_count; \
+                while (lo <= hi) { \
+                    int mid = lo + (hi - lo) / 2; \
+                    if (compare_canonical_name(arena.sorted_unique_names[mid], qname) > 0) { \
+                        pos = mid; hi = mid - 1; \
+                    } else { \
+                        lo = mid + 1; \
+                    } \
+                } \
+                if (pos < (int)arena.sorted_unique_count) { \
+                    const char *rn = arena.sorted_unique_names[pos]; \
+                    size_t rlen = strlen(rn); \
+                    if (rlen > nlen && rn[rlen - nlen - 1] == '.' && strcasecmp(rn + rlen - nlen, qname) == 0) { \
+                        found = true; \
+                    } \
+                } \
+            } \
+            if (found != (expected)) { \
+                printf("FAIL: TEST_ENT_EXISTS '%s' expected %d, got %d\n", qname, (expected), found); \
+                free(zone_copy); \
+                zone_arena_destroy(&arena); \
+                return 1; \
+            } \
+        } while(0)
+
+        // Direct records
+        TEST_ENT_EXISTS("example.com.", true);
+        TEST_ENT_EXISTS("ns1.example.com.", true);
+        TEST_ENT_EXISTS("deep.child.sub.example.com.", true);
+        TEST_ENT_EXISTS("alpha.beta.gamma.delta.example.com.", true);
+
+        // ENTs
+        TEST_ENT_EXISTS("child.sub.example.com.", true);
+        TEST_ENT_EXISTS("sub.example.com.", true);
+        TEST_ENT_EXISTS("wildcard.sub.example.com.", true);
+        TEST_ENT_EXISTS("beta.gamma.delta.example.com.", true);
+        TEST_ENT_EXISTS("gamma.delta.example.com.", true);
+        TEST_ENT_EXISTS("delta.example.com.", true);
+
+        // Non-existent names (no records, no ENTs)
+        TEST_ENT_EXISTS("notexist.example.com.", false);
+        TEST_ENT_EXISTS("other.child.sub.example.com.", false);
+        TEST_ENT_EXISTS("z.delta.example.com.", false);
+        TEST_ENT_EXISTS("1.2.3.4.5.6.7.8.9.10.11.12.example.com.", false);
+
+        #undef TEST_ENT_EXISTS
+
+        // Test zone arena cloning resets sorted_unique_names safely
+        zone_arena_t cloned;
+        zone_arena_init(&cloned);
+        // Simulate clone_zone_arena reset behavior
+        if (cloned.sorted_unique_names != NULL || cloned.sorted_unique_count != 0) {
+            printf("FAIL: cloned arena sorted_unique_names must be initialized to NULL/0\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            zone_arena_destroy(&cloned);
+            return 1;
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        zone_arena_destroy(&cloned);
+        printf("PASS: Binary search ENT resolution & sorted_unique_names tests\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

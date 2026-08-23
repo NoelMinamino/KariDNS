@@ -2318,6 +2318,11 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     dst->nsec_records = NULL;
     dst->nsec_count = 0;
   }
+  if (dst->sorted_unique_names) {
+    free(dst->sorted_unique_names);
+    dst->sorted_unique_names = NULL;
+    dst->sorted_unique_count = 0;
+  }
   dst->count = 0;
   dst->data_pool_count = 0;
   dst->current_pool_cap = 0;
@@ -2754,16 +2759,29 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name) {
     if (strcasecmp(zone->records[i].name, name) == 0) return true;
   }
 
-  // (b) Empty Non-Terminal (ENT) check: any record having name as a proper suffix on label boundary
-  for (size_t i = 0; i < zone->count; i++) {
-    const char *rn = zone->records[i].name;
-    if (!rn) continue;
-    size_t rn_len = strlen(rn);
-    if (rn_len > name_len &&
-        rn[rn_len - name_len - 1] == '.' &&
-        strcasecmp(rn + rn_len - name_len, name) == 0) {
-      return true;
+  // (b) Empty Non-Terminal (ENT) check via binary search on sorted_unique_names
+  if (!zone->sorted_unique_names || zone->sorted_unique_count == 0) return false;
+
+  int lo = 0, hi = (int)zone->sorted_unique_count - 1;
+  int pos = (int)zone->sorted_unique_count;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (compare_canonical_name(zone->sorted_unique_names[mid], name) > 0) {
+      pos = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
     }
+  }
+
+  if (pos >= (int)zone->sorted_unique_count) return false;
+
+  const char *rn = zone->sorted_unique_names[pos];
+  size_t rn_len = strlen(rn);
+  if (rn_len > name_len &&
+      rn[rn_len - name_len - 1] == '.' &&
+      strcasecmp(rn + rn_len - name_len, name) == 0) {
+    return true;
   }
   return false;
 }
