@@ -2153,6 +2153,16 @@ int main() {
             return 1;
         }
 
+        // 4. Maximum forward step across 32-bit boundary (4294967290 to 2147483641: diff = 2^31 - 1)
+        if (!serial_is_newer(2147483641U, 4294967290U)) {
+            printf("FAIL: serial_is_newer(2147483641, 4294967290) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(4294967290U, 2147483641U)) {
+            printf("FAIL: serial_is_newer(4294967290, 2147483641) should be false\n");
+            return 1;
+        }
+
         printf("PASS: RFC 1982 Serial arithmetic & wraparound tests\n");
     }
 
