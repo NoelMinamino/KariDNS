@@ -3704,7 +3704,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             if (qtype == 252 || qtype == 251) {
                 printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_index, total_bytes);
             } else {
-                printf(";; MSG SIZE  rcvd: %zd\n", (size_t)total_bytes);
+                printf(";; MSG SIZE  rcvd: %zu\n", total_bytes);
             }
         }
         if (tcp_sock >= 0) close(tcp_sock);
@@ -4093,6 +4093,13 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
                 memcpy(secret, p, end - p);
                 secret[end - p] = '\0';
             }
+        } else {
+            char *end = p;
+            while (*end && *end != ';' && *end != ' ' && *end != '\t' && *end != '\n') end++;
+            if ((long)(end - p) < (long)sizeof(secret)) {
+                memcpy(secret, p, end - p);
+                secret[end - p] = '\0';
+            }
         }
     }
     
@@ -4251,7 +4258,11 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         int r_ns = (root_resp[8] << 8) | root_resp[9];
         int r_ar = (root_resp[10] << 8) | root_resp[11];
         size_t roff = 12;
-        for (int i=0; i<r_qd; i++) { char *d; expand_wire_name(root_resp, root_n, roff, &roff, &g_dag_arena, &d); roff+=4; }
+        for (int i = 0; i < r_qd; i++) {
+            char *d;
+            if (expand_wire_name(root_resp, root_n, roff, &roff, &g_dag_arena, &d) != 0) break;
+            roff += 4;
+        }
         
         char rns_names[32][256];
         int rns_count = 0;
@@ -4493,7 +4504,11 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
                 size_t roff = 12;
                 int rqd = (resp[4] << 8) | resp[5];
                 int ran = (resp[6] << 8) | resp[7];
-                for(int i=0; i<rqd; i++) { char *d; expand_wire_name(resp, rn, roff, &roff, &g_dag_arena, &d); roff+=4; }
+                for (int i = 0; i < rqd; i++) {
+                    char *d;
+                    if (expand_wire_name(resp, rn, roff, &roff, &g_dag_arena, &d) != 0) break;
+                    roff += 4;
+                }
                 for(int i=0; i<ran; i++) {
                     dns_record_t rec; uint16_t rtype;
                     if (parse_resource_record(resp, rn, &roff, &g_dag_arena, &rec, &rtype) != 0) break;
@@ -4531,7 +4546,11 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
             int sancount = (resp[6] << 8) | resp[7];
             size_t soff = 12;
             int sqdcount = (resp[4] << 8) | resp[5];
-            for (int i=0; i<sqdcount; i++) { char *d; expand_wire_name(resp, sn, soff, &soff, &g_dag_arena, &d); soff+=4; }
+            for (int i = 0; i < sqdcount; i++) {
+                char *d;
+                if (expand_wire_name(resp, sn, soff, &soff, &g_dag_arena, &d) != 0) break;
+                soff += 4;
+            }
             for (int i=0; i<sancount; i++) {
                 dns_record_t rec; uint16_t type;
                 if (parse_resource_record(resp, sn, &soff, &g_dag_arena, &rec, &type) != 0) break;
@@ -4641,6 +4660,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     for (int i = 0; i < g_break_count; i++) {
         if (is_tcp_only_break(g_breaks[i].kind) && !use_tcp) {
             fprintf(stderr, "error: this --break kind requires --tcp\n");
+            free(server_list_buf);
             return 1;
         }
     }
@@ -5419,14 +5439,20 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             }
         } else if (strcmp(arg, "+adflag") == 0) {
             spec->adflag = true; spec->qo.ad_flag = true;
+        } else if (strcmp(arg, "+noadflag") == 0) {
+            spec->adflag = false; spec->qo.ad_flag = false;
         } else if (strcmp(arg, "+cdflag") == 0) {
             spec->cdflag = true; spec->qo.cd_flag = true;
-        } else if (strcmp(arg, "+aaflag") == 0) {
-            spec->aaflag = true; spec->qo.aa_flag = true;
+        } else if (strcmp(arg, "+nocdflag") == 0) {
+            spec->cdflag = false; spec->qo.cd_flag = false;
         } else if (strcmp(arg, "+tcflag") == 0) {
             spec->tcflag = true; spec->qo.tc_flag = true;
+        } else if (strcmp(arg, "+notcflag") == 0) {
+            spec->tcflag = false; spec->qo.tc_flag = false;
         } else if (strcmp(arg, "+zflag") == 0) {
             spec->zflag = true; spec->qo.z_flag = true;
+        } else if (strcmp(arg, "+nozflag") == 0) {
+            spec->zflag = false; spec->qo.z_flag = false;
         } else if (strncmp(arg, "+timeout=", 9) == 0) {
             char *endptr;
             long to = strtol(arg + 9, &endptr, 10);
@@ -5553,6 +5579,63 @@ static int parse_arg_slice(int start, int end, int argc, char **argv, query_spec
     return 0;
 }
 
+
+static int execute_batch_spec(const query_spec_t *spec) {
+    if (!spec->batch_file) return 0;
+    FILE *bf = fopen(spec->batch_file, "r");
+    if (!bf) {
+        fprintf(stderr, "error: could not open batch file '%s': %s\n", spec->batch_file, strerror(errno));
+        exit(8);
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), bf)) {
+        char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '#' || *p == ';') continue;
+        
+        char *b_qname = NULL;
+        char *b_qtype = NULL;
+        char *b_server = NULL;
+        char *tok = strtok(p, " \t\r\n");
+        while (tok) {
+            if (tok[0] == '@') {
+                b_server = tok;
+            } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0) {
+                // ignore class
+            } else if (is_known_qtype(tok)) {
+                if (!b_qtype) b_qtype = tok;
+                else if (!b_qname) b_qname = tok;
+            } else {
+                if (!b_qname) b_qname = tok;
+                else if (!b_qtype) b_qtype = tok;
+            }
+            tok = strtok(NULL, " \t\r\n");
+        }
+        if (!b_qname) continue;
+        if (!b_qtype) b_qtype = "A";
+        
+        bool b_allocated = false;
+        if (spec->qo.idnin) b_qname = (char *)idn_to_ascii(b_qname, &b_allocated);
+        const char *eff_server = b_server ? b_server : spec->server_arg;
+        if (spec->do_trace) {
+            run_trace_query(b_qname, eff_server, b_qtype, spec->port, spec->use_tcp, spec->force_udp,
+                            spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+        } else if (spec->do_nssearch) {
+            run_nssearch(b_qname, eff_server, spec->port, spec->use_tcp, spec->force_udp,
+                         spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+        } else {
+            run_single_job(b_qname, b_qtype, eff_server, spec->port, spec->use_tcp, spec->force_udp,
+                           spec->test_all, spec->norecurse,
+                           spec->adflag, spec->cdflag, spec->aaflag, spec->tcflag, spec->zflag,
+                           spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+        }
+#ifdef HAVE_LIBIDN2
+        if (b_allocated) idn2_free((void *)b_qname);
+#endif
+    }
+    fclose(bf);
+    return 0;
+}
 
 static int execute_query_spec(query_spec_t *spec) {
     if (spec->qo.explicit_qname) spec->qname = spec->qo.explicit_qname;
@@ -5765,59 +5848,7 @@ int main(int argc, char **argv) {
 
     // -f バッチファイルモードの処理
     if (global_spec.batch_file) {
-        FILE *bf = fopen(global_spec.batch_file, "r");
-        if (!bf) {
-            fprintf(stderr, "error: could not open batch file '%s': %s\n", global_spec.batch_file, strerror(errno));
-            exit(8);
-        }
-        char line[512];
-        while (fgets(line, sizeof(line), bf)) {
-            char *p = line;
-            while (isspace((unsigned char)*p)) p++;
-            if (*p == '\0' || *p == '#' || *p == ';') continue;
-            
-            char *b_qname = NULL;
-            char *b_qtype = NULL;
-            char *b_server = NULL;
-            char *tok = strtok(p, " \t\r\n");
-            while (tok) {
-                if (tok[0] == '@') {
-                    b_server = tok;
-                } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0) {
-                    // ignore class
-                } else if (is_known_qtype(tok)) {
-                    if (!b_qtype) b_qtype = tok;
-                    else if (!b_qname) b_qname = tok;
-                } else {
-                    if (!b_qname) b_qname = tok;
-                    else if (!b_qtype) b_qtype = tok;
-                }
-                tok = strtok(NULL, " \t\r\n");
-            }
-            if (!b_qname) continue;
-            if (!b_qtype) b_qtype = "A";
-            
-            bool b_allocated = false;
-            if (global_spec.qo.idnin) b_qname = (char *)idn_to_ascii(b_qname, &b_allocated);
-
-            const char *eff_server = b_server ? b_server : global_spec.server_arg;
-            if (global_spec.do_trace) {
-                run_trace_query(b_qname, eff_server, b_qtype, global_spec.port, global_spec.use_tcp, global_spec.force_udp,
-                                global_spec.no_hexdump_query, global_spec.no_hexdump_response, global_spec.qo, global_spec.hex_payload, &global_spec.dopt);
-            } else if (global_spec.do_nssearch) {
-                run_nssearch(b_qname, eff_server, global_spec.port, global_spec.use_tcp, global_spec.force_udp,
-                             global_spec.no_hexdump_query, global_spec.no_hexdump_response, global_spec.qo, global_spec.hex_payload, &global_spec.dopt);
-            } else {
-                run_single_job(b_qname, b_qtype, eff_server, global_spec.port, global_spec.use_tcp, global_spec.force_udp,
-                               global_spec.test_all, global_spec.norecurse,
-                               global_spec.adflag, global_spec.cdflag, global_spec.aaflag, global_spec.tcflag, global_spec.zflag,
-                               global_spec.no_hexdump_query, global_spec.no_hexdump_response, global_spec.qo, global_spec.hex_payload, &global_spec.dopt);
-            }
-#ifdef HAVE_LIBIDN2
-            if (b_allocated) idn2_free((void *)b_qname);
-#endif
-        }
-        fclose(bf);
+        execute_batch_spec(&global_spec);
         print_multi_server_summary(global_spec.use_ldnsz);
 #ifndef _WIN32
         if (global_spec.qo.mem_debug) {
@@ -5850,54 +5881,7 @@ int main(int argc, char **argv) {
 
         // タプル内で -f が指定された場合
         if (local_spec.batch_file) {
-            FILE *bf = fopen(local_spec.batch_file, "r");
-            if (!bf) {
-                fprintf(stderr, "error: could not open batch file '%s': %s\n", local_spec.batch_file, strerror(errno));
-                exit(8);
-            }
-            char line[512];
-            while (fgets(line, sizeof(line), bf)) {
-                char *p = line;
-                while (isspace((unsigned char)*p)) p++;
-                if (*p == '\0' || *p == '#' || *p == ';') continue;
-                char *b_qname = NULL;
-                char *b_qtype = NULL;
-                char *b_server = NULL;
-                char *tok = strtok(p, " \t\r\n");
-                while (tok) {
-                    if (tok[0] == '@') b_server = tok;
-                    else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0) {}
-                    else if (is_known_qtype(tok)) {
-                        if (!b_qtype) b_qtype = tok;
-                        else if (!b_qname) b_qname = tok;
-                    } else {
-                        if (!b_qname) b_qname = tok;
-                        else if (!b_qtype) b_qtype = tok;
-                    }
-                    tok = strtok(NULL, " \t\r\n");
-                }
-                if (!b_qname) continue;
-                if (!b_qtype) b_qtype = "A";
-                bool b_allocated = false;
-                if (local_spec.qo.idnin) b_qname = (char *)idn_to_ascii(b_qname, &b_allocated);
-                const char *eff_server = b_server ? b_server : local_spec.server_arg;
-                if (local_spec.do_trace) {
-                    run_trace_query(b_qname, eff_server, b_qtype, local_spec.port, local_spec.use_tcp, local_spec.force_udp,
-                                    local_spec.no_hexdump_query, local_spec.no_hexdump_response, local_spec.qo, local_spec.hex_payload, &local_spec.dopt);
-                } else if (local_spec.do_nssearch) {
-                    run_nssearch(b_qname, eff_server, local_spec.port, local_spec.use_tcp, local_spec.force_udp,
-                                 local_spec.no_hexdump_query, local_spec.no_hexdump_response, local_spec.qo, local_spec.hex_payload, &local_spec.dopt);
-                } else {
-                    run_single_job(b_qname, b_qtype, eff_server, local_spec.port, local_spec.use_tcp, local_spec.force_udp,
-                                   local_spec.test_all, local_spec.norecurse,
-                                   local_spec.adflag, local_spec.cdflag, local_spec.aaflag, local_spec.tcflag, local_spec.zflag,
-                                   local_spec.no_hexdump_query, local_spec.no_hexdump_response, local_spec.qo, local_spec.hex_payload, &local_spec.dopt);
-                }
-#ifdef HAVE_LIBIDN2
-                if (b_allocated) idn2_free((void *)b_qname);
-#endif
-            }
-            fclose(bf);
+            execute_batch_spec(&local_spec);
             continue;
         }
 
