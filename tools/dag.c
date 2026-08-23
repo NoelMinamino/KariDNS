@@ -29,6 +29,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include <io.h>
 #define close(s) closesocket(s)
 #ifndef MSG_WAITALL
@@ -4216,12 +4217,38 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
 }
 
 /*
- * /etc/resolv.conf から最初の nameserver を読み取って返す。
- * 見つからなければ "127.0.0.1" をフォールバックとして使用。
+ * /etc/resolv.conf (Windows: GetNetworkParams) から最初の nameserver を読み取って返す。
+ * 見つからなければパブリックDNS (1.1.1.1) または 127.0.0.1 をフォールバックとして使用。
  */
 
 static const char *get_system_resolver(void) {
     static char resolver[256];
+#ifdef _WIN32
+    FIXED_INFO *pFixedInfo = NULL;
+    ULONG ulOutBufLen = sizeof(FIXED_INFO);
+    pFixedInfo = (FIXED_INFO *)malloc(ulOutBufLen);
+    if (pFixedInfo) {
+        if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
+            free(pFixedInfo);
+            pFixedInfo = (FIXED_INFO *)malloc(ulOutBufLen);
+        }
+        if (pFixedInfo && GetNetworkParams(pFixedInfo, &ulOutBufLen) == NO_ERROR) {
+            IP_ADDR_STRING *pIPAddr = &pFixedInfo->DnsServerList;
+            while (pIPAddr) {
+                if (pIPAddr->IpAddress.String[0] != '\0' &&
+                    strcmp(pIPAddr->IpAddress.String, "0.0.0.0") != 0) {
+                    snprintf(resolver, sizeof(resolver), "%s", pIPAddr->IpAddress.String);
+                    free(pFixedInfo);
+                    return resolver;
+                }
+                pIPAddr = pIPAddr->Next;
+            }
+        }
+        if (pFixedInfo) free(pFixedInfo);
+    }
+    snprintf(resolver, sizeof(resolver), "1.1.1.1");
+    return resolver;
+#else
     FILE *fp = fopen("/etc/resolv.conf", "r");
     if (!fp) {
         snprintf(resolver, sizeof(resolver), "127.0.0.1");
@@ -4245,9 +4272,14 @@ static const char *get_system_resolver(void) {
     fclose(fp);
     snprintf(resolver, sizeof(resolver), "127.0.0.1");
     return resolver;
+#endif
 }
 
 static int get_system_search_domains(char domains[][256], int max_domains) {
+#ifdef _WIN32
+    (void)domains; (void)max_domains;
+    return 0;
+#else
     int count = 0;
     FILE *fp = fopen("/etc/resolv.conf", "r");
     if (!fp) return 0;
@@ -4268,6 +4300,7 @@ static int get_system_search_domains(char domains[][256], int max_domains) {
     }
     fclose(fp);
     return count;
+#endif
 }
 
 static int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
