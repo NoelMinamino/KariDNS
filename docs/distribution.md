@@ -85,11 +85,11 @@ sudo cp dag-?.?.?/dag /usr/local/bin/
 ## 4. macOS Installation (`dag`)
 
 ### 4.1 Homebrew (Recommended)
-You can install `dag` directly via Homebrew from the GitHub release formula:
 
 ```sh
-# Option 1: Direct install from release Formula
-brew install https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
+# Option 1: Direct install from downloaded Formula
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
+brew install --formula ./dag.rb
 
 # Option 2: Via Homebrew Tap repository
 brew tap NoelMinamino/karidns

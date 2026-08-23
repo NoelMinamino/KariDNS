@@ -210,15 +210,13 @@ service karidns start
 ### 2. macOS Installation (`dag` only)
 
 #### Option A: Homebrew (Recommended)
-You can install `dag` directly from the release Formula:
-
 ```sh
-# Install directly from the release Formula
-brew install https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
+# Method 1: Download Formula and install directly
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
+brew install --formula ./dag.rb
 
-# Or via Homebrew Tap (if tap repository is configured)
-brew tap NoelMinamino/karidns
-brew install dag
+# Method 2: Via Homebrew Tap (if tap repository is configured)
+brew install NoelMinamino/karidns/dag
 ```
 
 #### Option B: Standalone DMG (.dmg)
