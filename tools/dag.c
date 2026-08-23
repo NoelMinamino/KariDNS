@@ -3704,7 +3704,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             if (qtype == 252 || qtype == 251) {
                 printf(";; XFR size: %d records (messages %d, bytes %zu)\n", total_records, msg_index, total_bytes);
             } else {
-                printf(";; MSG SIZE  rcvd: %zd\n", (size_t)total_bytes);
+                printf(";; MSG SIZE  rcvd: %zu\n", total_bytes);
             }
         }
         if (tcp_sock >= 0) close(tcp_sock);
@@ -4093,6 +4093,13 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
                 memcpy(secret, p, end - p);
                 secret[end - p] = '\0';
             }
+        } else {
+            char *end = p;
+            while (*end && *end != ';' && *end != ' ' && *end != '\t' && *end != '\n') end++;
+            if ((long)(end - p) < (long)sizeof(secret)) {
+                memcpy(secret, p, end - p);
+                secret[end - p] = '\0';
+            }
         }
     }
     
@@ -4251,7 +4258,11 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         int r_ns = (root_resp[8] << 8) | root_resp[9];
         int r_ar = (root_resp[10] << 8) | root_resp[11];
         size_t roff = 12;
-        for (int i=0; i<r_qd; i++) { char *d; expand_wire_name(root_resp, root_n, roff, &roff, &g_dag_arena, &d); roff+=4; }
+        for (int i = 0; i < r_qd; i++) {
+            char *d;
+            if (expand_wire_name(root_resp, root_n, roff, &roff, &g_dag_arena, &d) != 0) break;
+            roff += 4;
+        }
         
         char rns_names[32][256];
         int rns_count = 0;
@@ -4493,7 +4504,11 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
                 size_t roff = 12;
                 int rqd = (resp[4] << 8) | resp[5];
                 int ran = (resp[6] << 8) | resp[7];
-                for(int i=0; i<rqd; i++) { char *d; expand_wire_name(resp, rn, roff, &roff, &g_dag_arena, &d); roff+=4; }
+                for (int i = 0; i < rqd; i++) {
+                    char *d;
+                    if (expand_wire_name(resp, rn, roff, &roff, &g_dag_arena, &d) != 0) break;
+                    roff += 4;
+                }
                 for(int i=0; i<ran; i++) {
                     dns_record_t rec; uint16_t rtype;
                     if (parse_resource_record(resp, rn, &roff, &g_dag_arena, &rec, &rtype) != 0) break;
@@ -4531,7 +4546,11 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
             int sancount = (resp[6] << 8) | resp[7];
             size_t soff = 12;
             int sqdcount = (resp[4] << 8) | resp[5];
-            for (int i=0; i<sqdcount; i++) { char *d; expand_wire_name(resp, sn, soff, &soff, &g_dag_arena, &d); soff+=4; }
+            for (int i = 0; i < sqdcount; i++) {
+                char *d;
+                if (expand_wire_name(resp, sn, soff, &soff, &g_dag_arena, &d) != 0) break;
+                soff += 4;
+            }
             for (int i=0; i<sancount; i++) {
                 dns_record_t rec; uint16_t type;
                 if (parse_resource_record(resp, sn, &soff, &g_dag_arena, &rec, &type) != 0) break;
@@ -4641,6 +4660,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     for (int i = 0; i < g_break_count; i++) {
         if (is_tcp_only_break(g_breaks[i].kind) && !use_tcp) {
             fprintf(stderr, "error: this --break kind requires --tcp\n");
+            free(server_list_buf);
             return 1;
         }
     }
@@ -4759,6 +4779,907 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     return 0;
 }
 
+#define MAX_DAG_QUERIES 64
+
+typedef struct {
+    int start;
+    int end;
+} arg_slice_t;
+
+typedef struct query_spec_s {
+    const char *server_arg;
+    int port;
+    const char *batch_file;
+    bool use_tcp;
+    bool force_udp;
+    bool use_ldnsz;
+    bool do_trace;
+    bool do_nssearch;
+    bool norecurse;
+    bool adflag;
+    bool cdflag;
+    bool aaflag;
+    bool tcflag;
+    bool zflag;
+    bool test_all;
+    bool no_hexdump_query;
+    bool no_hexdump_response;
+    const char *hex_payload;
+    const char *qname;
+    const char *qtype_s;
+    char rev_name[128];
+    query_opts_t qo;
+    display_opts_t dopt;
+} query_spec_t;
+
+static void init_query_spec(query_spec_t *spec) {
+    memset(spec, 0, sizeof(*spec));
+    spec->port = 53;
+    spec->dopt.show_question = true;
+    spec->dopt.show_answer = true;
+    spec->dopt.show_authority = true;
+    spec->dopt.show_additional = true;
+    spec->dopt.show_comments = true;
+    spec->dopt.show_stats = true;
+    spec->dopt.show_cmd = true;
+    spec->dopt.short_mode = false;
+    spec->dopt.multiline = false;
+    spec->dopt.yaml = false;
+    spec->dopt.ttlid = true;
+    spec->dopt.expire = false;
+    spec->dopt.showsearch = false;
+    spec->dopt.idnout = false;
+    spec->dopt.time_unit_usec = false;
+    spec->dopt.besteffort = false;
+    spec->dopt.show_class = true;
+    spec->dopt.show_crypto = true;
+    spec->dopt.show_query_message = false;
+    spec->dopt.rrcomments = false;
+    spec->dopt.onesoa = false;
+    spec->dopt.show_badcookie_msg = false;
+    spec->dopt.show_badvers_msg = false;
+    spec->dopt.split_width = 56;
+    spec->dopt.force_unknown_format = false;
+    spec->dopt.ttlunits = false;
+
+    spec->qo.qclass = 1;
+    spec->qo.udp_payload_size = 1232;
+    spec->qo.timeout_sec = 5;
+    spec->qo.tries = 1;
+    spec->qo.pref_family = AF_UNSPEC;
+    spec->qo.bind_addr[0] = '\0';
+    spec->qo.bind_port = 0;
+    spec->qo.retry_on_badcookie = true;
+    spec->qo.edns_negotiation = true;
+    spec->qo.rd_flag = true;
+    spec->qo.opcode_override = -1;
+    spec->qo.qid_override = -1;
+    spec->qo.ndots = -1;
+}
+
+static bool is_known_qclass_str(const char *s, uint16_t *out_class) {
+    if (!s) return false;
+    if (strcasecmp(s, "IN") == 0) {
+        if (out_class) *out_class = 1;
+        return true;
+    }
+    if (strcasecmp(s, "CH") == 0 || strcasecmp(s, "CHAOS") == 0) {
+        if (out_class) *out_class = 3;
+        return true;
+    }
+    if (strcasecmp(s, "HS") == 0 || strcasecmp(s, "HESIOD") == 0) {
+        if (out_class) *out_class = 4;
+        return true;
+    }
+    if (strncasecmp(s, "CLASS", 5) == 0 && isdigit((unsigned char)s[5])) {
+        if (out_class) *out_class = (uint16_t)atoi(s + 5);
+        return true;
+    }
+    return false;
+}
+
+static int get_arg_consume_count(int argc, char **argv, int i) {
+    if (i + 1 >= argc) return 1;
+    const char *arg = argv[i];
+    if (strcmp(arg, "-p") == 0 ||
+        strcmp(arg, "-c") == 0 ||
+        strcmp(arg, "-t") == 0 ||
+        strcmp(arg, "-b") == 0 ||
+        strcmp(arg, "-k") == 0 ||
+        strcmp(arg, "-y") == 0 ||
+        strcmp(arg, "-q") == 0 ||
+        strcmp(arg, "-x") == 0 ||
+        strcmp(arg, "-f") == 0 ||
+        strcmp(arg, "--hex") == 0 ||
+        strcmp(arg, "--break") == 0 ||
+        strcmp(arg, "--update-add") == 0 ||
+        strcmp(arg, "--update-del") == 0 ||
+        strcmp(arg, "--update-del-exact") == 0 ||
+        strcmp(arg, "--prereq-nxdomain") == 0 ||
+        strcmp(arg, "--prereq-yxdomain") == 0 ||
+        strcmp(arg, "--prereq-nxrrset") == 0 ||
+        strcmp(arg, "--prereq-yxrrset") == 0) {
+        return 2;
+    }
+    return 1;
+}
+
+static void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "+cmd") == 0) global_spec->dopt.show_cmd = true;
+        else if (strcmp(argv[i], "+nocmd") == 0) global_spec->dopt.show_cmd = false;
+        else if (strcmp(argv[i], "+short") == 0) global_spec->dopt.short_mode = true;
+        else if (strcmp(argv[i], "+noshort") == 0) global_spec->dopt.short_mode = false;
+        else if (strcmp(argv[i], "-m") == 0) global_spec->qo.mem_debug = true;
+        else if (strcmp(argv[i], "+allcompare") == 0) g_want_allcompare = true;
+    }
+}
+
+static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spec) {
+    const char *arg = argv[i];
+
+    // プレスキャンで確定済みの全域グローバルオプションは最優先でスキップ (no-op)
+    if (strcmp(arg, "+cmd") == 0 || strcmp(arg, "+nocmd") == 0 ||
+        strcmp(arg, "+short") == 0 || strcmp(arg, "+noshort") == 0) {
+        return 1;
+    }
+
+    if (arg[0] == '@') {
+        spec->server_arg = arg + 1;
+        spec->qo.server_explicit = true;
+        return 1;
+    }
+
+    if (strcmp(arg, "--hex") == 0 && i + 1 < argc) {
+        spec->hex_payload = argv[i + 1];
+        spec->qname = "(hex)";
+        spec->qtype_s = "ANY";
+        return 2;
+    }
+    if (strncmp(arg, "--hex=", 6) == 0) {
+        spec->hex_payload = arg + 6;
+        spec->qname = "(hex)";
+        spec->qtype_s = "ANY";
+        return 1;
+    }
+    if (strcmp(arg, "-x") == 0 && i + 1 < argc) {
+        if (!make_reverse_name(argv[i + 1], spec->rev_name, sizeof(spec->rev_name))) {
+            fprintf(stderr, "Invalid IP address for -x\n");
+            return -1;
+        }
+        spec->qname = spec->rev_name;
+        spec->qtype_s = "PTR";
+        spec->qo.qclass = 1;
+        return 2;
+    }
+    if (strcmp(arg, "-c") == 0 && i + 1 < argc) {
+        const char *c = argv[i + 1];
+        uint16_t cls = 0;
+        if (is_known_qclass_str(c, &cls)) {
+            spec->qo.qclass = cls;
+        } else {
+            fprintf(stderr, "invalid class %s\n", c);
+            return -1;
+        }
+        return 2;
+    }
+    if (strcmp(arg, "-t") == 0 && i + 1 < argc) {
+        spec->qtype_s = argv[i + 1];
+        return 2;
+    }
+    if (strcmp(arg, "-q") == 0 && i + 1 < argc) {
+        spec->qo.explicit_qname = argv[i + 1];
+        return 2;
+    }
+    if (strcmp(arg, "-u") == 0) {
+        spec->dopt.time_unit_usec = true;
+        return 1;
+    }
+    if (strcmp(arg, "-m") == 0) {
+        spec->qo.mem_debug = true;
+        return 1;
+    }
+    if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+        usage(argv[0]);
+        exit(0);
+    }
+    if (strcmp(arg, "-r") == 0) {
+        /* Handled in pre-scan */
+        return 1;
+    }
+    if (strcmp(arg, "-p") == 0 && i + 1 < argc) {
+        char *endptr;
+        long pval = strtol(argv[i + 1], &endptr, 10);
+        if (*endptr == '\0' && pval > 0 && pval <= 65535) spec->port = (int)pval;
+        return 2;
+    }
+    if (strcmp(arg, "-4") == 0) {
+        spec->qo.pref_family = AF_INET;
+        return 1;
+    }
+    if (strcmp(arg, "-6") == 0) {
+        spec->qo.pref_family = AF_INET6;
+        return 1;
+    }
+    if (strcmp(arg, "-b") == 0 && i + 1 < argc) {
+        const char *b_arg = argv[i + 1];
+        char *hash = strchr(b_arg, '#');
+        if (hash) {
+            int len = hash - b_arg;
+            if (len >= (int)sizeof(spec->qo.bind_addr)) len = sizeof(spec->qo.bind_addr) - 1;
+            memcpy(spec->qo.bind_addr, b_arg, len);
+            spec->qo.bind_addr[len] = '\0';
+            char *endptr;
+            long bp = strtol(hash + 1, &endptr, 10);
+            if (*endptr == '\0' && bp > 0 && bp <= 65535) spec->qo.bind_port = (int)bp;
+        } else {
+            snprintf(spec->qo.bind_addr, sizeof(spec->qo.bind_addr), "%s", b_arg);
+            spec->qo.bind_port = 0;
+        }
+        return 2;
+    }
+    if (strcmp(arg, "-f") == 0 && i + 1 < argc) {
+        spec->batch_file = argv[i + 1];
+        return 2;
+    }
+    if (strcmp(arg, "-y") == 0 && i + 1 < argc) {
+        char *tsig_str = strdup(argv[i + 1]);
+        parse_tsig_str(tsig_str, &spec->qo);
+        return 2;
+    }
+    if (strcmp(arg, "-k") == 0 && i + 1 < argc) {
+        parse_tsig_keyfile(argv[i + 1], &spec->qo);
+        return 2;
+    }
+    if (strcmp(arg, "--update-add") == 0 && i + 1 < argc) {
+        if (spec->qo.update_op_count < MAX_UPDATE_OPS) {
+            spec->qo.update_ops[spec->qo.update_op_count].kind = UPDATE_OP_ADD;
+            snprintf(spec->qo.update_ops[spec->qo.update_op_count].raw, sizeof(spec->qo.update_ops[0].raw), "%s", argv[i + 1]);
+            spec->qo.update_op_count++;
+        } else {
+            fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i + 1], MAX_UPDATE_OPS);
+        }
+        return 2;
+    }
+    if (strcmp(arg, "--update-del") == 0 && i + 1 < argc) {
+        if (spec->qo.update_op_count < MAX_UPDATE_OPS) {
+            spec->qo.update_ops[spec->qo.update_op_count].kind = UPDATE_OP_DEL;
+            snprintf(spec->qo.update_ops[spec->qo.update_op_count].raw, sizeof(spec->qo.update_ops[0].raw), "%s", argv[i + 1]);
+            spec->qo.update_op_count++;
+        } else {
+            fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i + 1], MAX_UPDATE_OPS);
+        }
+        return 2;
+    }
+    if (strcmp(arg, "--update-del-exact") == 0 && i + 1 < argc) {
+        if (spec->qo.update_op_count < MAX_UPDATE_OPS) {
+            spec->qo.update_ops[spec->qo.update_op_count].kind = UPDATE_OP_DEL_EXACT;
+            snprintf(spec->qo.update_ops[spec->qo.update_op_count].raw, sizeof(spec->qo.update_ops[0].raw), "%s", argv[i + 1]);
+            spec->qo.update_op_count++;
+        } else {
+            fprintf(stderr, "warning: too many update options, ignoring '%s' (max %d)\n", argv[i + 1], MAX_UPDATE_OPS);
+        }
+        return 2;
+    }
+    if (strncmp(arg, "--prereq=", 9) == 0) {
+        if (spec->qo.prereq_count >= MAX_PREREQS) {
+            fprintf(stderr, "warning: too many --prereq options, ignoring '%s' (max %d)\n", arg, MAX_PREREQS);
+        } else {
+            char *spec_str = strdup(arg + 9);
+            char *kind_str = strtok(spec_str, ":");
+            char *name = strtok(NULL, ":");
+            char *type_str = strtok(NULL, ":");
+            prereq_kind_t kind = PREREQ_NXDOMAIN;
+            bool needs_type = false;
+            if (kind_str && strcasecmp(kind_str, "nxdomain") == 0) kind = PREREQ_NXDOMAIN;
+            else if (kind_str && strcasecmp(kind_str, "yxdomain") == 0) kind = PREREQ_YXDOMAIN;
+            else if (kind_str && strcasecmp(kind_str, "nxrrset") == 0) { kind = PREREQ_NXRRSET; needs_type = true; }
+            else if (kind_str && strcasecmp(kind_str, "yxrrset") == 0) { kind = PREREQ_YXRRSET; needs_type = true; }
+            else { fprintf(stderr, "error: unknown prereq kind '%s'\n", kind_str ? kind_str : "(null)"); free(spec_str); return -1; }
+
+            if (!name || (needs_type && !type_str)) {
+                fprintf(stderr, "error: --prereq=%s requires a name%s\n", kind_str, needs_type ? " and a type" : "");
+                free(spec_str);
+                return -1;
+            }
+
+            struct { prereq_kind_t kind; char name[256]; char type_str[32]; } *pr = (void*)&spec->qo.prereqs[spec->qo.prereq_count++];
+            pr->kind = kind;
+            snprintf(pr->name, sizeof(pr->name), "%s", name);
+            snprintf(pr->type_str, sizeof(pr->type_str), "%s", needs_type ? type_str : "");
+            free(spec_str);
+        }
+        return 1;
+    }
+    if (strcmp(arg, "--prereq-nxdomain") == 0 && i + 1 < argc) {
+        if (spec->qo.prereq_count < MAX_PREREQS) {
+            spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_NXDOMAIN;
+            snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", argv[i + 1]);
+            spec->qo.prereqs[spec->qo.prereq_count].type_str[0] = '\0';
+            spec->qo.prereq_count++;
+        }
+        return 2;
+    }
+    if (strcmp(arg, "--prereq-yxdomain") == 0 && i + 1 < argc) {
+        if (spec->qo.prereq_count < MAX_PREREQS) {
+            spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_YXDOMAIN;
+            snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", argv[i + 1]);
+            spec->qo.prereqs[spec->qo.prereq_count].type_str[0] = '\0';
+            spec->qo.prereq_count++;
+        }
+        return 2;
+    }
+    if (strcmp(arg, "--prereq-nxrrset") == 0 && i + 1 < argc) {
+        if (spec->qo.prereq_count < MAX_PREREQS) {
+            spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_NXRRSET;
+            char *buf = strdup(argv[i + 1]);
+            char *name = strtok(buf, " ");
+            char *type_str = strtok(NULL, " ");
+            if (name && type_str) {
+                snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", name);
+                snprintf(spec->qo.prereqs[spec->qo.prereq_count].type_str, sizeof(spec->qo.prereqs[0].type_str), "%s", type_str);
+                spec->qo.prereq_count++;
+            }
+            free(buf);
+        }
+        return 2;
+    }
+    if (strcmp(arg, "--prereq-yxrrset") == 0 && i + 1 < argc) {
+        if (spec->qo.prereq_count < MAX_PREREQS) {
+            spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_YXRRSET;
+            char *buf = strdup(argv[i + 1]);
+            char *name = strtok(buf, " ");
+            char *type_str = strtok(NULL, " ");
+            if (name && type_str) {
+                snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", name);
+                snprintf(spec->qo.prereqs[spec->qo.prereq_count].type_str, sizeof(spec->qo.prereqs[0].type_str), "%s", type_str);
+                spec->qo.prereq_count++;
+            }
+            free(buf);
+        }
+        return 2;
+    }
+    if (strcmp(arg, "--break") == 0 && i + 1 < argc) {
+        char *brk = argv[i + 1];
+        if (strcmp(brk, "all") == 0) {
+            spec->test_all = true;
+        } else {
+            parse_break_arg(brk);
+        }
+        return 2;
+    }
+
+    if (arg[0] == '-' || arg[0] == '+') {
+        if (strcmp(arg, "+tcp") == 0 || strcmp(arg, "--tcp") == 0 || strcmp(arg, "+vc") == 0) {
+            spec->use_tcp = true; spec->qo.use_tcp = true;
+        } else if (strcmp(arg, "+novc") == 0) {
+            spec->use_tcp = false; spec->qo.use_tcp = false;
+        } else if (strcmp(arg, "+udp") == 0) {
+            spec->force_udp = true;
+        } else if (strcmp(arg, "+ignore") == 0) {
+            spec->qo.ignore_tc = true;
+        } else if (strcmp(arg, "+noignore") == 0) {
+            spec->qo.ignore_tc = false;
+        } else if (strcmp(arg, "+fail") == 0) {
+            spec->qo.nofail = false;
+        } else if (strcmp(arg, "+nofail") == 0) {
+            spec->qo.nofail = true;
+        } else if (strcmp(arg, "+ldnsz") == 0) {
+            spec->use_ldnsz = true;
+        } else if (strcmp(arg, "+allcompare") == 0) {
+            g_want_allcompare = true;
+        } else if (strcmp(arg, "+noall") == 0) {
+            spec->dopt.show_question = spec->dopt.show_answer = spec->dopt.show_authority =
+                spec->dopt.show_additional = spec->dopt.show_comments = spec->dopt.show_stats =
+                spec->dopt.show_cmd = false;
+        } else if (strcmp(arg, "+all") == 0) {
+            spec->dopt.show_question = spec->dopt.show_answer = spec->dopt.show_authority =
+                spec->dopt.show_additional = spec->dopt.show_comments = spec->dopt.show_stats =
+                spec->dopt.show_cmd = true;
+        } else if (strcmp(arg, "+answer") == 0) {
+            spec->dopt.show_answer = true;
+        } else if (strcmp(arg, "+noanswer") == 0) {
+            spec->dopt.show_answer = false;
+        } else if (strcmp(arg, "+authority") == 0) {
+            spec->dopt.show_authority = true;
+        } else if (strcmp(arg, "+noauthority") == 0) {
+            spec->dopt.show_authority = false;
+        } else if (strcmp(arg, "+additional") == 0) {
+            spec->dopt.show_additional = true;
+        } else if (strcmp(arg, "+noadditional") == 0) {
+            spec->dopt.show_additional = false;
+        } else if (strcmp(arg, "+question") == 0) {
+            spec->dopt.show_question = true;
+        } else if (strcmp(arg, "+noquestion") == 0) {
+            spec->dopt.show_question = false;
+        } else if (strcmp(arg, "+comments") == 0) {
+            spec->dopt.show_comments = true;
+        } else if (strcmp(arg, "+nocomments") == 0) {
+            spec->dopt.show_comments = false;
+        } else if (strcmp(arg, "+stats") == 0) {
+            spec->dopt.show_stats = true;
+        } else if (strcmp(arg, "+nostats") == 0) {
+            spec->dopt.show_stats = false;
+        } else if (strcmp(arg, "+identify") == 0) {
+            spec->dopt.identify = true;
+        } else if (strcmp(arg, "+noidentify") == 0) {
+            spec->dopt.identify = false;
+        } else if (strcmp(arg, "+multiline") == 0) {
+            spec->dopt.multiline = true;
+            if (spec->dopt.split_width == 56) spec->dopt.split_width = 44;
+        } else if (strcmp(arg, "+nomultiline") == 0) {
+            spec->dopt.multiline = false;
+            if (spec->dopt.split_width == 44) spec->dopt.split_width = 56;
+        } else if (strcmp(arg, "+yaml") == 0) {
+            spec->dopt.yaml = true;
+        } else if (strcmp(arg, "+noyaml") == 0) {
+            spec->dopt.yaml = false;
+        } else if (strcmp(arg, "+trace") == 0) {
+            spec->do_trace = true;
+        } else if (strcmp(arg, "+nssearch") == 0) {
+            spec->do_nssearch = true;
+        } else if (strcmp(arg, "+search") == 0 || strcmp(arg, "+defname") == 0) {
+            spec->qo.use_search_list = true;
+        } else if (strcmp(arg, "+nosearch") == 0 || strcmp(arg, "+nodefname") == 0) {
+            spec->qo.use_search_list = false;
+        } else if (strncmp(arg, "+domain=", 8) == 0) {
+            spec->qo.search_domain = strdup(arg + 8);
+            spec->qo.use_search_list = true;
+        } else if (strncmp(arg, "+ndots=", 7) == 0) {
+            spec->qo.ndots = atoi(arg + 7);
+        } else if (strcmp(arg, "+class") == 0) {
+            spec->dopt.show_class = true;
+        } else if (strcmp(arg, "+noclass") == 0) {
+            spec->dopt.show_class = false;
+        } else if (strcmp(arg, "+crypto") == 0) {
+            spec->dopt.show_crypto = true;
+        } else if (strcmp(arg, "+nocrypto") == 0) {
+            spec->dopt.show_crypto = false;
+        } else if (strcmp(arg, "+besteffort") == 0) {
+            spec->dopt.besteffort = true;
+        } else if (strcmp(arg, "+nobesteffort") == 0) {
+            spec->dopt.besteffort = false;
+        } else if (strcmp(arg, "+badcookie") == 0) {
+            spec->qo.want_opt = true;
+            spec->qo.want_cookie = true;
+            spec->qo.retry_on_badcookie = true;
+            bool all_zero = true;
+            for (int k = 0; k < 8; k++) { if (spec->qo.client_cookie[k] != 0) { all_zero = false; break; } }
+            if (all_zero) {
+                for (int k = 0; k < 8; k++) spec->qo.client_cookie[k] = (uint8_t)(arc4random() & 0xFF);
+            }
+        } else if (strcmp(arg, "+nobadcookie") == 0) {
+            spec->qo.retry_on_badcookie = false;
+        } else if (strcmp(arg, "+showbadcookie") == 0) {
+            spec->dopt.show_badcookie_msg = true;
+        } else if (strcmp(arg, "+noshowbadcookie") == 0) {
+            spec->dopt.show_badcookie_msg = false;
+        } else if (strcmp(arg, "+ednsnegotiation") == 0) {
+            spec->qo.edns_negotiation = true;
+        } else if (strcmp(arg, "+noednsnegotiation") == 0) {
+            spec->qo.edns_negotiation = false;
+        } else if (strcmp(arg, "+showbadvers") == 0) {
+            spec->dopt.show_badvers_msg = true;
+        } else if (strcmp(arg, "+noshowbadvers") == 0) {
+            spec->dopt.show_badvers_msg = false;
+        } else if (strcmp(arg, "+qr") == 0) {
+            spec->dopt.show_query_message = true;
+        } else if (strcmp(arg, "+noqr") == 0) {
+            spec->dopt.show_query_message = false;
+        } else if (strcmp(arg, "+rrcomments") == 0) {
+            spec->dopt.rrcomments = true;
+        } else if (strcmp(arg, "+norrcomments") == 0) {
+            spec->dopt.rrcomments = false;
+        } else if (strcmp(arg, "+onesoa") == 0) {
+            spec->dopt.onesoa = true;
+        } else if (strcmp(arg, "+noonesoa") == 0) {
+            spec->dopt.onesoa = false;
+        } else if (strncmp(arg, "+split=", 7) == 0) {
+            int w = atoi(arg + 7);
+            if (w < 0) w = 0;
+            spec->dopt.split_width = (w == 0) ? 0 : ((w + 3) / 4) * 4;
+        } else if (strcmp(arg, "+nosplit") == 0) {
+            spec->dopt.split_width = 0;
+        } else if (strcmp(arg, "+unknownformat") == 0) {
+            spec->dopt.force_unknown_format = true;
+        } else if (strcmp(arg, "+nounknownformat") == 0) {
+            spec->dopt.force_unknown_format = false;
+        } else if (strcmp(arg, "+ttlunits") == 0) {
+            spec->dopt.ttlunits = true; spec->dopt.ttlid = true;
+        } else if (strcmp(arg, "+nottlunits") == 0) {
+            spec->dopt.ttlunits = false;
+        } else if (strcmp(arg, "+ttlid") == 0) {
+            spec->dopt.ttlid = true;
+        } else if (strcmp(arg, "+nottlid") == 0) {
+            spec->dopt.ttlid = false;
+        } else if (strcmp(arg, "+expire") == 0) {
+            spec->dopt.expire = true;
+        } else if (strcmp(arg, "+noexpire") == 0) {
+            spec->dopt.expire = false;
+        } else if (strcmp(arg, "+showsearch") == 0) {
+            spec->dopt.showsearch = true;
+        } else if (strcmp(arg, "+noshowsearch") == 0) {
+            spec->dopt.showsearch = false;
+        } else if (strcmp(arg, "+idnin") == 0) {
+            spec->qo.idnin = true;
+        } else if (strcmp(arg, "+noidnin") == 0) {
+            spec->qo.idnin = false;
+        } else if (strcmp(arg, "+idnout") == 0) {
+            spec->dopt.idnout = true;
+        } else if (strcmp(arg, "+noidnout") == 0) {
+            spec->dopt.idnout = false;
+        } else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
+            printf("KariDNS dag v0.0.1\n");
+            exit(0);
+        } else if (strcmp(arg, "+norec") == 0 || strcmp(arg, "+norecurse") == 0 || strcmp(arg, "+nordflag") == 0) {
+            spec->norecurse = true; spec->qo.rd_flag = false;
+        } else if (strcmp(arg, "+rec") == 0 || strcmp(arg, "+recurse") == 0 || strcmp(arg, "+rdflag") == 0) {
+            spec->norecurse = false; spec->qo.rd_flag = true;
+        } else if (strcmp(arg, "+raflag") == 0) {
+            spec->qo.ra_flag = true;
+        } else if (strcmp(arg, "+noraflag") == 0) {
+            spec->qo.ra_flag = false;
+        } else if (strcmp(arg, "+aaonly") == 0 || strcmp(arg, "+aaflag") == 0) {
+            spec->aaflag = true; spec->qo.aa_flag = true;
+        } else if (strcmp(arg, "+noaaonly") == 0 || strcmp(arg, "+noaaflag") == 0) {
+            spec->aaflag = false; spec->qo.aa_flag = false;
+        } else if (strcmp(arg, "+coflag") == 0 || strcmp(arg, "+co") == 0) {
+            spec->qo.want_opt = true; spec->qo.compact_answers_ok = true;
+        } else if (strcmp(arg, "+nocoflag") == 0 || strcmp(arg, "+noco") == 0) {
+            spec->qo.compact_answers_ok = false;
+        } else if (strncmp(arg, "+ednsflags=", 11) == 0) {
+            spec->qo.want_opt = true; spec->qo.ednsflags_z = (uint16_t)strtol(arg + 11, NULL, 0);
+        } else if (strcmp(arg, "+ednsflags") == 0 || strcmp(arg, "+noednsflags") == 0) {
+            spec->qo.ednsflags_z = 0;
+        } else if (strncmp(arg, "+opcode=", 8) == 0) {
+            spec->qo.opcode_override = parse_opcode_value(arg + 8);
+        } else if (strcmp(arg, "+noopcode") == 0) {
+            spec->qo.opcode_override = -1;
+        } else if (strncmp(arg, "+qid=", 5) == 0) {
+            spec->qo.qid_override = atoi(arg + 5);
+        } else if (strcmp(arg, "+header-only") == 0) {
+            spec->qo.header_only = true;
+        } else if (strcmp(arg, "+noheader-only") == 0) {
+            spec->qo.header_only = false;
+        } else if (strcmp(arg, "+keepalive") == 0) {
+            spec->qo.want_opt = true; spec->qo.send_keepalive = true;
+        } else if (strcmp(arg, "+nokeepalive") == 0) {
+            spec->qo.send_keepalive = false;
+        } else if (strcmp(arg, "+keepopen") == 0) {
+            spec->qo.keep_tcp_open = true;
+        } else if (strcmp(arg, "+nokeepopen") == 0) {
+            spec->qo.keep_tcp_open = false;
+        } else if (strncmp(arg, "+fuzztime=", 10) == 0) {
+            spec->qo.fuzztime = strtoll(arg + 10, NULL, 10);
+        } else if (strcmp(arg, "+fuzztime") == 0) {
+            spec->qo.fuzztime = 1646972129;
+        } else if (strcmp(arg, "+nofuzztime") == 0) {
+            spec->qo.fuzztime = 0;
+        } else if (strcmp(arg, "+dns64prefix") == 0) {
+            spec->qo.check_dns64prefix = true;
+        } else if (strcmp(arg, "+nodns64prefix") == 0) {
+            spec->qo.check_dns64prefix = false;
+        } else if (strncmp(arg, "+proxy=", 7) == 0) {
+            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false; parse_proxy_arg(arg + 7, &spec->qo);
+        } else if (strcmp(arg, "+proxy") == 0) {
+            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
+        } else if (strcmp(arg, "+noproxy") == 0) {
+            spec->qo.use_proxy = false;
+        } else if (strncmp(arg, "+proxy-plain=", 13) == 0) {
+            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false; parse_proxy_arg(arg + 13, &spec->qo);
+        } else if (strcmp(arg, "+proxy-plain") == 0) {
+            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
+        } else if (strcmp(arg, "+noproxy-plain") == 0) {
+            spec->qo.use_proxy = false;
+        } else if (strcmp(arg, "+tls") == 0) {
+            spec->qo.use_tls = true; if (spec->port == 53) spec->port = 853;
+        } else if (strcmp(arg, "+notls") == 0) {
+            spec->qo.use_tls = false; if (spec->port == 853) spec->port = 53;
+        } else if (strncmp(arg, "+tls-ca=", 8) == 0) {
+            spec->qo.tls_ca_file = strdup(arg + 8);
+        } else if (strcmp(arg, "+tls-ca") == 0) {
+            spec->qo.tls_verify_default_store = true;
+        } else if (strcmp(arg, "+notls-ca") == 0) {
+            spec->qo.tls_verify_default_store = false;
+        } else if (strncmp(arg, "+tls-certfile=", 14) == 0) {
+            spec->qo.tls_certfile = strdup(arg + 14);
+        } else if (strncmp(arg, "+tls-keyfile=", 13) == 0) {
+            spec->qo.tls_keyfile = strdup(arg + 13);
+        } else if (strncmp(arg, "+tls-hostname=", 14) == 0) {
+            spec->qo.tls_hostname = strdup(arg + 14);
+        } else if (strncmp(arg, "+https=", 7) == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 7); if (spec->port == 53) spec->port = 443;
+        } else if (strcmp(arg, "+https") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 443;
+        } else if (strncmp(arg, "+https-get=", 11) == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 11); if (spec->port == 53) spec->port = 443;
+        } else if (strcmp(arg, "+https-get") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 443;
+        } else if (strncmp(arg, "+https-post=", 12) == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 12); if (spec->port == 53) spec->port = 443;
+        } else if (strcmp(arg, "+https-post") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 443;
+        } else if (strncmp(arg, "+http-plain=", 12) == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 12); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+http-plain") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
+        } else if (strncmp(arg, "+http-plain-get=", 16) == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 16); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+http-plain-get") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
+        } else if (strncmp(arg, "+http-plain-post=", 17) == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 17); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+http-plain-post") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+nohexdump") == 0) {
+            spec->no_hexdump_query = true;
+            spec->no_hexdump_response = true;
+        } else if (strcmp(arg, "+nohexdump-query") == 0) {
+            spec->no_hexdump_query = true;
+        } else if (strcmp(arg, "+nohexdump-response") == 0) {
+            spec->no_hexdump_response = true;
+        } else if (strcmp(arg, "+edns") == 0) {
+            spec->qo.want_opt = true;
+        } else if (strncmp(arg, "+edns=", 6) == 0) {
+            spec->qo.want_opt = true;
+            spec->qo.edns_version = (uint8_t)strtoul(arg + 6, NULL, 10);
+        } else if (strcmp(arg, "+noedns") == 0) {
+            spec->qo.want_opt = false;
+        } else if (strcmp(arg, "+dnssec") == 0 || strcmp(arg, "+do") == 0) {
+            spec->qo.want_opt = true; spec->qo.dnssec_ok = true;
+        } else if (strcmp(arg, "+nodo") == 0) {
+            spec->qo.dnssec_ok = false;
+        } else if (strcmp(arg, "+nsid") == 0) {
+            spec->qo.want_opt = true; spec->qo.want_nsid = true;
+        } else if (strncmp(arg, "+bufsize=", 9) == 0) {
+            char *endptr;
+            long bsz = strtol(arg + 9, &endptr, 10);
+            if (*endptr == '\0' && bsz >= 0 && bsz <= 65535) {
+                spec->qo.want_opt = true; spec->qo.udp_payload_size = (uint16_t)bsz;
+            }
+        } else if (strcmp(arg, "+adflag") == 0) {
+            spec->adflag = true; spec->qo.ad_flag = true;
+        } else if (strcmp(arg, "+noadflag") == 0) {
+            spec->adflag = false; spec->qo.ad_flag = false;
+        } else if (strcmp(arg, "+cdflag") == 0) {
+            spec->cdflag = true; spec->qo.cd_flag = true;
+        } else if (strcmp(arg, "+nocdflag") == 0) {
+            spec->cdflag = false; spec->qo.cd_flag = false;
+        } else if (strcmp(arg, "+tcflag") == 0) {
+            spec->tcflag = true; spec->qo.tc_flag = true;
+        } else if (strcmp(arg, "+notcflag") == 0) {
+            spec->tcflag = false; spec->qo.tc_flag = false;
+        } else if (strcmp(arg, "+zflag") == 0) {
+            spec->zflag = true; spec->qo.z_flag = true;
+        } else if (strcmp(arg, "+nozflag") == 0) {
+            spec->zflag = false; spec->qo.z_flag = false;
+        } else if (strncmp(arg, "+timeout=", 9) == 0) {
+            char *endptr;
+            long to = strtol(arg + 9, &endptr, 10);
+            if (*endptr == '\0' && to >= 0) spec->qo.timeout_sec = (int)to;
+        } else if (strncmp(arg, "+tries=", 7) == 0) {
+            char *endptr;
+            long tr = strtol(arg + 7, &endptr, 10);
+            if (*endptr == '\0' && tr >= 0) spec->qo.tries = (int)tr;
+        } else if (strncmp(arg, "+retry=", 7) == 0) {
+            char *endptr;
+            long tr = strtol(arg + 7, &endptr, 10);
+            if (*endptr == '\0' && tr >= 0) spec->qo.tries = (int)tr + 1;
+        } else if (strncmp(arg, "+padding=", 9) == 0) {
+            char *endptr;
+            long pd = strtol(arg + 9, &endptr, 10);
+            if (*endptr == '\0' && pd >= 0) {
+                spec->qo.want_opt = true; spec->qo.want_padding = true;
+                spec->qo.padding_size = (int)pd;
+            }
+        } else if (strncmp(arg, "+mqtype=", 8) == 0) {
+            spec->qo.want_opt = true;
+            if (spec->qo.custom_edns_opt_count < 8) {
+                char *mqstr = strdup(arg + 8);
+                char *token = strtok(mqstr, ",");
+                uint16_t mqtypes[16];
+                int mq_count = 0;
+                while (token && mq_count < 16) {
+                    mqtypes[mq_count++] = parse_qtype(token);
+                    token = strtok(NULL, ",");
+                }
+                spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].code = 20;
+                spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = mq_count * 2;
+                for (int m = 0; m < mq_count; m++) {
+                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data[m*2] = mqtypes[m] >> 8;
+                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data[m*2+1] = mqtypes[m] & 0xFF;
+                }
+                spec->qo.custom_edns_opt_count++;
+                free(mqstr);
+            }
+        } else if (strncmp(arg, "+ednsopt=", 9) == 0) {
+            spec->qo.want_opt = true;
+            if (spec->qo.custom_edns_opt_count < 8) {
+                const char *val = arg + 9;
+                char *colon = strchr(val, ':');
+                if (colon) {
+                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
+                    const char *hex = colon + 1;
+                    size_t hex_len = strlen(hex);
+                    size_t bytes = hex_len / 2;
+                    if (bytes > sizeof(spec->qo.custom_edns_opts[0].data)) bytes = sizeof(spec->qo.custom_edns_opts[0].data);
+                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = (uint16_t)bytes;
+                    for (size_t j = 0; j < bytes; j++) {
+                        unsigned int b; sscanf(hex + j * 2, "%02x", &b);
+                        spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data[j] = (uint8_t)b;
+                    }
+                } else {
+                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
+                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = 0;
+                }
+                spec->qo.custom_edns_opt_count++;
+            }
+        } else if (strncmp(arg, "+subnet=", 8) == 0) {
+            if (parse_subnet_arg(arg + 8, &spec->qo)) { spec->qo.want_opt = true; spec->qo.want_subnet = true; }
+        } else if (strncmp(arg, "+cookie", 7) == 0) {
+            spec->qo.want_opt = true; spec->qo.want_cookie = true;
+            if (arg[7] == '=') {
+                const char *hex = arg + 8;
+                size_t hex_len = strlen(hex);
+                if (hex_len > 64) hex_len = 64;
+                uint8_t full[32]; size_t full_len = hex_len / 2;
+                for (size_t j = 0; j < full_len; j++) {
+                    unsigned int byte; sscanf(hex + j * 2, "%02x", &byte); full[j] = (uint8_t)byte;
+                }
+                if (full_len >= 8) {
+                    memcpy(spec->qo.client_cookie, full, 8);
+                    if (full_len > 8) { spec->qo.server_cookie_len = full_len - 8; memcpy(spec->qo.server_cookie, full + 8, spec->qo.server_cookie_len); }
+                } else {
+                    for (int k = 0; k < 8; k++) spec->qo.client_cookie[k] = (uint8_t)(k + 1);
+                }
+            } else {
+                for (int k = 0; k < 8; k++) spec->qo.client_cookie[k] = (uint8_t)(arc4random() & 0xFF);
+            }
+        } else if (strcmp(arg, "+nocookie") == 0) {
+            spec->qo.want_cookie = false;
+        } else if (strncmp(arg, "+tsig=", 6) == 0) {
+            char *tsig_str = strdup(arg + 6);
+            parse_tsig_str(tsig_str, &spec->qo);
+        } else if (strcmp(arg, "--test-all") == 0) {
+            spec->test_all = true;
+        } else {
+            fprintf(stderr, "Invalid option: %s\n", arg);
+            fprintf(stderr, "Usage:  dag [@server] [-p port] [name] [type] [options]\n");
+            return -1;
+        }
+        return 1;
+    }
+
+    // 位置引数: CLASS / TYPE / NAME (任意順序対応)
+    uint16_t cls_val = 0;
+    if (is_known_qclass_str(arg, &cls_val)) {
+        spec->qo.qclass = cls_val;
+    } else if (is_known_qtype(arg)) {
+        if (!spec->qtype_s) {
+            spec->qtype_s = arg;
+        } else if (!spec->qname) {
+            spec->qname = arg;
+        }
+    } else {
+        if (!spec->qname) {
+            spec->qname = arg;
+        } else if (!spec->qtype_s) {
+            spec->qtype_s = arg;
+        }
+    }
+    return 1;
+}
+
+static int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec) {
+    for (int i = start; i < end; ) {
+        int rc = parse_query_arg_token(argc, argv, i, spec);
+        if (rc < 0) return -1;
+        i += rc;
+    }
+    return 0;
+}
+
+
+static int execute_batch_spec(const query_spec_t *spec) {
+    if (!spec->batch_file) return 0;
+    FILE *bf = fopen(spec->batch_file, "r");
+    if (!bf) {
+        fprintf(stderr, "error: could not open batch file '%s': %s\n", spec->batch_file, strerror(errno));
+        exit(8);
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), bf)) {
+        char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '#' || *p == ';') continue;
+        
+        char *b_qname = NULL;
+        char *b_qtype = NULL;
+        char *b_server = NULL;
+        char *tok = strtok(p, " \t\r\n");
+        while (tok) {
+            if (tok[0] == '@') {
+                b_server = tok;
+            } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0) {
+                // ignore class
+            } else if (is_known_qtype(tok)) {
+                if (!b_qtype) b_qtype = tok;
+                else if (!b_qname) b_qname = tok;
+            } else {
+                if (!b_qname) b_qname = tok;
+                else if (!b_qtype) b_qtype = tok;
+            }
+            tok = strtok(NULL, " \t\r\n");
+        }
+        if (!b_qname) continue;
+        if (!b_qtype) b_qtype = "A";
+        
+        bool b_allocated = false;
+        if (spec->qo.idnin) b_qname = (char *)idn_to_ascii(b_qname, &b_allocated);
+        const char *eff_server = b_server ? b_server : spec->server_arg;
+        if (spec->do_trace) {
+            run_trace_query(b_qname, eff_server, b_qtype, spec->port, spec->use_tcp, spec->force_udp,
+                            spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+        } else if (spec->do_nssearch) {
+            run_nssearch(b_qname, eff_server, spec->port, spec->use_tcp, spec->force_udp,
+                         spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+        } else {
+            run_single_job(b_qname, b_qtype, eff_server, spec->port, spec->use_tcp, spec->force_udp,
+                           spec->test_all, spec->norecurse,
+                           spec->adflag, spec->cdflag, spec->aaflag, spec->tcflag, spec->zflag,
+                           spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+        }
+#ifdef HAVE_LIBIDN2
+        if (b_allocated) idn2_free((void *)b_qname);
+#endif
+    }
+    fclose(bf);
+    return 0;
+}
+
+static int execute_query_spec(query_spec_t *spec) {
+    if (spec->qo.explicit_qname) spec->qname = spec->qo.explicit_qname;
+    if (!spec->qname) {
+        spec->qname = ".";
+        if (!spec->qtype_s) spec->qtype_s = "NS";
+    } else {
+        if (!spec->qtype_s) {
+            if (strcmp(spec->qname, ".") == 0) spec->qtype_s = "NS";
+            else spec->qtype_s = "A";
+        }
+    }
+
+    static char resolv_server_buf[260];
+    if (!spec->server_arg) {
+        const char *sys_resolver = get_system_resolver();
+        snprintf(resolv_server_buf, sizeof(resolv_server_buf), "%s", sys_resolver);
+        spec->server_arg = resolv_server_buf;
+    }
+
+    bool q_allocated = false;
+    if (spec->qo.idnin) spec->qname = (char *)idn_to_ascii(spec->qname, &q_allocated);
+
+    int exit_code = 0;
+    if (spec->do_trace) {
+        exit_code = run_trace_query(spec->qname, spec->server_arg, spec->qtype_s, spec->port, spec->use_tcp, spec->force_udp,
+                                    spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+    } else if (spec->do_nssearch) {
+        exit_code = run_nssearch(spec->qname, spec->server_arg, spec->port, spec->use_tcp, spec->force_udp,
+                                 spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+    } else {
+        exit_code = run_single_job(spec->qname, spec->qtype_s, spec->server_arg, spec->port, spec->use_tcp, spec->force_udp,
+                                   spec->test_all, spec->norecurse,
+                                   spec->adflag, spec->cdflag, spec->aaflag, spec->tcflag, spec->zflag,
+                                   spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+    }
+
+#ifdef HAVE_LIBIDN2
+    if (q_allocated) idn2_free((void *)spec->qname);
+#endif
+
+    return exit_code;
+}
+
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
     zone_arena_init(&g_dag_arena);
@@ -4812,791 +5733,170 @@ int main(int argc, char **argv) {
         }
     }
 
-    char rev_name[128];
-    const char *qname = NULL;
-    const char *qtype_s = NULL;
-    const char *server_arg = NULL;
-    const char *hex_payload = NULL;
+    query_spec_t global_spec;
+    init_query_spec(&global_spec);
 
-    int port = 53;
-    const char *batch_file = NULL;
-    bool use_tcp = false;
-    bool force_udp = false;
-    bool use_ldnsz = false;
-    bool do_trace = false;
-    bool do_nssearch = false;
-    display_opts_t dopt = {
-        .show_question = true,
-        .show_answer = true,
-        .show_authority = true,
-        .show_additional = true,
-        .show_comments = true,
-        .show_stats = true,
-        .show_cmd = true,
-        .short_mode = false,
-        .multiline = false,
-        .yaml = false,
-        .ttlid = true,
-        .expire = false,
-        .showsearch = false,
-        .idnout = false,
-        .time_unit_usec = false,
-        .besteffort = false,
-        .show_class = true,
-        .show_crypto = true,
-        .show_query_message = false,
-        .rrcomments = false,
-        .onesoa = false,
-        .show_badcookie_msg = false,
-        .show_badvers_msg = false,
-        .split_width = 56,
-        .force_unknown_format = false,
-        .ttlunits = false
-    };
+    // 全域グローバルオプションのプレスキャン
+    prescan_always_global_options(argc, argv, &global_spec);
 
-    bool norecurse = false;
-    bool adflag = false;
-    bool cdflag = false;
-    bool aaflag = false;
-    bool tcflag = false;
-    bool zflag = false;
-    bool test_all = false;
-    bool no_hexdump_query = false;
-    bool no_hexdump_response = false;
+    // クエリタプルの境界検出 (Token Slicing)
+    int global_end = 1;
+    arg_slice_t queries[MAX_DAG_QUERIES];
+    int query_count = 0;
 
-    query_opts_t qo;
-    memset(&qo, 0, sizeof(qo));
-    qo.qclass = 1;
-    qo.udp_payload_size = 1232;
-    qo.timeout_sec = 5;
-    qo.tries = 1;
-    qo.pref_family = AF_UNSPEC;
-    qo.bind_addr[0] = '\0';
-    qo.bind_port = 0;
-    qo.retry_on_badcookie = true;
-    qo.edns_negotiation = true;
-    qo.rd_flag = true;
-    qo.opcode_override = -1;
-    qo.qid_override = -1;
-    qo.ndots = -1;
+    bool in_queries = false;
+    bool cur_has_name = false;
+    bool cur_has_type = false;
+    bool cur_has_class = false;
+    int cur_start = 1;
 
-    for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == '@') {
-            server_arg = argv[i] + 1;
-            qo.server_explicit = true;
-        } else if (strcmp(argv[i], "--hex") == 0 && i + 1 < argc) {
-            hex_payload = argv[++i];
-            qname = "(hex)";
-            qtype_s = "ANY";
-        } else if (strncmp(argv[i], "--hex=", 6) == 0) {
-            hex_payload = argv[i] + 6;
-            qname = "(hex)";
-            qtype_s = "ANY";
-        } else if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) {
-            if (!make_reverse_name(argv[++i], rev_name, sizeof(rev_name))) {
-                fprintf(stderr, "Invalid IP address for -x\n");
-                return 1;
-            }
-            qname = rev_name;
-            qtype_s = "PTR";
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            const char *c = argv[++i];
-            if (strcasecmp(c, "IN") == 0) qo.qclass = 1;
-            else if (strcasecmp(c, "CH") == 0 || strcasecmp(c, "CHAOS") == 0) qo.qclass = 3;
-            else if (strcasecmp(c, "HS") == 0 || strcasecmp(c, "HESIOD") == 0) qo.qclass = 4;
-            else if (strncasecmp(c, "CLASS", 5) == 0 && isdigit((unsigned char)c[5])) qo.qclass = (uint16_t)atoi(c + 5);
-            else { fprintf(stderr, "invalid class %s\n", c); return 1; }
-        } else if (strcmp(argv[i], "-q") == 0 && i + 1 < argc) {
-            qo.explicit_qname = argv[++i];
-        } else if (strcmp(argv[i], "-u") == 0) {
-            dopt.time_unit_usec = true;
-        } else if (strcmp(argv[i], "-m") == 0) {
-            qo.mem_debug = true;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-            return 0;
-        } else if (strcmp(argv[i], "-r") == 0) {
-            /* Handled in pre-scan */
-        } else if (argv[i][0] == '-' || argv[i][0] == '+') {
-            if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-                char *endptr;
-                long pval = strtol(argv[++i], &endptr, 10);
-                if (*endptr == '\0' && pval > 0 && pval <= 65535) port = (int)pval;
-            } else if (strcmp(argv[i], "--update-add") == 0 && i + 1 < argc) {
-                if (qo.update_op_count < MAX_UPDATE_OPS) {
-                    qo.update_ops[qo.update_op_count].kind = UPDATE_OP_ADD;
-                    snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
-                    qo.update_op_count++;
-                } else {
-                    fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
-                    i++;
-                }
-            } else if (strcmp(argv[i], "--update-del") == 0 && i + 1 < argc) {
-                if (qo.update_op_count < MAX_UPDATE_OPS) {
-                    qo.update_ops[qo.update_op_count].kind = UPDATE_OP_DEL;
-                    snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
-                    qo.update_op_count++;
-                } else {
-                    fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
-                    i++;
-                }
-            } else if (strcmp(argv[i], "--update-del-exact") == 0 && i + 1 < argc) {
-                if (qo.update_op_count < MAX_UPDATE_OPS) {
-                    qo.update_ops[qo.update_op_count].kind = UPDATE_OP_DEL_EXACT;
-                    snprintf(qo.update_ops[qo.update_op_count].raw, sizeof(qo.update_ops[0].raw), "%s", argv[++i]);
-                    qo.update_op_count++;
-                } else {
-                    fprintf(stderr, "warning: too many update options, ignoring '%s' (max %d)\n", argv[i+1], MAX_UPDATE_OPS);
-                    i++;
-                }
-            } else if (strncmp(argv[i], "--prereq=", 9) == 0) {
-                if (qo.prereq_count >= MAX_PREREQS) {
-                    fprintf(stderr, "warning: too many --prereq options, ignoring '%s' (max %d)\n", argv[i], MAX_PREREQS);
-                } else {
-                    char *spec = strdup(argv[i] + 9);
-                    char *kind_str = strtok(spec, ":");
-                    char *name = strtok(NULL, ":");
-                    char *type_str = strtok(NULL, ":");
-                    prereq_kind_t kind = PREREQ_NXDOMAIN;
-                    bool needs_type = false;
-                    if (kind_str && strcasecmp(kind_str, "nxdomain") == 0) kind = PREREQ_NXDOMAIN;
-                    else if (kind_str && strcasecmp(kind_str, "yxdomain") == 0) kind = PREREQ_YXDOMAIN;
-                    else if (kind_str && strcasecmp(kind_str, "nxrrset") == 0) { kind = PREREQ_NXRRSET; needs_type = true; }
-                    else if (kind_str && strcasecmp(kind_str, "yxrrset") == 0) { kind = PREREQ_YXRRSET; needs_type = true; }
-                    else { fprintf(stderr, "error: unknown prereq kind '%s'\n", kind_str ? kind_str : "(null)"); free(spec); return 1; }
+    for (int i = 1; i < argc; ) {
+        int count = get_arg_consume_count(argc, argv, i);
+        const char *arg = argv[i];
 
-                    if (!name || (needs_type && !type_str)) {
-                        fprintf(stderr, "error: --prereq=%s requires a name%s\n", kind_str, needs_type ? " and a type" : "");
-                        free(spec);
-                        return 1;
-                    }
+        bool is_name_arg = false;
+        bool is_type_arg = false;
+        bool is_class_arg = false;
+        bool is_reverse = false;
 
-                    struct { prereq_kind_t kind; char name[256]; char type_str[32]; } *pr = (void*)&qo.prereqs[qo.prereq_count++];
-                    pr->kind = kind;
-                    snprintf(pr->name, sizeof(pr->name), "%s", name);
-                    snprintf(pr->type_str, sizeof(pr->type_str), "%s", needs_type ? type_str : "");
-                    free(spec);
-                }
-            } else if (strcmp(argv[i], "--prereq-nxdomain") == 0 && i + 1 < argc) {
-                if (qo.prereq_count < MAX_PREREQS) {
-                    qo.prereqs[qo.prereq_count].kind = PREREQ_NXDOMAIN;
-                    snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", argv[++i]);
-                    qo.prereqs[qo.prereq_count].type_str[0] = '\0';
-                    qo.prereq_count++;
-                }
-            } else if (strcmp(argv[i], "--prereq-yxdomain") == 0 && i + 1 < argc) {
-                if (qo.prereq_count < MAX_PREREQS) {
-                    qo.prereqs[qo.prereq_count].kind = PREREQ_YXDOMAIN;
-                    snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", argv[++i]);
-                    qo.prereqs[qo.prereq_count].type_str[0] = '\0';
-                    qo.prereq_count++;
-                }
-            } else if (strcmp(argv[i], "--prereq-nxrrset") == 0 && i + 1 < argc) {
-                if (qo.prereq_count < MAX_PREREQS) {
-                    qo.prereqs[qo.prereq_count].kind = PREREQ_NXRRSET;
-                    char *buf = strdup(argv[++i]);
-                    char *name = strtok(buf, " ");
-                    char *type_str = strtok(NULL, " ");
-                    if (name && type_str) {
-                        snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", name);
-                        snprintf(qo.prereqs[qo.prereq_count].type_str, sizeof(qo.prereqs[0].type_str), "%s", type_str);
-                        qo.prereq_count++;
-                    }
-                    free(buf);
-                }
-            } else if (strcmp(argv[i], "--prereq-yxrrset") == 0 && i + 1 < argc) {
-                if (qo.prereq_count < MAX_PREREQS) {
-                    qo.prereqs[qo.prereq_count].kind = PREREQ_YXRRSET;
-                    char *buf = strdup(argv[++i]);
-                    char *name = strtok(buf, " ");
-                    char *type_str = strtok(NULL, " ");
-                    if (name && type_str) {
-                        snprintf(qo.prereqs[qo.prereq_count].name, sizeof(qo.prereqs[0].name), "%s", name);
-                        snprintf(qo.prereqs[qo.prereq_count].type_str, sizeof(qo.prereqs[0].type_str), "%s", type_str);
-                        qo.prereq_count++;
-                    }
-                    free(buf);
-                }
-            } else if (strcmp(argv[i], "-4") == 0) {
-                qo.pref_family = AF_INET;
-            } else if (strcmp(argv[i], "-6") == 0) {
-                qo.pref_family = AF_INET6;
-            } else if (strcmp(argv[i], "-b") == 0) {
-                if (i + 1 < argc) {
-                    const char *arg = argv[++i];
-                    char *hash = strchr(arg, '#');
-                    if (hash) {
-                        int len = hash - arg;
-                        if (len >= (int)sizeof(qo.bind_addr)) len = sizeof(qo.bind_addr) - 1;
-                        memcpy(qo.bind_addr, arg, len);
-                        qo.bind_addr[len] = '\0';
-                        char *endptr;
-                        long bp = strtol(hash + 1, &endptr, 10);
-                        if (*endptr == '\0' && bp > 0 && bp <= 65535) qo.bind_port = (int)bp;
-                    } else {
-                        snprintf(qo.bind_addr, sizeof(qo.bind_addr), "%s", arg);
-                        qo.bind_port = 0;
-                    }
-                } else {
-                    fprintf(stderr, "warning: -b requires an address argument\n");
-                }
-            } else if (strcmp(argv[i], "-f") == 0) {
-                if (i + 1 < argc) {
-                    batch_file = argv[++i];
-                } else {
-                    fprintf(stderr, "warning: -f requires a filename\n");
-                }
-            } else if (strcmp(argv[i], "+tcp") == 0 || strcmp(argv[i], "--tcp") == 0 || strcmp(argv[i], "+vc") == 0) {
-                use_tcp = true; qo.use_tcp = true;
-            } else if (strcmp(argv[i], "+novc") == 0) {
-                use_tcp = false; qo.use_tcp = false;
-            } else if (strcmp(argv[i], "+udp") == 0) {
-                force_udp = true;
-            } else if (strcmp(argv[i], "+ignore") == 0) {
-                qo.ignore_tc = true;
-            } else if (strcmp(argv[i], "+noignore") == 0) {
-                qo.ignore_tc = false;
-            } else if (strcmp(argv[i], "+fail") == 0) {
-                qo.nofail = false;
-            } else if (strcmp(argv[i], "+nofail") == 0) {
-                qo.nofail = true;
-            } else if (strcmp(argv[i], "+ldnsz") == 0) {
-                use_ldnsz = true;
-            } else if (strcmp(argv[i], "+allcompare") == 0) {
-                g_want_allcompare = true;
-            } else if (strcmp(argv[i], "+noall") == 0) {
-                dopt.show_question = dopt.show_answer = dopt.show_authority =
-                    dopt.show_additional = dopt.show_comments = dopt.show_stats =
-                    dopt.show_cmd = false;
-            } else if (strcmp(argv[i], "+all") == 0) {
-                dopt.show_question = dopt.show_answer = dopt.show_authority =
-                    dopt.show_additional = dopt.show_comments = dopt.show_stats =
-                    dopt.show_cmd = true;
-            } else if (strcmp(argv[i], "+answer") == 0) {
-                dopt.show_answer = true;
-            } else if (strcmp(argv[i], "+noanswer") == 0) {
-                dopt.show_answer = false;
-            } else if (strcmp(argv[i], "+authority") == 0) {
-                dopt.show_authority = true;
-            } else if (strcmp(argv[i], "+noauthority") == 0) {
-                dopt.show_authority = false;
-            } else if (strcmp(argv[i], "+additional") == 0) {
-                dopt.show_additional = true;
-            } else if (strcmp(argv[i], "+noadditional") == 0) {
-                dopt.show_additional = false;
-            } else if (strcmp(argv[i], "+question") == 0) {
-                dopt.show_question = true;
-            } else if (strcmp(argv[i], "+noquestion") == 0) {
-                dopt.show_question = false;
-            } else if (strcmp(argv[i], "+comments") == 0) {
-                dopt.show_comments = true;
-            } else if (strcmp(argv[i], "+nocomments") == 0) {
-                dopt.show_comments = false;
-            } else if (strcmp(argv[i], "+cmd") == 0) {
-                dopt.show_cmd = true;
-            } else if (strcmp(argv[i], "+nocmd") == 0) {
-                dopt.show_cmd = false;
-            } else if (strcmp(argv[i], "+stats") == 0) {
-                dopt.show_stats = true;
-            } else if (strcmp(argv[i], "+nostats") == 0) {
-                dopt.show_stats = false;
-            } else if (strcmp(argv[i], "+short") == 0) {
-                dopt.short_mode = true;
-            } else if (strcmp(argv[i], "+identify") == 0) {
-                dopt.identify = true;
-            } else if (strcmp(argv[i], "+noidentify") == 0) {
-                dopt.identify = false;
-            } else if (strcmp(argv[i], "+multiline") == 0) {
-                dopt.multiline = true;
-                if (dopt.split_width == 56) dopt.split_width = 44;
-            } else if (strcmp(argv[i], "+nomultiline") == 0) {
-                dopt.multiline = false;
-                if (dopt.split_width == 44) dopt.split_width = 56;
-            } else if (strcmp(argv[i], "+yaml") == 0) {
-                dopt.yaml = true;
-            } else if (strcmp(argv[i], "+noyaml") == 0) {
-                dopt.yaml = false;
-            } else if (strcmp(argv[i], "+trace") == 0) {
-                do_trace = true;
-            } else if (strcmp(argv[i], "+nssearch") == 0) {
-                do_nssearch = true;
-            } else if (strcmp(argv[i], "+search") == 0 || strcmp(argv[i], "+defname") == 0) {
-                qo.use_search_list = true;
-            } else if (strcmp(argv[i], "+nosearch") == 0 || strcmp(argv[i], "+nodefname") == 0) {
-                qo.use_search_list = false;
-            } else if (strncmp(argv[i], "+domain=", 8) == 0) {
-                qo.search_domain = strdup(argv[i] + 8);
-                qo.use_search_list = true;
-            } else if (strncmp(argv[i], "+ndots=", 7) == 0) {
-                qo.ndots = atoi(argv[i] + 7);
-            } else if (strcmp(argv[i], "+class") == 0) {
-                dopt.show_class = true;
-            } else if (strcmp(argv[i], "+noclass") == 0) {
-                dopt.show_class = false;
-            } else if (strcmp(argv[i], "+crypto") == 0) {
-                dopt.show_crypto = true;
-            } else if (strcmp(argv[i], "+nocrypto") == 0) {
-                dopt.show_crypto = false;
-            } else if (strcmp(argv[i], "+besteffort") == 0) {
-                dopt.besteffort = true;
-            } else if (strcmp(argv[i], "+nobesteffort") == 0) {
-                dopt.besteffort = false;
-            } else if (strcmp(argv[i], "+badcookie") == 0) {
-                qo.want_opt = true;
-                qo.want_cookie = true;
-                qo.retry_on_badcookie = true;
-                bool all_zero = true;
-                for (int k = 0; k < 8; k++) { if (qo.client_cookie[k] != 0) { all_zero = false; break; } }
-                if (all_zero) {
-                    for (int k = 0; k < 8; k++) qo.client_cookie[k] = (uint8_t)(arc4random() & 0xFF);
-                }
-            } else if (strcmp(argv[i], "+nobadcookie") == 0) {
-                qo.retry_on_badcookie = false;
-            } else if (strcmp(argv[i], "+showbadcookie") == 0) {
-                dopt.show_badcookie_msg = true;
-            } else if (strcmp(argv[i], "+noshowbadcookie") == 0) {
-                dopt.show_badcookie_msg = false;
-            } else if (strcmp(argv[i], "+ednsnegotiation") == 0) {
-                qo.edns_negotiation = true;
-            } else if (strcmp(argv[i], "+noednsnegotiation") == 0) {
-                qo.edns_negotiation = false;
-            } else if (strcmp(argv[i], "+showbadvers") == 0) {
-                dopt.show_badvers_msg = true;
-            } else if (strcmp(argv[i], "+noshowbadvers") == 0) {
-                dopt.show_badvers_msg = false;
-            } else if (strcmp(argv[i], "+qr") == 0) {
-                dopt.show_query_message = true;
-            } else if (strcmp(argv[i], "+noqr") == 0) {
-                dopt.show_query_message = false;
-            } else if (strcmp(argv[i], "+rrcomments") == 0) {
-                dopt.rrcomments = true;
-            } else if (strcmp(argv[i], "+norrcomments") == 0) {
-                dopt.rrcomments = false;
-            } else if (strcmp(argv[i], "+onesoa") == 0) {
-                dopt.onesoa = true;
-            } else if (strcmp(argv[i], "+noonesoa") == 0) {
-                dopt.onesoa = false;
-            } else if (strncmp(argv[i], "+split=", 7) == 0) {
-                int w = atoi(argv[i] + 7);
-                if (w < 0) w = 0;
-                dopt.split_width = (w == 0) ? 0 : ((w + 3) / 4) * 4;
-            } else if (strcmp(argv[i], "+nosplit") == 0) {
-                dopt.split_width = 0;
-            } else if (strcmp(argv[i], "+unknownformat") == 0) {
-                dopt.force_unknown_format = true;
-            } else if (strcmp(argv[i], "+nounknownformat") == 0) {
-                dopt.force_unknown_format = false;
-            } else if (strcmp(argv[i], "+ttlunits") == 0) {
-                dopt.ttlunits = true; dopt.ttlid = true;
-            } else if (strcmp(argv[i], "+nottlunits") == 0) {
-                dopt.ttlunits = false;
-            } else if (strcmp(argv[i], "+ttlid") == 0) {
-                dopt.ttlid = true;
-            } else if (strcmp(argv[i], "+nottlid") == 0) {
-                dopt.ttlid = false;
-            } else if (strcmp(argv[i], "+expire") == 0) {
-                dopt.expire = true;
-            } else if (strcmp(argv[i], "+noexpire") == 0) {
-                dopt.expire = false;
-            } else if (strcmp(argv[i], "+showsearch") == 0) {
-                dopt.showsearch = true;
-            } else if (strcmp(argv[i], "+noshowsearch") == 0) {
-                dopt.showsearch = false;
-            } else if (strcmp(argv[i], "+idnin") == 0) {
-                qo.idnin = true;
-            } else if (strcmp(argv[i], "+noidnin") == 0) {
-                qo.idnin = false;
-            } else if (strcmp(argv[i], "+idnout") == 0) {
-                dopt.idnout = true;
-            } else if (strcmp(argv[i], "+noidnout") == 0) {
-                dopt.idnout = false;
-            } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
-                printf("KariDNS dag v0.0.1\n");
-                exit(0);
-            } else if (strcmp(argv[i], "+norec") == 0 || strcmp(argv[i], "+norecurse") == 0 || strcmp(argv[i], "+nordflag") == 0 || strcmp(argv[i], "+norec") == 0) {
-                norecurse = true; qo.rd_flag = false;
-            } else if (strcmp(argv[i], "+rec") == 0 || strcmp(argv[i], "+recurse") == 0 || strcmp(argv[i], "+rdflag") == 0) {
-                norecurse = false; qo.rd_flag = true;
-            } else if (strcmp(argv[i], "+raflag") == 0) {
-                qo.ra_flag = true;
-            } else if (strcmp(argv[i], "+noraflag") == 0) {
-                qo.ra_flag = false;
-            } else if (strcmp(argv[i], "+aaonly") == 0 || strcmp(argv[i], "+aaflag") == 0) {
-                aaflag = true; qo.aa_flag = true;
-            } else if (strcmp(argv[i], "+noaaonly") == 0 || strcmp(argv[i], "+noaaflag") == 0) {
-                aaflag = false; qo.aa_flag = false;
-            } else if (strcmp(argv[i], "+coflag") == 0 || strcmp(argv[i], "+co") == 0) {
-                qo.want_opt = true; qo.compact_answers_ok = true;
-            } else if (strcmp(argv[i], "+nocoflag") == 0 || strcmp(argv[i], "+noco") == 0) {
-                qo.compact_answers_ok = false;
-            } else if (strncmp(argv[i], "+ednsflags=", 11) == 0) {
-                qo.want_opt = true; qo.ednsflags_z = (uint16_t)strtol(argv[i] + 11, NULL, 0);
-            } else if (strcmp(argv[i], "+ednsflags") == 0 || strcmp(argv[i], "+noednsflags") == 0) {
-                qo.ednsflags_z = 0;
-            } else if (strncmp(argv[i], "+opcode=", 8) == 0) {
-                qo.opcode_override = parse_opcode_value(argv[i] + 8);
-            } else if (strcmp(argv[i], "+noopcode") == 0) {
-                qo.opcode_override = -1;
-            } else if (strncmp(argv[i], "+qid=", 5) == 0) {
-                qo.qid_override = atoi(argv[i] + 5);
-            } else if (strcmp(argv[i], "+header-only") == 0) {
-                qo.header_only = true;
-            } else if (strcmp(argv[i], "+noheader-only") == 0) {
-                qo.header_only = false;
-            } else if (strcmp(argv[i], "+keepalive") == 0) {
-                qo.want_opt = true; qo.send_keepalive = true;
-            } else if (strcmp(argv[i], "+nokeepalive") == 0) {
-                qo.send_keepalive = false;
-            } else if (strcmp(argv[i], "+keepopen") == 0) {
-                qo.keep_tcp_open = true;
-            } else if (strcmp(argv[i], "+nokeepopen") == 0) {
-                qo.keep_tcp_open = false;
-            } else if (strncmp(argv[i], "+fuzztime=", 10) == 0) {
-                qo.fuzztime = strtoll(argv[i] + 10, NULL, 10);
-            } else if (strcmp(argv[i], "+fuzztime") == 0) {
-                qo.fuzztime = 1646972129;
-            } else if (strcmp(argv[i], "+nofuzztime") == 0) {
-                qo.fuzztime = 0;
-            } else if (strcmp(argv[i], "+dns64prefix") == 0) {
-                qo.check_dns64prefix = true;
-            } else if (strcmp(argv[i], "+nodns64prefix") == 0) {
-                qo.check_dns64prefix = false;
-            } else if (strncmp(argv[i], "+proxy=", 7) == 0) {
-                qo.use_proxy = true; qo.proxy_use_local_cmd = false; parse_proxy_arg(argv[i] + 7, &qo);
-            } else if (strcmp(argv[i], "+proxy") == 0) {
-                qo.use_proxy = true; qo.proxy_use_local_cmd = true;
-            } else if (strcmp(argv[i], "+noproxy") == 0) {
-                qo.use_proxy = false;
-            } else if (strncmp(argv[i], "+proxy-plain=", 13) == 0) {
-                qo.use_proxy = true; qo.proxy_use_local_cmd = false; parse_proxy_arg(argv[i] + 13, &qo);
-            } else if (strcmp(argv[i], "+proxy-plain") == 0) {
-                qo.use_proxy = true; qo.proxy_use_local_cmd = true;
-            } else if (strcmp(argv[i], "+noproxy-plain") == 0) {
-                qo.use_proxy = false;
-            } else if (strcmp(argv[i], "+tls") == 0) {
-                qo.use_tls = true; if (port == 53) port = 853;
-            } else if (strcmp(argv[i], "+notls") == 0) {
-                qo.use_tls = false; if (port == 853) port = 53;
-            } else if (strncmp(argv[i], "+tls-ca=", 8) == 0) {
-                qo.tls_ca_file = strdup(argv[i] + 8);
-            } else if (strcmp(argv[i], "+tls-ca") == 0) {
-                qo.tls_verify_default_store = true;
-            } else if (strcmp(argv[i], "+notls-ca") == 0) {
-                qo.tls_verify_default_store = false;
-            } else if (strncmp(argv[i], "+tls-certfile=", 14) == 0) {
-                qo.tls_certfile = strdup(argv[i] + 14);
-            } else if (strncmp(argv[i], "+tls-keyfile=", 13) == 0) {
-                qo.tls_keyfile = strdup(argv[i] + 13);
-            } else if (strncmp(argv[i], "+tls-hostname=", 14) == 0) {
-                qo.tls_hostname = strdup(argv[i] + 14);
-            } else if (strncmp(argv[i], "+https=", 7) == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = true; qo.doh_path = strdup(argv[i] + 7); if (port == 53) port = 443;
-            } else if (strcmp(argv[i], "+https") == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = true; qo.doh_path = strdup("/dns-query"); if (port == 53) port = 443;
-            } else if (strncmp(argv[i], "+https-get=", 11) == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_GET; qo.doh_tls = true; qo.doh_path = strdup(argv[i] + 11); if (port == 53) port = 443;
-            } else if (strcmp(argv[i], "+https-get") == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_GET; qo.doh_tls = true; qo.doh_path = strdup("/dns-query"); if (port == 53) port = 443;
-            } else if (strncmp(argv[i], "+https-post=", 12) == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = true; qo.doh_path = strdup(argv[i] + 12); if (port == 53) port = 443;
-            } else if (strcmp(argv[i], "+https-post") == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = true; qo.doh_path = strdup("/dns-query"); if (port == 53) port = 443;
-            } else if (strncmp(argv[i], "+http-plain=", 12) == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = false; qo.doh_path = strdup(argv[i] + 12); if (port == 53) port = 80;
-            } else if (strcmp(argv[i], "+http-plain") == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = false; qo.doh_path = strdup("/dns-query"); if (port == 53) port = 80;
-            } else if (strncmp(argv[i], "+http-plain-get=", 16) == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_GET; qo.doh_tls = false; qo.doh_path = strdup(argv[i] + 16); if (port == 53) port = 80;
-            } else if (strcmp(argv[i], "+http-plain-get") == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_GET; qo.doh_tls = false; qo.doh_path = strdup("/dns-query"); if (port == 53) port = 80;
-            } else if (strncmp(argv[i], "+http-plain-post=", 17) == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = false; qo.doh_path = strdup(argv[i] + 17); if (port == 53) port = 80;
-            } else if (strcmp(argv[i], "+http-plain-post") == 0) {
-                qo.use_doh = true; qo.doh_method = DOH_POST; qo.doh_tls = false; qo.doh_path = strdup("/dns-query"); if (port == 53) port = 80;
-            } else if (strcmp(argv[i], "+nohexdump") == 0) {
-                no_hexdump_query = true;
-                no_hexdump_response = true;
-            } else if (strcmp(argv[i], "+nohexdump-query") == 0) {
-                no_hexdump_query = true;
-            } else if (strcmp(argv[i], "+nohexdump-response") == 0) {
-                no_hexdump_response = true;
-            } else if (strcmp(argv[i], "--break") == 0 && i + 1 < argc) {
-                char *brk = argv[++i];
-                if (strcmp(brk, "all") == 0) {
-                    test_all = true;
-                } else {
-                    parse_break_arg(brk);
-                }
-            } else if (strcmp(argv[i], "+edns") == 0) {
-                qo.want_opt = true;
-            } else if (strncmp(argv[i], "+edns=", 6) == 0) {
-                qo.want_opt = true;
-                qo.edns_version = (uint8_t)strtoul(argv[i] + 6, NULL, 10);
-            } else if (strcmp(argv[i], "+noedns") == 0) {
-                qo.want_opt = false;
-            } else if (strcmp(argv[i], "+dnssec") == 0 || strcmp(argv[i], "+do") == 0) {
-                qo.want_opt = true; qo.dnssec_ok = true;
-            } else if (strcmp(argv[i], "+nodo") == 0) {
-                qo.dnssec_ok = false;
-            } else if (strcmp(argv[i], "+nsid") == 0) {
-                qo.want_opt = true; qo.want_nsid = true;
-            } else if (strncmp(argv[i], "+bufsize=", 9) == 0) {
-                char *endptr;
-                long bsz = strtol(argv[i] + 9, &endptr, 10);
-                if (*endptr == '\0' && bsz >= 0 && bsz <= 65535) {
-                    qo.want_opt = true; qo.udp_payload_size = (uint16_t)bsz;
-                }
-            } else if (strcmp(argv[i], "+adflag") == 0) {
-                adflag = true; qo.ad_flag = true;
-            } else if (strcmp(argv[i], "+cdflag") == 0) {
-                cdflag = true; qo.cd_flag = true;
-            } else if (strcmp(argv[i], "+aaflag") == 0) {
-                aaflag = true; qo.aa_flag = true;
-            } else if (strcmp(argv[i], "+tcflag") == 0) {
-                tcflag = true; qo.tc_flag = true;
-            } else if (strcmp(argv[i], "+zflag") == 0) {
-                zflag = true; qo.z_flag = true;
-            } else if (strncmp(argv[i], "+timeout=", 9) == 0) {
-                char *endptr;
-                long to = strtol(argv[i] + 9, &endptr, 10);
-                if (*endptr == '\0' && to >= 0) qo.timeout_sec = (int)to;
-            } else if (strncmp(argv[i], "+tries=", 7) == 0) {
-                char *endptr;
-                long tr = strtol(argv[i] + 7, &endptr, 10);
-                if (*endptr == '\0' && tr >= 0) qo.tries = (int)tr;
-            } else if (strncmp(argv[i], "+retry=", 7) == 0) {
-                char *endptr;
-                long tr = strtol(argv[i] + 7, &endptr, 10);
-                if (*endptr == '\0' && tr >= 0) qo.tries = (int)tr + 1;
-            } else if (strncmp(argv[i], "+padding=", 9) == 0) {
-                char *endptr;
-                long pd = strtol(argv[i] + 9, &endptr, 10);
-                if (*endptr == '\0' && pd >= 0) {
-                    qo.want_opt = true; qo.want_padding = true;
-                    qo.padding_size = (int)pd;
-                }
-            } else if (strncmp(argv[i], "+mqtype=", 8) == 0) {
-                qo.want_opt = true;
-                if (qo.custom_edns_opt_count < 8) {
-                    char *mqstr = strdup(argv[i] + 8);
-                    char *token = strtok(mqstr, ",");
-                    uint16_t mqtypes[16];
-                    int mq_count = 0;
-                    while (token && mq_count < 16) {
-                        mqtypes[mq_count++] = parse_qtype(token);
-                        token = strtok(NULL, ",");
-                    }
-                    qo.custom_edns_opts[qo.custom_edns_opt_count].code = 20;
-                    qo.custom_edns_opts[qo.custom_edns_opt_count].len = mq_count * 2;
-                    for (int m = 0; m < mq_count; m++) {
-                        qo.custom_edns_opts[qo.custom_edns_opt_count].data[m*2] = mqtypes[m] >> 8;
-                        qo.custom_edns_opts[qo.custom_edns_opt_count].data[m*2+1] = mqtypes[m] & 0xFF;
-                    }
-                    qo.custom_edns_opt_count++;
-                    free(mqstr);
-                }
-            } else if (strncmp(argv[i], "+ednsopt=", 9) == 0) {
-                qo.want_opt = true;
-                if (qo.custom_edns_opt_count < 8) {
-                    const char *val = argv[i] + 9;
-                    char *colon = strchr(val, ':');
-                    if (colon) {
-                        qo.custom_edns_opts[qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
-                        const char *hex = colon + 1;
-                        size_t hex_len = strlen(hex);
-                        size_t bytes = hex_len / 2;
-                        if (bytes > sizeof(qo.custom_edns_opts[0].data)) bytes = sizeof(qo.custom_edns_opts[0].data);
-                        qo.custom_edns_opts[qo.custom_edns_opt_count].len = (uint16_t)bytes;
-                        for (size_t j = 0; j < bytes; j++) {
-                            unsigned int b; sscanf(hex + j * 2, "%02x", &b);
-                            qo.custom_edns_opts[qo.custom_edns_opt_count].data[j] = (uint8_t)b;
-                        }
-                    } else {
-                        qo.custom_edns_opts[qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
-                        qo.custom_edns_opts[qo.custom_edns_opt_count].len = 0;
-                    }
-                    qo.custom_edns_opt_count++;
-                }
-            } else if (strncmp(argv[i], "+subnet=", 8) == 0) {
-                if (parse_subnet_arg(argv[i] + 8, &qo)) { qo.want_opt = true; qo.want_subnet = true; }
-            } else if (strncmp(argv[i], "+cookie", 7) == 0) {
-                qo.want_opt = true; qo.want_cookie = true;
-                if (argv[i][7] == '=') {
-                    const char *hex = argv[i] + 8;
-                    size_t hex_len = strlen(hex);
-                    if (hex_len > 64) hex_len = 64;
-                    uint8_t full[32]; size_t full_len = hex_len / 2;
-                    for (size_t j = 0; j < full_len; j++) {
-                        unsigned int byte; sscanf(hex + j * 2, "%02x", &byte); full[j] = (uint8_t)byte;
-                    }
-                    if (full_len >= 8) {
-                        memcpy(qo.client_cookie, full, 8);
-                        if (full_len > 8) { qo.server_cookie_len = full_len - 8; memcpy(qo.server_cookie, full + 8, qo.server_cookie_len); }
-                    } else {
-                        for (int k = 0; k < 8; k++) qo.client_cookie[k] = (uint8_t)(k + 1);
-                    }
-                } else {
-                    for (int k = 0; k < 8; k++) qo.client_cookie[k] = (uint8_t)(arc4random() & 0xFF);
-                }
-            } else if (strcmp(argv[i], "+nocookie") == 0) {
-                qo.want_cookie = false;
-            } else if (strcmp(argv[i], "-y") == 0) {
-                if (i + 1 < argc) {
-                    i++;
-                    char *tsig_str = strdup(argv[i]);
-                    parse_tsig_str(tsig_str, &qo);
-                } else {
-                    fprintf(stderr, "warning: -y requires an argument\n");
-                }
-            } else if (strcmp(argv[i], "-k") == 0) {
-                if (i + 1 < argc) {
-                    i++;
-                    parse_tsig_keyfile(argv[i], &qo);
-                } else {
-                    fprintf(stderr, "warning: -k requires a keyfile argument\n");
-                }
-            } else if (strncmp(argv[i], "+tsig=", 6) == 0) {
-                char *tsig_str = strdup(argv[i] + 6);
-                parse_tsig_str(tsig_str, &qo);
-            } else if (strcmp(argv[i], "--test-all") == 0) {
-                test_all = true;
-            } else {
-                fprintf(stderr, "Invalid option: %s\n", argv[i]);
-                fprintf(stderr, "Usage:  dag [@server] [-p port] [name] [type] [options]\n");
-                return 1;
+        if (arg[0] == '@' || arg[0] == '-' || arg[0] == '+') {
+            if (strcmp(arg, "-x") == 0) {
+                is_reverse = true;
+                is_name_arg = true;
+                is_type_arg = true;
+                is_class_arg = true;
+            } else if (strcmp(arg, "-q") == 0) {
+                is_name_arg = true;
+            } else if (strcmp(arg, "-t") == 0) {
+                is_type_arg = true;
+            } else if (strcmp(arg, "-c") == 0) {
+                is_class_arg = true;
             }
         } else {
-            if (strcasecmp(argv[i], "CH") == 0 || strcasecmp(argv[i], "CHAOS") == 0) {
-                qo.qclass = 3;
-            } else if (strcasecmp(argv[i], "HS") == 0) {
-                qo.qclass = 4;
-            } else if (strcasecmp(argv[i], "IN") == 0) {
-                qo.qclass = 1;
-            } else if (is_known_qtype(argv[i])) {
-                if (!qtype_s) {
-                    qtype_s = argv[i];
-                } else if (!qname) {
-                    qname = argv[i];
-                }
+            // 位置引数
+            if (is_known_qclass_str(arg, NULL)) {
+                is_class_arg = true;
+            } else if (is_known_qtype(arg)) {
+                is_type_arg = true;
             } else {
-                if (!qname) {
-                    qname = argv[i];
-                } else if (!qtype_s) {
-                    qtype_s = argv[i];
-                }
+                is_name_arg = true;
             }
         }
-    }
 
-    if (qo.explicit_qname) qname = qo.explicit_qname;
-    if (!qname) {
-        qname = ".";
-        if (!qtype_s) qtype_s = "NS";
-    } else {
-        if (!qtype_s) {
-            if (strcmp(qname, ".") == 0) qtype_s = "NS";
-            else qtype_s = "A";
-        }
-    }
-
-    static char resolv_server_buf[260];
-    if (!server_arg) {
-        const char *sys_resolver = get_system_resolver();
-        snprintf(resolv_server_buf, sizeof(resolv_server_buf), "%s", sys_resolver);
-        server_arg = resolv_server_buf;
-    }
-
-    if (batch_file) {
-        FILE *bf = fopen(batch_file, "r");
-        if (!bf) {
-            fprintf(stderr, "error: could not open batch file '%s': %s\n", batch_file, strerror(errno));
-            exit(8);
-        }
-        char line[512];
-        while (fgets(line, sizeof(line), bf)) {
-            char *p = line;
-            while (isspace((unsigned char)*p)) p++;
-            if (*p == '\0' || *p == '#' || *p == ';') continue;
-            
-            char *b_qname = NULL;
-            char *b_qtype = NULL;
-            char *b_server = NULL;
-            char *tok = strtok(p, " \t\r\n");
-            while (tok) {
-                if (tok[0] == '@') {
-                    b_server = tok;
-                } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0) {
-                    // ignore class
-                } else if (is_known_qtype(tok)) {
-                    if (!b_qtype) b_qtype = tok;
-                    else if (!b_qname) b_qname = tok;
-                } else {
-                    if (!b_qname) b_qname = tok;
-                    else if (!b_qtype) b_qtype = tok;
-                }
-                tok = strtok(NULL, " \t\r\n");
+        if (!in_queries) {
+            if (is_name_arg || is_type_arg || is_class_arg) {
+                in_queries = true;
+                cur_start = i;
+                cur_has_name = is_name_arg;
+                cur_has_type = is_type_arg;
+                cur_has_class = is_class_arg;
+                global_end = i;
             }
-            if (!b_qname) continue;
-            if (!b_qtype) b_qtype = "A";
-            
-            bool b_allocated = false;
-            if (qo.idnin) b_qname = (char *)idn_to_ascii(b_qname, &b_allocated);
-
-            const char *eff_server = b_server ? b_server : server_arg;
-            if (do_trace) {
-                run_trace_query(b_qname, eff_server, b_qtype, port, use_tcp, force_udp, no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
-            } else if (do_nssearch) {
-                run_nssearch(b_qname, eff_server, port, use_tcp, force_udp, no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
-            } else {
-                run_single_job(b_qname, b_qtype, eff_server, port, use_tcp, force_udp, test_all, norecurse,
-                               adflag, cdflag, aaflag, tcflag, zflag,
-                               no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
-            }
-#ifdef HAVE_LIBIDN2
-            if (b_allocated) idn2_free((void *)b_qname);
-#endif
-        }
-        fclose(bf);
-    } else {
-        bool q_allocated = false;
-        if (qo.idnin) qname = (char *)idn_to_ascii(qname, &q_allocated);
-
-        int exit_code = 0;
-        if (do_trace) {
-            exit_code = run_trace_query(qname, server_arg, qtype_s, port, use_tcp, force_udp, no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
-        } else if (do_nssearch) {
-            exit_code = run_nssearch(qname, server_arg, port, use_tcp, force_udp, no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
         } else {
-            exit_code = run_single_job(qname, qtype_s, server_arg, port, use_tcp, force_udp, test_all, norecurse,
-                                       adflag, cdflag, aaflag, tcflag, zflag,
-                                       no_hexdump_query, no_hexdump_response, qo, hex_payload, &dopt);
-        }
-#ifdef HAVE_LIBIDN2
-        if (q_allocated) idn2_free((void *)qname);
-#endif
+            bool start_new_query = false;
+            if (is_reverse) {
+                if (cur_has_name || cur_has_type || cur_has_class) {
+                    start_new_query = true;
+                }
+            } else if (is_name_arg && cur_has_name) {
+                start_new_query = true;
+            } else if (is_type_arg && cur_has_name && cur_has_type) {
+                start_new_query = true;
+            } else if (is_class_arg && cur_has_name && cur_has_class) {
+                start_new_query = true;
+            }
 
-        bool used_nofail_failover = qo.nofail && (!test_all) && (!do_trace) && (!do_nssearch) && (!batch_file) && (server_arg && strchr(server_arg, ',') != NULL);
-        if (!used_nofail_failover) {
-            print_multi_server_summary(use_ldnsz);
+            if (start_new_query) {
+                if (query_count >= MAX_DAG_QUERIES) {
+                    fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
+                    return 1;
+                }
+                queries[query_count].start = cur_start;
+                queries[query_count].end = i;
+                query_count++;
+
+                cur_start = i;
+                cur_has_name = is_name_arg;
+                cur_has_type = is_type_arg;
+                cur_has_class = is_class_arg;
+            } else {
+                if (is_name_arg) cur_has_name = true;
+                if (is_type_arg) cur_has_type = true;
+                if (is_class_arg) cur_has_class = true;
+            }
         }
 
+        i += count;
+    }
+
+    if (in_queries) {
+        if (query_count >= MAX_DAG_QUERIES) {
+            fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
+            return 1;
+        }
+        queries[query_count].start = cur_start;
+        queries[query_count].end = argc;
+        query_count++;
+    } else {
+        global_end = argc;
+    }
+
+    // グローバル引数区間のパース
+    if (parse_arg_slice(1, global_end, argc, argv, &global_spec) < 0) {
+        return 1;
+    }
+
+    // -f バッチファイルモードの処理
+    if (global_spec.batch_file) {
+        execute_batch_spec(&global_spec);
+        print_multi_server_summary(global_spec.use_ldnsz);
 #ifndef _WIN32
-        if (qo.mem_debug) {
+        if (global_spec.qo.mem_debug) {
             struct rusage ru;
             getrusage(RUSAGE_SELF, &ru);
             fprintf(stderr, ";; Memory usage: maxrss=%ld KB\n", (long)ru.ru_maxrss);
         }
 #endif
-
         zone_arena_destroy(&g_dag_arena);
         if (g_results) free(g_results);
-        return exit_code;
+        return 0;
     }
 
-    print_multi_server_summary(use_ldnsz);
+    // クエリタプルが0個の場合はデフォルトクエリを1個作成
+    if (query_count == 0) {
+        queries[0].start = 0;
+        queries[0].end = 0;
+        query_count = 1;
+    }
+
+    int last_exit_code = 0;
+    for (int q = 0; q < query_count; q++) {
+        query_spec_t local_spec = global_spec;
+        if (queries[q].start < queries[q].end) {
+            if (parse_arg_slice(queries[q].start, queries[q].end, argc, argv, &local_spec) < 0) {
+                last_exit_code = 1;
+                continue;
+            }
+        }
+
+        // タプル内で -f が指定された場合
+        if (local_spec.batch_file) {
+            execute_batch_spec(&local_spec);
+            continue;
+        }
+
+        if (local_spec.qo.mem_debug) global_spec.qo.mem_debug = true;
+        int rc = execute_query_spec(&local_spec);
+        if (rc != 0) last_exit_code = rc;
+    }
+
+    bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
+    if (!used_nofail_failover) {
+        print_multi_server_summary(global_spec.use_ldnsz);
+    }
 
 #ifndef _WIN32
-    if (qo.mem_debug) {
+    if (global_spec.qo.mem_debug) {
         struct rusage ru;
         getrusage(RUSAGE_SELF, &ru);
         fprintf(stderr, ";; Memory usage: maxrss=%ld KB\n", (long)ru.ru_maxrss);
@@ -5605,5 +5905,5 @@ int main(int argc, char **argv) {
 
     zone_arena_destroy(&g_dag_arena);
     if (g_results) free(g_results);
-    return 0;
+    return last_exit_code;
 }

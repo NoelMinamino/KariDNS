@@ -71,18 +71,19 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Output normalizer to mask non-deterministic fields
+# Output normalizer to mask non-deterministic fields, tool banner, and dag-specific comparison summary
 normalize_output() {
     sed -E \
         -e '/^; <<>>/d' \
         -e '/^;; global options: \+cmd/d' \
         -e '/^; \([0-9]+ servers? found\)/d' \
         -e 's/id: [0-9]+/id: <ID>/g' \
-        -e 's/; COOKIE: [0-9a-fA-F]+/; COOKIE: <COOKIE>/g' \
+        -e 's/; COOKIE: [0-9a-fA-F]+/;; COOKIE: <COOKIE>/g' \
         -e 's/[0-9]+[[:space:]]+IN[[:space:]]+/<TTL> IN /g' \
         -e 's/;; Query time: [0-9]+ (msec|usec)/;; Query time: <TIME>/g' \
         -e 's/;; WHEN: .*/;; WHEN: <DATE>/g' \
         -e '/;; (no usable response received|connection failed|no servers could be reached)/d' \
+        -e '/^;; === MULTI-SERVER COMPARISON SUMMARY ===/,$d' \
         -e 's/[[:space:]]+/ /g' \
         -e 's/[[:space:]]*$//' | \
     awk 'NF { print }'
@@ -102,8 +103,8 @@ compare_query() {
 
     # dig runs with its native defaults + any ARGS
     dig @127.0.0.1 -p $PORT $ARGS 2>&1 | normalize_output > dig.out || true
-    # dag runs with dig-equivalent defaults + any ARGS + nohexdump
-    "$DAG" @127.0.0.1 -p $PORT $DIG_DEFAULTS $ARGS +nohexdump 2>&1 | normalize_output > dag.out || true
+    # dag runs with dig-equivalent defaults + nohexdump in global options + any ARGS
+    "$DAG" @127.0.0.1 -p $PORT $DIG_DEFAULTS +nohexdump $ARGS 2>&1 | normalize_output > dag.out || true
 
     if diff -u dig.out dag.out > diff.out 2>&1; then
         echo "  [MATCH] $NAME"
@@ -230,6 +231,17 @@ else
     else
         echo "  [SKIP] Outbound DoT not reachable"
     fi
+
+    echo "--------------------------------------------------------"
+    echo "8. Multiple Queries & Argument Flexibility"
+    echo "--------------------------------------------------------"
+    compare_query "Multiple Queries (A and TXT)" "www.example.com A example.com TXT"
+    compare_query "Multiple Queries Short Mode" "www.example.com A +short example.com TXT +short"
+    compare_query "Positional Order: Name Class Type" "www.example.com IN A"
+    compare_query "Positional Order: Name Type Class" "www.example.com A IN"
+    compare_query "Positional Order: Type Name Class" "A www.example.com IN"
+    compare_query "Multiple Reverse (-x) and Forward" "-x 192.0.2.10 www.example.com A"
+    compare_query "Per-query flag override (+noanswer on second)" "www.example.com A example.com TXT +noanswer"
 fi
 
 echo "========================================================"

@@ -283,7 +283,30 @@ run_exit_check "Exit code 8 on missing batch file" "$DAG -f /nonexistent/batch/f
 run_exit_check "Exit code 9 on unreachable server / timeout" "$DAG @127.0.0.1 -p 19999 www.example.com A +timeout=1 +tries=1" 9
 
 echo "========================================================"
-echo "12. Live DoT / DoH Checks (against public resolvers)"
+echo "12. Multiple Queries & Positional Flexibility"
+echo "========================================================"
+run_check "Multiple Queries (A and TXT)" "$DAG @127.0.0.1 -p $PORT www.example.com A example.com TXT" "192\.0\.2\.10"
+run_check "Positional Order: Name Class Type (www.example.com IN A)" "$DAG @127.0.0.1 -p $PORT www.example.com IN A" "192\.0\.2\.10"
+run_check "Positional Order: Name Type Class (www.example.com A IN)" "$DAG @127.0.0.1 -p $PORT www.example.com A IN" "192\.0\.2\.10"
+run_check "Positional Order: Type Name Class (A www.example.com IN)" "$DAG @127.0.0.1 -p $PORT A www.example.com IN" "192\.0\.2\.10"
+run_check "Global +short applied to multiple queries" "$DAG @127.0.0.1 -p $PORT www.example.com A +short example.com TXT" "192\.0\.2\.10"
+run_check "Per-query display override (+qr / +noqr)" "$DAG @127.0.0.1 -p $PORT +qr www.example.com A example.com TXT +noqr" ";; Sending:"
+run_check "Mixed -x reverse and normal lookup" "$DAG @127.0.0.1 -p $PORT -x 192.0.2.10 www.example.com A" "192\.0\.2\.10"
+if [ "$DAG" = "dig" ]; then
+    run_skip "MAX_DAG_QUERIES (64) exceeded error"
+else
+    # 65 queries generates exit code 1
+    Q65_ARGS=""
+    i=1
+    while [ "$i" -le 65 ]; do
+        Q65_ARGS="$Q65_ARGS test$i.example.com A"
+        i=$((i + 1))
+    done
+    run_exit_check "MAX_DAG_QUERIES (64) exceeded error" "$DAG @127.0.0.1 -p $PORT $Q65_ARGS" 1
+fi
+
+echo "========================================================"
+echo "13. Live DoT / DoH Checks (against public resolvers)"
 echo "========================================================"
 # Check if outbound internet is accessible
 if "$DAG" @1.1.1.1 example.com A +timeout=2 +tries=1 >/dev/null 2>&1; then
