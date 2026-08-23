@@ -34,6 +34,36 @@
 #ifndef MSG_WAITALL
 #define MSG_WAITALL 0
 #endif
+
+/* Winsock API casting wrappers for uint8_t* buffers to avoid signedness warnings */
+#define send(s, b, l, f) send((s), (const char *)(b), (int)(l), (f))
+#define recv(s, b, l, f) recv((s), (char *)(b), (int)(l), (f))
+#define sendto(s, b, l, f, to, tolen) sendto((s), (const char *)(b), (int)(l), (f), (to), (tolen))
+
+/* Portable gmtime_r for Windows */
+static inline struct tm *dag_gmtime_r(const time_t *timep, struct tm *result) {
+    if (gmtime_s(result, timep) == 0) return result;
+    return NULL;
+}
+#undef gmtime_r
+#define gmtime_r dag_gmtime_r
+
+/* Portable memmem for Windows */
+static inline void *dag_memmem(const void *haystack, size_t haystacklen,
+                               const void *needle, size_t needlelen) {
+    if (!haystack || !needle || needlelen == 0 || haystacklen < needlelen) return NULL;
+    const unsigned char *h = (const unsigned char *)haystack;
+    const unsigned char *n = (const unsigned char *)needle;
+    for (size_t i = 0; i <= haystacklen - needlelen; i++) {
+        if (h[i] == n[0] && memcmp(&h[i], n, needlelen) == 0) {
+            return (void *)&h[i];
+        }
+    }
+    return NULL;
+}
+#undef memmem
+#define memmem dag_memmem
+
 #else
 #include <unistd.h>
 #include <sys/time.h>
@@ -3736,7 +3766,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
         time_t now = time(NULL);
         char time_buf[64];
+#ifdef _WIN32
+        strftime(time_buf, sizeof(time_buf), "%a %b %d %H:%M:%S %Z %Y", localtime(&now));
+#else
         strftime(time_buf, sizeof(time_buf), "%a %b %e %H:%M:%S %Z %Y", localtime(&now));
+#endif
 
         const char *proto_name = "UDP";
         if (qo->use_doh) {
