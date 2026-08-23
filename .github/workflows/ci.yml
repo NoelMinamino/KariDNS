@@ -3,10 +3,16 @@ name: KariDNS CI
 on:
   push:
     branches:
-      - main
+      - 'main'
+      - 'feature/**'
+      - 'fix/**'
+      - 'improve/**'
   pull_request:
     branches:
-      - main
+      - 'main'
+      - 'feature/**'
+      - 'fix/**'
+      - 'improve/**'
   workflow_dispatch:
 
 jobs:
