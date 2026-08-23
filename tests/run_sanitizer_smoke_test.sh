@@ -34,7 +34,8 @@ GENERATE_NORMAL="tests/zones/generate_normal.zone"
 GENERATE_BAD_RANGE="tests/zones/generate_bad_range.zone"
 GENERATE_BAD_WIDTH="tests/zones/generate_bad_width.zone"
 
-FUZZ_SMOKE_SECONDS=60   # Time (in seconds) spent on each fuzz target. Keep it short since this is for routine checks
+FUZZ_RUNS="${FUZZ_RUNS:-1000}"         # Default runs per fuzz target for quick CI smoke test
+FUZZ_SMOKE_SECONDS="${FUZZ_SMOKE_SECONDS:-}" # Optional time limit (if set and FUZZ_RUNS is empty)
 
 FAILED=0
 log_fail() { echo "  -> FAIL: $1"; FAILED=1; }
@@ -237,7 +238,11 @@ for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_pars
         continue
     fi
     mkdir -p "$corpus"
-    "$bin" -max_total_time="$FUZZ_SMOKE_SECONDS" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+    if [ -n "${FUZZ_RUNS:-}" ] && [ "$FUZZ_RUNS" -gt 0 ]; then
+        "$bin" -runs="$FUZZ_RUNS" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+    else
+        "$bin" -max_total_time="${FUZZ_SMOKE_SECONDS:-5}" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+    fi
     pids="$pids $target:$!"
 done
 
@@ -249,7 +254,11 @@ for tp in $pids; do
         log_fail "$target (see fuzz_${target}.log)"
         tail -n 40 "fuzz_${target}.log"
     else
-        log_ok "$target (${FUZZ_SMOKE_SECONDS}s, no crash)"
+        if [ -n "${FUZZ_RUNS:-}" ] && [ "$FUZZ_RUNS" -gt 0 ]; then
+            log_ok "$target (${FUZZ_RUNS} runs, no crash)"
+        else
+            log_ok "$target (${FUZZ_SMOKE_SECONDS}s, no crash)"
+        fi
     fi
 done
 

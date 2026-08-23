@@ -1,0 +1,88 @@
+name: KariDNS Continuous Fuzzing & Stress Test
+
+on:
+  schedule:
+    # Run every night at 02:00 UTC (11:00 JST)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: 'Duration (in seconds) per fuzz target'
+        required: true
+        default: '180'
+      runs_target:
+        description: 'Maximum runs per target (leave empty for time-based)'
+        required: false
+        default: ''
+
+jobs:
+  nightly-fuzz-freebsd:
+    name: Nightly Deep Fuzzing (FreeBSD 14.4)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore Fuzzer Corpus Cache
+        uses: actions/cache/restore@v4
+        id: corpus-cache
+        with:
+          path: tests/fuzz/corpus_*
+          key: fuzzer-corpus-freebsd-14-${{ github.run_id }}
+          restore-keys: |
+            fuzzer-corpus-freebsd-14-
+            fuzzer-corpus-
+
+      - name: Run Continuous Fuzzing in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '14.4'
+          run: |
+            set -e
+            FUZZ_TIME="${{ inputs.fuzz_seconds || '180' }}"
+            FUZZ_RUNS_INPUT="${{ inputs.runs_target || '' }}"
+
+            echo "::group::📦 [Build] Build all libFuzzer targets in parallel"
+            NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+            make -j"$NCPU" fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_dag fuzz_tsig_verify
+            echo "::endgroup::"
+
+            echo "::group::🛡️ [Fuzzing] Continuous Deep Fuzzing (${FUZZ_TIME}s per target)"
+            FAILED=0
+            pids=""
+            for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_dag_response fuzz_tsig_verify; do
+                bin="tests/fuzz/$target"
+                corpus="tests/fuzz/corpus_$target"
+                mkdir -p "$corpus"
+                echo "[+] Fuzzing target: $target (corpus size: $(ls -1 "$corpus" 2>/dev/null | wc -l) files)"
+                if [ -n "$FUZZ_RUNS_INPUT" ]; then
+                    "$bin" -runs="$FUZZ_RUNS_INPUT" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                else
+                    "$bin" -max_total_time="$FUZZ_TIME" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                fi
+                pids="$pids $target:$!"
+            done
+
+            for tp in $pids; do
+                target="${tp%%:*}"
+                pid="${tp##*:}"
+                wait $pid || {
+                    echo "❌ Fuzzer target $target crashed! (see fuzz_${target}.log)"
+                    tail -n 60 "fuzz_${target}.log"
+                    FAILED=1
+                }
+            done
+
+            if [ "$FAILED" -ne 0 ]; then
+                echo "One or more fuzzers detected crashes/memory errors!"
+                exit 1
+            fi
+            echo "🎉 All fuzz targets survived without crashes!"
+            echo "::endgroup::"
+
+      - name: Save Updated Fuzzer Corpus Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tests/fuzz/corpus_*
+          key: fuzzer-corpus-freebsd-14-${{ github.run_id }}

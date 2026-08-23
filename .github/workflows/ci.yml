@@ -40,18 +40,15 @@ jobs:
             pkg install -y perl5 || true
             echo "::endgroup::"
 
-            echo "::group::📦 [Build] Build KariDNS and Tools"
-            make all asan tsan tools-asan
+            echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
+            NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+            make -j"$NCPU" all asan tsan tools-asan fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_dag fuzz_tsig_verify asan_test hash_test include_test
             echo "::endgroup::"
 
             echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
-            make asan_test
-            make hash_test
-            make include_test
-            echo "::endgroup::"
-
-            echo "::group::📦 [Build] Build Fuzzers"
-            make fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig
+            ./test_asan_overflow
+            ./test_hash_table
+            ./test_conf_include
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
