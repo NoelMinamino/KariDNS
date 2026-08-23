@@ -416,6 +416,19 @@ static void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
     }
 }
 
+static bool is_in_bailiwick(const char *name, const char *domain) {
+    if (!name || !domain) return false;
+    size_t nlen = strlen(name);
+    size_t dlen = strlen(domain);
+    if (nlen == dlen) {
+        return strcasecmp(name, domain) == 0;
+    }
+    if (nlen > dlen && name[nlen - dlen - 1] == '.') {
+        return strcasecmp(name + nlen - dlen, domain) == 0;
+    }
+    return false;
+}
+
 static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
@@ -543,6 +556,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
     fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
     bool has_soa = false;
+    bool has_apex_ns = false;
     bool error_found = false;
     for (size_t i = 0; i < arena.count; i++) {
         uint16_t tcode = arena.records[i].type_code;
@@ -576,6 +590,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
         if (tcode == 6 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_soa = true;
+        }
+        if (tcode == 2 && strcasecmp(arena.records[i].name, domain) == 0) {
+            has_apex_ns = true;
         }
         if (tcode == 62) { // CSYNC
             for (int j = 2; j < rcount; j++) {
@@ -661,6 +678,57 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         if (tcode == 2 && rcount >= 1) { // NS
             if (is_cname(&arena, rdata[0])) {
                 fprintf(stderr, "[WARNING] NS record for '%s' points to a CNAME '%s' (RFC 1912)\n", arena.records[i].name, rdata[0]);
+            }
+            const char *ns_target = rdata[0];
+            if (is_in_bailiwick(ns_target, domain)) {
+                bool glue_found = false;
+                if (arena.hash_table && arena.hash_size > 0) {
+                    uint32_t hash = calc_fnv1a_str(ns_target);
+                    size_t idx = hash & (arena.hash_size - 1);
+                    for (int j = arena.hash_table[idx]; j != -1; j = arena.records[j].next_record) {
+                        if (strcasecmp(arena.records[j].name, ns_target) == 0) {
+                            if (arena.records[j].type_code == 1 || arena.records[j].type_code == 28) {
+                                glue_found = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    for (size_t j = 0; j < arena.count; j++) {
+                        if (strcasecmp(arena.records[j].name, ns_target) == 0) {
+                            if (arena.records[j].type_code == 1 || arena.records[j].type_code == 28) {
+                                glue_found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!glue_found) {
+                    fprintf(stderr, "[WARNING] NS record for '%s' delegates to '%s', which is "
+                                    "in-bailiwick but has no glue A/AAAA record in this zone "
+                                    "(RFC 1912 section 2.8 / delegation will fail to resolve)\n",
+                            arena.records[i].name, ns_target);
+                }
+            } else {
+                bool extra_glue_found = false;
+                if (arena.hash_table && arena.hash_size > 0) {
+                    uint32_t hash = calc_fnv1a_str(ns_target);
+                    size_t idx = hash & (arena.hash_size - 1);
+                    for (int j = arena.hash_table[idx]; j != -1; j = arena.records[j].next_record) {
+                        if (strcasecmp(arena.records[j].name, ns_target) == 0) {
+                            if (arena.records[j].type_code == 1 || arena.records[j].type_code == 28) {
+                                extra_glue_found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (extra_glue_found) {
+                    fprintf(stderr, "[INFO] Out-of-bailiwick glue record found for '%s' "
+                                    "(target of NS at '%s'); this glue will be ignored by "
+                                    "compliant resolvers and should be removed\n",
+                            ns_target, arena.records[i].name);
+                }
             }
         }
         if (tcode == 6 && rcount >= 2) { // SOA
@@ -773,6 +841,11 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         zone_arena_destroy(&arena);
         free(root_path);
         return 1;
+    }
+
+    if (!has_apex_ns) {
+        fprintf(stderr, "[ERROR] No NS record found at zone apex '%s' (%s); this zone cannot be properly delegated\n", domain, file_path);
+        error_found = true;
     }
 
     if (is_catalog) {
@@ -918,7 +991,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         const char *domain = argv[2];
-        if (argc >= 4 && strstr(argv[3], ".conf") == NULL && strstr(argv[3], "/") != NULL) {
+        if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
             return check_zone(domain, argv[3], true, false);
         } else {
