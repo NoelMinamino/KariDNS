@@ -332,6 +332,17 @@ else
 fi
 
 echo "========================================================"
+echo "15. Version Flags & Tool Metadata Tests"
+echo "========================================================"
+if [ "$DAG" != "dig" ]; then
+    run_check "dag -v output" "$DAG -v" "KariDNS dag v0\."
+    run_check "dag --version output" "$DAG --version" "KariDNS dag v0\."
+    run_check "karictl -v output" "$BIN_DIR/karictl -v" "karictl 0\."
+    run_check "karicheck -v output" "$BIN_DIR/karicheck -v" "karicheck 0\."
+    run_check "karidns -v output" "$BIN_DIR/karidns -v" "KariDNS 0\."
+fi
+
+echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
     if [ "$SKIPPED" -gt 0 ]; then
         echo "🎉 ALL TESTS PASSED! ($SKIPPED skipped for $CLIENT_NAME)"

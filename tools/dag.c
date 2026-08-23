@@ -6038,11 +6038,21 @@ int main(int argc, char **argv) {
         if (local_spec.use_ldnsz) global_spec.use_ldnsz = true;
         int rc = execute_query_spec(&local_spec);
         if (rc != 0) last_exit_code = rc;
+
+        if (query_count > 1) {
+            bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
+            if (!used_nofail) {
+                print_multi_server_summary(local_spec.use_ldnsz);
+            }
+            g_server_count = 0;
+        }
     }
 
-    bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
-    if (!used_nofail_failover) {
-        print_multi_server_summary(global_spec.use_ldnsz);
+    if (query_count <= 1) {
+        bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
+        if (!used_nofail_failover) {
+            print_multi_server_summary(global_spec.use_ldnsz);
+        }
     }
 
 #ifndef _WIN32

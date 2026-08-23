@@ -75,6 +75,8 @@ jobs:
             sh ./tests/run_capsicum_axfr_test.sh
             sh ./tests/run_dynamic_update_test.sh
             sh ./tests/run_roundtrip_test.sh
+            sh ./tests/run_karicheck_glue_test.sh
+            sh ./tests/run_dag_compat_test.sh
             sh ./tests/run_dag_ci_test.sh
             echo "::endgroup::"
 
