@@ -343,6 +343,15 @@ if [ "$DAG" != "dig" ]; then
 fi
 
 echo "========================================================"
+echo "16. Hex Payload Overflow & Boundary Tests"
+echo "========================================================"
+if [ "$DAG" != "dig" ]; then
+    OVERSIZED_HEX=$(python3 -c "print('aa' * 70000)" 2>/dev/null || perl -e 'print "aa" x 70000' 2>/dev/null || printf '%0.sAA' $(seq 1 70000))
+    run_check "Oversized hex payload rejected without crash" "$DAG @127.0.0.1 -p $PORT --hex $OVERSIZED_HEX" "Invalid, empty, or oversized hex payload"
+    run_check "Empty hex payload rejected" "$DAG @127.0.0.1 -p $PORT --hex ''" "Invalid, empty, or oversized hex payload"
+fi
+
+echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
     if [ "$SKIPPED" -gt 0 ]; then
         echo "🎉 ALL TESTS PASSED! ($SKIPPED skipped for $CLIENT_NAME)"

@@ -108,6 +108,9 @@ dag [global-queryopt...] [query...]
 `-y [hmac:]name:secret`
 : Sign queries using TSIG with the provided base64-encoded shared secret. The algorithm prefix can be `hmac-md5`, `hmac-sha1`, `hmac-sha224`, `hmac-sha256` (default), `hmac-sha384`, or `hmac-sha512`.
 
+`--hex <hex>`, `--hex=<hex>`
+: Transmit an arbitrary raw DNS wire-format packet provided as a hexadecimal string (up to 65,535 bytes). Allows direct crafting and replay of custom or malformed DNS messages.
+
 ---
 
 ## TRANSPORT & PROTOCOL OPTIONS
@@ -195,7 +198,7 @@ dag [global-queryopt...] [query...]
 : Override the DNS header **OPCODE** (e.g., `0` for QUERY, `2` for STATUS, `4` for NOTIFY, `5` for UPDATE).
 
 `+qid=N`
-: Override the 16-bit DNS Query ID (0–65535). If omitted, a cryptographically secure random ID is generated via `arc4random(3)`.
+: Override the 16-bit DNS Query ID (0–65535). If omitted, a cryptographically secure random ID is generated via `arc4random(3)` (or platform CSPRNG / OpenSSL `RAND_bytes` on non-BSD platforms).
 
 `+[no]header-only`
 : Send a query containing only the 12-byte DNS header with `QDCOUNT=0` (no QUESTION section).

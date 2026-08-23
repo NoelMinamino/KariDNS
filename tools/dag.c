@@ -152,6 +152,12 @@ static inline uint32_t dag_arc4random(void) {
         if (n == (ssize_t)sizeof(val)) return val;
     }
 #endif
+    static bool warned = false;
+    if (!warned) {
+        fprintf(stderr, ";; WARNING: all CSPRNG sources failed; falling back to a "
+                        "non-cryptographic PRNG. Query IDs/cookies may be predictable.\n");
+        warned = true;
+    }
     return (uint32_t)rand();
 }
 #undef arc4random
@@ -3433,7 +3439,9 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
 
 
 static size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
-    return hex_decode(hex, out, out_cap);
+    size_t r = hex_decode(hex, out, out_cap);
+    if (r == (size_t)-1) return 0;
+    return r;
 }
 static int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
                     bool use_tcp, bool norecurse,
@@ -3464,8 +3472,8 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
     if (hex_payload) {
         pkt_len = parse_hex_string(hex_payload, pkt, sizeof(pkt));
-        if (pkt_len == 0) {
-            fprintf(stderr, "Error: Invalid or empty hex payload\n");
+        if (pkt_len == 0 || pkt_len > sizeof(pkt)) {
+            fprintf(stderr, "Error: Invalid, empty, or oversized hex payload (max %zu bytes)\n", sizeof(pkt));
             return 1;
         }
     } else {
@@ -5829,6 +5837,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "WSAStartup failed\n");
         return 1;
     }
+    srand((unsigned int)time(NULL) ^ (unsigned int)GetCurrentProcessId());
+#else
+    srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
 #endif
     setlocale(LC_ALL, "");
     zone_arena_init(&g_dag_arena);
@@ -5920,6 +5931,9 @@ int main(int argc, char **argv) {
                 is_type_arg = true;
             } else if (strcmp(arg, "-c") == 0) {
                 is_class_arg = true;
+            } else if (strcmp(arg, "--hex") == 0 || strncmp(arg, "--hex=", 6) == 0) {
+                is_name_arg = true;
+                is_type_arg = true;
             }
         } else {
             // 位置引数
