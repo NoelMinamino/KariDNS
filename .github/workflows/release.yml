@@ -260,6 +260,29 @@ jobs:
           ./packaging/homebrew/update_formula.sh "$TAG_VER"
           cp Formula/dag.rb release-assets/dag.rb
 
+      - name: Push Formula to NoelMinamino/homebrew-tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          echo "==> Pushing Formula/dag.rb to NoelMinamino/homebrew-tap..."
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/NoelMinamino/homebrew-tap.git" tap-repo
+          mkdir -p tap-repo/Formula
+          cp Formula/dag.rb tap-repo/Formula/dag.rb
+          cd tap-repo
+          git add Formula/dag.rb
+          if git diff --staged --quiet; then
+            echo "No changes in Formula/dag.rb"
+          else
+            git commit -m "feat(dag): release ${{ env.RELEASE_VER }}"
+            git push origin main || git push origin master
+            echo "Successfully updated NoelMinamino/homebrew-tap!"
+          fi
+          cd ..
+          rm -rf tap-repo
+
       - name: Create Draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
