@@ -220,40 +220,6 @@ static void print_error_context(const char *root_file_path, const char *root_buf
     fprintf(stderr, "\033[0m\n\n");
 }
 
-static int compare_canonical_name(const char *name1, const char *name2) {
-    int len1 = strlen(name1), len2 = strlen(name2);
-    if (len1 > 0 && name1[len1-1] == '.') len1--;
-    if (len2 > 0 && name2[len2-1] == '.') len2--;
-    
-    int p1 = len1, p2 = len2;
-    while (p1 > 0 || p2 > 0) {
-        int d1 = p1 - 1;
-        while (d1 >= 0 && name1[d1] != '.') d1--;
-        int d2 = p2 - 1;
-        while (d2 >= 0 && name2[d2] != '.') d2--;
-        
-        int label_len1 = p1 - d1 - 1;
-        int label_len2 = p2 - d2 - 1;
-        
-        int min_len = label_len1 < label_len2 ? label_len1 : label_len2;
-        int cmp = 0;
-        if (min_len > 0) {
-            for(int i=0; i<min_len; i++) {
-                char c1 = name1[d1 + 1 + i];
-                char c2 = name2[d2 + 1 + i];
-                if (c1 >= 'A' && c1 <= 'Z') c1 |= 0x20;
-                if (c2 >= 'A' && c2 <= 'Z') c2 |= 0x20;
-                if (c1 != c2) { cmp = c1 - c2; break; }
-            }
-        }
-        if (cmp != 0) return cmp;
-        if (label_len1 != label_len2) return label_len1 - label_len2;
-        
-        p1 = d1; p2 = d2;
-    }
-    return 0;
-}
-
 // Full transitive total order over (canonical name, type, canonical RDATA bytes).
 // Because this is a true total order, RRs that compare equal (i.e. true duplicates)
 // are guaranteed to be contiguous after qsort(), regardless of qsort's stability.

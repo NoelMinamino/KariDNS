@@ -1093,6 +1093,8 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->file_buf_count = 0;
   arena->hash_size = 0;
   arena->hash_table = NULL;
+  arena->nsec_records = NULL;
+  arena->nsec_count = 0;
   atomic_init(&arena->reader_count, 0);
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
@@ -1109,6 +1111,9 @@ void zone_arena_destroy(zone_arena_t *arena) {
   for (int i = 0; i < arena->data_pool_count; i++)
     free(arena->data_pools[i]);
   free(arena->hash_table);
+  free(arena->nsec_records);
+  arena->nsec_records = NULL;
+  arena->nsec_count = 0;
   zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {
@@ -1128,10 +1133,21 @@ static size_t next_pow2(size_t n) {
     p <<= 1;
   return p;
 }
+static int cmp_canonical_nsec_ptr(const void *a, const void *b) {
+  const dns_record_t *r1 = *(const dns_record_t **)a;
+  const dns_record_t *r2 = *(const dns_record_t **)b;
+  return compare_canonical_name(r1->name, r2->name);
+}
+
 int build_zone_index(zone_arena_t *arena) {
   if (arena->hash_table) {
     free(arena->hash_table);
     arena->hash_table = NULL;
+  }
+  if (arena->nsec_records) {
+    free(arena->nsec_records);
+    arena->nsec_records = NULL;
+    arena->nsec_count = 0;
   }
   arena->hash_size = next_pow2(arena->count * 2);
   if (arena->hash_size == 0) arena->hash_size = 1;
@@ -1142,6 +1158,8 @@ int build_zone_index(zone_arena_t *arena) {
   }
   for (size_t i = 0; i < arena->hash_size; i++)
     arena->hash_table[i] = -1;
+
+  size_t nsec_cnt = 0;
   for (size_t i = arena->count; i-- > 0; ) {
     dns_record_t *rec = &arena->records[i];
     if (!rec->name)
@@ -1150,7 +1168,28 @@ int build_zone_index(zone_arena_t *arena) {
     size_t idx = hash & (arena->hash_size - 1);
     rec->next_record = arena->hash_table[idx];
     arena->hash_table[idx] = i;
+    if (rec->type_code == 47 && rec->rdata_count >= 1 && rec->rdata[0]) {
+      nsec_cnt++;
+    }
   }
+
+  if (nsec_cnt > 0) {
+    arena->nsec_records = malloc(sizeof(dns_record_t *) * nsec_cnt);
+    if (arena->nsec_records) {
+      size_t idx = 0;
+      for (size_t i = 0; i < arena->count; i++) {
+        dns_record_t *rec = &arena->records[i];
+        if (rec->name && rec->type_code == 47 && rec->rdata_count >= 1 && rec->rdata[0]) {
+          arena->nsec_records[idx++] = rec;
+        }
+      }
+      arena->nsec_count = idx;
+      qsort(arena->nsec_records, arena->nsec_count, sizeof(dns_record_t *), cmp_canonical_nsec_ptr);
+    } else {
+      arena->nsec_count = 0;
+    }
+  }
+
   return 0;
 }
 

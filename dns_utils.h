@@ -13,5 +13,6 @@ const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
 
 int hex_char_to_val(char c);
 size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap);
+int compare_canonical_name(const char *name1, const char *name2);
 
 #endif

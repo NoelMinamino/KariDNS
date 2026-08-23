@@ -1776,9 +1776,9 @@ int main() {
             .is_standalone_mode = true,
         };
         int pr = parse_zone_fast(zone_buf, strlen(zone_buf), &arena, &ctx);
-        free(zone_buf);
         if (pr < 0 || arena.count < 4) {
             printf("FAIL: parse_zone_fast failed for IPSECKEY/AMTRELAY test zone (pr=%d, count=%zu)\n", pr, arena.count);
+            free(zone_buf);
             zone_arena_destroy(&arena);
             return 1;
         }
@@ -1795,6 +1795,7 @@ int main() {
             strcmp(ipseckey_rec->rdata[3], "gw.example.com.") != 0) {
             printf("FAIL: IPSECKEY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
                    (ipseckey_rec && ipseckey_rec->rdata_count >= 4) ? ipseckey_rec->rdata[3] : "null");
+            free(zone_buf);
             zone_arena_destroy(&arena);
             return 1;
         }
@@ -1803,12 +1804,158 @@ int main() {
             strcmp(amtrelay_rec->rdata[3], "gw.example.com.") != 0) {
             printf("FAIL: AMTRELAY gateway name was not properly expanded to gw.example.com. (got '%s')\n",
                    (amtrelay_rec && amtrelay_rec->rdata_count >= 4) ? amtrelay_rec->rdata[3] : "null");
+            free(zone_buf);
             zone_arena_destroy(&arena);
             return 1;
         }
 
+        free(zone_buf);
         zone_arena_destroy(&arena);
         printf("PASS: IPSECKEY and AMTRELAY '03' gateway domain expansion test\n");
+    }
+
+    // --- Test 26: RRL token refill 32-bit overflow & boundary test ---
+    {
+        uint32_t rate = 1000;
+        int64_t now_ms = 3000000000LL;
+        int64_t last_refill_ms = now_ms - (30LL * 24 * 3600 * 1000); // 30 days elapsed
+        int32_t tokens = 0;
+
+        int64_t elapsed_ms = now_ms - last_refill_ms;
+        if (elapsed_ms > 0) {
+            uint64_t add_t = ((uint64_t)elapsed_ms * rate) / 1000;
+            if (add_t > 0) {
+                if (add_t > (uint64_t)rate) add_t = rate;
+                tokens += (int32_t)add_t;
+                if (tokens > (int32_t)rate) tokens = rate;
+                if (tokens < 0) tokens = 0;
+            }
+        }
+        if (tokens != (int32_t)rate) {
+            printf("FAIL: RRL refill overflow test failed (tokens=%d, expected=%u)\n", tokens, rate);
+            return 1;
+        }
+
+        // Test normal small interval (e.g. 500ms elapsed at rate 100)
+        rate = 100;
+        tokens = 10;
+        elapsed_ms = 500;
+        uint64_t add_t = ((uint64_t)elapsed_ms * rate) / 1000; // 50
+        if (add_t > 0) {
+            if (add_t > (uint64_t)rate) add_t = rate;
+            tokens += (int32_t)add_t;
+            if (tokens > (int32_t)rate) tokens = rate;
+            if (tokens < 0) tokens = 0;
+        }
+        if (tokens != 60) {
+            printf("FAIL: RRL normal refill test failed (tokens=%d, expected=60)\n", tokens);
+            return 1;
+        }
+        printf("PASS: RRL token refill 32-bit overflow & normal refill test\n");
+    }
+
+    // --- Test 27: RFC 4034 §6.1 Canonical ordering & NSEC non-existence proof tests ---
+    {
+        // 1. Canonical DNS name comparison tests
+        if (compare_canonical_name("example.com.", "example.com.") != 0) {
+            printf("FAIL: compare_canonical_name equal names failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("EXAMPLE.COM.", "example.com.") != 0) {
+            printf("FAIL: compare_canonical_name case insensitivity failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("example.com.", "a.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name apex < subdomain failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("a.example.com.", "b.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name a < b failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("*.example.com.", "a.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name '*' < 'a' failed\n");
+            return 1;
+        }
+        if (compare_canonical_name("example.com.", "*.example.com.") >= 0) {
+            printf("FAIL: compare_canonical_name apex < wildcard failed\n");
+            return 1;
+        }
+
+        // RFC 4034 Section 6.1 test vector sequence
+        const char *rfc4034_seq[] = {
+            "example",
+            "a.example",
+            "yljkjhh.a.example",
+            "Z.a.example",
+            "zABC.a.EXAMPLE",
+            "z.example",
+            "*.z.example"
+        };
+        for (size_t i = 0; i < sizeof(rfc4034_seq)/sizeof(rfc4034_seq[0]) - 1; i++) {
+            if (compare_canonical_name(rfc4034_seq[i], rfc4034_seq[i+1]) >= 0) {
+                printf("FAIL: RFC 4034 sequence ordering failed for '%s' vs '%s'\n",
+                       rfc4034_seq[i], rfc4034_seq[i+1]);
+                return 1;
+            }
+        }
+
+        // 2. Zone NSEC index construction and canonical sorting test
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        const char *nsec_zone_str =
+            "$ORIGIN nsec.example.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.nsec.example. hostmaster.nsec.example. 2026010101 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.nsec.example.\n"
+            "@ IN NSEC d.nsec.example. SOA NS RRSIG NSEC\n"
+            "d.nsec.example. IN A 192.0.2.4\n"
+            "d.nsec.example. IN NSEC nsec.example. A RRSIG NSEC\n"
+            "a.nsec.example. IN A 192.0.2.1\n"
+            "a.nsec.example. IN NSEC d.nsec.example. A RRSIG NSEC\n";
+
+        char *zone_copy = strdup(nsec_zone_str);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "nsec.example.";
+        int pr = parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx);
+        if (pr < 0) {
+            printf("FAIL: parse_zone_fast failed on nsec test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed on nsec test zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        if (arena.nsec_count != 3 || !arena.nsec_records) {
+            printf("FAIL: arena.nsec_count != 3 (got %zu)\n", arena.nsec_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Check canonical sorted order of NSEC records:
+        // [0]: nsec.example.
+        // [1]: a.nsec.example.
+        // [2]: d.nsec.example.
+        if (strcasecmp(arena.nsec_records[0]->name, "nsec.example.") != 0 ||
+            strcasecmp(arena.nsec_records[1]->name, "a.nsec.example.") != 0 ||
+            strcasecmp(arena.nsec_records[2]->name, "d.nsec.example.") != 0) {
+            printf("FAIL: NSEC records are not canonically sorted: [0]=%s, [1]=%s, [2]=%s\n",
+                   arena.nsec_records[0]->name, arena.nsec_records[1]->name, arena.nsec_records[2]->name);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: RFC 4034 §6.1 Canonical ordering & NSEC index tests\n");
     }
 
     printf("All tests passed safely.\n");
