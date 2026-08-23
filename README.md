@@ -68,10 +68,10 @@ KariDNS implements specifications according to official IETF RFC standards. For 
 ## Included Tools
 
 ### 1. `karidns`
-The main authoritative DNS server daemon.
+The main authoritative DNS server daemon. For detailed architecture and configuration options, see the **[karidns(8) Manual](docs/karidns.md)**.
 
 ### 2. `karictl`
-An authenticated management tool (RNDC-style) that communicates with the server over a UNIX domain socket using HMAC-SHA256.
+An authenticated management tool (RNDC-style) that communicates with the server over a UNIX domain socket using HMAC-SHA256. For command reference and configuration details, see the **[karictl(8) Manual](docs/karictl.md)**.
 
 ```sh
 # Check server status
@@ -91,7 +91,7 @@ An authenticated management tool (RNDC-style) that communicates with the server 
 ```
 
 ### 3. `karicheck`
-A zone file syntax and configuration validation utility. It performs pre-flight checks and validates RFC 8976 ZONEMD message digests.
+A zone file syntax and configuration validation utility. It performs pre-flight checks and validates RFC 8976 ZONEMD message digests. For command options and verification details, see the **[karicheck(1) Manual](docs/karicheck.md)**.
 
 ```sh
 # Validate configuration syntax
@@ -105,7 +105,7 @@ A zone file syntax and configuration validation utility. It performs pre-flight 
 ```
 
 ### 4. `dag` (DNS Anomaly Generator)
-A test client, protocol debugger, and packet fuzzer for DNS servers.
+A test client, protocol debugger, and packet fuzzer for DNS servers. For full option specifications and fuzzing modes, see the **[dag(1) Manual](docs/dag.md)**.
 
 `dag` can construct custom queries (including EDNS options, Cookie, EDNS Client Subnet, IXFR, Dynamic Updates, etc.), output formatted responses (`+short`, `+yaml`, `+multiline`), generate web links (`+ldnsz`) for online wire-format analysis, and intentionally generate malformed or boundary-testing packets using the `--break` option.
 
@@ -159,6 +159,10 @@ A test client, protocol debugger, and packet fuzzer for DNS servers.
 # View full list of available --break options
 ./dag --break-help
 ```
+
+For complete command-line options, advanced transport modes (DoT/DoH/PROXYv2), multi-server consistency checking (`+allcompare`), and protocol anomaly generator specifications, please consult the dedicated manual:
+
+- **[KariDNS `dag(1)` Reference Manual](docs/dag.md)**
 
 ---
 
