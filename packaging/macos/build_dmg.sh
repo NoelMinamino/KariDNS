@@ -1,70 +1,68 @@
 #!/bin/bash
 set -e
 
-# build_dmg.sh - Build macOS Universal Binary & DMG for dag
+# build_dmg.sh - Build macOS DMG and tar.gz for dag
 # Usage: ./packaging/macos/build_dmg.sh [version] [output_dir]
 
 VERSION="${1:-1.0.0}"
 VERSION="${VERSION#v}" # Strip leading 'v'
 OUT_DIR="${2:-./dist}"
+ARCH="$(uname -m)"
 
-echo "==> Building dag Universal Binary for macOS (arm64 + x86_64, version ${VERSION})..."
+echo "==> Building dag binary for macOS (${ARCH}, version ${VERSION})..."
 
 mkdir -p "${OUT_DIR}"
-BUILD_TMP="$(mktemp -d -t dag-macos-XXXXXX)"
+STAGE_DIR="$(mktemp -d -t dag-dmg-stage-XXXXXX)"
 
-OPENSSL_ARM64="/opt/homebrew/opt/openssl@3"
-OPENSSL_X86_64="/usr/local/opt/openssl@3"
+# Determine OpenSSL & libidn2 paths from Homebrew
+OPENSSL_DIR="$(brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl)"
+IDN2_DIR="$(brew --prefix libidn2 2>/dev/null || echo /usr/local/opt/libidn2)"
 
-# Determine available OpenSSL paths
-if [ -d "$OPENSSL_ARM64" ]; then
-    SSL_ARM_INC="-I${OPENSSL_ARM64}/include"
-    SSL_ARM_LIB="-L${OPENSSL_ARM64}/lib"
-elif [ -d "$OPENSSL_X86_64" ]; then
-    SSL_ARM_INC="-I${OPENSSL_X86_64}/include"
-    SSL_ARM_LIB="-L${OPENSSL_X86_64}/lib"
-else
-    SSL_ARM_INC=""
-    SSL_ARM_LIB=""
+SSL_INC=""
+SSL_LIB=""
+if [ -d "$OPENSSL_DIR" ]; then
+    SSL_INC="-I${OPENSSL_DIR}/include"
+    SSL_LIB="-L${OPENSSL_DIR}/lib"
 fi
 
-# 1. Build arm64
-echo "==> Compiling arm64 slice..."
-clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -target arm64-apple-macos11.0 \
-      ${SSL_ARM_INC} tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c \
-      -o "${BUILD_TMP}/dag-arm64" ${SSL_ARM_LIB} -pthread -lcrypto -lssl -lz -lm
+IDN_INC=""
+IDN_LIB=""
+IDN_DEF=""
+if [ -d "$IDN2_DIR" ]; then
+    IDN_INC="-I${IDN2_DIR}/include"
+    IDN_LIB="-L${IDN2_DIR}/lib -lidn2"
+    IDN_DEF="-DHAVE_LIBIDN2"
+fi
 
-# 2. Build x86_64
-echo "==> Compiling x86_64 slice..."
-clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -target x86_64-apple-macos10.15 \
-      ${SSL_ARM_INC} tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c \
-      -o "${BUILD_TMP}/dag-x86_64" ${SSL_ARM_LIB} -pthread -lcrypto -lssl -lz -lm
+# Build native binary for the current runner architecture
+echo "==> Compiling dag for ${ARCH}..."
+clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pie \
+      ${SSL_INC} ${IDN_INC} ${IDN_DEF} \
+      tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c \
+      -o "${STAGE_DIR}/dag" \
+      ${SSL_LIB} ${IDN_LIB} -pthread -lcrypto -lssl -lz -lm
 
-# 3. Create Universal Binary
-echo "==> Creating Universal binary with lipo..."
-lipo -create -output "${BUILD_TMP}/dag" "${BUILD_TMP}/dag-arm64" "${BUILD_TMP}/dag-x86_64"
+# 1. Create Standalone Binary Tarball
+echo "==> Packaging tar.gz release for macOS ${ARCH}..."
+TAR_STAGE="$(mktemp -d -t dag-tar-XXXXXX)"
+mkdir -p "${TAR_STAGE}/dag-${VERSION}"
+cp "${STAGE_DIR}/dag" "${TAR_STAGE}/dag-${VERSION}/"
+cp LICENSE "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
+cp README.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
+cp docs/dag.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
 
-# 4. Create Tarball
-echo "==> Creating macOS Universal tar.gz..."
-STAGE_DIR="$(mktemp -d -t dag-dmg-stage-XXXXXX)"
-mkdir -p "${STAGE_DIR}/dag-${VERSION}"
-cp "${BUILD_TMP}/dag" "${STAGE_DIR}/dag-${VERSION}/"
-cp LICENSE "${STAGE_DIR}/dag-${VERSION}/" 2>/dev/null || true
-cp README.md "${STAGE_DIR}/dag-${VERSION}/" 2>/dev/null || true
-cp docs/dag.md "${STAGE_DIR}/dag-${VERSION}/" 2>/dev/null || true
+tar -czf "${OUT_DIR}/dag-${VERSION}-macos-${ARCH}.tar.gz" -C "${TAR_STAGE}" "dag-${VERSION}"
+rm -rf "${TAR_STAGE}"
 
-tar -czf "${OUT_DIR}/dag-${VERSION}-macos-universal.tar.gz" -C "${STAGE_DIR}" "dag-${VERSION}"
-
-# 5. Create DMG
-echo "==> Creating macOS DMG..."
+# 2. Create DMG
+echo "==> Packaging DMG for macOS ${ARCH}..."
 DMG_STAGE="$(mktemp -d -t dag-dmg-root-XXXXXX)"
 mkdir -p "${DMG_STAGE}/bin"
-cp "${BUILD_TMP}/dag" "${DMG_STAGE}/bin/dag"
+cp "${STAGE_DIR}/dag" "${DMG_STAGE}/bin/dag"
 cp LICENSE "${DMG_STAGE}/" 2>/dev/null || true
 cp README.md "${DMG_STAGE}/" 2>/dev/null || true
 cp docs/dag.md "${DMG_STAGE}/" 2>/dev/null || true
 
-# Simple install guide text
 cat << 'EOF' > "${DMG_STAGE}/INSTALL.txt"
 DAG (DNS Anomaly Generator) - Installation Guide
 
@@ -79,10 +77,10 @@ To verify:
   dag www.google.com A @8.8.8.8
 EOF
 
-hdiutil create -volname "DAG" -srcfolder "${DMG_STAGE}" -ov -format UDZO "${OUT_DIR}/dag-${VERSION}-macos.dmg"
+hdiutil create -volname "DAG" -srcfolder "${DMG_STAGE}" -ov -format UDZO "${OUT_DIR}/dag-${VERSION}-macos-${ARCH}.dmg"
 
 # Cleanup
-rm -rf "${BUILD_TMP}" "${STAGE_DIR}" "${DMG_STAGE}"
+rm -rf "${STAGE_DIR}" "${DMG_STAGE}"
 
 echo "==> macOS packages generated in ${OUT_DIR}:"
 ls -lh "${OUT_DIR}"/dag*

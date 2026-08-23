@@ -77,6 +77,7 @@ if command -v rpmbuild >/dev/null 2>&1; then
     rpmbuild --define "_topdir ${RPM_TOPDIR}" \
              --define "version ${VERSION}" \
              --target "${RPM_ARCH}" \
+             --nodeps \
              -bb packaging/linux/dag.spec
 
     cp "${RPM_TOPDIR}"/RPMS/*/*.rpm "${OUT_DIR}/"

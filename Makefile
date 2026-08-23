@@ -1,18 +1,17 @@
 # Makefile for karidns & dag (FreeBSD, Linux, macOS)
 
-UNAME_S := $(shell uname -s 2>/dev/null || echo Unknown)
+UNAME_S != uname -s 2>/dev/null || echo Unknown
 
 # OS-specific flags
-DARWIN_OPENSSL := $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl)
-DARWIN_CFLAGS  := $(shell [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && echo "-I$(DARWIN_OPENSSL)/include" || echo "-I/usr/local/include")
-DARWIN_LDFLAGS := $(shell [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && echo "-L$(DARWIN_OPENSSL)/lib" || echo "-L/usr/local/lib")
+DARWIN_CFLAGS  != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-I`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/include" || echo "-I/usr/local/include"
+DARWIN_LDFLAGS != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-L`brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl`/lib" || echo "-L/usr/local/lib"
 
 # Hardening LDFLAGS (macOS ld does not support -z options)
-HARDEN_LDFLAGS := $(shell [ "$$(uname -s 2>/dev/null)" = "Darwin" ] && echo "-pie" || echo "-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack")
+HARDEN_LDFLAGS != [ "`uname -s 2>/dev/null`" = "Darwin" ] && echo "-pie" || echo "-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack"
 
 # libidn2 detection (portable for BSD make & GNU make)
-IDN_CFLAGS := $(shell (pkg-config --cflags libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2")) || true)
-IDN_LDFLAGS := $(shell (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true)
+IDN_CFLAGS != (pkg-config --cflags libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2")) || true
+IDN_LDFLAGS != (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
 
 CC ?= cc
 CFLAGS += -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(DARWIN_CFLAGS) $(IDN_CFLAGS)

@@ -646,14 +646,14 @@ static bool parse_proxy_arg(const char *arg, query_opts_t *qo) {
     struct in6_addr a6;
     if (inet_pton(AF_INET, src_part, &a4) == 1 && inet_pton(AF_INET, dst_part, &a4) == 1) {
         qo->proxy_family = AF_INET;
-        snprintf(qo->proxy_src_addr, sizeof(qo->proxy_src_addr), "%s", src_part);
-        snprintf(qo->proxy_dst_addr, sizeof(qo->proxy_dst_addr), "%s", dst_part);
+        snprintf(qo->proxy_src_addr, sizeof(qo->proxy_src_addr), "%.63s", src_part);
+        snprintf(qo->proxy_dst_addr, sizeof(qo->proxy_dst_addr), "%.63s", dst_part);
         return true;
     }
     if (inet_pton(AF_INET6, src_part, &a6) == 1 && inet_pton(AF_INET6, dst_part, &a6) == 1) {
         qo->proxy_family = AF_INET6;
-        snprintf(qo->proxy_src_addr, sizeof(qo->proxy_src_addr), "%s", src_part);
-        snprintf(qo->proxy_dst_addr, sizeof(qo->proxy_dst_addr), "%s", dst_part);
+        snprintf(qo->proxy_src_addr, sizeof(qo->proxy_src_addr), "%.63s", src_part);
+        snprintf(qo->proxy_dst_addr, sizeof(qo->proxy_dst_addr), "%.63s", dst_part);
         return true;
     }
     qo->proxy_use_local_cmd = true;
@@ -972,7 +972,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 fprintf(stderr, "warning: failed to encode prereq name '%s', skipping\n", name);
                 continue;
             }
-            if (offset + 10 > max_len) {
+            if ((size_t)offset + 10 > max_len) {
                 fprintf(stderr, "warning: packet buffer full, dropping remaining prereqs\n");
                 break;
             }
@@ -1073,7 +1073,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 char *name = strtok(buf, " ");
                 char *type_str = strtok(NULL, " ");
                 if (name && type_str) {
-                    if (offset + 10 > max_len) {
+                    if ((size_t)offset + 10 > max_len) {
                         fprintf(stderr, "warning: packet buffer full, dropping remaining update ops\n");
                         free(buf);
                         break;
@@ -1170,7 +1170,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         long meta_type = 0; bool has_meta = false;
         if (has_break(BRK_UPDATE_META_TYPE, &meta_type, &has_meta)) {
             uint16_t fallback_offset = offset;
-            if (write_dns_name_str(pkt, &fallback_offset, qname, &comp_ctx, max_len) == 0 && fallback_offset + 10 <= max_len) {
+            if (write_dns_name_str(pkt, &fallback_offset, qname, &comp_ctx, max_len) == 0 && (size_t)fallback_offset + 10 <= max_len) {
                 pkt[fallback_offset++] = (uint16_t)meta_type >> 8; pkt[fallback_offset++] = (uint16_t)meta_type & 0xFF;
                 pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x01; /* Class IN */
                 pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; pkt[fallback_offset++] = 0x00; /* TTL 0 */
@@ -1918,7 +1918,7 @@ static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_has
     uint8_t flags = rdata[1];
     uint16_t iterations = (rdata[2]<<8)|rdata[3];
     uint8_t salt_len = rdata[4];
-    if (5 + salt_len > rdlen) { printf("(malformed)"); return; }
+    if ((size_t)(5 + salt_len) > rdlen) { printf("(malformed)"); return; }
     char salt_hex[512] = "-";
     if (salt_len > 0) {
         size_t p2 = 0;
@@ -1927,7 +1927,7 @@ static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_has
     printf("%u %u %u %s", hash_alg, flags, iterations, salt_hex);
 
     if (with_hash) { // NSEC3 specific
-        if (5 + salt_len + 1 > rdlen) { printf(" (malformed)"); return; }
+        if ((size_t)(5 + salt_len + 1) > rdlen) { printf(" (malformed)"); return; }
         size_t pos = 5 + salt_len;
         uint8_t hash_len = rdata[pos++];
         if (pos + hash_len > rdlen) { printf(" (malformed)"); return; }
@@ -4467,8 +4467,8 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
         if (want && rec.rdata_count > 0) {
             for (int j=0; j<ns_count; j++) {
                 if (strcasecmp(rec.name, ns_names[j]) == 0 && all_ns_count < 128) {
-                    snprintf(all_ns_ips[all_ns_count].ns_name, sizeof(all_ns_ips[all_ns_count].ns_name), "%s", ns_names[j]);
-                    snprintf(all_ns_ips[all_ns_count].ip, sizeof(all_ns_ips[all_ns_count].ip), "%s", rec.rdata[0]);
+                    snprintf(all_ns_ips[all_ns_count].ns_name, sizeof(all_ns_ips[all_ns_count].ns_name), "%.255s", ns_names[j]);
+                    snprintf(all_ns_ips[all_ns_count].ip, sizeof(all_ns_ips[all_ns_count].ip), "%.63s", rec.rdata[0]);
                     all_ns_count++;
                 }
             }

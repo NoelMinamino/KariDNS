@@ -23,7 +23,7 @@ wire hexdump analysis, TSIG signing/verification, EDNS options, and intentional 
 %autosetup -n KariDNS-%{version}
 
 %build
-make dag
+test -f dag || make dag
 
 %install
 rm -rf %{buildroot}
