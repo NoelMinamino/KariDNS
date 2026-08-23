@@ -87,10 +87,12 @@ jobs:
             make dag
             chmod +x ./packaging/linux/build_linux_pkgs.sh
             ./packaging/linux/build_linux_pkgs.sh \"$TAG_VER\" /src/dist
+            chmod -R a+rwX /src/dist /src/dag
           "
 
       - name: Build DEB and Tarball packages on host
         run: |
+          sudo chown -R $USER:$USER "${GITHUB_WORKSPACE}"
           TAG_VER="${{ env.RELEASE_VER }}"
           chmod +x packaging/linux/build_linux_pkgs.sh
           ./packaging/linux/build_linux_pkgs.sh "$TAG_VER" ./dist
