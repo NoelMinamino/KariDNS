@@ -97,8 +97,10 @@ brew install --build-from-source Formula/dag.rb
 ```
 
 ### 4.2 Standalone DMG
-1. Download `dag-<version>-macos.dmg` from GitHub Releases.
-2. Double click to mount `dag-<version>-macos.dmg`.
+1. Download the DMG for your architecture from GitHub Releases:
+   - **Apple Silicon (M1/M2/M3/M4):** `dag-<version>-macos-arm64.dmg`
+   - **Intel:** `dag-<version>-macos-x86_64.dmg`
+2. Double click to mount the DMG.
 3. Copy `bin/dag` to `/usr/local/bin`:
    ```sh
    sudo cp /Volumes/DAG/bin/dag /usr/local/bin/

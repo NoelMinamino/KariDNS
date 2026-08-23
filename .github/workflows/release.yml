@@ -113,8 +113,12 @@ jobs:
           path: dist/dag*
 
   build-and-test-macos:
-    name: Build & Test macOS Package (DMG, Universal Binary)
-    runs-on: macos-latest
+    name: Build & Test macOS (${{ matrix.os }}) Package (DMG, tar.gz)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -123,7 +127,7 @@ jobs:
         run: |
           brew install openssl@3 libidn2
 
-      - name: Build macOS Universal Binary & DMG
+      - name: Build macOS Package
         run: |
           TAG_VER="${{ env.RELEASE_VER }}"
           chmod +x packaging/macos/build_dmg.sh
@@ -132,7 +136,7 @@ jobs:
       - name: Test DMG mount and execution on macOS runner
         run: |
           echo "::group::🧪 [Verification] Test mounting DMG and executing dag"
-          DMG_FILE=$(ls dist/dag-*-macos.dmg | head -n 1)
+          DMG_FILE=$(ls dist/dag-*-macos-*.dmg | head -n 1)
           hdiutil attach "$DMG_FILE" -mountpoint /Volumes/DAG_TEST
           
           test -x /Volumes/DAG_TEST/bin/dag
@@ -144,10 +148,10 @@ jobs:
           echo "DMG mount and execution test passed!"
           echo "::endgroup::"
 
-      - name: Test Universal tar.gz extraction and execution
+      - name: Test tar.gz extraction and execution
         run: |
           echo "::group::🧪 [Verification] Test extracting tar.gz and executing dag"
-          TAR_FILE=$(ls dist/dag-*-macos-universal.tar.gz | head -n 1)
+          TAR_FILE=$(ls dist/dag-*-macos-*.tar.gz | head -n 1)
           mkdir -p test_tar
           tar -xzf "$TAR_FILE" -C test_tar
           ./test_tar/dag-*/dag www.google.com A @8.8.8.8
@@ -157,7 +161,7 @@ jobs:
       - name: Upload macOS Package Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: macos-packages
+          name: macos-${{ matrix.os }}-packages
           path: dist/dag*
 
   publish-draft-release:
