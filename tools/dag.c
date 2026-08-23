@@ -5048,6 +5048,8 @@ static void prescan_always_global_options(int argc, char **argv, query_spec_t *g
         else if (strcmp(argv[i], "+nocmd") == 0) global_spec->dopt.show_cmd = false;
         else if (strcmp(argv[i], "+short") == 0) global_spec->dopt.short_mode = true;
         else if (strcmp(argv[i], "+noshort") == 0) global_spec->dopt.short_mode = false;
+        else if (strcmp(argv[i], "+ldnsz") == 0) global_spec->use_ldnsz = true;
+        else if (strcmp(argv[i], "+noldnsz") == 0) global_spec->use_ldnsz = false;
         else if (strcmp(argv[i], "-m") == 0) global_spec->qo.mem_debug = true;
         else if (strcmp(argv[i], "+allcompare") == 0) g_want_allcompare = true;
     }
@@ -5304,6 +5306,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.nofail = true;
         } else if (strcmp(arg, "+ldnsz") == 0) {
             spec->use_ldnsz = true;
+        } else if (strcmp(arg, "+noldnsz") == 0) {
+            spec->use_ldnsz = false;
         } else if (strcmp(arg, "+allcompare") == 0) {
             g_want_allcompare = true;
         } else if (strcmp(arg, "+noall") == 0) {
@@ -6031,6 +6035,7 @@ int main(int argc, char **argv) {
         }
 
         if (local_spec.qo.mem_debug) global_spec.qo.mem_debug = true;
+        if (local_spec.use_ldnsz) global_spec.use_ldnsz = true;
         int rc = execute_query_spec(&local_spec);
         if (rc != 0) last_exit_code = rc;
     }

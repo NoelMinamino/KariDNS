@@ -320,6 +320,18 @@ else
 fi
 
 echo "========================================================"
+echo "14. Multi-Server Queries & +ldnsz Diff URL Tests"
+echo "========================================================"
+if [ "$DAG" = "dig" ]; then
+    run_skip "Multi-server query comparison and +ldnsz URL"
+else
+    run_check "Single server +ldnsz URL output" "$DAG @127.0.0.1 -p $PORT www.example.com A +ldnsz" "https://ldns\.jp/\?dnsz="
+    run_check "Multi-server comparison table output" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A" ";; === MULTI-SERVER COMPARISON SUMMARY ==="
+    run_check "Multi-server +ldnsz diff URL (option at end)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +ldnsz" "https://ldns\.jp/diff/#c="
+    run_check "Multi-server +ldnsz diff URL (option at beginning)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT +ldnsz www.example.com A" "https://ldns\.jp/diff/#c="
+fi
+
+echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
     if [ "$SKIPPED" -gt 0 ]; then
         echo "🎉 ALL TESTS PASSED! ($SKIPPED skipped for $CLIENT_NAME)"
