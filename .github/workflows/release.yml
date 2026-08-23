@@ -113,7 +113,8 @@ jobs:
           echo "::group::🧪 [Verification] Test installing RPM package in Rocky Linux 9 container"
           docker run --rm -v "$(pwd)/dist:/dist" rockylinux:9 sh -c "
             set -e
-            dnf install -y openssl zlib /dist/dag-*.rpm
+            RPM_FILE=\$(ls /dist/dag-*.rpm | head -n 1)
+            dnf install -y openssl zlib \"\$RPM_FILE\"
             which dag
             dag --help || true
             dag www.google.com A @8.8.8.8

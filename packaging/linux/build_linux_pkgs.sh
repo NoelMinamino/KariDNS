@@ -67,25 +67,29 @@ fi
 
 # 3. Create RPM Package (.rpm)
 if command -v rpmbuild >/dev/null 2>&1; then
-    echo "==> Packaging RPM (.rpm) package via rpmbuild..."
-    RPM_TOPDIR="$(mktemp -d -t dag-rpm-XXXXXX)"
-    mkdir -p "${RPM_TOPDIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-    
-    # Prepare source tarball for rpmbuild
-    TAR_SRC_DIR="$(mktemp -d -t dag-src-XXXXXX)"
-    mkdir -p "${TAR_SRC_DIR}/KariDNS-${VERSION}"
-    cp -r * "${TAR_SRC_DIR}/KariDNS-${VERSION}/" 2>/dev/null || true
-    tar -czf "${RPM_TOPDIR}/SOURCES/dag-${VERSION}.tar.gz" -C "${TAR_SRC_DIR}" "KariDNS-${VERSION}"
-    rm -rf "${TAR_SRC_DIR}"
+    if ls "${OUT_DIR}"/dag-*.rpm >/dev/null 2>&1; then
+        echo "==> RPM package already exists in ${OUT_DIR}, skipping rpmbuild..."
+    else
+        echo "==> Packaging RPM (.rpm) package via rpmbuild..."
+        RPM_TOPDIR="$(mktemp -d -t dag-rpm-XXXXXX)"
+        mkdir -p "${RPM_TOPDIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+        
+        # Prepare source tarball for rpmbuild
+        TAR_SRC_DIR="$(mktemp -d -t dag-src-XXXXXX)"
+        mkdir -p "${TAR_SRC_DIR}/KariDNS-${VERSION}"
+        cp -r * "${TAR_SRC_DIR}/KariDNS-${VERSION}/" 2>/dev/null || true
+        tar -czf "${RPM_TOPDIR}/SOURCES/dag-${VERSION}.tar.gz" -C "${TAR_SRC_DIR}" "KariDNS-${VERSION}"
+        rm -rf "${TAR_SRC_DIR}"
 
-    rpmbuild --define "_topdir ${RPM_TOPDIR}" \
-             --define "version ${VERSION}" \
-             --target "${RPM_ARCH}" \
-             --nodeps \
-             -bb packaging/linux/dag.spec
+        rpmbuild --define "_topdir ${RPM_TOPDIR}" \
+                 --define "version ${VERSION}" \
+                 --target "${RPM_ARCH}" \
+                 --nodeps \
+                 -bb packaging/linux/dag.spec
 
-    cp "${RPM_TOPDIR}"/RPMS/*/*.rpm "${OUT_DIR}/"
-    rm -rf "${RPM_TOPDIR}"
+        cp "${RPM_TOPDIR}"/RPMS/*/*.rpm "${OUT_DIR}/"
+        rm -rf "${RPM_TOPDIR}"
+    fi
 fi
 
 echo "==> Linux packages generated in ${OUT_DIR}:"
