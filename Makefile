@@ -96,25 +96,25 @@ run: $(TARGET)
 	./$(TARGET)
 
 fuzz: $(FUZZ_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TARGET) $(FUZZ_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TARGET) $(FUZZ_SRCS) $(LDFLAGS) -lcrypto
 
 fuzz_core: $(FUZZ_CORE_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS) $(LDFLAGS) -lcrypto
 
 fuzz_zone: $(FUZZ_ZONE_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_SRCS) $(LDFLAGS) -lcrypto
 
 fuzz_conf: $(FUZZ_CONF_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CONF_TARGET) $(FUZZ_CONF_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CONF_TARGET) $(FUZZ_CONF_SRCS) $(LDFLAGS) -lcrypto
 
 fuzz_tsig: $(FUZZ_TSIG_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_TARGET) $(FUZZ_TSIG_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_TARGET) $(FUZZ_TSIG_SRCS) $(LDFLAGS) -lcrypto
 
 fuzz_dag: $(FUZZ_DAG_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TARGET) $(FUZZ_DAG_SRCS) $(LDFLAGS) -lssl -lz $(IDN_LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TARGET) $(FUZZ_DAG_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
 fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS) $(LDFLAGS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS) $(LDFLAGS) -lcrypto
 
 clean-fuzz:
 	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET) $(FUZZ_TSIG_TARGET) $(FUZZ_DAG_TARGET) $(FUZZ_TSIG_VERIFY_TARGET)
@@ -126,7 +126,7 @@ ASAN_OBJS = $(SRCS:.c=.asan.o)
 asan: $(ASAN_TARGET)
 
 $(ASAN_TARGET): $(ASAN_OBJS)
-	$(CC) $(ASAN_CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(ASAN_CFLAGS) -o $@ $^ $(LDFLAGS) -lcrypto
 
 .SUFFIXES: .asan.o .c
 .c.asan.o:
@@ -140,7 +140,7 @@ TSAN_OBJS = $(SRCS:.c=.tsan.o)
 tsan: $(TSAN_TARGET)
 
 $(TSAN_TARGET): $(TSAN_OBJS)
-	$(CC) $(TSAN_CFLAGS) -o $@ $^ $(LDFLAGS) $(TSAN_LDFLAGS)
+	$(CC) $(TSAN_CFLAGS) -o $@ $^ $(LDFLAGS) $(TSAN_LDFLAGS) -lcrypto
 
 .SUFFIXES: .tsan.o .c
 .c.tsan.o:
@@ -149,11 +149,11 @@ $(TSAN_TARGET): $(TSAN_OBJS)
 # --- ASan版ツール群 ---
 KARICHECK_ASAN_SRCS = tools/karicheck.c dns_config_parser.c dns_zone_parser.c dns_wire.c dns_utils.c
 karicheck-asan: $(KARICHECK_ASAN_SRCS)
-	$(CC) $(ASAN_CFLAGS) $(KARICHECK_ASAN_SRCS) -o $@ $(LDFLAGS)
+	$(CC) $(ASAN_CFLAGS) $(KARICHECK_ASAN_SRCS) -o $@ $(LDFLAGS) -lcrypto
 
 DAG_ASAN_SRCS = tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c
 dag-asan: $(DAG_ASAN_SRCS)
-	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lssl -lz $(IDN_LDFLAGS)
+	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
 KARICTL_ASAN_SRCS = tools/karictl.c
 karictl-asan: $(KARICTL_ASAN_SRCS)
