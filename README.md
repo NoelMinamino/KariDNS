@@ -49,6 +49,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD
 KariDNS implements specifications according to official IETF RFC standards. For a detailed list of supported RFCs, implementation notes, and design boundaries, please consult:
 
 - **[KariDNS RFC Compliance Guideline](KariDNS_RFC_GUIDELINE.md)**
+- **[Installation & Multi-Platform Distribution Guide (FreeBSD, Linux, macOS, Homebrew)](docs/distribution.md)**
 
 ---
 

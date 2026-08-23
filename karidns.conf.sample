@@ -61,6 +61,12 @@ key "tsig-key-example" {
 };
 
 // マスターゾーンの定義
+zone "example.local" {
+    type master;
+    file "/usr/local/etc/karidns/zones/example.local.zone";
+    allow-transfer { 127.0.0.1; };
+};
+
 zone "example.com" {
     type master;
     file "/usr/local/etc/namedb/master/example.com.zone";

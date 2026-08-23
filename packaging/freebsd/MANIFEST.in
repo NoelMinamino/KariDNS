@@ -1,0 +1,34 @@
+name: "karidns"
+version: "__VERSION__"
+origin: "dns/karidns"
+comment: "High-performance authoritative DNS server for FreeBSD with Capsicum sandboxing"
+arch: "__ARCH__"
+www: "https://github.com/NoelMinamino/KariDNS"
+maintainer: "noel@karidns.org"
+prefix: "/usr/local"
+licenselogic: "single"
+licenses: [
+    "BSD2CLAUSE"
+]
+desc: <<EOD
+KariDNS is a FreeBSD-native authoritative DNS server engineered for ultra-low latency,
+high throughput, and strict security via Capsicum sandboxing and lock-free RCU architecture.
+Includes the dag protocol client/fuzzer, karictl management utility, and karicheck syntax validator.
+EOD
+categories: [
+    "dns",
+    "net",
+    "sysutils"
+]
+deps: {
+}
+files: {
+    /usr/local/sbin/karidns: "",
+    /usr/local/bin/karictl: "",
+    /usr/local/bin/karicheck: "",
+    /usr/local/bin/dag: "",
+    /usr/local/etc/rc.d/karidns: { "perm": "0555" },
+    /usr/local/etc/karidns/karidns.conf.sample: "",
+    /usr/local/etc/karidns/karictl.conf.sample: "",
+    /usr/local/etc/karidns/zones/example.local.zone.sample: ""
+}

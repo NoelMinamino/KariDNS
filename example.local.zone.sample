@@ -1,0 +1,31 @@
+$ORIGIN example.local.
+$TTL 3600
+
+@   IN  SOA ns1.example.local. admin.example.local. (
+            2026082301 ; Serial (YYYYMMDDNN)
+            3600       ; Refresh (1 hour)
+            1800       ; Retry (30 mins)
+            604800     ; Expire (1 week)
+            86400      ; Minimum TTL (1 day)
+)
+
+    IN  NS  ns1.example.local.
+    IN  NS  ns2.example.local.
+    IN  MX  10 mail.example.local.
+    IN  TXT "v=spf1 ip4:192.168.1.0/24 -all"
+
+; Name servers
+ns1     IN  A       192.168.1.10
+ns2     IN  A       192.168.1.11
+
+; Network devices & infrastructure
+router  IN  A       192.168.1.1
+server  IN  A       192.168.1.50
+gateway IN  CNAME   router.example.local.
+
+; Hostnames & Services
+www     IN  A       192.168.1.100
+www     IN  AAAA    2001:db8:1::100
+mail    IN  A       192.168.1.200
+ftp     IN  CNAME   www.example.local.
+status  IN  CNAME   server.example.local.

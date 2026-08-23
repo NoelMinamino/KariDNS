@@ -1,0 +1,206 @@
+name: KariDNS & Tools Multi-Platform Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (for debugging/testing)'
+        required: true
+        default: '0.0.1'
+
+env:
+  RELEASE_VER: ${{ inputs.version || github.ref_name || '0.0.1' }}
+
+jobs:
+  build-and-test-freebsd:
+    name: Build & Test FreeBSD ${{ matrix.release }} Package (.pkg)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.4', '15.1']
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build and Test FreeBSD pkg inside FreeBSD VM (${{ matrix.release }})
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: ${{ matrix.release }}
+          run: |
+            set -e
+            pkg install -y openssl pkgconf libidn2
+            mkdir -p dist
+            TAG_VER="${{ env.RELEASE_VER }}"
+            chmod +x packaging/freebsd/build_pkg.sh
+            ./packaging/freebsd/build_pkg.sh "$TAG_VER" ./dist
+
+            echo "::group::🧪 [Verification] Test installing generated FreeBSD pkg on ${{ matrix.release }}"
+            pkg install -y dist/karidns-*.pkg
+            
+            # Verify installed binaries and files
+            test -x /usr/local/sbin/karidns
+            test -x /usr/local/bin/karictl
+            test -x /usr/local/bin/karicheck
+            test -x /usr/local/bin/dag
+            test -f /usr/local/etc/karidns/karidns.conf.sample
+            test -f /usr/local/etc/karidns/zones/example.local.zone.sample
+            test -x /usr/local/etc/rc.d/karidns
+            
+            # Smoke test dag query
+            echo "Testing dag against Google DNS..."
+            /usr/local/bin/dag www.google.com A @8.8.8.8
+            /usr/local/bin/dag google.com TXT @8.8.8.8 +tcp
+            echo "FreeBSD ${{ matrix.release }} package installation & verification test passed!"
+            echo "::endgroup::"
+
+      - name: Upload FreeBSD ${{ matrix.release }} Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ matrix.release }}-packages
+          path: dist/karidns-*.pkg*
+
+  build-and-test-linux:
+    name: Build & Test Linux Packages (RPM, DEB, tar.gz)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm dpkg-dev libssl-dev zlib1g-dev libidn2-dev
+
+      - name: Build Linux packages
+        run: |
+          TAG_VER="${{ env.RELEASE_VER }}"
+          chmod +x packaging/linux/build_linux_pkgs.sh
+          ./packaging/linux/build_linux_pkgs.sh "$TAG_VER" ./dist
+
+      - name: Test DEB installation on Ubuntu runner
+        run: |
+          echo "::group::🧪 [Verification] Test installing DEB package on Ubuntu"
+          sudo dpkg -i dist/dag_*.deb
+          which dag
+          dag --help || true
+          dag www.google.com A @8.8.8.8
+          dag google.com TXT @8.8.8.8 +tcp
+          echo "DEB package installation test passed!"
+          echo "::endgroup::"
+
+      - name: Test RPM installation in Rocky Linux container
+        run: |
+          echo "::group::🧪 [Verification] Test installing RPM package in Rocky Linux 9 container"
+          docker run --rm -v "$(pwd)/dist:/dist" rockylinux:9 sh -c "
+            set -e
+            dnf install -y openssl zlib /dist/dag-*.rpm
+            which dag
+            dag --help || true
+            dag www.google.com A @8.8.8.8
+            dag google.com TXT @8.8.8.8 +tcp
+            echo 'RPM package installation test passed!'
+          "
+          echo "::endgroup::"
+
+      - name: Upload Linux Package Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/dag*
+
+  build-and-test-macos:
+    name: Build & Test macOS Package (DMG, Universal Binary)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install openssl@3 libidn2
+
+      - name: Build macOS Universal Binary & DMG
+        run: |
+          TAG_VER="${{ env.RELEASE_VER }}"
+          chmod +x packaging/macos/build_dmg.sh
+          ./packaging/macos/build_dmg.sh "$TAG_VER" ./dist
+
+      - name: Test DMG mount and execution on macOS runner
+        run: |
+          echo "::group::🧪 [Verification] Test mounting DMG and executing dag"
+          DMG_FILE=$(ls dist/dag-*-macos.dmg | head -n 1)
+          hdiutil attach "$DMG_FILE" -mountpoint /Volumes/DAG_TEST
+          
+          test -x /Volumes/DAG_TEST/bin/dag
+          /Volumes/DAG_TEST/bin/dag --help || true
+          /Volumes/DAG_TEST/bin/dag www.google.com A @8.8.8.8
+          /Volumes/DAG_TEST/bin/dag google.com TXT @8.8.8.8 +tcp
+          
+          hdiutil detach /Volumes/DAG_TEST
+          echo "DMG mount and execution test passed!"
+          echo "::endgroup::"
+
+      - name: Test Universal tar.gz extraction and execution
+        run: |
+          echo "::group::🧪 [Verification] Test extracting tar.gz and executing dag"
+          TAR_FILE=$(ls dist/dag-*-macos-universal.tar.gz | head -n 1)
+          mkdir -p test_tar
+          tar -xzf "$TAR_FILE" -C test_tar
+          ./test_tar/dag-*/dag www.google.com A @8.8.8.8
+          echo "Tarball extraction & execution test passed!"
+          echo "::endgroup::"
+
+      - name: Upload macOS Package Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: dist/dag*
+
+  publish-draft-release:
+    name: Publish Draft GitHub Release & Homebrew Formula
+    needs: [build-and-test-freebsd, build-and-test-linux, build-and-test-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-dist
+          merge-multiple: true
+
+      - name: Generate Checksums & Homebrew Formula
+        run: |
+          mkdir -p release-assets
+          cp all-dist/* release-assets/ 2>/dev/null || true
+          
+          TAG_VER="${{ env.RELEASE_VER }}"
+          
+          # Generate SHA256SUMS.txt
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cd ..
+
+          # Generate Homebrew Formula
+          chmod +x packaging/homebrew/update_formula.sh
+          ./packaging/homebrew/update_formula.sh "$TAG_VER"
+          cp Formula/dag.rb release-assets/dag.rb
+
+      - name: Create Draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_VER }}
+          name: Release ${{ env.RELEASE_VER }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
