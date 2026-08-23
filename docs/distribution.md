@@ -20,11 +20,14 @@ This document describes how to install and use KariDNS and its accompanying tool
 ## 2. FreeBSD Installation (`pkg`)
 
 ### 2.1 Installing from Pre-built Package
-Download the appropriate package for your FreeBSD release from GitHub Releases:
+Download the appropriate package for your FreeBSD release from GitHub Releases and install as root (`su -`):
 - **FreeBSD 14.x:** `karidns-?.?.?-FreeBSD-14-amd64.pkg`
 - **FreeBSD 15.x:** `karidns-?.?.?-FreeBSD-15-amd64.pkg`
 
 ```sh
+# Switch to root
+su -
+
 # For FreeBSD 14.x
 pkg add karidns-?.?.?-FreeBSD-14-amd64.pkg
 

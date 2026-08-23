@@ -178,28 +178,31 @@ KariDNS and its tools are distributed as pre-built packages for FreeBSD, Linux, 
 
 ### 1. FreeBSD Installation (`karidns` Full Suite)
 
-Download the `.pkg` file matching your FreeBSD version from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases):
+Download the `.pkg` file matching your FreeBSD version from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases) and install as root (`su -`):
 
 ```sh
+# Switch to root
+su -
+
 # For FreeBSD 14.x (amd64)
-sudo pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns-?.?.?-FreeBSD-14-amd64.pkg
+pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns-?.?.?-FreeBSD-14-amd64.pkg
 
 # For FreeBSD 15.x (amd64)
-sudo pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns-?.?.?-FreeBSD-15-amd64.pkg
+pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns-?.?.?-FreeBSD-15-amd64.pkg
 
 # Or install locally downloaded package
-sudo pkg add karidns-?.?.?-FreeBSD-14-amd64.pkg
+pkg add karidns-?.?.?-FreeBSD-14-amd64.pkg
 ```
 
-**Starting the service:**
+**Starting the service (as root):**
 ```sh
 # Copy sample configuration
-sudo cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
-sudo cp /usr/local/etc/karidns/zones/example.local.zone.sample /usr/local/etc/karidns/zones/example.local.zone
+cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
+cp /usr/local/etc/karidns/zones/example.local.zone.sample /usr/local/etc/karidns/zones/example.local.zone
 
 # Enable and start daemon
-sudo sysrc karidns_enable="YES"
-sudo service karidns start
+sysrc karidns_enable="YES"
+service karidns start
 ```
 
 ---
