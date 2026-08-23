@@ -79,11 +79,13 @@ jobs:
         run: |
           mkdir -p dist
           TAG_VER="${{ env.RELEASE_VER }}"
+          chmod +x packaging/linux/build_linux_pkgs.sh
           docker run --rm -v "${GITHUB_WORKSPACE}:/src" -w /src rockylinux:9 sh -c "
             set -e
             dnf install -y gcc make openssl-devel zlib-devel libidn2-devel rpm-build
             make clean
             make dag
+            chmod +x ./packaging/linux/build_linux_pkgs.sh
             ./packaging/linux/build_linux_pkgs.sh \"$TAG_VER\" /src/dist
           "
 
