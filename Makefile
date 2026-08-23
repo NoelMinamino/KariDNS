@@ -18,7 +18,7 @@ WIN_LDFLAGS != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-sta
 
 CC ?= cc
 CFLAGS += -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(DARWIN_CFLAGS) $(IDN_CFLAGS)
-LDFLAGS = -pthread -lcrypto -lm $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS) $(WIN_LDFLAGS)
+LDFLAGS = -pthread -lm $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
 TARGET = karidns
@@ -60,13 +60,13 @@ FUZZ_TSIG_VERIFY_SRCS = tests/fuzz/fuzz_tsig_verify.c dns_wire.c dns_utils.c dns
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lcrypto
 
 $(KARICTL_TARGET): $(KARICTL_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ -lcrypto $(HARDEN_LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lcrypto
 
 $(DAG_TARGET): $(DAG_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lssl -lz $(IDN_LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS) $(WIN_LDFLAGS)
 
 karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o
 	$(CC) $(CFLAGS) tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_wire.o dns_utils.o -o karicheck $(LDFLAGS) -lcrypto
