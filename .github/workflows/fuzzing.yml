@@ -9,7 +9,7 @@ on:
       fuzz_seconds:
         description: 'Duration (in seconds) per fuzz target'
         required: true
-        default: '300'
+        default: '7200'
       runs_target:
         description: 'Maximum runs per target (leave empty for time-based)'
         required: false
@@ -39,7 +39,7 @@ jobs:
           release: '15.1'
           run: |
             set -e
-            FUZZ_TIME="${{ inputs.fuzz_seconds || '300' }}"
+            FUZZ_TIME="${{ inputs.fuzz_seconds || '7200' }}"
             FUZZ_RUNS_INPUT="${{ inputs.runs_target || '' }}"
 
             echo "::group::📦 [Build] Build all libFuzzer targets in parallel"
