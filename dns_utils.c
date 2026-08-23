@@ -425,3 +425,8 @@ int compare_canonical_name(const char *name1, const char *name2) {
     return 0;
 }
 
+bool serial_is_newer(uint32_t s1, uint32_t s2) {
+    return ((int32_t)(s1 - s2)) > 0;
+}
+
+

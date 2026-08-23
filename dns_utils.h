@@ -2,6 +2,7 @@
 #define DNS_UTILS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -14,5 +15,6 @@ const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
 int hex_char_to_val(char c);
 size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap);
 int compare_canonical_name(const char *name1, const char *name2);
+bool serial_is_newer(uint32_t s1, uint32_t s2);
 
 #endif

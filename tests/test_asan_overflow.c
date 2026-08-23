@@ -2040,6 +2040,61 @@ int main() {
         printf("PASS: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
     }
 
+    // --- Test 29: RFC 1982 Serial arithmetic & wraparound tests ---
+    {
+        // 1. Normal sequence
+        if (!serial_is_newer(100, 99)) {
+            printf("FAIL: serial_is_newer(100, 99) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(99, 100)) {
+            printf("FAIL: serial_is_newer(99, 100) should be false\n");
+            return 1;
+        }
+        if (serial_is_newer(100, 100)) {
+            printf("FAIL: serial_is_newer(100, 100) should be false\n");
+            return 1;
+        }
+        if (!serial_is_newer(2026082302, 2026082301)) {
+            printf("FAIL: serial_is_newer(2026082302, 2026082301) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(2026082301, 2026082302)) {
+            printf("FAIL: serial_is_newer(2026082301, 2026082302) should be false\n");
+            return 1;
+        }
+
+        // 2. 32-bit boundary wraparound
+        if (!serial_is_newer(0U, 4294967295U)) {
+            printf("FAIL: serial_is_newer(0, 4294967295) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(4294967295U, 0U)) {
+            printf("FAIL: serial_is_newer(4294967295, 0) should be false\n");
+            return 1;
+        }
+        if (!serial_is_newer(10U, 4294967290U)) {
+            printf("FAIL: serial_is_newer(10, 4294967290) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(4294967290U, 10U)) {
+            printf("FAIL: serial_is_newer(4294967290, 10) should be false\n");
+            return 1;
+        }
+
+        // 3. Half-range boundary (2^31 - 1 vs 2^31)
+        if (!serial_is_newer(0x7FFFFFFFU, 0U)) {
+            printf("FAIL: serial_is_newer(0x7FFFFFFF, 0) should be true\n");
+            return 1;
+        }
+        if (serial_is_newer(0x80000000U, 0U)) {
+            printf("FAIL: serial_is_newer(0x80000000, 0) should be false\n");
+            return 1;
+        }
+
+        printf("PASS: RFC 1982 Serial arithmetic & wraparound tests\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

@@ -2413,6 +2413,21 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           standby->count = 0;
           return 0;
         }
+
+        if (session->client_serial != 0) {
+          if (current_serial == session->client_serial) {
+            session->is_finished = true;
+            standby->count = 0;
+            return 0;
+          }
+          if (!serial_is_newer(current_serial, session->client_serial)) {
+            syslog(LOG_WARNING,
+                   "[AXFR] Rejecting transfer for zone '%s': received serial %u is not newer "
+                   "than current serial %u (possible rollback or spoofed master)",
+                   domain, current_serial, session->client_serial);
+            return -1;
+          }
+        }
       } else if (session->soa_count == 2 && session->is_ixfr) {
         standby->count = 0;
         standby->data_pool_count = 0;
