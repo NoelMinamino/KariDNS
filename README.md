@@ -228,7 +228,7 @@ sudo cp dag-?.?.?/dag /usr/local/bin/
 
 #### Option C: Homebrew Tap
 ```sh
-brew install NoelMinamino/karidns/dag
+brew install NoelMinamino/tap/dag
 ```
 
 ---

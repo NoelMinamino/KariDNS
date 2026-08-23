@@ -13,7 +13,7 @@ This document describes how to install and use KariDNS and its accompanying tool
 | **Linux (DEB)** (Ubuntu/Debian) | `.deb` | `dag` | `dpkg -i` / `apt install` |
 | **Linux (Generic)** | `.tar.gz` | `dag` (standalone binary) | Extract & copy to `/usr/local/bin` |
 | **macOS** | `.dmg`, `.tar.gz` | `dag` (Universal Binary: arm64 + x86_64) | Mount DMG / CLI install |
-| **Homebrew** | Formula (`dag.rb`) | `dag` | `brew install <user>/tap/dag` |
+| **Homebrew** | Formula (`dag.rb`) | `dag` | `brew install NoelMinamino/tap/dag` |
 | **Windows** | `.zip` | `dag.exe` (x86_64 standalone executable) | Extract & copy to `%PATH%` |
 
 ---
@@ -108,9 +108,9 @@ sudo cp dag-?.?.?/dag /usr/local/bin/
    ```
 
 ### 4.3 Homebrew Tap
-If you configure a Homebrew tap repository (`homebrew-karidns`):
+To install via Homebrew Tap (`NoelMinamino/homebrew-tap`):
 ```sh
-brew install NoelMinamino/karidns/dag
+brew install NoelMinamino/tap/dag
 ```
 
 ---
