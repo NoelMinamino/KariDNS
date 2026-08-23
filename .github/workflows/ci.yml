@@ -94,10 +94,10 @@ jobs:
         include:
           - os: ubuntu-latest
             name: Linux (Ubuntu)
-          - os: macos-13
-            name: macOS 13 (x86_64)
           - os: macos-14
             name: macOS 14 (ARM64)
+          - os: macos-15
+            name: macOS 15 (ARM64)
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
