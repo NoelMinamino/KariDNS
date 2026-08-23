@@ -104,7 +104,7 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
             compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) break;
             if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, label)) {
-                if (*offset + 2 > max_len) return -1;
+                if ((size_t)(*offset + 2) > max_len) return -1;
                 uint16_t ptr = 0xC000 | entry->offset;
                 packet_buf[(*offset)++] = ptr >> 8;
                 packet_buf[(*offset)++] = ptr & 0xFF;
@@ -125,14 +125,14 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         }
         
         uint8_t len = *label;
-        if (*offset + 1 + len > max_len) return -1;
+        if ((size_t)(*offset + 1 + len) > max_len) return -1;
         packet_buf[(*offset)++] = len;
         for (uint8_t k = 1; k <= len; k++) {
             packet_buf[(*offset)++] = label[k];
         }
     }
     
-    if (*offset + 1 > max_len) return -1;
+    if ((size_t)(*offset + 1) > max_len) return -1;
     packet_buf[(*offset)++] = 0;
     return 0;
 }
@@ -1058,13 +1058,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
 
-    if (offset + DNS_HEADER_SIZE > max_res_len) return -1; // TC bit needed
+    if ((size_t)offset + DNS_HEADER_SIZE > max_res_len) return -1; // TC bit needed
 
     if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx, max_res_len) != 0) {
         return -1;
     }
 
-    if (offset + 10 > max_res_len) return -1;
+    if ((size_t)offset + 10 > max_res_len) return -1;
 
     res[offset++] = rec_type >> 8; res[offset++] = rec_type & 0xFF;
     uint16_t class_val = rec->class_val;
@@ -1088,14 +1088,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     offset += 2; // reserve for rdlength
 
     if (rec->generic_data && rec->generic_len > 0) {
-        if (offset + rec->generic_len > max_res_len) return -1;
+        if ((size_t)offset + rec->generic_len > max_res_len) return -1;
         memcpy(&res[offset], rec->generic_data, rec->generic_len);
         offset += rec->generic_len;
     } else {
         switch (rec_type) {
             case 1: { // A
                 if (rec->rdata_count == 0) return -1;
-                if (offset + 4 > max_res_len) return -1;
+                if ((size_t)offset + 4 > max_res_len) return -1;
                 if (rec->is_cached) {
                     memcpy(&res[offset], &rec->cache.a.addr.s_addr, 4);
                 } else {
@@ -1108,7 +1108,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 28: { // AAAA
                 if (rec->rdata_count == 0) return -1;
-                if (offset + 16 > max_res_len) return -1;
+                if ((size_t)offset + 16 > max_res_len) return -1;
                 if (rec->is_cached) {
                     memcpy(&res[offset], &rec->cache.aaaa.addr.s6_addr, 16);
                 } else {
@@ -1121,7 +1121,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR
                 if (rec->rdata_count == 0) return -1;
-                if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || (size_t)offset > max_res_len) return -1;
                 break;
             }
             case 39: { // DNAME (RFC 6672: 圧縮禁止)
@@ -1133,7 +1133,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 15: { // MX
                 if (rec->rdata_count < 2) return -1;
-                if (offset + 2 > max_res_len) return -1;
+                if ((size_t)offset + 2 > max_res_len) return -1;
                 uint16_t pref;
                 const char *target;
                 if (rec->is_cached) {
@@ -1144,12 +1144,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     target = rec->rdata[1];
                 }
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-                if (write_dns_name_str(res, &offset, target, comp_ctx, max_res_len) != 0 || offset > max_res_len) return -1;
+                if (write_dns_name_str(res, &offset, target, comp_ctx, max_res_len) != 0 || (size_t)offset > max_res_len) return -1;
                 break;
             }
             case 33: { // SRV (RFC 2782: 圧縮禁止)
                 if (rec->rdata_count < 4) return -1;
-                if (offset + 6 > max_res_len) return -1;
+                if ((size_t)offset + 6 > max_res_len) return -1;
                 uint16_t prio, weight, port;
                 const char *target;
                 if (rec->is_cached) {
@@ -1308,7 +1308,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 size_t tag_len = strlen(rec->rdata[1]);
                 if (tag_len == 0 || tag_len > 255) return -1; // RFC 8659: Tagは1-255バイト
                 size_t val_len = strlen(rec->rdata[2]);
-                if (offset + 2 + tag_len + val_len > max_res_len) return -1;
+                if ((size_t)offset + 2 + tag_len + val_len > max_res_len) return -1;
                 
                 res[offset++] = flags;
                 res[offset++] = (uint8_t)tag_len;
@@ -1339,7 +1339,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 if (write_dns_name_str(res, &offset, mname, comp_ctx, max_res_len) != 0 ||
                     write_dns_name_str(res, &offset, rname, comp_ctx, max_res_len) != 0) return -1;
-                if (offset + 20 > max_res_len) return -1;
+                if ((size_t)offset + 20 > max_res_len) return -1;
                 for (int j = 0; j < 5; j++) {
                     uint32_t val = numbers[j];
                     res[offset++] = val >> 24; res[offset++] = (val >> 16) & 0xFF; res[offset++] = (val >> 8) & 0xFF; res[offset++] = val & 0xFF;
@@ -1355,7 +1355,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     if (chunks == 0) chunks = 1;
                     required += chunks + len;
                 }
-                if (offset + required > max_res_len) return -1;
+                if ((size_t)offset + required > max_res_len) return -1;
                 
                 for (int j = 0; j < rec->rdata_count; j++) {
                     size_t len = strlen(rec->rdata[j]);
@@ -1381,20 +1381,20 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u8(rec->rdata[0], &prec) ||
                     !parse_u8(rec->rdata[1], &gw_type) ||
                     !parse_u8(rec->rdata[2], &alg)) return -1;
-                if (offset + 3 > max_res_len) return -1;
+                if ((size_t)offset + 3 > max_res_len) return -1;
                 res[offset++] = prec; res[offset++] = gw_type; res[offset++] = alg;
                 
                 int pk_idx = 3;
                 if (gw_type == 1) { // IPv4
                     if (rec->rdata_count < 5) return -1;
-                    if (offset + 4 > max_res_len) return -1;
+                    if ((size_t)offset + 4 > max_res_len) return -1;
                     struct in_addr addr;
                     if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
                     pk_idx = 4;
                 } else if (gw_type == 2) { // IPv6
                     if (rec->rdata_count < 5) return -1;
-                    if (offset + 16 > max_res_len) return -1;
+                    if ((size_t)offset + 16 > max_res_len) return -1;
                     struct in6_addr addr;
                     if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
@@ -1423,19 +1423,19 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     !parse_u8(rec->rdata[1], &dbit) ||
                     !parse_u8(rec->rdata[2], &type)) return -1;
                 if (dbit > 1) return -1;
-                if (offset + 2 > max_res_len) return -1;
+                if ((size_t)offset + 2 > max_res_len) return -1;
                 res[offset++] = prec;
                 res[offset++] = (dbit << 7) | (type & 0x7F);
                 
                 if (type == 1) { // IPv4
                     if (rec->rdata_count < 4) return -1;
-                    if (offset + 4 > max_res_len) return -1;
+                    if ((size_t)offset + 4 > max_res_len) return -1;
                     struct in_addr addr;
                     if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
                 } else if (type == 2) { // IPv6
                     if (rec->rdata_count < 4) return -1;
-                    if (offset + 16 > max_res_len) return -1;
+                    if ((size_t)offset + 16 > max_res_len) return -1;
                     struct in6_addr addr;
                     if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
@@ -1451,7 +1451,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 104: { // NID
                 if (rec->rdata_count < 2) return -1;
-                if (offset + 10 > max_res_len) return -1;
+                if ((size_t)offset + 10 > max_res_len) return -1;
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
@@ -1462,7 +1462,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 105: { // L32
                 if (rec->rdata_count < 2) return -1;
-                if (offset + 6 > max_res_len) return -1;
+                if ((size_t)offset + 6 > max_res_len) return -1;
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
@@ -1473,7 +1473,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 106: { // L64
                 if (rec->rdata_count < 2) return -1;
-                if (offset + 10 > max_res_len) return -1;
+                if ((size_t)offset + 10 > max_res_len) return -1;
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
@@ -1490,7 +1490,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint8_t fp[64]; 
                 size_t fp_len = hex_decode(rec->rdata[2], fp, sizeof(fp));
                 if (fp_len == (size_t)-1) return -1;
-                if (offset + 2 + fp_len > max_res_len) return -1;
+                if ((size_t)offset + 2 + fp_len > max_res_len) return -1;
                 res[offset++] = alg;
                 res[offset++] = fptype;
                 memcpy(&res[offset], fp, fp_len);
@@ -1527,7 +1527,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     signer = rec->rdata[7];
                 }
 
-                if (offset + 18 > max_res_len) return -1;
+                if ((size_t)offset + 18 > max_res_len) return -1;
                 res[offset++] = type_covered >> 8; res[offset++] = type_covered & 0xFF;
                 res[offset++] = algorithm;
                 res[offset++] = labels;
@@ -1544,7 +1544,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += w;
 
                 if (rec->is_cached && rec->cache.rrsig.signature) {
-                    if (offset + rec->cache.rrsig.signature_len > max_res_len) return -1;
+                    if ((size_t)offset + rec->cache.rrsig.signature_len > max_res_len) return -1;
                     memcpy(&res[offset], rec->cache.rrsig.signature, rec->cache.rrsig.signature_len);
                     offset += rec->cache.rrsig.signature_len;
                 } else {
@@ -1579,7 +1579,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 size_t next_hash_len = base32hex_decode(rec->rdata[4], next_hash, sizeof(next_hash));
                 if (next_hash_len == (size_t)-1) return -1;
 
-                if (offset + 5 + salt_len + 1 + next_hash_len > max_res_len) return -1;
+                if ((size_t)offset + 5 + salt_len + 1 + next_hash_len > max_res_len) return -1;
                 res[offset++] = halg;
                 res[offset++] = flags;
                 res[offset++] = iterations >> 8; res[offset++] = iterations & 0xFF;
@@ -1597,7 +1597,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u8(rec->rdata[0], &usage) ||
                     !parse_u8(rec->rdata[1], &selector) ||
                     !parse_u8(rec->rdata[2], &matching)) return -1;
-                if (offset + 3 > max_res_len) return -1;
+                if ((size_t)offset + 3 > max_res_len) return -1;
                 res[offset++] = usage;
                 res[offset++] = selector;
                 res[offset++] = matching;
@@ -1616,7 +1616,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 const char *b64 = rec->rdata[3];
                 size_t b64_len = strlen(b64);
                 size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-                if (offset + 5 + decoded_upper_bound > max_res_len) return -1;
+                if ((size_t)offset + 5 + decoded_upper_bound > max_res_len) return -1;
                 res[offset++] = cert_type >> 8; res[offset++] = cert_type & 0xFF;
                 res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
                 res[offset++] = algorithm;
@@ -1856,7 +1856,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 memcpy(buf, p, len); buf[len] = '\0';
                                 struct in_addr a;
                                 if (inet_pton(AF_INET, buf, &a) != 1) return -1;
-                                if (val_len + 4 > sizeof(val_wire)) return -1;
+                                if ((size_t)(val_len + 4) > sizeof(val_wire)) return -1;
                                 memcpy(&val_wire[val_len], &a.s_addr, 4);
                                 val_len += 4;
                                 if (!comma) break;
@@ -1872,7 +1872,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                                 memcpy(buf, p, len); buf[len] = '\0';
                                 struct in6_addr a;
                                 if (inet_pton(AF_INET6, buf, &a) != 1) return -1;
-                                if (val_len + 16 > sizeof(val_wire)) return -1;
+                                if ((size_t)(val_len + 16) > sizeof(val_wire)) return -1;
                                 memcpy(&val_wire[val_len], &a.s6_addr, 16);
                                 val_len += 16;
                                 if (!comma) break;
@@ -1881,7 +1881,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                         } else if (key == 5) { // ech
                             size_t blen = strlen(val_str);
                             size_t decoded_upper_bound = ((blen + 3) / 4) * 3;
-                            if (val_len + decoded_upper_bound > sizeof(val_wire)) return -1;
+                            if ((size_t)(val_len + decoded_upper_bound) > sizeof(val_wire)) return -1;
                             int declen = EVP_DecodeBlock(&val_wire[val_len], (const unsigned char *)val_str, blen);
                             if (declen > 0) {
                                 int pad = 0;
@@ -1895,13 +1895,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                             // character-string decoding 済みであり、そのバイト列がそのまま
                             // wire-format value になる。
                             size_t vlen = strlen(val_str);
-                            if (val_len + vlen > sizeof(val_wire)) return -1;
+                            if ((size_t)(val_len + vlen) > sizeof(val_wire)) return -1;
                             memcpy(&val_wire[val_len], val_str, vlen);
                             val_len += vlen;
                         }
                     }
 
-                    if (storage_offset + val_len > sizeof(val_storage)) return -1;
+                    if ((size_t)(storage_offset + val_len) > sizeof(val_storage)) return -1;
                     params[param_count].key = key;
                     params[param_count].val_offset = storage_offset;
                     params[param_count].val_len = val_len;
@@ -1936,7 +1936,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
 
                 for (int i = 0; i < param_count; i++) {
-                    if (offset + 4 + params[i].val_len > max_res_len) return -1;
+                    if ((size_t)offset + 4 + params[i].val_len > max_res_len) return -1;
                     res[offset++] = params[i].key >> 8; res[offset++] = params[i].key & 0xFF;
                     res[offset++] = params[i].val_len >> 8; res[offset++] = params[i].val_len & 0xFF;
                     if (params[i].val_len > 0) {
@@ -1962,7 +1962,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint16_t port;
                 if (!parse_u16(rec->rdata[2], &port)) return -1;
 
-                if (offset + 5 > max_res_len) return -1;
+                if ((size_t)offset + 5 > max_res_len) return -1;
                 res[offset++] = notify_rrtype >> 8; res[offset++] = notify_rrtype & 0xFF;
                 res[offset++] = scheme;
                 res[offset++] = port >> 8; res[offset++] = port & 0xFF;
@@ -1985,7 +1985,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     !parse_u16(rec->rdata[1], &weight)) return -1;
                 const char *target = rec->rdata[2];
                 size_t tlen = strlen(target);
-                if (offset + 4 + tlen > max_res_len) return -1;
+                if ((size_t)offset + 4 + tlen > max_res_len) return -1;
                 res[offset++] = prio >> 8; res[offset++] = prio & 0xFF;
                 res[offset++] = weight >> 8; res[offset++] = weight & 0xFF;
                 memcpy(&res[offset], target, tlen);
@@ -1997,7 +1997,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 const char *b64 = rec->rdata[0];
                 size_t b64_len = strlen(b64);
                 size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-                if (offset + decoded_upper_bound > max_res_len) return -1;
+                if ((size_t)offset + decoded_upper_bound > max_res_len) return -1;
                 int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
                 if (declen < 0) return -1;
                 int padding = 0;
@@ -2009,7 +2009,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 108: case 109: { // EUI48, EUI64
                 if (rec->rdata_count < 1) return -1;
                 size_t expected = (rec_type == 108) ? 6 : 8;
-                if (offset + expected > max_res_len) return -1;
+                if ((size_t)offset + expected > max_res_len) return -1;
                 uint8_t eui[16];
                 size_t dec_len = hex_decode(rec->rdata[0], eui, sizeof(eui));
                 if (dec_len != expected) return -1;
@@ -2023,7 +2023,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint8_t scheme, halg;
                 if (!parse_u8(rec->rdata[1], &scheme) ||
                     !parse_u8(rec->rdata[2], &halg)) return -1;
-                if (offset + 6 > max_res_len) return -1;
+                if ((size_t)offset + 6 > max_res_len) return -1;
                 res[offset++] = serial >> 24; res[offset++] = (serial >> 16) & 0xFF;
                 res[offset++] = (serial >> 8) & 0xFF; res[offset++] = serial & 0xFF;
                 res[offset++] = scheme;
@@ -2036,7 +2036,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 
             case 11: { // WKS
                 if (rec->rdata_count < 2) return -1;
-                if (offset + 5 > max_res_len) return -1;
+                if ((size_t)offset + 5 > max_res_len) return -1;
                 struct in_addr addr;
                 if (inet_pton(AF_INET, rec->rdata[0], &addr) != 1) return -1;
                 memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
@@ -2087,7 +2087,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 18: case 21: case 36: case 107: { // AFSDB, RT, KX, LP
                 if (rec->rdata_count < 2) return -1;
-                if (offset + 2 > max_res_len) return -1;
+                if ((size_t)offset + 2 > max_res_len) return -1;
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
@@ -2098,7 +2098,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 26: { // PX
                 if (rec->rdata_count < 3) return -1;
-                if (offset + 2 > max_res_len) return -1;
+                if ((size_t)offset + 2 > max_res_len) return -1;
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
@@ -2115,7 +2115,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint32_t serial = strtoul(rec->rdata[0], NULL, 10);
                 uint16_t flags;
                 if (!parse_u16(rec->rdata[1], &flags)) return -1;
-                if (offset + 6 > max_res_len) return -1;
+                if ((size_t)offset + 6 > max_res_len) return -1;
                 res[offset++] = serial >> 24; res[offset++] = (serial >> 16) & 0xFF;
                 res[offset++] = (serial >> 8) & 0xFF; res[offset++] = serial & 0xFF;
                 res[offset++] = flags >> 8; res[offset++] = flags & 0xFF;
@@ -2129,7 +2129,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u16(rec->rdata[0], &keytag) ||
                     !parse_u8(rec->rdata[1], &alg) ||
                     !parse_u8(rec->rdata[2], &dtype)) return -1;
-                if (offset + 4 > max_res_len) return -1;
+                if ((size_t)offset + 4 > max_res_len) return -1;
                 res[offset++] = keytag >> 8; res[offset++] = keytag & 0xFF;
                 res[offset++] = alg;
                 res[offset++] = dtype;
@@ -2146,7 +2146,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u16(rec->rdata[0], &flags) ||
                     !parse_u8(rec->rdata[1], &proto) ||
                     !parse_u8(rec->rdata[2], &alg)) return -1;
-                if (offset + 4 > max_res_len) return -1;
+                if ((size_t)offset + 4 > max_res_len) return -1;
                 res[offset++] = flags >> 8; res[offset++] = flags & 0xFF;
                 res[offset++] = proto;
                 res[offset++] = alg;
@@ -2330,7 +2330,7 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
         rdlen += 4 + 2;
     }
 
-    if (offset + 11 + rdlen <= max_res_len) {
+    if ((size_t)offset + 11 + rdlen <= max_res_len) {
         res[offset++] = 0; // Root name
         res[offset++] = 0; res[offset++] = 41; // TYPE OPT
         res[offset++] = 1232 >> 8; res[offset++] = 1232 & 0xFF; // UDP Payload size
