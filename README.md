@@ -167,17 +167,115 @@ For complete command-line options, advanced transport modes (DoT/DoH/PROXYv2), m
 
 ---
 
-## Building and Running
+## Installation & Distribution
+
+KariDNS and its tools are distributed as pre-built packages for FreeBSD, Linux, and macOS.
+
+> [!IMPORTANT]
+> **Platform Support Scope:**
+> - **FreeBSD (Full Suite):** Includes the authoritative server daemon (`karidns`), management tool (`karictl`), syntax validator (`karicheck`), and DNS testing client (`dag`), along with sample configs and `rc.d` service scripts.
+> - **Linux & macOS (Client Only):** Since `karidns` relies on FreeBSD-native kernel features (`kqueue`, `Capsicum`), non-FreeBSD platforms distribute **`dag` only** (as an ultra-fast, feature-rich DNS query tool and fuzzer alternative to `dig`).
+
+### 1. FreeBSD Installation (`karidns` Full Suite)
+
+Download the `.pkg` file matching your FreeBSD version from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases):
+
+```sh
+# For FreeBSD 14.x (amd64)
+sudo pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns-?.?.?-FreeBSD-14-amd64.pkg
+
+# For FreeBSD 15.x (amd64)
+sudo pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns-?.?.?-FreeBSD-15-amd64.pkg
+
+# Or install locally downloaded package
+sudo pkg add karidns-?.?.?-FreeBSD-14-amd64.pkg
+```
+
+**Starting the service:**
+```sh
+# Copy sample configuration
+sudo cp /usr/local/etc/karidns/karidns.conf.sample /usr/local/etc/karidns/karidns.conf
+sudo cp /usr/local/etc/karidns/zones/example.local.zone.sample /usr/local/etc/karidns/zones/example.local.zone
+
+# Enable and start daemon
+sudo sysrc karidns_enable="YES"
+sudo service karidns start
+```
+
+---
+
+### 2. macOS Installation (`dag` only)
+
+#### Option A: Homebrew (Recommended)
+You can install `dag` directly from the release Formula:
+
+```sh
+# Install directly from the release Formula
+brew install https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
+
+# Or via Homebrew Tap (if tap repository is configured)
+brew tap NoelMinamino/karidns
+brew install dag
+```
+
+#### Option B: Standalone DMG (.dmg)
+1. Download `dag-?.?.?-macos-arm64.dmg` from GitHub Releases.
+2. Double-click the DMG and drag `dag` to `/usr/local/bin` (or your preferred `$PATH`).
+
+#### Option C: Generic Tarball (.tar.gz)
+```sh
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-macos-arm64.tar.gz
+tar -xzf dag-?.?.?-macos-arm64.tar.gz
+sudo cp dag-?.?.?/dag /usr/local/bin/
+```
+
+---
+
+### 3. Linux Installation (`dag` only)
+
+#### RPM-based (RHEL 9, Rocky Linux 9, AlmaLinux 9, Fedora)
+```sh
+# Download and install with DNF / RPM
+sudo dnf install https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-1.el9.x86_64.rpm
+
+# Or via rpm command
+sudo rpm -ivh dag-?.?.?-1.el9.x86_64.rpm
+```
+
+#### DEB-based (Ubuntu 22.04 / 24.04, Debian 11 / 12)
+```sh
+# Download and install with DPKG
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag_?.?.?_amd64.deb
+sudo dpkg -i dag_?.?.?_amd64.deb
+```
+
+#### Generic Linux Tarball (.tar.gz)
+```sh
+curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-linux-x86_64.tar.gz
+tar -xzf dag-?.?.?-linux-x86_64.tar.gz
+sudo cp dag-?.?.?/dag /usr/local/bin/
+```
+
+For complete packaging details and checksum verification, see the **[Distribution Guide](docs/distribution.md)**.
+
+---
+
+## Building from Source
 
 ### Prerequisites
-- **Operating System:** FreeBSD (tested on FreeBSD 14.x / 15.0-CURRENT)
+- **Operating System:** FreeBSD (for full suite), Linux / macOS (for `dag` client)
 - **Compiler:** Clang or GCC (C11 support required)
-- **Libraries:** OpenSSL (`libcrypto`), `libidn2` (optional, for IDN support), `pthread`
+- **Libraries:** OpenSSL (`libcrypto`, `libssl`), `zlib`, `libidn2` (optional, for IDN support), `pthread`
 
 ### Compilation
-To compile the server and companion utilities:
+To compile all utilities on FreeBSD:
 ```sh
 make all
+```
+
+To compile only the `dag` client (on Linux, macOS, or FreeBSD):
+```sh
+make dag
 ```
 
 To run test suites with AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan):

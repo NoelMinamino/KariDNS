@@ -21,15 +21,15 @@ This document describes how to install and use KariDNS and its accompanying tool
 
 ### 2.1 Installing from Pre-built Package
 Download the appropriate package for your FreeBSD release from GitHub Releases:
-- **FreeBSD 14.x:** `karidns-<version>-FreeBSD-14-amd64.pkg`
-- **FreeBSD 15.x:** `karidns-<version>-FreeBSD-15-amd64.pkg`
+- **FreeBSD 14.x:** `karidns-?.?.?-FreeBSD-14-amd64.pkg`
+- **FreeBSD 15.x:** `karidns-?.?.?-FreeBSD-15-amd64.pkg`
 
 ```sh
 # For FreeBSD 14.x
-pkg add karidns-1.0.0-FreeBSD-14-amd64.pkg
+pkg add karidns-?.?.?-FreeBSD-14-amd64.pkg
 
 # For FreeBSD 15.x
-pkg add karidns-1.0.0-FreeBSD-15-amd64.pkg
+pkg add karidns-?.?.?-FreeBSD-15-amd64.pkg
 ```
 
 ### 2.2 Installed Components
@@ -62,18 +62,18 @@ pkg add karidns-1.0.0-FreeBSD-15-amd64.pkg
 
 ### 3.1 RPM-based (RHEL, Fedora, Rocky, AlmaLinux, openSUSE)
 ```sh
-sudo rpm -ivh dag-1.0.0-1.x86_64.rpm
+sudo rpm -ivh dag-?.?.?-1.x86_64.rpm
 ```
 
 ### 3.2 DEB-based (Ubuntu, Debian, Linux Mint)
 ```sh
-sudo dpkg -i dag_1.0.0_amd64.deb
+sudo dpkg -i dag_?.?.?_amd64.deb
 ```
 
 ### 3.3 Tarball (Generic Linux)
 ```sh
-tar -xzf dag-1.0.0-linux-x86_64.tar.gz
-sudo cp dag-1.0.0/dag /usr/local/bin/
+tar -xzf dag-?.?.?-linux-x86_64.tar.gz
+sudo cp dag-?.?.?/dag /usr/local/bin/
 ```
 
 ---
@@ -81,25 +81,24 @@ sudo cp dag-1.0.0/dag /usr/local/bin/
 ## 4. macOS Installation (`dag`)
 
 ### 4.1 Homebrew (Recommended)
-You can install `dag` via Homebrew Tap:
+You can install `dag` directly via Homebrew from the GitHub release formula:
+
 ```sh
-# Tap repository and install
-brew tap NoelMinamino/tap
+# Option 1: Direct install from release Formula
+brew install https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag.rb
+
+# Option 2: Via Homebrew Tap repository
+brew tap NoelMinamino/karidns
 brew install dag
 
 # Or in a single command
-brew install NoelMinamino/tap/dag
-```
-
-To install directly from local Formula or release asset:
-```sh
-brew install --build-from-source Formula/dag.rb
+brew install NoelMinamino/karidns/dag
 ```
 
 ### 4.2 Standalone DMG
 1. Download the DMG for your architecture from GitHub Releases:
-   - **Apple Silicon (M1/M2/M3/M4):** `dag-<version>-macos-arm64.dmg`
-   - **Intel:** `dag-<version>-macos-x86_64.dmg`
+   - **Apple Silicon (M1/M2/M3/M4):** `dag-?.?.?-macos-arm64.dmg`
+   - **Intel:** `dag-?.?.?-macos-x86_64.dmg`
 2. Double click to mount the DMG.
 3. Copy `bin/dag` to `/usr/local/bin`:
    ```sh
