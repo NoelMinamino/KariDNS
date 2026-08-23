@@ -36,7 +36,7 @@ fi
 
 # Build native binary for the current runner architecture
 echo "==> Compiling dag for ${ARCH}..."
-clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pie \
+clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pie -DKARIDNS_VERSION=\"${VERSION}\" \
       ${SSL_INC} ${IDN_INC} ${IDN_DEF} \
       tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c \
       -o "${STAGE_DIR}/dag" \

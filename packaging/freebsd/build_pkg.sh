@@ -15,7 +15,7 @@ MANIFEST_DIR="$(mktemp -d -t karidns-pkg-manifest)"
 
 echo "==> Building KariDNS binaries for FreeBSD (${ARCH}, version ${VERSION})..."
 make clean
-make all
+make VERSION="${VERSION}" all
 
 echo "==> Preparing staging root..."
 mkdir -p "${STAGE_DIR}/usr/local/sbin"

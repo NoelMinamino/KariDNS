@@ -16,6 +16,7 @@
 #include <openssl/rand.h>
 
 #include "../dns_wire.h"
+#include "../dns_utils.h"
 
 #ifndef explicit_bzero
 #if defined(OPENSSL_VERSION_NUMBER)
@@ -84,20 +85,27 @@ char* extract_secret_from_config(const char* path) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0)) {
+        printf("karictl %s\n", KARIDNS_VERSION);
+        return 0;
+    }
     const char *conf_path = "/usr/local/etc/karictl.conf";
     int opt;
-    while ((opt = getopt(argc, argv, "f:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:v")) != -1) {
         switch (opt) {
             case 'f':
                 conf_path = optarg;
                 break;
+            case 'v':
+                printf("karictl %s\n", KARIDNS_VERSION);
+                return 0;
             default:
-                fprintf(stderr, "Usage: %s [-f config_path] <command> [args...]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-f config_path] [-v] <command> [args...]\n", argv[0]);
                 return 1;
         }
     }
     if (optind >= argc) {
-        fprintf(stderr, "Usage: %s [-f config_path] <command> [args...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-f config_path] [-v] <command> [args...]\n", argv[0]);
         fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, tsig-keygen [keyname]\n");
         return 1;
     }
@@ -269,7 +277,7 @@ int main(int argc, char **argv) {
             tm_info = localtime(&st.last_configured_time);
             strftime(config_str, sizeof(config_str), "%d-%b-%Y %H:%M:%S.%03d", tm_info);
             
-            printf("version: KariDNS 0.0.0 (Authoritative)\n");
+            printf("version: KariDNS %s (Authoritative)\n", KARIDNS_VERSION);
             printf("running on %s: %s %s %s\n", un.nodename, un.sysname, un.machine, un.release);
             printf("boot time: %s\n", boot_str);
             printf("last configured: %s\n", config_str);

@@ -945,6 +945,7 @@ static int check_config(const char *config_path, server_config_t *cfg) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "  %s [-v | --version]\n", prog);
     fprintf(stderr, "  %s conf [config_path]\n", prog);
     fprintf(stderr, "  %s zones [config_path]\n", prog);
     fprintf(stderr, "  %s zone <domain> [config_path]\n", prog);
@@ -955,6 +956,11 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
+        printf("karicheck %s\n", KARIDNS_VERSION);
+        return 0;
     }
 
     const char *cmd = argv[1];

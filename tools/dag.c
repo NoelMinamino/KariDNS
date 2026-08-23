@@ -5451,7 +5451,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+noidnout") == 0) {
             spec->dopt.idnout = false;
         } else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
-            printf("KariDNS dag v0.0.1\n");
+            printf("KariDNS dag v%s\n", KARIDNS_VERSION);
             exit(0);
         } else if (strcmp(arg, "+norec") == 0 || strcmp(arg, "+norecurse") == 0 || strcmp(arg, "+nordflag") == 0) {
             spec->norecurse = true; spec->qo.rd_flag = false;

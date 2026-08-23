@@ -6485,7 +6485,10 @@ int main(int argc, char **argv) {
   const char *config_file = NULL;
 
   for (int i = 1; i < argc; i++) {
-      if (strcmp(argv[i], "-f") == 0) {
+      if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
+          printf("KariDNS %s\n", KARIDNS_VERSION);
+          return 0;
+      } else if (strcmp(argv[i], "-f") == 0) {
           foreground = true;
       } else {
           config_file = argv[i];
@@ -6493,7 +6496,8 @@ int main(int argc, char **argv) {
   }
 
   if (!config_file) {
-    syslog(LOG_ERR, "Usage: %s [-f] <config_file>", argv[0]);
+    fprintf(stderr, "Usage: %s [-v | --version] [-f] <config_file>\n", argv[0]);
+    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] <config_file>", argv[0]);
     return 1;
   }
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
@@ -6512,6 +6516,7 @@ int main(int argc, char **argv) {
 
   g_config_path = config_file;
   openlog("KariDNS", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
+  syslog(LOG_INFO, "Starting KariDNS %s...", KARIDNS_VERSION);
   start_connect_broker();
   if (!foreground) {
     daemonize();
