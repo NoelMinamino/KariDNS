@@ -4748,6 +4748,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
      * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
      * (resolve_server_addr()がgetaddrinfo()で解決する)。
      */
+    if (!server_arg) return 1;
     char *server_list_buf = strdup(server_arg);
     if (!server_list_buf) { perror("strdup"); return 1; }
     const char *servers[MAX_DAG_SERVERS];
@@ -4757,6 +4758,12 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         char *save = NULL;
         char *tok = strtok_r(server_list_buf, ",", &save);
         while (tok) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            char *end = tok + strlen(tok);
+            while (end > tok && isspace((unsigned char)end[-1])) {
+                *--end = '\0';
+            }
+
             if (*tok == '\0') {
                 fprintf(stderr, "warning: skipping empty server entry\n");
             } else if (server_count >= MAX_DAG_SERVERS) {
@@ -4773,8 +4780,14 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                         if (close[1] == ':' && close[2] != '\0') {
                             char *endptr;
                             long p = strtol(close + 2, &endptr, 10);
-                            if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
+                            if (*endptr == '\0' && p > 0 && p <= 65535) {
+                                srv_port = (int)p;
+                            } else {
+                                fprintf(stderr, "warning: invalid port '%s' for server '%s'; using default %d\n", close + 2, tok, port);
+                            }
                         }
+                    } else {
+                        fprintf(stderr, "warning: unclosed IPv6 bracket in server entry '%s'\n", tok);
                     }
                 } else {
                     // IPv4/FQDN: 最後の ':' をポート区切りとして扱う
@@ -4784,7 +4797,11 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                         *first_colon = '\0';
                         char *endptr;
                         long p = strtol(first_colon + 1, &endptr, 10);
-                        if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
+                        if (*endptr == '\0' && p > 0 && p <= 65535) {
+                            srv_port = (int)p;
+                        } else {
+                            fprintf(stderr, "warning: invalid port '%s' for server '%s'; using default %d\n", first_colon + 1, tok, port);
+                        }
                     }
                 }
                 servers[server_count] = tok;
