@@ -3,14 +3,21 @@ name: KariDNS CI
 on:
   push:
     branches:
-      - main
+      - 'main'
   pull_request:
     branches:
-      - main
+      - 'main'
+      - 'feature/**'
+      - 'fix/**'
+      - 'improve/**'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-test:
+  build-and-test-freebsd:
     name: Build and Test on FreeBSD ${{ matrix.release }}
     runs-on: ubuntu-latest
     strategy:
@@ -76,4 +83,90 @@ jobs:
             echo "::endgroup::"
 
             echo ""
-            echo "🎉 All builds and smoke tests passed!"
+            echo "🎉 All FreeBSD builds and smoke tests passed!"
+
+  build-dag-unix:
+    name: Build & Smoke Test dag on ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux (Ubuntu)
+          - os: macos-14
+            name: macOS 14 (ARM64)
+          - os: macos-15
+            name: macOS 15 (ARM64)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev zlib1g-dev libidn2-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3 zlib libidn2
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          LIBIDN2_PREFIX=$(brew --prefix libidn2 2>/dev/null || echo "")
+          echo "PKG_CONFIG_PATH=${OPENSSL_PREFIX}/lib/pkgconfig:${LIBIDN2_PREFIX}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+      - name: Build dag
+        run: |
+          make clean
+          make dag
+
+      - name: Smoke Test dag queries
+        run: |
+          echo "::group::🔍 Test dag execution"
+          ./dag --help || true
+          echo "Testing UDP query..."
+          ./dag www.google.com A @8.8.8.8
+          echo "Testing TCP query..."
+          ./dag google.com TXT @8.8.8.8 +tcp
+          echo "Testing multiple UDP query..."
+          ./dag www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
+          echo "::endgroup::"
+
+  build-dag-windows:
+    name: Build & Smoke Test dag on Windows (MinGW-w64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 and MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-libidn2
+            make
+
+      - name: Build dag.exe
+        shell: msys2 {0}
+        run: |
+          make clean
+          make dag
+
+      - name: Smoke Test dag.exe queries
+        shell: msys2 {0}
+        run: |
+          echo "::group::🔍 Test dag.exe execution"
+          ./dag.exe --help || true
+          echo "Testing UDP query..."
+          ./dag.exe www.google.com A @8.8.8.8
+          echo "Testing TCP query..."
+          ./dag.exe google.com TXT @8.8.8.8 +tcp
+          echo "Testing multiple UDP query..."
+          ./dag.exe www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
+          echo "::endgroup::"

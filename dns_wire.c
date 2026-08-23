@@ -2603,6 +2603,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
 
             if (standby->count >= standby->records_cap) {
                 size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
+                if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return 2;
                 dns_record_t *new_arr = realloc(standby->records, new_cap * sizeof(dns_record_t));
                 if (!new_arr) return 2;
                 standby->records = new_arr;

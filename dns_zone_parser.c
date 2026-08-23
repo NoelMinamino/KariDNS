@@ -1109,6 +1109,8 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->hash_table = NULL;
   arena->nsec_records = NULL;
   arena->nsec_count = 0;
+  arena->sorted_unique_names = NULL;
+  arena->sorted_unique_count = 0;
   atomic_init(&arena->reader_count, 0);
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
@@ -1128,6 +1130,9 @@ void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->nsec_records);
   arena->nsec_records = NULL;
   arena->nsec_count = 0;
+  free(arena->sorted_unique_names);
+  arena->sorted_unique_names = NULL;
+  arena->sorted_unique_count = 0;
   zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {
@@ -1153,6 +1158,12 @@ static int cmp_canonical_nsec_ptr(const void *a, const void *b) {
   return compare_canonical_name(r1->name, r2->name);
 }
 
+static int cmp_canonical_name_ptr(const void *a, const void *b) {
+  const char *s1 = *(const char * const *)a;
+  const char *s2 = *(const char * const *)b;
+  return compare_canonical_name(s1, s2);
+}
+
 int build_zone_index(zone_arena_t *arena) {
   if (arena->hash_table) {
     free(arena->hash_table);
@@ -1162,6 +1173,11 @@ int build_zone_index(zone_arena_t *arena) {
     free(arena->nsec_records);
     arena->nsec_records = NULL;
     arena->nsec_count = 0;
+  }
+  if (arena->sorted_unique_names) {
+    free(arena->sorted_unique_names);
+    arena->sorted_unique_names = NULL;
+    arena->sorted_unique_count = 0;
   }
   arena->hash_size = next_pow2(arena->count * 2);
   if (arena->hash_size == 0) arena->hash_size = 1;
@@ -1201,6 +1217,36 @@ int build_zone_index(zone_arena_t *arena) {
       qsort(arena->nsec_records, arena->nsec_count, sizeof(dns_record_t *), cmp_canonical_nsec_ptr);
     } else {
       arena->nsec_count = 0;
+    }
+  }
+
+  if (arena->count > 0) {
+    char **tmp_names = malloc(sizeof(char *) * arena->count);
+    if (tmp_names) {
+      size_t valid_cnt = 0;
+      for (size_t i = 0; i < arena->count; i++) {
+        if (arena->records[i].name) {
+          tmp_names[valid_cnt++] = arena->records[i].name;
+        }
+      }
+      if (valid_cnt > 0) {
+        qsort(tmp_names, valid_cnt, sizeof(char *), cmp_canonical_name_ptr);
+        size_t ucnt = 0;
+        for (size_t i = 0; i < valid_cnt; i++) {
+          if (i == 0 || compare_canonical_name(tmp_names[i], tmp_names[ucnt - 1]) != 0) {
+            tmp_names[ucnt++] = tmp_names[i];
+          }
+        }
+        arena->sorted_unique_names = tmp_names;
+        arena->sorted_unique_count = ucnt;
+      } else {
+        free(tmp_names);
+        arena->sorted_unique_names = NULL;
+        arena->sorted_unique_count = 0;
+      }
+    } else {
+      arena->sorted_unique_names = NULL;
+      arena->sorted_unique_count = 0;
     }
   }
 

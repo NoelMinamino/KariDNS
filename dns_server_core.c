@@ -2318,6 +2318,11 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     dst->nsec_records = NULL;
     dst->nsec_count = 0;
   }
+  if (dst->sorted_unique_names) {
+    free(dst->sorted_unique_names);
+    dst->sorted_unique_names = NULL;
+    dst->sorted_unique_count = 0;
+  }
   dst->count = 0;
   dst->data_pool_count = 0;
   dst->current_pool_cap = 0;
@@ -2754,16 +2759,29 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name) {
     if (strcasecmp(zone->records[i].name, name) == 0) return true;
   }
 
-  // (b) Empty Non-Terminal (ENT) check: any record having name as a proper suffix on label boundary
-  for (size_t i = 0; i < zone->count; i++) {
-    const char *rn = zone->records[i].name;
-    if (!rn) continue;
-    size_t rn_len = strlen(rn);
-    if (rn_len > name_len &&
-        rn[rn_len - name_len - 1] == '.' &&
-        strcasecmp(rn + rn_len - name_len, name) == 0) {
-      return true;
+  // (b) Empty Non-Terminal (ENT) check via binary search on sorted_unique_names
+  if (!zone->sorted_unique_names || zone->sorted_unique_count == 0) return false;
+
+  int lo = 0, hi = (int)zone->sorted_unique_count - 1;
+  int pos = (int)zone->sorted_unique_count;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (compare_canonical_name(zone->sorted_unique_names[mid], name) > 0) {
+      pos = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
     }
+  }
+
+  if (pos >= (int)zone->sorted_unique_count) return false;
+
+  const char *rn = zone->sorted_unique_names[pos];
+  size_t rn_len = strlen(rn);
+  if (rn_len > name_len &&
+      rn[rn_len - name_len - 1] == '.' &&
+      strcasecmp(rn + rn_len - name_len, name) == 0) {
+    return true;
   }
   return false;
 }
@@ -3453,6 +3471,10 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       const char *client_ip, compress_ctx_t *comp_ctx,
                       bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap) {
+  if (req_len < DNS_HEADER_SIZE) {
+    return 0; // 不正な短いパケットは無応答で破棄
+  }
+
   server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
@@ -3496,10 +3518,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
         *out_rrl_cfg = &zcfg->rrl;
       }
     }
-  }
-
-  if (req_len < DNS_HEADER_SIZE) {
-    return -1;
   }
   
   uint16_t qdcount = (req[4] << 8) | req[5],
@@ -5015,7 +5033,8 @@ worker_startup_success:;
             continue;
 
           udp_ipc_t *ipc_msg = (udp_ipc_t *)req_buf_full;
-          if (ipc_msg->payload_len > received - (ssize_t)sizeof(udp_ipc_t))
+          if (ipc_msg->payload_len > received - (ssize_t)sizeof(udp_ipc_t) ||
+              ipc_msg->payload_len < DNS_HEADER_SIZE)
             continue;
           uint8_t *req_buf = req_buf_full + sizeof(udp_ipc_t);
           ssize_t payload_received = ipc_msg->payload_len;
@@ -6234,7 +6253,9 @@ static void run_frontend_router(pid_t backend_pid) {
 
           msg->sock_fd_idx = ud;
           msg->payload_len = len;
-          send(g_ipc_fds[rr][0], buffer, sizeof(udp_ipc_t) + len, 0);
+          if (len >= DNS_HEADER_SIZE) {
+            send(g_ipc_fds[rr][0], buffer, sizeof(udp_ipc_t) + len, 0);
+          }
           rr = (rr + 1) % g_num_ipc;
         }
       } else if (ud == 999) {

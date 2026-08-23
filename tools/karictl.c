@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/ucred.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <time.h>
@@ -15,6 +16,18 @@
 #include <openssl/rand.h>
 
 #include "../dns_wire.h"
+
+#ifndef explicit_bzero
+#if defined(OPENSSL_VERSION_NUMBER)
+#define explicit_bzero(ptr, len) OPENSSL_cleanse(ptr, len)
+#else
+static inline void karictl_explicit_bzero(void *p, size_t n) {
+    volatile unsigned char *vp = (volatile unsigned char *)p;
+    while (n--) *vp++ = 0;
+}
+#define explicit_bzero karictl_explicit_bzero
+#endif
+#endif
 
 char *read_entire_file(const char *path) {
   FILE *f = fopen(path, "r");
@@ -32,6 +45,15 @@ char *read_entire_file(const char *path) {
 }
 
 char* extract_secret_from_config(const char* path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (st.st_mode & (S_IRGRP | S_IROTH)) {
+            fprintf(stderr, "[WARNING] %s is readable by group/other users; "
+                            "this file contains a shared secret and should be "
+                            "mode 0600 (owner read/write only)\n", path);
+        }
+    }
+
     char *cfg = read_entire_file(path);
     if (!cfg) return NULL;
     
@@ -109,6 +131,7 @@ int main(int argc, char **argv) {
     size_t b64_len = strlen(secret_b64);
     if (b64_len > 341) { // 256*4/3 safe upper bound to prevent stack-buffer-overflow
         fprintf(stderr, "Secret in config too long (max ~341 base64 chars)\n");
+        explicit_bzero(secret_b64, b64_len);
         free(secret_b64);
         return 2;
     }
@@ -117,6 +140,7 @@ int main(int argc, char **argv) {
     int len = EVP_DecodeBlock(secret_decoded, (const unsigned char *)secret_b64, (int)b64_len);
     if (len < 0) {
         fprintf(stderr, "Failed to decode base64 secret\n");
+        explicit_bzero(secret_b64, b64_len);
         free(secret_b64);
         return 2;
     }
@@ -124,11 +148,13 @@ int main(int argc, char **argv) {
     if (b64_len > 0 && secret_b64[b64_len - 1] == '=') padding++;
     if (b64_len > 1 && secret_b64[b64_len - 2] == '=') padding++;
     size_t secret_decoded_len = len - padding;
+    explicit_bzero(secret_b64, b64_len);
     free(secret_b64);
 
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("socket");
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 1;
     }
 
@@ -141,6 +167,7 @@ int main(int argc, char **argv) {
     if (connect(sock, (struct sockaddr *)&un, sizeof(un)) < 0) {
         perror("connect");
         close(sock);
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 1;
     }
 
@@ -149,6 +176,7 @@ int main(int argc, char **argv) {
     if (r <= 0) {
         fprintf(stderr, "Failed to receive challenge\n");
         close(sock);
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 1;
     }
     buf[r] = '\0';
@@ -156,6 +184,7 @@ int main(int argc, char **argv) {
     if (strncmp(buf, "CHALLENGE ", 10) != 0) {
         fprintf(stderr, "Invalid challenge format\n");
         close(sock);
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 2;
     }
 
@@ -167,6 +196,7 @@ int main(int argc, char **argv) {
     if (challenge_len != EXPECTED_CHALLENGE_LEN) {
         fprintf(stderr, "Invalid challenge length: %zu\n", challenge_len);
         close(sock);
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 2;
     }
 
@@ -176,6 +206,7 @@ int main(int argc, char **argv) {
     unsigned int md_len;
     HMAC(EVP_sha256(), secret_decoded, secret_decoded_len, 
          (unsigned char*)challenge, challenge_len, md, &md_len);
+    explicit_bzero(secret_decoded, sizeof(secret_decoded));
     
     char auth_msg[256];
     char expected[65];

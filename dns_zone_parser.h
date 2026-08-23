@@ -51,6 +51,8 @@ typedef struct zone_arena_s {
   size_t hash_size;
   dns_record_t **nsec_records;
   size_t nsec_count;
+  char **sorted_unique_names;
+  size_t sorted_unique_count;
   _Atomic int reader_count;
 } zone_arena_t;
 

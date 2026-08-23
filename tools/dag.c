@@ -107,6 +107,11 @@ static inline void set_socket_timeouts(int sock, int timeout_sec) {
 }
 
 #if !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(__APPLE__)
+#if defined(__linux__)
+#include <sys/random.h>
+#include <fcntl.h>
+#endif
+
 /* Portable strlcpy for Linux / non-BSD platforms */
 static inline size_t dag_strlcpy(char *dst, const char *src, size_t siz) {
     char *d = dst;
@@ -136,6 +141,17 @@ static inline uint32_t dag_arc4random(void) {
     if (RAND_bytes((unsigned char *)&val, sizeof(val)) == 1) {
         return val;
     }
+#if defined(__linux__)
+    if (getrandom(&val, sizeof(val), 0) == (ssize_t)sizeof(val)) {
+        return val;
+    }
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, &val, sizeof(val));
+        close(fd);
+        if (n == (ssize_t)sizeof(val)) return val;
+    }
+#endif
     return (uint32_t)rand();
 }
 #undef arc4random
@@ -208,6 +224,10 @@ static zone_arena_t g_dag_arena;
 static void reset_dag_arena(void) {
     zone_arena_destroy(&g_dag_arena);
     zone_arena_init(&g_dag_arena);
+}
+
+static inline int timespec_diff_ms(const struct timespec *start, const struct timespec *end) {
+    return (int)((end->tv_sec - start->tv_sec) * 1000 + (end->tv_nsec - start->tv_nsec) / 1000000);
 }
 
 /* ========================================================================
@@ -462,7 +482,10 @@ static void parse_break_arg(const char *arg) {
     else if (strcmp(name, "opcode") == 0)                 kind = BRK_OPCODE;
     else if (strcmp(name, "qr-bit") == 0)                 kind = BRK_QR_BIT;
     else if (strcmp(name, "notify-no-question") == 0)     kind = BRK_NOTIFY_NO_QUESTION;
-    else if (strcmp(name, "too-short") == 0)              kind = BRK_TOO_SHORT;
+    else if (strcmp(name, "too-short") == 0 || strcmp(name, "short-header") == 0) {
+        kind = BRK_TOO_SHORT;
+        if (!has_param) { param = 3; has_param = true; }
+    }
     else if (strcmp(name, "tcp-length-overclaim") == 0)   { kind = BRK_TCP_LENGTH_OVERCLAIM; if (!has_param) { param = 10; has_param = true; } }
     else if (strcmp(name, "tcp-zero-length") == 0)        kind = BRK_TCP_ZERO_LENGTH;
     else if (strcmp(name, "tcp-idle-hold") == 0)          { kind = BRK_TCP_IDLE_HOLD; if (!has_param) { param = 20; has_param = true; } }
@@ -493,7 +516,8 @@ static void print_break_help(void) {
         "  opcode=N                   override header OPCODE\n"
         "  qr-bit                     set QR=1 on an outgoing query\n"
         "  notify-no-question         OPCODE=4 (NOTIFY) with QDCOUNT=0, no question\n"
-        "  too-short                  send only the first 3 bytes of the message\n"
+        "  too-short[=N]              send only the first N bytes of the message (default 3)\n"
+        "  short-header[=N]           alias for too-short[=N]\n"
         "  tcp-length-overclaim[=N]   (--tcp only) length prefix N bytes bigger than body sent\n"
         "  tcp-zero-length            (--tcp only) send a 0 length prefix\n"
         "  tcp-idle-hold[=SEC]        (--tcp only) send only the length prefix, hold the\n"
@@ -798,6 +822,14 @@ static size_t build_proxyv2_header(uint8_t *buf, size_t buf_cap, const query_opt
         buf[off++] = dp >> 8; buf[off++] = dp & 0xFF;
     }
     return off;
+}
+
+static void send_proxyv2_if_enabled(int sock, const query_opts_t *qo, bool is_tcp) {
+    if (qo && qo->use_proxy) {
+        uint8_t pbuf[64];
+        size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, is_tcp);
+        if (plen > 0) send(sock, pbuf, plen, 0);
+    }
 }
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
@@ -1422,7 +1454,11 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
         wire_len = build_proxyv2_header(wire_buf, sizeof(wire_buf), qo, false);
     }
     size_t send_len = pkt_len;
-    if (has_break(BRK_TOO_SHORT, NULL, NULL) && send_len > 3) send_len = 3;
+    long short_len = 3;
+    if (has_break(BRK_TOO_SHORT, &short_len, NULL)) {
+        if (short_len < 0) short_len = 3;
+        if (send_len > (size_t)short_len) send_len = (size_t)short_len;
+    }
     memcpy(wire_buf + wire_len, pkt, send_len);
     wire_len += send_len;
 
@@ -1441,19 +1477,19 @@ static int do_tcp_send_request(const char *server, int port, const query_opts_t 
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port);
     if (sock < 0) return -1;
 
-    if (qo && qo->use_proxy) {
-        uint8_t pbuf[64];
-        size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
-        if (plen > 0) send(sock, pbuf, plen, 0);
-    }
+    send_proxyv2_if_enabled(sock, qo, true);
 
     long idle_secs = 20; bool idle_hold = has_break(BRK_TCP_IDLE_HOLD, &idle_secs, NULL);
     long overclaim = 0; bool overclaim_break = has_break(BRK_TCP_LENGTH_OVERCLAIM, &overclaim, NULL);
     bool zero_len_break = has_break(BRK_TCP_ZERO_LENGTH, NULL, NULL);
-    bool too_short = has_break(BRK_TOO_SHORT, NULL, NULL);
+    long short_len = 3;
+    bool too_short = has_break(BRK_TOO_SHORT, &short_len, NULL);
 
     size_t body_len = pkt_len;
-    if (too_short && body_len > 3) body_len = 3;
+    if (too_short) {
+        if (short_len < 0) short_len = 3;
+        if (body_len > (size_t)short_len) body_len = (size_t)short_len;
+    }
 
     uint16_t prefix_value;
     if (zero_len_break) prefix_value = 0;
@@ -1588,11 +1624,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port);
     if (sock < 0) return -1;
     set_socket_timeouts(sock, timeout_sec);
-    if (qo->use_proxy) {
-        uint8_t pbuf[64];
-        size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
-        if (plen > 0) send(sock, pbuf, plen, 0);
-    }
+    send_proxyv2_if_enabled(sock, qo, true);
     SSL *ssl = establish_tls(sock, qo, server, port);
     if (!ssl) {
         close(sock);
@@ -1648,11 +1680,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port);
     if (sock < 0) return -1;
     set_socket_timeouts(sock, timeout_sec);
-    if (qo->use_proxy) {
-        uint8_t pbuf[64];
-        size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, true);
-        if (plen > 0) send(sock, pbuf, plen, 0);
-    }
+    send_proxyv2_if_enabled(sock, qo, true);
     SSL *ssl = NULL;
     if (qo->doh_tls) {
         ssl = establish_tls(sock, qo, server, port);
@@ -1891,6 +1919,25 @@ static char *base64_encode_alloc(const uint8_t *data, size_t len, int *out_len) 
     return buf;
 }
 
+static void print_split_b64(const char *b64, int len, int split_width) {
+    if (split_width > 0 && len > split_width) {
+        for (int i = 0; i < len; i += split_width) {
+            if (i > 0) printf(" ");
+            printf("%.*s", (len - i) < split_width ? (len - i) : split_width, b64 + i);
+        }
+    } else {
+        printf("%.*s", len, b64);
+    }
+}
+
+static void print_split_hex(const uint8_t *data, size_t len, int split_width) {
+    int sw = (split_width > 0) ? (split_width / 2) : 0;
+    for (size_t i = 0; i < len; i++) {
+        if (sw > 0 && i > 0 && (i % sw) == 0) printf(" ");
+        printf("%02X", data[i]);
+    }
+}
+
 static void print_dnskey_like(const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
     if (rdlen < 4) { printf("(malformed)"); return; }
     uint16_t flags = (rdata[0]<<8)|rdata[1];
@@ -1922,14 +1969,7 @@ static void print_dnskey_like(const uint8_t *rdata, size_t rdlen, const display_
         }
     } else {
         printf("%u %u %u ", flags, protocol, algorithm);
-        if (dopt && dopt->split_width > 0) {
-            for (int i = 0; i < n; i += dopt->split_width) {
-                if (i > 0) printf(" ");
-                printf("%.*s", (n - i) < dopt->split_width ? (n - i) : dopt->split_width, b64 + i);
-            }
-        } else {
-            printf("%.*s", n, b64);
-        }
+        print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
         if (dopt && dopt->rrcomments) {
             printf("  ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
         }
@@ -1962,11 +2002,7 @@ static void print_ds_like(const uint8_t *rdata, size_t rdlen, const display_opts
         printf("\t\t\t\t\t)");
     } else {
         printf("%u %u %u ", keytag, algorithm, digest_type);
-        int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
-        for (size_t i = 4; i < rdlen; i++) {
-            if (sw > 0 && (i - 4) > 0 && ((i - 4) % sw) == 0) printf(" ");
-            printf("%02X", rdata[i]);
-        }
+        print_split_hex(&rdata[4], rdlen - 4, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
     }
 }
 
@@ -2107,11 +2143,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         printf("\\# %u", rdlen);
         if (rdlen > 0) {
             printf(" ");
-            int sw = (dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
-            for (uint16_t i = 0; i < rdlen && abs_offset + i < pkt_len; i++) {
-                if (sw > 0 && i > 0 && (i % sw) == 0) printf(" ");
-                printf("%02X", pkt[abs_offset + i]);
-            }
+            size_t valid_len = (abs_offset + rdlen <= pkt_len) ? rdlen : (pkt_len - abs_offset);
+            print_split_hex(&pkt[abs_offset], valid_len, dopt->split_width);
         }
         return;
     }
@@ -2347,11 +2380,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         case 44: { // SSHFP
             if (rdlen < 2) goto fallback;
             printf("%u %u ", pkt[abs_offset], pkt[abs_offset + 1]);
-            int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
-            for (size_t i = 2; i < rdlen; i++) {
-                if (sw > 0 && (i - 2) > 0 && ((i - 2) % sw) == 0) printf(" ");
-                printf("%02X", pkt[abs_offset + i]);
-            }
+            print_split_hex(&pkt[abs_offset + 2], rdlen - 2, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
             break;
         }
         case 45: { // IPSECKEY
@@ -2385,14 +2414,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 int n = 0;
                 char *b64 = base64_encode_alloc(p, key_len, &n);
                 if (!b64) goto fallback;
-                if (dopt && dopt->split_width > 0 && n > dopt->split_width) {
-                    for (int i = 0; i < n; i += dopt->split_width) {
-                        if (i > 0) printf(" ");
-                        printf("%.*s", (n - i) < dopt->split_width ? (n - i) : dopt->split_width, b64 + i);
-                    }
-                } else {
-                    printf("%s", b64);
-                }
+                print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 free(b64);
             }
             break;
@@ -2402,14 +2424,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             int n = 0;
             char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &n);
             if (!b64) goto fallback;
-            if (dopt && dopt->split_width > 0 && n > dopt->split_width) {
-                for (int i = 0; i < n; i += dopt->split_width) {
-                    if (i > 0) printf(" ");
-                    printf("%.*s", (n - i) < dopt->split_width ? (n - i) : dopt->split_width, b64 + i);
-                }
-            } else {
-                printf("%s", b64);
-            }
+            print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
             free(b64);
             break;
         }
@@ -2420,11 +2435,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         case 52: case 53: { // TLSA / SMIMEA
             if (rdlen < 3) goto fallback;
             printf("%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
-            int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
-            for (size_t i = 3; i < rdlen; i++) {
-                if (sw > 0 && (i - 3) > 0 && ((i - 3) % sw) == 0) printf(" ");
-                printf("%02X", pkt[abs_offset + i]);
-            }
+            print_split_hex(&pkt[abs_offset + 3], rdlen - 3, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
             break;
         }
         case 64: case 65: { // SVCB / HTTPS
@@ -2545,14 +2556,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             } else {
                 printf("%s %u %u %u %s %s %u %s ", covered_name, algorithm, labels,
                        original_ttl, exp_str, inc_str, key_tag, signer_name);
-                if (dopt && dopt->split_width > 0) {
-                    for (int i = 0; i < n; i += dopt->split_width) {
-                        if (i > 0) printf(" ");
-                        printf("%.*s", (n - i) < dopt->split_width ? (n - i) : dopt->split_width, b64 + i);
-                    }
-                } else {
-                    printf("%.*s", n, b64);
-                }
+                print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
             }
             free(b64);
             break;
@@ -2672,11 +2676,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint8_t scheme = pkt[abs_offset+4];
             uint8_t halg = pkt[abs_offset+5];
             printf("%u %u %u ", serial, scheme, halg);
-            int sw = (dopt && dopt->split_width > 0) ? (dopt->split_width / 2) : 0;
-            for (uint16_t i = 6; i < rdlen; i++) {
-                if (sw > 0 && (i - 6) > 0 && ((i - 6) % sw) == 0) printf(" ");
-                printf("%02X", pkt[abs_offset + i]);
-            }
+            print_split_hex(&pkt[abs_offset + 6], rdlen - 6, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
             break;
         }
         case 104: { // NID
@@ -4359,7 +4359,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
     
     if (root_n > 0) {
-        int dt_ms = (end_ts.tv_sec - start_ts.tv_sec) * 1000 + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+        int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
         record_ldnsz_result(eff_server, root_n, root_resp, dt_ms);
         if (!no_hexdump_response) {
             printf("Response (%zd bytes):\n", root_n);
@@ -4371,7 +4371,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
     if (root_n > 12) {
         axfr_state_t dummy_axfr = {0};
         print_response(root_resp, root_n, &dummy_axfr, &trace_dopt);
-        int dt_ms = (end_ts.tv_sec - start_ts.tv_sec) * 1000 + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+        int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
         printf(";; Received %zd bytes from %s#%d in %d ms\n\n", root_n, eff_server, port, dt_ms);
         
         int r_qd = (root_resp[4] << 8) | root_resp[5];
@@ -4444,7 +4444,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
             return 9;
         }
         
-        int dt_ms = (end_ts.tv_sec - start_ts.tv_sec) * 1000 + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+        int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
         record_ldnsz_result(target_ips[0], n, resp, dt_ms);
 
         if (!no_hexdump_response) {
@@ -4537,7 +4537,7 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     ssize_t n = do_udp_exchange(eff_server, port, &qo, qbuf, qlen, resp, sizeof(resp), qo.timeout_sec);
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
     if (n > 0) {
-        int dt_ms = (end_ts.tv_sec - start_ts.tv_sec) * 1000 + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+        int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
         record_ldnsz_result(eff_server, n, resp, dt_ms);
         if (!no_hexdump_response) {
             printf("Response (%zd bytes):\n", n);
@@ -4613,7 +4613,7 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
             ssize_t rn = do_udp_exchange(eff_server, port, &qo, qbuf, rlen, resp, sizeof(resp), qo.timeout_sec);
             clock_gettime(CLOCK_MONOTONIC, &end_ts);
             if (rn > 0) {
-                int dt_ms = (end_ts.tv_sec - start_ts.tv_sec) * 1000 + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+                int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
                 record_ldnsz_result(eff_server, rn, resp, dt_ms);
                 if (!no_hexdump_response) {
                     printf("Response (%zd bytes):\n", rn);
@@ -4655,7 +4655,7 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
         int dt_ms = 0;
         if (sn > 0) {
-            dt_ms = (end_ts.tv_sec - start_ts.tv_sec) * 1000 + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+            dt_ms = timespec_diff_ms(&start_ts, &end_ts);
             record_ldnsz_result(all_ns_ips[k].ip, sn, resp, dt_ms);
             if (!no_hexdump_response) {
                 printf("Response (%zd bytes):\n", sn);
@@ -4720,6 +4720,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
      * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
      * (resolve_server_addr()がgetaddrinfo()で解決する)。
      */
+    if (!server_arg) return 1;
     char *server_list_buf = strdup(server_arg);
     if (!server_list_buf) { perror("strdup"); return 1; }
     const char *servers[MAX_DAG_SERVERS];
@@ -4729,6 +4730,12 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         char *save = NULL;
         char *tok = strtok_r(server_list_buf, ",", &save);
         while (tok) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            char *end = tok + strlen(tok);
+            while (end > tok && isspace((unsigned char)end[-1])) {
+                *--end = '\0';
+            }
+
             if (*tok == '\0') {
                 fprintf(stderr, "warning: skipping empty server entry\n");
             } else if (server_count >= MAX_DAG_SERVERS) {
@@ -4745,8 +4752,14 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                         if (close[1] == ':' && close[2] != '\0') {
                             char *endptr;
                             long p = strtol(close + 2, &endptr, 10);
-                            if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
+                            if (*endptr == '\0' && p > 0 && p <= 65535) {
+                                srv_port = (int)p;
+                            } else {
+                                fprintf(stderr, "warning: invalid port '%s' for server '%s'; using default %d\n", close + 2, tok, port);
+                            }
                         }
+                    } else {
+                        fprintf(stderr, "warning: unclosed IPv6 bracket in server entry '%s'\n", tok);
                     }
                 } else {
                     // IPv4/FQDN: 最後の ':' をポート区切りとして扱う
@@ -4756,7 +4769,11 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                         *first_colon = '\0';
                         char *endptr;
                         long p = strtol(first_colon + 1, &endptr, 10);
-                        if (*endptr == '\0' && p > 0 && p <= 65535) srv_port = (int)p;
+                        if (*endptr == '\0' && p > 0 && p <= 65535) {
+                            srv_port = (int)p;
+                        } else {
+                            fprintf(stderr, "warning: invalid port '%s' for server '%s'; using default %d\n", first_colon + 1, tok, port);
+                        }
                     }
                 }
                 servers[server_count] = tok;
