@@ -36,6 +36,16 @@ cp "${DAG_BIN}" "${PKG_DIR}/dag.exe"
 mkdir -p "${PKG_DIR}/docs"
 [ -f "docs/dag.md" ] && cp "docs/dag.md" "${PKG_DIR}/docs/"
 
+# Auto-bundle non-system runtime DLLs if dynamically linked
+if command -v ldd >/dev/null 2>&1; then
+    for dll in $(ldd "${DAG_BIN}" 2>/dev/null | grep -iE 'mingw|msys|ucrt|clang' | awk '{print $3}' | grep -v '^/c/Windows'); do
+        if [ -f "$dll" ]; then
+            echo "==> Bundling dependent DLL: $dll"
+            cp "$dll" "${PKG_DIR}/" 2>/dev/null || true
+        fi
+    done
+fi
+
 ZIP_NAME="dag-${VERSION}-windows-x86_64.zip"
 
 if command -v zip >/dev/null 2>&1; then
