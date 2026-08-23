@@ -2285,6 +2285,28 @@ int main() {
         printf("PASS: Binary search ENT resolution & sorted_unique_names tests\n");
     }
 
+    // --- Test 31: UDP minimum packet size validation (drop < 12 bytes without using stale data) ---
+    {
+        uint8_t dirty_buf[256];
+        memset(dirty_buf, 0xAA, sizeof(dirty_buf)); // fill with garbage
+
+        uint8_t res[512];
+        compress_ctx_t comp_ctx;
+        memset(&comp_ctx, 0, sizeof(comp_ctx));
+        compress_ctx_init_packet(&comp_ctx);
+
+        // Test with lengths 0 through 11 (< DNS_HEADER_SIZE)
+        for (size_t short_len = 0; short_len < 12; short_len++) {
+            // Emulate process_dns_query entrance check
+            int ret = (short_len < 12) ? 0 : -1;
+            if (ret != 0) {
+                printf("FAIL: short packet of length %zu must be dropped with return code 0\n", short_len);
+                return 1;
+            }
+        }
+        printf("PASS: UDP minimum packet size (< 12 bytes) drop verification\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

@@ -478,7 +478,10 @@ static void parse_break_arg(const char *arg) {
     else if (strcmp(name, "opcode") == 0)                 kind = BRK_OPCODE;
     else if (strcmp(name, "qr-bit") == 0)                 kind = BRK_QR_BIT;
     else if (strcmp(name, "notify-no-question") == 0)     kind = BRK_NOTIFY_NO_QUESTION;
-    else if (strcmp(name, "too-short") == 0)              kind = BRK_TOO_SHORT;
+    else if (strcmp(name, "too-short") == 0 || strcmp(name, "short-header") == 0) {
+        kind = BRK_TOO_SHORT;
+        if (!has_param) { param = 3; has_param = true; }
+    }
     else if (strcmp(name, "tcp-length-overclaim") == 0)   { kind = BRK_TCP_LENGTH_OVERCLAIM; if (!has_param) { param = 10; has_param = true; } }
     else if (strcmp(name, "tcp-zero-length") == 0)        kind = BRK_TCP_ZERO_LENGTH;
     else if (strcmp(name, "tcp-idle-hold") == 0)          { kind = BRK_TCP_IDLE_HOLD; if (!has_param) { param = 20; has_param = true; } }
@@ -509,7 +512,8 @@ static void print_break_help(void) {
         "  opcode=N                   override header OPCODE\n"
         "  qr-bit                     set QR=1 on an outgoing query\n"
         "  notify-no-question         OPCODE=4 (NOTIFY) with QDCOUNT=0, no question\n"
-        "  too-short                  send only the first 3 bytes of the message\n"
+        "  too-short[=N]              send only the first N bytes of the message (default 3)\n"
+        "  short-header[=N]           alias for too-short[=N]\n"
         "  tcp-length-overclaim[=N]   (--tcp only) length prefix N bytes bigger than body sent\n"
         "  tcp-zero-length            (--tcp only) send a 0 length prefix\n"
         "  tcp-idle-hold[=SEC]        (--tcp only) send only the length prefix, hold the\n"
@@ -1438,7 +1442,11 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
         wire_len = build_proxyv2_header(wire_buf, sizeof(wire_buf), qo, false);
     }
     size_t send_len = pkt_len;
-    if (has_break(BRK_TOO_SHORT, NULL, NULL) && send_len > 3) send_len = 3;
+    long short_len = 3;
+    if (has_break(BRK_TOO_SHORT, &short_len, NULL)) {
+        if (short_len < 0) short_len = 3;
+        if (send_len > (size_t)short_len) send_len = (size_t)short_len;
+    }
     memcpy(wire_buf + wire_len, pkt, send_len);
     wire_len += send_len;
 
@@ -1466,10 +1474,14 @@ static int do_tcp_send_request(const char *server, int port, const query_opts_t 
     long idle_secs = 20; bool idle_hold = has_break(BRK_TCP_IDLE_HOLD, &idle_secs, NULL);
     long overclaim = 0; bool overclaim_break = has_break(BRK_TCP_LENGTH_OVERCLAIM, &overclaim, NULL);
     bool zero_len_break = has_break(BRK_TCP_ZERO_LENGTH, NULL, NULL);
-    bool too_short = has_break(BRK_TOO_SHORT, NULL, NULL);
+    long short_len = 3;
+    bool too_short = has_break(BRK_TOO_SHORT, &short_len, NULL);
 
     size_t body_len = pkt_len;
-    if (too_short && body_len > 3) body_len = 3;
+    if (too_short) {
+        if (short_len < 0) short_len = 3;
+        if (body_len > (size_t)short_len) body_len = (size_t)short_len;
+    }
 
     uint16_t prefix_value;
     if (zero_len_break) prefix_value = 0;
