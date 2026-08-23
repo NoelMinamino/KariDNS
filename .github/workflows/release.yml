@@ -101,7 +101,7 @@ jobs:
         run: |
           echo "::group::🧪 [Verification] Test installing DEB package on Ubuntu"
           sudo dpkg -i dist/dag_*.deb
-          which dag
+          command -v dag
           dag --help || true
           dag www.google.com A @8.8.8.8
           dag google.com TXT @8.8.8.8 +tcp
@@ -115,7 +115,7 @@ jobs:
             set -e
             RPM_FILE=\$(ls /dist/dag-*.rpm | head -n 1)
             dnf install -y openssl zlib \"\$RPM_FILE\"
-            which dag
+            command -v dag
             dag --help || true
             dag www.google.com A @8.8.8.8
             dag google.com TXT @8.8.8.8 +tcp
