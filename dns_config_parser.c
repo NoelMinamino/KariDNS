@@ -952,6 +952,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   bool saw_top_level_zone = false;
   view_config_t *last_view = NULL;
   zone_config_t *last_zone = NULL;
+  tsig_key_t *last_key = NULL;
   while (1) {
     conf_token_t tok = get_next_token(ctx);
     if (ctx->error_occurred) {
@@ -1266,6 +1267,15 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_partial_view(view);
             return -1;
           }
+          for (zone_config_t *existing = view->zones; existing; existing = existing->next) {
+            if (strcasecmp(existing->domain, z->domain) == 0) {
+              syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined in view '%s'; rejecting configuration", z->domain, view->name);
+              fprintf(stderr, "[ERROR] Duplicate zone '%s' defined in view '%s'\n", z->domain, view->name);
+              free_zone_config(z);
+              free_partial_view(view);
+              return -1;
+            }
+          }
           if (!view->zones) view->zones = z; else last_view_zone->next = z;
           last_view_zone = z;
         } else {
@@ -1276,6 +1286,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free_partial_view(view); free_token(&tok); return -1; }
       free_token(&tok);
+      for (view_config_t *existing = config->views; existing; existing = existing->next) {
+        if (strcasecmp(existing->name, view->name) == 0) {
+          syslog(LOG_ERR, "[Config] Duplicate view '%s' defined; rejecting configuration", view->name);
+          fprintf(stderr, "[ERROR] Duplicate view '%s' defined\n", view->name);
+          free_partial_view(view);
+          return -1;
+        }
+      }
       saw_view_block = true;
       if (!config->views) config->views = view; else last_view->next = view;
       last_view = view;
@@ -1283,6 +1301,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       zone_config_t *zone = NULL;
       if (parse_zone_block(ctx, &zone) != 0) return -1;
+      for (zone_config_t *existing = config->zones; existing; existing = existing->next) {
+        if (strcasecmp(existing->domain, zone->domain) == 0) {
+          syslog(LOG_ERR, "[Config] Duplicate zone '%s' defined (top-level); rejecting configuration", zone->domain);
+          fprintf(stderr, "[ERROR] Duplicate zone '%s' defined\n", zone->domain);
+          free_zone_config(zone);
+          return -1;
+        }
+      }
       saw_top_level_zone = true;
       if (!config->zones)
         config->zones = zone;
@@ -1301,6 +1327,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       free_token(&tok);
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) {
+        free(tsig->name);
+        free(tsig);
         free_token(&tok);
         return -1;
       }
@@ -1312,6 +1340,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           break;
         }
         if (tok.type != TOKEN_STRING) {
+          free(tsig->name);
+          if (tsig->algorithm) free(tsig->algorithm);
+          if (tsig->secret) free(tsig->secret);
+          free(tsig);
           free_token(&tok);
           return -1;
         }
@@ -1322,6 +1354,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key_prop);
+            free(tsig->name);
+            if (tsig->algorithm) free(tsig->algorithm);
+            if (tsig->secret) free(tsig->secret);
+            free(tsig);
             free_token(&tok);
             return -1;
           }
@@ -1331,6 +1367,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           if (tok.type != TOKEN_SEMICOLON) {
             free(key_prop);
             free(val);
+            free(tsig->name);
+            if (tsig->algorithm) free(tsig->algorithm);
+            if (tsig->secret) free(tsig->secret);
+            free(tsig);
             free_token(&tok);
             return -1;
           }
@@ -1341,7 +1381,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               fprintf(stderr, "[ERROR] Unsupported TSIG algorithm: %s\n", val);
               free(key_prop);
               free(val);
-              free_token(&tok);
+              free(tsig->name);
+              if (tsig->algorithm) free(tsig->algorithm);
+              if (tsig->secret) free(tsig->secret);
+              free(tsig);
               return -1;
             }
             if (strstr(val, "md5") || strstr(val, "sha1")) {
@@ -1358,7 +1401,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               free(key_prop);
               free(val);
               tsig->secret = NULL;
-              free_token(&tok);
+              free(tsig->name);
+              if (tsig->algorithm) free(tsig->algorithm);
+              free(tsig);
               return -1;
             }
             int len = EVP_DecodeBlock(tsig->secret_decoded,
@@ -1368,7 +1413,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               free(key_prop);
               free(val);
               tsig->secret = NULL;
-              free_token(&tok);
+              free(tsig->name);
+              if (tsig->algorithm) free(tsig->algorithm);
+              free(tsig);
               return -1;
             }
             int padding = 0;
@@ -1384,12 +1431,30 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) {
+        free(tsig->name);
+        if (tsig->algorithm) free(tsig->algorithm);
+        if (tsig->secret) free(tsig->secret);
+        free(tsig);
         free_token(&tok);
         return -1;
       }
       free_token(&tok);
-      tsig->next = config->keys;
-      config->keys = tsig;
+      for (tsig_key_t *existing = config->keys; existing; existing = existing->next) {
+        if (strcasecmp(existing->name, tsig->name) == 0) {
+          syslog(LOG_ERR, "[Config] Duplicate TSIG key '%s' defined; rejecting configuration", tsig->name);
+          fprintf(stderr, "[ERROR] Duplicate TSIG key '%s' defined\n", tsig->name);
+          free(tsig->name);
+          if (tsig->algorithm) free(tsig->algorithm);
+          if (tsig->secret) free(tsig->secret);
+          free(tsig);
+          return -1;
+        }
+      }
+      if (!config->keys)
+        config->keys = tsig;
+      else
+        last_key->next = tsig;
+      last_key = tsig;
     } else if (strcmp(tok.value, "control-channel") == 0) {
       free_token(&tok);
       tok = get_next_token(ctx);

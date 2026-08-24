@@ -2818,6 +2818,86 @@ int main() {
         printf("PASS: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
     }
 
+    // --- Test 39: Duplicate zone/view/key block rejection & FIFO key order ---
+    {
+        // 1. Duplicate top-level zone
+        const char *dup_zone_conf =
+            "options { port 53; };\n"
+            "zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "zone \"example.com\" { type master; file \"/tmp/z2.zone\"; };\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(dup_zone_conf, NULL, &cfg1) == 0) {
+            printf("FAIL: Duplicate top-level zone should be rejected\n");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+
+        // 2. Duplicate key
+        const char *dup_key_conf =
+            "options { port 53; };\n"
+            "key \"tsig-test\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "key \"tsig-test\" { algorithm hmac-sha256; secret \"k999999999012345678901234567890123456789012=\"; };\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(dup_key_conf, NULL, &cfg2) == 0) {
+            printf("FAIL: Duplicate key should be rejected\n");
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+
+        // 3. Duplicate view
+        const char *dup_view_conf =
+            "options { port 53; };\n"
+            "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
+            "view \"internal\" { zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; }; };\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(dup_view_conf, NULL, &cfg3) == 0) {
+            printf("FAIL: Duplicate view should be rejected\n");
+            free_server_config_fields(&cfg3);
+            return 1;
+        }
+
+        // 4. Duplicate zone inside same view
+        const char *dup_view_zone_conf =
+            "options { port 53; };\n"
+            "view \"internal\" {\n"
+            "  zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "  zone \"example.com\" { type master; file \"/tmp/z2.zone\"; };\n"
+            "};\n";
+        server_config_t cfg4;
+        memset(&cfg4, 0, sizeof(cfg4));
+        if (parse_named_conf_ext(dup_view_zone_conf, NULL, &cfg4) == 0) {
+            printf("FAIL: Duplicate zone inside view should be rejected\n");
+            free_server_config_fields(&cfg4);
+            return 1;
+        }
+
+        // 5. Valid config with multiple keys (verify FIFO definition order)
+        const char *valid_keys_conf =
+            "options { port 53; };\n"
+            "key \"key1\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "key \"key2\" { algorithm hmac-sha256; secret \"k999999999012345678901234567890123456789012=\"; };\n";
+        server_config_t cfg5;
+        memset(&cfg5, 0, sizeof(cfg5));
+        if (parse_named_conf_ext(valid_keys_conf, NULL, &cfg5) != 0) {
+            printf("FAIL: Valid config with multiple keys failed to parse\n");
+            return 1;
+        }
+        if (!cfg5.keys || strcmp(cfg5.keys->name, "key1") != 0 ||
+            !cfg5.keys->next || strcmp(cfg5.keys->next->name, "key2") != 0) {
+            printf("FAIL: Keys list is not in FIFO definition order (got %s -> %s)\n",
+                   cfg5.keys ? cfg5.keys->name : "NULL",
+                   (cfg5.keys && cfg5.keys->next) ? cfg5.keys->next->name : "NULL");
+            free_server_config_fields(&cfg5);
+            return 1;
+        }
+        free_server_config_fields(&cfg5);
+
+        printf("PASS: Duplicate zone/view/key rejection & FIFO key order\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
