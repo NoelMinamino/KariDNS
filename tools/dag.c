@@ -1284,6 +1284,7 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         memset(&rec, 0, sizeof(rec));
                         rec.name = tokens[0];
                         rec.ttl = tokens[1];
+                        rec.ttl_value = parse_ttl_value(tokens[1]);
                         rec.type_code = type_code;
                         rec.type = tokens[type_idx];
                         rec.class_str = class_str;
@@ -4208,7 +4209,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
     if (qo->want_tsig) {
         qo->tsig_key.fuzztime = qo->fuzztime;
-        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, false) != 0) {
+        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
             fprintf(stderr, "Error: tsig_sign_packet failed\n");
             return 1;
         }
@@ -4368,6 +4369,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         int total_records = 0;
         size_t total_bytes = 0;
         bool had_tsig_fail = false;
+        bool last_msg_had_tsig = false;
+        int unsigned_msg_count = 0;
+        uint8_t unsigned_accum[262144];
+        size_t unsigned_accum_len = 0;
         
         int start_index = g_server_count;
         sres = alloc_result_row();
@@ -4407,7 +4412,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             if (qo->want_tsig) {
                 uint8_t resp_mac[64];
                 size_t resp_mac_len = 0;
-                int err = tsig_verify_packet(resp, (size_t)n, &qo->tsig_key, request_mac, request_mac_len, resp_mac, &resp_mac_len);
+                int err = tsig_verify_packet(resp, (size_t)n, &qo->tsig_key, request_mac, request_mac_len,
+                                             unsigned_accum, unsigned_accum_len, (msg_index > 1),
+                                             resp_mac, &resp_mac_len);
                 if (err == 0) {
                     if (!dopt->short_mode) printf(";; TSIG verified.\n");
                     // Update prior_mac for subsequent AXFR messages
@@ -4415,8 +4422,27 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                         memcpy(request_mac, resp_mac, resp_mac_len);
                         request_mac_len = resp_mac_len;
                     }
+                    unsigned_accum_len = 0;
+                    unsigned_msg_count = 0;
+                    last_msg_had_tsig = true;
+                } else if (err == -1 && axfr_state.is_axfr && msg_index > 1) {
+                    // RFC 2845 §4.4 / RFC 8945 §5.4: Intermediate AXFR messages MAY omit TSIG
+                    last_msg_had_tsig = false;
+                    unsigned_msg_count++;
+                    if (unsigned_msg_count > 99) {
+                        had_tsig_fail = true;
+                        fprintf(stderr, ";; WARNING: too many consecutive unsigned intermediate messages (%d > 99, RFC 8945 violation)\n", unsigned_msg_count);
+                    }
+                    if (unsigned_accum_len + (size_t)n <= sizeof(unsigned_accum)) {
+                        memcpy(unsigned_accum + unsigned_accum_len, resp, (size_t)n);
+                        unsigned_accum_len += (size_t)n;
+                    } else {
+                        had_tsig_fail = true;
+                        fprintf(stderr, ";; WARNING: unsigned intermediate message buffer overflow, cannot verify final TSIG\n");
+                    }
                 } else {
                     had_tsig_fail = true;
+                    last_msg_had_tsig = false;
                     if (err == -1) {
                         fprintf(stderr, ";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
                     } else if (err == 16) {
@@ -4489,6 +4515,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 break;
             }
         } while (true);
+
+        if (qo->want_tsig && axfr_state.is_axfr && axfr_state.axfr_complete) {
+            if (!last_msg_had_tsig) {
+                had_tsig_fail = true;
+                fprintf(stderr, ";; WARNING: final AXFR message MUST contain TSIG but none was found (RFC 8945 §5.4 violation)\n");
+            }
+        }
 
         if (sres) g_server_count++;
 
@@ -6398,9 +6431,10 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->zflag = true; spec->qo.z_flag = true;
         } else if (strcmp(arg, "+nozflag") == 0) {
             spec->zflag = false; spec->qo.z_flag = false;
-        } else if (strncmp(arg, "+timeout=", 9) == 0) {
+        } else if (strncmp(arg, "+timeout=", 9) == 0 || strncmp(arg, "+time=", 6) == 0) {
+            const char *val = (arg[5] == '=') ? arg + 6 : arg + 9;
             char *endptr;
-            long to = strtol(arg + 9, &endptr, 10);
+            long to = strtol(val, &endptr, 10);
             if (*endptr == '\0' && to >= 0) spec->qo.timeout_sec = (int)to;
         } else if (strncmp(arg, "+tries=", 7) == 0) {
             char *endptr;

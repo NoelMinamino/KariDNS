@@ -2494,7 +2494,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
     }
-    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, 0, NULL, NULL) != 0) {
+    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, 0, NULL, 0, false, NULL, NULL) != 0) {
       syslog(LOG_ERR, "[AXFR] TSIG failed");
       pthread_mutex_unlock(&entry->writer_lock);
       return -1;
@@ -3691,7 +3691,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
             auth = false;
           } else {
             attempted_key = matched_key;
-            int err = tsig_verify_packet(req, req_len, matched_key, NULL, 0, tsig_mac, &tsig_mac_len);
+            int err = tsig_verify_packet(req, req_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
             if (err != 0) {
               auth = false;
               tsig_error_code = err > 0 ? err : 16;
@@ -3735,7 +3735,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *sign_key = auth ? matched_key : attempted_key;
     if (sign_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, false);
+      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false);
       offset = sign_len;
     }
     return offset;
@@ -3768,7 +3768,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
           }
           if (key_allowed) {
             attempted_key = k;
-            int err = tsig_verify_packet(req, req_len, k, NULL, 0, tsig_mac, &tsig_mac_len);
+            int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
             if (err == 0) {
               matched_key = k;
               auth = true;
@@ -3814,7 +3814,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *sign_key = auth ? matched_key : attempted_key;
     if (sign_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, false);
+      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false);
       offset = sign_len;
     }
     return offset;
@@ -4232,7 +4232,7 @@ void *axfr_bg_thread_func(void *arg) {
     if (ctx->tsig_key) {
       size_t p_len = req_len - 2;
       tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
-                       ctx->tsig_key, 0, NULL, NULL, false);
+                       ctx->tsig_key, 0, NULL, NULL, NULL, 0, false);
       req_len = p_len + 2;
     }
     uint16_t msg_len = req_len - 2;
@@ -4751,7 +4751,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     *res_ancount = htons(answers); \
     if (tsig_key) { \
       size_t sign_len = prev_offset; \
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, is_subsequent); \
+      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, NULL, 0, is_subsequent); \
       is_subsequent = true; \
       prev_offset = sign_len; \
     } \
@@ -4826,7 +4826,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if (tsig_key) {
       size_t sign_len = offset;
       tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
-                       &tsig_mac_len, is_subsequent);
+                       &tsig_mac_len, NULL, 0, is_subsequent);
       offset = sign_len;
     }
     uint8_t len_prefix[2] = {offset >> 8, offset & 0xFF};
@@ -5387,7 +5387,7 @@ worker_startup_success:;
                 if (!matched_key) {
                   tsig_error = 17;
                 } else {
-                  int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, tsig_mac, &tsig_mac_len);
+                  int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
                   if (err != 0) {
                     tsig_error = err > 0 ? err : 16;
                   } else {
@@ -5478,13 +5478,13 @@ worker_startup_success:;
 
                 if (matched_key)
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
-                                   matched_key, tsig_error, tsig_mac, &tsig_mac_len, false);
+                                   matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
                 else {
                   tsig_key_t dummy = {0};
                   dummy.name = zcfg->tsig_key;
                   dummy.algorithm = "hmac-sha256";
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
-                                   17, tsig_mac, &tsig_mac_len, false);
+                                   17, tsig_mac, &tsig_mac_len, NULL, 0, false);
                 }
               } else {
                 res_buf[2] |= 0x84;

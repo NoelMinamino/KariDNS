@@ -228,11 +228,16 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);
 int const_time_memcmp(const void *a, const void *b, size_t len);
-int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len, bool is_subsequent);
+int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
+                     uint8_t *prior_mac, size_t *prior_mac_len,
+                     const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                     bool is_subsequent);
 // 注意: mac_out は最低 EVP_MAX_MD_SIZE (64) バイトを確保すること。
 // mac_len_out には実際にコピーされたバイト数（<= EVP_MAX_MD_SIZE）が返る。
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
                        const uint8_t *prior_mac, size_t prior_mac_len,
+                       const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                       bool is_subsequent,
                        uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
                        size_t *mac_len_out);
 

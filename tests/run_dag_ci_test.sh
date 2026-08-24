@@ -20,9 +20,9 @@ if [ "$CLIENT_ARG" = "dig" ]; then
     fi
     DAG="dig"
     CLIENT_NAME="BIND 9 dig ($(dig -v 2>&1 | head -n 1))"
-    make -C "$BIN_DIR" all >/dev/null 2>&1
+    make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
 else
-    make -C "$BIN_DIR" all >/dev/null 2>&1
+    make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
     DAG="$BIN_DIR/dag"
     CLIENT_NAME="KariDNS dag"
 fi
@@ -413,20 +413,19 @@ echo "19. RFC 5452 UDP Security & Transport Resilience Tests"
 echo "========================================================"
 run_check "Standard UDP resolution with connected socket" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
 run_check "Explicit QID query with connected socket (+qid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qid=4660 +timeout=2" "192\.0\.2\.10"
-if [ "$DAG" != "dig" ]; then
-    run_check "UDP socket bind to source IP (-b)" "$DAG -b 127.0.0.1 @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
-fi
+run_check "UDP socket bind to source IP (-b)" "$DAG -b 127.0.0.1 @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
 
 echo "========================================================"
 echo "20. Dedicated Security & Regression Test Scripts"
 echo "========================================================"
 if [ "$DAG" != "dig" ]; then
-    run_check "Regression: --update-del type omission (tests/run_update_del_no_type_test.sh)" "sh \"$SCRIPT_DIR/run_update_del_no_type_test.sh\"" "PASS:"
-    run_check "Regression: --update-del-exact TTL & type safety (tests/run_update_del_exact_ttl_notype_crash_test.sh)" "sh \"$SCRIPT_DIR/run_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
-    if command -v perl >/dev/null 2>&1; then
-        run_check "Security: UDP spoofing source rejection (tests/run_udp_spoofing_source_test.sh)" "sh \"$SCRIPT_DIR/run_udp_spoofing_source_test.sh\"" "PASS:"
-        run_check "Security: UDP transaction ID mismatch discard (tests/run_udp_id_mismatch_discard_test.sh)" "sh \"$SCRIPT_DIR/run_udp_id_mismatch_discard_test.sh\"" "PASS:"
-    fi
+    run_check "Regression: --update-del type omission (tests/run_dag_update_del_no_type_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_no_type_test.sh\"" "PASS:"
+    run_check "Regression: --update-del-exact TTL & type safety (tests/run_dag_update_del_exact_ttl_notype_crash_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
+fi
+if command -v perl >/dev/null 2>&1; then
+    run_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"
+    run_check "Security: UDP transaction ID mismatch discard (tests/run_dag_udp_id_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_id_mismatch_discard_test.sh\"" "PASS:"
+    run_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
 fi
 
 echo "========================================================"

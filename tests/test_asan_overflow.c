@@ -708,7 +708,7 @@ int main() {
 
         uint8_t prior_mac[64];
         size_t prior_mac_len = 0;
-        r = tsig_sign_packet(pkt5, &pkt5_len, 75000, &key, 0, prior_mac, &prior_mac_len, false);
+        r = tsig_sign_packet(pkt5, &pkt5_len, 75000, &key, 0, prior_mac, &prior_mac_len, NULL, 0, false);
         if (r == -1) {
             printf("FAIL: TSIG malloc fallback failed\n");
             free(pkt5);
