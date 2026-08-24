@@ -2408,6 +2408,110 @@ int main() {
         printf("PASS: Multiple EDNS OPT RR rejection and RCODE bitmask verification\n");
     }
 
+    // --- Test 34: MX / SRV Additional Glue records target resolution & in-bailiwick validation ---
+    {
+        const char *zone_data =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "ns1 IN A 192.0.2.1\n"
+            "@ IN MX 10 mail.example.com.\n"
+            "@ IN MX 20 mail.example.com.\n"
+            "mail IN A 192.0.2.10\n"
+            "mail IN AAAA 2001:db8::10\n"
+            "_sip._tcp IN SRV 10 60 5060 sip.example.com.\n"
+            "sip IN A 192.0.2.20\n"
+            "external IN MX 10 mail.otherdomain.net.\n";
+
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        char *zone_copy = strdup(zone_data);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        if (parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx) < 0) {
+            printf("FAIL: parse_zone_fast failed for Test 34\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed for Test 34\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Verify MX records and rdata target extraction
+        int mx_count = 0;
+        int srv_count = 0;
+        for (size_t i = 0; i < arena.count; i++) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 15 && (strcasecmp(rec->name, "example.com.") == 0 || strcasecmp(rec->name, "example.com") == 0)) {
+                mx_count++;
+                if (rec->rdata_count < 2 || !rec->rdata[1]) {
+                    printf("FAIL: MX record missing exchange target in rdata[1]\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            } else if (rec->type_code == 33 && (strcasecmp(rec->name, "_sip._tcp.example.com.") == 0 || strcasecmp(rec->name, "_sip._tcp.example.com") == 0)) {
+                srv_count++;
+                if (rec->rdata_count < 4 || !rec->rdata[3]) {
+                    printf("FAIL: SRV record missing target host in rdata[3]\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            }
+        }
+
+        if (mx_count != 2 || srv_count != 1) {
+            printf("FAIL: Expected 2 MX and 1 SRV records, got %d MX, %d SRV\n", mx_count, srv_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test in-bailiwick lookup for mail.example.com. (A + AAAA)
+        uint32_t mail_hash = calc_fnv1a_str("mail.example.com.");
+        size_t mail_idx = mail_hash & (arena.hash_size - 1);
+        int mail_glue_count = 0;
+        for (int j = arena.hash_table[mail_idx]; j != -1; j = arena.records[j].next_record) {
+            if ((arena.records[j].type_code == 1 || arena.records[j].type_code == 28) &&
+                (strcasecmp(arena.records[j].name, "mail.example.com.") == 0 || strcasecmp(arena.records[j].name, "mail.example.com") == 0)) {
+                mail_glue_count++;
+            }
+        }
+        if (mail_glue_count != 2) {
+            printf("FAIL: Expected 2 glue records (A + AAAA) for mail.example.com., got %d\n", mail_glue_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test in-bailiwick lookup for sip.example.com. (A)
+        uint32_t sip_hash = calc_fnv1a_str("sip.example.com.");
+        size_t sip_idx = sip_hash & (arena.hash_size - 1);
+        int sip_glue_count = 0;
+        for (int j = arena.hash_table[sip_idx]; j != -1; j = arena.records[j].next_record) {
+            if (arena.records[j].type_code == 1 &&
+                (strcasecmp(arena.records[j].name, "sip.example.com.") == 0 || strcasecmp(arena.records[j].name, "sip.example.com") == 0)) {
+                sip_glue_count++;
+            }
+        }
+        if (sip_glue_count != 1) {
+            printf("FAIL: Expected 1 glue record for sip.example.com., got %d\n", sip_glue_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: MX / SRV Additional Glue records target resolution & in-bailiwick validation\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
