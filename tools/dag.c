@@ -1694,10 +1694,16 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
             return -1; // Timeout
         }
 
+#ifdef _WIN32
+        DWORD dw_timeout = (DWORD)(remain_sec * 1000 + (remain_usec / 1000));
+        if (dw_timeout == 0) dw_timeout = 1;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&dw_timeout, sizeof(dw_timeout));
+#else
         struct timeval tv;
         tv.tv_sec = (time_t)remain_sec;
         tv.tv_usec = (long)remain_usec;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+#endif
 
         ssize_t n = recv(sock, resp, resp_cap, 0);
         if (n < 0) {
