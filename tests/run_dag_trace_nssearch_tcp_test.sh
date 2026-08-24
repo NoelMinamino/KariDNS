@@ -89,13 +89,14 @@ cat <<EOF > "$ZONE_FILE"
                 86400 )    ; minimum
         IN NS   localhost.
 localhost IN A  127.0.0.1
+localhost IN AAAA ::1
 www     IN A    192.0.2.10
 EOF
 
 cat <<EOF > "$CONF_FILE"
 options {
     port $PORT;
-    bind-address { 127.0.0.1; };
+    bind-address { 127.0.0.1; ::1; };
 };
 
 zone "example.com" {
@@ -109,7 +110,7 @@ SERVER_PID=$!
 sleep 0.5
 
 # Test that querying karidns with +nssearch +tcp resolves SOA from zone nameservers (identical output on dig and dag)
-run_check "+nssearch +tcp queries nameservers for SOA" "$DAG @127.0.0.1 -p $PORT example.com +nssearch +tcp +timeout=2" "SOA\s+localhost\.\s+hostmaster\.example\.com\..*from server 127\.0\.0\.1"
+run_check "+nssearch +tcp queries nameservers for SOA" "$DAG @127.0.0.1 -p $PORT example.com +nssearch +tcp +timeout=2" "SOA\s+localhost\.\s+hostmaster\.example\.com\..*from server"
 
 # Test that querying karidns with +trace +tcp successfully communicates via TCP
 run_check "+trace +tcp receives response from root probe" "$DAG @127.0.0.1 -p $PORT example.com +trace +tcp +timeout=2" "Received [0-9]+ bytes from 127\.0\.0\.1#$PORT"

@@ -703,6 +703,7 @@ typedef struct {
     bool ttlunits;
     bool has_expected_client_cookie;
     uint8_t expected_client_cookie[8];
+    bool check_dns64prefix;
 } display_opts_t;
 
 static const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size) {
@@ -1701,6 +1702,22 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
             if (resp_id != sent_id) {
                 fprintf(stderr, ";; Warning: ID mismatch: expected %u, got %u\n", sent_id, resp_id);
                 continue; // Discard spoofed / stray packet and wait for matching response (RFC 5452)
+            }
+        }
+
+        // RFC 7873 §5.2: Client Cookie Echo Verification
+        if (qo && qo->want_cookie && n >= 12 && !skip_id_check) {
+            uint16_t r_qd = (resp[4] << 8) | resp[5];
+            uint16_t r_an = (resp[6] << 8) | resp[7];
+            uint16_t r_ns = (resp[8] << 8) | resp[9];
+            uint16_t r_ar = (resp[10] << 8) | resp[11];
+            edns_info_t chk_edns;
+            if (parse_edns_opt(resp, (size_t)n, r_qd, r_an, r_ns, r_ar, &chk_edns) == 0 &&
+                chk_edns.present && chk_edns.has_cookie) {
+                if (memcmp(qo->client_cookie, chk_edns.client_cookie, 8) != 0) {
+                    fprintf(stderr, ";; Warning: Client COOKIE mismatch\n");
+                    continue; // Discard spoofed or stale response and wait for matching cookie (RFC 7873 §5.2)
+                }
             }
         }
 
@@ -4184,6 +4201,71 @@ static size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
     if (r == (size_t)-1) return 0;
     return r;
 }
+
+static void run_dns64prefix_check(const char *server, int port, const query_opts_t *qo, bool use_tcp, bool no_hexdump_query, bool no_hexdump_response) {
+    (void)no_hexdump_query; (void)no_hexdump_response;
+    uint8_t qbuf[512];
+    query_opts_t q = *qo;
+    q.check_dns64prefix = false;
+    size_t qlen = build_query_packet(qbuf, sizeof(qbuf), "ipv4only.arpa", 28 /* AAAA */, &q);
+    uint8_t resp[65535];
+    ssize_t n = do_dns_exchange_auto(server, port, &q, qbuf, qlen, resp, sizeof(resp), q.timeout_sec, use_tcp);
+    if (n < 12) {
+        printf(";; dns64prefix: could not query ipv4only.arpa\n");
+        return;
+    }
+
+    int qdcount = (resp[4] << 8) | resp[5];
+    int ancount = (resp[6] << 8) | resp[7];
+    size_t offset = 12;
+    for (int i = 0; i < qdcount; i++) {
+        char *dummy;
+        if (expand_wire_name(resp, (size_t)n, offset, &offset, &g_dag_arena, &dummy) != 0) return;
+        offset += 4;
+    }
+
+    int found_prefixes = 0;
+    for (int i = 0; i < ancount; i++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(resp, (size_t)n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+        if (type == 28 && rec.rdata_count > 0) {
+            struct in6_addr in6;
+            if (inet_pton(AF_INET6, rec.rdata[0], &in6) == 1) {
+                const uint8_t *b = in6.s6_addr;
+                int plen = 0;
+                if (b[12] == 0xC0 && b[13] == 0x00 && b[14] == 0x00 && (b[15] == 0xAA || b[15] == 0xAB)) {
+                    plen = 96;
+                } else if (b[8] == 0x00 && b[9] == 0xC0 && b[10] == 0x00 && b[11] == 0x00 && (b[12] == 0xAA || b[12] == 0xAB)) {
+                    plen = 64;
+                } else if (b[8] == 0x00 && b[7] == 0xC0 && b[9] == 0x00 && b[10] == 0x00 && (b[11] == 0xAA || b[11] == 0xAB)) {
+                    plen = 56;
+                } else if (b[8] == 0x00 && b[6] == 0xC0 && b[7] == 0x00 && b[9] == 0x00 && (b[10] == 0xAA || b[10] == 0xAB)) {
+                    plen = 48;
+                } else if (b[8] == 0x00 && b[5] == 0xC0 && b[6] == 0x00 && b[7] == 0x00 && (b[9] == 0xAA || b[9] == 0xAB)) {
+                    plen = 40;
+                } else if (b[4] == 0xC0 && b[5] == 0x00 && b[6] == 0x00 && (b[7] == 0xAA || b[7] == 0xAB)) {
+                    plen = 32;
+                }
+
+                if (plen > 0) {
+                    struct in6_addr pref_addr = in6;
+                    for (int bit = plen; bit < 128; bit++) {
+                        pref_addr.s6_addr[bit / 8] &= ~(1 << (7 - (bit % 8)));
+                    }
+                    char pstr[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, &pref_addr, pstr, sizeof(pstr));
+                    printf("\n%s/%d\n", pstr, plen);
+                    found_prefixes++;
+                }
+            }
+        }
+    }
+
+    if (found_prefixes == 0) {
+        printf(";; could not get DNS64 prefixes from ipv4only.arpa\n");
+    }
+}
+
 static int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
                     bool use_tcp, bool norecurse,
                     bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
@@ -4191,6 +4273,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     query_opts_t *qo, const char *hex_payload, const display_opts_t *dopt) {
     zone_arena_destroy(&g_dag_arena);
     zone_arena_init(&g_dag_arena);
+
+    if (qo->check_dns64prefix && strcasecmp(qname, "ipv4only.arpa") != 0 && strcasecmp(qname, "ipv4only.arpa.") != 0) {
+        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response);
+    }
     
     if (test_name) {
         printf("=========================================================\n");
@@ -4203,6 +4289,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     if (qo->want_cookie) {
         effective_dopt.has_expected_client_cookie = true;
         memcpy(effective_dopt.expected_client_cookie, qo->client_cookie, 8);
+    }
+    if (qo->check_dns64prefix) {
+        effective_dopt.check_dns64prefix = true;
     }
     dopt = &effective_dopt;
     if (strncasecmp(qtype_s, "IXFR=", 5) == 0) {
@@ -4594,6 +4683,44 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 printf(";; WARNING -- Some TSIG could not be validated\n");
             }
         }
+        if (qo->check_dns64prefix && n >= 12) {
+            uint16_t r_qd = (resp[4] << 8) | resp[5];
+            uint16_t r_an = (resp[6] << 8) | resp[7];
+            size_t p_off = 12;
+            for (int i = 0; i < r_qd; i++) {
+                char *d;
+                if (expand_wire_name(resp, (size_t)n, p_off, &p_off, &g_dag_arena, &d) != 0) break;
+                p_off += 4;
+            }
+            for (int i = 0; i < r_an; i++) {
+                dns_record_t rec; uint16_t type;
+                if (parse_resource_record(resp, (size_t)n, &p_off, &g_dag_arena, &rec, &type) != 0) break;
+                if (type == 28 && rec.rdata_count > 0) {
+                    struct in6_addr in6;
+                    if (inet_pton(AF_INET6, rec.rdata[0], &in6) == 1) {
+                        const uint8_t *b = in6.s6_addr;
+                        int plen = 0;
+                        if (b[12] == 0xC0 && b[13] == 0x00 && b[14] == 0x00 && (b[15] == 0xAA || b[15] == 0xAB)) plen = 96;
+                        else if (b[8] == 0x00 && b[9] == 0xC0 && b[10] == 0x00 && b[11] == 0x00 && (b[12] == 0xAA || b[12] == 0xAB)) plen = 64;
+                        else if (b[8] == 0x00 && b[7] == 0xC0 && b[9] == 0x00 && b[10] == 0x00 && (b[11] == 0xAA || b[11] == 0xAB)) plen = 56;
+                        else if (b[8] == 0x00 && b[6] == 0xC0 && b[7] == 0x00 && b[9] == 0x00 && (b[10] == 0xAA || b[10] == 0xAB)) plen = 48;
+                        else if (b[8] == 0x00 && b[5] == 0xC0 && b[6] == 0x00 && b[7] == 0x00 && (b[9] == 0xAA || b[9] == 0xAB)) plen = 40;
+                        else if (b[4] == 0xC0 && b[5] == 0x00 && b[6] == 0x00 && (b[7] == 0xAA || b[7] == 0xAB)) plen = 32;
+
+                        if (plen > 0) {
+                            struct in6_addr pref_addr = in6;
+                            for (int bit = plen; bit < 128; bit++) {
+                                pref_addr.s6_addr[bit / 8] &= ~(1 << (7 - (bit % 8)));
+                            }
+                            char pstr[INET6_ADDRSTRLEN];
+                            inet_ntop(AF_INET6, &pref_addr, pstr, sizeof(pstr));
+                            printf("\n%s/%d\n", pstr, plen);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         if (tcp_sock >= 0) close(tcp_sock);
 
         if (is_truncated) {
@@ -4749,8 +4876,8 @@ static void usage(const char *prog) {
         "  +[no]http-plain[=endpoint]   Use plain HTTP DNS mode [default endpoint: /dns-query, port: 80]\n"
         "  +[no]http-plain-get[=ep]     Use GET method for plain HTTP\n"
         "  +[no]http-plain-post[=ep]    Use POST method for plain HTTP\n"
-        "  +[no]proxy[=spec]            Inject PROXYv2 transport header (e.g. +proxy=192.0.2.1#1234-192.0.2.2#53)\n"
-        "  +[no]proxy-plain[=spec]      Inject PROXYv2 header ahead of TLS encryption layer\n"
+        "  +[no]proxy[=spec]            Inject PROXYv2 transport header ahead of any TLS handshake (e.g. +proxy=192.0.2.1#1234-192.0.2.2#53)\n"
+        "  +[no]proxy-plain[=spec]      Alias for +proxy (retained for dig/kdig compatibility); behaves identically\n"
         "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828)\n"
         "  +[no]keepopen                Keep TCP socket open between consecutive queries (RFC 7766)\n"
         "  +[no]dns64prefix             Query IPv4-only prefix from ipv4only.arpa (RFC 7050)\n"
@@ -4847,9 +4974,9 @@ static void usage(const char *prog) {
         "                               Example: dag @127.0.0.1 --hex '000101000001000000000000076578616d706c6503636f6d0000010001'\n"
         "  --break <kind>[=<param>]     Inject deliberate protocol anomalies / mutations into query packet\n"
         "                               Examples:\n"
-        "                                 dag example.com A @127.0.0.1 --break null_qname\n"
-        "                                 dag example.com A @127.0.0.1 --break dname_loop\n"
-        "                                 dag example.com A @127.0.0.1 --break tc_bit=1\n"
+        "                                 dag example.com A @127.0.0.1 --break oversized-qname\n"
+        "                                 dag example.com A @127.0.0.1 --break compression-loop\n"
+        "                                 dag example.com A @127.0.0.1 --break too-short=2\n"
         "                                 dag example.com A @127.0.0.1 --break all\n"
         "  --break-help                 Display list of all supported --break anomaly mutation kinds\n"
     );
