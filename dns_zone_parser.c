@@ -375,14 +375,24 @@ static int parse_generate_range(const char *range_str, generate_range_t *out, pa
     }
     char *endptr;
     uint64_t start = strtoull(range_str, &endptr, 10);
-    if (endptr != dash) {
+    if (endptr != dash || endptr == range_str) {
         if (err_out) err_out->error_message = "$GENERATE invalid start value";
         return -1;
     }
-    uint64_t stop = strtoull(dash + 1, &endptr, 10);
+    const char *stop_str = dash + 1;
+    uint64_t stop = strtoull(stop_str, &endptr, 10);
+    if (endptr == stop_str) {
+        if (err_out) err_out->error_message = "$GENERATE invalid stop value";
+        return -1;
+    }
     uint64_t step = 1;
     if (*endptr == '/') {
-        step = strtoull(endptr + 1, &endptr, 10);
+        const char *step_str = endptr + 1;
+        step = strtoull(step_str, &endptr, 10);
+        if (endptr == step_str) {
+            if (err_out) err_out->error_message = "$GENERATE invalid step value";
+            return -1;
+        }
     }
     if (*endptr != '\0') {
         if (err_out) err_out->error_message = "$GENERATE invalid range syntax";
@@ -438,8 +448,12 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
                         return (size_t)-1;
                     }
                     if (*p == ',') {
-                        base = *(p + 1);
-                        p += 2;
+                        p++;
+                        if (*p == '\0') {
+                            if (err_out) err_out->error_message = "$GENERATE malformed ${...} substitution";
+                            return (size_t)-1;
+                        }
+                        base = *p++;
                     }
                 }
                 if (*p != '}') {
@@ -456,7 +470,8 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
             int64_t v = (int64_t)value + offset;
             char numbuf[80];
             const char *fmt = (base == 'd') ? "%0*lld" : (base == 'o') ? "%0*llo" : (base == 'x') ? "%0*llx" : "%0*llX";
-            int n = snprintf(numbuf, sizeof(numbuf), fmt, width, (long long)v);
+            int n = (base == 'd') ? snprintf(numbuf, sizeof(numbuf), fmt, width, (long long)v)
+                                  : snprintf(numbuf, sizeof(numbuf), fmt, width, (unsigned long long)v);
             if (n < 0 || (size_t)n >= sizeof(numbuf)) return (size_t)-1;
             if (out_len + (size_t)n > out_cap) return (size_t)-1;
             memcpy(out + out_len, numbuf, (size_t)n);

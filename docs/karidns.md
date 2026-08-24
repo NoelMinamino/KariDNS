@@ -33,7 +33,8 @@ karidns [-h | --help]
 2. **Read-Copy-Update (RCU) Architecture**:
    - Zone data and configuration pointers are swapped atomically using C11 atomic operations (`memory_order_acquire` / `memory_order_release`), allowing worker threads to serve queries concurrently during zone reloads without locking.
 3. **Memory Arena Allocator (`zone_arena_t`)**:
-   - Dynamic memory allocations (`malloc`/`free`) are not used on the query processing path. Stack buffers and bump-allocated memory arenas (`zone_arena_t`) are used for request handling.
+   - For ordinary read-only queries (e.g. standard `QUERY` lookups), dynamic memory allocations (`malloc`/`free`) are not used; stack buffers and bump-allocated memory arenas (`zone_arena_t`) are used for request handling.
+   - The exception is Dynamic Update (`RFC 2136`, OPCODE=5): applying an update clones the zone's active arena into the standby arena (`clone_zone_arena`, using `realloc`) and computes an IXFR diff (`compute_ixfr_diff`, using `malloc`) so that secondaries can be notified incrementally. This path is synchronous with the query but is inherently a write path, not the hot read path.
 4. **Kqueue Event Loop**:
    - Network I/O events for TCP connections and UDP sockets are managed using FreeBSD `kqueue(2)`.
 

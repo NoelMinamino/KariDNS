@@ -281,10 +281,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         parse_zone_fast(text_buf, fuzz_size, &arena, &ctx);
 
         // Free arena memory
-        for (int i = 0; i < arena.data_pool_count; i++) {
-            if (arena.data_pools[i]) free(arena.data_pools[i]);
-        }
-        if (arena.records) free(arena.records);
+        zone_arena_destroy(&arena);
     }
     else {
         // 3. Fuzz parse_xfr_packet (AXFR packet parser)
@@ -302,11 +299,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         // Use original data for packet parsing (binary, not text_buf)
         parse_xfr_packet(fuzz_data, fuzz_size, &standby, &active, &session, "fuzz.local.");
 
-        // Free standby arena
-        for (int i = 0; i < standby.data_pool_count; i++) {
-            if (standby.data_pools[i]) free(standby.data_pools[i]);
-        }
-        if (standby.records) free(standby.records);
+        // Free standby and active arenas
+        zone_arena_destroy(&standby);
+        zone_arena_destroy(&active);
     }
 
     free(text_buf);

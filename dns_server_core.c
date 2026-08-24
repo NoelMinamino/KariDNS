@@ -916,6 +916,14 @@ static void wait_for_readers(zone_arena_t *arena) {
   }
 }
 
+static void free_ixfr_txn(ixfr_txn_t *txn) {
+  if (!txn) return;
+  zone_arena_destroy(&txn->arena);
+  if (txn->deleted) free(txn->deleted);
+  if (txn->added) free(txn->added);
+  free(txn);
+}
+
 void free_zone_db_entry(zone_db_entry_t *entry) {
   if (!entry) return;
   if (entry->groups) {
@@ -936,21 +944,11 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   for (int idx = 0; idx < MAX_IXFR_HISTORY; idx++) {
     ixfr_txn_t *txn = entry->ixfr_history.entries[idx];
     if (txn) {
-      if (txn->deleted) free(txn->deleted);
-      if (txn->added) free(txn->added);
-      free(txn);
+      free_ixfr_txn(txn);
     }
   }
-  zone_arena_t *arenas[2] = {&entry->rcu.arena_a, &entry->rcu.arena_b};
-  for (int i = 0; i < 2; i++) {
-    zone_arena_t *a = arenas[i];
-    for (int p = 0; p < a->data_pool_count; p++) {
-      if (a->data_pools[p]) free(a->data_pools[p]);
-    }
-    zone_arena_free_include_buffers(a);
-    if (a->records) free(a->records);
-    if (a->hash_table) free(a->hash_table);
-  }
+  zone_arena_destroy(&entry->rcu.arena_a);
+  zone_arena_destroy(&entry->rcu.arena_b);
   free(entry);
 }
 
@@ -979,14 +977,6 @@ static void *gc_snapshot_thread(void *arg) {
   free(snap->views);
   free(snap);
   return NULL;
-}
-
-static void free_ixfr_txn(ixfr_txn_t *txn) {
-  if (!txn) return;
-  zone_arena_destroy(&txn->arena);
-  if (txn->deleted) free(txn->deleted);
-  if (txn->added) free(txn->added);
-  free(txn);
 }
 
 static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
@@ -3320,7 +3310,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
 // ============================================================================
 static uint8_t g_server_cookie_secret[16];
 
-static void generate_server_cookie(const char *client_ip, const uint8_t client_cookie[8], uint8_t server_cookie[16], uint32_t timestamp) {
+static bool generate_server_cookie(const char *client_ip, const uint8_t client_cookie[8], uint8_t server_cookie[16], uint32_t timestamp) {
     uint8_t hash[SHA256_DIGEST_LENGTH];
     unsigned int hash_len = 0;
     
@@ -3338,12 +3328,15 @@ static void generate_server_cookie(const char *client_ip, const uint8_t client_c
     
     struct sockaddr_storage addr;
     memset(&addr, 0, sizeof(addr));
-    if (inet_pton(AF_INET, client_ip, &((struct sockaddr_in *)&addr)->sin_addr) == 1) {
+    if (client_ip && inet_pton(AF_INET, client_ip, &((struct sockaddr_in *)&addr)->sin_addr) == 1) {
         memcpy(data, &((struct sockaddr_in *)&addr)->sin_addr, 4);
         data_len = 4;
-    } else if (inet_pton(AF_INET6, client_ip, &((struct sockaddr_in6 *)&addr)->sin6_addr) == 1) {
+    } else if (client_ip && inet_pton(AF_INET6, client_ip, &((struct sockaddr_in6 *)&addr)->sin6_addr) == 1) {
         memcpy(data, &((struct sockaddr_in6 *)&addr)->sin6_addr, 16);
         data_len = 16;
+    } else {
+        syslog(LOG_WARNING, "[Cookie] client_ip could not be parsed as IPv4/IPv6; refusing to bind cookie to address");
+        return false;
     }
     memcpy(data + data_len, client_cookie, 8);
     data_len += 8;
@@ -3354,6 +3347,7 @@ static void generate_server_cookie(const char *client_ip, const uint8_t client_c
          data, data_len, hash, &hash_len);
     
     memcpy(server_cookie + 8, hash, 8);
+    return true;
 }
 
 static void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
@@ -3645,8 +3639,12 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     if (edns.present) {
       if (edns.has_cookie) {
         // Refresh server cookie for cookie-only probes (RFC 7873 §5.4)
-        edns.server_cookie_len = 16;
-        generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL));
+        if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
+            edns.server_cookie_len = 0;
+            edns.has_cookie = false;
+        } else {
+            edns.server_cookie_len = 16;
+        }
       }
       assemble_edns_opt(res, max_res_len, &offset0, &arcount0, &edns, 0, is_tcp, cfg);
     }
@@ -3847,8 +3845,12 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   
   if (edns.has_cookie) {
       if (edns.server_cookie_len == 0) {
-          edns.server_cookie_len = 16;
-          generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL));
+          if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
+              edns.server_cookie_len = 0;
+              edns.has_cookie = false;
+          } else {
+              edns.server_cookie_len = 16;
+          }
       } else {
           bool valid = false;
           if (edns.server_cookie_len == 16 && edns.server_cookie[0] == 1) {
@@ -3859,8 +3861,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
               uint32_t now = time(NULL);
               if ((now >= ts && now - ts <= 3600) || (now < ts && ts - now <= 300)) {
                   uint8_t expected_server_cookie[16];
-                  generate_server_cookie(client_ip, edns.client_cookie, expected_server_cookie, ts);
-                  if (const_time_memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
+                  if (generate_server_cookie(client_ip, edns.client_cookie, expected_server_cookie, ts) &&
+                      const_time_memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
                       valid = true;
                   }
               }
@@ -3868,8 +3870,12 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
           if (!valid) {
               is_badcookie = true;
               ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
-              edns.server_cookie_len = 16;
-              generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL));
+              if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
+                  edns.server_cookie_len = 0;
+                  edns.has_cookie = false;
+              } else {
+                  edns.server_cookie_len = 16;
+              }
           }
       }
   }
