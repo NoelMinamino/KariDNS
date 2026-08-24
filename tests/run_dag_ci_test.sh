@@ -425,6 +425,7 @@ if [ "$DAG" != "dig" ]; then
     run_check "Regression: --update-del type omission (tests/run_dag_update_del_no_type_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_no_type_test.sh\"" "PASS:"
     run_check "Regression: --update-del-exact TTL & type safety (tests/run_dag_update_del_exact_ttl_notype_crash_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
     run_check "Help examples: --break usage examples validation (tests/run_dag_break_help_examples_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_break_help_examples_test.sh\"" "PASS:"
+    run_check "Override: duplicate --break kind override validation (tests/run_break_duplicate_kind_override_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_break_duplicate_kind_override_test.sh\"" "PASS:"
 fi
 if command -v perl >/dev/null 2>&1; then
     run_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"

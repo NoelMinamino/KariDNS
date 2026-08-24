@@ -460,10 +460,6 @@ static bool any_structural_break(break_kind_t *which_out) {
 }
 
 static void parse_break_arg(const char *arg) {
-    if (g_break_count >= MAX_BREAKS) {
-        fprintf(stderr, "warning: too many --break options, ignoring '%s'\n", arg);
-        return;
-    }
     char name[64]; long param = 0; bool has_param = false;
     const char *eq = strchr(arg, '=');
     if (eq) {
@@ -502,6 +498,17 @@ static void parse_break_arg(const char *arg) {
         return;
     }
 
+    // Check if the same break kind is already registered; if so, override parameter
+    for (int i = 0; i < g_break_count; i++) {
+        if (g_breaks[i].kind == kind) {
+            fprintf(stderr, ";; note: --break '%s' overrides previous value for this kind (was param=%ld, now param=%ld)\n",
+                    name, g_breaks[i].param, param);
+            g_breaks[i].param = param;
+            g_breaks[i].has_param = has_param;
+            return;
+        }
+    }
+
     if (is_structural_break(kind)) {
         break_kind_t existing;
         if (any_structural_break(&existing) && existing != kind) {
@@ -511,6 +518,11 @@ static void parse_break_arg(const char *arg) {
                 name);
             return;
         }
+    }
+
+    if (g_break_count >= MAX_BREAKS) {
+        fprintf(stderr, "warning: too many --break options, ignoring '%s'\n", arg);
+        return;
     }
 
     g_breaks[g_break_count].kind = kind;
@@ -4345,6 +4357,12 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     }
     if (zflag) {
         pkt[3] |= 0x40;  // Set Z bit
+    }
+
+    long short_len = 3;
+    if (has_break(BRK_TOO_SHORT, &short_len, NULL)) {
+        if (short_len < 0) short_len = 3;
+        if (pkt_len > (size_t)short_len) pkt_len = (size_t)short_len;
     }
 
     server_result_t *sres = NULL;
