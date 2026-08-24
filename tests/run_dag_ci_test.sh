@@ -226,9 +226,10 @@ run_check "Recursion flag override (+norec)" "$DAG @127.0.0.1 -p $PORT www.examp
 run_check "Ignore truncation flag (+ignore)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ignore" "192\.0\.2\.10"
 run_check "Timeout flag (+timeout=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
 run_check "Tries and Retry flags (+tries=2 +retry=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tries=2 +retry=2" "192\.0\.2\.10"
-run_check "Search list and ndots (+search +domain +ndots)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +ndots=2 +search" "192\.0\.2\.10"
+run_check "Search list and ndots expansion (+search +domain +ndots=2)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=2 +search" "192\.0\.2\.10"
+run_check "Search list not expanded when ndots exceeded (+ndots=1)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=1 +search" "(NXDOMAIN|SERVFAIL|REFUSED|no servers could be reached|got NXDOMAIN)"
 run_check "Showsearch diagnostic (+showsearch)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +showsearch" "192\.0\.2\.10"
-run_check "DNS64 prefix check (+dns64prefix)" "$DAG @127.0.0.1 -p $PORT www.example.com A +dns64prefix +timeout=1" "(192\.0\.2\.10|timed out|no usable response)"
+run_check "DNS64 prefix check (+dns64prefix)" "$DAG @127.0.0.1 -p $PORT ipv4only.arpa AAAA +dns64prefix +qr" ";ipv4only\.arpa\..*IN.*AAAA"
 run_check "PROXYv2 local header (+proxy)" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy +timeout=1" "(192\.0\.2\.10|timed out|no usable response|NOTIMP|Got bad packet|ID mismatch)"
 run_check "Plain HTTP query (+http-plain)" "$DAG @127.0.0.1 -p $PORT www.example.com A +http-plain +timeout=1" "(192\.0\.2\.10|timed out|connection failed|no usable response)"
 
@@ -258,7 +259,7 @@ key "testkey" {
 };
 EOF
 run_check "TSIG keyfile flag (-k)" "$DAG @127.0.0.1 -p $PORT www.example.com A -k tsig_key.conf +qr" "(TSIG|testkey|ADDITIONAL)"
-run_check "TSIG signing time override (+fuzztime)" "$DAG @127.0.0.1 -p $PORT www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +fuzztime=1646972129 +qr" "(TSIG|testkey|ADDITIONAL)"
+run_check "TSIG signing time override (+fuzztime)" "$DAG @127.0.0.1 -p $PORT www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +fuzztime=1646972129 +qr" "(BADTIME|62 2a ab 61|1646972129|ADDITIONAL)"
 if [ "$DAG" = "dig" ]; then
     run_skip "TSIG signature (+tsig=)"
 else

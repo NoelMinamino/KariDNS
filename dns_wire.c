@@ -662,7 +662,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
     }
-    uint64_t now = time(NULL);
+    uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
     pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
     pre_mac[offset++] = (now >> 8) & 0xFF; pre_mac[offset++] = now & 0xFF;

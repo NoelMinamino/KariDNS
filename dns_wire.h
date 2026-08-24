@@ -164,6 +164,7 @@ typedef struct tsig_key {
     char *secret;
     uint8_t secret_decoded[256];
     size_t secret_decoded_len;
+    int64_t fuzztime;
     struct tsig_key *next;
 } tsig_key_t;
 

@@ -79,7 +79,7 @@ normalize_output() {
         -e '/^; \([0-9]+ servers? found\)/d' \
         -e 's/^(dig|dag):/dig:/' \
         -e 's/id: [0-9]+/id: <ID>/g' \
-        -e 's/; COOKIE: [0-9a-fA-F]+/;; COOKIE: <COOKIE>/g' \
+        -e 's/;* COOKIE: .*/;; COOKIE: <COOKIE>/g' \
         -e 's/[0-9]+[[:space:]]+IN[[:space:]]+/<TTL> IN /g' \
         -e 's/;; Query time: [0-9]+ (msec|usec)/;; Query time: <TIME>/g' \
         -e 's/ in [0-9]+ ms/ in <TIME> ms/g' \
@@ -263,11 +263,22 @@ else
     compare_query "Explicit EDNS Cookie (+cookie)" "www.example.com A +cookie=0102030405060708"
     compare_query "EDNS Keepalive (+keepalive)" "www.example.com A +keepalive"
     compare_query "EDNS Expire (+expire)" "example.com SOA +expire"
+    compare_query "EDNS CO flag (+coflag)" "www.example.com A +coflag"
     compare_query "EDNS Flags raw Z-bits (+ednsflags)" "www.example.com A +ednsflags=0x0040"
     compare_query "Generic EDNS option (+ednsopt)" "www.example.com A +ednsopt=65001:01020304"
     compare_query "Standard TCP Query (+tcp)" "www.example.com A +tcp"
     compare_query "Keep TCP open (+tcp +keepopen)" "www.example.com A +tcp +keepopen"
     compare_query "Flags override (+raflag +tcflag +zflag)" "www.example.com A +raflag +tcflag +zflag"
+    compare_query "Header flags (+adflag +cdflag +aaflag)" "www.example.com A +adflag +cdflag +aaflag"
+    compare_query "Opcode override (+opcode=NOTIFY)" "www.example.com A +opcode=NOTIFY +noadflag"
+    compare_query "QID override (+qid=4660)" "www.example.com A +qid=4660"
+    compare_query "Ignore TC flag (+ignore)" "www.example.com A +ignore"
+    compare_query "Best effort parsing (+besteffort)" "www.example.com A +besteffort"
+    compare_query "DNS64 prefix check (+dns64prefix)" "ipv4only.arpa AAAA +dns64prefix"
+    compare_query "Search domain option (+domain= +search)" "www +domain=example.com +search"
+    compare_query "Search ndots expansion (+domain= +ndots=2 +search)" "www.example +domain=com +ndots=2 +search"
+    compare_query "Search ndots not expanded (+domain= +ndots=1 +search)" "www.example +domain=com +ndots=1 +search"
+    compare_query "Showsearch diagnostic (+showsearch)" "www +domain=example.com +showsearch"
 
     echo "--------------------------------------------------------"
     echo "5. Zone Transfers (AXFR)"
@@ -313,6 +324,7 @@ key "testkey" {
 EOF
     compare_query "TSIG key inline (-y)" "www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl"
     compare_query "TSIG keyfile flag (-k)" "www.example.com A -k tsig_key.conf"
+    compare_query "TSIG signing time override (+fuzztime)" "www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +fuzztime=1646972129"
 
     echo "--------------------------------------------------------"
     echo "9. IDN (Internationalized Domain Names)"

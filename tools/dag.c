@@ -4112,6 +4112,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     size_t request_mac_len = 0;
 
     if (qo->want_tsig) {
+        qo->tsig_key.fuzztime = qo->fuzztime;
         if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, false) != 0) {
             fprintf(stderr, "Error: tsig_sign_packet failed\n");
             return 1;
@@ -4279,8 +4280,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         do {
             if (n >= 2) {
                 uint16_t resp_id = (resp[0] << 8) | resp[1];
-                if (resp_id != qo->query_id) {
-                    fprintf(stderr, ";; Warning: ID mismatch: expected %u, got %u\n", qo->query_id, resp_id);
+                uint16_t expected_id = (qo->qid_override >= 0) ? (uint16_t)(qo->qid_override & 0xFFFF) : qo->query_id;
+                if (resp_id != expected_id) {
+                    fprintf(stderr, ";; Warning: ID mismatch: expected %u, got %u\n", expected_id, resp_id);
                 }
             }
             reset_dag_arena();
@@ -5333,21 +5335,20 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                           bool no_hexdump_query, bool no_hexdump_response,
                           query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     char expanded_qname[512];
-    if (qo.use_search_list && strchr(qname, '.') == NULL) {
+    int num_dots = 0;
+    for (const char *p = qname; *p; p++) {
+        if (*p == '.') num_dots++;
+    }
+    int req_ndots = (qo.ndots > 0) ? qo.ndots : 1;
+    if (qo.use_search_list && num_dots < req_ndots) {
         if (qo.search_domain && *qo.search_domain) {
             snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, qo.search_domain);
-            if (dopt && dopt->showsearch) {
-                printf(";; SEARCH: %s -> %s\n", qname, expanded_qname);
-            }
             qname = expanded_qname;
         } else {
             char domains[4][256];
             int count = get_system_search_domains(domains, 4);
             if (count > 0) {
                 snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, domains[0]);
-                if (dopt && dopt->showsearch) {
-                    printf(";; SEARCH: %s -> %s\n", qname, expanded_qname);
-                }
                 qname = expanded_qname;
             }
         }
@@ -6205,7 +6206,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+nofuzztime") == 0) {
             spec->qo.fuzztime = 0;
         } else if (strcmp(arg, "+dns64prefix") == 0) {
-            spec->qo.check_dns64prefix = true;
+            spec->qo.want_opt = true; spec->qo.check_dns64prefix = true;
         } else if (strcmp(arg, "+nodns64prefix") == 0) {
             spec->qo.check_dns64prefix = false;
         } else if (strncmp(arg, "+proxy=", 7) == 0) {
