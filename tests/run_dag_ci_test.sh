@@ -409,6 +409,27 @@ if [ "$DAG" != "dig" ]; then
 fi
 
 echo "========================================================"
+echo "19. RFC 5452 UDP Security & Transport Resilience Tests"
+echo "========================================================"
+run_check "Standard UDP resolution with connected socket" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+run_check "Explicit QID query with connected socket (+qid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qid=4660 +timeout=2" "192\.0\.2\.10"
+if [ "$DAG" != "dig" ]; then
+    run_check "UDP socket bind to source IP (-b)" "$DAG -b 127.0.0.1 @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+fi
+
+echo "========================================================"
+echo "20. Dedicated Security & Regression Test Scripts"
+echo "========================================================"
+if [ "$DAG" != "dig" ]; then
+    run_check "Regression: --update-del type omission (tests/run_update_del_no_type_test.sh)" "sh \"$SCRIPT_DIR/run_update_del_no_type_test.sh\"" "PASS:"
+    run_check "Regression: --update-del-exact TTL & type safety (tests/run_update_del_exact_ttl_notype_crash_test.sh)" "sh \"$SCRIPT_DIR/run_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
+    if command -v perl >/dev/null 2>&1; then
+        run_check "Security: UDP spoofing source rejection (tests/run_udp_spoofing_source_test.sh)" "sh \"$SCRIPT_DIR/run_udp_spoofing_source_test.sh\"" "PASS:"
+        run_check "Security: UDP transaction ID mismatch discard (tests/run_udp_id_mismatch_discard_test.sh)" "sh \"$SCRIPT_DIR/run_udp_id_mismatch_discard_test.sh\"" "PASS:"
+    fi
+fi
+
+echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
     if [ "$SKIPPED" -gt 0 ]; then
         echo "🎉 ALL TESTS PASSED! ($SKIPPED skipped for $CLIENT_NAME)"

@@ -1556,6 +1556,16 @@ static int connect_udp(const char *server, int port, int pref_family, const char
             }
         }
     }
+    /*
+     * RFC 5452 §9.1: Connect UDP socket to the destination address/port.
+     * This instructs the OS kernel to automatically filter and discard any
+     * incoming UDP datagrams originating from unauthorized sources/ports.
+     */
+    if (connect(sock, (struct sockaddr *)dest, *dest_len) != 0) {
+        perror("connect (udp)");
+        close(sock);
+        return -1;
+    }
     return sock;
 }
 
@@ -1638,15 +1648,59 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
     memcpy(wire_buf + wire_len, pkt, send_len);
     wire_len += send_len;
 
-    if (sendto(sock, wire_buf, wire_len, 0, (struct sockaddr *)&dest, dest_len) < 0) {
+    if (send(sock, wire_buf, wire_len, 0) < 0) {
         fprintf(stderr, ";; UDP setup with %s#%d(%s) failed: %s\n", server, port, server, strerror(errno));
         close(sock); return -1;
     }
 
-    set_socket_timeouts(sock, timeout_sec);
-    ssize_t n = recv(sock, resp, resp_cap, 0);
-    close(sock);
-    return n;
+    int eff_timeout = (timeout_sec > 0) ? timeout_sec : 5;
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += eff_timeout;
+
+    uint16_t sent_id = (pkt_len >= 2) ? ((pkt[0] << 8) | pkt[1]) : 0;
+    bool skip_id_check = has_break(BRK_QR_BIT, NULL, NULL) || has_break(BRK_TOO_SHORT, NULL, NULL);
+
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remain_sec = deadline.tv_sec - now.tv_sec;
+        long remain_usec = (deadline.tv_nsec - now.tv_nsec) / 1000;
+        if (remain_usec < 0) {
+            remain_sec -= 1;
+            remain_usec += 1000000;
+        }
+        if (remain_sec < 0 || (remain_sec == 0 && remain_usec <= 0)) {
+            close(sock);
+            return -1; // Timeout
+        }
+
+        struct timeval tv;
+        tv.tv_sec = (time_t)remain_sec;
+        tv.tv_usec = (suseconds_t)remain_usec;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+
+        ssize_t n = recv(sock, resp, resp_cap, 0);
+        if (n < 0) {
+            close(sock);
+            return -1; // Timeout or network error
+        }
+        if (n < 2) {
+            // Malformed/too short response, discard and keep waiting
+            continue;
+        }
+
+        if (!skip_id_check) {
+            uint16_t resp_id = (resp[0] << 8) | resp[1];
+            if (resp_id != sent_id) {
+                fprintf(stderr, ";; Warning: ID mismatch: expected %u, got %u\n", sent_id, resp_id);
+                continue; // Discard spoofed / stray packet and wait for matching response (RFC 5452)
+            }
+        }
+
+        close(sock);
+        return n;
+    }
 }
 
 typedef struct {
