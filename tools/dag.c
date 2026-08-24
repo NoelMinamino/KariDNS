@@ -501,6 +501,17 @@ static void parse_break_arg(const char *arg) {
         return;
     }
 
+    if (is_structural_break(kind)) {
+        break_kind_t existing;
+        if (any_structural_break(&existing) && existing != kind) {
+            fprintf(stderr,
+                "warning: --break '%s' ignored; structural break kind is already set "
+                "and only one structural break can be active per query (see --break-help)\n",
+                name);
+            return;
+        }
+    }
+
     g_breaks[g_break_count].kind = kind;
     g_breaks[g_break_count].param = param;
     g_breaks[g_break_count].has_param = has_param;
@@ -509,6 +520,11 @@ static void parse_break_arg(const char *arg) {
 
 static void print_break_help(void) {
     printf(
+        "NOTE: Only one *structural* --break kind (compression-loop, compression-forward,\n"
+        "      label-too-long, reserved-length-bits, oversized-qname, truncated-question,\n"
+        "      notify-no-question) can be active per query. If multiple are specified, only\n"
+        "      the first one takes effect; TCP-only and header-flag breaks can still be\n"
+        "      combined freely with a structural break.\n\n"
         "--break kinds:\n"
         "  compression-loop           question name = self-referencing compression pointer\n"
         "  compression-forward        question name = pointer to an unseen forward offset\n"
@@ -595,6 +611,7 @@ typedef struct {
         prereq_kind_t kind;
         char name[256];
         char type_str[32];
+        char rdata[512];
     } prereqs[MAX_PREREQS];
     int prereq_count;
     uint16_t query_id;
@@ -1088,6 +1105,67 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
         for (int pi = 0; pi < qo->prereq_count; pi++) {
             const char *name = qo->prereqs[pi].name;
             uint16_t type, class_val;
+
+            if (qo->prereqs[pi].kind == PREREQ_YXRRSET && qo->prereqs[pi].rdata[0] != '\0') {
+                // RFC 2136 Section 2.4.2: RRset Exists (Value Dependent)
+                char *buf = strdup(qo->prereqs[pi].rdata);
+                char *tokens[32];
+                int token_count = 0;
+                bool in_quote = false;
+                char *p = buf;
+                char *tok_start = NULL;
+                char *out = buf;
+
+                while (*p && token_count < 32) {
+                    if (*p == '"') {
+                        in_quote = !in_quote;
+                        if (!tok_start) tok_start = out;
+                        p++;
+                    } else if (*p == ' ' && !in_quote) {
+                        if (tok_start) {
+                            *out++ = '\0';
+                            tokens[token_count++] = tok_start;
+                            tok_start = NULL;
+                        }
+                        p++;
+                    } else {
+                        if (!tok_start) tok_start = out;
+                        if (*p == '\\' && *(p+1) == '"') {
+                            p++;
+                            *out++ = *p++;
+                        } else {
+                            *out++ = *p++;
+                        }
+                    }
+                }
+                if (tok_start && token_count < 32) {
+                    *out = '\0';
+                    tokens[token_count++] = tok_start;
+                }
+
+                type = parse_qtype(qo->prereqs[pi].type_str);
+                dns_record_t rec;
+                memset(&rec, 0, sizeof(rec));
+                rec.name = (char *)name;
+                rec.ttl = (char *)"0";
+                rec.type_code = type;
+                rec.type = (char *)qo->prereqs[pi].type_str;
+                rec.class_str = (char *)(qo->qclass == 3 ? "CH" : (qo->qclass == 4 ? "HS" : "IN"));
+                rec.rdata_count = token_count;
+                for (int t = 0; t < token_count; t++) rec.rdata[t] = tokens[t];
+
+                uint16_t out_offset = offset;
+                if (serialize_dns_record(pkt, max_len, &out_offset, &rec, &comp_ctx, NULL, 0) == 0) {
+                    offset = out_offset;
+                    uint16_t prcount = (pkt[6] << 8) | pkt[7];
+                    prcount++;
+                    pkt[6] = prcount >> 8; pkt[7] = prcount & 0xFF;
+                } else {
+                    fprintf(stderr, "warning: failed to serialize yxrrset prereq rdata: %s\n", qo->prereqs[pi].rdata);
+                }
+                free(buf);
+                continue;
+            }
 
             switch (qo->prereqs[pi].kind) {
                 case PREREQ_NXDOMAIN: type = 255; class_val = 254; break; // ANY, NONE
@@ -2883,7 +2961,10 @@ static const char *idn_to_ascii(const char *name, bool *allocated) {
     if (allocated) *allocated = false;
 #ifdef HAVE_LIBIDN2
     char *p = NULL;
-    int rc = idn2_lookup_ul(name, &p, 0);
+    int rc = idn2_lookup_u8((const uint8_t *)name, (uint8_t **)&p, 0);
+    if (rc != IDN2_OK) {
+        rc = idn2_lookup_ul(name, &p, 0);
+    }
     if (rc == IDN2_OK) {
         if (allocated) *allocated = true;
         return p;
@@ -5024,28 +5105,44 @@ static bool is_known_qclass_str(const char *s, uint16_t *out_class) {
     return false;
 }
 
+// 2引数（オプション名 + 値1個）を消費するオプションの一覧（Single Source of Truth）
+static const char *TWO_ARG_OPTIONS[] = {
+    "-p", "-c", "-t", "-b", "-k", "-y", "-q", "-x", "-f",
+    "--hex", "--break",
+    "--update-add", "--update-del", "--update-del-exact",
+    "--prereq-nxdomain", "--prereq-yxdomain",
+    NULL
+};
+
 static int get_arg_consume_count(int argc, char **argv, int i) {
+    if (i >= argc) return 0;
     if (i + 1 >= argc) return 1;
     const char *arg = argv[i];
-    if (strcmp(arg, "-p") == 0 ||
-        strcmp(arg, "-c") == 0 ||
-        strcmp(arg, "-t") == 0 ||
-        strcmp(arg, "-b") == 0 ||
-        strcmp(arg, "-k") == 0 ||
-        strcmp(arg, "-y") == 0 ||
-        strcmp(arg, "-q") == 0 ||
-        strcmp(arg, "-x") == 0 ||
-        strcmp(arg, "-f") == 0 ||
-        strcmp(arg, "--hex") == 0 ||
-        strcmp(arg, "--break") == 0 ||
-        strcmp(arg, "--update-add") == 0 ||
-        strcmp(arg, "--update-del") == 0 ||
-        strcmp(arg, "--update-del-exact") == 0 ||
-        strcmp(arg, "--prereq-nxdomain") == 0 ||
-        strcmp(arg, "--prereq-yxdomain") == 0 ||
-        strcmp(arg, "--prereq-nxrrset") == 0 ||
-        strcmp(arg, "--prereq-yxrrset") == 0) {
+
+    if (strcmp(arg, "--prereq-nxrrset") == 0) {
+        if (strchr(argv[i + 1], ' ') != NULL) {
+            return 2; // "name type" quoted in single token
+        }
+        if (i + 2 < argc && argv[i + 2][0] != '-' && argv[i + 2][0] != '+' && argv[i + 2][0] != '@') {
+            return 3; // name type
+        }
         return 2;
+    }
+    if (strcmp(arg, "--prereq-yxrrset") == 0) {
+        if (strchr(argv[i + 1], ' ') != NULL) {
+            return 2; // "name type [rdata]" quoted in single token
+        }
+        if (i + 2 < argc && argv[i + 2][0] != '-' && argv[i + 2][0] != '+' && argv[i + 2][0] != '@') {
+            if (i + 3 < argc && argv[i + 3][0] != '-' && argv[i + 3][0] != '+' && argv[i + 3][0] != '@') {
+                return 4; // name type rdata
+            }
+            return 3; // name type
+        }
+        return 2;
+    }
+
+    for (int k = 0; TWO_ARG_OPTIONS[k]; k++) {
+        if (strcmp(arg, TWO_ARG_OPTIONS[k]) == 0) return 2;
     }
     return 1;
 }
@@ -5217,6 +5314,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             char *kind_str = strtok(spec_str, ":");
             char *name = strtok(NULL, ":");
             char *type_str = strtok(NULL, ":");
+            char *rdata = strtok(NULL, ":");
             prereq_kind_t kind = PREREQ_NXDOMAIN;
             bool needs_type = false;
             if (kind_str && strcasecmp(kind_str, "nxdomain") == 0) kind = PREREQ_NXDOMAIN;
@@ -5231,10 +5329,11 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 return -1;
             }
 
-            struct { prereq_kind_t kind; char name[256]; char type_str[32]; } *pr = (void*)&spec->qo.prereqs[spec->qo.prereq_count++];
-            pr->kind = kind;
-            snprintf(pr->name, sizeof(pr->name), "%s", name);
-            snprintf(pr->type_str, sizeof(pr->type_str), "%s", needs_type ? type_str : "");
+            int p = spec->qo.prereq_count++;
+            spec->qo.prereqs[p].kind = kind;
+            snprintf(spec->qo.prereqs[p].name, sizeof(spec->qo.prereqs[p].name), "%s", name);
+            snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", needs_type ? type_str : "");
+            snprintf(spec->qo.prereqs[p].rdata, sizeof(spec->qo.prereqs[p].rdata), "%s", rdata ? rdata : "");
             free(spec_str);
         }
         return 1;
@@ -5244,6 +5343,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_NXDOMAIN;
             snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", argv[i + 1]);
             spec->qo.prereqs[spec->qo.prereq_count].type_str[0] = '\0';
+            spec->qo.prereqs[spec->qo.prereq_count].rdata[0] = '\0';
             spec->qo.prereq_count++;
         }
         return 2;
@@ -5253,39 +5353,76 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_YXDOMAIN;
             snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", argv[i + 1]);
             spec->qo.prereqs[spec->qo.prereq_count].type_str[0] = '\0';
+            spec->qo.prereqs[spec->qo.prereq_count].rdata[0] = '\0';
             spec->qo.prereq_count++;
         }
         return 2;
     }
     if (strcmp(arg, "--prereq-nxrrset") == 0 && i + 1 < argc) {
         if (spec->qo.prereq_count < MAX_PREREQS) {
-            spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_NXRRSET;
-            char *buf = strdup(argv[i + 1]);
-            char *name = strtok(buf, " ");
-            char *type_str = strtok(NULL, " ");
-            if (name && type_str) {
-                snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", name);
-                snprintf(spec->qo.prereqs[spec->qo.prereq_count].type_str, sizeof(spec->qo.prereqs[0].type_str), "%s", type_str);
+            int p = spec->qo.prereq_count;
+            spec->qo.prereqs[p].kind = PREREQ_NXRRSET;
+            spec->qo.prereqs[p].rdata[0] = '\0';
+            if (strchr(argv[i + 1], ' ') != NULL) {
+                char *buf = strdup(argv[i + 1]);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                if (name && type_str) {
+                    snprintf(spec->qo.prereqs[p].name, sizeof(spec->qo.prereqs[p].name), "%s", name);
+                    snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", type_str);
+                    spec->qo.prereq_count++;
+                }
+                free(buf);
+                return 2;
+            } else if (i + 2 < argc && argv[i + 2][0] != '-' && argv[i + 2][0] != '+' && argv[i + 2][0] != '@') {
+                snprintf(spec->qo.prereqs[p].name, sizeof(spec->qo.prereqs[p].name), "%s", argv[i + 1]);
+                snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", argv[i + 2]);
                 spec->qo.prereq_count++;
+                return 3;
+            } else {
+                fprintf(stderr, "error: --prereq-nxrrset requires <name> <type>\n");
+                return -1;
             }
-            free(buf);
         }
-        return 2;
+        return get_arg_consume_count(argc, argv, i);
     }
     if (strcmp(arg, "--prereq-yxrrset") == 0 && i + 1 < argc) {
         if (spec->qo.prereq_count < MAX_PREREQS) {
-            spec->qo.prereqs[spec->qo.prereq_count].kind = PREREQ_YXRRSET;
-            char *buf = strdup(argv[i + 1]);
-            char *name = strtok(buf, " ");
-            char *type_str = strtok(NULL, " ");
-            if (name && type_str) {
-                snprintf(spec->qo.prereqs[spec->qo.prereq_count].name, sizeof(spec->qo.prereqs[0].name), "%s", name);
-                snprintf(spec->qo.prereqs[spec->qo.prereq_count].type_str, sizeof(spec->qo.prereqs[0].type_str), "%s", type_str);
+            int p = spec->qo.prereq_count;
+            spec->qo.prereqs[p].kind = PREREQ_YXRRSET;
+            spec->qo.prereqs[p].rdata[0] = '\0';
+            if (strchr(argv[i + 1], ' ') != NULL) {
+                char *buf = strdup(argv[i + 1]);
+                char *name = strtok(buf, " ");
+                char *type_str = strtok(NULL, " ");
+                char *rdata = strtok(NULL, "");
+                if (name && type_str) {
+                    snprintf(spec->qo.prereqs[p].name, sizeof(spec->qo.prereqs[p].name), "%s", name);
+                    snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", type_str);
+                    if (rdata) {
+                        while (*rdata == ' ') rdata++;
+                        snprintf(spec->qo.prereqs[p].rdata, sizeof(spec->qo.prereqs[p].rdata), "%s", rdata);
+                    }
+                    spec->qo.prereq_count++;
+                }
+                free(buf);
+                return 2;
+            } else if (i + 2 < argc && argv[i + 2][0] != '-' && argv[i + 2][0] != '+' && argv[i + 2][0] != '@') {
+                snprintf(spec->qo.prereqs[p].name, sizeof(spec->qo.prereqs[p].name), "%s", argv[i + 1]);
+                snprintf(spec->qo.prereqs[p].type_str, sizeof(spec->qo.prereqs[p].type_str), "%s", argv[i + 2]);
+                int consumed = 3;
+                if (i + 3 < argc && argv[i + 3][0] != '-' && argv[i + 3][0] != '+' && argv[i + 3][0] != '@') {
+                    snprintf(spec->qo.prereqs[p].rdata, sizeof(spec->qo.prereqs[p].rdata), "%s", argv[i + 3]);
+                    consumed = 4;
+                }
                 spec->qo.prereq_count++;
+                return consumed;
+            } else {
+                fprintf(stderr, "error: --prereq-yxrrset requires <name> <type> [rdata]\n");
+                return -1;
             }
-            free(buf);
         }
-        return 2;
+        return get_arg_consume_count(argc, argv, i);
     }
     if (strcmp(arg, "--break") == 0 && i + 1 < argc) {
         char *brk = argv[i + 1];
@@ -5450,6 +5587,12 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->dopt.showsearch = true;
         } else if (strcmp(arg, "+noshowsearch") == 0) {
             spec->dopt.showsearch = false;
+        } else if (strcmp(arg, "+idn") == 0) {
+            spec->qo.idnin = true;
+            spec->dopt.idnout = true;
+        } else if (strcmp(arg, "+noidn") == 0) {
+            spec->qo.idnin = false;
+            spec->dopt.idnout = false;
         } else if (strcmp(arg, "+idnin") == 0) {
             spec->qo.idnin = true;
         } else if (strcmp(arg, "+noidnin") == 0) {
@@ -5642,6 +5785,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 spec->qo.custom_edns_opt_count++;
                 free(mqstr);
             }
+        } else if (strcmp(arg, "+noednsopt") == 0) {
+            spec->qo.custom_edns_opt_count = 0;
         } else if (strncmp(arg, "+ednsopt=", 9) == 0) {
             spec->qo.want_opt = true;
             if (spec->qo.custom_edns_opt_count < 8) {

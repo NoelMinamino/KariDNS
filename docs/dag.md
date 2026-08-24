@@ -224,6 +224,12 @@ dag [global-queryopt...] [query...]
 `+ndots=N`
 : Set the threshold for the number of dots that must appear in a domain name for it to be considered absolute before search domain appending takes place.
 
+`+[no]idn`
+: Toggle Internationalized Domain Names (IDN) processing for both input and output simultaneously.
+
+`+[no]idnin`, `+[no]idnout`
+: Independently control IDN conversion for input query domain names (Punycode encoding via `libidn2`) and output response domain names (Unicode decoding).
+
 ---
 
 ## EDNS0 EXTENSIONS
@@ -347,8 +353,8 @@ dag [global-queryopt...] [query...]
 `--prereq-nxrrset <name> <type>`
 : Prerequisite: RRset of `<type>` on `<name>` must NOT exist.
 
-`--prereq=<kind:name[:type]>`
-: Alternative colon-delimited format for specifying prerequisites (e.g., `--prereq=nxdomain:host.example.com`).
+`--prereq=<kind:name[:type][:rdata]>`
+: Alternative colon-delimited format for specifying prerequisites (e.g., `--prereq=nxdomain:host.example.com` or `--prereq=yxrrset:host.example.com:A:192.0.2.1`).
 
 ---
 
@@ -357,6 +363,9 @@ dag [global-queryopt...] [query...]
 > [!WARNING]
 > **Intended for Local Testing & Security Audits Only**
 > Do not execute `--break` anomaly tests against external or production public DNS servers without explicit authorization.
+
+> [!NOTE]
+> Only one *structural* `--break` mutation (e.g. `compression-loop`, `compression-forward`, `label-too-long`, `reserved-length-bits`, `oversized-qname`, `truncated-question`, `notify-no-question`) can be active per query. If multiple structural breaks are specified, only the first one is applied and subsequent ones are ignored with a warning. Transport/header flags can be combined freely.
 
 `dag` provides built-in packet mutators to test server resilience against protocol edge cases, malformed wire formats, and parser exploits.
 

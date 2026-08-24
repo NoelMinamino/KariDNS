@@ -79,6 +79,7 @@ jobs:
             sh ./tests/run_karicheck_glue_test.sh
             sh ./tests/run_dag_compat_test.sh
             sh ./tests/run_hex_payload_overflow_test.sh
+            sh ./tests/run_dag_cli_options_test.sh
             sh ./tests/run_dag_ci_test.sh
             echo "::endgroup::"
 
