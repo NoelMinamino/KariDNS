@@ -504,6 +504,9 @@ When `+ldnsz` is supplied:
 `+[no]onesoa`
 : Print only the initial SOA record during AXFR transfers instead of both starting and ending SOAs.
 
+`+[no]expandaaaa`
+: Display IPv6 AAAA record addresses in fully expanded 8-group notation (e.g. `2001:0db8:0000:0000:...`) instead of compressed notation.
+
 `+[no]split=N`
 : Split long base64 and hex strings into chunks of `N` characters (default: 56; 44 in multiline mode). `+nosplit` disables splitting.
 

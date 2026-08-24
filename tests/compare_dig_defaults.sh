@@ -86,9 +86,58 @@ normalize_output() {
         -e 's/;; WHEN: .*/;; WHEN: <DATE>/g' \
         -e '/;; (no usable response received|connection failed|no servers could be reached)/d' \
         -e '/^;; === MULTI-SERVER COMPARISON SUMMARY ===/,$d' \
+        -e 's/\x1b\[[0-9;]*m//g' \
         -e 's/[[:space:]]+/ /g' \
         -e 's/[[:space:]]*$//' | \
-    awk 'NF { print }'
+    awk '
+    BEGIN { in_sec = 0; count = 0; }
+    NF == 0 { next }
+    /^;; (ANSWER|AUTHORITY|ADDITIONAL) SECTION:/ {
+        if (in_sec && count > 0) {
+            for (i = 1; i <= count; i++) {
+                for (j = i + 1; j <= count; j++) {
+                    if (lines[i] > lines[j]) { t = lines[i]; lines[i] = lines[j]; lines[j] = t; }
+                }
+                print lines[i];
+            }
+            count = 0;
+        }
+        in_sec = 1;
+        print;
+        next;
+    }
+    /^;;/ || /^; / {
+        if (in_sec && count > 0) {
+            for (i = 1; i <= count; i++) {
+                for (j = i + 1; j <= count; j++) {
+                    if (lines[i] > lines[j]) { t = lines[i]; lines[i] = lines[j]; lines[j] = t; }
+                }
+                print lines[i];
+            }
+            count = 0;
+        }
+        in_sec = 0;
+        print;
+        next;
+    }
+    {
+        if (in_sec) {
+            count++;
+            lines[count] = $0;
+        } else {
+            print;
+        }
+    }
+    END {
+        if (in_sec && count > 0) {
+            for (i = 1; i <= count; i++) {
+                for (j = i + 1; j <= count; j++) {
+                    if (lines[i] > lines[j]) { t = lines[i]; lines[i] = lines[j]; lines[j] = t; }
+                }
+                print lines[i];
+            }
+        }
+    }'
 }
 
 TOTAL=0
@@ -154,9 +203,11 @@ if [ $# -gt 0 ]; then
     compare_query "Custom Query" "$*"
 else
     echo "--------------------------------------------------------"
-    echo "1. Record Types & Resolution (with EDNS0 + Cookie defaults)"
+    echo "1. Record Types & Resolution"
     echo "--------------------------------------------------------"
     compare_query "Standard A query" "www.example.com A"
+    compare_query "Explicit query name (-q)" "-q www.example.com A"
+    compare_query "Explicit query type (-t)" "example.com -t MX"
     compare_query "Standard AAAA query" "www.example.com AAAA"
     compare_query "SOA query" "example.com SOA"
     compare_query "NS query" "example.com NS"
@@ -184,9 +235,12 @@ else
     compare_query "Unknown format (+unknownformat)" "www.example.com A +noall +answer +unknownformat"
     compare_query "Omit TTL ID (+nottlid)" "www.example.com A +nottlid"
     compare_query "Multiline mode (+multiline)" "example.com SOA +multiline"
+    compare_query "Expand AAAA (+expandaaaa)" "www.example.com AAAA +expandaaaa"
     compare_query "No comments (+nocomments)" "www.example.com A +nocomments"
     compare_query "No command header (+nocmd)" "www.example.com A +nocmd"
     compare_query "No answer section (+noanswer)" "www.example.com A +noanswer"
+    compare_query "No authority section (+noauthority)" "nonexistent.example.com A +noauthority"
+    compare_query "No additional section (+noadditional)" "example.com NS +noadditional"
     compare_query "No question section (+noquestion)" "www.example.com A +noquestion"
     compare_query "Combined +noall +answer" "www.example.com A +noall +answer"
     compare_query "No stats section (+nostats)" "www.example.com A +nostats"
@@ -207,7 +261,13 @@ else
     compare_query "EDNS Subnet (+subnet)" "www.example.com A +subnet=192.0.2.0/24"
     compare_query "EDNS Padding (+padding)" "www.example.com A +padding=64"
     compare_query "Explicit EDNS Cookie (+cookie)" "www.example.com A +cookie=0102030405060708"
+    compare_query "EDNS Keepalive (+keepalive)" "www.example.com A +keepalive"
+    compare_query "EDNS Expire (+expire)" "example.com SOA +expire"
+    compare_query "EDNS Flags raw Z-bits (+ednsflags)" "www.example.com A +ednsflags=0x0040"
+    compare_query "Generic EDNS option (+ednsopt)" "www.example.com A +ednsopt=65001:01020304"
     compare_query "Standard TCP Query (+tcp)" "www.example.com A +tcp"
+    compare_query "Keep TCP open (+tcp +keepopen)" "www.example.com A +tcp +keepopen"
+    compare_query "Flags override (+raflag +tcflag +zflag)" "www.example.com A +raflag +tcflag +zflag"
 
     echo "--------------------------------------------------------"
     echo "5. Zone Transfers (AXFR)"
@@ -215,6 +275,7 @@ else
     compare_query "Standard AXFR Transfer" "example.com AXFR"
     compare_query "AXFR Short Mode (+short)" "example.com AXFR +short"
     compare_query "AXFR No Comments (+nocomments)" "example.com AXFR +nocomments"
+    compare_query "AXFR Single SOA (+onesoa)" "example.com AXFR +onesoa"
 
     echo "--------------------------------------------------------"
     echo "6. Default Query (No domain/type specified)"
@@ -224,12 +285,12 @@ else
     echo "--------------------------------------------------------"
     echo "7. TLS / DoT Verification (RFC 7858)"
     echo "--------------------------------------------------------"
-    if "$DAG" @9.9.9.9 dns.quad9.net A +tls +timeout=2 +tries=1 >/dev/null 2>&1; then
-        compare_raw "Live DoT with default CA & SNI verification" "dig @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=dns.quad9.net +timeout=4" "$DAG @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=dns.quad9.net $DIG_DEFAULTS +timeout=4 +nohexdump"
-        compare_raw "Live DoT with mismatched hostname rejected" "dig @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=mismatch.invalid +timeout=4" "$DAG @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=mismatch.invalid +timeout=4 +nohexdump"
-    elif "$DAG" @8.8.8.8 dns.google A +tls +timeout=2 +tries=1 >/dev/null 2>&1; then
+    if "$DAG" @8.8.8.8 dns.google A +tls +timeout=2 +tries=1 >/dev/null 2>&1; then
         compare_raw "Live DoT with default CA & SNI verification" "dig @8.8.8.8 dns.google A +tls +tls-ca +tls-hostname=dns.google +timeout=4" "$DAG @8.8.8.8 dns.google A +tls +tls-ca +tls-hostname=dns.google $DIG_DEFAULTS +timeout=4 +nohexdump"
         compare_raw "Live DoT with mismatched hostname rejected" "dig @8.8.8.8 www.google.com A +tls +tls-ca +tls-hostname=mismatch.invalid +timeout=4" "$DAG @8.8.8.8 www.google.com A +tls +tls-ca +tls-hostname=mismatch.invalid +timeout=4 +nohexdump"
+    elif "$DAG" @9.9.9.9 dns.quad9.net A +tls +timeout=2 +tries=1 >/dev/null 2>&1; then
+        compare_raw "Live DoT with default CA & SNI verification" "dig @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=dns.quad9.net +timeout=4" "$DAG @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=dns.quad9.net $DIG_DEFAULTS +timeout=4 +nohexdump"
+        compare_raw "Live DoT with mismatched hostname rejected" "dig @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=mismatch.invalid +timeout=4" "$DAG @9.9.9.9 dns.quad9.net A +tls +tls-ca +tls-hostname=mismatch.invalid +timeout=4 +nohexdump"
     else
         echo "  [SKIP] Outbound DoT not reachable"
     fi
@@ -244,6 +305,14 @@ else
     compare_query "Positional Order: Type Name Class" "A www.example.com IN"
     compare_query "Multiple Reverse (-x) and Forward" "-x 192.0.2.10 www.example.com A"
     compare_query "Per-query flag override (+noanswer on second)" "www.example.com A example.com TXT +noanswer"
+    cat << 'EOF' > tsig_key.conf
+key "testkey" {
+    algorithm hmac-sha256;
+    secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
+};
+EOF
+    compare_query "TSIG key inline (-y)" "www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl"
+    compare_query "TSIG keyfile flag (-k)" "www.example.com A -k tsig_key.conf"
 
     echo "--------------------------------------------------------"
     echo "9. IDN (Internationalized Domain Names)"

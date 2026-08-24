@@ -697,6 +697,7 @@ typedef struct {
     bool onesoa;
     bool show_badcookie_msg;
     bool show_badvers_msg;
+    bool expandaaaa;
     int split_width;
     bool force_unknown_format;
     bool ttlunits;
@@ -2707,9 +2708,16 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         case 28:
             if (rdlen == 16) {
-                char buf[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET6, &pkt[abs_offset], buf, sizeof(buf));
-                printf("%s", buf);
+                if (dopt && dopt->expandaaaa) {
+                    for (int g = 0; g < 8; g++) {
+                        uint16_t val = (pkt[abs_offset + g * 2] << 8) | pkt[abs_offset + g * 2 + 1];
+                        printf("%s%04x", (g > 0) ? ":" : "", val);
+                    }
+                } else {
+                    char buf[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, &pkt[abs_offset], buf, sizeof(buf));
+                    printf("%s", buf);
+                }
             } else printf("(malformed AAAA, rdlen=%u)", rdlen);
             break;
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS / CNAME / PTR / DNAME
@@ -2749,19 +2757,11 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 printf("\t\t\t\t\t%u\t; serial\n", serial);
                 printf("\t\t\t\t\t%u\t; refresh%s\n", refresh, t_ref);
                 printf("\t\t\t\t\t%u\t; retry%s\n", retry, t_ret);
-                if (dopt->expire) {
-                    printf("\t\t\t\t\t\033[1;31m%u\033[0m\t; expire%s (HIGHLIGHTED)\n", expire, t_exp);
-                } else {
-                    printf("\t\t\t\t\t%u\t; expire%s\n", expire, t_exp);
-                }
+                printf("\t\t\t\t\t%u\t; expire%s\n", expire, t_exp);
                 printf("\t\t\t\t\t%u\t; minimum%s\n", minimum, t_min);
                 printf("\t\t\t\t\t)");
             } else {
-                if (dopt && dopt->expire) {
-                    printf("%s %s %u %u %u \033[1;31m%u\033[0m %u", mname, rname, serial, refresh, retry, expire, minimum);
-                } else {
-                    printf("%s %s %u %u %u %u %u", mname, rname, serial, refresh, retry, expire, minimum);
-                }
+                printf("%s %s %u %u %u %u %u", mname, rname, serial, refresh, retry, expire, minimum);
             }
             break;
         }
@@ -3944,7 +3944,7 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         if (cd) printf(";; (checking disabled)\n");
     }
 
-    if (edns.present && dopt->show_comments && dopt->show_additional) {
+    if (edns.present && dopt->show_comments) {
         printf("\n;; OPT PSEUDOSECTION:\n");
         char flags_buf[32];
         format_edns_flags(edns.dnssec_ok, edns.compact_answers_ok, flags_buf, sizeof(flags_buf));
@@ -4271,6 +4271,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         int msg_index = 1;
         int total_records = 0;
         size_t total_bytes = 0;
+        bool had_tsig_fail = false;
         
         int start_index = g_server_count;
         sres = alloc_result_row();
@@ -4306,6 +4307,35 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
             }
             
+            if (qo->want_tsig) {
+                uint8_t resp_mac[64];
+                size_t resp_mac_len = 0;
+                int err = tsig_verify_packet(resp, (size_t)n, &qo->tsig_key, request_mac, request_mac_len, resp_mac, &resp_mac_len);
+                if (err == 0) {
+                    if (!dopt->short_mode) printf(";; TSIG verified.\n");
+                    // Update prior_mac for subsequent AXFR messages
+                    if (resp_mac_len > 0 && resp_mac_len <= sizeof(request_mac)) {
+                        memcpy(request_mac, resp_mac, resp_mac_len);
+                        request_mac_len = resp_mac_len;
+                    }
+                } else {
+                    had_tsig_fail = true;
+                    if (err == -1) {
+                        fprintf(stderr, ";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+                    } else if (err == 16) {
+                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADSIG)\n");
+                    } else if (err == 17) {
+                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADKEY)\n");
+                    } else if (err == 18) {
+                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADTIME)\n");
+                    } else if (err == 21) {
+                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADALG)\n");
+                    } else {
+                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (%d)\n", err);
+                    }
+                }
+            }
+
             if (!dopt->short_mode) {
                 if (!no_hexdump_response && dopt->show_comments) {
                     if (use_tcp) {
@@ -4343,28 +4373,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                         printf("\n");
                         off = nxt+10+rdlen;
                     } else break;
-                }
-            }
-
-            if (qo->want_tsig) {
-                uint8_t resp_mac[64];
-                size_t resp_mac_len = 0;
-                int err = tsig_verify_packet(resp, (size_t)n, &qo->tsig_key, request_mac, request_mac_len, resp_mac, &resp_mac_len);
-                if (err == 0) {
-                    if (!dopt->short_mode) printf(";; TSIG verified.\n");
-                    // Update prior_mac for subsequent AXFR messages
-                    if (resp_mac_len > 0 && resp_mac_len <= sizeof(request_mac)) {
-                        memcpy(request_mac, resp_mac, resp_mac_len);
-                        request_mac_len = resp_mac_len;
-                    }
-                } else {
-                    const char *reason = "unknown";
-                    if (err == -1) reason = "no TSIG record or malformed packet";
-                    else if (err == 16) reason = "BADSIG (signature mismatch)";
-                    else if (err == 17) reason = "BADKEY (key mismatch)";
-                    else if (err == 18) reason = "BADTIME (time out of window)";
-                    else if (err == 21) reason = "BADALG (unsupported algorithm)";
-                    fprintf(stderr, ";; WARNING: TSIG verification FAILED (%s)\n", reason);
                 }
             }
 
@@ -4428,6 +4436,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             } else {
                 printf(";; MSG SIZE  rcvd: %zu\n", total_bytes);
             }
+            if (qo->want_tsig && had_tsig_fail) {
+                printf(";; WARNING -- Some TSIG could not be validated\n");
+            }
         }
         if (tcp_sock >= 0) close(tcp_sock);
 
@@ -4435,7 +4446,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             if (qo->ignore_tc) {
                 fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
             } else {
-                fprintf(stderr, "\n;; Truncated, retrying in TCP mode...\n\n");
+                fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
                 use_tcp = true;
                 retry_tcp = true;
             }
@@ -4647,6 +4658,7 @@ static void usage(const char *prog) {
         "  +[no]identify                Display responding server IP in short-mode responses\n"
         "  +[no]idn                     Convert Internationalized Domain Names (IDN) (+[no]idnin / +[no]idnout)\n"
         "  +[no]onesoa                  Display only the first SOA record during AXFR transfers\n"
+        "  +[no]expandaaaa              Display IPv6 AAAA addresses in fully expanded 8-field format\n"
         "  +[no]split=N                 Split long hex and base64 fields into N-character chunks [56]\n"
         "  +[no]besteffort              Attempt to parse and display malformed/illegal DNS packets\n"
         "  +[no]expire                  Request and highlight zone expiration TTL in SOA output\n"
@@ -6034,6 +6046,10 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+nomultiline") == 0) {
             spec->dopt.multiline = false;
             if (spec->dopt.split_width == 44) spec->dopt.split_width = 56;
+        } else if (strcmp(arg, "+expandaaaa") == 0) {
+            spec->dopt.expandaaaa = true;
+        } else if (strcmp(arg, "+noexpandaaaa") == 0) {
+            spec->dopt.expandaaaa = false;
         } else if (strcmp(arg, "+yaml") == 0) {
             spec->dopt.yaml = true;
         } else if (strcmp(arg, "+noyaml") == 0) {

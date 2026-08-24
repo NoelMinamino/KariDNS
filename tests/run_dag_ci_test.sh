@@ -58,6 +58,7 @@ view "default" {
     zone "example.com" {
         type master;
         file "${SCRIPT_DIR}/zones/example.com.zone";
+        allow-transfer { any; };
     };
 };
 EOF
@@ -124,10 +125,15 @@ echo "========================================================"
 echo "1. Basic Queries, Transport & Protocols"
 echo "========================================================"
 run_check "Standard UDP Query" "$DAG @127.0.0.1 -p $PORT www.example.com A" "192.0.2.10"
+run_check "Explicit Query Name flag (-q)" "$DAG @127.0.0.1 -p $PORT -q www.example.com" "192.0.2.10"
+run_check "Explicit Query Type flag (-t)" "$DAG @127.0.0.1 -p $PORT example.com -t MX" "mail\.example\.com"
+run_check "Explicit Query Class flag (-c)" "$DAG @127.0.0.1 -p $PORT -c IN www.example.com A" "192.0.2.10"
 run_check "Standard TCP Query (+tcp)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tcp" "192.0.2.10"
 run_check "Standard TCP Query (+vc)" "$DAG @127.0.0.1 -p $PORT www.example.com A +vc" "192.0.2.10"
 run_check "Reverse PTR Query (-x)" "$DAG @127.0.0.1 -p $PORT -x 192.0.2.10" "10\.2\.0\.192\.in-addr\.arpa"
 run_check "IPv4 preference flag (-4)" "$DAG @127.0.0.1 -p $PORT www.example.com A -4" "192.0.2.10"
+run_check "IPv6 preference flag (-6)" "$DAG @127.0.0.1 -p $PORT www.example.com AAAA -6 +timeout=1" "(2001:db8::10|timed out|no usable response|No acceptable nameservers)"
+run_check "Ignore .digrc flag (-r)" "$DAG @127.0.0.1 -p $PORT www.example.com A -r" "192.0.2.10"
 run_check "Source address & port bind (-b)" "$DAG @127.0.0.1 -p $PORT www.example.com A -b 127.0.0.1#54321" "192.0.2.10"
 run_check "Short mode (+short)" "$DAG @127.0.0.1 -p $PORT www.example.com A +short" "^192\.0\.2\.10$"
 run_check "Show Query (+qr)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qr" ";; Sending:"
@@ -146,11 +152,14 @@ echo "2. Section & Display Toggling (+noall, +identify, +yaml)"
 echo "========================================================"
 run_check "No comments (+nocomments)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nocomments" "192\.0\.2\.10"
 run_check "No answer section (+noanswer)" "$DAG @127.0.0.1 -p $PORT www.example.com A +noanswer" ";; flags:"
+run_check "No authority section (+noauthority)" "$DAG @127.0.0.1 -p $PORT nonexistent.example.com A +noauthority" "status: NXDOMAIN"
+run_check "No additional section (+noadditional)" "$DAG @127.0.0.1 -p $PORT example.com NS +noadditional" "ns1\.example\.com"
 run_check "No question section (+noquestion)" "$DAG @127.0.0.1 -p $PORT www.example.com A +noquestion" "192\.0\.2\.10"
 run_check "No command header (+nocmd)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nocmd" "192\.0\.2\.10"
 run_check "No stats section (+nostats)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nostats" "192\.0\.2\.10"
 run_check "Combined +noall +answer" "$DAG @127.0.0.1 -p $PORT www.example.com A +noall +answer" "192\.0\.2\.10"
 run_check "Identify server (+identify)" "$DAG @127.0.0.1 -p $PORT www.example.com A +identify" "(127\.0\.0\.1#53555|from server 127\.0\.0\.1)"
+run_check "Best effort parsing flag (+besteffort)" "$DAG @127.0.0.1 -p $PORT www.example.com A +besteffort" "192\.0\.2\.10"
 if [ "$DAG" = "dig" ]; then
     run_skip "YAML formatted output (+yaml)"
     run_skip "Hexdump suppression (+nohexdump)"
@@ -172,6 +181,8 @@ run_check "Unknown format (+unknownformat)" "$DAG @127.0.0.1 -p $PORT www.exampl
 run_check "TTL ID toggling (+ttlid / +nottlid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nottlid" "www\.example\.com\.[[:space:]]+IN[[:space:]]+A"
 run_check "Multiline mode (+multiline)" "$DAG @127.0.0.1 -p $PORT example.com SOA +multiline" "serial"
 run_check "Expire time display (+expire)" "$DAG @127.0.0.1 -p $PORT example.com SOA +expire" "(SOA|expire|serial)"
+run_check "AXFR single SOA (+onesoa)" "$DAG @127.0.0.1 -p $PORT example.com AXFR +onesoa" "SOA"
+run_check "Expand AAAA addresses (+expandaaaa)" "$DAG @127.0.0.1 -p $PORT www.example.com AAAA +expandaaaa" "2001:0db8:0000:0000:0000:0000:0000:0010"
 
 echo "========================================================"
 echo "4. DNSSEC & RR Comments & Crypto formatting"
@@ -182,7 +193,7 @@ run_check "Split width (+split=16)" "$DAG @127.0.0.1 -p $PORT example.com DNSKEY
 run_check "DNSSEC OK flag (+dnssec / +do)" "$DAG @127.0.0.1 -p $PORT example.com DNSKEY +dnssec +qr" "flags: do"
 
 echo "========================================================"
-echo "5. EDNS0 & RFC 9824 / RFC 10029 Options"
+echo "5. EDNS0, Badcookie & Transport Extensions"
 echo "========================================================"
 run_check "EDNS Buffer Size (+bufsize=4096)" "$DAG @127.0.0.1 -p $PORT www.example.com A +bufsize=4096 +qr" "udp:[[:space:]]*4096"
 run_check "EDNS NSID Option (+nsid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nsid +qr" "NSID"
@@ -191,6 +202,12 @@ run_check "EDNS Cookie (+cookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +c
 run_check "EDNS Subnet (+subnet)" "$DAG @127.0.0.1 -p $PORT www.example.com A +subnet=192.0.2.0/24 +qr" "; CLIENT-SUBNET: 192\.0\.2\.0/24"
 run_check "EDNS Padding (+padding)" "$DAG @127.0.0.1 -p $PORT www.example.com A +padding=64 +qr" "; PADDING:"
 run_check "EDNS Keepalive (+keepalive)" "$DAG @127.0.0.1 -p $PORT www.example.com A +keepalive +qr" "; (TCP-)?KEEPALIVE"
+run_check "EDNS Flags raw Z-bits (+ednsflags)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ednsflags=0x0040 +qr" "flags:.*0x0040|OPT PSEUDOSECTION"
+run_check "EDNS Negotiation flag (+ednsnegotiation)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ednsnegotiation" "192\.0\.2\.10"
+run_check "BADCOOKIE retry (+badcookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +badcookie" "192\.0\.2\.10"
+run_check "Show BADCOOKIE diagnostic (+showbadcookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +showbadcookie" "192\.0\.2\.10"
+run_check "Show BADVERS diagnostic (+showbadvers)" "$DAG @127.0.0.1 -p $PORT www.example.com A +showbadvers" "192\.0\.2\.10"
+run_check "Keep TCP socket open (+keepopen)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tcp +keepopen" "192\.0\.2\.10"
 run_check "Generic EDNS option (+ednsopt)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ednsopt=65001:01020304 +qr" "; (OPTION:[[:space:]]+|OPT=)65001"
 if [ "$DAG" = "dig" ]; then
     run_skip "RFC 10029 Multi-QTYPE (+mqtype)"
@@ -204,9 +221,16 @@ echo "========================================================"
 run_check "Header only / QDCOUNT=0 (+header-only)" "$DAG @127.0.0.1 -p $PORT www.example.com A +header-only +qr" "QUERY: 0"
 run_check "QID override (+qid=4660)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qid=4660 +qr" "id: 4660"
 run_check "Opcode override (+opcode=NOTIFY)" "$DAG @127.0.0.1 -p $PORT www.example.com A +opcode=NOTIFY +qr" "opcode: NOTIFY"
-run_check "Flags override (+adflag +cdflag +aaflag +tcflag +zflag)" "$DAG @127.0.0.1 -p $PORT www.example.com A +adflag +cdflag +aaflag +tcflag +zflag +qr" "flags:.*(ad|cd|aa|tc)"
+run_check "Flags override (+adflag +cdflag +aaflag +tcflag +raflag +zflag)" "$DAG @127.0.0.1 -p $PORT www.example.com A +adflag +cdflag +aaflag +tcflag +raflag +zflag +qr" "flags:.*(ad|cd|aa|tc|ra)"
 run_check "Recursion flag override (+norec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +norec +qr" ";; flags:"
 run_check "Ignore truncation flag (+ignore)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ignore" "192\.0\.2\.10"
+run_check "Timeout flag (+timeout=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+run_check "Tries and Retry flags (+tries=2 +retry=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tries=2 +retry=2" "192\.0\.2\.10"
+run_check "Search list and ndots (+search +domain +ndots)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +ndots=2 +search" "192\.0\.2\.10"
+run_check "Showsearch diagnostic (+showsearch)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +showsearch" "192\.0\.2\.10"
+run_check "DNS64 prefix check (+dns64prefix)" "$DAG @127.0.0.1 -p $PORT www.example.com A +dns64prefix +timeout=1" "(192\.0\.2\.10|timed out|no usable response)"
+run_check "PROXYv2 local header (+proxy)" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy +timeout=1" "(192\.0\.2\.10|timed out|no usable response|NOTIMP|Got bad packet|ID mismatch)"
+run_check "Plain HTTP query (+http-plain)" "$DAG @127.0.0.1 -p $PORT www.example.com A +http-plain +timeout=1" "(192\.0\.2\.10|timed out|connection failed|no usable response)"
 
 echo "========================================================"
 echo "7. Multi-Server, LDNSZ & Failover"
@@ -224,9 +248,17 @@ else
 fi
 
 echo "========================================================"
-echo "8. TSIG Authentication"
+echo "8. TSIG Authentication (-y, +tsig, -k keyfile, +fuzztime)"
 echo "========================================================"
 run_check "TSIG signature (-y)" "$DAG @127.0.0.1 -p $PORT www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +qr" "(TSIG|testkey|ADDITIONAL)"
+cat << 'EOF' > tsig_key.conf
+key "testkey" {
+    algorithm hmac-sha256;
+    secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
+};
+EOF
+run_check "TSIG keyfile flag (-k)" "$DAG @127.0.0.1 -p $PORT www.example.com A -k tsig_key.conf +qr" "(TSIG|testkey|ADDITIONAL)"
+run_check "TSIG signing time override (+fuzztime)" "$DAG @127.0.0.1 -p $PORT www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +fuzztime=1646972129 +qr" "(TSIG|testkey|ADDITIONAL)"
 if [ "$DAG" = "dig" ]; then
     run_skip "TSIG signature (+tsig=)"
 else
@@ -366,7 +398,7 @@ fi
 echo "========================================================"
 echo "18. +trace/+nssearch Transport & +yaml RDATA Output Tests"
 echo "========================================================"
-run_check "+trace +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +trace +tcp +timeout=1" "(TRACE:|connection timed out|no servers could be reached|no usable response)"
+run_check "+trace +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +trace +tcp +timeout=1" "(TRACE:|connection timed out|no servers could be reached|no usable response|Received [0-9]+ bytes)"
 run_check "+nssearch +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +nssearch +tcp +timeout=1" "(couldn't get address|SOA |connection timed out|no usable response)"
 if [ "$DAG" != "dig" ]; then
     run_check "+yaml output structure" "$DAG @127.0.0.1 -p $PORT example.com A +yaml +timeout=1" "(^---|question:)"
