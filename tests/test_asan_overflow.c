@@ -458,6 +458,20 @@ int main() {
         // 正常系: width 32-64
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,64,d} A 10.0.0.$", false);
+        // 異常系 / エッジケース: テンプレート末尾カンマ・欠落・未クローズ (Fuzzer Crash regression)
+        RUN_GEN_TEST("$GENERATE 1-2 host-${,60, A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${,, A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${ A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${1,2, A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${1,2,d A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,60,", true);
+        RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,,", true);
+        // 異常系: range 構文の不正 (start/stop/step の省略やゴミ)
+        RUN_GEN_TEST("$GENERATE - host-$ A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 1- host-$ A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE -5 host-$ A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 1-5/ host-$ A 10.0.0.$", true);
+        RUN_GEN_TEST("$GENERATE 0-/1 host-$ A 10.0.0.$", true);
     }
 
     // Test 6: LOC and APL Validation Tests

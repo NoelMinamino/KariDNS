@@ -56,9 +56,9 @@ jobs:
                 mkdir -p "$corpus"
                 echo "[+] Fuzzing target: $target (corpus size: $(ls -1 "$corpus" 2>/dev/null | wc -l) files)"
                 if [ -n "$FUZZ_RUNS_INPUT" ]; then
-                    "$bin" -runs="$FUZZ_RUNS_INPUT" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                    "$bin" -runs="$FUZZ_RUNS_INPUT" -rss_limit_mb=0 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
                 else
-                    "$bin" -max_total_time="$FUZZ_TIME" -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                    "$bin" -max_total_time="$FUZZ_TIME" -rss_limit_mb=0 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
                 fi
                 pids="$pids $target:$!"
             done
