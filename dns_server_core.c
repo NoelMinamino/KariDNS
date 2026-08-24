@@ -2686,12 +2686,20 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             const char *zone_apex, uint8_t *res,
                             size_t max_res_len, uint16_t *offset,
                             compress_ctx_t *comp_ctx, uint16_t *nscount,
-                            uint16_t *arcount) {
+                            uint16_t *arcount, bool is_ds_query) {
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
     return false;
   const char *name = qname;
   while (name && strcasecmp(name, zone_apex) != 0) {
+    // RFC 4035 §3.1.4.1: 委任点そのもの(name == qname)へのDSクエリは、
+    // 参照応答(referral)にせず、権威応答としてフェーズ2の通常検索へ継続させる。
+    if (is_ds_query && name == qname) {
+      name = strchr(name, '.');
+      if (name)
+        name++;
+      continue;
+    }
     uint32_t hash = calc_fnv1a_str(name);
     size_t idx = hash & (current_zone->hash_size - 1);
     bool delegated = false;
@@ -2877,8 +2885,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     }
     
     // ==== フェーズ1: 委任判定 ====
+    bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount))
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====

@@ -2641,6 +2641,87 @@ int main() {
         printf("PASS: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses\n");
     }
 
+    // --- Test 37: Delegation point DS record (RFC 4035 §3.1.4.1) in parent zone ---
+    {
+        const char *zone_text =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "ns1 IN A 192.0.2.1\n"
+            "sub IN NS ns1.sub.example.com.\n"
+            "sub IN DS 12345 13 2 2BB1834370273412E81E3272C18B868FD63804EB61A086C38D04FF2DEDFE2516\n"
+            "sub IN RRSIG DS 13 3 3600 20260901000000 20260801000000 12345 example.com. dGVzdGRzcmln\n";
+
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        char *zone_copy = strdup(zone_text);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        ctx.is_standalone_mode = true;
+        if (parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx) < 0) {
+            printf("FAIL: parse_zone_fast failed for delegation DS zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed for delegation DS zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        uint32_t sub_hash = calc_fnv1a_str("sub.example.com.");
+        size_t sub_idx = sub_hash & (arena.hash_size - 1);
+        bool found_ns = false;
+        bool found_ds = false;
+        bool found_rrsig_ds = false;
+
+        for (int i = arena.hash_table[sub_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 2) {
+                found_ns = true;
+            } else if (rec->type_code == 43) {
+                found_ds = true;
+            } else if (rec->type_code == 46 && rec->rdata_count >= 9) {
+                if (get_type_code(rec->rdata[0]) == 43) {
+                    found_rrsig_ds = true;
+                }
+            }
+        }
+
+        if (!found_ns || !found_ds || !found_rrsig_ds) {
+            printf("FAIL: Delegation point missing NS (%d), DS (%d), or RRSIG(DS) (%d)\n",
+                   found_ns, found_ds, found_rrsig_ds);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test serialize DS record
+        uint8_t buf[2048];
+        uint16_t offset = 12;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        for (int i = arena.hash_table[sub_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 43) {
+                if (serialize_dns_record(buf, sizeof(buf), &offset, rec, &comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+                    printf("FAIL: Failed to serialize DS record at delegation point\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            }
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 §3.1.4.1)\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
