@@ -1155,7 +1155,11 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                     tokens[token_count++] = tok_start;
                 }
 
-                type = parse_qtype(qo->prereqs[pi].type_str);
+                if (!resolve_qtype(qo->prereqs[pi].type_str, &type)) {
+                    fprintf(stderr, "warning: unknown record type '%s' in prereq yxrrset, skipping\n", qo->prereqs[pi].type_str);
+                    free(buf);
+                    continue;
+                }
                 dns_record_t rec;
                 memset(&rec, 0, sizeof(rec));
                 rec.name = (char *)name;
@@ -1182,8 +1186,18 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
             switch (qo->prereqs[pi].kind) {
                 case PREREQ_NXDOMAIN: type = 255; class_val = 254; break; // ANY, NONE
                 case PREREQ_YXDOMAIN: type = 255; class_val = 255; break; // ANY, ANY
-                case PREREQ_NXRRSET:  type = parse_qtype(qo->prereqs[pi].type_str); class_val = 254; break; // <type>, NONE
-                case PREREQ_YXRRSET:  type = parse_qtype(qo->prereqs[pi].type_str); class_val = 255; break; // <type>, ANY
+                case PREREQ_NXRRSET:
+                    if (!resolve_qtype(qo->prereqs[pi].type_str, &type)) {
+                        fprintf(stderr, "warning: unknown record type '%s' in prereq nxrrset, skipping\n", qo->prereqs[pi].type_str);
+                        continue;
+                    }
+                    class_val = 254; break;
+                case PREREQ_YXRRSET:
+                    if (!resolve_qtype(qo->prereqs[pi].type_str, &type)) {
+                        fprintf(stderr, "warning: unknown record type '%s' in prereq yxrrset, skipping\n", qo->prereqs[pi].type_str);
+                        continue;
+                    }
+                    class_val = 255; break;
                 default: continue;
             }
 
@@ -1260,11 +1274,17 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                         type_idx = 3;
                     }
                     if (token_count > type_idx) {
+                        uint16_t type_code;
+                        if (!resolve_qtype(tokens[type_idx], &type_code)) {
+                            fprintf(stderr, "warning: unknown record type '%s' in update-add operation, skipping: %s\n", tokens[type_idx], raw);
+                            free(buf);
+                            continue;
+                        }
                         dns_record_t rec;
                         memset(&rec, 0, sizeof(rec));
                         rec.name = tokens[0];
                         rec.ttl = tokens[1];
-                        rec.type_code = parse_qtype(tokens[type_idx]);
+                        rec.type_code = type_code;
                         rec.type = tokens[type_idx];
                         rec.class_str = class_str;
                         rec.rdata_count = token_count - (type_idx + 1);
@@ -1291,14 +1311,21 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
                 char *buf = strdup(raw);
                 char *name = strtok(buf, " ");
                 char *type_str = strtok(NULL, " ");
-                if (name && type_str) {
+                if (name) {
                     if ((size_t)offset + 10 > max_len) {
                         fprintf(stderr, "warning: packet buffer full, dropping remaining update ops\n");
                         free(buf);
                         break;
                     }
+                    uint16_t type = 255; // Default: ANY (255) for all RRsets delete (RFC 2136 §2.5.2)
+                    if (type_str) {
+                        if (!resolve_qtype(type_str, &type)) {
+                            fprintf(stderr, "warning: unknown record type '%s' in update-del operation, skipping: %s\n", type_str, raw);
+                            free(buf);
+                            continue;
+                        }
+                    }
                     if (write_dns_name_str(pkt, &offset, name, &comp_ctx, max_len) == 0) {
-                        uint16_t type = parse_qtype(type_str);
                         pkt[offset++] = type >> 8; pkt[offset++] = type & 0xFF;
                         pkt[offset++] = 0x00; pkt[offset++] = 255; /* Class ANY */
                         pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* TTL 0 */
@@ -1351,17 +1378,31 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
 
                 if (token_count >= 3) {
                     int type_idx = 1;
-                    if (token_count >= 3 && (strcasecmp(tokens[1], "NONE") == 0 || strcasecmp(tokens[1], "IN") == 0 || strcasecmp(tokens[1], "ANY") == 0)) {
-                        type_idx = 2;
-                    } else if (token_count >= 4 && isdigit((unsigned char)tokens[1][0]) && (strcasecmp(tokens[2], "NONE") == 0 || strcasecmp(tokens[2], "IN") == 0 || strcasecmp(tokens[2], "ANY") == 0)) {
-                        type_idx = 3;
+                    if (token_count >= 3 && (strcasecmp(tokens[1], "NONE") == 0 || strcasecmp(tokens[1], "IN") == 0 ||
+                                             strcasecmp(tokens[1], "ANY") == 0 || strcasecmp(tokens[1], "CH") == 0 ||
+                                             strcasecmp(tokens[1], "HS") == 0)) {
+                        type_idx = 2; // name class type rdata...
+                    } else if (token_count >= 3 && isdigit((unsigned char)tokens[1][0])) {
+                        if (token_count >= 4 && (strcasecmp(tokens[2], "NONE") == 0 || strcasecmp(tokens[2], "IN") == 0 ||
+                                                 strcasecmp(tokens[2], "ANY") == 0 || strcasecmp(tokens[2], "CH") == 0 ||
+                                                 strcasecmp(tokens[2], "HS") == 0)) {
+                            type_idx = 3; // name ttl class type rdata...
+                        } else {
+                            type_idx = 2; // name ttl type rdata... (class omitted)
+                        }
                     }
                     if (token_count > type_idx) {
+                        uint16_t type_code;
+                        if (!resolve_qtype(tokens[type_idx], &type_code)) {
+                            fprintf(stderr, "warning: unknown record type '%s' in update-del-exact operation, skipping: %s\n", tokens[type_idx], raw);
+                            free(buf);
+                            continue;
+                        }
                         dns_record_t rec;
                         memset(&rec, 0, sizeof(rec));
                         rec.name = tokens[0];
                         rec.ttl = (char *)"0"; // TTL must be 0 for exact match delete
-                        rec.type_code = parse_qtype(tokens[type_idx]);
+                        rec.type_code = type_code;
                         rec.type = tokens[type_idx];
                         rec.class_str = (char *)"NONE"; // Class NONE for exact match delete
                         rec.rdata_count = token_count - (type_idx + 1);
@@ -6448,20 +6489,34 @@ static int execute_batch_spec(const query_spec_t *spec) {
         char *b_qname = NULL;
         char *b_qtype = NULL;
         char *b_server = NULL;
+        int extra_tokens = 0;
+        char orig_line[512];
+        snprintf(orig_line, sizeof(orig_line), "%s", p);
+        char *nl = strchr(orig_line, '\n');
+        if (nl) *nl = '\0';
+        char *cr = strchr(orig_line, '\r');
+        if (cr) *cr = '\0';
+
         char *tok = strtok(p, " \t\r\n");
         while (tok) {
             if (tok[0] == '@') {
-                b_server = tok;
-            } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0) {
+                if (!b_server) b_server = tok;
+                else extra_tokens++;
+            } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0 || strcasecmp(tok, "HS") == 0) {
                 // ignore class
             } else if (is_known_qtype(tok)) {
                 if (!b_qtype) b_qtype = tok;
                 else if (!b_qname) b_qname = tok;
+                else extra_tokens++;
             } else {
                 if (!b_qname) b_qname = tok;
                 else if (!b_qtype) b_qtype = tok;
+                else extra_tokens++;
             }
             tok = strtok(NULL, " \t\r\n");
+        }
+        if (extra_tokens > 0) {
+            fprintf(stderr, "warning: batch file line has %d unexpected extra token(s), ignoring: %s\n", extra_tokens, orig_line);
         }
         if (!b_qname) continue;
         if (!b_qtype) b_qtype = "A";

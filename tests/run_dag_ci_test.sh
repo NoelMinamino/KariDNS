@@ -281,7 +281,10 @@ if [ "$DAG" = "dig" ]; then
 else
     run_check "Dynamic update add (--update-add)" "$DAG @127.0.0.1 -p $PORT example.com --update-add \"dyn.example.com 300 IN A 192.0.2.99\" +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update del (--update-del)" "$DAG @127.0.0.1 -p $PORT example.com --update-del \"dyn.example.com A\" +qr" "opcode:[[:space:]]*UPDATE"
+    run_check "Dynamic update del without type (--update-del name)" "$DAG @127.0.0.1 -p $PORT example.com --update-del \"obsolete.example.com\" +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update del exact (--update-del-exact)" "$DAG @127.0.0.1 -p $PORT example.com --update-del-exact \"dyn.example.com A 192.0.2.99\" +qr" "opcode:[[:space:]]*UPDATE"
+    run_check "Dynamic update del exact with TTL (--update-del-exact 'name TTL type rdata')" "$DAG @127.0.0.1 -p $PORT example.com --update-del-exact \"host.example.com 300 A 192.0.2.1\" +qr" "opcode:[[:space:]]*UPDATE"
+    run_check "Dynamic update unknown type skipped gracefully" "$DAG @127.0.0.1 -p $PORT example.com --update-del-exact \"host.example.com BOGUSTYPE 192.0.2.1\" --update-add \"valid.example.com 300 A 192.0.2.1\" +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update prereq NXDOMAIN (--prereq-nxdomain)" "$DAG @127.0.0.1 -p $PORT example.com --prereq-nxdomain dyn.example.com +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update prereq YXDOMAIN (--prereq-yxdomain)" "$DAG @127.0.0.1 -p $PORT example.com --prereq-yxdomain example.com +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update prereq NXRRSET (--prereq-nxrrset)" "$DAG @127.0.0.1 -p $PORT example.com --prereq-nxrrset \"dyn.example.com TXT\" +qr" "opcode:[[:space:]]*UPDATE"
