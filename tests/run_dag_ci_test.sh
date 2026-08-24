@@ -166,13 +166,12 @@ run_check "No stats section (+nostats)" "$DAG @127.0.0.1 -p $PORT www.example.co
 run_check "Combined +noall +answer" "$DAG @127.0.0.1 -p $PORT www.example.com A +noall +answer" "192\.0\.2\.10"
 run_check "Identify server (+identify)" "$DAG @127.0.0.1 -p $PORT www.example.com A +identify" "(127\.0\.0\.1#53555|from server 127\.0\.0\.1)"
 run_check "Best effort parsing flag (+besteffort)" "$DAG @127.0.0.1 -p $PORT www.example.com A +besteffort" "192\.0\.2\.10"
+run_check "YAML formatted output (+yaml)" "$DAG @127.0.0.1 -p $PORT www.example.com A +yaml" "(answers:|answer:|name:|opcode:|message:)"
 if [ "$DAG" = "dig" ]; then
-    run_skip "YAML formatted output (+yaml)"
     run_skip "Hexdump suppression (+nohexdump)"
     run_skip "Hexdump query suppression (+nohexdump-query)"
     run_skip "Hexdump response suppression (+nohexdump-response)"
 else
-    run_check "YAML formatted output (+yaml)" "$DAG @127.0.0.1 -p $PORT www.example.com A +yaml" "(answers:|name:|opcode:)"
     run_check "Hexdump suppression (+nohexdump)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nohexdump" "192\.0\.2\.10"
     run_check "Hexdump query suppression (+nohexdump-query)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nohexdump-query" "192\.0\.2\.10"
     run_check "Hexdump response suppression (+nohexdump-response)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nohexdump-response" "192\.0\.2\.10"
@@ -401,8 +400,8 @@ echo "17. CLI Options, IDN, EDNSOPT, Prereq, and Break Validation"
 echo "========================================================"
 run_check "+idn flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +idn +timeout=1" "(opcode: QUERY|status:|timed out|no usable response)"
 run_check "+noidn flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +noidn +timeout=1" "(opcode: QUERY|status:|timed out|no usable response)"
+run_check "+noednsopt flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(opcode: QUERY|status:|timed out|no usable response)"
 if [ "$DAG" != "dig" ]; then
-    run_check "+noednsopt flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(opcode: QUERY|status:|timed out|no usable response)"
     run_check "--prereq-nxrrset separate args" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
     run_check "--prereq-yxrrset separate args with rdata" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A 1.2.3.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
     run_check "Multiple structural breaks warning" "$DAG @127.0.0.1 -p $PORT example.com A --break compression-loop --break oversized-qname +timeout=1" "warning: --break 'oversized-qname' ignored; structural break kind is already set"
@@ -413,9 +412,7 @@ echo "18. +trace/+nssearch Transport & +yaml RDATA Output Tests"
 echo "========================================================"
 run_check "+trace +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +trace +tcp +timeout=1" "(TRACE:|connection timed out|no servers could be reached|no usable response|Received [0-9]+ bytes)"
 run_check "+nssearch +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +nssearch +tcp +timeout=1" "(couldn't get address|SOA |connection timed out|no usable response)"
-if [ "$DAG" != "dig" ]; then
-    run_check "+yaml output structure" "$DAG @127.0.0.1 -p $PORT example.com A +yaml +timeout=1" "(^---|question:)"
-fi
+run_check "+yaml output structure" "$DAG @127.0.0.1 -p $PORT example.com A +yaml +timeout=1" "(^---|question:|- type: MESSAGE)"
 
 echo "========================================================"
 echo "19. RFC 5452 UDP Security & Transport Resilience Tests"
@@ -432,23 +429,23 @@ if [ "$DAG" != "dig" ]; then
     run_check "Regression: --update-del-exact TTL & type safety (tests/run_dag_update_del_exact_ttl_notype_crash_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
     run_check "Help examples: --break usage examples validation (tests/run_dag_break_help_examples_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_break_help_examples_test.sh\"" "PASS:"
     run_check "Override: duplicate --break kind override validation (tests/run_break_duplicate_kind_override_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_break_duplicate_kind_override_test.sh\"" "PASS:"
-    run_check "CLI Options & Prereq/Break validation (tests/run_dag_cli_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cli_options_test.sh\"" "PASS:"
-    run_check "Hex payload overflow safety (tests/run_dag_hex_payload_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_hex_payload_overflow_test.sh\"" "PASS:"
-    run_check "YAML RDATA output structure (tests/run_dag_yaml_rdata_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rdata_test.sh\"" "PASS:"
 fi
+run_check "CLI Options & Prereq/Break validation (tests/run_dag_cli_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cli_options_test.sh\"" "ALL CLI OPTION TESTS PASSED"
+run_check "Hex payload overflow safety (tests/run_dag_hex_payload_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_hex_payload_overflow_test.sh\"" "ALL HEX PAYLOAD OVERFLOW TESTS PASSED"
+run_check "YAML RDATA output structure (tests/run_dag_yaml_rdata_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rdata_test.sh\"" "ALL YAML RDATA TESTS PASSED"
 if command -v perl >/dev/null 2>&1; then
     run_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"
     run_check "Security: UDP transaction ID mismatch discard (tests/run_dag_udp_id_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_id_mismatch_discard_test.sh\"" "PASS:"
     run_check "Security: DNS Cookie mismatch discard (tests/run_dag_cookie_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cookie_mismatch_discard_test.sh\"" "PASS:"
-    run_check "RFC 7873: BADCOOKIE TCP transport fallback (tests/run_dag_badcookie_transport_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_badcookie_transport_test.sh\"" "PASS:"
     run_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
+    run_check "RFC 7873: BADCOOKIE TCP transport fallback (tests/run_dag_badcookie_transport_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_badcookie_transport_test.sh\"" "ALL BADCOOKIE / EXPIRE / KEEPOPEN TESTS PASSED"
     run_check "RFC 7050: DNS64 prefix discovery (tests/run_dag_dns64prefix_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dns64prefix_test.sh\"" "PASS:"
     run_check "Diagnostic: Malformed packet detection in default mode (tests/run_malformed_detection_default_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_malformed_detection_default_test.sh\"" "PASS:"
 fi
-run_check "Transport: TCP Keepopen & EDNS0 Keepalive (tests/run_dag_keepopen_keepalive_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_keepalive_test.sh\"" "PASS:"
+run_check "Transport: TCP Keepopen & EDNS0 Keepalive (tests/run_dag_keepopen_keepalive_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_keepalive_test.sh\"" "ALL KEEPOPEN & KEEPALIVE TESTS PASSED"
 run_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
 run_check "Features: +trace & +nssearch TCP validation (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
-run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "PASS:"
+run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then

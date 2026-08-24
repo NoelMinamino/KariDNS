@@ -13,10 +13,17 @@ PORT=10530
 echo "=== Building tools/dag with make ==="
 make -C "$ROOT_DIR" dag
 
-DAG="$ROOT_DIR/dag"
-if [ ! -x "$DAG" ]; then
-    echo "dag binary not found at $DAG"
-    exit 1
+DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
+if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
+    DAG="dig"
+    if ! command -v "$DAG" >/dev/null 2>&1; then
+        echo "Error: dig executable not found"
+        exit 1
+    fi
+else
+    if [ ! -x "$DAG" ]; then
+        DAG="$ROOT_DIR/dag"
+    fi
 fi
 
 if ! command -v perl >/dev/null 2>&1; then

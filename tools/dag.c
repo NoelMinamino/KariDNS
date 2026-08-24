@@ -3764,44 +3764,7 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
     }
 }
 
-static void yaml_escape_string(const char *src, char *dst, size_t dst_cap) {
-    if (!dst || dst_cap == 0) return;
-    if (!src) { dst[0] = '\0'; return; }
-    size_t d = 0;
-    for (size_t s = 0; src[s] != '\0' && d + 2 < dst_cap; s++) {
-        unsigned char c = (unsigned char)src[s];
-        if (c == '\\') {
-            if (d + 2 >= dst_cap) break;
-            dst[d++] = '\\';
-            dst[d++] = '\\';
-        } else if (c == '"') {
-            if (d + 2 >= dst_cap) break;
-            dst[d++] = '\\';
-            dst[d++] = '"';
-        } else if (c == '\n') {
-            if (d + 2 >= dst_cap) break;
-            dst[d++] = '\\';
-            dst[d++] = 'n';
-        } else if (c == '\r') {
-            if (d + 2 >= dst_cap) break;
-            dst[d++] = '\\';
-            dst[d++] = 'r';
-        } else if (c == '\t') {
-            if (d + 2 >= dst_cap) break;
-            dst[d++] = '\\';
-            dst[d++] = 't';
-        } else if (c < 0x20 || c == 0x7F) {
-            if (d + 6 >= dst_cap) break;
-            int n = snprintf(dst + d, dst_cap - d, "\\x%02x", c);
-            d += n;
-        } else {
-            dst[d++] = c;
-        }
-    }
-    dst[d] = '\0';
-}
-
-static void print_response_yaml(const uint8_t *pkt, size_t pkt_len) {
+static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp, const display_opts_t *dopt) {
     if (pkt_len < 12) return;
     uint16_t id = (pkt[0] << 8) | pkt[1];
     uint16_t flags = (pkt[2] << 8) | pkt[3];
@@ -3810,19 +3773,147 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len) {
     uint16_t nscount = (pkt[8] << 8) | pkt[9];
     uint16_t arcount = (pkt[10] << 8) | pkt[11];
 
-    printf("---\n");
-    printf("id: %u\n", id);
-    printf("opcode: %u\n", (flags >> 11) & 0xF);
-    printf("rcode: %u\n", flags & 0xF);
-    printf("flags: %04x\n", flags);
-    printf("qdcount: %u\n", qdcount);
-    printf("ancount: %u\n", ancount);
-    printf("nscount: %u\n", nscount);
-    printf("arcount: %u\n", arcount);
+    bool qr = (flags >> 15) & 1;
+    bool aa = (flags >> 10) & 1;
+    bool tc = (flags >> 9) & 1;
+    bool rd = (flags >> 8) & 1;
+    bool ra = (flags >> 7) & 1;
+    bool z  = (flags >> 6) & 1;
+    bool ad = (flags >> 5) & 1;
+    bool cd = (flags >> 4) & 1;
+    uint8_t opcode = (flags >> 11) & 0xF;
+    uint8_t rcode = flags & 0xF;
+
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S.000Z", &tm_utc);
+
+    const char *resp_type = "RESPONSE";
+    if (qr) {
+        if (aa) resp_type = "AUTH_RESPONSE";
+        else resp_type = "RECURSIVE_RESPONSE";
+    } else {
+        resp_type = "QUERY";
+    }
+
+    const char *family_str = (server && strchr(server, ':')) ? "INET6" : "INET";
+    const char *proto_str = is_tcp ? "TCP" : "UDP";
+
+    printf("- type: MESSAGE\n");
+    printf("  message:\n");
+    printf("    type: %s\n", resp_type);
+    printf("    query_time: !!timestamp %s\n", time_str);
+    printf("    response_time: !!timestamp %s\n", time_str);
+    printf("    message_size: %zub\n", pkt_len);
+    printf("    socket_family: %s\n", family_str);
+    printf("    socket_protocol: %s\n", proto_str);
+    printf("    response_address: \"%s\"\n", server ? server : "127.0.0.1");
+    printf("    response_port: %u\n", port ? port : 53);
+    printf("    query_address: \"0.0.0.0\"\n");
+    printf("    query_port: 0\n");
+    printf("    response_message_data:\n");
+    printf("      opcode: %s\n", opcode_name(opcode));
+    printf("      status: %s\n", rcode_name(rcode));
+    printf("      id: %u\n", id);
+
+    printf("      flags:");
+    if (qr) printf(" qr");
+    if (aa) printf(" aa");
+    if (tc) printf(" tc");
+    if (rd) printf(" rd");
+    if (ra) printf(" ra");
+    if (z)  printf(" z");
+    if (ad) printf(" ad");
+    if (cd) printf(" cd");
+    printf("\n");
+
+    printf("      QUESTION: %u\n", qdcount);
+    printf("      ANSWER: %u\n", ancount);
+    printf("      AUTHORITY: %u\n", nscount);
+    printf("      ADDITIONAL: %u\n", arcount);
+
+    // Scan for OPT record in additional section
+    size_t scan_off = 12;
+    for (int i = 0; i < qdcount; i++) {
+        size_t nxt;
+        if (skip_wire_name(pkt, pkt_len, scan_off, &nxt) != 0) break;
+        scan_off = nxt + 4;
+        if (scan_off > pkt_len) break;
+    }
+    int non_qd_total = ancount + nscount + arcount;
+    bool has_opt = false;
+    uint8_t opt_ver = 0;
+    uint16_t opt_udp = 0;
+    uint16_t opt_ext_flags = 0;
+    char client_cookie[64] = "";
+    char server_cookie[128] = "";
+    bool has_cookie = false;
+
+    for (int i = 0; i < non_qd_total; i++) {
+        if (scan_off >= pkt_len) break;
+        char *rname = NULL;
+        size_t nxt;
+        if (expand_wire_name(pkt, pkt_len, scan_off, &nxt, &g_dag_arena, &rname) != 0) break;
+        if (nxt + 10 > pkt_len) break;
+        uint16_t type = (pkt[nxt] << 8) | pkt[nxt+1];
+        uint16_t klass = (pkt[nxt+2] << 8) | pkt[nxt+3];
+        uint32_t ttl = ((uint32_t)pkt[nxt+4]<<24)|((uint32_t)pkt[nxt+5]<<16)|((uint32_t)pkt[nxt+6]<<8)|pkt[nxt+7];
+        uint16_t rdlen = (pkt[nxt+8] << 8) | pkt[nxt+9];
+        size_t rdata_start = nxt + 10;
+        if (rdata_start + rdlen > pkt_len) break;
+
+        if (i >= ancount + nscount && type == 41) { // OPT in additional
+            has_opt = true;
+            opt_udp = klass;
+            opt_ver = (ttl >> 16) & 0xFF;
+            opt_ext_flags = (ttl & 0xFFFF);
+            size_t p = rdata_start, end = rdata_start + rdlen;
+            while (p + 4 <= end) {
+                uint16_t code = (pkt[p] << 8) | pkt[p+1];
+                uint16_t olen = (pkt[p+2] << 8) | pkt[p+3];
+                p += 4;
+                if (p + olen > end) break;
+                if (code == 10) { // COOKIE
+                    has_cookie = true;
+                    if (olen >= 8) {
+                        for (int j = 0; j < 8; j++) snprintf(client_cookie + j * 2, 3, "%02x", pkt[p + j]);
+                        if (olen > 8) {
+                            for (int j = 8; j < olen && (j - 8) * 2 < (int)sizeof(server_cookie) - 3; j++) {
+                                snprintf(server_cookie + (j - 8) * 2, 3, "%02x", pkt[p + j]);
+                            }
+                        }
+                    }
+                }
+                p += olen;
+            }
+        }
+        scan_off = rdata_start + rdlen;
+    }
+
+    if (has_opt) {
+        printf("      OPT_PSEUDOSECTION:\n");
+        printf("        EDNS:\n");
+        printf("          version: %u\n", opt_ver);
+        printf("          flags:");
+        if (opt_ext_flags & 0x8000) printf(" do");
+        if (opt_ext_flags & 0x0040) printf(" co");
+        printf("\n");
+        printf("          udp: %u\n", opt_udp);
+        if (has_cookie) {
+            printf("          COOKIE:\n");
+            printf("            CLIENT: %s\n", client_cookie);
+            if (server_cookie[0] != '\0') {
+                printf("            SERVER: %s\n", server_cookie);
+                printf("            STATUS: good\n");
+            }
+        }
+    }
 
     size_t offset = 12;
     if (qdcount > 0) {
-        printf("question:\n");
+        printf("      QUESTION_SECTION:\n");
         for (int i = 0; i < qdcount; i++) {
             char *name = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
@@ -3830,25 +3921,37 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len) {
             uint16_t qtype = (pkt[next] << 8) | pkt[next+1];
             uint16_t qclass = (pkt[next+2] << 8) | pkt[next+3];
             char tname_buf[32];
-            char escaped_name[512];
-            yaml_escape_string(name ? name : "", escaped_name, sizeof(escaped_name));
-            printf("  - name: \"%s\"\n", escaped_name);
-            printf("    type: %s\n", format_type_name(qtype, tname_buf, sizeof(tname_buf)));
-            printf("    class: %u\n", qclass);
+            char cname_buf[16];
+            const char *tname = format_type_name(qtype, tname_buf, sizeof(tname_buf));
+            const char *cname = format_class_name(qclass, cname_buf, sizeof(cname_buf));
+            printf("        - '%s %s %s'\n", name ? name : ".", cname, tname);
             offset = next + 4;
         }
     }
 
-    struct { const char *section_name; int count; } sections[] = {
-        { "answer", ancount },
-        { "authority", nscount },
-        { "additional", arcount }
+    struct { const char *section_yaml_name; int count; } sec_defs[] = {
+        { "ANSWER_SECTION", ancount },
+        { "AUTHORITY_SECTION", nscount },
+        { "ADDITIONAL_SECTION", arcount }
     };
 
     for (int s = 0; s < 3; s++) {
-        if (sections[s].count > 0) {
-            printf("%s:\n", sections[s].section_name);
-            for (int i = 0; i < sections[s].count; i++) {
+        if (sec_defs[s].count <= 0) continue;
+        size_t sec_offset = offset;
+        int non_opt_count = 0;
+        for (int i = 0; i < sec_defs[s].count; i++) {
+            char *name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, sec_offset, &next, &g_dag_arena, &name) != 0) break;
+            if (next + 10 > pkt_len) break;
+            uint16_t type = (pkt[next] << 8) | pkt[next+1];
+            uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
+            if (s != 2 || type != 41) non_opt_count++;
+            sec_offset = next + 10 + rdlen;
+        }
+
+        if (non_opt_count > 0) {
+            printf("      %s:\n", sec_defs[s].section_yaml_name);
+            for (int i = 0; i < sec_defs[s].count; i++) {
                 char *name = NULL; size_t next;
                 if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
                 if (next + 10 > pkt_len) break;
@@ -3856,31 +3959,34 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len) {
                 uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
                 uint32_t ttl = ((uint32_t)pkt[next+4]<<24)|((uint32_t)pkt[next+5]<<16)|((uint32_t)pkt[next+6]<<8)|pkt[next+7];
                 uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
-                if (next + 10 + rdlen > pkt_len) break;
+                size_t rdata_start = next + 10;
+                if (rdata_start + rdlen > pkt_len) break;
 
-                // OPT pseudo-record in additional section
                 if (type == 41 && s == 2) {
-                    offset = next + 10 + rdlen;
+                    offset = rdata_start + rdlen;
                     continue;
                 }
 
                 char tname_buf[32];
-                char escaped_name[512];
-                yaml_escape_string(name ? name : "", escaped_name, sizeof(escaped_name));
-                printf("  - name: \"%s\"\n", escaped_name);
-                printf("    type: %s\n", format_type_name(type, tname_buf, sizeof(tname_buf)));
-                printf("    class: %u\n", klass);
-                printf("    ttl: %u\n", ttl);
-                printf("    rdlen: %u\n", rdlen);
+                char cname_buf[16];
+                char ttl_str[32];
+                if (dopt && dopt->ttlunits) {
+                    format_ttl_units(ttl, ttl_str, sizeof(ttl_str));
+                } else {
+                    snprintf(ttl_str, sizeof(ttl_str), "%u", ttl);
+                }
+
+                const char *tname = format_type_name(type, tname_buf, sizeof(tname_buf));
+                const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
 
                 char rdata_raw[2048];
-                format_rdata_for_display(pkt, pkt_len, type, next + 10, rdlen, rdata_raw, sizeof(rdata_raw));
-                char rdata_escaped[4096];
-                yaml_escape_string(rdata_raw, rdata_escaped, sizeof(rdata_escaped));
-                printf("    rdata: \"%s\"\n", rdata_escaped);
+                format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw));
 
-                offset = next + 10 + rdlen;
+                printf("        - '%s %s %s %s %s'\n", name ? name : ".", ttl_str, cname, tname, rdata_raw);
+                offset = rdata_start + rdlen;
             }
+        } else {
+            offset = sec_offset;
         }
     }
 }
@@ -3895,7 +4001,7 @@ static void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opt
     if (pkt_len < 12) return;
     if (dopt->yaml) {
         printf(";; Sending query in YAML format\n");
-        print_response_yaml(pkt, pkt_len);
+        print_response_yaml(pkt, pkt_len, "0.0.0.0", 0, qo ? qo->use_tcp : false, dopt);
         return;
     }
     uint16_t qid = (pkt[0] << 8) | pkt[1];
@@ -4383,7 +4489,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         axfr_state.is_axfr = (qtype == 252 || qtype == 251);
 
 
-        if (!dopt->short_mode) {
+        if (!dopt->short_mode && !dopt->yaml) {
             if (dopt->show_cmd) {
                 const char *disp_qname = (qo && qo->orig_qname) ? qo->orig_qname : qname;
                 const char *disp_qtype = (qo && qo->orig_qtype_s) ? qo->orig_qtype_s : (qtype_s ? qtype_s : "");
@@ -4602,7 +4708,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
 
             if (!dopt->short_mode) {
-                if (!no_hexdump_response && dopt->show_comments) {
+                if (!dopt->yaml && !no_hexdump_response && dopt->show_comments) {
                     if (use_tcp) {
                         printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
                     } else {
@@ -4612,7 +4718,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     printf("\n");
                 }
                 if (dopt->yaml) {
-                    print_response_yaml(resp, (size_t)n);
+                    print_response_yaml(resp, (size_t)n, server, port, use_tcp, dopt);
                 } else {
                     print_response(resp, (size_t)n, &axfr_state, dopt);
                 }
@@ -4694,7 +4800,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             proto_name = "TCP";
         }
 
-        if (!dopt->short_mode && dopt->show_stats) {
+        if (!dopt->short_mode && !dopt->yaml && dopt->show_stats) {
             if (dopt->time_unit_usec) {
                 printf("\n;; Query time: %lld usec\n", elapsed_usec);
             } else {

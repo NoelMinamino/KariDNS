@@ -80,6 +80,10 @@ normalize_output() {
         -e 's/^(dig|dag):/dig:/' \
         -e 's/id: [0-9]+/id: <ID>/g' \
         -e 's/;* COOKIE: .*/;; COOKIE: <COOKIE>/g' \
+        -e 's/CLIENT: [0-9a-fA-F]+/CLIENT: <COOKIE>/g' \
+        -e 's/SERVER: [0-9a-fA-F]{16,}/SERVER: <COOKIE>/g' \
+        -e 's/(query|response)_time: !!timestamp .*/\1_time: <TIME>/g' \
+        -e "s/'([^']+) [0-9]+ IN /'\1 <TTL> IN /g" \
         -e 's/[0-9]+[[:space:]]+IN[[:space:]]+/<TTL> IN /g' \
         -e 's/;; Query time: [0-9]+ (msec|usec)/;; Query time: <TIME>/g' \
         -e 's/ in [0-9]+ ms/ in <TIME> ms/g' \
@@ -252,6 +256,7 @@ else
     compare_query "No stats section (+nostats)" "www.example.com A +nostats"
     compare_query "Query header dump (+qr)" "www.example.com A +qr"
     compare_query "Identification (+short +identify)" "www.example.com A +short +identify"
+    compare_query "YAML formatted output (+yaml)" "www.example.com A +yaml"
 
     echo "--------------------------------------------------------"
     echo "3. DNSSEC & Crypto Formatting"
@@ -276,6 +281,7 @@ else
     compare_query "EDNS CO flag (+coflag)" "www.example.com A +coflag"
     compare_query "EDNS Flags raw Z-bits (+ednsflags)" "www.example.com A +ednsflags=0x0040"
     compare_query "Generic EDNS option (+ednsopt)" "www.example.com A +ednsopt=65001:01020304"
+    compare_query "Generic EDNS option cleared (+ednsopt +noednsopt)" "www.example.com A +ednsopt=65001:01020304 +noednsopt"
     compare_query "EDNS Subnet + NSID + Padding" "www.example.com A +subnet=192.0.2.0/24 +nsid +padding=64"
     compare_query "Standard TCP Query (+tcp)" "www.example.com A +tcp"
     compare_query "TCP Query with explicit timeout (+tcp +timeout=2)" "www.example.com A +tcp +timeout=2"

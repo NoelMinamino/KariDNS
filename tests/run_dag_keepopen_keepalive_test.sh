@@ -11,11 +11,26 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "=== Building dag and karidns with make ==="
 make -C "$ROOT_DIR" dag karidns
 
-DAG="$ROOT_DIR/dag"
-KARIDNS="$ROOT_DIR/karidns"
+DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
+KARIDNS="${KARIDNS:-$ROOT_DIR/karidns}"
 
-if [ ! -x "$DAG" ] || [ ! -x "$KARIDNS" ]; then
-    echo "dag or karidns binary not found"
+if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
+    DAG="dig"
+    if ! command -v "$DAG" >/dev/null 2>&1; then
+        echo "Error: dig executable not found"
+        exit 1
+    fi
+else
+    if [ ! -x "$DAG" ]; then
+        DAG="$ROOT_DIR/dag"
+    fi
+fi
+
+if [ ! -x "$KARIDNS" ]; then
+    KARIDNS="./karidns"
+fi
+if [ ! -x "$KARIDNS" ]; then
+    echo "Error: karidns binary not found at $KARIDNS"
     exit 1
 fi
 
@@ -37,6 +52,12 @@ run_check() {
         echo "$OUT" | sed 's/^/    /'
         FAILED=$((FAILED + 1))
     fi
+}
+
+run_skip() {
+    NAME="$1"
+    REASON="${2:-dag-only feature}"
+    echo "Test: $NAME ... SKIP ($REASON)"
 }
 
 echo "=== 1. Testing +keepalive (EDNS TCP Keepalive, RFC 7828) Option Generation ==="
@@ -71,9 +92,13 @@ sleep 0.5
 
 echo "=== 3. Testing +keepopen Multi-Query Tuple Execution (RFC 7766) ==="
 # Test executing 3 consecutive queries in one invocation over TCP with +keepopen
-run_check "3 consecutive queries via TCP with +keepopen" \
-    "$DAG @127.0.0.1 -p $PORT example.com A +tcp +keepopen example.com TXT @127.0.0.1 -p $PORT +tcp +keepopen example.com NS @127.0.0.1 -p $PORT +tcp +keepopen +timeout=2" \
-    "v=spf1 mx"
+if [ "$DAG" = "dig" ]; then
+    run_skip "3 consecutive queries via TCP with +keepopen"
+else
+    run_check "3 consecutive queries via TCP with +keepopen" \
+        "$DAG @127.0.0.1 -p $PORT example.com A +tcp +keepopen example.com TXT @127.0.0.1 -p $PORT +tcp +keepopen example.com NS @127.0.0.1 -p $PORT +tcp +keepopen +timeout=2" \
+        "v=spf1 mx"
+fi
 
 echo "=== 4. Testing +keepopen Batch Mode (-f) ==="
 BATCH_FILE="/tmp/dag_batch_keepopen.txt"
@@ -83,17 +108,25 @@ example.com TXT
 example.com SOA
 EOF
 
-run_check "batch mode queries via TCP with +keepopen" \
-    "$DAG @127.0.0.1 -p $PORT -f $BATCH_FILE +tcp +keepopen +timeout=2" \
-    "hostmaster\.example\.com"
+if [ "$DAG" = "dig" ]; then
+    run_skip "batch mode queries via TCP with +keepopen"
+else
+    run_check "batch mode queries via TCP with +keepopen" \
+        "$DAG @127.0.0.1 -p $PORT -f $BATCH_FILE +tcp +keepopen +timeout=2" \
+        "hostmaster\.example\.com"
+fi
 
 rm -f "$BATCH_FILE"
 
 echo "=== 5. Testing +keepopen with Combined +keepalive Option (RFC 7828) ==="
 # When tcp-connection-reuse is enabled on KariDNS, KariDNS responds with EDNS Keepalive timeout (100 in 100ms units = 10s)
-run_check "combined +keepopen and +keepalive over TCP" \
-    "$DAG @127.0.0.1 -p $PORT example.com A +tcp +keepopen +keepalive example.com TXT @127.0.0.1 -p $PORT +tcp +keepopen +keepalive +timeout=2" \
-    "(KEEPALIVE: 100|KEEPALIVE)"
+if [ "$DAG" = "dig" ]; then
+    run_skip "combined +keepopen and +keepalive over TCP"
+else
+    run_check "combined +keepopen and +keepalive over TCP" \
+        "$DAG @127.0.0.1 -p $PORT example.com A +tcp +keepopen +keepalive example.com TXT @127.0.0.1 -p $PORT +tcp +keepopen +keepalive +timeout=2" \
+        "(KEEPALIVE: 100|KEEPALIVE)"
+fi
 
 kill $SERVER_PID 2>/dev/null || true
 killall -9 karidns 2>/dev/null || true
