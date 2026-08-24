@@ -1062,14 +1062,17 @@ uint32_t parse_ttl_value(const char *ttl_str) {
         if (!isdigit((unsigned char)*p)) { all_digits = false; break; }
     }
     if (all_digits) {
-        return (uint32_t)strtoul(ttl_str, NULL, 10);
+        uint64_t v = strtoull(ttl_str, NULL, 10);
+        // RFC 2181 §8: TTLは符号なし32bit、最上位ビットは立てない(実質最大2147483647)
+        if (v > 2147483647ULL) v = 2147483647ULL;
+        return (uint32_t)v;
     }
 
     uint64_t total = 0;
     const char *p = ttl_str;
     while (*p) {
         char *endptr = NULL;
-        unsigned long num = strtoul(p, &endptr, 10);
+        unsigned long long num = strtoull(p, &endptr, 10);
         if (endptr == p) return 3600; // 数字が続かない不正な表記 -> デフォルトへフォールバック
         uint64_t multiplier = 1;
         if (*endptr) {

@@ -1420,6 +1420,27 @@ int main() {
             printf("FAIL: parse_ttl_value('invalid') != 3600\n");
             return 1;
         }
+        // RFC 2181 §8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
+        if (parse_ttl_value("4000000000") != 2147483647) {
+            printf("FAIL: parse_ttl_value('4000000000') != 2147483647 (got %u)\n", parse_ttl_value("4000000000"));
+            return 1;
+        }
+        if (parse_ttl_value("46296d17m") != 2147483647) {
+            printf("FAIL: parse_ttl_value('46296d17m') != 2147483647 (got %u)\n", parse_ttl_value("46296d17m"));
+            return 1;
+        }
+        if (parse_ttl_value("2147483648") != 2147483647) {
+            printf("FAIL: parse_ttl_value('2147483648') != 2147483647\n");
+            return 1;
+        }
+        if (parse_ttl_value("2147483647") != 2147483647) {
+            printf("FAIL: parse_ttl_value('2147483647') != 2147483647\n");
+            return 1;
+        }
+        if (parse_ttl_value("2147483646") != 2147483646) {
+            printf("FAIL: parse_ttl_value('2147483646') != 2147483646\n");
+            return 1;
+        }
 
         // Test zone parsing with TTL units
         zone_arena_t arena;
