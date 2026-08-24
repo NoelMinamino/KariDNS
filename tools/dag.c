@@ -4066,9 +4066,10 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         }
         printf(";; Got answer:\n");
         printf(";; ->>HEADER<<- opcode: %s, status: %s, id: %u\n", opcode_name(opcode), rcode_name(full_rcode), qid);
-        printf(";; flags:%s%s%s%s%s%s; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n",
+        printf(";; flags:%s%s%s%s%s%s%s;%s QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n",
                qr ? " qr" : "", aa ? " aa" : "", tc ? " tc" : "", rd ? " rd" : "",
-               ra ? " ra" : "", ad ? " ad" : "",
+               ra ? " ra" : "", ad ? " ad" : "", cd ? " cd" : "",
+               (flags2 & 0x40) ? " MBZ: 0x4;" : "",
                qdcount, ancount, nscount, arcount);
         if (!ra && rd) {
             printf(";; WARNING: recursion requested but not available\n");
@@ -4076,7 +4077,6 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         if (is_malformed && extra_bytes > 0) {
             printf(";; WARNING: Message has %zu extra bytes at end\n", extra_bytes);
         }
-        if (cd) printf(";; (checking disabled)\n");
     }
 
     if (edns.present && dopt->show_comments) {
@@ -4494,6 +4494,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         }
 
+        struct timespec end_ts;
+        clock_gettime(CLOCK_MONOTONIC, &end_ts);
+        long long elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
+        long elapsed_ms = (long)(elapsed_usec / 1000LL);
+
         bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
 
         int msg_index = 1;
@@ -4600,9 +4605,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     hexdump(resp, (size_t)n);
                     printf("\n");
                 }
-                if (dopt->identify) {
-                    printf(";; ANSWER FROM: %s\n", server);
-                }
                 if (dopt->yaml) {
                     print_response_yaml(resp, (size_t)n);
                 } else {
@@ -4624,6 +4626,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                             check_axfr_soa(&axfr_state, resp, n, name, &resp[nxt], rdlen);
                         }
                         print_rdata(resp, n, type, nxt+10, rdlen, dopt);
+                        if (dopt->identify) {
+                            printf(" from server %s in %ld ms.", server, elapsed_ms);
+                        }
                         printf("\n");
                         off = nxt+10+rdlen;
                     } else break;
@@ -4656,10 +4661,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
         if (sres) g_server_count++;
 
-        struct timespec end_ts;
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
-        long long elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
-        long elapsed_ms = (long)(elapsed_usec / 1000LL);
+        elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
+        elapsed_ms = (long)(elapsed_usec / 1000LL);
 
         int end_index = g_server_count;
         for (int idx = start_index; idx < end_index; idx++) {
@@ -5726,8 +5730,8 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     }
 
 
-    // AXFRの場合は自動的にTCPモードに昇格（+udpが明示されていない場合）
-    if (strcasecmp(qtype_s, "AXFR") == 0 && !force_udp) {
+    // AXFRまたはANYの場合は自動的にTCPモードに昇格（+udpが明示されていない場合、BIND 9 dig / RFC 8482準拠）
+    if ((strcasecmp(qtype_s, "AXFR") == 0 || strcasecmp(qtype_s, "ANY") == 0) && !force_udp) {
         use_tcp = true;
     }
 
@@ -5926,6 +5930,8 @@ static void init_query_spec(query_spec_t *spec) {
     spec->qo.retry_on_badcookie = true;
     spec->qo.edns_negotiation = true;
     spec->qo.rd_flag = true;
+    spec->adflag = true;
+    spec->qo.ad_flag = true;
     spec->qo.opcode_override = -1;
     spec->qo.qid_override = -1;
     spec->qo.ndots = -1;
