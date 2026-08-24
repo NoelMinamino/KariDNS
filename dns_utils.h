@@ -8,7 +8,7 @@
 #include <stdio.h>
 
 #ifndef KARIDNS_VERSION
-#define KARIDNS_VERSION "0.0.3"
+#define KARIDNS_VERSION "0.0.4"
 #endif
 
 uint16_t get_type_code(const char *type_str);
