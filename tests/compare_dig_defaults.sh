@@ -80,6 +80,10 @@ normalize_output() {
         -e 's/^(dig|dag):/dig:/' \
         -e 's/id: [0-9]+/id: <ID>/g' \
         -e 's/;* COOKIE: .*/;; COOKIE: <COOKIE>/g' \
+        -e 's/CLIENT: [0-9a-fA-F]+/CLIENT: <COOKIE>/g' \
+        -e 's/SERVER: [0-9a-fA-F]{16,}/SERVER: <COOKIE>/g' \
+        -e 's/(query|response)_time: !!timestamp .*/\1_time: <TIME>/g' \
+        -e "s/'([^']+) [0-9]+ IN /'\1 <TTL> IN /g" \
         -e 's/[0-9]+[[:space:]]+IN[[:space:]]+/<TTL> IN /g' \
         -e 's/;; Query time: [0-9]+ (msec|usec)/;; Query time: <TIME>/g' \
         -e 's/ in [0-9]+ ms/ in <TIME> ms/g' \
@@ -222,9 +226,15 @@ else
     compare_query "CAA query" "example.com CAA"
     compare_query "LOC query" "office.example.com LOC"
     compare_query "CNAME resolution" "ftp.example.com A"
+    compare_query "DNAME resolution" "sub.legacy.example.com A"
+    compare_query "URI query" "_https._tcp.example.com URI"
+    compare_query "SPF query" "example.com SPF"
     compare_query "Wildcard query" "foo.wild.example.com A"
+    compare_query "Reverse IPv4 lookup (-x)" "-x 192.0.2.10"
+    compare_query "Reverse IPv6 lookup (-x)" "-x 2001:db8::1"
     compare_query "NXDOMAIN response" "nonexistent.example.com A"
     compare_query "NODATA response" "mail.example.com TXT"
+    compare_query "ANY query" "example.com ANY"
 
     echo "--------------------------------------------------------"
     echo "2. Format & Layout Options"
@@ -244,11 +254,15 @@ else
     compare_query "No question section (+noquestion)" "www.example.com A +noquestion"
     compare_query "Combined +noall +answer" "www.example.com A +noall +answer"
     compare_query "No stats section (+nostats)" "www.example.com A +nostats"
+    compare_query "Query header dump (+qr)" "www.example.com A +qr"
+    compare_query "Identification (+short +identify)" "www.example.com A +short +identify"
+    compare_query "YAML formatted output (+yaml)" "www.example.com A +yaml"
 
     echo "--------------------------------------------------------"
     echo "3. DNSSEC & Crypto Formatting"
     echo "--------------------------------------------------------"
     compare_query "DNSSEC OK (+dnssec)" "example.com DNSKEY +dnssec"
+    compare_query "DNSSEC DS query" "example.com DS +dnssec"
     compare_query "RR Comments on DNSKEY (+rrcomments)" "example.com DNSKEY +rrcomments"
     compare_query "Omit Crypto on DNSKEY (+nocrypto)" "example.com DNSKEY +nocrypto"
     compare_query "Split width (+split=16)" "example.com DNSKEY +split=16"
@@ -267,6 +281,8 @@ else
     compare_query "EDNS CO flag (+coflag)" "www.example.com A +coflag"
     compare_query "EDNS Flags raw Z-bits (+ednsflags)" "www.example.com A +ednsflags=0x0040"
     compare_query "Generic EDNS option (+ednsopt)" "www.example.com A +ednsopt=65001:01020304"
+    compare_query "Generic EDNS option cleared (+ednsopt +noednsopt)" "www.example.com A +ednsopt=65001:01020304 +noednsopt"
+    compare_query "EDNS Subnet + NSID + Padding" "www.example.com A +subnet=192.0.2.0/24 +nsid +padding=64"
     compare_query "Standard TCP Query (+tcp)" "www.example.com A +tcp"
     compare_query "TCP Query with explicit timeout (+tcp +timeout=2)" "www.example.com A +tcp +timeout=2"
     compare_query "TCP Query with +time alias (+tcp +time=2)" "www.example.com A +tcp +time=2"
@@ -276,6 +292,10 @@ else
     compare_query "Keep TCP open (+tcp +keepopen)" "www.example.com A +tcp +keepopen"
     compare_query "Flags override (+raflag +tcflag +zflag)" "www.example.com A +raflag +tcflag +zflag"
     compare_query "Header flags (+adflag +cdflag +aaflag)" "www.example.com A +adflag +cdflag +aaflag"
+    compare_query "No RD flag (+nordflag)" "www.example.com A +nordflag"
+    compare_query "No AD flag (+noadflag)" "www.example.com A +noadflag"
+    compare_query "Explicit CD flag only (+cdflag)" "www.example.com A +cdflag"
+    compare_query "Explicit AA flag query (+aaflag)" "www.example.com A +aaflag"
     compare_query "Opcode override (+opcode=NOTIFY)" "www.example.com A +opcode=NOTIFY +noadflag"
     compare_query "QID override (+qid=4660)" "www.example.com A +qid=4660"
     compare_query "Ignore TC flag (+ignore)" "www.example.com A +ignore"
@@ -320,6 +340,9 @@ else
     compare_query "Positional Order: Name Class Type" "www.example.com IN A"
     compare_query "Positional Order: Name Type Class" "www.example.com A IN"
     compare_query "Positional Order: Type Name Class" "A www.example.com IN"
+    compare_query "Multiple Queries with different classes" "www.example.com IN A example.com IN MX"
+    compare_query "Multiple Queries with mixed options" "www.example.com A +nocmd example.com SOA +noquestion"
+    compare_query "Three positional queries" "ns1.example.com A ns2.example.com AAAA mail.example.com MX"
     compare_query "Multiple Reverse (-x) and Forward" "-x 192.0.2.10 www.example.com A"
     compare_query "Per-query flag override (+noanswer on second)" "www.example.com A example.com TXT +noanswer"
     cat << 'EOF' > tsig_key.conf

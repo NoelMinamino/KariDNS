@@ -67,9 +67,16 @@ if ($client_addr && length($query) >= 12) {
         return $pkt;
     };
 
-    # Send response with mismatched Client Cookie
+    # 1. Send first response with mismatched Client Cookie (spoofed/stale)
     my $mismatch_resp = $build_resp->($fake_cookie, 66);
     send($srv, $mismatch_resp, 0, $client_addr);
+
+    # Brief delay before sending valid matching response
+    select(undef, undef, undef, 0.05);
+
+    # 2. Send second response with matched Client Cookie (valid)
+    my $valid_resp = $build_resp->($real_cookie, 77);
+    send($srv, $valid_resp, 0, $client_addr);
 }
 ' "$PORT_COOKIE_TEST" &
 SRV_PID=$!
@@ -86,19 +93,33 @@ echo "$OUT" | grep -q -i "Warning: Client COOKIE mismatch" || {
     exit 1
 }
 
-# 2. Verify (bad) indication in COOKIE option
-echo "$OUT" | grep -q -i -E "COOKIE:.*\(bad\)" || {
-    echo "FAIL: Expected 'COOKIE: ... (bad)' in output"
-    echo "$OUT"
-    exit 1
-}
+if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
+    # BIND 9 dig emits warning and (bad) marker, but processes the response
+    echo "$OUT" | grep -q -i -E "COOKIE:.*\(bad\)" || {
+        echo "FAIL: Expected 'COOKIE: ... (bad)' in dig output"
+        echo "$OUT"
+        exit 1
+    }
+    echo "$OUT" | grep -q "192\.0\.2\.66" || {
+        echo "FAIL: Expected answer 192.0.2.66 in dig output"
+        echo "$OUT"
+        exit 1
+    }
+else
+    # KariDNS dag strictly complies with RFC 7873 §5.2 by discarding the mismatched response
+    # and accepting the subsequent valid response (192.0.2.77)
+    echo "$OUT" | grep -q "192\.0\.2\.77" || {
+        echo "FAIL: Expected valid response (192.0.2.77) to be accepted after discarding mismatched cookie"
+        echo "$OUT"
+        exit 1
+    }
 
-# 3. Verify packet is displayed
-echo "$OUT" | grep -q "192\.0\.2\.66" || {
-    echo "FAIL: Expected answer record 192.0.2.66 in output"
-    echo "$OUT"
-    exit 1
-}
+    if echo "$OUT" | grep -q "192\.0\.2\.66"; then
+        echo "FAIL: Mismatched cookie response (192.0.2.66) was erroneously accepted!"
+        echo "$OUT"
+        exit 1
+    fi
+fi
 
 echo "PASS: test_dag_cookie_mismatch_discard"
 exit 0
