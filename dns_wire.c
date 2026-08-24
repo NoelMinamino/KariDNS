@@ -611,7 +611,10 @@ bool tsig_algorithm_is_supported(const char *alg) {
     return tsig_algorithm_from_name(alg) != NULL;
 }
 
-int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error, uint8_t *prior_mac, size_t *prior_mac_len, bool is_subsequent) {
+int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
+                     uint8_t *prior_mac, size_t *prior_mac_len,
+                     const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                     bool is_subsequent) {
     if (!key) return -1;
 
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
@@ -633,6 +636,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     size_t pre_mac_len = *packet_len;
     size_t pre_mac_cap = pre_mac_len
                        + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0)
+                       + unsigned_intermediate_msgs_len
                        + keyname_wire_len + 6 + alg_wire_len
                        + 8 /* time+fudge */
                        + 4 /* error+otherlen */
@@ -650,6 +654,10 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         memcpy(&pre_mac[offset], prior_mac, *prior_mac_len);
         offset += *prior_mac_len;
     }
+    if (unsigned_intermediate_msgs && unsigned_intermediate_msgs_len > 0) {
+        memcpy(&pre_mac[offset], unsigned_intermediate_msgs, unsigned_intermediate_msgs_len);
+        offset += unsigned_intermediate_msgs_len;
+    }
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
     if (!is_subsequent) {
@@ -662,7 +670,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
     }
-    uint64_t now = time(NULL);
+    uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
     pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
     pre_mac[offset++] = (now >> 8) & 0xFF; pre_mac[offset++] = now & 0xFF;
@@ -732,7 +740,11 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     return 0;
 }
 
-int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key, const uint8_t *prior_mac, size_t prior_mac_len, uint8_t *mac_out, size_t *mac_len_out) {
+int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
+                       const uint8_t *prior_mac, size_t prior_mac_len,
+                       const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                       bool is_subsequent,
+                       uint8_t *mac_out, size_t *mac_len_out) {
     if (!key || packet_len < DNS_HEADER_SIZE) return -1;
     uint16_t arcount = (packet[10] << 8) | packet[11];
     if (arcount == 0) return -1;
@@ -795,7 +807,9 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     size_t keyname_wire_len = wire_name_length(key->name);
     size_t alg_wire_len = wire_name_length(wire_alg_name);
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
-    size_t pre_mac_cap = prior_mac_len + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
+    size_t pre_mac_cap = (prior_mac_len > 0 ? prior_mac_len + 2 : 0)
+                       + unsigned_intermediate_msgs_len
+                       + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
     
     uint8_t *pre_mac = NULL;
     bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
@@ -810,29 +824,38 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         memcpy(&pre_mac[p_offset], prior_mac, prior_mac_len);
         p_offset += prior_mac_len;
     }
+    if (unsigned_intermediate_msgs && unsigned_intermediate_msgs_len > 0) {
+        memcpy(&pre_mac[p_offset], unsigned_intermediate_msgs, unsigned_intermediate_msgs_len);
+        p_offset += unsigned_intermediate_msgs_len;
+    }
     
     memcpy(&pre_mac[p_offset], packet, last_rr_offset);
     pre_mac[p_offset + 0] = orig_id >> 8; pre_mac[p_offset + 1] = orig_id & 0xFF;
     uint16_t new_arcount = arcount - 1;
     pre_mac[p_offset + 10] = new_arcount >> 8; pre_mac[p_offset + 11] = new_arcount & 0xFF;
     p_offset += last_rr_offset;
-    long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
-    if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
-    p_offset += (size_t)w3;
+
+    if (!is_subsequent) {
+        long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
+        if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
+        p_offset += (size_t)w3;
+        
+        if (p_offset + 6 > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
+        pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
+        pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
+        
+        w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, wire_alg_name);
+        if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
+        p_offset += (size_t)w3;
+    }
     
-    if (p_offset + 6 > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
-    pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
-    pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
-    
-    w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, wire_alg_name);
-    if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
-    p_offset += (size_t)w3;
-    
-    if (p_offset + DNS_HEADER_SIZE + other_len > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
+    if (p_offset + 8 + (!is_subsequent ? 4 + other_len : 0) > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
     memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8); p_offset += 8;
-    pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
-    pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
-    if (other_len > 0) { memcpy(&pre_mac[p_offset], &packet[tsig_p], other_len); p_offset += other_len; }
+    if (!is_subsequent) {
+        pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
+        pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
+        if (other_len > 0) { memcpy(&pre_mac[p_offset], &packet[tsig_p], other_len); p_offset += other_len; }
+    }
     unsigned int calc_mac_len = 0; unsigned char calc_mac[EVP_MAX_MD_SIZE];
     HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, p_offset, calc_mac, &calc_mac_len);
     if (use_malloc) free(pre_mac);
@@ -1093,6 +1116,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     res[offset++] = class_val >> 8; res[offset++] = class_val & 0xFF;
     
     uint32_t ttl = rec->ttl_value;
+    if (ttl == 0 && rec->ttl && *rec->ttl) {
+        ttl = parse_ttl_value(rec->ttl);
+    }
     if (ttl > 0x7FFFFFFF) ttl = 0; // RFC 2181 §8: TTL >= 2^31 is treated as 0
     if (override_ttl != 0xFFFFFFFF && override_ttl < ttl) ttl = override_ttl;
     

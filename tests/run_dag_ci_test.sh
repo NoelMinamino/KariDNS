@@ -20,9 +20,9 @@ if [ "$CLIENT_ARG" = "dig" ]; then
     fi
     DAG="dig"
     CLIENT_NAME="BIND 9 dig ($(dig -v 2>&1 | head -n 1))"
-    make -C "$BIN_DIR" all >/dev/null 2>&1
+    make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
 else
-    make -C "$BIN_DIR" all >/dev/null 2>&1
+    make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
     DAG="$BIN_DIR/dag"
     CLIENT_NAME="KariDNS dag"
 fi
@@ -58,6 +58,7 @@ view "default" {
     zone "example.com" {
         type master;
         file "${SCRIPT_DIR}/zones/example.com.zone";
+        allow-transfer { any; };
     };
 };
 EOF
@@ -124,10 +125,15 @@ echo "========================================================"
 echo "1. Basic Queries, Transport & Protocols"
 echo "========================================================"
 run_check "Standard UDP Query" "$DAG @127.0.0.1 -p $PORT www.example.com A" "192.0.2.10"
+run_check "Explicit Query Name flag (-q)" "$DAG @127.0.0.1 -p $PORT -q www.example.com" "192.0.2.10"
+run_check "Explicit Query Type flag (-t)" "$DAG @127.0.0.1 -p $PORT example.com -t MX" "mail\.example\.com"
+run_check "Explicit Query Class flag (-c)" "$DAG @127.0.0.1 -p $PORT -c IN www.example.com A" "192.0.2.10"
 run_check "Standard TCP Query (+tcp)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tcp" "192.0.2.10"
 run_check "Standard TCP Query (+vc)" "$DAG @127.0.0.1 -p $PORT www.example.com A +vc" "192.0.2.10"
 run_check "Reverse PTR Query (-x)" "$DAG @127.0.0.1 -p $PORT -x 192.0.2.10" "10\.2\.0\.192\.in-addr\.arpa"
 run_check "IPv4 preference flag (-4)" "$DAG @127.0.0.1 -p $PORT www.example.com A -4" "192.0.2.10"
+run_check "IPv6 preference flag (-6)" "$DAG @127.0.0.1 -p $PORT www.example.com AAAA -6 +timeout=1" "(2001:db8::10|timed out|no usable response|No acceptable nameservers)"
+run_check "Ignore .digrc flag (-r)" "$DAG @127.0.0.1 -p $PORT www.example.com A -r" "192.0.2.10"
 run_check "Source address & port bind (-b)" "$DAG @127.0.0.1 -p $PORT www.example.com A -b 127.0.0.1#54321" "192.0.2.10"
 run_check "Short mode (+short)" "$DAG @127.0.0.1 -p $PORT www.example.com A +short" "^192\.0\.2\.10$"
 run_check "Show Query (+qr)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qr" ";; Sending:"
@@ -146,11 +152,14 @@ echo "2. Section & Display Toggling (+noall, +identify, +yaml)"
 echo "========================================================"
 run_check "No comments (+nocomments)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nocomments" "192\.0\.2\.10"
 run_check "No answer section (+noanswer)" "$DAG @127.0.0.1 -p $PORT www.example.com A +noanswer" ";; flags:"
+run_check "No authority section (+noauthority)" "$DAG @127.0.0.1 -p $PORT nonexistent.example.com A +noauthority" "status: NXDOMAIN"
+run_check "No additional section (+noadditional)" "$DAG @127.0.0.1 -p $PORT example.com NS +noadditional" "ns1\.example\.com"
 run_check "No question section (+noquestion)" "$DAG @127.0.0.1 -p $PORT www.example.com A +noquestion" "192\.0\.2\.10"
 run_check "No command header (+nocmd)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nocmd" "192\.0\.2\.10"
 run_check "No stats section (+nostats)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nostats" "192\.0\.2\.10"
 run_check "Combined +noall +answer" "$DAG @127.0.0.1 -p $PORT www.example.com A +noall +answer" "192\.0\.2\.10"
 run_check "Identify server (+identify)" "$DAG @127.0.0.1 -p $PORT www.example.com A +identify" "(127\.0\.0\.1#53555|from server 127\.0\.0\.1)"
+run_check "Best effort parsing flag (+besteffort)" "$DAG @127.0.0.1 -p $PORT www.example.com A +besteffort" "192\.0\.2\.10"
 if [ "$DAG" = "dig" ]; then
     run_skip "YAML formatted output (+yaml)"
     run_skip "Hexdump suppression (+nohexdump)"
@@ -172,6 +181,8 @@ run_check "Unknown format (+unknownformat)" "$DAG @127.0.0.1 -p $PORT www.exampl
 run_check "TTL ID toggling (+ttlid / +nottlid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nottlid" "www\.example\.com\.[[:space:]]+IN[[:space:]]+A"
 run_check "Multiline mode (+multiline)" "$DAG @127.0.0.1 -p $PORT example.com SOA +multiline" "serial"
 run_check "Expire time display (+expire)" "$DAG @127.0.0.1 -p $PORT example.com SOA +expire" "(SOA|expire|serial)"
+run_check "AXFR single SOA (+onesoa)" "$DAG @127.0.0.1 -p $PORT example.com AXFR +onesoa" "SOA"
+run_check "Expand AAAA addresses (+expandaaaa)" "$DAG @127.0.0.1 -p $PORT www.example.com AAAA +expandaaaa" "2001:0db8:0000:0000:0000:0000:0000:0010"
 
 echo "========================================================"
 echo "4. DNSSEC & RR Comments & Crypto formatting"
@@ -182,7 +193,7 @@ run_check "Split width (+split=16)" "$DAG @127.0.0.1 -p $PORT example.com DNSKEY
 run_check "DNSSEC OK flag (+dnssec / +do)" "$DAG @127.0.0.1 -p $PORT example.com DNSKEY +dnssec +qr" "flags: do"
 
 echo "========================================================"
-echo "5. EDNS0 & RFC 9824 / RFC 10029 Options"
+echo "5. EDNS0, Badcookie & Transport Extensions"
 echo "========================================================"
 run_check "EDNS Buffer Size (+bufsize=4096)" "$DAG @127.0.0.1 -p $PORT www.example.com A +bufsize=4096 +qr" "udp:[[:space:]]*4096"
 run_check "EDNS NSID Option (+nsid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nsid +qr" "NSID"
@@ -191,6 +202,12 @@ run_check "EDNS Cookie (+cookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +c
 run_check "EDNS Subnet (+subnet)" "$DAG @127.0.0.1 -p $PORT www.example.com A +subnet=192.0.2.0/24 +qr" "; CLIENT-SUBNET: 192\.0\.2\.0/24"
 run_check "EDNS Padding (+padding)" "$DAG @127.0.0.1 -p $PORT www.example.com A +padding=64 +qr" "; PADDING:"
 run_check "EDNS Keepalive (+keepalive)" "$DAG @127.0.0.1 -p $PORT www.example.com A +keepalive +qr" "; (TCP-)?KEEPALIVE"
+run_check "EDNS Flags raw Z-bits (+ednsflags)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ednsflags=0x0040 +qr" "flags:.*0x0040|OPT PSEUDOSECTION"
+run_check "EDNS Negotiation flag (+ednsnegotiation)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ednsnegotiation" "192\.0\.2\.10"
+run_check "BADCOOKIE retry (+badcookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +badcookie" "192\.0\.2\.10"
+run_check "Show BADCOOKIE diagnostic (+showbadcookie)" "$DAG @127.0.0.1 -p $PORT www.example.com A +showbadcookie" "192\.0\.2\.10"
+run_check "Show BADVERS diagnostic (+showbadvers)" "$DAG @127.0.0.1 -p $PORT www.example.com A +showbadvers" "192\.0\.2\.10"
+run_check "Keep TCP socket open (+keepopen)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tcp +keepopen" "192\.0\.2\.10"
 run_check "Generic EDNS option (+ednsopt)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ednsopt=65001:01020304 +qr" "; (OPTION:[[:space:]]+|OPT=)65001"
 if [ "$DAG" = "dig" ]; then
     run_skip "RFC 10029 Multi-QTYPE (+mqtype)"
@@ -204,9 +221,17 @@ echo "========================================================"
 run_check "Header only / QDCOUNT=0 (+header-only)" "$DAG @127.0.0.1 -p $PORT www.example.com A +header-only +qr" "QUERY: 0"
 run_check "QID override (+qid=4660)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qid=4660 +qr" "id: 4660"
 run_check "Opcode override (+opcode=NOTIFY)" "$DAG @127.0.0.1 -p $PORT www.example.com A +opcode=NOTIFY +qr" "opcode: NOTIFY"
-run_check "Flags override (+adflag +cdflag +aaflag +tcflag +zflag)" "$DAG @127.0.0.1 -p $PORT www.example.com A +adflag +cdflag +aaflag +tcflag +zflag +qr" "flags:.*(ad|cd|aa|tc)"
+run_check "Flags override (+adflag +cdflag +aaflag +tcflag +raflag +zflag)" "$DAG @127.0.0.1 -p $PORT www.example.com A +adflag +cdflag +aaflag +tcflag +raflag +zflag +qr" "flags:.*(ad|cd|aa|tc|ra)"
 run_check "Recursion flag override (+norec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +norec +qr" ";; flags:"
 run_check "Ignore truncation flag (+ignore)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ignore" "192\.0\.2\.10"
+run_check "Timeout flag (+timeout=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+run_check "Tries and Retry flags (+tries=2 +retry=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tries=2 +retry=2" "192\.0\.2\.10"
+run_check "Search list and ndots expansion (+search +domain +ndots=2)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=2 +search" "192\.0\.2\.10"
+run_check "Search list not expanded when ndots exceeded (+ndots=1)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=1 +search" "(NXDOMAIN|SERVFAIL|REFUSED|no servers could be reached|got NXDOMAIN)"
+run_check "Showsearch diagnostic (+showsearch)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +showsearch" "192\.0\.2\.10"
+run_check "DNS64 prefix check (+dns64prefix)" "$DAG @127.0.0.1 -p $PORT ipv4only.arpa AAAA +dns64prefix +qr" ";ipv4only\.arpa\..*IN.*AAAA"
+run_check "PROXYv2 local header (+proxy)" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy +timeout=1" "(192\.0\.2\.10|timed out|no usable response)"
+run_check "Plain HTTP query (+http-plain)" "$DAG @127.0.0.1 -p $PORT www.example.com A +http-plain +timeout=1" "(192\.0\.2\.10|timed out|connection failed|no usable response)"
 
 echo "========================================================"
 echo "7. Multi-Server, LDNSZ & Failover"
@@ -220,13 +245,24 @@ else
     run_check "Multi-Server query list" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A" "192\.0\.2\.10"
     run_check "LDNS-style summary (+ldnsz)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +ldnsz" "127\.0\.0\.1"
     run_check "Comparison matrix (+allcompare)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +allcompare" "127\.0\.0\.1"
+    run_check "Comparison matrix with Cookie (+allcompare +cookie)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +cookie +allcompare" "127\.0\.0\.1"
+    run_check "Comparison matrix with TCP timeout (+allcompare +tcp +timeout=2)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +tcp +timeout=2 +allcompare" "127\.0\.0\.1"
+    run_check "Comparison matrix with +time alias (+allcompare +time=2)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +time=2 +allcompare" "127\.0\.0\.1"
     run_check "Server failover (+nofail)" "$DAG @127.0.0.1:19999,127.0.0.1:$PORT www.example.com A +nofail +timeout=1 +tries=1" "192\.0\.2\.10"
 fi
 
 echo "========================================================"
-echo "8. TSIG Authentication"
+echo "8. TSIG Authentication (-y, +tsig, -k keyfile, +fuzztime)"
 echo "========================================================"
 run_check "TSIG signature (-y)" "$DAG @127.0.0.1 -p $PORT www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +qr" "(TSIG|testkey|ADDITIONAL)"
+cat << 'EOF' > tsig_key.conf
+key "testkey" {
+    algorithm hmac-sha256;
+    secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
+};
+EOF
+run_check "TSIG keyfile flag (-k)" "$DAG @127.0.0.1 -p $PORT www.example.com A -k tsig_key.conf +qr" "(TSIG|testkey|ADDITIONAL)"
+run_check "TSIG signing time override (+fuzztime)" "$DAG @127.0.0.1 -p $PORT www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +fuzztime=1646972129 +qr" "(BADTIME|62 2a ab 61|1646972129|ADDITIONAL)"
 if [ "$DAG" = "dig" ]; then
     run_skip "TSIG signature (+tsig=)"
 else
@@ -248,7 +284,10 @@ if [ "$DAG" = "dig" ]; then
 else
     run_check "Dynamic update add (--update-add)" "$DAG @127.0.0.1 -p $PORT example.com --update-add \"dyn.example.com 300 IN A 192.0.2.99\" +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update del (--update-del)" "$DAG @127.0.0.1 -p $PORT example.com --update-del \"dyn.example.com A\" +qr" "opcode:[[:space:]]*UPDATE"
+    run_check "Dynamic update del without type (--update-del name)" "$DAG @127.0.0.1 -p $PORT example.com --update-del \"obsolete.example.com\" +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update del exact (--update-del-exact)" "$DAG @127.0.0.1 -p $PORT example.com --update-del-exact \"dyn.example.com A 192.0.2.99\" +qr" "opcode:[[:space:]]*UPDATE"
+    run_check "Dynamic update del exact with TTL (--update-del-exact 'name TTL type rdata')" "$DAG @127.0.0.1 -p $PORT example.com --update-del-exact \"host.example.com 300 A 192.0.2.1\" +qr" "opcode:[[:space:]]*UPDATE"
+    run_check "Dynamic update unknown type skipped gracefully" "$DAG @127.0.0.1 -p $PORT example.com --update-del-exact \"host.example.com BOGUSTYPE 192.0.2.1\" --update-add \"valid.example.com 300 A 192.0.2.1\" +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update prereq NXDOMAIN (--prereq-nxdomain)" "$DAG @127.0.0.1 -p $PORT example.com --prereq-nxdomain dyn.example.com +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update prereq YXDOMAIN (--prereq-yxdomain)" "$DAG @127.0.0.1 -p $PORT example.com --prereq-yxdomain example.com +qr" "opcode:[[:space:]]*UPDATE"
     run_check "Dynamic update prereq NXRRSET (--prereq-nxrrset)" "$DAG @127.0.0.1 -p $PORT example.com --prereq-nxrrset \"dyn.example.com TXT\" +qr" "opcode:[[:space:]]*UPDATE"
@@ -341,6 +380,59 @@ if [ "$DAG" != "dig" ]; then
     run_check "karicheck -v output" "$BIN_DIR/karicheck -v" "karicheck 0\."
     run_check "karidns -v output" "$BIN_DIR/karidns -v" "KariDNS 0\."
 fi
+
+echo "========================================================"
+echo "16. Hex Payload Overflow & Boundary Tests"
+echo "========================================================"
+if [ "$DAG" != "dig" ]; then
+    OVERSIZED_HEX=$(awk 'BEGIN { for (i=1; i<=70000; i++) printf "aa" }' 2>/dev/null || perl -e 'print "aa" x 70000' 2>/dev/null)
+    run_check "Oversized hex payload rejected without crash" "$DAG @127.0.0.1 -p $PORT --hex $OVERSIZED_HEX" "Invalid, empty, or oversized hex payload"
+    run_check "Empty hex payload rejected" "$DAG @127.0.0.1 -p $PORT --hex ''" "Invalid, empty, or oversized hex payload"
+fi
+
+echo "========================================================"
+echo "17. CLI Options, IDN, EDNSOPT, Prereq, and Break Validation"
+echo "========================================================"
+run_check "+idn flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +idn +timeout=1" "(opcode: QUERY|status:|timed out|no usable response)"
+run_check "+noidn flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +noidn +timeout=1" "(opcode: QUERY|status:|timed out|no usable response)"
+if [ "$DAG" != "dig" ]; then
+    run_check "+noednsopt flag accepted" "$DAG @127.0.0.1 -p $PORT example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(opcode: QUERY|status:|timed out|no usable response)"
+    run_check "--prereq-nxrrset separate args" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "--prereq-yxrrset separate args with rdata" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A 1.2.3.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    run_check "Multiple structural breaks warning" "$DAG @127.0.0.1 -p $PORT example.com A --break compression-loop --break oversized-qname +timeout=1" "warning: --break 'oversized-qname' ignored; structural break kind is already set"
+fi
+
+echo "========================================================"
+echo "18. +trace/+nssearch Transport & +yaml RDATA Output Tests"
+echo "========================================================"
+run_check "+trace +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +trace +tcp +timeout=1" "(TRACE:|connection timed out|no servers could be reached|no usable response|Received [0-9]+ bytes)"
+run_check "+nssearch +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +nssearch +tcp +timeout=1" "(couldn't get address|SOA |connection timed out|no usable response)"
+if [ "$DAG" != "dig" ]; then
+    run_check "+yaml output structure" "$DAG @127.0.0.1 -p $PORT example.com A +yaml +timeout=1" "(^---|question:)"
+fi
+
+echo "========================================================"
+echo "19. RFC 5452 UDP Security & Transport Resilience Tests"
+echo "========================================================"
+run_check "Standard UDP resolution with connected socket" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+run_check "Explicit QID query with connected socket (+qid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +qid=4660 +timeout=2" "192\.0\.2\.10"
+run_check "UDP socket bind to source IP (-b)" "$DAG -b 127.0.0.1 @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+
+echo "========================================================"
+echo "20. Dedicated Security & Regression Test Scripts"
+echo "========================================================"
+if [ "$DAG" != "dig" ]; then
+    run_check "Regression: --update-del type omission (tests/run_dag_update_del_no_type_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_no_type_test.sh\"" "PASS:"
+    run_check "Regression: --update-del-exact TTL & type safety (tests/run_dag_update_del_exact_ttl_notype_crash_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
+fi
+if command -v perl >/dev/null 2>&1; then
+    run_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"
+    run_check "Security: UDP transaction ID mismatch discard (tests/run_dag_udp_id_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_id_mismatch_discard_test.sh\"" "PASS:"
+    run_check "Security: DNS Cookie mismatch discard (tests/run_dag_cookie_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cookie_mismatch_discard_test.sh\"" "PASS:"
+    run_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
+fi
+run_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
+run_check "Features: +trace & +nssearch TCP validation (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then

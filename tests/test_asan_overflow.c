@@ -708,7 +708,7 @@ int main() {
 
         uint8_t prior_mac[64];
         size_t prior_mac_len = 0;
-        r = tsig_sign_packet(pkt5, &pkt5_len, 75000, &key, 0, prior_mac, &prior_mac_len, false);
+        r = tsig_sign_packet(pkt5, &pkt5_len, 75000, &key, 0, prior_mac, &prior_mac_len, NULL, 0, false);
         if (r == -1) {
             printf("FAIL: TSIG malloc fallback failed\n");
             free(pkt5);
@@ -2305,6 +2305,27 @@ int main() {
             }
         }
         printf("PASS: UDP minimum packet size (< 12 bytes) drop verification\n");
+    }
+
+    // --- Test 32: DNS record type parsing & non-fatal type resolution test ---
+    {
+        if (get_type_code("A") != 1) {
+            printf("FAIL: get_type_code('A') should return 1\n");
+            return 1;
+        }
+        if (get_type_code("SOA") != 6) {
+            printf("FAIL: get_type_code('SOA') should return 6\n");
+            return 1;
+        }
+        if (get_type_code("BOGUSTYPE") != 0) {
+            printf("FAIL: get_type_code('BOGUSTYPE') should return 0\n");
+            return 1;
+        }
+        if (get_type_code("300") != 0) {
+            printf("FAIL: get_type_code('300') should return 0 (bare number without TYPE prefix)\n");
+            return 1;
+        }
+        printf("PASS: DNS record type parsing & non-fatal type resolution test\n");
     }
 
     printf("All tests passed safely.\n");

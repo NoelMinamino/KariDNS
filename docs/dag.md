@@ -108,6 +108,9 @@ dag [global-queryopt...] [query...]
 `-y [hmac:]name:secret`
 : Sign queries using TSIG with the provided base64-encoded shared secret. The algorithm prefix can be `hmac-md5`, `hmac-sha1`, `hmac-sha224`, `hmac-sha256` (default), `hmac-sha384`, or `hmac-sha512`.
 
+`--hex <hex>`, `--hex=<hex>`
+: Transmit an arbitrary raw DNS wire-format packet provided as a hexadecimal string (up to 65,535 bytes). Allows direct crafting and replay of custom or malformed DNS messages.
+
 ---
 
 ## TRANSPORT & PROTOCOL OPTIONS
@@ -195,7 +198,7 @@ dag [global-queryopt...] [query...]
 : Override the DNS header **OPCODE** (e.g., `0` for QUERY, `2` for STATUS, `4` for NOTIFY, `5` for UPDATE).
 
 `+qid=N`
-: Override the 16-bit DNS Query ID (0–65535). If omitted, a cryptographically secure random ID is generated via `arc4random(3)`.
+: Override the 16-bit DNS Query ID (0–65535). If omitted, a cryptographically secure random ID is generated via `arc4random(3)` (or platform CSPRNG / OpenSSL `RAND_bytes` on non-BSD platforms).
 
 `+[no]header-only`
 : Send a query containing only the 12-byte DNS header with `QDCOUNT=0` (no QUESTION section).
@@ -207,10 +210,10 @@ dag [global-queryopt...] [query...]
 : When querying multiple nameservers or using failover lists, controls whether to try the next nameserver when receiving a `SERVFAIL` response.
 
 `+[no]trace`
-: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). `dag` follows referrals down to authoritative servers and displays each intermediate answer.
+: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). `dag` follows referrals down to authoritative servers and displays each intermediate answer. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses.
 
 `+[no]nssearch`
-: Look up authoritative nameservers for the zone containing the query name and display the SOA record from each responding nameserver.
+: Look up authoritative nameservers for the zone containing the query name and display the SOA record from each responding nameserver. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses.
 
 `+[no]search`, `+[no]defname`
 : Enable or disable domain search list processing as defined in `/etc/resolv.conf`.
@@ -220,6 +223,12 @@ dag [global-queryopt...] [query...]
 
 `+ndots=N`
 : Set the threshold for the number of dots that must appear in a domain name for it to be considered absolute before search domain appending takes place.
+
+`+[no]idn`
+: Toggle Internationalized Domain Names (IDN) processing for both input and output simultaneously.
+
+`+[no]idnin`, `+[no]idnout`
+: Independently control IDN conversion for input query domain names (Punycode encoding via `libidn2`) and output response domain names (Unicode decoding).
 
 ---
 
@@ -234,8 +243,17 @@ dag [global-queryopt...] [query...]
 `+[no]dnssec`, `+[no]do`
 : Set the **DO (DNSSEC OK)** bit in the EDNS0 OPT record, requesting DNSSEC RRs (RRSIG, NSEC, NSEC3, DS) from the authoritative server.
 
+`+[no]keepopen`
+: Keep the TCP or TLS socket open between consecutive queries to the same nameserver (RFC 7766 DNS over TCP connection reuse).
+
+`+[no]keepalive`
+: Send the **EDNS TCP Keepalive (RFC 7828)** option (Option Code 11) in the OPT pseudo-RR.
+
+`+[no]expire`
+: Send the **EDNS EXPIRE (RFC 7314)** option (Option Code 9) in query and highlight the zone expiration TTL field in SOA responses.
+
 `+[no]cookie[=hex]`
-: Send the EDNS COOKIE option (RFC 7873 / RFC 9018). If `hex` is supplied, uses the exact 16-hex-digit (8-byte) client cookie and optional server cookie; otherwise, generates a random 8-byte client cookie.
+: Send the **DNS Cookie (RFC 7873 / RFC 9018)** option. If `hex` is supplied, sets the client (8 bytes) or client+server cookie value. If omitted, a random 8-byte client cookie is generated.
 
 `+[no]badcookie`
 : Automatically retry the query once if the server returns a `BADCOOKIE` error, attaching the returned Server Cookie. Enabled by default.
@@ -344,8 +362,8 @@ dag [global-queryopt...] [query...]
 `--prereq-nxrrset <name> <type>`
 : Prerequisite: RRset of `<type>` on `<name>` must NOT exist.
 
-`--prereq=<kind:name[:type]>`
-: Alternative colon-delimited format for specifying prerequisites (e.g., `--prereq=nxdomain:host.example.com`).
+`--prereq=<kind:name[:type][:rdata]>`
+: Alternative colon-delimited format for specifying prerequisites (e.g., `--prereq=nxdomain:host.example.com` or `--prereq=yxrrset:host.example.com:A:192.0.2.1`).
 
 ---
 
@@ -354,6 +372,9 @@ dag [global-queryopt...] [query...]
 > [!WARNING]
 > **Intended for Local Testing & Security Audits Only**
 > Do not execute `--break` anomaly tests against external or production public DNS servers without explicit authorization.
+
+> [!NOTE]
+> Only one *structural* `--break` mutation (e.g. `compression-loop`, `compression-forward`, `label-too-long`, `reserved-length-bits`, `oversized-qname`, `truncated-question`, `notify-no-question`) can be active per query. If multiple structural breaks are specified, only the first one is applied and subsequent ones are ignored with a warning. Transport/header flags can be combined freely.
 
 `dag` provides built-in packet mutators to test server resilience against protocol edge cases, malformed wire formats, and parser exploits.
 
@@ -483,6 +504,9 @@ When `+ldnsz` is supplied:
 `+[no]onesoa`
 : Print only the initial SOA record during AXFR transfers instead of both starting and ending SOAs.
 
+`+[no]expandaaaa`
+: Display IPv6 AAAA record addresses in fully expanded 8-group notation (e.g. `2001:0db8:0000:0000:...`) instead of compressed notation.
+
 `+[no]split=N`
 : Split long base64 and hex strings into chunks of `N` characters (default: 56; 44 in multiline mode). `+nosplit` disables splitting.
 
@@ -500,6 +524,9 @@ When `+ldnsz` is supplied:
 
 `+[no]nohexdump-response`
 : Suppress hex dump for incoming responses only.
+
+`+[no]yaml`
+: Output parsed response in structured YAML format (including headers, question, answer, authority, and additional sections with decoded `rdata:` fields).
 
 ---
 

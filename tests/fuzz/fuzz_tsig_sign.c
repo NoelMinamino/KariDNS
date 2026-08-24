@@ -54,7 +54,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     uint16_t tsig_error = (data[5] % 2) == 0 ? 0 : 18;
 
-    tsig_sign_packet(packet, &packet_len, max_packet_len, &key, tsig_error, prior_mac, &prior_mac_len, false);
+    tsig_sign_packet(packet, &packet_len, max_packet_len, &key, tsig_error, prior_mac, &prior_mac_len, NULL, 0, false);
 
     free(packet);
     return 0;
