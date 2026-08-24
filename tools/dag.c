@@ -4005,8 +4005,8 @@ static int count_non_opt_rrs(const uint8_t *pkt, size_t pkt_len, size_t offset, 
 
 static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state, const display_opts_t *dopt) {
     size_t extra_bytes = 0;
-    bool is_malformed = (dopt && dopt->besteffort) ? check_packet_malformed(pkt, pkt_len, &extra_bytes) : false;
-    if (is_malformed) {
+    bool is_malformed = check_packet_malformed(pkt, pkt_len, &extra_bytes);
+    if (is_malformed && dopt && dopt->show_comments) {
         printf(";; Warning: Message parser reports malformed message packet.\n\n");
     }
 
