@@ -81,18 +81,18 @@ int main() {
     free_server_config_fields(&cfg);
     
 
-    // Test 4: allow-transfer key correctly sets zone->tsig_key
+    // Test 4: allow-transfer key correctly sets zone->tsig_keys
     memset(&cfg, 0, sizeof(cfg));
     char conf_acl[1024];
     strcpy(conf_acl, "zone \"example.com\" { type master; file \"dummy\"; allow-transfer { key \"mykey\"; }; };");
     char* copy_acl = strdup(conf_acl);
     int res_acl = parse_named_conf(copy_acl, &cfg);
     free(copy_acl);
-    if (res_acl == 0 && cfg.zones && cfg.zones->tsig_key && strcmp(cfg.zones->tsig_key, "mykey") == 0 && cfg.zones->allow_transfer_count == 0) {
-        printf("Test 4 Passed: allow-transfer key correctly parsed as tsig_key\n");
+    if (res_acl == 0 && cfg.zones && cfg.zones->tsig_keys_count == 1 && cfg.zones->tsig_keys && strcmp(cfg.zones->tsig_keys[0], "mykey") == 0 && cfg.zones->allow_transfer_count == 0) {
+        printf("Test 4 Passed: allow-transfer key correctly parsed as tsig_keys\n");
     } else {
-        printf("Test 4 Failed: allow-transfer key parsing failed! res_acl=%d, tsig_key=%s, count=%d\n",
-               res_acl, cfg.zones ? (cfg.zones->tsig_key ? cfg.zones->tsig_key : "NULL") : "NO ZONE",
+        printf("Test 4 Failed: allow-transfer key parsing failed! res_acl=%d, tsig_keys_count=%d, count=%d\n",
+               res_acl, cfg.zones ? cfg.zones->tsig_keys_count : -1,
                cfg.zones ? cfg.zones->allow_transfer_count : -1);
         return 1;
     }
@@ -3099,6 +3099,89 @@ int main() {
         free_server_config_fields(&cfg3);
 
         printf("PASS: allow-update in master vs slave zones and type defaulting\n");
+    }
+
+    // --- Test 42: Logging category channel validation & multiple TSIG keys in allow-transfer ---
+    {
+        // 1. 正常系: 正しいチャンネル名を参照する logging category
+        const char *valid_logging_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "logging {\n"
+            "    channel query_log { file \"/tmp/queries.log\"; };\n"
+            "    channel resp_log  { file \"/tmp/responses.log\"; };\n"
+            "    category queries { query_log; };\n"
+            "    category responses { resp_log; };\n"
+            "};\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(valid_logging_conf, NULL, &cfg1) != 0) {
+            printf("FAIL: Valid logging config failed to parse\n");
+            return 1;
+        }
+        if (!cfg1.logging.queries_channel || strcmp(cfg1.logging.queries_channel->name, "query_log") != 0 ||
+            !cfg1.logging.responses_channel || strcmp(cfg1.logging.responses_channel->name, "resp_log") != 0) {
+            printf("FAIL: logging channel pointer resolution mismatch\n");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+        free_server_config_fields(&cfg1);
+
+        // 2. 正常系: allow-transfer に複数 key を指定 (両方の key が配列 tsig_keys に保持される)
+        const char *multi_key_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example.com\" {\n"
+            "    type master;\n"
+            "    file \"/tmp/z.zone\";\n"
+            "    allow-transfer { key \"key1\"; key \"key2\"; };\n"
+            "};\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(multi_key_conf, NULL, &cfg2) != 0) {
+            printf("FAIL: allow-transfer with multiple keys should parse safely\n");
+            return 1;
+        }
+        if (!cfg2.zones || cfg2.zones->tsig_keys_count != 2 ||
+            !cfg2.zones->tsig_keys ||
+            strcmp(cfg2.zones->tsig_keys[0], "key1") != 0 ||
+            strcmp(cfg2.zones->tsig_keys[1], "key2") != 0) {
+            printf("FAIL: allow-transfer with multiple keys should retain both keys 'key1' and 'key2' (count=%d)\n",
+                   cfg2.zones ? cfg2.zones->tsig_keys_count : -1);
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+        free_server_config_fields(&cfg2);
+
+        // 3. 異常系: 未定義チャンネル名を参照する category queries
+        const char *undef_qchannel_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "logging {\n"
+            "    channel query_log { file \"/tmp/queries.log\"; };\n"
+            "    category queries { nonexistent_query_log; };\n"
+            "};\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(undef_qchannel_conf, NULL, &cfg3) == 0) {
+            printf("FAIL: category queries referencing undefined channel should be rejected\n");
+            free_server_config_fields(&cfg3);
+            return 1;
+        }
+
+        // 4. 異常系: 未定義チャンネル名を参照する category responses
+        const char *undef_rchannel_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "logging {\n"
+            "    channel resp_log { file \"/tmp/resp.log\"; };\n"
+            "    category responses { nonexistent_resp_log; };\n"
+            "};\n";
+        server_config_t cfg4;
+        memset(&cfg4, 0, sizeof(cfg4));
+        if (parse_named_conf_ext(undef_rchannel_conf, NULL, &cfg4) == 0) {
+            printf("FAIL: category responses referencing undefined channel should be rejected\n");
+            free_server_config_fields(&cfg4);
+            return 1;
+        }
+
+        printf("PASS: Logging category channel validation & multiple TSIG keys in allow-transfer\n");
     }
 
     printf("All tests passed safely.\n");

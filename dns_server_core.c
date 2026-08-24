@@ -5475,28 +5475,61 @@ worker_startup_success:;
             size_t tsig_mac_len = 0;
             if (zcfg) {
               bool has_acl = (zcfg->allow_transfer_count > 0);
-              bool has_tsig = (zcfg->tsig_key != NULL);
+              int num_keys = zcfg->tsig_keys_count;
+              bool has_tsig = (num_keys > 0 || zcfg->tsig_key != NULL);
               
               bool acl_ok = has_acl ? check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count) : false;
               bool tsig_ok = false;
               
               if (has_tsig) {
-                tsig_key_t *k = cfg->keys;
-                while (k) {
-                  if (strcmp(k->name, zcfg->tsig_key) == 0) {
-                    matched_key = k;
-                    break;
+                if (num_keys > 0) {
+                  for (int ki = 0; ki < num_keys; ki++) {
+                    const char *target_key_name = zcfg->tsig_keys[ki];
+                    tsig_key_t *k = cfg->keys;
+                    tsig_key_t *cand = NULL;
+                    while (k) {
+                      if (strcmp(k->name, target_key_name) == 0) {
+                        cand = k;
+                        break;
+                      }
+                      k = k->next;
+                    }
+                    if (cand) {
+                      size_t tmp_mac_len = 0;
+                      uint8_t tmp_mac[64];
+                      int err = tsig_verify_packet(msg, msg_len, cand, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
+                      if (err == 0) {
+                        matched_key = cand;
+                        memcpy(tsig_mac, tmp_mac, tmp_mac_len);
+                        tsig_mac_len = tmp_mac_len;
+                        tsig_ok = true;
+                        tsig_error = 0;
+                        break;
+                      } else {
+                        tsig_error = err > 0 ? err : 16;
+                      }
+                    } else {
+                      tsig_error = 17;
+                    }
                   }
-                  k = k->next;
-                }
-                if (!matched_key) {
-                  tsig_error = 17;
-                } else {
-                  int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
-                  if (err != 0) {
-                    tsig_error = err > 0 ? err : 16;
+                } else if (zcfg->tsig_key) {
+                  tsig_key_t *k = cfg->keys;
+                  while (k) {
+                    if (strcmp(k->name, zcfg->tsig_key) == 0) {
+                      matched_key = k;
+                      break;
+                    }
+                    k = k->next;
+                  }
+                  if (!matched_key) {
+                    tsig_error = 17;
                   } else {
-                    tsig_ok = true;
+                    int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
+                    if (err != 0) {
+                      tsig_error = err > 0 ? err : 16;
+                    } else {
+                      tsig_ok = true;
+                    }
                   }
                 }
               }
@@ -5586,7 +5619,7 @@ worker_startup_success:;
                                    matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
                 else {
                   tsig_key_t dummy = {0};
-                  dummy.name = zcfg->tsig_key;
+                  dummy.name = (zcfg && zcfg->tsig_keys_count > 0) ? zcfg->tsig_keys[0] : (zcfg ? zcfg->tsig_key : "unknown");
                   dummy.algorithm = "hmac-sha256";
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
                                    17, tsig_mac, &tsig_mac_len, NULL, 0, false);

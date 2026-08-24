@@ -302,6 +302,9 @@ void free_zone_config(zone_config_t *zone) {
     free(zone->masters[i].ip);
   free(zone->masters);
   free(zone->tsig_key);
+  for (int i = 0; i < zone->tsig_keys_count; i++)
+    free(zone->tsig_keys[i]);
+  free(zone->tsig_keys);
   for (int i = 0; i < zone->also_notify_count; i++)
     free(zone->also_notify[i].ip);
   free(zone->also_notify);
@@ -380,17 +383,16 @@ void free_server_config_fields(server_config_t *cfg) {
   tsig_key_t *k = cfg->keys;
   while (k) {
     tsig_key_t *next_k = k->next;
-    free(k->name); free(k->algorithm); free(k->secret);
+    free(k->name);
+    if (k->algorithm) free(k->algorithm);
+    if (k->secret) free(k->secret);
     free(k);
     k = next_k;
   }
-  cfg->keys = NULL;
-
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
   if (cfg->control.secret) { free(cfg->control.secret); cfg->control.secret = NULL; }
   memset(&cfg->control, 0, sizeof(control_channel_config_t));
   free_rate_limit_config(&cfg->rrl);
-  memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
 
   log_channel_t *ch = cfg->logging.channels;
   while (ch) {
@@ -561,7 +563,7 @@ static int parse_string_list_inner(token_ctx_t *ctx, char ***list, int *count) {
 typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD } acl_key_mode_t;
 
 static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
-                           acl_key_mode_t key_mode, char **tsig_key_out) {
+                           acl_key_mode_t key_mode, char ***tsig_keys_out, int *tsig_keys_count_out) {
     conf_token_t tok = get_next_token(ctx);
     if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
     free_token(&tok);
@@ -575,11 +577,13 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
 
         if (tok.type == TOKEN_RBRACE) {
             brace_depth--;
-            in_negated_block = false;
             free_token(&tok);
-            tok = get_next_token(ctx);
-            if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
-            free_token(&tok);
+            if (brace_depth == 1 && in_negated_block) {
+                in_negated_block = false;
+                tok = get_next_token(ctx);
+                if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+                free_token(&tok);
+            }
             continue;
         }
         if (tok.type == TOKEN_LBRACE) { brace_depth++; free_token(&tok); continue; }
@@ -590,9 +594,8 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
             free_token(&tok);
             tok = get_next_token(ctx);
             if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
-            if (key_mode == ACL_KEY_AS_TSIG_FIELD && tsig_key_out) {
-                if (*tsig_key_out) free(*tsig_key_out);
-                *tsig_key_out = strdup(tok.value);
+            if (key_mode == ACL_KEY_AS_TSIG_FIELD && tsig_keys_out && tsig_keys_count_out) {
+                APPEND_STR(*tsig_keys_out, *tsig_keys_count_out, strdup(tok.value));
             } else {
                 APPEND_STR(*list, *count, strdup(tok.value));
             }
@@ -641,6 +644,9 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
         if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
         free_token(&tok);
     }
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+    free_token(&tok);
     return 0;
 }
 
@@ -849,11 +855,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
     } else if (strcmp(key, "allow-transfer") == 0) {
-      if (parse_acl_list(ctx, &zone->allow_transfer, &zone->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &zone->tsig_key) != 0) {
+      if (parse_acl_list(ctx, &zone->allow_transfer, &zone->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &zone->tsig_keys, &zone->tsig_keys_count) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "allow-update") == 0) {
-      if (parse_acl_list(ctx, &zone->allow_update, &zone->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
+      if (parse_acl_list(ctx, &zone->allow_update, &zone->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
@@ -1286,7 +1292,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
           if (parse_acl_list(ctx, &view->match_clients, &view->match_clients_count,
-                             ACL_KEY_AS_LIST_ENTRY, NULL) != 0) {
+                             ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
             free_partial_view(view);
             return -1;
           }
@@ -1730,6 +1736,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               config->logging.queries_channel_name = strdup(tok.value);
             else if (strcmp(cat_name, "responses") == 0 && tok.type == TOKEN_STRING)
               config->logging.responses_channel_name = strdup(tok.value);
+            else {
+              syslog(LOG_WARNING, "[Config] Unknown logging category '%s', ignoring", cat_name);
+              fprintf(stderr, "[WARNING] Unknown logging category '%s', ignoring\n", cat_name);
+            }
             free_token(&tok);
             tok = get_next_token(ctx);
             if (tok.type == TOKEN_SEMICOLON)
@@ -1761,6 +1771,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           ch = ch->next;
         }
+        if (!config->logging.queries_channel) {
+          syslog(LOG_ERR, "[Config] logging category 'queries' references undefined channel '%s'",
+                 config->logging.queries_channel_name);
+          fprintf(stderr, "[ERROR] logging category 'queries' references undefined channel '%s'\n",
+                 config->logging.queries_channel_name);
+          return -1;
+        }
       }
       if (config->logging.responses_channel_name) {
         log_channel_t *ch = config->logging.channels;
@@ -1770,6 +1787,13 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             break;
           }
           ch = ch->next;
+        }
+        if (!config->logging.responses_channel) {
+          syslog(LOG_ERR, "[Config] logging category 'responses' references undefined channel '%s'",
+                 config->logging.responses_channel_name);
+          fprintf(stderr, "[ERROR] logging category 'responses' references undefined channel '%s'\n",
+                 config->logging.responses_channel_name);
+          return -1;
         }
       }
     } else {
