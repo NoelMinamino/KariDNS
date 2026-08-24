@@ -924,6 +924,20 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     return -1;
   }
   free_token(&tok);
+  if (!zone->type) {
+    zone->type = strdup("master");
+  }
+  if (zone->allow_update_count > 0 && zone->type &&
+      (strcasecmp(zone->type, "slave") == 0 || strcasecmp(zone->type, "secondary") == 0)) {
+    syslog(LOG_WARNING,
+           "[Config] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
+           "Dynamic Update requests to secondary zones will be rejected at runtime with NOTAUTH (RFC 2136)",
+           zone->domain);
+    fprintf(stderr,
+           "[WARNING] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
+           "Dynamic Update requests to secondary zones will be rejected at runtime with NOTAUTH (RFC 2136)\n",
+           zone->domain);
+  }
   *zone_out = zone;
   return 0;
 }

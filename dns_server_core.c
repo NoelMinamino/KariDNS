@@ -3823,6 +3823,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       return DNS_HEADER_SIZE;
     }
     bool auth = false;
+    bool zone_is_master = false;
     tsig_key_t *matched_key = NULL;
     tsig_key_t *attempted_key = NULL;
     int tsig_error_code = 0;
@@ -3830,6 +3831,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      if (zcfg) {
+        if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
+          zone_is_master = true;
+        }
+      }
       if (zcfg && zcfg->allow_update_count > 0) {
         tsig_key_t *k = cfg->keys;
         while (k) {
@@ -3861,8 +3867,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[2] |= 0x80; // QR=1
     
     int rcode = 5; // REFUSED
-    if (auth) {
+    if (auth && zone_is_master) {
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key->name);
+    } else if (auth && !zone_is_master) {
+      rcode = 9; // NOTAUTH (RFC 2136 §3.8: Server is not the primary for the zone)
+      add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not the primary for the zone");
     } else {
       if (attempted_key) {
         rcode = 9; // NOTAUTH

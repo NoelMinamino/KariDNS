@@ -3038,6 +3038,69 @@ int main() {
         printf("PASS: Zone type validation and normalization (primary->master, secondary->slave)\n");
     }
 
+    // --- Test 41: allow-update in master vs slave zones and type defaulting ---
+    {
+        // 1. 正常系: master zone with allow-update
+        const char *master_update_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"upd-key\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "zone \"example.com\" {\n"
+            "    type master;\n"
+            "    file \"/tmp/z.zone\";\n"
+            "    allow-update { key \"upd-key\"; };\n"
+            "};\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(master_update_conf, NULL, &cfg1) != 0) {
+            printf("FAIL: master zone with allow-update failed to parse\n");
+            return 1;
+        }
+        if (!cfg1.zones || cfg1.zones->allow_update_count != 1 ||
+            strcmp(cfg1.zones->allow_update[0], "upd-key") != 0) {
+            printf("FAIL: allow-update ACL mismatch on master zone\n");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+        free_server_config_fields(&cfg1);
+
+        // 2. 正常系: zone without explicit type defaults to master
+        const char *no_type_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"default-type.com\" { file \"/tmp/z.zone\"; };\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(no_type_conf, NULL, &cfg2) != 0) {
+            printf("FAIL: zone without explicit type failed to parse\n");
+            return 1;
+        }
+        if (!cfg2.zones || !cfg2.zones->type || strcmp(cfg2.zones->type, "master") != 0) {
+            printf("FAIL: zone without explicit type should default to master (got %s)\n",
+                   (cfg2.zones && cfg2.zones->type) ? cfg2.zones->type : "NULL");
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+        free_server_config_fields(&cfg2);
+
+        // 3. 正常系 (警告付き): slave zone with allow-update (parses safely, logs warning)
+        const char *slave_update_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"upd-key\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "zone \"slave.example.com\" {\n"
+            "    type slave;\n"
+            "    masters { 192.0.2.1; };\n"
+            "    allow-update { key \"upd-key\"; };\n"
+            "};\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(slave_update_conf, NULL, &cfg3) != 0) {
+            printf("FAIL: slave zone with allow-update should parse safely\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg3);
+
+        printf("PASS: allow-update in master vs slave zones and type defaulting\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
