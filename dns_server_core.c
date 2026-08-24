@@ -2727,6 +2727,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
                                    max_res_len, offset, comp_ctx, arcount)) {
+            res[2] |= 0x02;
             return true;
           }
         }
