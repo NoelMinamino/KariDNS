@@ -61,10 +61,11 @@
 
 // Frontend/Backendプロセス間のUDPパケット受け渡し用ヘッダ
 typedef struct {
-  int sock_fd_idx; // 返信に使用するFrontend側のUDPソケットインデックス (-1 =
-                   // 動的生成/NOTIFY用)
+  int sock_fd_idx; // 返信に使用するFrontend側のUDPソケットインデックス (-1 = 動的生成/NOTIFY用, -2 = 停止)
   socklen_t addr_len;
   struct sockaddr_storage client_addr;
+  struct sockaddr_storage source_addr;
+  bool has_source_addr;
   uint16_t payload_len;
   // この構造体の直後にパケットのペイロードが続く
 } udp_ipc_t;
@@ -318,18 +319,27 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   clock_gettime(CLOCK_MONOTONIC, &ts);
   int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
+  uint32_t window_sec = (cfg->window_seconds > 0) ? (uint32_t)cfg->window_seconds : 15;
+  if (window_sec > 3600) window_sec = 3600;
+
   if (b->client_hash != full_hash) {
     // Hash collision or new entry
-    // Only reset if it's older than 1 second to prevent hash-collision DoS
-    if (now_ms - b->last_refill_ms[cls] > 1000) {
+    // Only reset if it's older than window_sec seconds to prevent hash-collision DoS
+    if (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000) {
       b->client_hash = full_hash;
       for (int i = 0; i < 4; i++) {
           b->last_refill_ms[i] = now_ms;
       }
-      b->tokens[0] = cfg->responses_per_second;
-      b->tokens[1] = cfg->responses_per_second;
-      b->tokens[2] = cfg->nxdomains_per_second;
-      b->tokens[3] = cfg->errors_per_second;
+      uint64_t cap0 = (uint64_t)cfg->responses_per_second * window_sec;
+      uint64_t cap2 = (uint64_t)cfg->nxdomains_per_second * window_sec;
+      uint64_t cap3 = (uint64_t)cfg->errors_per_second * window_sec;
+      if (cap0 > 0x7FFFFFFF) cap0 = 0x7FFFFFFF;
+      if (cap2 > 0x7FFFFFFF) cap2 = 0x7FFFFFFF;
+      if (cap3 > 0x7FFFFFFF) cap3 = 0x7FFFFFFF;
+      b->tokens[0] = (int32_t)cap0;
+      b->tokens[1] = (int32_t)cap0;
+      b->tokens[2] = (int32_t)cap2;
+      b->tokens[3] = (int32_t)cap3;
       b->slip_counter = 0;
     } else {
       // It's a recent collision. Share the limit instead of resetting.
@@ -346,11 +356,13 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       if (rates[i] == 0) continue;
       int64_t elapsed_ms = now_ms - b->last_refill_ms[i];
       if (elapsed_ms > 0) {
+        uint64_t max_cap = (uint64_t)rates[i] * window_sec;
+        if (max_cap > 0x7FFFFFFF) max_cap = 0x7FFFFFFF;
         uint64_t add_t = ((uint64_t)elapsed_ms * rates[i]) / 1000;
         if (add_t > 0) {
-          if (add_t > (uint64_t)rates[i]) add_t = rates[i];
+          if (add_t > max_cap) add_t = max_cap;
           b->tokens[i] += (int32_t)add_t;
-          if (b->tokens[i] > (int32_t)rates[i]) b->tokens[i] = rates[i];
+          if (b->tokens[i] > (int32_t)max_cap) b->tokens[i] = (int32_t)max_cap;
           if (b->tokens[i] < 0) b->tokens[i] = 0;
           b->last_refill_ms[i] = now_ms;
         }
@@ -2622,10 +2634,11 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
       if ((current_zone->records[j].type_code == 1 ||
            current_zone->records[j].type_code == 28) &&
           strcasecmp(current_zone->records[j].name, target) == 0) {
+        uint16_t saved_offset = *offset;
         if (serialize_dns_record(res, max_res_len, offset,
                                  &current_zone->records[j], comp_ctx,
                                  NULL, 0xFFFFFFFF) < 0) {
-          res[2] |= 0x02;
+          *offset = saved_offset;
           return false;
         } else
           (*arcount)++;
@@ -2635,16 +2648,58 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
   return true;
 }
 
+static void append_additional_rr_glue(zone_arena_t *current_zone, dns_record_t *rec,
+                                      const char *zone_apex, uint8_t *res,
+                                      size_t max_res_len, uint16_t *offset,
+                                      compress_ctx_t *comp_ctx, uint16_t *arcount,
+                                      const char *glue_targets[16], int *glue_target_count,
+                                      bool minimal_responses) {
+  if (minimal_responses || !rec || !current_zone) return;
+  const char *target = NULL;
+  if (rec->type_code == 15 && rec->rdata_count >= 2) {
+    // MX: rdata[0] = preference, rdata[1] = exchange (RFC 1035 §3.3.9)
+    target = rec->rdata[1];
+  } else if (rec->type_code == 33 && rec->rdata_count >= 4) {
+    // SRV: rdata[0] = priority, rdata[1] = weight, rdata[2] = port, rdata[3] = target (RFC 2782)
+    target = rec->rdata[3];
+  } else if (rec->type_code == 2 && rec->rdata_count >= 1) {
+    // NS: rdata[0] = target
+    target = rec->rdata[0];
+  }
+  if (!target || *target == '\0') return;
+
+  if (glue_targets && glue_target_count) {
+    for (int k = 0; k < *glue_target_count; k++) {
+      if (glue_targets[k] && strcasecmp(glue_targets[k], target) == 0) {
+        return;
+      }
+    }
+    if (*glue_target_count < 16) {
+      glue_targets[(*glue_target_count)++] = target;
+    }
+  }
+
+  append_glue_records(current_zone, target, zone_apex, res, max_res_len, offset, comp_ctx, arcount);
+}
+
 static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             const char *zone_apex, uint8_t *res,
                             size_t max_res_len, uint16_t *offset,
                             compress_ctx_t *comp_ctx, uint16_t *nscount,
-                            uint16_t *arcount) {
+                            uint16_t *arcount, bool is_ds_query) {
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
     return false;
   const char *name = qname;
   while (name && strcasecmp(name, zone_apex) != 0) {
+    // RFC 4035 §3.1.4.1: 委任点そのもの(name == qname)へのDSクエリは、
+    // 参照応答(referral)にせず、権威応答としてフェーズ2の通常検索へ継続させる。
+    if (is_ds_query && name == qname) {
+      name = strchr(name, '.');
+      if (name)
+        name++;
+      continue;
+    }
     uint32_t hash = calc_fnv1a_str(name);
     size_t idx = hash & (current_zone->hash_size - 1);
     bool delegated = false;
@@ -2672,6 +2727,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
                                    max_res_len, offset, comp_ctx, arcount)) {
+            res[2] |= 0x02;
             return true;
           }
         }
@@ -2816,6 +2872,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
   current_qname[255] = '\0';
+  const char *glue_targets[16];
+  int glue_target_count = 0;
+  memset(glue_targets, 0, sizeof(glue_targets));
   bool chain_exhausted = true;
   for (int depth = 0; depth < 16; depth++) {
     zone_db_entry_t *db_entry = *db_entry_ptr;
@@ -2827,8 +2886,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     }
     
     // ==== フェーズ1: 委任判定 ====
+    bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount))
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====
@@ -2910,6 +2970,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               return;
             }
             (*ancount)++;
+            append_additional_rr_glue(current_zone, rec, db_entry->domain,
+                                      res, max_res_len, offset, comp_ctx, arcount,
+                                      glue_targets, &glue_target_count, minimal_responses);
             if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
               if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
                                         res, max_res_len, offset, comp_ctx, ancount)) {
@@ -3023,6 +3086,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                   return;
                 } else
                   (*ancount)++;
+                append_additional_rr_glue(current_zone, rec, db_entry->domain,
+                                          res, max_res_len, offset, comp_ctx, arcount,
+                                          glue_targets, &glue_target_count, minimal_responses);
                 if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
                   if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
                                             res, max_res_len, offset, comp_ctx, ancount)) {
@@ -3117,6 +3183,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               this_qtx_failed = true; break;
             }
             (*ancount)++;
+            append_additional_rr_glue(current_zone, rec, db_entry->domain,
+                                      res, max_res_len, offset, comp_ctx, arcount,
+                                      glue_targets, &glue_target_count, minimal_responses);
             if (dnssec_ok && qtx != 46) {
               if (!attach_covering_rrsig(current_zone, final_idx, current_qname, NULL, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                 this_qtx_failed = true; break;
@@ -3145,6 +3214,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                   this_qtx_failed = true; break;
                 }
                 (*ancount)++;
+                append_additional_rr_glue(current_zone, rec, db_entry->domain,
+                                          res, max_res_len, offset, comp_ctx, arcount,
+                                          glue_targets, &glue_target_count, minimal_responses);
                 if (dnssec_ok && qtx != 46) {
                   if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                     this_qtx_failed = true; break;
@@ -3192,6 +3264,13 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             return;
           } else
             (*nscount)++;
+          if (dnssec_ok) {
+            if (!attach_covering_rrsig(current_zone, apex_idx, db_entry->domain, NULL, 6,
+                                       res, max_res_len, offset, comp_ctx, nscount)) {
+              res[2] |= 0x02;
+              return;
+            }
+          }
           break;
         }
       }
@@ -3288,11 +3367,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           } else {
             (*nscount)++;
             if (rec->rdata_count > 0) {
-              const char *target = rec->rdata[0];
-              if (!append_glue_records(current_zone, target, db_entry->domain, res,
-                                       max_res_len, offset, comp_ctx, arcount)) {
-                return;
-              }
+              append_additional_rr_glue(current_zone, rec, db_entry->domain, res,
+                                        max_res_len, offset, comp_ctx, arcount,
+                                        glue_targets, &glue_target_count, minimal_responses);
             }
           }
         }
@@ -3525,7 +3602,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0 || edns.has_malformed_cookie) {
     memcpy(res, req, DNS_HEADER_SIZE);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
+    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
     memset(&res[4], 0, 8); // qdcount, ancount, nscount, arcount = 0
     return DNS_HEADER_SIZE;
   }
@@ -3602,7 +3679,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
+    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     res[6] = 0; res[7] = 0; // ANCOUNT = 0
@@ -3704,7 +3781,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[2] |= 0x84; // QR=1, AA=1
     
     if (auth) {
-      res[3] &= 0x0F;
+      res[3] &= 0xF0;
       atomic_store_explicit(&db_entry->refresh_now, true, memory_order_release);
       if (g_control_kq != -1) {
         struct kevent ev;
@@ -3747,6 +3824,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       return DNS_HEADER_SIZE;
     }
     bool auth = false;
+    bool zone_is_master = false;
     tsig_key_t *matched_key = NULL;
     tsig_key_t *attempted_key = NULL;
     int tsig_error_code = 0;
@@ -3754,6 +3832,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       server_config_t *cfg =
           atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
+      if (zcfg) {
+        if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
+          zone_is_master = true;
+        }
+      }
       if (zcfg && zcfg->allow_update_count > 0) {
         tsig_key_t *k = cfg->keys;
         while (k) {
@@ -3785,8 +3868,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[2] |= 0x80; // QR=1
     
     int rcode = 5; // REFUSED
-    if (auth) {
+    if (auth && zone_is_master) {
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key->name);
+    } else if (auth && !zone_is_master) {
+      rcode = 9; // NOTAUTH (RFC 2136 §3.8: Server is not the primary for the zone)
+      add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not the primary for the zone");
     } else {
       if (attempted_key) {
         rcode = 9; // NOTAUTH
@@ -3893,7 +3979,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01;
+    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = copy_len;
     uint16_t arcount = 0;
@@ -3915,7 +4001,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                 size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
                 memcpy(res, req, copy_len);
                 res[2] |= 0x80;
-                res[3] = (res[3] & 0x0F) | 0x02; // SERVFAIL
+                res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
                 add_ede(&edns, cfg_for_ede->send_extended_errors, 3, "Zone expired (SOA EXPIRE exceeded)");
                 uint16_t offset = copy_len;
                 uint16_t arcount = 0;
@@ -3958,7 +4044,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x05;
+    res[3] = (res[3] & 0xF0) | 0x05; // REFUSED
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = copy_len;
     uint16_t arcount = 0;
@@ -3974,7 +4060,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   q_offset += 4;
   memcpy(res, req, q_offset);
   res[2] |= 0x84;
-  res[3] &= 0x0F;
+  res[3] &= 0xF0;
   uint16_t *res_ancount = (uint16_t *)&res[6],
            *res_nscount = (uint16_t *)&res[8],
            *res_arcount = (uint16_t *)&res[10];
@@ -4315,11 +4401,25 @@ void send_notify_to_all(const char *domain, const char *view_name) {
       continue;
 
     udp_ipc_t msg;
+    memset(&msg, 0, sizeof(msg));
     msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
     msg.client_addr = dest_addr;
     msg.addr_len = (domain_family == AF_INET) ? sizeof(struct sockaddr_in)
                                               : sizeof(struct sockaddr_in6);
     msg.payload_len = offset;
+    if (zone->notify_source && *zone->notify_source) {
+      if (domain_family == AF_INET &&
+          inet_pton(AF_INET, zone->notify_source,
+                    &((struct sockaddr_in *)&msg.source_addr)->sin_addr) == 1) {
+        msg.source_addr.ss_family = AF_INET;
+        msg.has_source_addr = true;
+      } else if (domain_family == AF_INET6 &&
+                 inet_pton(AF_INET6, zone->notify_source,
+                           &((struct sockaddr_in6 *)&msg.source_addr)->sin6_addr) == 1) {
+        msg.source_addr.ss_family = AF_INET6;
+        msg.has_source_addr = true;
+      }
+    }
 
     uint8_t buf[2048];
     memcpy(buf, &msg, sizeof(msg));
@@ -4675,7 +4775,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   memset(res, 0, 65535);
   memcpy(res, req, q_offset);
   res[2] |= 0x84;
-  res[3] &= 0x0F;
+  res[3] &= 0xF0;
   res[8] = 0;
   res[9] = 0;
   res[10] = 0;
@@ -4770,7 +4870,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     memcpy(res, req, q_offset); \
     memset(&comp_ctx, 0, sizeof(comp_ctx)); \
     compress_ctx_init_packet(&comp_ctx); \
-    res[2] |= 0x84; res[3] &= 0x0F; \
+    res[2] |= 0x84; res[3] &= 0xF0; \
     res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
     if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
       syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer", \
@@ -5376,28 +5476,61 @@ worker_startup_success:;
             size_t tsig_mac_len = 0;
             if (zcfg) {
               bool has_acl = (zcfg->allow_transfer_count > 0);
-              bool has_tsig = (zcfg->tsig_key != NULL);
+              int num_keys = zcfg->tsig_keys_count;
+              bool has_tsig = (num_keys > 0 || zcfg->tsig_key != NULL);
               
               bool acl_ok = has_acl ? check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count) : false;
               bool tsig_ok = false;
               
               if (has_tsig) {
-                tsig_key_t *k = cfg->keys;
-                while (k) {
-                  if (strcmp(k->name, zcfg->tsig_key) == 0) {
-                    matched_key = k;
-                    break;
+                if (num_keys > 0) {
+                  for (int ki = 0; ki < num_keys; ki++) {
+                    const char *target_key_name = zcfg->tsig_keys[ki];
+                    tsig_key_t *k = cfg->keys;
+                    tsig_key_t *cand = NULL;
+                    while (k) {
+                      if (strcmp(k->name, target_key_name) == 0) {
+                        cand = k;
+                        break;
+                      }
+                      k = k->next;
+                    }
+                    if (cand) {
+                      size_t tmp_mac_len = 0;
+                      uint8_t tmp_mac[64];
+                      int err = tsig_verify_packet(msg, msg_len, cand, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
+                      if (err == 0) {
+                        matched_key = cand;
+                        memcpy(tsig_mac, tmp_mac, tmp_mac_len);
+                        tsig_mac_len = tmp_mac_len;
+                        tsig_ok = true;
+                        tsig_error = 0;
+                        break;
+                      } else {
+                        tsig_error = err > 0 ? err : 16;
+                      }
+                    } else {
+                      tsig_error = 17;
+                    }
                   }
-                  k = k->next;
-                }
-                if (!matched_key) {
-                  tsig_error = 17;
-                } else {
-                  int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
-                  if (err != 0) {
-                    tsig_error = err > 0 ? err : 16;
+                } else if (zcfg->tsig_key) {
+                  tsig_key_t *k = cfg->keys;
+                  while (k) {
+                    if (strcmp(k->name, zcfg->tsig_key) == 0) {
+                      matched_key = k;
+                      break;
+                    }
+                    k = k->next;
+                  }
+                  if (!matched_key) {
+                    tsig_error = 17;
                   } else {
-                    tsig_ok = true;
+                    int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
+                    if (err != 0) {
+                      tsig_error = err > 0 ? err : 16;
+                    } else {
+                      tsig_ok = true;
+                    }
                   }
                 }
               }
@@ -5487,7 +5620,7 @@ worker_startup_success:;
                                    matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
                 else {
                   tsig_key_t dummy = {0};
-                  dummy.name = zcfg->tsig_key;
+                  dummy.name = (zcfg && zcfg->tsig_keys_count > 0) ? zcfg->tsig_keys[0] : (zcfg ? zcfg->tsig_key : "unknown");
                   dummy.algorithm = "hmac-sha256";
                   tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
                                    17, tsig_mac, &tsig_mac_len, NULL, 0, false);
@@ -5640,7 +5773,7 @@ static void reload_all_zones(void) {
                 void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
                 catalog_process_membership(entry, zcfg, vcfg->name);
               }
-            } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
+            } else if (zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0)) {
               syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
               atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
             }
@@ -5877,7 +6010,7 @@ void *control_thread_func(void *arg) {
                             send(cfd, "ERROR missing SOA\n", 18, 0);
                             break;
                     }
-                  } else if (lr.zcfg->type && strcasecmp(lr.zcfg->type, "slave") == 0) {
+                  } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {
                     syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", lr.zcfg->domain);
                     atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
                     send(cfd, "OK reloaded (slave)\n", 20, 0);
@@ -6055,7 +6188,7 @@ void *control_thread_func(void *arg) {
                         strncpy(tsig_key_name, entry->cached_tsig_key_name, sizeof(tsig_key_name) - 1);
                     } else {
                         zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
-                        if (zcfg && zcfg->type && strcasecmp(zcfg->type, "slave") == 0 &&
+                        if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
                             zcfg->masters_count > 0 && zcfg->masters[0].ip != NULL) {
                             is_slave = true;
                             strncpy(master_ip, zcfg->masters[0].ip, sizeof(master_ip) - 1);
@@ -6278,6 +6411,14 @@ static void run_frontend_router(pid_t backend_pid) {
           }
           int sock = socket(msg->client_addr.ss_family, SOCK_DGRAM, 0);
           if (sock >= 0) {
+            if (msg->has_source_addr) {
+              socklen_t src_len = (msg->source_addr.ss_family == AF_INET)
+                                      ? sizeof(struct sockaddr_in)
+                                      : sizeof(struct sockaddr_in6);
+              if (bind(sock, (struct sockaddr *)&msg->source_addr, src_len) < 0) {
+                syslog(LOG_WARNING, "[Frontend] Failed to bind NOTIFY socket to notify-source: %m");
+              }
+            }
             sendto(sock, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
                    (struct sockaddr *)&msg->client_addr, msg->addr_len);
             close(sock);

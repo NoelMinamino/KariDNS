@@ -36,6 +36,8 @@ typedef struct zone_config {
   ip_port_t *masters;
   int masters_count;
   char *tsig_key;
+  char **tsig_keys;
+  int tsig_keys_count;
   ip_port_t *also_notify;
   int also_notify_count;
   char *notify_source;

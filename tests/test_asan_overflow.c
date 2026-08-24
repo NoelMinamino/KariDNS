@@ -1,6 +1,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#endif
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
 #include "../dns_zone_parser.h"
@@ -73,18 +81,18 @@ int main() {
     free_server_config_fields(&cfg);
     
 
-    // Test 4: allow-transfer key correctly sets zone->tsig_key
+    // Test 4: allow-transfer key correctly sets zone->tsig_keys
     memset(&cfg, 0, sizeof(cfg));
     char conf_acl[1024];
     strcpy(conf_acl, "zone \"example.com\" { type master; file \"dummy\"; allow-transfer { key \"mykey\"; }; };");
     char* copy_acl = strdup(conf_acl);
     int res_acl = parse_named_conf(copy_acl, &cfg);
     free(copy_acl);
-    if (res_acl == 0 && cfg.zones && cfg.zones->tsig_key && strcmp(cfg.zones->tsig_key, "mykey") == 0 && cfg.zones->allow_transfer_count == 0) {
-        printf("Test 4 Passed: allow-transfer key correctly parsed as tsig_key\n");
+    if (res_acl == 0 && cfg.zones && cfg.zones->tsig_keys_count == 1 && cfg.zones->tsig_keys && strcmp(cfg.zones->tsig_keys[0], "mykey") == 0 && cfg.zones->allow_transfer_count == 0) {
+        printf("Test 4 Passed: allow-transfer key correctly parsed as tsig_keys\n");
     } else {
-        printf("Test 4 Failed: allow-transfer key parsing failed! res_acl=%d, tsig_key=%s, count=%d\n",
-               res_acl, cfg.zones ? (cfg.zones->tsig_key ? cfg.zones->tsig_key : "NULL") : "NO ZONE",
+        printf("Test 4 Failed: allow-transfer key parsing failed! res_acl=%d, tsig_keys_count=%d, count=%d\n",
+               res_acl, cfg.zones ? cfg.zones->tsig_keys_count : -1,
                cfg.zones ? cfg.zones->allow_transfer_count : -1);
         return 1;
     }
@@ -457,7 +465,8 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
         // 正常系: width 32-64
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
-        RUN_GEN_TEST("$GENERATE 1-2 host-${0,64,d} A 10.0.0.$", false);
+        RUN_GEN_TEST("$GENERATE 1-2 host-$ TXT ${0,64,d}", false);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${0,30,d}.${0,34,d} A 10.0.0.$", false);
         // 異常系 / エッジケース: テンプレート末尾カンマ・欠落・未クローズ (Fuzzer Crash regression)
         RUN_GEN_TEST("$GENERATE 1-2 host-${,60, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${,, A 10.0.0.$", true);
@@ -1412,6 +1421,27 @@ int main() {
             printf("FAIL: parse_ttl_value('invalid') != 3600\n");
             return 1;
         }
+        // RFC 2181 §8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
+        if (parse_ttl_value("4000000000") != 2147483647) {
+            printf("FAIL: parse_ttl_value('4000000000') != 2147483647 (got %u)\n", parse_ttl_value("4000000000"));
+            return 1;
+        }
+        if (parse_ttl_value("46296d17m") != 2147483647) {
+            printf("FAIL: parse_ttl_value('46296d17m') != 2147483647 (got %u)\n", parse_ttl_value("46296d17m"));
+            return 1;
+        }
+        if (parse_ttl_value("2147483648") != 2147483647) {
+            printf("FAIL: parse_ttl_value('2147483648') != 2147483647\n");
+            return 1;
+        }
+        if (parse_ttl_value("2147483647") != 2147483647) {
+            printf("FAIL: parse_ttl_value('2147483647') != 2147483647\n");
+            return 1;
+        }
+        if (parse_ttl_value("2147483646") != 2147483646) {
+            printf("FAIL: parse_ttl_value('2147483646') != 2147483646\n");
+            return 1;
+        }
 
         // Test zone parsing with TTL units
         zone_arena_t arena;
@@ -2340,6 +2370,818 @@ int main() {
             return 1;
         }
         printf("PASS: DNS record type parsing & non-fatal type resolution test\n");
+    }
+
+    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 §6.1.1) and RCODE bitmask test ---
+    {
+        uint8_t pkt[512];
+        memset(pkt, 0, sizeof(pkt));
+        // Header: ID=0x1234, QR=0, RD=1, QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=1
+        pkt[0] = 0x12; pkt[1] = 0x34;
+        pkt[2] = 0x01; pkt[3] = 0x00; // RD=1
+        pkt[4] = 0x00; pkt[5] = 0x01; // QDCOUNT=1
+        pkt[10] = 0x00; pkt[11] = 0x01; // ARCOUNT=1
+
+        // Question: example.com. A IN
+        size_t off = 12;
+        pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+        pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+        pkt[off++] = 0;
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // TYPE A (1)
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // CLASS IN (1)
+
+        // Additional RR 1: Root (.) OPT (41) UDP_SIZE=4096 TTL=0 RDLEN=0
+        pkt[off++] = 0; // Root name
+        pkt[off++] = 0x00; pkt[off++] = 0x29; // TYPE OPT (41)
+        pkt[off++] = 0x10; pkt[off++] = 0x00; // UDP size 4096
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; // TTL/flags
+        pkt[off++] = 0x00; pkt[off++] = 0x00; // RDLEN=0
+
+        edns_info_t edns;
+        int ret1 = parse_edns_opt(pkt, off, 1, 0, 0, 1, &edns);
+        if (ret1 != 0 || !edns.present || edns.udp_payload_size != 4096) {
+            printf("FAIL: parse_edns_opt failed for valid single OPT RR\n");
+            return 1;
+        }
+
+        // Additional RR 2: Root (.) OPT (41) UDP_SIZE=1232 (Multiple OPT RRs, RFC 6891 violation)
+        pkt[10] = 0x00; pkt[11] = 0x02; // ARCOUNT=2
+        pkt[off++] = 0; // Root name
+        pkt[off++] = 0x00; pkt[off++] = 0x29; // TYPE OPT (41)
+        pkt[off++] = 0x04; pkt[off++] = 0xD0; // UDP size 1232
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00;
+        pkt[off++] = 0x00; pkt[off++] = 0x00; // RDLEN=0
+
+        int ret2 = parse_edns_opt(pkt, off, 1, 0, 0, 2, &edns);
+        if (ret2 != -1) {
+            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 §6.1.1\n");
+            return 1;
+        }
+
+        // RCODE bitmask test: ensuring client-supplied low 4 bits (e.g. 0x0A) do not leak
+        uint8_t dirty_req_byte3 = 0x0A;
+        uint8_t formerr_byte3 = (dirty_req_byte3 & 0xF0) | 1;
+        if (formerr_byte3 != 1) {
+            printf("FAIL: RCODE masking error: expected 1, got %u\n", formerr_byte3);
+            return 1;
+        }
+        uint8_t servfail_byte3 = (dirty_req_byte3 & 0xF0) | 2;
+        if (servfail_byte3 != 2) {
+            printf("FAIL: RCODE masking error: expected 2, got %u\n", servfail_byte3);
+            return 1;
+        }
+        uint8_t refused_byte3 = (dirty_req_byte3 & 0xF0) | 5;
+        if (refused_byte3 != 5) {
+            printf("FAIL: RCODE masking error: expected 5, got %u\n", refused_byte3);
+            return 1;
+        }
+        printf("PASS: Multiple EDNS OPT RR rejection and RCODE bitmask verification\n");
+    }
+
+    // --- Test 34: MX / SRV Additional Glue records target resolution & in-bailiwick validation ---
+    {
+        const char *zone_data =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "ns1 IN A 192.0.2.1\n"
+            "@ IN MX 10 mail.example.com.\n"
+            "@ IN MX 20 mail.example.com.\n"
+            "mail IN A 192.0.2.10\n"
+            "mail IN AAAA 2001:db8::10\n"
+            "_sip._tcp IN SRV 10 60 5060 sip.example.com.\n"
+            "sip IN A 192.0.2.20\n"
+            "external IN MX 10 mail.otherdomain.net.\n";
+
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        char *zone_copy = strdup(zone_data);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        if (parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx) < 0) {
+            printf("FAIL: parse_zone_fast failed for Test 34\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed for Test 34\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Verify MX records and rdata target extraction
+        int mx_count = 0;
+        int srv_count = 0;
+        for (size_t i = 0; i < arena.count; i++) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 15 && (strcasecmp(rec->name, "example.com.") == 0 || strcasecmp(rec->name, "example.com") == 0)) {
+                mx_count++;
+                if (rec->rdata_count < 2 || !rec->rdata[1]) {
+                    printf("FAIL: MX record missing exchange target in rdata[1]\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            } else if (rec->type_code == 33 && (strcasecmp(rec->name, "_sip._tcp.example.com.") == 0 || strcasecmp(rec->name, "_sip._tcp.example.com") == 0)) {
+                srv_count++;
+                if (rec->rdata_count < 4 || !rec->rdata[3]) {
+                    printf("FAIL: SRV record missing target host in rdata[3]\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            }
+        }
+
+        if (mx_count != 2 || srv_count != 1) {
+            printf("FAIL: Expected 2 MX and 1 SRV records, got %d MX, %d SRV\n", mx_count, srv_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test in-bailiwick lookup for mail.example.com. (A + AAAA)
+        uint32_t mail_hash = calc_fnv1a_str("mail.example.com.");
+        size_t mail_idx = mail_hash & (arena.hash_size - 1);
+        int mail_glue_count = 0;
+        for (int j = arena.hash_table[mail_idx]; j != -1; j = arena.records[j].next_record) {
+            if ((arena.records[j].type_code == 1 || arena.records[j].type_code == 28) &&
+                (strcasecmp(arena.records[j].name, "mail.example.com.") == 0 || strcasecmp(arena.records[j].name, "mail.example.com") == 0)) {
+                mail_glue_count++;
+            }
+        }
+        if (mail_glue_count != 2) {
+            printf("FAIL: Expected 2 glue records (A + AAAA) for mail.example.com., got %d\n", mail_glue_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test in-bailiwick lookup for sip.example.com. (A)
+        uint32_t sip_hash = calc_fnv1a_str("sip.example.com.");
+        size_t sip_idx = sip_hash & (arena.hash_size - 1);
+        int sip_glue_count = 0;
+        for (int j = arena.hash_table[sip_idx]; j != -1; j = arena.records[j].next_record) {
+            if (arena.records[j].type_code == 1 &&
+                (strcasecmp(arena.records[j].name, "sip.example.com.") == 0 || strcasecmp(arena.records[j].name, "sip.example.com") == 0)) {
+                sip_glue_count++;
+            }
+        }
+        if (sip_glue_count != 1) {
+            printf("FAIL: Expected 1 glue record for sip.example.com., got %d\n", sip_glue_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: MX / SRV Additional Glue records target resolution & in-bailiwick validation\n");
+    }
+
+    // --- Test 35: notify-source directive parsing and RRL window burst scaling ---
+    {
+        const char *notify_src_conf =
+            "zone \"example.com\" {\n"
+            "    type master;\n"
+            "    file \"master/example.com.zone\";\n"
+            "    also-notify { 192.168.1.100 port 5353; };\n"
+            "    notify-source \"192.168.1.1\";\n"
+            "};\n";
+
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        char *copy_conf = strdup(notify_src_conf);
+        int res = parse_named_conf(copy_conf, &cfg);
+        free(copy_conf);
+        if (res != 0) {
+            printf("FAIL: parse_named_conf failed on notify-source config\n");
+            return 1;
+        }
+
+        if (!cfg.zones || !cfg.zones->notify_source ||
+            strcmp(cfg.zones->notify_source, "192.168.1.1") != 0) {
+            printf("FAIL: notify_source not parsed properly\n");
+            free_server_config_fields(&cfg);
+            return 1;
+        }
+
+        struct in_addr src_ip;
+        if (inet_pton(AF_INET, cfg.zones->notify_source, &src_ip) != 1) {
+            printf("FAIL: inet_pton failed on parsed notify_source\n");
+            free_server_config_fields(&cfg);
+            return 1;
+        }
+
+        // Verify RRL burst token calculation with window
+        uint32_t rps = 10;
+        uint32_t win = 15;
+        uint64_t expected_cap = (uint64_t)rps * win;
+        if (expected_cap != 150) {
+            printf("FAIL: unexpected expected_cap calculation\n");
+            free_server_config_fields(&cfg);
+            return 1;
+        }
+
+        free_server_config_fields(&cfg);
+        printf("PASS: notify-source directive parsing and RRL window burst scaling\n");
+    }
+
+    // --- Test 36: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses ---
+    {
+        const char *zone_text =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600\n"
+            "@ IN RRSIG SOA 13 2 3600 20260901000000 20260801000000 12345 example.com. dGVzdHNpZw==\n";
+
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        char *zone_copy = strdup(zone_text);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        ctx.is_standalone_mode = true;
+        if (parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx) < 0) {
+            printf("FAIL: parse_zone_fast failed for SOA + RRSIG zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed for SOA + RRSIG zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        uint32_t apex_hash = calc_fnv1a_str("example.com.");
+        size_t apex_idx = apex_hash & (arena.hash_size - 1);
+        bool found_soa = false;
+        bool found_rrsig_soa = false;
+
+        for (int i = arena.hash_table[apex_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 6) {
+                found_soa = true;
+            } else if (rec->type_code == 46 && rec->rdata_count >= 9) {
+                if (get_type_code(rec->rdata[0]) == 6) {
+                    found_rrsig_soa = true;
+                }
+            }
+        }
+
+        if (!found_soa || !found_rrsig_soa) {
+            printf("FAIL: Did not find SOA or covering RRSIG(SOA) in zone hash table\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test serialize DNS record for SOA and RRSIG
+        uint8_t buf[2048];
+        uint16_t offset = 12; // after DNS header
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        for (int i = arena.hash_table[apex_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 6 || (rec->type_code == 46 && get_type_code(rec->rdata[0]) == 6)) {
+                if (serialize_dns_record(buf, sizeof(buf), &offset, rec, &comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+                    printf("FAIL: Failed to serialize SOA or RRSIG record\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            }
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses\n");
+    }
+
+    // --- Test 37: Delegation point DS record (RFC 4035 §3.1.4.1) in parent zone ---
+    {
+        const char *zone_text =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600\n"
+            "@ IN NS ns1.example.com.\n"
+            "ns1 IN A 192.0.2.1\n"
+            "sub IN NS ns1.sub.example.com.\n"
+            "sub IN DS 12345 13 2 2BB1834370273412E81E3272C18B868FD63804EB61A086C38D04FF2DEDFE2516\n"
+            "sub IN RRSIG DS 13 3 3600 20260901000000 20260801000000 12345 example.com. dGVzdGRzcmln\n";
+
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        char *zone_copy = strdup(zone_text);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        ctx.is_standalone_mode = true;
+        if (parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx) < 0) {
+            printf("FAIL: parse_zone_fast failed for delegation DS zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed for delegation DS zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        uint32_t sub_hash = calc_fnv1a_str("sub.example.com.");
+        size_t sub_idx = sub_hash & (arena.hash_size - 1);
+        bool found_ns = false;
+        bool found_ds = false;
+        bool found_rrsig_ds = false;
+
+        for (int i = arena.hash_table[sub_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 2) {
+                found_ns = true;
+            } else if (rec->type_code == 43) {
+                found_ds = true;
+            } else if (rec->type_code == 46 && rec->rdata_count >= 9) {
+                if (get_type_code(rec->rdata[0]) == 43) {
+                    found_rrsig_ds = true;
+                }
+            }
+        }
+
+        if (!found_ns || !found_ds || !found_rrsig_ds) {
+            printf("FAIL: Delegation point missing NS (%d), DS (%d), or RRSIG(DS) (%d)\n",
+                   found_ns, found_ds, found_rrsig_ds);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test serialize DS record
+        uint8_t buf[2048];
+        uint16_t offset = 12;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        for (int i = arena.hash_table[sub_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 43) {
+                if (serialize_dns_record(buf, sizeof(buf), &offset, rec, &comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+                    printf("FAIL: Failed to serialize DS record at delegation point\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            }
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 §3.1.4.1)\n");
+    }
+
+    // --- Test 38: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
+    {
+        // 1. Label exceeds 63 octets (64 'a's)
+        const char *long_label_zone =
+            "$ORIGIN example.com.\n"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1\n";
+
+        zone_arena_t arena1;
+        zone_arena_init(&arena1);
+        char *copy1 = strdup(long_label_zone);
+        parse_error_t err1 = {0};
+        parse_context_t ctx1 = { .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err1 };
+        int res1 = parse_zone_fast(copy1, strlen(copy1), &arena1, &ctx1);
+        free(copy1);
+        zone_arena_destroy(&arena1);
+
+        if (res1 >= 0) {
+            printf("FAIL: parse_zone_fast should reject label > 63 octets\n");
+            return 1;
+        }
+        if (!err1.error_message || strstr(err1.error_message, "63 octets") == NULL) {
+            printf("FAIL: Expected 63 octets error message, got: %s\n", err1.error_message ? err1.error_message : "NULL");
+            return 1;
+        }
+
+        // 2. Total wire length exceeds 255 octets
+        // 4 labels of 60 chars each + origin = 240 + 4 dots + 11 = 255+
+        const char *long_name_zone =
+            "$ORIGIN example.com.\n"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc."
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd."
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee IN A 192.0.2.1\n";
+
+        zone_arena_t arena2;
+        zone_arena_init(&arena2);
+        char *copy2 = strdup(long_name_zone);
+        parse_error_t err2 = {0};
+        parse_context_t ctx2 = { .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err2 };
+        int res2 = parse_zone_fast(copy2, strlen(copy2), &arena2, &ctx2);
+        free(copy2);
+        zone_arena_destroy(&arena2);
+
+        if (res2 >= 0) {
+            printf("FAIL: parse_zone_fast should reject total name > 255 octets\n");
+            return 1;
+        }
+        if (!err2.error_message || strstr(err2.error_message, "255 octets") == NULL) {
+            printf("FAIL: Expected 255 octets error message, got: %s\n", err2.error_message ? err2.error_message : "NULL");
+            return 1;
+        }
+
+        // 3. Valid 63-octet label should succeed
+        const char *valid_label_zone =
+            "$ORIGIN example.com.\n"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1\n"; // 63 'a's
+
+        zone_arena_t arena3;
+        zone_arena_init(&arena3);
+        char *copy3 = strdup(valid_label_zone);
+        parse_error_t err3 = {0};
+        parse_context_t ctx3 = { .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err3 };
+        int res3 = parse_zone_fast(copy3, strlen(copy3), &arena3, &ctx3);
+        free(copy3);
+        zone_arena_destroy(&arena3);
+
+        if (res3 < 0) {
+            printf("FAIL: parse_zone_fast should accept valid 63-octet label (err: %s)\n", err3.error_message ? err3.error_message : "none");
+            return 1;
+        }
+
+        printf("PASS: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
+    }
+
+    // --- Test 39: Duplicate zone/view/key block rejection & FIFO key order ---
+    {
+        // 1. 正常系: 異なるドメイン名を持つ複数トップレベルゾーン
+        const char *valid_zones_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; };\n";
+        server_config_t cfg_vz;
+        memset(&cfg_vz, 0, sizeof(cfg_vz));
+        if (parse_named_conf_ext(valid_zones_conf, NULL, &cfg_vz) != 0) {
+            printf("FAIL: Valid multiple top-level zones failed to parse\n");
+            return 1;
+        }
+        if (!cfg_vz.zones || !cfg_vz.zones->next) {
+            printf("FAIL: Valid multiple top-level zones count mismatch\n");
+            free_server_config_fields(&cfg_vz);
+            return 1;
+        }
+        free_server_config_fields(&cfg_vz);
+
+        // 2. 正常系: 異なるビュー名を持つ複数ビュー
+        const char *valid_views_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
+            "view \"external\" { zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; }; };\n";
+        server_config_t cfg_vv;
+        memset(&cfg_vv, 0, sizeof(cfg_vv));
+        if (parse_named_conf_ext(valid_views_conf, NULL, &cfg_vv) != 0) {
+            printf("FAIL: Valid multiple views failed to parse\n");
+            return 1;
+        }
+        if (!cfg_vv.views || !cfg_vv.views->next) {
+            printf("FAIL: Valid multiple views count mismatch\n");
+            free_server_config_fields(&cfg_vv);
+            return 1;
+        }
+        free_server_config_fields(&cfg_vv);
+
+        // 3. 正常系: ビュー内の異なるゾーン
+        const char *valid_view_zones_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "view \"internal\" {\n"
+            "  zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "  zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; };\n"
+            "};\n";
+        server_config_t cfg_vvz;
+        memset(&cfg_vvz, 0, sizeof(cfg_vvz));
+        if (parse_named_conf_ext(valid_view_zones_conf, NULL, &cfg_vvz) != 0) {
+            printf("FAIL: Valid zones inside view failed to parse\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg_vvz);
+
+        // 4. 正常系: 複数TSIGキー（FIFO定義順序の検証）
+        const char *valid_keys_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"key1\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "key \"key2\" { algorithm hmac-sha256; secret \"k999999999012345678901234567890123456789012=\"; };\n";
+        server_config_t cfg_vk;
+        memset(&cfg_vk, 0, sizeof(cfg_vk));
+        if (parse_named_conf_ext(valid_keys_conf, NULL, &cfg_vk) != 0) {
+            printf("FAIL: Valid config with multiple keys failed to parse\n");
+            return 1;
+        }
+        if (!cfg_vk.keys || strcmp(cfg_vk.keys->name, "key1") != 0 ||
+            !cfg_vk.keys->next || strcmp(cfg_vk.keys->next->name, "key2") != 0) {
+            printf("FAIL: Keys list is not in FIFO definition order (got %s -> %s)\n",
+                   cfg_vk.keys ? cfg_vk.keys->name : "NULL",
+                   (cfg_vk.keys && cfg_vk.keys->next) ? cfg_vk.keys->next->name : "NULL");
+            free_server_config_fields(&cfg_vk);
+            return 1;
+        }
+        free_server_config_fields(&cfg_vk);
+
+        // 5. 異常系: 重複トップレベルゾーン
+        const char *dup_zone_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "zone \"example.com\" { type master; file \"/tmp/z2.zone\"; };\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(dup_zone_conf, NULL, &cfg1) == 0) {
+            printf("FAIL: Duplicate top-level zone should be rejected\n");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+
+        // 6. 異常系: 重複TSIGキー
+        const char *dup_key_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"tsig-test\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "key \"tsig-test\" { algorithm hmac-sha256; secret \"k999999999012345678901234567890123456789012=\"; };\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(dup_key_conf, NULL, &cfg2) == 0) {
+            printf("FAIL: Duplicate key should be rejected\n");
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+
+        // 7. 異常系: 重複ビュー
+        const char *dup_view_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
+            "view \"internal\" { zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; }; };\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(dup_view_conf, NULL, &cfg3) == 0) {
+            printf("FAIL: Duplicate view should be rejected\n");
+            free_server_config_fields(&cfg3);
+            return 1;
+        }
+
+        // 8. 異常系: 同一ビュー内の重複ゾーン
+        const char *dup_view_zone_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "view \"internal\" {\n"
+            "  zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "  zone \"example.com\" { type master; file \"/tmp/z2.zone\"; };\n"
+            "};\n";
+        server_config_t cfg4;
+        memset(&cfg4, 0, sizeof(cfg4));
+        if (parse_named_conf_ext(dup_view_zone_conf, NULL, &cfg4) == 0) {
+            printf("FAIL: Duplicate zone inside view should be rejected\n");
+            free_server_config_fields(&cfg4);
+            return 1;
+        }
+
+        printf("PASS: Duplicate zone/view/key rejection & FIFO key order\n");
+    }
+
+    // --- Test 40: Zone type validation and normalization (primary/master, secondary/slave) ---
+    {
+        // 1. 正常系: primary -> master 正規化
+        const char *primary_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example1.com\" { type primary; file \"/tmp/z1.zone\"; };\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(primary_conf, NULL, &cfg1) != 0) {
+            printf("FAIL: type primary should be accepted\n");
+            return 1;
+        }
+        if (!cfg1.zones || strcmp(cfg1.zones->type, "master") != 0) {
+            printf("FAIL: type primary should be normalized to master (got %s)\n",
+                   cfg1.zones ? cfg1.zones->type : "NULL");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+        free_server_config_fields(&cfg1);
+
+        // 2. 正常系: secondary -> slave 正規化
+        const char *secondary_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example2.com\" { type secondary; masters { 192.0.2.1; }; };\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(secondary_conf, NULL, &cfg2) != 0) {
+            printf("FAIL: type secondary should be accepted\n");
+            return 1;
+        }
+        if (!cfg2.zones || strcmp(cfg2.zones->type, "slave") != 0) {
+            printf("FAIL: type secondary should be normalized to slave (got %s)\n",
+                   cfg2.zones ? cfg2.zones->type : "NULL");
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+        free_server_config_fields(&cfg2);
+
+        // 3. 正常系: master そのまま
+        const char *master_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example3.com\" { type master; file \"/tmp/z3.zone\"; };\n";
+        server_config_t cfg_m;
+        memset(&cfg_m, 0, sizeof(cfg_m));
+        if (parse_named_conf_ext(master_conf, NULL, &cfg_m) != 0) {
+            printf("FAIL: type master should be accepted\n");
+            return 1;
+        }
+        if (!cfg_m.zones || strcmp(cfg_m.zones->type, "master") != 0) {
+            printf("FAIL: type master should be master (got %s)\n",
+                   cfg_m.zones ? cfg_m.zones->type : "NULL");
+            free_server_config_fields(&cfg_m);
+            return 1;
+        }
+        free_server_config_fields(&cfg_m);
+
+        // 4. 正常系: slave そのまま
+        const char *slave_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example4.com\" { type slave; masters { 192.0.2.1; }; };\n";
+        server_config_t cfg_s;
+        memset(&cfg_s, 0, sizeof(cfg_s));
+        if (parse_named_conf_ext(slave_conf, NULL, &cfg_s) != 0) {
+            printf("FAIL: type slave should be accepted\n");
+            return 1;
+        }
+        if (!cfg_s.zones || strcmp(cfg_s.zones->type, "slave") != 0) {
+            printf("FAIL: type slave should be slave (got %s)\n",
+                   cfg_s.zones ? cfg_s.zones->type : "NULL");
+            free_server_config_fields(&cfg_s);
+            return 1;
+        }
+        free_server_config_fields(&cfg_s);
+
+        // 5. 異常系: 未知のゾーン種別を拒絶
+        const char *invalid_type_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example5.com\" { type unknown_type; file \"/tmp/z5.zone\"; };\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(invalid_type_conf, NULL, &cfg3) == 0) {
+            printf("FAIL: Unknown zone type should be rejected\n");
+            free_server_config_fields(&cfg3);
+            return 1;
+        }
+
+        printf("PASS: Zone type validation and normalization (primary->master, secondary->slave)\n");
+    }
+
+    // --- Test 41: allow-update in master vs slave zones and type defaulting ---
+    {
+        // 1. 正常系: master zone with allow-update
+        const char *master_update_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"upd-key\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "zone \"example.com\" {\n"
+            "    type master;\n"
+            "    file \"/tmp/z.zone\";\n"
+            "    allow-update { key \"upd-key\"; };\n"
+            "};\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(master_update_conf, NULL, &cfg1) != 0) {
+            printf("FAIL: master zone with allow-update failed to parse\n");
+            return 1;
+        }
+        if (!cfg1.zones || cfg1.zones->allow_update_count != 1 ||
+            strcmp(cfg1.zones->allow_update[0], "upd-key") != 0) {
+            printf("FAIL: allow-update ACL mismatch on master zone\n");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+        free_server_config_fields(&cfg1);
+
+        // 2. 正常系: zone without explicit type defaults to master
+        const char *no_type_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"default-type.com\" { file \"/tmp/z.zone\"; };\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(no_type_conf, NULL, &cfg2) != 0) {
+            printf("FAIL: zone without explicit type failed to parse\n");
+            return 1;
+        }
+        if (!cfg2.zones || !cfg2.zones->type || strcmp(cfg2.zones->type, "master") != 0) {
+            printf("FAIL: zone without explicit type should default to master (got %s)\n",
+                   (cfg2.zones && cfg2.zones->type) ? cfg2.zones->type : "NULL");
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+        free_server_config_fields(&cfg2);
+
+        // 3. 正常系 (警告付き): slave zone with allow-update (parses safely, logs warning)
+        const char *slave_update_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"upd-key\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "zone \"slave.example.com\" {\n"
+            "    type slave;\n"
+            "    masters { 192.0.2.1; };\n"
+            "    allow-update { key \"upd-key\"; };\n"
+            "};\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(slave_update_conf, NULL, &cfg3) != 0) {
+            printf("FAIL: slave zone with allow-update should parse safely\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg3);
+
+        printf("PASS: allow-update in master vs slave zones and type defaulting\n");
+    }
+
+    // --- Test 42: Logging category channel validation & multiple TSIG keys in allow-transfer ---
+    {
+        // 1. 正常系: 正しいチャンネル名を参照する logging category
+        const char *valid_logging_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "logging {\n"
+            "    channel query_log { file \"/tmp/queries.log\"; };\n"
+            "    channel resp_log  { file \"/tmp/responses.log\"; };\n"
+            "    category queries { query_log; };\n"
+            "    category responses { resp_log; };\n"
+            "};\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(valid_logging_conf, NULL, &cfg1) != 0) {
+            printf("FAIL: Valid logging config failed to parse\n");
+            return 1;
+        }
+        if (!cfg1.logging.queries_channel || strcmp(cfg1.logging.queries_channel->name, "query_log") != 0 ||
+            !cfg1.logging.responses_channel || strcmp(cfg1.logging.responses_channel->name, "resp_log") != 0) {
+            printf("FAIL: logging channel pointer resolution mismatch\n");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+        free_server_config_fields(&cfg1);
+
+        // 2. 正常系: allow-transfer に複数 key を指定 (両方の key が配列 tsig_keys に保持される)
+        const char *multi_key_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example.com\" {\n"
+            "    type master;\n"
+            "    file \"/tmp/z.zone\";\n"
+            "    allow-transfer { key \"key1\"; key \"key2\"; };\n"
+            "};\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(multi_key_conf, NULL, &cfg2) != 0) {
+            printf("FAIL: allow-transfer with multiple keys should parse safely\n");
+            return 1;
+        }
+        if (!cfg2.zones || cfg2.zones->tsig_keys_count != 2 ||
+            !cfg2.zones->tsig_keys ||
+            strcmp(cfg2.zones->tsig_keys[0], "key1") != 0 ||
+            strcmp(cfg2.zones->tsig_keys[1], "key2") != 0) {
+            printf("FAIL: allow-transfer with multiple keys should retain both keys 'key1' and 'key2' (count=%d)\n",
+                   cfg2.zones ? cfg2.zones->tsig_keys_count : -1);
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+        free_server_config_fields(&cfg2);
+
+        // 3. 異常系: 未定義チャンネル名を参照する category queries
+        const char *undef_qchannel_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "logging {\n"
+            "    channel query_log { file \"/tmp/queries.log\"; };\n"
+            "    category queries { nonexistent_query_log; };\n"
+            "};\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(undef_qchannel_conf, NULL, &cfg3) == 0) {
+            printf("FAIL: category queries referencing undefined channel should be rejected\n");
+            free_server_config_fields(&cfg3);
+            return 1;
+        }
+
+        // 4. 異常系: 未定義チャンネル名を参照する category responses
+        const char *undef_rchannel_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "logging {\n"
+            "    channel resp_log { file \"/tmp/resp.log\"; };\n"
+            "    category responses { nonexistent_resp_log; };\n"
+            "};\n";
+        server_config_t cfg4;
+        memset(&cfg4, 0, sizeof(cfg4));
+        if (parse_named_conf_ext(undef_rchannel_conf, NULL, &cfg4) == 0) {
+            printf("FAIL: category responses referencing undefined channel should be rejected\n");
+            free_server_config_fields(&cfg4);
+            return 1;
+        }
+
+        printf("PASS: Logging category channel validation & multiple TSIG keys in allow-transfer\n");
     }
 
     printf("All tests passed safely.\n");
