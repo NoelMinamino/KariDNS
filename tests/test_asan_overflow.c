@@ -465,7 +465,8 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
         // 正常系: width 32-64
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
-        RUN_GEN_TEST("$GENERATE 1-2 host-${0,64,d} A 10.0.0.$", false);
+        RUN_GEN_TEST("$GENERATE 1-2 host-$ TXT ${0,64,d}", false);
+        RUN_GEN_TEST("$GENERATE 1-2 host-${0,30,d}.${0,34,d} A 10.0.0.$", false);
         // 異常系 / エッジケース: テンプレート末尾カンマ・欠落・未クローズ (Fuzzer Crash regression)
         RUN_GEN_TEST("$GENERATE 1-2 host-${,60, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${,, A 10.0.0.$", true);
@@ -2741,6 +2742,80 @@ int main() {
         free(zone_copy);
         zone_arena_destroy(&arena);
         printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 §3.1.4.1)\n");
+    }
+
+    // --- Test 38: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
+    {
+        // 1. Label exceeds 63 octets (64 'a's)
+        const char *long_label_zone =
+            "$ORIGIN example.com.\n"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1\n";
+
+        zone_arena_t arena1;
+        zone_arena_init(&arena1);
+        char *copy1 = strdup(long_label_zone);
+        parse_error_t err1 = {0};
+        parse_context_t ctx1 = { .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err1 };
+        int res1 = parse_zone_fast(copy1, strlen(copy1), &arena1, &ctx1);
+        free(copy1);
+        zone_arena_destroy(&arena1);
+
+        if (res1 >= 0) {
+            printf("FAIL: parse_zone_fast should reject label > 63 octets\n");
+            return 1;
+        }
+        if (!err1.error_message || strstr(err1.error_message, "63 octets") == NULL) {
+            printf("FAIL: Expected 63 octets error message, got: %s\n", err1.error_message ? err1.error_message : "NULL");
+            return 1;
+        }
+
+        // 2. Total wire length exceeds 255 octets
+        // 4 labels of 60 chars each + origin = 240 + 4 dots + 11 = 255+
+        const char *long_name_zone =
+            "$ORIGIN example.com.\n"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc."
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd."
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee IN A 192.0.2.1\n";
+
+        zone_arena_t arena2;
+        zone_arena_init(&arena2);
+        char *copy2 = strdup(long_name_zone);
+        parse_error_t err2 = {0};
+        parse_context_t ctx2 = { .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err2 };
+        int res2 = parse_zone_fast(copy2, strlen(copy2), &arena2, &ctx2);
+        free(copy2);
+        zone_arena_destroy(&arena2);
+
+        if (res2 >= 0) {
+            printf("FAIL: parse_zone_fast should reject total name > 255 octets\n");
+            return 1;
+        }
+        if (!err2.error_message || strstr(err2.error_message, "255 octets") == NULL) {
+            printf("FAIL: Expected 255 octets error message, got: %s\n", err2.error_message ? err2.error_message : "NULL");
+            return 1;
+        }
+
+        // 3. Valid 63-octet label should succeed
+        const char *valid_label_zone =
+            "$ORIGIN example.com.\n"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1\n"; // 63 'a's
+
+        zone_arena_t arena3;
+        zone_arena_init(&arena3);
+        char *copy3 = strdup(valid_label_zone);
+        parse_error_t err3 = {0};
+        parse_context_t ctx3 = { .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err3 };
+        int res3 = parse_zone_fast(copy3, strlen(copy3), &arena3, &ctx3);
+        free(copy3);
+        zone_arena_destroy(&arena3);
+
+        if (res3 < 0) {
+            printf("FAIL: parse_zone_fast should accept valid 63-octet label (err: %s)\n", err3.error_message ? err3.error_message : "none");
+            return 1;
+        }
+
+        printf("PASS: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
     }
 
     printf("All tests passed safely.\n");

@@ -188,6 +188,66 @@ static char *expand_domain_name(char *name, const char *origin,
   return fqdn;
 }
 
+// RFC 1035 §3.1: 各ラベルは63オクテット以下、ドメイン名全体は255オクテット以下を検証
+static bool validate_domain_name_length(const char *fqdn, parse_error_t *err_out,
+                                        const char *field_pos_in_buf, const char *buf) {
+    if (!fqdn) return true;
+    size_t total_wire_len = 1; // 終端の0バイト分
+    size_t label_len = 0;
+    for (const char *p = fqdn; *p; p++) {
+        if (*p == '\\') {
+            if (*(p + 1) != '\0') {
+                if (isdigit((unsigned char)*(p + 1)) &&
+                    isdigit((unsigned char)*(p + 2)) &&
+                    isdigit((unsigned char)*(p + 3))) {
+                    p += 3;
+                } else {
+                    p++;
+                }
+            }
+            label_len++;
+            total_wire_len++;
+            continue;
+        }
+        if (*p == '.') {
+            if (label_len > 63) {
+                if (err_out) {
+                    err_out->error_message = "Domain name label exceeds 63 octets (RFC 1035 §3.1)";
+                    if (buf && field_pos_in_buf) err_out->error_offset = (size_t)(field_pos_in_buf - buf);
+                    err_out->token_length = label_len;
+                }
+                return false;
+            }
+            if (label_len > 0) {
+                total_wire_len += 1; // ラベル長バイト分
+            }
+            label_len = 0;
+            continue;
+        }
+        label_len++;
+        total_wire_len++;
+    }
+    if (label_len > 63) {
+        if (err_out) {
+            err_out->error_message = "Domain name label exceeds 63 octets (RFC 1035 §3.1)";
+            if (buf && field_pos_in_buf) err_out->error_offset = (size_t)(field_pos_in_buf - buf);
+            err_out->token_length = label_len;
+        }
+        return false;
+    }
+    if (label_len > 0) {
+        total_wire_len += 1;
+    }
+    if (total_wire_len > 255) {
+        if (err_out) {
+            err_out->error_message = "Domain name exceeds 255 octets total (RFC 1035 §3.1)";
+            if (buf && field_pos_in_buf) err_out->error_offset = (size_t)(field_pos_in_buf - buf);
+            err_out->token_length = strlen(fqdn);
+        }
+        return false;
+    }
+    return true;
+}
 
 #include <limits.h>
 
@@ -581,6 +641,9 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         memcpy(rdata_copy, rdata_buf, rdata_len + 1);
 
         rec->name = expand_domain_name(name_copy, origin, arena);
+        if (!validate_domain_name_length(rec->name, ctx ? ctx->err_out : NULL, fields[0], cur_buf)) {
+            return -1;
+        }
         rec->ttl = (char *)ttl_str;
         rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
         rec->class_str = (char *)class_str;
@@ -591,6 +654,9 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
 
         if (type_code == 2 || type_code == 5 || type_code == 12 || type_code == 39) {
             rec->rdata[0] = expand_domain_name(rec->rdata[0], origin, arena);
+            if (!validate_domain_name_length(rec->rdata[0], ctx ? ctx->err_out : NULL, fields[4], cur_buf)) {
+                return -1;
+            }
         }
 
         if (v == UINT64_MAX) break;
@@ -806,8 +872,12 @@ PROCESS_RECORD:
     goto DONE;
   }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$ORIGIN") == 0) {
-    if (field_idx > 1)
+    if (field_idx > 1) {
+      if (!validate_domain_name_length(fields[1], ctx ? ctx->err_out : NULL, fields[1], buf)) {
+        return -1;
+      }
       *origin_io = fields[1];
+    }
     if (p < end)
       goto STATE_START_LINE;
     goto DONE;
@@ -842,6 +912,9 @@ PROCESS_RECORD:
           ctx->err_out->error_offset = (size_t)(fields[0] - buf);
           ctx->err_out->token_length = strlen(fields[0]);
       }
+      return -1;
+  }
+  if (!validate_domain_name_length(rec->name, ctx ? ctx->err_out : NULL, fields[0], buf)) {
       return -1;
   }
   *prev_owner_io = rec->name;
@@ -1018,7 +1091,47 @@ PROCESS_RECORD:
           rec->rdata[1] = expand_domain_name(rec->rdata[1], *origin_io, arena);
         }
       }
-    } else if (rec->type_code == 22) { // NSAP
+    }
+
+    // Validate domain name length in RDATA
+    for (int j = 0; j < rec->rdata_count; j++) {
+      bool is_domain_field = false;
+      switch (rec->type_code) {
+        case 2: case 5: case 12: case 39: case 23: case 3: case 4: case 7: case 8: case 9:
+          if (j == 0) is_domain_field = true;
+          break;
+        case 15: case 18: case 36: case 21: case 107:
+          if (j == 1) is_domain_field = true;
+          break;
+        case 6: case 14: case 17:
+          if (j == 0 || j == 1) is_domain_field = true;
+          break;
+        case 33:
+          if (j == 3) is_domain_field = true;
+          break;
+        case 35:
+          if (j == 5) is_domain_field = true;
+          break;
+        case 26:
+          if (j == 1 || j == 2) is_domain_field = true;
+          break;
+        case 45: case 260:
+          if (j == 3) is_domain_field = true;
+          break;
+        default:
+          if ((rec->type_code == 64 || rec->type_code == 65) && j == 1 && strcmp(rec->rdata[1], ".") != 0) {
+            is_domain_field = true;
+          }
+          break;
+      }
+      if (is_domain_field && rec->rdata[j]) {
+        if (!validate_domain_name_length(rec->rdata[j], ctx ? ctx->err_out : NULL, rec->rdata[j], buf)) {
+          return -1;
+        }
+      }
+    }
+
+    if (rec->type_code == 22) { // NSAP
       if (rec->rdata_count > 0) {
         char *raw = rec->rdata[0];
         // "0x" または "0X" で始まっていればスキップ
