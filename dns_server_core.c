@@ -61,10 +61,11 @@
 
 // Frontend/Backendプロセス間のUDPパケット受け渡し用ヘッダ
 typedef struct {
-  int sock_fd_idx; // 返信に使用するFrontend側のUDPソケットインデックス (-1 =
-                   // 動的生成/NOTIFY用)
+  int sock_fd_idx; // 返信に使用するFrontend側のUDPソケットインデックス (-1 = 動的生成/NOTIFY用, -2 = 停止)
   socklen_t addr_len;
   struct sockaddr_storage client_addr;
+  struct sockaddr_storage source_addr;
+  bool has_source_addr;
   uint16_t payload_len;
   // この構造体の直後にパケットのペイロードが続く
 } udp_ipc_t;
@@ -318,18 +319,27 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   clock_gettime(CLOCK_MONOTONIC, &ts);
   int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
+  uint32_t window_sec = (cfg->window_seconds > 0) ? (uint32_t)cfg->window_seconds : 15;
+  if (window_sec > 3600) window_sec = 3600;
+
   if (b->client_hash != full_hash) {
     // Hash collision or new entry
-    // Only reset if it's older than 1 second to prevent hash-collision DoS
-    if (now_ms - b->last_refill_ms[cls] > 1000) {
+    // Only reset if it's older than window_sec seconds to prevent hash-collision DoS
+    if (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000) {
       b->client_hash = full_hash;
       for (int i = 0; i < 4; i++) {
           b->last_refill_ms[i] = now_ms;
       }
-      b->tokens[0] = cfg->responses_per_second;
-      b->tokens[1] = cfg->responses_per_second;
-      b->tokens[2] = cfg->nxdomains_per_second;
-      b->tokens[3] = cfg->errors_per_second;
+      uint64_t cap0 = (uint64_t)cfg->responses_per_second * window_sec;
+      uint64_t cap2 = (uint64_t)cfg->nxdomains_per_second * window_sec;
+      uint64_t cap3 = (uint64_t)cfg->errors_per_second * window_sec;
+      if (cap0 > 0x7FFFFFFF) cap0 = 0x7FFFFFFF;
+      if (cap2 > 0x7FFFFFFF) cap2 = 0x7FFFFFFF;
+      if (cap3 > 0x7FFFFFFF) cap3 = 0x7FFFFFFF;
+      b->tokens[0] = (int32_t)cap0;
+      b->tokens[1] = (int32_t)cap0;
+      b->tokens[2] = (int32_t)cap2;
+      b->tokens[3] = (int32_t)cap3;
       b->slip_counter = 0;
     } else {
       // It's a recent collision. Share the limit instead of resetting.
@@ -346,11 +356,13 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       if (rates[i] == 0) continue;
       int64_t elapsed_ms = now_ms - b->last_refill_ms[i];
       if (elapsed_ms > 0) {
+        uint64_t max_cap = (uint64_t)rates[i] * window_sec;
+        if (max_cap > 0x7FFFFFFF) max_cap = 0x7FFFFFFF;
         uint64_t add_t = ((uint64_t)elapsed_ms * rates[i]) / 1000;
         if (add_t > 0) {
-          if (add_t > (uint64_t)rates[i]) add_t = rates[i];
+          if (add_t > max_cap) add_t = max_cap;
           b->tokens[i] += (int32_t)add_t;
-          if (b->tokens[i] > (int32_t)rates[i]) b->tokens[i] = rates[i];
+          if (b->tokens[i] > (int32_t)max_cap) b->tokens[i] = (int32_t)max_cap;
           if (b->tokens[i] < 0) b->tokens[i] = 0;
           b->last_refill_ms[i] = now_ms;
         }
@@ -4363,11 +4375,25 @@ void send_notify_to_all(const char *domain, const char *view_name) {
       continue;
 
     udp_ipc_t msg;
+    memset(&msg, 0, sizeof(msg));
     msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
     msg.client_addr = dest_addr;
     msg.addr_len = (domain_family == AF_INET) ? sizeof(struct sockaddr_in)
                                               : sizeof(struct sockaddr_in6);
     msg.payload_len = offset;
+    if (zone->notify_source && *zone->notify_source) {
+      if (domain_family == AF_INET &&
+          inet_pton(AF_INET, zone->notify_source,
+                    &((struct sockaddr_in *)&msg.source_addr)->sin_addr) == 1) {
+        msg.source_addr.ss_family = AF_INET;
+        msg.has_source_addr = true;
+      } else if (domain_family == AF_INET6 &&
+                 inet_pton(AF_INET6, zone->notify_source,
+                           &((struct sockaddr_in6 *)&msg.source_addr)->sin6_addr) == 1) {
+        msg.source_addr.ss_family = AF_INET6;
+        msg.has_source_addr = true;
+      }
+    }
 
     uint8_t buf[2048];
     memcpy(buf, &msg, sizeof(msg));
@@ -6326,6 +6352,14 @@ static void run_frontend_router(pid_t backend_pid) {
           }
           int sock = socket(msg->client_addr.ss_family, SOCK_DGRAM, 0);
           if (sock >= 0) {
+            if (msg->has_source_addr) {
+              socklen_t src_len = (msg->source_addr.ss_family == AF_INET)
+                                      ? sizeof(struct sockaddr_in)
+                                      : sizeof(struct sockaddr_in6);
+              if (bind(sock, (struct sockaddr *)&msg->source_addr, src_len) < 0) {
+                syslog(LOG_WARNING, "[Frontend] Failed to bind NOTIFY socket to notify-source: %m");
+              }
+            }
             sendto(sock, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
                    (struct sockaddr *)&msg->client_addr, msg->addr_len);
             close(sock);

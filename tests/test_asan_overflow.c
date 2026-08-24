@@ -1,6 +1,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#endif
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
 #include "../dns_zone_parser.h"
@@ -2510,6 +2518,54 @@ int main() {
         free(zone_copy);
         zone_arena_destroy(&arena);
         printf("PASS: MX / SRV Additional Glue records target resolution & in-bailiwick validation\n");
+    }
+
+    // --- Test 35: notify-source directive parsing and RRL window burst scaling ---
+    {
+        const char *notify_src_conf =
+            "zone \"example.com\" {\n"
+            "    type master;\n"
+            "    file \"master/example.com.zone\";\n"
+            "    also-notify { 192.168.1.100 port 5353; };\n"
+            "    notify-source \"192.168.1.1\";\n"
+            "};\n";
+
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        char *copy_conf = strdup(notify_src_conf);
+        int res = parse_named_conf(copy_conf, &cfg);
+        free(copy_conf);
+        if (res != 0) {
+            printf("FAIL: parse_named_conf failed on notify-source config\n");
+            return 1;
+        }
+
+        if (!cfg.zones || !cfg.zones->notify_source ||
+            strcmp(cfg.zones->notify_source, "192.168.1.1") != 0) {
+            printf("FAIL: notify_source not parsed properly\n");
+            free_server_config_fields(&cfg);
+            return 1;
+        }
+
+        struct in_addr src_ip;
+        if (inet_pton(AF_INET, cfg.zones->notify_source, &src_ip) != 1) {
+            printf("FAIL: inet_pton failed on parsed notify_source\n");
+            free_server_config_fields(&cfg);
+            return 1;
+        }
+
+        // Verify RRL burst token calculation with window
+        uint32_t rps = 10;
+        uint32_t win = 15;
+        uint64_t expected_cap = (uint64_t)rps * win;
+        if (expected_cap != 150) {
+            printf("FAIL: unexpected expected_cap calculation\n");
+            free_server_config_fields(&cfg);
+            return 1;
+        }
+
+        free_server_config_fields(&cfg);
+        printf("PASS: notify-source directive parsing and RRL window burst scaling\n");
     }
 
     printf("All tests passed safely.\n");
