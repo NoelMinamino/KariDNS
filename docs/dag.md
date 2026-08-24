@@ -210,10 +210,10 @@ dag [global-queryopt...] [query...]
 : When querying multiple nameservers or using failover lists, controls whether to try the next nameserver when receiving a `SERVFAIL` response.
 
 `+[no]trace`
-: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). `dag` follows referrals down to authoritative servers and displays each intermediate answer.
+: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). `dag` follows referrals down to authoritative servers and displays each intermediate answer. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses.
 
 `+[no]nssearch`
-: Look up authoritative nameservers for the zone containing the query name and display the SOA record from each responding nameserver.
+: Look up authoritative nameservers for the zone containing the query name and display the SOA record from each responding nameserver. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses.
 
 `+[no]search`, `+[no]defname`
 : Enable or disable domain search list processing as defined in `/etc/resolv.conf`.
@@ -512,6 +512,9 @@ When `+ldnsz` is supplied:
 
 `+[no]nohexdump-response`
 : Suppress hex dump for incoming responses only.
+
+`+[no]yaml`
+: Output parsed response in structured YAML format (including headers, question, answer, authority, and additional sections with decoded `rdata:` fields).
 
 ---
 

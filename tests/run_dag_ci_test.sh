@@ -346,7 +346,7 @@ echo "========================================================"
 echo "16. Hex Payload Overflow & Boundary Tests"
 echo "========================================================"
 if [ "$DAG" != "dig" ]; then
-    OVERSIZED_HEX=$(python3 -c "print('aa' * 70000)" 2>/dev/null || perl -e 'print "aa" x 70000' 2>/dev/null || printf '%0.sAA' $(seq 1 70000))
+    OVERSIZED_HEX=$(awk 'BEGIN { for (i=1; i<=70000; i++) printf "aa" }' 2>/dev/null || perl -e 'print "aa" x 70000' 2>/dev/null)
     run_check "Oversized hex payload rejected without crash" "$DAG @127.0.0.1 -p $PORT --hex $OVERSIZED_HEX" "Invalid, empty, or oversized hex payload"
     run_check "Empty hex payload rejected" "$DAG @127.0.0.1 -p $PORT --hex ''" "Invalid, empty, or oversized hex payload"
 fi
@@ -361,6 +361,15 @@ if [ "$DAG" != "dig" ]; then
     run_check "--prereq-nxrrset separate args" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxrrset test.example.com A +qr +timeout=1" "Query \([0-9]+ bytes\)"
     run_check "--prereq-yxrrset separate args with rdata" "$DAG @127.0.0.1 -p $PORT example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset test.example.com A 1.2.3.4 +qr +timeout=1" "Query \([0-9]+ bytes\)"
     run_check "Multiple structural breaks warning" "$DAG @127.0.0.1 -p $PORT example.com A --break compression-loop --break oversized-qname +timeout=1" "warning: --break 'oversized-qname' ignored; structural break kind is already set"
+fi
+
+echo "========================================================"
+echo "18. +trace/+nssearch Transport & +yaml RDATA Output Tests"
+echo "========================================================"
+run_check "+trace +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +trace +tcp +timeout=1" "(TRACE:|connection timed out|no servers could be reached|no usable response)"
+run_check "+nssearch +tcp execution" "$DAG @127.0.0.1 -p $PORT example.com +nssearch +tcp +timeout=1" "(couldn't get address|SOA |connection timed out|no usable response)"
+if [ "$DAG" != "dig" ]; then
+    run_check "+yaml output structure" "$DAG @127.0.0.1 -p $PORT example.com A +yaml +timeout=1" "(^---|question:)"
 fi
 
 echo "========================================================"

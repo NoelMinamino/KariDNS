@@ -57,7 +57,7 @@ run_exit_check() {
 echo "=== Running Hex Payload Boundary & Overflow Tests ==="
 
 # 1. Generate an oversized hex string (140,000 hex characters = 70,000 bytes > 65,535 bytes buffer)
-OVERSIZED_HEX=$(python3 -c "print('aa' * 70000)" 2>/dev/null || perl -e 'print "aa" x 70000' 2>/dev/null || printf '%0.sAA' $(seq 1 70000))
+OVERSIZED_HEX=$(awk 'BEGIN { for (i=1; i<=70000; i++) printf "aa" }' 2>/dev/null || perl -e 'print "aa" x 70000' 2>/dev/null)
 
 # Test 1: Oversized hex payload must be rejected without crashing (Exit code 1)
 run_check "Oversized hex payload error message" "$DAG @127.0.0.1 -p 10053 --hex $OVERSIZED_HEX" "Invalid, empty, or oversized hex payload"

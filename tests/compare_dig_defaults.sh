@@ -77,10 +77,12 @@ normalize_output() {
         -e '/^; <<>>/d' \
         -e '/^;; global options: \+cmd/d' \
         -e '/^; \([0-9]+ servers? found\)/d' \
+        -e 's/^(dig|dag):/dig:/' \
         -e 's/id: [0-9]+/id: <ID>/g' \
         -e 's/; COOKIE: [0-9a-fA-F]+/;; COOKIE: <COOKIE>/g' \
         -e 's/[0-9]+[[:space:]]+IN[[:space:]]+/<TTL> IN /g' \
         -e 's/;; Query time: [0-9]+ (msec|usec)/;; Query time: <TIME>/g' \
+        -e 's/ in [0-9]+ ms/ in <TIME> ms/g' \
         -e 's/;; WHEN: .*/;; WHEN: <DATE>/g' \
         -e '/;; (no usable response received|connection failed|no servers could be reached)/d' \
         -e '/^;; === MULTI-SERVER COMPARISON SUMMARY ===/,$d' \
@@ -242,6 +244,23 @@ else
     compare_query "Positional Order: Type Name Class" "A www.example.com IN"
     compare_query "Multiple Reverse (-x) and Forward" "-x 192.0.2.10 www.example.com A"
     compare_query "Per-query flag override (+noanswer on second)" "www.example.com A example.com TXT +noanswer"
+
+    echo "--------------------------------------------------------"
+    echo "9. IDN (Internationalized Domain Names)"
+    echo "--------------------------------------------------------"
+    compare_query "IDN Japanese domain (+idn)" "日本語ドメイン.jp +idn"
+    compare_query "IDN Japanese domain with noidnout (+idn +noidnout)" "日本語ドメイン.jp +idn +noidnout"
+    compare_query "IDN Japanese domain with explicit A (+idn +noidnout A)" "日本語ドメイン.jp A +idn +noidnout"
+    compare_query "IDN ASCII domain enabled (+idn)" "www.example.com A +idn"
+    compare_query "IDN disabled (+noidn)" "www.example.com A +noidn"
+    compare_query "IDN in/out flags (+idnin +idnout)" "www.example.com A +idnin +idnout"
+    compare_query "IDN disabled in/out (+noidnin +noidnout)" "www.example.com A +noidnin +noidnout"
+
+    echo "--------------------------------------------------------"
+    echo "10. Zone Nameserver Search (+nssearch)"
+    echo "--------------------------------------------------------"
+    compare_query "NS Search for zone (+nssearch)" "example.com +nssearch +timeout=2"
+    compare_query "NS Search with TCP (+nssearch +tcp)" "example.com +nssearch +tcp +timeout=2"
 fi
 
 echo "========================================================"
