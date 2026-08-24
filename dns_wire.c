@@ -2222,6 +2222,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
     memset(edns, 0, sizeof(edns_info_t));
     edns->udp_payload_size = 512;
 
+    int opt_rr_count = 0;
     size_t scan_offset = DNS_HEADER_SIZE;
     for (int i = 0; i < qdcount + ancount_req + nscount_req + arcount_req; i++) {
         if (scan_offset >= req_len) break;
@@ -2255,6 +2256,8 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                 uint16_t rdlen = (req[scan_offset+8] << 8) | req[scan_offset+9];
                 
                 if (is_opt && rtype == 41) {
+                    opt_rr_count++;
+                    if (opt_rr_count > 1) return -1; // RFC 6891 §6.1.1: 複数OPT RRはFORMERR
                     edns->present = true;
                     edns->udp_payload_size = rclass;
                     edns->ext_rcode = (ttl >> 24) & 0xFF;
@@ -2323,7 +2326,6 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         }
                         rdata_offset += opt_len;
                     }
-                    break;
                 }
                 scan_offset += 10 + rdlen;
             } else {

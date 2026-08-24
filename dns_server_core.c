@@ -3525,7 +3525,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0 || edns.has_malformed_cookie) {
     memcpy(res, req, DNS_HEADER_SIZE);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
+    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
     memset(&res[4], 0, 8); // qdcount, ancount, nscount, arcount = 0
     return DNS_HEADER_SIZE;
   }
@@ -3602,7 +3602,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01; // FORMERR
+    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     res[6] = 0; res[7] = 0; // ANCOUNT = 0
@@ -3704,7 +3704,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     res[2] |= 0x84; // QR=1, AA=1
     
     if (auth) {
-      res[3] &= 0x0F;
+      res[3] &= 0xF0;
       atomic_store_explicit(&db_entry->refresh_now, true, memory_order_release);
       if (g_control_kq != -1) {
         struct kevent ev;
@@ -3893,7 +3893,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x01;
+    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = copy_len;
     uint16_t arcount = 0;
@@ -3915,7 +3915,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                 size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
                 memcpy(res, req, copy_len);
                 res[2] |= 0x80;
-                res[3] = (res[3] & 0x0F) | 0x02; // SERVFAIL
+                res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
                 add_ede(&edns, cfg_for_ede->send_extended_errors, 3, "Zone expired (SOA EXPIRE exceeded)");
                 uint16_t offset = copy_len;
                 uint16_t arcount = 0;
@@ -3958,7 +3958,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
-    res[3] = (res[3] & 0x0F) | 0x05;
+    res[3] = (res[3] & 0xF0) | 0x05; // REFUSED
     add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
     uint16_t offset = copy_len;
     uint16_t arcount = 0;
@@ -3974,7 +3974,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   q_offset += 4;
   memcpy(res, req, q_offset);
   res[2] |= 0x84;
-  res[3] &= 0x0F;
+  res[3] &= 0xF0;
   uint16_t *res_ancount = (uint16_t *)&res[6],
            *res_nscount = (uint16_t *)&res[8],
            *res_arcount = (uint16_t *)&res[10];
@@ -4675,7 +4675,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   memset(res, 0, 65535);
   memcpy(res, req, q_offset);
   res[2] |= 0x84;
-  res[3] &= 0x0F;
+  res[3] &= 0xF0;
   res[8] = 0;
   res[9] = 0;
   res[10] = 0;
@@ -4770,7 +4770,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     memcpy(res, req, q_offset); \
     memset(&comp_ctx, 0, sizeof(comp_ctx)); \
     compress_ctx_init_packet(&comp_ctx); \
-    res[2] |= 0x84; res[3] &= 0x0F; \
+    res[2] |= 0x84; res[3] &= 0xF0; \
     res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
     if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
       syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer", \

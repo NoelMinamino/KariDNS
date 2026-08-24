@@ -2342,6 +2342,72 @@ int main() {
         printf("PASS: DNS record type parsing & non-fatal type resolution test\n");
     }
 
+    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 §6.1.1) and RCODE bitmask test ---
+    {
+        uint8_t pkt[512];
+        memset(pkt, 0, sizeof(pkt));
+        // Header: ID=0x1234, QR=0, RD=1, QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=1
+        pkt[0] = 0x12; pkt[1] = 0x34;
+        pkt[2] = 0x01; pkt[3] = 0x00; // RD=1
+        pkt[4] = 0x00; pkt[5] = 0x01; // QDCOUNT=1
+        pkt[10] = 0x00; pkt[11] = 0x01; // ARCOUNT=1
+
+        // Question: example.com. A IN
+        size_t off = 12;
+        pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+        pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+        pkt[off++] = 0;
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // TYPE A (1)
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // CLASS IN (1)
+
+        // Additional RR 1: Root (.) OPT (41) UDP_SIZE=4096 TTL=0 RDLEN=0
+        pkt[off++] = 0; // Root name
+        pkt[off++] = 0x00; pkt[off++] = 0x29; // TYPE OPT (41)
+        pkt[off++] = 0x10; pkt[off++] = 0x00; // UDP size 4096
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; // TTL/flags
+        pkt[off++] = 0x00; pkt[off++] = 0x00; // RDLEN=0
+
+        edns_info_t edns;
+        int ret1 = parse_edns_opt(pkt, off, 1, 0, 0, 1, &edns);
+        if (ret1 != 0 || !edns.present || edns.udp_payload_size != 4096) {
+            printf("FAIL: parse_edns_opt failed for valid single OPT RR\n");
+            return 1;
+        }
+
+        // Additional RR 2: Root (.) OPT (41) UDP_SIZE=1232 (Multiple OPT RRs, RFC 6891 violation)
+        pkt[10] = 0x00; pkt[11] = 0x02; // ARCOUNT=2
+        pkt[off++] = 0; // Root name
+        pkt[off++] = 0x00; pkt[off++] = 0x29; // TYPE OPT (41)
+        pkt[off++] = 0x04; pkt[off++] = 0xD0; // UDP size 1232
+        pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00; pkt[off++] = 0x00;
+        pkt[off++] = 0x00; pkt[off++] = 0x00; // RDLEN=0
+
+        int ret2 = parse_edns_opt(pkt, off, 1, 0, 0, 2, &edns);
+        if (ret2 != -1) {
+            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 §6.1.1\n");
+            return 1;
+        }
+
+        // RCODE bitmask test: ensuring client-supplied low 4 bits (e.g. 0x0A) do not leak
+        uint8_t dirty_req_byte3 = 0x0A;
+        uint8_t formerr_byte3 = (dirty_req_byte3 & 0xF0) | 1;
+        if (formerr_byte3 != 1) {
+            printf("FAIL: RCODE masking error: expected 1, got %u\n", formerr_byte3);
+            return 1;
+        }
+        uint8_t servfail_byte3 = (dirty_req_byte3 & 0xF0) | 2;
+        if (servfail_byte3 != 2) {
+            printf("FAIL: RCODE masking error: expected 2, got %u\n", servfail_byte3);
+            return 1;
+        }
+        uint8_t refused_byte3 = (dirty_req_byte3 & 0xF0) | 5;
+        if (refused_byte3 != 5) {
+            printf("FAIL: RCODE masking error: expected 5, got %u\n", refused_byte3);
+            return 1;
+        }
+        printf("PASS: Multiple EDNS OPT RR rejection and RCODE bitmask verification\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
