@@ -82,6 +82,8 @@ jobs:
             sh ./tests/run_dag_cli_options_test.sh
             sh ./tests/run_dag_trace_nssearch_tcp_test.sh
             sh ./tests/run_dag_yaml_rdata_test.sh
+            sh ./tests/run_dag_badcookie_transport_test.sh
+            sh ./tests/run_dag_keepopen_keepalive_test.sh
             sh ./tests/run_dag_ci_test.sh
             echo "::endgroup::"
 

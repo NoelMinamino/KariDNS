@@ -243,8 +243,17 @@ dag [global-queryopt...] [query...]
 `+[no]dnssec`, `+[no]do`
 : Set the **DO (DNSSEC OK)** bit in the EDNS0 OPT record, requesting DNSSEC RRs (RRSIG, NSEC, NSEC3, DS) from the authoritative server.
 
+`+[no]keepopen`
+: Keep the TCP or TLS socket open between consecutive queries to the same nameserver (RFC 7766 DNS over TCP connection reuse).
+
+`+[no]keepalive`
+: Send the **EDNS TCP Keepalive (RFC 7828)** option (Option Code 11) in the OPT pseudo-RR.
+
+`+[no]expire`
+: Send the **EDNS EXPIRE (RFC 7314)** option (Option Code 9) in query and highlight the zone expiration TTL field in SOA responses.
+
 `+[no]cookie[=hex]`
-: Send the EDNS COOKIE option (RFC 7873 / RFC 9018). If `hex` is supplied, uses the exact 16-hex-digit (8-byte) client cookie and optional server cookie; otherwise, generates a random 8-byte client cookie.
+: Send the **DNS Cookie (RFC 7873 / RFC 9018)** option. If `hex` is supplied, sets the client (8 bytes) or client+server cookie value. If omitted, a random 8-byte client cookie is generated.
 
 `+[no]badcookie`
 : Automatically retry the query once if the server returns a `BADCOOKIE` error, attaching the returned Server Cookie. Enabled by default.

@@ -568,6 +568,7 @@ typedef struct {
     uint16_t ednsflags_z;
 
     bool want_nsid;
+    bool want_expire_opt;
 
     bool want_cookie;
     uint8_t client_cookie[8];
@@ -914,6 +915,13 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
         if ((size_t)offset + 4 > max_len) goto done;
         pkt[offset++] = 0x00; pkt[offset++] = 0x03; /* OPTION-CODE = NSID */
         pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* OPTION-LENGTH = 0 (empty request) */
+    }
+
+    if (qo->want_expire_opt) {
+        if ((size_t)offset + 4 <= max_len) {
+            pkt[offset++] = 0x00; pkt[offset++] = 0x09; /* OPTION-CODE = EDNS EXPIRE (RFC 7314) */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* OPTION-LENGTH = 0 */
+        }
     }
 
     if (qo->send_keepalive) {
@@ -1599,6 +1607,43 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
     return n;
 }
 
+typedef struct {
+    int sock;
+    SSL *ssl;
+    char server[256];
+    int port;
+    int pref_family;
+    char bind_addr[64];
+    int bind_port;
+    bool is_tls;
+} tcp_conn_cache_t;
+
+static tcp_conn_cache_t g_cached_conn = {
+    .sock = -1,
+    .ssl = NULL,
+    .server = {0},
+    .port = 0,
+    .pref_family = AF_UNSPEC,
+    .bind_addr = {0},
+    .bind_port = 0,
+    .is_tls = false
+};
+
+static void close_cached_tcp(void) {
+    if (g_cached_conn.ssl) {
+        SSL_shutdown(g_cached_conn.ssl);
+        SSL_free(g_cached_conn.ssl);
+        g_cached_conn.ssl = NULL;
+    }
+    if (g_cached_conn.sock >= 0) {
+        close(g_cached_conn.sock);
+        g_cached_conn.sock = -1;
+    }
+    g_cached_conn.server[0] = '\0';
+    g_cached_conn.port = 0;
+    g_cached_conn.is_tls = false;
+}
+
 static int do_tcp_send_request(const char *server, int port, const query_opts_t *qo, const uint8_t *pkt, size_t pkt_len, int timeout_sec) {
     int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
     if (sock < 0) return -1;
@@ -1747,19 +1792,78 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
 static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
-    int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
-    if (sock < 0) return -1;
-    set_socket_timeouts(sock, timeout_sec);
-    send_proxyv2_if_enabled(sock, qo, true);
-    SSL *ssl = establish_tls(sock, qo, server, port);
+    SSL *ssl = NULL;
+    int sock = -1;
+    bool reused = false;
+
+    if (qo && qo->keep_tcp_open) {
+        if (g_cached_conn.sock >= 0 && g_cached_conn.is_tls && g_cached_conn.ssl &&
+            strcmp(g_cached_conn.server, server) == 0 && g_cached_conn.port == port &&
+            g_cached_conn.pref_family == qo->pref_family &&
+            strcmp(g_cached_conn.bind_addr, qo->bind_addr) == 0 &&
+            g_cached_conn.bind_port == qo->bind_port) {
+            sock = g_cached_conn.sock;
+            ssl = g_cached_conn.ssl;
+            reused = true;
+        } else {
+            close_cached_tcp();
+        }
+    } else {
+        close_cached_tcp();
+    }
+
     if (!ssl) {
-        close(sock);
+        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        if (sock < 0) return -1;
+        set_socket_timeouts(sock, timeout_sec);
+        send_proxyv2_if_enabled(sock, qo, true);
+        ssl = establish_tls(sock, qo, server, port);
+        if (!ssl) {
+            close(sock);
+            return -1;
+        }
+        if (qo && qo->keep_tcp_open) {
+            g_cached_conn.sock = sock;
+            g_cached_conn.ssl = ssl;
+            snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+            g_cached_conn.port = port;
+            g_cached_conn.pref_family = qo->pref_family;
+            snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+            g_cached_conn.bind_port = qo->bind_port;
+            g_cached_conn.is_tls = true;
+        }
+    }
+
+    uint8_t len_prefix[2] = { (uint8_t)(pkt_len >> 8), (uint8_t)(pkt_len & 0xFF) };
+    bool write_ok = (SSL_write(ssl, len_prefix, 2) > 0 && SSL_write(ssl, pkt, (int)pkt_len) > 0);
+    if (!write_ok && reused) {
+        close_cached_tcp();
+        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        if (sock < 0) return -1;
+        set_socket_timeouts(sock, timeout_sec);
+        send_proxyv2_if_enabled(sock, qo, true);
+        ssl = establish_tls(sock, qo, server, port);
+        if (!ssl) { close(sock); return -1; }
+        if (qo && qo->keep_tcp_open) {
+            g_cached_conn.sock = sock;
+            g_cached_conn.ssl = ssl;
+            snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+            g_cached_conn.port = port;
+            g_cached_conn.pref_family = qo->pref_family;
+            snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+            g_cached_conn.bind_port = qo->bind_port;
+            g_cached_conn.is_tls = true;
+        }
+        if (SSL_write(ssl, len_prefix, 2) <= 0 || SSL_write(ssl, pkt, (int)pkt_len) <= 0) {
+            close_cached_tcp();
+            return -1;
+        }
+    } else if (!write_ok) {
+        close_cached_tcp();
+        if (!(qo && qo->keep_tcp_open)) { SSL_shutdown(ssl); SSL_free(ssl); close(sock); }
         return -1;
     }
-    uint8_t len_prefix[2] = { (uint8_t)(pkt_len >> 8), (uint8_t)(pkt_len & 0xFF) };
-    if (SSL_write(ssl, len_prefix, 2) <= 0 || SSL_write(ssl, pkt, (int)pkt_len) <= 0) {
-        SSL_shutdown(ssl); SSL_free(ssl); close(sock); return -1;
-    }
+
     uint8_t rlen_buf[2];
     int got = 0;
     while (got < 2) {
@@ -1768,7 +1872,9 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         got += r;
     }
     if (got < 2) {
-        SSL_shutdown(ssl); SSL_free(ssl); close(sock); return -1;
+        close_cached_tcp();
+        if (!(qo && qo->keep_tcp_open)) { SSL_shutdown(ssl); SSL_free(ssl); close(sock); }
+        return -1;
     }
     uint16_t rlen = (rlen_buf[0] << 8) | rlen_buf[1];
     if (rlen > resp_cap) rlen = (uint16_t)resp_cap;
@@ -1778,9 +1884,12 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         if (r <= 0) break;
         total_read += r;
     }
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(sock);
+
+    if (!(qo && qo->keep_tcp_open)) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(sock);
+    }
     return (ssize_t)total_read;
 }
 
@@ -1902,25 +2011,99 @@ err:
 static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
-    int sock = do_tcp_send_request(server, port, qo, pkt, pkt_len, timeout_sec);
-    if (sock < 0) return -1;
+    int sock = -1;
+    bool reused = false;
+
+    if (qo && qo->keep_tcp_open) {
+        if (g_cached_conn.sock >= 0 && !g_cached_conn.is_tls &&
+            strcmp(g_cached_conn.server, server) == 0 && g_cached_conn.port == port &&
+            g_cached_conn.pref_family == qo->pref_family &&
+            strcmp(g_cached_conn.bind_addr, qo->bind_addr) == 0 &&
+            g_cached_conn.bind_port == qo->bind_port) {
+            sock = g_cached_conn.sock;
+            reused = true;
+        } else {
+            close_cached_tcp();
+        }
+    } else {
+        close_cached_tcp();
+    }
+
+    if (sock < 0) {
+        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        if (sock < 0) return -1;
+        send_proxyv2_if_enabled(sock, qo, true);
+        if (qo && qo->keep_tcp_open) {
+            g_cached_conn.sock = sock;
+            g_cached_conn.ssl = NULL;
+            snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+            g_cached_conn.port = port;
+            g_cached_conn.pref_family = qo->pref_family;
+            snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+            g_cached_conn.bind_port = qo->bind_port;
+            g_cached_conn.is_tls = false;
+        }
+    }
+
+    set_socket_timeouts(sock, timeout_sec);
+
+    uint16_t prefix_value = (uint16_t)pkt_len;
+    uint8_t len_prefix[2] = { (uint8_t)(prefix_value >> 8), (uint8_t)(prefix_value & 0xFF) };
+
+    bool send_ok = (send(sock, len_prefix, 2, 0) == 2 && send(sock, pkt, pkt_len, 0) == (ssize_t)pkt_len);
+    if (!send_ok && reused) {
+        close_cached_tcp();
+        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        if (sock < 0) return -1;
+        send_proxyv2_if_enabled(sock, qo, true);
+        set_socket_timeouts(sock, timeout_sec);
+        if (qo && qo->keep_tcp_open) {
+            g_cached_conn.sock = sock;
+            g_cached_conn.ssl = NULL;
+            snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+            g_cached_conn.port = port;
+            g_cached_conn.pref_family = qo->pref_family;
+            snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+            g_cached_conn.bind_port = qo->bind_port;
+            g_cached_conn.is_tls = false;
+        }
+        if (send(sock, len_prefix, 2, 0) != 2 || send(sock, pkt, pkt_len, 0) != (ssize_t)pkt_len) {
+            close_cached_tcp();
+            return -1;
+        }
+    } else if (!send_ok) {
+        close_cached_tcp();
+        return -1;
+    }
+
     ssize_t n = do_tcp_recv_response(sock, resp, resp_cap);
-    close(sock);
+    if (n < 0 || !(qo && qo->keep_tcp_open)) {
+        close_cached_tcp();
+        if (!(qo && qo->keep_tcp_open)) close(sock);
+    }
     return n;
+}
+
+static ssize_t do_dns_exchange_by_transport(const char *server, int port, const query_opts_t *qo,
+                                            bool use_tcp, const uint8_t *pkt, size_t pkt_len,
+                                            uint8_t *resp, size_t resp_cap, int timeout_sec) {
+    if (qo && qo->use_doh) {
+        return do_doh_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+    } else if (qo && qo->use_tls) {
+        return do_tls_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+    } else if (use_tcp) {
+        return do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+    } else {
+        return do_udp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+    }
 }
 
 static ssize_t do_dns_exchange_auto(const char *server, int port, const query_opts_t *qo,
                                      const uint8_t *pkt, size_t pkt_len,
                                      uint8_t *resp, size_t resp_cap, int timeout_sec,
                                      bool force_tcp) {
-    if (qo && qo->use_doh) {
-        return do_doh_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
-    }
-    if (qo && qo->use_tls) {
-        return do_tls_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
-    }
-    if (force_tcp) {
-        return do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+    if (force_tcp || (qo && (qo->use_doh || qo->use_tls))) {
+        return do_dns_exchange_by_transport(server, port, qo, force_tcp, pkt, pkt_len, resp, resp_cap, timeout_sec);
     }
     ssize_t n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
     if (n >= 4 && (resp[2] & 0x02) != 0) { // TC bit detected (truncation)
@@ -3254,6 +3437,17 @@ static const char *idn_to_ascii(const char *name, bool *allocated) {
         return p;
     }
     fprintf(stderr, ";; IDN conversion failed: %s\n", idn2_strerror(rc));
+#else
+    static bool warned = false;
+    bool looks_non_ascii = false;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (*p >= 0x80) { looks_non_ascii = true; break; }
+    }
+    if (looks_non_ascii && !warned) {
+        fprintf(stderr, ";; WARNING: this build of dag was compiled without libidn2; "
+                        "IDN conversion for '%s' was skipped and the name will be sent as-is\n", name);
+        warned = true;
+    }
 #endif
     return name;
 }
@@ -3386,6 +3580,13 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
                     if (family == 1) inet_ntop(AF_INET, addr, abuf, sizeof(abuf));
                     else if (family == 2) inet_ntop(AF_INET6, addr, abuf, sizeof(abuf));
                     printf("; CLIENT-SUBNET: %s/%u/%u\n", abuf, src_prefix, scope_prefix);
+                } else if (code == 9) {
+                    if (olen >= 4) {
+                        uint32_t exp_sec = ((uint32_t)pkt[p]<<24)|((uint32_t)pkt[p+1]<<16)|((uint32_t)pkt[p+2]<<8)|pkt[p+3];
+                        printf("; EXPIRE: %u (seconds)\n", exp_sec);
+                    } else {
+                        printf("; EXPIRE\n");
+                    }
                 } else if (code == 11) {
                     if (olen >= 2) {
                         uint16_t to = (pkt[p] << 8) | pkt[p+1];
@@ -4039,7 +4240,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 qo->server_cookie_len = bc_edns.server_cookie_len;
                 memcpy(qo->server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
                 pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
-                n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                n = do_dns_exchange_by_transport(server, port, qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
             }
         }
 
@@ -4061,19 +4262,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 printf(";; BADVERS, retrying with EDNS version %d.\n", qo->edns_version - 1);
                 qo->edns_version -= 1;
                 pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
-                if (qo->use_doh) {
-                    n = do_doh_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
-                } else if (qo->use_tls) {
-                    n = do_tls_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
-                } else if (use_tcp) {
-                    int s = do_tcp_send_request(server, port, qo, pkt, pkt_len, qo->timeout_sec);
-                    if (s >= 0) {
-                        n = do_tcp_recv_response(s, resp, sizeof(resp));
-                        close(s);
-                    }
-                } else {
-                    n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
-                }
+                n = do_dns_exchange_by_transport(server, port, qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
             }
         }
 
@@ -4277,13 +4466,13 @@ static void print_multi_server_summary(bool use_ldnsz) {
     printf("\n;; === MULTI-SERVER COMPARISON SUMMARY ===\n");
     
     // 2. ヘッダの出力 ( %-*s を使って動的幅を指定 )
-    printf("%-*s | %-5s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
+    printf("%-*s | %-5s | %-7s | %3s | %3s | %3s | %-13s | %-6s | %s\n", 
            max_server_len, "SERVER", "PROTO", "RCODE", "ANS", "AUT", "ADD", 
-           g_want_allcompare ? "STR_HASH" : "SEM_HASH", "TIME", "MATCH STATUS");
+           g_want_allcompare ? "SEM_HASH(+TTL)" : "SEM_HASH", "TIME", "MATCH STATUS");
     
     // 3. 区切り線の出力 ( max_server_len の分だけ '-' を出力 )
     for (int i = 0; i < max_server_len; i++) printf("-");
-    printf("-+-------+---------+-----+-----+-----+------------+--------+------------------------\n");
+    printf("-+-------+---------+-----+-----+-----+---------------+--------+------------------------\n");
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
@@ -4398,7 +4587,7 @@ static void usage(const char *prog) {
         "  +[no]proxy[=spec]            Inject PROXYv2 transport header (e.g. +proxy=192.0.2.1#1234-192.0.2.2#53)\n"
         "  +[no]proxy-plain[=spec]      Inject PROXYv2 header ahead of TLS encryption layer\n"
         "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828)\n"
-        "  +[no]keepopen                Keep TCP socket open between consecutive queries\n"
+        "  +[no]keepopen                Keep TCP socket open between consecutive queries (RFC 7766)\n"
         "  +[no]dns64prefix             Query IPv4-only prefix from ipv4only.arpa (RFC 7050)\n"
         "  +timeout=N                   Query timeout in seconds [5]\n"
         "  +tries=N / +retry=N          Number of query attempts [1]\n"
@@ -5929,8 +6118,11 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->dopt.ttlid = false;
         } else if (strcmp(arg, "+expire") == 0) {
             spec->dopt.expire = true;
+            spec->qo.want_opt = true;
+            spec->qo.want_expire_opt = true;
         } else if (strcmp(arg, "+noexpire") == 0) {
             spec->dopt.expire = false;
+            spec->qo.want_expire_opt = false;
         } else if (strcmp(arg, "+showsearch") == 0) {
             spec->dopt.showsearch = true;
         } else if (strcmp(arg, "+noshowsearch") == 0) {
@@ -6576,6 +6768,7 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    close_cached_tcp();
     zone_arena_destroy(&g_dag_arena);
     if (g_results) free(g_results);
 #ifdef _WIN32
