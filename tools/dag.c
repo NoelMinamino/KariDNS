@@ -1683,7 +1683,7 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
 
         struct timeval tv;
         tv.tv_sec = (time_t)remain_sec;
-        tv.tv_usec = (suseconds_t)remain_usec;
+        tv.tv_usec = (long)remain_usec;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 
         ssize_t n = recv(sock, resp, resp_cap, 0);
