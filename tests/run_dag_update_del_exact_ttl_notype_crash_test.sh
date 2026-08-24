@@ -10,13 +10,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DAG="${DAG:-$BIN_DIR/dag}"
-if [ ! -x "$DAG" ]; then
-    DAG="./dag"
-fi
-
-if [ ! -x "$DAG" ]; then
-    echo "Error: dag executable not found at $DAG"
-    exit 1
+if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
+    if ! command -v "$DAG" >/dev/null 2>&1; then
+        echo "Error: dig executable not found"
+        exit 1
+    fi
+else
+    if [ ! -x "$DAG" ]; then
+        DAG="$BIN_DIR/dag"
+    fi
+    if [ ! -x "$DAG" ]; then
+        DAG="./dag"
+    fi
+    if [ ! -x "$DAG" ]; then
+        echo "Error: dag executable not found at $DAG"
+        exit 1
+    fi
 fi
 
 echo "Running: test_dag_update_del_exact_ttl_notype_crash"

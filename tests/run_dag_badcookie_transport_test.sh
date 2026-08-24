@@ -72,6 +72,9 @@ sleep 0.5
 
 # 3.1 +allcompare header test (multi-server comparison summary)
 run_check "+allcompare displays SEM_HASH(+TTL) header" "$DAG @127.0.0.1,127.0.0.1 -p $PORT example.com A +allcompare +timeout=2" "SEM_HASH\(\+TTL\)"
+run_check "+allcompare with +cookie" "$DAG @127.0.0.1,127.0.0.1 -p $PORT example.com A +cookie +allcompare +timeout=2" "SEM_HASH\(\+TTL\)"
+run_check "+allcompare with +tcp +timeout=2" "$DAG @127.0.0.1,127.0.0.1 -p $PORT example.com A +tcp +timeout=2 +allcompare" "SEM_HASH\(\+TTL\)"
+run_check "+allcompare with +time=2" "$DAG @127.0.0.1,127.0.0.1 -p $PORT example.com A +time=2 +allcompare" "SEM_HASH\(\+TTL\)"
 run_check "default comparison displays SEM_HASH header" "$DAG @127.0.0.1,127.0.0.1 -p $PORT example.com A +timeout=2" "SEM_HASH\s*\|"
 
 # 3.2 BADCOOKIE transport retention on retry

@@ -701,6 +701,8 @@ typedef struct {
     int split_width;
     bool force_unknown_format;
     bool ttlunits;
+    bool has_expected_client_cookie;
+    uint8_t expected_client_cookie[8];
 } display_opts_t;
 
 static const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size) {
@@ -1606,13 +1608,16 @@ static int connect_tcp(const char *server, int port, int pref_family, const char
             struct timeval tv = { .tv_sec = (timeout_sec > 0) ? timeout_sec : 5, .tv_usec = 0 };
             int sel = select(sock + 1, NULL, &wfds, NULL, &tv);
             if (sel <= 0) {
+                fprintf(stderr, ";; connection to %s#%d timed out after %ds\n", server, port, (timeout_sec > 0) ? timeout_sec : 5);
                 close(sock); return -1;
             }
             int sock_err = 0; socklen_t err_len = sizeof(sock_err);
             if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&sock_err, &err_len) < 0 || sock_err != 0) {
+                fprintf(stderr, ";; connect to %s#%d failed: %s\n", server, port, strerror(sock_err ? sock_err : errno));
                 close(sock); return -1;
             }
         } else {
+            fprintf(stderr, ";; connect to %s#%d failed: %s\n", server, port, strerror(errno));
             close(sock); return -1;
         }
     }
@@ -4025,6 +4030,11 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
     }
 
     if (dopt->show_comments) {
+        if (edns.present && edns.has_cookie && dopt->has_expected_client_cookie) {
+            if (memcmp(dopt->expected_client_cookie, edns.client_cookie, 8) != 0) {
+                printf(";; Warning: Client COOKIE mismatch\n\n");
+            }
+        }
         printf(";; Got answer:\n");
         printf(";; ->>HEADER<<- opcode: %s, status: %s, id: %u\n", opcode_name(opcode), rcode_name(full_rcode), qid);
         printf(";; flags:%s%s%s%s%s%s; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n",
@@ -4051,6 +4061,14 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
             for (int i = 0; i < 8; i++) printf("%02x", edns.client_cookie[i]);
             if (edns.server_cookie_len > 0) {
                 for (uint16_t i = 0; i < edns.server_cookie_len; i++) printf("%02x", edns.server_cookie[i]);
+            }
+            if (dopt->has_expected_client_cookie) {
+                if (memcmp(dopt->expected_client_cookie, edns.client_cookie, 8) == 0) {
+                    printf(" (good)");
+                } else {
+                    printf(" (bad)");
+                }
+            } else if (edns.server_cookie_len > 0) {
                 printf(" (good)");
             }
             printf("\n");
@@ -4181,6 +4199,12 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     }
 
     uint16_t qtype = 0;
+    display_opts_t effective_dopt = *dopt;
+    if (qo->want_cookie) {
+        effective_dopt.has_expected_client_cookie = true;
+        memcpy(effective_dopt.expected_client_cookie, qo->client_cookie, 8);
+    }
+    dopt = &effective_dopt;
     if (strncasecmp(qtype_s, "IXFR=", 5) == 0) {
         qtype = 251;
         qo->is_ixfr = true;

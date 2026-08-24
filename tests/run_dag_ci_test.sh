@@ -245,6 +245,9 @@ else
     run_check "Multi-Server query list" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A" "192\.0\.2\.10"
     run_check "LDNS-style summary (+ldnsz)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +ldnsz" "127\.0\.0\.1"
     run_check "Comparison matrix (+allcompare)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +allcompare" "127\.0\.0\.1"
+    run_check "Comparison matrix with Cookie (+allcompare +cookie)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +cookie +allcompare" "127\.0\.0\.1"
+    run_check "Comparison matrix with TCP timeout (+allcompare +tcp +timeout=2)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +tcp +timeout=2 +allcompare" "127\.0\.0\.1"
+    run_check "Comparison matrix with +time alias (+allcompare +time=2)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +time=2 +allcompare" "127\.0\.0\.1"
     run_check "Server failover (+nofail)" "$DAG @127.0.0.1:19999,127.0.0.1:$PORT www.example.com A +nofail +timeout=1 +tries=1" "192\.0\.2\.10"
 fi
 
@@ -425,8 +428,10 @@ fi
 if command -v perl >/dev/null 2>&1; then
     run_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"
     run_check "Security: UDP transaction ID mismatch discard (tests/run_dag_udp_id_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_id_mismatch_discard_test.sh\"" "PASS:"
+    run_check "Security: DNS Cookie mismatch discard (tests/run_dag_cookie_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cookie_mismatch_discard_test.sh\"" "PASS:"
     run_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
 fi
+run_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
