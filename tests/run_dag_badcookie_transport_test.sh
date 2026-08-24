@@ -11,11 +11,33 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "=== Building dag and karidns with make ==="
 make -C "$ROOT_DIR" dag karidns
 
-DAG="$ROOT_DIR/dag"
-KARIDNS="$ROOT_DIR/karidns"
+DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
+KARIDNS="${KARIDNS:-$ROOT_DIR/karidns}"
 
-if [ ! -x "$DAG" ] || [ ! -x "$KARIDNS" ]; then
-    echo "dag or karidns binary not found"
+if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
+    DAG="dig"
+    if ! command -v "$DAG" >/dev/null 2>&1; then
+        echo "Error: dig executable not found"
+        exit 1
+    fi
+else
+    if [ ! -x "$DAG" ]; then
+        DAG="$ROOT_DIR/dag"
+    fi
+    if [ ! -x "$DAG" ]; then
+        DAG="./dag"
+    fi
+    if [ ! -x "$DAG" ]; then
+        echo "Error: dag executable not found at $DAG"
+        exit 1
+    fi
+fi
+
+if [ ! -x "$KARIDNS" ]; then
+    KARIDNS="./karidns"
+fi
+if [ ! -x "$KARIDNS" ]; then
+    echo "Error: karidns binary not found at $KARIDNS"
     exit 1
 fi
 

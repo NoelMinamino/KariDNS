@@ -230,7 +230,7 @@ run_check "Search list and ndots expansion (+search +domain +ndots=2)" "$DAG @12
 run_check "Search list not expanded when ndots exceeded (+ndots=1)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=1 +search" "(NXDOMAIN|SERVFAIL|REFUSED|no servers could be reached|got NXDOMAIN)"
 run_check "Showsearch diagnostic (+showsearch)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +showsearch" "192\.0\.2\.10"
 run_check "DNS64 prefix check (+dns64prefix)" "$DAG @127.0.0.1 -p $PORT ipv4only.arpa AAAA +dns64prefix +qr" ";ipv4only\.arpa\..*IN.*AAAA"
-run_check "PROXYv2 local header (+proxy)" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy +timeout=1" "(192\.0\.2\.10|timed out|no usable response|NOTIMP|Got bad packet|ID mismatch)"
+run_check "PROXYv2 local header (+proxy)" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy +timeout=1" "(192\.0\.2\.10|timed out|no usable response)"
 run_check "Plain HTTP query (+http-plain)" "$DAG @127.0.0.1 -p $PORT www.example.com A +http-plain +timeout=1" "(192\.0\.2\.10|timed out|connection failed|no usable response)"
 
 echo "========================================================"
@@ -432,6 +432,7 @@ if command -v perl >/dev/null 2>&1; then
     run_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
 fi
 run_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
+run_check "Features: +trace & +nssearch TCP validation (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then

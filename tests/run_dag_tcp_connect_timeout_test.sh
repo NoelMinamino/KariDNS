@@ -8,8 +8,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DAG="${DAG:-$BIN_DIR/dag}"
+DAG="${1:-${DAG:-$BIN_DIR/dag}}"
 if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
+    DAG="dig"
     if ! command -v "$DAG" >/dev/null 2>&1; then
         echo "Error: dig executable not found"
         exit 1
@@ -42,14 +43,12 @@ if [ "$DURATION" -gt 5 ]; then
     exit 1
 fi
 
-# Verify timeout indication or failure exit
-if [ "$DAG" != "dig" ]; then
-    echo "$OUT" | grep -q -i -E "timed out|no usable response" || {
-        echo "FAIL: Expected timeout indication in output"
-        echo "$OUT"
-        exit 1
-    }
-fi
+# Verify timeout indication on both dig and dag
+echo "$OUT" | grep -q -i -E "timed out|no servers could be reached|no usable response" || {
+    echo "FAIL: Expected timeout indication in output"
+    echo "$OUT"
+    exit 1
+}
 
 echo "PASS: test_dag_tcp_connect_timeout (completed in ${DURATION}s)"
 exit 0

@@ -9,8 +9,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DAG="${DAG:-$BIN_DIR/dag}"
+DAG="${1:-${DAG:-$BIN_DIR/dag}}"
 if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
+    DAG="dig"
     if ! command -v "$DAG" >/dev/null 2>&1; then
         echo "Error: dig executable not found"
         exit 1
