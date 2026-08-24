@@ -5730,7 +5730,7 @@ static void reload_all_zones(void) {
                 void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
                 catalog_process_membership(entry, zcfg, vcfg->name);
               }
-            } else if (zcfg->type && strcasecmp(zcfg->type, "slave") == 0) {
+            } else if (zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0)) {
               syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
               atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
             }
@@ -5967,7 +5967,7 @@ void *control_thread_func(void *arg) {
                             send(cfd, "ERROR missing SOA\n", 18, 0);
                             break;
                     }
-                  } else if (lr.zcfg->type && strcasecmp(lr.zcfg->type, "slave") == 0) {
+                  } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {
                     syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", lr.zcfg->domain);
                     atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
                     send(cfd, "OK reloaded (slave)\n", 20, 0);
@@ -6145,7 +6145,7 @@ void *control_thread_func(void *arg) {
                         strncpy(tsig_key_name, entry->cached_tsig_key_name, sizeof(tsig_key_name) - 1);
                     } else {
                         zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
-                        if (zcfg && zcfg->type && strcasecmp(zcfg->type, "slave") == 0 &&
+                        if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
                             zcfg->masters_count > 0 && zcfg->masters[0].ip != NULL) {
                             is_slave = true;
                             strncpy(master_ip, zcfg->masters[0].ip, sizeof(master_ip) - 1);

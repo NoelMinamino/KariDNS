@@ -2820,9 +2820,81 @@ int main() {
 
     // --- Test 39: Duplicate zone/view/key block rejection & FIFO key order ---
     {
-        // 1. Duplicate top-level zone
+        // 1. 正常系: 異なるドメイン名を持つ複数トップレベルゾーン
+        const char *valid_zones_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; };\n";
+        server_config_t cfg_vz;
+        memset(&cfg_vz, 0, sizeof(cfg_vz));
+        if (parse_named_conf_ext(valid_zones_conf, NULL, &cfg_vz) != 0) {
+            printf("FAIL: Valid multiple top-level zones failed to parse\n");
+            return 1;
+        }
+        if (!cfg_vz.zones || !cfg_vz.zones->next) {
+            printf("FAIL: Valid multiple top-level zones count mismatch\n");
+            free_server_config_fields(&cfg_vz);
+            return 1;
+        }
+        free_server_config_fields(&cfg_vz);
+
+        // 2. 正常系: 異なるビュー名を持つ複数ビュー
+        const char *valid_views_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
+            "view \"external\" { zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; }; };\n";
+        server_config_t cfg_vv;
+        memset(&cfg_vv, 0, sizeof(cfg_vv));
+        if (parse_named_conf_ext(valid_views_conf, NULL, &cfg_vv) != 0) {
+            printf("FAIL: Valid multiple views failed to parse\n");
+            return 1;
+        }
+        if (!cfg_vv.views || !cfg_vv.views->next) {
+            printf("FAIL: Valid multiple views count mismatch\n");
+            free_server_config_fields(&cfg_vv);
+            return 1;
+        }
+        free_server_config_fields(&cfg_vv);
+
+        // 3. 正常系: ビュー内の異なるゾーン
+        const char *valid_view_zones_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "view \"internal\" {\n"
+            "  zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
+            "  zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; };\n"
+            "};\n";
+        server_config_t cfg_vvz;
+        memset(&cfg_vvz, 0, sizeof(cfg_vvz));
+        if (parse_named_conf_ext(valid_view_zones_conf, NULL, &cfg_vvz) != 0) {
+            printf("FAIL: Valid zones inside view failed to parse\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg_vvz);
+
+        // 4. 正常系: 複数TSIGキー（FIFO定義順序の検証）
+        const char *valid_keys_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"key1\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
+            "key \"key2\" { algorithm hmac-sha256; secret \"k999999999012345678901234567890123456789012=\"; };\n";
+        server_config_t cfg_vk;
+        memset(&cfg_vk, 0, sizeof(cfg_vk));
+        if (parse_named_conf_ext(valid_keys_conf, NULL, &cfg_vk) != 0) {
+            printf("FAIL: Valid config with multiple keys failed to parse\n");
+            return 1;
+        }
+        if (!cfg_vk.keys || strcmp(cfg_vk.keys->name, "key1") != 0 ||
+            !cfg_vk.keys->next || strcmp(cfg_vk.keys->next->name, "key2") != 0) {
+            printf("FAIL: Keys list is not in FIFO definition order (got %s -> %s)\n",
+                   cfg_vk.keys ? cfg_vk.keys->name : "NULL",
+                   (cfg_vk.keys && cfg_vk.keys->next) ? cfg_vk.keys->next->name : "NULL");
+            free_server_config_fields(&cfg_vk);
+            return 1;
+        }
+        free_server_config_fields(&cfg_vk);
+
+        // 5. 異常系: 重複トップレベルゾーン
         const char *dup_zone_conf =
-            "options { port 53; };\n"
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
             "zone \"example.com\" { type master; file \"/tmp/z2.zone\"; };\n";
         server_config_t cfg1;
@@ -2833,9 +2905,9 @@ int main() {
             return 1;
         }
 
-        // 2. Duplicate key
+        // 6. 異常系: 重複TSIGキー
         const char *dup_key_conf =
-            "options { port 53; };\n"
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "key \"tsig-test\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
             "key \"tsig-test\" { algorithm hmac-sha256; secret \"k999999999012345678901234567890123456789012=\"; };\n";
         server_config_t cfg2;
@@ -2846,9 +2918,9 @@ int main() {
             return 1;
         }
 
-        // 3. Duplicate view
+        // 7. 異常系: 重複ビュー
         const char *dup_view_conf =
-            "options { port 53; };\n"
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
             "view \"internal\" { zone \"example2.com\" { type master; file \"/tmp/z2.zone\"; }; };\n";
         server_config_t cfg3;
@@ -2859,9 +2931,9 @@ int main() {
             return 1;
         }
 
-        // 4. Duplicate zone inside same view
+        // 8. 異常系: 同一ビュー内の重複ゾーン
         const char *dup_view_zone_conf =
-            "options { port 53; };\n"
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" {\n"
             "  zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
             "  zone \"example.com\" { type master; file \"/tmp/z2.zone\"; };\n"
@@ -2874,28 +2946,96 @@ int main() {
             return 1;
         }
 
-        // 5. Valid config with multiple keys (verify FIFO definition order)
-        const char *valid_keys_conf =
-            "options { port 53; };\n"
-            "key \"key1\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
-            "key \"key2\" { algorithm hmac-sha256; secret \"k999999999012345678901234567890123456789012=\"; };\n";
-        server_config_t cfg5;
-        memset(&cfg5, 0, sizeof(cfg5));
-        if (parse_named_conf_ext(valid_keys_conf, NULL, &cfg5) != 0) {
-            printf("FAIL: Valid config with multiple keys failed to parse\n");
-            return 1;
-        }
-        if (!cfg5.keys || strcmp(cfg5.keys->name, "key1") != 0 ||
-            !cfg5.keys->next || strcmp(cfg5.keys->next->name, "key2") != 0) {
-            printf("FAIL: Keys list is not in FIFO definition order (got %s -> %s)\n",
-                   cfg5.keys ? cfg5.keys->name : "NULL",
-                   (cfg5.keys && cfg5.keys->next) ? cfg5.keys->next->name : "NULL");
-            free_server_config_fields(&cfg5);
-            return 1;
-        }
-        free_server_config_fields(&cfg5);
-
         printf("PASS: Duplicate zone/view/key rejection & FIFO key order\n");
+    }
+
+    // --- Test 40: Zone type validation and normalization (primary/master, secondary/slave) ---
+    {
+        // 1. 正常系: primary -> master 正規化
+        const char *primary_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example1.com\" { type primary; file \"/tmp/z1.zone\"; };\n";
+        server_config_t cfg1;
+        memset(&cfg1, 0, sizeof(cfg1));
+        if (parse_named_conf_ext(primary_conf, NULL, &cfg1) != 0) {
+            printf("FAIL: type primary should be accepted\n");
+            return 1;
+        }
+        if (!cfg1.zones || strcmp(cfg1.zones->type, "master") != 0) {
+            printf("FAIL: type primary should be normalized to master (got %s)\n",
+                   cfg1.zones ? cfg1.zones->type : "NULL");
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
+        free_server_config_fields(&cfg1);
+
+        // 2. 正常系: secondary -> slave 正規化
+        const char *secondary_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example2.com\" { type secondary; masters { 192.0.2.1; }; };\n";
+        server_config_t cfg2;
+        memset(&cfg2, 0, sizeof(cfg2));
+        if (parse_named_conf_ext(secondary_conf, NULL, &cfg2) != 0) {
+            printf("FAIL: type secondary should be accepted\n");
+            return 1;
+        }
+        if (!cfg2.zones || strcmp(cfg2.zones->type, "slave") != 0) {
+            printf("FAIL: type secondary should be normalized to slave (got %s)\n",
+                   cfg2.zones ? cfg2.zones->type : "NULL");
+            free_server_config_fields(&cfg2);
+            return 1;
+        }
+        free_server_config_fields(&cfg2);
+
+        // 3. 正常系: master そのまま
+        const char *master_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example3.com\" { type master; file \"/tmp/z3.zone\"; };\n";
+        server_config_t cfg_m;
+        memset(&cfg_m, 0, sizeof(cfg_m));
+        if (parse_named_conf_ext(master_conf, NULL, &cfg_m) != 0) {
+            printf("FAIL: type master should be accepted\n");
+            return 1;
+        }
+        if (!cfg_m.zones || strcmp(cfg_m.zones->type, "master") != 0) {
+            printf("FAIL: type master should be master (got %s)\n",
+                   cfg_m.zones ? cfg_m.zones->type : "NULL");
+            free_server_config_fields(&cfg_m);
+            return 1;
+        }
+        free_server_config_fields(&cfg_m);
+
+        // 4. 正常系: slave そのまま
+        const char *slave_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example4.com\" { type slave; masters { 192.0.2.1; }; };\n";
+        server_config_t cfg_s;
+        memset(&cfg_s, 0, sizeof(cfg_s));
+        if (parse_named_conf_ext(slave_conf, NULL, &cfg_s) != 0) {
+            printf("FAIL: type slave should be accepted\n");
+            return 1;
+        }
+        if (!cfg_s.zones || strcmp(cfg_s.zones->type, "slave") != 0) {
+            printf("FAIL: type slave should be slave (got %s)\n",
+                   cfg_s.zones ? cfg_s.zones->type : "NULL");
+            free_server_config_fields(&cfg_s);
+            return 1;
+        }
+        free_server_config_fields(&cfg_s);
+
+        // 5. 異常系: 未知のゾーン種別を拒絶
+        const char *invalid_type_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "zone \"example5.com\" { type unknown_type; file \"/tmp/z5.zone\"; };\n";
+        server_config_t cfg3;
+        memset(&cfg3, 0, sizeof(cfg3));
+        if (parse_named_conf_ext(invalid_type_conf, NULL, &cfg3) == 0) {
+            printf("FAIL: Unknown zone type should be rejected\n");
+            free_server_config_fields(&cfg3);
+            return 1;
+        }
+
+        printf("PASS: Zone type validation and normalization (primary->master, secondary->slave)\n");
     }
 
     printf("All tests passed safely.\n");

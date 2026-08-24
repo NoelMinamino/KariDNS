@@ -878,8 +878,24 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
       free_token(&tok);
-      if (strcmp(key, "type") == 0)
-        zone->type = val;
+      if (strcmp(key, "type") == 0) {
+        if (strcasecmp(val, "primary") == 0) {
+          free(val);
+          zone->type = strdup("master");
+        } else if (strcasecmp(val, "secondary") == 0) {
+          free(val);
+          zone->type = strdup("slave");
+        } else if (strcasecmp(val, "master") == 0 || strcasecmp(val, "slave") == 0) {
+          zone->type = val;
+        } else {
+          syslog(LOG_ERR, "[Config] Unknown zone type '%s' for zone '%s' (expected master/primary or slave/secondary)", val, zone->domain);
+          fprintf(stderr, "[ERROR] Unknown zone type '%s' for zone '%s' (expected master/primary or slave/secondary)\n", val, zone->domain);
+          free(key);
+          free(val);
+          free_zone_config(zone);
+          return -1;
+        }
+      }
       else if (strcmp(key, "file") == 0)
         zone->file = val;
       else if (strcmp(key, "tsig-key") == 0)
