@@ -3254,6 +3254,13 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             return;
           } else
             (*nscount)++;
+          if (dnssec_ok) {
+            if (!attach_covering_rrsig(current_zone, apex_idx, db_entry->domain, NULL, 6,
+                                       res, max_res_len, offset, comp_ctx, nscount)) {
+              res[2] |= 0x02;
+              return;
+            }
+          }
           break;
         }
       }

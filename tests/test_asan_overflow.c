@@ -2568,6 +2568,79 @@ int main() {
         printf("PASS: notify-source directive parsing and RRL window burst scaling\n");
     }
 
+    // --- Test 36: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses ---
+    {
+        const char *zone_text =
+            "$ORIGIN example.com.\n"
+            "$TTL 3600\n"
+            "@ IN SOA ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600\n"
+            "@ IN RRSIG SOA 13 2 3600 20260901000000 20260801000000 12345 example.com. dGVzdHNpZw==\n";
+
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        char *zone_copy = strdup(zone_text);
+        parse_context_t ctx = {0};
+        ctx.default_origin = "example.com.";
+        ctx.is_standalone_mode = true;
+        if (parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx) < 0) {
+            printf("FAIL: parse_zone_fast failed for SOA + RRSIG zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (build_zone_index(&arena) != 0) {
+            printf("FAIL: build_zone_index failed for SOA + RRSIG zone\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        uint32_t apex_hash = calc_fnv1a_str("example.com.");
+        size_t apex_idx = apex_hash & (arena.hash_size - 1);
+        bool found_soa = false;
+        bool found_rrsig_soa = false;
+
+        for (int i = arena.hash_table[apex_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 6) {
+                found_soa = true;
+            } else if (rec->type_code == 46 && rec->rdata_count >= 9) {
+                if (get_type_code(rec->rdata[0]) == 6) {
+                    found_rrsig_soa = true;
+                }
+            }
+        }
+
+        if (!found_soa || !found_rrsig_soa) {
+            printf("FAIL: Did not find SOA or covering RRSIG(SOA) in zone hash table\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test serialize DNS record for SOA and RRSIG
+        uint8_t buf[2048];
+        uint16_t offset = 12; // after DNS header
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        for (int i = arena.hash_table[apex_idx]; i != -1; i = arena.records[i].next_record) {
+            dns_record_t *rec = &arena.records[i];
+            if (rec->type_code == 6 || (rec->type_code == 46 && get_type_code(rec->rdata[0]) == 6)) {
+                if (serialize_dns_record(buf, sizeof(buf), &offset, rec, &comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+                    printf("FAIL: Failed to serialize SOA or RRSIG record\n");
+                    free(zone_copy);
+                    zone_arena_destroy(&arena);
+                    return 1;
+                }
+            }
+        }
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
