@@ -88,6 +88,7 @@ normalize_output() {
         -e 's/;; Query time: [0-9]+ (msec|usec)/;; Query time: <TIME>/g' \
         -e 's/ in [0-9]+ ms/ in <TIME> ms/g' \
         -e 's/;; WHEN: .*/;; WHEN: <DATE>/g' \
+        -e 's/;; communications error to [0-9a-fA-F.:#]+: end of file/;; communications error to <SERVER>: end of file/g' \
         -e '/;; (no usable response received|connection failed|no servers could be reached)/d' \
         -e '/^;; === MULTI-SERVER COMPARISON SUMMARY ===/,$d' \
         -e 's/\x1b\[[0-9;]*m//g' \
@@ -368,6 +369,35 @@ EOF
     echo "--------------------------------------------------------"
     compare_query "NS Search for zone (+nssearch)" "example.com +nssearch +timeout=2"
     compare_query "NS Search with TCP (+nssearch +tcp)" "example.com +nssearch +tcp +timeout=2"
+
+    echo "--------------------------------------------------------"
+    echo "11. Comprehensive YAML Output Comparison (+yaml)"
+    echo "--------------------------------------------------------"
+    compare_query "YAML: Standard A query" "www.example.com A +yaml +noedns"
+    compare_query "YAML: TXT with special characters & quotes" "example.com TXT +yaml +noedns"
+    compare_query "YAML: Authority & Additional sections (NS)" "example.com NS +yaml +noedns"
+    compare_query "YAML: NXDOMAIN response with SOA" "nonexistent.example.com A +yaml +noedns"
+    compare_query "YAML: EDNS0 Opts (Cookie, Subnet, NSID)" "www.example.com A +yaml +cookie +subnet=192.0.2.0/24 +nsid"
+    compare_query "YAML: Multiple Queries" "www.example.com A example.com TXT +yaml +noedns"
+    compare_query "YAML: DNS64 prefix" "ipv4only.arpa AAAA +dns64prefix +yaml +noedns"
+
+    echo "--------------------------------------------------------"
+    echo "12. DNS64 Prefix Discovery (+dns64prefix)"
+    echo "--------------------------------------------------------"
+    compare_query "DNS64 prefix: Standard mode" "ipv4only.arpa AAAA +dns64prefix +noedns"
+    compare_query "DNS64 prefix: Short mode (+short)" "ipv4only.arpa AAAA +short +dns64prefix +noedns"
+    compare_query "DNS64 prefix: With regular query" "www.example.com A +dns64prefix +noedns"
+
+    echo "--------------------------------------------------------"
+    echo "13. Class Argument Flexibility (-c)"
+    echo "--------------------------------------------------------"
+    compare_query "Class argument: Valid class (-c IN)" "www.example.com A -c IN +noedns"
+    compare_query "Class argument: Fallback on unknown class (-c INVALIDCLASS)" "www.example.com A -c INVALIDCLASS +noedns"
+
+    echo "--------------------------------------------------------"
+    echo "14. TCP Keepopen & Session Transport (+keepopen)"
+    echo "--------------------------------------------------------"
+    compare_query "TCP Keepopen: Multiple queries on single TCP connection" "www.example.com A +tcp +keepopen example.com TXT +tcp +keepopen +noedns"
 fi
 
 echo "========================================================"

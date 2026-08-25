@@ -116,7 +116,7 @@ run_check "Split width (+split=16)" "$DAG @127.0.0.1 -p $PORT crypto.example DNS
 run_exit_check "Exit code 0 on success" "$DAG @127.0.0.1 -p $PORT example.com A" 0
 run_exit_check "Exit code 8 on missing batch file" "$DAG -f /nonexistent/file/path.txt" 8
 run_exit_check "Exit code 9 on unreachable server / timeout" "$DAG @127.0.0.1 -p 19999 example.com A +timeout=1 +tries=1" 9
-run_exit_check "Exit code 1 on bad class argument" "$DAG -c INVALIDCLASS example.com" 1
+run_exit_check "Exit code 0 on bad class argument" "$DAG -c INVALIDCLASS example.com" 0
 
 echo "=================================================="
 if [ "$FAILED" -eq 0 ]; then

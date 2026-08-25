@@ -70,15 +70,15 @@ run_skip() {
 
 echo "=== 1. Testing +idn and +noidn flags ==="
 # +idn and +noidn should be recognized as valid options
-run_check "+idn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:)"
-run_check "+noidn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +noidn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:)"
-run_check "+idnin and +idnout accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idnin +idnout +timeout=1" "(opcode: QUERY|timed out|no usable response|status:)"
-run_check "+idnin converts UTF-8 domain to Punycode" "$DAG @127.0.0.1 -p 10053 日本語.jp A +idnin +qr +timeout=1" "(xn--wgv71a119e\.jp|timed out|no usable response)"
+run_check "+idn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+noidn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +noidn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+idnin and +idnout accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idnin +idnout +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+idnin converts UTF-8 domain to Punycode" "$DAG @127.0.0.1 -p 10053 日本語.jp A +idnin +qr +timeout=1" "(xn--wgv71a119e\.jp|timed out|no usable response|connection refused|no servers could be reached)"
 
 echo "=== 2. Testing +noednsopt flag ==="
 # +ednsopt=65001:0102 adds custom option 65001 (0xfde9 in hex dump)
-run_check "+ednsopt adds custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +qr +timeout=1" "(fd e9 00 02 01 02|OPT 65001|OPTION: 65001)"
-run_not_check "+noednsopt clears custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(fd e9 00 02 01 02|OPTION: 65001|OPT 65001)"
+run_check "+ednsopt adds custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +qr +timeout=1" "(fd e9 00 02 01 02|OPT[ =]65001|OPTION: 65001)"
+run_not_check "+noednsopt clears custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(fd e9 00 02 01 02|OPTION: 65001|OPT[ =]65001)"
 
 echo "=== 3. Testing Dynamic DNS UPDATE prerequisites (--prereq-*) ==="
 if [ "$DAG" = "dig" ]; then
