@@ -3266,6 +3266,87 @@ int main() {
         printf("PASS: Config reload cleanup test passed successfully\n");
     }
 
+    // --- Test 44: Numerical config validation (tcp-idle-timeout, minimal-any-ttl, log channel size) ---
+    {
+        printf("\n--- Test 44: Numerical config option validation ---\n");
+        server_config_t cfg_num;
+
+        // 1. tcp-idle-timeout valid & invalid
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_timeout_ok = "options { tcp-idle-timeout 30000; };\n";
+        if (parse_named_conf(conf_timeout_ok, &cfg_num) != 0 || cfg_num.tcp_idle_timeout != 30000) {
+            printf("FAIL: valid tcp-idle-timeout 30000 not accepted (got %d)\n", cfg_num.tcp_idle_timeout);
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_timeout_neg = "options { tcp-idle-timeout -1; };\n";
+        if (parse_named_conf(conf_timeout_neg, &cfg_num) == 0) {
+            printf("FAIL: negative tcp-idle-timeout -1 should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_timeout_bad = "options { tcp-idle-timeout 10000abc; };\n";
+        if (parse_named_conf(conf_timeout_bad, &cfg_num) == 0) {
+            printf("FAIL: invalid tcp-idle-timeout 10000abc should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        // 2. minimal-any-ttl valid & invalid
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_ttl_ok = "options { minimal-any-ttl 60; };\n";
+        if (parse_named_conf(conf_ttl_ok, &cfg_num) != 0 || cfg_num.minimal_any_ttl != 60) {
+            printf("FAIL: valid minimal-any-ttl 60 not accepted\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_ttl_neg = "options { minimal-any-ttl -1; };\n";
+        if (parse_named_conf(conf_ttl_neg, &cfg_num) == 0) {
+            printf("FAIL: negative minimal-any-ttl -1 should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_ttl_bad = "options { minimal-any-ttl 60xyz; };\n";
+        if (parse_named_conf(conf_ttl_bad, &cfg_num) == 0) {
+            printf("FAIL: invalid minimal-any-ttl 60xyz should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        // 3. Log channel size validation
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_log_ok = "logging { channel ch1 { file \"/tmp/ch1.log\" size 10M; }; };\n";
+        if (parse_named_conf(conf_log_ok, &cfg_num) != 0 || !cfg_num.logging.channels ||
+            cfg_num.logging.channels->size_limit != 10ULL * 1024 * 1024) {
+            printf("FAIL: log channel size 10M not parsed correctly (got %llu)\n",
+                   (unsigned long long)(cfg_num.logging.channels ? cfg_num.logging.channels->size_limit : 0));
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_log_neg = "logging { channel ch2 { file \"/tmp/ch2.log\" size -1M; }; };\n";
+        if (parse_named_conf(conf_log_neg, &cfg_num) != 0 || !cfg_num.logging.channels ||
+            cfg_num.logging.channels->size_limit != 0) {
+            printf("FAIL: negative log size should not set non-zero size_limit (got %llu)\n",
+                   (unsigned long long)(cfg_num.logging.channels ? cfg_num.logging.channels->size_limit : 0));
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        printf("PASS: Numerical config option validation\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

@@ -1150,7 +1150,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         } else if (strcmp(key, "tcp-idle-timeout") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
-          config->tcp_idle_timeout = strtoul(tok.value, NULL, 10);
+          char *endptr;
+          unsigned long v = strtoul(tok.value, &endptr, 10);
+          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
+            syslog(LOG_ERR, "[Config] Invalid tcp-idle-timeout value '%s' (must be a non-negative integer)", tok.value);
+            fprintf(stderr, "[ERROR] Invalid tcp-idle-timeout value '%s' (must be a non-negative integer)\n", tok.value);
+            free(key); free_token(&tok); return -1;
+          }
+          config->tcp_idle_timeout = (int)v;
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
@@ -1227,7 +1234,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_token(&tok);
             return -1;
           }
-          config->minimal_any_ttl = strtoul(tok.value, NULL, 10);
+          char *endptr;
+          unsigned long v = strtoul(tok.value, &endptr, 10);
+          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
+            syslog(LOG_ERR, "[Config] Invalid minimal-any-ttl value '%s' (must be a non-negative integer)", tok.value);
+            fprintf(stderr, "[ERROR] Invalid minimal-any-ttl value '%s' (must be a non-negative integer)\n", tok.value);
+            free(key); free_token(&tok); return -1;
+          }
+          config->minimal_any_ttl = (uint32_t)v;
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
@@ -1675,13 +1689,33 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                     size_t len = strlen(tok.value);
                     if (len > 0) {
                       char last = tok.value[len - 1];
-                      if (last == 'M' || last == 'm')
+                      char numeric_part[64];
+                      size_t numeric_len = len;
+                      if (last == 'M' || last == 'm') {
                         mult = 1024 * 1024;
-                      else if (last == 'K' || last == 'k')
+                        numeric_len--;
+                      } else if (last == 'K' || last == 'k') {
                         mult = 1024;
-                      else if (last == 'G' || last == 'g')
+                        numeric_len--;
+                      } else if (last == 'G' || last == 'g') {
                         mult = 1024 * 1024 * 1024;
-                      ch->size_limit = strtoull(tok.value, NULL, 10) * mult;
+                        numeric_len--;
+                      }
+                      if (numeric_len == 0 || numeric_len >= sizeof(numeric_part) || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
+                        syslog(LOG_ERR, "[Config] Invalid log channel size value '%s'", tok.value);
+                        fprintf(stderr, "[ERROR] Invalid log channel size value '%s'\n", tok.value);
+                      } else {
+                        memcpy(numeric_part, tok.value, numeric_len);
+                        numeric_part[numeric_len] = '\0';
+                        char *endptr;
+                        unsigned long long v = strtoull(numeric_part, &endptr, 10);
+                        if (*endptr == '\0') {
+                          ch->size_limit = v * mult;
+                        } else {
+                          syslog(LOG_ERR, "[Config] Invalid log channel size value '%s'", tok.value);
+                          fprintf(stderr, "[ERROR] Invalid log channel size value '%s'\n", tok.value);
+                        }
+                      }
                     }
                   }
                   free_token(&tok);
