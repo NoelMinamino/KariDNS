@@ -76,6 +76,8 @@ cat <<EOF > "$CONF_FILE"
 options {
     port $PORT;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
     tcp-connection-reuse yes;
     tcp-idle-timeout 10000;
 };

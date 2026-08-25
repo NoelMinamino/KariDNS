@@ -20,6 +20,8 @@ cat << 'EOF' > "$CONF_SLAVE_UPD"
 options {
     port 10053;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
 };
 key "test-key" {
     algorithm hmac-sha256;
@@ -36,6 +38,8 @@ cat << 'EOF' > "$CONF_MASTER_UPD"
 options {
     port 10053;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
 };
 key "test-key" {
     algorithm hmac-sha256;
