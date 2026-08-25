@@ -448,6 +448,8 @@ run_check "Transport: TCP Keepopen & EDNS0 Keepalive (tests/run_dag_keepopen_kee
 run_check "Transport: TCP Keepopen partial read cache invalidation (tests/run_dag_keepopen_partial_read_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_partial_read_test.sh\"" "ALL KEEPOPEN PARTIAL READ TESTS PASSED"
 run_check "Transport: TLS Keepopen & DoT continuity (tests/run_dag_keepopen_tls_partial_read_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_tls_partial_read_test.sh\"" "ALL KEEPOPEN TLS TESTS PASSED"
 run_check "Formatting: YAML EDE double-quote escaping (tests/run_dag_yaml_ede_escaping_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_ede_escaping_test.sh\"" "ALL YAML EDE ESCAPING TESTS PASSED"
+run_check "Formatting: YAML Cookie STATUS verification (tests/run_dag_yaml_cookie_status_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_cookie_status_test.sh\"" "ALL YAML COOKIE STATUS TESTS PASSED"
+run_check "Formatting: YAML socket_family accuracy (tests/run_dag_yaml_socket_family_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_socket_family_test.sh\"" "ALL YAML SOCKET_FAMILY TESTS PASSED"
 run_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
 run_check "Features: +trace & +nssearch TCP validation (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
 run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"

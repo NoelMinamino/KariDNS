@@ -3943,7 +3943,15 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
         resp_type = "QUERY";
     }
 
-    const char *family_str = (server && strchr(server, ':')) ? "INET6" : "INET";
+    const char *family_str = "INET";
+    int actual_family = AF_INET;
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (resolve_server_addr(server ? server : "127.0.0.1", port ? port : 53, AF_UNSPEC, &ss, &slen, &actual_family)) {
+        if (actual_family == AF_INET6) family_str = "INET6";
+    } else if (server && strchr(server, ':')) {
+        family_str = "INET6";
+    }
     const char *proto_str = is_tcp ? "TCP" : "UDP";
 
     printf("- type: MESSAGE\n");
@@ -3995,6 +4003,7 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
     char client_cookie[64] = "";
     char server_cookie[128] = "";
     bool has_cookie = false;
+    bool cookie_matches = true;
 
     for (int i = 0; i < non_qd_total; i++) {
         if (scan_off >= pkt_len) break;
@@ -4024,6 +4033,9 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
                     has_cookie = true;
                     if (olen >= 8) {
                         for (int j = 0; j < 8; j++) snprintf(client_cookie + j * 2, 3, "%02x", pkt[p + j]);
+                        if (dopt->has_expected_client_cookie) {
+                            cookie_matches = (memcmp(dopt->expected_client_cookie, &pkt[p], 8) == 0);
+                        }
                         if (olen > 8) {
                             for (int j = 8; j < olen && (j - 8) * 2 < (int)sizeof(server_cookie) - 3; j++) {
                                 snprintf(server_cookie + (j - 8) * 2, 3, "%02x", pkt[p + j]);
@@ -4051,7 +4063,9 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
             printf("            CLIENT: %s\n", client_cookie);
             if (server_cookie[0] != '\0') {
                 printf("            SERVER: %s\n", server_cookie);
-                printf("            STATUS: good\n");
+            }
+            if (dopt->has_expected_client_cookie) {
+                printf("            STATUS: %s\n", cookie_matches ? "good" : "bad");
             }
         }
         edns_info_t yaml_edns;
@@ -4548,7 +4562,15 @@ static void print_response_yaml_dns64(const uint8_t *pkt, size_t pkt_len, const 
         resp_type = "QUERY";
     }
 
-    const char *family_str = (server && strchr(server, ':')) ? "INET6" : "INET";
+    const char *family_str = "INET";
+    int actual_family = AF_INET;
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (resolve_server_addr(server ? server : "127.0.0.1", port ? port : 53, AF_UNSPEC, &ss, &slen, &actual_family)) {
+        if (actual_family == AF_INET6) family_str = "INET6";
+    } else if (server && strchr(server, ':')) {
+        family_str = "INET6";
+    }
     const char *proto_str = is_tcp ? "TCP" : "UDP";
 
     printf("- type: MESSAGE\n");
