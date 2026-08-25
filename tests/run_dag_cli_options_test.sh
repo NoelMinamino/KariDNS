@@ -74,6 +74,8 @@ run_check "+idn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idn +tim
 run_check "+noidn flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +noidn +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 run_check "+idnin and +idnout accepted" "$DAG @127.0.0.1 -p 10053 example.com A +idnin +idnout +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 run_check "+idnin converts UTF-8 domain to Punycode" "$DAG @127.0.0.1 -p 10053 日本語.jp A +idnin +qr +timeout=1" "(xn--wgv71a119e\.jp|timed out|no usable response|connection refused|no servers could be reached)"
+run_check "+multi flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +multi +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+nomulti flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +nomulti +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 echo "=== 2. Testing +noednsopt flag ==="
 # +ednsopt=65001:0102 adds custom option 65001 (0xfde9 in hex dump)
@@ -113,7 +115,7 @@ fi
 
 echo "=== 5. Testing Multi-Query Argument Slicing with Two-Arg Options ==="
 # Two queries with -c IN in both
-run_check "Multi-query with -c IN option" "$DAG @127.0.0.1 -p 10053 -c IN example.com A @127.0.0.1 -p 10053 -c IN example.net AAAA +timeout=1" "(example\.com.*example\.net|no usable response)"
+run_check "Multi-query with -c IN option" "$DAG @127.0.0.1 -p 10053 -c IN example.com A @127.0.0.1 -p 10053 -c IN example.net AAAA +timeout=1" "(example\.com.*example\.net|no usable response|no servers could be reached)"
 
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then

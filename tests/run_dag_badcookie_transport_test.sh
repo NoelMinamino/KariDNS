@@ -73,7 +73,7 @@ if [ "$DAG" = "dig" ]; then
     run_skip "+keepopen flag accepted"
 else
     run_check "--help contains +keepopen RFC 7766 note" "$DAG --help" "Keep TCP socket open between consecutive queries \(RFC 7766\)"
-    run_check "+keepopen flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +tcp +keepopen +timeout=1" "(opcode: QUERY|timed out|no usable response|status:)"
+    run_check "+keepopen flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +tcp +keepopen +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|no servers could be reached)"
 fi
 
 echo "=== 2. Testing +expire EDNS Option (RFC 7314) Generation ==="

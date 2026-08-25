@@ -97,7 +97,7 @@ run_exit_check "Non-hex payload exit code 1" "$DAG @127.0.0.1 -p 10053 --hex 'zz
 # Test 4: Valid minimal DNS query hex payload format validation
 # Query ID: 0x1234, Flags: 0x0100 (RD), QDCOUNT: 1, QNAME: example.com, QTYPE: A, QCLASS: IN
 VALID_HEX="123401000001000000000000076578616d706c6503636f6d0000010001"
-run_check "Valid hex payload parses without error" "$DAG @127.0.0.1 -p 10053 --hex $VALID_HEX +timeout=1" "(Query \(29 bytes\)|opcode: QUERY|timed out|no usable response)"
+run_check "Valid hex payload parses without error" "$DAG @127.0.0.1 -p 10053 --hex $VALID_HEX +timeout=1" "(Query \(29 bytes\)|opcode: QUERY|timed out|no usable response|no servers could be reached)"
 fi
 
 echo "========================================================="

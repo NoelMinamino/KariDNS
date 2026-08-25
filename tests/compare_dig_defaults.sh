@@ -89,6 +89,8 @@ normalize_output() {
         -e 's/ in [0-9]+ ms/ in <TIME> ms/g' \
         -e 's/;; WHEN: .*/;; WHEN: <DATE>/g' \
         -e 's/;; communications error to [0-9a-fA-F.:#]+: end of file/;; communications error to <SERVER>: end of file/g' \
+        -e 's/;; communications error to [0-9a-fA-F.:#]+: connection refused/;; communications error to <SERVER>: connection refused/g' \
+        -e 's/;; UDP setup with [0-9a-fA-F.:#()]+( for [^ ]+)? failed: .*/;; UDP setup with <SERVER> failed: <ERR>/g' \
         -e '/;; (no usable response received|connection failed|no servers could be reached)/d' \
         -e '/^;; === MULTI-SERVER COMPARISON SUMMARY ===/,$d' \
         -e 's/\x1b\[[0-9;]*m//g' \
@@ -401,6 +403,25 @@ EOF
     echo "14. TCP Keepopen & Session Transport (+keepopen)"
     echo "--------------------------------------------------------"
     compare_query "TCP Keepopen: Multiple queries on single TCP connection" "www.example.com A +tcp +keepopen example.com TXT +tcp +keepopen"
+
+    echo "--------------------------------------------------------"
+    echo "15. Multiline Formatting (+multiline)"
+    echo "--------------------------------------------------------"
+    compare_query "Multiline: SOA record formatting" "example.com SOA +multiline"
+    compare_query "Multiline: DNSKEY record formatting" "example.com DNSKEY +multiline"
+    compare_query "Multiline: DS record single-line formatting" "example.com DS +multiline"
+
+    echo "--------------------------------------------------------"
+    echo "16. Source Address Binding (-b)"
+    echo "--------------------------------------------------------"
+    compare_query "Source address binding: IPv4 localhost" "www.example.com A -b 127.0.0.1"
+
+    echo "--------------------------------------------------------"
+    echo "17. Error Handling & Negative Test Cases"
+    echo "--------------------------------------------------------"
+    compare_query "Negative: Unassignable bind address (-b)" "www.example.com A -b 192.0.2.1 +tries=1 +timeout=1"
+    compare_query "Negative: Unreachable port" "www.example.com A -p 19999 +tries=1 +timeout=1"
+    compare_query "Negative: Unknown record type" "www.example.com UNKNOWNTYPE"
 fi
 
 echo "========================================================"

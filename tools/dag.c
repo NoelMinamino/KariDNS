@@ -1569,10 +1569,23 @@ static int connect_udp(const char *server, int port, int pref_family, const char
     if (sock < 0) { perror("socket"); return -1; }
     if (bind_addr && bind_addr[0] != '\0') {
         struct sockaddr_storage baddr; socklen_t blen; int bfam = family;
-        if (resolve_server_addr(bind_addr, bind_port, family, &baddr, &blen, &bfam)) {
-            if (bind(sock, (struct sockaddr *)&baddr, blen) != 0) {
-                perror("bind (udp)");
-            }
+        if (!resolve_server_addr(bind_addr, bind_port, AF_UNSPEC, &baddr, &blen, &bfam)) {
+            fprintf(stderr, "Error: -b address '%s' could not be resolved\n", bind_addr);
+            close(sock);
+            return -1;
+        }
+        if (bfam != family) {
+            fprintf(stderr, "Error: -b address '%s' is %s, but destination server '%s' resolved to %s; "
+                            "the source address family must match the destination\n",
+                    bind_addr, bfam == AF_INET6 ? "IPv6" : "IPv4",
+                    server, family == AF_INET6 ? "IPv6" : "IPv4");
+            close(sock);
+            return -1;
+        }
+        if (bind(sock, (struct sockaddr *)&baddr, blen) != 0) {
+            fprintf(stderr, ";; UDP setup with %s#%d(%s) failed: %s.\n", server, port, server, strerror(errno));
+            close(sock);
+            return -1;
         }
     }
     /*
@@ -1596,10 +1609,23 @@ static int connect_tcp(const char *server, int port, int pref_family, const char
     if (sock < 0) { perror("socket"); return -1; }
     if (bind_addr && bind_addr[0] != '\0') {
         struct sockaddr_storage baddr; socklen_t blen; int bfam = family;
-        if (resolve_server_addr(bind_addr, bind_port, family, &baddr, &blen, &bfam)) {
-            if (bind(sock, (struct sockaddr *)&baddr, blen) != 0) {
-                perror("bind (tcp)");
-            }
+        if (!resolve_server_addr(bind_addr, bind_port, AF_UNSPEC, &baddr, &blen, &bfam)) {
+            fprintf(stderr, "Error: -b address '%s' could not be resolved\n", bind_addr);
+            close(sock);
+            return -1;
+        }
+        if (bfam != family) {
+            fprintf(stderr, "Error: -b address '%s' is %s, but destination server '%s' resolved to %s; "
+                            "the source address family must match the destination\n",
+                    bind_addr, bfam == AF_INET6 ? "IPv6" : "IPv4",
+                    server, family == AF_INET6 ? "IPv6" : "IPv4");
+            close(sock);
+            return -1;
+        }
+        if (bind(sock, (struct sockaddr *)&baddr, blen) != 0) {
+            perror("bind (tcp)");
+            close(sock);
+            return -1;
         }
     }
 
@@ -1711,6 +1737,9 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
 
         ssize_t n = recv(sock, resp, resp_cap, 0);
         if (n < 0) {
+            if (errno == ECONNREFUSED) {
+                printf(";; communications error to %s#%d: connection refused\n", server, port);
+            }
             close(sock);
             return -1; // Timeout or network error
         }
@@ -2535,6 +2564,32 @@ static void print_split_hex(const uint8_t *data, size_t len, int split_width) {
     }
 }
 
+static void print_multiline_hex(const uint8_t *data, size_t len, int split_width) {
+    int sw = (split_width > 0) ? (split_width / 2) : 22;
+    if (sw <= 0) sw = 22;
+    for (size_t i = 0; i < len; ) {
+        printf("\t\t\t\t\t");
+        size_t chunk = (len - i) < (size_t)sw ? (len - i) : (size_t)sw;
+        for (size_t j = 0; j < chunk; j++) printf("%02X", data[i + j]);
+        i += chunk;
+        if (i < len) printf("\n");
+        else printf(" )");
+    }
+}
+
+static void print_multiline_b64(const char *b64, int len, int split_width) {
+    int sw = (split_width > 0) ? split_width : 44;
+    if (sw <= 0) sw = 44;
+    for (int i = 0; i < len; ) {
+        printf("\t\t\t\t\t");
+        int chunk = (len - i) < sw ? (len - i) : sw;
+        printf("%.*s", chunk, b64 + i);
+        i += chunk;
+        if (i < len) printf("\n");
+        else printf(" )");
+    }
+}
+
 static void print_dnskey_like(const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
     if (rdlen < 4) { printf("(malformed)"); return; }
     uint16_t flags = (rdata[0]<<8)|rdata[1];
@@ -2587,16 +2642,7 @@ static void print_ds_like(const uint8_t *rdata, size_t rdlen, const display_opts
 
     if (dopt && dopt->multiline) {
         printf("%u %u %u (\n", keytag, algorithm, digest_type);
-        int chunk_width = (dopt->split_width > 0) ? (dopt->split_width / 2) : 16;
-        if (chunk_width <= 0) chunk_width = 16;
-        for (size_t i = 4; i < rdlen; ) {
-            printf("\t\t\t\t\t");
-            size_t chunk = (rdlen - i) < (size_t)chunk_width ? (rdlen - i) : (size_t)chunk_width;
-            for (size_t j = 0; j < chunk; j++) printf("%02X", rdata[i + j]);
-            printf("\n");
-            i += chunk;
-        }
-        printf("\t\t\t\t\t)");
+        print_multiline_hex(&rdata[4], rdlen - 4, dopt->split_width);
     } else {
         printf("%u %u %u ", keytag, algorithm, digest_type);
         print_split_hex(&rdata[4], rdlen - 4, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
@@ -2630,7 +2676,7 @@ static void format_rrsig_time(uint32_t t, char *out, size_t out_cap) {
     strftime(out, out_cap, "%Y%m%d%H%M%S", &tm_buf);
 }
 
-static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_hash) {
+static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_hash, const display_opts_t *dopt) {
     if (rdlen < 5) { printf("(malformed)"); return; }
     uint8_t hash_alg = rdata[0];
     uint8_t flags = rdata[1];
@@ -2642,7 +2688,6 @@ static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_has
         size_t p2 = 0;
         for (int i = 0; i < salt_len; i++) p2 += snprintf(salt_hex + p2, sizeof(salt_hex) - p2, "%02X", rdata[5 + i]);
     }
-    printf("%u %u %u %s", hash_alg, flags, iterations, salt_hex);
 
     if (with_hash) { // NSEC3 specific
         if ((size_t)(5 + salt_len + 1) > rdlen) { printf(" (malformed)"); return; }
@@ -2654,7 +2699,13 @@ static void print_nsec3_params(const uint8_t *rdata, size_t rdlen, bool with_has
         pos += hash_len;
         char types_buf[512];
         decode_type_bitmap(&rdata[pos], rdlen - pos, types_buf, sizeof(types_buf));
-        printf(" %s %s", hash_b32, types_buf);
+        if (dopt && dopt->multiline) {
+            printf("%u %u %u %s (\n\t\t\t\t\t%s\n\t\t\t\t\t%s )", hash_alg, flags, iterations, salt_hex, hash_b32, types_buf);
+        } else {
+            printf("%u %u %u %s %s %s", hash_alg, flags, iterations, salt_hex, hash_b32, types_buf);
+        }
+    } else {
+        printf("%u %u %u %s", hash_alg, flags, iterations, salt_hex);
     }
 }
 
@@ -3138,12 +3189,25 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t keytag = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
             uint8_t alg = pkt[abs_offset + 4];
             char cbuf[32];
-            printf("%s %u %u ", cert_type_name(ctype, cbuf, sizeof(cbuf)), keytag, alg);
-            if (rdlen > 5) {
-                char *b64 = base64_encode_alloc(&pkt[abs_offset + 5], rdlen - 5, NULL);
-                if (!b64) goto fallback;
-                printf("%s", b64);
-                free(b64);
+            if (dopt && dopt->multiline) {
+                printf("%s %u %u (\n", cert_type_name(ctype, cbuf, sizeof(cbuf)), keytag, alg);
+                if (rdlen > 5) {
+                    int n = 0;
+                    char *b64 = base64_encode_alloc(&pkt[abs_offset + 5], rdlen - 5, &n);
+                    if (!b64) goto fallback;
+                    print_multiline_b64(b64, n, dopt->split_width);
+                    free(b64);
+                } else {
+                    printf("\t\t\t\t\t)");
+                }
+            } else {
+                printf("%s %u %u ", cert_type_name(ctype, cbuf, sizeof(cbuf)), keytag, alg);
+                if (rdlen > 5) {
+                    char *b64 = base64_encode_alloc(&pkt[abs_offset + 5], rdlen - 5, NULL);
+                    if (!b64) goto fallback;
+                    printf("%s", b64);
+                    free(b64);
+                }
             }
             break;
         }
@@ -3186,8 +3250,13 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 44: { // SSHFP
             if (rdlen < 2) goto fallback;
-            printf("%u %u ", pkt[abs_offset], pkt[abs_offset + 1]);
-            print_split_hex(&pkt[abs_offset + 2], rdlen - 2, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            if (dopt && dopt->multiline) {
+                printf("%u %u (\n", pkt[abs_offset], pkt[abs_offset + 1]);
+                print_multiline_hex(&pkt[abs_offset + 2], rdlen - 2, dopt->split_width);
+            } else {
+                printf("%u %u ", pkt[abs_offset], pkt[abs_offset + 1]);
+                print_split_hex(&pkt[abs_offset + 2], rdlen - 2, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            }
             break;
         }
         case 45: { // IPSECKEY
@@ -3195,54 +3264,97 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint8_t prec = pkt[abs_offset];
             uint8_t gw_type = pkt[abs_offset + 1];
             uint8_t alg = pkt[abs_offset + 2];
-            printf("%u %u %u ", prec, gw_type, alg);
+            char gw_buf[256] = ".";
             const uint8_t *p = &pkt[abs_offset + 3];
             const uint8_t *end = &pkt[abs_offset + rdlen];
             if (gw_type == 0) {
-                printf(". ");
+                snprintf(gw_buf, sizeof(gw_buf), ".");
             } else if (gw_type == 1) {
                 if (p + 4 > end) goto fallback;
-                printf("%d.%d.%d.%d ", p[0], p[1], p[2], p[3]);
+                snprintf(gw_buf, sizeof(gw_buf), "%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
                 p += 4;
             } else if (gw_type == 2) {
                 if (p + 16 > end) goto fallback;
-                char buf[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET6, p, buf, sizeof(buf));
-                printf("%s ", buf);
+                inet_ntop(AF_INET6, p, gw_buf, sizeof(gw_buf));
                 p += 16;
             } else if (gw_type == 3) {
                 char *gw = NULL; size_t next;
                 if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0) goto fallback;
-                printf("%s ", gw);
+                snprintf(gw_buf, sizeof(gw_buf), "%s", gw);
                 p = &pkt[next];
             } else goto fallback;
-            if (p < end) {
-                size_t key_len = end - p;
-                int n = 0;
-                char *b64 = base64_encode_alloc(p, key_len, &n);
-                if (!b64) goto fallback;
-                print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
-                free(b64);
+
+            if (dopt && dopt->multiline) {
+                printf("( %u %u %u %s\n", prec, gw_type, alg, gw_buf);
+                if (p < end) {
+                    size_t key_len = end - p;
+                    int n = 0;
+                    char *b64 = base64_encode_alloc(p, key_len, &n);
+                    if (!b64) goto fallback;
+                    print_multiline_b64(b64, n, dopt->split_width);
+                    free(b64);
+                } else {
+                    printf("\t\t\t\t\t)");
+                }
+            } else {
+                printf("%u %u %u %s ", prec, gw_type, alg, gw_buf);
+                if (p < end) {
+                    size_t key_len = end - p;
+                    int n = 0;
+                    char *b64 = base64_encode_alloc(p, key_len, &n);
+                    if (!b64) goto fallback;
+                    print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+                    free(b64);
+                }
             }
             break;
         }
-        case 49: case 61: { // DHCID / OPENPGPKEY
+        case 49: { // DHCID
             if (rdlen == 0) break;
             int n = 0;
             char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &n);
             if (!b64) goto fallback;
-            print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            if (dopt && dopt->multiline) {
+                printf("( ");
+                print_multiline_b64(b64, n, dopt->split_width);
+                if (rdlen >= 3) {
+                    uint16_t id_type = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
+                    uint8_t d_type = pkt[abs_offset+2];
+                    printf(" ; %u %u %u", id_type, d_type, (unsigned int)(rdlen - 3));
+                }
+            } else {
+                print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            }
+            free(b64);
+            break;
+        }
+        case 61: { // OPENPGPKEY
+            if (rdlen == 0) break;
+            int n = 0;
+            char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &n);
+            if (!b64) goto fallback;
+            if (dopt && dopt->multiline) {
+                printf("( ");
+                print_multiline_b64(b64, n, dopt->split_width);
+            } else {
+                print_split_b64(b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            }
             free(b64);
             break;
         }
         case 51: { // NSEC3PARAM
-            print_nsec3_params(&pkt[abs_offset], rdlen, false);
+            print_nsec3_params(&pkt[abs_offset], rdlen, false, dopt);
             break;
         }
         case 52: case 53: { // TLSA / SMIMEA
             if (rdlen < 3) goto fallback;
-            printf("%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
-            print_split_hex(&pkt[abs_offset + 3], rdlen - 3, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            if (dopt && dopt->multiline) {
+                printf("%u %u %u (\n", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
+                print_multiline_hex(&pkt[abs_offset + 3], rdlen - 3, dopt->split_width);
+            } else {
+                printf("%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
+                print_split_hex(&pkt[abs_offset + 3], rdlen - 3, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            }
             break;
         }
         case 64: case 65: { // SVCB / HTTPS
@@ -3355,11 +3467,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (dopt && dopt->multiline) {
                 printf("%s %u %u %u (\n", covered_name, algorithm, labels, original_ttl);
                 printf("\t\t\t\t\t%s %s %u %s\n", exp_str, inc_str, key_tag, signer_name);
-                int chunk_w = (dopt->split_width > 0) ? dopt->split_width : 44;
-                for (int i = 0; i < n; i += chunk_w) {
-                    printf("\t\t\t\t\t%.*s\n", (n - i) < chunk_w ? (n - i) : chunk_w, b64 + i);
-                }
-                printf("\t\t\t\t\t)");
+                print_multiline_b64(b64, n, dopt->split_width);
             } else {
                 printf("%s %u %u %u %s %s %u %s ", covered_name, algorithm, labels,
                        original_ttl, exp_str, inc_str, key_tag, signer_name);
@@ -3383,7 +3491,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         }
         case 50: { // NSEC3
-            print_nsec3_params(&pkt[abs_offset], rdlen, true);
+            print_nsec3_params(&pkt[abs_offset], rdlen, true, dopt);
             break;
         }
         case 43: case 59: case 32768: case 32769: { // DS, CDS, TA, DLV
@@ -3423,9 +3531,15 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             
             const char *err_str = rcode_name(tsig_error);
 
-            printf("%s %llu %u %u %.*s %u %s %u", alg_name, (unsigned long long)time_signed,
-                   fudge, mac_size, n, mac_b64 ? mac_b64 : "", original_id,
-                   err_str, other_len);
+            if (dopt && dopt->multiline) {
+                printf("%s %llu %u %u (\n\t\t\t\t\t%.*s ) %u %s %u",
+                       alg_name, (unsigned long long)time_signed, fudge, mac_size,
+                       n, mac_b64 ? mac_b64 : "", original_id, err_str, other_len);
+            } else {
+                printf("%s %llu %u %u %.*s %u %s %u", alg_name, (unsigned long long)time_signed,
+                       fudge, mac_size, n, mac_b64 ? mac_b64 : "", original_id,
+                       err_str, other_len);
+            }
             if (mac_b64) free(mac_b64);
             break;
         }
@@ -3437,23 +3551,38 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             size_t pos = 4;
             if (pos + hit_len + pk_len > rdlen) goto fallback;
 
-            printf("%u ", pk_algorithm);
-            for (int i = 0; i < hit_len; i++) printf("%02X", pkt[abs_offset + pos + i]);
+            char hit_hex[512] = "";
+            size_t hp = 0;
+            for (int i = 0; i < hit_len; i++) hp += snprintf(hit_hex + hp, sizeof(hit_hex) - hp, "%02X", pkt[abs_offset + pos + i]);
             pos += hit_len;
 
             int n = 0;
             char *b64 = base64_encode_alloc(&pkt[abs_offset + pos], pk_len, &n);
             if (!b64) goto fallback;
-            printf(" %.*s", n, b64);
-            free(b64);
             pos += pk_len;
 
+            char rvs_names[512] = "";
+            size_t rp = 0;
             while (pos < rdlen) {
                 char *rvs_name = NULL; size_t next;
                 if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0) break;
-                printf(" %s", rvs_name);
+                rp += snprintf(rvs_names + rp, sizeof(rvs_names) - rp, "\n\t\t\t\t\t%s", rvs_name);
                 pos = next - abs_offset;
             }
+
+            if (dopt && dopt->multiline) {
+                printf("( %u %s\n\t\t\t\t\t%.*s%s )", pk_algorithm, hit_hex, n, b64, rvs_names);
+            } else {
+                printf("%u %s %.*s", pk_algorithm, hit_hex, n, b64);
+                if (rvs_names[0] != '\0') {
+                    // in single line, replace newline with space
+                    for (char *c = rvs_names; *c; c++) {
+                        if (*c == '\n' || *c == '\t') *c = ' ';
+                    }
+                    printf("%s", rvs_names);
+                }
+            }
+            free(b64);
             break;
         }
         case 11: { // WKS
@@ -3482,8 +3611,13 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                               ((uint32_t)pkt[abs_offset+2]<<8)  | pkt[abs_offset+3];
             uint8_t scheme = pkt[abs_offset+4];
             uint8_t halg = pkt[abs_offset+5];
-            printf("%u %u %u ", serial, scheme, halg);
-            print_split_hex(&pkt[abs_offset + 6], rdlen - 6, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            if (dopt && dopt->multiline) {
+                printf("%u %u %u (\n", serial, scheme, halg);
+                print_multiline_hex(&pkt[abs_offset + 6], rdlen - 6, dopt->split_width);
+            } else {
+                printf("%u %u %u ", serial, scheme, halg);
+                print_split_hex(&pkt[abs_offset + 6], rdlen - 6, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+            }
             break;
         }
         case 104: { // NID
@@ -4351,6 +4485,12 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         for (int i = 0; i < ancount; i++) {
             if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
         }
+        for (int i = 0; i < nscount; i++) {
+            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
+        }
+        for (int i = 0; i < arcount; i++) {
+            if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
+        }
         return;
     }
 
@@ -4821,7 +4961,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
 
         if (n <= 0) {
-            printf(";; no usable response received\n");
+            printf(";; no servers could be reached\n");
             return 9;
         }
 
@@ -4929,7 +5069,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                                              unsigned_accum, unsigned_accum_len, (msg_index > 1),
                                              resp_mac, &resp_mac_len);
                 if (err == 0) {
-                    if (!dopt->short_mode) printf(";; TSIG verified.\n");
                     // Update prior_mac for subsequent AXFR messages
                     if (resp_mac_len > 0 && resp_mac_len <= sizeof(request_mac)) {
                         memcpy(request_mac, resp_mac, resp_mac_len);
@@ -6690,10 +6829,10 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->dopt.identify = true;
         } else if (strcmp(arg, "+noidentify") == 0) {
             spec->dopt.identify = false;
-        } else if (strcmp(arg, "+multiline") == 0) {
+        } else if (strcmp(arg, "+multiline") == 0 || strcmp(arg, "+multi") == 0) {
             spec->dopt.multiline = true;
             if (spec->dopt.split_width == 56) spec->dopt.split_width = 44;
-        } else if (strcmp(arg, "+nomultiline") == 0) {
+        } else if (strcmp(arg, "+nomultiline") == 0 || strcmp(arg, "+nomulti") == 0) {
             spec->dopt.multiline = false;
             if (spec->dopt.split_width == 44) spec->dopt.split_width = 56;
         } else if (strcmp(arg, "+expandaaaa") == 0) {
