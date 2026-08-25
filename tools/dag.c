@@ -1487,6 +1487,8 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
 /* ========================================================================
  * 6. Networking
  * ==================================================================== */
+static int g_last_socket_family = AF_INET;
+
 /*
  * server引数(IPv4リテラル / IPv6リテラル / FQDN)をsockaddr_storageへ解決する。
  * まずinet_pton()でIPリテラルとしての解釈を試み(DNS解決を伴わない高速パス)、
@@ -1562,6 +1564,7 @@ static int get_server_addr_count(const char *server, int port, int pref_family) 
 static int connect_udp(const char *server, int port, int pref_family, const char *bind_addr, int bind_port, struct sockaddr_storage *dest, socklen_t *dest_len) {
     int family = AF_INET;
     if (!resolve_server_addr(server, port, pref_family, dest, dest_len, &family)) return -1;
+    g_last_socket_family = family;
     int sock = socket(family, SOCK_DGRAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
     if (bind_addr && bind_addr[0] != '\0') {
@@ -1588,6 +1591,7 @@ static int connect_udp(const char *server, int port, int pref_family, const char
 static int connect_tcp(const char *server, int port, int pref_family, const char *bind_addr, int bind_port, int timeout_sec) {
     struct sockaddr_storage dest; socklen_t dest_len; int family = AF_INET;
     if (!resolve_server_addr(server, port, pref_family, (struct sockaddr_storage *)&dest, &dest_len, &family)) return -1;
+    g_last_socket_family = family;
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
     if (bind_addr && bind_addr[0] != '\0') {
@@ -1750,6 +1754,7 @@ typedef struct {
     char server[256];
     int port;
     int pref_family;
+    int family;
     char bind_addr[64];
     int bind_port;
     bool is_tls;
@@ -1761,6 +1766,7 @@ static tcp_conn_cache_t g_cached_conn = {
     .server = {0},
     .port = 0,
     .pref_family = AF_UNSPEC,
+    .family = AF_INET,
     .bind_addr = {0},
     .bind_port = 0,
     .is_tls = false
@@ -1946,6 +1952,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
             g_cached_conn.bind_port == qo->bind_port) {
             sock = g_cached_conn.sock;
             ssl = g_cached_conn.ssl;
+            g_last_socket_family = g_cached_conn.family;
             reused = true;
         } else {
             close_cached_tcp();
@@ -1970,6 +1977,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
             snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
             g_cached_conn.port = port;
             g_cached_conn.pref_family = qo->pref_family;
+            g_cached_conn.family = g_last_socket_family;
             snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
             g_cached_conn.bind_port = qo->bind_port;
             g_cached_conn.is_tls = true;
@@ -1992,6 +2000,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
             snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
             g_cached_conn.port = port;
             g_cached_conn.pref_family = qo->pref_family;
+            g_cached_conn.family = g_last_socket_family;
             snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
             g_cached_conn.bind_port = qo->bind_port;
             g_cached_conn.is_tls = true;
@@ -2244,6 +2253,7 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
             strcmp(g_cached_conn.bind_addr, qo->bind_addr) == 0 &&
             g_cached_conn.bind_port == qo->bind_port) {
             sock = g_cached_conn.sock;
+            g_last_socket_family = g_cached_conn.family;
             reused = true;
         } else {
             close_cached_tcp();
@@ -2262,6 +2272,7 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
             snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
             g_cached_conn.port = port;
             g_cached_conn.pref_family = qo->pref_family;
+            g_cached_conn.family = g_last_socket_family;
             snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
             g_cached_conn.bind_port = qo->bind_port;
             g_cached_conn.is_tls = false;
@@ -2286,6 +2297,7 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
             snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
             g_cached_conn.port = port;
             g_cached_conn.pref_family = qo->pref_family;
+            g_cached_conn.family = g_last_socket_family;
             snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
             g_cached_conn.bind_port = qo->bind_port;
             g_cached_conn.is_tls = false;
@@ -2313,6 +2325,7 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
             snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
             g_cached_conn.port = port;
             g_cached_conn.pref_family = qo->pref_family;
+            g_cached_conn.family = g_last_socket_family;
             snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
             g_cached_conn.bind_port = qo->bind_port;
             g_cached_conn.is_tls = false;
@@ -3943,15 +3956,7 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
         resp_type = "QUERY";
     }
 
-    const char *family_str = "INET";
-    int actual_family = AF_INET;
-    struct sockaddr_storage ss;
-    socklen_t slen = sizeof(ss);
-    if (resolve_server_addr(server ? server : "127.0.0.1", port ? port : 53, AF_UNSPEC, &ss, &slen, &actual_family)) {
-        if (actual_family == AF_INET6) family_str = "INET6";
-    } else if (server && strchr(server, ':')) {
-        family_str = "INET6";
-    }
+    const char *family_str = (g_last_socket_family == AF_INET6) ? "INET6" : "INET";
     const char *proto_str = is_tcp ? "TCP" : "UDP";
 
     printf("- type: MESSAGE\n");
@@ -4562,15 +4567,7 @@ static void print_response_yaml_dns64(const uint8_t *pkt, size_t pkt_len, const 
         resp_type = "QUERY";
     }
 
-    const char *family_str = "INET";
-    int actual_family = AF_INET;
-    struct sockaddr_storage ss;
-    socklen_t slen = sizeof(ss);
-    if (resolve_server_addr(server ? server : "127.0.0.1", port ? port : 53, AF_UNSPEC, &ss, &slen, &actual_family)) {
-        if (actual_family == AF_INET6) family_str = "INET6";
-    } else if (server && strchr(server, ':')) {
-        family_str = "INET6";
-    }
+    const char *family_str = (g_last_socket_family == AF_INET6) ? "INET6" : "INET";
     const char *proto_str = is_tcp ? "TCP" : "UDP";
 
     printf("- type: MESSAGE\n");
