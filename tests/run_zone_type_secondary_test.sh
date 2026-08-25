@@ -20,6 +20,8 @@ trap cleanup EXIT INT TERM
 cat << 'EOF' > "$CONF_PRIMARY"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 zone "example1.com" {
     type primary;
@@ -30,6 +32,8 @@ EOF
 cat << 'EOF' > "$CONF_SECONDARY"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 zone "example2.com" {
     type secondary;
@@ -40,6 +44,8 @@ EOF
 cat << 'EOF' > "$CONF_INVALID"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 zone "example3.com" {
     type invalid_zone_type;

@@ -23,6 +23,8 @@ trap cleanup EXIT INT TERM
 cat << 'EOF' > "$CONF_DUP_ZONE"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 zone "example.com" {
     type master;
@@ -38,6 +40,8 @@ EOF
 cat << 'EOF' > "$CONF_DUP_KEY"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 key "transfer-key" {
     algorithm hmac-sha256;
@@ -53,6 +57,8 @@ EOF
 cat << 'EOF' > "$CONF_DUP_VIEW"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 view "internal" {
     zone "example1.com" {
@@ -72,6 +78,8 @@ EOF
 cat << 'EOF' > "$CONF_DUP_VIEW_ZONE"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 view "internal" {
     zone "example.com" {
@@ -89,6 +97,8 @@ EOF
 cat << 'EOF' > "$CONF_GOOD"
 options {
     port 10053;
+    user "nobody";
+    group "nobody";
 };
 key "key1" {
     algorithm hmac-sha256;

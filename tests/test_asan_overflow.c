@@ -1311,6 +1311,25 @@ int main() {
                 return 1;
             }
         }
+
+        // 3. Root privilege enforcement logic test
+        struct {
+            uid_t euid;
+            const char *user;
+            bool expected_permit;
+        } root_cases[] = {
+            { 0,    "named", true  },
+            { 0,    NULL,    false },
+            { 1000, NULL,    true  },
+            { 1000, "named", true  },
+        };
+        for (size_t i = 0; i < sizeof(root_cases)/sizeof(root_cases[0]); i++) {
+            bool permit = !(root_cases[i].euid == 0 && !root_cases[i].user);
+            if (permit != root_cases[i].expected_permit) {
+                printf("FAIL: Root privilege enforcement logic test %zu failed\n", i);
+                return 1;
+            }
+        }
         printf("PASS: Backend and Frontend privilege drop verification logic\n");
     }
 
@@ -3182,6 +3201,150 @@ int main() {
         }
 
         printf("PASS: Logging category channel validation & multiple TSIG keys in allow-transfer\n");
+    }
+
+    // --- Test 43: server_config_t reload cleanup (keys pointer & rrl struct reset) ---
+    {
+        printf("\n--- Test 43: Config reload cleanup regression test ---\n");
+        server_config_t cfg_reload;
+        memset(&cfg_reload, 0, sizeof(cfg_reload));
+
+        // 1. First config with key and rate-limit
+        const char *conf_gen1 =
+            "options {\n"
+            "    port 53;\n"
+            "    bind-address { 127.0.0.1; };\n"
+            "    rate-limit { responses-per-second 10; exempt-clients { 192.0.2.1; 192.0.2.2; }; };\n"
+            "};\n"
+            "key \"tsig1\" { algorithm \"hmac-sha256\"; secret \"AAAAAAAAAAAAAAAA\"; };\n";
+
+        if (parse_named_conf_ext(conf_gen1, NULL, &cfg_reload) != 0) {
+            printf("FAIL: gen1 config parsing failed\n");
+            return 1;
+        }
+        if (!cfg_reload.keys || cfg_reload.rrl.exempt_clients_count != 2) {
+            printf("FAIL: gen1 expected keys and rrl.exempt_clients_count == 2\n");
+            free_server_config_fields(&cfg_reload);
+            return 1;
+        }
+
+        // Free fields as perform_config_reload does
+        free_server_config_fields(&cfg_reload);
+
+        if (cfg_reload.keys != NULL) {
+            printf("FAIL: free_server_config_fields did not reset cfg->keys to NULL\n");
+            return 1;
+        }
+        if (cfg_reload.rrl.exempt_clients_count != 0 || cfg_reload.rrl.exempt_clients != NULL) {
+            printf("FAIL: free_server_config_fields did not zero out cfg->rrl (exempt_clients_count=%d)\n",
+                   cfg_reload.rrl.exempt_clients_count);
+            return 1;
+        }
+
+        // 2. Second config reload on the SAME buffer without rate-limit and with a new key
+        const char *conf_gen2 =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"tsig2\" { algorithm \"hmac-sha256\"; secret \"BBBBBBBBBBBBBBBB\"; };\n";
+
+        if (parse_named_conf_ext(conf_gen2, NULL, &cfg_reload) != 0) {
+            printf("FAIL: gen2 config reload parsing failed (potential NULL deref on last_key)\n");
+            return 1;
+        }
+        if (!cfg_reload.keys || strcmp(cfg_reload.keys->name, "tsig2") != 0) {
+            printf("FAIL: gen2 key 'tsig2' not parsed properly\n");
+            free_server_config_fields(&cfg_reload);
+            return 1;
+        }
+        if (cfg_reload.rrl.exempt_clients_count != 0) {
+            printf("FAIL: gen2 rrl.exempt_clients_count leaked across reload! (%d)\n",
+                   cfg_reload.rrl.exempt_clients_count);
+            free_server_config_fields(&cfg_reload);
+            return 1;
+        }
+
+        free_server_config_fields(&cfg_reload);
+        printf("PASS: Config reload cleanup test passed successfully\n");
+    }
+
+    // --- Test 44: Numerical config validation (tcp-idle-timeout, minimal-any-ttl, log channel size) ---
+    {
+        printf("\n--- Test 44: Numerical config option validation ---\n");
+        server_config_t cfg_num;
+
+        // 1. tcp-idle-timeout valid & invalid
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_timeout_ok = "options { tcp-idle-timeout 30000; };\n";
+        if (parse_named_conf(conf_timeout_ok, &cfg_num) != 0 || cfg_num.tcp_idle_timeout != 30000) {
+            printf("FAIL: valid tcp-idle-timeout 30000 not accepted (got %d)\n", cfg_num.tcp_idle_timeout);
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_timeout_neg = "options { tcp-idle-timeout -1; };\n";
+        if (parse_named_conf(conf_timeout_neg, &cfg_num) == 0) {
+            printf("FAIL: negative tcp-idle-timeout -1 should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_timeout_bad = "options { tcp-idle-timeout 10000abc; };\n";
+        if (parse_named_conf(conf_timeout_bad, &cfg_num) == 0) {
+            printf("FAIL: invalid tcp-idle-timeout 10000abc should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        // 2. minimal-any-ttl valid & invalid
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_ttl_ok = "options { minimal-any-ttl 60; };\n";
+        if (parse_named_conf(conf_ttl_ok, &cfg_num) != 0 || cfg_num.minimal_any_ttl != 60) {
+            printf("FAIL: valid minimal-any-ttl 60 not accepted\n");
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_ttl_neg = "options { minimal-any-ttl -1; };\n";
+        if (parse_named_conf(conf_ttl_neg, &cfg_num) == 0) {
+            printf("FAIL: negative minimal-any-ttl -1 should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_ttl_bad = "options { minimal-any-ttl 60xyz; };\n";
+        if (parse_named_conf(conf_ttl_bad, &cfg_num) == 0) {
+            printf("FAIL: invalid minimal-any-ttl 60xyz should be rejected\n");
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+
+        // 3. Log channel size validation
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_log_ok = "logging { channel ch1 { file \"/tmp/ch1.log\" size 10M; }; };\n";
+        if (parse_named_conf(conf_log_ok, &cfg_num) != 0 || !cfg_num.logging.channels ||
+            cfg_num.logging.channels->size_limit != 10ULL * 1024 * 1024) {
+            printf("FAIL: log channel size 10M not parsed correctly (got %llu)\n",
+                   (unsigned long long)(cfg_num.logging.channels ? cfg_num.logging.channels->size_limit : 0));
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        memset(&cfg_num, 0, sizeof(cfg_num));
+        const char *conf_log_neg = "logging { channel ch2 { file \"/tmp/ch2.log\" size -1M; }; };\n";
+        if (parse_named_conf(conf_log_neg, &cfg_num) != 0 || !cfg_num.logging.channels ||
+            cfg_num.logging.channels->size_limit != 0) {
+            printf("FAIL: negative log size should not set non-zero size_limit (got %llu)\n",
+                   (unsigned long long)(cfg_num.logging.channels ? cfg_num.logging.channels->size_limit : 0));
+            free_server_config_fields(&cfg_num);
+            return 1;
+        }
+        free_server_config_fields(&cfg_num);
+
+        printf("PASS: Numerical config option validation\n");
     }
 
     printf("All tests passed safely.\n");

@@ -22,6 +22,8 @@ cat << 'EOF' > "$CONF_VALID_LOG"
 options {
     port 10053;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
 };
 logging {
     channel query_log { file "/tmp/queries.log"; };
@@ -35,6 +37,8 @@ cat << 'EOF' > "$CONF_UNDEF_QLOG"
 options {
     port 10053;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
 };
 logging {
     channel query_log { file "/tmp/queries.log"; };
@@ -46,6 +50,8 @@ cat << 'EOF' > "$CONF_UNDEF_RLOG"
 options {
     port 10053;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
 };
 logging {
     channel resp_log { file "/tmp/responses.log"; };
@@ -57,6 +63,8 @@ cat << 'EOF' > "$CONF_MULTI_KEY"
 options {
     port 10053;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
 };
 zone "example.com" {
     type master;

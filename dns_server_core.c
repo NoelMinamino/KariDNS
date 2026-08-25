@@ -3001,7 +3001,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             size_t prefix_len = dname_parent - current_qname;
             if (rec->rdata_count == 0) break;
             size_t target_len = strlen(rec->rdata[0]);
-            if (prefix_len + target_len > 255) { res[3] |= 6; return; }
+            if (prefix_len + target_len > 255) { res[3] = (res[3] & 0xF0) | 6; return; }
             if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
             (*ancount)++;
             if (dnssec_ok) {
@@ -3011,7 +3011,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             memcpy(synth_name, current_qname, prefix_len);
             int written = snprintf(synth_name + prefix_len, sizeof(synth_name) - prefix_len, "%s", rec->rdata[0]);
             if (written < 0 || (size_t)written >= sizeof(synth_name) - prefix_len) {
-                res[3] |= 6; // YXDomain/error for truncation
+                res[3] = (res[3] & 0xF0) | 6; // YXDomain/error for truncation
                 return;
             }
             dns_record_t synth_cname;
@@ -3245,9 +3245,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     // ==== フェーズ7: ネガティブ応答(SOA)付加 ====
     if (!found || !type_matched) {
       if (!found)
-        res[3] |= 3;
+        res[3] = (res[3] & 0xF0) | 3;
       else
-        res[3] &= ~3;
+        res[3] &= 0xF0;
       uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
       size_t apex_idx = apex_hash & (current_zone->hash_size - 1);
       for (int i = current_zone->hash_table[apex_idx]; i != -1;
@@ -4068,7 +4068,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   *res_nscount = 0;
   *res_arcount = 0;
   if (!current_zone) {
-    res[3] |= 5;
+    res[3] = (res[3] & 0xF0) | 5;
     if (!view) {
       add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control (no view matched)");
     } else {
@@ -4084,7 +4084,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (current_zone->count == 0) {
-    res[3] |= 2; // SERVFAIL
+    res[3] = (res[3] & 0xF0) | 2; // SERVFAIL
     add_ede(&edns, cfg_for_ede->send_extended_errors, 14, "Zone not ready (empty)");
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
@@ -5800,6 +5800,15 @@ static void perform_config_reload(void) {
   
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
+    if (geteuid() == 0 && !standby->user) {
+      syslog(LOG_ERR,
+             "[Config] Reload rejected: running as root but new configuration has no 'user' directive in options{}.");
+      fprintf(stderr,
+             "[ERROR] Reload rejected: running as root but new configuration has no 'user' directive in options{}.\n");
+      free_server_config_fields(standby);
+      free(config_str);
+      return;
+    }
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
@@ -6319,6 +6328,10 @@ static void run_frontend_router(pid_t backend_pid) {
       syslog(LOG_ERR, "[Frontend] privilege drop verification failed (group only)");
       exit(EXIT_FAILURE);
     }
+  } else if (geteuid() == 0) {
+    syslog(LOG_ERR, "[Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
+    fprintf(stderr, "[ERROR] [Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
+    exit(EXIT_FAILURE);
   }
 
   int kq = kqueue();
@@ -6700,6 +6713,22 @@ int main(int argc, char **argv) {
     return 1;
   }
   free(config_str);
+
+  // 特権分離が本サーバの前提とするセキュリティモデルであるため、
+  // rootとして起動された場合は user の明示的指定を必須とする。
+  if (geteuid() == 0 && !g_config_db.config_a.user) {
+    syslog(LOG_ERR,
+           "[Config] Server started as root but no 'user' directive is set in options{}. "
+           "Refusing to start: running as root without privilege drop is not permitted. "
+           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.");
+    fprintf(stderr,
+           "[ERROR] Server started as root but no 'user' directive is set in options{}. "
+           "Refusing to start: running as root without privilege drop is not permitted. "
+           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.\n");
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+
   init_logging_channels(&g_config_db.config_a);
   atomic_init(&g_config_db.active, &g_config_db.config_a);
   rebuild_zone_db_from_config(&g_config_db.config_a);
@@ -6819,6 +6848,10 @@ int main(int argc, char **argv) {
       syslog(LOG_ERR, "[Backend] privilege drop verification failed (group only)");
       exit(EXIT_FAILURE);
     }
+  } else if (geteuid() == 0) {
+    syslog(LOG_ERR, "[Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
+    fprintf(stderr, "[ERROR] [Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
+    exit(EXIT_FAILURE);
   }
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から

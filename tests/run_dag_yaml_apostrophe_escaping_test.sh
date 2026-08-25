@@ -78,6 +78,8 @@ cat <<EOF > "$CONF_FILE"
 options {
     port $PORT;
     bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
 };
 
 zone "example.com" {
