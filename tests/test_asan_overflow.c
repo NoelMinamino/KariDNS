@@ -3347,6 +3347,61 @@ int main() {
         printf("PASS: Numerical config option validation\n");
     }
 
+    // --- Test 45: Multi-key allow-transfer parsing and IXFR mini-arena lifecycle ---
+    {
+        printf("\n--- Test 45: Multi-key allow-transfer parsing and IXFR mini-arena lifecycle ---\n");
+        server_config_t cfg_mk;
+        memset(&cfg_mk, 0, sizeof(cfg_mk));
+        const char *conf_multikey =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"keyA\" { algorithm \"hmac-sha256\"; secret \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"; };\n"
+            "key \"keyB\" { algorithm \"hmac-sha256\"; secret \"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\"; };\n"
+            "zone \"multikey.test\" {\n"
+            "    type master;\n"
+            "    file \"dummy.zone\";\n"
+            "    allow-transfer { key \"keyA\"; key \"keyB\"; };\n"
+            "};\n";
+
+        if (parse_named_conf_ext(conf_multikey, NULL, &cfg_mk) != 0) {
+            printf("FAIL: multi-key config parsing failed\n");
+            return 1;
+        }
+
+        zone_config_t *zcfg = cfg_mk.zones;
+        if (!zcfg || zcfg->tsig_keys_count != 2 || !zcfg->tsig_keys ||
+            strcmp(zcfg->tsig_keys[0], "keyA") != 0 || strcmp(zcfg->tsig_keys[1], "keyB") != 0) {
+            printf("FAIL: zcfg tsig_keys not populated correctly (count=%d)\n", zcfg ? zcfg->tsig_keys_count : -1);
+            free_server_config_fields(&cfg_mk);
+            return 1;
+        }
+
+        // Test IXFR mini-arena allocation and clean destruction
+        zone_arena_t test_arena;
+        zone_arena_init(&test_arena);
+        for (int i = 0; i < 50; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "host%d.example.com", i);
+            char *p = arena_strdup(&test_arena, name);
+            if (!p) {
+                printf("FAIL: arena_strdup returned NULL\n");
+                zone_arena_destroy(&test_arena);
+                free_server_config_fields(&cfg_mk);
+                return 1;
+            }
+            void *mem = arena_alloc(&test_arena, 256);
+            if (!mem) {
+                printf("FAIL: arena_alloc returned NULL\n");
+                zone_arena_destroy(&test_arena);
+                free_server_config_fields(&cfg_mk);
+                return 1;
+            }
+        }
+        zone_arena_destroy(&test_arena);
+
+        free_server_config_fields(&cfg_mk);
+        printf("PASS: Multi-key allow-transfer parsing and IXFR mini-arena lifecycle\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

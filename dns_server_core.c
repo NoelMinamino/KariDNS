@@ -5476,62 +5476,64 @@ worker_startup_success:;
             size_t tsig_mac_len = 0;
             if (zcfg) {
               bool has_acl = (zcfg->allow_transfer_count > 0);
-              int num_keys = zcfg->tsig_keys_count;
-              bool has_tsig = (num_keys > 0 || zcfg->tsig_key != NULL);
+              bool has_tsig = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
               
               bool acl_ok = has_acl ? check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count) : false;
               bool tsig_ok = false;
               
               if (has_tsig) {
-                if (num_keys > 0) {
-                  for (int ki = 0; ki < num_keys; ki++) {
-                    const char *target_key_name = zcfg->tsig_keys[ki];
-                    tsig_key_t *k = cfg->keys;
-                    tsig_key_t *cand = NULL;
-                    while (k) {
-                      if (strcmp(k->name, target_key_name) == 0) {
-                        cand = k;
-                        break;
-                      }
-                      k = k->next;
-                    }
-                    if (cand) {
-                      size_t tmp_mac_len = 0;
-                      uint8_t tmp_mac[64];
-                      int err = tsig_verify_packet(msg, msg_len, cand, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
-                      if (err == 0) {
-                        matched_key = cand;
-                        memcpy(tsig_mac, tmp_mac, tmp_mac_len);
-                        tsig_mac_len = tmp_mac_len;
-                        tsig_ok = true;
-                        tsig_error = 0;
-                        break;
-                      } else {
-                        tsig_error = err > 0 ? err : 16;
-                      }
-                    } else {
-                      tsig_error = 17;
-                    }
-                  }
-                } else if (zcfg->tsig_key) {
+                // allow-transfer { key "A"; key "B"; ... } で指定された全キー名を候補として、
+                // それぞれに対応する tsig_key_t を探し、TSIG検証が成功するものが1つでもあれば許可する。
+                // (どの鍵で署名されたかはメッセージを見るまで分からないため、候補を順に試す)
+                bool any_key_recognized = false;
+                for (int ki = 0; ki < zcfg->tsig_keys_count && !tsig_ok; ki++) {
+                  const char *cand_name = zcfg->tsig_keys[ki];
                   tsig_key_t *k = cfg->keys;
                   while (k) {
-                    if (strcmp(k->name, zcfg->tsig_key) == 0) {
-                      matched_key = k;
-                      break;
-                    }
+                    if (strcmp(k->name, cand_name) == 0) break;
                     k = k->next;
                   }
-                  if (!matched_key) {
-                    tsig_error = 17;
-                  } else {
-                    int err = tsig_verify_packet(msg, msg_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
-                    if (err != 0) {
-                      tsig_error = err > 0 ? err : 16;
-                    } else {
+                  if (!k) continue; // このキー名は定義されていない。次の候補へ
+                  any_key_recognized = true;
+                  size_t tmp_mac_len = 0;
+                  uint8_t tmp_mac[64];
+                  int err = tsig_verify_packet(msg, msg_len, k, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
+                  if (err == 0) {
+                    matched_key = k;
+                    memcpy(tsig_mac, tmp_mac, tmp_mac_len);
+                    tsig_mac_len = tmp_mac_len;
+                    tsig_ok = true;
+                    tsig_error = 0;
+                    break;
+                  } else if (tsig_error == 0) {
+                    tsig_error = err > 0 ? err : 16; // 最初に遭遇した検証エラーを記録
+                  }
+                }
+                // 後方互換: 旧来の tsig-key 単一指定(allow-transfer外の標準directive)も引き続きサポートする
+                if (!tsig_ok && zcfg->tsig_key) {
+                  tsig_key_t *k = cfg->keys;
+                  while (k) {
+                    if (strcmp(k->name, zcfg->tsig_key) == 0) break;
+                    k = k->next;
+                  }
+                  if (k) {
+                    any_key_recognized = true;
+                    size_t tmp_mac_len = 0;
+                    uint8_t tmp_mac[64];
+                    int err = tsig_verify_packet(msg, msg_len, k, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
+                    if (err == 0) {
+                      matched_key = k;
+                      memcpy(tsig_mac, tmp_mac, tmp_mac_len);
+                      tsig_mac_len = tmp_mac_len;
                       tsig_ok = true;
+                      tsig_error = 0;
+                    } else if (tsig_error == 0) {
+                      tsig_error = err > 0 ? err : 16;
                     }
                   }
+                }
+                if (!any_key_recognized) {
+                  tsig_error = 17; // BADKEY: 設定されているキー名のうち、どれ一つとして定義済みキーと一致しなかった
                 }
               }
               
