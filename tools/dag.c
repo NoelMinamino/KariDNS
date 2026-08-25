@@ -4350,7 +4350,32 @@ static size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
     return r;
 }
 
-static void run_dns64prefix_check(const char *server, int port, const query_opts_t *qo, bool use_tcp, bool no_hexdump_query, bool no_hexdump_response) {
+// AAAAレコードのアドレスからRFC 6052 Well-Known PrefixまたはNSPを検出し、
+// 見つかった場合はプレフィックス文字列とプレフィックス長を返す。見つからなければ false。
+static bool detect_dns64_prefix_from_aaaa(const uint8_t *addr16, char *out_pstr, size_t out_cap, int *out_plen) {
+    const uint8_t *b = addr16;
+    int plen = 0;
+    if (b[12] == 0xC0 && b[13] == 0x00 && b[14] == 0x00 && (b[15] == 0xAA || b[15] == 0xAB)) plen = 96;
+    else if (b[8] == 0x00 && b[9] == 0xC0 && b[10] == 0x00 && b[11] == 0x00 && (b[12] == 0xAA || b[12] == 0xAB)) plen = 64;
+    else if (b[8] == 0x00 && b[7] == 0xC0 && b[9] == 0x00 && b[10] == 0x00 && (b[11] == 0xAA || b[11] == 0xAB)) plen = 56;
+    else if (b[8] == 0x00 && b[6] == 0xC0 && b[7] == 0x00 && b[9] == 0x00 && (b[10] == 0xAA || b[10] == 0xAB)) plen = 48;
+    else if (b[8] == 0x00 && b[5] == 0xC0 && b[6] == 0x00 && b[7] == 0x00 && (b[9] == 0xAA || b[9] == 0xAB)) plen = 40;
+    else if (b[4] == 0xC0 && b[5] == 0x00 && b[6] == 0x00 && (b[7] == 0xAA || b[7] == 0xAB)) plen = 32;
+    if (plen == 0) return false;
+
+    struct in6_addr pref_addr;
+    memcpy(&pref_addr, addr16, 16);
+    for (int bit = plen; bit < 128; bit++) {
+        pref_addr.s6_addr[bit / 8] &= ~(1 << (7 - (bit % 8)));
+    }
+    inet_ntop(AF_INET6, &pref_addr, out_pstr, out_cap);
+    *out_plen = plen;
+    return true;
+}
+
+static void run_dns64prefix_check(const char *server, int port, const query_opts_t *qo, bool use_tcp,
+                                   bool no_hexdump_query, bool no_hexdump_response,
+                                   const display_opts_t *dopt) {
     (void)no_hexdump_query; (void)no_hexdump_response;
     uint8_t qbuf[512];
     query_opts_t q = *qo;
@@ -4359,7 +4384,9 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
     uint8_t resp[65535];
     ssize_t n = do_dns_exchange_auto(server, port, &q, qbuf, qlen, resp, sizeof(resp), q.timeout_sec, use_tcp);
     if (n < 12) {
-        printf(";; dns64prefix: could not query ipv4only.arpa\n");
+        if (!dopt->short_mode && !dopt->yaml) {
+            printf(";; dns64prefix: could not query ipv4only.arpa\n");
+        }
         return;
     }
 
@@ -4372,6 +4399,10 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
         offset += 4;
     }
 
+    if (dopt->yaml) {
+        print_response_yaml(resp, (size_t)n, server, port, use_tcp, dopt);
+    }
+
     int found_prefixes = 0;
     for (int i = 0; i < ancount; i++) {
         dns_record_t rec; uint16_t type;
@@ -4379,37 +4410,23 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
         if (type == 28 && rec.rdata_count > 0) {
             struct in6_addr in6;
             if (inet_pton(AF_INET6, rec.rdata[0], &in6) == 1) {
-                const uint8_t *b = in6.s6_addr;
+                char pstr[INET6_ADDRSTRLEN];
                 int plen = 0;
-                if (b[12] == 0xC0 && b[13] == 0x00 && b[14] == 0x00 && (b[15] == 0xAA || b[15] == 0xAB)) {
-                    plen = 96;
-                } else if (b[8] == 0x00 && b[9] == 0xC0 && b[10] == 0x00 && b[11] == 0x00 && (b[12] == 0xAA || b[12] == 0xAB)) {
-                    plen = 64;
-                } else if (b[8] == 0x00 && b[7] == 0xC0 && b[9] == 0x00 && b[10] == 0x00 && (b[11] == 0xAA || b[11] == 0xAB)) {
-                    plen = 56;
-                } else if (b[8] == 0x00 && b[6] == 0xC0 && b[7] == 0x00 && b[9] == 0x00 && (b[10] == 0xAA || b[10] == 0xAB)) {
-                    plen = 48;
-                } else if (b[8] == 0x00 && b[5] == 0xC0 && b[6] == 0x00 && b[7] == 0x00 && (b[9] == 0xAA || b[9] == 0xAB)) {
-                    plen = 40;
-                } else if (b[4] == 0xC0 && b[5] == 0x00 && b[6] == 0x00 && (b[7] == 0xAA || b[7] == 0xAB)) {
-                    plen = 32;
-                }
-
-                if (plen > 0) {
-                    struct in6_addr pref_addr = in6;
-                    for (int bit = plen; bit < 128; bit++) {
-                        pref_addr.s6_addr[bit / 8] &= ~(1 << (7 - (bit % 8)));
+                if (detect_dns64_prefix_from_aaaa(in6.s6_addr, pstr, sizeof(pstr), &plen)) {
+                    if (dopt->yaml) {
+                        printf("    %s/%d\n", pstr, plen);
+                    } else if (dopt->short_mode) {
+                        printf("%s/%d\n", pstr, plen);
+                    } else {
+                        printf("\n%s/%d\n", pstr, plen);
                     }
-                    char pstr[INET6_ADDRSTRLEN];
-                    inet_ntop(AF_INET6, &pref_addr, pstr, sizeof(pstr));
-                    printf("\n%s/%d\n", pstr, plen);
                     found_prefixes++;
                 }
             }
         }
     }
 
-    if (found_prefixes == 0) {
+    if (found_prefixes == 0 && !dopt->short_mode && !dopt->yaml) {
         printf(";; could not get DNS64 prefixes from ipv4only.arpa\n");
     }
 }
@@ -4423,7 +4440,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     zone_arena_init(&g_dag_arena);
 
     if (qo->check_dns64prefix && strcasecmp(qname, "ipv4only.arpa") != 0 && strcasecmp(qname, "ipv4only.arpa.") != 0) {
-        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response);
+        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
     }
     
     if (test_name) {
@@ -4841,7 +4858,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 printf(";; WARNING -- Some TSIG could not be validated\n");
             }
         }
-        if (qo->check_dns64prefix && n >= 12) {
+        if (qo->check_dns64prefix && (strcasecmp(qname, "ipv4only.arpa") == 0 || strcasecmp(qname, "ipv4only.arpa.") == 0) && n >= 12) {
             uint16_t r_qd = (resp[4] << 8) | resp[5];
             uint16_t r_an = (resp[6] << 8) | resp[7];
             size_t p_off = 12;
@@ -4856,23 +4873,16 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 if (type == 28 && rec.rdata_count > 0) {
                     struct in6_addr in6;
                     if (inet_pton(AF_INET6, rec.rdata[0], &in6) == 1) {
-                        const uint8_t *b = in6.s6_addr;
+                        char pstr[INET6_ADDRSTRLEN];
                         int plen = 0;
-                        if (b[12] == 0xC0 && b[13] == 0x00 && b[14] == 0x00 && (b[15] == 0xAA || b[15] == 0xAB)) plen = 96;
-                        else if (b[8] == 0x00 && b[9] == 0xC0 && b[10] == 0x00 && b[11] == 0x00 && (b[12] == 0xAA || b[12] == 0xAB)) plen = 64;
-                        else if (b[8] == 0x00 && b[7] == 0xC0 && b[9] == 0x00 && b[10] == 0x00 && (b[11] == 0xAA || b[11] == 0xAB)) plen = 56;
-                        else if (b[8] == 0x00 && b[6] == 0xC0 && b[7] == 0x00 && b[9] == 0x00 && (b[10] == 0xAA || b[10] == 0xAB)) plen = 48;
-                        else if (b[8] == 0x00 && b[5] == 0xC0 && b[6] == 0x00 && b[7] == 0x00 && (b[9] == 0xAA || b[9] == 0xAB)) plen = 40;
-                        else if (b[4] == 0xC0 && b[5] == 0x00 && b[6] == 0x00 && (b[7] == 0xAA || b[7] == 0xAB)) plen = 32;
-
-                        if (plen > 0) {
-                            struct in6_addr pref_addr = in6;
-                            for (int bit = plen; bit < 128; bit++) {
-                                pref_addr.s6_addr[bit / 8] &= ~(1 << (7 - (bit % 8)));
+                        if (detect_dns64_prefix_from_aaaa(in6.s6_addr, pstr, sizeof(pstr), &plen)) {
+                            if (dopt->yaml) {
+                                printf("    %s/%d\n", pstr, plen);
+                            } else if (dopt->short_mode) {
+                                printf("%s/%d\n", pstr, plen);
+                            } else {
+                                printf("\n%s/%d\n", pstr, plen);
                             }
-                            char pstr[INET6_ADDRSTRLEN];
-                            inet_ntop(AF_INET6, &pref_addr, pstr, sizeof(pstr));
-                            printf("\n%s/%d\n", pstr, plen);
                             break;
                         }
                     }
@@ -6192,8 +6202,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         if (is_known_qclass_str(c, &cls)) {
             spec->qo.qclass = cls;
         } else {
-            fprintf(stderr, "invalid class %s\n", c);
-            return -1;
+            spec->qo.qclass = 1;
         }
         return 2;
     }

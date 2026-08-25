@@ -441,6 +441,7 @@ if command -v perl >/dev/null 2>&1; then
     run_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
     run_check "RFC 7873: BADCOOKIE TCP transport fallback (tests/run_dag_badcookie_transport_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_badcookie_transport_test.sh\"" "ALL BADCOOKIE / EXPIRE / KEEPOPEN TESTS PASSED"
     run_check "RFC 7050: DNS64 prefix discovery (tests/run_dag_dns64prefix_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dns64prefix_test.sh\"" "PASS:"
+    run_check "RFC 7050: DNS64 prefix in +short and +yaml mode (tests/run_dag_dns64prefix_short_yaml_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dns64prefix_short_yaml_test.sh\"" "ALL DNS64PREFIX SHORT/YAML TESTS PASSED"
     run_check "Diagnostic: Malformed packet detection in default mode (tests/run_malformed_detection_default_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_malformed_detection_default_test.sh\"" "PASS:"
 fi
 run_check "Transport: TCP Keepopen & EDNS0 Keepalive (tests/run_dag_keepopen_keepalive_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_keepalive_test.sh\"" "ALL KEEPOPEN & KEEPALIVE TESTS PASSED"
