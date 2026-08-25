@@ -2014,9 +2014,40 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         got += r;
     }
     if (got < 2) {
-        close_cached_tcp();
-        if (!(qo && qo->keep_tcp_open)) { SSL_shutdown(ssl); SSL_free(ssl); close(sock); }
-        return -1;
+        if (reused) {
+            close_cached_tcp();
+            printf(";; communications error to %s#%d: end of file\n", server, port);
+            sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+            if (sock < 0) return -1;
+            set_socket_timeouts(sock, timeout_sec);
+            send_proxyv2_if_enabled(sock, qo, true);
+            ssl = establish_tls(sock, qo, server, port);
+            if (!ssl) { close(sock); return -1; }
+            if (qo && qo->keep_tcp_open) {
+                g_cached_conn.sock = sock;
+                g_cached_conn.ssl = ssl;
+                snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+                g_cached_conn.port = port;
+                g_cached_conn.pref_family = qo->pref_family;
+                snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+                g_cached_conn.bind_port = qo->bind_port;
+                g_cached_conn.is_tls = true;
+            }
+            if (SSL_write(ssl, len_prefix, 2) <= 0 || SSL_write(ssl, pkt, (int)pkt_len) <= 0) {
+                close_cached_tcp();
+                return -1;
+            }
+            got = 0;
+            while (got < 2) {
+                int r = SSL_read(ssl, rlen_buf + got, 2 - got);
+                if (r <= 0) { close_cached_tcp(); return -1; }
+                got += r;
+            }
+        } else {
+            close_cached_tcp();
+            if (!(qo && qo->keep_tcp_open)) { SSL_shutdown(ssl); SSL_free(ssl); close(sock); }
+            return -1;
+        }
     }
     uint16_t rlen = (rlen_buf[0] << 8) | rlen_buf[1];
     if (rlen > resp_cap) rlen = (uint16_t)resp_cap;
@@ -2025,6 +2056,56 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         int r = SSL_read(ssl, resp + total_read, (int)(rlen - total_read));
         if (r <= 0) break;
         total_read += r;
+    }
+
+    if (total_read < (size_t)rlen) {
+        if (reused) {
+            close_cached_tcp();
+            printf(";; communications error to %s#%d: end of file\n", server, port);
+            sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+            if (sock < 0) return -1;
+            set_socket_timeouts(sock, timeout_sec);
+            send_proxyv2_if_enabled(sock, qo, true);
+            ssl = establish_tls(sock, qo, server, port);
+            if (!ssl) { close(sock); return -1; }
+            if (qo && qo->keep_tcp_open) {
+                g_cached_conn.sock = sock;
+                g_cached_conn.ssl = ssl;
+                snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+                g_cached_conn.port = port;
+                g_cached_conn.pref_family = qo->pref_family;
+                snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+                g_cached_conn.bind_port = qo->bind_port;
+                g_cached_conn.is_tls = true;
+            }
+            if (SSL_write(ssl, len_prefix, 2) <= 0 || SSL_write(ssl, pkt, (int)pkt_len) <= 0) {
+                close_cached_tcp();
+                return -1;
+            }
+            uint8_t rlen_buf2[2];
+            int got2 = 0;
+            while (got2 < 2) {
+                int r = SSL_read(ssl, rlen_buf2 + got2, 2 - got2);
+                if (r <= 0) { close_cached_tcp(); return -1; }
+                got2 += r;
+            }
+            uint16_t rlen2 = (rlen_buf2[0] << 8) | rlen_buf2[1];
+            if (rlen2 > resp_cap) rlen2 = (uint16_t)resp_cap;
+            total_read = 0;
+            while (total_read < rlen2) {
+                int r = SSL_read(ssl, resp + total_read, (int)(rlen2 - total_read));
+                if (r <= 0) break;
+                total_read += r;
+            }
+            if (total_read < (size_t)rlen2) {
+                close_cached_tcp();
+                return -1;
+            }
+        } else {
+            close_cached_tcp();
+            if (!(qo && qo->keep_tcp_open)) { SSL_shutdown(ssl); SSL_free(ssl); close(sock); }
+            return -1;
+        }
     }
 
     if (!(qo && qo->keep_tcp_open)) {
@@ -3807,6 +3888,27 @@ static void yaml_single_quote_escape(const char *src, char *dst, size_t dst_cap)
     dst[d] = '\0';
 }
 
+// YAML double-quoted scalar内で安全な形にエスケープする（" \ および制御文字を処理）
+static void yaml_double_quote_escape(const char *src, char *dst, size_t dst_cap) {
+    if (!dst || dst_cap == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t d = 0;
+    for (size_t s = 0; src[s] != '\0' && d + 1 < dst_cap; s++) {
+        unsigned char c = (unsigned char)src[s];
+        if (c == '"' || c == '\\') {
+            if (d + 2 >= dst_cap) break;
+            dst[d++] = '\\';
+            dst[d++] = (char)c;
+        } else if (c < 0x20) {
+            if (d + 4 >= dst_cap) break;
+            d += (size_t)snprintf(dst + d, dst_cap - d, "\\x%02x", c);
+        } else {
+            dst[d++] = (char)c;
+        }
+    }
+    dst[d] = '\0';
+}
+
 static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp, const display_opts_t *dopt) {
     if (pkt_len < 12) return;
     uint16_t id = (pkt[0] << 8) | pkt[1];
@@ -3959,7 +4061,9 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
                 printf("          EDE:\n");
                 printf("            INFO-CODE: %u (%s)\n", yaml_edns.ede_list[i].code, msg);
                 if (yaml_edns.ede_list[i].text[0]) {
-                    printf("            EXTRA-TEXT: \"%s\"\n", yaml_edns.ede_list[i].text);
+                    char text_esc[512];
+                    yaml_double_quote_escape(yaml_edns.ede_list[i].text, text_esc, sizeof(text_esc));
+                    printf("            EXTRA-TEXT: \"%s\"\n", text_esc);
                 }
             }
         }
