@@ -433,6 +433,7 @@ fi
 run_check "CLI Options & Prereq/Break validation (tests/run_dag_cli_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cli_options_test.sh\"" "ALL CLI OPTION TESTS PASSED"
 run_check "Hex payload overflow safety (tests/run_dag_hex_payload_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_hex_payload_overflow_test.sh\"" "ALL HEX PAYLOAD OVERFLOW TESTS PASSED"
 run_check "YAML RDATA output structure (tests/run_dag_yaml_rdata_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rdata_test.sh\"" "ALL YAML RDATA TESTS PASSED"
+run_check "YAML apostrophe escaping (tests/run_dag_yaml_apostrophe_escaping_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_apostrophe_escaping_test.sh\"" "ALL YAML APOSTROPHE ESCAPING TESTS PASSED"
 if command -v perl >/dev/null 2>&1; then
     run_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"
     run_check "Security: UDP transaction ID mismatch discard (tests/run_dag_udp_id_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_id_mismatch_discard_test.sh\"" "PASS:"

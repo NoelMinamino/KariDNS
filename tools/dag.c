@@ -3764,6 +3764,23 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
     }
 }
 
+// YAML single-quoted scalar内で安全な形にエスケープする（'を''に置換するのみ）
+static void yaml_single_quote_escape(const char *src, char *dst, size_t dst_cap) {
+    if (!dst || dst_cap == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t d = 0;
+    for (size_t s = 0; src[s] != '\0' && d + 1 < dst_cap; s++) {
+        if (src[s] == '\'') {
+            if (d + 2 >= dst_cap) break;
+            dst[d++] = '\'';
+            dst[d++] = '\'';
+        } else {
+            dst[d++] = src[s];
+        }
+    }
+    dst[d] = '\0';
+}
+
 static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp, const display_opts_t *dopt) {
     if (pkt_len < 12) return;
     uint16_t id = (pkt[0] << 8) | pkt[1];
@@ -3922,9 +3939,11 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
             uint16_t qclass = (pkt[next+2] << 8) | pkt[next+3];
             char tname_buf[32];
             char cname_buf[16];
+            char name_esc[512];
+            yaml_single_quote_escape(name ? name : ".", name_esc, sizeof(name_esc));
             const char *tname = format_type_name(qtype, tname_buf, sizeof(tname_buf));
             const char *cname = format_class_name(qclass, cname_buf, sizeof(cname_buf));
-            printf("        - '%s %s %s'\n", name ? name : ".", cname, tname);
+            printf("        - '%s %s %s'\n", name_esc, cname, tname);
             offset = next + 4;
         }
     }
@@ -3982,7 +4001,12 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
                 char rdata_raw[2048];
                 format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw));
 
-                printf("        - '%s %s %s %s %s'\n", name ? name : ".", ttl_str, cname, tname, rdata_raw);
+                char name_esc[512];
+                char rdata_esc[4096];
+                yaml_single_quote_escape(name ? name : ".", name_esc, sizeof(name_esc));
+                yaml_single_quote_escape(rdata_raw, rdata_esc, sizeof(rdata_esc));
+
+                printf("        - '%s %s %s %s %s'\n", name_esc, ttl_str, cname, tname, rdata_esc);
                 offset = rdata_start + rdlen;
             }
         } else {
