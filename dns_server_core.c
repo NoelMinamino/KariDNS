@@ -5800,6 +5800,15 @@ static void perform_config_reload(void) {
   
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
+    if (geteuid() == 0 && !standby->user) {
+      syslog(LOG_ERR,
+             "[Config] Reload rejected: running as root but new configuration has no 'user' directive in options{}.");
+      fprintf(stderr,
+             "[ERROR] Reload rejected: running as root but new configuration has no 'user' directive in options{}.\n");
+      free_server_config_fields(standby);
+      free(config_str);
+      return;
+    }
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
@@ -6319,6 +6328,10 @@ static void run_frontend_router(pid_t backend_pid) {
       syslog(LOG_ERR, "[Frontend] privilege drop verification failed (group only)");
       exit(EXIT_FAILURE);
     }
+  } else if (geteuid() == 0) {
+    syslog(LOG_ERR, "[Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
+    fprintf(stderr, "[ERROR] [Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
+    exit(EXIT_FAILURE);
   }
 
   int kq = kqueue();
@@ -6700,6 +6713,22 @@ int main(int argc, char **argv) {
     return 1;
   }
   free(config_str);
+
+  // 特権分離が本サーバの前提とするセキュリティモデルであるため、
+  // rootとして起動された場合は user の明示的指定を必須とする。
+  if (geteuid() == 0 && !g_config_db.config_a.user) {
+    syslog(LOG_ERR,
+           "[Config] Server started as root but no 'user' directive is set in options{}. "
+           "Refusing to start: running as root without privilege drop is not permitted. "
+           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.");
+    fprintf(stderr,
+           "[ERROR] Server started as root but no 'user' directive is set in options{}. "
+           "Refusing to start: running as root without privilege drop is not permitted. "
+           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.\n");
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+
   init_logging_channels(&g_config_db.config_a);
   atomic_init(&g_config_db.active, &g_config_db.config_a);
   rebuild_zone_db_from_config(&g_config_db.config_a);
@@ -6819,6 +6848,10 @@ int main(int argc, char **argv) {
       syslog(LOG_ERR, "[Backend] privilege drop verification failed (group only)");
       exit(EXIT_FAILURE);
     }
+  } else if (geteuid() == 0) {
+    syslog(LOG_ERR, "[Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
+    fprintf(stderr, "[ERROR] [Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
+    exit(EXIT_FAILURE);
   }
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から

@@ -1311,6 +1311,25 @@ int main() {
                 return 1;
             }
         }
+
+        // 3. Root privilege enforcement logic test
+        struct {
+            uid_t euid;
+            const char *user;
+            bool expected_permit;
+        } root_cases[] = {
+            { 0,    "named", true  },
+            { 0,    NULL,    false },
+            { 1000, NULL,    true  },
+            { 1000, "named", true  },
+        };
+        for (size_t i = 0; i < sizeof(root_cases)/sizeof(root_cases[0]); i++) {
+            bool permit = !(root_cases[i].euid == 0 && !root_cases[i].user);
+            if (permit != root_cases[i].expected_permit) {
+                printf("FAIL: Root privilege enforcement logic test %zu failed\n", i);
+                return 1;
+            }
+        }
         printf("PASS: Backend and Frontend privilege drop verification logic\n");
     }
 
