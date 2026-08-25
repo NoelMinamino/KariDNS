@@ -1851,7 +1851,12 @@ static ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
     size_t got = 0;
     while (got < rlen) {
         ssize_t r = recv(sock, resp + got, rlen - got, 0);
-        if (r <= 0) break;
+        if (r <= 0) {
+            // 宣言された長さに満たないまま受信が終了した。
+            // ストリームの同期が崩れている可能性が高いため、
+            // 呼び出し元が必ず接続を破棄できるよう -1 を返す。
+            return -1;
+        }
         got += r;
     }
     return (ssize_t)got;
@@ -4577,15 +4582,20 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 n = do_tls_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
                 if (n > 0) break;
             } else if (use_tcp) {
-                tcp_sock = do_tcp_send_request(server, port, qo, pkt, pkt_len, qo->timeout_sec);
-                if (tcp_sock >= 0) {
-                    n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
-                    if (n > 0) {
-                        break; // connected and got first message
+                if (qo->keep_tcp_open && !axfr_state.is_axfr) {
+                    n = do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                    if (n > 0) break;
+                } else {
+                    tcp_sock = do_tcp_send_request(server, port, qo, pkt, pkt_len, qo->timeout_sec);
+                    if (tcp_sock >= 0) {
+                        n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+                        if (n > 0) {
+                            break; // connected and got first message
+                        }
+                        close(tcp_sock);
+                        tcp_sock = -1;
+                        n = -1;
                     }
-                    close(tcp_sock);
-                    tcp_sock = -1;
-                    n = -1;
                 }
             } else {
                 n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
