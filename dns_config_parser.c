@@ -389,10 +389,13 @@ void free_server_config_fields(server_config_t *cfg) {
     free(k);
     k = next_k;
   }
+  cfg->keys = NULL;
+
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
   if (cfg->control.secret) { free(cfg->control.secret); cfg->control.secret = NULL; }
   memset(&cfg->control, 0, sizeof(control_channel_config_t));
   free_rate_limit_config(&cfg->rrl);
+  memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
 
   log_channel_t *ch = cfg->logging.channels;
   while (ch) {

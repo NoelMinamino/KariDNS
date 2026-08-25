@@ -3184,6 +3184,69 @@ int main() {
         printf("PASS: Logging category channel validation & multiple TSIG keys in allow-transfer\n");
     }
 
+    // --- Test 43: server_config_t reload cleanup (keys pointer & rrl struct reset) ---
+    {
+        printf("\n--- Test 43: Config reload cleanup regression test ---\n");
+        server_config_t cfg_reload;
+        memset(&cfg_reload, 0, sizeof(cfg_reload));
+
+        // 1. First config with key and rate-limit
+        const char *conf_gen1 =
+            "options {\n"
+            "    port 53;\n"
+            "    bind-address { 127.0.0.1; };\n"
+            "    rate-limit { responses-per-second 10; exempt-clients { 192.0.2.1; 192.0.2.2; }; };\n"
+            "};\n"
+            "key \"tsig1\" { algorithm \"hmac-sha256\"; secret \"AAAAAAAAAAAAAAAA\"; };\n";
+
+        if (parse_named_conf_ext(conf_gen1, NULL, &cfg_reload) != 0) {
+            printf("FAIL: gen1 config parsing failed\n");
+            return 1;
+        }
+        if (!cfg_reload.keys || cfg_reload.rrl.exempt_clients_count != 2) {
+            printf("FAIL: gen1 expected keys and rrl.exempt_clients_count == 2\n");
+            free_server_config_fields(&cfg_reload);
+            return 1;
+        }
+
+        // Free fields as perform_config_reload does
+        free_server_config_fields(&cfg_reload);
+
+        if (cfg_reload.keys != NULL) {
+            printf("FAIL: free_server_config_fields did not reset cfg->keys to NULL\n");
+            return 1;
+        }
+        if (cfg_reload.rrl.exempt_clients_count != 0 || cfg_reload.rrl.exempt_clients != NULL) {
+            printf("FAIL: free_server_config_fields did not zero out cfg->rrl (exempt_clients_count=%d)\n",
+                   cfg_reload.rrl.exempt_clients_count);
+            return 1;
+        }
+
+        // 2. Second config reload on the SAME buffer without rate-limit and with a new key
+        const char *conf_gen2 =
+            "options { port 53; bind-address { 127.0.0.1; }; };\n"
+            "key \"tsig2\" { algorithm \"hmac-sha256\"; secret \"BBBBBBBBBBBBBBBB\"; };\n";
+
+        if (parse_named_conf_ext(conf_gen2, NULL, &cfg_reload) != 0) {
+            printf("FAIL: gen2 config reload parsing failed (potential NULL deref on last_key)\n");
+            return 1;
+        }
+        if (!cfg_reload.keys || strcmp(cfg_reload.keys->name, "tsig2") != 0) {
+            printf("FAIL: gen2 key 'tsig2' not parsed properly\n");
+            free_server_config_fields(&cfg_reload);
+            return 1;
+        }
+        if (cfg_reload.rrl.exempt_clients_count != 0) {
+            printf("FAIL: gen2 rrl.exempt_clients_count leaked across reload! (%d)\n",
+                   cfg_reload.rrl.exempt_clients_count);
+            free_server_config_fields(&cfg_reload);
+            return 1;
+        }
+
+        free_server_config_fields(&cfg_reload);
+        printf("PASS: Config reload cleanup test passed successfully\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
