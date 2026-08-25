@@ -2219,6 +2219,27 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
     }
 
     ssize_t n = do_tcp_recv_response(sock, resp, resp_cap);
+    if (n < 0 && reused) {
+        printf(";; communications error to %s#%d: end of file\n", server, port);
+        close_cached_tcp();
+        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        if (sock < 0) return -1;
+        send_proxyv2_if_enabled(sock, qo, true);
+        set_socket_timeouts(sock, timeout_sec);
+        if (qo && qo->keep_tcp_open) {
+            g_cached_conn.sock = sock;
+            g_cached_conn.ssl = NULL;
+            snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+            g_cached_conn.port = port;
+            g_cached_conn.pref_family = qo->pref_family;
+            snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+            g_cached_conn.bind_port = qo->bind_port;
+            g_cached_conn.is_tls = false;
+        }
+        if (send(sock, len_prefix, 2, 0) == 2 && send(sock, pkt, pkt_len, 0) == (ssize_t)pkt_len) {
+            n = do_tcp_recv_response(sock, resp, resp_cap);
+        }
+    }
     if (n < 0 || !(qo && qo->keep_tcp_open)) {
         close_cached_tcp();
         if (!(qo && qo->keep_tcp_open)) close(sock);
@@ -3931,6 +3952,17 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
                 printf("            STATUS: good\n");
             }
         }
+        edns_info_t yaml_edns;
+        if (parse_edns_opt(pkt, pkt_len, qdcount, ancount, nscount, arcount, &yaml_edns) == 0) {
+            for (uint16_t i = 0; i < yaml_edns.ede_count; i++) {
+                const char *msg = get_ede_error_string(yaml_edns.ede_list[i].code);
+                printf("          EDE:\n");
+                printf("            INFO-CODE: %u (%s)\n", yaml_edns.ede_list[i].code, msg);
+                if (yaml_edns.ede_list[i].text[0]) {
+                    printf("            EXTRA-TEXT: \"%s\"\n", yaml_edns.ede_list[i].text);
+                }
+            }
+        }
     }
 
     size_t offset = 12;
@@ -4378,6 +4410,77 @@ static bool detect_dns64_prefix_from_aaaa(const uint8_t *addr16, char *out_pstr,
     return true;
 }
 
+static void print_response_yaml_dns64(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp) {
+    if (pkt_len < 12) return;
+    uint16_t id = (pkt[0] << 8) | pkt[1];
+    uint16_t flags = (pkt[2] << 8) | pkt[3];
+    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+    uint16_t ancount = (pkt[6] << 8) | pkt[7];
+    uint16_t nscount = (pkt[8] << 8) | pkt[9];
+    uint16_t arcount = (pkt[10] << 8) | pkt[11];
+
+    bool qr = (flags >> 15) & 1;
+    bool aa = (flags >> 10) & 1;
+    bool tc = (flags >> 9) & 1;
+    bool rd = (flags >> 8) & 1;
+    bool ra = (flags >> 7) & 1;
+    bool z  = (flags >> 6) & 1;
+    bool ad = (flags >> 5) & 1;
+    bool cd = (flags >> 4) & 1;
+    uint8_t opcode = (flags >> 11) & 0xF;
+    uint8_t rcode = flags & 0xF;
+
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S.000Z", &tm_utc);
+
+    const char *resp_type = "RESPONSE";
+    if (qr) {
+        if (aa) resp_type = "AUTH_RESPONSE";
+        else resp_type = "RECURSIVE_RESPONSE";
+    } else {
+        resp_type = "QUERY";
+    }
+
+    const char *family_str = (server && strchr(server, ':')) ? "INET6" : "INET";
+    const char *proto_str = is_tcp ? "TCP" : "UDP";
+
+    printf("- type: MESSAGE\n");
+    printf("  message:\n");
+    printf("    type: %s\n", resp_type);
+    printf("    query_time: !!timestamp %s\n", time_str);
+    printf("    response_time: !!timestamp %s\n", time_str);
+    printf("    message_size: %zub\n", pkt_len);
+    printf("    socket_family: %s\n", family_str);
+    printf("    socket_protocol: %s\n", proto_str);
+    printf("    response_address: \"%s\"\n", server ? server : "127.0.0.1");
+    printf("    response_port: %u\n", port ? port : 53);
+    printf("    query_address: \"0.0.0.0\"\n");
+    printf("    query_port: 0\n");
+    printf("    response_message_data:\n");
+    printf("      opcode: %s\n", opcode_name(opcode));
+    printf("      status: %s\n", rcode_name(rcode));
+    printf("      id: %u\n", id);
+
+    printf("      flags:");
+    if (qr) printf(" qr");
+    if (aa) printf(" aa");
+    if (tc) printf(" tc");
+    if (rd) printf(" rd");
+    if (ra) printf(" ra");
+    if (z)  printf(" z");
+    if (ad) printf(" ad");
+    if (cd) printf(" cd");
+    printf("\n");
+
+    printf("      QUESTION: %u\n", qdcount);
+    printf("      ANSWER: %u\n", ancount);
+    printf("      AUTHORITY: %u\n", nscount);
+    printf("      ADDITIONAL: %u\n", arcount);
+}
+
 static void run_dns64prefix_check(const char *server, int port, const query_opts_t *qo, bool use_tcp,
                                    bool no_hexdump_query, bool no_hexdump_response,
                                    const display_opts_t *dopt) {
@@ -4389,9 +4492,6 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
     uint8_t resp[65535];
     ssize_t n = do_dns_exchange_auto(server, port, &q, qbuf, qlen, resp, sizeof(resp), q.timeout_sec, use_tcp);
     if (n < 12) {
-        if (!dopt->short_mode && !dopt->yaml) {
-            printf(";; dns64prefix: could not query ipv4only.arpa\n");
-        }
         return;
     }
 
@@ -4405,10 +4505,9 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
     }
 
     if (dopt->yaml) {
-        print_response_yaml(resp, (size_t)n, server, port, use_tcp, dopt);
+        print_response_yaml_dns64(resp, (size_t)n, server, port, use_tcp);
     }
 
-    int found_prefixes = 0;
     for (int i = 0; i < ancount; i++) {
         dns_record_t rec; uint16_t type;
         if (parse_resource_record(resp, (size_t)n, &offset, &g_dag_arena, &rec, &type) != 0) break;
@@ -4425,14 +4524,10 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
                     } else {
                         printf("\n%s/%d\n", pstr, plen);
                     }
-                    found_prefixes++;
+                    break;
                 }
             }
         }
-    }
-
-    if (found_prefixes == 0 && !dopt->short_mode && !dopt->yaml) {
-        printf(";; could not get DNS64 prefixes from ipv4only.arpa\n");
     }
 }
 
@@ -4444,10 +4539,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     zone_arena_destroy(&g_dag_arena);
     zone_arena_init(&g_dag_arena);
 
-    if (qo->check_dns64prefix && strcasecmp(qname, "ipv4only.arpa") != 0 && strcasecmp(qname, "ipv4only.arpa.") != 0) {
-        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
-    }
-    
     if (test_name) {
         printf("=========================================================\n");
         printf(">>> TEST: %s\n", test_name);
@@ -4868,37 +4959,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 printf(";; WARNING -- Some TSIG could not be validated\n");
             }
         }
-        if (qo->check_dns64prefix && (strcasecmp(qname, "ipv4only.arpa") == 0 || strcasecmp(qname, "ipv4only.arpa.") == 0) && n >= 12) {
-            uint16_t r_qd = (resp[4] << 8) | resp[5];
-            uint16_t r_an = (resp[6] << 8) | resp[7];
-            size_t p_off = 12;
-            for (int i = 0; i < r_qd; i++) {
-                char *d;
-                if (expand_wire_name(resp, (size_t)n, p_off, &p_off, &g_dag_arena, &d) != 0) break;
-                p_off += 4;
-            }
-            for (int i = 0; i < r_an; i++) {
-                dns_record_t rec; uint16_t type;
-                if (parse_resource_record(resp, (size_t)n, &p_off, &g_dag_arena, &rec, &type) != 0) break;
-                if (type == 28 && rec.rdata_count > 0) {
-                    struct in6_addr in6;
-                    if (inet_pton(AF_INET6, rec.rdata[0], &in6) == 1) {
-                        char pstr[INET6_ADDRSTRLEN];
-                        int plen = 0;
-                        if (detect_dns64_prefix_from_aaaa(in6.s6_addr, pstr, sizeof(pstr), &plen)) {
-                            if (dopt->yaml) {
-                                printf("    %s/%d\n", pstr, plen);
-                            } else if (dopt->short_mode) {
-                                printf("%s/%d\n", pstr, plen);
-                            } else {
-                                printf("\n%s/%d\n", pstr, plen);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
         if (tcp_sock >= 0) close(tcp_sock);
 
         if (is_truncated) {
@@ -4911,6 +4971,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         }
     } while (retry_tcp);
+
+    if (qo->check_dns64prefix) {
+        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
+    }
 
     return 0;
 }
@@ -6162,6 +6226,8 @@ static void prescan_always_global_options(int argc, char **argv, query_spec_t *g
         else if (strcmp(argv[i], "+nocmd") == 0) global_spec->dopt.show_cmd = false;
         else if (strcmp(argv[i], "+short") == 0) global_spec->dopt.short_mode = true;
         else if (strcmp(argv[i], "+noshort") == 0) global_spec->dopt.short_mode = false;
+        else if (strcmp(argv[i], "+yaml") == 0) global_spec->dopt.yaml = true;
+        else if (strcmp(argv[i], "+noyaml") == 0) global_spec->dopt.yaml = false;
         else if (strcmp(argv[i], "+ldnsz") == 0) global_spec->use_ldnsz = true;
         else if (strcmp(argv[i], "+noldnsz") == 0) global_spec->use_ldnsz = false;
         else if (strcmp(argv[i], "-m") == 0) global_spec->qo.mem_debug = true;
@@ -6174,7 +6240,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
 
     // プレスキャンで確定済みの全域グローバルオプションは最優先でスキップ (no-op)
     if (strcmp(arg, "+cmd") == 0 || strcmp(arg, "+nocmd") == 0 ||
-        strcmp(arg, "+short") == 0 || strcmp(arg, "+noshort") == 0) {
+        strcmp(arg, "+short") == 0 || strcmp(arg, "+noshort") == 0 ||
+        strcmp(arg, "+yaml") == 0 || strcmp(arg, "+noyaml") == 0) {
         return 1;
     }
 
@@ -6212,6 +6279,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         if (is_known_qclass_str(c, &cls)) {
             spec->qo.qclass = cls;
         } else {
+            printf(";; Warning, ignoring invalid class %s\n", c);
             spec->qo.qclass = 1;
         }
         return 2;
