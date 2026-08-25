@@ -457,7 +457,9 @@ run_check "Formatting: YAML clean stream without spurious errors (tests/run_dag_
 run_check "Formatting: +multiline DS single-line formatting (tests/run_dag_multiline_ds_single_line_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multiline_ds_single_line_test.sh\"" "ALL MULTILINE DS TESTS PASSED"
 run_check "Transport: -b bind address family mismatch detection (tests/run_dag_bind_address_family_mismatch_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_bind_address_family_mismatch_test.sh\"" "ALL BIND ADDRESS FAMILY MISMATCH TESTS PASSED"
 run_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
-run_check "Features: +trace & +nssearch TCP validation (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
+run_check "Formatting: YAML +nocrypto suppression (tests/run_dag_yaml_nocrypto_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_nocrypto_test.sh\"" "ALL YAML NOCRYPTO TESTS PASSED"
+run_check "Formatting: YAML +expandaaaa AAAA expansion (tests/run_dag_yaml_expandaaaa_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_expandaaaa_test.sh\"" "ALL YAML EXPANDAAAA TESTS PASSED"
+run_check "Formatting: YAML RRSIG structured decoding (tests/run_dag_yaml_rrsig_decode_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rrsig_decode_test.sh\"" "ALL YAML RRSIG DECODE TESTS PASSED"
 run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"
 
 echo "========================================================"

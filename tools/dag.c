@@ -2797,15 +2797,43 @@ static void rdata_buf_append(char *out, size_t out_cap, size_t *pos, const char 
     }
 }
 
+static void rdata_buf_append_split_b64(char *out, size_t out_cap, size_t *pos, const char *b64, int len, int split_width) {
+    if (split_width <= 0) split_width = 56;
+    for (int i = 0; i < len; i += split_width) {
+        if (i > 0) rdata_buf_append(out, out_cap, pos, " ");
+        int chunk = (len - i) < split_width ? (len - i) : split_width;
+        rdata_buf_append(out, out_cap, pos, "%.*s", chunk, b64 + i);
+    }
+}
+
+static void rdata_buf_append_split_hex(char *out, size_t out_cap, size_t *pos, const uint8_t *data, size_t len, int split_width) {
+    int sw = (split_width > 0) ? (split_width / 2) : 0;
+    for (size_t i = 0; i < len; i++) {
+        if (sw > 0 && i > 0 && (i % sw) == 0) rdata_buf_append(out, out_cap, pos, " ");
+        rdata_buf_append(out, out_cap, pos, "%02X", data[i]);
+    }
+}
+
 static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                                      size_t abs_offset, uint16_t rdlen,
-                                     char *out, size_t out_cap) {
+                                     char *out, size_t out_cap, const display_opts_t *dopt) {
     if (!out || out_cap == 0) return;
     out[0] = '\0';
     size_t pos = 0;
 
     if (abs_offset + rdlen > pkt_len) {
         rdata_buf_append(out, out_cap, &pos, "(truncated RDATA)");
+        return;
+    }
+
+    if (dopt && dopt->force_unknown_format) {
+        rdata_buf_append(out, out_cap, &pos, "\\# %u", rdlen);
+        if (rdlen > 0) {
+            rdata_buf_append(out, out_cap, &pos, " ");
+            for (size_t i = 0; i < rdlen; i++) {
+                rdata_buf_append(out, out_cap, &pos, "%02X", pkt[abs_offset + i]);
+            }
+        }
         return;
     }
 
@@ -2889,6 +2917,256 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             return;
         }
+        case 17: case 18: case 19: case 20: case 22: case 26: case 40: { // RP, AFSDB, X25, ISDN, NSAP, PX, SINK
+            if (type == 17) { // RP
+                char *mbox = NULL, *txt = NULL; size_t next;
+                if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) == 0 &&
+                    expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) == 0) {
+                    rdata_buf_append(out, out_cap, &pos, "%s %s", mbox, txt);
+                    return;
+                }
+            } else if (type == 18) { // AFSDB
+                if (rdlen >= 2) {
+                    uint16_t sub = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
+                    char *name = NULL; size_t next;
+                    if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0) {
+                        rdata_buf_append(out, out_cap, &pos, "%u %s", sub, name);
+                        return;
+                    }
+                }
+            } else if (type == 19) { // X25
+                if (rdlen >= 1) {
+                    uint8_t slen = pkt[abs_offset];
+                    if (1 + slen <= rdlen) {
+                        rdata_buf_append(out, out_cap, &pos, "\"%.*s\"", slen, &pkt[abs_offset + 1]);
+                        return;
+                    }
+                }
+            } else if (type == 20) { // ISDN
+                if (rdlen >= 1) {
+                    uint8_t slen = pkt[abs_offset];
+                    if (1 + slen <= rdlen) {
+                        rdata_buf_append(out, out_cap, &pos, "\"%.*s\"", slen, &pkt[abs_offset + 1]);
+                        size_t p2 = 1 + slen;
+                        if (p2 < rdlen) {
+                            uint8_t slen2 = pkt[abs_offset + p2];
+                            if (p2 + 1 + slen2 <= rdlen) {
+                                rdata_buf_append(out, out_cap, &pos, " \"%.*s\"", slen2, &pkt[abs_offset + p2 + 1]);
+                            }
+                        }
+                        return;
+                    }
+                }
+            } else if (type == 22) { // NSAP
+                rdata_buf_append(out, out_cap, &pos, "0x");
+                for (size_t i = 0; i < rdlen; i++) rdata_buf_append(out, out_cap, &pos, "%02x", pkt[abs_offset + i]);
+                return;
+            }
+            break;
+        }
+        case 21: case 36: case 107: { // RT / KX / LP
+            if (rdlen >= 2) {
+                uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+                char *name = NULL; size_t next;
+                if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0) {
+                    rdata_buf_append(out, out_cap, &pos, "%u %s", pref, name);
+                    return;
+                }
+            }
+            break;
+        }
+        case 27: { // GPOS
+            const uint8_t *p = &pkt[abs_offset], *end = p + rdlen;
+            char lat[64], lon[64], alt[64];
+            p = read_char_string(p, end, lat, sizeof(lat));
+            if (p) p = read_char_string(p, end, lon, sizeof(lon));
+            if (p) p = read_char_string(p, end, alt, sizeof(alt));
+            if (p) {
+                rdata_buf_append(out, out_cap, &pos, "\"%s\" \"%s\" \"%s\"", lat, lon, alt);
+                return;
+            }
+            break;
+        }
+        case 37: { // CERT
+            if (rdlen >= 5) {
+                uint16_t ctype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+                uint16_t keytag = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
+                uint8_t alg = pkt[abs_offset + 4];
+                char cbuf[32];
+                rdata_buf_append(out, out_cap, &pos, "%s %u %u", cert_type_name(ctype, cbuf, sizeof(cbuf)), keytag, alg);
+                if (rdlen > 5) {
+                    int n = 0;
+                    char *b64 = base64_encode_alloc(&pkt[abs_offset + 5], rdlen - 5, &n);
+                    if (b64) {
+                        rdata_buf_append(out, out_cap, &pos, " ");
+                        rdata_buf_append_split_b64(out, out_cap, &pos, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+                        free(b64);
+                    }
+                }
+                return;
+            }
+            break;
+        }
+        case 42: { // APL
+            size_t p = 0;
+            bool first = true;
+            while (p + 4 <= rdlen) {
+                uint16_t afi = (pkt[abs_offset + p]<<8)|pkt[abs_offset + p + 1];
+                uint8_t prefix = pkt[abs_offset + p + 2];
+                uint8_t n_len = pkt[abs_offset + p + 3];
+                bool negate = (n_len & 0x80) != 0;
+                uint8_t afdlength = n_len & 0x7F;
+                p += 4;
+                if (p + afdlength > rdlen) break;
+                uint8_t addr[16] = {0};
+                memcpy(addr, &pkt[abs_offset + p], afdlength);
+                p += afdlength;
+                char addr_str[64] = "?";
+                if (afi == 1) inet_ntop(AF_INET, addr, addr_str, sizeof(addr_str));
+                else if (afi == 2) inet_ntop(AF_INET6, addr, addr_str, sizeof(addr_str));
+                if (!first) rdata_buf_append(out, out_cap, &pos, " ");
+                first = false;
+                rdata_buf_append(out, out_cap, &pos, "%s%u:%s/%u", negate ? "!" : "", afi, addr_str, prefix);
+            }
+            return;
+        }
+        case 44: { // SSHFP
+            if (rdlen >= 2) {
+                rdata_buf_append(out, out_cap, &pos, "%u %u ", pkt[abs_offset], pkt[abs_offset + 1]);
+                rdata_buf_append_split_hex(out, out_cap, &pos, &pkt[abs_offset + 2], rdlen - 2, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+                return;
+            }
+            break;
+        }
+        case 45: { // IPSECKEY
+            if (rdlen >= 3) {
+                uint8_t prec = pkt[abs_offset];
+                uint8_t gw_type = pkt[abs_offset + 1];
+                uint8_t alg = pkt[abs_offset + 2];
+                char gw_buf[256] = ".";
+                const uint8_t *p = &pkt[abs_offset + 3];
+                const uint8_t *end = &pkt[abs_offset + rdlen];
+                if (gw_type == 0) {
+                    snprintf(gw_buf, sizeof(gw_buf), ".");
+                } else if (gw_type == 1) {
+                    if (p + 4 <= end) {
+                        snprintf(gw_buf, sizeof(gw_buf), "%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
+                        p += 4;
+                    }
+                } else if (gw_type == 2) {
+                    if (p + 16 <= end) {
+                        inet_ntop(AF_INET6, p, gw_buf, sizeof(gw_buf));
+                        p += 16;
+                    }
+                } else if (gw_type == 3) {
+                    char *gw = NULL; size_t next;
+                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0) {
+                        snprintf(gw_buf, sizeof(gw_buf), "%s", gw);
+                        p = &pkt[next];
+                    }
+                }
+                rdata_buf_append(out, out_cap, &pos, "%u %u %u %s", prec, gw_type, alg, gw_buf);
+                if (p < end) {
+                    int n = 0;
+                    char *b64 = base64_encode_alloc(p, end - p, &n);
+                    if (b64) {
+                        rdata_buf_append(out, out_cap, &pos, " ");
+                        rdata_buf_append_split_b64(out, out_cap, &pos, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+                        free(b64);
+                    }
+                }
+                return;
+            }
+            break;
+        }
+        case 49: case 61: { // DHCID / OPENPGPKEY
+            if (rdlen > 0) {
+                int n = 0;
+                char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &n);
+                if (b64) {
+                    rdata_buf_append_split_b64(out, out_cap, &pos, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+                    free(b64);
+                }
+                return;
+            }
+            break;
+        }
+        case 51: { // NSEC3PARAM
+            if (rdlen >= 4) {
+                uint8_t hash_alg = pkt[abs_offset];
+                uint8_t flags = pkt[abs_offset + 1];
+                uint16_t iter = (pkt[abs_offset + 2]<<8)|pkt[abs_offset + 3];
+                uint8_t slen = pkt[abs_offset + 4];
+                char salt_hex[512] = "-";
+                if (slen > 0 && 5 + slen <= rdlen) {
+                    size_t p2 = 0;
+                    for (int i = 0; i < slen; i++) p2 += snprintf(salt_hex + p2, sizeof(salt_hex) - p2, "%02X", pkt[abs_offset + 5 + i]);
+                }
+                rdata_buf_append(out, out_cap, &pos, "%u %u %u %s", hash_alg, flags, iter, salt_hex);
+                return;
+            }
+            break;
+        }
+        case 52: case 53: { // TLSA / SMIMEA
+            if (rdlen >= 3) {
+                rdata_buf_append(out, out_cap, &pos, "%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
+                rdata_buf_append_split_hex(out, out_cap, &pos, &pkt[abs_offset + 3], rdlen - 3, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
+                return;
+            }
+            break;
+        }
+        case 64: case 65: { // SVCB / HTTPS
+            if (rdlen >= 2) {
+                uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
+                char *target = NULL; size_t next;
+                if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &target) == 0 &&
+                    next >= abs_offset + 2 && next <= abs_offset + rdlen) {
+                    rdata_buf_append(out, out_cap, &pos, "%u %s", priority, (target[0] == '\0') ? "." : target);
+                    size_t sp_pos = next;
+                    while (sp_pos + 4 <= abs_offset + rdlen) {
+                        uint16_t key = (pkt[sp_pos]<<8)|pkt[sp_pos+1];
+                        uint16_t vlen = (pkt[sp_pos+2]<<8)|pkt[sp_pos+3];
+                        sp_pos += 4;
+                        if (sp_pos + vlen > abs_offset + rdlen) break;
+                        const uint8_t *val = &pkt[sp_pos];
+                        if (key == 1) { // alpn
+                            rdata_buf_append(out, out_cap, &pos, " alpn=\"");
+                            size_t ap = 0; bool afirst = true;
+                            while (ap < vlen) {
+                                uint8_t alen = val[ap++];
+                                if (ap + alen > vlen) break;
+                                if (!afirst) rdata_buf_append(out, out_cap, &pos, ",");
+                                afirst = false;
+                                rdata_buf_append(out, out_cap, &pos, "%.*s", alen, &val[ap]);
+                                ap += alen;
+                            }
+                            rdata_buf_append(out, out_cap, &pos, "\"");
+                        } else if (key == 2) {
+                            rdata_buf_append(out, out_cap, &pos, " no-default-alpn");
+                        } else if (key == 3) {
+                            uint16_t pnum = (vlen >= 2) ? ((val[0]<<8)|val[1]) : 0;
+                            rdata_buf_append(out, out_cap, &pos, " port=%u", pnum);
+                        } else if (key == 4 || key == 6) {
+                            rdata_buf_append(out, out_cap, &pos, " %s=\"", (key == 4) ? "ipv4hint" : "ipv6hint");
+                            size_t sz = (key == 4) ? 4 : 16;
+                            bool hfirst = true;
+                            for (size_t hp = 0; hp + sz <= vlen; hp += sz) {
+                                char abuf[INET6_ADDRSTRLEN];
+                                if (key == 4) inet_ntop(AF_INET, val + hp, abuf, sizeof(abuf));
+                                else inet_ntop(AF_INET6, val + hp, abuf, sizeof(abuf));
+                                if (!hfirst) rdata_buf_append(out, out_cap, &pos, ",");
+                                hfirst = false;
+                                rdata_buf_append(out, out_cap, &pos, "%s", abuf);
+                            }
+                            rdata_buf_append(out, out_cap, &pos, "\"");
+                        }
+                        sp_pos += vlen;
+                    }
+                    return;
+                }
+            }
+            break;
+        }
         case 33: { // SRV
             if (rdlen < 7) { rdata_buf_append(out, out_cap, &pos, "(malformed SRV)"); return; }
             uint16_t prio = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
@@ -2902,15 +3180,72 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             return;
         }
+        case 35: { // NAPTR
+            if (rdlen >= 4) {
+                uint16_t order = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+                uint16_t pref = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
+                char flags[256], svcs[256], regexp[256];
+                const uint8_t *p = &pkt[abs_offset + 4];
+                const uint8_t *end = &pkt[abs_offset + rdlen];
+                p = read_char_string(p, end, flags, sizeof(flags));
+                if (p) p = read_char_string(p, end, svcs, sizeof(svcs));
+                if (p) p = read_char_string(p, end, regexp, sizeof(regexp));
+                if (p) {
+                    char *repl = NULL; size_t next;
+                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) == 0) {
+                        rdata_buf_append(out, out_cap, &pos, "%u %u \"%s\" \"%s\" \"%s\" %s", order, pref, flags, svcs, regexp, repl);
+                        return;
+                    }
+                }
+            }
+            break;
+        }
+        case 256: { // URI
+            if (rdlen >= 4) {
+                uint16_t prio = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+                uint16_t weight = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
+                rdata_buf_append(out, out_cap, &pos, "%u %u \"%.*s\"", prio, weight, (int)(rdlen - 4), &pkt[abs_offset + 4]);
+                return;
+            }
+            break;
+        }
+        case 24: case 46: { // SIG, RRSIG
+            if (rdlen < 18) { rdata_buf_append(out, out_cap, &pos, "(malformed)"); return; }
+            uint16_t type_covered = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
+            uint8_t algorithm = pkt[abs_offset+2];
+            uint8_t labels = pkt[abs_offset+3];
+            uint32_t original_ttl = ((uint32_t)pkt[abs_offset+4]<<24)|((uint32_t)pkt[abs_offset+5]<<16)|((uint32_t)pkt[abs_offset+6]<<8)|pkt[abs_offset+7];
+            uint32_t sig_expiration = ((uint32_t)pkt[abs_offset+8]<<24)|((uint32_t)pkt[abs_offset+9]<<16)|((uint32_t)pkt[abs_offset+10]<<8)|pkt[abs_offset+11];
+            uint32_t sig_inception = ((uint32_t)pkt[abs_offset+12]<<24)|((uint32_t)pkt[abs_offset+13]<<16)|((uint32_t)pkt[abs_offset+14]<<8)|pkt[abs_offset+15];
+            uint16_t key_tag = (pkt[abs_offset+16]<<8)|pkt[abs_offset+17];
+            char *signer_name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer_name) == 0) {
+                char exp_str[32], inc_str[32], tname_buf[32];
+                format_rrsig_time(sig_expiration, exp_str, sizeof(exp_str));
+                format_rrsig_time(sig_inception, inc_str, sizeof(inc_str));
+                const char *cov_name = format_type_name(type_covered, tname_buf, sizeof(tname_buf));
+                rdata_buf_append(out, out_cap, &pos, "%s %u %u %u %s %s %u %s ",
+                                 cov_name, algorithm, labels, original_ttl, exp_str, inc_str, key_tag, signer_name);
+                size_t sig_offset = next - abs_offset;
+                if (sig_offset <= rdlen) {
+                    int n = 0;
+                    char *b64 = base64_encode_alloc(&pkt[abs_offset + sig_offset], rdlen - sig_offset, &n);
+                    if (b64) {
+                        rdata_buf_append_split_b64(out, out_cap, &pos, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 56);
+                        free(b64);
+                        return;
+                    }
+                }
+            }
+            break;
+        }
         case 43: case 59: case 32768: case 32769: { // DS, CDS, TA, DLV
             if (rdlen < 4) { rdata_buf_append(out, out_cap, &pos, "(malformed)"); return; }
             uint16_t keytag = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
             uint8_t algorithm = pkt[abs_offset+2];
             uint8_t digest_type = pkt[abs_offset+3];
             rdata_buf_append(out, out_cap, &pos, "%u %u %u ", keytag, algorithm, digest_type);
-            for (size_t i = 4; i < rdlen; i++) {
-                rdata_buf_append(out, out_cap, &pos, "%02X", pkt[abs_offset + i]);
-            }
+            rdata_buf_append_split_hex(out, out_cap, &pos, &pkt[abs_offset + 4], rdlen - 4, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
             return;
         }
         case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
@@ -2922,7 +3257,7 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             int n = 0;
             char *b64 = base64_encode_alloc(&pkt[abs_offset + 4], rdlen - 4, &n);
             if (b64) {
-                rdata_buf_append(out, out_cap, &pos, "%s", b64);
+                rdata_buf_append_split_b64(out, out_cap, &pos, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 56);
                 free(b64);
             }
             return;
@@ -2969,6 +3304,55 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             break;
         }
+        case 62: { // CSYNC
+            if (rdlen >= 6) {
+                uint32_t serial = ((uint32_t)pkt[abs_offset]<<24)|((uint32_t)pkt[abs_offset+1]<<16)|((uint32_t)pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
+                uint16_t flags = (pkt[abs_offset+4]<<8)|pkt[abs_offset+5];
+                char types_buf[512];
+                decode_type_bitmap(&pkt[abs_offset+6], rdlen - 6, types_buf, sizeof(types_buf));
+                rdata_buf_append(out, out_cap, &pos, "%u %u %s", serial, flags, types_buf);
+                return;
+            }
+            break;
+        }
+        case 63: { // ZONEMD
+            if (rdlen >= 6) {
+                uint32_t serial = ((uint32_t)pkt[abs_offset]<<24)|((uint32_t)pkt[abs_offset+1]<<16)|((uint32_t)pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
+                uint8_t scheme = pkt[abs_offset+4];
+                uint8_t halg = pkt[abs_offset+5];
+                rdata_buf_append(out, out_cap, &pos, "%u %u %u ", serial, scheme, halg);
+                for (size_t i = 6; i < rdlen; i++) rdata_buf_append(out, out_cap, &pos, "%02X", pkt[abs_offset + i]);
+                return;
+            }
+            break;
+        }
+        case 250: { // TSIG
+            char *alg_name = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) == 0) {
+                size_t tpos = next - abs_offset;
+                if (tpos + 10 <= rdlen) {
+                    uint64_t time_signed = ((uint64_t)pkt[abs_offset+tpos] << 40) | ((uint64_t)pkt[abs_offset+tpos+1] << 32) |
+                                            ((uint64_t)pkt[abs_offset+tpos+2] << 24) | ((uint64_t)pkt[abs_offset+tpos+3] << 16) |
+                                            ((uint64_t)pkt[abs_offset+tpos+4] << 8) | pkt[abs_offset+tpos+5];
+                    uint16_t fudge = (pkt[abs_offset+tpos+6]<<8)|pkt[abs_offset+tpos+7];
+                    uint16_t mac_size = (pkt[abs_offset+tpos+8]<<8)|pkt[abs_offset+tpos+9];
+                    tpos += 10;
+                    if (tpos + mac_size + 6 <= rdlen) {
+                        char *mac_b64 = base64_encode_alloc(&pkt[abs_offset+tpos], mac_size, NULL);
+                        tpos += mac_size;
+                        uint16_t orig_id = (pkt[abs_offset+tpos]<<8)|pkt[abs_offset+tpos+1];
+                        uint16_t tsig_err = (pkt[abs_offset+tpos+2]<<8)|pkt[abs_offset+tpos+3];
+                        uint16_t other_len = (pkt[abs_offset+tpos+4]<<8)|pkt[abs_offset+tpos+5];
+                        rdata_buf_append(out, out_cap, &pos, "%s %llu %u %u %s %u %s %u",
+                                         alg_name, (unsigned long long)time_signed, fudge, mac_size,
+                                         mac_b64 ? mac_b64 : "", orig_id, rcode_name(tsig_err), other_len);
+                        if (mac_b64) free(mac_b64);
+                        return;
+                    }
+                }
+            }
+            break;
+        }
         case 257: { // CAA
             if (rdlen >= 2) {
                 uint8_t flags = pkt[abs_offset];
@@ -2979,6 +3363,53 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                                      (int)(rdlen - 2 - tag_len), &pkt[abs_offset + 2 + tag_len]);
                     return;
                 }
+            }
+            break;
+        }
+        case 100: { // EUI48
+            if (rdlen == 6) {
+                rdata_buf_append(out, out_cap, &pos, "%02x-%02x-%02x-%02x-%02x-%02x",
+                                 pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2],
+                                 pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5]);
+                return;
+            }
+            break;
+        }
+        case 101: { // EUI64
+            if (rdlen == 8) {
+                rdata_buf_append(out, out_cap, &pos, "%02x-%02x-%02x-%02x-%02x-%02x-%02x-%02x",
+                                 pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2], pkt[abs_offset+3],
+                                 pkt[abs_offset+4], pkt[abs_offset+5], pkt[abs_offset+6], pkt[abs_offset+7]);
+                return;
+            }
+            break;
+        }
+        case 104: { // NID
+            if (rdlen == 10) {
+                uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
+                rdata_buf_append(out, out_cap, &pos, "%u %02x%02x:%02x%02x:%02x%02x:%02x%02x", pref,
+                                 pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5],
+                                 pkt[abs_offset+6], pkt[abs_offset+7], pkt[abs_offset+8], pkt[abs_offset+9]);
+                return;
+            }
+            break;
+        }
+        case 105: { // L32
+            if (rdlen == 6) {
+                uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
+                rdata_buf_append(out, out_cap, &pos, "%u %d.%d.%d.%d", pref,
+                                 pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5]);
+                return;
+            }
+            break;
+        }
+        case 106: { // L64
+            if (rdlen == 10) {
+                uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
+                rdata_buf_append(out, out_cap, &pos, "%u %02x%02x:%02x%02x:%02x%02x:%02x%02x", pref,
+                                 pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5],
+                                 pkt[abs_offset+6], pkt[abs_offset+7], pkt[abs_offset+8], pkt[abs_offset+9]);
+                return;
             }
             break;
         }
@@ -4293,7 +4724,7 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
                 const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
 
                 char rdata_raw[2048];
-                format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw));
+                format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw), dopt);
 
                 char name_esc[512];
                 char rdata_esc[4096];

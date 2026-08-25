@@ -385,6 +385,10 @@ EOF
     compare_query "YAML: EDNS0 Opts (Cookie, Subnet, NSID)" "www.example.com A +yaml +cookie +subnet=192.0.2.0/24 +nsid"
     compare_query "YAML: Multiple Queries" "www.example.com A example.com TXT +yaml"
     compare_query "YAML: DNS64 prefix" "ipv4only.arpa AAAA +dns64prefix +yaml"
+    compare_query "YAML: AAAA with expandaaaa (+yaml +expandaaaa)" "www.example.com AAAA +yaml +expandaaaa"
+    compare_query "YAML: DNSKEY with nocrypto (+yaml +nocrypto)" "example.com DNSKEY +yaml +nocrypto"
+    compare_query "YAML: DS with nocrypto (+yaml +nocrypto)" "example.com DS +yaml +nocrypto"
+    compare_query "YAML: RRSIG structured output (+yaml)" "example.com RRSIG +yaml"
 
     echo "--------------------------------------------------------"
     echo "12. DNS64 Prefix Discovery (+dns64prefix)"

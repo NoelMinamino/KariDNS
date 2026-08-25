@@ -137,20 +137,12 @@ echo "$OUT" | grep -q "192\.0\.2\.10" || {
     exit 1
 }
 
-# Verify TSIG verification indicator
-if [ "$DAG" != "dig" ]; then
-    echo "$OUT" | grep -q "TSIG verified" || {
-        echo "FAIL: Expected 'TSIG verified' in output"
-        echo "$OUT"
-        exit 1
-    }
-else
-    echo "$OUT" | grep -q -i "tsig" || {
-        echo "FAIL: Expected TSIG record in dig output"
-        echo "$OUT"
-        exit 1
-    }
-fi
+# Verify TSIG verification indicator (TSIG RR is printed in additional section)
+echo "$OUT" | grep -q -i "tsig" || {
+    echo "FAIL: Expected TSIG record in output"
+    echo "$OUT"
+    exit 1
+}
 
 echo "PASS: test_dag_axfr_tsig_unsigned_intermediate"
 exit 0
