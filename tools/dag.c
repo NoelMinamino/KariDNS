@@ -6635,7 +6635,17 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                 break;
             } else {
                 int srv_port = port; // -p のデフォルト値
-                if (tok[0] == '[') {
+                char *hash = strchr(tok, '#');
+                if (hash) {
+                    *hash = '\0';
+                    char *endptr;
+                    long p = strtol(hash + 1, &endptr, 10);
+                    if (*endptr == '\0' && p > 0 && p <= 65535) {
+                        srv_port = (int)p;
+                    } else {
+                        fprintf(stderr, "warning: invalid port '%s' for server '%s'; using default %d\n", hash + 1, tok, port);
+                    }
+                } else if (tok[0] == '[') {
                     // [IPv6]:port 記法
                     char *close = strchr(tok, ']');
                     if (close) {
