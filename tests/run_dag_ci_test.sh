@@ -461,6 +461,7 @@ run_check "Formatting: YAML +nocrypto suppression (tests/run_dag_yaml_nocrypto_t
 run_check "Formatting: YAML +expandaaaa AAAA expansion (tests/run_dag_yaml_expandaaaa_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_expandaaaa_test.sh\"" "ALL YAML EXPANDAAAA TESTS PASSED"
 run_check "Formatting: YAML RRSIG structured decoding (tests/run_dag_yaml_rrsig_decode_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rrsig_decode_test.sh\"" "ALL YAML RRSIG DECODE TESTS PASSED"
 run_check "Protocol: Long label (63 bytes) name expansion (tests/run_dag_long_label_name_expansion_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_long_label_name_expansion_test.sh\"" "ALL LONG LABEL EXPANSION TESTS PASSED"
+run_check "Features: Multi-server Semantic Match across compression (tests/run_dag_multi_server_semantic_match_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multi_server_semantic_match_test.sh\"" "ALL MULTI-SERVER SEMANTIC MATCH TESTS PASSED"
 run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"
 
 echo "========================================================"
