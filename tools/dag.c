@@ -188,7 +188,8 @@ typedef struct {
     bool qr, aa, tc, rd, ra, ad, cd;
     ssize_t resp_len;
     uint8_t resp_buf[65535];
-    uint32_t semantic_hash; // 順不同ハッシュの合計値
+    uint32_t semantic_hash; // 順不同ハッシュの合計値 (Wire format)
+    uint32_t record_hash;   // 順不同レコードハッシュの合計値 (Canonical Text)
     long elapsed_ms;
     match_status_t match_status;
     int msg_index;
@@ -4170,7 +4171,7 @@ static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_l
     }
 }
 
-static uint32_t calc_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
+static uint32_t calc_wire_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
     uint32_t h = 2166136261u;
     for (int i = 0; name && name[i]; i++) {
         h ^= tolower((unsigned char)name[i]);
@@ -4195,41 +4196,75 @@ static uint32_t calc_rr_hash(const char *name, uint16_t type, uint16_t klass, ui
     return h;
 }
 
-static uint32_t calculate_packet_semantic_hash(const uint8_t *pkt, size_t pkt_len) {
-    if (pkt_len < 12) return 0;
-    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
-    uint16_t ancount = (pkt[6] << 8) | pkt[7];
-    uint16_t nscount = (pkt[8] << 8) | pkt[9];
-    uint16_t arcount = (pkt[10] << 8) | pkt[11];
-    
-    size_t offset = 12;
-    for (int i = 0; i < qdcount; i++) {
-        size_t next;
-        if (skip_wire_name(pkt, pkt_len, offset, &next) != 0) return 0;
-        offset = next + 4;
-        if (offset > pkt_len) return 0;
+static uint32_t calc_record_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const char *rdata_text) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; name && name[i]; i++) {
+        h ^= tolower((unsigned char)name[i]);
+        h *= 16777619u;
     }
-    
-    uint32_t total_hash = 0;
-    int total_rr = ancount + nscount + arcount;
-    for (int i = 0; i < total_rr; i++) {
-        char *name = NULL;
-        size_t next;
-        if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
-        if (next + 10 > pkt_len) break;
-        uint16_t type = (pkt[next] << 8) | pkt[next+1];
-        uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
-        uint32_t ttl = ((uint32_t)pkt[next+4] << 24) | ((uint32_t)pkt[next+5] << 16) | ((uint32_t)pkt[next+6] << 8) | pkt[next+7];
-        uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
-        size_t rdata_start = next + 10;
-        if (rdata_start + rdlen > pkt_len) break;
+    h ^= (type >> 8); h *= 16777619u;
+    h ^= (type & 0xFF); h *= 16777619u;
+    h ^= (klass >> 8); h *= 16777619u;
+    h ^= (klass & 0xFF); h *= 16777619u;
+
+    if (g_want_allcompare) {
+        h ^= (ttl >> 24) & 0xFF; h *= 16777619u;
+        h ^= (ttl >> 16) & 0xFF; h *= 16777619u;
+        h ^= (ttl >> 8)  & 0xFF; h *= 16777619u;
+        h ^= (ttl & 0xFF);       h *= 16777619u;
+    }
+
+    for (int i = 0; rdata_text && rdata_text[i]; i++) {
+        h ^= tolower((unsigned char)rdata_text[i]);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void calculate_packet_hashes(const uint8_t *pkt, size_t pkt_len, uint32_t *wire_hash_out, uint32_t *record_hash_out) {
+    uint32_t wire_hash = 0;
+    uint32_t record_hash = 0;
+    if (pkt_len >= 12) {
+        uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+        uint16_t ancount = (pkt[6] << 8) | pkt[7];
+        uint16_t nscount = (pkt[8] << 8) | pkt[9];
+        uint16_t arcount = (pkt[10] << 8) | pkt[11];
         
-        if (type != 41) { // Skip OPT
-            total_hash += calc_rr_hash(name, type, klass, ttl, &pkt[rdata_start], rdlen);
+        size_t offset = 12;
+        for (int i = 0; i < qdcount; i++) {
+            size_t next;
+            if (skip_wire_name(pkt, pkt_len, offset, &next) != 0) break;
+            offset = next + 4;
+            if (offset > pkt_len) break;
         }
-        offset = rdata_start + rdlen;
+        
+        int total_rr = ancount + nscount + arcount;
+        for (int i = 0; i < total_rr; i++) {
+            char *name = NULL;
+            size_t next;
+            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
+            if (next + 10 > pkt_len) break;
+            uint16_t type = (pkt[next] << 8) | pkt[next+1];
+            uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
+            uint32_t ttl = ((uint32_t)pkt[next+4] << 24) | ((uint32_t)pkt[next+5] << 16) | ((uint32_t)pkt[next+6] << 8) | pkt[next+7];
+            uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
+            size_t rdata_start = next + 10;
+            if (rdata_start + rdlen > pkt_len) break;
+            
+            if (type != 41) { // Skip OPT
+                // 1. 生のワイヤフォーマット RDATA をハッシュ（圧縮の有無が反映される）
+                wire_hash += calc_wire_rr_hash(name, type, klass, ttl, &pkt[rdata_start], rdlen);
+                
+                // 2. 展開された Canonical テキスト表現をハッシュ（出力レコード内容が反映される）
+                char rdata_raw[2048];
+                format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw), NULL);
+                record_hash += calc_record_rr_hash(name, type, klass, ttl, rdata_raw);
+            }
+            offset = rdata_start + rdlen;
+        }
     }
-    return total_hash;
+    if (wire_hash_out) *wire_hash_out = wire_hash;
+    if (record_hash_out) *record_hash_out = record_hash;
 }
 
 static const char *format_class_name(uint16_t klass, char *buf, size_t buf_size) {
@@ -5488,7 +5523,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 size_t to_copy = (size_t)n < sizeof(sres->resp_buf) ? (size_t)n : sizeof(sres->resp_buf);
                 memcpy(sres->resp_buf, resp, to_copy);
                 sres->resp_len = (ssize_t)to_copy;
-                sres->semantic_hash = calculate_packet_semantic_hash(resp, n);
+                calculate_packet_hashes(resp, n, &sres->semantic_hash, &sres->record_hash);
                 snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", server);
                 snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
             }
@@ -5721,11 +5756,15 @@ static void print_multi_server_summary(bool use_ldnsz) {
                 memcmp(r->resp_buf + 2, base->resp_buf + 2, r->resp_len - 2) == 0) {
                 status_str = "== BASE (Exact Match)";
             } 
-            // バイナリは違うが、RCODEと意味的ハッシュが完全一致する場合
+            // バイナリは違うが、RCODEとワイヤハッシュ（SEM_HASH）が完全一致する場合
             else if (r->rcode == base->rcode && r->semantic_hash == base->semantic_hash) {
                 status_str = "== BASE (Semantic Match)";
             } 
-            // 差異あり
+            // ワイヤハッシュ（SEM_HASH）は違う（圧縮有無など）が、展開されたレコード内容（record_hash）は完全一致する場合
+            else if (r->rcode == base->rcode && r->record_hash == base->record_hash) {
+                status_str = "== BASE (Record Match / Comp Diff)";
+            }
+            // 展開されたレコード内容自体に差異あり
             else {
                 status_str = "!! DIFF (Data differs) !!";
             }
@@ -6186,7 +6225,7 @@ static void record_ldnsz_result(const char *server, ssize_t n, const uint8_t *re
     size_t to_copy = (size_t)n < sizeof(sres->resp_buf) ? (size_t)n : sizeof(sres->resp_buf);
     memcpy(sres->resp_buf, resp, to_copy);
     sres->resp_len = (ssize_t)to_copy;
-    sres->semantic_hash = calculate_packet_semantic_hash(resp, n);
+    calculate_packet_hashes(resp, n, &sres->semantic_hash, &sres->record_hash);
     snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", server);
     snprintf(sres->proto, sizeof(sres->proto), "%s", proto ? proto : "UDP");
     sres->elapsed_ms = elapsed_ms;
@@ -6596,7 +6635,17 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                 break;
             } else {
                 int srv_port = port; // -p のデフォルト値
-                if (tok[0] == '[') {
+                char *hash = strchr(tok, '#');
+                if (hash) {
+                    *hash = '\0';
+                    char *endptr;
+                    long p = strtol(hash + 1, &endptr, 10);
+                    if (*endptr == '\0' && p > 0 && p <= 65535) {
+                        srv_port = (int)p;
+                    } else {
+                        fprintf(stderr, "warning: invalid port '%s' for server '%s'; using default %d\n", hash + 1, tok, port);
+                    }
+                } else if (tok[0] == '[') {
                     // [IPv6]:port 記法
                     char *close = strchr(tok, ']');
                     if (close) {

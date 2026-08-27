@@ -208,7 +208,8 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
     size_t p = current_offset, jumped_offset = 0; bool jumped = false; int jump_count = 0;
     uint16_t visited[MAX_JUMPS];
-    char buf[257]; size_t written = 0;
+    char buf[1025]; size_t written = 0;
+    size_t total_wire_len = 0;
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t raw = packet[p];
@@ -231,19 +232,21 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             return -1;
         }
         p++;
+        total_wire_len += 1 + len;
+        if (total_wire_len > 255) return -1;
         if (len == 0) {
             if (written == 0 || buf[written - 1] != '.') { 
-                if (written >= 256) return -1; 
+                if (written >= sizeof(buf) - 1) return -1; 
                 buf[written++] = '.'; 
             } 
             buf[written++] = '\0'; 
             break; 
         }
         if (written > 0 && buf[written - 1] != '.') { 
-            if (written >= 256) return -1; 
+            if (written >= sizeof(buf) - 1) return -1; 
             buf[written++] = '.'; 
         }
-        if (written + (len * 4) >= 256 || p + len > packet_len) return -1;
+        if (p + len > packet_len) return -1;
         bool needs_escape = false;
         for (int i = 0; i < len; i++) {
             uint8_t c = packet[p + i];
@@ -253,6 +256,7 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             }
         }
         if (!needs_escape) {
+            if (written + len >= sizeof(buf)) return -1;
             memcpy(&buf[written], &packet[p], len);
             written += len;
             p += len;
@@ -260,17 +264,17 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             for (int i = 0; i < len; i++) {
                 uint8_t c = packet[p++];
                 if (c == '.' || c == '\\') {
-                    if (written + 2 > 256) return -1;
+                    if (written + 2 >= sizeof(buf)) return -1;
                     buf[written++] = '\\';
                     buf[written++] = (char)c;
                 } else if (c < 0x21 || c >= 0x7F) {
-                    if (written + 4 > 256) return -1;
+                    if (written + 4 >= sizeof(buf)) return -1;
                     buf[written++] = '\\';
                     buf[written++] = '0' + (c / 100);
                     buf[written++] = '0' + ((c / 10) % 10);
                     buf[written++] = '0' + (c % 10);
                 } else {
-                    if (written + 1 > 256) return -1;
+                    if (written + 1 >= sizeof(buf)) return -1;
                     buf[written++] = (char)c;
                 }
             }
