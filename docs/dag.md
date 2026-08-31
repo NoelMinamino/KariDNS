@@ -173,7 +173,7 @@ dag [global-queryopt...] [query...]
 
 ## DNS HEADER & QUERY FLAGS
 
-`+[no]recurse`, `+[no]rdflag`
+`+[no]rec`, `+[no]recurse`, `+[no]rdflag`
 : Set or clear the **RD (Recursion Desired)** header bit. Recursion is enabled by default. Automatically disabled when `+trace` or `+nssearch` is active.
 
 `+[no]adflag`

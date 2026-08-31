@@ -185,6 +185,8 @@ run_check "TTL units (+ttlunits)" "$DAG @127.0.0.1 -p $PORT www.example.com A +t
 run_check "Unknown format (+unknownformat)" "$DAG @127.0.0.1 -p $PORT www.example.com A +unknownformat" 'CLASS1[[:space:]]+TYPE1[[:space:]]+\\#[[:space:]]+[0-9]+'
 run_check "TTL ID toggling (+ttlid / +nottlid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nottlid" "www\.example\.com\.[[:space:]]+IN[[:space:]]+A"
 run_check "Multiline mode (+multiline)" "$DAG @127.0.0.1 -p $PORT example.com SOA +multiline" "serial"
+run_check "Multiline mode alias (+multi)" "$DAG @127.0.0.1 -p $PORT example.com SOA +multi" "serial"
+run_check "Multiline mode disable alias (+nomulti)" "$DAG @127.0.0.1 -p $PORT example.com SOA +nomulti" "(IN[[:space:]]+SOA|serial)"
 run_check "Expire time display (+expire)" "$DAG @127.0.0.1 -p $PORT example.com SOA +expire" "(SOA|expire|serial)"
 run_check "AXFR single SOA (+onesoa)" "$DAG @127.0.0.1 -p $PORT example.com AXFR +onesoa" "SOA"
 run_check "Expand AAAA addresses (+expandaaaa)" "$DAG @127.0.0.1 -p $PORT www.example.com AAAA +expandaaaa" "2001:0db8:0000:0000:0000:0000:0000:0010"
@@ -228,8 +230,10 @@ run_check "QID override (+qid=4660)" "$DAG @127.0.0.1 -p $PORT www.example.com A
 run_check "Opcode override (+opcode=NOTIFY)" "$DAG @127.0.0.1 -p $PORT www.example.com A +opcode=NOTIFY +qr" "opcode: NOTIFY"
 run_check "Flags override (+adflag +cdflag +aaflag +tcflag +raflag +zflag)" "$DAG @127.0.0.1 -p $PORT www.example.com A +adflag +cdflag +aaflag +tcflag +raflag +zflag +qr" "flags:.*(ad|cd|aa|tc|ra)"
 run_check "Recursion flag override (+norec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +norec +qr" ";; flags:"
+run_check "Recursion flag enable (+rec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +rec +qr" "flags:.*rd"
 run_check "Ignore truncation flag (+ignore)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ignore" "192\.0\.2\.10"
 run_check "Timeout flag (+timeout=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+run_check "Timeout alias (+time=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +time=2" "192\.0\.2\.10"
 run_check "Tries and Retry flags (+tries=2 +retry=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tries=2 +retry=2" "192\.0\.2\.10"
 run_check "Search list and ndots expansion (+search +domain +ndots=2)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=2 +search" "192\.0\.2\.10"
 run_check "Search list not expanded when ndots exceeded (+ndots=1)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=1 +search" "(NXDOMAIN|SERVFAIL|REFUSED|no servers could be reached|got NXDOMAIN)"
@@ -304,6 +308,7 @@ echo "========================================================"
 echo "10. Search Domains, Batch Files & .digrc Configuration"
 echo "========================================================"
 run_check "Search domain option (+domain= +search)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +search" "192\.0\.2\.10"
+run_check "Persistent option lifecycle across retries (+domain= with +tries=2)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +search +tries=2" "192\.0\.2\.10"
 cat << 'EOF' > batch_test.txt
 www.example.com A
 mail.example.com A
@@ -467,6 +472,7 @@ run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_tes
 if command -v perl >/dev/null 2>&1; then
     run_check "Plugin Zones: 'type program' zone loader (tests/run_program_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_program_zone_test.sh\"" "ALL PROGRAM ZONE TESTS PASSED"
     run_check "Anomalous Packets: Comprehensive DNS packet wire suite (tests/run_dag_dig_anomalous_suite.sh)" "DAG_BIN=\"$DAG\" DIG_BIN=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dig_anomalous_suite.sh\" \"$([ "$DAG" = "dig" ] && echo "dig" || echo "dag")\"" "ALL ANOMALOUS PACKET TESTS PASSED SUCCESSFULLY"
+    run_check "Transport: Multi-Message AXFR & Plain-HTTP DoH mock (tests/run_dag_doh_dot_axfr_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_dot_axfr_test.sh\"" "ALL DOT/DOH AXFR & MEMORY TESTS PASSED"
 fi
 
 echo "========================================================"

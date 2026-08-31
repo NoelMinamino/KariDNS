@@ -2017,6 +2017,28 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     return ssl;
 }
 
+static ssize_t do_tls_recv_response(SSL *ssl, uint8_t *resp, size_t resp_cap) {
+    if (!ssl) return -1;
+    uint8_t rlen_buf[2];
+    int got = 0;
+    while (got < 2) {
+        int r = SSL_read(ssl, rlen_buf + got, 2 - got);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    uint16_t rlen = (rlen_buf[0] << 8) | rlen_buf[1];
+    if (rlen > resp_cap) {
+        return -1;
+    }
+    size_t total_read = 0;
+    while (total_read < rlen) {
+        int r = SSL_read(ssl, resp + total_read, (int)(rlen - total_read));
+        if (r <= 0) return -1;
+        total_read += r;
+    }
+    return (ssize_t)total_read;
+}
+
 static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
@@ -2234,14 +2256,46 @@ static void base64url_encode(const uint8_t *data, size_t len, char *out, size_t 
 static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
-    int sock = connect_tcp(server, port, qo, timeout_sec);
-    if (sock < 0) return -1;
-    set_socket_timeouts(sock, timeout_sec);
-    send_proxyv2_if_enabled(sock, qo, true);
+    int sock = -1;
     SSL *ssl = NULL;
-    if (qo->doh_tls) {
-        ssl = establish_tls(sock, qo, server, port);
-        if (!ssl) { close(sock); return -1; }
+
+    if (qo && qo->keep_tcp_open) {
+        if (g_cached_conn.sock >= 0 && g_cached_conn.is_tls == qo->doh_tls &&
+            (!qo->doh_tls || g_cached_conn.ssl) &&
+            strcmp(g_cached_conn.server, server) == 0 && g_cached_conn.port == port &&
+            g_cached_conn.pref_family == qo->pref_family &&
+            strcmp(g_cached_conn.bind_addr, qo->bind_addr) == 0 &&
+            g_cached_conn.bind_port == qo->bind_port) {
+            sock = g_cached_conn.sock;
+            ssl = g_cached_conn.ssl;
+            g_last_socket_family = g_cached_conn.family;
+        } else {
+            close_cached_tcp();
+        }
+    } else {
+        close_cached_tcp();
+    }
+
+    if (sock < 0) {
+        sock = connect_tcp(server, port, qo, timeout_sec);
+        if (sock < 0) return -1;
+        set_socket_timeouts(sock, timeout_sec);
+        send_proxyv2_if_enabled(sock, qo, true);
+        if (qo->doh_tls) {
+            ssl = establish_tls(sock, qo, server, port);
+            if (!ssl) { close(sock); return -1; }
+        }
+        if (qo && qo->keep_tcp_open) {
+            g_cached_conn.sock = sock;
+            g_cached_conn.ssl = ssl;
+            snprintf(g_cached_conn.server, sizeof(g_cached_conn.server), "%s", server);
+            g_cached_conn.port = port;
+            g_cached_conn.pref_family = qo->pref_family;
+            g_cached_conn.family = g_last_socket_family;
+            snprintf(g_cached_conn.bind_addr, sizeof(g_cached_conn.bind_addr), "%s", qo->bind_addr);
+            g_cached_conn.bind_port = qo->bind_port;
+            g_cached_conn.is_tls = qo->doh_tls;
+        }
     }
 
     const char *path = (qo->doh_path && qo->doh_path[0]) ? qo->doh_path : "/dns-query";
@@ -2253,9 +2307,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
         size_t b64_needed = ((pkt_len + 2) / 3) * 4 + 1;
         if (b64_needed > sizeof(b64_dns)) {
             fprintf(stderr, ";; Query too large for +https-get (use +https-post or +https instead)\n");
-            if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-            close(sock);
-            return -1;
+            goto err;
         }
         base64url_encode(pkt, pkt_len, b64_dns, sizeof(b64_dns));
         const char *separator = strchr(path, '?') ? "&" : "?";
@@ -2264,8 +2316,8 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             "Host: %s\r\n"
             "Accept: application/dns-message\r\n"
             "User-Agent: KariDNS-dag/1.0\r\n"
-            "Connection: close\r\n\r\n",
-            path, separator, b64_dns, server);
+            "Connection: %s\r\n\r\n",
+            path, separator, b64_dns, server, (qo && qo->keep_tcp_open) ? "keep-alive" : "close");
     } else {
         req_hdr_len = snprintf(req_hdr, sizeof(req_hdr),
             "POST %s HTTP/1.1\r\n"
@@ -2274,8 +2326,8 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             "Accept: application/dns-message\r\n"
             "Content-Length: %zu\r\n"
             "User-Agent: KariDNS-dag/1.0\r\n"
-            "Connection: close\r\n\r\n",
-            path, server, pkt_len);
+            "Connection: %s\r\n\r\n",
+            path, server, pkt_len, (qo && qo->keep_tcp_open) ? "keep-alive" : "close");
     }
 
     if (ssl) {
@@ -2319,8 +2371,10 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
         }
     }
 
-    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-    close(sock);
+    if (!(qo && qo->keep_tcp_open)) {
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+        close(sock);
+    }
 
     if (http_len < 16) return -1;
     uint8_t *hdr_end_u8 = memmem(http_buf, http_len, "\r\n\r\n", 4);
@@ -2356,8 +2410,11 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     return (ssize_t)body_len;
 
 err:
-    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-    close(sock);
+    close_cached_tcp();
+    if (!(qo && qo->keep_tcp_open)) {
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+        close(sock);
+    }
     return -1;
 }
 
@@ -2473,6 +2530,29 @@ static ssize_t do_dns_exchange_by_transport(const char *server, int port, const 
         return do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
     } else {
         return do_udp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+    }
+}
+
+static ssize_t do_axfr_recv_next(int tcp_sock, const query_opts_t *qo, uint8_t *resp, size_t resp_cap) {
+    if (qo && qo->use_tls) {
+        if (g_cached_conn.is_tls && g_cached_conn.ssl) {
+            return do_tls_recv_response(g_cached_conn.ssl, resp, resp_cap);
+        }
+        return -1;
+    } else if (qo && qo->use_doh) {
+        if (g_cached_conn.is_tls && g_cached_conn.ssl) {
+            return do_tls_recv_response(g_cached_conn.ssl, resp, resp_cap);
+        } else if (g_cached_conn.sock >= 0) {
+            return do_tcp_recv_response(g_cached_conn.sock, resp, resp_cap);
+        }
+        return -1;
+    } else {
+        if (tcp_sock >= 0) {
+            return do_tcp_recv_response(tcp_sock, resp, resp_cap);
+        } else if (g_cached_conn.sock >= 0 && !g_cached_conn.is_tls) {
+            return do_tcp_recv_response(g_cached_conn.sock, resp, resp_cap);
+        }
+        return -1;
     }
 }
 
@@ -5575,6 +5655,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             print_sent_query(pkt, pkt_len, qo, dopt);
         }
 
+        query_opts_t eff_qo = *qo;
+        if (axfr_state.is_axfr) {
+            eff_qo.keep_tcp_open = true;
+        }
+
         static uint8_t resp[65535];
         ssize_t n = -1;
         int attempts = 0;
@@ -5583,18 +5668,18 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         int tcp_sock = -1;
         while (attempts < max_tries) {
             attempts++;
-            if (qo->use_doh) {
-                n = do_doh_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+            if (eff_qo.use_doh) {
+                n = do_doh_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
                 if (n > 0) break;
-            } else if (qo->use_tls) {
-                n = do_tls_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+            } else if (eff_qo.use_tls) {
+                n = do_tls_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
                 if (n > 0) break;
             } else if (use_tcp) {
-                if (qo->keep_tcp_open && !axfr_state.is_axfr) {
-                    n = do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                if (eff_qo.keep_tcp_open) {
+                    n = do_tcp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
                     if (n > 0) break;
                 } else {
-                    tcp_sock = do_tcp_send_request(server, port, qo, pkt, pkt_len, qo->timeout_sec);
+                    tcp_sock = do_tcp_send_request(server, port, &eff_qo, pkt, pkt_len, eff_qo.timeout_sec);
                     if (tcp_sock >= 0) {
                         n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
                         if (n > 0) {
@@ -5606,7 +5691,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     }
                 }
             } else {
-                n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                n = do_udp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
                 if (n >= 0) break;
             }
             if (attempts < max_tries) {
@@ -5839,11 +5924,12 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
 
 
-            bool has_more = axfr_state.is_axfr && !axfr_state.axfr_complete && use_tcp && tcp_sock >= 0;
+            bool has_more = axfr_state.is_axfr && !axfr_state.axfr_complete &&
+                            (use_tcp || eff_qo.use_tls || eff_qo.use_doh);
 
             if (has_more) {
                 if (sres) g_server_count++;
-                n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+                n = do_axfr_recv_next(tcp_sock, &eff_qo, resp, sizeof(resp));
                 if (n <= 0) {
                     sres = NULL;
                     break;
@@ -5854,6 +5940,14 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 break;
             }
         } while (true);
+
+        if (tcp_sock >= 0) {
+            close(tcp_sock);
+            tcp_sock = -1;
+        }
+        if (!qo->keep_tcp_open && axfr_state.is_axfr) {
+            close_cached_tcp();
+        }
 
         if (qo->want_tsig && axfr_state.is_axfr && axfr_state.axfr_complete) {
             if (!last_msg_had_tsig) {
@@ -6083,7 +6177,7 @@ static void usage(const char *prog) {
         "  +[no]dns64prefix             Query IPv4-only prefix from ipv4only.arpa (RFC 7050)\n"
         "  +timeout=N                   Query timeout in seconds [5]\n"
         "  +tries=N / +retry=N          Number of query attempts [1]\n"
-        "  +[no]recurse                 Set / clear RD (Recursion Desired) bit (+[no]rdflag)\n"
+        "  +[no]rec, +[no]recurse      Set / clear RD (Recursion Desired) bit (+[no]rdflag)\n"
         "  +[no]adflag                  Set / clear AD (Authenticated Data) bit in query\n"
         "  +[no]cdflag                  Set / clear CD (Checking Disabled) bit in query\n"
         "  +[no]aaflag                  Set / clear AA (Authoritative Answer) bit in query (+[no]aaonly)\n"
@@ -7586,7 +7680,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+nosearch") == 0 || strcmp(arg, "+nodefname") == 0) {
             spec->qo.use_search_list = false;
         } else if (strncmp(arg, "+domain=", 8) == 0) {
-            spec->qo.search_domain = arena_strdup(&g_dag_arena, arg + 8);
+            spec->qo.search_domain = strdup(arg + 8);
             spec->qo.use_search_list = true;
         } else if (strncmp(arg, "+ndots=", 7) == 0) {
             spec->qo.ndots = atoi(arg + 7);
@@ -7749,39 +7843,39 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+notls") == 0) {
             spec->qo.use_tls = false; if (spec->port == 853) spec->port = 53;
         } else if (strncmp(arg, "+tls-ca=", 8) == 0) {
-            spec->qo.tls_ca_file = arena_strdup(&g_dag_arena, arg + 8);
+            spec->qo.tls_ca_file = strdup(arg + 8);
         } else if (strcmp(arg, "+tls-ca") == 0) {
             spec->qo.tls_verify_default_store = true;
         } else if (strcmp(arg, "+notls-ca") == 0) {
             spec->qo.tls_verify_default_store = false;
         } else if (strncmp(arg, "+tls-certfile=", 14) == 0) {
-            spec->qo.tls_certfile = arena_strdup(&g_dag_arena, arg + 14);
+            spec->qo.tls_certfile = strdup(arg + 14);
         } else if (strncmp(arg, "+tls-keyfile=", 13) == 0) {
-            spec->qo.tls_keyfile = arena_strdup(&g_dag_arena, arg + 13);
+            spec->qo.tls_keyfile = strdup(arg + 13);
         } else if (strncmp(arg, "+tls-hostname=", 14) == 0) {
-            spec->qo.tls_hostname = arena_strdup(&g_dag_arena, arg + 14);
+            spec->qo.tls_hostname = strdup(arg + 14);
         } else if (strncmp(arg, "+https=", 7) == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = arena_strdup(&g_dag_arena, arg + 7); if (spec->port == 53) spec->port = 443;
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 7); if (spec->port == 53) spec->port = 443;
         } else if (strcmp(arg, "+https") == 0) {
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 443;
         } else if (strncmp(arg, "+https-get=", 11) == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = arena_strdup(&g_dag_arena, arg + 11); if (spec->port == 53) spec->port = 443;
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 11); if (spec->port == 53) spec->port = 443;
         } else if (strcmp(arg, "+https-get") == 0) {
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 443;
         } else if (strncmp(arg, "+https-post=", 12) == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = arena_strdup(&g_dag_arena, arg + 12); if (spec->port == 53) spec->port = 443;
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 12); if (spec->port == 53) spec->port = 443;
         } else if (strcmp(arg, "+https-post") == 0) {
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 443;
         } else if (strncmp(arg, "+http-plain=", 12) == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = arena_strdup(&g_dag_arena, arg + 12); if (spec->port == 53) spec->port = 80;
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 12); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+http-plain") == 0) {
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 80;
         } else if (strncmp(arg, "+http-plain-get=", 16) == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = arena_strdup(&g_dag_arena, arg + 16); if (spec->port == 53) spec->port = 80;
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 16); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+http-plain-get") == 0) {
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 80;
         } else if (strncmp(arg, "+http-plain-post=", 17) == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = arena_strdup(&g_dag_arena, arg + 17); if (spec->port == 53) spec->port = 80;
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 17); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+http-plain-post") == 0) {
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+nohttps") == 0 || strcmp(arg, "+nohttp-plain") == 0) {
