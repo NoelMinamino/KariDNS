@@ -5850,21 +5850,17 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         }
 
-        if (g_results && g_server_count > 0 && start_index < g_server_count) {
-            for (int i = start_index; i < g_server_count; i++) {
-                g_results[i].elapsed_ms = elapsed_ms;
-                g_results[i].msg_total = (msg_index > 1) ? msg_index : 0;
-            }
-        }
+        if (sres) g_server_count++;
 
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
         elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
         elapsed_ms = (long)(elapsed_usec / 1000LL);
 
-        int end_index = g_server_count;
-        for (int idx = start_index; idx < end_index; idx++) {
-            g_results[idx].msg_total = end_index - start_index;
-            g_results[idx].elapsed_ms = elapsed_ms;
+        if (g_results && g_server_count > 0 && start_index < g_server_count) {
+            for (int i = start_index; i < g_server_count; i++) {
+                g_results[i].elapsed_ms = elapsed_ms;
+                g_results[i].msg_total = (msg_index > 1) ? msg_index : 0;
+            }
         }
 
         time_t now = time(NULL);
