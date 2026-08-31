@@ -2406,6 +2406,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     uint8_t http_buf[65535 + 4096];
     size_t http_len = 0;
     http_buf[0] = '\0';
+    bool framing_complete = false;
     while (http_len + 1 < sizeof(http_buf)) {
         int r = 0;
         if (ssl) r = SSL_read(ssl, http_buf + http_len, (int)(sizeof(http_buf) - http_len - 1));
@@ -2461,7 +2462,10 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
                         src += 2;
                     }
                 }
-                if (chunk_complete) break;
+                if (chunk_complete) {
+                    framing_complete = true;
+                    break;
+                }
             } else {
                 size_t cl_val = 0;
                 bool has_cl = false;
@@ -2473,7 +2477,10 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
                         break;
                     }
                 }
-                if (has_cl && current_body_len >= cl_val) break;
+                if (has_cl && current_body_len >= cl_val) {
+                    framing_complete = true;
+                    break;
+                }
             }
         }
     }
@@ -2481,11 +2488,20 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     if (!(qo && qo->keep_tcp_open)) {
         if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
         close(sock);
+    } else if (!framing_complete) {
+        // D-1: フレーミング不確定(中途切断やバッファ溢れ等)で抜けた場合、接続キャッシュを必ず無効化する
+        close_cached_tcp();
     }
 
-    if (http_len < 16) return -1;
+    if (http_len < 16) {
+        if (qo && qo->keep_tcp_open) close_cached_tcp();
+        return -1;
+    }
     uint8_t *hdr_end_u8 = memmem(http_buf, http_len, "\r\n\r\n", 4);
-    if (!hdr_end_u8) return -1;
+    if (!hdr_end_u8) {
+        if (qo && qo->keep_tcp_open) close_cached_tcp();
+        return -1;
+    }
     size_t header_len = hdr_end_u8 - http_buf;
     size_t body_offset = header_len + 4;
     size_t body_len = http_len - body_offset;
@@ -2524,7 +2540,10 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             char *line_end = strstr((char *)http_buf + src, "\r\n");
             if (!line_end) break;
             long chunk_sz = strtol((char *)http_buf + src, NULL, 16);
-            if (chunk_sz < 0) return -1;
+            if (chunk_sz < 0) {
+                if (qo && qo->keep_tcp_open) close_cached_tcp();
+                return -1;
+            }
             if (chunk_sz == 0) break; // 終了チャンク
 
             src = (size_t)(line_end - (char *)http_buf) + 2;
@@ -4925,7 +4944,7 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
                 } else if (code == 12) {
                     printf("; PADDING: %u octets\n", olen);
                 } else if (code == 20 || code == 21) {
-                    printf("; MQTYPE: ");
+                    printf("; %s: ", code == 20 ? "MQTYPE-Query" : "MQTYPE-Response");
                     if (olen % 2 != 0) {
                         printf("(malformed, length %u is not even)\n", olen);
                     } else if (olen == 0) {
@@ -4935,7 +4954,7 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
                             uint16_t mq = (pkt[p + j] << 8) | pkt[p + j + 1];
                             char tbuf[16];
                             const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
-                            if (j > 0) printf(", ");
+                            if (j > 0) printf(" ");
                             printf("%s", mq_name);
                         }
                         printf("\n");
@@ -6378,6 +6397,7 @@ static void usage(const char *prog) {
         "\n"
         "Transport & Protocol Options:\n"
         "  +[no]tcp                     Use TCP transport (+[no]vc)\n"
+        "  +udp                         Force UDP transport (opposite of +tcp)\n"
         "  +[no]tls                     Use DNS-over-TLS (DoT) [default port: 853]\n"
         "  +[no]tls-ca[=file]           Enable TLS certificate verification using system store or CA file\n"
         "  +tls-certfile=file           Load client TLS certificate chain from file\n"
@@ -6482,9 +6502,13 @@ static void usage(const char *prog) {
         "  +mqtype=TYPE[,TYPE...]       Send Multiple QTYPE EDNS option (RFC 10029)\n"
         "                               Example: dag example.com A @127.0.0.1 +mqtype=A,AAAA,HTTPS\n"
         "  +[no]header-only             Send DNS query packet without a QUESTION section\n"
-        "  +[no]nohexdump               Suppress raw packet hex dumps for query and response\n"
-        "  +[no]nohexdump-query         Suppress raw query packet hex dump\n"
-        "  +[no]nohexdump-response      Suppress raw response packet hex dump\n"
+        "  +[no]hexdump                 Show/suppress raw packet hex dumps for query and response\n"
+        "  +[no]hexdump-query           Show/suppress raw query packet hex dump\n"
+        "  +[no]hexdump-response        Show/suppress raw response packet hex dump\n"
+        "  +fuzztime[=N]                [TEST-ONLY] Override TSIG time_signed with a fixed\n"
+        "                               timestamp (default 1646972129) instead of current time,\n"
+        "                               for reproducible TSIG MAC testing. Do not use against\n"
+        "                               production TSIG keys.\n"
         "  --hex=<hex> | --hex <hex>    Send raw hex payload directly as DNS query packet\n"
         "                               Example: dag @127.0.0.1 --hex '000101000001000000000000076578616d706c6503636f6d0000010001'\n"
         "  --break <kind>[=<param>]     Inject deliberate protocol anomalies / mutations into query packet\n"
@@ -6773,6 +6797,20 @@ static void record_ldnsz_result(const char *server, ssize_t n, const uint8_t *re
     g_server_count++;
 }
 
+/* pkt内のsection_count分のRRをパースし、want_typeに一致するレコードのrdata[0]を
+ * out配列(out_cap個まで)に集める。roffは呼び出し元で更新される。 */
+static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff,
+                                int section_count, uint16_t want_type,
+                                char out[][256], int *out_count, int out_cap) {
+    for (int i = 0; i < section_count; i++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(pkt, pkt_len, roff, &g_dag_arena, &rec, &type) != 0) break;
+        if (type == want_type && *out_count < out_cap && rec.rdata_count > 0) {
+            snprintf(out[(*out_count)++], 256, "%s", rec.rdata[0]);
+        }
+    }
+}
+
 static int run_trace_query(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     (void)force_udp; (void)hex_payload;
     qo.rd_flag = false;
@@ -6829,20 +6867,8 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         
         char rns_names[32][256];
         int rns_count = 0;
-        for (int i=0; i<r_an; i++) {
-            dns_record_t rec; uint16_t type;
-            if (parse_resource_record(root_resp, root_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
-            if (type == 2 && rns_count < 32 && rec.rdata_count > 0) {
-                snprintf(rns_names[rns_count++], sizeof(rns_names[0]), "%s", rec.rdata[0]);
-            }
-        }
-        for (int i=0; i<r_ns; i++) {
-            dns_record_t rec; uint16_t type;
-            if (parse_resource_record(root_resp, root_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
-            if (type == 2 && rns_count < 32 && rec.rdata_count > 0) {
-                snprintf(rns_names[rns_count++], sizeof(rns_names[0]), "%s", rec.rdata[0]);
-            }
-        }
+        collect_rrs_by_type(root_resp, root_n, &roff, r_an, 2 /* NS */, rns_names, &rns_count, 32);
+        collect_rrs_by_type(root_resp, root_n, &roff, r_ns, 2 /* NS */, rns_names, &rns_count, 32);
         for (int i=0; i<r_ar; i++) {
             dns_record_t rec; uint16_t type;
             if (parse_resource_record(root_resp, root_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
@@ -6934,13 +6960,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         
         char ns_names[16][256];
         int ns_count = 0;
-        for (int i = 0; i < nscount; i++) {
-            dns_record_t rec; uint16_t type;
-            if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-            if (type == 2 && ns_count < 16 && rec.rdata_count > 0) {
-                snprintf(ns_names[ns_count++], sizeof(ns_names[0]), "%s", rec.rdata[0]);
-            }
-        }
+        collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, &ns_count, 16);
         
         int new_target_count = 0;
         char new_target_ips[16][64];
