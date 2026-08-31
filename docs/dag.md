@@ -163,8 +163,8 @@ dag [global-queryopt...] [query...]
 `+[no]dns64prefix`
 : Automatically query `ipv4only.arpa` for `AAAA` records to discover local DNS64 prefixes (RFC 7050).
 
-`+timeout=N`
-: Set query network timeout in seconds (default: 5 seconds).
+`+timeout=N`, `+time=N`
+: Set query network timeout in seconds (default: 5 seconds). `+time=N` functions as a synonym/alias.
 
 `+tries=N`, `+retry=N`
 : Set number of transmission attempts (default: 1 attempt).
@@ -453,8 +453,8 @@ When `+ldnsz` is supplied:
 `+[no]short`
 : Provide a terse, machine-readable answer containing only the RDATA of the ANSWER section.
 
-`+[no]multiline`
-: Print records (such as SOA, DNSKEY, RRSIG, and HTTPS) in human-readable multi-line format with field descriptions and structured comments.
+`+[no]multiline`, `+[no]multi`
+: Print records (such as SOA, DNSKEY, RRSIG, and HTTPS) in human-readable multi-line format with field descriptions and structured comments. Short form (`+[no]multi`) is also supported.
 
 `+[no]yaml`
 : Output the complete parsed DNS response in structured YAML format.

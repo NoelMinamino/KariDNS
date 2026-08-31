@@ -281,40 +281,13 @@ static const char *get_ede_error_string(uint16_t code) {
 }
 
 static bool resolve_qtype(const char *s, uint16_t *out_type) {
-    static const struct { const char *name; uint16_t type; } types[] = {
-        {"A", 1}, {"NS", 2}, {"MD", 3}, {"MF", 4}, {"CNAME", 5}, {"SOA", 6},
-        {"MB", 7}, {"MG", 8}, {"MR", 9}, {"NULL", 10}, {"WKS", 11}, {"PTR", 12},
-        {"HINFO", 13}, {"MINFO", 14}, {"MX", 15}, {"TXT", 16}, {"RP", 17},
-        {"AFSDB", 18}, {"X25", 19}, {"ISDN", 20}, {"RT", 21}, {"NSAP", 22},
-        {"NSAP-PTR", 23}, {"SIG", 24}, {"KEY", 25}, {"PX", 26}, {"GPOS", 27},
-        {"AAAA", 28}, {"LOC", 29}, {"NXT", 30}, {"EID", 31}, {"NIMLOC", 32},
-        {"SRV", 33}, {"ATMA", 34}, {"NAPTR", 35}, {"KX", 36}, {"CERT", 37},
-        {"A6", 38}, {"DNAME", 39}, {"SINK", 40}, {"OPT", 41}, {"APL", 42},
-        {"DS", 43}, {"SSHFP", 44}, {"IPSECKEY", 45}, {"RRSIG", 46}, {"NSEC", 47},
-        {"DNSKEY", 48}, {"DHCID", 49}, {"NSEC3", 50}, {"NSEC3PARAM", 51},
-        {"TLSA", 52}, {"SMIMEA", 53}, {"HIP", 55}, {"CDS", 59}, {"CDNSKEY", 60},
-        {"OPENPGPKEY", 61}, {"CSYNC", 62}, {"ZONEMD", 63}, {"SVCB", 64},
-        {"HTTPS", 65}, {"DSYNC", 66}, {"NXNAME", 128}, {"SPF", 99}, {"NID", 104}, {"L32", 105}, {"L64", 106},
-        {"LP", 107}, {"EUI48", 108}, {"EUI64", 109}, {"TKEY", 249}, {"TSIG", 250},
-        {"IXFR", 251}, {"AXFR", 252}, {"MAILB", 253}, {"MAILA", 254}, {"ANY", 255},
-        {"URI", 256}, {"CAA", 257}, {"AVC", 258}, {"DOA", 259}, {"AMTRELAY", 260},
-        {"TA", 32768}, {"DLV", 32769}
-    };
-    for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
-        if (strcasecmp(s, types[i].name) == 0) {
-            if (out_type) *out_type = types[i].type;
-            return true;
-        }
+    if (!s) return false;
+    uint16_t t = get_type_code(s);
+    if (t != 0) {
+        if (out_type) *out_type = t;
+        return true;
     }
-    if (strncasecmp(s, "TYPE", 4) == 0 && s[4] != '\0') {
-        char *end;
-        long v = strtol(s + 4, &end, 10);
-        // RFC 3597 §2: TYPE0 は予約されており RR Type として使用不可 (1-65535)
-        if (*end == '\0' && v > 0 && v <= 65535) {
-            if (out_type) *out_type = (uint16_t)v;
-            return true;
-        }
-    }
+    // IXFR等の特殊構文処理は残す
     if (strncasecmp(s, "IXFR=", 5) == 0) {
         if (out_type) *out_type = 251; // IXFR
         return true;
@@ -2319,12 +2292,14 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
 
     uint8_t http_buf[65535 + 4096];
     size_t http_len = 0;
-    while (http_len < sizeof(http_buf)) {
+    http_buf[0] = '\0';
+    while (http_len + 1 < sizeof(http_buf)) {
         int r = 0;
-        if (ssl) r = SSL_read(ssl, http_buf + http_len, (int)(sizeof(http_buf) - http_len));
-        else r = (int)recv(sock, http_buf + http_len, sizeof(http_buf) - http_len, 0);
+        if (ssl) r = SSL_read(ssl, http_buf + http_len, (int)(sizeof(http_buf) - http_len - 1));
+        else r = (int)recv(sock, http_buf + http_len, sizeof(http_buf) - http_len - 1, 0);
         if (r <= 0) break;
         http_len += r;
+        http_buf[http_len] = '\0';
 
         // Content-Lengthを動的にチェックしてループを抜ける
         uint8_t *hdr_end = memmem(http_buf, http_len, "\r\n\r\n", 4);
@@ -6578,6 +6553,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
     
     int hop = 0;
     while (hop < 15 && target_count > 0) {
+        reset_dag_arena();
         hop++;
         uint8_t qbuf[512];
         int qtype_val = parse_qtype(qtype_s);
