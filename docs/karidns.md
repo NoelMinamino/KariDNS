@@ -145,6 +145,28 @@ zone "anomaly.test." {
 
 ---
 
+## FORWARD ZONES
+
+KariDNS supports forwarding queries for specific zones to designated upstream nameservers (`type forward;`).
+
+```
+zone "corp.example.com." {
+    type forward;
+    forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
+    forward-timeout 2000; # timeout in milliseconds per forwarder (default: 2000)
+};
+```
+
+> [!NOTE]
+> **Forward Zone Processing Semantics:**
+> - **Transparent Query Relaying**: KariDNS does not maintain zone resource records locally for forward zones. Incoming queries matching the zone are forwarded directly to the configured `forwarders` list in order.
+> - **No Subprocess Overhead**: Unlike `type program` zones, forward zones do not spawn external processes and do not require global opt-in flags like `allow-program-zones`.
+> - **Immediate Reload Support**: Changes to `forwarders` or `forward-timeout` take effect immediately upon configuration reload (`SIGHUP` / `karictl reload`) without requiring a full server restart.
+> - **Unsupported Operations**: Dynamic Update (RFC 2136), Zone Transfer (`AXFR`/`IXFR`), and `NOTIFY` requests are not supported on forward zones and are rejected with `NOTIMP`.
+> - **Security & Transaction ID Randomization**: When relaying to upstream forwarders, KariDNS assigns a fresh cryptographic random transaction ID (`arc4random`) and verifies that the upstream response Question section and ID match before relaying the answer with the client's original transaction ID restored.
+
+---
+
 ## SIGNALS
 
 `SIGHUP`

@@ -320,6 +320,9 @@ void free_zone_config(zone_config_t *zone) {
     free(zone->program_args[i]);
   free(zone->program_args);
   free(zone->program_user);
+  for (int i = 0; i < zone->forwarders_count; i++)
+    free(zone->forwarders[i].ip);
+  free(zone->forwarders);
   free_rate_limit_config(&zone->rrl);
   free(zone);
 }
@@ -913,8 +916,10 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           zone->type = val;
         } else if (strcasecmp(val, "program") == 0) {
           zone->type = val;
+        } else if (strcasecmp(val, "forward") == 0) {
+          zone->type = val;
         } else {
-          syslog(LOG_ERR, "[Config] Unknown zone type '%s' for zone '%s' (expected master/primary, slave/secondary, or program)", val, zone->domain);
+          syslog(LOG_ERR, "[Config] Unknown zone type '%s' for zone '%s' (expected master/primary, slave/secondary, forward, or program)", val, zone->domain);
           fprintf(stderr, "[ERROR] Unknown zone type '%s' for zone '%s'\n", val, zone->domain);
           free(key);
           free(val);
@@ -982,6 +987,22 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
+    } else if (strcmp(key, "forwarders") == 0) {
+      if (parse_ip_port_list(ctx, &zone->forwarders, &zone->forwarders_count) != 0) {
+        free(key); free_zone_config(zone); return -1;
+      }
+    } else if (strcmp(key, "forward-timeout") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      char *endptr = NULL;
+      unsigned long val_num = strtoul(tok.value, &endptr, 10);
+      if (*endptr == '\0') {
+        zone->forward_timeout_ms = (uint32_t)val_num;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      free_token(&tok);
     } else if (strcmp(key, "rate-limit") == 0) {
       if (parse_rate_limit_config(ctx, &zone->rrl) != 0) {
         free(key);
@@ -1008,6 +1029,14 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     }
     if (zone->masters_count > 0) {
       syslog(LOG_WARNING, "[Config] Zone '%s' is type 'program' but has 'masters' configured; ignoring masters", zone->domain);
+    }
+  }
+  if (zone->type && strcasecmp(zone->type, "forward") == 0) {
+    if (zone->file) {
+      syslog(LOG_WARNING, "[Config] Zone '%s' is type 'forward' but has 'file' configured; ignoring file", zone->domain);
+    }
+    if (zone->masters_count > 0) {
+      syslog(LOG_WARNING, "[Config] Zone '%s' is type 'forward' but has 'masters' configured; ignoring masters", zone->domain);
     }
   }
   if (zone->allow_update_count > 0 && zone->type &&

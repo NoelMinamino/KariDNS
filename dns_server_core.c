@@ -590,6 +590,25 @@ static int broker_connect(int family, int type, struct sockaddr *addr,
   return fd;
 }
 
+/* ip_port_t(文字列IP+ポート)を sockaddr_storage へ変換する共通ヘルパー。
+ * 戻り値: 成功時 sockaddr の実サイズ(sizeof(sockaddr_in) 等)、
+ *         IPアドレスとして解釈できなければ 0。 */
+static size_t resolve_ip_port_to_sockaddr(const char *ip, int port,
+                                          struct sockaddr_storage *out) {
+  memset(out, 0, sizeof(*out));
+  if (inet_pton(AF_INET, ip, &((struct sockaddr_in *)out)->sin_addr) == 1) {
+    out->ss_family = AF_INET;
+    ((struct sockaddr_in *)out)->sin_port = htons(port > 0 ? port : 53);
+    return sizeof(struct sockaddr_in);
+  }
+  if (inet_pton(AF_INET6, ip, &((struct sockaddr_in6 *)out)->sin6_addr) == 1) {
+    out->ss_family = AF_INET6;
+    ((struct sockaddr_in6 *)out)->sin6_port = htons(port > 0 ? port : 53);
+    return sizeof(struct sockaddr_in6);
+  }
+  return 0;
+}
+
 // ============================================================================
 // Capsicum capability-mode support
 // ============================================================================
@@ -3578,14 +3597,13 @@ static void compute_program_zone_fingerprint(const zone_config_t *z, char *out, 
   }
 }
 
-/* type "program" ゾーンでプラグインが死んでいる/通信に失敗した場合に、
- * ログの文言通り実際にSERVFAILパケットを構築して返す。
- * (以前は単に0を返しており、これは「応答なし(サイレントドロップ)」を意味して
- *  いた。クライアント視点ではタイムアウトとSERVFAILは挙動が大きく異なるため、
- *  ログの記述に合わせて実装側もSERVFAILを返すようにする。) */
-static int build_program_zone_servfail(const char *domain, const uint8_t *req, size_t req_len,
+/* type "program"/"forward" ゾーンで、実際の応答を得られなかった場合に
+ * 合成SERVFAILパケットを構築して返す共通ヘルパー。
+ * (以前は単に0を返しており、これは「応答なし(サイレントドロップ)」を
+ *  意味していた。クライアント視点ではタイムアウトとSERVFAILは挙動が
+ *  大きく異なるため、ログの記述に合わせて実装側もSERVFAILを返す。) */
+static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                                        uint8_t *res, size_t max_res_len) {
-  (void)domain;
   if (req_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
   size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
   memcpy(res, req, copy_len);
@@ -3667,7 +3685,7 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
                                     const char *client_ip, bool is_tcp) {
   program_plugin_t *plugin = find_program_plugin(domain);
   if (!plugin || atomic_load_explicit(&plugin->dead, memory_order_acquire)) {
-    return build_program_zone_servfail(domain, req, req_len, res, max_res_len); // M-1
+    return build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
   }
 
   pthread_mutex_lock(&plugin->lock);
@@ -3739,13 +3757,126 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
       kill(plugin->pid, SIGKILL);
       waitpid(plugin->pid, NULL, WNOHANG);
     }
-    result_len = build_program_zone_servfail(domain, req, req_len, res, max_res_len); // M-1
+    result_len = build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
   } else {
     atomic_store_explicit(&plugin->consecutive_failures, 0, memory_order_relaxed);
   }
 
   pthread_mutex_unlock(&plugin->lock);
   return result_len;
+}
+
+/* reqのQuestion section(ヘッダ12バイトの直後から、QTYPE/QCLASSの4バイトを
+ * 含む部分)が、respの中に(先頭12バイトの直後に)同一に存在するかを
+ * 確認する。qdcount>1の異常系は呼び出し前に弾かれている前提。 */
+static bool question_section_matches(const uint8_t *resp, size_t resp_len,
+                                     const uint8_t *req, size_t req_len) {
+  if (req_len <= DNS_HEADER_SIZE || resp_len <= DNS_HEADER_SIZE) return false;
+  size_t q_len = req_len - DNS_HEADER_SIZE;
+  if (resp_len < DNS_HEADER_SIZE + q_len) return false;
+  return memcmp(req + DNS_HEADER_SIZE, resp + DNS_HEADER_SIZE, q_len) == 0;
+}
+
+static ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
+                               const uint8_t *query, size_t query_len,
+                               uint8_t *resp_out, size_t resp_out_cap,
+                               uint32_t timeout_ms) {
+  int fd = broker_connect(ss->ss_family, SOCK_STREAM, (struct sockaddr *)ss, ss_len);
+  if (fd < 0) return -1;
+
+  uint8_t len_prefix[2] = { (uint8_t)(query_len >> 8), (uint8_t)(query_len & 0xFF) };
+  if (write_all_timeout(fd, len_prefix, 2, timeout_ms) != 2 ||
+      write_all_timeout(fd, query, query_len, timeout_ms) != (ssize_t)query_len) {
+    close(fd);
+    return -1;
+  }
+
+  uint8_t resp_len_prefix[2];
+  if (read_all_timeout(fd, resp_len_prefix, 2, timeout_ms) != 2) { close(fd); return -1; }
+  uint16_t resp_len = (resp_len_prefix[0] << 8) | resp_len_prefix[1];
+  if (resp_len == 0 || resp_len > resp_out_cap) { close(fd); return -1; }
+
+  ssize_t got = read_all_timeout(fd, resp_out, resp_len, timeout_ms);
+  close(fd);
+  return got;
+}
+
+static int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+                                 uint8_t *res, size_t max_res_len) {
+  if (req_len < DNS_HEADER_SIZE || zcfg->forwarders_count == 0) {
+    return build_synthetic_servfail(req, req_len, res, max_res_len);
+  }
+  if (req_len > 65535) {
+    return build_synthetic_servfail(req, req_len, res, max_res_len);
+  }
+
+  uint32_t per_fwd_timeout = zcfg->forward_timeout_ms > 0 ? zcfg->forward_timeout_ms : 2000;
+
+  uint8_t upstream_req[65535];
+  memcpy(upstream_req, req, req_len);
+  uint16_t fresh_id = (uint16_t)(arc4random() & 0xFFFF);
+  upstream_req[0] = fresh_id >> 8;
+  upstream_req[1] = fresh_id & 0xFF;
+
+  for (int i = 0; i < zcfg->forwarders_count; i++) {
+    ip_port_t *fwd = &zcfg->forwarders[i];
+    struct sockaddr_storage ss;
+    size_t ss_len = resolve_ip_port_to_sockaddr(fwd->ip, fwd->port, &ss);
+    if (ss_len == 0) {
+      syslog(LOG_ERR, "[Forward] zone '%s': forwarder '%s' is not a valid IP address, skipping",
+             zcfg->domain, fwd->ip);
+      continue;
+    }
+
+    int sock = broker_connect(ss.ss_family, SOCK_DGRAM, (struct sockaddr *)&ss, ss_len);
+    if (sock < 0) {
+      syslog(LOG_WARNING, "[Forward] zone '%s': connect to forwarder '%s:%d' failed",
+             zcfg->domain, fwd->ip, fwd->port);
+      continue;
+    }
+
+    uint8_t upstream_res[65535];
+    ssize_t got = -1;
+    if (send(sock, upstream_req, req_len, 0) == (ssize_t)req_len) {
+      struct pollfd pfd = { .fd = sock, .events = POLLIN };
+      if (poll(&pfd, 1, (int)per_fwd_timeout) > 0)
+        got = recv(sock, upstream_res, sizeof(upstream_res), 0);
+    }
+    close(sock);
+
+    if (got < (ssize_t)DNS_HEADER_SIZE) {
+      syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' timed out or failed, trying next",
+             zcfg->domain, fwd->ip, fwd->port);
+      continue;
+    }
+
+    uint16_t resp_id = (upstream_res[0] << 8) | upstream_res[1];
+    if (resp_id != fresh_id || !(upstream_res[2] & 0x80) ||
+        !question_section_matches(upstream_res, (size_t)got, req, req_len)) {
+      syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' returned a mismatched "
+             "response (id/question mismatch), discarding", zcfg->domain, fwd->ip, fwd->port);
+      continue;
+    }
+
+    if (upstream_res[2] & 0x02) { // TC bit
+      ssize_t tcp_got = forward_via_tcp(&ss, ss_len, upstream_req, req_len,
+                                        upstream_res, sizeof(upstream_res), per_fwd_timeout);
+      if (tcp_got >= (ssize_t)DNS_HEADER_SIZE &&
+          question_section_matches(upstream_res, (size_t)tcp_got, req, req_len)) {
+        got = tcp_got;
+      }
+      // TCPフォールバックが失敗した場合は、UDPで得た(TC付きの)応答を
+      // そのまま使う(何も返さないよりはマシ、というBIND等と同じ扱い)。
+    }
+
+    size_t copy_len = (size_t)got > max_res_len ? max_res_len : (size_t)got;
+    memcpy(res, upstream_res, copy_len);
+    res[0] = req[0]; res[1] = req[1]; // クライアントの元のトランザクションIDへ復元
+    return (int)copy_len;
+  }
+
+  syslog(LOG_ERR, "[Forward] zone '%s': all %d forwarder(s) failed", zcfg->domain, zcfg->forwarders_count);
+  return build_synthetic_servfail(req, req_len, res, max_res_len);
 }
 
 static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
@@ -4091,7 +4222,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     if (db_entry && view) {
       server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
-      if (zc && zc->type && strcasecmp(zc->type, "program") == 0) {
+      if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
+                              strcasecmp(zc->type, "forward") == 0)) {
         size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
         memcpy(res, req, copy_len);
         res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
@@ -4188,7 +4320,8 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     if (db_entry && view) {
       server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
-      if (zc && zc->type && strcasecmp(zc->type, "program") == 0) {
+      if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
+                              strcasecmp(zc->type, "forward") == 0)) {
         size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
         memcpy(res, req, copy_len);
         res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
@@ -4459,6 +4592,13 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       // (スプーフィングされたUDPクエリでプラグイン呼び出しを無制限に
       //  誘発できてしまい、RRLの存在意義そのものが破られる)。
       return plugin_result_len;
+    }
+    if (zcfg && zcfg->type && strcasecmp(zcfg->type, "forward") == 0) {
+      if (current_zone)
+        atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+
+      int fwd_len = dispatch_forward_zone(zcfg, req, req_len, res, max_res_len);
+      return fwd_len;
     }
   }
 
@@ -5898,9 +6038,11 @@ worker_startup_success:;
           zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
-          bool is_prog_zone = (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0);
+          bool is_synthetic_zone = (zcfg && zcfg->type &&
+                                    (strcasecmp(zcfg->type, "program") == 0 ||
+                                     strcasecmp(zcfg->type, "forward") == 0));
 
-          if ((qtype == 252 || qtype == 251) && !is_prog_zone) {
+          if ((qtype == 252 || qtype == 251) && !is_synthetic_zone) {
             bool allowed = false;
             uint16_t tsig_error = 0;
             tsig_key_t *matched_key = NULL;
