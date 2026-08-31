@@ -92,7 +92,7 @@ sub run_plugin_mode {
     binmode(STDIN,  ":raw");
     binmode(STDOUT, ":raw");
 
-    while (my $line = read_raw_line()) {
+    while (defined(my $line = read_raw_line())) {
         chomp($line);
         my ($cmd, $proto, $client_ip) = split(/\s+/, $line);
         next unless $cmd && $cmd eq "QUERY";
@@ -105,7 +105,14 @@ sub run_plugin_mode {
         last unless defined $req && length($req) == $req_len;
 
         my $is_tcp = (defined $proto && lc($proto) eq 'tcp') ? 1 : 0;
-        my $resp = process_query_packet($req, $is_tcp, $client_ip // '127.0.0.1');
+        my $resp = "";
+        eval {
+            $resp = process_query_packet($req, $is_tcp, $client_ip // '127.0.0.1');
+        };
+        if ($@) {
+            print STDERR "[Plugin Exception] process_query_packet failed: $@\n";
+            $resp = "";
+        }
 
         my $resp_len = length($resp // "");
         write_raw_bytes(pack("n", $resp_len));
@@ -228,7 +235,8 @@ sub decode_qname {
     my ($pkt, $offset) = @_;
     my $name = '';
     my $len = length($pkt);
-    while ($offset < $len) {
+    my $hops = 0;
+    while ($offset < $len && $hops++ < 128) {
         my $l = ord(substr($pkt, $offset, 1));
         if ($l == 0) {
             $offset++;
@@ -238,6 +246,7 @@ sub decode_qname {
             last;
         } else {
             $offset++;
+            last if $offset + $l > $len;
             my $label = substr($pkt, $offset, $l);
             $name .= ($name eq '' ? '' : '.') . $label;
             $offset += $l;
