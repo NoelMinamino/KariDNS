@@ -563,6 +563,62 @@ PL_EOF
     CAA_PID=""
 fi
 
+# ------------------------------------------------------------------------------
+# Section 9: APL Record Parser Security and Validation (CWE-121 / RFC 3123)
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Section 9: APL Record Parser Security and Validation ---"
+
+if command -v perl >/dev/null 2>&1; then
+    PORT_APL=$((25000 + $$ % 8000))
+    cat <<'PL_EOF' > "$TMP_DIR/mock_apl.pl"
+use strict;
+use warnings;
+use Socket;
+
+my $port = $ARGV[0];
+socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname("udp")) or die "socket: $!";
+setsockopt($srv, SOL_SOCKET, SO_REUSEADDR, 1);
+bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
+
+while (1) {
+    my $client_addr = recv($srv, my $query, 4096, 0);
+    next unless $client_addr && length($query) >= 12;
+    my $qid = substr($query, 0, 2);
+
+    # APL Answer:
+    # Item 1: Valid IPv4: AFI=1, prefix=32, n_len=4, data=192.0.2.1
+    my $item1 = pack("nCC", 1, 32, 4) . inet_aton("192.0.2.1");
+    # Item 2: Invalid/Oversized IPv4: AFI=1, prefix=32, n_len=127, data=127 bytes padding (Stack Overflow PoC)
+    my $item2 = pack("nCC", 1, 32, 127) . ("\x41" x 127);
+    # Item 3: Invalid IPv6: AFI=2, prefix=128, n_len=17, data=17 bytes
+    my $item3 = pack("nCC", 2, 128, 17) . ("\x42" x 17);
+
+    my $rdata = $item1 . $item2 . $item3;
+    my $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0);
+    $resp .= "\x07example\x03com\x00" . pack("nn", 42, 1);
+    $resp .= "\xc0\x0c" . pack("nnNn", 42, 1, 300, length($rdata)) . $rdata;
+
+    send($srv, $resp, 0, $client_addr);
+}
+PL_EOF
+
+    perl "$TMP_DIR/mock_apl.pl" "$PORT_APL" &
+    APL_PID=$!
+    sleep 0.3
+
+    run_check "APL oversized afdlength=127 does not crash and reports error" \
+        "$DAG @127.0.0.1 -p $PORT_APL example.com APL +timeout=2" \
+        "\[APL afdlength=127 invalid for AFI=1\]"
+
+    run_check "APL valid entry is decoded alongside oversized entry" \
+        "$DAG @127.0.0.1 -p $PORT_APL example.com APL +timeout=2" \
+        "1:192\.0\.2\.1/32"
+
+    kill -9 "$APL_PID" 2>/dev/null || true
+    APL_PID=""
+fi
+
 # ==============================================================================
 # Summary
 # ==============================================================================

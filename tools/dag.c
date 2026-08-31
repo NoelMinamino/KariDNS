@@ -3139,9 +3139,26 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                 uint8_t afdlength = n_len & 0x7F;
                 p += 4;
                 if (p + afdlength > rdlen) break;
+
+                // RFC 3123: afdlength は AFI=1(IPv4) なら4バイト以下、
+                // AFI=2(IPv6) なら16バイト以下でなければならない。
+                // それ以外の値/AFIは不正データとして扱い、addr[] のサイズを
+                // 超えてコピーしないようにクランプする（stack overflow 対策）。
+                uint8_t max_len = (afi == 1) ? 4 : (afi == 2) ? 16 : 0;
+                bool afd_invalid = (max_len == 0 || afdlength > max_len);
                 uint8_t addr[16] = {0};
-                memcpy(addr, &pkt[abs_offset + p], afdlength);
+                size_t copy_len = (afdlength > sizeof(addr)) ? sizeof(addr) : afdlength;
+                memcpy(addr, &pkt[abs_offset + p], copy_len);
                 p += afdlength;
+
+                if (afd_invalid) {
+                    if (!first) rdata_buf_append(out, out_cap, &pos, " ");
+                    rdata_buf_append(out, out_cap, &pos, "[APL afdlength=%u invalid for AFI=%u]",
+                                      afdlength, afi);
+                    first = false;
+                    continue;
+                }
+
                 char addr_str[64] = "?";
                 if (afi == 1) inet_ntop(AF_INET, addr, addr_str, sizeof(addr_str));
                 else if (afi == 2) inet_ntop(AF_INET6, addr, addr_str, sizeof(addr_str));
