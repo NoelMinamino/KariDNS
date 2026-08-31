@@ -10,7 +10,7 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$BASE_DIR}"
 KARIDNS="${BIN_DIR}/karidns"
 KARICHECK="${BIN_DIR}/karicheck"
-DAG="${BIN_DIR}/dag"
+DAG="${DAG:-$BIN_DIR/dag}"
 PLUGIN_SCRIPT="${BASE_DIR}/tests/plugins/dnstestscript.pl"
 
 # Ensure clean slate before running

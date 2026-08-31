@@ -464,6 +464,10 @@ run_check "Protocol: Long label (63 bytes) name expansion (tests/run_dag_long_la
 run_check "Features: Multi-server Semantic Match across compression (tests/run_dag_multi_server_semantic_match_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multi_server_semantic_match_test.sh\"" "ALL MULTI-SERVER SEMANTIC MATCH TESTS PASSED"
 run_check "RFC & CLI Fixes validation (tests/run_dag_fixes_validation_test.sh)" "sh \"$SCRIPT_DIR/run_dag_fixes_validation_test.sh\" \"$DAG\"" "All tests PASSED successfully\."
 run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"
+if command -v perl >/dev/null 2>&1; then
+    run_check "Plugin Zones: 'type program' zone loader (tests/run_program_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_program_zone_test.sh\"" "ALL PROGRAM ZONE TESTS PASSED"
+    run_check "Anomalous Packets: Comprehensive DNS packet wire suite (tests/run_dag_dig_anomalous_suite.sh)" "DAG_BIN=\"$DAG\" DIG_BIN=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dig_anomalous_suite.sh\" \"$([ "$DAG" = "dig" ] && echo "dig" || echo "dag")\"" "ALL ANOMALOUS PACKET TESTS PASSED SUCCESSFULLY"
+fi
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
