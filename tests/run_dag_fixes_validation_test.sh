@@ -139,6 +139,23 @@ run_check "+subnet=0 privacy flag accepted" \
     "$DAG @127.0.0.1 -p 10053 example.com A +subnet=0 +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
+run_check "+nodnssec, +nonsid, +nosubnet flags accepted" \
+    "$DAG @127.0.0.1 -p 10053 example.com A +nodnssec +nonsid +nosubnet +timeout=1" \
+    "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
+if [ "$DAG" = "dig" ]; then
+    run_skip "+nopadding, +hexdump, +nohttps flags" "dag-specific CLI flags"
+else
+    run_check "+nopadding, +hexdump, +nohttps flags accepted" \
+        "$DAG @127.0.0.1 -p 10053 example.com A +nopadding +hexdump +nohttps +timeout=1" \
+        "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+fi
+
+echo "example.com A @127.0.0.1" > "$TMP_DIR/test_batch.txt"
+run_check "Batch mode (-f) with @server syntax" \
+    "$DAG -f $TMP_DIR/test_batch.txt -p 10053 +timeout=1" \
+    "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
 # ==============================================================================
 # 2. Dynamic DNS Prerequisites (--prereq= with Colons in RDATA)
 # ==============================================================================

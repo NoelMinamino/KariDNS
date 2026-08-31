@@ -1908,8 +1908,12 @@ static int do_tcp_send_request(const char *server, int port, const query_opts_t 
 
 static ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
     uint8_t rlen_buf[2];
-    ssize_t n = recv(sock, rlen_buf, 2, MSG_WAITALL);
-    if (n < 2) return -1;
+    size_t got_len = 0;
+    while (got_len < 2) {
+        ssize_t n = recv(sock, rlen_buf + got_len, 2 - got_len, 0);
+        if (n <= 0) return -1;
+        got_len += (size_t)n;
+    }
     uint16_t rlen = (rlen_buf[0] << 8) | rlen_buf[1];
     if (rlen > resp_cap) {
         // バッファ超過時はTCPストリームの同期崩れを防ぐため直ちに切断する
@@ -3445,7 +3449,7 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             break;
         }
-        case 100: { // EUI48
+        case 108: { // EUI48
             if (rdlen == 6) {
                 rdata_buf_append(out, out_cap, &pos, "%02x-%02x-%02x-%02x-%02x-%02x",
                                  pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2],
@@ -3454,7 +3458,7 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             break;
         }
-        case 101: { // EUI64
+        case 109: { // EUI64
             if (rdlen == 8) {
                 rdata_buf_append(out, out_cap, &pos, "%02x-%02x-%02x-%02x-%02x-%02x-%02x-%02x",
                                  pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2], pkt[abs_offset+3],
@@ -4252,7 +4256,7 @@ static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_l
         state->first_soa_norm_len = norm_len;
         state->soa_seen_count = 1;
     } else {
-        if (strcmp(state->first_soa_name, name) == 0 &&
+        if (strcasecmp(state->first_soa_name, name) == 0 &&
             norm_len == state->first_soa_norm_len &&
             memcmp(norm, state->first_soa_norm, norm_len) == 0) {
             state->axfr_complete = true;
@@ -5541,6 +5545,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 qo->server_cookie_len = bc_edns.server_cookie_len;
                 memcpy(qo->server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
                 pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
+                if (qo->want_tsig) {
+                    qo->tsig_key.fuzztime = qo->fuzztime;
+                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
+                        fprintf(stderr, "Error: tsig_sign_packet failed on badcookie retry\n");
+                        return 1;
+                    }
+                }
                 n = do_dns_exchange_by_transport(server, port, qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
             }
         }
@@ -5563,6 +5574,13 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 printf(";; BADVERS, retrying with EDNS version %d.\n", qo->edns_version - 1);
                 qo->edns_version -= 1;
                 pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
+                if (qo->want_tsig) {
+                    qo->tsig_key.fuzztime = qo->fuzztime;
+                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
+                        fprintf(stderr, "Error: tsig_sign_packet failed on badvers retry\n");
+                        return 1;
+                    }
+                }
                 n = do_dns_exchange_by_transport(server, port, qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
             }
         }
@@ -5839,24 +5857,16 @@ static void print_multi_server_summary(bool use_ldnsz) {
         
         const char *status_str = "";
         if (r == base) {
-            status_str = "[BASE]";
+            status_str = "MATCH_BASE";
         } else {
             // クエリID (2バイト) を除外してバイナリ比較
             if (r->resp_len == base->resp_len && r->resp_len >= 2 && 
                 memcmp(r->resp_buf + 2, base->resp_buf + 2, r->resp_len - 2) == 0) {
-                status_str = "== BASE (Exact Match)";
-            } 
-            // バイナリは違うが、RCODEとワイヤハッシュ（SEM_HASH）が完全一致する場合
-            else if (r->rcode == base->rcode && r->semantic_hash == base->semantic_hash) {
-                status_str = "== BASE (Semantic Match)";
-            } 
-            // ワイヤハッシュ（SEM_HASH）は違う（圧縮有無など）が、展開されたレコード内容（record_hash）は完全一致する場合
-            else if (r->rcode == base->rcode && r->record_hash == base->record_hash) {
-                status_str = "== BASE (Record Match / Comp Diff)";
-            }
-            // 展開されたレコード内容自体に差異あり
-            else {
-                status_str = "!! DIFF (Data differs) !!";
+                status_str = "MATCH_EXACT";
+            } else if (r->rcode == base->rcode && (r->semantic_hash == base->semantic_hash || r->record_hash == base->record_hash)) {
+                status_str = "MATCH_SEMANTIC";
+            } else {
+                status_str = "MATCH_DIFF";
             }
         }
 
@@ -6078,10 +6088,10 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
         char *alg, *name, *secret_b64;
         if (colon2) {
             *colon1 = '\0'; *colon2 = '\0';
-            alg = tsig_str; name = colon1 + 1; secret_b64 = colon2 + 1;
+            alg = strdup(tsig_str); name = strdup(colon1 + 1); secret_b64 = colon2 + 1;
         } else {
             *colon1 = '\0';
-            alg = "hmac-sha256"; name = tsig_str; secret_b64 = colon1 + 1;
+            alg = strdup("hmac-sha256"); name = strdup(tsig_str); secret_b64 = colon1 + 1;
         }
         qo->tsig_key.algorithm = alg;
         qo->tsig_key.name = name;
@@ -6096,8 +6106,8 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
             return;
         }
         int dec_len = EVP_DecodeBlock(qo->tsig_key.secret_decoded, (const unsigned char *)secret_b64, b64_len);
-        if (dec_len > 0) {
-            qo->tsig_key.secret_decoded_len = dec_len - pad;
+        if (dec_len > 0 && dec_len >= pad) {
+            qo->tsig_key.secret_decoded_len = (size_t)(dec_len - pad);
         } else {
             fprintf(stderr, "warning: invalid tsig secret base64\n");
             qo->want_tsig = false;
@@ -6326,6 +6336,7 @@ static void record_ldnsz_result(const char *server, ssize_t n, const uint8_t *re
 
 static int run_trace_query(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     (void)force_udp; (void)hex_payload;
+    qo.rd_flag = false;
     printf(";; TRACE: tracing %s from root servers...\n", qname);
     char target_ips[32][64];
     int target_count = 0;
@@ -6389,6 +6400,9 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         for (int i=0; i<r_ns; i++) {
             dns_record_t rec; uint16_t type;
             if (parse_resource_record(root_resp, root_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
+            if (type == 2 && rns_count < 32 && rec.rdata_count > 0) {
+                snprintf(rns_names[rns_count++], sizeof(rns_names[0]), "%s", rec.rdata[0]);
+            }
         }
         for (int i=0; i<r_ar; i++) {
             dns_record_t rec; uint16_t type;
@@ -6514,6 +6528,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
 
 static int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     (void)force_udp; (void)hex_payload; (void)dopt;
+    qo.rd_flag = false;
     const char *eff_server = server ? server : get_system_resolver();
     uint8_t qbuf[512];
     size_t qlen = build_query_packet(qbuf, sizeof(qbuf), qname, 2 /* NS */, &qo);
@@ -7628,13 +7643,23 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 17); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+http-plain-post") == 0) {
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+nohttps") == 0 || strcmp(arg, "+nohttp-plain") == 0) {
+            spec->qo.use_doh = false;
+            if (spec->port == 443 || spec->port == 80) spec->port = 53;
         } else if (strcmp(arg, "+nohexdump") == 0) {
             spec->no_hexdump_query = true;
             spec->no_hexdump_response = true;
+        } else if (strcmp(arg, "+hexdump") == 0) {
+            spec->no_hexdump_query = false;
+            spec->no_hexdump_response = false;
         } else if (strcmp(arg, "+nohexdump-query") == 0) {
             spec->no_hexdump_query = true;
+        } else if (strcmp(arg, "+hexdump-query") == 0) {
+            spec->no_hexdump_query = false;
         } else if (strcmp(arg, "+nohexdump-response") == 0) {
             spec->no_hexdump_response = true;
+        } else if (strcmp(arg, "+hexdump-response") == 0) {
+            spec->no_hexdump_response = false;
         } else if (strcmp(arg, "+edns") == 0) {
             spec->qo.want_opt = true;
         } else if (strncmp(arg, "+edns=", 6) == 0) {
@@ -7644,10 +7669,12 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.want_opt = false;
         } else if (strcmp(arg, "+dnssec") == 0 || strcmp(arg, "+do") == 0) {
             spec->qo.want_opt = true; spec->qo.dnssec_ok = true;
-        } else if (strcmp(arg, "+nodo") == 0) {
+        } else if (strcmp(arg, "+nodo") == 0 || strcmp(arg, "+nodnssec") == 0) {
             spec->qo.dnssec_ok = false;
         } else if (strcmp(arg, "+nsid") == 0) {
             spec->qo.want_opt = true; spec->qo.want_nsid = true;
+        } else if (strcmp(arg, "+nonsid") == 0) {
+            spec->qo.want_nsid = false;
         } else if (strncmp(arg, "+bufsize=", 9) == 0) {
             char *endptr;
             long bsz = strtol(arg + 9, &endptr, 10);
@@ -7696,6 +7723,9 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 spec->qo.want_opt = true; spec->qo.want_padding = true;
                 spec->qo.padding_size = (int)pd;
             }
+        } else if (strcmp(arg, "+nopadding") == 0) {
+            spec->qo.want_padding = false;
+            spec->qo.padding_size = -1;
         } else if (strncmp(arg, "+mqtype=", 8) == 0) {
             spec->qo.want_opt = true;
             if (spec->qo.custom_edns_opt_count < 8) {
@@ -7742,6 +7772,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             }
         } else if (strncmp(arg, "+subnet=", 8) == 0) {
             if (parse_subnet_arg(arg + 8, &spec->qo)) { spec->qo.want_opt = true; spec->qo.want_subnet = true; }
+        } else if (strcmp(arg, "+nosubnet") == 0) {
+            spec->qo.want_subnet = false;
         } else if (strcmp(arg, "+cookie") == 0 || strncmp(arg, "+cookie=", 8) == 0) {
             spec->qo.want_opt = true; spec->qo.want_cookie = true;
             if (arg[7] == '=') {
@@ -7834,7 +7866,7 @@ static int execute_batch_spec(const query_spec_t *spec) {
         char *tok = strtok(p, " \t\r\n");
         while (tok) {
             if (tok[0] == '@') {
-                if (!b_server) b_server = tok;
+                if (!b_server) b_server = tok + 1;
                 else extra_tokens++;
             } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0 || strcasecmp(tok, "HS") == 0) {
                 // ignore class
