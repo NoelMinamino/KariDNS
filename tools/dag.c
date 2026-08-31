@@ -702,6 +702,7 @@ typedef struct {
     bool multiline;
     bool yaml;
     bool ttlid;
+    bool explicit_ttlid;
     bool expire;
     bool showsearch;
     bool idnout;
@@ -882,17 +883,23 @@ static void send_proxyv2_if_enabled(int sock, const query_opts_t *qo, bool is_tc
 }
 
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
-    char buf[128];
-    strncpy(buf, arg, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
-
-    // プライバシー保護目的の +subnet=0 の処理
-    if (strcmp(buf, "0") == 0) {
+    if (!arg || !*arg) return false;
+    // RFC 7871 §5: +subnet=0 または +subnet=0/0 によるECS無効化/プライバシー要求
+    if (strcmp(arg, "0") == 0 || strcmp(arg, "0/0") == 0 || strcmp(arg, "0.0.0.0/0") == 0) {
         qo->subnet_family = 1;
         memset(qo->subnet_addr, 0, sizeof(qo->subnet_addr));
         qo->subnet_prefix = 0;
         return true;
     }
+    if (strcmp(arg, "::/0") == 0) {
+        qo->subnet_family = 2;
+        memset(qo->subnet_addr, 0, sizeof(qo->subnet_addr));
+        qo->subnet_prefix = 0;
+        return true;
+    }
 
+    char buf[128];
+    strncpy(buf, arg, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
     char *slash = strchr(buf, '/');
     int prefix = -1;
     if (slash) {
@@ -1009,12 +1016,19 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
         }
     }
 
-    if (qo->want_padding && qo->padding_size >= 0) {
-        if ((size_t)offset + 4 + qo->padding_size <= max_len) {
-            pkt[offset++] = 0x00; pkt[offset++] = 0x0C; // Padding (12)
-            pkt[offset++] = qo->padding_size >> 8; pkt[offset++] = qo->padding_size & 0xFF;
-            memset(&pkt[offset], 0, qo->padding_size);
-            offset += qo->padding_size;
+    if (qo->want_padding) {
+        int block_size = (qo->padding_size > 0) ? qo->padding_size : 468;
+        // OPTヘッダ(4バイト)を含めた現在長から、ブロック境界に必要なパディング長を算出
+        size_t current_len = (size_t)offset + 4;
+        size_t pad_len = (block_size - (current_len % block_size)) % block_size;
+        if ((size_t)offset + 4 + pad_len <= max_len) {
+            pkt[offset++] = 0x00; pkt[offset++] = 0x0C; // Option Code: 12 (Padding)
+            pkt[offset++] = (uint16_t)pad_len >> 8;
+            pkt[offset++] = (uint16_t)pad_len & 0xFF;
+            if (pad_len > 0) {
+                memset(&pkt[offset], 0, pad_len);
+                offset += (uint16_t)pad_len;
+            }
         }
     }
 
@@ -5398,7 +5412,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
     } else {
         pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
-        if (pkt_len == 0) return 1;
+        if (pkt_len == 0 && !has_break(BRK_TOO_SHORT, NULL, NULL) && !qo->header_only) {
+            return 1;
+        }
     }
 
     uint8_t request_mac[64];
@@ -5711,9 +5727,19 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     char *name = NULL;
                     size_t nxt; if(expand_wire_name(resp, n, off, &nxt, &g_dag_arena, &name)==0) {
                         uint16_t type = (resp[nxt]<<8)|resp[nxt+1];
+                        uint32_t ttl = ((uint32_t)resp[nxt+4]<<24)|((uint32_t)resp[nxt+5]<<16)|((uint32_t)resp[nxt+6]<<8)|resp[nxt+7];
                         uint16_t rdlen = (resp[nxt+8]<<8)|resp[nxt+9];
                         if (type == 6) {
                             check_axfr_soa(&axfr_state, resp, n, name, &resp[nxt], rdlen);
+                        }
+                        if (dopt->explicit_ttlid) {
+                            if (dopt->ttlunits) {
+                                char ttl_str[32];
+                                format_ttl_units(ttl, ttl_str, sizeof(ttl_str));
+                                printf("%s ", ttl_str);
+                            } else {
+                                printf("%u ", ttl);
+                            }
                         }
                         print_rdata(resp, n, type, nxt+10, rdlen, dopt);
                         if (dopt->identify) {
@@ -6203,15 +6229,12 @@ static void parse_tsig_keyfile(const char *path, query_opts_t *qo) {
             }
         }
         size_t combined_len = strlen(name) + strlen(secret) + strlen(algo) + 3;
-        char *combined_copy = malloc(combined_len);
+        char *combined_copy = arena_alloc(&g_dag_arena, combined_len);
         if (!combined_copy) {
             fprintf(stderr, "error: out of memory for TSIG key string\n");
             return;
         }
-        int ret = snprintf(combined_copy, combined_len, "%s:%s:%s", algo, name, secret);
-        if (ret < 0 || (size_t)ret >= combined_len) {
-            fprintf(stderr, "warning: TSIG key string truncated\n");
-        }
+        snprintf(combined_copy, combined_len, "%s:%s:%s", algo, name, secret);
         parse_tsig_str(combined_copy, qo);
     } else {
         fprintf(stderr, "warning: failed to parse TSIG key from '%s'\n", path);
@@ -6437,21 +6460,32 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         if (qlen == 0) break;
         
         uint8_t resp[65535];
-        if (!no_hexdump_query) {
-            printf("Query (%zd bytes):\n", qlen);
-            hexdump(qbuf, qlen);
-            printf("\n");
+        ssize_t n = -1;
+        int active_target_idx = 0;
+
+        for (int ti = 0; ti < target_count; ti++) {
+            if (!no_hexdump_query) {
+                printf("Query (%zd bytes):\n", qlen);
+                hexdump(qbuf, qlen);
+                printf("\n");
+            }
+            clock_gettime(CLOCK_MONOTONIC, &start_ts);
+            n = do_dns_exchange_auto(target_ips[ti], port, &qo, qbuf, qlen, resp, sizeof(resp), qo.timeout_sec, use_tcp);
+            clock_gettime(CLOCK_MONOTONIC, &end_ts);
+            if (n > 0) {
+                active_target_idx = ti;
+                break;
+            }
+            printf(";; connection to %s#%d timed out; trying next server...\n", target_ips[ti], port);
         }
-        clock_gettime(CLOCK_MONOTONIC, &start_ts);
-        ssize_t n = do_dns_exchange_auto(target_ips[0], port, &qo, qbuf, qlen, resp, sizeof(resp), qo.timeout_sec, use_tcp);
-        clock_gettime(CLOCK_MONOTONIC, &end_ts);
+
         if (n <= 0) {
-            printf(";; connection timed out; no servers could be reached\n");
+            printf(";; no servers could be reached for hop %d\n", hop);
             return 9;
         }
         
         int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        record_ldnsz_result(target_ips[0], n, resp, dt_ms, use_tcp ? "TCP" : "UDP");
+        record_ldnsz_result(target_ips[active_target_idx], n, resp, dt_ms, use_tcp ? "TCP" : "UDP");
 
         if (!no_hexdump_response) {
             printf("Response (%zd bytes):\n", n);
@@ -6461,7 +6495,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
 
         axfr_state_t dummy_axfr = {0};
         print_response(resp, n, &dummy_axfr, &trace_dopt);
-        printf(";; Received %zd bytes from %s#%d in %d ms\n\n", n, target_ips[0], port, dt_ms);
+        printf(";; Received %zd bytes from %s#%d in %d ms\n\n", n, target_ips[active_target_idx], port, dt_ms);
         
         if (n < 12) break;
         uint16_t flags = (resp[2] << 8) | resp[3];
@@ -6599,7 +6633,9 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
         char clean_name[256];
         snprintf(clean_name, sizeof(clean_name), "%s", ns_names[j]);
         size_t c_len = strlen(clean_name);
-        if (c_len > 0 && clean_name[c_len - 1] == '.') clean_name[c_len - 1] = '\0';
+        if (c_len > 1 && clean_name[c_len - 1] == '.') {
+            clean_name[c_len - 1] = '\0';
+        }
 
         struct addrinfo hints, *res = NULL;
         memset(&hints, 0, sizeof(hints));
@@ -6973,6 +7009,7 @@ static void init_query_spec(query_spec_t *spec) {
     spec->dopt.multiline = false;
     spec->dopt.yaml = false;
     spec->dopt.ttlid = true;
+    spec->dopt.explicit_ttlid = false;
     spec->dopt.expire = false;
     spec->dopt.showsearch = false;
     spec->dopt.idnout = false;
@@ -7508,13 +7545,13 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+nounknownformat") == 0) {
             spec->dopt.force_unknown_format = false;
         } else if (strcmp(arg, "+ttlunits") == 0) {
-            spec->dopt.ttlunits = true; spec->dopt.ttlid = true;
+            spec->dopt.ttlunits = true; spec->dopt.ttlid = true; spec->dopt.explicit_ttlid = true;
         } else if (strcmp(arg, "+nottlunits") == 0) {
             spec->dopt.ttlunits = false;
         } else if (strcmp(arg, "+ttlid") == 0) {
-            spec->dopt.ttlid = true;
+            spec->dopt.ttlid = true; spec->dopt.explicit_ttlid = true;
         } else if (strcmp(arg, "+nottlid") == 0) {
-            spec->dopt.ttlid = false;
+            spec->dopt.ttlid = false; spec->dopt.explicit_ttlid = false;
         } else if (strcmp(arg, "+expire") == 0) {
             spec->dopt.expire = true;
             spec->qo.want_opt = true;
@@ -7756,14 +7793,13 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 if (colon) {
                     spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
                     const char *hex = colon + 1;
-                    size_t hex_len = strlen(hex);
-                    size_t bytes = hex_len / 2;
-                    if (bytes > sizeof(spec->qo.custom_edns_opts[0].data)) bytes = sizeof(spec->qo.custom_edns_opts[0].data);
-                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = (uint16_t)bytes;
-                    for (size_t j = 0; j < bytes; j++) {
-                        unsigned int b; sscanf(hex + j * 2, "%02x", &b);
-                        spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data[j] = (uint8_t)b;
+                    size_t dec_len = hex_decode(hex, spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data,
+                                                sizeof(spec->qo.custom_edns_opts[0].data));
+                    if (dec_len == (size_t)-1) {
+                        fprintf(stderr, "warning: +ednsopt hex payload exceeds buffer size, truncating\n");
+                        dec_len = sizeof(spec->qo.custom_edns_opts[0].data);
                     }
+                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = (uint16_t)dec_len;
                 } else {
                     spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].code = (uint16_t)strtoul(val, NULL, 10);
                     spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = 0;

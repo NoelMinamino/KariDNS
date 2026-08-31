@@ -139,16 +139,44 @@ run_check "+subnet=0 privacy flag accepted" \
     "$DAG @127.0.0.1 -p 10053 example.com A +subnet=0 +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
+run_check "+subnet=0/0, +subnet=0.0.0.0/0, +subnet=::/0 accepted" \
+    "$DAG @127.0.0.1 -p 10053 example.com A +subnet=0/0 +timeout=1" \
+    "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
+run_check "+padding=128 block padding alignment (+qr)" \
+    "$DAG @127.0.0.1 -p 10053 example.com A +padding=128 +qr +timeout=1" \
+    "Query \(128 bytes\)"
+
+run_check "+ednsopt=100:01020304 hex decode accepted" \
+    "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=100:01020304 +qr +timeout=1" \
+    "Query \([0-9]+ bytes\)"
+
+cat <<'KEY_EOF' > "$TMP_DIR/tsig_test.key"
+key "tsig-file-key" {
+    algorithm hmac-sha256;
+    secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
+};
+KEY_EOF
+
+run_check "TSIG keyfile loading (-k)" \
+    "$DAG @127.0.0.1 -p 10053 -k $TMP_DIR/tsig_test.key example.com A +qr +timeout=1" \
+    "(TSIG|tsig-file-key|ADDITIONAL)"
+
 run_check "+nodnssec, +nonsid, +nosubnet flags accepted" \
     "$DAG @127.0.0.1 -p 10053 example.com A +nodnssec +nonsid +nosubnet +timeout=1" \
     "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 if [ "$DAG" = "dig" ]; then
     run_skip "+nopadding, +hexdump, +nohttps flags" "dag-specific CLI flags"
+    run_skip "--break too-short=0" "dag-specific break flag"
 else
     run_check "+nopadding, +hexdump, +nohttps flags accepted" \
         "$DAG @127.0.0.1 -p 10053 example.com A +nopadding +hexdump +nohttps +timeout=1" \
         "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
+    run_check "--break too-short=0 terminates safely without crash" \
+        "$DAG @127.0.0.1 -p 10053 example.com A --break too-short=0 +timeout=1" \
+        "(timed out|no usable response|connection|status:|timed out|no servers could be reached)"
 fi
 
 echo "example.com A @127.0.0.1" > "$TMP_DIR/test_batch.txt"
@@ -353,6 +381,55 @@ PL_EOF
 
     kill -9 "$UDP_PID" 2>/dev/null || true
     UDP_PID=""
+
+# ==============================================================================
+# 6. +short Output Mode with TTL Options (+ttlid, +ttlunits)
+# ==============================================================================
+    echo "=== 6. Testing +short with +ttlid and +ttlunits ==="
+
+    PORT_SHORT=$((24000 + $$ % 8000))
+    cat <<'PL_EOF' > "$TMP_DIR/mock_short_ttl.pl"
+use strict;
+use warnings;
+use Socket;
+
+my $port = $ARGV[0];
+socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname("udp")) or die "socket: $!";
+setsockopt($srv, SOL_SOCKET, SO_REUSEADDR, 1);
+bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
+
+while (1) {
+    my $client_addr = recv($srv, my $query, 4096, 0);
+    next unless $client_addr && length($query) >= 12;
+    my $qid = substr($query, 0, 2);
+
+    # Response: example.com A 3600 192.0.2.10
+    my $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0);
+    $resp .= "\x07example\x03com\x00" . pack("nn", 1, 1); # QNAME=example.com, QTYPE=A, QCLASS=IN
+    $resp .= "\xc0\x0c" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("192.0.2.10");
+
+    send($srv, $resp, 0, $client_addr);
+}
+PL_EOF
+
+    perl "$TMP_DIR/mock_short_ttl.pl" "$PORT_SHORT" &
+    SHORT_PID=$!
+    sleep 0.3
+
+    run_check "+short alone prints only RDATA" \
+        "$DAG @127.0.0.1 -p $PORT_SHORT example.com A +short +timeout=2" \
+        "^192\.0\.2\.10$"
+
+    run_check "+short +ttlid prints numeric TTL and RDATA" \
+        "$DAG @127.0.0.1 -p $PORT_SHORT example.com A +short +ttlid +timeout=2" \
+        "^3600 192\.0\.2\.10$"
+
+    run_check "+short +ttlid +ttlunits prints formatted TTL and RDATA" \
+        "$DAG @127.0.0.1 -p $PORT_SHORT example.com A +short +ttlid +ttlunits +timeout=2" \
+        "^1h 192\.0\.2\.10$"
+
+    kill -9 "$SHORT_PID" 2>/dev/null || true
+    SHORT_PID=""
 fi
 
 # ==============================================================================
