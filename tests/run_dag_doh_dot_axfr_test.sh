@@ -175,13 +175,41 @@ while (my $paddr = accept(my $client, $srv)) {
     $dns_resp .= "\x03www\x07example\x03com\x00" . pack("nn", 1, 1);
     $dns_resp .= "\x03www\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . pack("C4", 192, 0, 2, 42);
 
-    my $resp_hdr = "HTTP/1.1 200 OK\r\n"
-                 . "Content-Type: application/dns-message\r\n"
-                 . "Content-Length: " . length($dns_resp) . "\r\n"
-                 . "Connection: close\r\n\r\n";
-
-    print $client $resp_hdr . $dns_resp;
-    close($client);
+    # Check if GET/POST requested chunked path /chunked or /chunked-keepalive
+    if ($http_req =~ /(GET|POST)\s+\/chunked-keepalive/i) {
+        my $chunk1 = substr($dns_resp, 0, 10);
+        my $chunk2 = substr($dns_resp, 10);
+        my $resp_hdr = "HTTP/1.1 200 OK\r\n"
+                     . "Content-Type: application/dns-message\r\n"
+                     . "Transfer-Encoding: chunked\r\n"
+                     . "Connection: keep-alive\r\n\r\n";
+        print $client $resp_hdr;
+        printf $client "%X\r\n%s\r\n", length($chunk1), $chunk1;
+        printf $client "%X\r\n%s\r\n", length($chunk2), $chunk2;
+        print $client "0\r\n\r\n";
+        # Do not close immediately, wait for client
+        sleep 1;
+        close($client);
+    } elsif ($http_req =~ /(GET|POST)\s+\/chunked/i) {
+        my $chunk1 = substr($dns_resp, 0, 10);
+        my $chunk2 = substr($dns_resp, 10);
+        my $resp_hdr = "HTTP/1.1 200 OK\r\n"
+                     . "Content-Type: application/dns-message\r\n"
+                     . "Transfer-Encoding: chunked\r\n"
+                     . "Connection: close\r\n\r\n";
+        print $client $resp_hdr;
+        printf $client "%X\r\n%s\r\n", length($chunk1), $chunk1;
+        printf $client "%X\r\n%s\r\n", length($chunk2), $chunk2;
+        print $client "0\r\n\r\n";
+        close($client);
+    } else {
+        my $resp_hdr = "HTTP/1.1 200 OK\r\n"
+                     . "Content-Type: application/dns-message\r\n"
+                     . "Content-Length: " . length($dns_resp) . "\r\n"
+                     . "Connection: close\r\n\r\n";
+        print $client $resp_hdr . $dns_resp;
+        close($client);
+    }
 }
 PL_EOF
 
@@ -196,6 +224,14 @@ run_check "+http-plain DoH query response resolution" \
 
 run_check "+http-plain-post DoH method" \
     "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +http-plain-post +timeout=2" \
+    "192\.0\.2\.42"
+
+run_check "+http-plain DoH chunked transfer decoding" \
+    "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +http-plain=/chunked +timeout=2" \
+    "192\.0\.2\.42"
+
+run_check "+http-plain DoH chunked transfer with keep-alive does not hang" \
+    "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +http-plain=/chunked-keepalive +keepopen +timeout=2" \
     "192\.0\.2\.42"
 
 # ==============================================================================

@@ -1976,8 +1976,22 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     SSL_set_fd(ssl, tcp_sock);
 
     const char *sni_host = qo->tls_hostname ? qo->tls_hostname : server;
+    char unbracketed_ip[128];
+    const char *check_host = sni_host;
+    if (sni_host && sni_host[0] == '[') {
+        size_t slen = strlen(sni_host);
+        if (slen > 2 && sni_host[slen - 1] == ']') {
+            size_t inner_len = slen - 2;
+            if (inner_len < sizeof(unbracketed_ip)) {
+                memcpy(unbracketed_ip, sni_host + 1, inner_len);
+                unbracketed_ip[inner_len] = '\0';
+                check_host = unbracketed_ip;
+            }
+        }
+    }
+
     struct in_addr a4; struct in6_addr a6;
-    bool sni_is_ip = (inet_pton(AF_INET, sni_host, &a4) == 1 || inet_pton(AF_INET6, sni_host, &a6) == 1);
+    bool sni_is_ip = (inet_pton(AF_INET, check_host, &a4) == 1 || inet_pton(AF_INET6, check_host, &a6) == 1);
     if (!sni_is_ip) {
         SSL_set_tlsext_host_name(ssl, sni_host);
     }
@@ -1987,7 +2001,7 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     if (qo->tls_ca_file || qo->tls_verify_default_store) {
         if (sni_is_ip) {
             X509_VERIFY_PARAM *vpm = SSL_get0_param(ssl);
-            X509_VERIFY_PARAM_set1_ip_asc(vpm, sni_host);
+            X509_VERIFY_PARAM_set1_ip_asc(vpm, check_host);
         } else {
             SSL_set1_host(ssl, sni_host);
         }
@@ -2353,7 +2367,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
         http_len += r;
         http_buf[http_len] = '\0';
 
-        // Content-Lengthを動的にチェックしてループを抜ける
+        // Content-Length または Transfer-Encoding: chunked を動的にチェックしてループを抜ける
         uint8_t *hdr_end = memmem(http_buf, http_len, "\r\n\r\n", 4);
         if (hdr_end) {
             size_t header_len = hdr_end - http_buf;
@@ -2361,13 +2375,59 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             size_t current_body_len = http_len - body_offset;
             
             size_t cl_val = 0;
+            bool has_cl = false;
             for (size_t i = 0; i + 15 <= header_len; i++) {
                 if (strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
                     cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
+                    has_cl = true;
                     break;
                 }
             }
-            if (cl_val > 0 && current_body_len >= cl_val) break;
+            if (has_cl && current_body_len >= cl_val) break;
+
+            if (!has_cl) {
+                // Transfer-Encoding: chunked の判定
+                bool is_chunked = false;
+                for (size_t i = 0; i + 18 <= header_len; i++) {
+                    if (strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
+                        for (size_t j = i + 18; j + 7 <= header_len; j++) {
+                            if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
+                            if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
+                                is_chunked = true;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                if (is_chunked) {
+                    size_t src = body_offset;
+                    bool chunk_complete = false;
+                    while (src < http_len) {
+                        char *line_end = strstr((char *)http_buf + src, "\r\n");
+                        if (!line_end) break;
+                        long chunk_sz = strtol((char *)http_buf + src, NULL, 16);
+                        if (chunk_sz < 0) break;
+                        if (chunk_sz == 0) {
+                            if (strstr((char *)http_buf + src, "\r\n\r\n")) {
+                                chunk_complete = true;
+                            }
+                            break;
+                        }
+                        size_t chunk_data_start = (size_t)(line_end - (char *)http_buf) + 2;
+                        size_t chunk_data_end = chunk_data_start + (size_t)chunk_sz;
+                        if (chunk_data_end + 2 > http_len) {
+                            break;
+                        }
+                        src = chunk_data_end;
+                        if (src + 2 <= http_len && http_buf[src] == '\r' && http_buf[src+1] == '\n') {
+                            src += 2;
+                        }
+                    }
+                    if (chunk_complete) break;
+                }
+            }
         }
     }
 
@@ -2392,6 +2452,51 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             fprintf(stderr, ";; DoH server returned HTTP status %d (expected 200 OK)\n", status_code);
             return -1;
         }
+    }
+
+    // Transfer-Encoding: chunked の判定
+    bool is_chunked = false;
+    for (size_t i = 0; i + 18 <= header_len; i++) {
+        if (strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
+            for (size_t j = i + 18; j + 7 <= header_len; j++) {
+                if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
+                if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
+                    is_chunked = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    if (is_chunked) {
+        size_t src = body_offset;
+        size_t dst = 0;
+        while (src < http_len) {
+            char *line_end = strstr((char *)http_buf + src, "\r\n");
+            if (!line_end) break;
+            long chunk_sz = strtol((char *)http_buf + src, NULL, 16);
+            if (chunk_sz < 0) return -1;
+            if (chunk_sz == 0) break; // 終了チャンク
+
+            src = (size_t)(line_end - (char *)http_buf) + 2;
+            if (src + (size_t)chunk_sz > http_len) {
+                chunk_sz = (long)(http_len - src);
+            }
+            size_t copy_sz = (size_t)chunk_sz;
+            if (dst + copy_sz > resp_cap) {
+                copy_sz = resp_cap - dst;
+            }
+            if (copy_sz > 0) {
+                memcpy(resp + dst, http_buf + src, copy_sz);
+                dst += copy_sz;
+            }
+            src += (size_t)chunk_sz;
+            if (src + 2 <= http_len && http_buf[src] == '\r' && http_buf[src+1] == '\n') {
+                src += 2;
+            }
+        }
+        return (ssize_t)dst;
     }
 
     size_t cl_val = 0;
@@ -6313,6 +6418,8 @@ static void parse_tsig_str(char *tsig_str, query_opts_t *qo) {
             *colon1 = '\0';
             alg = strdup("hmac-sha256"); name = strdup(tsig_str); secret_b64 = colon1 + 1;
         }
+        if (qo->tsig_key.algorithm) free((void *)qo->tsig_key.algorithm);
+        if (qo->tsig_key.name) free((void *)qo->tsig_key.name);
         qo->tsig_key.algorithm = alg;
         qo->tsig_key.name = name;
         int b64_len = strlen(secret_b64);
@@ -6925,7 +7032,9 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                           bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
                           bool no_hexdump_query, bool no_hexdump_response,
                           query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
-    char expanded_qname[512];
+    char search_candidates[8][512];
+    int candidate_count = 0;
+
     size_t qname_len = strlen(qname);
     bool is_absolute = (qname_len > 0 && qname[qname_len - 1] == '.');
     int num_dots = 0;
@@ -6935,23 +7044,20 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     int req_ndots = (qo.ndots > 0) ? qo.ndots : 1;
     if (qo.use_search_list && !is_absolute && num_dots < req_ndots) {
         if (qo.search_domain && *qo.search_domain) {
-            snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, qo.search_domain);
-            qname = expanded_qname;
+            snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, qo.search_domain);
+            snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
         } else {
             char domains[4][256];
             int count = get_system_search_domains(domains, 4);
-            if (count > 0) {
-                snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, domains[0]);
-                qname = expanded_qname;
+            for (int i = 0; i < count && candidate_count < 6; i++) {
+                snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, domains[i]);
             }
+            snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
         }
+    } else {
+        snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
     }
 
-    /*
-     * @8.8.8.8,9.9.9.9 のようにカンマ区切りで複数サーバーを指定できるようにする。
-     * 各要素はIPv4/IPv6リテラルの他、@dns.google のようなFQDNも許可する
-     * (resolve_server_addr()がgetaddrinfo()で解決する)。
-     */
     if (!server_arg) return 1;
     char *server_list_buf = strdup(server_arg);
     if (!server_list_buf) { perror("strdup"); return 1; }
@@ -7031,7 +7137,6 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         return 1;
     }
 
-
     // AXFRまたはANYの場合は自動的にTCPモードに昇格（+udpが明示されていない場合、BIND 9 dig / RFC 8482準拠）
     if ((strcasecmp(qtype_s, "AXFR") == 0 || strcasecmp(qtype_s, "ANY") == 0) && !force_udp) {
         use_tcp = true;
@@ -7046,117 +7151,133 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     }
     qo.query_id = (uint16_t)(arc4random() & 0xFFFF);
 
-    if (qo.nofail && server_count > 1 && !test_all) {
-        for (int si = 0; si < server_count; si++) {
-            const char *server = servers[si];
-            int srv_port = server_ports[si];
-            bool is_last = (si == server_count - 1);
+    int last_overall_rc = 0;
+    for (int ci = 0; ci < candidate_count; ci++) {
+        const char *cur_qname = search_candidates[ci];
 
-            int rc = run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, norecurse,
-                              adflag, cdflag, aaflag, tcflag, zflag,
-                              no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
+        if (qo.nofail && server_count > 1 && !test_all) {
+            for (int si = 0; si < server_count; si++) {
+                const char *server = servers[si];
+                int srv_port = server_ports[si];
+                bool is_last = (si == server_count - 1);
 
-            uint8_t last_rcode = 2; // Default to SERVFAIL if no response
-            if (g_server_count > 0) {
-                last_rcode = g_results[g_server_count - 1].rcode;
-            }
-
-            if (rc == 0 && last_rcode != 2) {
-                break;
-            }
-            if (!is_last) {
-                fprintf(stderr, ";; Server %s failed (SERVFAIL or no response), trying next server...\n", server);
-            }
-        }
-    } else {
-        for (int si = 0; si < server_count; si++) {
-            const char *server = servers[si];
-            int srv_port = server_ports[si];
-            
-            if (server_count > 1) {
-                printf("\n;; ===============================================\n");
-                printf(";; Server: %s\n", server);
-                printf(";; ===============================================\n");
-            }
-
-            if (test_all) {
-            if (strcmp(qname, ".") == 0) qname = "example.com";
-            struct {
-                const char *name; break_kind_t kind; long param; bool tcp;
-                bool cdflag; bool zflag; bool aaflag; bool tcflag;
-                int padding; int edns_code;
-            } all_tests[] = {
-                {"Compression Loop", BRK_COMPRESSION_LOOP, 0, false, false,false,false,false, -1, -1},
-                {"Compression Forward", BRK_COMPRESSION_FORWARD, 0, false, false,false,false,false, -1, -1},
-                {"Label Too Long", BRK_LABEL_TOO_LONG, 100, false, false,false,false,false, -1, -1},
-                {"Reserved Length Bits", BRK_RESERVED_LENGTH_BITS, 0, false, false,false,false,false, -1, -1},
-                {"Oversized QNAME", BRK_OVERSIZED_QNAME, 0, false, false,false,false,false, -1, -1},
-                {"Override QDCOUNT", BRK_QDCOUNT, 2, false, false,false,false,false, -1, -1},
-                {"Truncated Question", BRK_TRUNCATED_QUESTION, 0, false, false,false,false,false, -1, -1},
-                {"Fake OPT RDLEN", BRK_OPT_RDLEN, 500, false, false,false,false,false, -1, -1},
-                {"Override ARCOUNT", BRK_ARCOUNT, 10, false, false,false,false,false, -1, -1},
-                {"Override OPCODE", BRK_OPCODE, 15, false, false,false,false,false, -1, -1},
-                {"Set QR Bit", BRK_QR_BIT, 0, false, false,false,false,false, -1, -1},
-                {"Notify No Question", BRK_NOTIFY_NO_QUESTION, 0, false, false,false,false,false, -1, -1},
-                {"Too Short Packet", BRK_TOO_SHORT, 0, false, false,false,false,false, -1, -1},
-                {"TCP Length Overclaim", BRK_TCP_LENGTH_OVERCLAIM, 50, true, false,false,false,false, -1, -1},
-                {"TCP Zero Length", BRK_TCP_ZERO_LENGTH, 0, true, false,false,false,false, -1, -1},
-                {"TCP Idle Hold", BRK_TCP_IDLE_HOLD, 2, true, false,false,false,false, -1, -1},
-                {"Bogus EDNS Option", BRK_NONE, 0, false, false,false,false,false, -1, 65535},
-                {"Z-Flag Set", BRK_NONE, 0, false, false,true,false,false, -1, -1},
-                {"AA-Flag Set", BRK_NONE, 0, false, false,false,true,false, -1, -1},
-                {"CD-Flag Set", BRK_NONE, 0, false, true,false,false,false, -1, -1},
-                {"TC-Flag Set", BRK_NONE, 0, false, false,false,false,true, -1, -1},
-                {"Massive Padding", BRK_NONE, 0, false, false,false,false,false, 2000, -1},
-            };
-
-            qo.timeout_sec = 1;
-            qo.tries = 1;
-
-            for (size_t t = 0; t < sizeof(all_tests)/sizeof(all_tests[0]); t++) {
-                g_break_count = 0;
-                if (all_tests[t].kind != BRK_NONE) {
-                    g_breaks[0].kind = all_tests[t].kind;
-                    g_breaks[0].param = all_tests[t].param;
-                    g_breaks[0].has_param = true;
-                    g_break_count = 1;
-                }
-                
-                query_opts_t t_qo = qo;
-                if (all_tests[t].edns_code >= 0) {
-                    t_qo.want_opt = true;
-                    t_qo.custom_edns_opts[0].code = all_tests[t].edns_code;
-                    t_qo.custom_edns_opts[0].len = 4;
-                    t_qo.custom_edns_opts[0].data[0] = 0xDE;
-                    t_qo.custom_edns_opts[0].data[1] = 0xAD;
-                    t_qo.custom_edns_opts[0].data[2] = 0xBE;
-                    t_qo.custom_edns_opts[0].data[3] = 0xEF;
-                    t_qo.custom_edns_opt_count = 1;
-                }
-                if (all_tests[t].padding >= 0) {
-                    t_qo.want_opt = true;
-                    t_qo.want_padding = true;
-                    t_qo.padding_size = all_tests[t].padding;
-                }
-
-                run_test(all_tests[t].name, qname, qtype_s, server, srv_port,
-                         use_tcp || all_tests[t].tcp, norecurse,
-                         adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
-                         no_hexdump_query, no_hexdump_response,
-                         &t_qo, hex_payload, dopt);
-            }
-
-            } else {
-                int rc = run_test(NULL, qname, qtype_s, server, srv_port, use_tcp, norecurse,
+                int rc = run_test(NULL, cur_qname, qtype_s, server, srv_port, use_tcp, norecurse,
                                   adflag, cdflag, aaflag, tcflag, zflag,
                                   no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
-                if (rc != 0) { free(server_list_buf); return rc; }
+                last_overall_rc = rc;
+
+                uint8_t last_rcode = 2; // Default to SERVFAIL if no response
+                if (g_server_count > 0) {
+                    last_rcode = g_results[g_server_count - 1].rcode;
+                }
+
+                if (rc == 0 && last_rcode != 2) {
+                    break;
+                }
+                if (!is_last) {
+                    fprintf(stderr, ";; Server %s failed (SERVFAIL or no response), trying next server...\n", server);
+                }
             }
+        } else {
+            for (int si = 0; si < server_count; si++) {
+                const char *server = servers[si];
+                int srv_port = server_ports[si];
+                
+                if (server_count > 1) {
+                    printf("\n;; ===============================================\n");
+                    printf(";; Server: %s\n", server);
+                    printf(";; ===============================================\n");
+                }
+
+                if (test_all) {
+                    if (strcmp(cur_qname, ".") == 0) cur_qname = "example.com";
+                    struct {
+                        const char *name; break_kind_t kind; long param; bool tcp;
+                        bool cdflag; bool zflag; bool aaflag; bool tcflag;
+                        int padding; int edns_code;
+                    } all_tests[] = {
+                        {"Compression Loop", BRK_COMPRESSION_LOOP, 0, false, false,false,false,false, -1, -1},
+                        {"Compression Forward", BRK_COMPRESSION_FORWARD, 0, false, false,false,false,false, -1, -1},
+                        {"Label Too Long", BRK_LABEL_TOO_LONG, 100, false, false,false,false,false, -1, -1},
+                        {"Reserved Length Bits", BRK_RESERVED_LENGTH_BITS, 0, false, false,false,false,false, -1, -1},
+                        {"Oversized QNAME", BRK_OVERSIZED_QNAME, 0, false, false,false,false,false, -1, -1},
+                        {"Override QDCOUNT", BRK_QDCOUNT, 2, false, false,false,false,false, -1, -1},
+                        {"Truncated Question", BRK_TRUNCATED_QUESTION, 0, false, false,false,false,false, -1, -1},
+                        {"Fake OPT RDLEN", BRK_OPT_RDLEN, 500, false, false,false,false,false, -1, -1},
+                        {"Override ARCOUNT", BRK_ARCOUNT, 10, false, false,false,false,false, -1, -1},
+                        {"Override OPCODE", BRK_OPCODE, 15, false, false,false,false,false, -1, -1},
+                        {"Set QR Bit", BRK_QR_BIT, 0, false, false,false,false,false, -1, -1},
+                        {"Notify No Question", BRK_NOTIFY_NO_QUESTION, 0, false, false,false,false,false, -1, -1},
+                        {"Too Short Packet", BRK_TOO_SHORT, 0, false, false,false,false,false, -1, -1},
+                        {"TCP Length Overclaim", BRK_TCP_LENGTH_OVERCLAIM, 50, true, false,false,false,false, -1, -1},
+                        {"TCP Zero Length", BRK_TCP_ZERO_LENGTH, 0, true, false,false,false,false, -1, -1},
+                        {"TCP Idle Hold", BRK_TCP_IDLE_HOLD, 2, true, false,false,false,false, -1, -1},
+                        {"Bogus EDNS Option", BRK_NONE, 0, false, false,false,false,false, -1, 65535},
+                        {"Z-Flag Set", BRK_NONE, 0, false, false,true,false,false, -1, -1},
+                        {"AA-Flag Set", BRK_NONE, 0, false, false,false,true,false, -1, -1},
+                        {"CD-Flag Set", BRK_NONE, 0, false, true,false,false,false, -1, -1},
+                        {"TC-Flag Set", BRK_NONE, 0, false, false,false,false,true, -1, -1},
+                        {"Massive Padding", BRK_NONE, 0, false, false,false,false,false, 2000, -1},
+                    };
+
+                    qo.timeout_sec = 1;
+                    qo.tries = 1;
+
+                    for (size_t t = 0; t < sizeof(all_tests)/sizeof(all_tests[0]); t++) {
+                        g_break_count = 0;
+                        if (all_tests[t].kind != BRK_NONE) {
+                            g_breaks[0].kind = all_tests[t].kind;
+                            g_breaks[0].param = all_tests[t].param;
+                            g_breaks[0].has_param = true;
+                            g_break_count = 1;
+                        }
+                        
+                        query_opts_t t_qo = qo;
+                        if (all_tests[t].edns_code >= 0) {
+                            t_qo.want_opt = true;
+                            t_qo.custom_edns_opts[0].code = all_tests[t].edns_code;
+                            t_qo.custom_edns_opts[0].len = 4;
+                            t_qo.custom_edns_opts[0].data[0] = 0xDE;
+                            t_qo.custom_edns_opts[0].data[1] = 0xAD;
+                            t_qo.custom_edns_opts[0].data[2] = 0xBE;
+                            t_qo.custom_edns_opts[0].data[3] = 0xEF;
+                            t_qo.custom_edns_opt_count = 1;
+                        }
+                        if (all_tests[t].padding >= 0) {
+                            t_qo.want_opt = true;
+                            t_qo.want_padding = true;
+                            t_qo.padding_size = all_tests[t].padding;
+                        }
+
+                        run_test(all_tests[t].name, cur_qname, qtype_s, server, srv_port,
+                                 use_tcp || all_tests[t].tcp, norecurse,
+                                 adflag, all_tests[t].cdflag, all_tests[t].aaflag, all_tests[t].tcflag, all_tests[t].zflag,
+                                 no_hexdump_query, no_hexdump_response,
+                                 &t_qo, hex_payload, dopt);
+                    }
+
+                } else {
+                    int rc = run_test(NULL, cur_qname, qtype_s, server, srv_port, use_tcp, norecurse,
+                                      adflag, cdflag, aaflag, tcflag, zflag,
+                                      no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
+                    last_overall_rc = rc;
+                    if (rc != 0 && candidate_count == 1) { free(server_list_buf); return rc; }
+                }
+            }
+        }
+
+        // RFC 1536: NXDOMAIN (rcode 3) が返った場合のみ次のサーチドメイン候補へフォールバック
+        uint8_t last_rcode = 0;
+        if (g_server_count > 0) {
+            last_rcode = g_results[g_server_count - 1].rcode;
+        }
+        if (last_rcode != 3 /* NXDOMAIN */ || ci == candidate_count - 1) {
+            break;
         }
     }
     
     free(server_list_buf);
-    return 0;
+    return last_overall_rc;
 }
 
 #define MAX_DAG_QUERIES 64
@@ -7680,6 +7801,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+nosearch") == 0 || strcmp(arg, "+nodefname") == 0) {
             spec->qo.use_search_list = false;
         } else if (strncmp(arg, "+domain=", 8) == 0) {
+            if (spec->qo.search_domain) free(spec->qo.search_domain);
             spec->qo.search_domain = strdup(arg + 8);
             spec->qo.use_search_list = true;
         } else if (strncmp(arg, "+ndots=", 7) == 0) {
@@ -7843,41 +7965,57 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+notls") == 0) {
             spec->qo.use_tls = false; if (spec->port == 853) spec->port = 53;
         } else if (strncmp(arg, "+tls-ca=", 8) == 0) {
+            if (spec->qo.tls_ca_file) free(spec->qo.tls_ca_file);
             spec->qo.tls_ca_file = strdup(arg + 8);
         } else if (strcmp(arg, "+tls-ca") == 0) {
             spec->qo.tls_verify_default_store = true;
         } else if (strcmp(arg, "+notls-ca") == 0) {
             spec->qo.tls_verify_default_store = false;
         } else if (strncmp(arg, "+tls-certfile=", 14) == 0) {
+            if (spec->qo.tls_certfile) free(spec->qo.tls_certfile);
             spec->qo.tls_certfile = strdup(arg + 14);
         } else if (strncmp(arg, "+tls-keyfile=", 13) == 0) {
+            if (spec->qo.tls_keyfile) free(spec->qo.tls_keyfile);
             spec->qo.tls_keyfile = strdup(arg + 13);
         } else if (strncmp(arg, "+tls-hostname=", 14) == 0) {
+            if (spec->qo.tls_hostname) free(spec->qo.tls_hostname);
             spec->qo.tls_hostname = strdup(arg + 14);
         } else if (strncmp(arg, "+https=", 7) == 0) {
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 7); if (spec->port == 53) spec->port = 443;
         } else if (strcmp(arg, "+https") == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 443;
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 443;
         } else if (strncmp(arg, "+https-get=", 11) == 0) {
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 11); if (spec->port == 53) spec->port = 443;
         } else if (strcmp(arg, "+https-get") == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 443;
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = true; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 443;
         } else if (strncmp(arg, "+https-post=", 12) == 0) {
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup(arg + 12); if (spec->port == 53) spec->port = 443;
         } else if (strcmp(arg, "+https-post") == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 443;
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 443;
         } else if (strncmp(arg, "+http-plain=", 12) == 0) {
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 12); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+http-plain") == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 80;
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
         } else if (strncmp(arg, "+http-plain-get=", 16) == 0) {
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 16); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+http-plain-get") == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 80;
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
         } else if (strncmp(arg, "+http-plain-post=", 17) == 0) {
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 17); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+http-plain-post") == 0) {
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = (char *)"/dns-query"; if (spec->port == 53) spec->port = 80;
+            if (spec->qo.doh_path) free(spec->qo.doh_path);
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
         } else if (strcmp(arg, "+nohttps") == 0 || strcmp(arg, "+nohttp-plain") == 0) {
             spec->qo.use_doh = false;
             if (spec->port == 443 || spec->port == 80) spec->port = 53;
@@ -8198,6 +8336,31 @@ static int execute_query_spec(query_spec_t *spec) {
     return exit_code;
 }
 
+static void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
+    if (!dst || !src) return;
+    *dst = *src;
+    if (src->tls_ca_file) dst->tls_ca_file = strdup(src->tls_ca_file);
+    if (src->tls_certfile) dst->tls_certfile = strdup(src->tls_certfile);
+    if (src->tls_keyfile) dst->tls_keyfile = strdup(src->tls_keyfile);
+    if (src->tls_hostname) dst->tls_hostname = strdup(src->tls_hostname);
+    if (src->doh_path) dst->doh_path = strdup(src->doh_path);
+    if (src->search_domain) dst->search_domain = strdup(src->search_domain);
+    if (src->tsig_key.algorithm) dst->tsig_key.algorithm = strdup(src->tsig_key.algorithm);
+    if (src->tsig_key.name) dst->tsig_key.name = strdup(src->tsig_key.name);
+}
+
+static void free_query_opts(query_opts_t *qo) {
+    if (!qo) return;
+    if (qo->tls_ca_file) { free(qo->tls_ca_file); qo->tls_ca_file = NULL; }
+    if (qo->tls_certfile) { free(qo->tls_certfile); qo->tls_certfile = NULL; }
+    if (qo->tls_keyfile) { free(qo->tls_keyfile); qo->tls_keyfile = NULL; }
+    if (qo->tls_hostname) { free(qo->tls_hostname); qo->tls_hostname = NULL; }
+    if (qo->doh_path) { free(qo->doh_path); qo->doh_path = NULL; }
+    if (qo->search_domain) { free(qo->search_domain); qo->search_domain = NULL; }
+    if (qo->tsig_key.algorithm) { free((void *)qo->tsig_key.algorithm); qo->tsig_key.algorithm = NULL; }
+    if (qo->tsig_key.name) { free((void *)qo->tsig_key.name); qo->tsig_key.name = NULL; }
+}
+
 int main(int argc, char **argv) {
 #ifndef _WIN32
     // サーバーからのTCP切断時におけるSIGPIPEによるプロセス強制終了を防止
@@ -8378,6 +8541,7 @@ int main(int argc, char **argv) {
 
     // グローバル引数区間のパース
     if (parse_arg_slice(1, global_end, argc, argv, &global_spec) < 0) {
+        free_query_opts(&global_spec.qo);
         return 1;
     }
 
@@ -8392,7 +8556,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, ";; Memory usage: maxrss=%ld KB\n", (long)ru.ru_maxrss);
         }
 #endif
+        close_cached_tcp();
         zone_arena_destroy(&g_dag_arena);
+        free_query_opts(&global_spec.qo);
         if (g_results) free(g_results);
         return 0;
     }
@@ -8407,9 +8573,11 @@ int main(int argc, char **argv) {
     int last_exit_code = 0;
     for (int q = 0; q < query_count; q++) {
         query_spec_t local_spec = global_spec;
+        deep_copy_query_opts(&local_spec.qo, &global_spec.qo);
         if (queries[q].start < queries[q].end) {
             if (parse_arg_slice(queries[q].start, queries[q].end, argc, argv, &local_spec) < 0) {
                 last_exit_code = 1;
+                free_query_opts(&local_spec.qo);
                 continue;
             }
         }
@@ -8417,6 +8585,7 @@ int main(int argc, char **argv) {
         // タプル内で -f が指定された場合
         if (local_spec.batch_file) {
             execute_batch_spec(&local_spec);
+            free_query_opts(&local_spec.qo);
             continue;
         }
 
@@ -8424,6 +8593,7 @@ int main(int argc, char **argv) {
         if (local_spec.use_ldnsz) global_spec.use_ldnsz = true;
         int rc = execute_query_spec(&local_spec);
         if (rc != 0) last_exit_code = rc;
+        free_query_opts(&local_spec.qo);
 
         if (query_count > 1) {
             bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
@@ -8451,6 +8621,7 @@ int main(int argc, char **argv) {
 
     close_cached_tcp();
     zone_arena_destroy(&g_dag_arena);
+    free_query_opts(&global_spec.qo);
     if (g_results) free(g_results);
 #ifdef _WIN32
     WSACleanup();
