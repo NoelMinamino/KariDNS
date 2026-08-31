@@ -4787,7 +4787,32 @@ static void submit_response_log(log_action_t action, const char *client_ip, int 
     // データ書き込み完了をConsumerに通知
     atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
+static void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
+  if (!dst || dst_size == 0) return;
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
 
+  size_t di = 0;
+  for (size_t si = 0; src[si] != '\0' && di + 4 < dst_size; si++) {
+    uint8_t c = (uint8_t)src[si];
+    if (c >= 0x21 && c <= 0x7E && c != '\\' && c != '"' && c != ';') {
+      dst[di++] = (char)c;
+    } else if (c == '\\') {
+      dst[di++] = '\\';
+      dst[di++] = '\\';
+    } else if (c == '"') {
+      dst[di++] = '\\';
+      dst[di++] = '"';
+    } else {
+      // 改行(\n, \r)、タブ、スペース、制御文字、非ASCII文字を RFC 1035 §5.1 / BIND互換の \DDD 形式にエスケープ
+      int n = snprintf(&dst[di], dst_size - di, "\\%03u", c);
+      if (n > 0) di += (size_t)n;
+    }
+  }
+  dst[di < dst_size ? di : dst_size - 1] = '\0';
+}
 
 static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
     int today = (tm_info->tm_year + 1900) * 10000 + (tm_info->tm_mon + 1) * 100 + tm_info->tm_mday;
@@ -4877,6 +4902,9 @@ void *response_logger_thread_func(void *arg) {
                 if (entry->action == LOG_ACT_DROP_RRL) action_str = " [DROP:RRL]";
                 else if (entry->action == LOG_ACT_DROP_MALFORMED) action_str = " [DROP:MALFORMED]";
 
+                char safe_qname[512];
+                escape_qname_for_log(entry->qname, safe_qname, sizeof(safe_qname));
+
                 char log_buf[1024];
                 int len = snprintf(log_buf, sizeof(log_buf), 
                                    "%s%s%sclient %s#%d (%s): response: %s %s %s %s -> %s%s\n", 
@@ -4884,7 +4912,7 @@ void *response_logger_thread_func(void *arg) {
                                    ch->print_category ? "responses: " : "",
                                    ch->print_severity ? "info: " : "", 
                                    entry->client_ip, entry->client_port,
-                                   entry->qname, entry->qname, class_str, type_str_tmp, edns_str, rcode_str, action_str);
+                                   safe_qname, safe_qname, class_str, type_str_tmp, edns_str, rcode_str, action_str);
                 
                 if (len > 0) {
                     if (len >= (int)sizeof(log_buf)) len = sizeof(log_buf) - 1;
@@ -4934,12 +4962,16 @@ static void write_query_log(const char *client_ip, int client_port,
   char edns_str[16] = "";
   if (has_edns)
     snprintf(edns_str, sizeof(edns_str), "+E(0)%s", dnssec_ok ? "D" : "K");
+  
+  char safe_qname[512];
+  escape_qname_for_log(qname, safe_qname, sizeof(safe_qname));
+
   char log_buf[1024];
   int len = snprintf(log_buf, sizeof(log_buf),
                      "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
                      ch->print_category ? "queries: " : "",
                      ch->print_severity ? "info: " : "", client_ip, client_port,
-                     qname, qname, class_str, type_str_tmp, edns_str);
+                     safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
   if (len <= 0)
     return;
   if (len >= (int)sizeof(log_buf))
