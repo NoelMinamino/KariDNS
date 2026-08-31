@@ -335,6 +335,10 @@ else
         echo "  [SKIP] Outbound DoT not reachable"
     fi
 
+    if dig @dns.google example.com A +timeout=2 +tries=1 >/dev/null 2>&1; then
+        compare_raw "FQDN Server Name (@dns.google)" "dig @dns.google example.com A +timeout=4" "$DAG @dns.google example.com A $DIG_DEFAULTS +timeout=4 +nohexdump"
+    fi
+
     echo "--------------------------------------------------------"
     echo "8. Multiple Queries & Argument Flexibility"
     echo "--------------------------------------------------------"

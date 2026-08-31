@@ -82,7 +82,7 @@ dag [global-queryopt...] [query...]
 : Sign queries using TSIG with credentials read from a BIND-compatible key file.
 
 `-m`
-: Enable memory usage debugging. Upon completion, `dag` prints process maximum resident set size (`ru_maxrss`) via `getrusage(2)`.
+: Enable memory usage debugging. Upon completion, `dag` prints process maximum resident set size (`ru_maxrss`) via `getrusage(2)`. *(Not available on Windows)*
 
 `-p port`
 : Send queries to the specified port instead of the default port 53 (or 853 for DoT, 443 for DoH, 80 for Plain HTTP).
@@ -158,7 +158,7 @@ dag [global-queryopt...] [query...]
 : Include the EDNS TCP Keepalive option (RFC 7828) in the query.
 
 `+[no]keepopen`
-: Keep the TCP socket open between consecutive queries when executing multiple queries in a batch.
+: Keep the TCP or TLS socket open between consecutive queries when executing multiple queries in a batch. *(Note: HTTP Keep-Alive is currently unsupported in DoH `+https` mode, and connections will be closed after each query).*
 
 `+[no]dns64prefix`
 : Automatically query `ipv4only.arpa` for `AAAA` records to discover local DNS64 prefixes (RFC 7050).
@@ -268,7 +268,7 @@ dag [global-queryopt...] [query...]
 : Request the **Name Server Identifier (NSID)** option (RFC 5001).
 
 `+padding[=N]`
-: Pad the outgoing query packet to a multiple of `N` bytes using the EDNS0 Padding option (RFC 7830 / RFC 8467).
+: Add exactly `N` bytes of EDNS0 Padding option payload (useful for packet size fuzzing).
 
 `+mqtype=TYPE[,TYPE...]`
 : Send the **Multiple QTYPE (RFC 10029)** EDNS option (Option Code 20), requesting multiple resource record types (e.g., `+mqtype=A,AAAA,HTTPS`) in a single query transaction.
@@ -403,7 +403,7 @@ dag [global-queryopt...] [query...]
 ### Automated Batch Fuzzing
 
 `--break all`, `--test-all`
-: Sequentially executes all built-in anomaly tests against the target server, printing the response status or timeout for each test case.
+: Sequentially executes the predefined set of built-in anomaly test cases against the target server, printing the response status or timeout for each test case.
 
 `--hex=<hexstring>`
 : Directly transmits the raw hexadecimal byte stream as a DNS packet without validation or reconstruction.

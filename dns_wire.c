@@ -620,6 +620,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
                      const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
                      bool is_subsequent) {
     if (!key) return -1;
+    if (*packet_len < DNS_HEADER_SIZE) return -1; // OOBアクセスの防止
 
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
     size_t keyname_wire_len = wire_name_length(key->name);
@@ -790,7 +791,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         ((uint64_t)packet[time_fudge_start+2] << 24) | ((uint64_t)packet[time_fudge_start+3] << 16) |
         ((uint64_t)packet[time_fudge_start+4] << 8)  |  (uint64_t)packet[time_fudge_start+5];
     uint16_t fudge = (packet[time_fudge_start+6] << 8) | packet[time_fudge_start+7];
-    uint64_t now = time(NULL);
+    uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
     uint64_t upper = (UINT64_MAX - fudge < time_signed) ? UINT64_MAX : time_signed + fudge;
     uint64_t lower = (time_signed < fudge) ? 0 : time_signed - fudge;
     if (now > upper || now < lower) return 18; // BADTIME

@@ -112,7 +112,7 @@ echo "=== 1. Testing Multi-Server Semantic Match across compression and RR order
 echo -n "Test: Multi-server summary reports Semantic Match ... "
 OUT=$($DAG msg.size.tcpreplay.net @127.0.0.1#$PORT1,127.0.0.1#$PORT2 2>&1 || true)
 
-if echo "$OUT" | grep -q "Record Match"; then
+if echo "$OUT" | grep -q -E "(Record Match|MATCH_SEMANTIC)"; then
     echo "OK"
 else
     echo "FAILED"
