@@ -135,6 +135,10 @@ if [ "$DAG" != "dig" ]; then
         "Invalid option: \+cookies"
 fi
 
+run_check "+subnet=0 privacy flag accepted" \
+    "$DAG @127.0.0.1 -p 10053 example.com A +subnet=0 +timeout=1" \
+    "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
 # ==============================================================================
 # 2. Dynamic DNS Prerequisites (--prereq= with Colons in RDATA)
 # ==============================================================================

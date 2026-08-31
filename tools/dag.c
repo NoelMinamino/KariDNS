@@ -77,6 +77,7 @@ static inline void *dag_memmem(const void *haystack, size_t haystacklen,
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <strings.h>
+#include <signal.h>
 #endif
 
 #include <zlib.h>
@@ -883,6 +884,15 @@ static void send_proxyv2_if_enabled(int sock, const query_opts_t *qo, bool is_tc
 static bool parse_subnet_arg(const char *arg, query_opts_t *qo) {
     char buf[128];
     strncpy(buf, arg, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+
+    // プライバシー保護目的の +subnet=0 の処理
+    if (strcmp(buf, "0") == 0) {
+        qo->subnet_family = 1;
+        memset(qo->subnet_addr, 0, sizeof(qo->subnet_addr));
+        qo->subnet_prefix = 0;
+        return true;
+    }
+
     char *slash = strchr(buf, '/');
     int prefix = -1;
     if (slash) {
@@ -2111,7 +2121,12 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         }
     }
     uint16_t rlen = (rlen_buf[0] << 8) | rlen_buf[1];
-    if (rlen > resp_cap) rlen = (uint16_t)resp_cap;
+    if (rlen > resp_cap) {
+        // TLSストリームの同期崩れを防ぐため直ちに切断する
+        close_cached_tcp();
+        if (!(qo && qo->keep_tcp_open)) { SSL_shutdown(ssl); SSL_free(ssl); close(sock); }
+        return -1;
+    }
     size_t total_read = 0;
     while (total_read < rlen) {
         int r = SSL_read(ssl, resp + total_read, (int)(rlen - total_read));
@@ -2151,7 +2166,12 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
                 got2 += r;
             }
             uint16_t rlen2 = (rlen_buf2[0] << 8) | rlen_buf2[1];
-            if (rlen2 > resp_cap) rlen2 = (uint16_t)resp_cap;
+            if (rlen2 > resp_cap) {
+                // TLSストリームの同期崩れを防ぐため直ちに切断する
+                close_cached_tcp();
+                if (!(qo && qo->keep_tcp_open)) { SSL_shutdown(ssl); SSL_free(ssl); close(sock); }
+                return -1;
+            }
             total_read = 0;
             while (total_read < rlen2) {
                 int r = SSL_read(ssl, resp + total_read, (int)(rlen2 - total_read));
@@ -2606,6 +2626,10 @@ static void print_split_hex(const uint8_t *data, size_t len, int split_width) {
 }
 
 static void print_multiline_hex(const uint8_t *data, size_t len, int split_width) {
+    if (len == 0) {
+        printf("\t\t\t\t\t )\n");
+        return;
+    }
     int sw = (split_width > 0) ? (split_width / 2) : 22;
     if (sw <= 0) sw = 22;
     for (size_t i = 0; i < len; ) {
@@ -2619,6 +2643,10 @@ static void print_multiline_hex(const uint8_t *data, size_t len, int split_width
 }
 
 static void print_multiline_b64(const char *b64, int len, int split_width) {
+    if (len == 0) {
+        printf("\t\t\t\t\t )\n");
+        return;
+    }
     int sw = (split_width > 0) ? split_width : 44;
     if (sw <= 0) sw = 44;
     for (int i = 0; i < len; ) {
@@ -7900,6 +7928,10 @@ static int execute_query_spec(query_spec_t *spec) {
 }
 
 int main(int argc, char **argv) {
+#ifndef _WIN32
+    // サーバーからのTCP切断時におけるSIGPIPEによるプロセス強制終了を防止
+    signal(SIGPIPE, SIG_IGN);
+#endif
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
