@@ -231,7 +231,22 @@ run_check "Multiline disable alias (+nomulti)" \
     "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +nomulti +http-plain +timeout=2" \
     "192\.0\.2\.42"
 
-echo "========================================================="
+echo "=== 5. Testing +cookie invalid hex resilience, opcode mnemonics, ednsflags ==="
+run_check "Invalid hex cookie does not crash and handles gracefully" \
+    "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +cookie=ZZZZ +http-plain +timeout=2" \
+    "192\.0\.2\.42"
+
+run_check "Opcode string mnemonic (+opcode=UPDATE)" \
+    "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +opcode=UPDATE +http-plain +qr +timeout=2" \
+    "opcode: UPDATE"
+
+run_check "Opcode string mnemonic (+opcode=NOTIFY)" \
+    "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +opcode=NOTIFY +http-plain +qr +timeout=2" \
+    "opcode: NOTIFY"
+
+run_check "EDNS flags reset (+noednsflags)" \
+    "$DAG @127.0.0.1 -p $PORT_HTTP www.example.com A +ednsflags=0x0040 +noednsflags +http-plain +qr +timeout=2" \
+    "192\.0\.2\.42"
 if [ "$FAILED" -eq 0 ]; then
     echo "🎉 ALL DOT/DOH AXFR & MEMORY TESTS PASSED!"
     exit 0

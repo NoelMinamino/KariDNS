@@ -4391,7 +4391,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
 typedef struct {
     bool is_axfr;
     char first_soa_name[256];
-    uint8_t first_soa_norm[512];
+    uint8_t first_soa_norm[1024];
     size_t first_soa_norm_len;
     int soa_seen_count;
     bool axfr_complete;
@@ -4412,7 +4412,7 @@ static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_l
     size_t norm_len = mlen + 1 + rlen + 1 + 20;
     if (norm_len > sizeof(state->first_soa_norm)) return;
 
-    uint8_t norm[512];
+    uint8_t norm[1024];
     memcpy(norm, mname, mlen + 1);
     memcpy(norm + mlen + 1, rname, rlen + 1);
     memcpy(norm + mlen + 1 + rlen + 1, pkt + next2, 20);
@@ -8016,7 +8016,12 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 if (hex_len > 64) hex_len = 64;
                 uint8_t full[32]; size_t full_len = hex_len / 2;
                 for (size_t j = 0; j < full_len; j++) {
-                    unsigned int byte; sscanf(hex + j * 2, "%02x", &byte); full[j] = (uint8_t)byte;
+                    unsigned int byte = 0;
+                    if (sscanf(hex + j * 2, "%02x", &byte) == 1) {
+                        full[j] = (uint8_t)byte;
+                    } else {
+                        full[j] = 0;
+                    }
                 }
                 if (full_len >= 8) {
                     memcpy(spec->qo.client_cookie, full, 8);
