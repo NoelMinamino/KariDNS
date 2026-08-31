@@ -315,6 +315,11 @@ void free_zone_config(zone_config_t *zone) {
   for (int i = 0; i < zone->allow_update_count; i++)
     free(zone->allow_update[i]);
   free(zone->allow_update);
+  free(zone->program_path);
+  for (int i = 0; i < zone->program_args_count; i++)
+    free(zone->program_args[i]);
+  free(zone->program_args);
+  free(zone->program_user);
   free_rate_limit_config(&zone->rrl);
   free(zone);
 }
@@ -561,6 +566,16 @@ static int parse_string_list_inner(token_ctx_t *ctx, char ***list, int *count) {
   }
   free_token(&tok);
   return 0;
+}
+
+static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return parse_string_list_inner(ctx, list, count);
 }
 
 typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD } acl_key_mode_t;
@@ -896,9 +911,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           zone->type = strdup("slave");
         } else if (strcasecmp(val, "master") == 0 || strcasecmp(val, "slave") == 0) {
           zone->type = val;
+        } else if (strcasecmp(val, "program") == 0) {
+          zone->type = val;
         } else {
-          syslog(LOG_ERR, "[Config] Unknown zone type '%s' for zone '%s' (expected master/primary or slave/secondary)", val, zone->domain);
-          fprintf(stderr, "[ERROR] Unknown zone type '%s' for zone '%s' (expected master/primary or slave/secondary)\n", val, zone->domain);
+          syslog(LOG_ERR, "[Config] Unknown zone type '%s' for zone '%s' (expected master/primary, slave/secondary, or program)", val, zone->domain);
+          fprintf(stderr, "[ERROR] Unknown zone type '%s' for zone '%s'\n", val, zone->domain);
           free(key);
           free(val);
           free_zone_config(zone);
@@ -916,6 +933,50 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           zone->is_catalog = true;
         free(val);
       }
+    } else if (strcmp(key, "program") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      zone->program_path = strdup(tok.value);
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      free_token(&tok);
+    } else if (strcmp(key, "program-args") == 0) {
+      if (parse_string_list(ctx, &zone->program_args, &zone->program_args_count) != 0) {
+        free(key); free_zone_config(zone); return -1;
+      }
+    } else if (strcmp(key, "program-user") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      zone->program_user = strdup(tok.value);
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      free_token(&tok);
+    } else if (strcmp(key, "program-timeout") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      char *endptr = NULL;
+      unsigned long val_num = strtoul(tok.value, &endptr, 10);
+      if (*endptr == '\0') {
+        zone->program_timeout_ms = (uint32_t)val_num;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      free_token(&tok);
+    } else if (strcmp(key, "program-max-failures") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      char *endptr = NULL;
+      unsigned long val_num = strtoul(tok.value, &endptr, 10);
+      if (*endptr == '\0') {
+        zone->program_max_failures = (uint32_t)val_num;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
+      free_token(&tok);
     } else if (strcmp(key, "rate-limit") == 0) {
       if (parse_rate_limit_config(ctx, &zone->rrl) != 0) {
         free(key);
@@ -935,6 +996,14 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   free_token(&tok);
   if (!zone->type) {
     zone->type = strdup("master");
+  }
+  if (zone->type && strcasecmp(zone->type, "program") == 0) {
+    if (zone->file) {
+      syslog(LOG_WARNING, "[Config] Zone '%s' is type 'program' but has 'file' configured; ignoring file", zone->domain);
+    }
+    if (zone->masters_count > 0) {
+      syslog(LOG_WARNING, "[Config] Zone '%s' is type 'program' but has 'masters' configured; ignoring masters", zone->domain);
+    }
   }
   if (zone->allow_update_count > 0 && zone->type &&
       (strcasecmp(zone->type, "slave") == 0 || strcasecmp(zone->type, "secondary") == 0)) {
@@ -1203,6 +1272,25 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "allow-program-zones") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->allow_program_zones = true;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->allow_program_zones = false;
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            free_token(&tok);
             return -1;
           }
           free_token(&tok);
