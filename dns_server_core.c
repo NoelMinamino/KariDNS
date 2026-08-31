@@ -200,6 +200,7 @@ typedef struct {
   uint32_t max_failures;
   _Atomic unsigned int consecutive_failures;
   _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
+  char config_fingerprint[512]; /* M-4: reload時の設定変更検知用 */
 } program_plugin_t;
 
 static program_plugin_t *g_program_plugins = NULL;
@@ -3550,6 +3551,52 @@ static program_plugin_t *find_program_plugin(const char *domain) {
   return NULL;
 }
 
+static int64_t monotonic_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* deadline(monotonic_ms()基準の絶対時刻)までの残り時間をmsで返す。
+ * 既に締切を過ぎていれば0を返す(呼び出し先のwrite_all_timeout/read_all_timeoutは
+ * timeout_ms=0で即座にタイムアウト扱いになる)。 */
+static uint32_t remaining_ms(int64_t deadline) {
+  int64_t rem = deadline - monotonic_ms();
+  if (rem <= 0) return 0;
+  if (rem > UINT32_MAX) return UINT32_MAX; /* 実際には発生しないが念のため */
+  return (uint32_t)rem;
+}
+
+static void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap) {
+  size_t pos = 0;
+  pos += (size_t)snprintf(out + pos, out_cap - pos, "path=%s|user=%s|timeout=%u|maxfail=%u|args=",
+                          z->program_path ? z->program_path : "",
+                          z->program_user ? z->program_user : "",
+                          z->program_timeout_ms, z->program_max_failures);
+  for (int i = 0; i < z->program_args_count && pos < out_cap; i++) {
+    pos += (size_t)snprintf(out + pos, out_cap - pos, "%s;", z->program_args[i]);
+  }
+}
+
+/* type "program" ゾーンでプラグインが死んでいる/通信に失敗した場合に、
+ * ログの文言通り実際にSERVFAILパケットを構築して返す。
+ * (以前は単に0を返しており、これは「応答なし(サイレントドロップ)」を意味して
+ *  いた。クライアント視点ではタイムアウトとSERVFAILは挙動が大きく異なるため、
+ *  ログの記述に合わせて実装側もSERVFAILを返すようにする。) */
+static int build_program_zone_servfail(const char *domain, const uint8_t *req, size_t req_len,
+                                       uint8_t *res, size_t max_res_len) {
+  (void)domain;
+  if (req_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
+  size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+  memcpy(res, req, copy_len);
+  res[2] |= 0x80;              // QR=1
+  res[3] = (res[3] & 0xF0) | 2; // RCODE=2 (SERVFAIL), RA/Z/AD/CDは維持
+  res[6] = 0; res[7] = 0;   // ANCOUNT=0
+  res[8] = 0; res[9] = 0;   // NSCOUNT=0
+  res[10] = 0; res[11] = 0; // ARCOUNT=0
+  return (int)copy_len;
+}
+
 static ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms) {
   size_t written = 0;
   struct timespec start_ts, now_ts;
@@ -3608,15 +3655,26 @@ static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeo
   return (ssize_t)nread;
 }
 
+/* 1回の宣言応答長として明らかに異常とみなす閾値。
+ * max_res_lenの4倍(UDPで最大4096バイト程度、TCPで最大65535バイト程度を
+ * 想定しても十分な余裕がある)を超える宣言があった場合は、ドレインすら試みず
+ * 即座に通信失敗として扱い、巨大なドレインループでmutexを長時間占有しない
+ * ようにする。 */
+#define PROGRAM_ZONE_MAX_SANE_RESPLEN(max_res_len) ((max_res_len) * 4)
+
 static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
                                     uint8_t *res, size_t max_res_len,
                                     const char *client_ip, bool is_tcp) {
   program_plugin_t *plugin = find_program_plugin(domain);
   if (!plugin || atomic_load_explicit(&plugin->dead, memory_order_acquire)) {
-    return 0; // 応答なし
+    return build_program_zone_servfail(domain, req, req_len, res, max_res_len); // M-1
   }
 
   pthread_mutex_lock(&plugin->lock);
+
+  // H-3: 1クエリ全体で共有する絶対締切。以降の全I/O呼び出しは
+  // 「plugin->timeout_ms」ではなく「この締切までの残り時間」を使う。
+  int64_t deadline = monotonic_ms() + plugin->timeout_ms;
 
   char header[80];
   int hlen = snprintf(header, sizeof(header), "QUERY %s %s\n",
@@ -3625,33 +3683,40 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
   uint8_t len_prefix[2] = { (uint8_t)(req_len >> 8), (uint8_t)(req_len & 0xFF) };
 
   bool ok = true;
-  if (write_all_timeout(plugin->stdin_fd, (const uint8_t *)header, (size_t)hlen, plugin->timeout_ms) != hlen) ok = false;
-  if (ok && write_all_timeout(plugin->stdin_fd, len_prefix, 2, plugin->timeout_ms) != 2) ok = false;
-  if (ok && write_all_timeout(plugin->stdin_fd, req, req_len, plugin->timeout_ms) != (ssize_t)req_len) ok = false;
+  if (write_all_timeout(plugin->stdin_fd, (const uint8_t *)header, (size_t)hlen, remaining_ms(deadline)) != hlen) ok = false;
+  if (ok && write_all_timeout(plugin->stdin_fd, len_prefix, 2, remaining_ms(deadline)) != 2) ok = false;
+  if (ok && write_all_timeout(plugin->stdin_fd, req, req_len, remaining_ms(deadline)) != (ssize_t)req_len) ok = false;
 
   int result_len = 0;
   if (ok) {
     uint8_t resp_len_prefix[2];
-    if (read_all_timeout(plugin->stdout_fd, resp_len_prefix, 2, plugin->timeout_ms) == 2) {
+    if (read_all_timeout(plugin->stdout_fd, resp_len_prefix, 2, remaining_ms(deadline)) == 2) {
       uint16_t resp_len = (resp_len_prefix[0] << 8) | resp_len_prefix[1];
       if (resp_len == 0) {
         result_len = 0; // 意図的な無応答
         ok = true;
       } else if (resp_len <= max_res_len) {
-        if (read_all_timeout(plugin->stdout_fd, res, resp_len, plugin->timeout_ms) == resp_len) {
+        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == resp_len) {
           result_len = (int)resp_len;
         } else {
           ok = false;
         }
+      } else if (resp_len > PROGRAM_ZONE_MAX_SANE_RESPLEN(max_res_len)) {
+        // H-3: 明らかに異常な宣言長は、ドレインすら試みずに即座に失敗させる。
+        syslog(LOG_WARNING, "[Plugin] zone '%s' declared implausible response length %u; "
+               "treating as protocol desync, not draining", domain, resp_len);
+        ok = false;
       } else {
         syslog(LOG_WARNING, "[Plugin] zone '%s' returned oversized response (%u > %zu); dropping",
                domain, resp_len, max_res_len);
-        /* パイプ内の oversized データを読み捨ててパイプの同期を保つ */
+        /* パイプ内の oversized データを読み捨ててパイプの同期を保つ。
+         * H-3: ここも共有締切の残り時間を使うため、宣言長がどれだけ大きくても
+         * 合計の待ち時間はplugin->timeout_msを超えない。 */
         size_t remaining = resp_len;
         uint8_t drain_buf[512];
         while (remaining > 0) {
           size_t chunk = remaining < sizeof(drain_buf) ? remaining : sizeof(drain_buf);
-          if (read_all_timeout(plugin->stdout_fd, drain_buf, chunk, plugin->timeout_ms) != (ssize_t)chunk) {
+          if (read_all_timeout(plugin->stdout_fd, drain_buf, chunk, remaining_ms(deadline)) != (ssize_t)chunk) {
             ok = false;
             break;
           }
@@ -3669,11 +3734,12 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
     syslog(LOG_ERR, "[Plugin] zone '%s' communication failure (%u/%u)", domain, f, plugin->max_failures);
     if (f >= plugin->max_failures) {
       atomic_store_explicit(&plugin->dead, true, memory_order_release);
-      syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead (will SERVFAIL until restart)", domain);
+      syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead "
+             "(will return SERVFAIL until restart)", domain);
       kill(plugin->pid, SIGKILL);
       waitpid(plugin->pid, NULL, WNOHANG);
     }
-    result_len = 0;
+    result_len = build_program_zone_servfail(domain, req, req_len, res, max_res_len); // M-1
   } else {
     atomic_store_explicit(&plugin->consecutive_failures, 0, memory_order_relaxed);
   }
@@ -3712,7 +3778,7 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
     close(out_pipe[0]); close(out_pipe[1]);
 
 #ifdef __FreeBSD__
-    closefrom(3); // 継承済みの全fd(制御チャネル/IPC/リスニングソケット等)を確実に閉じる
+    closefrom(STDERR_FILENO + 1); // 継承済みの全fd(制御チャネル/IPC/リスニングソケット等)を確実に閉じる
 #else
     int maxfd = (int)sysconf(_SC_OPEN_MAX);
     if (maxfd < 0) maxfd = 1024;
@@ -3720,6 +3786,16 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
       close(fd);
     }
 #endif
+
+    // H-1適用に伴う必須フェイルセーフ:
+    // program-user未設定のままrootでexecされることを、main()の
+    // 「root起動でuser/group未設定なら拒否する」既存ポリシーと同様に禁止する。
+    if (!zcfg->program_user && geteuid() == 0) {
+      // 標準エラーはまだ生きている(closefromはSTDERR_FILENO+1から)ので出力可能
+      fprintf(stderr, "[FATAL] Zone '%s': 'program-user' is not set and karidns is running "
+              "as root; refusing to exec plugin as root.\n", zcfg->domain);
+      _exit(125);
+    }
 
     if (zcfg->program_user) {
       struct passwd *pwd = getpwnam(zcfg->program_user);
@@ -3762,6 +3838,7 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
   pthread_mutex_init(&out->lock, NULL);
   out->timeout_ms = zcfg->program_timeout_ms > 0 ? zcfg->program_timeout_ms : 2000;
   out->max_failures = zcfg->program_max_failures > 0 ? zcfg->program_max_failures : 5;
+  compute_program_zone_fingerprint(zcfg, out->config_fingerprint, sizeof(out->config_fingerprint));
   atomic_init(&out->consecutive_failures, 0);
   atomic_init(&out->dead, false);
 
@@ -4376,7 +4453,11 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
       int plugin_result_len = dispatch_to_program_zone(
           zcfg->domain, req, req_len, res, max_res_len, client_ip, is_tcp);
 
-      if (out_rrl_cfg) *out_rrl_cfg = NULL; // RRL分類を完全にスキップさせる合図
+      // programゾーンも他ゾーンと同じRRL設定(out_rrl_cfgは関数冒頭で既に
+      // このゾーン用に正しくセット済み)でレート制限を受けさせる。
+      // *out_rrl_cfg = NULL による無効化は絶対に行わないこと
+      // (スプーフィングされたUDPクエリでプラグイン呼び出しを無制限に
+      //  誘発できてしまい、RRLの存在意義そのものが破られる)。
       return plugin_result_len;
     }
   }
@@ -6174,6 +6255,16 @@ static void perform_config_reload(void) {
           for (int i = 0; i < g_program_plugins_count; i++) {
             if (strcasecmp(g_program_plugins[i].domain, z->domain) == 0) {
               already_running = true;
+              /* M-4: 実行中の設定と新しい設定を比較し、変わっていれば警告 */
+              char new_fingerprint[512];
+              compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
+              if (strcmp(g_program_plugins[i].config_fingerprint, new_fingerprint) != 0) {
+                syslog(LOG_WARNING, "[Plugin] zone '%s' (type program) configuration changed "
+                       "(program/program-args/program-user/program-timeout/program-max-failures), "
+                       "but the running plugin process cannot be restarted without a full karidns "
+                       "restart (Capsicum sandbox is already active). The OLD configuration is "
+                       "still in effect for this zone.", z->domain);
+              }
               break;
             }
           }
@@ -7184,6 +7275,14 @@ int main(int argc, char **argv) {
     sched_yield();
 
   server_config_t *cfg = &g_config_db.config_a;
+
+  // 重要: type "program" ゾーンの子プロセスへの権限降格(program-user)は
+  // fork元(karidns自身)がまだroot権限を持っている間でなければ成立しない
+  // (POSIXでは非root→別の非rootユーザへのsetuid()は許可されない)。
+  // そのため、必ずkaridns自身のsetuid/setgid(直後のブロック)より前に
+  // プラグインをspawnすること。この順序を変更してはならない。
+  spawn_program_zone_plugins(&g_config_db.config_a);
+
   if (cfg->user) {
     struct passwd *pwd = getpwnam(cfg->user);
     if (!pwd)
@@ -7225,10 +7324,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[ERROR] [Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
     exit(EXIT_FAILURE);
   }
-
-  // 注意: spawn_program_zone_plugins は Workerスレッドへの公開(g_privilege_drop_complete の
-  // release-store)および Capsicum サンドボックス突入より前でなければならない。
-  spawn_program_zone_plugins(&g_config_db.config_a);
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から
   // 呼ばれるコードで、tzset()が内部的に別のTZ設定を要求する関数

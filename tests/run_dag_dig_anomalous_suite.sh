@@ -44,8 +44,10 @@ trap cleanup EXIT INT TERM
 chmod +x "$PLUGIN_SCRIPT" || true
 
 USER_OPT=""
+PROG_USER_OPT=""
 if [ "$(id -u)" = "0" ]; then
     USER_OPT="user \"nobody\"; group \"nobody\";"
+    PROG_USER_OPT="program-user \"nobody\";"
 fi
 
 # ------------------------------------------------------------------------------
@@ -62,6 +64,7 @@ options {
 zone "anomaly.test." {
     type program;
     program "$PLUGIN_SCRIPT";
+    $PROG_USER_OPT
     program-timeout 2000;
     program-max-failures 500;
 };
