@@ -243,6 +243,13 @@ run_suite_for_tool() {
     printf "${BOLD}[8. Drop / Silent Discard Handling]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Silent query drop handling" \
         "drop.anomaly.test" "" "(no servers could be reached|connection timed out|communications error)"
+
+    # Section 9: AXFR & TXT Usage Guide
+    printf "${BOLD}[9. Usage Guide & Help (AXFR / TXT)]${NC}\n"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "AXFR Zone Transfer Usage Guide" \
+        "anomaly.test" "AXFR" "KariDNS Anomalous DNS Packet Test Server"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Apex TXT Query Usage Guide" \
+        "anomaly.test" "TXT" "KariDNS Anomalous DNS Packet Test Server"
 }
 
 # Run target suites

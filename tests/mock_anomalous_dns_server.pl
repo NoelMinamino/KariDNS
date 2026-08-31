@@ -222,6 +222,29 @@ sub encode_name {
     return $wire;
 }
 
+sub encode_soa_rr {
+    my ($zone_name, $ttl) = @_;
+    $ttl //= 300;
+    my $name_wire = encode_name($zone_name);
+    my $mname_wire = encode_name("ns1." . $zone_name);
+    my $rname_wire = encode_name("hostmaster." . $zone_name);
+    my $soa_rdata = $mname_wire . $rname_wire . pack('NNNNN', 2026083101, 3600, 900, 604800, $ttl);
+    return $name_wire . pack('nnNn', 6, 1, $ttl, length($soa_rdata)) . $soa_rdata;
+}
+
+sub encode_txt_rr {
+    my ($name, $text, $ttl) = @_;
+    $ttl //= 300;
+    my $name_wire = encode_name($name);
+    my $rdata = '';
+    # Split text into 255-byte chunks as per RFC 1035 §3.3.14
+    for (my $i = 0; $i < length($text); $i += 255) {
+        my $chunk = substr($text, $i, 255);
+        $rdata .= pack('C', length($chunk)) . $chunk;
+    }
+    return $name_wire . pack('nnNn', 16, 1, $ttl, length($rdata)) . $rdata;
+}
+
 # ==============================================================================
 # Scenario Dispatcher: Generates crafted anomalous response packets
 # ==============================================================================
@@ -265,13 +288,128 @@ sub process_query_packet {
         }
     }
 
-    my $qname_lc = lc($qname);
-    my ($scenario) = ($qname_lc =~ /^([^.]+)/);
-    $scenario //= 'normal';
+    my %KNOWN_SCENARIOS = map { $_ => 1 } qw(
+        normal header-only short-header trailing-garbage qdcount-mismatch
+        ancount-underflow ancount-overflow compression-loop compression-forward-ptr
+        unclosed-label rdata-short-a rdata-short-aaaa rdata-soa-truncated
+        rdata-mx-truncated rdata-txt-len-mismatch rdata-svcb-overflow
+        rdata-opt-truncated cookie-badcookie truncated-tc rcode-formerr
+        rcode-servfail rcode-nxdomain rcode-notimp rcode-refused rcode-yxdomain
+        rcode-yxrrset rcode-nxrrset rcode-notauth rcode-notzone ede-prohibited
+        ede-long-text drop
+    );
+
+    my $qname_clean = lc($qname);
+    $qname_clean =~ s/\.+$//; # Strip trailing dots
+
+    my ($first_label, $rest_domain) = ($qname_clean =~ /^([^.]+)(?:\.(.*))?$/);
+    $first_label //= '';
+    $rest_domain //= '';
+
+    my $scenario = '';
+    my $zone_apex = '';
+
+    if (exists $KNOWN_SCENARIOS{$first_label}) {
+        $scenario = $first_label;
+        $zone_apex = $rest_domain ne '' ? $rest_domain : $qname_clean;
+    } else {
+        $scenario = 'help';
+        $zone_apex = $qname_clean ne '' ? $qname_clean : 'anomaly.test';
+    }
 
     my $id_raw = pack('n', $id);
     my $qname_wire = encode_name($qname);
     my $question_wire = $qname_wire . pack('nn', $qtype, $qclass);
+
+    # --------------------------------------------------------------------------
+    # AXFR (QTYPE=252) or Apex Help/TXT Query: Return Dynamic Usage Guide
+    # --------------------------------------------------------------------------
+    if ($qtype == 252 || $scenario eq 'help' || $qtype == 16) {
+        my $display_zone = $zone_apex;
+        my @help_lines = (
+            "=== KariDNS Anomalous DNS Packet Test Server ===",
+            "Usage: dag @<server> -p <port> <scenario>.$display_zone <type>",
+            "",
+            "[Normal]",
+            "  normal.$display_zone                    - Standard NOERROR answer (192.0.2.1)",
+            "",
+            "[Header & Structure Anomalies]",
+            "  header-only.$display_zone               - Header-only packet (QD=0, AN=0)",
+            "  short-header.$display_zone              - Truncated header (< 12 bytes)",
+            "  trailing-garbage.$display_zone          - Answer with 24 trailing garbage bytes",
+            "  qdcount-mismatch.$display_zone          - Claims QDCOUNT=2, but only 1 present",
+            "  ancount-underflow.$display_zone         - Claims ANCOUNT=5, but only 1 present",
+            "  ancount-overflow.$display_zone          - Claims ANCOUNT=1, but 2 records present",
+            "",
+            "[Compression & Pointer Safety]",
+            "  compression-loop.$display_zone          - Direct pointer compression loop (offset 12)",
+            "  compression-forward-ptr.$display_zone   - Out-of-bounds pointer (0x3000)",
+            "  unclosed-label.$display_zone            - Unterminated label without trailing 0x00",
+            "",
+            "[RDATA Truncation & Boundary Violations]",
+            "  rdata-short-a.$display_zone             - Truncated A record (RDLENGTH=4 with 2 bytes)",
+            "  rdata-short-aaaa.$display_zone          - Truncated AAAA (RDLENGTH=16 with 8 bytes)",
+            "  rdata-soa-truncated.$display_zone       - Truncated SOA record",
+            "  rdata-mx-truncated.$display_zone        - Truncated MX record (missing exchange)",
+            "  rdata-txt-len-mismatch.$display_zone    - TXT string length exceeds RDLENGTH",
+            "  rdata-svcb-overflow.$display_zone       - SVCB TargetName length exceeds RDLENGTH",
+            "  rdata-opt-truncated.$display_zone       - Truncated OPT record option data",
+            "",
+            "[Protocol & Security Flags]",
+            "  cookie-badcookie.$display_zone          - BADCOOKIE (RCODE 23) retry negotiation",
+            "  truncated-tc.$display_zone              - TC=1 response triggering TCP fallback",
+            "",
+            "[RFC Standard RCODEs]",
+            "  rcode-formerr.$display_zone             - Returns FORMERR (RCODE 1)",
+            "  rcode-servfail.$display_zone            - Returns SERVFAIL (RCODE 2)",
+            "  rcode-nxdomain.$display_zone            - Returns NXDOMAIN (RCODE 3)",
+            "  rcode-notimp.$display_zone              - Returns NOTIMP (RCODE 4)",
+            "  rcode-refused.$display_zone             - Returns REFUSED (RCODE 5)",
+            "  rcode-yxdomain.$display_zone            - Returns YXDOMAIN (RCODE 6)",
+            "  rcode-yxrrset.$display_zone             - Returns YXRRSET (RCODE 7)",
+            "  rcode-nxrrset.$display_zone             - Returns NXRRSET (RCODE 8)",
+            "  rcode-notauth.$display_zone             - Returns NOTAUTH (RCODE 9)",
+            "  rcode-notzone.$display_zone             - Returns NOTZONE (RCODE 10)",
+            "",
+            "[Extended DNS Errors (EDE)]",
+            "  ede-prohibited.$display_zone            - EDE Code 18 (Prohibited)",
+            "  ede-long-text.$display_zone             - EDE with long description string",
+            "",
+            "[Drop / Discard]",
+            "  drop.$display_zone                      - Silently discards query without reply",
+        );
+
+        my $soa_start = encode_soa_rr($qname, 300);
+        my $soa_end   = encode_soa_rr($qname, 300);
+
+        my $answers = '';
+        my $ans_count = 0;
+
+        if ($qtype == 252) {
+            # AXFR transfer format (RFC 5936): SOA + TXT Records + SOA
+            $answers .= $soa_start;
+            $ans_count++;
+            for my $line (@help_lines) {
+                next if $line eq '';
+                $answers .= encode_txt_rr($qname, $line, 300);
+                $ans_count++;
+            }
+            $answers .= $soa_end;
+            $ans_count++;
+        } else {
+            # Standard TXT query format
+            for my $line (@help_lines) {
+                next if $line eq '';
+                $answers .= encode_txt_rr($qname, $line, 300);
+                $ans_count++;
+            }
+        }
+
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, $ans_count, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $answers;
+        return $pkt;
+    }
 
     # --------------------------------------------------------------------------
     # 0. Intentional Drop / No Response
