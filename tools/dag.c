@@ -2835,11 +2835,18 @@ static void print_svcparams(const uint8_t *rdata, size_t offset, size_t rdlen) {
         printf(" ");
         const uint8_t *value = &rdata[offset];
         switch (key) {
-            case 0: { // mandatory
+            case 0: { // mandatory (RFC 9460 §8)
                 printf("mandatory=");
                 for (size_t i = 0; i + 2 <= vlen; i += 2) {
                     uint16_t mkey = (value[i]<<8)|value[i+1];
-                    printf("%s%u", (i>0)?",":"", mkey);
+                    const char *mk_name = (mkey == 1) ? "alpn" : (mkey == 2) ? "no-default-alpn" :
+                                          (mkey == 3) ? "port" : (mkey == 4) ? "ipv4hint" :
+                                          (mkey == 5) ? "ech" : (mkey == 6) ? "ipv6hint" : NULL;
+                    if (mk_name) {
+                        printf("%s%s", (i > 0) ? "," : "", mk_name);
+                    } else {
+                        printf("%skey%u", (i > 0) ? "," : "", mkey);
+                    }
                 }
                 break;
             }
@@ -3221,7 +3228,20 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                         sp_pos += 4;
                         if (sp_pos + vlen > abs_offset + rdlen) break;
                         const uint8_t *val = &pkt[sp_pos];
-                        if (key == 1) { // alpn
+                        if (key == 0) { // mandatory (RFC 9460 §8)
+                            rdata_buf_append(out, out_cap, &pos, " mandatory=");
+                            for (size_t mi = 0; mi + 2 <= vlen; mi += 2) {
+                                uint16_t mkey = (val[mi] << 8) | val[mi + 1];
+                                const char *mk_name = (mkey == 1) ? "alpn" : (mkey == 2) ? "no-default-alpn" :
+                                                      (mkey == 3) ? "port" : (mkey == 4) ? "ipv4hint" :
+                                                      (mkey == 5) ? "ech" : (mkey == 6) ? "ipv6hint" : NULL;
+                                if (mk_name) {
+                                    rdata_buf_append(out, out_cap, &pos, "%s%s", (mi > 0) ? "," : "", mk_name);
+                                } else {
+                                    rdata_buf_append(out, out_cap, &pos, "%skey%u", (mi > 0) ? "," : "", mkey);
+                                }
+                            }
+                        } else if (key == 1) { // alpn
                             rdata_buf_append(out, out_cap, &pos, " alpn=\"");
                             size_t ap = 0; bool afirst = true;
                             while (ap < vlen) {
@@ -3238,6 +3258,13 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                         } else if (key == 3) {
                             uint16_t pnum = (vlen >= 2) ? ((val[0]<<8)|val[1]) : 0;
                             rdata_buf_append(out, out_cap, &pos, " port=%u", pnum);
+                        } else if (key == 5) { // ech
+                            int en = 0;
+                            char *b64_ech = base64_encode_alloc(val, vlen, &en);
+                            if (b64_ech) {
+                                rdata_buf_append(out, out_cap, &pos, " ech=\"%.*s\"", en, b64_ech);
+                                free(b64_ech);
+                            }
                         } else if (key == 4 || key == 6) {
                             rdata_buf_append(out, out_cap, &pos, " %s=\"", (key == 4) ? "ipv4hint" : "ipv6hint");
                             size_t sz = (key == 4) ? 4 : 16;
@@ -3675,7 +3702,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         }
         case 29: { // LOC
-            if (rdlen != 16) goto fallback;
+            if (rdlen != 16 || pkt[abs_offset] != 0) goto fallback; // VERSION must be 0 (RFC 1876)
             uint8_t size_b = pkt[abs_offset + 1], hp_b = pkt[abs_offset + 2], vp_b = pkt[abs_offset + 3];
             uint32_t lat_wire = ((uint32_t)pkt[abs_offset + 4]<<24)|((uint32_t)pkt[abs_offset + 5]<<16)|((uint32_t)pkt[abs_offset + 6]<<8)|pkt[abs_offset + 7];
             uint32_t lon_wire = ((uint32_t)pkt[abs_offset + 8]<<24)|((uint32_t)pkt[abs_offset + 9]<<16)|((uint32_t)pkt[abs_offset + 10]<<8)|pkt[abs_offset + 11];
@@ -5399,6 +5426,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         use_tcp = true;
     } else {
         qtype = parse_qtype(qtype_s);
+        if (qtype == 251) {
+            qo->is_ixfr = true;
+            qo->ixfr_serial = 0; // シリアル指定なし時は 0 (全転送/差分開始シリアル)
+            use_tcp = true;
+        }
     }
 
     uint8_t pkt[65535];
@@ -5557,6 +5589,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     }
                 }
                 printf(";; BADCOOKIE, retrying.\n");
+                qo->retry_on_badcookie = false; // RFC 7873 §5.4: 再送は 1 回限り
                 qo->want_cookie = true;
                 qo->server_cookie_len = bc_edns.server_cookie_len;
                 memcpy(qo->server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
@@ -5731,6 +5764,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                         uint16_t rdlen = (resp[nxt+8]<<8)|resp[nxt+9];
                         if (type == 6) {
                             check_axfr_soa(&axfr_state, resp, n, name, &resp[nxt], rdlen);
+                            if (axfr_state.is_axfr && axfr_state.soa_seen_count > 1 && dopt && dopt->onesoa) {
+                                off = nxt + 10 + rdlen;
+                                continue;
+                            }
                         }
                         if (dopt->explicit_ttlid) {
                             if (dopt->ttlunits) {
@@ -5862,13 +5899,13 @@ static void print_multi_server_summary(bool use_ldnsz) {
     printf("\n;; === MULTI-SERVER COMPARISON SUMMARY ===\n");
     
     // 2. ヘッダの出力 ( %-*s を使って動的幅を指定 )
-    printf("%-*s | %-5s | %-7s | %3s | %3s | %3s | %-13s | %-6s | %s\n", 
+    printf("%-*s | %-5s | %-7s | %3s | %3s | %3s | %-10s | %-6s | %s\n", 
            max_server_len, "SERVER", "PROTO", "RCODE", "ANS", "AUT", "ADD", 
-           g_want_allcompare ? "SEM_HASH(+TTL)" : "SEM_HASH", "TIME", "MATCH STATUS");
+           "SEM_HASH", "TIME", "MATCH STATUS");
     
     // 3. 区切り線の出力 ( max_server_len の分だけ '-' を出力 )
     for (int i = 0; i < max_server_len; i++) printf("-");
-    printf("-+-------+---------+-----+-----+-----+---------------+--------+------------------------\n");
+    printf("-+-------+---------+-----+-----+-----+------------+--------+------------------------\n");
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
@@ -6731,12 +6768,14 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                           bool no_hexdump_query, bool no_hexdump_response,
                           query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     char expanded_qname[512];
+    size_t qname_len = strlen(qname);
+    bool is_absolute = (qname_len > 0 && qname[qname_len - 1] == '.');
     int num_dots = 0;
     for (const char *p = qname; *p; p++) {
         if (*p == '.') num_dots++;
     }
     int req_ndots = (qo.ndots > 0) ? qo.ndots : 1;
-    if (qo.use_search_list && num_dots < req_ndots) {
+    if (qo.use_search_list && !is_absolute && num_dots < req_ndots) {
         if (qo.search_domain && *qo.search_domain) {
             snprintf(expanded_qname, sizeof(expanded_qname), "%s.%s", qname, qo.search_domain);
             qname = expanded_qname;

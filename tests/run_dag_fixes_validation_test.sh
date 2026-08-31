@@ -430,6 +430,56 @@ PL_EOF
 
     kill -9 "$SHORT_PID" 2>/dev/null || true
     SHORT_PID=""
+
+# ==============================================================================
+# 7. Additional Protocol & Search Semantics (IXFR serial, LOC ver, search abs)
+# ==============================================================================
+    echo "=== 7. Testing IXFR serial default, LOC version != 0, and search absolute name ==="
+
+    run_check "IXFR without explicit serial defaults to serial 0 (+qr)" \
+        "$DAG @127.0.0.1 -p 10053 example.com IXFR +qr +timeout=1" \
+        "(IXFR|Query \([0-9]+ bytes\))"
+
+    run_check "+search with absolute domain name (trailing dot) does not expand" \
+        "$DAG @127.0.0.1 -p 10053 example.com. A +search +domain=sub.example.net +qr +timeout=1" \
+        "example\.com\."
+
+    PORT_LOC=$((25000 + $$ % 8000))
+    cat <<'PL_EOF' > "$TMP_DIR/mock_loc.pl"
+use strict;
+use warnings;
+use Socket;
+
+my $port = $ARGV[0];
+socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname("udp")) or die "socket: $!";
+setsockopt($srv, SOL_SOCKET, SO_REUSEADDR, 1);
+bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
+
+while (1) {
+    my $client_addr = recv($srv, my $query, 4096, 0);
+    next unless $client_addr && length($query) >= 12;
+    my $qid = substr($query, 0, 2);
+
+    # Response with LOC record having VERSION=1 (RFC 1876 requires fallback to generic hex)
+    my $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0);
+    $resp .= "\x07example\x03com\x00" . pack("nn", 29, 1); # QNAME=example.com, QTYPE=LOC, QCLASS=IN
+    # LOC Answer: 16 bytes with VERSION=1
+    $resp .= "\xc0\x0c" . pack("nnNn", 29, 1, 300, 16) . "\x01\x12\x16\x13" . ("\x00" x 12);
+
+    send($srv, $resp, 0, $client_addr);
+}
+PL_EOF
+
+    perl "$TMP_DIR/mock_loc.pl" "$PORT_LOC" &
+    LOC_PID=$!
+    sleep 0.3
+
+    run_check "LOC with VERSION != 0 falls back to unknown format (\\# 16)" \
+        "$DAG @127.0.0.1 -p $PORT_LOC example.com LOC +timeout=2" \
+        "\\\\# 16"
+
+    kill -9 "$LOC_PID" 2>/dev/null || true
+    LOC_PID=""
 fi
 
 # ==============================================================================
