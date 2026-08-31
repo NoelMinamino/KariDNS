@@ -3646,7 +3646,18 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
       } else {
         syslog(LOG_WARNING, "[Plugin] zone '%s' returned oversized response (%u > %zu); dropping",
                domain, resp_len, max_res_len);
-        ok = false;
+        /* パイプ内の oversized データを読み捨ててパイプの同期を保つ */
+        size_t remaining = resp_len;
+        uint8_t drain_buf[512];
+        while (remaining > 0) {
+          size_t chunk = remaining < sizeof(drain_buf) ? remaining : sizeof(drain_buf);
+          if (read_all_timeout(plugin->stdout_fd, drain_buf, chunk, plugin->timeout_ms) != (ssize_t)chunk) {
+            ok = false;
+            break;
+          }
+          remaining -= chunk;
+        }
+        result_len = 0;
       }
     } else {
       ok = false;
