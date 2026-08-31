@@ -1975,6 +1975,21 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
         SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
     } else if (qo->tls_verify_default_store) {
         SSL_CTX_set_default_verify_paths(g_ssl_ctx);
+        static const char *const default_ca_locations[] = {
+            "/etc/ssl/cert.pem",
+            "/usr/local/etc/ssl/cert.pem",
+            "/usr/local/share/certs/ca-root-nss.crt",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+            NULL
+        };
+        for (int i = 0; default_ca_locations[i]; i++) {
+            if (access(default_ca_locations[i], R_OK) == 0) {
+                SSL_CTX_load_verify_locations(g_ssl_ctx, default_ca_locations[i], NULL);
+                break;
+            }
+        }
         SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
     } else {
         SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);

@@ -96,14 +96,15 @@ run_single_test() {
     CLI_PATH="$2"
     TEST_NAME="$3"
     QUERY_DOMAIN="$4"
-    EXTRA_FLAGS="$5"
-    EXPECTED_PATTERN="$6"
+    QUERY_TYPE="${5:-A}"
+    EXTRA_FLAGS="$6"
+    EXPECTED_PATTERN="$7"
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     printf "  [%-4s] %-55s ... " "$CLI_NAME" "$TEST_NAME"
 
     set +e
-    CMD="$CLI_PATH @127.0.0.1 -p $PORT $QUERY_DOMAIN A +timeout=2 +tries=1 $EXTRA_FLAGS"
+    CMD="$CLI_PATH @127.0.0.1 -p $PORT $QUERY_DOMAIN $QUERY_TYPE +timeout=2 +tries=1 $EXTRA_FLAGS"
     OUTPUT=$(eval "$CMD" 2>&1)
     EXIT_CODE=$?
     set -e
@@ -157,92 +158,99 @@ run_suite_for_tool() {
     # Section 1: Baseline
     printf "${BOLD}[1. Baseline Normal Query]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Normal NOERROR response" \
-        "normal.anomaly.test" "" "192\.0\.2\.1"
+        "normal.anomaly.test" "A" "" "192\.0\.2\.1"
 
     # Section 2: Header & Structure Anomalies
     printf "${BOLD}[2. Header & Structural Anomalies]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Header-only packet (QD=0, AN=0)" \
-        "header-only.anomaly.test" "" "(NOERROR|status: NOERROR|Got bad packet)"
+        "header-only.anomaly.test" "A" "" "(NOERROR|status: NOERROR|Got bad packet)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Short truncated header (< 12 bytes)" \
-        "short-header.anomaly.test" "" "(malformed|bad packet|error|connection)"
+        "short-header.anomaly.test" "A" "" "(malformed|bad packet|error|connection)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Trailing garbage bytes at packet end" \
-        "trailing-garbage.anomaly.test" "" "(192\.0\.2\.1|Warning:.*malformed|extra bytes)"
+        "trailing-garbage.anomaly.test" "A" "" "(192\.0\.2\.1|Warning:.*malformed|extra bytes)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "QDCOUNT header mismatch" \
-        "qdcount-mismatch.anomaly.test" "" "(malformed|bad packet|FORMERR|error)"
+        "qdcount-mismatch.anomaly.test" "A" "" "(malformed|bad packet|FORMERR|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "ANCOUNT underflow (missing records)" \
-        "ancount-underflow.anomaly.test" "" "(malformed|bad packet|unexpected end)"
+        "ancount-underflow.anomaly.test" "A" "" "(malformed|bad packet|unexpected end)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "ANCOUNT with +besteffort" \
-        "ancount-underflow.anomaly.test" "+besteffort" "192\.0\.2\.1"
+        "ancount-underflow.anomaly.test" "A" "+besteffort" "192\.0\.2\.1"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "ANCOUNT overflow (extra record)" \
-        "ancount-overflow.anomaly.test" "" "192\.0\.2\.1"
+        "ancount-overflow.anomaly.test" "A" "" "192\.0\.2\.1"
 
     # Section 3: Name Compression & Pointer Anomalies
     printf "${BOLD}[3. Name Compression & Pointer Safety]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Direct pointer compression loop" \
-        "compression-loop.anomaly.test" "" "(malformed|bad packet|loop|error)"
+        "compression-loop.anomaly.test" "A" "" "(malformed|bad packet|loop|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Forward/out-of-bounds pointer" \
-        "compression-forward-ptr.anomaly.test" "" "(malformed|bad packet|error)"
+        "compression-forward-ptr.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Unclosed/unterminated label" \
-        "unclosed-label.anomaly.test" "" "(malformed|bad packet|error)"
+        "unclosed-label.anomaly.test" "A" "" "(malformed|bad packet|error)"
 
     # Section 4: RDATA Truncation & Boundary Violations
     printf "${BOLD}[4. RDATA Truncation & Boundary Safety]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Truncated A record (2 bytes RDATA)" \
-        "rdata-short-a.anomaly.test" "" "(malformed|bad packet|error)"
+        "rdata-short-a.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Truncated AAAA record (8 bytes RDATA)" \
-        "rdata-short-aaaa.anomaly.test" "" "(malformed|bad packet|error)"
+        "rdata-short-aaaa.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Truncated SOA record" \
-        "rdata-soa-truncated.anomaly.test" "" "(malformed|bad packet|error)"
+        "rdata-soa-truncated.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Truncated MX record" \
-        "rdata-mx-truncated.anomaly.test" "" "(malformed|bad packet|error)"
+        "rdata-mx-truncated.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "TXT record length mismatch" \
-        "rdata-txt-len-mismatch.anomaly.test" "" "(malformed|bad packet|error)"
+        "rdata-txt-len-mismatch.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "SVCB TargetName length overflow" \
-        "rdata-svcb-overflow.anomaly.test" "" "(malformed|bad packet|error)"
+        "rdata-svcb-overflow.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "OPT RR truncated option" \
-        "rdata-opt-truncated.anomaly.test" "" "(malformed|bad packet|error|OPT Pseudo)"
+        "rdata-opt-truncated.anomaly.test" "A" "" "(malformed|bad packet|error|OPT Pseudo)"
 
     # Section 5: Protocol & Security Flags
     printf "${BOLD}[5. Protocol & Security Flags]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "BADCOOKIE (RCODE 23) auto-retry" \
-        "cookie-badcookie.anomaly.test" "+cookie" "(BADCOOKIE|192\.0\.2\.1|COOKIE:)"
+        "cookie-badcookie.anomaly.test" "A" "+cookie" "(BADCOOKIE|192\.0\.2\.1|COOKIE:)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Truncated TC=1 UDP response" \
-        "truncated-tc.anomaly.test" "" "(flags:.*tc|Truncated, retrying in TCP|192\.0\.2\.1)"
+        "truncated-tc.anomaly.test" "A" "" "(flags:.*tc|Truncated, retrying in TCP|192\.0\.2\.1)"
 
     # Section 6: RFC Standard & Extended RCODEs
     printf "${BOLD}[6. DNS RCODE Responses]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 1: FORMERR" \
-        "rcode-formerr.anomaly.test" "" "FORMERR"
+        "rcode-formerr.anomaly.test" "A" "" "FORMERR"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 2: SERVFAIL" \
-        "rcode-servfail.anomaly.test" "" "SERVFAIL"
+        "rcode-servfail.anomaly.test" "A" "" "SERVFAIL"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 3: NXDOMAIN" \
-        "rcode-nxdomain.anomaly.test" "" "NXDOMAIN"
+        "rcode-nxdomain.anomaly.test" "A" "" "NXDOMAIN"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 4: NOTIMP" \
-        "rcode-notimp.anomaly.test" "" "NOTIMP"
+        "rcode-notimp.anomaly.test" "A" "" "NOTIMP"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 5: REFUSED" \
-        "rcode-refused.anomaly.test" "" "REFUSED"
+        "rcode-refused.anomaly.test" "A" "" "REFUSED"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 6: YXDOMAIN" \
-        "rcode-yxdomain.anomaly.test" "" "YXDOMAIN"
+        "rcode-yxdomain.anomaly.test" "A" "" "YXDOMAIN"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 7: YXRRSET" \
-        "rcode-yxrrset.anomaly.test" "" "YXRRSET"
+        "rcode-yxrrset.anomaly.test" "A" "" "YXRRSET"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 8: NXRRSET" \
-        "rcode-nxrrset.anomaly.test" "" "NXRRSET"
+        "rcode-nxrrset.anomaly.test" "A" "" "NXRRSET"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 9: NOTAUTH" \
-        "rcode-notauth.anomaly.test" "" "NOTAUTH"
+        "rcode-notauth.anomaly.test" "A" "" "NOTAUTH"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 10: NOTZONE" \
-        "rcode-notzone.anomaly.test" "" "NOTZONE"
+        "rcode-notzone.anomaly.test" "A" "" "NOTZONE"
 
     # Section 7: Extended DNS Errors (EDE, RFC 8914)
     printf "${BOLD}[7. Extended DNS Errors (EDE)]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "EDE Code 18 (Prohibited)" \
-        "ede-prohibited.anomaly.test" "" "(EDE: 18|Prohibited|Query blocked)"
+        "ede-prohibited.anomaly.test" "A" "" "(EDE: 18|Prohibited|Query blocked)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "EDE Long description string" \
-        "ede-long-text.anomaly.test" "" "(EDE: 0|ExtendedErrorDescription|AAAA)"
+        "ede-long-text.anomaly.test" "A" "" "(EDE: 0|ExtendedErrorDescription|AAAA)"
 
     # Section 8: Drop / Timeout
     printf "${BOLD}[8. Drop / Silent Discard Handling]${NC}\n"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Silent query drop handling" \
-        "drop.anomaly.test" "" "(no servers could be reached|connection timed out|communications error)"
+        "drop.anomaly.test" "A" "" "(no servers could be reached|connection timed out|communications error)"
+
+    # Section 9: AXFR & TXT Usage Guide
+    printf "${BOLD}[9. Usage Guide & Help (AXFR / TXT)]${NC}\n"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "AXFR Zone Transfer Usage Guide" \
+        "anomaly.test" "AXFR" "" "KariDNS Anomalous DNS Packet Test Server"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Apex TXT Query Usage Guide" \
+        "anomaly.test" "TXT" "" "KariDNS Anomalous DNS Packet Test Server"
 }
 
 # Run target suites

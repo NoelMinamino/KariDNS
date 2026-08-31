@@ -5749,23 +5749,15 @@ worker_startup_success:;
                           has_edns, dnssec_ok);
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
-          if (qtype == 252 || qtype == 251) {
-            view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
-            server_config_t *cfg =
-                atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-            zone_config_t *zcfg = xfr_view
-                ? find_zone_config_in_view(cfg, xfr_view->name, qname)
-                : NULL;
-            if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
-              release_zone_snapshot(snap);
-              struct kevent ev_del;
-              EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-              kevent(kq, &ev_del, 1, NULL, 0, NULL);
-              close(client_fd);
-              dec_tcp_clients();
-              free(ctx_tcp);
-              continue;
-            }
+          view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
+          server_config_t *cfg =
+              atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+          zone_config_t *zcfg = xfr_view
+              ? find_zone_config_in_view(cfg, xfr_view->name, qname)
+              : NULL;
+          bool is_prog_zone = (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0);
+
+          if ((qtype == 252 || qtype == 251) && !is_prog_zone) {
             bool allowed = false;
             uint16_t tsig_error = 0;
             tsig_key_t *matched_key = NULL;
