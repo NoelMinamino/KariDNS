@@ -390,6 +390,10 @@ EOF
     compare_query "YAML: DNSKEY with nocrypto (+yaml +nocrypto)" "example.com DNSKEY +yaml +nocrypto +noedns"
     compare_query "YAML: DS with nocrypto (+yaml +nocrypto)" "example.com DS +yaml +nocrypto +noedns"
     compare_query "YAML: RRSIG structured output (+yaml)" "example.com RRSIG +yaml +noedns"
+    compare_query "YAML: SOA with multiline (+yaml +multiline)" "example.com SOA +yaml +multiline +noedns"
+    compare_query "YAML: SOA with multi alias (+yaml +multi)" "example.com SOA +yaml +multi +noedns"
+    compare_query "YAML: LOC record (+yaml)" "office.example.com LOC +yaml +noedns"
+    compare_query "YAML: LOC record (where-is-the-iss.dedyn.io)" "where-is-the-iss.dedyn.io LOC +yaml +timeout=3 +noedns"
 
     echo "--------------------------------------------------------"
     echo "12. DNS64 Prefix Discovery (+dns64prefix)"

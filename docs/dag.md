@@ -163,17 +163,20 @@ dag [global-queryopt...] [query...]
 `+[no]dns64prefix`
 : Automatically query `ipv4only.arpa` for `AAAA` records to discover local DNS64 prefixes (RFC 7050).
 
-`+timeout=N`
-: Set query network timeout in seconds (default: 5 seconds).
+`+timeout=N`, `+time=N`
+: Set query network timeout in seconds (default: 5 seconds). `+time=N` functions as a synonym/alias.
 
-`+tries=N`, `+retry=N`
-: Set number of transmission attempts (default: 1 attempt).
+`+tries=N`
+: Set the total number of transmission attempts to `N` (default: 1 attempt).
+
+`+retry=N`
+: Set the number of transmission retries to `N` (total attempts will be `N + 1`).
 
 ---
 
 ## DNS HEADER & QUERY FLAGS
 
-`+[no]recurse`, `+[no]rdflag`
+`+[no]rec`, `+[no]recurse`, `+[no]rdflag`
 : Set or clear the **RD (Recursion Desired)** header bit. Recursion is enabled by default. Automatically disabled when `+trace` or `+nssearch` is active.
 
 `+[no]adflag`
@@ -195,7 +198,7 @@ dag [global-queryopt...] [query...]
 : Set or clear the reserved **Z** bit in the DNS header.
 
 `+opcode=N`
-: Override the DNS header **OPCODE** (e.g., `0` for QUERY, `2` for STATUS, `4` for NOTIFY, `5` for UPDATE).
+: Override the DNS header **OPCODE**. Accepts numeric values (0–15) or standard mnemonic strings (`QUERY`, `IQUERY`, `STATUS`, `NOTIFY`, `UPDATE`). Example: `+opcode=UPDATE` or `+opcode=5`.
 
 `+qid=N`
 : Override the 16-bit DNS Query ID (0–65535). If omitted, a cryptographically secure random ID is generated via `arc4random(3)` (or platform CSPRNG / OpenSSL `RAND_bytes` on non-BSD platforms).
@@ -279,8 +282,8 @@ dag [global-queryopt...] [query...]
 `+noednsopt`
 : Clear all configured custom EDNS options.
 
-`+ednsflags=N`
-: Directly set the raw 16-bit EDNS Z-flags in the OPT record.
+`+ednsflags=N`, `+[no]ednsflags`
+: Set or reset the raw 16-bit EDNS Z-flags in the OPT record. `+ednsflags=N` sets the flag bits to `N`, while `+ednsflags` (without `=`) or `+noednsflags` resets the flags to `0`.
 
 `+[no]coflag`, `+[no]co`
 : Set the **Compact Answers OK (CO)** flag in the OPT record to signal support for Compact Denial of Existence.
@@ -453,8 +456,8 @@ When `+ldnsz` is supplied:
 `+[no]short`
 : Provide a terse, machine-readable answer containing only the RDATA of the ANSWER section.
 
-`+[no]multiline`
-: Print records (such as SOA, DNSKEY, RRSIG, and HTTPS) in human-readable multi-line format with field descriptions and structured comments.
+`+[no]multiline`, `+[no]multi`
+: Print records (such as SOA, DNSKEY, RRSIG, and HTTPS) in human-readable multi-line format with field descriptions and structured comments. Short form (`+[no]multi`) is also supported.
 
 `+[no]yaml`
 : Output the complete parsed DNS response in structured YAML format.

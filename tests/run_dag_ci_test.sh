@@ -127,6 +127,9 @@ echo "========================================================"
 run_check "Standard UDP Query" "$DAG @127.0.0.1 -p $PORT www.example.com A" "192.0.2.10"
 run_check "Explicit Query Name flag (-q)" "$DAG @127.0.0.1 -p $PORT -q www.example.com" "192.0.2.10"
 run_check "Explicit Query Type flag (-t)" "$DAG @127.0.0.1 -p $PORT example.com -t MX" "mail\.example\.com"
+run_check "Uppercase Query Type (SOA)" "$DAG @127.0.0.1 -p $PORT example.com SOA" "ns1\.example\.com"
+run_check "Lowercase Query Type (soa)" "$DAG @127.0.0.1 -p $PORT example.com soa" "ns1\.example\.com"
+run_check "Mixed-case Query Type (SOa)" "$DAG @127.0.0.1 -p $PORT example.com SOa" "ns1\.example\.com"
 run_check "Explicit Query Class flag (-c)" "$DAG @127.0.0.1 -p $PORT -c IN www.example.com A" "192.0.2.10"
 run_check "Standard TCP Query (+tcp)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tcp" "192.0.2.10"
 run_check "Standard TCP Query (+vc)" "$DAG @127.0.0.1 -p $PORT www.example.com A +vc" "192.0.2.10"
@@ -135,6 +138,10 @@ run_check "Reverse IPv6 PTR Query (-x)" "$DAG @127.0.0.1 -p $PORT -x 2001:db8::1
 run_check "DNAME resolution" "$DAG @127.0.0.1 -p $PORT sub.legacy.example.com A" "(archive\.example\.com|192\.0\.2)"
 run_check "URI query" "$DAG @127.0.0.1 -p $PORT _https._tcp.example.com URI" "https://www\.example\.com"
 run_check "SPF query" "$DAG @127.0.0.1 -p $PORT example.com SPF" "v=spf1"
+run_check "LOC query" "$DAG @127.0.0.1 -p $PORT example.com LOC" "35 10.*N 136 58.*E"
+run_check "LOC query (+yaml)" "$DAG @127.0.0.1 -p $PORT example.com LOC +yaml" "35 10.*N 136 58.*E"
+run_check "LOC query external (where-is-the-iss.dedyn.io)" "$DAG where-is-the-iss.dedyn.io LOC +timeout=2" "(LOC|timed out|no usable response|no servers could be reached)"
+run_check "LOC query external (+yaml)" "$DAG where-is-the-iss.dedyn.io LOC +yaml +timeout=2" "(IN[[:space:]]+LOC|LOC|timed out|no usable response|no servers could be reached)"
 run_check "ANY query" "$DAG @127.0.0.1 -p $PORT example.com ANY" "(SOA|NS|MX|TXT)"
 run_check "DNSSEC DS query" "$DAG @127.0.0.1 -p $PORT example.com DS +dnssec" "(status: NOERROR|SOA|DS)"
 run_check "IPv4 preference flag (-4)" "$DAG @127.0.0.1 -p $PORT www.example.com A -4" "192.0.2.10"
@@ -185,6 +192,8 @@ run_check "TTL units (+ttlunits)" "$DAG @127.0.0.1 -p $PORT www.example.com A +t
 run_check "Unknown format (+unknownformat)" "$DAG @127.0.0.1 -p $PORT www.example.com A +unknownformat" 'CLASS1[[:space:]]+TYPE1[[:space:]]+\\#[[:space:]]+[0-9]+'
 run_check "TTL ID toggling (+ttlid / +nottlid)" "$DAG @127.0.0.1 -p $PORT www.example.com A +nottlid" "www\.example\.com\.[[:space:]]+IN[[:space:]]+A"
 run_check "Multiline mode (+multiline)" "$DAG @127.0.0.1 -p $PORT example.com SOA +multiline" "serial"
+run_check "Multiline mode alias (+multi)" "$DAG @127.0.0.1 -p $PORT example.com SOA +multi" "serial"
+run_check "Multiline mode disable alias (+nomulti)" "$DAG @127.0.0.1 -p $PORT example.com SOA +nomulti" "(IN[[:space:]]+SOA|serial)"
 run_check "Expire time display (+expire)" "$DAG @127.0.0.1 -p $PORT example.com SOA +expire" "(SOA|expire|serial)"
 run_check "AXFR single SOA (+onesoa)" "$DAG @127.0.0.1 -p $PORT example.com AXFR +onesoa" "SOA"
 run_check "Expand AAAA addresses (+expandaaaa)" "$DAG @127.0.0.1 -p $PORT www.example.com AAAA +expandaaaa" "2001:0db8:0000:0000:0000:0000:0000:0010"
@@ -228,8 +237,10 @@ run_check "QID override (+qid=4660)" "$DAG @127.0.0.1 -p $PORT www.example.com A
 run_check "Opcode override (+opcode=NOTIFY)" "$DAG @127.0.0.1 -p $PORT www.example.com A +opcode=NOTIFY +qr" "opcode: NOTIFY"
 run_check "Flags override (+adflag +cdflag +aaflag +tcflag +raflag +zflag)" "$DAG @127.0.0.1 -p $PORT www.example.com A +adflag +cdflag +aaflag +tcflag +raflag +zflag +qr" "flags:.*(ad|cd|aa|tc|ra)"
 run_check "Recursion flag override (+norec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +norec +qr" ";; flags:"
+run_check "Recursion flag enable (+rec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +rec +qr" "flags:.*rd"
 run_check "Ignore truncation flag (+ignore)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ignore" "192\.0\.2\.10"
 run_check "Timeout flag (+timeout=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
+run_check "Timeout alias (+time=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +time=2" "192\.0\.2\.10"
 run_check "Tries and Retry flags (+tries=2 +retry=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tries=2 +retry=2" "192\.0\.2\.10"
 run_check "Search list and ndots expansion (+search +domain +ndots=2)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=2 +search" "192\.0\.2\.10"
 run_check "Search list not expanded when ndots exceeded (+ndots=1)" "$DAG @127.0.0.1 -p $PORT www.example +domain=com +ndots=1 +search" "(NXDOMAIN|SERVFAIL|REFUSED|no servers could be reached|got NXDOMAIN)"
@@ -304,6 +315,7 @@ echo "========================================================"
 echo "10. Search Domains, Batch Files & .digrc Configuration"
 echo "========================================================"
 run_check "Search domain option (+domain= +search)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +search" "192\.0\.2\.10"
+run_check "Persistent option lifecycle across retries (+domain= with +tries=2)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +search +tries=2" "192\.0\.2\.10"
 cat << 'EOF' > batch_test.txt
 www.example.com A
 mail.example.com A
@@ -467,6 +479,7 @@ run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_tes
 if command -v perl >/dev/null 2>&1; then
     run_check "Plugin Zones: 'type program' zone loader (tests/run_program_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_program_zone_test.sh\"" "ALL PROGRAM ZONE TESTS PASSED"
     run_check "Anomalous Packets: Comprehensive DNS packet wire suite (tests/run_dag_dig_anomalous_suite.sh)" "DAG_BIN=\"$DAG\" DIG_BIN=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dig_anomalous_suite.sh\" \"$([ "$DAG" = "dig" ] && echo "dig" || echo "dag")\"" "ALL ANOMALOUS PACKET TESTS PASSED SUCCESSFULLY"
+    run_check "Transport: Multi-Message AXFR & Plain-HTTP DoH mock (tests/run_dag_doh_dot_axfr_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_dot_axfr_test.sh\"" "ALL DOT/DOH AXFR & MEMORY TESTS PASSED"
 fi
 
 echo "========================================================"
