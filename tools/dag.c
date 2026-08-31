@@ -596,7 +596,7 @@ typedef struct {
 
     struct {
         update_op_kind_t kind;
-        char raw[512];
+        char *raw;
     } update_ops[MAX_UPDATE_OPS];
     int update_op_count;
     struct {
@@ -1500,7 +1500,7 @@ static int g_last_socket_family = AF_INET;
  */
 static bool resolve_server_addr(const char *server, int port, int pref_family,
                                  struct sockaddr_storage *dest, socklen_t *dest_len,
-                                 int *family_out) {
+                                 int *family_out, bool update_global_ip) {
     memset(dest, 0, sizeof(*dest));
     struct sockaddr_in *d4 = (struct sockaddr_in *)dest;
     struct sockaddr_in6 *d6 = (struct sockaddr_in6 *)dest;
@@ -1509,14 +1509,14 @@ static bool resolve_server_addr(const char *server, int port, int pref_family,
         d4->sin_family = AF_INET; d4->sin_port = htons((uint16_t)port);
         *dest_len = sizeof(*d4);
         if (family_out) *family_out = AF_INET;
-        snprintf(g_last_server_ip, sizeof(g_last_server_ip), "%s", server);
+        if (update_global_ip) snprintf(g_last_server_ip, sizeof(g_last_server_ip), "%s", server);
         return true;
     }
     if (inet_pton(AF_INET6, server, &d6->sin6_addr) == 1) {
         d6->sin6_family = AF_INET6; d6->sin6_port = htons((uint16_t)port);
         *dest_len = sizeof(*d6);
         if (family_out) *family_out = AF_INET6;
-        snprintf(g_last_server_ip, sizeof(g_last_server_ip), "%s", server);
+        if (update_global_ip) snprintf(g_last_server_ip, sizeof(g_last_server_ip), "%s", server);
         return true;
     }
 
@@ -1543,10 +1543,12 @@ static bool resolve_server_addr(const char *server, int port, int pref_family,
     memcpy(dest, res->ai_addr, res->ai_addrlen);
     *dest_len = (socklen_t)res->ai_addrlen;
     if (family_out) *family_out = res->ai_family;
-    if (res->ai_family == AF_INET) {
-        inet_ntop(AF_INET, &((struct sockaddr_in *)res->ai_addr)->sin_addr, g_last_server_ip, sizeof(g_last_server_ip));
-    } else if (res->ai_family == AF_INET6) {
-        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr, g_last_server_ip, sizeof(g_last_server_ip));
+    if (update_global_ip) {
+        if (res->ai_family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)res->ai_addr)->sin_addr, g_last_server_ip, sizeof(g_last_server_ip));
+        } else if (res->ai_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr, g_last_server_ip, sizeof(g_last_server_ip));
+        }
     }
     freeaddrinfo(res);
     return true;
@@ -1574,13 +1576,13 @@ static int get_server_addr_count(const char *server, int port, int pref_family) 
 
 static int connect_udp(const char *server, int port, int pref_family, const char *bind_addr, int bind_port, struct sockaddr_storage *dest, socklen_t *dest_len) {
     int family = AF_INET;
-    if (!resolve_server_addr(server, port, pref_family, dest, dest_len, &family)) return -1;
+    if (!resolve_server_addr(server, port, pref_family, dest, dest_len, &family, true)) return -1;
     g_last_socket_family = family;
     int sock = socket(family, SOCK_DGRAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
     if (bind_addr && bind_addr[0] != '\0') {
         struct sockaddr_storage baddr; socklen_t blen; int bfam = family;
-        if (!resolve_server_addr(bind_addr, bind_port, AF_UNSPEC, &baddr, &blen, &bfam)) {
+        if (!resolve_server_addr(bind_addr, bind_port, AF_UNSPEC, &baddr, &blen, &bfam, false)) {
             fprintf(stderr, "Error: -b address '%s' could not be resolved\n", bind_addr);
             close(sock);
             return -1;
@@ -1616,7 +1618,7 @@ static int connect_tcp(const char *server, int port, const query_opts_t *qo, int
     const char *bind_addr = qo->bind_addr;
     int bind_port = qo->bind_port;
     struct sockaddr_storage dest; socklen_t dest_len; int family = AF_INET;
-    if (!resolve_server_addr(server, port, qo->pref_family, (struct sockaddr_storage *)&dest, &dest_len, &family)) return -1;
+    if (!resolve_server_addr(server, port, qo->pref_family, (struct sockaddr_storage *)&dest, &dest_len, &family, true)) return -1;
     g_last_socket_family = family;
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
@@ -1635,7 +1637,7 @@ static int connect_tcp(const char *server, int port, const query_opts_t *qo, int
 
     if (bind_addr && bind_addr[0] != '\0') {
         struct sockaddr_storage baddr; socklen_t blen; int bfam = family;
-        if (!resolve_server_addr(bind_addr, bind_port, AF_UNSPEC, &baddr, &blen, &bfam)) {
+        if (!resolve_server_addr(bind_addr, bind_port, AF_UNSPEC, &baddr, &blen, &bfam, false)) {
             fprintf(stderr, "Error: -b address '%s' could not be resolved\n", bind_addr);
             close(sock);
             return -1;
@@ -6760,7 +6762,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
     while (hop < 15 && target_count > 0) {
         reset_dag_arena();
         hop++;
-        uint8_t qbuf[512];
+        uint8_t qbuf[65535];
         int qtype_val = parse_qtype(qtype_s);
         size_t qlen = build_query_packet(qbuf, sizeof(qbuf), qname, qtype_val, &qo);
         if (qlen == 0) break;
@@ -6870,7 +6872,7 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     (void)force_udp; (void)hex_payload; (void)dopt;
     qo.rd_flag = false;
     const char *eff_server = server ? server : get_system_resolver();
-    uint8_t qbuf[512];
+    uint8_t qbuf[65535];
     size_t qlen = build_query_packet(qbuf, sizeof(qbuf), qname, 2 /* NS */, &qo);
     if (!no_hexdump_query) {
         printf("Query (%zd bytes):\n", qlen);
@@ -7566,7 +7568,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     if (strcmp(arg, "--update-add") == 0 && i + 1 < argc) {
         if (spec->qo.update_op_count < MAX_UPDATE_OPS) {
             spec->qo.update_ops[spec->qo.update_op_count].kind = UPDATE_OP_ADD;
-            snprintf(spec->qo.update_ops[spec->qo.update_op_count].raw, sizeof(spec->qo.update_ops[0].raw), "%s", argv[i + 1]);
+            spec->qo.update_ops[spec->qo.update_op_count].raw = strdup(argv[i + 1]);
             spec->qo.update_op_count++;
         } else {
             fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i + 1], MAX_UPDATE_OPS);
@@ -7576,7 +7578,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     if (strcmp(arg, "--update-del") == 0 && i + 1 < argc) {
         if (spec->qo.update_op_count < MAX_UPDATE_OPS) {
             spec->qo.update_ops[spec->qo.update_op_count].kind = UPDATE_OP_DEL;
-            snprintf(spec->qo.update_ops[spec->qo.update_op_count].raw, sizeof(spec->qo.update_ops[0].raw), "%s", argv[i + 1]);
+            spec->qo.update_ops[spec->qo.update_op_count].raw = strdup(argv[i + 1]);
             spec->qo.update_op_count++;
         } else {
             fprintf(stderr, "warning: too many --update-add/--update-del options, ignoring '%s' (max %d)\n", argv[i + 1], MAX_UPDATE_OPS);
@@ -7586,7 +7588,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     if (strcmp(arg, "--update-del-exact") == 0 && i + 1 < argc) {
         if (spec->qo.update_op_count < MAX_UPDATE_OPS) {
             spec->qo.update_ops[spec->qo.update_op_count].kind = UPDATE_OP_DEL_EXACT;
-            snprintf(spec->qo.update_ops[spec->qo.update_op_count].raw, sizeof(spec->qo.update_ops[0].raw), "%s", argv[i + 1]);
+            spec->qo.update_ops[spec->qo.update_op_count].raw = strdup(argv[i + 1]);
             spec->qo.update_op_count++;
         } else {
             fprintf(stderr, "warning: too many update options, ignoring '%s' (max %d)\n", argv[i + 1], MAX_UPDATE_OPS);
@@ -8351,6 +8353,11 @@ static void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
     if (src->search_domain) dst->search_domain = strdup(src->search_domain);
     if (src->tsig_key.algorithm) dst->tsig_key.algorithm = strdup(src->tsig_key.algorithm);
     if (src->tsig_key.name) dst->tsig_key.name = strdup(src->tsig_key.name);
+    for (int i = 0; i < src->update_op_count; i++) {
+        if (src->update_ops[i].raw) {
+            dst->update_ops[i].raw = strdup(src->update_ops[i].raw);
+        }
+    }
 }
 
 static void free_query_opts(query_opts_t *qo) {
@@ -8363,6 +8370,13 @@ static void free_query_opts(query_opts_t *qo) {
     if (qo->search_domain) { free(qo->search_domain); qo->search_domain = NULL; }
     if (qo->tsig_key.algorithm) { free((void *)qo->tsig_key.algorithm); qo->tsig_key.algorithm = NULL; }
     if (qo->tsig_key.name) { free((void *)qo->tsig_key.name); qo->tsig_key.name = NULL; }
+    for (int i = 0; i < qo->update_op_count; i++) {
+        if (qo->update_ops[i].raw) {
+            free(qo->update_ops[i].raw);
+            qo->update_ops[i].raw = NULL;
+        }
+    }
+    qo->update_op_count = 0;
 }
 
 int main(int argc, char **argv) {
