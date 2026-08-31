@@ -941,7 +941,7 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
     uint16_t flags = 0;
     if (qo->dnssec_ok) flags |= 0x8000;
     if (qo->compact_answers_ok) flags |= 0x4000;
-    if (qo->ednsflags_z) flags |= (qo->ednsflags_z & ~(uint16_t)0xC000);
+    if (qo->ednsflags_z) flags |= qo->ednsflags_z;
     pkt[offset++] = flags >> 8; pkt[offset++] = flags & 0xFF;
 
     uint16_t rdlen_field_offset = offset;
@@ -2013,25 +2013,34 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     if (!ssl) return NULL;
     SSL_set_fd(ssl, tcp_sock);
 
-    const char *sni_host = qo->tls_hostname ? qo->tls_hostname : server;
-    char unbracketed_ip[128];
-    const char *check_host = sni_host;
-    if (sni_host && sni_host[0] == '[') {
-        size_t slen = strlen(sni_host);
-        if (slen > 2 && sni_host[slen - 1] == ']') {
+    const char *raw_sni_host = qo->tls_hostname ? qo->tls_hostname : server;
+    char clean_sni_host[256];
+    const char *check_host = raw_sni_host;
+
+    if (raw_sni_host) {
+        size_t slen = strlen(raw_sni_host);
+        if (raw_sni_host[0] == '[' && slen > 2 && raw_sni_host[slen - 1] == ']') {
             size_t inner_len = slen - 2;
-            if (inner_len < sizeof(unbracketed_ip)) {
-                memcpy(unbracketed_ip, sni_host + 1, inner_len);
-                unbracketed_ip[inner_len] = '\0';
-                check_host = unbracketed_ip;
+            if (inner_len < sizeof(clean_sni_host)) {
+                memcpy(clean_sni_host, raw_sni_host + 1, inner_len);
+                clean_sni_host[inner_len] = '\0';
+                check_host = clean_sni_host;
+            }
+        } else if (slen > 1 && raw_sni_host[slen - 1] == '.') {
+            // RFC 6066 §3: The hostname specification for SNI MUST NOT end with a trailing dot
+            size_t inner_len = slen - 1;
+            if (inner_len < sizeof(clean_sni_host)) {
+                memcpy(clean_sni_host, raw_sni_host, inner_len);
+                clean_sni_host[inner_len] = '\0';
+                check_host = clean_sni_host;
             }
         }
     }
 
     struct in_addr a4; struct in6_addr a6;
     bool sni_is_ip = (inet_pton(AF_INET, check_host, &a4) == 1 || inet_pton(AF_INET6, check_host, &a6) == 1);
-    if (!sni_is_ip) {
-        SSL_set_tlsext_host_name(ssl, sni_host);
+    if (!sni_is_ip && check_host) {
+        SSL_set_tlsext_host_name(ssl, check_host);
     }
 
     /* 証明書検証を行うモード(tls_ca_fileまたはtls_verify_default_store指定時)
@@ -2040,8 +2049,8 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
         if (sni_is_ip) {
             X509_VERIFY_PARAM *vpm = SSL_get0_param(ssl);
             X509_VERIFY_PARAM_set1_ip_asc(vpm, check_host);
-        } else {
-            SSL_set1_host(ssl, sni_host);
+        } else if (check_host) {
+            SSL_set1_host(ssl, check_host);
         }
     }
 
@@ -6073,10 +6082,18 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
             if (!dopt->short_mode) {
                 if (!dopt->yaml && !no_hexdump_response && dopt->show_comments) {
-                    if (use_tcp) {
-                        printf("Response message %d (%zd bytes, TCP):\n", msg_index, n);
+                    const char *resp_proto = "UDP";
+                    if (qo->use_doh) {
+                        resp_proto = (qo->doh_method == DOH_GET) ? (qo->doh_tls ? "HTTPS-GET" : "HTTP-GET") : (qo->doh_tls ? "HTTPS" : "HTTP");
+                    } else if (qo->use_tls) {
+                        resp_proto = "TLS";
+                    } else if (use_tcp) {
+                        resp_proto = "TCP";
+                    }
+                    if (use_tcp && (qtype == 252 || qtype == 251)) {
+                        printf("Response message %d (%zd bytes, %s):\n", msg_index, n, resp_proto);
                     } else {
-                        printf("Response (%zd bytes, UDP):\n", n);
+                        printf("Response (%zd bytes, %s):\n", n, resp_proto);
                     }
                     hexdump(resp, (size_t)n);
                     printf("\n");
@@ -8287,7 +8304,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                     memcpy(spec->qo.client_cookie, full, 8);
                     if (full_len > 8) { spec->qo.server_cookie_len = full_len - 8; memcpy(spec->qo.server_cookie, full + 8, spec->qo.server_cookie_len); }
                 } else {
-                    for (int k = 0; k < 8; k++) spec->qo.client_cookie[k] = (uint8_t)(k + 1);
+                    memset(spec->qo.client_cookie, 0, 8);
+                    memcpy(spec->qo.client_cookie, full, full_len);
                 }
             } else {
                 for (int k = 0; k < 8; k++) spec->qo.client_cookie[k] = (uint8_t)(arc4random() & 0xFF);
