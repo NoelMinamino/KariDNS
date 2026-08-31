@@ -393,6 +393,8 @@ EOF
     compare_query "YAML: DNSKEY with nocrypto (+yaml +nocrypto)" "example.com DNSKEY +yaml +nocrypto"
     compare_query "YAML: DS with nocrypto (+yaml +nocrypto)" "example.com DS +yaml +nocrypto"
     compare_query "YAML: RRSIG structured output (+yaml)" "example.com RRSIG +yaml"
+    compare_query "YAML: SOA with multiline (+yaml +multiline)" "example.com SOA +yaml +multiline"
+    compare_query "YAML: SOA with multi alias (+yaml +multi)" "example.com SOA +yaml +multi"
 
     echo "--------------------------------------------------------"
     echo "12. DNS64 Prefix Discovery (+dns64prefix)"

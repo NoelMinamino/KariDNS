@@ -282,10 +282,24 @@ static const char *get_ede_error_string(uint16_t code) {
 
 static bool resolve_qtype(const char *s, uint16_t *out_type) {
     if (!s) return false;
-    uint16_t t = get_type_code(s);
-    if (t != 0) {
-        if (out_type) *out_type = t;
-        return true;
+    char upper_s[32];
+    size_t len = strlen(s);
+    if (len < sizeof(upper_s)) {
+        for (size_t i = 0; i < len; i++) {
+            upper_s[i] = (char)toupper((unsigned char)s[i]);
+        }
+        upper_s[len] = '\0';
+        uint16_t t = get_type_code(upper_s);
+        if (t != 0) {
+            if (out_type) *out_type = t;
+            return true;
+        }
+    } else {
+        uint16_t t = get_type_code(s);
+        if (t != 0) {
+            if (out_type) *out_type = t;
+            return true;
+        }
     }
     // IXFR等の特殊構文処理は残す
     if (strncasecmp(s, "IXFR=", 5) == 0) {
@@ -995,6 +1009,18 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
         int block_size = (qo->padding_size > 0) ? qo->padding_size : 468;
         // OPTヘッダ(4バイト)を含めた現在長から、ブロック境界に必要なパディング長を算出
         size_t current_len = (size_t)offset + 4;
+        if (qo->want_tsig) {
+            // 付与予定のTSIGレコード長を見積もり（TSIG RRヘッダ＋アルゴリズム名＋MACサイズ＋固定フィールド）
+            size_t tsig_keyname_len = qo->tsig_key.name ? strlen(qo->tsig_key.name) + 2 : 10;
+            size_t tsig_alg_len = qo->tsig_key.algorithm ? strlen(qo->tsig_key.algorithm) + 2 : 15;
+            size_t tsig_mac_len = 32; // HMAC-SHA256 (default)
+            if (qo->tsig_key.algorithm) {
+                if (strcasestr(qo->tsig_key.algorithm, "sha512") || strcasestr(qo->tsig_key.algorithm, "sha384")) tsig_mac_len = 64;
+                else if (strcasestr(qo->tsig_key.algorithm, "md5") || strcasestr(qo->tsig_key.algorithm, "sha1")) tsig_mac_len = 20;
+            }
+            size_t tsig_estimated_len = tsig_keyname_len + 10 + tsig_alg_len + 6 + 2 + 2 + tsig_mac_len + 2 + 2 + 2;
+            current_len += tsig_estimated_len;
+        }
         size_t pad_len = (block_size - (current_len % block_size)) % block_size;
         if ((size_t)offset + 4 + pad_len <= max_len) {
             pkt[offset++] = 0x00; pkt[offset++] = 0x0C; // Option Code: 12 (Padding)
@@ -2379,7 +2405,8 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             size_t cl_val = 0;
             bool has_cl = false;
             for (size_t i = 0; i + 15 <= header_len; i++) {
-                if (strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
+                if ((i == 0 || http_buf[i - 1] == '\n') &&
+                    strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
                     cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
                     has_cl = true;
                     break;
@@ -2391,7 +2418,8 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
                 // Transfer-Encoding: chunked の判定
                 bool is_chunked = false;
                 for (size_t i = 0; i + 18 <= header_len; i++) {
-                    if (strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
+                    if ((i == 0 || http_buf[i - 1] == '\n') &&
+                        strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
                         for (size_t j = i + 18; j + 7 <= header_len; j++) {
                             if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
                             if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
@@ -2459,7 +2487,8 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     // Transfer-Encoding: chunked の判定
     bool is_chunked = false;
     for (size_t i = 0; i + 18 <= header_len; i++) {
-        if (strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
+        if ((i == 0 || http_buf[i - 1] == '\n') &&
+            strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
             for (size_t j = i + 18; j + 7 <= header_len; j++) {
                 if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
                 if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
@@ -2504,7 +2533,8 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     size_t cl_val = 0;
     bool found_cl = false;
     for (size_t i = 0; i + 15 <= header_len; i++) {
-        if (strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
+        if ((i == 0 || http_buf[i - 1] == '\n') &&
+            strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
             cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
             found_cl = true;
             break;
@@ -7047,8 +7077,8 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     for (const char *p = qname; *p; p++) {
         if (*p == '.') num_dots++;
     }
-    int req_ndots = (qo.ndots > 0) ? qo.ndots : 1;
-    if (qo.use_search_list && !is_absolute && num_dots < req_ndots) {
+    int req_ndots = (qo.ndots >= 0) ? qo.ndots : 1;
+    if (qo.use_search_list && !is_absolute && (num_dots < req_ndots || req_ndots == 0)) {
         if (qo.search_domain && *qo.search_domain) {
             snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, qo.search_domain);
             snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
