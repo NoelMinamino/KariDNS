@@ -480,6 +480,87 @@ PL_EOF
 
     kill -9 "$LOC_PID" 2>/dev/null || true
     LOC_PID=""
+
+# ==============================================================================
+# 8. Transport, Parser & CAA Escape Fixes (TYPE0, +showsearch, CAA, +tls-ca)
+# ==============================================================================
+    echo "=== 8. Testing TYPE0 rejection, +showsearch, CAA escape, and TLS-CA error ==="
+
+    run_check "TYPE0 is rejected as invalid/unknown query type" \
+        "$DAG @127.0.0.1 -p 10053 example.com TYPE0 +timeout=1" \
+        "(invalid|unknown|error|Usage)"
+
+    run_check "+showsearch flag is accepted and enables search list (+qr)" \
+        "$DAG @127.0.0.1 -p 10053 myhost A +domain=corp.example.com +showsearch +qr +timeout=1" \
+        "myhost\.corp\.example\.com"
+
+    PORT_TLS=$((27000 + $$ % 8000))
+    cat <<'PL_EOF' > "$TMP_DIR/mock_tcp.pl"
+use strict;
+use warnings;
+use Socket;
+
+my $port = $ARGV[0];
+socket(my $srv, PF_INET, SOCK_STREAM, getprotobyname("tcp")) or die "socket: $!";
+setsockopt($srv, SOL_SOCKET, SO_REUSEADDR, 1);
+bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
+listen($srv, 5) or die "listen: $!";
+
+while (my $client = accept(my $conn, $srv)) {
+    sleep 1;
+    close($conn);
+}
+PL_EOF
+
+    perl "$TMP_DIR/mock_tcp.pl" "$PORT_TLS" &
+    TLS_PID=$!
+    sleep 0.3
+
+    run_check "+tls-ca with non-existent file reports error" \
+        "$DAG @127.0.0.1 -p $PORT_TLS example.com A +tls +tls-ca=/tmp/nonexistent_ca_file.crt +timeout=1" \
+        "(could not load TLS CA file|Error)"
+
+    kill -9 "$TLS_PID" 2>/dev/null || true
+    TLS_PID=""
+
+    PORT_CAA=$((26000 + $$ % 8000))
+    cat <<'PL_EOF' > "$TMP_DIR/mock_caa.pl"
+use strict;
+use warnings;
+use Socket;
+
+my $port = $ARGV[0];
+socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname("udp")) or die "socket: $!";
+setsockopt($srv, SOL_SOCKET, SO_REUSEADDR, 1);
+bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
+
+while (1) {
+    my $client_addr = recv($srv, my $query, 4096, 0);
+    next unless $client_addr && length($query) >= 12;
+    my $qid = substr($query, 0, 2);
+
+    # CAA Answer: 0 issue "example.com; foo=\"bar\""
+    my $tag = "issue";
+    my $val = 'example.com; foo="bar"';
+    my $rdata = pack("C", 0) . pack("C", length($tag)) . $tag . $val;
+    my $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0);
+    $resp .= "\x07example\x03com\x00" . pack("nn", 257, 1);
+    $resp .= "\xc0\x0c" . pack("nnNn", 257, 1, 300, length($rdata)) . $rdata;
+
+    send($srv, $resp, 0, $client_addr);
+}
+PL_EOF
+
+    perl "$TMP_DIR/mock_caa.pl" "$PORT_CAA" &
+    CAA_PID=$!
+    sleep 0.3
+
+    run_check "CAA Value double quotes are properly escaped in output" \
+        "$DAG @127.0.0.1 -p $PORT_CAA example.com CAA +timeout=2" \
+        '0 issue "example\.com; foo=\\"bar\\""'
+
+    kill -9 "$CAA_PID" 2>/dev/null || true
+    CAA_PID=""
 fi
 
 # ==============================================================================
