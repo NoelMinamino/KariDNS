@@ -241,6 +241,16 @@ static inline int timespec_diff_ms(const struct timespec *start, const struct ti
     return (int)((end->tv_sec - start->tv_sec) * 1000 + (end->tv_nsec - start->tv_nsec) / 1000000);
 }
 
+static const char *dag_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (*needle == '\0') return haystack;
+    size_t needle_len = strlen(needle);
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, needle_len) == 0) return haystack;
+    }
+    return NULL;
+}
+
 /* ========================================================================
  * 2. EDE strings / basic helpers
  * ==================================================================== */
@@ -1015,8 +1025,8 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
             size_t tsig_alg_len = qo->tsig_key.algorithm ? strlen(qo->tsig_key.algorithm) + 2 : 15;
             size_t tsig_mac_len = 32; // HMAC-SHA256 (default)
             if (qo->tsig_key.algorithm) {
-                if (strcasestr(qo->tsig_key.algorithm, "sha512") || strcasestr(qo->tsig_key.algorithm, "sha384")) tsig_mac_len = 64;
-                else if (strcasestr(qo->tsig_key.algorithm, "md5") || strcasestr(qo->tsig_key.algorithm, "sha1")) tsig_mac_len = 20;
+                if (dag_strcasestr(qo->tsig_key.algorithm, "sha512") || dag_strcasestr(qo->tsig_key.algorithm, "sha384")) tsig_mac_len = 64;
+                else if (dag_strcasestr(qo->tsig_key.algorithm, "md5") || dag_strcasestr(qo->tsig_key.algorithm, "sha1")) tsig_mac_len = 20;
             }
             size_t tsig_estimated_len = tsig_keyname_len + 10 + tsig_alg_len + 6 + 2 + 2 + tsig_mac_len + 2 + 2 + 2;
             current_len += tsig_estimated_len;
