@@ -187,8 +187,43 @@ sub run_standalone_mode {
 }
 
 # ==============================================================================
+# ==============================================================================
 # Wire Format Parsing & Encoding Helpers
 # ==============================================================================
+sub sanitize_domain_name {
+    my ($name) = @_;
+    return 'anomaly.test' unless defined $name && length($name) > 0;
+
+    my $clean = lc($name);
+    # Remove leading/trailing dots and whitespace
+    $clean =~ s/^\s+//;
+    $clean =~ s/\s+$//;
+    $clean =~ s/^\.+//;
+    $clean =~ s/\.+$//;
+
+    # Replace dangerous characters (quotes `, ", ', shell metachars, control chars, spaces) with hyphen
+    $clean =~ s/[^a-z0-9_.-]/-/g;
+
+    # Normalize consecutive dots and hyphens
+    $clean =~ s/\.{2,}/\./g;
+    $clean =~ s/-{2,}/-/g;
+    $clean =~ s/^\.+//;
+    $clean =~ s/\.+$//;
+
+    # Enforce label length limits (RFC 1035: max 63 chars per label)
+    my @labels = split(/\./, $clean);
+    @labels = grep { length($_) > 0 } @labels;
+    for my $l (@labels) {
+        $l = substr($l, 0, 63) if length($l) > 63;
+    }
+    $clean = join('.', @labels);
+
+    # Enforce total FQDN length limit (RFC 1035: max 253 chars)
+    $clean = substr($clean, 0, 253) if length($clean) > 253;
+
+    return (length($clean) > 0) ? $clean : 'anomaly.test';
+}
+
 sub decode_qname {
     my ($pkt, $offset) = @_;
     my $name = '';
@@ -216,7 +251,9 @@ sub encode_name {
     return "\x00" if !defined $name || $name eq '.' || $name eq '';
     my $wire = '';
     for my $label (split /\./, $name) {
-        $wire .= pack('C', length($label)) . $label;
+        next if length($label) == 0;
+        my $l = substr($label, 0, 63); # RFC 1035 max 63 bytes
+        $wire .= pack('C', length($l)) . $l;
     }
     $wire .= "\x00";
     return $wire;
@@ -225,9 +262,10 @@ sub encode_name {
 sub encode_soa_rr {
     my ($zone_name, $ttl) = @_;
     $ttl //= 300;
-    my $name_wire = encode_name($zone_name);
-    my $mname_wire = encode_name("ns1." . $zone_name);
-    my $rname_wire = encode_name("hostmaster." . $zone_name);
+    my $safe_zone = sanitize_domain_name($zone_name);
+    my $name_wire = encode_name($safe_zone);
+    my $mname_wire = encode_name("ns1." . $safe_zone);
+    my $rname_wire = encode_name("hostmaster." . $safe_zone);
     my $soa_rdata = $mname_wire . $rname_wire . pack('NNNNN', 2026083101, 3600, 900, 604800, $ttl);
     return $name_wire . pack('nnNn', 6, 1, $ttl, length($soa_rdata)) . $soa_rdata;
 }
@@ -236,6 +274,10 @@ sub encode_txt_rr {
     my ($name, $text, $ttl) = @_;
     $ttl //= 300;
     my $name_wire = encode_name($name);
+    
+    # Sanitize text to printable ASCII to prevent escape injection or terminal corruption
+    $text =~ s/[^\x20-\x7E]/ /g;
+
     my $rdata = '';
     # Split text into 255-byte chunks as per RFC 1035 §3.3.14
     for (my $i = 0; $i < length($text); $i += 255) {
@@ -325,7 +367,7 @@ sub process_query_packet {
     # AXFR (QTYPE=252) or Apex Help/TXT Query: Return Dynamic Usage Guide
     # --------------------------------------------------------------------------
     if ($qtype == 252 || $scenario eq 'help' || $qtype == 16) {
-        my $display_zone = $zone_apex;
+        my $display_zone = sanitize_domain_name($zone_apex);
         my @help_lines = (
             "=== KariDNS Anomalous DNS Packet Test Server ===",
             "Usage: dag @<server> -p <port> <scenario>.$display_zone <type>",
