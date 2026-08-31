@@ -785,8 +785,8 @@ static bool parse_proxy_arg(const char *arg, query_opts_t *qo) {
     buf[sizeof(buf) - 1] = '\0';
     char *dash = strchr(buf, '-');
     if (!dash) {
-        qo->proxy_use_local_cmd = true;
-        return true;
+        fprintf(stderr, "Invalid +proxy format '%s': expected src_addr[#src_port]-dst_addr[#dst_port]\n", arg);
+        return false;
     }
     *dash = '\0';
     char *src_part = buf;
@@ -820,8 +820,8 @@ static bool parse_proxy_arg(const char *arg, query_opts_t *qo) {
         snprintf(qo->proxy_dst_addr, sizeof(qo->proxy_dst_addr), "%.63s", dst_part);
         return true;
     }
-    qo->proxy_use_local_cmd = true;
-    return true;
+    fprintf(stderr, "Invalid +proxy address format '%s': IP address parse failed\n", arg);
+    return false;
 }
 
 static size_t build_proxyv2_header(uint8_t *buf, size_t buf_cap, const query_opts_t *qo, bool is_tcp) {
@@ -2412,61 +2412,59 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             size_t body_offset = header_len + 4;
             size_t current_body_len = http_len - body_offset;
             
-            size_t cl_val = 0;
-            bool has_cl = false;
-            for (size_t i = 0; i + 15 <= header_len; i++) {
+            // RFC 7230 §3.3.3: Transfer-Encoding takes precedence over Content-Length
+            bool is_chunked = false;
+            for (size_t i = 0; i + 18 <= header_len; i++) {
                 if ((i == 0 || http_buf[i - 1] == '\n') &&
-                    strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
-                    cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
-                    has_cl = true;
+                    strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
+                    for (size_t j = i + 18; j + 7 <= header_len; j++) {
+                        if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
+                        if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
+                            is_chunked = true;
+                            break;
+                        }
+                    }
                     break;
                 }
             }
-            if (has_cl && current_body_len >= cl_val) break;
 
-            if (!has_cl) {
-                // Transfer-Encoding: chunked の判定
-                bool is_chunked = false;
-                for (size_t i = 0; i + 18 <= header_len; i++) {
-                    if ((i == 0 || http_buf[i - 1] == '\n') &&
-                        strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
-                        for (size_t j = i + 18; j + 7 <= header_len; j++) {
-                            if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
-                            if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
-                                is_chunked = true;
-                                break;
-                            }
+            if (is_chunked) {
+                size_t src = body_offset;
+                bool chunk_complete = false;
+                while (src < http_len) {
+                    char *line_end = strstr((char *)http_buf + src, "\r\n");
+                    if (!line_end) break;
+                    long chunk_sz = strtol((char *)http_buf + src, NULL, 16);
+                    if (chunk_sz < 0) break;
+                    if (chunk_sz == 0) {
+                        if (strstr((char *)http_buf + src, "\r\n\r\n")) {
+                            chunk_complete = true;
                         }
                         break;
                     }
-                }
-
-                if (is_chunked) {
-                    size_t src = body_offset;
-                    bool chunk_complete = false;
-                    while (src < http_len) {
-                        char *line_end = strstr((char *)http_buf + src, "\r\n");
-                        if (!line_end) break;
-                        long chunk_sz = strtol((char *)http_buf + src, NULL, 16);
-                        if (chunk_sz < 0) break;
-                        if (chunk_sz == 0) {
-                            if (strstr((char *)http_buf + src, "\r\n\r\n")) {
-                                chunk_complete = true;
-                            }
-                            break;
-                        }
-                        size_t chunk_data_start = (size_t)(line_end - (char *)http_buf) + 2;
-                        size_t chunk_data_end = chunk_data_start + (size_t)chunk_sz;
-                        if (chunk_data_end + 2 > http_len) {
-                            break;
-                        }
-                        src = chunk_data_end;
-                        if (src + 2 <= http_len && http_buf[src] == '\r' && http_buf[src+1] == '\n') {
-                            src += 2;
-                        }
+                    size_t chunk_data_start = (size_t)(line_end - (char *)http_buf) + 2;
+                    size_t chunk_data_end = chunk_data_start + (size_t)chunk_sz;
+                    if (chunk_data_end + 2 > http_len) {
+                        break;
                     }
-                    if (chunk_complete) break;
+                    src = chunk_data_end;
+                    if (src + 2 <= http_len && http_buf[src] == '\r' && http_buf[src+1] == '\n') {
+                        src += 2;
+                    }
                 }
+                if (chunk_complete) break;
+            } else {
+                size_t cl_val = 0;
+                bool has_cl = false;
+                for (size_t i = 0; i + 15 <= header_len; i++) {
+                    if ((i == 0 || http_buf[i - 1] == '\n') &&
+                        strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
+                        cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
+                        has_cl = true;
+                        break;
+                    }
+                }
+                if (has_cl && current_body_len >= cl_val) break;
             }
         }
     }
@@ -3565,6 +3563,26 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             break;
         }
+        case 66: { // DSYNC (RFC 9859)
+            if (rdlen >= 5) {
+                uint16_t target_type = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+                uint8_t scheme = pkt[abs_offset + 2];
+                uint16_t port = (pkt[abs_offset + 3] << 8) | pkt[abs_offset + 4];
+                char *target = NULL; size_t next;
+                if (expand_wire_name(pkt, pkt_len, abs_offset + 5, &next, &g_dag_arena, &target) == 0 &&
+                    next <= abs_offset + rdlen) {
+                    char tbuf[32];
+                    const char *tname = format_type_name(target_type, tbuf, sizeof(tbuf));
+                    if (scheme == 1) {
+                        rdata_buf_append(out, out_cap, &pos, "%s NOTIFY %u %s", tname, port, target);
+                    } else {
+                        rdata_buf_append(out, out_cap, &pos, "%s %u %u %s", tname, scheme, port, target);
+                    }
+                    return;
+                }
+            }
+            break;
+        }
         case 33: { // SRV
             if (rdlen < 7) { rdata_buf_append(out, out_cap, &pos, "(malformed SRV)"); return; }
             uint16_t prio = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
@@ -4217,6 +4235,23 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             size_t target_len = next - abs_offset - 2;
             printf("%u %s", priority, (target[0] == '\0') ? "." : target);
             print_svcparams(&pkt[abs_offset], 2 + target_len, rdlen);
+            break;
+        }
+        case 66: { // DSYNC (RFC 9859)
+            if (rdlen < 5) goto fallback;
+            uint16_t target_type = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+            uint8_t scheme = pkt[abs_offset + 2];
+            uint16_t port = (pkt[abs_offset + 3] << 8) | pkt[abs_offset + 4];
+            char *target = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 5, &next, &g_dag_arena, &target) != 0 ||
+                next > abs_offset + rdlen) goto fallback;
+            char tbuf[32];
+            const char *tname = format_type_name(target_type, tbuf, sizeof(tbuf));
+            if (scheme == 1) {
+                printf("%s NOTIFY %u %s", tname, port, target);
+            } else {
+                printf("%s %u %u %s", tname, scheme, port, target);
+            }
             break;
         }
         case 108: { // EUI48
@@ -8028,13 +8063,21 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+nodns64prefix") == 0) {
             spec->qo.check_dns64prefix = false;
         } else if (strncmp(arg, "+proxy=", 7) == 0) {
-            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false; parse_proxy_arg(arg + 7, &spec->qo);
+            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false;
+            if (!parse_proxy_arg(arg + 7, &spec->qo)) {
+                fprintf(stderr, "dag: invalid proxy specification '%s'\n", arg + 7);
+                exit(1);
+            }
         } else if (strcmp(arg, "+proxy") == 0) {
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
         } else if (strcmp(arg, "+noproxy") == 0) {
             spec->qo.use_proxy = false;
         } else if (strncmp(arg, "+proxy-plain=", 13) == 0) {
-            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false; parse_proxy_arg(arg + 13, &spec->qo);
+            spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false;
+            if (!parse_proxy_arg(arg + 13, &spec->qo)) {
+                fprintf(stderr, "dag: invalid proxy specification '%s'\n", arg + 13);
+                exit(1);
+            }
         } else if (strcmp(arg, "+proxy-plain") == 0) {
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
         } else if (strcmp(arg, "+noproxy-plain") == 0) {

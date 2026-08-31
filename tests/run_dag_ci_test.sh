@@ -142,6 +142,8 @@ run_check "LOC query" "$DAG @127.0.0.1 -p $PORT example.com LOC" "35 10.*N 136 5
 run_check "LOC query (+yaml)" "$DAG @127.0.0.1 -p $PORT example.com LOC +yaml" "35 10.*N 136 58.*E"
 run_check "LOC query external (where-is-the-iss.dedyn.io)" "$DAG where-is-the-iss.dedyn.io LOC +timeout=2" "(LOC|timed out|no usable response|no servers could be reached)"
 run_check "LOC query external (+yaml)" "$DAG where-is-the-iss.dedyn.io LOC +yaml +timeout=2" "(IN[[:space:]]+LOC|LOC|timed out|no usable response|no servers could be reached)"
+run_check "DSYNC query" "$DAG @127.0.0.1 -p $PORT _dsync.example.com DSYNC" "A[[:space:]]+NOTIFY[[:space:]]+53[[:space:]]+ns1\.example\.com"
+run_check "DSYNC query (+yaml)" "$DAG @127.0.0.1 -p $PORT _dsync.example.com DSYNC +yaml" "A[[:space:]]+NOTIFY[[:space:]]+53[[:space:]]+ns1\.example\.com"
 run_check "ANY query" "$DAG @127.0.0.1 -p $PORT example.com ANY" "(SOA|NS|MX|TXT)"
 run_check "DNSSEC DS query" "$DAG @127.0.0.1 -p $PORT example.com DS +dnssec" "(status: NOERROR|SOA|DS)"
 run_check "IPv4 preference flag (-4)" "$DAG @127.0.0.1 -p $PORT www.example.com A -4" "192.0.2.10"
@@ -247,6 +249,10 @@ run_check "Search list not expanded when ndots exceeded (+ndots=1)" "$DAG @127.0
 run_check "Showsearch diagnostic (+showsearch)" "$DAG @127.0.0.1 -p $PORT www +domain=example.com +showsearch" "192\.0\.2\.10"
 run_check "DNS64 prefix check (+dns64prefix)" "$DAG @127.0.0.1 -p $PORT ipv4only.arpa AAAA +dns64prefix +qr" ";ipv4only\.arpa\..*IN.*AAAA"
 run_check "PROXYv2 local header (+proxy)" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy +timeout=1" "(192\.0\.2\.10|timed out|no usable response|no servers could be reached)"
+if [ "$DAG" != "dig" ]; then
+    run_exit_check "Invalid +proxy format returns non-zero" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy=invalid-format" 1
+    run_check "PROXYv2 custom spec (+proxy=src-dst)" "$DAG @127.0.0.1 -p $PORT www.example.com A +proxy=192.0.2.1#1234-192.0.2.2#53 +timeout=1" "(192\.0\.2\.10|timed out|no usable response|no servers could be reached)"
+fi
 run_check "Plain HTTP query (+http-plain)" "$DAG @127.0.0.1 -p $PORT www.example.com A +http-plain +timeout=1" "(192\.0\.2\.10|timed out|connection failed|no usable response|no servers could be reached)"
 
 echo "========================================================"

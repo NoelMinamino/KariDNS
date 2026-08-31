@@ -267,3 +267,6 @@ relay.example.com.   3600  IN  ISDN  "150862028003217"
 ; サブアドレス（004）あり
 pbx.example.com.     3600  IN  ISDN  "150862028003217" "004"
 route1.example.com.  3600  IN  X25   "311061700956"
+
+; DSYNC (Type 66, RFC 9859)
+_dsync.example.com.  3600  IN  DSYNC A NOTIFY 53 ns1.example.com.
