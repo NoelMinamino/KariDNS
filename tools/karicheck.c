@@ -945,9 +945,45 @@ static int check_config(const char *config_path, server_config_t *cfg) {
         if (z->type && strcasecmp(z->type, "program") == 0) {
             program_zone_count++;
             if (z->program_path) {
+                if (cfg->user && !z->program_user) {
+                    fprintf(stderr,
+                        "[ERROR] Zone '%s': 'options.user' is set but this program zone has no "
+                        "'program-user'. Without it, the plugin process would run as root. "
+                        "Set 'program-user' explicitly for this zone.\n", z->domain);
+                    free(buf);
+                    return 1;
+                }
+                if (z->program_path[0] != '/') {
+                    fprintf(stderr,
+                        "[ERROR] Zone '%s': 'program' must be an absolute path (got '%s'). "
+                        "A relative name would be resolved via $PATH at runtime, which is "
+                        "not deterministic for a network-facing daemon.\n",
+                        z->domain, z->program_path);
+                    free(buf);
+                    return 1;
+                }
                 if (access(z->program_path, X_OK) != 0) {
                     fprintf(stderr, "[WARNING] Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
                             z->domain, z->program_path, strerror(errno));
+                }
+                if (z->program_user && cfg->user &&
+                    strcasecmp(z->program_user, cfg->user) != 0) {
+                    fprintf(stderr,
+                        "[WARNING] Zone '%s': program-user '%s' differs from options.user '%s'. "
+                        "This only works if karidns itself starts as root (no prior privilege drop); "
+                        "if karidns is started as a non-root user, this zone's plugin will fail to "
+                        "start (setuid to a different non-root user is not permitted by the OS) and "
+                        "will silently never answer queries.\n",
+                        z->domain, z->program_user, cfg->user);
+                }
+                if (z->program_args_count > 62) {
+                    fprintf(stderr,
+                        "[ERROR] Zone '%s': program-args has %d entries, but only 62 are "
+                        "supported (argv[] is fixed-size in spawn_one_program_plugin()). "
+                        "Reduce the argument count.\n",
+                        z->domain, z->program_args_count);
+                    free(buf);
+                    return 1;
                 }
             } else {
                 fprintf(stderr, "[ERROR] Zone '%s' has type 'program' but no 'program' path specified\n", z->domain);

@@ -32,8 +32,10 @@ trap cleanup EXIT INT TERM
 PORT=$((28000 + $$ % 5000))
 FAILED=0
 USER_OPT=""
+PROG_USER_OPT=""
 if [ "$(id -u)" = "0" ]; then
     USER_OPT="user \"nobody\"; group \"nobody\";"
+    PROG_USER_OPT="program-user \"nobody\";"
 fi
 
 run_check() {
@@ -73,13 +75,14 @@ cat << EOF > "$TMP_DIR/with_opt.conf"
 options {
     port $PORT;
     bind-address { 127.0.0.1; };
-    user "named";
+    user "nobody";
     allow-program-zones yes;
 };
 
 zone "brokentest.example." {
     type program;
     program "$PLUGIN_SCRIPT";
+    program-user "nobody";
     program-args { };
     program-timeout 2000;
     program-max-failures 5;
@@ -104,6 +107,7 @@ options {
 zone "brokentest.example." {
     type program;
     program "$PLUGIN_SCRIPT";
+    $PROG_USER_OPT
     program-timeout 2000;
     program-max-failures 5;
 };
