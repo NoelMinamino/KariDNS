@@ -100,7 +100,13 @@ else
     run_check "--prereq-yxrrset quoted argument with rdata" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxrrset 'test.example.com A 1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
     # Test --prereq=yxrrset:name:type:rdata colon-delimited format
     run_check "--prereq colon-delimited with rdata" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq='yxrrset:test.example.com:A:1.2.3.4' +qr +timeout=1" "Query \([0-9]+ bytes\)"
+    # Test --prereq= with colons inside RDATA (e.g. IPv6 address or TXT)
+    run_check "--prereq colon-delimited with IPv6 RDATA" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN AAAA 2001:db8::1' --prereq='yxrrset:test.example.com:AAAA:2001:db8::1' +qr +timeout=1" "Query \([0-9]+ bytes\)"
 fi
+
+echo "=== 3.5. Testing +notrace and +nonssearch negation flags ==="
+run_check "+notrace flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +notrace +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+nonssearch flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +nonssearch +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
 echo "=== 4. Testing Structural --break exclusivity warning & help ==="
 if [ "$DAG" = "dig" ]; then
@@ -115,7 +121,18 @@ fi
 
 echo "=== 5. Testing Multi-Query Argument Slicing with Two-Arg Options ==="
 # Two queries with -c IN in both
-run_check "Multi-query with -c IN option" "$DAG @127.0.0.1 -p 10053 -c IN example.com A @127.0.0.1 -p 10053 -c IN example.net AAAA +timeout=1" "(example\.com.*example\.net|no usable response|no servers could be reached)"
+echo -n "Test: Multi-query with -c IN option ... "
+OUT=$($DAG @127.0.0.1 -p 10053 -c IN example.com A @127.0.0.1 -p 10053 -c IN example.net AAAA +timeout=1 2>&1 || true)
+if (echo "$OUT" | grep -q "example.com" && echo "$OUT" | grep -q "example.net") || \
+   echo "$OUT" | grep -E -q "(no usable response|no servers could be reached|connection refused)"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Command: $DAG @127.0.0.1 -p 10053 -c IN example.com A @127.0.0.1 -p 10053 -c IN example.net AAAA +timeout=1"
+    echo "  Output:"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
 
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then

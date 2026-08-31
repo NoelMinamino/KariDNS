@@ -1901,7 +1901,10 @@ static ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
     ssize_t n = recv(sock, rlen_buf, 2, MSG_WAITALL);
     if (n < 2) return -1;
     uint16_t rlen = (rlen_buf[0] << 8) | rlen_buf[1];
-    if (rlen > resp_cap) rlen = (uint16_t)resp_cap;
+    if (rlen > resp_cap) {
+        // バッファ超過時はTCPストリームの同期崩れを防ぐため直ちに切断する
+        return -1;
+    }
 
     size_t got = 0;
     while (got < rlen) {
@@ -2256,6 +2259,23 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
         else r = (int)recv(sock, http_buf + http_len, sizeof(http_buf) - http_len, 0);
         if (r <= 0) break;
         http_len += r;
+
+        // Content-Lengthを動的にチェックしてループを抜ける
+        uint8_t *hdr_end = memmem(http_buf, http_len, "\r\n\r\n", 4);
+        if (hdr_end) {
+            size_t header_len = hdr_end - http_buf;
+            size_t body_offset = header_len + 4;
+            size_t current_body_len = http_len - body_offset;
+            
+            size_t cl_val = 0;
+            for (size_t i = 0; i + 15 <= header_len; i++) {
+                if (strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
+                    cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
+                    break;
+                }
+            }
+            if (cl_val > 0 && current_body_len >= cl_val) break;
+        }
     }
 
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
@@ -2879,7 +2899,7 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
         }
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0 && next <= abs_offset + rdlen) {
                 rdata_buf_append(out, out_cap, &pos, "%s", name);
             } else {
                 rdata_buf_append(out, out_cap, &pos, "(unparsable name)");
@@ -2890,7 +2910,7 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             if (rdlen < 3) { rdata_buf_append(out, out_cap, &pos, "(malformed MX)"); return; }
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 && next <= abs_offset + rdlen) {
                 rdata_buf_append(out, out_cap, &pos, "%u %s", pref, name);
             } else {
                 rdata_buf_append(out, out_cap, &pos, "%u (unparsable name)", pref);
@@ -2900,12 +2920,13 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
         case 6: { // SOA
             char *mname = NULL, *rname = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mname) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &rname) != 0) {
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &rname) != 0 ||
+                next > abs_offset + rdlen) { // RDATA境界外読み取り防止
                 rdata_buf_append(out, out_cap, &pos, "(unparsable SOA)");
                 return;
             }
             size_t nums_off = next;
-            if (nums_off + 20 > pkt_len) {
+            if (nums_off + 20 > pkt_len || nums_off + 20 > abs_offset + rdlen) {
                 rdata_buf_append(out, out_cap, &pos, "(truncated SOA)");
                 return;
             }
@@ -2941,7 +2962,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             if (type == 17) { // RP
                 char *mbox = NULL, *txt = NULL; size_t next;
                 if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) == 0 &&
-                    expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) == 0) {
+                    expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) == 0 &&
+                    next <= abs_offset + rdlen) {
                     rdata_buf_append(out, out_cap, &pos, "%s %s", mbox, txt);
                     return;
                 }
@@ -2949,7 +2971,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                 if (rdlen >= 2) {
                     uint16_t sub = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
                     char *name = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0) {
+                    if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
+                        next <= abs_offset + rdlen) {
                         rdata_buf_append(out, out_cap, &pos, "%u %s", sub, name);
                         return;
                     }
@@ -2988,7 +3011,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             if (rdlen >= 2) {
                 uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
                 char *name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0) {
+                if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 &&
+                    next <= abs_offset + rdlen) {
                     rdata_buf_append(out, out_cap, &pos, "%u %s", pref, name);
                     return;
                 }
@@ -3080,7 +3104,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                     }
                 } else if (gw_type == 3) {
                     char *gw = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0) {
+                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0 &&
+                        next <= abs_offset + rdlen) {
                         snprintf(gw_buf, sizeof(gw_buf), "%s", gw);
                         p = &pkt[next];
                     }
@@ -3193,7 +3218,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             uint16_t weight = (pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
             uint16_t port = (pkt[abs_offset+4]<<8)|pkt[abs_offset+5];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0 &&
+                next <= abs_offset + rdlen) {
                 rdata_buf_append(out, out_cap, &pos, "%u %u %u %s", prio, weight, port, name);
             } else {
                 rdata_buf_append(out, out_cap, &pos, "%u %u %u (unparsable name)", prio, weight, port);
@@ -3212,7 +3238,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                 if (p) p = read_char_string(p, end, regexp, sizeof(regexp));
                 if (p) {
                     char *repl = NULL; size_t next;
-                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) == 0) {
+                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) == 0 &&
+                        next <= abs_offset + rdlen) {
                         rdata_buf_append(out, out_cap, &pos, "%u %u \"%s\" \"%s\" \"%s\" %s", order, pref, flags, svcs, regexp, repl);
                         return;
                     }
@@ -3239,7 +3266,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             uint32_t sig_inception = ((uint32_t)pkt[abs_offset+12]<<24)|((uint32_t)pkt[abs_offset+13]<<16)|((uint32_t)pkt[abs_offset+14]<<8)|pkt[abs_offset+15];
             uint16_t key_tag = (pkt[abs_offset+16]<<8)|pkt[abs_offset+17];
             char *signer_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer_name) == 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer_name) == 0 &&
+                next <= abs_offset + rdlen) {
                 char exp_str[32], inc_str[32], tname_buf[32];
                 format_rrsig_time(sig_expiration, exp_str, sizeof(exp_str));
                 format_rrsig_time(sig_inception, inc_str, sizeof(inc_str));
@@ -3284,7 +3312,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
         }
         case 47: { // NSEC
             char *next_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) == 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) == 0 &&
+                next <= abs_offset + rdlen) {
                 size_t name_consumed = next - abs_offset;
                 if (name_consumed < rdlen) {
                     char types_buf[512];
@@ -3348,7 +3377,8 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
         }
         case 250: { // TSIG
             char *alg_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) == 0) {
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) == 0 &&
+                next <= abs_offset + rdlen) {
                 size_t tpos = next - abs_offset;
                 if (tpos + 10 <= rdlen) {
                     uint64_t time_signed = ((uint64_t)pkt[abs_offset+tpos] << 40) | ((uint64_t)pkt[abs_offset+tpos+1] << 32) |
@@ -3480,7 +3510,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             break;
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS / CNAME / PTR / DNAME
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0) printf("%s", name);
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &name) == 0 && next <= abs_offset + rdlen) printf("%s", name);
             else printf("(unparsable name)");
             break;
         }
@@ -3488,7 +3518,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 3) { printf("(malformed MX)"); break; }
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0)
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) == 0 && next <= abs_offset + rdlen)
                 printf("%u %s", pref, name);
             else printf("%u (unparsable name)", pref);
             break;
@@ -3497,9 +3527,9 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             char *mname = NULL, *rname = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mname) != 0) { printf("(unparsable SOA)"); break; }
             size_t after_mname = next;
-            if (expand_wire_name(pkt, pkt_len, after_mname, &next, &g_dag_arena, &rname) != 0) { printf("(unparsable SOA)"); break; }
+            if (expand_wire_name(pkt, pkt_len, after_mname, &next, &g_dag_arena, &rname) != 0 || next > abs_offset + rdlen) { printf("(unparsable SOA)"); break; }
             size_t nums_off = next;
-            if (nums_off + 20 > pkt_len) { printf("(truncated SOA)"); break; }
+            if (nums_off + 20 > pkt_len || nums_off + 20 > abs_offset + rdlen) { printf("(truncated SOA)"); break; }
             uint32_t serial  = ((uint32_t)pkt[nums_off]<<24)|((uint32_t)pkt[nums_off+1]<<16)|((uint32_t)pkt[nums_off+2]<<8)|pkt[nums_off+3];
             uint32_t refresh = ((uint32_t)pkt[nums_off+4]<<24)|((uint32_t)pkt[nums_off+5]<<16)|((uint32_t)pkt[nums_off+6]<<8)|pkt[nums_off+7];
             uint32_t retry   = ((uint32_t)pkt[nums_off+8]<<24)|((uint32_t)pkt[nums_off+9]<<16)|((uint32_t)pkt[nums_off+10]<<8)|pkt[nums_off+11];
@@ -3529,7 +3559,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t weight = (pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
             uint16_t port = (pkt[abs_offset+4]<<8)|pkt[abs_offset+5];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0)
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 6, &next, &g_dag_arena, &name) == 0 && next <= abs_offset + rdlen)
                 printf("%u %u %u %s", prio, weight, port, name);
             else printf("%u %u %u (unparsable name)", prio, weight, port);
             break;
@@ -3557,7 +3587,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         case 17: { // RP
             char *mbox = NULL, *txt = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) != 0) {
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &txt) != 0 ||
+                next > abs_offset + rdlen) {
                 goto fallback;
             }
             printf("%s %s", mbox, txt);
@@ -3567,7 +3598,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 3) goto fallback;
             uint16_t subtype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *hostname = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &hostname) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &hostname) != 0 ||
+                next > abs_offset + rdlen) goto fallback;
             printf("%u %s", subtype, hostname);
             break;
         }
@@ -3588,7 +3620,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *map822 = NULL, *mapx400 = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &map822) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &mapx400) != 0) {
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &mapx400) != 0 ||
+                next > abs_offset + rdlen) {
                 goto fallback;
             }
             printf("%u %s %s", pref, map822, mapx400);
@@ -3622,7 +3655,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             p = read_char_string(p, end, svcs, sizeof(svcs)); if (!p) goto fallback;
             p = read_char_string(p, end, regexp, sizeof(regexp)); if (!p) goto fallback;
             char *repl = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) != 0 ||
+                next > abs_offset + rdlen) goto fallback;
             printf("%u %u \"%s\" \"%s\" \"%s\" %s", order, pref, flags, svcs, regexp, repl);
             break;
         }
@@ -3630,7 +3664,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (rdlen < 2) goto fallback;
             uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
             char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &name) != 0 ||
+                next > abs_offset + rdlen) goto fallback;
             printf("%u %s", pref, name);
             break;
         }
@@ -3730,7 +3765,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 p += 16;
             } else if (gw_type == 3) {
                 char *gw = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0) goto fallback;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0 ||
+                    next > abs_offset + rdlen) goto fallback;
                 snprintf(gw_buf, sizeof(gw_buf), "%s", gw);
                 p = &pkt[next];
             } else goto fallback;
@@ -3877,7 +3913,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                 printf("%s", buf);
             } else if (relay_type == 3) {
                 char *gw = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0) goto fallback;
+                if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) != 0 ||
+                    next > abs_offset + rdlen) goto fallback;
                 printf("%s", gw);
             } else goto fallback;
             break;
@@ -3894,7 +3931,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             uint16_t key_tag = (pkt[abs_offset+16]<<8)|pkt[abs_offset+17];
 
             char *signer_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer_name) != 0 ||
+                next > abs_offset + rdlen) goto fallback;
             size_t sig_offset_in_rdata = (next - abs_offset);
             if (sig_offset_in_rdata >= rdlen) goto fallback;
 
@@ -3929,7 +3967,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 47: { // NSEC
             char *next_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &next_name) != 0 ||
+                next > abs_offset + rdlen) goto fallback;
             size_t name_consumed = next - abs_offset;
             if (name_consumed >= rdlen) goto fallback;
             char types_buf[512];
@@ -3960,7 +3999,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         }
         case 250: { // TSIG
             char *alg_name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) != 0) goto fallback;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &alg_name) != 0 ||
+                next > abs_offset + rdlen) goto fallback;
             size_t pos = next - abs_offset;
             if (pos + 10 > rdlen) goto fallback;
 
@@ -4016,7 +4056,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             size_t rp = 0;
             while (pos < rdlen) {
                 char *rvs_name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0) break;
+                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0 ||
+                    next > abs_offset + rdlen) break;
                 rp += snprintf(rvs_names + rp, sizeof(rvs_names) - rp, "\n\t\t\t\t\t%s", rvs_name);
                 pos = next - abs_offset;
             }
@@ -4050,7 +4091,8 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         case 14: { // MINFO
             char *rmailbx = NULL, *emailbx = NULL; size_t next;
             if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &rmailbx) != 0 ||
-                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &emailbx) != 0) {
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &emailbx) != 0 ||
+                next > abs_offset + rdlen) {
                 goto fallback;
             }
             printf("%s %s", rmailbx, emailbx);
@@ -7111,6 +7153,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     if (strcmp(arg, "-y") == 0 && i + 1 < argc) {
         char *tsig_str = strdup(argv[i + 1]);
         parse_tsig_str(tsig_str, &spec->qo);
+        free(tsig_str);
         return 2;
     }
     if (strcmp(arg, "-k") == 0 && i + 1 < argc) {
@@ -7155,7 +7198,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             char *kind_str = strtok(spec_str, ":");
             char *name = strtok(NULL, ":");
             char *type_str = strtok(NULL, ":");
-            char *rdata = strtok(NULL, ":");
+            char *rdata = strtok(NULL, "");
             prereq_kind_t kind = PREREQ_NXDOMAIN;
             bool needs_type = false;
             if (kind_str && strcasecmp(kind_str, "nxdomain") == 0) kind = PREREQ_NXDOMAIN;
@@ -7348,8 +7391,12 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->dopt.yaml = false;
         } else if (strcmp(arg, "+trace") == 0) {
             spec->do_trace = true;
+        } else if (strcmp(arg, "+notrace") == 0) {
+            spec->do_trace = false;
         } else if (strcmp(arg, "+nssearch") == 0) {
             spec->do_nssearch = true;
+        } else if (strcmp(arg, "+nonssearch") == 0) {
+            spec->do_nssearch = false;
         } else if (strcmp(arg, "+search") == 0 || strcmp(arg, "+defname") == 0) {
             spec->qo.use_search_list = true;
         } else if (strcmp(arg, "+nosearch") == 0 || strcmp(arg, "+nodefname") == 0) {
@@ -7690,6 +7737,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strncmp(arg, "+tsig=", 6) == 0) {
             char *tsig_str = strdup(arg + 6);
             parse_tsig_str(tsig_str, &spec->qo);
+            free(tsig_str);
         } else if (strcmp(arg, "--test-all") == 0) {
             spec->test_all = true;
         } else {
