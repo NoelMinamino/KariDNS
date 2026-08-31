@@ -2220,13 +2220,14 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             return -1;
         }
         base64url_encode(pkt, pkt_len, b64_dns, sizeof(b64_dns));
+        const char *separator = strchr(path, '?') ? "&" : "?";
         req_hdr_len = snprintf(req_hdr, sizeof(req_hdr),
-            "GET %s?dns=%s HTTP/1.1\r\n"
+            "GET %s%sdns=%s HTTP/1.1\r\n"
             "Host: %s\r\n"
             "Accept: application/dns-message\r\n"
             "User-Agent: KariDNS-dag/1.0\r\n"
             "Connection: close\r\n\r\n",
-            path, b64_dns, server);
+            path, separator, b64_dns, server);
     } else {
         req_hdr_len = snprintf(req_hdr, sizeof(req_hdr),
             "POST %s HTTP/1.1\r\n"
@@ -7713,7 +7714,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             }
         } else if (strncmp(arg, "+subnet=", 8) == 0) {
             if (parse_subnet_arg(arg + 8, &spec->qo)) { spec->qo.want_opt = true; spec->qo.want_subnet = true; }
-        } else if (strncmp(arg, "+cookie", 7) == 0) {
+        } else if (strcmp(arg, "+cookie") == 0 || strncmp(arg, "+cookie=", 8) == 0) {
             spec->qo.want_opt = true; spec->qo.want_cookie = true;
             if (arg[7] == '=') {
                 const char *hex = arg + 8;

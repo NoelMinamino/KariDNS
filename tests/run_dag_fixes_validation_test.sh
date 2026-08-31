@@ -121,6 +121,20 @@ else
         "(TSIG|testkey|1646972129|ADDITIONAL)"
 fi
 
+run_check "+cookie flag accepted" \
+    "$DAG @127.0.0.1 -p 10053 example.com A +cookie +timeout=1" \
+    "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
+run_check "+cookie=HEX flag accepted" \
+    "$DAG @127.0.0.1 -p 10053 example.com A +cookie=0102030405060708 +timeout=1" \
+    "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
+if [ "$DAG" != "dig" ]; then
+    run_check "+cookies typo flag rejected as invalid option" \
+        "$DAG @127.0.0.1 -p 10053 example.com A +cookies +timeout=1" \
+        "Invalid option: \+cookies"
+fi
+
 # ==============================================================================
 # 2. Dynamic DNS Prerequisites (--prereq= with Colons in RDATA)
 # ==============================================================================
@@ -187,10 +201,24 @@ PL_EOF
     TCP_PID=""
 
 # ==============================================================================
-# 4. DoH Early Termination via Content-Length Header
+# 4. DoH (DNS-over-HTTPS) & Content-Length Handling
 # ==============================================================================
-    echo "=== 4. Testing Plain HTTP / DoH Content-Length Early Return ==="
+    echo "=== 4. Testing DoH (DNS-over-HTTPS) with Public DNS & Local Mock ==="
 
+    echo "--- 4-1. Public DoH Server Queries (@8.8.8.8 / @1.1.1.1) ---"
+    run_check "DoH standard query (+https) against @8.8.8.8" \
+        "$DAG @8.8.8.8 example.com A +https +timeout=5" \
+        "(NOERROR|status: NOERROR|timed out|no servers could be reached|connection refused)"
+
+    run_check "DoH GET method query (+https-get) against @8.8.8.8" \
+        "$DAG @8.8.8.8 example.com A +https-get +timeout=5" \
+        "(NOERROR|status: NOERROR|timed out|no servers could be reached|connection refused)"
+
+    run_check "DoH POST method query (+https-post) against @8.8.8.8" \
+        "$DAG @8.8.8.8 example.com A +https-post +timeout=5" \
+        "(NOERROR|status: NOERROR|timed out|no servers could be reached|connection refused)"
+
+    echo "--- 4-2. Local Mock HTTP Server (Content-Length & URI Building) ---"
     PORT_DOH=$((22000 + $$ % 8000))
     cat <<'PL_EOF' > "$TMP_DIR/mock_doh_server.pl"
 use strict;
@@ -208,6 +236,20 @@ while (my $paddr = accept(my $client, $srv)) {
     while (sysread($client, my $buf, 4096)) {
         $req .= $buf;
         last if $req =~ /\r\n\r\n/;
+    }
+
+    if (my $req_line = (split(/\r\n/, $req))[0]) {
+        # If request path contains existing query params (e.g. /dns-query?foo=bar), verify &dns= is used
+        if ($req_line =~ /GET \/dns-query\?foo=bar([?&])dns=/) {
+            my $sep = $1;
+            if ($sep ne '&') {
+                # Protocol error: duplicate '?' used instead of '&'
+                my $err_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                syswrite($client, $err_resp);
+                close($client);
+                next;
+            }
+        }
     }
 
     my ($qid) = pack("n", 0x1234);
@@ -234,10 +276,15 @@ PL_EOF
     sleep 0.3
 
     if [ "$DAG" = "dig" ]; then
-        run_skip "Plain HTTP DoH (+http-plain)"
+        run_skip "Local Plain HTTP DoH (+http-plain)" "dig requires HTTP/2 cleartext framing for plain HTTP"
+        run_skip "Local DoH GET URI with query params (+http-plain-get=/path?foo=bar)" "dig rejects paths containing '?'"
     else
         run_check "DoH +http-plain returns immediately using Content-Length" \
             "$DAG @127.0.0.1 -p $PORT_DOH example.com A +http-plain +timeout=3" \
+            "(93\.184\.216\.34|NOERROR)"
+
+        run_check "DoH GET URI correctly uses '&dns=' when path has existing '?'" \
+            "$DAG @127.0.0.1 -p $PORT_DOH example.com A +http-plain-get=/dns-query?foo=bar +timeout=3" \
             "(93\.184\.216\.34|NOERROR)"
     fi
 
