@@ -23,7 +23,7 @@ load_rc_config "${name}"
 
 : ${karidns_enable:="NO"}
 : ${karidns_config:="/usr/local/etc/karidns/karidns.conf"}
-: ${karidns_flags:="-c ${karidns_config}"}
+: ${karidns_flags:="${karidns_config}"}
 : ${karidns_user:="named"}
 : ${karidns_group:="named"}
 
@@ -37,7 +37,7 @@ karidns_prestart()
 {
     # Validate config with karicheck before starting
     if [ -x /usr/local/bin/karicheck ]; then
-        /usr/local/bin/karicheck -c "${karidns_config}" || return 1
+        /usr/local/bin/karicheck conf "${karidns_config}" || return 1
     fi
     # Ensure run / log directory exists
     install -d -o "${karidns_user}" -g "${karidns_group}" -m 0755 /var/run/karidns
@@ -59,7 +59,7 @@ karidns_checkconf()
 {
     if [ -x /usr/local/bin/karicheck ]; then
         echo "Checking configuration: ${karidns_config}"
-        /usr/local/bin/karicheck -c "${karidns_config}"
+        /usr/local/bin/karicheck conf "${karidns_config}"
     else
         echo "karicheck not found."
     fi

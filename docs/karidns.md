@@ -15,8 +15,7 @@ KARIDNS(8)                     KariDNS Manual                     KARIDNS(8)
 ## SYNOPSIS
 
 ```sh
-karidns [-c config_file] [-t directory] [-u user] [-g group] [-d level] [-f] [-v]
-karidns [-h | --help]
+karidns [-f] [-v | --version] <config_file>
 ```
 
 ---
@@ -40,31 +39,21 @@ karidns [-h | --help]
 
 ---
 
-## OPTIONS
+## OPTIONS & ARGUMENTS
 
-`-c config_file`
-: Specify the path to the primary configuration file (default: `/usr/local/etc/karidns/karidns.conf`).
-
-`-t directory`
-: Chroot into `directory` after opening configuration files and initializing directory descriptors.
-
-`-u user`
-: Set user ID to `user` after binding privileged network ports.
-
-`-g group`
-: Set group ID to `group` after initialization.
-
-`-d level`
-: Set daemon debug logging level (0–9).
+`<config_file>`
+: Positional argument specifying the path to the configuration file (e.g., `/usr/local/etc/karidns/karidns.conf`). This argument is required.
 
 `-f`
 : Run in the foreground instead of daemonizing into the background.
 
-`-v`
-: Print the version information and build configuration, then exit.
+`-v`, `--version`, `-V`
+: Print the version information and exit.
 
-`-h`, `--help`
-: Display usage information and command-line summary.
+> [!NOTE]
+> **User, Group, and Sandboxing Controls:**
+> - Process privileges (`user` and `group`) are configured exclusively via the `options { user "..."; group "..."; }` directive in the configuration file rather than command-line arguments.
+> - Traditional `chroot` is not implemented; filesystem and system call sandboxing is enforced via FreeBSD native **Capsicum** (`cap_enter(2)` capability mode) in the backend worker process.
 
 ---
 
