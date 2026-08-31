@@ -117,6 +117,34 @@ Runtime administration of `karidns` is managed over a local UNIX domain socket (
 
 ---
 
+---
+
+## PROGRAM ZONE PLUGINS (TEST-ONLY FEATURE)
+
+KariDNS supports dynamic external program-backed zones (`type program;`) exclusively for testing and anomaly fuzzing.
+
+```
+options {
+    allow-program-zones yes; # Required to enable type program zones
+};
+
+zone "anomaly.test." {
+    type program;
+    program "/usr/local/bin/mock_server.pl";
+    program-args { "--verbose"; };
+    program-timeout 2000; # timeout in milliseconds (default: 2000)
+    program-user "nobody"; # optional privilege drop for plugin process
+};
+```
+
+> [!NOTE]
+> **Design Boundaries and Processing Semantics:**
+> - **Pre-filtering & Packet Validation**: KariDNS enforces standard basic DNS header validation (QDCOUNT, valid OPCODES, EDNS version <= 0, valid QCLASS) prior to dispatching queries to the program plugin. Corrupted queries that violate fundamental DNS framing are responded to directly by KariDNS (e.g. FORMERR / NOTIMP / REFUSED) before reaching the plugin.
+> - **TCP & AXFR Semantics**: TCP queries (including `AXFR` / `IXFR`) sent to a program zone are forwarded directly to the plugin as a single query-response transaction. Multi-envelope streaming AXFR is not supported.
+> - **Security & Isolation**: Plugin child processes are spawned prior to Capsicum capability mode and drop privileges (`program-user`). All internal control channels, frontend IPC, and network sockets are strictly closed via `closefrom(3)` before executing the plugin.
+
+---
+
 ## SIGNALS
 
 `SIGHUP`

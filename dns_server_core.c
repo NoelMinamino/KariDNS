@@ -3671,6 +3671,7 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
       atomic_store_explicit(&plugin->dead, true, memory_order_release);
       syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead (will SERVFAIL until restart)", domain);
       kill(plugin->pid, SIGKILL);
+      waitpid(plugin->pid, NULL, WNOHANG);
     }
     result_len = 0;
   } else {
@@ -3682,6 +3683,14 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
 }
 
 static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
+  if (!zcfg->program_path || zcfg->program_path[0] != '/') {
+    syslog(LOG_ERR, "[Plugin] zone '%s' program_path '%s' is not an absolute path (must start with '/'); refusing to spawn",
+           zcfg->domain, zcfg->program_path ? zcfg->program_path : "(null)");
+    fprintf(stderr, "[ERROR] [Plugin] zone '%s' program path must be an absolute path (starting with '/'): %s\n",
+            zcfg->domain, zcfg->program_path ? zcfg->program_path : "(null)");
+    return false;
+  }
+
   int in_pipe[2];  // parent(karidns) write -> child(script) stdin
   int out_pipe[2]; // child(script) stdout -> parent(karidns) read
   if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
@@ -3702,6 +3711,16 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
     close(in_pipe[0]); close(in_pipe[1]);
     close(out_pipe[0]); close(out_pipe[1]);
 
+#ifdef __FreeBSD__
+    closefrom(3); // 継承済みの全fd(制御チャネル/IPC/リスニングソケット等)を確実に閉じる
+#else
+    int maxfd = (int)sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0) maxfd = 1024;
+    for (int fd = 3; fd < maxfd; fd++) {
+      close(fd);
+    }
+#endif
+
     if (zcfg->program_user) {
       struct passwd *pwd = getpwnam(zcfg->program_user);
       if (!pwd) { _exit(126); }
@@ -3717,7 +3736,7 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
       argv[ai++] = zcfg->program_args[i];
     argv[ai] = NULL;
 
-    execvp(zcfg->program_path, argv);
+    execv(zcfg->program_path, argv);
     _exit(127);
   }
 
@@ -7207,6 +7226,8 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
+  // 注意: spawn_program_zone_plugins は Workerスレッドへの公開(g_privilege_drop_complete の
+  // release-store)および Capsicum サンドボックス突入より前でなければならない。
   spawn_program_zone_plugins(&g_config_db.config_a);
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から

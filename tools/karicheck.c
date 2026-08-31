@@ -945,6 +945,12 @@ static int check_config(const char *config_path, server_config_t *cfg) {
         if (z->type && strcasecmp(z->type, "program") == 0) {
             program_zone_count++;
             if (z->program_path) {
+                if (z->program_path[0] != '/') {
+                    fprintf(stderr, "[ERROR] Zone '%s' program path '%s' must be an absolute path (starting with '/')\n",
+                            z->domain, z->program_path);
+                    free(buf);
+                    return 1;
+                }
                 if (access(z->program_path, X_OK) != 0) {
                     fprintf(stderr, "[WARNING] Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
                             z->domain, z->program_path, strerror(errno));
