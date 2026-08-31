@@ -3078,14 +3078,17 @@ static void print_svcparams(const uint8_t *rdata, size_t offset, size_t rdlen) {
 }
 
 static void rdata_buf_append(char *out, size_t out_cap, size_t *pos, const char *fmt, ...) {
-    if (*pos >= out_cap) return;
+    if (*pos >= out_cap - 1) return;
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(out + *pos, out_cap - *pos, fmt, args);
     va_end(args);
     if (n > 0) {
-        *pos += (size_t)n;
-        if (*pos >= out_cap) *pos = out_cap - 1;
+        if ((size_t)n >= out_cap - *pos) {
+            *pos = out_cap - 1; // バッファ限界に達したため限界値で固定
+        } else {
+            *pos += (size_t)n;
+        }
     }
 }
 
@@ -4622,7 +4625,7 @@ static void calculate_packet_hashes(const uint8_t *pkt, size_t pkt_len, uint32_t
                 wire_hash += calc_wire_rr_hash(name, type, klass, ttl, &pkt[rdata_start], rdlen);
                 
                 // 2. 展開された Canonical テキスト表現をハッシュ（出力レコード内容が反映される）
-                char rdata_raw[2048];
+                static char rdata_raw[65536];
                 format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw), NULL);
                 record_hash += calc_record_rr_hash(name, type, klass, ttl, rdata_raw);
             }
@@ -5124,11 +5127,11 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
                 const char *tname = format_type_name(type, tname_buf, sizeof(tname_buf));
                 const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
 
-                char rdata_raw[2048];
+                static char rdata_raw[65536];
                 format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw), dopt);
 
                 char name_esc[512];
-                char rdata_esc[4096];
+                static char rdata_esc[131072];
                 yaml_single_quote_escape(name ? name : ".", name_esc, sizeof(name_esc));
                 yaml_single_quote_escape(rdata_raw, rdata_esc, sizeof(rdata_esc));
 
@@ -6280,7 +6283,7 @@ static void usage(const char *prog) {
         "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828)\n"
         "  +[no]keepopen                Keep TCP socket open between consecutive queries (RFC 7766)\n"
         "  +[no]dns64prefix             Query IPv4-only prefix from ipv4only.arpa (RFC 7050)\n"
-        "  +timeout=N                   Query timeout in seconds [5]\n"
+        "  +timeout=N, +time=N          Query timeout in seconds [5]\n"
         "  +tries=N / +retry=N          Number of query attempts [1]\n"
         "  +[no]rec, +[no]recurse      Set / clear RD (Recursion Desired) bit (+[no]rdflag)\n"
         "  +[no]adflag                  Set / clear AD (Authenticated Data) bit in query\n"
@@ -6320,7 +6323,7 @@ static void usage(const char *prog) {
         "\n"
         "Display & Formatting Options:\n"
         "  +[no]short                   Display concise short-form answer data only\n"
-        "  +[no]multiline               Display multiline format for SOA, DNSKEY, and RRSIG records\n"
+        "  +[no]multiline, +[no]multi   Display multiline format for SOA, DNSKEY, and RRSIG records\n"
         "  +[no]yaml                    Output parsed response in structured YAML format\n"
         "  +[no]ttlunits                Display TTL values in human-readable time units (w/d/h/m/s)\n"
         "  +[no]class                   Display / suppress CLASS field in resource records\n"
@@ -6616,6 +6619,7 @@ static int get_system_search_domains(char domains[][256], int max_domains) {
         if (*p == '#' || *p == ';' || *p == '\n') continue;
         if ((strncmp(p, "search", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) ||
             (strncmp(p, "domain", 6) == 0 && (p[6] == ' ' || p[6] == '\t'))) {
+            count = 0; // search と domain は相互排他で最後のインスタンスが有効
             p += 6;
             char *tok = strtok(p, " \t\r\n");
             while (tok && count < max_domains) {
