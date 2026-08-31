@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 # ==============================================================================
 # mock_anomalous_dns_server.pl
 #
@@ -285,15 +285,15 @@ sub process_query_packet {
     # --------------------------------------------------------------------------
     if ($scenario eq 'header-only') {
         # Valid header but 0 questions, 0 answers
-        return $id_raw . pack('n5', 0x8180, 0, 0, 0, 0);
+        return $id_raw . pack('n5', 0x8400, 0, 0, 0, 0);
     }
     if ($scenario eq 'short-header') {
         # Only 6 bytes (truncated header)
-        return $id_raw . pack('n2', 0x8180, 1);
+        return $id_raw . pack('n2', 0x8400, 1);
     }
     if ($scenario eq 'trailing-garbage') {
         # Normal Answer + 24 extra garbage bytes
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
         $pkt .= "EXTRA_TRAILING_GARBAGE_BYTES";
@@ -301,20 +301,20 @@ sub process_query_packet {
     }
     if ($scenario eq 'qdcount-mismatch') {
         # Header says QDCOUNT=2, but only 1 question present
-        my $pkt = $id_raw . pack('n5', 0x8180, 2, 0, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 2, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
     }
     if ($scenario eq 'ancount-underflow') {
         # Header says ANCOUNT=5, but only 1 record present
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 5, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 5, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
         return $pkt;
     }
     if ($scenario eq 'ancount-overflow') {
         # Header says ANCOUNT=1, but 2 records present
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 2);
@@ -326,19 +326,19 @@ sub process_query_packet {
     # --------------------------------------------------------------------------
     if ($scenario eq 'compression-loop') {
         # Offset 12 starts name: 0xc0 0x0c (direct loop)
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 0, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\xc0\x0c" . pack('nn', 1, 1);
         return $pkt;
     }
     if ($scenario eq 'compression-forward-ptr') {
         # Pointer to offset 0x3000 (far beyond packet length)
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 0, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\xc0\xff" . pack('nn', 1, 1);
         return $pkt;
     }
     if ($scenario eq 'unclosed-label') {
         # Unterminated label without 0x00
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 0, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\x05hello\x0aabc";
         return $pkt;
     }
@@ -348,49 +348,49 @@ sub process_query_packet {
     # --------------------------------------------------------------------------
     if ($scenario eq 'rdata-short-a') {
         # TYPE=A, RDLENGTH=4, but only 2 bytes provided
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . "\xc0\x00";
         return $pkt;
     }
     if ($scenario eq 'rdata-short-aaaa') {
         # TYPE=AAAA, RDLENGTH=16, but only 8 bytes provided
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 28, 1, 300, 16) . pack('C8', 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1);
         return $pkt;
     }
     if ($scenario eq 'rdata-soa-truncated') {
         # SOA record ends abruptly
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 6, 1, 300, 30) . "\x02ns\x07example";
         return $pkt;
     }
     if ($scenario eq 'rdata-mx-truncated') {
         # MX with preference only
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 15, 1, 300, 2) . pack('n', 10);
         return $pkt;
     }
     if ($scenario eq 'rdata-txt-len-mismatch') {
         # TXT length declares 100, but RDLENGTH is 10
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 16, 1, 300, 10) . pack('C', 100) . "123456789";
         return $pkt;
     }
     if ($scenario eq 'rdata-svcb-overflow') {
         # SVCB TargetName length exceeds RDLENGTH
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 64, 1, 300, 8) . pack('n', 1) . "\x14target";
         return $pkt;
     }
     if ($scenario eq 'rdata-opt-truncated') {
         # OPT RR with truncated option
-        my $pkt = $id_raw . pack('n5', 0x8180, 1, 0, 0, 1);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 1);
         $pkt .= $question_wire;
         $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, 8) . pack('nn', 10, 16) . "1234";
         return $pkt;
@@ -404,7 +404,7 @@ sub process_query_packet {
         my $cl_c = $client_cookie // "\x01\x02\x03\x04\x05\x06\x07\x08";
         if (defined $server_cookie && $server_cookie eq $srv_cookie) {
             # Verified server cookie returned on retry: respond with NOERROR Answer
-            my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 1);
+            my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 1);
             $pkt .= $question_wire;
             $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
             my $copt = pack('nn', 10, 16) . $cl_c . $srv_cookie;
@@ -412,7 +412,7 @@ sub process_query_packet {
             return $pkt;
         } else {
             # First query without valid server cookie: return BADCOOKIE (RCODE 23)
-            my $pkt = $id_raw . pack('n5', 0x8187, 1, 0, 0, 1);
+            my $pkt = $id_raw . pack('n5', 0x8407, 1, 0, 0, 1);
             $pkt .= $question_wire;
             my $copt = pack('nn', 10, 16) . $cl_c . $srv_cookie;
             $pkt .= "\x00" . pack('nnNn', 41, 4096, 0x01000000, length($copt)) . $copt;
@@ -421,7 +421,7 @@ sub process_query_packet {
     }
     if ($scenario eq 'truncated-tc') {
         # TC=1 (Truncated) response
-        my $pkt = $id_raw . pack('n5', 0x8380, 1, 0, 0, 0);
+        my $pkt = $id_raw . pack('n5', 0x8600, 1, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
     }
@@ -443,7 +443,7 @@ sub process_query_packet {
     );
     if (exists $RCODES{$scenario}) {
         my $rc = $RCODES{$scenario};
-        my $flags_val = 0x8180 | ($rc & 0x0F);
+        my $flags_val = 0x8400 | ($rc & 0x0F);
         my $pkt = $id_raw . pack('n5', $flags_val, 1, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
@@ -453,7 +453,7 @@ sub process_query_packet {
     # 6. Extended DNS Errors (EDE, RFC 8914)
     # --------------------------------------------------------------------------
     if ($scenario eq 'ede-prohibited') {
-        my $pkt = $id_raw . pack('n5', 0x8185, 1, 0, 0, 1);
+        my $pkt = $id_raw . pack('n5', 0x8405, 1, 0, 0, 1);
         $pkt .= $question_wire;
         my $ede_text = "Query blocked by test policy";
         my $ede_opt = pack('nnn', 15, length($ede_text) + 2, 18) . $ede_text;
@@ -461,7 +461,7 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'ede-long-text') {
-        my $pkt = $id_raw . pack('n5', 0x8182, 1, 0, 0, 1);
+        my $pkt = $id_raw . pack('n5', 0x8402, 1, 0, 0, 1);
         $pkt .= $question_wire;
         my $ede_text = "ExtendedErrorDescription:" . ("A" x 280);
         my $ede_opt = pack('nnn', 15, length($ede_text) + 2, 0) . $ede_text;
@@ -472,7 +472,7 @@ sub process_query_packet {
     # --------------------------------------------------------------------------
     # Default: Normal NOERROR Answer
     # --------------------------------------------------------------------------
-    my $pkt = $id_raw . pack('n5', 0x8180, 1, 1, 0, 0);
+    my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
     $pkt .= $question_wire;
     $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
     return $pkt;

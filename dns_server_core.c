@@ -3706,7 +3706,7 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
       argv[ai++] = zcfg->program_args[i];
     argv[ai] = NULL;
 
-    execv(zcfg->program_path, argv);
+    execvp(zcfg->program_path, argv);
     _exit(127);
   }
 
