@@ -73,6 +73,7 @@ static inline void *dag_memmem(const void *haystack, size_t haystacklen,
 #include <sys/select.h>
 #include <sys/resource.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <strings.h>
@@ -668,6 +669,9 @@ typedef struct {
     int proxy_src_port;
     char proxy_dst_addr[64];
     int proxy_dst_port;
+
+    int tcp_mss;
+    int tcp_window;
 
     // TLS (DoT)
     bool use_tls;
@@ -1602,12 +1606,27 @@ static int connect_udp(const char *server, int port, int pref_family, const char
     return sock;
 }
 
-static int connect_tcp(const char *server, int port, int pref_family, const char *bind_addr, int bind_port, int timeout_sec) {
+static int connect_tcp(const char *server, int port, const query_opts_t *qo, int timeout_sec) {
+    const char *bind_addr = qo->bind_addr;
+    int bind_port = qo->bind_port;
     struct sockaddr_storage dest; socklen_t dest_len; int family = AF_INET;
-    if (!resolve_server_addr(server, port, pref_family, (struct sockaddr_storage *)&dest, &dest_len, &family)) return -1;
+    if (!resolve_server_addr(server, port, qo->pref_family, (struct sockaddr_storage *)&dest, &dest_len, &family)) return -1;
     g_last_socket_family = family;
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
+
+    if (qo->tcp_mss > 0) {
+        int mss = qo->tcp_mss;
+#ifdef TCP_MAXSEG
+        setsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, (const char *)&mss, sizeof(mss));
+#endif
+    }
+    if (qo->tcp_window > 0) {
+        int wsize = qo->tcp_window;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&wsize, sizeof(wsize));
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&wsize, sizeof(wsize));
+    }
+
     if (bind_addr && bind_addr[0] != '\0') {
         struct sockaddr_storage baddr; socklen_t blen; int bfam = family;
         if (!resolve_server_addr(bind_addr, bind_port, AF_UNSPEC, &baddr, &blen, &bfam)) {
@@ -1818,7 +1837,7 @@ static void close_cached_tcp(void) {
 }
 
 static int do_tcp_send_request(const char *server, int port, const query_opts_t *qo, const uint8_t *pkt, size_t pkt_len, int timeout_sec) {
-    int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+    int sock = connect_tcp(server, port, qo, timeout_sec);
     if (sock < 0) return -1;
 
     send_proxyv2_if_enabled(sock, qo, true);
@@ -1992,7 +2011,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
     }
 
     if (!ssl) {
-        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        sock = connect_tcp(server, port, qo, timeout_sec);
         if (sock < 0) return -1;
         set_socket_timeouts(sock, timeout_sec);
         send_proxyv2_if_enabled(sock, qo, true);
@@ -2018,7 +2037,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
     bool write_ok = (SSL_write(ssl, len_prefix, 2) > 0 && SSL_write(ssl, pkt, (int)pkt_len) > 0);
     if (!write_ok && reused) {
         close_cached_tcp();
-        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        sock = connect_tcp(server, port, qo, timeout_sec);
         if (sock < 0) return -1;
         set_socket_timeouts(sock, timeout_sec);
         send_proxyv2_if_enabled(sock, qo, true);
@@ -2056,7 +2075,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         if (reused) {
             close_cached_tcp();
             printf(";; communications error to %s#%d: end of file\n", server, port);
-            sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+            sock = connect_tcp(server, port, qo, timeout_sec);
             if (sock < 0) return -1;
             set_socket_timeouts(sock, timeout_sec);
             send_proxyv2_if_enabled(sock, qo, true);
@@ -2101,7 +2120,7 @@ static ssize_t do_tls_exchange(const char *server, int port, const query_opts_t 
         if (reused) {
             close_cached_tcp();
             printf(";; communications error to %s#%d: end of file\n", server, port);
-            sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+            sock = connect_tcp(server, port, qo, timeout_sec);
             if (sock < 0) return -1;
             set_socket_timeouts(sock, timeout_sec);
             send_proxyv2_if_enabled(sock, qo, true);
@@ -2174,7 +2193,7 @@ static void base64url_encode(const uint8_t *data, size_t len, char *out, size_t 
 static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
-    int sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+    int sock = connect_tcp(server, port, qo, timeout_sec);
     if (sock < 0) return -1;
     set_socket_timeouts(sock, timeout_sec);
     send_proxyv2_if_enabled(sock, qo, true);
@@ -2293,7 +2312,7 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
     }
 
     if (sock < 0) {
-        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        sock = connect_tcp(server, port, qo, timeout_sec);
         if (sock < 0) return -1;
         send_proxyv2_if_enabled(sock, qo, true);
         if (qo && qo->keep_tcp_open) {
@@ -2317,7 +2336,7 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
     bool send_ok = (send(sock, len_prefix, 2, 0) == 2 && send(sock, pkt, pkt_len, 0) == (ssize_t)pkt_len);
     if (!send_ok && reused) {
         close_cached_tcp();
-        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        sock = connect_tcp(server, port, qo, timeout_sec);
         if (sock < 0) return -1;
         send_proxyv2_if_enabled(sock, qo, true);
         set_socket_timeouts(sock, timeout_sec);
@@ -2345,7 +2364,7 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
     if (n < 0 && reused) {
         printf(";; communications error to %s#%d: end of file\n", server, port);
         close_cached_tcp();
-        sock = connect_tcp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, timeout_sec);
+        sock = connect_tcp(server, port, qo, timeout_sec);
         if (sock < 0) return -1;
         send_proxyv2_if_enabled(sock, qo, true);
         set_socket_timeouts(sock, timeout_sec);
@@ -5867,6 +5886,8 @@ static void usage(const char *prog) {
         "  +opcode=N                    Override DNS Opcode in query header (0=QUERY, 2=STATUS, 5=UPDATE, etc.)\n"
         "  +qid=N                       Explicitly specify DNS query ID (0-65535)\n"
         "  +[no]ignore                  Ignore TC flag and do not retry via TCP\n"
+        "  +tcp-mss=N                   Force TCP Maximum Segment Size (MSS) to N bytes\n"
+        "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses)\n"
         "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP on truncated responses)\n"
@@ -6897,6 +6918,8 @@ static void init_query_spec(query_spec_t *spec) {
     spec->qo.opcode_override = -1;
     spec->qo.qid_override = -1;
     spec->qo.ndots = -1;
+    spec->qo.tcp_mss = 0;
+    spec->qo.tcp_window = 0;
 }
 
 static bool is_known_qclass_str(const char *s, uint16_t *out_class) {
@@ -7571,6 +7594,12 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->zflag = true; spec->qo.z_flag = true;
         } else if (strcmp(arg, "+nozflag") == 0) {
             spec->zflag = false; spec->qo.z_flag = false;
+        } else if (strncmp(arg, "+tcp-mss=", 9) == 0) {
+            spec->use_tcp = true; spec->qo.use_tcp = true;
+            spec->qo.tcp_mss = atoi(arg + 9);
+        } else if (strncmp(arg, "+tcp-window=", 12) == 0) {
+            spec->use_tcp = true; spec->qo.use_tcp = true;
+            spec->qo.tcp_window = atoi(arg + 12);
         } else if (strncmp(arg, "+timeout=", 9) == 0 || strncmp(arg, "+time=", 6) == 0) {
             const char *val = (arg[5] == '=') ? arg + 6 : arg + 9;
             char *endptr;
