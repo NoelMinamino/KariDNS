@@ -1997,11 +1997,11 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     /* 証明書検証を行うモード(tls_ca_fileまたはtls_verify_default_store指定時)
        のみ、ホスト名検証パラメータを明示的に設定する */
     if (qo->tls_ca_file || qo->tls_verify_default_store) {
-        X509_VERIFY_PARAM *vpm = SSL_get0_param(ssl);
         if (sni_is_ip) {
+            X509_VERIFY_PARAM *vpm = SSL_get0_param(ssl);
             X509_VERIFY_PARAM_set1_ip_asc(vpm, sni_host);
         } else {
-            X509_VERIFY_PARAM_set1_host(vpm, sni_host, 0);
+            SSL_set1_host(ssl, sni_host);
         }
     }
 

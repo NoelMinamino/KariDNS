@@ -74,22 +74,61 @@ my %HANDLERS = (
     'drop'         => \&build_nodata_response,
 );
 
-while (my $line = <STDIN>) {
+sub read_raw_line {
+    my $line = '';
+    while (1) {
+        my $ch;
+        my $n = sysread(STDIN, $ch, 1);
+        return undef unless defined($n) && $n == 1;
+        $line .= $ch;
+        last if $ch eq "\n";
+    }
+    return $line;
+}
+
+sub read_raw_bytes {
+    my ($len) = @_;
+    my $buf = '';
+    my $got = 0;
+    while ($got < $len) {
+        my $chunk;
+        my $n = sysread(STDIN, $chunk, $len - $got);
+        return undef unless defined($n) && $n > 0;
+        $buf .= $chunk;
+        $got += $n;
+    }
+    return $buf;
+}
+
+sub write_raw_bytes {
+    my ($data) = @_;
+    my $len = length($data);
+    my $written = 0;
+    while ($written < $len) {
+        my $n = syswrite(STDOUT, substr($data, $written));
+        return 0 unless defined($n) && $n > 0;
+        $written += $n;
+    }
+    return 1;
+}
+
+binmode(STDIN,  ":raw");
+binmode(STDOUT, ":raw");
+
+while (my $line = read_raw_line()) {
     chomp($line);
     # Expect: QUERY <proto> <client_ip>
     my ($cmd, $proto, $client_ip) = split(/\s+/, $line);
     next unless $cmd && $cmd eq "QUERY";
 
     # Read 2-byte length prefix
-    my $len_buf;
-    my $n = read(STDIN, $len_buf, 2);
-    last unless defined($n) && $n == 2;
+    my $len_buf = read_raw_bytes(2);
+    last unless defined $len_buf && length($len_buf) == 2;
     my $req_len = unpack("n", $len_buf);
 
     # Read DNS request packet
-    my $req;
-    $n = read(STDIN, $req, $req_len);
-    last unless defined($n) && $n == $req_len;
+    my $req = read_raw_bytes($req_len);
+    last unless defined $req && length($req) == $req_len;
 
     my $txid = unpack("n", substr($req, 0, 2));
     my $qname = extract_qname($req);
@@ -101,8 +140,8 @@ while (my $line = <STDIN>) {
     my $resp = $handler->($req, $qname, $txid);
 
     my $resp_len = length($resp);
-    print STDOUT pack("n", $resp_len);
+    write_raw_bytes(pack("n", $resp_len));
     if ($resp_len > 0) {
-        print STDOUT $resp;
+        write_raw_bytes($resp);
     }
 }

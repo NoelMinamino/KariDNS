@@ -49,40 +49,68 @@ if ($standalone) {
 # ==============================================================================
 # Mode 1: KariDNS type "program" Plugin Loop (STDIN/STDOUT)
 # ==============================================================================
+sub read_raw_line {
+    my $line = '';
+    while (1) {
+        my $ch;
+        my $n = sysread(STDIN, $ch, 1);
+        return undef unless defined($n) && $n == 1;
+        $line .= $ch;
+        last if $ch eq "\n";
+    }
+    return $line;
+}
+
+sub read_raw_bytes {
+    my ($len) = @_;
+    my $buf = '';
+    my $got = 0;
+    while ($got < $len) {
+        my $chunk;
+        my $n = sysread(STDIN, $chunk, $len - $got);
+        return undef unless defined($n) && $n > 0;
+        $buf .= $chunk;
+        $got += $n;
+    }
+    return $buf;
+}
+
+sub write_raw_bytes {
+    my ($data) = @_;
+    my $len = length($data);
+    my $written = 0;
+    while ($written < $len) {
+        my $n = syswrite(STDOUT, substr($data, $written));
+        return 0 unless defined($n) && $n > 0;
+        $written += $n;
+    }
+    return 1;
+}
+
 sub run_plugin_mode {
     my ($v) = @_;
-    $| = 1; # Autoflush stdout
     binmode(STDIN,  ":raw");
     binmode(STDOUT, ":raw");
 
-    while (my $line = <STDIN>) {
+    while (my $line = read_raw_line()) {
         chomp($line);
         my ($cmd, $proto, $client_ip) = split(/\s+/, $line);
         next unless $cmd && $cmd eq "QUERY";
 
-        my $len_buf;
-        my $n = read(STDIN, $len_buf, 2);
-        last unless defined($n) && $n == 2;
+        my $len_buf = read_raw_bytes(2);
+        last unless defined $len_buf && length($len_buf) == 2;
         my $req_len = unpack("n", $len_buf);
 
-        my $req = "";
-        my $got = 0;
-        while ($got < $req_len) {
-            my $buf;
-            my $r = read(STDIN, $buf, $req_len - $got);
-            last unless defined($r) && $r > 0;
-            $req .= $buf;
-            $got += $r;
-        }
-        last if length($req) < $req_len;
+        my $req = read_raw_bytes($req_len);
+        last unless defined $req && length($req) == $req_len;
 
         my $is_tcp = (defined $proto && lc($proto) eq 'tcp') ? 1 : 0;
         my $resp = process_query_packet($req, $is_tcp, $client_ip // '127.0.0.1');
 
         my $resp_len = length($resp // "");
-        print STDOUT pack("n", $resp_len);
+        write_raw_bytes(pack("n", $resp_len));
         if ($resp_len > 0) {
-            print STDOUT $resp;
+            write_raw_bytes($resp);
         }
     }
     exit 0;
