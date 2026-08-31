@@ -428,7 +428,7 @@ sub process_query_packet {
         my $ans_count = 0;
 
         if ($qtype == 252) {
-            # AXFR transfer format (RFC 5936): SOA + TXT Records + SOA
+            # AXFR transfer format (RFC 5936): Full 35+ scenarios list
             $answers .= $soa_start;
             $ans_count++;
             for my $line (@help_lines) {
@@ -439,8 +439,13 @@ sub process_query_packet {
             $answers .= $soa_end;
             $ans_count++;
         } else {
-            # Standard TXT query format
-            for my $line (@help_lines) {
+            # Standard TXT / Apex Query format: Compact overview (fits safely in 512-byte UDP packet)
+            my @summary_lines = (
+                "=== KariDNS Anomalous DNS Packet Test Server ===",
+                "Usage: dag @<server> -p <port> <scenario>.$display_zone <type>",
+                "Query AXFR (Zone Transfer) to view all 30+ anomalous test scenarios."
+            );
+            for my $line (@summary_lines) {
                 next if $line eq '';
                 $answers .= encode_txt_rr($qname, $line, 300);
                 $ans_count++;
