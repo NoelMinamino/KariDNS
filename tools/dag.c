@@ -3318,6 +3318,25 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             break;
         }
+        case 29: { // LOC
+            if (rdlen == 16 && pkt[abs_offset] == 0) {
+                uint8_t size_b = pkt[abs_offset + 1], hp_b = pkt[abs_offset + 2], vp_b = pkt[abs_offset + 3];
+                uint32_t lat_wire = ((uint32_t)pkt[abs_offset + 4]<<24)|((uint32_t)pkt[abs_offset + 5]<<16)|((uint32_t)pkt[abs_offset + 6]<<8)|pkt[abs_offset + 7];
+                uint32_t lon_wire = ((uint32_t)pkt[abs_offset + 8]<<24)|((uint32_t)pkt[abs_offset + 9]<<16)|((uint32_t)pkt[abs_offset + 10]<<8)|pkt[abs_offset + 11];
+                uint32_t alt_wire = ((uint32_t)pkt[abs_offset + 12]<<24)|((uint32_t)pkt[abs_offset + 13]<<16)|((uint32_t)pkt[abs_offset + 14]<<8)|pkt[abs_offset + 15];
+                double alt_m = ((int64_t)alt_wire - 10000000LL) / 100.0;
+                char lat_buf[64], lon_buf[64];
+                loc_format_coord(lat_wire, true, lat_buf, sizeof(lat_buf));
+                loc_format_coord(lon_wire, false, lon_buf, sizeof(lon_buf));
+                char s_buf[32], hp_buf[32], vp_buf[32];
+                format_loc_prec(loc_decode_precsize(size_b), s_buf, sizeof(s_buf));
+                format_loc_prec(loc_decode_precsize(hp_b), hp_buf, sizeof(hp_buf));
+                format_loc_prec(loc_decode_precsize(vp_b), vp_buf, sizeof(vp_buf));
+                rdata_buf_append(out, out_cap, &pos, "%s %s %.2fm %s %s %s", lat_buf, lon_buf, alt_m, s_buf, hp_buf, vp_buf);
+                return;
+            }
+            break;
+        }
         case 37: { // CERT
             if (rdlen >= 5) {
                 uint16_t ctype = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
@@ -4392,26 +4411,24 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
             if (!b64) goto fallback;
             pos += pk_len;
 
-            char rvs_names[512] = "";
-            size_t rp = 0;
-            while (pos < rdlen) {
-                char *rvs_name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0 ||
-                    next > abs_offset + rdlen) break;
-                rp += snprintf(rvs_names + rp, sizeof(rvs_names) - rp, "\n\t\t\t\t\t%s", rvs_name);
-                pos = next - abs_offset;
-            }
-
             if (dopt && dopt->multiline) {
-                printf("( %u %s\n\t\t\t\t\t%.*s%s )", pk_algorithm, hit_hex, n, b64, rvs_names);
+                printf("( %u %s\n\t\t\t\t\t%.*s", pk_algorithm, hit_hex, n, b64);
+                while (pos < rdlen) {
+                    char *rvs_name = NULL; size_t next;
+                    if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0 ||
+                        next > abs_offset + rdlen) break;
+                    printf("\n\t\t\t\t\t%s", rvs_name ? rvs_name : ".");
+                    pos = next - abs_offset;
+                }
+                printf(" )");
             } else {
                 printf("%u %s %.*s", pk_algorithm, hit_hex, n, b64);
-                if (rvs_names[0] != '\0') {
-                    // in single line, replace newline with space
-                    for (char *c = rvs_names; *c; c++) {
-                        if (*c == '\n' || *c == '\t') *c = ' ';
-                    }
-                    printf("%s", rvs_names);
+                while (pos < rdlen) {
+                    char *rvs_name = NULL; size_t next;
+                    if (expand_wire_name(pkt, pkt_len, abs_offset + pos, &next, &g_dag_arena, &rvs_name) != 0 ||
+                        next > abs_offset + rdlen) break;
+                    printf(" %s", rvs_name ? rvs_name : ".");
+                    pos = next - abs_offset;
                 }
             }
             free(b64);
@@ -7078,17 +7095,33 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         if (*p == '.') num_dots++;
     }
     int req_ndots = (qo.ndots >= 0) ? qo.ndots : 1;
-    if (qo.use_search_list && !is_absolute && (num_dots < req_ndots || req_ndots == 0)) {
-        if (qo.search_domain && *qo.search_domain) {
-            snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, qo.search_domain);
+    if (qo.use_search_list && !is_absolute) {
+        if (num_dots < req_ndots) {
+            /* 1. サーチドメインを先に追加 */
+            if (qo.search_domain && *qo.search_domain) {
+                snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, qo.search_domain);
+            } else {
+                char domains[4][256];
+                int count = get_system_search_domains(domains, 4);
+                for (int i = 0; i < count && candidate_count < 6; i++) {
+                    snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, domains[i]);
+                }
+            }
+            /* 2. 生のドメイン (qname) を最後に追加 */
             snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
         } else {
-            char domains[4][256];
-            int count = get_system_search_domains(domains, 4);
-            for (int i = 0; i < count && candidate_count < 6; i++) {
-                snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, domains[i]);
-            }
+            /* 1. 生のドメイン (qname) を先に追加 */
             snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
+            /* 2. サーチドメインを最後に追加 */
+            if (qo.search_domain && *qo.search_domain) {
+                snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, qo.search_domain);
+            } else {
+                char domains[4][256];
+                int count = get_system_search_domains(domains, 4);
+                for (int i = 0; i < count && candidate_count < 6; i++) {
+                    snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, domains[i]);
+                }
+            }
         }
     } else {
         snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
