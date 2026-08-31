@@ -190,6 +190,21 @@ pending_coo_t *g_pending_coo = NULL;
 int g_pending_coo_count = 0;
 int g_pending_coo_capacity = 0;
 
+typedef struct {
+  char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
+  pid_t pid;
+  int stdin_fd;           /* karidns -> script への書き込み側 */
+  int stdout_fd;          /* script -> karidns への読み込み側 */
+  pthread_mutex_t lock;    /* 1子プロセスを複数workerから同時に叩かないための直列化 */
+  uint32_t timeout_ms;
+  uint32_t max_failures;
+  _Atomic unsigned int consecutive_failures;
+  _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
+} program_plugin_t;
+
+static program_plugin_t *g_program_plugins = NULL;
+static int g_program_plugins_count = 0;
+
 typedef enum {
   RRL_RESP_NOERROR,
   RRL_RESP_NODATA,
@@ -3526,6 +3541,241 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
   return 0; // NOERROR
 }
 
+static program_plugin_t *find_program_plugin(const char *domain) {
+  if (!domain) return NULL;
+  for (int i = 0; i < g_program_plugins_count; i++) {
+    if (strcasecmp(g_program_plugins[i].domain, domain) == 0)
+      return &g_program_plugins[i];
+  }
+  return NULL;
+}
+
+static ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms) {
+  size_t written = 0;
+  struct timespec start_ts, now_ts;
+  clock_gettime(CLOCK_MONOTONIC, &start_ts);
+
+  while (written < len) {
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    int64_t elapsed_ms = (now_ts.tv_sec - start_ts.tv_sec) * 1000 + (now_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+    if (elapsed_ms >= timeout_ms) return -1;
+    int rem_ms = (int)(timeout_ms - elapsed_ms);
+
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+    int ret = poll(&pfd, 1, rem_ms);
+    if (ret <= 0) return -1;
+
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    if (pfd.revents & POLLOUT) {
+      ssize_t n = write(fd, buf + written, len - written);
+      if (n <= 0) {
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        return -1;
+      }
+      written += (size_t)n;
+    }
+  }
+  return (ssize_t)written;
+}
+
+static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms) {
+  size_t nread = 0;
+  struct timespec start_ts, now_ts;
+  clock_gettime(CLOCK_MONOTONIC, &start_ts);
+
+  while (nread < len) {
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    int64_t elapsed_ms = (now_ts.tv_sec - start_ts.tv_sec) * 1000 + (now_ts.tv_nsec - start_ts.tv_nsec) / 1000000;
+    if (elapsed_ms >= timeout_ms) return -1;
+    int rem_ms = (int)(timeout_ms - elapsed_ms);
+
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int ret = poll(&pfd, 1, rem_ms);
+    if (ret <= 0) return -1;
+
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+      if (!(pfd.revents & POLLIN)) return -1;
+    }
+    if (pfd.revents & POLLIN) {
+      ssize_t n = read(fd, buf + nread, len - nread);
+      if (n <= 0) {
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        return -1;
+      }
+      nread += (size_t)n;
+    }
+  }
+  return (ssize_t)nread;
+}
+
+static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
+                                    uint8_t *res, size_t max_res_len,
+                                    const char *client_ip, bool is_tcp) {
+  program_plugin_t *plugin = find_program_plugin(domain);
+  if (!plugin || atomic_load_explicit(&plugin->dead, memory_order_acquire)) {
+    return 0; // 応答なし
+  }
+
+  pthread_mutex_lock(&plugin->lock);
+
+  char header[80];
+  int hlen = snprintf(header, sizeof(header), "QUERY %s %s\n",
+                      is_tcp ? "tcp" : "udp", client_ip ? client_ip : "127.0.0.1");
+
+  uint8_t len_prefix[2] = { (uint8_t)(req_len >> 8), (uint8_t)(req_len & 0xFF) };
+
+  bool ok = true;
+  if (write_all_timeout(plugin->stdin_fd, (const uint8_t *)header, (size_t)hlen, plugin->timeout_ms) != hlen) ok = false;
+  if (ok && write_all_timeout(plugin->stdin_fd, len_prefix, 2, plugin->timeout_ms) != 2) ok = false;
+  if (ok && write_all_timeout(plugin->stdin_fd, req, req_len, plugin->timeout_ms) != (ssize_t)req_len) ok = false;
+
+  int result_len = 0;
+  if (ok) {
+    uint8_t resp_len_prefix[2];
+    if (read_all_timeout(plugin->stdout_fd, resp_len_prefix, 2, plugin->timeout_ms) == 2) {
+      uint16_t resp_len = (resp_len_prefix[0] << 8) | resp_len_prefix[1];
+      if (resp_len == 0) {
+        result_len = 0; // 意図的な無応答
+        ok = true;
+      } else if (resp_len <= max_res_len) {
+        if (read_all_timeout(plugin->stdout_fd, res, resp_len, plugin->timeout_ms) == resp_len) {
+          result_len = (int)resp_len;
+        } else {
+          ok = false;
+        }
+      } else {
+        syslog(LOG_WARNING, "[Plugin] zone '%s' returned oversized response (%u > %zu); dropping",
+               domain, resp_len, max_res_len);
+        ok = false;
+      }
+    } else {
+      ok = false;
+    }
+  }
+
+  if (!ok) {
+    unsigned int f = atomic_fetch_add_explicit(&plugin->consecutive_failures, 1, memory_order_acq_rel) + 1;
+    syslog(LOG_ERR, "[Plugin] zone '%s' communication failure (%u/%u)", domain, f, plugin->max_failures);
+    if (f >= plugin->max_failures) {
+      atomic_store_explicit(&plugin->dead, true, memory_order_release);
+      syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead (will SERVFAIL until restart)", domain);
+      kill(plugin->pid, SIGKILL);
+    }
+    result_len = 0;
+  } else {
+    atomic_store_explicit(&plugin->consecutive_failures, 0, memory_order_relaxed);
+  }
+
+  pthread_mutex_unlock(&plugin->lock);
+  return result_len;
+}
+
+static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
+  int in_pipe[2];  // parent(karidns) write -> child(script) stdin
+  int out_pipe[2]; // child(script) stdout -> parent(karidns) read
+  if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+    syslog(LOG_ERR, "[Plugin] pipe() failed for zone '%s': %m", zcfg->domain);
+    return false;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    syslog(LOG_ERR, "[Plugin] fork() failed for zone '%s': %m", zcfg->domain);
+    close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
+    return false;
+  }
+
+  if (pid == 0) {
+    dup2(in_pipe[0], STDIN_FILENO);
+    dup2(out_pipe[1], STDOUT_FILENO);
+    close(in_pipe[0]); close(in_pipe[1]);
+    close(out_pipe[0]); close(out_pipe[1]);
+
+    if (zcfg->program_user) {
+      struct passwd *pwd = getpwnam(zcfg->program_user);
+      if (!pwd) { _exit(126); }
+      if (setgroups(0, NULL) != 0) _exit(126);
+      if (setgid(pwd->pw_gid) != 0) _exit(126);
+      if (setuid(pwd->pw_uid) != 0) _exit(126);
+    }
+
+    char *argv[64];
+    int ai = 0;
+    argv[ai++] = zcfg->program_path;
+    for (int i = 0; i < zcfg->program_args_count && ai < 63; i++)
+      argv[ai++] = zcfg->program_args[i];
+    argv[ai] = NULL;
+
+    execv(zcfg->program_path, argv);
+    _exit(127);
+  }
+
+  close(in_pipe[0]);
+  close(out_pipe[1]);
+
+  fcntl(in_pipe[1], F_SETFD, FD_CLOEXEC);
+  fcntl(out_pipe[0], F_SETFD, FD_CLOEXEC);
+#ifdef __FreeBSD__
+  cap_rights_t rights;
+  cap_rights_init(&rights, CAP_WRITE, CAP_EVENT, CAP_FCNTL);
+  cap_rights_limit(in_pipe[1], &rights);
+  cap_rights_t rights_r;
+  cap_rights_init(&rights_r, CAP_READ, CAP_EVENT, CAP_FCNTL);
+  cap_rights_limit(out_pipe[0], &rights_r);
+#endif
+
+  strncpy(out->domain, zcfg->domain, sizeof(out->domain) - 1);
+  out->domain[sizeof(out->domain) - 1] = '\0';
+  out->pid = pid;
+  out->stdin_fd = in_pipe[1];
+  out->stdout_fd = out_pipe[0];
+  pthread_mutex_init(&out->lock, NULL);
+  out->timeout_ms = zcfg->program_timeout_ms > 0 ? zcfg->program_timeout_ms : 2000;
+  out->max_failures = zcfg->program_max_failures > 0 ? zcfg->program_max_failures : 5;
+  atomic_init(&out->consecutive_failures, 0);
+  atomic_init(&out->dead, false);
+
+  syslog(LOG_INFO, "[Plugin] Spawned program zone '%s' -> pid=%d exec='%s'",
+         zcfg->domain, pid, zcfg->program_path);
+  return true;
+}
+
+static void spawn_program_zone_plugins(server_config_t *cfg) {
+  int count = 0;
+  for (view_config_t *v = cfg->views; v; v = v->next)
+    for (zone_config_t *z = v->zones; z; z = z->next)
+      if (z->type && strcasecmp(z->type, "program") == 0) count++;
+
+  if (count == 0) return;
+
+  if (!cfg->allow_program_zones) {
+    syslog(LOG_CRIT, "[Plugin] %d zone(s) with type \"program\" found but "
+           "allow-program-zones is not set to yes in options{}. Refusing to start.", count);
+    fprintf(stderr, "[FATAL] type \"program\" zones require "
+            "'allow-program-zones yes;' in options{}.\n");
+    exit(EXIT_FAILURE);
+  }
+
+  syslog(LOG_WARNING, "[Plugin] %d program zone(s) enabled. "
+         "This is a TEST-ONLY feature; do not use in production.", count);
+
+  g_program_plugins = calloc(count, sizeof(program_plugin_t));
+  if (!g_program_plugins) exit(EXIT_FAILURE);
+
+  int idx = 0;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (!z->type || strcasecmp(z->type, "program") != 0) continue;
+      if (!z->program_path) {
+        syslog(LOG_ERR, "[Plugin] zone '%s' has type program but no 'program' path set; skipping (will SERVFAIL)", z->domain);
+        continue;
+      }
+      if (spawn_one_program_plugin(z, &g_program_plugins[idx])) idx++;
+    }
+  }
+  g_program_plugins_count = idx;
+}
+
 static bool check_acl(const char *client_ip, char **acl_list, int acl_count);
 
 static view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
@@ -3731,6 +3981,17 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (opcode == 4) { // NOTIFY
+    if (db_entry && view) {
+      server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
+      if (zc && zc->type && strcasecmp(zc->type, "program") == 0) {
+        size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+        memcpy(res, req, copy_len);
+        res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
+        res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
+        return copy_len;
+      }
+    }
     if (edns.has_mqtype_query) {
       memcpy(res, req, DNS_HEADER_SIZE);
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
@@ -3817,6 +4078,17 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (opcode == 5) { // UPDATE
+    if (db_entry && view) {
+      server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
+      if (zc && zc->type && strcasecmp(zc->type, "program") == 0) {
+        size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+        memcpy(res, req, copy_len);
+        res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
+        res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
+        return copy_len;
+      }
+    }
     if (edns.has_mqtype_query) {
       memcpy(res, req, DNS_HEADER_SIZE);
       res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
@@ -4064,9 +4336,25 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   uint16_t *res_ancount = (uint16_t *)&res[6],
            *res_nscount = (uint16_t *)&res[8],
            *res_arcount = (uint16_t *)&res[10];
+  if (db_entry && view) {
+    server_config_t *cfg_lookup = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
+    if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
+      if (current_zone)
+        atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+
+      int plugin_result_len = dispatch_to_program_zone(
+          zcfg->domain, req, req_len, res, max_res_len, client_ip, is_tcp);
+
+      if (out_rrl_cfg) *out_rrl_cfg = NULL; // RRL分類を完全にスキップさせる合図
+      return plugin_result_len;
+    }
+  }
+
   *res_ancount = 0;
   *res_nscount = 0;
   *res_arcount = 0;
+
   if (!current_zone) {
     res[3] = (res[3] & 0xF0) | 5;
     if (!view) {
@@ -5468,6 +5756,16 @@ worker_startup_success:;
             zone_config_t *zcfg = xfr_view
                 ? find_zone_config_in_view(cfg, xfr_view->name, qname)
                 : NULL;
+            if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
+              release_zone_snapshot(snap);
+              struct kevent ev_del;
+              EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+              kevent(kq, &ev_del, 1, NULL, 0, NULL);
+              close(client_fd);
+              dec_tcp_clients();
+              free(ctx_tcp);
+              continue;
+            }
             bool allowed = false;
             uint16_t tsig_error = 0;
             tsig_key_t *matched_key = NULL;
@@ -5815,6 +6113,24 @@ static void perform_config_reload(void) {
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
     rebuild_zone_db_from_config(standby);
+    for (view_config_t *v = standby->views; v; v = v->next) {
+      for (zone_config_t *z = v->zones; z; z = z->next) {
+        if (z->type && strcasecmp(z->type, "program") == 0) {
+          bool already_running = false;
+          for (int i = 0; i < g_program_plugins_count; i++) {
+            if (strcasecmp(g_program_plugins[i].domain, z->domain) == 0) {
+              already_running = true;
+              break;
+            }
+          }
+          if (!already_running) {
+            syslog(LOG_ERR, "[Plugin] zone '%s' (type program) was added via reload but "
+                   "cannot be started without a full restart (Capsicum sandbox is already active). "
+                   "This zone will return SERVFAIL until karidns is restarted.", z->domain);
+          }
+        }
+      }
+    }
     syslog(LOG_NOTICE, "Configuration and zones reloaded successfully.");
   } else {
     syslog(LOG_ERR, "Failed to reload configuration: parse error.");
@@ -6855,6 +7171,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[ERROR] [Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
     exit(EXIT_FAILURE);
   }
+
+  spawn_program_zone_plugins(&g_config_db.config_a);
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から
   // 呼ばれるコードで、tzset()が内部的に別のTZ設定を要求する関数

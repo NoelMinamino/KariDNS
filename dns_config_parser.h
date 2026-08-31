@@ -46,6 +46,17 @@ typedef struct zone_config {
   char **allow_update;
   int allow_update_count;
   rate_limit_config_t rrl;
+
+  /* --- ここから追加: type "program" 用 --- */
+  char *program_path;          /* 実行ファイルへの絶対パス(argv[0]相当) */
+  char **program_args;         /* argv[1]以降。シェル展開はしない */
+  int program_args_count;
+  char *program_user;          /* 追加の権限降格先ユーザ(省略可) */
+  uint32_t program_timeout_ms; /* 1クエリの応答待ちタイムアウト(既定 2000) */
+  uint32_t program_max_failures; /* 連続失敗許容回数(既定 5) */
+  uint32_t program_restart_backoff_ms; /* 未使用: v1では自動再起動なし。将来用に予約 */
+  /* --- ここまで追加 --- */
+
   struct zone_config *next;
 } zone_config_t;
 
@@ -113,6 +124,7 @@ typedef struct server_config_s {
   char *nsid_string;
   int udp_recvbuf_size;
   int udp_sndbuf_size;
+  bool allow_program_zones; /* 既定 false。trueでない限り type program は起動時エラーで拒否 */
 } server_config_t;
 
 #define MAX_INCLUDE_DEPTH 16

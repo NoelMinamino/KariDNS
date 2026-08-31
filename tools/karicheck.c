@@ -938,6 +938,33 @@ static int check_config(const char *config_path, server_config_t *cfg) {
         free(buf);
         return 1;
     }
+
+    int program_zone_count = 0;
+    zone_config_t *z = cfg->zones;
+    while (z) {
+        if (z->type && strcasecmp(z->type, "program") == 0) {
+            program_zone_count++;
+            if (z->program_path) {
+                if (access(z->program_path, X_OK) != 0) {
+                    fprintf(stderr, "[WARNING] Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
+                            z->domain, z->program_path, strerror(errno));
+                }
+            } else {
+                fprintf(stderr, "[ERROR] Zone '%s' has type 'program' but no 'program' path specified\n", z->domain);
+                free(buf);
+                return 1;
+            }
+        }
+        z = z->next;
+    }
+
+    if (program_zone_count > 0 && !cfg->allow_program_zones) {
+        fprintf(stderr, "[ERROR] Config contains %d type 'program' zone(s), but 'allow-program-zones' is not enabled in options{}\n",
+                program_zone_count);
+        free(buf);
+        return 1;
+    }
+
     printf("[OK] Config file %s is valid.\n", config_path);
     free(buf);
     return 0;
@@ -981,7 +1008,10 @@ int main(int argc, char **argv) {
         int checked = 0;
         zone_config_t *z = cfg.zones;
         while (z) {
-            if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
+            if (z->type && strcasecmp(z->type, "program") == 0) {
+                printf("[INFO] Skipping file validation for program zone '%s'\n", z->domain);
+                checked++;
+            } else if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
                 if (check_zone(z->domain, z->file, false, z->is_catalog) != 0) {
                     error_count++;
                 }
@@ -1014,6 +1044,10 @@ int main(int argc, char **argv) {
             zone_config_t *z = cfg.zones;
             while (z) {
                 if (strcasecmp(z->domain, norm_domain) == 0) {
+                    if (z->type && strcasecmp(z->type, "program") == 0) {
+                        printf("[INFO] Zone '%s' is type 'program'; skipping file validation.\n", z->domain);
+                        return 0;
+                    }
                     return check_zone(z->domain, z->file, false, z->is_catalog);
                 }
                 z = z->next;

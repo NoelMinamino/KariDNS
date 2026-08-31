@@ -5690,6 +5690,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         }
 
+        if (n <= 0) {
+            printf(";; no servers could be reached\n");
+            return 9;
+        }
+
         struct timespec end_ts;
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
         long long elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
