@@ -193,7 +193,12 @@ run_check "Mismatched question section from upstream is rejected and returns SER
     "$DAG @127.0.0.1 -p $PORT test.fwd-mismatch.example A +timeout=2 +tries=1" \
     "SERVFAIL"
 
-# Scenario 6: NOTIFY and UPDATE return NOTIMP
+# Scenario 6: Mixed-case (0x20 encoding) question section matches properly
+run_check "Mixed-case query to forward zone returns upstream-generated response" \
+    "$DAG @127.0.0.1 -p $PORT TtL-TeSt.ExAmPlE A +timeout=2 +tries=1" \
+    "(192\.0\.2\.1|NOERROR)"
+
+# Scenario 7: NOTIFY and UPDATE return NOTIMP
 run_check "NOTIFY to forward zone is rejected with NOTIMP" \
     "$DAG @127.0.0.1 -p $PORT ttl-test.example SOA +opcode=NOTIFY +timeout=1" \
     "NOTIMP"
