@@ -3129,9 +3129,22 @@ static void print_svcparams(const uint8_t *rdata, size_t offset, size_t rdlen) {
                 break;
             }
             case 6: print_svcparam_ipvXhint(value, vlen, true); break;
-            default: { // unknown
-                printf("key%u=\"", key);
-                for (uint16_t i = 0; i < vlen; i++) printf("%02x", value[i]);
+            case 7: // dohpath / key7 (RFC 9460 / RFC 9461 / RFC 9462)
+            default: { // unknown / generic keyNNN (RFC 9460 §2.1 character-string value)
+                if (key == 7) {
+                    printf("key7=\"");
+                } else {
+                    printf("key%u=\"", key);
+                }
+                for (uint16_t i = 0; i < vlen; i++) {
+                    if (value[i] == '"' || value[i] == '\\') {
+                        printf("\\%c", value[i]);
+                    } else if (value[i] >= 32 && value[i] <= 126) {
+                        printf("%c", value[i]);
+                    } else {
+                        printf("\\%03u", value[i]);
+                    }
+                }
                 printf("\"");
                 break;
             }
@@ -3658,6 +3671,19 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                                 if (!hfirst) rdata_buf_append(out, out_cap, &pos, ",");
                                 hfirst = false;
                                 rdata_buf_append(out, out_cap, &pos, "%s", abuf);
+                            }
+                            rdata_buf_append(out, out_cap, &pos, "\"");
+                        } else {
+                            // key7 (dohpath) / generic keyNNN (RFC 9460 §2.1 character-string value)
+                            rdata_buf_append(out, out_cap, &pos, " key%u=\"", key);
+                            for (uint16_t vi = 0; vi < vlen; vi++) {
+                                if (val[vi] == '"' || val[vi] == '\\') {
+                                    rdata_buf_append(out, out_cap, &pos, "\\%c", val[vi]);
+                                } else if (val[vi] >= 32 && val[vi] <= 126) {
+                                    rdata_buf_append(out, out_cap, &pos, "%c", val[vi]);
+                                } else {
+                                    rdata_buf_append(out, out_cap, &pos, "\\%03u", val[vi]);
+                                }
                             }
                             rdata_buf_append(out, out_cap, &pos, "\"");
                         }
@@ -7017,7 +7043,7 @@ static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff
 }
 
 static int run_trace_query_impl(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt, int cname_depth) {
-    (void)force_udp; (void)hex_payload;
+    bool eff_use_tcp = (!force_udp && use_tcp);
     if (!dopt->yaml) {
         printf(";; TRACE: tracing %s from root servers...\n", qname);
     }
@@ -7043,7 +7069,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
 
     struct timespec start_ts, end_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
-    ssize_t root_n = do_dns_exchange_auto(eff_server, port, &root_qo, root_qbuf, root_qlen, root_resp, sizeof(root_resp), root_qo.timeout_sec, use_tcp);
+    ssize_t root_n = do_dns_exchange_auto(eff_server, port, &root_qo, root_qbuf, root_qlen, root_resp, sizeof(root_resp), root_qo.timeout_sec, eff_use_tcp);
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
     
     if (root_n <= 0) {
@@ -7056,7 +7082,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
     }
 
     int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-    record_ldnsz_result(eff_server, root_n, root_resp, dt_ms, use_tcp ? "TCP" : "UDP");
+    record_ldnsz_result(eff_server, root_n, root_resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
     if (!no_hexdump_response && !dopt->yaml) {
         printf("Response (%zd bytes):\n", root_n);
         hexdump(root_resp, (size_t)root_n);
@@ -7065,7 +7091,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
 
     if (root_n > 12) {
         if (dopt->yaml) {
-            print_response_yaml(root_resp, root_n, eff_server, port, use_tcp, dopt);
+            print_response_yaml(root_resp, root_n, eff_server, port, eff_use_tcp, dopt);
         } else {
             axfr_state_t dummy_axfr = {0};
             print_response(root_resp, root_n, &dummy_axfr, &trace_dopt);
@@ -7117,9 +7143,18 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         reset_dag_arena();
         hop++;
         uint8_t qbuf[65535];
-        int qtype_val = parse_qtype(qtype_s);
-        size_t qlen = build_query_packet(qbuf, sizeof(qbuf), qname, qtype_val, &qo);
-        if (qlen == 0) break;
+        size_t qlen = 0;
+        if (hex_payload) {
+            qlen = parse_hex_string(hex_payload, qbuf, sizeof(qbuf));
+            if (qlen == 0 || qlen > sizeof(qbuf)) {
+                fprintf(stderr, "Error: Invalid, empty, or oversized hex payload (max %zu bytes)\n", sizeof(qbuf));
+                return 1;
+            }
+        } else {
+            int qtype_val = parse_qtype(qtype_s);
+            qlen = build_query_packet(qbuf, sizeof(qbuf), qname, qtype_val, &qo);
+            if (qlen == 0) break;
+        }
         
         uint8_t resp[65535];
         ssize_t n = -1;
@@ -7132,7 +7167,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
                 printf("\n");
             }
             clock_gettime(CLOCK_MONOTONIC, &start_ts);
-            n = do_dns_exchange_auto(target_ips[ti], port, &qo, qbuf, qlen, resp, sizeof(resp), qo.timeout_sec, use_tcp);
+            n = do_dns_exchange_auto(target_ips[ti], port, &qo, qbuf, qlen, resp, sizeof(resp), qo.timeout_sec, eff_use_tcp);
             clock_gettime(CLOCK_MONOTONIC, &end_ts);
             if (n > 0) {
                 active_target_idx = ti;
@@ -7155,7 +7190,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         }
         
         int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        record_ldnsz_result(target_ips[active_target_idx], n, resp, dt_ms, use_tcp ? "TCP" : "UDP");
+        record_ldnsz_result(target_ips[active_target_idx], n, resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
 
         if (!no_hexdump_response && !dopt->yaml) {
             printf("Response (%zd bytes):\n", n);
@@ -7164,7 +7199,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         }
 
         if (dopt->yaml) {
-            print_response_yaml(resp, n, target_ips[active_target_idx], port, use_tcp, dopt);
+            print_response_yaml(resp, n, target_ips[active_target_idx], port, eff_use_tcp, dopt);
         } else {
             axfr_state_t dummy_axfr = {0};
             print_response(resp, n, &dummy_axfr, &trace_dopt);
@@ -7251,7 +7286,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
                     uint8_t res_qbuf[512];
                     size_t res_qlen = build_query_packet(res_qbuf, sizeof(res_qbuf), ns_names[j], 1 /* A */, &resolve_qo);
                     uint8_t res_resp[4096];
-                    ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, use_tcp);
+                    ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
                     if (res_n > 12) {
                         int r_qd = (res_resp[4] << 8) | res_resp[5];
                         int r_an = (res_resp[6] << 8) | res_resp[7];
@@ -7274,7 +7309,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
                     uint8_t res_qbuf[512];
                     size_t res_qlen = build_query_packet(res_qbuf, sizeof(res_qbuf), ns_names[j], 28 /* AAAA */, &resolve_qo);
                     uint8_t res_resp[4096];
-                    ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, use_tcp);
+                    ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
                     if (res_n > 12) {
                         int r_qd = (res_resp[4] << 8) | res_resp[5];
                         int r_an = (res_resp[6] << 8) | res_resp[7];
@@ -7319,7 +7354,8 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
 }
 
 static int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
-    (void)force_udp; (void)hex_payload; (void)dopt;
+    (void)dopt;
+    bool eff_use_tcp = (!force_udp && use_tcp);
     const char *eff_server = server ? server : get_system_resolver();
     query_opts_t ns_qo = qo;
     ns_qo.rd_flag = true;
@@ -7333,11 +7369,11 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     uint8_t resp[65535];
     struct timespec start_ts, end_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
-    ssize_t n = do_dns_exchange_auto(eff_server, port, &ns_qo, qbuf, qlen, resp, sizeof(resp), ns_qo.timeout_sec, use_tcp);
+    ssize_t n = do_dns_exchange_auto(eff_server, port, &ns_qo, qbuf, qlen, resp, sizeof(resp), ns_qo.timeout_sec, eff_use_tcp);
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
     if (n > 0) {
         int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        record_ldnsz_result(eff_server, n, resp, dt_ms, use_tcp ? "TCP" : "UDP");
+        record_ldnsz_result(eff_server, n, resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
         if (!no_hexdump_response) {
             printf("Response (%zd bytes):\n", n);
             hexdump(resp, (size_t)n);
@@ -7439,19 +7475,28 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     }
 
     for (int k = 0; k < all_ns_count; k++) {
-        size_t slen = build_query_packet(qbuf, sizeof(qbuf), qname, 6 /* SOA */, &qo);
+        size_t slen = 0;
+        if (hex_payload) {
+            slen = parse_hex_string(hex_payload, qbuf, sizeof(qbuf));
+            if (slen == 0 || slen > sizeof(qbuf)) {
+                fprintf(stderr, "Error: Invalid, empty, or oversized hex payload (max %zu bytes)\n", sizeof(qbuf));
+                return 1;
+            }
+        } else {
+            slen = build_query_packet(qbuf, sizeof(qbuf), qname, 6 /* SOA */, &qo);
+        }
         if (!no_hexdump_query) {
             printf("Query (%zd bytes):\n", slen);
             hexdump(qbuf, slen);
             printf("\n");
         }
         clock_gettime(CLOCK_MONOTONIC, &start_ts);
-        ssize_t sn = do_dns_exchange_auto(all_ns_ips[k].ip, port, &qo, qbuf, slen, resp, sizeof(resp), qo.timeout_sec, use_tcp);
+        ssize_t sn = do_dns_exchange_auto(all_ns_ips[k].ip, port, &qo, qbuf, slen, resp, sizeof(resp), qo.timeout_sec, eff_use_tcp);
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
         int dt_ms = 0;
         if (sn > 0) {
             dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-            record_ldnsz_result(all_ns_ips[k].ip, sn, resp, dt_ms, use_tcp ? "TCP" : "UDP");
+            record_ldnsz_result(all_ns_ips[k].ip, sn, resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
             if (!no_hexdump_response) {
                 printf("Response (%zd bytes):\n", sn);
                 hexdump(resp, (size_t)sn);
@@ -8479,25 +8524,28 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
         } else if (strcmp(arg, "+https-post") == 0) {
             if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = true; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 443;
-        } else if (strncmp(arg, "+http-plain=", 12) == 0) {
+        } else if (strncmp(arg, "+http-plain=", 12) == 0 || strncmp(arg, "+http=", 6) == 0) {
+            const char *val = (strncmp(arg, "+http-plain=", 12) == 0) ? (arg + 12) : (arg + 6);
             if (spec->qo.doh_path) free(spec->qo.doh_path);
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 12); if (spec->port == 53) spec->port = 80;
-        } else if (strcmp(arg, "+http-plain") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(val); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+http-plain") == 0 || strcmp(arg, "+http") == 0) {
             if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
-        } else if (strncmp(arg, "+http-plain-get=", 16) == 0) {
+        } else if (strncmp(arg, "+http-plain-get=", 16) == 0 || strncmp(arg, "+http-get=", 10) == 0) {
+            const char *val = (strncmp(arg, "+http-plain-get=", 16) == 0) ? (arg + 16) : (arg + 10);
             if (spec->qo.doh_path) free(spec->qo.doh_path);
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 16); if (spec->port == 53) spec->port = 80;
-        } else if (strcmp(arg, "+http-plain-get") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(val); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+http-plain-get") == 0 || strcmp(arg, "+http-get") == 0) {
             if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_GET; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
-        } else if (strncmp(arg, "+http-plain-post=", 17) == 0) {
+        } else if (strncmp(arg, "+http-plain-post=", 17) == 0 || strncmp(arg, "+http-post=", 11) == 0) {
+            const char *val = (strncmp(arg, "+http-plain-post=", 17) == 0) ? (arg + 17) : (arg + 11);
             if (spec->qo.doh_path) free(spec->qo.doh_path);
-            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(arg + 17); if (spec->port == 53) spec->port = 80;
-        } else if (strcmp(arg, "+http-plain-post") == 0) {
+            spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup(val); if (spec->port == 53) spec->port = 80;
+        } else if (strcmp(arg, "+http-plain-post") == 0 || strcmp(arg, "+http-post") == 0) {
             if (spec->qo.doh_path) free(spec->qo.doh_path);
             spec->qo.use_doh = true; spec->qo.doh_method = DOH_POST; spec->qo.doh_tls = false; spec->qo.doh_path = strdup("/dns-query"); if (spec->port == 53) spec->port = 80;
-        } else if (strcmp(arg, "+nohttps") == 0 || strcmp(arg, "+nohttp-plain") == 0) {
+        } else if (strcmp(arg, "+nohttps") == 0 || strcmp(arg, "+nohttp-plain") == 0 || strcmp(arg, "+nohttp") == 0) {
             spec->qo.use_doh = false;
             if (spec->port == 443 || spec->port == 80) spec->port = 53;
         } else if (strcmp(arg, "+nohexdump") == 0) {

@@ -226,6 +226,7 @@ else
     compare_query "NAPTR query" "_ldap._tcp.example.com NAPTR +noedns"
     compare_query "HTTPS query" "www.example.com HTTPS +noedns"
     compare_query "SVCB query" "_8443._tcp.svc.example.com SVCB +noedns"
+    compare_query "SVCB key7 query" "_dns.resolver.example.com SVCB +noedns"
     compare_query "TLSA query" "_443._tcp.www.example.com TLSA +noedns"
     compare_query "SSHFP query" "ns1.example.com SSHFP +noedns"
     compare_query "CAA query" "example.com CAA +noedns"

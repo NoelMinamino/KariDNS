@@ -86,6 +86,11 @@ www     IN HTTPS 1 . alpn=h2
 svc             IN A 192.0.2.40
 _8443._tcp.svc  IN SVCB 1 svc.example.com. alpn=h2 port=8443
 
+dns             IN A 192.0.2.53
+                IN AAAA 2001:db8::53
+_dns.resolver   IN SVCB 1 dns.example.com. alpn="dot"
+_dns.resolver   IN SVCB 2 dns.example.com. alpn="h2,h3" key7="/dns-query{?dns}"
+
 ; ----------------------------------------------------------------------------
 ; TLSA (DANE)
 ; ----------------------------------------------------------------------------

@@ -489,7 +489,12 @@ if command -v perl >/dev/null 2>&1; then
     run_check "Forward Zones: 'type forward' zone relay (tests/run_forward_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_forward_zone_test.sh\"" "ALL FORWARD ZONE TESTS PASSED"
     run_check "Anomalous Packets: Comprehensive DNS packet wire suite (tests/run_dag_dig_anomalous_suite.sh)" "DAG_BIN=\"$DAG\" DIG_BIN=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dig_anomalous_suite.sh\" \"$([ "$DAG" = "dig" ] && echo "dig" || echo "dag")\"" "ALL ANOMALOUS PACKET TESTS PASSED SUCCESSFULLY"
     run_check "Transport: Multi-Message AXFR & Plain-HTTP DoH mock (tests/run_dag_doh_dot_axfr_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_dot_axfr_test.sh\"" "ALL DOT/DOH AXFR & MEMORY TESTS PASSED"
+    run_check "Protocol: IXFR Up-to-Date single SOA completion (tests/run_dag_ixfr_uptodate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_ixfr_uptodate_test.sh\"" "ALL IXFR UP-TO-DATE COMPLETION TESTS PASSED"
+    run_check "Transport: DoH connection cache cleanup & error recovery (tests/run_dag_doh_cache_cleanup_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_cache_cleanup_test.sh\"" "ALL DOH CACHE CLEANUP TESTS PASSED"
+    run_check "Protocol: +trace glue fallback & CNAME chain tracing (tests/run_dag_trace_cname_glue_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_cname_glue_test.sh\"" "ALL TRACE GLUE & CNAME TESTS PASSED"
+    run_check "CLI: +trace and +nssearch options (--hex, +udp) (tests/run_dag_trace_nssearch_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_opts_test.sh\"" "ALL TRACE & NSSEARCH OPTIONS TESTS PASSED"
 fi
+run_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
