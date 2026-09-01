@@ -140,8 +140,8 @@ MOCK_PID=$!
 sleep 0.5
 
 echo "=== 1. Testing +nssearch In-Bailiwick Glue Utilization ==="
-echo -n "Test: +nssearch resolves SOA using in-bailiwick Glue without system resolver ... "
-OUT=$("$DAG" @127.0.0.1 -p $PORT test.internal.zone +nssearch +timeout=2 2>&1 || true)
+echo -n "Test: +nssearch +glue resolves SOA using in-bailiwick Glue without system resolver ... "
+OUT=$("$DAG" @127.0.0.1 -p $PORT test.internal.zone +nssearch +glue +timeout=2 2>&1 || true)
 if echo "$OUT" | grep -q "SOA ns1\.test\.internal\.zone\." && echo "$OUT" | grep -q "2026090101"; then
     echo "OK"
 else
@@ -155,10 +155,10 @@ echo "=== 2. Testing Batch Mode (-f) with Advanced Per-Line Options ==="
 cat << EOF > "$TMP_DIR/batch.txt"
 test.internal.zone A +tcp +nohexdump
 test.internal.zone A +yaml +nohexdump
-test.internal.zone +nssearch +nohexdump
+test.internal.zone +nssearch +glue +nohexdump
 EOF
 
-echo -n "Test: Batch mode executes per-line +tcp, +yaml, and +nssearch without warnings ... "
+echo -n "Test: Batch mode executes per-line +tcp, +yaml, and +nssearch +glue without warnings ... "
 OUT=$("$DAG" @127.0.0.1 -p $PORT -f "$TMP_DIR/batch.txt" 2>&1 || true)
 if echo "$OUT" | grep -q "type: MESSAGE" && echo "$OUT" | grep -q "SOA ns1\.test\.internal\.zone\." && ! echo "$OUT" | grep -qi "unexpected extra token"; then
     echo "OK"

@@ -5974,6 +5974,7 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
         } else if (terr != 0) {
             printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
         }
+        fflush(stdout);
     }
 
     int qdcount = (resp[4] << 8) | resp[5];
@@ -6343,6 +6344,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     } else {
                         printf(";; Couldn't verify signature: tsig verify failure (%d)\n", err);
                     }
+                    fflush(stdout);
                 }
             }
 
@@ -6680,8 +6682,8 @@ static void usage(const char *prog) {
         "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses)\n"
-        "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +glue by default)\n"
-        "  +[no]glue                    Prefer in-bailiwick Glue records from ADDITIONAL section for +trace/+nssearch [default: +glue]\n"
+        "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +noglue by default)\n"
+        "  +[no]glue                    Prefer in-bailiwick Glue records from ADDITIONAL section for +nssearch [default: +noglue]\n"
         "  +[no]search / +[no]defname   Use search list defined in /etc/resolv.conf\n"
         "  +domain=domain               Set default search domain\n"
         "  +ndots=N                     Set search NDOTS threshold\n"
@@ -7115,6 +7117,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             } else if (terr != 0) {
                 printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
             }
+            fflush(stdout);
         }
         if (dopt->yaml) {
             print_response_yaml(root_resp, root_n, eff_server, port, eff_use_tcp, dopt);
@@ -7229,6 +7232,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             } else if (terr != 0) {
                 printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
             }
+            fflush(stdout);
         }
 
         if (dopt->yaml) {
@@ -7294,21 +7298,19 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         
         int new_target_count = 0;
         char new_target_ips[16][64];
-        if (qo.use_glue) {
-            for (int i = 0; i < arcount; i++) {
-                dns_record_t rec; uint16_t type;
-                if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-                bool want = false;
-                if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
-                if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
-                if (want && rec.rdata_count > 0) {
-                    bool match = false;
-                    for (int j=0; j<ns_count; j++) {
-                        if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
-                    }
-                    if (match && new_target_count < 16) {
-                        snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
-                    }
+        for (int i = 0; i < arcount; i++) {
+            dns_record_t rec; uint16_t type;
+            if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+            bool want = false;
+            if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
+            if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
+            if (want && rec.rdata_count > 0) {
+                bool match = false;
+                for (int j=0; j<ns_count; j++) {
+                    if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
+                }
+                if (match && new_target_count < 16) {
+                    snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
                 }
             }
         }
@@ -7421,6 +7423,17 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     }
     
     if (n < 12) return 1;
+
+    if (ns_qo.want_tsig) {
+        uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+        int terr = tsig_verify_packet(resp, (size_t)n, &ns_qo.tsig_key, NULL, 0, NULL, 0, false, dummy_mac, &dummy_mac_len);
+        if (terr == -1) {
+            printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+        } else if (terr != 0) {
+            printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
+        }
+        fflush(stdout);
+    }
     int qdcount = (resp[4] << 8) | resp[5];
     int ancount = (resp[6] << 8) | resp[7];
     int nscount = (resp[8] << 8) | resp[9];
@@ -7580,6 +7593,16 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
             }
         }
         if (sn > 12) {
+            if (qo.want_tsig) {
+                uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+                int terr = tsig_verify_packet(resp, (size_t)sn, &qo.tsig_key, NULL, 0, NULL, 0, false, dummy_mac, &dummy_mac_len);
+                if (terr == -1) {
+                    printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+                } else if (terr != 0) {
+                    printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
+                }
+                fflush(stdout);
+            }
             int sancount = (resp[6] << 8) | resp[7];
             size_t soff = 12;
             int sqdcount = (resp[4] << 8) | resp[5];
@@ -7955,7 +7978,7 @@ static void init_query_spec(query_spec_t *spec) {
     spec->qo.ndots = -1;
     spec->qo.tcp_mss = 0;
     spec->qo.tcp_window = 0;
-    spec->qo.use_glue = true;
+    spec->qo.use_glue = false;
 }
 
 static bool is_known_qclass_str(const char *s, uint16_t *out_class) {

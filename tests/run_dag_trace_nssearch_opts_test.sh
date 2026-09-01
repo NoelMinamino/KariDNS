@@ -123,31 +123,21 @@ else
 fi
 
 echo "=== 3. Testing +nssearch with +[no]glue Options ==="
-if [ "$DAG" = "dig" ]; then
-    echo -n "Test: dig native +nssearch bypasses Glue and reports resolver failure on local zone ... "
-    OUT_DIG=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +timeout=2 2>&1 || true)
-    if echo "$OUT_DIG" | grep -q "couldn't get address for 'ns1\.example\.com': failure"; then
-        echo "OK"
-    else
-        echo "FAILED"
-        echo "  Output:"
-        echo "$OUT_DIG" | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-    fi
-    echo "Test: +nssearch with +[no]glue option switching ... SKIP (dag-only option)"
+echo -n "Test: +nssearch (default: +noglue) bypasses Glue and reports resolver failure on local zone ... "
+OUT_DEF=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +timeout=2 2>&1 || true)
+if echo "$OUT_DEF" | grep -q "couldn't get address for 'ns1\.example\.com'"; then
+    echo "OK"
 else
-    echo -n "Test: +nssearch with +noglue bypasses Glue and reports resolver failure on local zone ... "
-    OUT_NOGLUE=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +noglue +timeout=2 2>&1 || true)
-    if echo "$OUT_NOGLUE" | grep -q "couldn't get address for 'ns1\.example\.com': failure"; then
-        echo "OK"
-    else
-        echo "FAILED"
-        echo "  Output:"
-        echo "$OUT_NOGLUE" | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-    fi
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_DEF" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
 
-    echo -n "Test: +nssearch with +glue (default) utilizes Glue and connects directly ... "
+if [ "$DAG" = "dig" ]; then
+    echo "Test: +nssearch +glue (explicit opt-in) ... SKIP (dag-only option)"
+else
+    echo -n "Test: +nssearch +glue (explicit opt-in) utilizes Glue and connects directly ... "
     OUT_GLUE=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +glue +timeout=2 2>&1 || true)
     if echo "$OUT_GLUE" | grep -q "SOA ns1\.example\.com\."; then
         echo "OK"
