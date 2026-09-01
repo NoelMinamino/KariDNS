@@ -143,6 +143,7 @@ typedef struct {
   char owning_catalog_domain[256];
   _Atomic(time_t) last_successful_transfer;
   _Atomic(time_t) last_stale_log_time;
+  time_t last_loaded_mtime;
 } zone_db_entry_t;
 
 // TCPストリーム解析ステート
@@ -734,6 +735,19 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   return openat(dfd, basebuf, flags | O_RESOLVE_BENEATH, mode);
 }
 
+static int stat_via_dir_cache(const char *path, struct stat *sb) {
+  char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+  if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf,
+                             sizeof(basebuf))) {
+    errno = EINVAL;
+    return -1;
+  }
+  int dfd = get_or_open_dir_fd(dirbuf, false);
+  if (dfd < 0)
+    return -1;
+  return fstatat(dfd, basebuf, sb, 0);
+}
+
 static int renameat_via_dir_cache(const char *old_path, const char *new_path) {
   char odir[PATH_MAX], obase[PATH_MAX], ndir[PATH_MAX], nbase[PATH_MAX];
   if (!split_path_for_openat(old_path, odir, sizeof(odir), obase,
@@ -1301,6 +1315,10 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 
   compute_ixfr_diff(entry, z_active, z_standby);
   atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+  struct stat st_loaded;
+  if (stat_via_dir_cache(file, &st_loaded) == 0) {
+    entry->last_loaded_mtime = st_loaded.st_mtime;
+  }
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
   return RELOAD_OK;
@@ -2273,7 +2291,12 @@ void rebuild_zone_db_from_config(server_config_t *config) {
             if (snap) {
                 zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
                 if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
-                    reload_master_zone(entry, z->file);
+                    struct stat st;
+                    if (stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
+                        syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
+                    } else {
+                        reload_master_zone(entry, z->file);
+                    }
                 }
                 release_zone_snapshot(snap);
             }
@@ -6367,44 +6390,10 @@ static ctrl_client_t *get_ctrl_client(int fd) {
   return NULL;
 }
 
+static void perform_config_reload(void);
+
 static void reload_all_zones(void) {
-  zone_db_snapshot_t *snap = acquire_zone_snapshot();
-  server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  
-  for (size_t v = 0; v < snap->view_count; v++) {
-    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
-      zone_db_entry_t *entry = snap->views[v].entries[i];
-      zone_config_t *zcfg = NULL;
-      view_config_t *vcfg = NULL;
-      for (view_config_t *vc = active_cfg->views; vc; vc = vc->next) {
-        if (strcasecmp(vc->name, snap->views[v].name) == 0) {
-          vcfg = vc;
-          break;
-        }
-      }
-      if (vcfg) {
-        zcfg = vcfg->zones;
-        while (zcfg) {
-          if (strcasecmp(zcfg->domain, entry->domain) == 0) {
-            if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0) && zcfg->file) {
-              syslog(LOG_NOTICE, "[Control] Reloading master zone: %s", entry->domain);
-              reload_result_t rr = reload_master_zone(entry, zcfg->file);
-              if (rr == RELOAD_OK && zcfg->is_catalog) {
-                void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
-                catalog_process_membership(entry, zcfg, vcfg->name);
-              }
-            } else if (zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0)) {
-              syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
-              atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
-            }
-            break;
-          }
-          zcfg = zcfg->next;
-        }
-      }
-    }
-  }
-  release_zone_snapshot(snap);
+  perform_config_reload();
 }
 
 static void perform_config_reload(void) {
