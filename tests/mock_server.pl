@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # ==============================================================================
-# mock_dns_server.pl
+# mock_server.pl / mock_dns_server.pl
 #
 # A versatile DNS mock server in pure Perl (no non-core dependencies).
 # Serves both UDP and TCP on the specified port.
@@ -18,6 +18,8 @@
 #   7. axfr.example           -> Returns complete AXFR sequence (SOA -> A -> TXT -> SOA).
 #   8. ipv4only.arpa          -> Returns AAAA 64:ff9b::c000:aa01 for DNS64 prefix testing.
 #   9. crypto.example         -> Returns DNSKEY, RRSIG, DS records for crypto/nocrypto testing.
+#  10. ede-0 .. ede-29        -> Returns Extended DNS Error (EDE, RFC 8914) with codes 0..29.
+#  11. ede-all.example        -> Returns all 30 EDE options in a single OPT record.
 # ==============================================================================
 
 use strict;
