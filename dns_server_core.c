@@ -2278,7 +2278,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     }
     syslog(LOG_INFO, "[Catalog] Processed membership for '%s', desired members: %d", catalog_entry->domain, new_desired_count);
 }
-void rebuild_zone_db_from_config(server_config_t *config) {
+void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
     if (!new_snap) {
         syslog(LOG_ERR, "[Core] Failed to rebuild zone DB snapshot from config due to allocation failure. Reload aborted.");
@@ -2292,7 +2292,7 @@ void rebuild_zone_db_from_config(server_config_t *config) {
                 zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
                 if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
                     struct stat st;
-                    if (stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
+                    if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
                         syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
                     } else {
                         reload_master_zone(entry, z->file);
@@ -6390,13 +6390,17 @@ static ctrl_client_t *get_ctrl_client(int fd) {
   return NULL;
 }
 
-static void perform_config_reload(void);
+static void perform_config_reload_ext(bool skip_unchanged);
 
 static void reload_all_zones(void) {
-  perform_config_reload();
+  perform_config_reload_ext(false);
 }
 
 static void perform_config_reload(void) {
+  perform_config_reload_ext(true);
+}
+
+static void perform_config_reload_ext(bool skip_unchanged) {
   g_last_configured_time = time(NULL);
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
@@ -6421,7 +6425,7 @@ static void perform_config_reload(void) {
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
-    rebuild_zone_db_from_config(standby);
+    rebuild_zone_db_from_config(standby, skip_unchanged);
     for (view_config_t *v = standby->views; v; v = v->next) {
       for (zone_config_t *z = v->zones; z; z = z->next) {
         if (z->type && strcasecmp(z->type, "program") == 0) {
@@ -7368,7 +7372,7 @@ int main(int argc, char **argv) {
 
   init_logging_channels(&g_config_db.config_a);
   atomic_init(&g_config_db.active, &g_config_db.config_a);
-  rebuild_zone_db_from_config(&g_config_db.config_a);
+  rebuild_zone_db_from_config(&g_config_db.config_a, false);
 
   int num_workers = sysconf(_SC_NPROCESSORS_ONLN);
   if (num_workers <= 0)
