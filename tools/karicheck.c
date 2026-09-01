@@ -990,6 +990,28 @@ static int check_config(const char *config_path, server_config_t *cfg) {
                 free(buf);
                 return 1;
             }
+        } else if (z->type && strcasecmp(z->type, "forward") == 0) {
+            if (z->forwarders_count == 0) {
+                fprintf(stderr, "[ERROR] Zone '%s' has type 'forward' but no 'forwarders' specified\n",
+                        z->domain);
+                free(buf);
+                return 1;
+            }
+            // 自己ループ検知: forwarders のいずれかが自分自身の
+            // bind-address:port と一致していないか確認する
+            for (int fi = 0; fi < z->forwarders_count; fi++) {
+                if (cfg->bind_addresses) {
+                    for (int bi = 0; bi < cfg->bind_address_count; bi++) {
+                        if (strcmp(z->forwarders[fi].ip, cfg->bind_addresses[bi]) == 0 &&
+                            (z->forwarders[fi].port == cfg->port || z->forwarders[fi].port == 0)) {
+                            fprintf(stderr,
+                                "[WARNING] Zone '%s': forwarder '%s:%d' appears to point back "
+                                "at this server itself (self-loop risk).\n",
+                                z->domain, z->forwarders[fi].ip, z->forwarders[fi].port);
+                        }
+                    }
+                }
+            }
         }
         z = z->next;
     }

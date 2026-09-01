@@ -486,6 +486,7 @@ run_check "RFC & CLI Fixes validation (tests/run_dag_fixes_validation_test.sh)" 
 run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"
 if command -v perl >/dev/null 2>&1; then
     run_check "Plugin Zones: 'type program' zone loader (tests/run_program_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_program_zone_test.sh\"" "ALL PROGRAM ZONE TESTS PASSED"
+    run_check "Forward Zones: 'type forward' zone relay (tests/run_forward_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_forward_zone_test.sh\"" "ALL FORWARD ZONE TESTS PASSED"
     run_check "Anomalous Packets: Comprehensive DNS packet wire suite (tests/run_dag_dig_anomalous_suite.sh)" "DAG_BIN=\"$DAG\" DIG_BIN=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dig_anomalous_suite.sh\" \"$([ "$DAG" = "dig" ] && echo "dig" || echo "dag")\"" "ALL ANOMALOUS PACKET TESTS PASSED SUCCESSFULLY"
     run_check "Transport: Multi-Message AXFR & Plain-HTTP DoH mock (tests/run_dag_doh_dot_axfr_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_dot_axfr_test.sh\"" "ALL DOT/DOH AXFR & MEMORY TESTS PASSED"
 fi

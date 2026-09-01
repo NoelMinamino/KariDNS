@@ -57,6 +57,11 @@ typedef struct zone_config {
   uint32_t program_restart_backoff_ms; /* 未使用: v1では自動再起動なし。将来用に予約 */
   /* --- ここまで追加 --- */
 
+  /* --- type "forward" 用 --- */
+  ip_port_t *forwarders;
+  int forwarders_count;
+  uint32_t forward_timeout_ms; /* 既定 2000ms。フォワーダー1台あたりの待ち時間 */
+
   struct zone_config *next;
 } zone_config_t;
 
