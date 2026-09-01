@@ -169,6 +169,25 @@ else
     FAILED=$((FAILED + 1))
 fi
 
+echo "=== 3. Testing Batch Mode Resilience Against Per-Line Errors ==="
+cat << EOF > "$TMP_DIR/batch_resilience.txt"
+test.internal.zone A +tcp +nohexdump
+test.internal.zone INVALIDQTYPE
+-h
+test.internal.zone TXT +nohexdump
+EOF
+
+echo -n "Test: Batch mode continues execution when lines contain invalid qtype or CLI-only opts ... "
+OUT=$("$DAG" @127.0.0.1 -p $PORT -f "$TMP_DIR/batch_resilience.txt" 2>&1 || true)
+if echo "$OUT" | grep -q ";test\.internal\.zone\..*IN.*A" && echo "$OUT" | grep -q ";test\.internal\.zone\..*IN.*TXT" && echo "$OUT" | grep -qi "unknown query type 'INVALIDQTYPE'" && echo "$OUT" | grep -qi "ignores CLI-only option '-h'"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "🎉 ALL BATCH & NSSEARCH GLUE TESTS PASSED!"

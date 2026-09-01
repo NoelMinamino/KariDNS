@@ -78,6 +78,7 @@ static inline void *dag_memmem(const void *haystack, size_t haystacklen,
 #include <netdb.h>
 #include <strings.h>
 #include <signal.h>
+#include <sys/wait.h>
 #endif
 
 #include <zlib.h>
@@ -95,6 +96,8 @@ static inline void *dag_memmem(const void *haystack, size_t haystacklen,
 #include "../dns_wire.h"
 #include "../dns_utils.h"
 #include "../dns_zone_parser.h"
+
+#define TRACE_MAX_CNAME_DEPTH 16
 
 static inline void set_socket_timeouts(int sock, int timeout_sec) {
     int tsec = timeout_sec > 0 ? timeout_sec : 5;
@@ -327,7 +330,7 @@ static uint16_t parse_qtype(const char *s) {
     uint16_t t;
     if (resolve_qtype(s, &t)) return t;
     fprintf(stderr, "dag: unknown query type '%s'\n", s);
-    exit(1);
+    return 0;
 }
 
 static void print_ldnsz_payload(const uint8_t *buf, size_t len) {
@@ -6046,6 +6049,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         use_tcp = true;
     } else {
         qtype = parse_qtype(qtype_s);
+        if (qtype == 0) return -1;
         if (qtype == 251) {
             qo->is_ixfr = true;
             qo->ixfr_serial = 0; // シリアル指定なし時は 0 (全転送/差分開始シリアル)
@@ -6660,9 +6664,12 @@ static void usage(const char *prog) {
         "  +[no]https[=endpoint]        Use DNS-over-HTTPS (DoH) mode [default endpoint: /dns-query, port: 443]\n"
         "  +[no]https-get[=endpoint]    Use GET method instead of POST for DoH\n"
         "  +[no]https-post[=endpoint]   Use POST method for DoH\n"
-        "  +[no]http-plain[=endpoint]   Use plain HTTP DNS mode [default endpoint: /dns-query, port: 80]\n"
-        "  +[no]http-plain-get[=ep]     Use GET method for plain HTTP\n"
-        "  +[no]http-plain-post[=ep]    Use POST method for plain HTTP\n"
+        "  +[no]http-plain[=endpoint]   Use plain HTTP DNS mode (+http) [default endpoint: /dns-query, port: 80]\n"
+        "  +[no]http-plain-get[=ep]     Use GET method for plain HTTP (+http-get)\n"
+        "  +[no]http-plain-post[=ep]    Use POST method for plain HTTP (+http-post)\n"
+        "  +[no]http[=endpoint]         Alias for +http-plain\n"
+        "  +[no]http-get[=endpoint]     Alias for +http-plain-get\n"
+        "  +[no]http-post[=endpoint]    Alias for +http-plain-post\n"
         "  +[no]proxy[=spec]            Inject PROXYv2 transport header ahead of any TLS handshake (e.g. +proxy=192.0.2.1#1234-192.0.2.2#53)\n"
         "  +[no]proxy-plain[=spec]      Alias for +proxy (retained for dig/kdig compatibility); behaves identically\n"
         "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828)\n"
@@ -7239,6 +7246,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             }
         } else {
             int qtype_val = parse_qtype(qtype_s);
+            if (qtype_val == 0) return 1;
             qlen = build_and_sign_query(qbuf, sizeof(qbuf), qname, qtype_val, &qo, hop_req_mac, &hop_req_mac_len);
             if (qlen == 0) break;
         }
@@ -7328,7 +7336,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
                         snprintf(cname_target, sizeof(cname_target), "%s", rec.rdata[0]);
                     }
                 }
-                if (cname_target[0] != '\0' && cname_depth < MAX_JUMPS) {
+                if (cname_target[0] != '\0' && cname_depth < TRACE_MAX_CNAME_DEPTH) {
                     return run_trace_query_impl(cname_target, server, qtype_s, port, use_tcp, force_udp,
                                                 no_hexdump_query, no_hexdump_response, qo, hex_payload, dopt, cname_depth + 1);
                 }
@@ -8651,7 +8659,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false;
             if (!parse_proxy_arg(arg + 7, &spec->qo)) {
                 fprintf(stderr, "dag: invalid proxy specification '%s'\n", arg + 7);
-                exit(1);
+                return -1;
             }
         } else if (strcmp(arg, "+proxy") == 0) {
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
@@ -8661,7 +8669,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false;
             if (!parse_proxy_arg(arg + 13, &spec->qo)) {
                 fprintf(stderr, "dag: invalid proxy specification '%s'\n", arg + 13);
-                exit(1);
+                return -1;
             }
         } else if (strcmp(arg, "+proxy-plain") == 0) {
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
@@ -9001,10 +9009,12 @@ static int execute_batch_spec(const query_spec_t *spec) {
     FILE *bf = fopen(spec->batch_file, "r");
     if (!bf) {
         fprintf(stderr, "error: could not open batch file '%s': %s\n", spec->batch_file, strerror(errno));
-        exit(8);
+        return 8;
     }
     char line[1024];
+    int line_num = 0;
     while (fgets(line, sizeof(line), bf)) {
+        line_num++;
         char *p = line;
         while (isspace((unsigned char)*p)) p++;
         if (*p == '\0' || *p == '#' || *p == ';') continue;
@@ -9020,6 +9030,56 @@ static int execute_batch_spec(const query_spec_t *spec) {
         line_argv[line_argc] = NULL;
 
         if (line_argc > 1) {
+            bool has_cli_only_opt = false;
+            for (int k = 1; k < line_argc; k++) {
+                if (strcmp(line_argv[k], "-h") == 0 || strcmp(line_argv[k], "--help") == 0 ||
+                    strcmp(line_argv[k], "-v") == 0 || strcmp(line_argv[k], "--version") == 0) {
+                    fprintf(stderr, "warning: batch line %d ignores CLI-only option '%s'\n", line_num, line_argv[k]);
+                    has_cli_only_opt = true;
+                    break;
+                }
+            }
+            if (has_cli_only_opt) continue;
+
+#ifndef _WIN32
+            pid_t pid = fork();
+            if (pid == 0) {
+                query_spec_t local_spec;
+                init_query_spec(&local_spec);
+                deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
+                local_spec.dopt = spec->dopt;
+                if (spec->server_arg) local_spec.server_arg = spec->server_arg;
+                if (spec->port != 53) local_spec.port = spec->port;
+                prescan_always_global_options(line_argc, line_argv, &local_spec);
+                int rc = 0;
+                if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
+                    rc = execute_query_spec(&local_spec);
+                } else {
+                    fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
+                    rc = 1;
+                }
+                free_query_opts(&local_spec.qo);
+                exit(rc < 0 ? 1 : 0);
+            } else if (pid > 0) {
+                int status = 0;
+                waitpid(pid, &status, 0);
+            } else {
+                // Fallback if fork fails
+                query_spec_t local_spec;
+                init_query_spec(&local_spec);
+                deep_copy_query_opts(&local_spec.qo, &spec->qo);
+                local_spec.dopt = spec->dopt;
+                if (spec->server_arg) local_spec.server_arg = spec->server_arg;
+                if (spec->port != 53) local_spec.port = spec->port;
+                prescan_always_global_options(line_argc, line_argv, &local_spec);
+                if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
+                    execute_query_spec(&local_spec);
+                } else {
+                    fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
+                }
+                free_query_opts(&local_spec.qo);
+            }
+#else
             query_spec_t local_spec;
             init_query_spec(&local_spec);
             deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
@@ -9029,8 +9089,11 @@ static int execute_batch_spec(const query_spec_t *spec) {
             prescan_always_global_options(line_argc, line_argv, &local_spec);
             if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
                 execute_query_spec(&local_spec);
+            } else {
+                fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
             }
             free_query_opts(&local_spec.qo);
+#endif
         }
     }
     fclose(bf);
