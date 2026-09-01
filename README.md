@@ -25,17 +25,21 @@ KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD
 
 ## Features
 
-- **Authoritative Master & Slave Roles:** Supports AXFR (RFC 5936) and IXFR (RFC 1995) zone transfers, as well as inbound and outbound NOTIFY (RFC 1996) with TSIG authentication.
+- **Authoritative Zone Roles:**
+  - **Master (Primary) & Slave (Secondary):** Supports AXFR (RFC 5936) and IXFR (RFC 1995) zone transfers, inbound and outbound NOTIFY (RFC 1996) with TSIG authentication.
+  - **Forward Zones (`type forward`):** Transparent query forwarding to multiple upstream nameservers with per-zone timeouts, shared deadline budgeting, automatic failover, transaction ID randomization, and response verification.
+  - **Program Zone Plugins (`type program`):** Test-only dynamic external process-backed zones communicating over stdin/stdout pipes with strict privilege dropping and automatic circuit-breaker failure isolation.
 - **Dynamic DNS Update:** Ephemeral DNS UPDATE handling (RFC 2136 / RFC 3007) with prerequisite evaluation and TSIG verification.
-- **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, DS, CDS, CDNSKEY, CSYNC, etc.). Includes RFC 8976 (ZONEMD) digest validation.
+- **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, DS, CDS, CDNSKEY, CSYNC, etc.). Includes RFC 8976 (ZONEMD) digest validation.
 - **Security & Rate Limiting:**
   - **Response Rate Limiting (RRL):** BIND9-compatible token-bucket rate limiting with response classification, CIDR aggregation, and `slip` truncation.
   - **DNS Cookies (RFC 7873 / RFC 9018):** Generates and validates client and server cookies.
   - **TSIG (RFC 8945):** Transaction authentication supporting HMAC-MD5, SHA1, SHA224, SHA256, SHA384, and SHA512.
   - **Extended DNS Errors (EDE, RFC 8914):** Returns diagnostic error codes when queries cannot be fulfilled normally.
 - **Protocol Extensions:**
-  - **SVCB / HTTPS Records (RFC 9460):** Serialization of structured SvcParams (`alpn`, `port`, `ipv4hint`, `ipv6hint`, `ech`, etc.).
+  - **SVCB / HTTPS Records (RFC 9460):** Serialization of structured SvcParams (`alpn`, `port`, `ipv4hint`, `ipv6hint`, `ech`, `mandatory`, and generic `keyNNN`).
   - **Multiple QTYPEs (MQTYPE, RFC 10029):** Resolving multiple record types in a single query (configurable via `rfc10029-mqtype`).
+  - **Delegation Synchronization (DSYNC, RFC 9859):** Full support for DSYNC record formatting, parsing, and wire-format serialization.
   - **TCP Connection Reuse & Keepalive (RFC 7766, RFC 9210, RFC 7828):** Configurable TCP connection reuse and idle timeout parameters.
   - **Minimal ANY & Minimal Responses (RFC 8482):** Prevents ANY query response amplification.
   - **NSID (RFC 5001):** Server identifier transmission via EDNS.
@@ -55,14 +59,19 @@ KariDNS implements specifications according to official IETF RFC standards. For 
 
 ## Supported Record Types & Zone Directives
 
-### Supported Record Types
-`A`, `AAAA`, `NS`, `CNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `DNAME`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `X25`, `ISDN`, `NSAP`, `GPOS`, `NID`, `L32`, `L64`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `NAPTR`, `NSEC3PARAM`, `HTTPS`, `SVCB`, `OPENPGPKEY`, `DHCID`, `EUI48`, `EUI64`, `ZONEMD`, `CSYNC`, `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `IPSECKEY`, `AMTRELAY`, `AVC`, `DSYNC`, `NXNAME`
+### Supported Resource Record (RR) Types
+KariDNS natively parses, validates, and serializes the following standard and experimental DNS record types, as well as RFC 3597 unknown record syntax (`TYPE<n>` / `\#`):
+
+- **Core & Routing:** `A`, `AAAA`, `NS`, `CNAME`, `DNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `WKS`, `X25`, `ISDN`, `NSAP`, `NSAP-PTR`, `GPOS`, `NULL`, `MD`, `MF`, `MB`, `MG`, `MR`, `NXT`, `EID`, `NIMLOC`, `ATMA`, `A6`, `SINK`
+- **DNSSEC & Cryptographic Identities:** `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `OPENPGPKEY`, `IPSECKEY`, `HIP`, `TA`, `DLV`, `SIG`, `KEY`
+- **Modern Web, Discovery & Service Bindings:** `HTTPS`, `SVCB`, `NAPTR`, `DSYNC`, `ZONEMD`, `CSYNC`, `DHCID`, `EUI48`, `EUI64`, `NID`, `L32`, `L64`, `NXNAME`, `AVC`, `DOA`, `AMTRELAY`
+- **Pseudo & Meta Types:** `OPT` (EDNS0), `TSIG`, `TKEY`, `AXFR`, `IXFR`, `ANY` (RFC 8482), `MAILB`, `MAILA`, `TYPE<n>` (RFC 3597)
 
 ### Zone File Directives
 - `$ORIGIN <domain>`
 - `$TTL <default-ttl>` (supports BIND-compatible time unit suffixes: `w`, `d`, `h`, `m`, `s`)
 - `$INCLUDE <filename> [origin]` (supports up to 32 files and 16 nesting levels within Capsicum constraints)
-- `$GENERATE <range> <template>`
+- `$GENERATE <range> <template>` (supports standard, width-padded, and offset numerical generators)
 
 ---
 
@@ -363,6 +372,12 @@ zone "slave.example.net" {
     file "slave/slave.example.net.zone";
     masters { 192.0.2.100 port 53; };
     tsig-key "tsig-key-primary";
+};
+
+zone "corp.example.org" {
+    type forward;
+    forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
+    forward-timeout 2000; # timeout in milliseconds
 };
 ```
 
