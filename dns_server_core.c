@@ -4497,7 +4497,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
-  if (edns.present && max_res_len == UDP_DEFAULT_MAX_RES_LEN) {
+  if (edns.present && !is_tcp) {
     if (edns.udp_payload_size > 1232)
       edns.udp_payload_size = 1232;
     if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
