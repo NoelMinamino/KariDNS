@@ -3281,6 +3281,44 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
             }
             return;
         }
+        case 11: { // WKS
+            if (rdlen >= 5) {
+                rdata_buf_append(out, out_cap, &pos, "%d.%d.%d.%d %u",
+                                 pkt[abs_offset], pkt[abs_offset+1], pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4]);
+                for (uint16_t i = 5; i < rdlen; i++) {
+                    uint8_t b = pkt[abs_offset+i];
+                    for (int bit = 0; bit < 8; bit++) {
+                        if (b & (0x80 >> bit)) {
+                            rdata_buf_append(out, out_cap, &pos, " %d", (i - 5) * 8 + bit);
+                        }
+                    }
+                }
+                return;
+            }
+            break;
+        }
+        case 13: { // HINFO
+            char cpu[256], os[256];
+            const uint8_t *p = &pkt[abs_offset];
+            const uint8_t *end = p + rdlen;
+            p = read_char_string(p, end, cpu, sizeof(cpu));
+            if (p) p = read_char_string(p, end, os, sizeof(os));
+            if (p) {
+                rdata_buf_append(out, out_cap, &pos, "\"%s\" \"%s\"", cpu, os);
+                return;
+            }
+            break;
+        }
+        case 14: { // MINFO
+            char *rmailbx = NULL, *emailbx = NULL; size_t next;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &rmailbx) == 0 &&
+                expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &emailbx) == 0 &&
+                next <= abs_offset + rdlen) {
+                rdata_buf_append(out, out_cap, &pos, "%s %s", rmailbx, emailbx);
+                return;
+            }
+            break;
+        }
         case 17: case 18: case 19: case 20: case 22: case 26: case 40: { // RP, AFSDB, X25, ISDN, NSAP, PX, SINK
             if (type == 17) { // RP
                 char *mbox = NULL, *txt = NULL; size_t next;
@@ -3327,6 +3365,17 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                 rdata_buf_append(out, out_cap, &pos, "0x");
                 for (size_t i = 0; i < rdlen; i++) rdata_buf_append(out, out_cap, &pos, "%02x", pkt[abs_offset + i]);
                 return;
+            } else if (type == 26) { // PX
+                if (rdlen >= 2) {
+                    uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+                    char *map822 = NULL, *mapx400 = NULL; size_t next;
+                    if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &map822) == 0 &&
+                        expand_wire_name(pkt, pkt_len, next, &next, &g_dag_arena, &mapx400) == 0 &&
+                        next <= abs_offset + rdlen) {
+                        rdata_buf_append(out, out_cap, &pos, "%u %s %s", pref, map822, mapx400);
+                        return;
+                    }
+                }
             }
             break;
         }
@@ -3516,6 +3565,39 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                 rdata_buf_append(out, out_cap, &pos, "%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
                 rdata_buf_append_split_hex(out, out_cap, &pos, &pkt[abs_offset + 3], rdlen - 3, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 return;
+            }
+            break;
+        }
+        case 55: { // HIP
+            if (rdlen >= 4) {
+                uint8_t hit_len = pkt[abs_offset];
+                uint8_t pk_algorithm = pkt[abs_offset+1];
+                uint16_t pk_len = (pkt[abs_offset+2]<<8)|pkt[abs_offset+3];
+                size_t p_off = 4;
+                if (p_off + hit_len + pk_len <= rdlen) {
+                    char hit_hex[512] = "";
+                    size_t hp = 0;
+                    for (int i = 0; i < hit_len && hp + 2 < sizeof(hit_hex); i++) {
+                        hp += snprintf(hit_hex + hp, sizeof(hit_hex) - hp, "%02X", pkt[abs_offset + p_off + i]);
+                    }
+                    p_off += hit_len;
+
+                    int n = 0;
+                    char *b64 = base64_encode_alloc(&pkt[abs_offset + p_off], pk_len, &n);
+                    if (b64) {
+                        p_off += pk_len;
+                        rdata_buf_append(out, out_cap, &pos, "%u %s %.*s", pk_algorithm, hit_hex, n, b64);
+                        free(b64);
+                        while (p_off < rdlen) {
+                            char *rvs_name = NULL; size_t next;
+                            if (expand_wire_name(pkt, pkt_len, abs_offset + p_off, &next, &g_dag_arena, &rvs_name) != 0 ||
+                                next > abs_offset + rdlen) break;
+                            rdata_buf_append(out, out_cap, &pos, " %s", rvs_name ? rvs_name : ".");
+                            p_off = next - abs_offset;
+                        }
+                        return;
+                    }
+                }
             }
             break;
         }
@@ -3866,6 +3948,45 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                                  pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5],
                                  pkt[abs_offset+6], pkt[abs_offset+7], pkt[abs_offset+8], pkt[abs_offset+9]);
                 return;
+            }
+            break;
+        }
+        case 260: { // AMTRELAY
+            if (rdlen >= 1) {
+                uint8_t prec = pkt[abs_offset];
+                uint8_t d_opt = (prec & 0x80) != 0;
+                prec &= 0x7F;
+                if (rdlen < 2) {
+                    rdata_buf_append(out, out_cap, &pos, "%u %u 0 .", prec, d_opt);
+                    return;
+                }
+                uint8_t relay_type = pkt[abs_offset + 1];
+                const uint8_t *p = &pkt[abs_offset + 2];
+                const uint8_t *end = &pkt[abs_offset + rdlen];
+                rdata_buf_append(out, out_cap, &pos, "%u %u %u ", prec, d_opt, relay_type);
+                if (relay_type == 0) {
+                    rdata_buf_append(out, out_cap, &pos, ".");
+                    return;
+                } else if (relay_type == 1) {
+                    if (p + 4 <= end) {
+                        rdata_buf_append(out, out_cap, &pos, "%d.%d.%d.%d", p[0], p[1], p[2], p[3]);
+                        return;
+                    }
+                } else if (relay_type == 2) {
+                    if (p + 16 <= end) {
+                        char buf[INET6_ADDRSTRLEN];
+                        inet_ntop(AF_INET6, p, buf, sizeof(buf));
+                        rdata_buf_append(out, out_cap, &pos, "%s", buf);
+                        return;
+                    }
+                } else if (relay_type == 3) {
+                    char *gw = NULL; size_t next;
+                    if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &gw) == 0 &&
+                        next <= abs_offset + rdlen) {
+                        rdata_buf_append(out, out_cap, &pos, "%s", gw);
+                        return;
+                    }
+                }
             }
             break;
         }
@@ -5041,7 +5162,7 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
 
     const char *resp_type = "RESPONSE";
     if (qr) {
-        if (aa) resp_type = "AUTH_RESPONSE";
+        if (aa || !ra) resp_type = "AUTH_RESPONSE";
         else resp_type = "RECURSIVE_RESPONSE";
     } else {
         resp_type = "QUERY";
@@ -6261,8 +6382,8 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     return 0;
 }
 
-static void print_multi_server_summary(bool use_ldnsz) {
-    if (g_server_count == 0) return;
+static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
+    if (is_yaml || g_server_count == 0) return;
     
     if (g_server_count > 1) {
 
@@ -6813,8 +6934,9 @@ static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff
 
 static int run_trace_query(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     (void)force_udp; (void)hex_payload;
-    qo.rd_flag = false;
-    printf(";; TRACE: tracing %s from root servers...\n", qname);
+    if (!dopt->yaml) {
+        printf(";; TRACE: tracing %s from root servers...\n", qname);
+    }
     char target_ips[32][64];
     int target_count = 0;
     
@@ -6824,10 +6946,12 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
     trace_dopt.show_question = false;
     trace_dopt.show_stats = false;
 
-    uint8_t root_qbuf[512];
-    size_t root_qlen = build_query_packet(root_qbuf, sizeof(root_qbuf), ".", 2 /* NS */, &qo);
+    query_opts_t root_qo = qo;
+    root_qo.rd_flag = true;
+    uint8_t root_qbuf[65535];
+    size_t root_qlen = build_query_packet(root_qbuf, sizeof(root_qbuf), ".", 2 /* NS */, &root_qo);
     uint8_t root_resp[65535];
-    if (!no_hexdump_query) {
+    if (!no_hexdump_query && !dopt->yaml) {
         printf("Query (%zd bytes):\n", root_qlen);
         hexdump(root_qbuf, root_qlen);
         printf("\n");
@@ -6835,24 +6959,35 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
 
     struct timespec start_ts, end_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
-    ssize_t root_n = do_dns_exchange_auto(eff_server, port, &qo, root_qbuf, root_qlen, root_resp, sizeof(root_resp), qo.timeout_sec, use_tcp);
+    ssize_t root_n = do_dns_exchange_auto(eff_server, port, &root_qo, root_qbuf, root_qlen, root_resp, sizeof(root_resp), root_qo.timeout_sec, use_tcp);
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
     
-    if (root_n > 0) {
-        int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        record_ldnsz_result(eff_server, root_n, root_resp, dt_ms, use_tcp ? "TCP" : "UDP");
-        if (!no_hexdump_response) {
-            printf("Response (%zd bytes):\n", root_n);
-            hexdump(root_resp, (size_t)root_n);
-            printf("\n");
+    if (root_n <= 0) {
+        if (dopt->yaml) {
+            printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
+        } else {
+            printf(";; connection timed out; no servers could be reached\n");
         }
+        return 9;
+    }
+
+    int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
+    record_ldnsz_result(eff_server, root_n, root_resp, dt_ms, use_tcp ? "TCP" : "UDP");
+    if (!no_hexdump_response && !dopt->yaml) {
+        printf("Response (%zd bytes):\n", root_n);
+        hexdump(root_resp, (size_t)root_n);
+        printf("\n");
     }
 
     if (root_n > 12) {
-        axfr_state_t dummy_axfr = {0};
-        print_response(root_resp, root_n, &dummy_axfr, &trace_dopt);
-        int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        printf(";; Received %zd bytes from %s#%d in %d ms\n\n", root_n, eff_server, port, dt_ms);
+        if (dopt->yaml) {
+            print_response_yaml(root_resp, root_n, eff_server, port, use_tcp, dopt);
+        } else {
+            axfr_state_t dummy_axfr = {0};
+            print_response(root_resp, root_n, &dummy_axfr, &trace_dopt);
+            int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
+            printf(";; Received %zd bytes from %s#%d in %d ms\n\n", root_n, eff_server, port, dt_ms);
+        }
         
         int r_qd = (root_resp[4] << 8) | root_resp[5];
         int r_an = (root_resp[6] << 8) | root_resp[7];
@@ -6873,8 +7008,8 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
             dns_record_t rec; uint16_t type;
             if (parse_resource_record(root_resp, root_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
             bool want = false;
-            if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
-            if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
+            if (type == 1 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET)) want = true;
+            if (type == 28 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET6)) want = true;
             if (want && rec.rdata_count > 0) {
                 for (int j=0; j<rns_count; j++) {
                     if (strcasecmp(rec.name, rns_names[j]) == 0 && target_count < 32) {
@@ -6886,13 +7021,13 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
     }
     
     if (target_count == 0) {
-        printf(";; could not fetch root servers, falling back to 198.41.0.4\n");
-        if (strlcpy(target_ips[0], "198.41.0.4", sizeof(target_ips[0])) >= sizeof(target_ips[0])) {
-            fprintf(stderr, "warning: target IP truncated\n");
+        if (!dopt->yaml) {
+            printf(";; could not fetch root servers, stopping trace.\n");
         }
-        target_count = 1;
+        return 0;
     }
     
+    qo.rd_flag = false;
     int hop = 0;
     while (hop < 15 && target_count > 0) {
         reset_dag_arena();
@@ -6907,7 +7042,7 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         int active_target_idx = 0;
 
         for (int ti = 0; ti < target_count; ti++) {
-            if (!no_hexdump_query) {
+            if (!no_hexdump_query && !dopt->yaml) {
                 printf("Query (%zd bytes):\n", qlen);
                 hexdump(qbuf, qlen);
                 printf("\n");
@@ -6919,26 +7054,38 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
                 active_target_idx = ti;
                 break;
             }
-            printf(";; connection to %s#%d timed out; trying next server...\n", target_ips[ti], port);
+            if (dopt->yaml) {
+                printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
+            } else {
+                printf(";; connection to %s#%d timed out; trying next server...\n", target_ips[ti], port);
+            }
         }
 
         if (n <= 0) {
-            printf(";; no servers could be reached for hop %d\n", hop);
+            if (dopt->yaml) {
+                printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
+            } else {
+                printf(";; no servers could be reached for hop %d\n", hop);
+            }
             return 9;
         }
         
         int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
         record_ldnsz_result(target_ips[active_target_idx], n, resp, dt_ms, use_tcp ? "TCP" : "UDP");
 
-        if (!no_hexdump_response) {
+        if (!no_hexdump_response && !dopt->yaml) {
             printf("Response (%zd bytes):\n", n);
             hexdump(resp, (size_t)n);
             printf("\n");
         }
 
-        axfr_state_t dummy_axfr = {0};
-        print_response(resp, n, &dummy_axfr, &trace_dopt);
-        printf(";; Received %zd bytes from %s#%d in %d ms\n\n", n, target_ips[active_target_idx], port, dt_ms);
+        if (dopt->yaml) {
+            print_response_yaml(resp, n, target_ips[active_target_idx], port, use_tcp, dopt);
+        } else {
+            axfr_state_t dummy_axfr = {0};
+            print_response(resp, n, &dummy_axfr, &trace_dopt);
+            printf(";; Received %zd bytes from %s#%d in %d ms\n\n", n, target_ips[active_target_idx], port, dt_ms);
+        }
         
         if (n < 12) break;
         uint16_t flags = (resp[2] << 8) | resp[3];
@@ -6982,7 +7129,9 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
         }
         
         if (new_target_count == 0) {
-            printf(";; No glue found for next hop, stopping trace.\n");
+            if (!dopt->yaml) {
+                printf(";; No glue found for next hop, stopping trace.\n");
+            }
             break;
         }
         
@@ -6999,10 +7148,11 @@ static int run_trace_query(const char *qname, const char *server, const char *qt
 
 static int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
     (void)force_udp; (void)hex_payload; (void)dopt;
-    qo.rd_flag = false;
     const char *eff_server = server ? server : get_system_resolver();
+    query_opts_t ns_qo = qo;
+    ns_qo.rd_flag = true;
     uint8_t qbuf[65535];
-    size_t qlen = build_query_packet(qbuf, sizeof(qbuf), qname, 2 /* NS */, &qo);
+    size_t qlen = build_query_packet(qbuf, sizeof(qbuf), qname, 2 /* NS */, &ns_qo);
     if (!no_hexdump_query) {
         printf("Query (%zd bytes):\n", qlen);
         hexdump(qbuf, qlen);
@@ -7011,7 +7161,7 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     uint8_t resp[65535];
     struct timespec start_ts, end_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
-    ssize_t n = do_dns_exchange_auto(eff_server, port, &qo, qbuf, qlen, resp, sizeof(resp), qo.timeout_sec, use_tcp);
+    ssize_t n = do_dns_exchange_auto(eff_server, port, &ns_qo, qbuf, qlen, resp, sizeof(resp), ns_qo.timeout_sec, use_tcp);
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
     if (n > 0) {
         int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
@@ -8720,7 +8870,7 @@ int main(int argc, char **argv) {
     // -f バッチファイルモードの処理
     if (global_spec.batch_file) {
         execute_batch_spec(&global_spec);
-        print_multi_server_summary(global_spec.use_ldnsz);
+        print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml);
 #ifndef _WIN32
         if (global_spec.qo.mem_debug) {
             struct rusage ru;
@@ -8770,7 +8920,7 @@ int main(int argc, char **argv) {
         if (query_count > 1) {
             bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
             if (!used_nofail) {
-                print_multi_server_summary(local_spec.use_ldnsz);
+                print_multi_server_summary(local_spec.use_ldnsz, local_spec.dopt.yaml);
             }
             g_server_count = 0;
         }
@@ -8779,7 +8929,7 @@ int main(int argc, char **argv) {
     if (query_count <= 1) {
         bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
         if (!used_nofail_failover) {
-            print_multi_server_summary(global_spec.use_ldnsz);
+            print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml);
         }
     }
 

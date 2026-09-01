@@ -397,6 +397,7 @@ EOF
     compare_query "YAML: SOA with multi alias (+yaml +multi)" "example.com SOA +yaml +multi"
     compare_query "YAML: LOC record (+yaml)" "office.example.com LOC +yaml"
     compare_query "YAML: LOC record (where-is-the-iss.dedyn.io)" "where-is-the-iss.dedyn.io LOC +yaml +timeout=3"
+    compare_query "YAML: Trace query (+trace +yaml)" "example.com +trace +yaml +timeout=3"
 
     echo "--------------------------------------------------------"
     echo "12. DNS64 Prefix Discovery (+dns64prefix)"
