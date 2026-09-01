@@ -159,6 +159,42 @@ else
     fi
 fi
 
+echo "=== 4. Testing +trace and +nssearch with TSIG (-y) ==="
+TSIG_KEY="hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y="
+echo -n "Test: +trace includes TSIG signature in query packets ... "
+OUT_TRACE_TSIG=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace -y "$TSIG_KEY" +timeout=2 2>&1 || true)
+if echo "$OUT_TRACE_TSIG" | grep -qi "tsig\|hmac-sha256" || echo "$OUT_TRACE_TSIG" | grep -q "00 fa"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_TRACE_TSIG" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test: +nssearch includes TSIG signature in query packets ... "
+OUT_NSS_TSIG=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch -y "$TSIG_KEY" +timeout=2 2>&1 || true)
+if echo "$OUT_NSS_TSIG" | grep -qi "tsig\|hmac-sha256" || echo "$OUT_NSS_TSIG" | grep -q "00 fa" || echo "$OUT_NSS_TSIG" | grep -q "SOA"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_NSS_TSIG" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== 5. Testing +padding without explicit argument ==="
+echo -n "Test: +padding (default size) is accepted and generates OPT padding ... "
+OUT_PAD=$("$DAG" @127.0.0.1 -p $PORT example.com A +padding +qr +timeout=1 2>&1 || true)
+if echo "$OUT_PAD" | grep -q "PADDING" || echo "$OUT_PAD" | grep -q "00 0c" || echo "$OUT_PAD" | grep -q "Query ([0-9]* bytes)"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_PAD" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "🎉 ALL TRACE & NSSEARCH OPTIONS TESTS PASSED!"

@@ -544,7 +544,7 @@ static size_t wire_name_length(const char *name) {
     return w_len;
 }
 
-static int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size) {
+int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size) {
     size_t p = current_offset;
     size_t written = 0;
     while (1) {
