@@ -77,10 +77,11 @@ run_check "+idnin converts UTF-8 domain to Punycode" "$DAG @127.0.0.1 -p 10053 æ
 run_check "+multi flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +multi +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 run_check "+nomulti flag accepted" "$DAG @127.0.0.1 -p 10053 example.com A +nomulti +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
 
-echo "=== 2. Testing +noednsopt flag ==="
+echo "=== 2. Testing +noednsopt and +mqtype flags ==="
 # +ednsopt=65001:0102 adds custom option 65001 (0xfde9 in hex dump)
 run_check "+ednsopt adds custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +qr +timeout=1" "(fd e9 00 02 01 02|OPT[ =]65001|OPTION: 65001)"
 run_not_check "+noednsopt clears custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(fd e9 00 02 01 02|OPTION: 65001|OPT[ =]65001)"
+run_check "multiple +mqtype flags merge into single option" "$DAG @127.0.0.1 -p 10053 example.com A +mqtype=A +mqtype=AAAA +qr +timeout=1" "(00 14 00 04 00 01 00 1c|OPT[ =]20|OPTION: 20)"
 
 echo "=== 3. Testing Dynamic DNS UPDATE prerequisites (--prereq-*) ==="
 if [ "$DAG" = "dig" ]; then

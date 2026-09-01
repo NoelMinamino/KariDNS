@@ -224,6 +224,7 @@ else
     compare_query "NAPTR query" "_ldap._tcp.example.com NAPTR"
     compare_query "HTTPS query" "www.example.com HTTPS"
     compare_query "SVCB query" "_8443._tcp.svc.example.com SVCB"
+    compare_query "SVCB key7 query" "_dns.resolver.example.com SVCB"
     compare_query "TLSA query" "_443._tcp.www.example.com TLSA"
     compare_query "SSHFP query" "ns1.example.com SSHFP"
     compare_query "CAA query" "example.com CAA"
@@ -397,6 +398,7 @@ EOF
     compare_query "YAML: SOA with multi alias (+yaml +multi)" "example.com SOA +yaml +multi"
     compare_query "YAML: LOC record (+yaml)" "office.example.com LOC +yaml"
     compare_query "YAML: LOC record (where-is-the-iss.dedyn.io)" "where-is-the-iss.dedyn.io LOC +yaml +timeout=3"
+    compare_query "YAML: Trace query (+trace +yaml)" "example.com +trace +yaml +timeout=3"
 
     echo "--------------------------------------------------------"
     echo "12. DNS64 Prefix Discovery (+dns64prefix)"

@@ -143,6 +143,7 @@ typedef struct {
   char owning_catalog_domain[256];
   _Atomic(time_t) last_successful_transfer;
   _Atomic(time_t) last_stale_log_time;
+  time_t last_loaded_mtime;
 } zone_db_entry_t;
 
 // TCPストリーム解析ステート
@@ -734,6 +735,19 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   return openat(dfd, basebuf, flags | O_RESOLVE_BENEATH, mode);
 }
 
+static int stat_via_dir_cache(const char *path, struct stat *sb) {
+  char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+  if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf,
+                             sizeof(basebuf))) {
+    errno = EINVAL;
+    return -1;
+  }
+  int dfd = get_or_open_dir_fd(dirbuf, false);
+  if (dfd < 0)
+    return -1;
+  return fstatat(dfd, basebuf, sb, 0);
+}
+
 static int renameat_via_dir_cache(const char *old_path, const char *new_path) {
   char odir[PATH_MAX], obase[PATH_MAX], ndir[PATH_MAX], nbase[PATH_MAX];
   if (!split_path_for_openat(old_path, odir, sizeof(odir), obase,
@@ -1301,6 +1315,10 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
 
   compute_ixfr_diff(entry, z_active, z_standby);
   atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+  struct stat st_loaded;
+  if (stat_via_dir_cache(file, &st_loaded) == 0) {
+    entry->last_loaded_mtime = st_loaded.st_mtime;
+  }
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
   return RELOAD_OK;
@@ -2260,7 +2278,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     }
     syslog(LOG_INFO, "[Catalog] Processed membership for '%s', desired members: %d", catalog_entry->domain, new_desired_count);
 }
-void rebuild_zone_db_from_config(server_config_t *config) {
+void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
     if (!new_snap) {
         syslog(LOG_ERR, "[Core] Failed to rebuild zone DB snapshot from config due to allocation failure. Reload aborted.");
@@ -2273,7 +2291,12 @@ void rebuild_zone_db_from_config(server_config_t *config) {
             if (snap) {
                 zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
                 if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
-                    reload_master_zone(entry, z->file);
+                    struct stat st;
+                    if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
+                        syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
+                    } else {
+                        reload_master_zone(entry, z->file);
+                    }
                 }
                 release_zone_snapshot(snap);
             }
@@ -4474,7 +4497,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
-  if (edns.present && max_res_len == UDP_DEFAULT_MAX_RES_LEN) {
+  if (edns.present && !is_tcp) {
     if (edns.udp_payload_size > 1232)
       edns.udp_payload_size = 1232;
     if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
@@ -6367,47 +6390,17 @@ static ctrl_client_t *get_ctrl_client(int fd) {
   return NULL;
 }
 
+static void perform_config_reload_ext(bool skip_unchanged);
+
 static void reload_all_zones(void) {
-  zone_db_snapshot_t *snap = acquire_zone_snapshot();
-  server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  
-  for (size_t v = 0; v < snap->view_count; v++) {
-    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
-      zone_db_entry_t *entry = snap->views[v].entries[i];
-      zone_config_t *zcfg = NULL;
-      view_config_t *vcfg = NULL;
-      for (view_config_t *vc = active_cfg->views; vc; vc = vc->next) {
-        if (strcasecmp(vc->name, snap->views[v].name) == 0) {
-          vcfg = vc;
-          break;
-        }
-      }
-      if (vcfg) {
-        zcfg = vcfg->zones;
-        while (zcfg) {
-          if (strcasecmp(zcfg->domain, entry->domain) == 0) {
-            if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0) && zcfg->file) {
-              syslog(LOG_NOTICE, "[Control] Reloading master zone: %s", entry->domain);
-              reload_result_t rr = reload_master_zone(entry, zcfg->file);
-              if (rr == RELOAD_OK && zcfg->is_catalog) {
-                void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
-                catalog_process_membership(entry, zcfg, vcfg->name);
-              }
-            } else if (zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0)) {
-              syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone: %s", entry->domain);
-              atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
-            }
-            break;
-          }
-          zcfg = zcfg->next;
-        }
-      }
-    }
-  }
-  release_zone_snapshot(snap);
+  perform_config_reload_ext(false);
 }
 
 static void perform_config_reload(void) {
+  perform_config_reload_ext(true);
+}
+
+static void perform_config_reload_ext(bool skip_unchanged) {
   g_last_configured_time = time(NULL);
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
@@ -6432,7 +6425,7 @@ static void perform_config_reload(void) {
     init_logging_channels(standby);
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
-    rebuild_zone_db_from_config(standby);
+    rebuild_zone_db_from_config(standby, skip_unchanged);
     for (view_config_t *v = standby->views; v; v = v->next) {
       for (zone_config_t *z = v->zones; z; z = z->next) {
         if (z->type && strcasecmp(z->type, "program") == 0) {
@@ -7379,7 +7372,7 @@ int main(int argc, char **argv) {
 
   init_logging_channels(&g_config_db.config_a);
   atomic_init(&g_config_db.active, &g_config_db.config_a);
-  rebuild_zone_db_from_config(&g_config_db.config_a);
+  rebuild_zone_db_from_config(&g_config_db.config_a, false);
 
   int num_workers = sysconf(_SC_NPROCESSORS_ONLN);
   if (num_workers <= 0)
