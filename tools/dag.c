@@ -6055,7 +6055,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             return 9;
         }
 
-        if (n >= 12 && qo->retry_on_badcookie) {
+        if (n >= 12 && eff_qo.retry_on_badcookie) {
             edns_info_t bc_edns;
             uint16_t b_qd = (resp[4] << 8) | resp[5];
             uint16_t b_an = (resp[6] << 8) | resp[7];
@@ -6071,23 +6071,23 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     }
                 }
                 printf(";; BADCOOKIE, retrying.\n");
-                qo->retry_on_badcookie = false; // RFC 7873 §5.4: 再送は 1 回限り
-                qo->want_cookie = true;
-                qo->server_cookie_len = bc_edns.server_cookie_len;
-                memcpy(qo->server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
-                pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
-                if (qo->want_tsig) {
-                    qo->tsig_key.fuzztime = qo->fuzztime;
-                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
+                eff_qo.retry_on_badcookie = false; // RFC 7873 §5.4: 再送は 1 回限り
+                eff_qo.want_cookie = true;
+                eff_qo.server_cookie_len = bc_edns.server_cookie_len;
+                memcpy(eff_qo.server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
+                pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, &eff_qo);
+                if (eff_qo.want_tsig) {
+                    eff_qo.tsig_key.fuzztime = eff_qo.fuzztime;
+                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &eff_qo.tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
                         fprintf(stderr, "Error: tsig_sign_packet failed on badcookie retry\n");
                         return 1;
                     }
                 }
-                n = do_dns_exchange_by_transport(server, port, qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                n = do_dns_exchange_by_transport(server, port, &eff_qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
             }
         }
 
-        if (n >= 12 && qo->edns_negotiation && qo->want_opt) {
+        if (n >= 12 && eff_qo.edns_negotiation && eff_qo.want_opt) {
             uint16_t bv_qd = (resp[4] << 8) | resp[5];
             uint16_t bv_an = (resp[6] << 8) | resp[7];
             uint16_t bv_ns = (resp[8] << 8) | resp[9];
@@ -6097,22 +6097,22 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             uint16_t bv_rcode = bv_edns.present
                 ? (((uint16_t)bv_edns.ext_rcode << 4) | (resp[3] & 0x0F))
                 : (resp[3] & 0x0F);
-            if (bv_rcode == 16 && qo->edns_version > 0) {
+            if (bv_rcode == 16 && eff_qo.edns_version > 0) {
                 if (dopt->show_badvers_msg && !dopt->short_mode) {
                     print_response(resp, (size_t)n, &axfr_state, dopt);
                     printf("\n");
                 }
-                printf(";; BADVERS, retrying with EDNS version %d.\n", qo->edns_version - 1);
-                qo->edns_version -= 1;
-                pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
-                if (qo->want_tsig) {
-                    qo->tsig_key.fuzztime = qo->fuzztime;
-                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
+                printf(";; BADVERS, retrying with EDNS version %d.\n", eff_qo.edns_version - 1);
+                eff_qo.edns_version -= 1;
+                pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, &eff_qo);
+                if (eff_qo.want_tsig) {
+                    eff_qo.tsig_key.fuzztime = eff_qo.fuzztime;
+                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &eff_qo.tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
                         fprintf(stderr, "Error: tsig_sign_packet failed on badvers retry\n");
                         return 1;
                     }
                 }
-                n = do_dns_exchange_by_transport(server, port, qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), qo->timeout_sec);
+                n = do_dns_exchange_by_transport(server, port, &eff_qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
             }
         }
 
@@ -8410,8 +8410,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.padding_size = -1;
         } else if (strncmp(arg, "+mqtype=", 8) == 0) {
             spec->qo.want_opt = true;
-            if (spec->qo.custom_edns_opt_count < 8) {
-                char *mqstr = strdup(arg + 8);
+            char *mqstr = strdup(arg + 8);
+            if (mqstr) {
                 char *token = strtok(mqstr, ",");
                 uint16_t mqtypes[16];
                 int mq_count = 0;
@@ -8419,14 +8419,30 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                     mqtypes[mq_count++] = parse_qtype(token);
                     token = strtok(NULL, ",");
                 }
-                spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].code = 20;
-                spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = mq_count * 2;
-                for (int m = 0; m < mq_count; m++) {
-                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data[m*2] = mqtypes[m] >> 8;
-                    spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data[m*2+1] = mqtypes[m] & 0xFF;
-                }
-                spec->qo.custom_edns_opt_count++;
                 free(mqstr);
+
+                int idx = -1;
+                for (int i = 0; i < spec->qo.custom_edns_opt_count; i++) {
+                    if (spec->qo.custom_edns_opts[i].code == 20) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (idx == -1 && spec->qo.custom_edns_opt_count < 8) {
+                    idx = spec->qo.custom_edns_opt_count++;
+                    spec->qo.custom_edns_opts[idx].code = 20;
+                    spec->qo.custom_edns_opts[idx].len = 0;
+                }
+                if (idx != -1) {
+                    for (int m = 0; m < mq_count; m++) {
+                        if (spec->qo.custom_edns_opts[idx].len + 2 <= sizeof(spec->qo.custom_edns_opts[idx].data)) {
+                            size_t cur_len = spec->qo.custom_edns_opts[idx].len;
+                            spec->qo.custom_edns_opts[idx].data[cur_len] = (uint8_t)(mqtypes[m] >> 8);
+                            spec->qo.custom_edns_opts[idx].data[cur_len + 1] = (uint8_t)(mqtypes[m] & 0xFF);
+                            spec->qo.custom_edns_opts[idx].len += 2;
+                        }
+                    }
+                }
             }
         } else if (strcmp(arg, "+noednsopt") == 0) {
             spec->qo.custom_edns_opt_count = 0;
