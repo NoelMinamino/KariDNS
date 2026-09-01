@@ -7389,6 +7389,7 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     int qdcount = (resp[4] << 8) | resp[5];
     int ancount = (resp[6] << 8) | resp[7];
     int nscount = (resp[8] << 8) | resp[9];
+    int arcount = (resp[10] << 8) | resp[11];
     
     size_t offset = 12;
     for (int i = 0; i < qdcount; i++) {
@@ -7399,20 +7400,20 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     
     char ns_names[32][256];
     int ns_count = 0;
-    for (int i = 0; i < ancount; i++) {
+    int an_parsed = 0;
+    for (; an_parsed < ancount; an_parsed++) {
         dns_record_t rec; uint16_t type;
         if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
         if (type == 2 && ns_count < 32 && rec.rdata_count > 0) {
             snprintf(ns_names[ns_count++], sizeof(ns_names[0]), "%s", rec.rdata[0]);
         }
     }
-    if (ns_count == 0) {
-        for (int i = 0; i < nscount; i++) {
-            dns_record_t rec; uint16_t type;
-            if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-            if (type == 2 && ns_count < 32 && rec.rdata_count > 0) {
-                snprintf(ns_names[ns_count++], sizeof(ns_names[0]), "%s", rec.rdata[0]);
-            }
+    int ns_parsed = 0;
+    for (; ns_parsed < nscount; ns_parsed++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+        if (type == 2 && ns_count < 32 && rec.rdata_count > 0) {
+            snprintf(ns_names[ns_count++], sizeof(ns_names[0]), "%s", rec.rdata[0]);
         }
     }
 
@@ -7423,8 +7424,46 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
 
     struct { char ns_name[256]; char ip[64]; } all_ns_ips[128];
     int all_ns_count = 0;
+    bool ns_has_glue[32] = {false};
 
+    // Scan remaining records up to ADDITIONAL section
+    for (int i = an_parsed; i < ancount; i++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+    }
+    for (int i = ns_parsed; i < nscount; i++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+    }
+
+    // Scan ADDITIONAL section for glue A/AAAA records
+    for (int i = 0; i < arcount; i++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+        bool want = false;
+        if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
+        if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
+        if (want && rec.rdata_count > 0) {
+            for (int j = 0; j < ns_count; j++) {
+                if (strcasecmp(rec.name, ns_names[j]) == 0) {
+                    ns_has_glue[j] = true;
+                    bool duplicate = false;
+                    for (int d = 0; d < all_ns_count; d++) {
+                        if (strcmp(all_ns_ips[d].ip, rec.rdata[0]) == 0) { duplicate = true; break; }
+                    }
+                    if (!duplicate && all_ns_count < 128) {
+                        snprintf(all_ns_ips[all_ns_count].ns_name, sizeof(all_ns_ips[all_ns_count].ns_name), "%s", ns_names[j]);
+                        snprintf(all_ns_ips[all_ns_count].ip, sizeof(all_ns_ips[all_ns_count].ip), "%s", rec.rdata[0]);
+                        all_ns_count++;
+                    }
+                }
+            }
+        }
+    }
+
+    // Resolve out-of-bailiwick NS names without glue using getaddrinfo
     for (int j = 0; j < ns_count; j++) {
+        if (ns_has_glue[j]) continue;
         char clean_name[256];
         snprintf(clean_name, sizeof(clean_name), "%s", ns_names[j]);
         size_t c_len = strlen(clean_name);
@@ -7962,10 +8001,23 @@ static void prescan_always_global_options(int argc, char **argv, query_spec_t *g
 static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spec) {
     const char *arg = argv[i];
 
-    // プレスキャンで確定済みの全域グローバルオプションは最優先でスキップ (no-op)
-    if (strcmp(arg, "+cmd") == 0 || strcmp(arg, "+nocmd") == 0 ||
-        strcmp(arg, "+short") == 0 || strcmp(arg, "+noshort") == 0 ||
-        strcmp(arg, "+yaml") == 0 || strcmp(arg, "+noyaml") == 0) {
+    if (strcmp(arg, "+cmd") == 0) {
+        spec->dopt.show_cmd = true;
+        return 1;
+    } else if (strcmp(arg, "+nocmd") == 0) {
+        spec->dopt.show_cmd = false;
+        return 1;
+    } else if (strcmp(arg, "+short") == 0) {
+        spec->dopt.short_mode = true;
+        return 1;
+    } else if (strcmp(arg, "+noshort") == 0) {
+        spec->dopt.short_mode = false;
+        return 1;
+    } else if (strcmp(arg, "+yaml") == 0) {
+        spec->dopt.yaml = true;
+        return 1;
+    } else if (strcmp(arg, "+noyaml") == 0) {
+        spec->dopt.yaml = false;
         return 1;
     }
 
@@ -8762,6 +8814,8 @@ static int parse_arg_slice(int start, int end, int argc, char **argv, query_spec
 }
 
 
+static int execute_query_spec(query_spec_t *spec);
+
 static int execute_batch_spec(const query_spec_t *spec) {
     if (!spec->batch_file) return 0;
     FILE *bf = fopen(spec->batch_file, "r");
@@ -8769,68 +8823,31 @@ static int execute_batch_spec(const query_spec_t *spec) {
         fprintf(stderr, "error: could not open batch file '%s': %s\n", spec->batch_file, strerror(errno));
         exit(8);
     }
-    char line[512];
+    char line[1024];
     while (fgets(line, sizeof(line), bf)) {
         char *p = line;
         while (isspace((unsigned char)*p)) p++;
         if (*p == '\0' || *p == '#' || *p == ';') continue;
         
-        char *b_qname = NULL;
-        char *b_qtype = NULL;
-        char *b_server = NULL;
-        int extra_tokens = 0;
-        char orig_line[512];
-        snprintf(orig_line, sizeof(orig_line), "%s", p);
-        char *nl = strchr(orig_line, '\n');
-        if (nl) *nl = '\0';
-        char *cr = strchr(orig_line, '\r');
-        if (cr) *cr = '\0';
-
+        char *tokens[64];
+        int token_count = 0;
         char *tok = strtok(p, " \t\r\n");
-        while (tok) {
-            if (tok[0] == '@') {
-                if (!b_server) b_server = tok + 1;
-                else extra_tokens++;
-            } else if (strcasecmp(tok, "IN") == 0 || strcasecmp(tok, "CH") == 0 || strcasecmp(tok, "HS") == 0) {
-                // ignore class
-            } else if (is_known_qtype(tok)) {
-                if (!b_qtype) b_qtype = tok;
-                else if (!b_qname) b_qname = tok;
-                else extra_tokens++;
-            } else {
-                if (!b_qname) b_qname = tok;
-                else if (!b_qtype) b_qtype = tok;
-                else extra_tokens++;
-            }
+        while (tok && token_count < 64) {
+            tokens[token_count++] = tok;
             tok = strtok(NULL, " \t\r\n");
         }
-        if (extra_tokens > 0) {
-            fprintf(stderr, "warning: batch file line has %d unexpected extra token(s), ignoring: %s\n", extra_tokens, orig_line);
+        if (token_count == 0) continue;
+
+        query_spec_t line_spec = *spec;
+        line_spec.batch_file = NULL;
+        line_spec.qname = NULL;
+        line_spec.qtype_s = NULL;
+
+        if (parse_arg_slice(0, token_count, token_count, tokens, &line_spec) < 0) {
+            fprintf(stderr, "warning: failed to parse batch file line: %s\n", line);
+            continue;
         }
-        if (!b_qname) continue;
-        if (!b_qtype) b_qtype = "A";
-        
-        query_opts_t qo = spec->qo;
-        bool b_allocated = false;
-        qo.orig_qname = b_qname;
-        qo.orig_qtype_s = b_qtype;
-        if (qo.idnin) b_qname = (char *)idn_to_ascii(b_qname, &b_allocated);
-        const char *eff_server = b_server ? b_server : spec->server_arg;
-        if (spec->do_trace) {
-            run_trace_query(b_qname, eff_server, b_qtype, spec->port, spec->use_tcp, spec->force_udp,
-                            spec->no_hexdump_query, spec->no_hexdump_response, qo, spec->hex_payload, &spec->dopt);
-        } else if (spec->do_nssearch) {
-            run_nssearch(b_qname, eff_server, spec->port, spec->use_tcp, spec->force_udp,
-                         spec->no_hexdump_query, spec->no_hexdump_response, qo, spec->hex_payload, &spec->dopt);
-        } else {
-            run_single_job(b_qname, b_qtype, eff_server, spec->port, spec->use_tcp, spec->force_udp,
-                           spec->test_all, spec->norecurse,
-                           spec->adflag, spec->cdflag, spec->aaflag, spec->tcflag, spec->zflag,
-                           spec->no_hexdump_query, spec->no_hexdump_response, qo, spec->hex_payload, &spec->dopt);
-        }
-#ifdef HAVE_LIBIDN2
-        if (b_allocated) idn2_free((void *)b_qname);
-#endif
+        execute_query_spec(&line_spec);
     }
     fclose(bf);
     return 0;

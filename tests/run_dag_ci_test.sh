@@ -493,6 +493,7 @@ if command -v perl >/dev/null 2>&1; then
     run_check "Transport: DoH connection cache cleanup & error recovery (tests/run_dag_doh_cache_cleanup_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_cache_cleanup_test.sh\"" "ALL DOH CACHE CLEANUP TESTS PASSED"
     run_check "Protocol: +trace glue fallback & CNAME chain tracing (tests/run_dag_trace_cname_glue_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_cname_glue_test.sh\"" "ALL TRACE GLUE & CNAME TESTS PASSED"
     run_check "CLI: +trace and +nssearch options (--hex, +udp) (tests/run_dag_trace_nssearch_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_opts_test.sh\"" "ALL TRACE & NSSEARCH OPTIONS TESTS PASSED"
+    run_check "Features: Batch mode advanced options & NS Search glue (tests/run_dag_batch_advanced_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_batch_advanced_opts_test.sh\"" "ALL BATCH & NSSEARCH GLUE TESTS PASSED"
 fi
 run_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
 
