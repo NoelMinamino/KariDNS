@@ -431,6 +431,22 @@ typedef struct {
 } zone_db_snapshot_t;
 static _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
 static config_rcu_t g_config_db;
+
+static server_config_t *acquire_config_snapshot(void) {
+  server_config_t *snap = NULL;
+  do {
+    snap = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    if (!snap) return NULL;
+    atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
+    if (snap == atomic_load_explicit(&g_config_db.active, memory_order_acquire)) break;
+    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+  } while (1);
+  return snap;
+}
+
+static void release_config_snapshot(server_config_t *snap) {
+  if (snap) atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+}
 int g_control_kq = -1;
 int g_cwd_fd = -1;
 static const char *g_config_path = NULL;
@@ -2113,6 +2129,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     snprintf(suffix, sizeof(suffix), ".zones.%s", catalog_entry->domain);
     size_t suffix_len = strlen(suffix);
 
+    server_config_t *cfg = acquire_config_snapshot();
     for (size_t i = 0; i < arena->count; i++) {
         if (arena->records[i].type_code == 12) { // PTR
             size_t name_len = strlen(arena->records[i].name);
@@ -2123,7 +2140,6 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                     normalize_domain_fqdn_local(target, norm_target, sizeof(norm_target));
                     
                     // Collision check with static config
-                    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
                     zone_config_t *zcfg = find_zone_config_in_view(cfg, view_name, norm_target);
                     if (zcfg) {
                         syslog(LOG_WARNING, "[Catalog] Zone '%s' generated member '%s' which collides with static config. Skipping.", catalog_entry->domain, norm_target);
@@ -2142,6 +2158,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
             }
         }
     }
+    release_config_snapshot(cfg);
 
     // RFC 9432 §5.1: 壊れたカタログゾーンの検出
     // (1) 同一 <unique-N> に複数のPTRレコードが存在しないか
@@ -2598,12 +2615,13 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       pthread_mutex_unlock(&entry->writer_lock);
 
       // Hook for catalog zone processing
-      server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      server_config_t *cfg = acquire_config_snapshot();
       zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
       if (zcfg && zcfg->is_catalog) {
           void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
           catalog_process_membership(entry, zcfg, entry->view_name);
       }
+      release_config_snapshot(cfg);
       return ret_code;
     }
   }
@@ -4091,16 +4109,15 @@ static view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client
   return NULL;
 }
 
-int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
-                      size_t max_res_len, const char *qname, uint16_t qtype,
-                      const char *client_ip, compress_ctx_t *comp_ctx,
-                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
-                      zone_db_snapshot_t *snap) {
+static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
+                            size_t max_res_len, const char *qname, uint16_t qtype,
+                            const char *client_ip, compress_ctx_t *comp_ctx,
+                            bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                            zone_db_snapshot_t *snap, server_config_t *cfg) {
   if (req_len < DNS_HEADER_SIZE) {
     return 0; // 不正な短いパケットは無応答で破棄
   }
 
-  server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
   size_t tsig_mac_len = 0;
@@ -4162,7 +4179,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   edns.ede_count = 0; // 反射防止
 
-  server_config_t *cfg_for_ede = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *cfg_for_ede = cfg;
   
   if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
     edns.has_mqtype_query = false;
@@ -4286,7 +4303,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     if (db_entry && view) {
-      server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      server_config_t *cfg_chk = cfg;
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
@@ -4309,8 +4326,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     int tsig_error_code = 0;
     
     if (db_entry && view) {
-      server_config_t *cfg =
-          atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->masters_count > 0) {
         for (int k = 0; k < zcfg->masters_count; k++) {
@@ -4384,7 +4399,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 5) { // UPDATE
     if (db_entry && view) {
-      server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      server_config_t *cfg_chk = cfg;
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
@@ -4407,8 +4422,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *attempted_key = NULL;
     int tsig_error_code = 0;
     if (db_entry && view) {
-      server_config_t *cfg =
-          atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg) {
         if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
@@ -4643,7 +4656,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
            *res_nscount = (uint16_t *)&res[8],
            *res_arcount = (uint16_t *)&res[10];
   if (db_entry && view) {
-    server_config_t *cfg_lookup = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    server_config_t *cfg_lookup = cfg;
     zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
       if (current_zone)
@@ -4798,6 +4811,18 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
                               memory_order_release);
   return offset;
+}
+
+int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
+                      size_t max_res_len, const char *qname, uint16_t qtype,
+                      const char *client_ip, compress_ctx_t *comp_ctx,
+                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                      zone_db_snapshot_t *snap) {
+  server_config_t *cfg = acquire_config_snapshot();
+  int ret = process_dns_query_impl(req, req_len, res, max_res_len, qname, qtype,
+                                   client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg);
+  release_config_snapshot(cfg);
+  return ret;
 }
 
 // ============================================================================
@@ -4960,13 +4985,14 @@ void *axfr_bg_thread_func(void *arg) {
 }
 
 void send_notify_to_all(const char *domain, const char *view_name) {
-  server_config_t *active =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *active = acquire_config_snapshot();
   if (!active)
     return;
   zone_config_t *zone = find_zone_config_in_view(active, view_name, domain);
-  if (!zone || zone->also_notify_count == 0)
+  if (!zone || zone->also_notify_count == 0) {
+    release_config_snapshot(active);
     return;
+  }
 
   uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   memset(req, 0, DNS_HEADER_SIZE);
@@ -5031,6 +5057,7 @@ void send_notify_to_all(const char *domain, const char *view_name) {
     memcpy(buf + sizeof(msg), req, offset);
     send(g_notify_ipc[1], buf, sizeof(msg) + offset, 0);
   }
+  release_config_snapshot(active);
 }
 
 // ============================================================================
@@ -5062,8 +5089,11 @@ static void init_logging_channels(server_config_t *cfg) {
 static void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
                                 uint16_t qclass, uint16_t qtype, uint8_t rcode, 
                                 bool has_edns, bool dnssec_ok) {
-    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-    if (!cfg || !cfg->logging.responses_channel) return;
+    server_config_t *cfg = acquire_config_snapshot();
+    if (!cfg) return;
+    bool enabled = (cfg->logging.responses_channel != NULL);
+    release_config_snapshot(cfg);
+    if (!enabled) return;
 
     uint64_t t = atomic_load_explicit(&g_resp_log_tail, memory_order_relaxed);
     uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
@@ -5114,7 +5144,13 @@ static void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
     } else {
       // 改行(\n, \r)、タブ、スペース、制御文字、非ASCII文字を RFC 1035 §5.1 / BIND互換の \DDD 形式にエスケープ
       int n = snprintf(&dst[di], dst_size - di, "\\%03u", c);
-      if (n > 0) di += (size_t)n;
+      if (n > 0) {
+          if ((size_t)n < dst_size - di) {
+              di += (size_t)n;
+          } else {
+              di = dst_size - 1;
+          }
+      }
     }
   }
   dst[di < dst_size ? di : dst_size - 1] = '\0';
@@ -5172,7 +5208,7 @@ void *response_logger_thread_func(void *arg) {
         
         if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
             resp_log_entry_t *entry = &g_resp_log_ring[idx];
-            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+            server_config_t *cfg = acquire_config_snapshot();
             
             if (cfg && cfg->logging.responses_channel) {
                 log_channel_t *ch = cfg->logging.responses_channel;
@@ -5225,6 +5261,7 @@ void *response_logger_thread_func(void *arg) {
                     log_write_rotated(ch, log_buf, len, &tm_info);
                 }
             }
+            release_config_snapshot(cfg);
             
             // Consumerのポインタを進める
             atomic_store_explicit(&entry->ready, false, memory_order_release);
@@ -5239,10 +5276,11 @@ void *response_logger_thread_func(void *arg) {
 static void write_query_log(const char *client_ip, int client_port,
                             const char *qname, uint16_t qclass, uint16_t qtype,
                             bool has_edns, bool dnssec_ok) {
-  server_config_t *cfg =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  if (!cfg || !cfg->logging.queries_channel)
+  server_config_t *cfg = acquire_config_snapshot();
+  if (!cfg || !cfg->logging.queries_channel) {
+    if (cfg) release_config_snapshot(cfg);
     return;
+  }
   log_channel_t *ch = cfg->logging.queries_channel;
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -5278,11 +5316,12 @@ static void write_query_log(const char *client_ip, int client_port,
                      ch->print_category ? "queries: " : "",
                      ch->print_severity ? "info: " : "", client_ip, client_port,
                      safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
-  if (len <= 0)
-    return;
-  if (len >= (int)sizeof(log_buf))
-    len = sizeof(log_buf) - 1;
-  log_write_rotated(ch, log_buf, len, &tm_info);
+  if (len > 0) {
+    if (len >= (int)sizeof(log_buf))
+      len = sizeof(log_buf) - 1;
+    log_write_rotated(ch, log_buf, len, &tm_info);
+  }
+  release_config_snapshot(cfg);
 }
 
 // ============================================================================
@@ -5644,8 +5683,7 @@ void *worker_thread_func(void *arg) {
   if (kq < 0)
     goto worker_startup_failed;
   int opt = 1;
-  server_config_t *active_cfg =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *active_cfg = acquire_config_snapshot();
   int port = active_cfg && active_cfg->port > 0 ? active_cfg->port : DNS_PORT;
   int bind_count = active_cfg ? active_cfg->bind_address_count : 0;
 
@@ -5721,6 +5759,7 @@ void *worker_thread_func(void *arg) {
       }
     }
   }
+  release_config_snapshot(active_cfg);
 
   // FrontendからのUDP転送を受け取るIPCパイプをkqueueに登録 (udata=1)
   int my_ipc_fd = g_ipc_fds[ctx->thread_id][1];
@@ -5757,10 +5796,9 @@ worker_startup_success:;
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
-        tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
-        close(client_fd);
-        dec_tcp_clients();
-        free(ctx_tcp);
+        // SHUT_RDWRによりソケットをEOF状態にし、同一バッチ内または次回の
+        // EVFILT_READイベントで安全にリソースを回収(free)させる
+        shutdown(client_fd, SHUT_RDWR);
       } else if (ev_list[i].udata == (void *)1) {
         // UDP (IPC経由)
         int active_fd = ev_list[i].ident; // my_ipc_fd
@@ -6099,8 +6137,7 @@ worker_startup_success:;
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
-          server_config_t *cfg =
-              atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+          server_config_t *cfg = acquire_config_snapshot();
           zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
@@ -6186,6 +6223,7 @@ worker_startup_success:;
                   allowed = tsig_ok;
               }
             }
+            release_config_snapshot(cfg);
             zone_db_entry_t *entry = NULL;
             if (xfr_view) {
               for (size_t i = 0; i < xfr_view->zone_count; i++) {
@@ -6321,15 +6359,18 @@ worker_startup_success:;
               release_zone_snapshot(snap);
             }
             
-            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-            if (cfg && cfg->tcp_connection_reuse) {
+            server_config_t *cfg = acquire_config_snapshot();
+            bool reuse = (cfg && cfg->tcp_connection_reuse);
+            uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
+            release_config_snapshot(cfg);
+            if (reuse) {
               ctx_tcp->state = TCP_STATE_READ_LEN;
               ctx_tcp->accumulated = 0;
               ctx_tcp->msg_len = 0;
               
               struct kevent ev_timeout;
               EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
-                     cfg->tcp_idle_timeout > 0 ? cfg->tcp_idle_timeout : 10000, ctx_tcp);
+                     idle_timeout, ctx_tcp);
               kevent(kq, &ev_timeout, 1, NULL, 0, NULL);
               
               // Event EVFILT_READ is already added with EV_ADD | EV_CLEAR
@@ -6411,6 +6452,15 @@ static void perform_config_reload_ext(bool skip_unchanged) {
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
   
+  // 既存のリーダーが参照を終えるのを待機
+  int retries = 0;
+  useconds_t sleep_time = 1;
+  while (atomic_load_explicit(&standby->reader_count, memory_order_acquire) > 0) {
+    if (retries < 100) sched_yield();
+    else { usleep(sleep_time); if (sleep_time < 100000) sleep_time *= 2; }
+    retries++;
+  }
+  
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
     if (geteuid() == 0 && !standby->user) {
@@ -6461,18 +6511,31 @@ static void perform_config_reload_ext(bool skip_unchanged) {
   free(config_str);
 }
 
-static const char *find_configured_domain(const char *arg) {
-  server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+static const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
+  if (!out_buf || out_size == 0) return arg;
+  snprintf(out_buf, out_size, "%s", arg);
+  server_config_t *active = acquire_config_snapshot();
+  if (!active) return out_buf;
   zone_config_t *zcfg = active->zones;
   size_t arg_len = strlen(arg);
   while (zcfg) {
     size_t z_len = strlen(zcfg->domain);
-    if (strcasecmp(zcfg->domain, arg) == 0) return zcfg->domain;
-    if (arg_len + 1 == z_len && zcfg->domain[z_len - 1] == '.' && strncasecmp(zcfg->domain, arg, arg_len) == 0) return zcfg->domain;
-    if (z_len + 1 == arg_len && arg[arg_len - 1] == '.' && strncasecmp(zcfg->domain, arg, z_len) == 0) return zcfg->domain;
+    if (strcasecmp(zcfg->domain, arg) == 0) {
+      snprintf(out_buf, out_size, "%s", zcfg->domain);
+      break;
+    }
+    if (arg_len + 1 == z_len && zcfg->domain[z_len - 1] == '.' && strncasecmp(zcfg->domain, arg, arg_len) == 0) {
+      snprintf(out_buf, out_size, "%s", zcfg->domain);
+      break;
+    }
+    if (z_len + 1 == arg_len && arg[arg_len - 1] == '.' && strncasecmp(zcfg->domain, arg, z_len) == 0) {
+      snprintf(out_buf, out_size, "%s", zcfg->domain);
+      break;
+    }
     zcfg = zcfg->next;
   }
-  return arg;
+  release_config_snapshot(active);
+  return out_buf;
 }
 
 void *control_thread_func(void *arg) {
@@ -6585,8 +6648,9 @@ void *control_thread_func(void *arg) {
         if (nl) {
           *nl = '\0';
           if (c->state == CTRL_STATE_AUTH_WAIT) {
-            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-            if (strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
+            server_config_t *cfg = acquire_config_snapshot();
+            bool auth_ok = false;
+            if (cfg && strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
               char *client_hmac = c->buf + 5;
               unsigned char md[EVP_MAX_MD_SIZE];
               unsigned int md_len;
@@ -6597,13 +6661,13 @@ void *control_thread_func(void *arg) {
               
               if (strlen(client_hmac) == strlen(expected) &&
                   const_time_memcmp(client_hmac, expected, strlen(expected)) == 0) {
-                send(cfd, "OK\n", 3, 0);
-                c->state = CTRL_STATE_CMD_WAIT;
-              } else {
-                send(cfd, "AUTH_FAILED\n", 12, 0);
-                free_ctrl_client(cfd);
-                continue;
+                auth_ok = true;
               }
+            }
+            release_config_snapshot(cfg);
+            if (auth_ok) {
+              send(cfd, "OK\n", 3, 0);
+              c->state = CTRL_STATE_CMD_WAIT;
             } else {
               send(cfd, "AUTH_FAILED\n", 12, 0);
               free_ctrl_client(cfd);
@@ -6627,9 +6691,10 @@ void *control_thread_func(void *arg) {
             
             if (strcmp(cmd, "reload") == 0) {
               if (arg && strlen(arg) > 0) {
-                const char *canon_arg = find_configured_domain(arg);
+                char canon_buf[256];
+                const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
                 zone_db_snapshot_t *snap = acquire_zone_snapshot();
-                server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+                server_config_t *active = acquire_config_snapshot();
                 zone_lookup_result_t lr = {0};
                 int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
                 if (nmatches == 0) {
@@ -6670,6 +6735,7 @@ void *control_thread_func(void *arg) {
                 } else {
                   send(cfd, "ERROR zone not found\n", 21, 0);
                 }
+                release_config_snapshot(active);
                 release_zone_snapshot(snap);
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
@@ -6701,10 +6767,8 @@ void *control_thread_func(void *arg) {
                 for (size_t v = 0; v < snap->view_count; v++) {
                   st.num_zones += snap->views[v].zone_count;
                 }
-              } else {
-                st.num_zones = 0;
+                release_zone_snapshot(snap);
               }
-              release_zone_snapshot(snap);
 
               st.xfers_running = atomic_load_explicit(&g_xfers_running, memory_order_relaxed);
               st.tcp_clients = atomic_load_explicit(&g_tcp_clients, memory_order_relaxed);
@@ -6716,9 +6780,10 @@ void *control_thread_func(void *arg) {
               }
               st.frontend_alive = atomic_load(&g_frontend_alive);
               
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               st.query_logging = (active_cfg && active_cfg->logging.queries_channel != NULL);
               st.response_logging = (active_cfg && active_cfg->logging.responses_channel != NULL);
+              release_config_snapshot(active_cfg);
               
               st.rrl_dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
               st.rrl_slipped = atomic_load_explicit(&g_rrl_slip_total, memory_order_relaxed);
@@ -6739,9 +6804,10 @@ void *control_thread_func(void *arg) {
               msg.msg_iovlen = 2;
               sendmsg(cfd, &msg, 0);
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
-              const char *canon_arg = find_configured_domain(arg);
+              char canon_buf[256];
+              const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
@@ -6756,11 +6822,13 @@ void *control_thread_func(void *arg) {
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
-              const char *canon_arg = find_configured_domain(arg);
+              char canon_buf[256];
+              const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
@@ -6775,11 +6843,13 @@ void *control_thread_func(void *arg) {
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "retransfer") == 0 && arg) {
-              const char *canon_arg = find_configured_domain(arg);
+              char canon_buf[256];
+              const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
@@ -6794,6 +6864,7 @@ void *control_thread_func(void *arg) {
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
@@ -6813,8 +6884,7 @@ void *control_thread_func(void *arg) {
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
-        server_config_t *active =
-            atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+        server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_zone_snapshot();
         if (snap) {
             for (size_t v = 0; v < snap->view_count; v++) {
@@ -6855,7 +6925,7 @@ void *control_thread_func(void *arg) {
                         if (last_ok > 0 && expire > 0 && (now - last_ok) > expire) {
                             time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
                             if (now - last_log > 900) {
-                                if (active->serve_stale) {
+                                if (active && active->serve_stale) {
                                     syslog(LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
                                 } else {
                                     syslog(LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
@@ -6881,7 +6951,7 @@ void *control_thread_func(void *arg) {
                                     strncpy(bg_ctx->domain, entry->domain, sizeof(bg_ctx->domain) - 1);
                                     bg_ctx->entry = entry;
                                     
-                                    if (tsig_key_name[0] != '\0') {
+                                    if (tsig_key_name[0] != '\0' && active) {
                                         tsig_key_t *k = active->keys;
                                         while (k) {
                                             if (strcmp(k->name, tsig_key_name) == 0) {
@@ -6911,6 +6981,7 @@ void *control_thread_func(void *arg) {
             }
             release_zone_snapshot(snap);
         }
+        release_config_snapshot(active);
       }
     }
   }
@@ -6932,11 +7003,12 @@ static void run_frontend_router(pid_t backend_pid) {
     close(g_control_sock);
     g_control_sock = -1;
   }
-  server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  if (cfg->user) {
+  server_config_t *cfg = acquire_config_snapshot();
+  if (cfg && cfg->user) {
     struct passwd *pwd = getpwnam(cfg->user);
     if (!pwd) {
       syslog(LOG_ERR, "[Frontend] user '%s' not found, aborting privilege drop", cfg->user);
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
     gid_t target_gid = pwd->pw_gid;
@@ -6944,36 +7016,42 @@ static void run_frontend_router(pid_t backend_pid) {
       struct group *grp = getgrnam(cfg->group);
       if (!grp) {
         syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+        release_config_snapshot(cfg);
         exit(EXIT_FAILURE);
       }
       target_gid = grp->gr_gid;
     }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); exit(EXIT_FAILURE); }
-    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); exit(EXIT_FAILURE); }
-    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend] setuid failed: %m"); exit(EXIT_FAILURE); }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend] setuid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
     
     if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid || getgid() != target_gid || getegid() != target_gid) {
       syslog(LOG_ERR, "[Frontend] privilege drop verification failed");
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
-  } else if (cfg->group) {
+  } else if (cfg && cfg->group) {
     struct group *grp = getgrnam(cfg->group);
     if (!grp) {
       syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); exit(EXIT_FAILURE); }
-    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); exit(EXIT_FAILURE); }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
     
     if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
       syslog(LOG_ERR, "[Frontend] privilege drop verification failed (group only)");
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
   } else if (geteuid() == 0) {
     syslog(LOG_ERR, "[Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
     fprintf(stderr, "[ERROR] [Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
+    release_config_snapshot(cfg);
     exit(EXIT_FAILURE);
   }
+  release_config_snapshot(cfg);
 
   int kq = kqueue();
   if (kq < 0)
@@ -7522,8 +7600,13 @@ int main(int argc, char **argv) {
     pthread_join(threads[i], NULL);
   pthread_join(control_thread, NULL);
 
-  server_config_t *active =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  free_server_config_fields(active);
+  server_config_t *active = acquire_config_snapshot();
+  if (active) {
+    release_config_snapshot(active);
+    while (atomic_load_explicit(&active->reader_count, memory_order_acquire) > 0) {
+      sched_yield();
+    }
+    free_server_config_fields(active);
+  }
   return 0;
 }
