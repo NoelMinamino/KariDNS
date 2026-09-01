@@ -66,13 +66,21 @@ while (1) {
                "\x00" . pack("nnNn", 2, 1, 3600, 20) . "\x01a\x0croot-servers\x03net\x00" .
                "\x01a\x0croot-servers\x03net\x00" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("127.0.0.1");
 
+    # If it's a NS query for example.com, return NS in ANSWER and Glue in ADDITIONAL
+    if ($query =~ /\x07example\x03com\x00\x00\x02\x00\x01/i) {
+        $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 1) .
+                "\x07example\x03com\x00" . pack("nn", 2, 1) .
+                "\x07example\x03com\x00" . pack("nnNn", 2, 1, 300, 17) . "\x03ns1\x07example\x03com\x00" .
+                "\x03ns1\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
+    }
     # If it's a SOA query or custom hex query, return SOA
-    if ($query =~ /example\x03com/i) {
+    elsif ($query =~ /example\x03com/i) {
+        my $soa_rdata = "\x03ns1\x07example\x03com\x00\x0ahostmaster\x07example\x03com\x00" .
+                        pack("NNNNN", 2026090101, 7200, 3600, 1209600, 300);
         $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 0) .
                 "\x07example\x03com\x00" . pack("nn", 6, 1) .
-                "\x07example\x03com\x00" . pack("nnNn", 6, 1, 300, 38) .
-                "\x03ns1\x07example\x03com\x00\x0ahostmaster\x07example\x03com\x00" .
-                pack("NNNNN", 2026090101, 7200, 3600, 1209600, 300);
+                "\x07example\x03com\x00" . pack("nnNn", 6, 1, 300, length($soa_rdata)) .
+                $soa_rdata;
     }
 
     send($srv, $resp, 0, $client_addr);
@@ -87,15 +95,19 @@ sleep 0.5
 CUSTOM_HEX="123400000001000000000000076578616d706c6503636f6d0000010001"
 
 echo "=== 1. Testing +trace with --hex Option ==="
-echo -n "Test: +trace sends injected raw hex payload ... "
-OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace --hex="$CUSTOM_HEX" +timeout=2 2>&1 || true)
-if echo "$OUT" | grep -q "12 34" || echo "$OUT" | grep -q "example\.com"; then
-    echo "OK"
+if [ "$DAG" = "dig" ]; then
+    echo "Test: +trace sends injected raw hex payload ... SKIP (dag-only --hex option)"
 else
-    echo "FAILED"
-    echo "  Output:"
-    echo "$OUT" | sed 's/^/    /'
-    FAILED=$((FAILED + 1))
+    echo -n "Test: +trace sends injected raw hex payload ... "
+    OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace --hex="$CUSTOM_HEX" +timeout=2 2>&1 || true)
+    if echo "$OUT" | grep -q "12 34" || echo "$OUT" | grep -q "example\.com"; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "  Output:"
+        echo "$OUT" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    fi
 fi
 
 echo "=== 2. Testing +trace with +udp Option ==="
@@ -108,6 +120,43 @@ else
     echo "  Output:"
     echo "$OUT_UDP" | sed 's/^/    /'
     FAILED=$((FAILED + 1))
+fi
+
+echo "=== 3. Testing +nssearch with +[no]glue Options ==="
+if [ "$DAG" = "dig" ]; then
+    echo -n "Test: dig native +nssearch bypasses Glue and reports resolver failure on local zone ... "
+    OUT_DIG=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +timeout=2 2>&1 || true)
+    if echo "$OUT_DIG" | grep -q "couldn't get address for 'ns1\.example\.com': failure"; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "  Output:"
+        echo "$OUT_DIG" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    fi
+    echo "Test: +nssearch with +[no]glue option switching ... SKIP (dag-only option)"
+else
+    echo -n "Test: +nssearch with +noglue bypasses Glue and reports resolver failure on local zone ... "
+    OUT_NOGLUE=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +noglue +timeout=2 2>&1 || true)
+    if echo "$OUT_NOGLUE" | grep -q "couldn't get address for 'ns1\.example\.com': failure"; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "  Output:"
+        echo "$OUT_NOGLUE" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    fi
+
+    echo -n "Test: +nssearch with +glue (default) utilizes Glue and connects directly ... "
+    OUT_GLUE=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +glue +timeout=2 2>&1 || true)
+    if echo "$OUT_GLUE" | grep -q "SOA ns1\.example\.com\."; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "  Output:"
+        echo "$OUT_GLUE" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    fi
 fi
 
 echo "========================================================="

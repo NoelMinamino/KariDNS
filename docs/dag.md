@@ -217,6 +217,10 @@ dag [global-queryopt...] [query...]
 
 `+[no]nssearch`
 : Look up authoritative nameservers for the zone containing the query name and display the SOA record from each responding nameserver. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses.
+  - **BIND 9 `dig` との互換性**: BIND 9 の `dig +nssearch` は NS 応答取得後、同梱された Glue レコードを無視して OS のシステムリゾルバ（`/etc/resolv.conf` の `getaddrinfo`）でのみ NS 名の名前解決を行います。これに対し `dag` はデフォルト（`+glue`）で NS 応答の `ADDITIONAL` セクション（In-bailiwick Glue A/AAAA）を自律的にスキャンして直接ネームサーバーへ問い合わせるため、閉鎖環境やテスト網のローカルゾーンでも外部リゾルバに依存せず正しく動作します。BIND 9 `dig` と同等の挙動（システムリゾルバ限定）を強制したい場合は `+noglue` を併用してください。
+
+`+[no]glue`
+: Control whether `+trace` and `+nssearch` prioritize in-bailiwick Glue records (A/AAAA) present in the `ADDITIONAL` section of delegation and NS response packets (default: `+glue`). When disabled with `+noglue`, `dag` bypasses Glue records and resolves nameserver addresses strictly using the resolver (`getaddrinfo` / initial upstream resolver), matching BIND 9 `dig` behavior.
 
 `+[no]search`, `+[no]defname`
 : Enable or disable domain search list processing as defined in `/etc/resolv.conf`.

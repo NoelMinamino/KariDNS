@@ -660,6 +660,7 @@ typedef struct {
     bool idnin;
     bool ignore_tc;
     bool nofail;
+    bool use_glue;
 
     // PROXYv2
     bool use_proxy;
@@ -1643,7 +1644,7 @@ static int connect_udp(const char *server, int port, int pref_family, const char
      * incoming UDP datagrams originating from unauthorized sources/ports.
      */
     if (connect(sock, (struct sockaddr *)dest, *dest_len) != 0) {
-        perror("connect (udp)");
+        fprintf(stderr, ";; connect to %s#%d failed: %s\n", server, port, strerror(errno));
         close(sock);
         return -1;
     }
@@ -6661,7 +6662,8 @@ static void usage(const char *prog) {
         "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses)\n"
-        "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP on truncated responses)\n"
+        "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +glue by default)\n"
+        "  +[no]glue                    Prefer in-bailiwick Glue records from ADDITIONAL section for +trace/+nssearch [default: +glue]\n"
         "  +[no]search / +[no]defname   Use search list defined in /etc/resolv.conf\n"
         "  +domain=domain               Set default search domain\n"
         "  +ndots=N                     Set search NDOTS threshold\n"
@@ -7261,19 +7263,21 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         
         int new_target_count = 0;
         char new_target_ips[16][64];
-        for (int i = 0; i < arcount; i++) {
-            dns_record_t rec; uint16_t type;
-            if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-            bool want = false;
-            if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
-            if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
-            if (want && rec.rdata_count > 0) {
-                bool match = false;
-                for (int j=0; j<ns_count; j++) {
-                    if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
-                }
-                if (match && new_target_count < 16) {
-                    snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
+        if (qo.use_glue) {
+            for (int i = 0; i < arcount; i++) {
+                dns_record_t rec; uint16_t type;
+                if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+                bool want = false;
+                if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
+                if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
+                if (want && rec.rdata_count > 0) {
+                    bool match = false;
+                    for (int j=0; j<ns_count; j++) {
+                        if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
+                    }
+                    if (match && new_target_count < 16) {
+                        snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
+                    }
                 }
             }
         }
@@ -7436,25 +7440,27 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
         if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
     }
 
-    // Scan ADDITIONAL section for glue A/AAAA records
-    for (int i = 0; i < arcount; i++) {
-        dns_record_t rec; uint16_t type;
-        if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-        bool want = false;
-        if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
-        if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
-        if (want && rec.rdata_count > 0) {
-            for (int j = 0; j < ns_count; j++) {
-                if (strcasecmp(rec.name, ns_names[j]) == 0) {
-                    ns_has_glue[j] = true;
-                    bool duplicate = false;
-                    for (int d = 0; d < all_ns_count; d++) {
-                        if (strcmp(all_ns_ips[d].ip, rec.rdata[0]) == 0) { duplicate = true; break; }
-                    }
-                    if (!duplicate && all_ns_count < 128) {
-                        snprintf(all_ns_ips[all_ns_count].ns_name, sizeof(all_ns_ips[all_ns_count].ns_name), "%s", ns_names[j]);
-                        snprintf(all_ns_ips[all_ns_count].ip, sizeof(all_ns_ips[all_ns_count].ip), "%s", rec.rdata[0]);
-                        all_ns_count++;
+    // Scan ADDITIONAL section for glue A/AAAA records (if +glue is active)
+    if (qo.use_glue) {
+        for (int i = 0; i < arcount; i++) {
+            dns_record_t rec; uint16_t type;
+            if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+            bool want = false;
+            if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
+            if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
+            if (want && rec.rdata_count > 0) {
+                for (int j = 0; j < ns_count; j++) {
+                    if (strcasecmp(rec.name, ns_names[j]) == 0) {
+                        ns_has_glue[j] = true;
+                        bool duplicate = false;
+                        for (int d = 0; d < all_ns_count; d++) {
+                            if (strcmp(all_ns_ips[d].ip, rec.rdata[0]) == 0) { duplicate = true; break; }
+                        }
+                        if (!duplicate && all_ns_count < 128) {
+                            snprintf(all_ns_ips[all_ns_count].ns_name, sizeof(all_ns_ips[all_ns_count].ns_name), "%s", ns_names[j]);
+                            snprintf(all_ns_ips[all_ns_count].ip, sizeof(all_ns_ips[all_ns_count].ip), "%s", rec.rdata[0]);
+                            all_ns_count++;
+                        }
                     }
                 }
             }
@@ -7918,6 +7924,7 @@ static void init_query_spec(query_spec_t *spec) {
     spec->qo.ndots = -1;
     spec->qo.tcp_mss = 0;
     spec->qo.tcp_window = 0;
+    spec->qo.use_glue = true;
 }
 
 static bool is_known_qclass_str(const char *s, uint16_t *out_class) {
@@ -7995,6 +8002,8 @@ static void prescan_always_global_options(int argc, char **argv, query_spec_t *g
         else if (strcmp(argv[i], "+noldnsz") == 0) global_spec->use_ldnsz = false;
         else if (strcmp(argv[i], "-m") == 0) global_spec->qo.mem_debug = true;
         else if (strcmp(argv[i], "+allcompare") == 0) g_want_allcompare = true;
+        else if (strcmp(argv[i], "+glue") == 0) global_spec->qo.use_glue = true;
+        else if (strcmp(argv[i], "+noglue") == 0) global_spec->qo.use_glue = false;
     }
 }
 
@@ -8366,6 +8375,10 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->do_nssearch = true;
         } else if (strcmp(arg, "+nonssearch") == 0) {
             spec->do_nssearch = false;
+        } else if (strcmp(arg, "+glue") == 0) {
+            spec->qo.use_glue = true;
+        } else if (strcmp(arg, "+noglue") == 0) {
+            spec->qo.use_glue = false;
         } else if (strcmp(arg, "+search") == 0 || strcmp(arg, "+defname") == 0) {
             spec->qo.use_search_list = true;
         } else if (strcmp(arg, "+nosearch") == 0 || strcmp(arg, "+nodefname") == 0) {
