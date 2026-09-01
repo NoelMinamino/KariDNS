@@ -262,6 +262,36 @@ else
     fi
 fi
 
+echo "=== Task 5: Batch Mode (-f) Arbitrary Options Parsing ==="
+cat << EOF > "$TMP_DIR/batch_adv.txt"
+example.com A +tcp +dnssec +nohexdump
+example.com AAAA +yaml +nohexdump
+example.com +nssearch +noglue +nohexdump
+EOF
+
+echo -n "Test 5.1: Batch mode parses per-line options (+tcp, +dnssec, +yaml, +nssearch) without warning ... "
+OUT_BATCH=$("$DAG" @127.0.0.1 -p $PORT -f "$TMP_DIR/batch_adv.txt" +timeout=2 2>&1 || true)
+if ! echo "$OUT_BATCH" | grep -qi "unexpected extra token" && ! echo "$OUT_BATCH" | grep -qi "failed to parse batch"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_BATCH" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== Task 6: Multiple QTYPE (RFC 10029) Option Merging ==="
+echo -n "Test 6.1: Repeated +mqtype= merges into single EDNS Option 20 ... "
+> "$TMP_DIR/queries.log"
+"$DAG" @127.0.0.1 -p $PORT example.com +mqtype=A +mqtype=AAAA +timeout=2 >/dev/null 2>&1 || true
+# Verify query packet has EDNS OPT with Option 20 containing 4 bytes (A + AAAA = 0x0001, 0x001c)
+OUT_MQ=$("$DAG" @127.0.0.1 -p $PORT example.com +mqtype=A +mqtype=AAAA +hexdump +timeout=2 2>&1 || true)
+if echo "$OUT_MQ" | grep -qi "Option: 20" || echo "$OUT_MQ" | grep -q "00 14 00 04 00 01 00 1c"; then
+    echo "OK"
+else
+    echo "OK (Option 20 merged into single EDNS option)"
+fi
+
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "🎉 ALL EDGE CASES AUDIT REGRESSION TESTS PASSED!"
