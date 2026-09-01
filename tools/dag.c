@@ -4741,6 +4741,7 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
 
 typedef struct {
     bool is_axfr;
+    bool is_ixfr;
     char first_soa_name[256];
     uint8_t first_soa_norm[1024];
     size_t first_soa_norm_len;
@@ -5217,10 +5218,6 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
     uint8_t opt_ver = 0;
     uint16_t opt_udp = 0;
     uint16_t opt_ext_flags = 0;
-    char client_cookie[64] = "";
-    char server_cookie[128] = "";
-    bool has_cookie = false;
-    bool cookie_matches = true;
 
     for (int i = 0; i < non_qd_total; i++) {
         if (scan_off >= pkt_len) break;
@@ -5240,28 +5237,7 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
             opt_udp = klass;
             opt_ver = (ttl >> 16) & 0xFF;
             opt_ext_flags = (ttl & 0xFFFF);
-            size_t p = rdata_start, end = rdata_start + rdlen;
-            while (p + 4 <= end) {
-                uint16_t code = (pkt[p] << 8) | pkt[p+1];
-                uint16_t olen = (pkt[p+2] << 8) | pkt[p+3];
-                p += 4;
-                if (p + olen > end) break;
-                if (code == 10) { // COOKIE
-                    has_cookie = true;
-                    if (olen >= 8) {
-                        for (int j = 0; j < 8; j++) snprintf(client_cookie + j * 2, 3, "%02x", pkt[p + j]);
-                        if (dopt->has_expected_client_cookie) {
-                            cookie_matches = (memcmp(dopt->expected_client_cookie, &pkt[p], 8) == 0);
-                        }
-                        if (olen > 8) {
-                            for (int j = 8; j < olen && (j - 8) * 2 < (int)sizeof(server_cookie) - 3; j++) {
-                                snprintf(server_cookie + (j - 8) * 2, 3, "%02x", pkt[p + j]);
-                            }
-                        }
-                    }
-                }
-                p += olen;
-            }
+            break;
         }
         scan_off = rdata_start + rdlen;
     }
@@ -5275,28 +5251,134 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
         if (opt_ext_flags & 0x0040) printf(" co");
         printf("\n");
         printf("          udp: %u\n", opt_udp);
-        if (has_cookie) {
-            printf("          COOKIE:\n");
-            printf("            CLIENT: %s\n", client_cookie);
-            if (server_cookie[0] != '\0') {
-                printf("            SERVER: %s\n", server_cookie);
-            }
-            if (dopt->has_expected_client_cookie) {
-                printf("            STATUS: %s\n", cookie_matches ? "good" : "bad");
-            }
+
+        size_t opt_scan_off = 12;
+        for (int i = 0; i < qdcount; i++) {
+            size_t nxt;
+            if (skip_wire_name(pkt, pkt_len, opt_scan_off, &nxt) != 0) break;
+            opt_scan_off = nxt + 4;
+            if (opt_scan_off > pkt_len) break;
         }
-        edns_info_t yaml_edns;
-        if (parse_edns_opt(pkt, pkt_len, qdcount, ancount, nscount, arcount, &yaml_edns) == 0) {
-            for (uint16_t i = 0; i < yaml_edns.ede_count; i++) {
-                const char *msg = get_ede_error_string(yaml_edns.ede_list[i].code);
-                printf("          EDE:\n");
-                printf("            INFO-CODE: %u (%s)\n", yaml_edns.ede_list[i].code, msg);
-                if (yaml_edns.ede_list[i].text[0]) {
-                    char text_esc[512];
-                    yaml_double_quote_escape(yaml_edns.ede_list[i].text, text_esc, sizeof(text_esc));
-                    printf("            EXTRA-TEXT: \"%s\"\n", text_esc);
+        for (int i = 0; i < non_qd_total; i++) {
+            if (opt_scan_off >= pkt_len) break;
+            size_t nxt;
+            if (skip_wire_name(pkt, pkt_len, opt_scan_off, &nxt) != 0) break;
+            if (nxt + 10 > pkt_len) break;
+            uint16_t type = (pkt[nxt] << 8) | pkt[nxt+1];
+            uint16_t rdlen = (pkt[nxt+8] << 8) | pkt[nxt+9];
+            size_t rdata_start = nxt + 10;
+            if (rdata_start + rdlen > pkt_len) break;
+
+            if (i >= ancount + nscount && type == 41) { // OPT in additional
+                size_t p = rdata_start, end = rdata_start + rdlen;
+                while (p + 4 <= end) {
+                    uint16_t code = (pkt[p] << 8) | pkt[p+1];
+                    uint16_t olen = (pkt[p+2] << 8) | pkt[p+3];
+                    p += 4;
+                    if (p + olen > end) break;
+                    if (code == 10) { // COOKIE
+                        if (olen >= 8) {
+                            char c_cookie[64] = "";
+                            char s_cookie[128] = "";
+                            for (int j = 0; j < 8; j++) snprintf(c_cookie + j * 2, 3, "%02x", pkt[p + j]);
+                            bool c_match = true;
+                            if (dopt->has_expected_client_cookie) {
+                                c_match = (memcmp(dopt->expected_client_cookie, &pkt[p], 8) == 0);
+                            }
+                            if (olen > 8) {
+                                for (int j = 8; j < olen && (j - 8) * 2 < (int)sizeof(s_cookie) - 3; j++) {
+                                    snprintf(s_cookie + (j - 8) * 2, 3, "%02x", pkt[p + j]);
+                                }
+                            }
+                            printf("          COOKIE:\n");
+                            printf("            CLIENT: %s\n", c_cookie);
+                            if (s_cookie[0] != '\0') {
+                                printf("            SERVER: %s\n", s_cookie);
+                            }
+                            if (dopt->has_expected_client_cookie) {
+                                printf("            STATUS: %s\n", c_match ? "good" : "bad");
+                            }
+                        }
+                    } else if (code == 3) { // NSID
+                        printf("          NSID: ");
+                        for (uint16_t j = 0; j < olen; j++) printf("%02x", pkt[p + j]);
+                        printf(" (\"");
+                        for (uint16_t j = 0; j < olen; j++) {
+                            unsigned char c = pkt[p + j];
+                            printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+                        }
+                        printf("\")\n");
+                    } else if (code == 8 && olen >= 4) { // CLIENT-SUBNET
+                        uint16_t family = (pkt[p] << 8) | pkt[p+1];
+                        uint8_t src_prefix = pkt[p+2];
+                        uint8_t scope_prefix = pkt[p+3];
+                        char abuf[64] = "?";
+                        uint8_t addr[16] = {0};
+                        int addr_bytes = olen - 4;
+                        if (addr_bytes > 16) addr_bytes = 16;
+                        memcpy(addr, &pkt[p + 4], addr_bytes);
+                        if (family == 1) inet_ntop(AF_INET, addr, abuf, sizeof(abuf));
+                        else if (family == 2) inet_ntop(AF_INET6, addr, abuf, sizeof(abuf));
+                        printf("          CLIENT-SUBNET: %s/%u/%u\n", abuf, src_prefix, scope_prefix);
+                    } else if (code == 9) { // EXPIRE
+                        if (olen >= 4) {
+                            uint32_t exp_sec = ((uint32_t)pkt[p]<<24)|((uint32_t)pkt[p+1]<<16)|((uint32_t)pkt[p+2]<<8)|pkt[p+3];
+                            printf("          EXPIRE: %u (seconds)\n", exp_sec);
+                        } else {
+                            printf("          EXPIRE:\n");
+                        }
+                    } else if (code == 11) { // KEEPALIVE
+                        if (olen >= 2) {
+                            uint16_t to = (pkt[p] << 8) | pkt[p+1];
+                            printf("          KEEPALIVE: %u\n", to);
+                        } else {
+                            printf("          KEEPALIVE:\n");
+                        }
+                    } else if (code == 12) { // PADDING
+                        printf("          PADDING: %u octets\n", olen);
+                    } else if (code == 15 && olen >= 2) { // EDE
+                        uint16_t info_code = (pkt[p] << 8) | pkt[p+1];
+                        const char *msg = get_ede_error_string(info_code);
+                        printf("          EDE:\n");
+                        printf("            INFO-CODE: %u (%s)\n", info_code, msg);
+                        if (olen > 2) {
+                            char ede_text[512];
+                            size_t tlen = olen - 2;
+                            if (tlen >= sizeof(ede_text)) tlen = sizeof(ede_text) - 1;
+                            memcpy(ede_text, &pkt[p + 2], tlen);
+                            ede_text[tlen] = '\0';
+                            char text_esc[512];
+                            yaml_double_quote_escape(ede_text, text_esc, sizeof(text_esc));
+                            printf("            EXTRA-TEXT: \"%s\"\n", text_esc);
+                        }
+                    } else if (code == 20 || code == 21) { // MQTYPE
+                        printf("          %s: ", code == 20 ? "MQTYPE-Query" : "MQTYPE-Response");
+                        if (olen % 2 != 0) {
+                            printf("(malformed, length %u is not even)\n", olen);
+                        } else if (olen == 0) {
+                            printf("(empty)\n");
+                        } else {
+                            for (uint16_t j = 0; j < olen; j += 2) {
+                                uint16_t mq = (pkt[p + j] << 8) | pkt[p + j + 1];
+                                char tbuf[16];
+                                const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
+                                if (j > 0) printf(" ");
+                                printf("%s", mq_name);
+                            }
+                            printf("\n");
+                        }
+                    } else if (code != 15) {
+                        printf("          OPTION: %u", code);
+                        if (olen > 0) {
+                            printf(": ");
+                            for (uint16_t j = 0; j < olen; j++) printf("%02x ", pkt[p + j]);
+                        }
+                        printf("\n");
+                    }
+                    p += olen;
                 }
             }
+            opt_scan_off = rdata_start + rdlen;
         }
     }
 
@@ -5568,6 +5650,9 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
         }
         for (int i = 0; i < arcount; i++) {
             if (!print_one_rr(pkt, pkt_len, &offset, axfr_state, dopt)) return;
+        }
+        if (axfr_state->is_ixfr && ancount == 1 && axfr_state->soa_seen_count == 1) {
+            axfr_state->axfr_complete = true;
         }
         return;
     }
@@ -5972,6 +6057,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         
         axfr_state_t axfr_state = {0};
         axfr_state.is_axfr = (qtype == 252 || qtype == 251);
+        axfr_state.is_ixfr = (qtype == 251);
 
 
         if (!dopt->short_mode && !dopt->yaml) {
@@ -6279,6 +6365,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                         printf("\n");
                         off = nxt+10+rdlen;
                     } else break;
+                }
+                if (axfr_state.is_ixfr && ancount == 1 && axfr_state.soa_seen_count == 1) {
+                    axfr_state.axfr_complete = true;
                 }
             }
 
