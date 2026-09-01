@@ -3714,13 +3714,6 @@ static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeo
   return (ssize_t)nread;
 }
 
-/* 1回の宣言応答長として明らかに異常とみなす閾値。
- * max_res_lenの4倍(UDPで最大4096バイト程度、TCPで最大65535バイト程度を
- * 想定しても十分な余裕がある)を超える宣言があった場合は、ドレインすら試みず
- * 即座に通信失敗として扱い、巨大なドレインループでmutexを長時間占有しない
- * ようにする。 */
-#define PROGRAM_ZONE_MAX_SANE_RESPLEN(max_res_len) ((max_res_len) * 4)
-
 static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
                                     uint8_t *res, size_t max_res_len,
                                     const char *client_ip, bool is_tcp) {
@@ -3760,28 +3753,47 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
         } else {
           ok = false;
         }
-      } else if (resp_len > PROGRAM_ZONE_MAX_SANE_RESPLEN(max_res_len)) {
-        // H-3: 明らかに異常な宣言長は、ドレインすら試みずに即座に失敗させる。
-        syslog(LOG_WARNING, "[Plugin] zone '%s' declared implausible response length %u; "
-               "treating as protocol desync, not draining", domain, resp_len);
-        ok = false;
       } else {
-        syslog(LOG_WARNING, "[Plugin] zone '%s' returned oversized response (%u > %zu); dropping",
+        syslog(LOG_INFO, "[Plugin] zone '%s' returned oversized response (%u > %zu); truncating with TC=1",
                domain, resp_len, max_res_len);
-        /* パイプ内の oversized データを読み捨ててパイプの同期を保つ。
-         * H-3: ここも共有締切の残り時間を使うため、宣言長がどれだけ大きくても
-         * 合計の待ち時間はplugin->timeout_msを超えない。 */
-        size_t remaining = resp_len;
-        uint8_t drain_buf[512];
-        while (remaining > 0) {
-          size_t chunk = remaining < sizeof(drain_buf) ? remaining : sizeof(drain_buf);
-          if (read_all_timeout(plugin->stdout_fd, drain_buf, chunk, remaining_ms(deadline)) != (ssize_t)chunk) {
-            ok = false;
-            break;
+        /* 最初の max_res_len 分を res に読み込み、残りを読み捨ててパイプの同期を保つ。
+         * 共有締切の残り時間を使うため、宣言長がどれだけ大きくても合計の待ち時間は plugin->timeout_ms を超えない。 */
+        size_t first_chunk = max_res_len;
+        if (read_all_timeout(plugin->stdout_fd, res, first_chunk, remaining_ms(deadline)) == (ssize_t)first_chunk) {
+          size_t remaining = resp_len - first_chunk;
+          uint8_t drain_buf[512];
+          while (remaining > 0) {
+            size_t chunk = remaining < sizeof(drain_buf) ? remaining : sizeof(drain_buf);
+            if (read_all_timeout(plugin->stdout_fd, drain_buf, chunk, remaining_ms(deadline)) != (ssize_t)chunk) {
+              ok = false;
+              break;
+            }
+            remaining -= chunk;
           }
-          remaining -= chunk;
+          if (ok) {
+            // TCビットをセットし、質問セクション以降をクリアして切り詰め応答とする
+            res[0] = req[0]; res[1] = req[1]; // クエリのトランザクションIDを反映
+            res[2] |= 0x82;                   // QR=1, TC=1
+            res[4] = req[4]; res[5] = req[5]; // QDCOUNT
+            res[6] = 0; res[7] = 0;           // ANCOUNT=0
+            res[8] = 0; res[9] = 0;           // NSCOUNT=0
+            res[10] = 0; res[11] = 0;         // ARCOUNT=0
+            uint16_t qdcount = (req[4] << 8) | req[5];
+            size_t qlen = get_question_end_offset(res, first_chunk, qdcount);
+            if (qlen < DNS_HEADER_SIZE || qlen > first_chunk) {
+              size_t req_qlen = get_question_end_offset(req, req_len, qdcount);
+              if (req_qlen >= DNS_HEADER_SIZE && req_qlen <= max_res_len) {
+                memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, req_qlen - DNS_HEADER_SIZE);
+                qlen = req_qlen;
+              } else {
+                qlen = DNS_HEADER_SIZE;
+              }
+            }
+            result_len = (int)qlen;
+          }
+        } else {
+          ok = false;
         }
-        result_len = 0;
       }
     } else {
       ok = false;
@@ -3953,7 +3965,30 @@ static int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t
       // そのまま使う(何も返さないよりはマシ、というBIND等と同じ扱い)。
     }
 
-    size_t copy_len = (size_t)got > max_res_len ? max_res_len : (size_t)got;
+    if ((size_t)got > max_res_len) {
+      size_t copy_len = max_res_len;
+      memcpy(res, s_forward_res_buf, copy_len);
+      res[0] = req[0]; res[1] = req[1];
+      res[2] |= 0x82; // QR=1, TC=1
+      res[4] = req[4]; res[5] = req[5];
+      res[6] = 0; res[7] = 0;
+      res[8] = 0; res[9] = 0;
+      res[10] = 0; res[11] = 0;
+      uint16_t qdcount = (req[4] << 8) | req[5];
+      size_t qlen = get_question_end_offset(res, copy_len, qdcount);
+      if (qlen < DNS_HEADER_SIZE || qlen > copy_len) {
+        size_t req_qlen = get_question_end_offset(req, req_len, qdcount);
+        if (req_qlen >= DNS_HEADER_SIZE && req_qlen <= max_res_len) {
+          memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, req_qlen - DNS_HEADER_SIZE);
+          qlen = req_qlen;
+        } else {
+          qlen = DNS_HEADER_SIZE;
+        }
+      }
+      return (int)qlen;
+    }
+
+    size_t copy_len = (size_t)got;
     memcpy(res, s_forward_res_buf, copy_len);
     res[0] = req[0]; res[1] = req[1]; // クライアントの元のトランザクションIDへ復元
     return (int)copy_len;

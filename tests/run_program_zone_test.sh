@@ -128,6 +128,16 @@ run_check "Query with truncated RDATA is handled without server crash" \
     "$DAG @127.0.0.1 -p $PORT trunc-rdata.brokentest.example A +timeout=2 +tries=1" \
     "ANSWER: 1"
 
+# Test oversized response (>1232 bytes) with UDP (should return TC bit and truncate safely)
+run_check "Oversized query via UDP returns TC bit" \
+    "$DAG @127.0.0.1 -p $PORT oversized.brokentest.example TXT +ignore +timeout=2 +tries=1" \
+    "flags:.*tc"
+
+# Test oversized response via TCP (should return full 10 TXT records)
+run_check "Oversized query via TCP returns full response" \
+    "$DAG @127.0.0.1 -p $PORT oversized.brokentest.example TXT +tcp +timeout=2 +tries=1" \
+    "ANSWER: 10"
+
 if [ "$FAILED" -gt 0 ] && [ -f "$TMP_DIR/karidns.log" ]; then
     echo "=== Server Log ==="
     cat "$TMP_DIR/karidns.log"
