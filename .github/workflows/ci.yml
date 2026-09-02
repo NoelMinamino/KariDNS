@@ -85,6 +85,7 @@ jobs:
             sh ./tests/run_dag_badcookie_transport_test.sh
             sh ./tests/run_dag_keepopen_keepalive_test.sh
             sh ./tests/run_dag_ci_test.sh
+            sh ./tests/run_phase2_core_audit_test.sh
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"

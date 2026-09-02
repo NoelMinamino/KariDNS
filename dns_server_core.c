@@ -131,6 +131,7 @@ typedef struct {
   catalog_member_id_t *catalog_members;
   int catalog_member_count;
   bool is_catalog_member;
+  bool is_secondary;
   char catalog_member_unique_id[256];
   char **groups;
   int group_count;
@@ -322,15 +323,7 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
     full_hash = hash;
   }
 
-  size_t idx = hash & (RRL_TABLE_SIZE - 1);
-  rrl_bucket_t *b = &g_rrl_table[idx];
-  while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
-#if defined(__x86_64__) || defined(__i386__)
-      __asm__ volatile("pause" ::: "memory");
-#else
-      sched_yield();
-#endif
-  }
+#define RRL_PROBE_WAYS 4
 
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -339,29 +332,73 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   uint32_t window_sec = (cfg->window_seconds > 0) ? (uint32_t)cfg->window_seconds : 15;
   if (window_sec > 3600) window_sec = 3600;
 
-  if (b->client_hash != full_hash) {
-    // Hash collision or new entry
-    // Only reset if it's older than window_sec seconds to prevent hash-collision DoS
-    if (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000) {
-      b->client_hash = full_hash;
-      for (int i = 0; i < 4; i++) {
-          b->last_refill_ms[i] = now_ms;
-      }
-      uint64_t cap0 = (uint64_t)cfg->responses_per_second * window_sec;
-      uint64_t cap2 = (uint64_t)cfg->nxdomains_per_second * window_sec;
-      uint64_t cap3 = (uint64_t)cfg->errors_per_second * window_sec;
-      if (cap0 > 0x7FFFFFFF) cap0 = 0x7FFFFFFF;
-      if (cap2 > 0x7FFFFFFF) cap2 = 0x7FFFFFFF;
-      if (cap3 > 0x7FFFFFFF) cap3 = 0x7FFFFFFF;
-      b->tokens[0] = (int32_t)cap0;
-      b->tokens[1] = (int32_t)cap0;
-      b->tokens[2] = (int32_t)cap2;
-      b->tokens[3] = (int32_t)cap3;
-      b->slip_counter = 0;
-    } else {
-      // It's a recent collision. Share the limit instead of resetting.
-      // This mitigates spoofed IPs from resetting other users' buckets.
+  rrl_bucket_t *selected_bucket = NULL;
+  bool is_new_entry = false;
+  size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
+
+  // 1st Pass: Look for exact hash match
+  for (int probe = 0; probe < RRL_PROBE_WAYS; probe++) {
+    size_t idx = (base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1);
+    rrl_bucket_t *b = &g_rrl_table[idx];
+    while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+      __asm__ volatile("pause" ::: "memory");
+#else
+      sched_yield();
+#endif
     }
+    if (b->client_hash == full_hash) {
+      selected_bucket = b;
+      is_new_entry = false;
+      break;
+    }
+    atomic_flag_clear_explicit(&b->lock, memory_order_release);
+  }
+
+  // 2nd Pass: If no exact match, look for an empty or expired bucket
+  if (!selected_bucket) {
+    for (int probe = 0; probe < RRL_PROBE_WAYS; probe++) {
+      size_t idx = (base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1);
+      rrl_bucket_t *b = &g_rrl_table[idx];
+      while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ volatile("pause" ::: "memory");
+#else
+        sched_yield();
+#endif
+      }
+      if (b->client_hash == 0 || (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000)) {
+        selected_bucket = b;
+        is_new_entry = true;
+        break;
+      }
+      atomic_flag_clear_explicit(&b->lock, memory_order_release);
+    }
+  }
+
+  // All candidate slots are busy active collisions.
+  // Bypass RRL to prevent token-stealing / collateral DoS on legitimate users.
+  if (!selected_bucket) {
+    return true;
+  }
+
+  rrl_bucket_t *b = selected_bucket;
+  if (is_new_entry) {
+    b->client_hash = full_hash;
+    for (int i = 0; i < 4; i++) {
+      b->last_refill_ms[i] = now_ms;
+    }
+    uint64_t cap0 = (uint64_t)cfg->responses_per_second * window_sec;
+    uint64_t cap2 = (uint64_t)cfg->nxdomains_per_second * window_sec;
+    uint64_t cap3 = (uint64_t)cfg->errors_per_second * window_sec;
+    if (cap0 > 0x7FFFFFFF) cap0 = 0x7FFFFFFF;
+    if (cap2 > 0x7FFFFFFF) cap2 = 0x7FFFFFFF;
+    if (cap3 > 0x7FFFFFFF) cap3 = 0x7FFFFFFF;
+    b->tokens[0] = (int32_t)cap0;
+    b->tokens[1] = (int32_t)cap0;
+    b->tokens[2] = (int32_t)cap2;
+    b->tokens[3] = (int32_t)cap3;
+    b->slip_counter = 0;
   } else {
     uint32_t rates[4] = {
       cfg->responses_per_second,
@@ -1031,27 +1068,34 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
 
 static void *gc_snapshot_thread(void *arg) {
   zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
+  if (!snap) return NULL;
   wait_for_snapshot_readers(snap);
-  for (size_t v = 0; v < snap->view_count; v++) {
-    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
-      zone_db_entry_t *entry = snap->views[v].entries[i];
-      if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
-        syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
-        free_zone_db_entry(entry);
+  if (snap->views) {
+    for (size_t v = 0; v < snap->view_count; v++) {
+      if (snap->views[v].entries) {
+        for (size_t i = 0; i < snap->views[v].zone_count; i++) {
+          zone_db_entry_t *entry = snap->views[v].entries[i];
+          if (entry) {
+            if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
+              syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
+              free_zone_db_entry(entry);
+            }
+          }
+        }
+        free(snap->views[v].entries);
       }
-    }
-    free(snap->views[v].entries);
-    free(snap->views[v].name);
-    if (snap->views[v].match_clients) {
-      for (int i = 0; i < snap->views[v].match_clients_count; i++) {
-        free(snap->views[v].match_clients[i]);
+      if (snap->views[v].name) free(snap->views[v].name);
+      if (snap->views[v].match_clients) {
+        for (int i = 0; i < snap->views[v].match_clients_count; i++) {
+          if (snap->views[v].match_clients[i]) free(snap->views[v].match_clients[i]);
+        }
+        free(snap->views[v].match_clients);
       }
-      free(snap->views[v].match_clients);
+      if (snap->views[v].hash_table) free(snap->views[v].hash_table);
+      if (snap->views[v].chain_next) free(snap->views[v].chain_next);
     }
-    if (snap->views[v].hash_table) free(snap->views[v].hash_table);
-    if (snap->views[v].chain_next) free(snap->views[v].chain_next);
+    free(snap->views);
   }
-  free(snap->views);
   free(snap);
   return NULL;
 }
@@ -1334,6 +1378,9 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   struct stat st_loaded;
   if (stat_via_dir_cache(file, &st_loaded) == 0) {
     entry->last_loaded_mtime = st_loaded.st_mtime;
+    if (entry->is_secondary) {
+      atomic_store_explicit(&entry->last_successful_transfer, (time_t)st_loaded.st_mtime, memory_order_release);
+    }
   }
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
@@ -1411,6 +1458,14 @@ void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, cons
     }
 }
 
+static void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason) {
+    syslog(LOG_ERR, "[Core] Memory allocation failed during snapshot rebuild (%s), aborting", reason);
+    if (new_snap) {
+        gc_snapshot_thread(new_snap);
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
@@ -1421,6 +1476,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     zone_db_snapshot_t *old_snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
     zone_db_snapshot_t *new_snap = calloc(1, sizeof(zone_db_snapshot_t));
+    if (!new_snap) {
+        abort_rebuild_snapshot(NULL, "new_snap");
+        return NULL;
+    }
     
     if (active_config) {
         // MODE: Full Config Reload
@@ -1437,6 +1496,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
         }
         catalog_member_id_t *valid_members = max_valid_members > 0 ? calloc(max_valid_members, sizeof(catalog_member_id_t)) : NULL;
+        if (max_valid_members > 0 && !valid_members) {
+            abort_rebuild_snapshot(new_snap, "valid_members");
+            return NULL;
+        }
         int valid_member_count = 0;
         
         if (old_snap) {
@@ -1475,7 +1538,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         for (view_config_t *v = active_config->views; v; v = v->next) view_count++;
         
         new_snap->view_count = view_count;
-        new_snap->views = calloc(view_count, sizeof(view_snapshot_t));
+        if (view_count > 0) {
+            new_snap->views = calloc(view_count, sizeof(view_snapshot_t));
+            if (!new_snap->views) {
+                if (valid_members) free(valid_members);
+                abort_rebuild_snapshot(new_snap, "new_snap->views");
+                return NULL;
+            }
+        }
         atomic_init(&new_snap->reader_count, 0);
 
         int vidx = 0;
@@ -1485,6 +1555,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             vs->match_clients_count = v->match_clients_count;
             if (v->match_clients_count > 0) {
                 vs->match_clients = calloc(v->match_clients_count, sizeof(char *));
+                if (!vs->match_clients) {
+                    if (valid_members) free(valid_members);
+                    abort_rebuild_snapshot(new_snap, "vs->match_clients");
+                    return NULL;
+                }
                 for (int i = 0; i < v->match_clients_count; i++) {
                     vs->match_clients[i] = strdup(v->match_clients[i]);
                 }
@@ -1513,7 +1588,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                     bool overridden = false;
                                     for (zone_config_t *z = v->zones; z; z = z->next) {
                                         if (strcasecmp(z->domain, entry->domain) == 0) {
-                                            overridden = true; break;
+                                             overridden = true; break;
                                         }
                                     }
                                     if (!overridden) dynamic_count++;
@@ -1526,7 +1601,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
 
             vs->zone_count = static_count + dynamic_count;
-            vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+            if (vs->zone_count > 0) {
+                vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+                if (!vs->entries) {
+                    if (valid_members) free(valid_members);
+                    abort_rebuild_snapshot(new_snap, "vs->entries");
+                    return NULL;
+                }
+            }
             
             int zidx = 0;
             for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -1548,7 +1630,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (!entry) {
                     zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
                     entry = create_new_zone_entry(z->domain, v->name);
-                    if (entry && z->type && (strcasecmp(z->type, "master") == 0 || strcasecmp(z->type, "primary") == 0) && z->file) {
+                    if (entry && z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0)) {
+                        entry->is_secondary = true;
+                    }
+                    if (entry && z->file) {
                         reload_master_zone(entry, z->file);
                     }
                 }
@@ -1875,6 +1960,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
+            entry->is_secondary = true;
             strncpy(entry->catalog_member_unique_id, added_members[i].unique_id, sizeof(entry->catalog_member_unique_id) - 1);
             if (added_members[i].group_count > 0) {
                 entry->groups = calloc(added_members[i].group_count, sizeof(char*));
@@ -1897,6 +1983,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         new_snap->view_count = old_snap ? old_snap->view_count : 0;
         if (new_snap->view_count > 0) {
             new_snap->views = calloc(new_snap->view_count, sizeof(view_snapshot_t));
+            if (!new_snap->views) {
+                free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                abort_rebuild_snapshot(new_snap, "catalog new_snap->views");
+                return NULL;
+            }
             atomic_init(&new_snap->reader_count, 0);
 
             // Build ephemeral hash table for deleted members (removed + coo_evicted)
@@ -1933,6 +2024,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 vs->match_clients_count = old_snap->views[v].match_clients_count;
                 if (vs->match_clients_count > 0) {
                     vs->match_clients = calloc(vs->match_clients_count, sizeof(char *));
+                    if (!vs->match_clients) {
+                        if (del_hash_table) free(del_hash_table);
+                        if (del_chain_next) free(del_chain_next);
+                        free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                        abort_rebuild_snapshot(new_snap, "catalog vs->match_clients");
+                        return NULL;
+                    }
                     for (int i = 0; i < vs->match_clients_count; i++) {
                         vs->match_clients[i] = strdup(old_snap->views[v].match_clients[i]);
                     }
@@ -1941,6 +2039,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (strcasecmp(vs->name, catalog_view_name) == 0) {
                     size_t max_zones = old_snap->views[v].zone_count + added_count;
                     vs->entries = calloc(max_zones > 0 ? max_zones : 1, sizeof(zone_db_entry_t *));
+                    if (!vs->entries) {
+                        if (del_hash_table) free(del_hash_table);
+                        if (del_chain_next) free(del_chain_next);
+                        free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                        abort_rebuild_snapshot(new_snap, "catalog vs->entries");
+                        return NULL;
+                    }
                     
                     int zidx = 0;
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
@@ -1987,6 +2092,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 } else {
                     vs->zone_count = old_snap->views[v].zone_count;
                     vs->entries = calloc(vs->zone_count > 0 ? vs->zone_count : 1, sizeof(zone_db_entry_t *));
+                    if (!vs->entries) {
+                        if (del_hash_table) free(del_hash_table);
+                        if (del_chain_next) free(del_chain_next);
+                        free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                        abort_rebuild_snapshot(new_snap, "catalog other vs->entries");
+                        return NULL;
+                    }
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                         zone_db_entry_t *entry = old_snap->views[v].entries[i];
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
@@ -2627,6 +2739,23 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   }
 }
 
+static const char *strchr_unescaped(const char *s, char c) {
+  if (!s) return NULL;
+  for (const char *p = s; *p != '\0'; p++) {
+    if (*p == '\\') {
+      if (*(p + 1) == '\0') {
+        break; // Trailing backslash at end of string
+      }
+      p++; // Skip escaped character
+      continue;
+    }
+    if (*p == c) {
+      return p;
+    }
+  }
+  return NULL;
+}
+
 static bool attach_covering_rrsig(zone_arena_t *zone, size_t hash_idx,
                                   const char *match_name,
                                   const char *owner_name_override,
@@ -2771,7 +2900,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
     // RFC 4035 §3.1.4.1: 委任点そのもの(name == qname)へのDSクエリは、
     // 参照応答(referral)にせず、権威応答としてフェーズ2の通常検索へ継続させる。
     if (is_ds_query && name == qname) {
-      name = strchr(name, '.');
+      name = strchr_unescaped(name, '.');
       if (name)
         name++;
       continue;
@@ -2810,7 +2939,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
       }
       return true;
     }
-    name = strchr(name, '.');
+    name = strchr_unescaped(name, '.');
     if (name)
       name++;
   }
@@ -2913,7 +3042,7 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
     return zone_apex;
   const char *parent = qname;
   size_t apex_len = strlen(zone_apex);
-  while ((parent = strchr(parent, '.')) != NULL) {
+  while ((parent = strchr_unescaped(parent, '.')) != NULL) {
     parent++;
     if (*parent == '\0') break;
 
@@ -3065,7 +3194,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     if (!found) {
       bool dname_found = false;
       const char *dname_parent = current_qname;
-      while ((dname_parent = strchr(dname_parent, '.')) != NULL) {
+      while ((dname_parent = strchr_unescaped(dname_parent, '.')) != NULL) {
         dname_parent++;
         if (*dname_parent == '\0') break;
         uint32_t p_hash = calc_fnv1a_str(dname_parent);
@@ -3113,7 +3242,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         char wc_name[256];
         wc_name[0] = '*';
         wc_name[1] = '.';
-        while ((parent = strchr(parent, '.')) != NULL) {
+        while ((parent = strchr_unescaped(parent, '.')) != NULL) {
           parent++;
           if (*parent == '\0') break;
           size_t parent_len = strlen(parent);
@@ -3274,7 +3403,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           const char *parent = current_qname;
           char wc_name[256];
           wc_name[0] = '*'; wc_name[1] = '.';
-          while ((parent = strchr(parent, '.')) != NULL) {
+          while ((parent = strchr_unescaped(parent, '.')) != NULL) {
             parent++; if (*parent == '\0') break;
             size_t parent_len = strlen(parent);
             if (parent_len + 3 > sizeof(wc_name)) break;
@@ -4930,7 +5059,7 @@ void *axfr_bg_thread_func(void *arg) {
     req_len = 14;
     const char *d = ctx->domain;
     while (*d) {
-      const char *dot = strchr(d, '.');
+      const char *dot = strchr_unescaped(d, '.');
       size_t len = dot ? (size_t)(dot - d) : strlen(d);
       if (len > 63)
         len = 63;
@@ -5693,6 +5822,195 @@ void *axfr_worker_thread(void *arg) {
   pthread_exit(NULL);
 }
 
+#define ASYNC_IO_POOL_SIZE 16
+#define ASYNC_IO_QUEUE_CAPACITY 4096
+
+typedef struct {
+  bool is_tcp;
+  int active_fd; // For UDP, IPC socket to frontend
+  int client_fd; // For TCP, client socket
+  udp_ipc_t ipc_hdr;
+  uint8_t req_buf[UDP_DEFAULT_MAX_RES_LEN];
+  size_t req_len;
+  char client_ip[INET6_ADDRSTRLEN];
+  int client_port;
+  char qname[256];
+  uint16_t qtype;
+  uint16_t qclass;
+  bool has_edns;
+  bool dnssec_ok;
+  size_t question_end;
+  zone_db_snapshot_t *snap;
+} async_io_task_t;
+
+typedef struct {
+  async_io_task_t queue[ASYNC_IO_QUEUE_CAPACITY];
+  size_t head;
+  size_t tail;
+  size_t count;
+  pthread_mutex_t lock;
+  pthread_cond_t cond_not_empty;
+  pthread_t threads[ASYNC_IO_POOL_SIZE];
+  bool running;
+} async_io_pool_t;
+
+static async_io_pool_t g_async_io_pool;
+
+static bool enqueue_async_io_task(const async_io_task_t *task) {
+  pthread_mutex_lock(&g_async_io_pool.lock);
+  if (!g_async_io_pool.running || g_async_io_pool.count >= ASYNC_IO_QUEUE_CAPACITY) {
+    pthread_mutex_unlock(&g_async_io_pool.lock);
+    return false;
+  }
+  g_async_io_pool.queue[g_async_io_pool.tail] = *task;
+  g_async_io_pool.tail = (g_async_io_pool.tail + 1) % ASYNC_IO_QUEUE_CAPACITY;
+  g_async_io_pool.count++;
+  pthread_cond_signal(&g_async_io_pool.cond_not_empty);
+  pthread_mutex_unlock(&g_async_io_pool.lock);
+  return true;
+}
+
+static void *async_io_worker_func(void *arg) {
+  (void)arg;
+  compress_ctx_t thread_compress_ctx = {0};
+  while (1) {
+    pthread_mutex_lock(&g_async_io_pool.lock);
+    while (g_async_io_pool.running && g_async_io_pool.count == 0) {
+      pthread_cond_wait(&g_async_io_pool.cond_not_empty, &g_async_io_pool.lock);
+    }
+    if (!g_async_io_pool.running && g_async_io_pool.count == 0) {
+      pthread_mutex_unlock(&g_async_io_pool.lock);
+      break;
+    }
+    async_io_task_t task = g_async_io_pool.queue[g_async_io_pool.head];
+    g_async_io_pool.head = (g_async_io_pool.head + 1) % ASYNC_IO_QUEUE_CAPACITY;
+    g_async_io_pool.count--;
+    pthread_mutex_unlock(&g_async_io_pool.lock);
+
+    if (!task.is_tcp) {
+      // UDP async resolution
+      uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
+      uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
+      rate_limit_config_t *rrl_cfg = NULL;
+      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                      task.qname, task.qtype, task.client_ip,
+                                      &thread_compress_ctx, false, &rrl_cfg, task.snap);
+      release_zone_snapshot(task.snap);
+
+      if (res_len > 0) {
+        bool slip_triggered = false;
+        rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
+        if (rrl_check((struct sockaddr_storage *)&task.ipc_hdr.client_addr, cls, rrl_cfg, &slip_triggered)) {
+          submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
+                              res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
+          *res_msg = task.ipc_hdr;
+          res_msg->payload_len = res_len;
+          send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0);
+        } else if (slip_triggered) {
+          submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
+                              res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          res_buf[2] |= 0x02; // Set TC bit
+          res_buf[6] = 0; res_buf[7] = 0;
+          res_buf[8] = 0; res_buf[9] = 0;
+          res_buf[10] = 0; res_buf[11] = 0;
+          int qlen = (int)task.question_end;
+          if (qlen > res_len) qlen = res_len;
+          if (qlen > (int)task.req_len) qlen = (int)task.req_len;
+          udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
+          *res_msg = task.ipc_hdr;
+          res_msg->payload_len = qlen;
+          send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0);
+        } else {
+          submit_response_log(LOG_ACT_DROP_RRL, task.client_ip, task.client_port, task.qname,
+                              task.qclass, task.qtype, res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
+        }
+      } else {
+        submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
+                            0, 0, 0, false, false);
+      }
+    } else {
+      // TCP async resolution
+      uint8_t *tcp_res = malloc(65535);
+      if (tcp_res) {
+        int res_len = process_dns_query(task.req_buf, task.req_len, tcp_res, 65535,
+                                        task.qname, task.qtype, task.client_ip,
+                                        &thread_compress_ctx, true, NULL, task.snap);
+        release_zone_snapshot(task.snap);
+        if (res_len > 0) {
+          submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
+                              tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
+          send(task.client_fd, len_prefix, 2, 0);
+          send(task.client_fd, tcp_res, res_len, 0);
+        } else {
+          submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
+                              0, 0, 0, false, false);
+        }
+        free(tcp_res);
+      } else {
+        release_zone_snapshot(task.snap);
+      }
+      close(task.client_fd);
+      dec_tcp_clients();
+    }
+  }
+  return NULL;
+}
+
+static void init_async_io_pool(void) {
+  memset(&g_async_io_pool, 0, sizeof(g_async_io_pool));
+  pthread_mutex_init(&g_async_io_pool.lock, NULL);
+  pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
+  g_async_io_pool.running = true;
+  for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
+    pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, NULL);
+  }
+}
+
+static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
+  if (!view || !qname) return NULL;
+  size_t q_len = strlen(qname);
+  zone_db_entry_t *best_entry = NULL;
+  size_t longest_match_len = 0;
+  for (size_t i = 0; i < view->zone_count; i++) {
+    zone_db_entry_t *entry = view->entries[i];
+    if (!entry) continue;
+    size_t z_len = strlen(entry->domain);
+    bool match = false;
+    if (q_len == z_len && strcasecmp(qname, entry->domain) == 0) {
+      match = true;
+    } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
+               strcasecmp(qname + q_len - z_len, entry->domain) == 0) {
+      match = true;
+    }
+    if (match && z_len > longest_match_len) {
+      longest_match_len = z_len;
+      best_entry = entry;
+    }
+  }
+  return best_entry;
+}
+
+static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
+  if (!snap || !qname) return false;
+  view_snapshot_t *view = select_view(snap, client_ip);
+  if (!view) return false;
+  server_config_t *cfg = acquire_config_snapshot();
+  if (!cfg) return false;
+
+  bool is_synth = false;
+  zone_db_entry_t *entry = find_zone_in_view(view, qname);
+  if (entry) {
+    zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, entry->domain);
+    if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "program") == 0 || strcasecmp(zcfg->type, "forward") == 0)) {
+      is_synth = true;
+    }
+  }
+  release_config_snapshot(cfg);
+  return is_synth;
+}
+
 static bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
     for (int i = 0; i < acl_count; i++) {
         char *rule = acl_list[i];
@@ -5884,14 +6202,18 @@ worker_startup_success:;
                   qname[written++] = '.';
               }
               if (offset + len <= recv_len) {
-                size_t copy_len = len;
-                if (written >= 255)
-                  copy_len = 0;
-                else if (written + copy_len > 255)
-                  copy_len = 255 - written;
-                if (copy_len > 0) {
-                  memcpy(&qname[written], &req_buf[offset], copy_len);
-                  written += copy_len;
+                for (size_t b = 0; b < len; b++) {
+                  uint8_t c = req_buf[offset + b];
+                  if (c == '.' || c == '\\') {
+                    if (written + 2 < 255) {
+                      qname[written++] = '\\';
+                      qname[written++] = (char)c;
+                    }
+                  } else {
+                    if (written < 255) {
+                      qname[written++] = (char)c;
+                    }
+                  }
                 }
               }
               offset += len;
@@ -5981,10 +6303,33 @@ worker_startup_success:;
           write_query_log(client_ip, client_port, qname, qclass, qtype,
                           has_edns, dnssec_ok);
 
+          zone_db_snapshot_t *snap = acquire_zone_snapshot();
+          if (is_zone_synthetic_type(snap, client_ip, qname)) {
+            async_io_task_t task = {0};
+            task.is_tcp = false;
+            task.active_fd = active_fd;
+            task.ipc_hdr = *ipc_msg;
+            task.req_len = payload_received > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : payload_received;
+            memcpy(task.req_buf, req_buf, task.req_len);
+            strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
+            task.client_port = client_port;
+            strncpy(task.qname, qname, sizeof(task.qname) - 1);
+            task.qtype = qtype;
+            task.qclass = qclass;
+            task.has_edns = has_edns;
+            task.dnssec_ok = dnssec_ok;
+            task.question_end = question_end;
+            task.snap = snap;
+            if (!enqueue_async_io_task(&task)) {
+              release_zone_snapshot(snap);
+              submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+            }
+            continue;
+          }
+
           uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
           uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
           rate_limit_config_t *rrl_cfg = NULL;
-          zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int res_len =
               process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
                                 qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
@@ -6110,14 +6455,18 @@ worker_startup_success:;
                   qname[written++] = '.';
               }
               if (offset + len <= msg_len) {
-                size_t copy_len = len;
-                if (written >= 255)
-                  copy_len = 0;
-                else if (written + copy_len > 255)
-                  copy_len = 255 - written;
-                if (copy_len > 0) {
-                  memcpy(&qname[written], &msg[offset], copy_len);
-                  written += copy_len;
+                for (size_t b = 0; b < len; b++) {
+                  uint8_t c = msg[offset + b];
+                  if (c == '.' || c == '\\') {
+                    if (written + 2 < 255) {
+                      qname[written++] = '\\';
+                      qname[written++] = (char)c;
+                    }
+                  } else {
+                    if (written < 255) {
+                      qname[written++] = (char)c;
+                    }
+                  }
                 }
               }
               offset += len;
@@ -6373,6 +6722,34 @@ worker_startup_success:;
             }
             free(ctx_tcp);
           } else {
+            if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
+              struct kevent ev_del;
+              EV_SET(&ev_del, client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+              kevent(kq, &ev_del, 1, NULL, 0, NULL);
+
+              async_io_task_t task = {0};
+              task.is_tcp = true;
+              task.client_fd = client_fd;
+              task.req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
+              memcpy(task.req_buf, msg, task.req_len);
+              strncpy(task.client_ip, ctx_tcp->client_ip, sizeof(task.client_ip) - 1);
+              task.client_port = client_port;
+              strncpy(task.qname, qname, sizeof(task.qname) - 1);
+              task.qtype = qtype;
+              task.qclass = qclass;
+              task.has_edns = has_edns;
+              task.dnssec_ok = dnssec_ok;
+              task.question_end = 0;
+              task.snap = snap;
+              free(ctx_tcp);
+
+              if (!enqueue_async_io_task(&task)) {
+                release_zone_snapshot(snap);
+                close(client_fd);
+                dec_tcp_clients();
+              }
+              continue;
+            }
             uint8_t *tcp_res = malloc(65535);
             if (tcp_res) {
               int res_len = process_dns_query(msg, msg_len, tcp_res, 65535,
@@ -7547,6 +7924,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < g_num_udp_fds; i++)
     close(g_udp_fds[i]);
   close(g_notify_ipc[0]);
+  init_async_io_pool();
 
   pthread_t control_thread;
   if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
