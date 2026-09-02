@@ -448,6 +448,9 @@ SERVER               | PROTO | RCODE    | QD | AN | NS | AR | TIME   | STATUS
 9.9.9.9:5353         | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 15 ms  | MATCH_EXACT
 ```
 
+> **Note on TC (Truncation) Retries:**
+> When a query triggers automatic TCP retry due to a truncated UDP response (`TC=1`), `dag` intentionally records and displays both the UDP attempt and the TCP retry as separate rows in the summary table. This allows users to explicitly observe and diagnose the transport fallback process.
+
 ### LDNSZ Web Inspection URLs (`+ldnsz`)
 
 When `+ldnsz` is supplied:

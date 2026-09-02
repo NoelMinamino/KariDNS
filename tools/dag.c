@@ -3034,7 +3034,7 @@ static void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rd
         }
     } else {
         sink_printf(sink, "%u %u %u ", flags, protocol, algorithm);
-        sink_split_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+        sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
         if (dopt && !dopt->yaml && dopt->rrcomments) {
             sink_printf(sink, "  ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
         }
@@ -3058,7 +3058,7 @@ static void sink_ds_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen,
         sink_multiline_hex(sink, &rdata[4], rdlen - 4, dopt->split_width);
     } else {
         sink_printf(sink, "%u %u %u ", keytag, algorithm, digest_type);
-        sink_split_hex(sink, &rdata[4], rdlen - 4, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+        sink_split_hex(sink, &rdata[4], rdlen - 4, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
     }
 }
 
@@ -3232,7 +3232,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
         sink_printf(sink, "\\# %u", rdlen);
         if (rdlen > 0) {
             sink_printf(sink, " ");
-            int sw = (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0;
+            int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
             sink_split_hex(sink, &pkt[abs_offset], rdlen, sw);
         }
         return;
@@ -3508,7 +3508,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
         case 35: { // NAPTR
             if (rdlen >= 4) {
                 uint16_t order = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
-                uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
+                uint16_t pref = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
                 char flags[256], svcs[256], regexp[256];
                 const uint8_t *p = &pkt[abs_offset + 4];
                 const uint8_t *end = &pkt[abs_offset + rdlen];
@@ -3539,7 +3539,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                         int n = 0;
                         char *b64 = base64_encode_alloc(&pkt[abs_offset + 5], rdlen - 5, &n);
                         if (b64) {
-                            sink_multiline_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 44);
+                            sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                             free(b64);
                         } else {
                             sink_printf(sink, "\t\t\t\t\t)");
@@ -3554,7 +3554,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                         char *b64 = base64_encode_alloc(&pkt[abs_offset + 5], rdlen - 5, &n);
                         if (b64) {
                             sink_printf(sink, " ");
-                            sink_split_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                            sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                             free(b64);
                         }
                     }
@@ -3602,10 +3602,10 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             if (rdlen >= 2) {
                 if (dopt && !dopt->yaml && dopt->multiline) {
                     sink_printf(sink, "%u %u (\n", pkt[abs_offset], pkt[abs_offset + 1]);
-                    sink_multiline_hex(sink, &pkt[abs_offset + 2], rdlen - 2, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                    sink_multiline_hex(sink, &pkt[abs_offset + 2], rdlen - 2, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 } else {
                     sink_printf(sink, "%u %u ", pkt[abs_offset], pkt[abs_offset + 1]);
-                    sink_split_hex(sink, &pkt[abs_offset + 2], rdlen - 2, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                    sink_split_hex(sink, &pkt[abs_offset + 2], rdlen - 2, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 }
                 return;
             }
@@ -3645,7 +3645,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                         int n = 0;
                         char *b64 = base64_encode_alloc(p, end - p, &n);
                         if (b64) {
-                            sink_multiline_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 44);
+                            sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                             free(b64);
                         } else {
                             sink_printf(sink, "\t\t\t\t\t)");
@@ -3660,7 +3660,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                         char *b64 = base64_encode_alloc(p, end - p, &n);
                         if (b64) {
                             sink_printf(sink, " ");
-                            sink_split_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                            sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                             free(b64);
                         }
                     }
@@ -3676,14 +3676,14 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                 if (b64) {
                     if (dopt && !dopt->yaml && dopt->multiline) {
                         sink_printf(sink, "( ");
-                        sink_multiline_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 44);
+                        sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                         if (rdlen >= 3) {
                             uint16_t id_type = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
                             uint8_t d_type = pkt[abs_offset+2];
                             sink_printf(sink, " ; %u %u %u", id_type, d_type, (unsigned int)(rdlen - 3));
                         }
                     } else {
-                        sink_split_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                        sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                     }
                     free(b64);
                 }
@@ -3698,9 +3698,9 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                 if (b64) {
                     if (dopt && !dopt->yaml && dopt->multiline) {
                         sink_printf(sink, "( ");
-                        sink_multiline_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 44);
+                        sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                     } else {
-                        sink_split_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                        sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                     }
                     free(b64);
                 }
@@ -3720,10 +3720,10 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             if (rdlen >= 3) {
                 if (dopt && !dopt->yaml && dopt->multiline) {
                     sink_printf(sink, "%u %u %u (\n", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
-                    sink_multiline_hex(sink, &pkt[abs_offset + 3], rdlen - 3, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                    sink_multiline_hex(sink, &pkt[abs_offset + 3], rdlen - 3, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 } else {
                     sink_printf(sink, "%u %u %u ", pkt[abs_offset], pkt[abs_offset + 1], pkt[abs_offset + 2]);
-                    sink_split_hex(sink, &pkt[abs_offset + 3], rdlen - 3, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                    sink_split_hex(sink, &pkt[abs_offset + 3], rdlen - 3, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 }
                 return;
             }
@@ -3845,7 +3845,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                                     format_type_name(cov, cov_buf, sizeof(cov_buf)),
                                     alg, labels, orig_ttl, exp_buf, incep_buf, keytag, signer);
                         if (b64) {
-                            sink_multiline_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 44);
+                            sink_multiline_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 44);
                             free(b64);
                         } else {
                             sink_printf(sink, "\t\t\t\t\t)");
@@ -3856,7 +3856,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                                     alg, labels, orig_ttl, exp_buf, incep_buf, keytag, signer);
                         if (b64) {
                             sink_printf(sink, " ");
-                            sink_split_b64(sink, b64, n, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                            sink_split_b64(sink, b64, n, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                             free(b64);
                         }
                     }
@@ -3902,10 +3902,10 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                 uint8_t hash_alg = pkt[abs_offset+5];
                 if (dopt && !dopt->yaml && dopt->multiline) {
                     sink_printf(sink, "%u %u %u (\n", serial, scheme, hash_alg);
-                    sink_multiline_hex(sink, &pkt[abs_offset+6], rdlen - 6, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                    sink_multiline_hex(sink, &pkt[abs_offset+6], rdlen - 6, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 } else {
                     sink_printf(sink, "%u %u %u ", serial, scheme, hash_alg);
-                    sink_split_hex(sink, &pkt[abs_offset+6], rdlen - 6, (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0);
+                    sink_split_hex(sink, &pkt[abs_offset+6], rdlen - 6, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 }
                 return;
             }
@@ -4077,7 +4077,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
     sink_printf(sink, "\\# %u", rdlen);
     if (rdlen > 0) {
         sink_printf(sink, " ");
-        int sw = (dopt && !dopt->yaml && dopt->split_width > 0) ? dopt->split_width : 0;
+        int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
         sink_split_hex(sink, &pkt[abs_offset], rdlen, sw);
     }
 }
