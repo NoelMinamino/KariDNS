@@ -25,8 +25,8 @@ KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD
 
 ## Features
 
-- **Authoritative Zone Roles:**
-  - **Master (Primary) & Slave (Secondary):** Supports AXFR (RFC 5936) and IXFR (RFC 1995) zone transfers, inbound and outbound NOTIFY (RFC 1996) with TSIG authentication.
+- **Authoritative Zone Roles & Formats:**
+  - **Master (Primary) & Slave (Secondary):** Supports standard BIND-style zone files and djbdns/tinydns-style plain-text `data` files (`file-format tinydns;`). Supports AXFR (RFC 5936) and IXFR (RFC 1995) zone transfers, inbound and outbound NOTIFY (RFC 1996) with TSIG authentication.
   - **Forward Zones (`type forward`):** Transparent query forwarding to multiple upstream nameservers with per-zone timeouts, shared deadline budgeting, automatic failover, transaction ID randomization, and response verification.
   - **Program Zone Plugins (`type program`):** Test-only dynamic external process-backed zones communicating over stdin/stdout pipes with strict privilege dropping and automatic circuit-breaker failure isolation.
 - **Dynamic DNS Update:** Ephemeral DNS UPDATE handling (RFC 2136 / RFC 3007) with prerequisite evaluation and TSIG verification.
@@ -67,11 +67,13 @@ KariDNS natively parses, validates, and serializes the following standard and ex
 - **Modern Web, Discovery & Service Bindings:** `HTTPS`, `SVCB`, `NAPTR`, `DSYNC`, `ZONEMD`, `CSYNC`, `DHCID`, `EUI48`, `EUI64`, `NID`, `L32`, `L64`, `NXNAME`, `AVC`, `DOA`, `AMTRELAY`
 - **Pseudo & Meta Types:** `OPT` (EDNS0), `TSIG`, `TKEY`, `AXFR`, `IXFR`, `ANY` (RFC 8482), `MAILB`, `MAILA`, `TYPE<n>` (RFC 3597)
 
-### Zone File Directives
-- `$ORIGIN <domain>`
-- `$TTL <default-ttl>` (supports BIND-compatible time unit suffixes: `w`, `d`, `h`, `m`, `s`)
-- `$INCLUDE <filename> [origin]` (supports up to 32 files and 16 nesting levels within Capsicum constraints)
-- `$GENERATE <range> <template>` (supports standard, width-padded, and offset numerical generators)
+### Zone File Formats & Directives
+- **Standard BIND Format (Default):**
+  - Directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (supports up to 32 files and 16 nesting levels within Capsicum constraints), `$GENERATE`.
+- **djbdns/tinydns Plain-Text Format (`file-format tinydns;`):**
+  - Loads zone data directly from djbdns/tinydns plain-text `data` files (not compiled `data.cdb`).
+  - Supports record markers `.` (SOA+NS+A), `&` (NS+A), `+` (A), `=` (A+PTR), `-` (disabled/comment), `@` (MX+A), `'` (TXT, 127-byte chunking), `^` (PTR), `C` (CNAME), `Z` (complete SOA), and `:` (generic RR).
+  - Handles parent/child zone delegation with longest-suffix matching and load-time TAI64 `timestamp` / countdown TTL evaluation.
 
 ---
 
@@ -146,7 +148,6 @@ A test client, protocol debugger, and packet fuzzer for DNS servers. For full op
 
 #### Protocol Robustness & Fuzzing (`--break`):
 `dag` supports various packet modification modes to evaluate how DNS servers handle malformed or edge-case wire formats:
-
 ```sh
 # Test compression pointer loop handling
 ./dag example.com A @127.0.0.1 --break compression-loop
@@ -325,6 +326,7 @@ options {
     user "bind";
     group "bind";
 
+    allow-program-zones yes; # Required if using type program zones
     tcp-connection-reuse yes;
     tcp-idle-timeout 10;
     minimal-any yes;
@@ -360,11 +362,20 @@ logging {
     category queries { query_log; };
 };
 
+# Standard BIND-format master zone
 zone "example.com" {
     type master;
     file "master/example.com.zone";
+    file-format bind; # "bind" (default) or "tinydns"
     also-notify { 198.51.100.2 port 53; };
     allow-transfer { key "tsig-key-primary"; };
+};
+
+# djbdns/tinydns plain-text data format master zone
+zone "tinydns.example.com" {
+    type master;
+    file "data/tinydns.example.com.data";
+    file-format tinydns; # loads djbdns plain-text data file (not .cdb)
 };
 
 zone "slave.example.net" {
@@ -374,10 +385,20 @@ zone "slave.example.net" {
     tsig-key "tsig-key-primary";
 };
 
+# Transparent forward zone
 zone "corp.example.org" {
     type forward;
     forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
     forward-timeout 2000; # timeout in milliseconds
+};
+
+# Dynamic external program plugin zone (testing/anomaly fuzzing)
+zone "anomaly.test" {
+    type program;
+    program "/usr/local/bin/mock_dns_server.pl";
+    program-args { "--verbose"; };
+    program-timeout 2000; # timeout in milliseconds
+    program-user "nobody"; # optional privilege drop
 };
 ```
 
