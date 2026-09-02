@@ -78,6 +78,7 @@ static inline void *dag_memmem(const void *haystack, size_t haystacklen,
 #include <netdb.h>
 #include <strings.h>
 #include <signal.h>
+#include <sys/wait.h>
 #endif
 
 #include <zlib.h>
@@ -95,6 +96,8 @@ static inline void *dag_memmem(const void *haystack, size_t haystacklen,
 #include "../dns_wire.h"
 #include "../dns_utils.h"
 #include "../dns_zone_parser.h"
+
+#define TRACE_MAX_CNAME_DEPTH 16
 
 static inline void set_socket_timeouts(int sock, int timeout_sec) {
     int tsec = timeout_sec > 0 ? timeout_sec : 5;
@@ -327,7 +330,7 @@ static uint16_t parse_qtype(const char *s) {
     uint16_t t;
     if (resolve_qtype(s, &t)) return t;
     fprintf(stderr, "dag: unknown query type '%s'\n", s);
-    exit(1);
+    return 0;
 }
 
 static void print_ldnsz_payload(const uint8_t *buf, size_t len) {
@@ -1018,7 +1021,7 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
 
     if (qo->want_padding) {
         int block_size = (qo->padding_size > 0) ? qo->padding_size : 468;
-        // OPTヘッダ(4バイト)を含めた現在長から、ブロック境界に必要なパディング長を算出
+        // Paddingオプションヘッダ(4バイト)を含めた現在長から、ブロック境界に必要なパディング長を算出
         size_t current_len = (size_t)offset + 4;
         if (qo->want_tsig) {
             // 付与予定のTSIGレコード長を見積もり（TSIG RRヘッダ＋アルゴリズム名＋MACサイズ＋固定フィールド）
@@ -1523,6 +1526,29 @@ static size_t build_query_packet(uint8_t *pkt, size_t max_len,
     if (has_break(BRK_QR_BIT, NULL, NULL)) { pkt[2] |= 0x80; }
 
     return offset;
+}
+
+static size_t build_and_sign_query(uint8_t *pkt, size_t max_len,
+                                   const char *qname, uint16_t qtype,
+                                   const query_opts_t *qo,
+                                   uint8_t *out_mac, size_t *out_mac_len) {
+    size_t pkt_len = build_query_packet(pkt, max_len, qname, qtype, qo);
+    if (pkt_len == 0 && !has_break(BRK_TOO_SHORT, NULL, NULL) && !qo->header_only) {
+        return 0;
+    }
+    if (qo->want_tsig) {
+        tsig_key_t key = qo->tsig_key;
+        key.fuzztime = qo->fuzztime;
+        uint8_t dummy_mac[64];
+        size_t dummy_mac_len = 0;
+        uint8_t *mac_ptr = out_mac ? out_mac : dummy_mac;
+        size_t *mac_len_ptr = out_mac_len ? out_mac_len : &dummy_mac_len;
+        if (tsig_sign_packet(pkt, &pkt_len, max_len, &key, 0, mac_ptr, mac_len_ptr, NULL, 0, false) != 0) {
+            fprintf(stderr, "Error: tsig_sign_packet failed\n");
+            return 0;
+        }
+    }
+    return pkt_len;
 }
 
 /* ========================================================================
@@ -2362,7 +2388,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     }
 
     const char *path = (qo->doh_path && qo->doh_path[0]) ? qo->doh_path : "/dns-query";
-    char req_hdr[4096];
+    char req_hdr[16384];
     int req_hdr_len = 0;
 
     if (qo->doh_method == DOH_GET) {
@@ -2733,7 +2759,7 @@ static ssize_t do_dns_exchange_auto(const char *server, int port, const query_op
         return do_dns_exchange_by_transport(server, port, qo, force_tcp, pkt, pkt_len, resp, resp_cap, timeout_sec);
     }
     ssize_t n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
-    if (n >= 4 && (resp[2] & 0x02) != 0) { // TC bit detected (truncation)
+    if (n >= 4 && (resp[2] & 0x02) != 0 && (!qo || !qo->ignore_tc)) { // TC bit detected (truncation)
         ssize_t tn = do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
         if (tn > 0) return tn;
     }
@@ -3613,10 +3639,10 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
         case 64: case 65: { // SVCB / HTTPS
             if (rdlen >= 2) {
                 uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
-                char *target = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &target) == 0 &&
+                char target[256]; size_t next;
+                if (extract_wire_name_to_buffer(pkt, pkt_len, abs_offset + 2, &next, target, sizeof(target)) == 0 &&
                     next >= abs_offset + 2 && next <= abs_offset + rdlen) {
-                    rdata_buf_append(out, out_cap, &pos, "%u %s", priority, (target[0] == '\0') ? "." : target);
+                    rdata_buf_append(out, out_cap, &pos, "%u %s", priority, (target[0] == '\0' || strcmp(target, ".") == 0) ? "." : target);
                     size_t sp_pos = next;
                     while (sp_pos + 4 <= abs_offset + rdlen) {
                         uint16_t key = (pkt[sp_pos]<<8)|pkt[sp_pos+1];
@@ -3873,7 +3899,7 @@ static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_
                 uint8_t scheme = pkt[abs_offset+4];
                 uint8_t halg = pkt[abs_offset+5];
                 rdata_buf_append(out, out_cap, &pos, "%u %u %u ", serial, scheme, halg);
-                for (size_t i = 6; i < rdlen; i++) rdata_buf_append(out, out_cap, &pos, "%02X", pkt[abs_offset + i]);
+                rdata_buf_append_split_hex(out, out_cap, &pos, &pkt[abs_offset + 6], rdlen - 6, (dopt && dopt->split_width > 0) ? dopt->split_width : 0);
                 return;
             }
             break;
@@ -4396,15 +4422,15 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
         case 64: case 65: { // SVCB / HTTPS
             if (rdlen < 2) goto fallback;
             uint16_t priority = (pkt[abs_offset]<<8)|pkt[abs_offset+1];
-            char *target = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, abs_offset + 2, &next, &g_dag_arena, &target) != 0) goto fallback;
+            char target[256]; size_t next;
+            if (extract_wire_name_to_buffer(pkt, pkt_len, abs_offset + 2, &next, target, sizeof(target)) != 0) goto fallback;
             if (next < abs_offset + 2 || next > abs_offset + rdlen) {
                 // RFC 9460 §2.2 違反: TargetNameがこのRRのRDATA境界をはみ出している
                 printf("(malformed SVCB/HTTPS: TargetName exceeds RDLENGTH)");
                 break;
             }
             size_t target_len = next - abs_offset - 2;
-            printf("%u %s", priority, (target[0] == '\0') ? "." : target);
+            printf("%u %s", priority, (target[0] == '\0' || strcmp(target, ".") == 0) ? "." : target);
             print_svcparams(&pkt[abs_offset], 2 + target_len, rdlen);
             break;
         }
@@ -5936,11 +5962,24 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
     uint8_t qbuf[512];
     query_opts_t q = *qo;
     q.check_dns64prefix = false;
-    size_t qlen = build_query_packet(qbuf, sizeof(qbuf), "ipv4only.arpa", 28 /* AAAA */, &q);
+    uint8_t req_mac[64];
+    size_t req_mac_len = 0;
+    size_t qlen = build_and_sign_query(qbuf, sizeof(qbuf), "ipv4only.arpa", 28 /* AAAA */, &q, req_mac, &req_mac_len);
     uint8_t resp[65535];
     ssize_t n = do_dns_exchange_auto(server, port, &q, qbuf, qlen, resp, sizeof(resp), q.timeout_sec, use_tcp);
     if (n < 12) {
         return;
+    }
+
+    if (q.want_tsig) {
+        uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+        int terr = tsig_verify_packet(resp, (size_t)n, &q.tsig_key, req_mac, req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
+        if (terr == -1) {
+            printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+        } else if (terr != 0) {
+            printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
+        }
+        fflush(stdout);
     }
 
     int qdcount = (resp[4] << 8) | resp[5];
@@ -6007,18 +6046,20 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         qtype = 251;
         qo->is_ixfr = true;
         qo->ixfr_serial = strtoul(qtype_s + 5, NULL, 10);
-        use_tcp = true;
     } else {
         qtype = parse_qtype(qtype_s);
+        if (qtype == 0) return -1;
         if (qtype == 251) {
             qo->is_ixfr = true;
             qo->ixfr_serial = 0; // シリアル指定なし時は 0 (全転送/差分開始シリアル)
-            use_tcp = true;
         }
     }
 
     uint8_t pkt[65535];
     size_t pkt_len = 0;
+
+    uint8_t request_mac[64];
+    size_t request_mac_len = 0;
 
     if (hex_payload) {
         pkt_len = parse_hex_string(hex_payload, pkt, sizeof(pkt));
@@ -6026,20 +6067,16 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             fprintf(stderr, "Error: Invalid, empty, or oversized hex payload (max %zu bytes)\n", sizeof(pkt));
             return 1;
         }
-    } else {
-        pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, qo);
-        if (pkt_len == 0 && !has_break(BRK_TOO_SHORT, NULL, NULL) && !qo->header_only) {
-            return 1;
+        if (qo->want_tsig) {
+            qo->tsig_key.fuzztime = qo->fuzztime;
+            if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
+                fprintf(stderr, "Error: tsig_sign_packet failed\n");
+                return 1;
+            }
         }
-    }
-
-    uint8_t request_mac[64];
-    size_t request_mac_len = 0;
-
-    if (qo->want_tsig) {
-        qo->tsig_key.fuzztime = qo->fuzztime;
-        if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &qo->tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
-            fprintf(stderr, "Error: tsig_sign_packet failed\n");
+    } else {
+        pkt_len = build_and_sign_query(pkt, sizeof(pkt), qname, qtype, qo, request_mac, &request_mac_len);
+        if (pkt_len == 0 && !has_break(BRK_TOO_SHORT, NULL, NULL) && !qo->header_only) {
             return 1;
         }
     }
@@ -6071,13 +6108,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
     server_result_t *sres = NULL;
 
-    bool retry_tcp = false;
-    do {
-        retry_tcp = false;
-        struct timespec start_ts;
-        clock_gettime(CLOCK_MONOTONIC, &start_ts);
-        
-        axfr_state_t axfr_state = {0};
+    struct timespec start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    
+    axfr_state_t axfr_state = {0};
         axfr_state.is_axfr = (qtype == 252 || qtype == 251);
         axfr_state.is_ixfr = (qtype == 251);
 
@@ -6151,16 +6185,35 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
             } else {
                 n = do_udp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
+                if (n >= 4 && (resp[2] & 0x02) != 0) {
+                    if (eff_qo.ignore_tc) {
+                        if (!dopt->short_mode && !dopt->yaml) {
+                            fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
+                        }
+                    } else {
+                        if (!dopt->short_mode && !dopt->yaml) {
+                            fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
+                        }
+                        use_tcp = true;
+                        if (eff_qo.keep_tcp_open) {
+                            n = do_tcp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
+                        } else {
+                            tcp_sock = do_tcp_send_request(server, port, &eff_qo, pkt, pkt_len, eff_qo.timeout_sec);
+                            if (tcp_sock >= 0) {
+                                n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+                                if (n <= 0) {
+                                    close(tcp_sock);
+                                    tcp_sock = -1;
+                                }
+                            }
+                        }
+                    }
+                }
                 if (n >= 0) break;
             }
             if (attempts < max_tries) {
                 if (!dopt->short_mode) printf(";; connection timed out; retrying...\n");
             }
-        }
-
-        if (n <= 0) {
-            printf(";; no servers could be reached\n");
-            return 9;
         }
 
         if (n >= 12 && eff_qo.retry_on_badcookie) {
@@ -6183,14 +6236,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 eff_qo.want_cookie = true;
                 eff_qo.server_cookie_len = bc_edns.server_cookie_len;
                 memcpy(eff_qo.server_cookie, bc_edns.server_cookie, bc_edns.server_cookie_len);
-                pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, &eff_qo);
-                if (eff_qo.want_tsig) {
-                    eff_qo.tsig_key.fuzztime = eff_qo.fuzztime;
-                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &eff_qo.tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
-                        fprintf(stderr, "Error: tsig_sign_packet failed on badcookie retry\n");
-                        return 1;
-                    }
-                }
+                pkt_len = build_and_sign_query(pkt, sizeof(pkt), qname, qtype, &eff_qo, request_mac, &request_mac_len);
                 n = do_dns_exchange_by_transport(server, port, &eff_qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
             }
         }
@@ -6212,20 +6258,26 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
                 printf(";; BADVERS, retrying with EDNS version %d.\n", eff_qo.edns_version - 1);
                 eff_qo.edns_version -= 1;
-                pkt_len = build_query_packet(pkt, sizeof(pkt), qname, qtype, &eff_qo);
-                if (eff_qo.want_tsig) {
-                    eff_qo.tsig_key.fuzztime = eff_qo.fuzztime;
-                    if (tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &eff_qo.tsig_key, 0, request_mac, &request_mac_len, NULL, 0, false) != 0) {
-                        fprintf(stderr, "Error: tsig_sign_packet failed on badvers retry\n");
-                        return 1;
-                    }
-                }
+                pkt_len = build_and_sign_query(pkt, sizeof(pkt), qname, qtype, &eff_qo, request_mac, &request_mac_len);
                 n = do_dns_exchange_by_transport(server, port, &eff_qo, use_tcp, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
             }
         }
 
         if (n <= 0) {
             printf(";; no servers could be reached\n");
+            sres = alloc_result_row();
+            if (sres) {
+                sres->rcode = 2; // SERVFAIL
+                sres->resp_len = 0;
+                if (port != 53) {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s#%d", (g_last_server_ip[0] ? g_last_server_ip : server), port);
+                } else {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", (g_last_server_ip[0] ? g_last_server_ip : server));
+                }
+                snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
+                g_server_count++;
+            }
+            if (tcp_sock >= 0) close(tcp_sock);
             return 9;
         }
 
@@ -6233,8 +6285,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
         long long elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
         long elapsed_ms = (long)(elapsed_usec / 1000LL);
-
-        bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
 
         int msg_index = 1;
         int total_records = 0;
@@ -6276,7 +6326,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 memcpy(sres->resp_buf, resp, to_copy);
                 sres->resp_len = (ssize_t)to_copy;
                 calculate_packet_hashes(resp, n, &sres->semantic_hash, &sres->record_hash);
-                snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", (g_last_server_ip[0] ? g_last_server_ip : server));
+                if (port != 53) {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s#%d", (g_last_server_ip[0] ? g_last_server_ip : server), port);
+                } else {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", (g_last_server_ip[0] ? g_last_server_ip : server));
+                }
                 snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
             }
             
@@ -6313,18 +6367,19 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                     had_tsig_fail = true;
                     last_msg_had_tsig = false;
                     if (err == -1) {
-                        fprintf(stderr, ";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+                        printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
                     } else if (err == 16) {
-                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADSIG)\n");
+                        printf(";; Couldn't verify signature: tsig verify failure (BADSIG)\n");
                     } else if (err == 17) {
-                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADKEY)\n");
+                        printf(";; Couldn't verify signature: tsig verify failure (BADKEY)\n");
                     } else if (err == 18) {
-                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADTIME)\n");
+                        printf(";; Couldn't verify signature: tsig verify failure (BADTIME)\n");
                     } else if (err == 21) {
-                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (BADALG)\n");
+                        printf(";; Couldn't verify signature: tsig verify failure (BADALG)\n");
                     } else {
-                        fprintf(stderr, ";; Couldn't verify signature: tsig verify failure (%d)\n", err);
+                        printf(";; Couldn't verify signature: tsig verify failure (%d)\n", err);
                     }
+                    fflush(stdout);
                 }
             }
 
@@ -6475,20 +6530,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
         if (tcp_sock >= 0) close(tcp_sock);
 
-        if (is_truncated) {
-            if (qo->ignore_tc) {
-                fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
-            } else {
-                fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
-                use_tcp = true;
-                retry_tcp = true;
-            }
+        if (qo->check_dns64prefix) {
+            run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
         }
-    } while (retry_tcp);
-
-    if (qo->check_dns64prefix) {
-        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
-    }
 
     return 0;
 }
@@ -6529,7 +6573,7 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
-        if (!g_results[i].tc) {
+        if (g_results[i].resp_len > 0 && !g_results[i].tc) {
             base = &g_results[i];
             break;
         }
@@ -6638,9 +6682,12 @@ static void usage(const char *prog) {
         "  +[no]https[=endpoint]        Use DNS-over-HTTPS (DoH) mode [default endpoint: /dns-query, port: 443]\n"
         "  +[no]https-get[=endpoint]    Use GET method instead of POST for DoH\n"
         "  +[no]https-post[=endpoint]   Use POST method for DoH\n"
-        "  +[no]http-plain[=endpoint]   Use plain HTTP DNS mode [default endpoint: /dns-query, port: 80]\n"
-        "  +[no]http-plain-get[=ep]     Use GET method for plain HTTP\n"
-        "  +[no]http-plain-post[=ep]    Use POST method for plain HTTP\n"
+        "  +[no]http-plain[=endpoint]   Use plain HTTP DNS mode (+http) [default endpoint: /dns-query, port: 80]\n"
+        "  +[no]http-plain-get[=ep]     Use GET method for plain HTTP (+http-get)\n"
+        "  +[no]http-plain-post[=ep]    Use POST method for plain HTTP (+http-post)\n"
+        "  +[no]http[=endpoint]         Alias for +http-plain\n"
+        "  +[no]http-get[=endpoint]     Alias for +http-plain-get\n"
+        "  +[no]http-post[=endpoint]    Alias for +http-plain-post\n"
         "  +[no]proxy[=spec]            Inject PROXYv2 transport header ahead of any TLS handshake (e.g. +proxy=192.0.2.1#1234-192.0.2.2#53)\n"
         "  +[no]proxy-plain[=spec]      Alias for +proxy (retained for dig/kdig compatibility); behaves identically\n"
         "  +[no]keepalive               Send EDNS TCP keepalive option (RFC 7828)\n"
@@ -6662,8 +6709,8 @@ static void usage(const char *prog) {
         "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses)\n"
-        "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +glue by default)\n"
-        "  +[no]glue                    Prefer in-bailiwick Glue records from ADDITIONAL section for +trace/+nssearch [default: +glue]\n"
+        "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +noglue by default)\n"
+        "  +[no]glue                    Prefer in-bailiwick Glue records from ADDITIONAL section for +nssearch [default: +noglue]\n"
         "  +[no]search / +[no]defname   Use search list defined in /etc/resolv.conf\n"
         "  +domain=domain               Set default search domain\n"
         "  +ndots=N                     Set search NDOTS threshold\n"
@@ -7046,9 +7093,6 @@ static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff
 
 static int run_trace_query_impl(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt, int cname_depth) {
     bool eff_use_tcp = (!force_udp && use_tcp);
-    if (!dopt->yaml) {
-        printf(";; TRACE: tracing %s from root servers...\n", qname);
-    }
     char target_ips[32][64];
     int target_count = 0;
     
@@ -7061,7 +7105,13 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
     query_opts_t root_qo = qo;
     root_qo.rd_flag = true;
     uint8_t root_qbuf[65535];
-    size_t root_qlen = build_query_packet(root_qbuf, sizeof(root_qbuf), ".", 2 /* NS */, &root_qo);
+    uint8_t root_req_mac[64];
+    size_t root_req_mac_len = 0;
+    size_t root_qlen = build_and_sign_query(root_qbuf, sizeof(root_qbuf), ".", 2 /* NS */, &root_qo, root_req_mac, &root_req_mac_len);
+    if (root_qlen == 0) {
+        fprintf(stderr, "Error: Failed to construct root query for +trace\n");
+        return 1;
+    }
     uint8_t root_resp[65535];
     if (!no_hexdump_query && !dopt->yaml) {
         printf("Query (%zd bytes):\n", root_qlen);
@@ -7092,6 +7142,16 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
     }
 
     if (root_n > 12) {
+        if (root_qo.want_tsig) {
+            uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+            int terr = tsig_verify_packet(root_resp, (size_t)root_n, &root_qo.tsig_key, root_req_mac, root_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
+            if (terr == -1) {
+                printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+            } else if (terr != 0) {
+                printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
+            }
+            fflush(stdout);
+        }
         if (dopt->yaml) {
             print_response_yaml(root_resp, root_n, eff_server, port, eff_use_tcp, dopt);
         } else {
@@ -7101,31 +7161,88 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             printf(";; Received %zd bytes from %s#%d in %d ms\n\n", root_n, eff_server, port, dt_ms);
         }
         
+        size_t offset = 12;
         int r_qd = (root_resp[4] << 8) | root_resp[5];
         int r_an = (root_resp[6] << 8) | root_resp[7];
         int r_ns = (root_resp[8] << 8) | root_resp[9];
         int r_ar = (root_resp[10] << 8) | root_resp[11];
-        size_t roff = 12;
         for (int i = 0; i < r_qd; i++) {
             char *d;
-            if (expand_wire_name(root_resp, root_n, roff, &roff, &g_dag_arena, &d) != 0) break;
-            roff += 4;
+            if (expand_wire_name(root_resp, root_n, offset, &offset, &g_dag_arena, &d) != 0) break;
+            offset += 4;
         }
         
         char rns_names[32][256];
         int rns_count = 0;
-        collect_rrs_by_type(root_resp, root_n, &roff, r_an, 2 /* NS */, rns_names, &rns_count, 32);
-        collect_rrs_by_type(root_resp, root_n, &roff, r_ns, 2 /* NS */, rns_names, &rns_count, 32);
-        for (int i=0; i<r_ar; i++) {
+        collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, &rns_count, 32);
+        collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, &rns_count, 32);
+        for (int i = 0; i < r_ar; i++) {
             dns_record_t rec; uint16_t type;
-            if (parse_resource_record(root_resp, root_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
+            if (parse_resource_record(root_resp, root_n, &offset, &g_dag_arena, &rec, &type) != 0) break;
             bool want = false;
             if (type == 1 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET)) want = true;
             if (type == 28 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET6)) want = true;
             if (want && rec.rdata_count > 0) {
-                for (int j=0; j<rns_count; j++) {
+                for (int j = 0; j < rns_count; j++) {
                     if (strcasecmp(rec.name, rns_names[j]) == 0 && target_count < 32) {
                         snprintf(target_ips[target_count++], sizeof(target_ips[0]), "%s", rec.rdata[0]);
+                    }
+                }
+            }
+        }
+
+        if (target_count == 0 && rns_count > 0) {
+            query_opts_t resolve_qo = root_qo;
+            resolve_qo.rd_flag = true;
+            for (int j = 0; j < rns_count && target_count < 32; j++) {
+                if (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET) {
+                    uint8_t res_qbuf[512];
+                    uint8_t res_req_mac[64];
+                    size_t res_req_mac_len = 0;
+                    size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), rns_names[j], 1 /* A */, &resolve_qo, res_req_mac, &res_req_mac_len);
+                    uint8_t res_resp[4096];
+                    ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
+                    if (res_n > 12) {
+                        int qd = (res_resp[4] << 8) | res_resp[5];
+                        int an = (res_resp[6] << 8) | res_resp[7];
+                        size_t roff = 12;
+                        for (int k = 0; k < qd; k++) {
+                            char *d;
+                            if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) break;
+                            roff += 4;
+                        }
+                        for (int k = 0; k < an; k++) {
+                            dns_record_t rec; uint16_t type;
+                            if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
+                            if (type == 1 && rec.rdata_count > 0 && target_count < 32) {
+                                snprintf(target_ips[target_count++], sizeof(target_ips[0]), "%s", rec.rdata[0]);
+                            }
+                        }
+                    }
+                }
+                if (target_count < 32 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET6)) {
+                    uint8_t res_qbuf[512];
+                    uint8_t res_req_mac[64];
+                    size_t res_req_mac_len = 0;
+                    size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), rns_names[j], 28 /* AAAA */, &resolve_qo, res_req_mac, &res_req_mac_len);
+                    uint8_t res_resp[4096];
+                    ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
+                    if (res_n > 12) {
+                        int qd = (res_resp[4] << 8) | res_resp[5];
+                        int an = (res_resp[6] << 8) | res_resp[7];
+                        size_t roff = 12;
+                        for (int k = 0; k < qd; k++) {
+                            char *d;
+                            if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) break;
+                            roff += 4;
+                        }
+                        for (int k = 0; k < an; k++) {
+                            dns_record_t rec; uint16_t type;
+                            if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
+                            if (type == 28 && rec.rdata_count > 0 && target_count < 32) {
+                                snprintf(target_ips[target_count++], sizeof(target_ips[0]), "%s", rec.rdata[0]);
+                            }
+                        }
                     }
                 }
             }
@@ -7133,19 +7250,16 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
     }
     
     if (target_count == 0) {
-        if (!dopt->yaml) {
-            printf(";; could not fetch root servers, stopping trace.\n");
-        }
         return 0;
     }
     
     qo.rd_flag = false;
-    int hop = 0;
-    while (hop < 15 && target_count > 0) {
+    for (int hop = 1; hop < 32 && target_count > 0; hop++) {
         reset_dag_arena();
-        hop++;
         uint8_t qbuf[65535];
         size_t qlen = 0;
+        uint8_t hop_req_mac[64];
+        size_t hop_req_mac_len = 0;
         if (hex_payload) {
             qlen = parse_hex_string(hex_payload, qbuf, sizeof(qbuf));
             if (qlen == 0 || qlen > sizeof(qbuf)) {
@@ -7154,7 +7268,8 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             }
         } else {
             int qtype_val = parse_qtype(qtype_s);
-            qlen = build_query_packet(qbuf, sizeof(qbuf), qname, qtype_val, &qo);
+            if (qtype_val == 0) return 1;
+            qlen = build_and_sign_query(qbuf, sizeof(qbuf), qname, qtype_val, &qo, hop_req_mac, &hop_req_mac_len);
             if (qlen == 0) break;
         }
         
@@ -7200,6 +7315,17 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             printf("\n");
         }
 
+        if (n > 12 && qo.want_tsig) {
+            uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+            int terr = tsig_verify_packet(resp, (size_t)n, &qo.tsig_key, hop_req_mac, hop_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
+            if (terr == -1) {
+                printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+            } else if (terr != 0) {
+                printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
+            }
+            fflush(stdout);
+        }
+
         if (dopt->yaml) {
             print_response_yaml(resp, n, target_ips[active_target_idx], port, eff_use_tcp, dopt);
         } else {
@@ -7209,36 +7335,30 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         }
         
         if (n < 12) break;
-        uint16_t flags = (resp[2] << 8) | resp[3];
-        int qdcount = (resp[4] << 8) | resp[5];
+        int flags = (resp[2] << 8) | resp[3];
         int ancount = (resp[6] << 8) | resp[7];
         int nscount = (resp[8] << 8) | resp[9];
         int arcount = (resp[10] << 8) | resp[11];
-        
-        if (ancount > 0) {
-            char cname_target[256] = "";
-            bool has_exact_match = false;
-            size_t an_off = 12;
-            for (int i = 0; i < qdcount; i++) {
-                char *dummy;
-                if (expand_wire_name(resp, n, an_off, &an_off, &g_dag_arena, &dummy) != 0) break;
-                an_off += 4;
-            }
-            int target_type = parse_qtype(qtype_s);
-            for (int i = 0; i < ancount; i++) {
-                dns_record_t rec; uint16_t rtype;
-                if (parse_resource_record(resp, n, &an_off, &g_dag_arena, &rec, &rtype) != 0) break;
-                if (rtype == (uint16_t)target_type) {
-                    has_exact_match = true;
-                } else if (rtype == 5 /* CNAME */ && rec.rdata_count > 0) {
-                    if (strcasecmp(rec.name, qname) == 0 || cname_target[0] == '\0') {
+        int rcode = flags & 0x0F;
+
+        if (ancount > 0 || rcode != 0) {
+            if (rcode == 0 && ancount > 0) {
+                char cname_target[256] = "";
+                size_t an_off = 12;
+                int qdcount = (resp[4] << 8) | resp[5];
+                for (int i = 0; i < qdcount; i++) {
+                    char *dummy;
+                    if (expand_wire_name(resp, n, an_off, &an_off, &g_dag_arena, &dummy) != 0) break;
+                    an_off += 4;
+                }
+                for (int i = 0; i < ancount; i++) {
+                    dns_record_t rec; uint16_t rtype;
+                    if (parse_resource_record(resp, n, &an_off, &g_dag_arena, &rec, &rtype) != 0) break;
+                    if (rtype == 5 /* CNAME */ && rec.rdata_count > 0) {
                         snprintf(cname_target, sizeof(cname_target), "%s", rec.rdata[0]);
                     }
                 }
-            }
-
-            if (!has_exact_match && cname_target[0] != '\0' && cname_depth < MAX_JUMPS) {
-                if (strcasecmp(cname_target, qname) != 0) {
+                if (cname_target[0] != '\0' && cname_depth < TRACE_MAX_CNAME_DEPTH) {
                     return run_trace_query_impl(cname_target, server, qtype_s, port, use_tcp, force_udp,
                                                 no_hexdump_query, no_hexdump_response, qo, hex_payload, dopt, cname_depth + 1);
                 }
@@ -7246,11 +7366,10 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             break;
         }
         
-        if ((flags & 0x000F) != 0 || (flags & 0x0400)) {
-            break;
-        }
+        if (nscount == 0) break;
         
         size_t offset = 12;
+        int qdcount = (resp[4] << 8) | resp[5];
         for (int i = 0; i < qdcount; i++) {
             char *dummy;
             if (expand_wire_name(resp, n, offset, &offset, &g_dag_arena, &dummy) != 0) break;
@@ -7263,21 +7382,19 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         
         int new_target_count = 0;
         char new_target_ips[16][64];
-        if (qo.use_glue) {
-            for (int i = 0; i < arcount; i++) {
-                dns_record_t rec; uint16_t type;
-                if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-                bool want = false;
-                if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
-                if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
-                if (want && rec.rdata_count > 0) {
-                    bool match = false;
-                    for (int j=0; j<ns_count; j++) {
-                        if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
-                    }
-                    if (match && new_target_count < 16) {
-                        snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
-                    }
+        for (int i = 0; i < arcount; i++) {
+            dns_record_t rec; uint16_t type;
+            if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
+            bool want = false;
+            if (type == 1 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET)) want = true;
+            if (type == 28 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) want = true;
+            if (want && rec.rdata_count > 0) {
+                bool match = false;
+                for (int j=0; j<ns_count; j++) {
+                    if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
+                }
+                if (match && new_target_count < 16) {
+                    snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
                 }
             }
         }
@@ -7288,7 +7405,9 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             for (int j = 0; j < ns_count && new_target_count < 16; j++) {
                 if (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET) {
                     uint8_t res_qbuf[512];
-                    size_t res_qlen = build_query_packet(res_qbuf, sizeof(res_qbuf), ns_names[j], 1 /* A */, &resolve_qo);
+                    uint8_t res_req_mac[64];
+                    size_t res_req_mac_len = 0;
+                    size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), ns_names[j], 1 /* A */, &resolve_qo, res_req_mac, &res_req_mac_len);
                     uint8_t res_resp[4096];
                     ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
                     if (res_n > 12) {
@@ -7311,7 +7430,9 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
                 }
                 if (new_target_count < 16 && (qo.pref_family == AF_UNSPEC || qo.pref_family == AF_INET6)) {
                     uint8_t res_qbuf[512];
-                    size_t res_qlen = build_query_packet(res_qbuf, sizeof(res_qbuf), ns_names[j], 28 /* AAAA */, &resolve_qo);
+                    uint8_t res_req_mac[64];
+                    size_t res_req_mac_len = 0;
+                    size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), ns_names[j], 28 /* AAAA */, &resolve_qo, res_req_mac, &res_req_mac_len);
                     uint8_t res_resp[4096];
                     ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
                     if (res_n > 12) {
@@ -7364,7 +7485,9 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     query_opts_t ns_qo = qo;
     ns_qo.rd_flag = true;
     uint8_t qbuf[65535];
-    size_t qlen = build_query_packet(qbuf, sizeof(qbuf), qname, 2 /* NS */, &ns_qo);
+    uint8_t ns_req_mac[64];
+    size_t ns_req_mac_len = 0;
+    size_t qlen = build_and_sign_query(qbuf, sizeof(qbuf), qname, 2 /* NS */, &ns_qo, ns_req_mac, &ns_req_mac_len);
     if (!no_hexdump_query) {
         printf("Query (%zd bytes):\n", qlen);
         hexdump(qbuf, qlen);
@@ -7390,6 +7513,17 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     }
     
     if (n < 12) return 1;
+
+    if (ns_qo.want_tsig) {
+        uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+        int terr = tsig_verify_packet(resp, (size_t)n, &ns_qo.tsig_key, ns_req_mac, ns_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
+        if (terr == -1) {
+            printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+        } else if (terr != 0) {
+            printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
+        }
+        fflush(stdout);
+    }
     int qdcount = (resp[4] << 8) | resp[5];
     int ancount = (resp[6] << 8) | resp[7];
     int nscount = (resp[8] << 8) | resp[9];
@@ -7521,6 +7655,8 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
 
     for (int k = 0; k < all_ns_count; k++) {
         size_t slen = 0;
+        uint8_t soa_req_mac[64];
+        size_t soa_req_mac_len = 0;
         if (hex_payload) {
             slen = parse_hex_string(hex_payload, qbuf, sizeof(qbuf));
             if (slen == 0 || slen > sizeof(qbuf)) {
@@ -7528,7 +7664,7 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
                 return 1;
             }
         } else {
-            slen = build_query_packet(qbuf, sizeof(qbuf), qname, 6 /* SOA */, &qo);
+            slen = build_and_sign_query(qbuf, sizeof(qbuf), qname, 6 /* SOA */, &qo, soa_req_mac, &soa_req_mac_len);
         }
         if (!no_hexdump_query) {
             printf("Query (%zd bytes):\n", slen);
@@ -7549,6 +7685,16 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
             }
         }
         if (sn > 12) {
+            if (qo.want_tsig) {
+                uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+                int terr = tsig_verify_packet(resp, (size_t)sn, &qo.tsig_key, soa_req_mac, soa_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
+                if (terr == -1) {
+                    printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
+                } else if (terr != 0) {
+                    printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
+                }
+                fflush(stdout);
+            }
             int sancount = (resp[6] << 8) | resp[7];
             size_t soff = 12;
             int sqdcount = (resp[4] << 8) | resp[5];
@@ -7700,8 +7846,8 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         return 1;
     }
 
-    // AXFRまたはANYの場合は自動的にTCPモードに昇格（+udpが明示されていない場合、BIND 9 dig / RFC 8482準拠）
-    if ((strcasecmp(qtype_s, "AXFR") == 0 || strcasecmp(qtype_s, "ANY") == 0) && !force_udp) {
+    // AXFR, IXFRまたはANYの場合は自動的にTCPモードに昇格（+udpが明示されていない場合、BIND 9 dig / RFC 8482 / RFC 1995準拠）
+    if ((strcasecmp(qtype_s, "AXFR") == 0 || strncasecmp(qtype_s, "IXFR", 4) == 0 || strcasecmp(qtype_s, "ANY") == 0) && !force_udp) {
         use_tcp = true;
     }
 
@@ -7715,6 +7861,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     qo.query_id = (uint16_t)(arc4random() & 0xFFFF);
 
     int last_overall_rc = 0;
+    bool has_any_success = false;
     for (int ci = 0; ci < candidate_count; ci++) {
         const char *cur_qname = search_candidates[ci];
 
@@ -7728,6 +7875,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                                   adflag, cdflag, aaflag, tcflag, zflag,
                                   no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
                 last_overall_rc = rc;
+                if (rc == 0) has_any_success = true;
 
                 uint8_t last_rcode = 2; // Default to SERVFAIL if no response
                 if (g_server_count > 0) {
@@ -7824,7 +7972,8 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                                       adflag, cdflag, aaflag, tcflag, zflag,
                                       no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
                     last_overall_rc = rc;
-                    if (rc != 0 && candidate_count == 1) { free(server_list_buf); return rc; }
+                    if (rc == 0) has_any_success = true;
+                    if (rc != 0 && server_count == 1 && candidate_count == 1) { free(server_list_buf); return rc; }
                 }
             }
         }
@@ -7839,6 +7988,10 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         }
     }
     
+    if (server_count > 1 && has_any_success) {
+        last_overall_rc = 0;
+    }
+
     free(server_list_buf);
     return last_overall_rc;
 }
@@ -7924,7 +8077,7 @@ static void init_query_spec(query_spec_t *spec) {
     spec->qo.ndots = -1;
     spec->qo.tcp_mss = 0;
     spec->qo.tcp_window = 0;
-    spec->qo.use_glue = true;
+    spec->qo.use_glue = false;
 }
 
 static bool is_known_qclass_str(const char *s, uint16_t *out_class) {
@@ -8299,7 +8452,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     if (arg[0] == '-' || arg[0] == '+') {
         if (strcmp(arg, "+tcp") == 0 || strcmp(arg, "--tcp") == 0 || strcmp(arg, "+vc") == 0) {
             spec->use_tcp = true; spec->qo.use_tcp = true;
-        } else if (strcmp(arg, "+novc") == 0) {
+        } else if (strcmp(arg, "+novc") == 0 || strcmp(arg, "+notcp") == 0) {
             spec->use_tcp = false; spec->qo.use_tcp = false;
         } else if (strcmp(arg, "+udp") == 0) {
             spec->force_udp = true;
@@ -8535,7 +8688,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false;
             if (!parse_proxy_arg(arg + 7, &spec->qo)) {
                 fprintf(stderr, "dag: invalid proxy specification '%s'\n", arg + 7);
-                exit(1);
+                return -1;
             }
         } else if (strcmp(arg, "+proxy") == 0) {
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
@@ -8545,7 +8698,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = false;
             if (!parse_proxy_arg(arg + 13, &spec->qo)) {
                 fprintf(stderr, "dag: invalid proxy specification '%s'\n", arg + 13);
-                exit(1);
+                return -1;
             }
         } else if (strcmp(arg, "+proxy-plain") == 0) {
             spec->qo.use_proxy = true; spec->qo.proxy_use_local_cmd = true;
@@ -8690,6 +8843,10 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 spec->qo.want_opt = true; spec->qo.want_padding = true;
                 spec->qo.padding_size = (int)pd;
             }
+        } else if (strcmp(arg, "+padding") == 0) {
+            spec->qo.want_opt = true;
+            spec->qo.want_padding = true;
+            spec->qo.padding_size = 0;
         } else if (strcmp(arg, "+nopadding") == 0) {
             spec->qo.want_padding = false;
             spec->qo.padding_size = -1;
@@ -8729,6 +8886,16 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                     }
                 }
             }
+        } else if (strcmp(arg, "+nomqtype") == 0) {
+            for (int i = 0; i < spec->qo.custom_edns_opt_count; i++) {
+                if (spec->qo.custom_edns_opts[i].code == 20) {
+                    for (int j = i; j < spec->qo.custom_edns_opt_count - 1; j++) {
+                        spec->qo.custom_edns_opts[j] = spec->qo.custom_edns_opts[j + 1];
+                    }
+                    spec->qo.custom_edns_opt_count--;
+                    break;
+                }
+            }
         } else if (strcmp(arg, "+noednsopt") == 0) {
             spec->qo.custom_edns_opt_count = 0;
         } else if (strncmp(arg, "+ednsopt=", 9) == 0) {
@@ -8742,8 +8909,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                     size_t dec_len = hex_decode(hex, spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data,
                                                 sizeof(spec->qo.custom_edns_opts[0].data));
                     if (dec_len == (size_t)-1) {
-                        fprintf(stderr, "warning: +ednsopt hex payload exceeds buffer size, truncating\n");
-                        dec_len = sizeof(spec->qo.custom_edns_opts[0].data);
+                        fprintf(stderr, "error: +ednsopt hex payload exceeds buffer size or is invalid\n");
+                        exit(1);
                     }
                     spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = (uint16_t)dec_len;
                 } else {
@@ -8827,6 +8994,43 @@ static int parse_arg_slice(int start, int end, int argc, char **argv, query_spec
 }
 
 
+static void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
+    if (!dst || !src) return;
+    *dst = *src;
+    if (src->tls_ca_file) dst->tls_ca_file = strdup(src->tls_ca_file);
+    if (src->tls_certfile) dst->tls_certfile = strdup(src->tls_certfile);
+    if (src->tls_keyfile) dst->tls_keyfile = strdup(src->tls_keyfile);
+    if (src->tls_hostname) dst->tls_hostname = strdup(src->tls_hostname);
+    if (src->doh_path) dst->doh_path = strdup(src->doh_path);
+    if (src->search_domain) dst->search_domain = strdup(src->search_domain);
+    if (src->tsig_key.algorithm) dst->tsig_key.algorithm = strdup(src->tsig_key.algorithm);
+    if (src->tsig_key.name) dst->tsig_key.name = strdup(src->tsig_key.name);
+    for (int i = 0; i < src->update_op_count; i++) {
+        if (src->update_ops[i].raw) {
+            dst->update_ops[i].raw = strdup(src->update_ops[i].raw);
+        }
+    }
+}
+
+static void free_query_opts(query_opts_t *qo) {
+    if (!qo) return;
+    if (qo->tls_ca_file) { free(qo->tls_ca_file); qo->tls_ca_file = NULL; }
+    if (qo->tls_certfile) { free(qo->tls_certfile); qo->tls_certfile = NULL; }
+    if (qo->tls_keyfile) { free(qo->tls_keyfile); qo->tls_keyfile = NULL; }
+    if (qo->tls_hostname) { free(qo->tls_hostname); qo->tls_hostname = NULL; }
+    if (qo->doh_path) { free(qo->doh_path); qo->doh_path = NULL; }
+    if (qo->search_domain) { free(qo->search_domain); qo->search_domain = NULL; }
+    if (qo->tsig_key.algorithm) { free((void *)qo->tsig_key.algorithm); qo->tsig_key.algorithm = NULL; }
+    if (qo->tsig_key.name) { free((void *)qo->tsig_key.name); qo->tsig_key.name = NULL; }
+    for (int i = 0; i < qo->update_op_count; i++) {
+        if (qo->update_ops[i].raw) {
+            free(qo->update_ops[i].raw);
+            qo->update_ops[i].raw = NULL;
+        }
+    }
+    qo->update_op_count = 0;
+}
+
 static int execute_query_spec(query_spec_t *spec);
 
 static int execute_batch_spec(const query_spec_t *spec) {
@@ -8834,33 +9038,92 @@ static int execute_batch_spec(const query_spec_t *spec) {
     FILE *bf = fopen(spec->batch_file, "r");
     if (!bf) {
         fprintf(stderr, "error: could not open batch file '%s': %s\n", spec->batch_file, strerror(errno));
-        exit(8);
+        return 8;
     }
     char line[1024];
+    int line_num = 0;
     while (fgets(line, sizeof(line), bf)) {
+        line_num++;
         char *p = line;
         while (isspace((unsigned char)*p)) p++;
         if (*p == '\0' || *p == '#' || *p == ';') continue;
         
-        char *tokens[64];
-        int token_count = 0;
+        char *line_argv[64];
+        int line_argc = 0;
+        line_argv[line_argc++] = "dag";
         char *tok = strtok(p, " \t\r\n");
-        while (tok && token_count < 64) {
-            tokens[token_count++] = tok;
+        while (tok && line_argc < 63) {
+            line_argv[line_argc++] = tok;
             tok = strtok(NULL, " \t\r\n");
         }
-        if (token_count == 0) continue;
+        line_argv[line_argc] = NULL;
 
-        query_spec_t line_spec = *spec;
-        line_spec.batch_file = NULL;
-        line_spec.qname = NULL;
-        line_spec.qtype_s = NULL;
+        if (line_argc > 1) {
+            bool has_cli_only_opt = false;
+            for (int k = 1; k < line_argc; k++) {
+                if (strcmp(line_argv[k], "-h") == 0 || strcmp(line_argv[k], "--help") == 0 ||
+                    strcmp(line_argv[k], "-v") == 0 || strcmp(line_argv[k], "--version") == 0) {
+                    fprintf(stderr, "warning: batch line %d ignores CLI-only option '%s'\n", line_num, line_argv[k]);
+                    has_cli_only_opt = true;
+                    break;
+                }
+            }
+            if (has_cli_only_opt) continue;
 
-        if (parse_arg_slice(0, token_count, token_count, tokens, &line_spec) < 0) {
-            fprintf(stderr, "warning: failed to parse batch file line: %s\n", line);
-            continue;
+#ifndef _WIN32
+            pid_t pid = fork();
+            if (pid == 0) {
+                query_spec_t local_spec;
+                init_query_spec(&local_spec);
+                deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
+                local_spec.dopt = spec->dopt;
+                if (spec->server_arg) local_spec.server_arg = spec->server_arg;
+                if (spec->port != 53) local_spec.port = spec->port;
+                prescan_always_global_options(line_argc, line_argv, &local_spec);
+                int rc = 0;
+                if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
+                    rc = execute_query_spec(&local_spec);
+                } else {
+                    fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
+                    rc = 1;
+                }
+                free_query_opts(&local_spec.qo);
+                exit(rc < 0 ? 1 : 0);
+            } else if (pid > 0) {
+                int status = 0;
+                waitpid(pid, &status, 0);
+            } else {
+                // Fallback if fork fails
+                query_spec_t local_spec;
+                init_query_spec(&local_spec);
+                deep_copy_query_opts(&local_spec.qo, &spec->qo);
+                local_spec.dopt = spec->dopt;
+                if (spec->server_arg) local_spec.server_arg = spec->server_arg;
+                if (spec->port != 53) local_spec.port = spec->port;
+                prescan_always_global_options(line_argc, line_argv, &local_spec);
+                if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
+                    execute_query_spec(&local_spec);
+                } else {
+                    fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
+                }
+                free_query_opts(&local_spec.qo);
+            }
+#else
+            query_spec_t local_spec;
+            init_query_spec(&local_spec);
+            deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
+            local_spec.dopt = spec->dopt;
+            if (spec->server_arg) local_spec.server_arg = spec->server_arg;
+            if (spec->port != 53) local_spec.port = spec->port;
+            prescan_always_global_options(line_argc, line_argv, &local_spec);
+            if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
+                execute_query_spec(&local_spec);
+            } else {
+                fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
+            }
+            free_query_opts(&local_spec.qo);
+#endif
         }
-        execute_query_spec(&line_spec);
     }
     fclose(bf);
     return 0;
@@ -8910,43 +9173,6 @@ static int execute_query_spec(query_spec_t *spec) {
 #endif
 
     return exit_code;
-}
-
-static void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
-    if (!dst || !src) return;
-    *dst = *src;
-    if (src->tls_ca_file) dst->tls_ca_file = strdup(src->tls_ca_file);
-    if (src->tls_certfile) dst->tls_certfile = strdup(src->tls_certfile);
-    if (src->tls_keyfile) dst->tls_keyfile = strdup(src->tls_keyfile);
-    if (src->tls_hostname) dst->tls_hostname = strdup(src->tls_hostname);
-    if (src->doh_path) dst->doh_path = strdup(src->doh_path);
-    if (src->search_domain) dst->search_domain = strdup(src->search_domain);
-    if (src->tsig_key.algorithm) dst->tsig_key.algorithm = strdup(src->tsig_key.algorithm);
-    if (src->tsig_key.name) dst->tsig_key.name = strdup(src->tsig_key.name);
-    for (int i = 0; i < src->update_op_count; i++) {
-        if (src->update_ops[i].raw) {
-            dst->update_ops[i].raw = strdup(src->update_ops[i].raw);
-        }
-    }
-}
-
-static void free_query_opts(query_opts_t *qo) {
-    if (!qo) return;
-    if (qo->tls_ca_file) { free(qo->tls_ca_file); qo->tls_ca_file = NULL; }
-    if (qo->tls_certfile) { free(qo->tls_certfile); qo->tls_certfile = NULL; }
-    if (qo->tls_keyfile) { free(qo->tls_keyfile); qo->tls_keyfile = NULL; }
-    if (qo->tls_hostname) { free(qo->tls_hostname); qo->tls_hostname = NULL; }
-    if (qo->doh_path) { free(qo->doh_path); qo->doh_path = NULL; }
-    if (qo->search_domain) { free(qo->search_domain); qo->search_domain = NULL; }
-    if (qo->tsig_key.algorithm) { free((void *)qo->tsig_key.algorithm); qo->tsig_key.algorithm = NULL; }
-    if (qo->tsig_key.name) { free((void *)qo->tsig_key.name); qo->tsig_key.name = NULL; }
-    for (int i = 0; i < qo->update_op_count; i++) {
-        if (qo->update_ops[i].raw) {
-            free(qo->update_ops[i].raw);
-            qo->update_ops[i].raw = NULL;
-        }
-    }
-    qo->update_op_count = 0;
 }
 
 int main(int argc, char **argv) {
@@ -9135,7 +9361,7 @@ int main(int argc, char **argv) {
 
     // -f バッチファイルモードの処理
     if (global_spec.batch_file) {
-        execute_batch_spec(&global_spec);
+        int batch_rc = execute_batch_spec(&global_spec);
         print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml);
 #ifndef _WIN32
         if (global_spec.qo.mem_debug) {
@@ -9148,7 +9374,7 @@ int main(int argc, char **argv) {
         zone_arena_destroy(&g_dag_arena);
         free_query_opts(&global_spec.qo);
         if (g_results) free(g_results);
-        return 0;
+        return batch_rc;
     }
 
     // クエリタプルが0個の場合はデフォルトクエリを1個作成
@@ -9172,7 +9398,8 @@ int main(int argc, char **argv) {
 
         // タプル内で -f が指定された場合
         if (local_spec.batch_file) {
-            execute_batch_spec(&local_spec);
+            int batch_rc = execute_batch_spec(&local_spec);
+            if (batch_rc != 0) last_exit_code = batch_rc;
             free_query_opts(&local_spec.qo);
             continue;
         }

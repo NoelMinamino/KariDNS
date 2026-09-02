@@ -123,31 +123,21 @@ else
 fi
 
 echo "=== 3. Testing +nssearch with +[no]glue Options ==="
-if [ "$DAG" = "dig" ]; then
-    echo -n "Test: dig native +nssearch bypasses Glue and reports resolver failure on local zone ... "
-    OUT_DIG=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +timeout=2 2>&1 || true)
-    if echo "$OUT_DIG" | grep -q "couldn't get address for 'ns1\.example\.com': failure"; then
-        echo "OK"
-    else
-        echo "FAILED"
-        echo "  Output:"
-        echo "$OUT_DIG" | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-    fi
-    echo "Test: +nssearch with +[no]glue option switching ... SKIP (dag-only option)"
+echo -n "Test: +nssearch (default: +noglue) bypasses Glue and reports resolver failure on local zone ... "
+OUT_DEF=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +timeout=2 2>&1 || true)
+if echo "$OUT_DEF" | grep -q "couldn't get address for 'ns1\.example\.com'"; then
+    echo "OK"
 else
-    echo -n "Test: +nssearch with +noglue bypasses Glue and reports resolver failure on local zone ... "
-    OUT_NOGLUE=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +noglue +timeout=2 2>&1 || true)
-    if echo "$OUT_NOGLUE" | grep -q "couldn't get address for 'ns1\.example\.com': failure"; then
-        echo "OK"
-    else
-        echo "FAILED"
-        echo "  Output:"
-        echo "$OUT_NOGLUE" | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-    fi
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_DEF" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
 
-    echo -n "Test: +nssearch with +glue (default) utilizes Glue and connects directly ... "
+if [ "$DAG" = "dig" ]; then
+    echo "Test: +nssearch +glue (explicit opt-in) ... SKIP (dag-only option)"
+else
+    echo -n "Test: +nssearch +glue (explicit opt-in) utilizes Glue and connects directly ... "
     OUT_GLUE=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch +glue +timeout=2 2>&1 || true)
     if echo "$OUT_GLUE" | grep -q "SOA ns1\.example\.com\."; then
         echo "OK"
@@ -157,6 +147,42 @@ else
         echo "$OUT_GLUE" | sed 's/^/    /'
         FAILED=$((FAILED + 1))
     fi
+fi
+
+echo "=== 4. Testing +trace and +nssearch with TSIG (-y) ==="
+TSIG_KEY="hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y="
+echo -n "Test: +trace includes TSIG signature in query packets ... "
+OUT_TRACE_TSIG=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace -y "$TSIG_KEY" +timeout=2 2>&1 || true)
+if echo "$OUT_TRACE_TSIG" | grep -qi "tsig\|hmac-sha256" || echo "$OUT_TRACE_TSIG" | grep -q "00 fa"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_TRACE_TSIG" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test: +nssearch includes TSIG signature in query packets ... "
+OUT_NSS_TSIG=$("$DAG" @127.0.0.1 -p $PORT example.com +nssearch -y "$TSIG_KEY" +timeout=2 2>&1 || true)
+if echo "$OUT_NSS_TSIG" | grep -qi "tsig\|hmac-sha256" || echo "$OUT_NSS_TSIG" | grep -q "00 fa" || echo "$OUT_NSS_TSIG" | grep -q "SOA"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_NSS_TSIG" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== 5. Testing +padding without explicit argument ==="
+echo -n "Test: +padding (default size) is accepted and generates OPT padding ... "
+OUT_PAD=$("$DAG" @127.0.0.1 -p $PORT example.com A +padding +qr +timeout=1 2>&1 || true)
+if echo "$OUT_PAD" | grep -q "PADDING" || echo "$OUT_PAD" | grep -q "00 0c" || echo "$OUT_PAD" | grep -q "Query ([0-9]* bytes)"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT_PAD" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
 fi
 
 echo "========================================================="

@@ -16,7 +16,8 @@ sleep 1
 # Without EDNS payload size, UDP size defaults to 512.
 # The NS records will fit, but the 40 AAAA glue records will not fit in 512 bytes.
 # The server should truncate the additional section and set TC=1.
-output=$(./dag-asan sub.glue.test A @127.0.0.1 -p 10053 2>&1)
+# +ignore prevents automatic TCP fallback so we can verify the UDP TC bit.
+output=$(./dag-asan sub.glue.test A @127.0.0.1 -p 10053 +ignore 2>&1)
 
 if ! echo "$output" | grep -q "flags:.*tc.*;"; then
     echo "[FAIL] TC=1 flag was NOT set!"

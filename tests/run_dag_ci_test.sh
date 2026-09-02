@@ -267,6 +267,7 @@ if [ "$DAG" = "dig" ]; then
     run_skip "Server failover (+nofail)"
 else
     run_check "Multi-Server query list" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A" "192\.0\.2\.10"
+    run_check "Multi-Server query with partial timeout continues and summarizes" "$DAG @127.0.0.1:$PORT,127.0.0.1:19999 www.example.com A +tcp +timeout=1 +tries=1" "MULTI-SERVER COMPARISON SUMMARY"
     run_check "LDNS-style summary (+ldnsz)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +ldnsz" "127\.0\.0\.1"
     run_check "Comparison matrix (+allcompare)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +allcompare" "127\.0\.0\.1"
     run_check "Comparison matrix with Cookie (+allcompare +cookie)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +cookie +allcompare" "127\.0\.0\.1"
@@ -494,6 +495,7 @@ if command -v perl >/dev/null 2>&1; then
     run_check "Protocol: +trace glue fallback & CNAME chain tracing (tests/run_dag_trace_cname_glue_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_cname_glue_test.sh\"" "ALL TRACE GLUE & CNAME TESTS PASSED"
     run_check "CLI: +trace and +nssearch options (--hex, +udp) (tests/run_dag_trace_nssearch_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_opts_test.sh\"" "ALL TRACE & NSSEARCH OPTIONS TESTS PASSED"
     run_check "Features: Batch mode advanced options & NS Search glue (tests/run_dag_batch_advanced_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_batch_advanced_opts_test.sh\"" "ALL BATCH & NSSEARCH GLUE TESTS PASSED"
+    run_check "Audit: Edge cases regression test suite (tests/run_dag_edge_cases_audit_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_edge_cases_audit_test.sh\"" "ALL EDGE CASES AUDIT REGRESSION TESTS PASSED"
 fi
 run_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
 

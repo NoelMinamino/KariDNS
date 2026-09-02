@@ -68,9 +68,30 @@ sub build_nodata_response {
     return ""; # 0 length = drop/no response
 }
 
+sub build_oversized_response {
+    my ($req, $qname, $txid) = @_;
+    # 2000+ bytes response with 10 large TXT records
+    my $header = pack("n", $txid) . pack("n", 0x8400) . pack("nnnn", 1, 10, 0, 0);
+    my $q_offset = 12;
+    while ($q_offset < length($req)) {
+        my $l = ord(substr($req, $q_offset, 1));
+        last if $l == 0;
+        $q_offset += ($l + 1);
+    }
+    $q_offset += 5;
+    my $question = substr($req, 12, $q_offset - 12);
+    my $answers = "";
+    for (1..10) {
+        my $txt = "A" x 190;
+        $answers .= pack("n", 0xc00c) . pack("nnNn", 16, 1, 300, length($txt) + 1) . chr(length($txt)) . $txt;
+    }
+    return $header . $question . $answers;
+}
+
 my %HANDLERS = (
     'normal'       => \&build_normal_a_response,
     'trunc-rdata'  => \&build_truncated_rdata_response,
+    'oversized'    => \&build_oversized_response,
     'drop'         => \&build_nodata_response,
 );
 

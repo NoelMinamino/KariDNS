@@ -131,6 +131,7 @@ typedef struct {
   catalog_member_id_t *catalog_members;
   int catalog_member_count;
   bool is_catalog_member;
+  bool is_secondary;
   char catalog_member_unique_id[256];
   char **groups;
   int group_count;
@@ -322,15 +323,7 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
     full_hash = hash;
   }
 
-  size_t idx = hash & (RRL_TABLE_SIZE - 1);
-  rrl_bucket_t *b = &g_rrl_table[idx];
-  while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
-#if defined(__x86_64__) || defined(__i386__)
-      __asm__ volatile("pause" ::: "memory");
-#else
-      sched_yield();
-#endif
-  }
+#define RRL_PROBE_WAYS 4
 
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -339,29 +332,73 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   uint32_t window_sec = (cfg->window_seconds > 0) ? (uint32_t)cfg->window_seconds : 15;
   if (window_sec > 3600) window_sec = 3600;
 
-  if (b->client_hash != full_hash) {
-    // Hash collision or new entry
-    // Only reset if it's older than window_sec seconds to prevent hash-collision DoS
-    if (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000) {
-      b->client_hash = full_hash;
-      for (int i = 0; i < 4; i++) {
-          b->last_refill_ms[i] = now_ms;
-      }
-      uint64_t cap0 = (uint64_t)cfg->responses_per_second * window_sec;
-      uint64_t cap2 = (uint64_t)cfg->nxdomains_per_second * window_sec;
-      uint64_t cap3 = (uint64_t)cfg->errors_per_second * window_sec;
-      if (cap0 > 0x7FFFFFFF) cap0 = 0x7FFFFFFF;
-      if (cap2 > 0x7FFFFFFF) cap2 = 0x7FFFFFFF;
-      if (cap3 > 0x7FFFFFFF) cap3 = 0x7FFFFFFF;
-      b->tokens[0] = (int32_t)cap0;
-      b->tokens[1] = (int32_t)cap0;
-      b->tokens[2] = (int32_t)cap2;
-      b->tokens[3] = (int32_t)cap3;
-      b->slip_counter = 0;
-    } else {
-      // It's a recent collision. Share the limit instead of resetting.
-      // This mitigates spoofed IPs from resetting other users' buckets.
+  rrl_bucket_t *selected_bucket = NULL;
+  bool is_new_entry = false;
+  size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
+
+  // 1st Pass: Look for exact hash match
+  for (int probe = 0; probe < RRL_PROBE_WAYS; probe++) {
+    size_t idx = (base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1);
+    rrl_bucket_t *b = &g_rrl_table[idx];
+    while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+      __asm__ volatile("pause" ::: "memory");
+#else
+      sched_yield();
+#endif
     }
+    if (b->client_hash == full_hash) {
+      selected_bucket = b;
+      is_new_entry = false;
+      break;
+    }
+    atomic_flag_clear_explicit(&b->lock, memory_order_release);
+  }
+
+  // 2nd Pass: If no exact match, look for an empty or expired bucket
+  if (!selected_bucket) {
+    for (int probe = 0; probe < RRL_PROBE_WAYS; probe++) {
+      size_t idx = (base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1);
+      rrl_bucket_t *b = &g_rrl_table[idx];
+      while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ volatile("pause" ::: "memory");
+#else
+        sched_yield();
+#endif
+      }
+      if (b->client_hash == 0 || (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000)) {
+        selected_bucket = b;
+        is_new_entry = true;
+        break;
+      }
+      atomic_flag_clear_explicit(&b->lock, memory_order_release);
+    }
+  }
+
+  // All candidate slots are busy active collisions.
+  // Bypass RRL to prevent token-stealing / collateral DoS on legitimate users.
+  if (!selected_bucket) {
+    return true;
+  }
+
+  rrl_bucket_t *b = selected_bucket;
+  if (is_new_entry) {
+    b->client_hash = full_hash;
+    for (int i = 0; i < 4; i++) {
+      b->last_refill_ms[i] = now_ms;
+    }
+    uint64_t cap0 = (uint64_t)cfg->responses_per_second * window_sec;
+    uint64_t cap2 = (uint64_t)cfg->nxdomains_per_second * window_sec;
+    uint64_t cap3 = (uint64_t)cfg->errors_per_second * window_sec;
+    if (cap0 > 0x7FFFFFFF) cap0 = 0x7FFFFFFF;
+    if (cap2 > 0x7FFFFFFF) cap2 = 0x7FFFFFFF;
+    if (cap3 > 0x7FFFFFFF) cap3 = 0x7FFFFFFF;
+    b->tokens[0] = (int32_t)cap0;
+    b->tokens[1] = (int32_t)cap0;
+    b->tokens[2] = (int32_t)cap2;
+    b->tokens[3] = (int32_t)cap3;
+    b->slip_counter = 0;
   } else {
     uint32_t rates[4] = {
       cfg->responses_per_second,
@@ -431,6 +468,22 @@ typedef struct {
 } zone_db_snapshot_t;
 static _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
 static config_rcu_t g_config_db;
+
+static server_config_t *acquire_config_snapshot(void) {
+  server_config_t *snap = NULL;
+  do {
+    snap = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    if (!snap) return NULL;
+    atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
+    if (snap == atomic_load_explicit(&g_config_db.active, memory_order_acquire)) break;
+    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+  } while (1);
+  return snap;
+}
+
+static void release_config_snapshot(server_config_t *snap) {
+  if (snap) atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+}
 int g_control_kq = -1;
 int g_cwd_fd = -1;
 static const char *g_config_path = NULL;
@@ -1015,27 +1068,34 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
 
 static void *gc_snapshot_thread(void *arg) {
   zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
+  if (!snap) return NULL;
   wait_for_snapshot_readers(snap);
-  for (size_t v = 0; v < snap->view_count; v++) {
-    for (size_t i = 0; i < snap->views[v].zone_count; i++) {
-      zone_db_entry_t *entry = snap->views[v].entries[i];
-      if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
-        syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
-        free_zone_db_entry(entry);
+  if (snap->views) {
+    for (size_t v = 0; v < snap->view_count; v++) {
+      if (snap->views[v].entries) {
+        for (size_t i = 0; i < snap->views[v].zone_count; i++) {
+          zone_db_entry_t *entry = snap->views[v].entries[i];
+          if (entry) {
+            if (atomic_fetch_sub_explicit(&entry->snapshot_refs, 1, memory_order_acq_rel) == 1) {
+              syslog(LOG_INFO, "[GC] Freeing deleted zone '%s'", entry->domain);
+              free_zone_db_entry(entry);
+            }
+          }
+        }
+        free(snap->views[v].entries);
       }
-    }
-    free(snap->views[v].entries);
-    free(snap->views[v].name);
-    if (snap->views[v].match_clients) {
-      for (int i = 0; i < snap->views[v].match_clients_count; i++) {
-        free(snap->views[v].match_clients[i]);
+      if (snap->views[v].name) free(snap->views[v].name);
+      if (snap->views[v].match_clients) {
+        for (int i = 0; i < snap->views[v].match_clients_count; i++) {
+          if (snap->views[v].match_clients[i]) free(snap->views[v].match_clients[i]);
+        }
+        free(snap->views[v].match_clients);
       }
-      free(snap->views[v].match_clients);
+      if (snap->views[v].hash_table) free(snap->views[v].hash_table);
+      if (snap->views[v].chain_next) free(snap->views[v].chain_next);
     }
-    if (snap->views[v].hash_table) free(snap->views[v].hash_table);
-    if (snap->views[v].chain_next) free(snap->views[v].chain_next);
+    free(snap->views);
   }
-  free(snap->views);
   free(snap);
   return NULL;
 }
@@ -1318,6 +1378,9 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   struct stat st_loaded;
   if (stat_via_dir_cache(file, &st_loaded) == 0) {
     entry->last_loaded_mtime = st_loaded.st_mtime;
+    if (entry->is_secondary) {
+      atomic_store_explicit(&entry->last_successful_transfer, (time_t)st_loaded.st_mtime, memory_order_release);
+    }
   }
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
@@ -1395,6 +1458,14 @@ void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, cons
     }
 }
 
+static void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason) {
+    syslog(LOG_ERR, "[Core] Memory allocation failed during snapshot rebuild (%s), aborting", reason);
+    if (new_snap) {
+        gc_snapshot_thread(new_snap);
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
     server_config_t *active_config, 
     const char *catalog_view_name,
@@ -1405,6 +1476,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     zone_db_snapshot_t *old_snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
     zone_db_snapshot_t *new_snap = calloc(1, sizeof(zone_db_snapshot_t));
+    if (!new_snap) {
+        abort_rebuild_snapshot(NULL, "new_snap");
+        return NULL;
+    }
     
     if (active_config) {
         // MODE: Full Config Reload
@@ -1421,6 +1496,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
         }
         catalog_member_id_t *valid_members = max_valid_members > 0 ? calloc(max_valid_members, sizeof(catalog_member_id_t)) : NULL;
+        if (max_valid_members > 0 && !valid_members) {
+            abort_rebuild_snapshot(new_snap, "valid_members");
+            return NULL;
+        }
         int valid_member_count = 0;
         
         if (old_snap) {
@@ -1459,7 +1538,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         for (view_config_t *v = active_config->views; v; v = v->next) view_count++;
         
         new_snap->view_count = view_count;
-        new_snap->views = calloc(view_count, sizeof(view_snapshot_t));
+        if (view_count > 0) {
+            new_snap->views = calloc(view_count, sizeof(view_snapshot_t));
+            if (!new_snap->views) {
+                if (valid_members) free(valid_members);
+                abort_rebuild_snapshot(new_snap, "new_snap->views");
+                return NULL;
+            }
+        }
         atomic_init(&new_snap->reader_count, 0);
 
         int vidx = 0;
@@ -1469,6 +1555,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             vs->match_clients_count = v->match_clients_count;
             if (v->match_clients_count > 0) {
                 vs->match_clients = calloc(v->match_clients_count, sizeof(char *));
+                if (!vs->match_clients) {
+                    if (valid_members) free(valid_members);
+                    abort_rebuild_snapshot(new_snap, "vs->match_clients");
+                    return NULL;
+                }
                 for (int i = 0; i < v->match_clients_count; i++) {
                     vs->match_clients[i] = strdup(v->match_clients[i]);
                 }
@@ -1497,7 +1588,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                     bool overridden = false;
                                     for (zone_config_t *z = v->zones; z; z = z->next) {
                                         if (strcasecmp(z->domain, entry->domain) == 0) {
-                                            overridden = true; break;
+                                             overridden = true; break;
                                         }
                                     }
                                     if (!overridden) dynamic_count++;
@@ -1510,7 +1601,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
 
             vs->zone_count = static_count + dynamic_count;
-            vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+            if (vs->zone_count > 0) {
+                vs->entries = calloc(vs->zone_count, sizeof(zone_db_entry_t *));
+                if (!vs->entries) {
+                    if (valid_members) free(valid_members);
+                    abort_rebuild_snapshot(new_snap, "vs->entries");
+                    return NULL;
+                }
+            }
             
             int zidx = 0;
             for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -1532,7 +1630,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (!entry) {
                     zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
                     entry = create_new_zone_entry(z->domain, v->name);
-                    if (entry && z->type && (strcasecmp(z->type, "master") == 0 || strcasecmp(z->type, "primary") == 0) && z->file) {
+                    if (entry && z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0)) {
+                        entry->is_secondary = true;
+                    }
+                    if (entry && z->file) {
                         reload_master_zone(entry, z->file);
                     }
                 }
@@ -1859,6 +1960,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
+            entry->is_secondary = true;
             strncpy(entry->catalog_member_unique_id, added_members[i].unique_id, sizeof(entry->catalog_member_unique_id) - 1);
             if (added_members[i].group_count > 0) {
                 entry->groups = calloc(added_members[i].group_count, sizeof(char*));
@@ -1881,6 +1983,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         new_snap->view_count = old_snap ? old_snap->view_count : 0;
         if (new_snap->view_count > 0) {
             new_snap->views = calloc(new_snap->view_count, sizeof(view_snapshot_t));
+            if (!new_snap->views) {
+                free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                abort_rebuild_snapshot(new_snap, "catalog new_snap->views");
+                return NULL;
+            }
             atomic_init(&new_snap->reader_count, 0);
 
             // Build ephemeral hash table for deleted members (removed + coo_evicted)
@@ -1917,6 +2024,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 vs->match_clients_count = old_snap->views[v].match_clients_count;
                 if (vs->match_clients_count > 0) {
                     vs->match_clients = calloc(vs->match_clients_count, sizeof(char *));
+                    if (!vs->match_clients) {
+                        if (del_hash_table) free(del_hash_table);
+                        if (del_chain_next) free(del_chain_next);
+                        free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                        abort_rebuild_snapshot(new_snap, "catalog vs->match_clients");
+                        return NULL;
+                    }
                     for (int i = 0; i < vs->match_clients_count; i++) {
                         vs->match_clients[i] = strdup(old_snap->views[v].match_clients[i]);
                     }
@@ -1925,6 +2039,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 if (strcasecmp(vs->name, catalog_view_name) == 0) {
                     size_t max_zones = old_snap->views[v].zone_count + added_count;
                     vs->entries = calloc(max_zones > 0 ? max_zones : 1, sizeof(zone_db_entry_t *));
+                    if (!vs->entries) {
+                        if (del_hash_table) free(del_hash_table);
+                        if (del_chain_next) free(del_chain_next);
+                        free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                        abort_rebuild_snapshot(new_snap, "catalog vs->entries");
+                        return NULL;
+                    }
                     
                     int zidx = 0;
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
@@ -1971,6 +2092,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 } else {
                     vs->zone_count = old_snap->views[v].zone_count;
                     vs->entries = calloc(vs->zone_count > 0 ? vs->zone_count : 1, sizeof(zone_db_entry_t *));
+                    if (!vs->entries) {
+                        if (del_hash_table) free(del_hash_table);
+                        if (del_chain_next) free(del_chain_next);
+                        free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                        abort_rebuild_snapshot(new_snap, "catalog other vs->entries");
+                        return NULL;
+                    }
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                         zone_db_entry_t *entry = old_snap->views[v].entries[i];
                         atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
@@ -2113,6 +2241,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     snprintf(suffix, sizeof(suffix), ".zones.%s", catalog_entry->domain);
     size_t suffix_len = strlen(suffix);
 
+    server_config_t *cfg = acquire_config_snapshot();
     for (size_t i = 0; i < arena->count; i++) {
         if (arena->records[i].type_code == 12) { // PTR
             size_t name_len = strlen(arena->records[i].name);
@@ -2123,7 +2252,6 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                     normalize_domain_fqdn_local(target, norm_target, sizeof(norm_target));
                     
                     // Collision check with static config
-                    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
                     zone_config_t *zcfg = find_zone_config_in_view(cfg, view_name, norm_target);
                     if (zcfg) {
                         syslog(LOG_WARNING, "[Catalog] Zone '%s' generated member '%s' which collides with static config. Skipping.", catalog_entry->domain, norm_target);
@@ -2142,6 +2270,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
             }
         }
     }
+    release_config_snapshot(cfg);
 
     // RFC 9432 §5.1: 壊れたカタログゾーンの検出
     // (1) 同一 <unique-N> に複数のPTRレコードが存在しないか
@@ -2368,25 +2497,32 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
   }
 }
 
+static void zone_arena_clear_data_pools(zone_arena_t *arena) {
+  if (!arena) return;
+  for (int i = 0; i < arena->data_pool_count; i++) {
+    if (arena->data_pools[i]) {
+      free(arena->data_pools[i]);
+      arena->data_pools[i] = NULL;
+    }
+  }
+  if (arena->nsec_records) {
+    free(arena->nsec_records);
+    arena->nsec_records = NULL;
+    arena->nsec_count = 0;
+  }
+  if (arena->sorted_unique_names) {
+    free(arena->sorted_unique_names);
+    arena->sorted_unique_names = NULL;
+    arena->sorted_unique_count = 0;
+  }
+  arena->count = 0;
+  arena->data_pool_count = 0;
+  arena->current_pool_cap = 0;
+  arena->current_pool_idx = 0;
+}
+
 static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
-  for (int i = 0; i < dst->data_pool_count; i++) {
-    if (dst->data_pools[i])
-      free(dst->data_pools[i]);
-  }
-  if (dst->nsec_records) {
-    free(dst->nsec_records);
-    dst->nsec_records = NULL;
-    dst->nsec_count = 0;
-  }
-  if (dst->sorted_unique_names) {
-    free(dst->sorted_unique_names);
-    dst->sorted_unique_names = NULL;
-    dst->sorted_unique_count = 0;
-  }
-  dst->count = 0;
-  dst->data_pool_count = 0;
-  dst->current_pool_cap = 0;
-  dst->current_pool_idx = 0;
+  zone_arena_clear_data_pools(dst);
   for (size_t i = 0; i < src->count; i++) {
     if (dst->count >= dst->records_cap) {
       size_t new_cap = dst->records_cap == 0 ? 16 : dst->records_cap * 2;
@@ -2536,77 +2672,119 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tsig_key_t *tsig_key) {
   uint8_t *msg;
   uint16_t msg_len;
-  pthread_mutex_lock(&entry->writer_lock);
-  zone_arena_t *active =
-      atomic_load_explicit(&entry->rcu.active, memory_order_relaxed);
-  zone_arena_t *standby = (active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
-                                                          : &entry->rcu.arena_a;
-  if (session->soa_count == 0) {
-    standby->count = 0;
-    standby->data_pool_count = 0;
-    standby->current_pool_cap = 0;
-    standby->current_pool_idx = 0;
-    session->is_finished = false;
-  }
+
+  zone_arena_t tmp_arena;
+  memset(&tmp_arena, 0, sizeof(tmp_arena));
+  zone_arena_init(&tmp_arena);
+
+  zone_arena_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  int ret_code = -1;
+
   while (1) {
     int ret = read_dns_tcp_message(tcp_fd, stream_ctx, &msg, &msg_len);
     if (ret < 0 || ret == 0) {
-      pthread_mutex_unlock(&entry->writer_lock);
+      zone_arena_destroy(&tmp_arena);
       return -1;
     }
     if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, 0, NULL, 0, false, NULL, NULL) != 0) {
       syslog(LOG_ERR, "[AXFR] TSIG failed");
-      pthread_mutex_unlock(&entry->writer_lock);
+      zone_arena_destroy(&tmp_arena);
       return -1;
     }
-    if (parse_xfr_packet(msg, msg_len, standby, active, session,
+    if (parse_xfr_packet(msg, msg_len, &tmp_arena, active, session,
                          entry->domain) != 0) {
-      pthread_mutex_unlock(&entry->writer_lock);
+      zone_arena_destroy(&tmp_arena);
       return -1;
     }
     if (session->is_finished) {
-      int ret_code = 1;
-      if (standby->count > 0) {
-        for (size_t k = 0; k < standby->count; k++) {
-          if (standby->records[k].type_code == 6 &&
-              standby->records[k].rdata_count >= 7) {
-            entry->serial = strtoul(standby->records[k].rdata[2], NULL, 10);
-            entry->refresh = parse_ttl_value(standby->records[k].rdata[3]);
-            entry->retry = parse_ttl_value(standby->records[k].rdata[4]);
-            entry->expire = parse_ttl_value(standby->records[k].rdata[5]);
-            atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
-            atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
+      if (tmp_arena.count > 0) {
+        uint32_t serial = 0, refresh = 0, retry = 0, expire = 0;
+        bool has_soa = false;
+        for (size_t k = 0; k < tmp_arena.count; k++) {
+          if (tmp_arena.records[k].type_code == 6 &&
+              tmp_arena.records[k].rdata_count >= 7) {
+            serial = strtoul(tmp_arena.records[k].rdata[2], NULL, 10);
+            refresh = parse_ttl_value(tmp_arena.records[k].rdata[3]);
+            retry = parse_ttl_value(tmp_arena.records[k].rdata[4]);
+            expire = parse_ttl_value(tmp_arena.records[k].rdata[5]);
+            has_soa = true;
             break;
           }
         }
-        if (build_zone_index(standby) != 0) {
-            pthread_mutex_unlock(&entry->writer_lock);
-            syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
-            return -1;
+
+        pthread_mutex_lock(&entry->writer_lock);
+        zone_arena_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+        zone_arena_t *standby = (cur_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
+                                                                    : &entry->rcu.arena_a;
+        wait_for_readers(standby);
+
+        if (has_soa) {
+          entry->serial = serial;
+          entry->refresh = refresh;
+          entry->retry = retry;
+          entry->expire = expire;
+          atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
+          atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
         }
-        compute_ixfr_diff(entry, active, standby);
+
+        clone_zone_arena(&tmp_arena, standby);
+
+        if (build_zone_index(standby) != 0) {
+          zone_arena_clear_data_pools(standby);
+          pthread_mutex_unlock(&entry->writer_lock);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
+          return -1;
+        }
+
+        compute_ixfr_diff(entry, cur_active, standby);
         atomic_store_explicit(&entry->rcu.active, standby,
                               memory_order_release);
-        wait_for_readers(active);
+        wait_for_readers(cur_active);
+        pthread_mutex_unlock(&entry->writer_lock);
+
         void send_notify_to_all(const char *domain, const char *view_name);
         send_notify_to_all(entry->domain, entry->view_name);
+        ret_code = 1;
       } else {
+        pthread_mutex_lock(&entry->writer_lock);
         atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
         atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
+        pthread_mutex_unlock(&entry->writer_lock);
         ret_code = 2;
       }
-      pthread_mutex_unlock(&entry->writer_lock);
-
-      // Hook for catalog zone processing
-      server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
-      if (zcfg && zcfg->is_catalog) {
-          void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
-          catalog_process_membership(entry, zcfg, entry->view_name);
-      }
-      return ret_code;
+      break;
     }
   }
+
+  zone_arena_destroy(&tmp_arena);
+
+  // Hook for catalog zone processing
+  server_config_t *cfg = acquire_config_snapshot();
+  zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+  if (zcfg && zcfg->is_catalog) {
+      void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+      catalog_process_membership(entry, zcfg, entry->view_name);
+  }
+  release_config_snapshot(cfg);
+  return ret_code;
+}
+
+static const char *strchr_unescaped(const char *s, char c) {
+  if (!s) return NULL;
+  for (const char *p = s; *p != '\0'; p++) {
+    if (*p == '\\') {
+      if (*(p + 1) == '\0') {
+        break; // Trailing backslash at end of string
+      }
+      p++; // Skip escaped character
+      continue;
+    }
+    if (*p == c) {
+      return p;
+    }
+  }
+  return NULL;
 }
 
 static bool attach_covering_rrsig(zone_arena_t *zone, size_t hash_idx,
@@ -2753,7 +2931,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
     // RFC 4035 §3.1.4.1: 委任点そのもの(name == qname)へのDSクエリは、
     // 参照応答(referral)にせず、権威応答としてフェーズ2の通常検索へ継続させる。
     if (is_ds_query && name == qname) {
-      name = strchr(name, '.');
+      name = strchr_unescaped(name, '.');
       if (name)
         name++;
       continue;
@@ -2792,7 +2970,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
       }
       return true;
     }
-    name = strchr(name, '.');
+    name = strchr_unescaped(name, '.');
     if (name)
       name++;
   }
@@ -2895,7 +3073,7 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
     return zone_apex;
   const char *parent = qname;
   size_t apex_len = strlen(zone_apex);
-  while ((parent = strchr(parent, '.')) != NULL) {
+  while ((parent = strchr_unescaped(parent, '.')) != NULL) {
     parent++;
     if (*parent == '\0') break;
 
@@ -3047,7 +3225,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     if (!found) {
       bool dname_found = false;
       const char *dname_parent = current_qname;
-      while ((dname_parent = strchr(dname_parent, '.')) != NULL) {
+      while ((dname_parent = strchr_unescaped(dname_parent, '.')) != NULL) {
         dname_parent++;
         if (*dname_parent == '\0') break;
         uint32_t p_hash = calc_fnv1a_str(dname_parent);
@@ -3095,7 +3273,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         char wc_name[256];
         wc_name[0] = '*';
         wc_name[1] = '.';
-        while ((parent = strchr(parent, '.')) != NULL) {
+        while ((parent = strchr_unescaped(parent, '.')) != NULL) {
           parent++;
           if (*parent == '\0') break;
           size_t parent_len = strlen(parent);
@@ -3256,7 +3434,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           const char *parent = current_qname;
           char wc_name[256];
           wc_name[0] = '*'; wc_name[1] = '.';
-          while ((parent = strchr(parent, '.')) != NULL) {
+          while ((parent = strchr_unescaped(parent, '.')) != NULL) {
             parent++; if (*parent == '\0') break;
             size_t parent_len = strlen(parent);
             if (parent_len + 3 > sizeof(wc_name)) break;
@@ -3552,6 +3730,7 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
   int prcount = 0, upcount = 0;
   int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &prcount, &upcount);
   if (rcode != 0) {
+    zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     return rcode;
   }
@@ -3559,6 +3738,7 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
   bump_soa_serial_in_arena(z_standby);
 
   if (build_zone_index(z_standby) != 0) {
+    zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
     return 2; // SERVFAIL
@@ -3696,13 +3876,6 @@ static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeo
   return (ssize_t)nread;
 }
 
-/* 1回の宣言応答長として明らかに異常とみなす閾値。
- * max_res_lenの4倍(UDPで最大4096バイト程度、TCPで最大65535バイト程度を
- * 想定しても十分な余裕がある)を超える宣言があった場合は、ドレインすら試みず
- * 即座に通信失敗として扱い、巨大なドレインループでmutexを長時間占有しない
- * ようにする。 */
-#define PROGRAM_ZONE_MAX_SANE_RESPLEN(max_res_len) ((max_res_len) * 4)
-
 static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
                                     uint8_t *res, size_t max_res_len,
                                     const char *client_ip, bool is_tcp) {
@@ -3742,28 +3915,47 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
         } else {
           ok = false;
         }
-      } else if (resp_len > PROGRAM_ZONE_MAX_SANE_RESPLEN(max_res_len)) {
-        // H-3: 明らかに異常な宣言長は、ドレインすら試みずに即座に失敗させる。
-        syslog(LOG_WARNING, "[Plugin] zone '%s' declared implausible response length %u; "
-               "treating as protocol desync, not draining", domain, resp_len);
-        ok = false;
       } else {
-        syslog(LOG_WARNING, "[Plugin] zone '%s' returned oversized response (%u > %zu); dropping",
+        syslog(LOG_INFO, "[Plugin] zone '%s' returned oversized response (%u > %zu); truncating with TC=1",
                domain, resp_len, max_res_len);
-        /* パイプ内の oversized データを読み捨ててパイプの同期を保つ。
-         * H-3: ここも共有締切の残り時間を使うため、宣言長がどれだけ大きくても
-         * 合計の待ち時間はplugin->timeout_msを超えない。 */
-        size_t remaining = resp_len;
-        uint8_t drain_buf[512];
-        while (remaining > 0) {
-          size_t chunk = remaining < sizeof(drain_buf) ? remaining : sizeof(drain_buf);
-          if (read_all_timeout(plugin->stdout_fd, drain_buf, chunk, remaining_ms(deadline)) != (ssize_t)chunk) {
-            ok = false;
-            break;
+        /* 最初の max_res_len 分を res に読み込み、残りを読み捨ててパイプの同期を保つ。
+         * 共有締切の残り時間を使うため、宣言長がどれだけ大きくても合計の待ち時間は plugin->timeout_ms を超えない。 */
+        size_t first_chunk = max_res_len;
+        if (read_all_timeout(plugin->stdout_fd, res, first_chunk, remaining_ms(deadline)) == (ssize_t)first_chunk) {
+          size_t remaining = resp_len - first_chunk;
+          uint8_t drain_buf[512];
+          while (remaining > 0) {
+            size_t chunk = remaining < sizeof(drain_buf) ? remaining : sizeof(drain_buf);
+            if (read_all_timeout(plugin->stdout_fd, drain_buf, chunk, remaining_ms(deadline)) != (ssize_t)chunk) {
+              ok = false;
+              break;
+            }
+            remaining -= chunk;
           }
-          remaining -= chunk;
+          if (ok) {
+            // TCビットをセットし、質問セクション以降をクリアして切り詰め応答とする
+            res[0] = req[0]; res[1] = req[1]; // クエリのトランザクションIDを反映
+            res[2] |= 0x82;                   // QR=1, TC=1
+            res[4] = req[4]; res[5] = req[5]; // QDCOUNT
+            res[6] = 0; res[7] = 0;           // ANCOUNT=0
+            res[8] = 0; res[9] = 0;           // NSCOUNT=0
+            res[10] = 0; res[11] = 0;         // ARCOUNT=0
+            uint16_t qdcount = (req[4] << 8) | req[5];
+            size_t qlen = get_question_end_offset(res, first_chunk, qdcount);
+            if (qlen < DNS_HEADER_SIZE || qlen > first_chunk) {
+              size_t req_qlen = get_question_end_offset(req, req_len, qdcount);
+              if (req_qlen >= DNS_HEADER_SIZE && req_qlen <= max_res_len) {
+                memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, req_qlen - DNS_HEADER_SIZE);
+                qlen = req_qlen;
+              } else {
+                qlen = DNS_HEADER_SIZE;
+              }
+            }
+            result_len = (int)qlen;
+          }
+        } else {
+          ok = false;
         }
-        result_len = 0;
       }
     } else {
       ok = false;
@@ -3935,7 +4127,30 @@ static int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t
       // そのまま使う(何も返さないよりはマシ、というBIND等と同じ扱い)。
     }
 
-    size_t copy_len = (size_t)got > max_res_len ? max_res_len : (size_t)got;
+    if ((size_t)got > max_res_len) {
+      size_t copy_len = max_res_len;
+      memcpy(res, s_forward_res_buf, copy_len);
+      res[0] = req[0]; res[1] = req[1];
+      res[2] |= 0x82; // QR=1, TC=1
+      res[4] = req[4]; res[5] = req[5];
+      res[6] = 0; res[7] = 0;
+      res[8] = 0; res[9] = 0;
+      res[10] = 0; res[11] = 0;
+      uint16_t qdcount = (req[4] << 8) | req[5];
+      size_t qlen = get_question_end_offset(res, copy_len, qdcount);
+      if (qlen < DNS_HEADER_SIZE || qlen > copy_len) {
+        size_t req_qlen = get_question_end_offset(req, req_len, qdcount);
+        if (req_qlen >= DNS_HEADER_SIZE && req_qlen <= max_res_len) {
+          memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, req_qlen - DNS_HEADER_SIZE);
+          qlen = req_qlen;
+        } else {
+          qlen = DNS_HEADER_SIZE;
+        }
+      }
+      return (int)qlen;
+    }
+
+    size_t copy_len = (size_t)got;
     memcpy(res, s_forward_res_buf, copy_len);
     res[0] = req[0]; res[1] = req[1]; // クライアントの元のトランザクションIDへ復元
     return (int)copy_len;
@@ -4091,16 +4306,15 @@ static view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client
   return NULL;
 }
 
-int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
-                      size_t max_res_len, const char *qname, uint16_t qtype,
-                      const char *client_ip, compress_ctx_t *comp_ctx,
-                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
-                      zone_db_snapshot_t *snap) {
+static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
+                            size_t max_res_len, const char *qname, uint16_t qtype,
+                            const char *client_ip, compress_ctx_t *comp_ctx,
+                            bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                            zone_db_snapshot_t *snap, server_config_t *cfg) {
   if (req_len < DNS_HEADER_SIZE) {
     return 0; // 不正な短いパケットは無応答で破棄
   }
 
-  server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
   size_t tsig_mac_len = 0;
@@ -4162,7 +4376,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   edns.ede_count = 0; // 反射防止
 
-  server_config_t *cfg_for_ede = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *cfg_for_ede = cfg;
   
   if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
     edns.has_mqtype_query = false;
@@ -4286,7 +4500,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 4) { // NOTIFY
     if (db_entry && view) {
-      server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      server_config_t *cfg_chk = cfg;
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
@@ -4309,8 +4523,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     int tsig_error_code = 0;
     
     if (db_entry && view) {
-      server_config_t *cfg =
-          atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->masters_count > 0) {
         for (int k = 0; k < zcfg->masters_count; k++) {
@@ -4384,7 +4596,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (opcode == 5) { // UPDATE
     if (db_entry && view) {
-      server_config_t *cfg_chk = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+      server_config_t *cfg_chk = cfg;
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
@@ -4407,8 +4619,6 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *attempted_key = NULL;
     int tsig_error_code = 0;
     if (db_entry && view) {
-      server_config_t *cfg =
-          atomic_load_explicit(&g_config_db.active, memory_order_acquire);
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg) {
         if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
@@ -4416,6 +4626,9 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
         }
       }
       if (zcfg && zcfg->allow_update_count > 0) {
+        if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
+          auth = true;
+        }
         tsig_key_t *k = cfg->keys;
         while (k) {
           bool key_allowed = false;
@@ -4447,7 +4660,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
     
     int rcode = 5; // REFUSED
     if (auth && zone_is_master) {
-      rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key->name);
+      rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key ? matched_key->name : "<none>");
     } else if (auth && !zone_is_master) {
       rcode = 9; // NOTAUTH (RFC 2136 §3.8: Server is not the primary for the zone)
       add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not the primary for the zone");
@@ -4643,7 +4856,7 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
            *res_nscount = (uint16_t *)&res[8],
            *res_arcount = (uint16_t *)&res[10];
   if (db_entry && view) {
-    server_config_t *cfg_lookup = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    server_config_t *cfg_lookup = cfg;
     zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
       if (current_zone)
@@ -4800,6 +5013,18 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
   return offset;
 }
 
+int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
+                      size_t max_res_len, const char *qname, uint16_t qtype,
+                      const char *client_ip, compress_ctx_t *comp_ctx,
+                      bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                      zone_db_snapshot_t *snap) {
+  server_config_t *cfg = acquire_config_snapshot();
+  int ret = process_dns_query_impl(req, req_len, res, max_res_len, qname, qtype,
+                                   client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg);
+  release_config_snapshot(cfg);
+  return ret;
+}
+
 // ============================================================================
 // 9. AXFR専用バックグラウンドスレッド (Detached)
 // ============================================================================
@@ -4870,7 +5095,7 @@ void *axfr_bg_thread_func(void *arg) {
     req_len = 14;
     const char *d = ctx->domain;
     while (*d) {
-      const char *dot = strchr(d, '.');
+      const char *dot = strchr_unescaped(d, '.');
       size_t len = dot ? (size_t)(dot - d) : strlen(d);
       if (len > 63)
         len = 63;
@@ -4960,13 +5185,14 @@ void *axfr_bg_thread_func(void *arg) {
 }
 
 void send_notify_to_all(const char *domain, const char *view_name) {
-  server_config_t *active =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *active = acquire_config_snapshot();
   if (!active)
     return;
   zone_config_t *zone = find_zone_config_in_view(active, view_name, domain);
-  if (!zone || zone->also_notify_count == 0)
+  if (!zone || zone->also_notify_count == 0) {
+    release_config_snapshot(active);
     return;
+  }
 
   uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   memset(req, 0, DNS_HEADER_SIZE);
@@ -5031,6 +5257,7 @@ void send_notify_to_all(const char *domain, const char *view_name) {
     memcpy(buf + sizeof(msg), req, offset);
     send(g_notify_ipc[1], buf, sizeof(msg) + offset, 0);
   }
+  release_config_snapshot(active);
 }
 
 // ============================================================================
@@ -5062,8 +5289,11 @@ static void init_logging_channels(server_config_t *cfg) {
 static void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname, 
                                 uint16_t qclass, uint16_t qtype, uint8_t rcode, 
                                 bool has_edns, bool dnssec_ok) {
-    server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-    if (!cfg || !cfg->logging.responses_channel) return;
+    server_config_t *cfg = acquire_config_snapshot();
+    if (!cfg) return;
+    bool enabled = (cfg->logging.responses_channel != NULL);
+    release_config_snapshot(cfg);
+    if (!enabled) return;
 
     uint64_t t = atomic_load_explicit(&g_resp_log_tail, memory_order_relaxed);
     uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
@@ -5114,7 +5344,13 @@ static void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
     } else {
       // 改行(\n, \r)、タブ、スペース、制御文字、非ASCII文字を RFC 1035 §5.1 / BIND互換の \DDD 形式にエスケープ
       int n = snprintf(&dst[di], dst_size - di, "\\%03u", c);
-      if (n > 0) di += (size_t)n;
+      if (n > 0) {
+          if ((size_t)n < dst_size - di) {
+              di += (size_t)n;
+          } else {
+              di = dst_size - 1;
+          }
+      }
     }
   }
   dst[di < dst_size ? di : dst_size - 1] = '\0';
@@ -5172,7 +5408,7 @@ void *response_logger_thread_func(void *arg) {
         
         if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
             resp_log_entry_t *entry = &g_resp_log_ring[idx];
-            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+            server_config_t *cfg = acquire_config_snapshot();
             
             if (cfg && cfg->logging.responses_channel) {
                 log_channel_t *ch = cfg->logging.responses_channel;
@@ -5225,6 +5461,7 @@ void *response_logger_thread_func(void *arg) {
                     log_write_rotated(ch, log_buf, len, &tm_info);
                 }
             }
+            release_config_snapshot(cfg);
             
             // Consumerのポインタを進める
             atomic_store_explicit(&entry->ready, false, memory_order_release);
@@ -5239,10 +5476,11 @@ void *response_logger_thread_func(void *arg) {
 static void write_query_log(const char *client_ip, int client_port,
                             const char *qname, uint16_t qclass, uint16_t qtype,
                             bool has_edns, bool dnssec_ok) {
-  server_config_t *cfg =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  if (!cfg || !cfg->logging.queries_channel)
+  server_config_t *cfg = acquire_config_snapshot();
+  if (!cfg || !cfg->logging.queries_channel) {
+    if (cfg) release_config_snapshot(cfg);
     return;
+  }
   log_channel_t *ch = cfg->logging.queries_channel;
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -5278,11 +5516,12 @@ static void write_query_log(const char *client_ip, int client_port,
                      ch->print_category ? "queries: " : "",
                      ch->print_severity ? "info: " : "", client_ip, client_port,
                      safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
-  if (len <= 0)
-    return;
-  if (len >= (int)sizeof(log_buf))
-    len = sizeof(log_buf) - 1;
-  log_write_rotated(ch, log_buf, len, &tm_info);
+  if (len > 0) {
+    if (len >= (int)sizeof(log_buf))
+      len = sizeof(log_buf) - 1;
+    log_write_rotated(ch, log_buf, len, &tm_info);
+  }
+  release_config_snapshot(cfg);
 }
 
 // ============================================================================
@@ -5619,6 +5858,195 @@ void *axfr_worker_thread(void *arg) {
   pthread_exit(NULL);
 }
 
+#define ASYNC_IO_POOL_SIZE 16
+#define ASYNC_IO_QUEUE_CAPACITY 4096
+
+typedef struct {
+  bool is_tcp;
+  int active_fd; // For UDP, IPC socket to frontend
+  int client_fd; // For TCP, client socket
+  udp_ipc_t ipc_hdr;
+  uint8_t req_buf[UDP_DEFAULT_MAX_RES_LEN];
+  size_t req_len;
+  char client_ip[INET6_ADDRSTRLEN];
+  int client_port;
+  char qname[256];
+  uint16_t qtype;
+  uint16_t qclass;
+  bool has_edns;
+  bool dnssec_ok;
+  size_t question_end;
+  zone_db_snapshot_t *snap;
+} async_io_task_t;
+
+typedef struct {
+  async_io_task_t queue[ASYNC_IO_QUEUE_CAPACITY];
+  size_t head;
+  size_t tail;
+  size_t count;
+  pthread_mutex_t lock;
+  pthread_cond_t cond_not_empty;
+  pthread_t threads[ASYNC_IO_POOL_SIZE];
+  bool running;
+} async_io_pool_t;
+
+static async_io_pool_t g_async_io_pool;
+
+static bool enqueue_async_io_task(const async_io_task_t *task) {
+  pthread_mutex_lock(&g_async_io_pool.lock);
+  if (!g_async_io_pool.running || g_async_io_pool.count >= ASYNC_IO_QUEUE_CAPACITY) {
+    pthread_mutex_unlock(&g_async_io_pool.lock);
+    return false;
+  }
+  g_async_io_pool.queue[g_async_io_pool.tail] = *task;
+  g_async_io_pool.tail = (g_async_io_pool.tail + 1) % ASYNC_IO_QUEUE_CAPACITY;
+  g_async_io_pool.count++;
+  pthread_cond_signal(&g_async_io_pool.cond_not_empty);
+  pthread_mutex_unlock(&g_async_io_pool.lock);
+  return true;
+}
+
+static void *async_io_worker_func(void *arg) {
+  (void)arg;
+  compress_ctx_t thread_compress_ctx = {0};
+  while (1) {
+    pthread_mutex_lock(&g_async_io_pool.lock);
+    while (g_async_io_pool.running && g_async_io_pool.count == 0) {
+      pthread_cond_wait(&g_async_io_pool.cond_not_empty, &g_async_io_pool.lock);
+    }
+    if (!g_async_io_pool.running && g_async_io_pool.count == 0) {
+      pthread_mutex_unlock(&g_async_io_pool.lock);
+      break;
+    }
+    async_io_task_t task = g_async_io_pool.queue[g_async_io_pool.head];
+    g_async_io_pool.head = (g_async_io_pool.head + 1) % ASYNC_IO_QUEUE_CAPACITY;
+    g_async_io_pool.count--;
+    pthread_mutex_unlock(&g_async_io_pool.lock);
+
+    if (!task.is_tcp) {
+      // UDP async resolution
+      uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
+      uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
+      rate_limit_config_t *rrl_cfg = NULL;
+      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                      task.qname, task.qtype, task.client_ip,
+                                      &thread_compress_ctx, false, &rrl_cfg, task.snap);
+      release_zone_snapshot(task.snap);
+
+      if (res_len > 0) {
+        bool slip_triggered = false;
+        rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
+        if (rrl_check((struct sockaddr_storage *)&task.ipc_hdr.client_addr, cls, rrl_cfg, &slip_triggered)) {
+          submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
+                              res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
+          *res_msg = task.ipc_hdr;
+          res_msg->payload_len = res_len;
+          send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0);
+        } else if (slip_triggered) {
+          submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
+                              res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          res_buf[2] |= 0x02; // Set TC bit
+          res_buf[6] = 0; res_buf[7] = 0;
+          res_buf[8] = 0; res_buf[9] = 0;
+          res_buf[10] = 0; res_buf[11] = 0;
+          int qlen = (int)task.question_end;
+          if (qlen > res_len) qlen = res_len;
+          if (qlen > (int)task.req_len) qlen = (int)task.req_len;
+          udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
+          *res_msg = task.ipc_hdr;
+          res_msg->payload_len = qlen;
+          send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0);
+        } else {
+          submit_response_log(LOG_ACT_DROP_RRL, task.client_ip, task.client_port, task.qname,
+                              task.qclass, task.qtype, res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
+        }
+      } else {
+        submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
+                            0, 0, 0, false, false);
+      }
+    } else {
+      // TCP async resolution
+      uint8_t *tcp_res = malloc(65535);
+      if (tcp_res) {
+        int res_len = process_dns_query(task.req_buf, task.req_len, tcp_res, 65535,
+                                        task.qname, task.qtype, task.client_ip,
+                                        &thread_compress_ctx, true, NULL, task.snap);
+        release_zone_snapshot(task.snap);
+        if (res_len > 0) {
+          submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
+                              tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
+          send(task.client_fd, len_prefix, 2, 0);
+          send(task.client_fd, tcp_res, res_len, 0);
+        } else {
+          submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
+                              0, 0, 0, false, false);
+        }
+        free(tcp_res);
+      } else {
+        release_zone_snapshot(task.snap);
+      }
+      close(task.client_fd);
+      dec_tcp_clients();
+    }
+  }
+  return NULL;
+}
+
+static void init_async_io_pool(void) {
+  memset(&g_async_io_pool, 0, sizeof(g_async_io_pool));
+  pthread_mutex_init(&g_async_io_pool.lock, NULL);
+  pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
+  g_async_io_pool.running = true;
+  for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
+    pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, NULL);
+  }
+}
+
+static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
+  if (!view || !qname) return NULL;
+  size_t q_len = strlen(qname);
+  zone_db_entry_t *best_entry = NULL;
+  size_t longest_match_len = 0;
+  for (size_t i = 0; i < view->zone_count; i++) {
+    zone_db_entry_t *entry = view->entries[i];
+    if (!entry) continue;
+    size_t z_len = strlen(entry->domain);
+    bool match = false;
+    if (q_len == z_len && strcasecmp(qname, entry->domain) == 0) {
+      match = true;
+    } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
+               strcasecmp(qname + q_len - z_len, entry->domain) == 0) {
+      match = true;
+    }
+    if (match && z_len > longest_match_len) {
+      longest_match_len = z_len;
+      best_entry = entry;
+    }
+  }
+  return best_entry;
+}
+
+static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
+  if (!snap || !qname) return false;
+  view_snapshot_t *view = select_view(snap, client_ip);
+  if (!view) return false;
+  server_config_t *cfg = acquire_config_snapshot();
+  if (!cfg) return false;
+
+  bool is_synth = false;
+  zone_db_entry_t *entry = find_zone_in_view(view, qname);
+  if (entry) {
+    zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, entry->domain);
+    if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "program") == 0 || strcasecmp(zcfg->type, "forward") == 0)) {
+      is_synth = true;
+    }
+  }
+  release_config_snapshot(cfg);
+  return is_synth;
+}
+
 static bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
     for (int i = 0; i < acl_count; i++) {
         char *rule = acl_list[i];
@@ -5644,8 +6072,7 @@ void *worker_thread_func(void *arg) {
   if (kq < 0)
     goto worker_startup_failed;
   int opt = 1;
-  server_config_t *active_cfg =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  server_config_t *active_cfg = acquire_config_snapshot();
   int port = active_cfg && active_cfg->port > 0 ? active_cfg->port : DNS_PORT;
   int bind_count = active_cfg ? active_cfg->bind_address_count : 0;
 
@@ -5721,6 +6148,7 @@ void *worker_thread_func(void *arg) {
       }
     }
   }
+  release_config_snapshot(active_cfg);
 
   // FrontendからのUDP転送を受け取るIPCパイプをkqueueに登録 (udata=1)
   int my_ipc_fd = g_ipc_fds[ctx->thread_id][1];
@@ -5757,10 +6185,9 @@ worker_startup_success:;
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
-        tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
-        close(client_fd);
-        dec_tcp_clients();
-        free(ctx_tcp);
+        // SHUT_RDWRによりソケットをEOF状態にし、同一バッチ内または次回の
+        // EVFILT_READイベントで安全にリソースを回収(free)させる
+        shutdown(client_fd, SHUT_RDWR);
       } else if (ev_list[i].udata == (void *)1) {
         // UDP (IPC経由)
         int active_fd = ev_list[i].ident; // my_ipc_fd
@@ -5811,14 +6238,18 @@ worker_startup_success:;
                   qname[written++] = '.';
               }
               if (offset + len <= recv_len) {
-                size_t copy_len = len;
-                if (written >= 255)
-                  copy_len = 0;
-                else if (written + copy_len > 255)
-                  copy_len = 255 - written;
-                if (copy_len > 0) {
-                  memcpy(&qname[written], &req_buf[offset], copy_len);
-                  written += copy_len;
+                for (size_t b = 0; b < len; b++) {
+                  uint8_t c = req_buf[offset + b];
+                  if (c == '.' || c == '\\') {
+                    if (written + 2 < 255) {
+                      qname[written++] = '\\';
+                      qname[written++] = (char)c;
+                    }
+                  } else {
+                    if (written < 255) {
+                      qname[written++] = (char)c;
+                    }
+                  }
                 }
               }
               offset += len;
@@ -5908,10 +6339,33 @@ worker_startup_success:;
           write_query_log(client_ip, client_port, qname, qclass, qtype,
                           has_edns, dnssec_ok);
 
+          zone_db_snapshot_t *snap = acquire_zone_snapshot();
+          if (is_zone_synthetic_type(snap, client_ip, qname)) {
+            async_io_task_t task = {0};
+            task.is_tcp = false;
+            task.active_fd = active_fd;
+            task.ipc_hdr = *ipc_msg;
+            task.req_len = payload_received > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : payload_received;
+            memcpy(task.req_buf, req_buf, task.req_len);
+            strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
+            task.client_port = client_port;
+            strncpy(task.qname, qname, sizeof(task.qname) - 1);
+            task.qtype = qtype;
+            task.qclass = qclass;
+            task.has_edns = has_edns;
+            task.dnssec_ok = dnssec_ok;
+            task.question_end = question_end;
+            task.snap = snap;
+            if (!enqueue_async_io_task(&task)) {
+              release_zone_snapshot(snap);
+              submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+            }
+            continue;
+          }
+
           uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
           uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
           rate_limit_config_t *rrl_cfg = NULL;
-          zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int res_len =
               process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
                                 qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
@@ -6006,6 +6460,15 @@ worker_startup_success:;
         // TCP 既存処理
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
+        if (ev_list[i].flags & (EV_EOF | EV_ERROR)) {
+          struct kevent ev_del;
+          EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+          kevent(kq, &ev_del, 1, NULL, 0, NULL);
+          close(client_fd);
+          dec_tcp_clients();
+          free(ctx_tcp);
+          continue;
+        }
         uint8_t *msg;
         uint16_t msg_len;
         int ret = read_dns_tcp_message(client_fd, ctx_tcp, &msg, &msg_len);
@@ -6037,14 +6500,18 @@ worker_startup_success:;
                   qname[written++] = '.';
               }
               if (offset + len <= msg_len) {
-                size_t copy_len = len;
-                if (written >= 255)
-                  copy_len = 0;
-                else if (written + copy_len > 255)
-                  copy_len = 255 - written;
-                if (copy_len > 0) {
-                  memcpy(&qname[written], &msg[offset], copy_len);
-                  written += copy_len;
+                for (size_t b = 0; b < len; b++) {
+                  uint8_t c = msg[offset + b];
+                  if (c == '.' || c == '\\') {
+                    if (written + 2 < 255) {
+                      qname[written++] = '\\';
+                      qname[written++] = (char)c;
+                    }
+                  } else {
+                    if (written < 255) {
+                      qname[written++] = (char)c;
+                    }
+                  }
                 }
               }
               offset += len;
@@ -6099,8 +6566,7 @@ worker_startup_success:;
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
-          server_config_t *cfg =
-              atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+          server_config_t *cfg = acquire_config_snapshot();
           zone_config_t *zcfg = xfr_view
               ? find_zone_config_in_view(cfg, xfr_view->name, qname)
               : NULL;
@@ -6186,6 +6652,7 @@ worker_startup_success:;
                   allowed = tsig_ok;
               }
             }
+            release_config_snapshot(cfg);
             zone_db_entry_t *entry = NULL;
             if (xfr_view) {
               for (size_t i = 0; i < xfr_view->zone_count; i++) {
@@ -6300,6 +6767,34 @@ worker_startup_success:;
             }
             free(ctx_tcp);
           } else {
+            if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
+              struct kevent ev_del;
+              EV_SET(&ev_del, client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+              kevent(kq, &ev_del, 1, NULL, 0, NULL);
+
+              async_io_task_t task = {0};
+              task.is_tcp = true;
+              task.client_fd = client_fd;
+              task.req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
+              memcpy(task.req_buf, msg, task.req_len);
+              strncpy(task.client_ip, ctx_tcp->client_ip, sizeof(task.client_ip) - 1);
+              task.client_port = client_port;
+              strncpy(task.qname, qname, sizeof(task.qname) - 1);
+              task.qtype = qtype;
+              task.qclass = qclass;
+              task.has_edns = has_edns;
+              task.dnssec_ok = dnssec_ok;
+              task.question_end = 0;
+              task.snap = snap;
+              free(ctx_tcp);
+
+              if (!enqueue_async_io_task(&task)) {
+                release_zone_snapshot(snap);
+                close(client_fd);
+                dec_tcp_clients();
+              }
+              continue;
+            }
             uint8_t *tcp_res = malloc(65535);
             if (tcp_res) {
               int res_len = process_dns_query(msg, msg_len, tcp_res, 65535,
@@ -6321,15 +6816,18 @@ worker_startup_success:;
               release_zone_snapshot(snap);
             }
             
-            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-            if (cfg && cfg->tcp_connection_reuse) {
+            server_config_t *cfg = acquire_config_snapshot();
+            bool reuse = (cfg && cfg->tcp_connection_reuse);
+            uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
+            release_config_snapshot(cfg);
+            if (reuse) {
               ctx_tcp->state = TCP_STATE_READ_LEN;
               ctx_tcp->accumulated = 0;
               ctx_tcp->msg_len = 0;
               
               struct kevent ev_timeout;
               EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
-                     cfg->tcp_idle_timeout > 0 ? cfg->tcp_idle_timeout : 10000, ctx_tcp);
+                     idle_timeout, ctx_tcp);
               kevent(kq, &ev_timeout, 1, NULL, 0, NULL);
               
               // Event EVFILT_READ is already added with EV_ADD | EV_CLEAR
@@ -6411,6 +6909,15 @@ static void perform_config_reload_ext(bool skip_unchanged) {
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
   
+  // 既存のリーダーが参照を終えるのを待機
+  int retries = 0;
+  useconds_t sleep_time = 1;
+  while (atomic_load_explicit(&standby->reader_count, memory_order_acquire) > 0) {
+    if (retries < 100) sched_yield();
+    else { usleep(sleep_time); if (sleep_time < 100000) sleep_time *= 2; }
+    retries++;
+  }
+  
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
     if (geteuid() == 0 && !standby->user) {
@@ -6461,18 +6968,31 @@ static void perform_config_reload_ext(bool skip_unchanged) {
   free(config_str);
 }
 
-static const char *find_configured_domain(const char *arg) {
-  server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+static const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
+  if (!out_buf || out_size == 0) return arg;
+  snprintf(out_buf, out_size, "%s", arg);
+  server_config_t *active = acquire_config_snapshot();
+  if (!active) return out_buf;
   zone_config_t *zcfg = active->zones;
   size_t arg_len = strlen(arg);
   while (zcfg) {
     size_t z_len = strlen(zcfg->domain);
-    if (strcasecmp(zcfg->domain, arg) == 0) return zcfg->domain;
-    if (arg_len + 1 == z_len && zcfg->domain[z_len - 1] == '.' && strncasecmp(zcfg->domain, arg, arg_len) == 0) return zcfg->domain;
-    if (z_len + 1 == arg_len && arg[arg_len - 1] == '.' && strncasecmp(zcfg->domain, arg, z_len) == 0) return zcfg->domain;
+    if (strcasecmp(zcfg->domain, arg) == 0) {
+      snprintf(out_buf, out_size, "%s", zcfg->domain);
+      break;
+    }
+    if (arg_len + 1 == z_len && zcfg->domain[z_len - 1] == '.' && strncasecmp(zcfg->domain, arg, arg_len) == 0) {
+      snprintf(out_buf, out_size, "%s", zcfg->domain);
+      break;
+    }
+    if (z_len + 1 == arg_len && arg[arg_len - 1] == '.' && strncasecmp(zcfg->domain, arg, z_len) == 0) {
+      snprintf(out_buf, out_size, "%s", zcfg->domain);
+      break;
+    }
     zcfg = zcfg->next;
   }
-  return arg;
+  release_config_snapshot(active);
+  return out_buf;
 }
 
 void *control_thread_func(void *arg) {
@@ -6585,8 +7105,9 @@ void *control_thread_func(void *arg) {
         if (nl) {
           *nl = '\0';
           if (c->state == CTRL_STATE_AUTH_WAIT) {
-            server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-            if (strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
+            server_config_t *cfg = acquire_config_snapshot();
+            bool auth_ok = false;
+            if (cfg && strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
               char *client_hmac = c->buf + 5;
               unsigned char md[EVP_MAX_MD_SIZE];
               unsigned int md_len;
@@ -6597,13 +7118,13 @@ void *control_thread_func(void *arg) {
               
               if (strlen(client_hmac) == strlen(expected) &&
                   const_time_memcmp(client_hmac, expected, strlen(expected)) == 0) {
-                send(cfd, "OK\n", 3, 0);
-                c->state = CTRL_STATE_CMD_WAIT;
-              } else {
-                send(cfd, "AUTH_FAILED\n", 12, 0);
-                free_ctrl_client(cfd);
-                continue;
+                auth_ok = true;
               }
+            }
+            release_config_snapshot(cfg);
+            if (auth_ok) {
+              send(cfd, "OK\n", 3, 0);
+              c->state = CTRL_STATE_CMD_WAIT;
             } else {
               send(cfd, "AUTH_FAILED\n", 12, 0);
               free_ctrl_client(cfd);
@@ -6627,9 +7148,10 @@ void *control_thread_func(void *arg) {
             
             if (strcmp(cmd, "reload") == 0) {
               if (arg && strlen(arg) > 0) {
-                const char *canon_arg = find_configured_domain(arg);
+                char canon_buf[256];
+                const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
                 zone_db_snapshot_t *snap = acquire_zone_snapshot();
-                server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+                server_config_t *active = acquire_config_snapshot();
                 zone_lookup_result_t lr = {0};
                 int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
                 if (nmatches == 0) {
@@ -6670,6 +7192,7 @@ void *control_thread_func(void *arg) {
                 } else {
                   send(cfd, "ERROR zone not found\n", 21, 0);
                 }
+                release_config_snapshot(active);
                 release_zone_snapshot(snap);
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
@@ -6701,10 +7224,8 @@ void *control_thread_func(void *arg) {
                 for (size_t v = 0; v < snap->view_count; v++) {
                   st.num_zones += snap->views[v].zone_count;
                 }
-              } else {
-                st.num_zones = 0;
+                release_zone_snapshot(snap);
               }
-              release_zone_snapshot(snap);
 
               st.xfers_running = atomic_load_explicit(&g_xfers_running, memory_order_relaxed);
               st.tcp_clients = atomic_load_explicit(&g_tcp_clients, memory_order_relaxed);
@@ -6716,9 +7237,10 @@ void *control_thread_func(void *arg) {
               }
               st.frontend_alive = atomic_load(&g_frontend_alive);
               
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               st.query_logging = (active_cfg && active_cfg->logging.queries_channel != NULL);
               st.response_logging = (active_cfg && active_cfg->logging.responses_channel != NULL);
+              release_config_snapshot(active_cfg);
               
               st.rrl_dropped = atomic_load_explicit(&g_rrl_dropped_total, memory_order_relaxed);
               st.rrl_slipped = atomic_load_explicit(&g_rrl_slip_total, memory_order_relaxed);
@@ -6739,9 +7261,10 @@ void *control_thread_func(void *arg) {
               msg.msg_iovlen = 2;
               sendmsg(cfd, &msg, 0);
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
-              const char *canon_arg = find_configured_domain(arg);
+              char canon_buf[256];
+              const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
@@ -6756,11 +7279,13 @@ void *control_thread_func(void *arg) {
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
-              const char *canon_arg = find_configured_domain(arg);
+              char canon_buf[256];
+              const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
@@ -6775,11 +7300,13 @@ void *control_thread_func(void *arg) {
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "retransfer") == 0 && arg) {
-              const char *canon_arg = find_configured_domain(arg);
+              char canon_buf[256];
+              const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+              server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
               if (nmatches == 0) {
@@ -6794,6 +7321,7 @@ void *control_thread_func(void *arg) {
               } else {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               }
+              release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
             } else {
               syslog(LOG_ERR, "[Control] Received unknown command: %s", cmd);
@@ -6813,8 +7341,7 @@ void *control_thread_func(void *arg) {
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
-        server_config_t *active =
-            atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+        server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_zone_snapshot();
         if (snap) {
             for (size_t v = 0; v < snap->view_count; v++) {
@@ -6855,7 +7382,7 @@ void *control_thread_func(void *arg) {
                         if (last_ok > 0 && expire > 0 && (now - last_ok) > expire) {
                             time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
                             if (now - last_log > 900) {
-                                if (active->serve_stale) {
+                                if (active && active->serve_stale) {
                                     syslog(LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
                                 } else {
                                     syslog(LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
@@ -6881,7 +7408,7 @@ void *control_thread_func(void *arg) {
                                     strncpy(bg_ctx->domain, entry->domain, sizeof(bg_ctx->domain) - 1);
                                     bg_ctx->entry = entry;
                                     
-                                    if (tsig_key_name[0] != '\0') {
+                                    if (tsig_key_name[0] != '\0' && active) {
                                         tsig_key_t *k = active->keys;
                                         while (k) {
                                             if (strcmp(k->name, tsig_key_name) == 0) {
@@ -6911,6 +7438,7 @@ void *control_thread_func(void *arg) {
             }
             release_zone_snapshot(snap);
         }
+        release_config_snapshot(active);
       }
     }
   }
@@ -6932,11 +7460,12 @@ static void run_frontend_router(pid_t backend_pid) {
     close(g_control_sock);
     g_control_sock = -1;
   }
-  server_config_t *cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  if (cfg->user) {
+  server_config_t *cfg = acquire_config_snapshot();
+  if (cfg && cfg->user) {
     struct passwd *pwd = getpwnam(cfg->user);
     if (!pwd) {
       syslog(LOG_ERR, "[Frontend] user '%s' not found, aborting privilege drop", cfg->user);
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
     gid_t target_gid = pwd->pw_gid;
@@ -6944,36 +7473,42 @@ static void run_frontend_router(pid_t backend_pid) {
       struct group *grp = getgrnam(cfg->group);
       if (!grp) {
         syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+        release_config_snapshot(cfg);
         exit(EXIT_FAILURE);
       }
       target_gid = grp->gr_gid;
     }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); exit(EXIT_FAILURE); }
-    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); exit(EXIT_FAILURE); }
-    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend] setuid failed: %m"); exit(EXIT_FAILURE); }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend] setuid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
     
     if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid || getgid() != target_gid || getegid() != target_gid) {
       syslog(LOG_ERR, "[Frontend] privilege drop verification failed");
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
-  } else if (cfg->group) {
+  } else if (cfg && cfg->group) {
     struct group *grp = getgrnam(cfg->group);
     if (!grp) {
       syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); exit(EXIT_FAILURE); }
-    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); exit(EXIT_FAILURE); }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
     
     if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
       syslog(LOG_ERR, "[Frontend] privilege drop verification failed (group only)");
+      release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
   } else if (geteuid() == 0) {
     syslog(LOG_ERR, "[Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
     fprintf(stderr, "[ERROR] [Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
+    release_config_snapshot(cfg);
     exit(EXIT_FAILURE);
   }
+  release_config_snapshot(cfg);
 
   int kq = kqueue();
   if (kq < 0)
@@ -7434,6 +7969,7 @@ int main(int argc, char **argv) {
   for (int i = 0; i < g_num_udp_fds; i++)
     close(g_udp_fds[i]);
   close(g_notify_ipc[0]);
+  init_async_io_pool();
 
   pthread_t control_thread;
   if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
@@ -7522,8 +8058,13 @@ int main(int argc, char **argv) {
     pthread_join(threads[i], NULL);
   pthread_join(control_thread, NULL);
 
-  server_config_t *active =
-      atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  free_server_config_fields(active);
+  server_config_t *active = acquire_config_snapshot();
+  if (active) {
+    release_config_snapshot(active);
+    while (atomic_load_explicit(&active->reader_count, memory_order_acquire) > 0) {
+      sched_yield();
+    }
+    free_server_config_fields(active);
+  }
   return 0;
 }

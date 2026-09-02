@@ -91,6 +91,7 @@ normalize_output() {
         -e 's/;; communications error to [0-9a-fA-F.:#]+: end of file/;; communications error to <SERVER>: end of file/g' \
         -e 's/;; communications error to [0-9a-fA-F.:#]+: connection refused/;; communications error to <SERVER>: connection refused/g' \
         -e 's/;; UDP setup with [0-9a-fA-F.:#()]+( for [^ ]+)? failed: .*/;; UDP setup with <SERVER> failed: <ERR>/g' \
+        -e 's/;; Received ([0-9]+ bytes from [0-9a-fA-F.:#]+)\([^)]+\) in /;; Received \1 in /g' \
         -e '/;; (no usable response received|connection failed|no servers could be reached)/d' \
         -e '/^;; === MULTI-SERVER COMPARISON SUMMARY ===/,$d' \
         -e 's/\x1b\[[0-9;]*m//g' \
@@ -436,6 +437,18 @@ EOF
     compare_query "Negative: Unassignable bind address (-b)" "www.example.com A -b 192.0.2.1 +tries=1 +timeout=1"
     compare_query "Negative: Unreachable port" "www.example.com A -p 19999 +tries=1 +timeout=1"
     compare_query "Negative: Unknown record type" "www.example.com UNKNOWNTYPE"
+
+    echo "--------------------------------------------------------"
+    echo "18. Edge Cases & Protocol Audit (TSIG, SVCB/HTTPS, ZONEMD, Padding)"
+    echo "--------------------------------------------------------"
+    compare_query "Audit: SVCB query" "www.example.com SVCB"
+    compare_query "Audit: HTTPS query" "www.example.com HTTPS"
+    compare_query "Audit: TSIG signed query with +trace (+trace -y)" "example.com +trace -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= +timeout=2"
+    compare_query "Audit: TSIG signed query with +nssearch (+nssearch -y)" "example.com +nssearch -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= +timeout=2"
+    compare_query "Audit: TSIG signed query with +dns64prefix (+dns64prefix -y)" "ipv4only.arpa AAAA +dns64prefix -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= +timeout=2"
+    compare_query "Audit: ZONEMD record query" "example.com TYPE63"
+    compare_query "Audit: ZONEMD with YAML (+yaml)" "example.com TYPE63 +yaml"
+    compare_query "Audit: EDNS padding with explicit size (+padding=512)" "www.example.com A +padding=512 +qr"
 fi
 
 echo "========================================================"

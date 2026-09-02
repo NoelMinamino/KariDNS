@@ -347,8 +347,11 @@ sub process_query_packet {
         rdata-opt-truncated cookie-badcookie truncated-tc rcode-formerr
         rcode-servfail rcode-nxdomain rcode-notimp rcode-refused rcode-yxdomain
         rcode-yxrrset rcode-nxrrset rcode-notauth rcode-notzone ede-prohibited
-        ede-long-text drop
+        ede-long-text ede-all ede-all2 drop
     );
+    for my $c (0 .. 29) {
+        $KNOWN_SCENARIOS{"ede-$c"} = 1;
+    }
 
     my $qname_clean = lc($qname);
     $qname_clean =~ s/\.+$//; # Strip trailing dots
@@ -360,7 +363,7 @@ sub process_query_packet {
     my $scenario = '';
     my $zone_apex = '';
 
-    if (exists $KNOWN_SCENARIOS{$first_label}) {
+    if (exists $KNOWN_SCENARIOS{$first_label} || $first_label =~ /^ede-(\d+)$/ || $first_label =~ /^ede-all2?$/) {
         $scenario = $first_label;
         $zone_apex = $rest_domain ne '' ? $rest_domain : $qname_clean;
     } else {
@@ -423,6 +426,9 @@ sub process_query_packet {
             "  rcode-notzone.$display_zone             - Returns NOTZONE (RCODE 10)",
             "",
             "[Extended DNS Errors (EDE)]",
+            "  ede-0 .. ede-29.$display_zone           - Individual EDE Code 0..29",
+            "  ede-all.$display_zone                   - All 30 EDE options in a single response",
+            "  ede-all2.$display_zone                  - All 30 EDE options duplicated (2x each)",
             "  ede-prohibited.$display_zone            - EDE Code 18 (Prohibited)",
             "  ede-long-text.$display_zone             - EDE with long description string",
             "",
@@ -646,6 +652,39 @@ sub process_query_packet {
     # --------------------------------------------------------------------------
     # 6. Extended DNS Errors (EDE, RFC 8914)
     # --------------------------------------------------------------------------
+    if ($scenario eq 'ede-all') {
+        my $pkt = $id_raw . pack('n5', 0x8402, 1, 0, 0, 1);
+        $pkt .= $question_wire;
+        my $ede_opts = '';
+        for my $code (0 .. 29) {
+            my $ede_text = "EDE code $code test description";
+            $ede_opts .= pack('nnn', 15, length($ede_text) + 2, $code) . $ede_text;
+        }
+        $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, length($ede_opts)) . $ede_opts;
+        return $pkt;
+    }
+    if ($scenario eq 'ede-all2') {
+        my $pkt = $id_raw . pack('n5', 0x8402, 1, 0, 0, 1);
+        $pkt .= $question_wire;
+        my $ede_opts = '';
+        for my $code (0 .. 29) {
+            for my $rep (1 .. 2) {
+                my $ede_text = "EDE code $code duplicate #$rep test description";
+                $ede_opts .= pack('nnn', 15, length($ede_text) + 2, $code) . $ede_text;
+            }
+        }
+        $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, length($ede_opts)) . $ede_opts;
+        return $pkt;
+    }
+    if ($scenario =~ /^ede-(\d+)$/) {
+        my $code = int($1);
+        my $pkt = $id_raw . pack('n5', 0x8402, 1, 0, 0, 1);
+        $pkt .= $question_wire;
+        my $ede_text = "EDE code $code test description";
+        my $ede_opt = pack('nnn', 15, length($ede_text) + 2, $code) . $ede_text;
+        $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, length($ede_opt)) . $ede_opt;
+        return $pkt;
+    }
     if ($scenario eq 'ede-prohibited') {
         my $pkt = $id_raw . pack('n5', 0x8405, 1, 0, 0, 1);
         $pkt .= $question_wire;

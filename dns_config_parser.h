@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include "dns_wire.h"
@@ -130,6 +131,7 @@ typedef struct server_config_s {
   int udp_recvbuf_size;
   int udp_sndbuf_size;
   bool allow_program_zones; /* 既定 false。trueでない限り type program は起動時エラーで拒否 */
+  _Atomic int reader_count;
 } server_config_t;
 
 #define MAX_INCLUDE_DEPTH 16
