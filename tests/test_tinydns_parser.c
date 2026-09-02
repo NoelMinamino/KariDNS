@@ -405,6 +405,96 @@ static void test_config_file_format(void) {
     free_server_config_fields(&cfg);
 }
 
+/* ============================================================================
+ * Test 7: timestamp 評価とカウントダウンTTL検証
+ * ============================================================================ */
+static void test_timestamp_evaluation(void) {
+    printf("--- Test 7: Timestamp Evaluation & Countdown TTL ---\n");
+
+    time_t now = time(NULL);
+
+    // 1. アクティベーション時刻 (ttl != 0)
+    // 過去のタイムスタンプ: 2001-09-09 (0x400000003b9aca00) -> 有効、生成される
+    // 未来のタイムスタンプ: 2065-01-24 (0x40000000b2d05e00) -> 未到来、スキップされる
+    const char *act_data =
+        "+act_past.example.com:192.168.1.1:300:400000003b9aca00\n"
+        "+act_future.example.com:192.168.1.2:300:40000000b2d05e00\n";
+
+    {
+        char buf[512]; strcpy(buf, act_data);
+        zone_arena_t arena; zone_arena_init(&arena);
+        parse_error_t err = {0};
+        parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+
+        int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
+        TEST_ASSERT(count == 1, "Activation timestamp: 1 record generated");
+        TEST_ASSERT(arena.count == 1, "Arena count is 1");
+        if (arena.count == 1) {
+            TEST_ASSERT(strcmp(arena.records[0].name, "act_past.example.com.") == 0, "Past activation record included");
+            TEST_ASSERT(arena.records[0].ttl_value == 300, "TTL preserved");
+        }
+        zone_arena_destroy(&arena);
+    }
+
+    // 2. カウントダウンTTL (ttl == 0)
+    // 過去のタイムスタンプ -> 期限切れ、スキップされる
+    // 未来のタイムスタンプ (now + 300秒) -> 有効、TTLが [2, 3600] の範囲にクランプ
+    uint64_t ts_past_tai = 4611686018427387904ULL + 1000000000ULL; // 過去
+    uint64_t ts_future_tai = 4611686018427387904ULL + (uint64_t)(now + 300); // 未来 (約300秒後)
+
+    char count_data[512];
+    snprintf(count_data, sizeof(count_data),
+        "+cnt_past.example.com:192.168.1.3:0:%016llx\n"
+        "+cnt_future.example.com:192.168.1.4:0:%016llx\n",
+        (unsigned long long)ts_past_tai, (unsigned long long)ts_future_tai);
+
+    {
+        zone_arena_t arena; zone_arena_init(&arena);
+        parse_error_t err = {0};
+        parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+
+        int count = parse_tinydns_data(count_data, strlen(count_data), &arena, &ctx);
+        TEST_ASSERT(count == 1, "Countdown TTL: 1 record generated");
+        TEST_ASSERT(arena.count == 1, "Arena count is 1");
+        if (arena.count == 1) {
+            TEST_ASSERT(strcmp(arena.records[0].name, "cnt_future.example.com.") == 0, "Future expiration record included");
+            TEST_ASSERT(arena.records[0].ttl_value >= 2 && arena.records[0].ttl_value <= 3600, "Countdown TTL within [2, 3600]");
+        }
+        zone_arena_destroy(&arena);
+    }
+
+    // 3. 不正な16進数文字を含むタイムスタンプ (ttdparseの緩さ検証) -> エラーにならず継続
+    const char *invalid_hex_data =
+        "+badhex.example.com:192.168.1.5:300:400000003b9acZ00\n"; // 'Z' は0として扱われる
+    {
+        char buf[256]; strcpy(buf, invalid_hex_data);
+        zone_arena_t arena; zone_arena_init(&arena);
+        parse_error_t err = {0};
+        parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+
+        int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
+        TEST_ASSERT(count == 1, "Invalid hex chars in timestamp do not cause error");
+        zone_arena_destroy(&arena);
+    }
+
+    // 4. timestamp フィールドが空 -> 従来通りの TTL で生成 (回帰確認)
+    const char *empty_ts_data =
+        "+notimestamp.example.com:192.168.1.6:300\n";
+    {
+        char buf[256]; strcpy(buf, empty_ts_data);
+        zone_arena_t arena; zone_arena_init(&arena);
+        parse_error_t err = {0};
+        parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+
+        int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
+        TEST_ASSERT(count == 1, "Empty timestamp field parsed normally");
+        if (arena.count == 1) {
+            TEST_ASSERT(arena.records[0].ttl_value == 300, "TTL is 300");
+        }
+        zone_arena_destroy(&arena);
+    }
+}
+
 int main(void) {
     printf("==================================================\n");
     printf(" Running KariDNS tinydns Parser Tests (djbdns 1.05)\n");
@@ -416,6 +506,7 @@ int main(void) {
     test_generic_record_prohibited_types();
     test_zone_filtering_and_parent_child();
     test_config_file_format();
+    test_timestamp_evaluation();
 
     printf("==================================================\n");
     printf(" Test Results: %d / %d Passed\n", pass_count, test_count);

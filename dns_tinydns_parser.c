@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <syslog.h>
 #include <time.h>
+#include <math.h>
 
 #define TTL_NS 259200UL
 #define TTL_POSITIVE 86400UL
@@ -172,6 +173,80 @@ static bool tinydns_ip4_scan(const char *s, size_t len, uint8_t ip[4]) {
     return true;
 }
 
+#define TAI64_UNIX_EPOCH_OFFSET 4611686018427387904ULL /* 0x4000000000000000 */
+
+/* timestampフィールド(0〜16桁の16進数)をUnix時刻へ変換する。
+ * ttdparse()と同じ緩さ: 不正な文字は0として扱い、16桁未満なら
+ * 残りをゼロ埋めする。エラーは返さない。
+ * フィールドが完全に空(flen==0)の場合は *has_ts に false を設定する。 */
+static void tinydns_parse_timestamp(const char *field, size_t flen, bool *has_ts, time_t *out_unix) {
+    if (flen == 0) {
+        *has_ts = false;
+        *out_unix = 0;
+        return;
+    }
+    uint64_t tai64 = 0;
+    for (size_t i = 0; i < 16; i++) {
+        int nibble = 0;
+        if (i < flen) {
+            char ch = field[i];
+            if (ch >= '0' && ch <= '9') nibble = ch - '0';
+            else if (ch >= 'a' && ch <= 'f') nibble = ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F') nibble = ch - 'A' + 10; /* ttdparse本体は大文字A-Fを
+                                                                        受け付けないが、実用上は
+                                                                        許容しておいて害はない */
+            else nibble = 0;
+        }
+        tai64 = (tai64 << 4) | (uint64_t)nibble;
+    }
+    *has_ts = true;
+    if (tai64 < TAI64_UNIX_EPOCH_OFFSET) {
+        *out_unix = 0; /* 変換不能なほど小さい値。実運用ではまず起こらない */
+    } else {
+        *out_unix = (time_t)(tai64 - TAI64_UNIX_EPOCH_OFFSET);
+    }
+}
+
+/* 注意: これは案B(ロード時評価)の実装であり、本家tinydnsのように
+ * クエリごとにリアルタイムで再評価されるわけではない。
+ * timestampを跨いだ切り替わりや、カウントダウンTTLの正確な減少は、
+ * ゾーンファイルが次にリロードされるまで反映されない。
+ * 真にリアルタイムな評価(案A)が必要になった場合は、
+ * dns_record_t にtimestamp情報を持たせた上でresolve_name()側に
+ * 判定ロジックを追加する、より大きな変更が必要になる。
+ *
+ * セクション0の仕様に基づき、レコードを生成すべきか・実効TTLはいくつかを判定する。
+ * 戻り値 true: レコードを生成する(*ttl_outが実効TTL)
+ * 戻り値 false: レコードをスキップする(呼び出し側は何も生成しない) */
+static bool tinydns_apply_timestamp(const char *ts_field, size_t ts_len,
+                                    unsigned long ttl_in, unsigned long *ttl_out) {
+    bool has_ts = false;
+    time_t cutoff = 0;
+    tinydns_parse_timestamp(ts_field, ts_len, &has_ts, &cutoff);
+
+    if (!has_ts) {
+        *ttl_out = ttl_in;
+        return true;
+    }
+
+    time_t now = time(NULL);
+
+    if (ttl_in != 0) {
+        /* アクティベーション時刻としてのtimestamp */
+        if (cutoff >= now) return false;
+        *ttl_out = ttl_in;
+        return true;
+    }
+
+    /* カウントダウンTTL(有効期限としてのtimestamp) */
+    if (cutoff < now) return false;
+    double remaining = difftime(cutoff, now);
+    if (remaining < 2.0) remaining = 2.0;
+    if (remaining > 3600.0) remaining = 3600.0;
+    *ttl_out = (unsigned long)remaining;
+    return true;
+}
+
 /* ============================================================================
  * ヘルパー: x展開ルール (., &, @ 用)
  * xに '.' が含まれていなければ x + suffix + fqdn として展開
@@ -260,6 +335,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_NS;
             if (flen[3] > 0) ttl = strtoul(f[3], NULL, 10);
+            if (!tinydns_apply_timestamp(f[4], flen[4], ttl, &ttl)) return true; /* スキップ */
 
             if (typech == '.') {
                 // SOA レコード
@@ -331,6 +407,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+            if (!tinydns_apply_timestamp(f[3], flen[3], ttl, &ttl)) return true; /* スキップ */
 
             uint8_t ip[4];
             if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
@@ -387,6 +464,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[4] > 0) ttl = strtoul(f[4], NULL, 10);
+            if (!tinydns_apply_timestamp(f[5], flen[5], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 dns_record_t *mx_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "MX", 15, ttl);
@@ -426,6 +504,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+            if (!tinydns_apply_timestamp(f[3], flen[3], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 size_t raw_len = 0;
@@ -502,6 +581,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+            if (!tinydns_apply_timestamp(f[3], flen[3], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 const char *tname = (typech == 'C') ? "CNAME" : "PTR";
@@ -548,6 +628,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[7] > 0) min = strtoul(f[7], NULL, 10);
             unsigned long ttl = TTL_NEGATIVE;
             if (flen[8] > 0) ttl = strtoul(f[8], NULL, 10);
+            if (!tinydns_apply_timestamp(f[9], flen[9], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, ttl);
@@ -606,6 +687,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[3] > 0) ttl = strtoul(f[3], NULL, 10);
+            if (!tinydns_apply_timestamp(f[4], flen[4], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 size_t raw_len = 0;
