@@ -6107,11 +6107,15 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     }
 
     server_result_t *sres = NULL;
+    bool retry_tcp = false;
+    bool tc_retried = false;
 
-    struct timespec start_ts;
-    clock_gettime(CLOCK_MONOTONIC, &start_ts);
-    
-    axfr_state_t axfr_state = {0};
+    do {
+        retry_tcp = false;
+        struct timespec start_ts;
+        clock_gettime(CLOCK_MONOTONIC, &start_ts);
+        
+        axfr_state_t axfr_state = {0};
         axfr_state.is_axfr = (qtype == 252 || qtype == 251);
         axfr_state.is_ixfr = (qtype == 251);
 
@@ -6185,30 +6189,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
             } else {
                 n = do_udp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
-                if (n >= 4 && (resp[2] & 0x02) != 0) {
-                    if (eff_qo.ignore_tc) {
-                        if (!dopt->short_mode && !dopt->yaml) {
-                            fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
-                        }
-                    } else {
-                        if (!dopt->short_mode && !dopt->yaml) {
-                            fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
-                        }
-                        use_tcp = true;
-                        if (eff_qo.keep_tcp_open) {
-                            n = do_tcp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
-                        } else {
-                            tcp_sock = do_tcp_send_request(server, port, &eff_qo, pkt, pkt_len, eff_qo.timeout_sec);
-                            if (tcp_sock >= 0) {
-                                n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
-                                if (n <= 0) {
-                                    close(tcp_sock);
-                                    tcp_sock = -1;
-                                }
-                            }
-                        }
-                    }
-                }
                 if (n >= 0) break;
             }
             if (attempts < max_tries) {
@@ -6530,9 +6510,26 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
         if (tcp_sock >= 0) close(tcp_sock);
 
-        if (qo->check_dns64prefix) {
-            run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
+        bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
+        if (is_truncated && !tc_retried) {
+            if (eff_qo.ignore_tc) {
+                if (!dopt->short_mode && !dopt->yaml) {
+                    fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
+                }
+            } else {
+                if (!dopt->short_mode && !dopt->yaml) {
+                    printf("\n;; Truncated, retrying in TCP mode.\n");
+                }
+                use_tcp = true;
+                retry_tcp = true;
+                tc_retried = true;
+            }
         }
+    } while (retry_tcp);
+
+    if (qo->check_dns64prefix) {
+        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
+    }
 
     return 0;
 }
@@ -6584,7 +6581,7 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
         
         const char *status_str = "";
         if (r == base) {
-            status_str = "MATCH_BASE";
+            status_str = "[BASE]";
         } else {
             // クエリID (2バイト) を除外してバイナリ比較
             if (r->resp_len == base->resp_len && r->resp_len >= 2 && 
@@ -6593,7 +6590,7 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
             } else if (r->rcode == base->rcode && (r->semantic_hash == base->semantic_hash || r->record_hash == base->record_hash)) {
                 status_str = "MATCH_SEMANTIC";
             } else {
-                status_str = "MATCH_DIFF";
+                status_str = "[DIFF]";
             }
         }
 

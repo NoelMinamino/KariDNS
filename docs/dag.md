@@ -37,7 +37,7 @@ dag [global-queryopt...] [query...]
 1. **Protocol Mutation & Fuzzing (`--break`)**:
    `dag` can craft malformed, edge-case, or boundary-testing DNS packets (such as compression pointer loops, oversized labels, invalid header counts, or TCP stream anomalies) to evaluate the robustness of DNS server implementations.
 2. **Multi-Server Consistency Comparison (`+allcompare`)**:
-   Users can supply a comma-separated list of nameservers (e.g., `@1.1.1.1,8.8.8.8,9.9.9.9:5353`). `dag` queries each server and can output a matrix comparing response equivalence (`MATCH_EXACT`, `MATCH_SEMANTIC`, or `MATCH_DIFF`).
+   Users can supply a comma-separated list of nameservers (e.g., `@1.1.1.1,8.8.8.8,9.9.9.9:5353`). `dag` queries each server and can output a matrix comparing response equivalence (`MATCH_EXACT`, `MATCH_SEMANTIC`, or `[DIFF]`).
 3. **Web Wire-Format Inspection (`+ldnsz`)**:
    Encodes the raw wire-format query and response using zlib compression and Base64URL encoding, generating inspection URLs for [ldns.jp](https://ldns.jp/) or multi-server binary diff URLs.
 4. **Transports & Protocol Extensions**:
@@ -432,17 +432,17 @@ dag example.com A @1.1.1.1,8.8.8.8,9.9.9.9:5353,[2001:4860:4860::8888]
 
 When `+allcompare` is specified, `dag` performs automated differential analysis across all responding servers:
 
-- `MATCH_BASE`: The reference response from the first server.
+- `[BASE]`: The reference response from the base server.
 - `MATCH_EXACT`: Binary byte-for-byte match (excluding the 16-bit Query ID).
 - `MATCH_SEMANTIC`: Semantic match — all Resource Records, RDATA sets, and section counts match regardless of record ordering or TTL differences.
-- `MATCH_DIFF`: Discrepancy detected in RCODE, flags, answer sets, or authority data.
+- `[DIFF]`: Discrepancy detected in RCODE, flags, answer sets, or authority data.
 
 A summary table is printed:
 ```text
 ;; --- Multi-Server Query Summary ---
 SERVER               | PROTO | RCODE    | QD | AN | NS | AR | TIME   | STATUS
 ---------------------+-------+----------+----+----+----+----+--------+------------------------
-1.1.1.1              | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 12 ms  | MATCH_BASE
+1.1.1.1              | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 12 ms  | [BASE]
 8.8.8.8              | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 18 ms  | MATCH_SEMANTIC
 9.9.9.9:5353         | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 15 ms  | MATCH_EXACT
 ```
