@@ -329,6 +329,7 @@ void free_zone_config(zone_config_t *zone) {
   for (int i = 0; i < zone->forwarders_count; i++)
     free(zone->forwarders[i].ip);
   free(zone->forwarders);
+  free(zone->file_format);
   free_rate_limit_config(&zone->rrl);
   free(zone);
 }
@@ -916,6 +917,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
+               strcmp(key, "file-format") == 0 ||
                strcmp(key, "tsig-key") == 0 ||
                strcmp(key, "notify-source") == 0 ||
                strcmp(key, "catalog-zone") == 0) {
@@ -973,6 +975,17 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       }
       else if (strcmp(key, "file") == 0)
         zone->file = val;
+      else if (strcmp(key, "file-format") == 0) {
+        if (strcasecmp(val, "bind") != 0 && strcasecmp(val, "tinydns") != 0) {
+          syslog(LOG_ERR, "[Config] zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')", zone->domain, val);
+          fprintf(stderr, "[ERROR] zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')\n", zone->domain, val);
+          free(key);
+          free(val);
+          free_zone_config(zone);
+          return -1;
+        }
+        zone->file_format = val;
+      }
       else if (strcmp(key, "tsig-key") == 0)
         zone->tsig_key = val;
       else if (strcmp(key, "notify-source") == 0)

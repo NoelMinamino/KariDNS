@@ -63,6 +63,9 @@ typedef struct zone_config {
   int forwarders_count;
   uint32_t forward_timeout_ms; /* 既定 2000ms。フォワーダー1台あたりの待ち時間 */
 
+  /* --- ゾーンファイルのフォーマット指定 --- */
+  char *file_format; /* NULL(既定) は "bind" 扱い。他に "tinydns" を受け付ける */
+
   struct zone_config *next;
 } zone_config_t;
 

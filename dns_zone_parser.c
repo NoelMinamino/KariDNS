@@ -396,7 +396,7 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     return rc;
 }
 
-static dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf) {
+dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf) {
     if (arena->count >= arena->records_cap) {
         size_t new_cap = arena->records_cap == 0 ? 16 : arena->records_cap * 2;
         if (new_cap > SIZE_MAX / sizeof(dns_record_t)) {

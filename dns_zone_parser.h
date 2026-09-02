@@ -33,6 +33,10 @@ typedef struct parse_context_s {
     ino_t *visited_inos;
     int visited_count;      // スタックの現在の深さ
     int visited_cap;        // visited_paths配列の容量
+
+    // --- 複数ゾーン・親子ゾーン振り分け用 ---
+    const char **all_zone_names;
+    int all_zone_count;
 } parse_context_t;
 
 typedef struct zone_arena_s {
@@ -57,6 +61,8 @@ typedef struct zone_arena_s {
 } zone_arena_t;
 
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
+int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
+dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf);
 void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
