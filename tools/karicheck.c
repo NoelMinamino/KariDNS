@@ -429,7 +429,7 @@ static bool is_in_bailiwick(const char *name, const char *domain) {
     return false;
 }
 
-static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog) {
+static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
     char domain_buf[256];
@@ -515,7 +515,12 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     ctx.visited_devs[0] = root_dev;
     ctx.visited_inos[0] = root_ino;
 
-    int res = parse_zone_fast(mutable_buf, strlen(mutable_buf), &arena, &ctx);
+    int res;
+    if (file_format && strcasecmp(file_format, "tinydns") == 0) {
+        res = parse_tinydns_data(mutable_buf, strlen(mutable_buf), &arena, &ctx);
+    } else {
+        res = parse_zone_fast(mutable_buf, strlen(mutable_buf), &arena, &ctx);
+    }
     if (res < 0) {
         print_error_context(file_path, buf, &err, &arena);
         free((void*)ctx.base_dir);
@@ -1070,7 +1075,7 @@ int main(int argc, char **argv) {
                 printf("[INFO] Skipping file validation for program zone '%s'\n", z->domain);
                 checked++;
             } else if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
-                if (check_zone(z->domain, z->file, false, z->is_catalog) != 0) {
+                if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format) != 0) {
                     error_count++;
                 }
                 checked++;
@@ -1087,7 +1092,7 @@ int main(int argc, char **argv) {
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
-            return check_zone(domain, argv[3], true, false);
+            return check_zone(domain, argv[3], true, false, NULL);
         } else {
             // From config: karicheck zone <domain> [config_path]
             const char *cfg_path = (argc >= 4) ? argv[3] : default_config;
@@ -1106,7 +1111,7 @@ int main(int argc, char **argv) {
                         printf("[INFO] Zone '%s' is type 'program'; skipping file validation.\n", z->domain);
                         return 0;
                     }
-                    return check_zone(z->domain, z->file, false, z->is_catalog);
+                    return check_zone(z->domain, z->file, false, z->is_catalog, z->file_format);
                 }
                 z = z->next;
             }

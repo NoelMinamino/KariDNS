@@ -1265,7 +1265,9 @@ typedef enum {
     RELOAD_ERR_MISSING_SOA = -3,
 } reload_result_t;
 
-static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *file) {
+static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
+  if (!entry || !zcfg || !zcfg->file) return RELOAD_ERR_FILE_READ;
+  const char *file = zcfg->file;
   dev_t root_dev = 0;
   ino_t root_ino = 0;
   char *buf = read_entire_file(file, &root_dev, &root_ino);
@@ -1325,7 +1327,24 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, const char *fi
   ctx.visited_inos[0] = root_ino;
   ctx.err_out = &parse_err;
 
-  int count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
+  server_config_t *active_cfg = acquire_config_snapshot();
+  const char *all_zone_ptrs[256];
+  int all_zone_cnt = 0;
+  if (active_cfg) {
+      for (zone_config_t *zc = active_cfg->zones; zc && all_zone_cnt < 256; zc = zc->next) {
+          if (zc->domain) all_zone_ptrs[all_zone_cnt++] = zc->domain;
+      }
+  }
+  ctx.all_zone_names = (all_zone_cnt > 0) ? all_zone_ptrs : NULL;
+  ctx.all_zone_count = all_zone_cnt;
+
+  int count;
+  if (zcfg->file_format && strcasecmp(zcfg->file_format, "tinydns") == 0) {
+      count = parse_tinydns_data(buf, strlen(buf), z_standby, &ctx);
+  } else {
+      count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
+  }
+  if (active_cfg) release_config_snapshot(active_cfg);
   free((void*)ctx.base_dir);
   free(root_path);
 
@@ -1634,7 +1653,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         entry->is_secondary = true;
                     }
                     if (entry && z->file) {
-                        reload_master_zone(entry, z->file);
+                        reload_master_zone(entry, z);
                     }
                 }
                 vs->entries[zidx++] = entry;
@@ -2424,7 +2443,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                     if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
                         syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
                     } else {
-                        reload_master_zone(entry, z->file);
+                        reload_master_zone(entry, z);
                     }
                 }
                 release_zone_snapshot(snap);
@@ -7162,7 +7181,7 @@ void *control_thread_func(void *arg) {
                 } else if (lr.entry && lr.zcfg) {
                   syslog(LOG_NOTICE, "[Control] Received targeted reload command for zone: %s", canon_arg);
                   if (lr.zcfg->type && (strcmp(lr.zcfg->type, "master") == 0 || strcmp(lr.zcfg->type, "primary") == 0)) {
-                    reload_result_t rr = reload_master_zone(lr.entry, lr.zcfg->file);
+                    reload_result_t rr = reload_master_zone(lr.entry, lr.zcfg);
                     switch (rr) {
                         case RELOAD_OK:
                             syslog(LOG_NOTICE, "[Control] Targeted reload successful for %s", lr.zcfg->domain);
