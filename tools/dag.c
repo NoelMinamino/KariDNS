@@ -6581,7 +6581,7 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
         
         const char *status_str = "";
         if (r == base) {
-            status_str = "MATCH_BASE";
+            status_str = "[BASE]";
         } else {
             // クエリID (2バイト) を除外してバイナリ比較
             if (r->resp_len == base->resp_len && r->resp_len >= 2 && 
@@ -6590,7 +6590,7 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
             } else if (r->rcode == base->rcode && (r->semantic_hash == base->semantic_hash || r->record_hash == base->record_hash)) {
                 status_str = "MATCH_SEMANTIC";
             } else {
-                status_str = "MATCH_DIFF";
+                status_str = "[DIFF]";
             }
         }
 
