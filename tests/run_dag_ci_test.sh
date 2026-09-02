@@ -494,8 +494,10 @@ if command -v perl >/dev/null 2>&1; then
     run_check "Transport: DoH connection cache cleanup & error recovery (tests/run_dag_doh_cache_cleanup_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_cache_cleanup_test.sh\"" "ALL DOH CACHE CLEANUP TESTS PASSED"
     run_check "Protocol: +trace glue fallback & CNAME chain tracing (tests/run_dag_trace_cname_glue_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_cname_glue_test.sh\"" "ALL TRACE GLUE & CNAME TESTS PASSED"
     run_check "CLI: +trace and +nssearch options (--hex, +udp) (tests/run_dag_trace_nssearch_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_opts_test.sh\"" "ALL TRACE & NSSEARCH OPTIONS TESTS PASSED"
-    run_check "Features: Batch mode advanced options & NS Search glue (tests/run_dag_batch_advanced_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_batch_advanced_opts_test.sh\"" "ALL BATCH & NSSEARCH GLUE TESTS PASSED"
+    run_check "Transport: +trace and +nssearch over TCP (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
     run_check "Audit: Edge cases regression test suite (tests/run_dag_edge_cases_audit_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_edge_cases_audit_test.sh\"" "ALL EDGE CASES AUDIT REGRESSION TESTS PASSED"
+    run_check "Audit: Edge cases Phase 3 audit suite (tests/run_dag_edge_cases_phase3_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_edge_cases_phase3_test.sh\"" "ALL DAG EDGE CASES PHASE 3 TESTS PASSED"
+    run_check "Transport: Multi-server query partial timeout handling (tests/run_dag_multi_server_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multi_server_timeout_test.sh\"" "ALL DAG MULTI-SERVER TIMEOUT TESTS PASSED"
     run_check "EDE & Truncation: Full EDE 0-29 and UDP TC fallback (tests/run_dag_ede_truncation_regression_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_ede_truncation_regression_test.sh\"" "ALL DAG EDE & TRUNCATION TESTS PASSED"
 fi
 run_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
