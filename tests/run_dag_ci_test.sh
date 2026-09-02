@@ -267,6 +267,7 @@ if [ "$DAG" = "dig" ]; then
     run_skip "Server failover (+nofail)"
 else
     run_check "Multi-Server query list" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A" "192\.0\.2\.10"
+    run_check "Multi-Server query with partial timeout continues and summarizes" "$DAG @127.0.0.1:$PORT,127.0.0.1:19999 www.example.com A +tcp +timeout=1 +tries=1" "MULTI-SERVER COMPARISON SUMMARY"
     run_check "LDNS-style summary (+ldnsz)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +ldnsz" "127\.0\.0\.1"
     run_check "Comparison matrix (+allcompare)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +allcompare" "127\.0\.0\.1"
     run_check "Comparison matrix with Cookie (+allcompare +cookie)" "$DAG @127.0.0.1,127.0.0.1 -p $PORT www.example.com A +cookie +allcompare" "127\.0\.0\.1"

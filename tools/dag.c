@@ -6216,11 +6216,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
             }
         }
 
-        if (n <= 0) {
-            printf(";; no servers could be reached\n");
-            return 9;
-        }
-
         if (n >= 12 && eff_qo.retry_on_badcookie) {
             edns_info_t bc_edns;
             uint16_t b_qd = (resp[4] << 8) | resp[5];
@@ -6270,6 +6265,19 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
         if (n <= 0) {
             printf(";; no servers could be reached\n");
+            sres = alloc_result_row();
+            if (sres) {
+                sres->rcode = 2; // SERVFAIL
+                sres->resp_len = 0;
+                if (port != 53) {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s#%d", (g_last_server_ip[0] ? g_last_server_ip : server), port);
+                } else {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", (g_last_server_ip[0] ? g_last_server_ip : server));
+                }
+                snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
+                g_server_count++;
+            }
+            if (tcp_sock >= 0) close(tcp_sock);
             return 9;
         }
 
@@ -6318,7 +6326,11 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 memcpy(sres->resp_buf, resp, to_copy);
                 sres->resp_len = (ssize_t)to_copy;
                 calculate_packet_hashes(resp, n, &sres->semantic_hash, &sres->record_hash);
-                snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", (g_last_server_ip[0] ? g_last_server_ip : server));
+                if (port != 53) {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s#%d", (g_last_server_ip[0] ? g_last_server_ip : server), port);
+                } else {
+                    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", (g_last_server_ip[0] ? g_last_server_ip : server));
+                }
                 snprintf(sres->proto, sizeof(sres->proto), "%s", use_tcp ? "TCP" : "UDP");
             }
             
@@ -6561,7 +6573,7 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
 
     server_result_t *base = &g_results[0];
     for (int i = 0; i < g_server_count; i++) {
-        if (!g_results[i].tc) {
+        if (g_results[i].resp_len > 0 && !g_results[i].tc) {
             base = &g_results[i];
             break;
         }
@@ -7849,6 +7861,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
     qo.query_id = (uint16_t)(arc4random() & 0xFFFF);
 
     int last_overall_rc = 0;
+    bool has_any_success = false;
     for (int ci = 0; ci < candidate_count; ci++) {
         const char *cur_qname = search_candidates[ci];
 
@@ -7862,6 +7875,7 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                                   adflag, cdflag, aaflag, tcflag, zflag,
                                   no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
                 last_overall_rc = rc;
+                if (rc == 0) has_any_success = true;
 
                 uint8_t last_rcode = 2; // Default to SERVFAIL if no response
                 if (g_server_count > 0) {
@@ -7958,7 +7972,8 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
                                       adflag, cdflag, aaflag, tcflag, zflag,
                                       no_hexdump_query, no_hexdump_response, &qo, hex_payload, dopt);
                     last_overall_rc = rc;
-                    if (rc != 0 && candidate_count == 1) { free(server_list_buf); return rc; }
+                    if (rc == 0) has_any_success = true;
+                    if (rc != 0 && server_count == 1 && candidate_count == 1) { free(server_list_buf); return rc; }
                 }
             }
         }
@@ -7973,6 +7988,10 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         }
     }
     
+    if (server_count > 1 && has_any_success) {
+        last_overall_rc = 0;
+    }
+
     free(server_list_buf);
     return last_overall_rc;
 }
