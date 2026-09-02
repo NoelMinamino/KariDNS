@@ -1021,7 +1021,7 @@ static uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
 
     if (qo->want_padding) {
         int block_size = (qo->padding_size > 0) ? qo->padding_size : 468;
-        // OPTヘッダ(4バイト)を含めた現在長から、ブロック境界に必要なパディング長を算出
+        // Paddingオプションヘッダ(4バイト)を含めた現在長から、ブロック境界に必要なパディング長を算出
         size_t current_len = (size_t)offset + 4;
         if (qo->want_tsig) {
             // 付与予定のTSIGレコード長を見積もり（TSIG RRヘッダ＋アルゴリズム名＋MACサイズ＋固定フィールド）
@@ -2388,7 +2388,7 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     }
 
     const char *path = (qo->doh_path && qo->doh_path[0]) ? qo->doh_path : "/dns-query";
-    char req_hdr[4096];
+    char req_hdr[16384];
     int req_hdr_len = 0;
 
     if (qo->doh_method == DOH_GET) {
@@ -6046,14 +6046,12 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         qtype = 251;
         qo->is_ixfr = true;
         qo->ixfr_serial = strtoul(qtype_s + 5, NULL, 10);
-        use_tcp = true;
     } else {
         qtype = parse_qtype(qtype_s);
         if (qtype == 0) return -1;
         if (qtype == 251) {
             qo->is_ixfr = true;
             qo->ixfr_serial = 0; // シリアル指定なし時は 0 (全転送/差分開始シリアル)
-            use_tcp = true;
         }
     }
 
@@ -7090,6 +7088,10 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
     uint8_t root_req_mac[64];
     size_t root_req_mac_len = 0;
     size_t root_qlen = build_and_sign_query(root_qbuf, sizeof(root_qbuf), ".", 2 /* NS */, &root_qo, root_req_mac, &root_req_mac_len);
+    if (root_qlen == 0) {
+        fprintf(stderr, "Error: Failed to construct root query for +trace\n");
+        return 1;
+    }
     uint8_t root_resp[65535];
     if (!no_hexdump_query && !dopt->yaml) {
         printf("Query (%zd bytes):\n", root_qlen);
@@ -7824,8 +7826,8 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         return 1;
     }
 
-    // AXFRまたはANYの場合は自動的にTCPモードに昇格（+udpが明示されていない場合、BIND 9 dig / RFC 8482準拠）
-    if ((strcasecmp(qtype_s, "AXFR") == 0 || strcasecmp(qtype_s, "ANY") == 0) && !force_udp) {
+    // AXFR, IXFRまたはANYの場合は自動的にTCPモードに昇格（+udpが明示されていない場合、BIND 9 dig / RFC 8482 / RFC 1995準拠）
+    if ((strcasecmp(qtype_s, "AXFR") == 0 || strncasecmp(qtype_s, "IXFR", 4) == 0 || strcasecmp(qtype_s, "ANY") == 0) && !force_udp) {
         use_tcp = true;
     }
 
@@ -9332,7 +9334,7 @@ int main(int argc, char **argv) {
 
     // -f バッチファイルモードの処理
     if (global_spec.batch_file) {
-        execute_batch_spec(&global_spec);
+        int batch_rc = execute_batch_spec(&global_spec);
         print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml);
 #ifndef _WIN32
         if (global_spec.qo.mem_debug) {
@@ -9345,7 +9347,7 @@ int main(int argc, char **argv) {
         zone_arena_destroy(&g_dag_arena);
         free_query_opts(&global_spec.qo);
         if (g_results) free(g_results);
-        return 0;
+        return batch_rc;
     }
 
     // クエリタプルが0個の場合はデフォルトクエリを1個作成
@@ -9369,7 +9371,8 @@ int main(int argc, char **argv) {
 
         // タプル内で -f が指定された場合
         if (local_spec.batch_file) {
-            execute_batch_spec(&local_spec);
+            int batch_rc = execute_batch_spec(&local_spec);
+            if (batch_rc != 0) last_exit_code = batch_rc;
             free_query_opts(&local_spec.qo);
             continue;
         }

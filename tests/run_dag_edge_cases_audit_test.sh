@@ -51,20 +51,35 @@ cat << 'PL_EOF' > "$TMP_DIR/mock_audit_server.pl"
 use strict;
 use warnings;
 use Socket;
+use IO::Socket::INET;
+use IO::Select;
 
 my $port = $ARGV[0] or die "Usage: $0 <port>\n";
 my $log_file = $ARGV[1] or die "Usage: $0 <port> <log_file>\n";
 
-socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname('udp')) or die "socket: $!";
-bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
+my $udp_srv = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1',
+    LocalPort => $port,
+    Proto     => 'udp',
+    ReuseAddr => 1,
+) or die "Cannot bind UDP: $!\n";
+
+my $tcp_srv = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1',
+    LocalPort => $port,
+    Proto     => 'tcp',
+    Listen    => 10,
+    ReuseAddr => 1,
+) or die "Cannot bind TCP: $!\n";
+
+my $sel = IO::Select->new($udp_srv, $tcp_srv);
 
 open(my $log, ">>", $log_file) or die "open log: $!";
 $log->autoflush(1);
 
-while (1) {
-    my $query;
-    my $client_addr = recv($srv, $query, 65535, 0);
-    next unless defined $client_addr && length($query) >= 12;
+sub build_dns_response {
+    my ($query, $proto) = @_;
+    return undef if length($query) < 12;
 
     my $qid = substr($query, 0, 2);
     my $qdcount = unpack("n", substr($query, 4, 2));
@@ -75,10 +90,8 @@ while (1) {
         $has_tsig = 1;
     }
 
-    # Log query info
-    print $log "QUERY len=" . length($query) . " arcount=$arcount has_tsig=$has_tsig hex=" . unpack("H*", $query) . "\n";
+    print $log "QUERY proto=$proto len=" . length($query) . " arcount=$arcount has_tsig=$has_tsig hex=" . unpack("H*", $query) . "\n";
 
-    # Default SOA/NS response
     my $resp;
 
     # 1. Root NS query for +trace
@@ -97,7 +110,6 @@ while (1) {
     }
     # 3. compressed SVCB (RFC 9460 violation test)
     elsif ($query =~ /svcb-compressed\x07example\x03com/i) {
-        # TargetName contains compression pointer \xC0\x0C (pointing to QNAME "svcb-compressed.example.com")
         my $svcb_rdata = pack("n", 1) . "\xc0\x0c" . pack("nnn", 3, 2, 443);
         $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 0) .
                 "\x0fsvcb-compressed\x07example\x03com\x00" . pack("nn", 64, 1) .
@@ -123,24 +135,106 @@ while (1) {
                 "\x06zonemd\x07example\x03com\x00" . pack("nnNn", 63, 1, 300, length($zonemd_rdata)) .
                 $zonemd_rdata;
     }
-    # 6. NS query for example.com
+    # 6. IXFR query (Type 251)
+    elsif ($query =~ /\x00\xfb\x00\x01/ || ($qdcount > 0 && $query =~ /\x07example\x03com\x00\x00\xfb/i)) {
+        my $soa = "\x07example\x03com\x00" . pack("nnNn", 6, 1, 300, 38) .
+                  "\x03ns1\x07example\x03com\x00\x0ahostmaster\x07example\x03com\x00" .
+                  pack("NNNNN", 2026090101, 7200, 3600, 1209600, 300);
+        $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 0) .
+                "\x07example\x03com\x00" . pack("nn", 251, 1) .
+                $soa;
+    }
+    # 7. NS query for example.com
     elsif ($query =~ /\x07example\x03com\x00\x00\x02\x00\x01/i) {
         $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 1) .
                 "\x07example\x03com\x00" . pack("nn", 2, 1) .
                 "\x07example\x03com\x00" . pack("nnNn", 2, 1, 300, 17) . "\x03ns1\x07example\x03com\x00" .
                 "\x03ns1\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
     }
-    # 7. SOA query for example.com
+    # 8. Default SOA/A response for example.com
     else {
         my $soa_rdata = "\x03ns1\x07example\x03com\x00\x0ahostmaster\x07example\x03com\x00" .
                         pack("NNNNN", 2026090101, 7200, 3600, 1209600, 300);
         $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 0) .
-                "\x07example\x03com\x00" . pack("nn", 6, 1) .
-                "\x07example\x03com\x00" . pack("nnNn", 6, 1, 300, length($soa_rdata)) .
-                $soa_rdata;
+                "\x07example\x03com\x00" . pack("nn", 1, 1) .
+                "\x07example\x03com\x00" . pack("nnNn", 1, 1, 300, 4) . inet_aton("192.0.2.1");
     }
+    return $resp;
+}
 
-    send($srv, $resp, 0, $client_addr);
+while (1) {
+    my @ready = $sel->can_read(1);
+    for my $fh (@ready) {
+        if ($fh == $udp_srv) {
+            my $query;
+            my $client_addr = $udp_srv->recv($query, 65535, 0);
+            next unless defined $client_addr && length($query) >= 12;
+            my $resp = build_dns_response($query, "UDP");
+            $udp_srv->send($resp, 0, $client_addr) if $resp;
+        } elsif ($fh == $tcp_srv) {
+            my $client = $tcp_srv->accept();
+            next unless $client;
+            
+            my $peek_buf = "";
+            $client->recv($peek_buf, 4, MSG_PEEK);
+            if ($peek_buf =~ /^GET /) {
+                # HTTP GET
+                my $req_line = <$client>;
+                while (my $hdr = <$client>) {
+                    last if $hdr =~ /^\r?\n$/;
+                }
+                if ($req_line && $req_line =~ /^GET \/dns-query\?.*?dns=([A-Za-z0-9_-]+)/) {
+                    my $b64 = $1;
+                    $b64 =~ tr/-_/+\//;
+                    while (length($b64) % 4) { $b64 .= '='; }
+                    # Simple Base64 decode without non-core deps
+                    my %b64_map = map { substr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", $_, 1) => $_ } 0..63;
+                    my $decoded = "";
+                    my $clean_b64 = $b64; $clean_b64 =~ s/[^A-Za-z0-9+\/]//g;
+                    for (my $i = 0; $i < length($clean_b64); $i += 4) {
+                        my $chunk = substr($clean_b64, $i, 4);
+                        my $val = 0;
+                        my $pad = 0;
+                        for my $c (split //, $chunk) {
+                            $val = ($val << 6) | ($b64_map{$c} || 0);
+                        }
+                        $pad = 2 if length($chunk) == 2;
+                        $pad = 1 if length($chunk) == 3;
+                        $decoded .= chr(($val >> 16) & 0xFF);
+                        $decoded .= chr(($val >> 8) & 0xFF) unless $pad >= 2;
+                        $decoded .= chr($val & 0xFF) unless $pad >= 1;
+                    }
+                    my $resp_dns = build_dns_response($decoded, "HTTP_GET");
+                    if ($resp_dns) {
+                        my $http_resp = "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: " . length($resp_dns) . "\r\nConnection: close\r\n\r\n" . $resp_dns;
+                        $client->send($http_resp);
+                    }
+                }
+            } else {
+                # Raw DNS over TCP
+                my $len_buf = "";
+                $client->read($len_buf, 2);
+                if (length($len_buf) == 2) {
+                    my $len = unpack("n", $len_buf);
+                    my $query = "";
+                    my $got = 0;
+                    while ($got < $len) {
+                        my $chunk;
+                        my $r = $client->read($chunk, $len - $got);
+                        last unless defined $r && $r > 0;
+                        $query .= $chunk;
+                        $got += $r;
+                    }
+                    my $resp_dns = build_dns_response($query, "TCP");
+                    if ($resp_dns) {
+                        my $rlen = pack("n", length($resp_dns));
+                        $client->send($rlen . $resp_dns);
+                    }
+                }
+            }
+            close($client);
+        }
+    }
 }
 PL_EOF
 
@@ -290,6 +384,59 @@ if echo "$OUT_MQ" | grep -qi "Option: 20" || echo "$OUT_MQ" | grep -q "00 14 00 
     echo "OK"
 else
     echo "OK (Option 20 merged into single EDNS option)"
+fi
+
+echo "=== Task 7: EDNS Padding Exact Alignment (RFC 8467) ==="
+echo -n "Test 7.1: +padding=64 aligns query packet size exactly to multiple of 64 ... "
+OUT_P64=$("$DAG" @127.0.0.1 -p $PORT example.com A +padding=64 +qr +timeout=1 2>&1 || true)
+LEN_P64=$(echo "$OUT_P64" | grep -o 'Query ([0-9]* bytes)' | grep -o '[0-9]*' | head -n 1)
+if [ -n "$LEN_P64" ] && [ $((LEN_P64 % 64)) -eq 0 ]; then
+    echo "OK ($LEN_P64 bytes is multiple of 64)"
+else
+    echo "FAILED ($LEN_P64 bytes is NOT multiple of 64)"
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test 7.2: +padding=128 aligns query packet size exactly to multiple of 128 ... "
+OUT_P128=$("$DAG" @127.0.0.1 -p $PORT example.com A +padding=128 +qr +timeout=1 2>&1 || true)
+LEN_P128=$(echo "$OUT_P128" | grep -o 'Query ([0-9]* bytes)' | grep -o '[0-9]*' | head -n 1)
+if [ -n "$LEN_P128" ] && [ $((LEN_P128 % 128)) -eq 0 ]; then
+    echo "OK ($LEN_P128 bytes is multiple of 128)"
+else
+    echo "FAILED ($LEN_P128 bytes is NOT multiple of 128)"
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== Task 8: Plain HTTP / DoH GET Method with Large URL Query Parameters ==="
+echo -n "Test 8.1: +http-plain-get handles large padded query without header truncation ... "
+OUT_DOH_GET=$("$DAG" @127.0.0.1 -p $PORT example.com A +http-plain-get +padding=1500 +timeout=2 2>&1 || true)
+if echo "$OUT_DOH_GET" | grep -q "192\.0\.2\.1" || echo "$OUT_DOH_GET" | grep -q "NOERROR"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "$OUT_DOH_GET" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== Task 9: IXFR Transport Control (RFC 1995: UDP with +udp, TCP default) ==="
+echo -n "Test 9.1: IXFR with +udp sends query via UDP transport ... "
+OUT_IXFR_UDP=$("$DAG" @127.0.0.1 -p $PORT example.com IXFR=100 +udp +timeout=1 2>&1 || true)
+if echo "$OUT_IXFR_UDP" | grep -q "(UDP)"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "$OUT_IXFR_UDP" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test 9.2: IXFR without +udp automatically promotes to TCP transport ... "
+OUT_IXFR_TCP=$("$DAG" @127.0.0.1 -p $PORT example.com IXFR=100 +timeout=1 2>&1 || true)
+if echo "$OUT_IXFR_TCP" | grep -q "(TCP)"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "$OUT_IXFR_TCP" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
 fi
 
 echo "========================================================="
