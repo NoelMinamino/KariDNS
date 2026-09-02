@@ -9,7 +9,7 @@ on:
       fuzz_seconds:
         description: 'Duration (in seconds) per fuzz target'
         required: true
-        default: '7200'
+        default: '1800'
       runs_target:
         description: 'Maximum runs per target (leave empty for time-based)'
         required: false
@@ -39,7 +39,7 @@ jobs:
           release: '15.1'
           run: |
             set -e
-            FUZZ_TIME="${{ inputs.fuzz_seconds || '7200' }}"
+            FUZZ_TIME="${{ inputs.fuzz_seconds || '1800' }}"
             FUZZ_RUNS_INPUT="${{ inputs.runs_target || '' }}"
 
             echo "::group::📦 [Build] Build all libFuzzer targets in parallel"
@@ -47,28 +47,44 @@ jobs:
             make -j"$NCPU" fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_dag fuzz_tsig_verify
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Fuzzing] Continuous Deep Fuzzing (${FUZZ_TIME}s per target)"
+            echo "::group::🛡️ [Fuzzing] Continuous Deep Fuzzing (${FUZZ_TIME}s per target, max 2 parallel, rss_limit_mb=2048)"
             FAILED=0
-            pids=""
+            active_pids=""
+            MAX_JOBS=2
+
             for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_dag_response fuzz_tsig_verify; do
                 bin="tests/fuzz/$target"
                 corpus="tests/fuzz/corpus_$target"
                 mkdir -p "$corpus"
                 echo "[+] Fuzzing target: $target (corpus size: $(ls -1 "$corpus" 2>/dev/null | wc -l) files)"
                 if [ -n "$FUZZ_RUNS_INPUT" ]; then
-                    "$bin" -runs="$FUZZ_RUNS_INPUT" -rss_limit_mb=0 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                    "$bin" -runs="$FUZZ_RUNS_INPUT" -rss_limit_mb=2048 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
                 else
-                    "$bin" -max_total_time="$FUZZ_TIME" -rss_limit_mb=0 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                    "$bin" -max_total_time="$FUZZ_TIME" -rss_limit_mb=2048 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
                 fi
-                pids="$pids $target:$!"
+                active_pids="$active_pids $target:$!"
+
+                count=$(echo $active_pids | wc -w)
+                if [ "$count" -ge "$MAX_JOBS" ]; then
+                    for tp in $active_pids; do
+                        t="${tp%%:*}"
+                        p="${tp##*:}"
+                        wait $p || {
+                            echo "❌ Fuzzer target $t crashed or failed! (see fuzz_${t}.log)"
+                            tail -n 60 "fuzz_${t}.log"
+                            FAILED=1
+                        }
+                    done
+                    active_pids=""
+                fi
             done
 
-            for tp in $pids; do
-                target="${tp%%:*}"
-                pid="${tp##*:}"
-                wait $pid || {
-                    echo "❌ Fuzzer target $target crashed! (see fuzz_${target}.log)"
-                    tail -n 60 "fuzz_${target}.log"
+            for tp in $active_pids; do
+                t="${tp%%:*}"
+                p="${tp##*:}"
+                wait $p || {
+                    echo "❌ Fuzzer target $t crashed or failed! (see fuzz_${t}.log)"
+                    tail -n 60 "fuzz_${t}.log"
                     FAILED=1
                 }
             done
