@@ -1327,12 +1327,19 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   ctx.visited_inos[0] = root_ino;
   ctx.err_out = &parse_err;
 
-  server_config_t *active_cfg = acquire_config_snapshot();
+  server_config_t *active_cfg = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   const char *all_zone_ptrs[256];
   int all_zone_cnt = 0;
   if (active_cfg) {
-      for (zone_config_t *zc = active_cfg->zones; zc && all_zone_cnt < 256; zc = zc->next) {
-          if (zc->domain) all_zone_ptrs[all_zone_cnt++] = zc->domain;
+      for (zone_config_t *zc = active_cfg->zones; zc; zc = zc->next) {
+          if (zc->domain) {
+              if (all_zone_cnt < 256) {
+                  all_zone_ptrs[all_zone_cnt++] = zc->domain;
+              } else {
+                  syslog(LOG_WARNING, "[ZoneLoader] Configured zones exceed 256; parent-child delegation filtering may be degraded for '%s'", entry->domain);
+                  break;
+              }
+          }
       }
   }
   ctx.all_zone_names = (all_zone_cnt > 0) ? all_zone_ptrs : NULL;
@@ -1344,7 +1351,6 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   } else {
       count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   }
-  if (active_cfg) release_config_snapshot(active_cfg);
   free((void*)ctx.base_dir);
   free(root_path);
 

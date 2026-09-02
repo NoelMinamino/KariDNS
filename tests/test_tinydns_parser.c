@@ -173,8 +173,27 @@ static void test_txt_127_byte_chunking(void) {
         TEST_ASSERT(strlen(rec->rdata[1]) == 127, "Chunk 1 is 127 bytes");
         TEST_ASSERT(strlen(rec->rdata[2]) == 46, "Chunk 2 is 46 bytes");
     }
-
     zone_arena_destroy(&arena);
+
+    // 6096バイト超のTXTレコードが拒否されることを検証
+    char *huge_txt = malloc(7000);
+    if (huge_txt) {
+        strcpy(huge_txt, "'overlong.example.com:");
+        size_t hlen = strlen(huge_txt);
+        for (int i = 0; i < 6200; i++) huge_txt[hlen + i] = 'X';
+        huge_txt[hlen + 6200] = '\0';
+        strcat(huge_txt, ":3600\n");
+
+        zone_arena_t arena_huge;
+        zone_arena_init(&arena_huge);
+        parse_error_t err_huge = {0};
+        parse_context_t ctx_huge = { .default_origin = "example.com.", .err_out = &err_huge };
+
+        int res_huge = parse_tinydns_data(huge_txt, strlen(huge_txt), &arena_huge, &ctx_huge);
+        TEST_ASSERT(res_huge < 0, "Oversized TXT (>6096 bytes) rejected with error");
+        zone_arena_destroy(&arena_huge);
+        free(huge_txt);
+    }
 }
 
 /* ============================================================================

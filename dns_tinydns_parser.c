@@ -432,6 +432,15 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 uint8_t *raw_bytes = tinydns_decode_bytes(arena, f[1], flen[1], &raw_len);
                 if (!raw_bytes && flen[1] > 0) return false;
 
+                if (raw_len > MAX_RDATA * 127) {
+                    if (ctx && ctx->err_out) {
+                        ctx->err_out->error_message = "TXT record data exceeds maximum supported length (6096 bytes)";
+                        ctx->err_out->error_offset = (size_t)(line_start - buf);
+                        ctx->err_out->token_length = flen[1];
+                    }
+                    return false;
+                }
+
                 dns_record_t *txt_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "TXT", 16, ttl);
                 if (!txt_rec) return false;
 
