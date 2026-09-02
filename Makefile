@@ -87,6 +87,9 @@ tinydns_test: tests/test_tinydns_parser.c dns_config_parser.c dns_zone_parser.c 
 	clang -fsanitize=address,undefined -O1 -g tests/test_tinydns_parser.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c -lcrypto -o test_tinydns_parser
 	./test_tinydns_parser
 
+tinydns_timestamp_test: $(TARGET) $(DAG_TARGET) karicheck
+	sh tests/run_tinydns_timestamp_test.sh
+
 asan_test: tests/test_asan_overflow.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o
 	clang -fsanitize=address,undefined -O1 -g tests/test_asan_overflow.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c -lcrypto -o test_asan_overflow
 	./test_asan_overflow

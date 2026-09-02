@@ -98,6 +98,9 @@ typedef struct {
     uint16_t generic_len;
     uint8_t *generic_data;
     int next_record; // Index of next record with same hash, -1 if none
+    time_t tinydns_ttd;         /* 0 = timestampなし(全ゾーン共通デフォルト)。
+                                   tinydns形式でtimestampフィールドが指定された場合のみ非0 */
+    bool tinydns_ttl_countdown; /* true なら「ttl=0 + timestamp」のカウントダウンTTLレコード */
     
     bool is_cached;
     union {

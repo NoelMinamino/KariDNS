@@ -58,6 +58,7 @@ typedef struct zone_arena_s {
   char **sorted_unique_names;
   size_t sorted_unique_count;
   _Atomic int reader_count;
+  bool is_tinydns_format; /* parse_tinydns_data()が呼ばれたzone_arenaでのみtrue */
 } zone_arena_t;
 
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);

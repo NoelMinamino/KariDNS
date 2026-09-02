@@ -406,16 +406,17 @@ static void test_config_file_format(void) {
 }
 
 /* ============================================================================
- * Test 7: timestamp 評価とカウントダウンTTL検証
+ * Test 7: timestamp 評価とカウントダウンTTL検証 (案A: パース時はスキップせずttd/countdownを保持)
  * ============================================================================ */
 static void test_timestamp_evaluation(void) {
-    printf("--- Test 7: Timestamp Evaluation & Countdown TTL ---\n");
+    printf("--- Test 7: Timestamp Parsing & TTD Fields (Plan A) ---\n");
 
     time_t now = time(NULL);
 
     // 1. アクティベーション時刻 (ttl != 0)
-    // 過去のタイムスタンプ: 2001-09-09 (0x400000003b9aca00) -> 有効、生成される
-    // 未来のタイムスタンプ: 2065-01-24 (0x40000000b2d05e00) -> 未到来、スキップされる
+    // 過去のタイムスタンプ: 2001-09-09 (0x400000003b9aca00 -> Unix 1000000000)
+    // 未来のタイムスタンプ: 2065-01-24 (0x40000000b2d05e00 -> Unix 3000000000)
+    // 案Aではパーサーでスキップされず、両方生成されて tinydns_ttd が設定される
     const char *act_data =
         "+act_past.example.com:192.168.1.1:300:400000003b9aca00\n"
         "+act_future.example.com:192.168.1.2:300:40000000b2d05e00\n";
@@ -427,18 +428,28 @@ static void test_timestamp_evaluation(void) {
         parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
 
         int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
-        TEST_ASSERT(count == 1, "Activation timestamp: 1 record generated");
-        TEST_ASSERT(arena.count == 1, "Arena count is 1");
-        if (arena.count == 1) {
-            TEST_ASSERT(strcmp(arena.records[0].name, "act_past.example.com.") == 0, "Past activation record included");
-            TEST_ASSERT(arena.records[0].ttl_value == 300, "TTL preserved");
+        TEST_ASSERT(count == 2, "Activation timestamp: both records preserved in Plan A");
+        TEST_ASSERT(arena.count == 2, "Arena count is 2");
+        TEST_ASSERT(arena.is_tinydns_format == true, "arena.is_tinydns_format is true");
+
+        for (size_t i = 0; i < arena.count; i++) {
+            dns_record_t *r = &arena.records[i];
+            if (strcmp(r->name, "act_past.example.com.") == 0) {
+                TEST_ASSERT(r->ttl_value == 300, "Past record TTL preserved");
+                TEST_ASSERT(r->tinydns_ttd == 1000000000, "Past TTD is 1000000000");
+                TEST_ASSERT(r->tinydns_ttl_countdown == false, "Past countdown flag is false");
+            }
+            if (strcmp(r->name, "act_future.example.com.") == 0) {
+                TEST_ASSERT(r->ttl_value == 300, "Future record TTL preserved");
+                TEST_ASSERT(r->tinydns_ttd == 3000000000LL, "Future TTD is 3000000000");
+                TEST_ASSERT(r->tinydns_ttl_countdown == false, "Future countdown flag is false");
+            }
         }
         zone_arena_destroy(&arena);
     }
 
     // 2. カウントダウンTTL (ttl == 0)
-    // 過去のタイムスタンプ -> 期限切れ、スキップされる
-    // 未来のタイムスタンプ (now + 300秒) -> 有効、TTLが [2, 3600] の範囲にクランプ
+    // 案Aでは過去・未来ともスキップされず、ttl_value=0, tinydns_ttl_countdown=true で保持される
     uint64_t ts_past_tai = 4611686018427387904ULL + 1000000000ULL; // 過去
     uint64_t ts_future_tai = 4611686018427387904ULL + (uint64_t)(now + 300); // 未来 (約300秒後)
 
@@ -454,11 +465,21 @@ static void test_timestamp_evaluation(void) {
         parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
 
         int count = parse_tinydns_data(count_data, strlen(count_data), &arena, &ctx);
-        TEST_ASSERT(count == 1, "Countdown TTL: 1 record generated");
-        TEST_ASSERT(arena.count == 1, "Arena count is 1");
-        if (arena.count == 1) {
-            TEST_ASSERT(strcmp(arena.records[0].name, "cnt_future.example.com.") == 0, "Future expiration record included");
-            TEST_ASSERT(arena.records[0].ttl_value >= 2 && arena.records[0].ttl_value <= 3600, "Countdown TTL within [2, 3600]");
+        TEST_ASSERT(count == 2, "Countdown TTL: both records preserved in Plan A");
+        TEST_ASSERT(arena.count == 2, "Arena count is 2");
+
+        for (size_t i = 0; i < arena.count; i++) {
+            dns_record_t *r = &arena.records[i];
+            if (strcmp(r->name, "cnt_past.example.com.") == 0) {
+                TEST_ASSERT(r->ttl_value == 0, "Past countdown raw TTL is 0");
+                TEST_ASSERT(r->tinydns_ttd == 1000000000, "Past countdown TTD is 1000000000");
+                TEST_ASSERT(r->tinydns_ttl_countdown == true, "Past countdown flag is true");
+            }
+            if (strcmp(r->name, "cnt_future.example.com.") == 0) {
+                TEST_ASSERT(r->ttl_value == 0, "Future countdown raw TTL is 0");
+                TEST_ASSERT(r->tinydns_ttd == (time_t)(now + 300), "Future countdown TTD matches now+300");
+                TEST_ASSERT(r->tinydns_ttl_countdown == true, "Future countdown flag is true");
+            }
         }
         zone_arena_destroy(&arena);
     }
@@ -474,10 +495,13 @@ static void test_timestamp_evaluation(void) {
 
         int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
         TEST_ASSERT(count == 1, "Invalid hex chars in timestamp do not cause error");
+        if (arena.count == 1) {
+            TEST_ASSERT(arena.records[0].tinydns_ttd != 0, "Non-zero TTD parsed with loose hex");
+        }
         zone_arena_destroy(&arena);
     }
 
-    // 4. timestamp フィールドが空 -> 従来通りの TTL で生成 (回帰確認)
+    // 4. timestamp フィールドが空 -> 従来通りの TTL で生成、tinydns_ttd=0
     const char *empty_ts_data =
         "+notimestamp.example.com:192.168.1.6:300\n";
     {
@@ -490,6 +514,8 @@ static void test_timestamp_evaluation(void) {
         TEST_ASSERT(count == 1, "Empty timestamp field parsed normally");
         if (arena.count == 1) {
             TEST_ASSERT(arena.records[0].ttl_value == 300, "TTL is 300");
+            TEST_ASSERT(arena.records[0].tinydns_ttd == 0, "tinydns_ttd is 0");
+            TEST_ASSERT(arena.records[0].tinydns_ttl_countdown == false, "tinydns_ttl_countdown is false");
         }
         zone_arena_destroy(&arena);
     }

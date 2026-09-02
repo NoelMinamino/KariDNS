@@ -2880,6 +2880,37 @@ static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
     *arcount = cp->arcount;
 }
 
+/* レコードが「今このクエリ時点で」応答に含めるべきかを判定する。
+ * 含めるべきならtrueを返し、*effective_ttl_out に配信すべきTTLを書く
+ * (通常のレコードならrec->ttl_valueをそのままコピーするだけ)。
+ * 含めるべきでなければfalseを返す(呼び出し側はこのレコードを無視する)。
+ *
+ * rec->tinydns_ttd == 0 の場合(BINDレコード、または timestamp未指定の
+ * tinydnsレコード)は即座にtrueを返す ── これが全体の大部分のケースで
+ * あり、コストは1回のゼロ比較のみ。 */
+static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
+                                                   uint32_t *effective_ttl_out) {
+    if (rec->tinydns_ttd == 0) {
+        *effective_ttl_out = rec->ttl_value;
+        return true;
+    }
+
+    if (!rec->tinydns_ttl_countdown) {
+        /* アクティベーション時刻としてのtimestamp */
+        if (rec->tinydns_ttd >= now) return false; /* まだ未来 */
+        *effective_ttl_out = rec->ttl_value;
+        return true;
+    }
+
+    /* カウントダウンTTL(有効期限としてのtimestamp)。 */
+    if (rec->tinydns_ttd < now) return false; /* 既に期限切れ */
+    double remaining = difftime(rec->tinydns_ttd, now);
+    if (remaining < 2.0) remaining = 2.0;
+    if (remaining > 3600.0) remaining = 3600.0;
+    *effective_ttl_out = (uint32_t)remaining;
+    return true;
+}
+
 static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 const char *zone_apex, uint8_t *res,
                                 size_t max_res_len, uint16_t *offset,
@@ -2888,16 +2919,21 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
   if (t_len >= a_len &&
       strcasecmp(target + t_len - a_len, zone_apex) == 0 &&
       (t_len == a_len || target[t_len - a_len - 1] == '.')) {
+    time_t tinydns_now = (current_zone && current_zone->is_tinydns_format) ? time(NULL) : 0;
     uint32_t tgt_hash = calc_fnv1a_str(target);
     size_t tgt_idx = tgt_hash & (current_zone->hash_size - 1);
     for (int j = current_zone->hash_table[tgt_idx]; j != -1;
          j = current_zone->records[j].next_record) {
-      if ((current_zone->records[j].type_code == 1 ||
-           current_zone->records[j].type_code == 28) &&
-          strcasecmp(current_zone->records[j].name, target) == 0) {
+      dns_record_t *rec = &current_zone->records[j];
+      if ((rec->type_code == 1 || rec->type_code == 28) &&
+          strcasecmp(rec->name, target) == 0) {
+        uint32_t eff_ttl;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
+        dns_record_t rec_copy = *rec;
+        rec_copy.ttl_value = eff_ttl;
         uint16_t saved_offset = *offset;
         if (serialize_dns_record(res, max_res_len, offset,
-                                 &current_zone->records[j], comp_ctx,
+                                 &rec_copy, comp_ctx,
                                  NULL, 0xFFFFFFFF) < 0) {
           *offset = saved_offset;
           return false;
@@ -2951,6 +2987,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
     return false;
+  time_t tinydns_now = (current_zone && current_zone->is_tinydns_format) ? time(NULL) : 0;
   const char *name = qname;
   while (name && strcasecmp(name, zone_apex) != 0) {
     // RFC 4035 §3.1.4.1: 委任点そのもの(name == qname)へのDSクエリは、
@@ -2966,11 +3003,16 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
     bool delegated = false;
     for (int i = current_zone->hash_table[idx]; i != -1;
          i = current_zone->records[i].next_record) {
-      if (current_zone->records[i].type_code == 2 &&
-          strcasecmp(current_zone->records[i].name, name) == 0) {
+      dns_record_t *rec = &current_zone->records[i];
+      if (rec->type_code == 2 &&
+          strcasecmp(rec->name, name) == 0) {
+        uint32_t eff_ttl;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
         delegated = true;
+        dns_record_t rec_copy = *rec;
+        rec_copy.ttl_value = eff_ttl;
         if (serialize_dns_record(res, max_res_len, offset,
-                                 &current_zone->records[i], comp_ctx, NULL,
+                                 &rec_copy, comp_ctx, NULL,
                                  0xFFFFFFFF) < 0) {
           res[2] |= 0x02;
           return true;
@@ -3058,12 +3100,17 @@ static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
 static bool name_exists_in_zone(zone_arena_t *zone, const char *name) {
   if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
   size_t name_len = strlen(name);
+  time_t tinydns_now = (zone && zone->is_tinydns_format) ? time(NULL) : 0;
 
   // (a) Exact match check via hash table
   uint32_t h = calc_fnv1a_str(name);
   size_t idx = h & (zone->hash_size - 1);
   for (int i = zone->hash_table[idx]; i != -1; i = zone->records[i].next_record) {
-    if (strcasecmp(zone->records[i].name, name) == 0) return true;
+    dns_record_t *rec = &zone->records[i];
+    if (strcasecmp(rec->name, name) == 0) {
+      uint32_t eff_ttl;
+      if (tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) return true;
+    }
   }
 
   // (b) Empty Non-Terminal (ENT) check via binary search on sorted_unique_names
@@ -3145,6 +3192,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
       return;
     }
+
+    time_t tinydns_now = 0;
+    if (current_zone->is_tinydns_format) {
+      tinydns_now = time(NULL);
+    }
     
     // ==== フェーズ1: 委任判定 ====
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
@@ -3163,6 +3215,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
            i = current_zone->records[i].next_record) {
         dns_record_t *rec = &current_zone->records[i];
         if (strcasecmp(rec->name, current_qname) == 0) {
+          uint32_t eff_ttl;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
           name_exists = true;
           if (rec->type_code == 5) has_cname = true;   // CNAME
           if (rec->type_code == 46) has_rrsig = true;  // RRSIG
@@ -3196,14 +3250,18 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
          i = current_zone->records[i].next_record) {
       dns_record_t *rec = &current_zone->records[i];
       if (strcasecmp(rec->name, current_qname) == 0) {
+        uint32_t eff_ttl;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
         found = true;
         uint16_t rec_type = rec->type_code;
         bool follow_cname = false;
         if (rec_type == 5) {
           if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
         }
+        dns_record_t rec_copy = *rec;
+        rec_copy.ttl_value = eff_ttl;
         if (follow_cname) {
-          if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+          if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {
             res[2] |= 0x02;
             return;
@@ -3225,13 +3283,13 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         } else {
           if (qtypes[0] == 255 || qtypes[0] == rec_type) {
             type_matched = true;
-            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                      NULL, 0xFFFFFFFF) < 0) {
               res[2] |= 0x02;
               return;
             }
             (*ancount)++;
-            append_additional_rr_glue(current_zone, rec, db_entry->domain,
+            append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                       res, max_res_len, offset, comp_ctx, arcount,
                                       glue_targets, &glue_target_count, minimal_responses);
             if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
@@ -3258,12 +3316,16 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         for (int i = current_zone->hash_table[p_idx]; i != -1; i = current_zone->records[i].next_record) {
           dns_record_t *rec = &current_zone->records[i];
           if (rec->type_code == 39 && strcasecmp(rec->name, dname_parent) == 0) {
+            uint32_t eff_ttl;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
             dname_found = true;
             size_t prefix_len = dname_parent - current_qname;
             if (rec->rdata_count == 0) break;
             size_t target_len = strlen(rec->rdata[0]);
             if (prefix_len + target_len > 255) { res[3] = (res[3] & 0xF0) | 6; return; }
-            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
+            dns_record_t rec_copy = *rec;
+            rec_copy.ttl_value = eff_ttl;
+            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
             (*ancount)++;
             if (dnssec_ok) {
               if (!attach_covering_rrsig(current_zone, p_idx, dname_parent, NULL, 39, res, max_res_len, offset, comp_ctx, ancount)) { res[2] |= 0x02; return; }
@@ -3280,6 +3342,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             synth_cname.name = (char *)current_qname;
             synth_cname.type_code = 5;
             synth_cname.ttl = rec->ttl;
+            synth_cname.ttl_value = eff_ttl;
             synth_cname.rdata_count = 1;
             synth_cname.rdata[0] = synth_name;
             if (serialize_dns_record(res, max_res_len, offset, &synth_cname, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
@@ -3311,6 +3374,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
              i = current_zone->records[i].next_record) {
           dns_record_t *rec = &current_zone->records[i];
           if (strcasecmp(rec->name, wc_name) == 0) {
+            uint32_t eff_ttl;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
             found = true;
             wc_found = true;
             uint16_t rec_type = rec->type_code;
@@ -3318,8 +3383,10 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             if (rec_type == 5) {
               if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
             }
+            dns_record_t rec_copy = *rec;
+            rec_copy.ttl_value = eff_ttl;
             if (follow_cname) {
-              if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+              if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                        current_qname, 0xFFFFFFFF) < 0) {
                 res[2] |= 0x02;
                 return;
@@ -3341,13 +3408,13 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             } else {
               if (qtypes[0] == 255 || qtypes[0] == rec_type) {
                 type_matched = true;
-                if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+                if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                          current_qname, 0xFFFFFFFF) < 0) {
                   res[2] |= 0x02;
                   return;
                 } else
                   (*ancount)++;
-                append_additional_rr_glue(current_zone, rec, db_entry->domain,
+                append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                           res, max_res_len, offset, comp_ctx, arcount,
                                           glue_targets, &glue_target_count, minimal_responses);
                 if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
@@ -3439,12 +3506,16 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         for (int i = current_zone->hash_table[final_idx]; i != -1; i = current_zone->records[i].next_record) {
           dns_record_t *rec = &current_zone->records[i];
           if (strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
+            uint32_t eff_ttl;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
             qtx_matched = true;
-            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+            dns_record_t rec_copy = *rec;
+            rec_copy.ttl_value = eff_ttl;
+            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
               this_qtx_failed = true; break;
             }
             (*ancount)++;
-            append_additional_rr_glue(current_zone, rec, db_entry->domain,
+            append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                       res, max_res_len, offset, comp_ctx, arcount,
                                       glue_targets, &glue_target_count, minimal_responses);
             if (dnssec_ok && qtx != 46) {
@@ -3470,12 +3541,16 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
               dns_record_t *rec = &current_zone->records[i];
               if (strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
+                uint32_t eff_ttl;
+                if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
                 wc_found = true; qtx_matched = true;
-                if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
+                dns_record_t rec_copy = *rec;
+                rec_copy.ttl_value = eff_ttl;
+                if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
                   this_qtx_failed = true; break;
                 }
                 (*ancount)++;
-                append_additional_rr_glue(current_zone, rec, db_entry->domain,
+                append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                           res, max_res_len, offset, comp_ctx, arcount,
                                           glue_targets, &glue_target_count, minimal_responses);
                 if (dnssec_ok && qtx != 46) {
@@ -3516,10 +3591,14 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         dns_record_t *rec = &current_zone->records[i];
         if (rec->type_code == 6 &&
             strcasecmp(rec->name, db_entry->domain) == 0) {
+          uint32_t eff_ttl;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
           uint32_t minimum_ttl = 3600;
           if (rec->rdata_count >= 7)
             minimum_ttl = parse_ttl_value(rec->rdata[6]);
-          if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+          dns_record_t rec_copy = *rec;
+          rec_copy.ttl_value = eff_ttl;
+          if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                    NULL, minimum_ttl) < 0) {
             res[2] |= 0x02;
             return;
@@ -3548,7 +3627,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           if (rec->type_code == 47 /* NSEC */ &&
               strcasecmp(rec->name, current_qname) == 0) {
             if (rec->rdata_count < 1) break; // 壊れたNSECは無視
-            if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+            uint32_t eff_ttl;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
+            dns_record_t rec_copy = *rec;
+            rec_copy.ttl_value = eff_ttl;
+            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                      NULL, 0xFFFFFFFF) < 0) {
               nsec_failed = true; break;
             }
@@ -3621,14 +3704,18 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         dns_record_t *rec = &current_zone->records[i];
         if (rec->type_code == 2 &&
             strcasecmp(rec->name, db_entry->domain) == 0) {
-          if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
+          uint32_t eff_ttl;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, &eff_ttl)) continue;
+          dns_record_t rec_copy = *rec;
+          rec_copy.ttl_value = eff_ttl;
+          if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {
             res[2] |= 0x02;
             return;
           } else {
             (*nscount)++;
             if (rec->rdata_count > 0) {
-              append_additional_rr_glue(current_zone, rec, db_entry->domain, res,
+              append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain, res,
                                         max_res_len, offset, comp_ctx, arcount,
                                         glue_targets, &glue_target_count, minimal_responses);
             }
