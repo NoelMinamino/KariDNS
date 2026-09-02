@@ -99,6 +99,9 @@ run_check "YAML Answer RDATA for AAAA record" "$DAG @127.0.0.1 -p $PORT www.exam
 run_check "YAML Answer RDATA for MX record" "$DAG @127.0.0.1 -p $PORT example.com MX +yaml" "mail\.example\.com"
 # TXT record
 run_check "YAML Answer RDATA for TXT record" "$DAG @127.0.0.1 -p $PORT example.com TXT +yaml" "v=spf1"
+# NAPTR record (order != pref regression test: order=100, pref=10)
+run_check "Standard Answer RDATA for NAPTR record (order!=pref)" "$DAG @127.0.0.1 -p $PORT _ldap._tcp.example.com NAPTR" "100 10 \"S\" \"LDAP2\+D2U\""
+run_check "YAML Answer RDATA for NAPTR record (order!=pref)" "$DAG @127.0.0.1 -p $PORT _ldap._tcp.example.com NAPTR +yaml" "100 10 \"S\" \"LDAP2\+D2U\""
 # Authority section for NXDOMAIN
 run_check "YAML Authority section for NXDOMAIN" "$DAG @127.0.0.1 -p $PORT nonexistent.example.com A +yaml" "(AUTHORITY_SECTION:|- 'example\.com\..*SOA|authority:)"
 

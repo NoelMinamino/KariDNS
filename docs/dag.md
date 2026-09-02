@@ -401,10 +401,11 @@ dag [global-queryopt...] [query...]
 | `opcode=N` | Sets an unallocated or reserved DNS `OPCODE` (`N=15`). | Unhandled Opcode crash / state machine |
 | `qr-bit` | Sets the `QR` bit to 1 on an outgoing query (sending a response as a query). | Server reflection / loop amplification |
 | `notify-no-question` | Sends `OPCODE=4` (NOTIFY) with `QDCOUNT=0`. | RFC 1996 missing zone question panic |
-| `too-short` | Sends only the first 3 bytes of a DNS message. | Short packet header read violation |
-| `tcp-length-overclaim[=N]` | (*TCP only*) Prefixes a 2-byte TCP length `N` bytes larger than sent data. | TCP frame starvation / hanging worker |
+| `too-short[=N]` | Sends only the first `N` bytes of the message (default: 3). | Short packet header read violation |
+| `short-header[=N]` | Alias for `too-short[=N]`. | (same as `too-short`) |
+| `tcp-length-overclaim[=N]` | (*TCP only*) Prefixes a 2-byte TCP length `N` bytes larger than sent data (default: `N=10`). | TCP frame starvation / hanging worker |
 | `tcp-zero-length` | (*TCP only*) Sends a 2-byte TCP length prefix of `0`. | Zero-length packet hang or memory leak |
-| `tcp-idle-hold[=SEC]` | (*TCP only*) Sends length prefix, holds connection open for `SEC` seconds. | Slowloris / connection pool exhaustion |
+| `tcp-idle-hold[=SEC]` | (*TCP only*) Sends length prefix, holds connection open for `SEC` seconds (default: `SEC=20`). | Slowloris / connection pool exhaustion |
 | `update-meta-type[=N]` | (*UPDATE only*) Injects a meta-type RR (e.g., OPT / TSIG) into the Update Section. | Meta-RR validation in dynamic updates |
 
 ### Automated Batch Fuzzing
@@ -446,6 +447,9 @@ SERVER               | PROTO | RCODE    | QD | AN | NS | AR | TIME   | STATUS
 8.8.8.8              | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 18 ms  | MATCH_SEMANTIC
 9.9.9.9:5353         | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 15 ms  | MATCH_EXACT
 ```
+
+> **Note on TC (Truncation) Retries:**
+> When a query triggers automatic TCP retry due to a truncated UDP response (`TC=1`), `dag` intentionally records and displays both the UDP attempt and the TCP retry as separate rows in the summary table. This allows users to explicitly observe and diagnose the transport fallback process.
 
 ### LDNSZ Web Inspection URLs (`+ldnsz`)
 
@@ -663,12 +667,15 @@ dag example.com A @127.0.0.1 --test-all
 - **RFC 1034 / RFC 1035**: Domain Names — Concepts and Implementation
 - **RFC 1995**: Incremental Zone Transfer in DNS (IXFR)
 - **RFC 1996**: Mechanism for Prompt Notification of Zone Changes (DNS NOTIFY)
-- **RFC 2136 / RFC 3007**: Dynamic Updates in the Domain Name System (DNS UPDATE)
+- **RFC 2136**: Dynamic Updates in the Domain Name System (DNS UPDATE)
+- **RFC 3007** (not yet implemented as of this version): Secure DNS Dynamic Update via SIG(0) (`dag` currently supports TSIG (`-k`/`-y`) authentication for UPDATE transactions; SIG(0) client-side signing is planned)
 - **RFC 3597**: Handling of Unknown DNS Resource Record Types
 - **RFC 4033 / RFC 4034 / RFC 4035**: Resource Records for the DNS Security Extensions (DNSSEC)
 - **RFC 5001**: DNS Name Server Identifier (NSID) Option
 - **RFC 5936**: DNS Zone Transfer Protocol (AXFR)
 - **RFC 7050**: Discovery of the IPv6 Prefix Used for IPv6 Address Synthesis (DNS64)
+- **RFC 7314**: Extension Mechanisms for DNS (EDNS) EXPIRE Option
+- **RFC 7766**: DNS Transport over TCP - Implementation Requirements
 - **RFC 7828**: The edns-tcp-keepalive EDNS0 Option
 - **RFC 7830 / RFC 8467**: The EDNS(0) Padding Option & Padding Policies
 - **RFC 7858**: Specification for DNS over Transport Layer Security (DoT)
