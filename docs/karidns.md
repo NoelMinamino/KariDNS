@@ -103,6 +103,7 @@ key "transfer-key" {
 zone "example.com" {
     type master;
     file "/usr/local/etc/namedb/master/example.com.zone";
+    file-format bind;   # "bind" (default) or "tinydns"; see TINYDNS ZONE FORMAT below
     allow-transfer { 192.168.1.100; };
     also-notify { 192.168.1.100 port 53; };
     notify-source "192.168.1.1";
@@ -164,6 +165,78 @@ zone "corp.example.com." {
 > - **Immediate Reload Support**: Changes to `forwarders` or `forward-timeout` take effect immediately upon configuration reload (`SIGHUP` / `karictl reload`) without requiring a full server restart.
 > - **Unsupported Operations**: Dynamic Update (RFC 2136), Zone Transfer (`AXFR`/`IXFR`), and `NOTIFY` requests are not supported on forward zones and are rejected with `NOTIMP`.
 > - **Security & Transaction ID Randomization**: When relaying to upstream forwarders, KariDNS assigns a fresh cryptographic random transaction ID (`arc4random`) and verifies that the upstream response Question section and ID match before relaying the answer with the client's original transaction ID restored.
+
+---
+
+## TINYDNS ZONE FORMAT
+
+KariDNS can load zone data directly from djbdns/tinydns-style plain-text
+`data` files (not the compiled `data.cdb`), in addition to standard
+BIND-style zone files.
+
+```
+zone "example.com." {
+    type master;
+    file "/usr/local/etc/karidns/data/example.com.tinydns";
+    file-format tinydns;   # omit for the default "bind" format
+};
+```
+
+A single `data` file that mixes forward-zone records (e.g. `=host:ip`)
+and reverse-zone records (`in-addr.arpa.`) can be referenced from
+multiple `zone {}` blocks simultaneously; each zone automatically keeps
+only the records belonging to it (longest-suffix match against all
+configured zone names, so parent/child zone delegation is handled
+correctly without duplicate records).
+
+> [!NOTE]
+> **tinydns Format Support Scope:**
+> - **Verified against djbdns 1.05 source**: Record types `.` `&` `+`
+>   `=` `-` `@` `'` `^` `C` `Z` `:` are supported, including exact
+>   default TTL values, the `x` (nameserver/MX target) expansion rules,
+>   127-byte TXT character-string chunking, and the same lenient IPv4
+>   octet parsing (no range validation, trailing garbage tolerated) as
+>   the original `tinydns-data`.
+> - **`timestamp` field**: Supported as a **load-time** approximation.
+>   A record whose `timestamp` is in the future is excluded until the
+>   zone is next reloaded (`SIGHUP` / `karictl reload`); the original
+>   djbdns behavior re-evaluates this on every single query in
+>   real time. The `ttl=0` "countdown TTL" variant is supported the
+>   same way: the shrinking TTL is computed once at load time, not
+>   recalculated per query.
+> - **`%` location (split-horizon by client IP) is NOT supported.**
+>   `%` lines are parsed but ignored with a warning; all records are
+>   served to all clients regardless of any `lo` field. If your data
+>   file relies on location-based responses, see the workaround below.
+> - **Hot reload limitation**: Because `timestamp` and (if it were
+>   supported) `%` location decisions are made at load time, any zone
+>   using these features should be reloaded on a schedule (e.g. a cron
+>   job calling `karictl reload <zone>`) if near-real-time accuracy is
+>   required.
+
+### Workaround for `%` location or real-time `timestamp` semantics
+
+If a zone genuinely depends on djbdns's per-query location matching or
+real-time timestamp evaluation, run the original `tinydns` binary as an
+independent local service and point a KariDNS **forward zone** at it,
+instead of using `file-format tinydns;` for that zone:
+
+```
+zone "legacy-location.example." {
+    type forward;
+    forwarders { 127.0.0.1 port 5453; };
+};
+```
+
+This delegates all query handling for that zone to the real `tinydns`,
+which implements these two features exactly as designed. Note that
+`%` location matching depends on seeing the true client source address;
+since KariDNS forwards from its own loopback address, per-client
+location resolution inside `tinydns` will not see the original
+client's IP unless `tinydns` is patched to honor EDNS Client Subnet
+(RFC 7871) and KariDNS is configured to attach it — this is outside
+KariDNS's current feature set and would need to be addressed
+separately if required.
 
 ---
 
