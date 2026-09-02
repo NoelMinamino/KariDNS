@@ -35,8 +35,14 @@ static void *safe_calloc_or_die(size_t nmemb, size_t size) {
 
 #define APPEND_STR(arr, cnt, val) \
     do { \
-        (arr) = safe_realloc_or_die((arr), sizeof(char *) * ((cnt) + 1)); \
-        (arr)[(cnt)++] = (val); \
+        char *_val_dup = (val); \
+        if (!_val_dup) { \
+            if (ctx) ctx->error_occurred = true; \
+            return -1; \
+        } \
+        char **_new_arr = safe_realloc_or_die((arr), sizeof(char *) * ((cnt) + 1)); \
+        (arr) = _new_arr; \
+        (arr)[(cnt)++] = _val_dup; \
     } while (0)
 
 static void skip_spaces_and_comments_in_frame(config_file_frame_t *frame) {
@@ -551,9 +557,7 @@ static int parse_string_list_inner(token_ctx_t *ctx, char ***list, int *count) {
       free_token(&tok);
       return -1;
     }
-    *list = safe_realloc_or_die(*list, sizeof(char *) * (*count + 1));
-    (*list)[*count] = strdup(tok.value);
-    (*count)++;
+    APPEND_STR(*list, *count, strdup(tok.value));
     free_token(&tok);
     tok = get_next_token(ctx);
     if (tok.type != TOKEN_SEMICOLON) {
@@ -641,10 +645,19 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
         } else {
             char *val = strdup(tok.value);
             free_token(&tok);
+            if (!val) {
+                if (ctx) ctx->error_occurred = true;
+                return -1;
+            }
             bool double_negated = false;
             if (in_negated_block && val[0] == '!') {
                 char *unbanged = strdup(val + 1);
-                free(val); val = unbanged;
+                free(val);
+                if (!unbanged) {
+                    if (ctx) ctx->error_occurred = true;
+                    return -1;
+                }
+                val = unbanged;
                 double_negated = true; // !{ !X; } => X
             }
             if (in_negated_block && strcmp(val, "any") == 0) {
@@ -652,10 +665,13 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
             } else if (in_negated_block && !double_negated) {
                 size_t buflen = strlen(val) + 2;
                 char *negated = malloc(buflen);
-                if (negated) {
-                    snprintf(negated, buflen, "!%s", val);
-                    APPEND_STR(*list, *count, negated);
+                if (!negated) {
+                    free(val);
+                    if (ctx) ctx->error_occurred = true;
+                    return -1;
                 }
+                snprintf(negated, buflen, "!%s", val);
+                APPEND_STR(*list, *count, negated);
                 free(val);
             } else {
                 APPEND_STR(*list, *count, val);
@@ -690,8 +706,14 @@ static int parse_ip_port_list(token_ctx_t *ctx, ip_port_t **list, int *count) {
       free_token(&tok);
       return -1;
     }
+    char *ip_val = strdup(tok.value);
+    if (!ip_val) {
+      free_token(&tok);
+      if (ctx) ctx->error_occurred = true;
+      return -1;
+    }
     *list = safe_realloc_or_die(*list, sizeof(ip_port_t) * (*count + 1));
-    (*list)[*count].ip = strdup(tok.value);
+    (*list)[*count].ip = ip_val;
     (*list)[*count].port = 53;
     free_token(&tok);
     tok = get_next_token(ctx);
@@ -830,6 +852,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   zone_config_t *zone = safe_calloc_or_die(1, sizeof(zone_config_t));
   zone->domain = strdup(tok.value);
   free_token(&tok);
+  if (!zone->domain) {
+    free_zone_config(zone);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
   size_t dl = strlen(zone->domain);
   if (dl > 0 && zone->domain[dl - 1] != '.') {
     char *norm = malloc(dl + 2);
@@ -861,6 +888,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     }
     char *key = strdup(tok.value);
     free_token(&tok);
+    if (!key) {
+      free_zone_config(zone);
+      if (ctx) ctx->error_occurred = true;
+      return -1;
+    }
     if (strcmp(key, "masters") == 0) {
       if (parse_ip_port_list(ctx, &zone->masters, &zone->masters_count) !=
           0) {
@@ -896,6 +928,12 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       }
       char *val = strdup(tok.value);
       free_token(&tok);
+      if (!val) {
+        free(key);
+        free_zone_config(zone);
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+      }
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) {
         free(key);
@@ -926,6 +964,12 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           free_zone_config(zone);
           return -1;
         }
+        if (!zone->type) {
+          free(key);
+          free_zone_config(zone);
+          if (ctx) ctx->error_occurred = true;
+          return -1;
+        }
       }
       else if (strcmp(key, "file") == 0)
         zone->file = val;
@@ -948,6 +992,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       }
       zone->program_path = strdup(tok.value);
       free_token(&tok);
+      if (!zone->program_path) { free(key); free_zone_config(zone); if (ctx) ctx->error_occurred = true; return -1; }
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
@@ -960,6 +1005,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       zone->program_user = strdup(tok.value);
       free_token(&tok);
+      if (!zone->program_user) { free(key); free_zone_config(zone); if (ctx) ctx->error_occurred = true; return -1; }
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
@@ -1022,6 +1068,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   free_token(&tok);
   if (!zone->type) {
     zone->type = strdup("master");
+    if (!zone->type) { free_zone_config(zone); if (ctx) ctx->error_occurred = true; return -1; }
   }
   if (zone->type && strcasecmp(zone->type, "program") == 0) {
     if (zone->file) {
@@ -1420,6 +1467,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       view_config_t *view = safe_calloc_or_die(1, sizeof(view_config_t));
       view->name = strdup(tok.value);
       free_token(&tok);
+      if (!view->name) { free(view); if (ctx) ctx->error_occurred = true; return -1; }
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) { free(view->name); free(view); free_token(&tok); return -1; }
       free_token(&tok);
@@ -1500,6 +1548,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       tsig_key_t *tsig = safe_calloc_or_die(1, sizeof(tsig_key_t));
       tsig->name = strdup(tok.value);
       free_token(&tok);
+      if (!tsig->name) { free(tsig); if (ctx) ctx->error_occurred = true; return -1; }
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_LBRACE) {
         free(tsig->name);
@@ -1524,6 +1573,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         }
         char *key_prop = strdup(tok.value);
         free_token(&tok);
+        if (!key_prop) {
+          free(tsig->name);
+          if (tsig->algorithm) free(tsig->algorithm);
+          if (tsig->secret) free(tsig->secret);
+          free(tsig);
+          if (ctx) ctx->error_occurred = true;
+          return -1;
+        }
         if (strcmp(key_prop, "algorithm") == 0 ||
             strcmp(key_prop, "secret") == 0) {
           tok = get_next_token(ctx);
@@ -1538,6 +1595,15 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           char *val = strdup(tok.value);
           free_token(&tok);
+          if (!val) {
+            free(key_prop);
+            free(tsig->name);
+            if (tsig->algorithm) free(tsig->algorithm);
+            if (tsig->secret) free(tsig->secret);
+            free(tsig);
+            if (ctx) ctx->error_occurred = true;
+            return -1;
+          }
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
             free(key_prop);

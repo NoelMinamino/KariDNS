@@ -2497,25 +2497,32 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
   }
 }
 
+static void zone_arena_clear_data_pools(zone_arena_t *arena) {
+  if (!arena) return;
+  for (int i = 0; i < arena->data_pool_count; i++) {
+    if (arena->data_pools[i]) {
+      free(arena->data_pools[i]);
+      arena->data_pools[i] = NULL;
+    }
+  }
+  if (arena->nsec_records) {
+    free(arena->nsec_records);
+    arena->nsec_records = NULL;
+    arena->nsec_count = 0;
+  }
+  if (arena->sorted_unique_names) {
+    free(arena->sorted_unique_names);
+    arena->sorted_unique_names = NULL;
+    arena->sorted_unique_count = 0;
+  }
+  arena->count = 0;
+  arena->data_pool_count = 0;
+  arena->current_pool_cap = 0;
+  arena->current_pool_idx = 0;
+}
+
 static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
-  for (int i = 0; i < dst->data_pool_count; i++) {
-    if (dst->data_pools[i])
-      free(dst->data_pools[i]);
-  }
-  if (dst->nsec_records) {
-    free(dst->nsec_records);
-    dst->nsec_records = NULL;
-    dst->nsec_count = 0;
-  }
-  if (dst->sorted_unique_names) {
-    free(dst->sorted_unique_names);
-    dst->sorted_unique_names = NULL;
-    dst->sorted_unique_count = 0;
-  }
-  dst->count = 0;
-  dst->data_pool_count = 0;
-  dst->current_pool_cap = 0;
-  dst->current_pool_idx = 0;
+  zone_arena_clear_data_pools(dst);
   for (size_t i = 0; i < src->count; i++) {
     if (dst->count >= dst->records_cap) {
       size_t new_cap = dst->records_cap == 0 ? 16 : dst->records_cap * 2;
@@ -2665,78 +2672,102 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tsig_key_t *tsig_key) {
   uint8_t *msg;
   uint16_t msg_len;
-  pthread_mutex_lock(&entry->writer_lock);
-  zone_arena_t *active =
-      atomic_load_explicit(&entry->rcu.active, memory_order_relaxed);
-  zone_arena_t *standby = (active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
-                                                          : &entry->rcu.arena_a;
-  if (session->soa_count == 0) {
-    standby->count = 0;
-    standby->data_pool_count = 0;
-    standby->current_pool_cap = 0;
-    standby->current_pool_idx = 0;
-    session->is_finished = false;
-  }
+
+  zone_arena_t tmp_arena;
+  memset(&tmp_arena, 0, sizeof(tmp_arena));
+  zone_arena_init(&tmp_arena);
+
+  zone_arena_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  int ret_code = -1;
+
   while (1) {
     int ret = read_dns_tcp_message(tcp_fd, stream_ctx, &msg, &msg_len);
     if (ret < 0 || ret == 0) {
-      pthread_mutex_unlock(&entry->writer_lock);
+      zone_arena_destroy(&tmp_arena);
       return -1;
     }
     if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, 0, NULL, 0, false, NULL, NULL) != 0) {
       syslog(LOG_ERR, "[AXFR] TSIG failed");
-      pthread_mutex_unlock(&entry->writer_lock);
+      zone_arena_destroy(&tmp_arena);
       return -1;
     }
-    if (parse_xfr_packet(msg, msg_len, standby, active, session,
+    if (parse_xfr_packet(msg, msg_len, &tmp_arena, active, session,
                          entry->domain) != 0) {
-      pthread_mutex_unlock(&entry->writer_lock);
+      zone_arena_destroy(&tmp_arena);
       return -1;
     }
     if (session->is_finished) {
-      int ret_code = 1;
-      if (standby->count > 0) {
-        for (size_t k = 0; k < standby->count; k++) {
-          if (standby->records[k].type_code == 6 &&
-              standby->records[k].rdata_count >= 7) {
-            entry->serial = strtoul(standby->records[k].rdata[2], NULL, 10);
-            entry->refresh = parse_ttl_value(standby->records[k].rdata[3]);
-            entry->retry = parse_ttl_value(standby->records[k].rdata[4]);
-            entry->expire = parse_ttl_value(standby->records[k].rdata[5]);
-            atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
-            atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
+      if (tmp_arena.count > 0) {
+        uint32_t serial = 0, refresh = 0, retry = 0, expire = 0;
+        bool has_soa = false;
+        for (size_t k = 0; k < tmp_arena.count; k++) {
+          if (tmp_arena.records[k].type_code == 6 &&
+              tmp_arena.records[k].rdata_count >= 7) {
+            serial = strtoul(tmp_arena.records[k].rdata[2], NULL, 10);
+            refresh = parse_ttl_value(tmp_arena.records[k].rdata[3]);
+            retry = parse_ttl_value(tmp_arena.records[k].rdata[4]);
+            expire = parse_ttl_value(tmp_arena.records[k].rdata[5]);
+            has_soa = true;
             break;
           }
         }
-        if (build_zone_index(standby) != 0) {
-            pthread_mutex_unlock(&entry->writer_lock);
-            syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
-            return -1;
+
+        pthread_mutex_lock(&entry->writer_lock);
+        zone_arena_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+        zone_arena_t *standby = (cur_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
+                                                                    : &entry->rcu.arena_a;
+        wait_for_readers(standby);
+
+        if (has_soa) {
+          entry->serial = serial;
+          entry->refresh = refresh;
+          entry->retry = retry;
+          entry->expire = expire;
+          atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
+          atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
         }
-        compute_ixfr_diff(entry, active, standby);
+
+        clone_zone_arena(&tmp_arena, standby);
+
+        if (build_zone_index(standby) != 0) {
+          zone_arena_clear_data_pools(standby);
+          pthread_mutex_unlock(&entry->writer_lock);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
+          return -1;
+        }
+
+        compute_ixfr_diff(entry, cur_active, standby);
         atomic_store_explicit(&entry->rcu.active, standby,
                               memory_order_release);
-        wait_for_readers(active);
+        wait_for_readers(cur_active);
+        pthread_mutex_unlock(&entry->writer_lock);
+
         void send_notify_to_all(const char *domain, const char *view_name);
         send_notify_to_all(entry->domain, entry->view_name);
+        ret_code = 1;
       } else {
+        pthread_mutex_lock(&entry->writer_lock);
         atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
         atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
+        pthread_mutex_unlock(&entry->writer_lock);
         ret_code = 2;
       }
-      pthread_mutex_unlock(&entry->writer_lock);
-
-      // Hook for catalog zone processing
-      server_config_t *cfg = acquire_config_snapshot();
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
-      if (zcfg && zcfg->is_catalog) {
-          void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
-          catalog_process_membership(entry, zcfg, entry->view_name);
-      }
-      release_config_snapshot(cfg);
-      return ret_code;
+      break;
     }
   }
+
+  zone_arena_destroy(&tmp_arena);
+
+  // Hook for catalog zone processing
+  server_config_t *cfg = acquire_config_snapshot();
+  zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+  if (zcfg && zcfg->is_catalog) {
+      void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
+      catalog_process_membership(entry, zcfg, entry->view_name);
+  }
+  release_config_snapshot(cfg);
+  return ret_code;
 }
 
 static const char *strchr_unescaped(const char *s, char c) {
@@ -3699,6 +3730,7 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
   int prcount = 0, upcount = 0;
   int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &prcount, &upcount);
   if (rcode != 0) {
+    zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     return rcode;
   }
@@ -3706,6 +3738,7 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
   bump_soa_serial_in_arena(z_standby);
 
   if (build_zone_index(z_standby) != 0) {
+    zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
     return 2; // SERVFAIL
@@ -4593,6 +4626,9 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
         }
       }
       if (zcfg && zcfg->allow_update_count > 0) {
+        if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
+          auth = true;
+        }
         tsig_key_t *k = cfg->keys;
         while (k) {
           bool key_allowed = false;
@@ -4624,7 +4660,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
     
     int rcode = 5; // REFUSED
     if (auth && zone_is_master) {
-      rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key->name);
+      rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key ? matched_key->name : "<none>");
     } else if (auth && !zone_is_master) {
       rcode = 9; // NOTAUTH (RFC 2136 §3.8: Server is not the primary for the zone)
       add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not the primary for the zone");
@@ -6424,6 +6460,15 @@ worker_startup_success:;
         // TCP 既存処理
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
+        if (ev_list[i].flags & (EV_EOF | EV_ERROR)) {
+          struct kevent ev_del;
+          EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+          kevent(kq, &ev_del, 1, NULL, 0, NULL);
+          close(client_fd);
+          dec_tcp_clients();
+          free(ctx_tcp);
+          continue;
+        }
         uint8_t *msg;
         uint16_t msg_len;
         int ret = read_dns_tcp_message(client_fd, ctx_tcp, &msg, &msg_len);
