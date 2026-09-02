@@ -982,12 +982,55 @@ static int write_char_string(uint8_t *res, size_t max_res_len, uint16_t *offset,
     return 0;
 }
 
+static double parse_double_c(const char *s, char **endptr) {
+    if (!s) {
+        if (endptr) *endptr = NULL;
+        return 0.0;
+    }
+    while (isspace((unsigned char)*s)) s++;
+    int sign = 1;
+    if (*s == '-') {
+        sign = -1;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    double int_part = 0.0;
+    bool has_digits = false;
+    while (isdigit((unsigned char)*s)) {
+        has_digits = true;
+        int_part = int_part * 10.0 + (*s - '0');
+        s++;
+    }
+    double frac_part = 0.0;
+    double divisor = 1.0;
+    if (*s == '.') {
+        s++;
+        while (isdigit((unsigned char)*s)) {
+            has_digits = true;
+            frac_part = frac_part * 10.0 + (*s - '0');
+            divisor *= 10.0;
+            s++;
+        }
+    }
+    if (!has_digits) {
+        if (endptr) *endptr = (char *)s;
+        return 0.0;
+    }
+    double val = (int_part + (frac_part / divisor)) * sign;
+    if (*s == 'm' || *s == 'M') {
+        s++; // LOC record altitude/size optional 'm' suffix
+    }
+    if (endptr) *endptr = (char *)s;
+    return val;
+}
+
 static int loc_parse_coord(char **rdata, int rdata_count, int *idx, double *out_seconds, char *dir_out) {
     double parts[3] = {0, 0, 0};
     int n = 0;
     while (n < 3 && *idx < rdata_count) {
         char *endptr;
-        double v = strtod(rdata[*idx], &endptr);
+        double v = parse_double_c(rdata[*idx], &endptr);
         if (endptr == rdata[*idx] || *endptr != '\0') break; // 数値でなければ方角トークンとみなす
         parts[n++] = v;
         (*idx)++;
@@ -1269,10 +1312,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (lon_sec < 0 || lon_sec > 648000.0) return -1;
 
                 double alt_m = 0, size_m = 1, hp_m = 10000, vp_m = 10;
-                if (idx < rec->rdata_count) alt_m  = strtod(rec->rdata[idx++], NULL);
-                if (idx < rec->rdata_count) size_m = strtod(rec->rdata[idx++], NULL);
-                if (idx < rec->rdata_count) hp_m   = strtod(rec->rdata[idx++], NULL);
-                if (idx < rec->rdata_count) vp_m   = strtod(rec->rdata[idx++], NULL);
+                if (idx < rec->rdata_count) alt_m  = parse_double_c(rec->rdata[idx++], NULL);
+                if (idx < rec->rdata_count) size_m = parse_double_c(rec->rdata[idx++], NULL);
+                if (idx < rec->rdata_count) hp_m   = parse_double_c(rec->rdata[idx++], NULL);
+                if (idx < rec->rdata_count) vp_m   = parse_double_c(rec->rdata[idx++], NULL);
 
                 uint8_t size_b = loc_encode_precsize(size_m);
                 uint8_t hp_b   = loc_encode_precsize(hp_m);

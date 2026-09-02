@@ -2759,7 +2759,7 @@ static ssize_t do_dns_exchange_auto(const char *server, int port, const query_op
         return do_dns_exchange_by_transport(server, port, qo, force_tcp, pkt, pkt_len, resp, resp_cap, timeout_sec);
     }
     ssize_t n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
-    if (n >= 4 && (resp[2] & 0x02) != 0) { // TC bit detected (truncation)
+    if (n >= 4 && (resp[2] & 0x02) != 0 && (!qo || !qo->ignore_tc)) { // TC bit detected (truncation)
         ssize_t tn = do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
         if (tn > 0) return tn;
     }
@@ -6108,13 +6108,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
 
     server_result_t *sres = NULL;
 
-    bool retry_tcp = false;
-    do {
-        retry_tcp = false;
-        struct timespec start_ts;
-        clock_gettime(CLOCK_MONOTONIC, &start_ts);
-        
-        axfr_state_t axfr_state = {0};
+    struct timespec start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    
+    axfr_state_t axfr_state = {0};
         axfr_state.is_axfr = (qtype == 252 || qtype == 251);
         axfr_state.is_ixfr = (qtype == 251);
 
@@ -6188,6 +6185,30 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                 }
             } else {
                 n = do_udp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
+                if (n >= 4 && (resp[2] & 0x02) != 0) {
+                    if (eff_qo.ignore_tc) {
+                        if (!dopt->short_mode && !dopt->yaml) {
+                            fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
+                        }
+                    } else {
+                        if (!dopt->short_mode && !dopt->yaml) {
+                            fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
+                        }
+                        use_tcp = true;
+                        if (eff_qo.keep_tcp_open) {
+                            n = do_tcp_exchange(server, port, &eff_qo, pkt, pkt_len, resp, sizeof(resp), eff_qo.timeout_sec);
+                        } else {
+                            tcp_sock = do_tcp_send_request(server, port, &eff_qo, pkt, pkt_len, eff_qo.timeout_sec);
+                            if (tcp_sock >= 0) {
+                                n = do_tcp_recv_response(tcp_sock, resp, sizeof(resp));
+                                if (n <= 0) {
+                                    close(tcp_sock);
+                                    tcp_sock = -1;
+                                }
+                            }
+                        }
+                    }
+                }
                 if (n >= 0) break;
             }
             if (attempts < max_tries) {
@@ -6256,8 +6277,6 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         clock_gettime(CLOCK_MONOTONIC, &end_ts);
         long long elapsed_usec = (end_ts.tv_sec - start_ts.tv_sec) * 1000000LL + (end_ts.tv_nsec - start_ts.tv_nsec) / 1000LL;
         long elapsed_ms = (long)(elapsed_usec / 1000LL);
-
-        bool is_truncated = (!use_tcp && n >= 4 && (resp[2] & 0x02) != 0);
 
         int msg_index = 1;
         int total_records = 0;
@@ -6499,20 +6518,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         }
         if (tcp_sock >= 0) close(tcp_sock);
 
-        if (is_truncated) {
-            if (qo->ignore_tc) {
-                fprintf(stderr, "\n;; Truncated response received, but +ignore specified; not retrying in TCP mode.\n");
-            } else {
-                fprintf(stderr, ";; Truncated, retrying in TCP mode.\n");
-                use_tcp = true;
-                retry_tcp = true;
-            }
+        if (qo->check_dns64prefix) {
+            run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
         }
-    } while (retry_tcp);
-
-    if (qo->check_dns64prefix) {
-        run_dns64prefix_check(server, port, qo, use_tcp, no_hexdump_query, no_hexdump_response, dopt);
-    }
 
     return 0;
 }
@@ -8882,8 +8890,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                     size_t dec_len = hex_decode(hex, spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].data,
                                                 sizeof(spec->qo.custom_edns_opts[0].data));
                     if (dec_len == (size_t)-1) {
-                        fprintf(stderr, "warning: +ednsopt hex payload exceeds buffer size, truncating\n");
-                        dec_len = sizeof(spec->qo.custom_edns_opts[0].data);
+                        fprintf(stderr, "error: +ednsopt hex payload exceeds buffer size or is invalid\n");
+                        exit(1);
                     }
                     spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = (uint16_t)dec_len;
                 } else {
