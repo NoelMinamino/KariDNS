@@ -42,11 +42,12 @@ jobs:
 
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-            make -j"$NCPU" all asan tsan tools-asan fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_dag fuzz_tsig_verify asan_test hash_test include_test
+            make -j"$NCPU" all asan tsan tools-asan fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_dag fuzz_tsig_verify asan_test tinydns_test hash_test include_test
             echo "::endgroup::"
 
             echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
             ./test_asan_overflow
+            ./test_tinydns_parser
             ./test_hash_table
             ./test_conf_include
             echo "::endgroup::"

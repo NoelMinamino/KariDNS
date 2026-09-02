@@ -207,44 +207,16 @@ static void tinydns_parse_timestamp(const char *field, size_t flen, bool *has_ts
     }
 }
 
-/* 注意: これは案B(ロード時評価)の実装であり、本家tinydnsのように
- * クエリごとにリアルタイムで再評価されるわけではない。
- * timestampを跨いだ切り替わりや、カウントダウンTTLの正確な減少は、
- * ゾーンファイルが次にリロードされるまで反映されない。
- * 真にリアルタイムな評価(案A)が必要になった場合は、
- * dns_record_t にtimestamp情報を持たせた上でresolve_name()側に
- * 判定ロジックを追加する、より大きな変更が必要になる。
- *
- * セクション0の仕様に基づき、レコードを生成すべきか・実効TTLはいくつかを判定する。
- * 戻り値 true: レコードを生成する(*ttl_outが実効TTL)
- * 戻り値 false: レコードをスキップする(呼び出し側は何も生成しない) */
-static bool tinydns_apply_timestamp(const char *ts_field, size_t ts_len,
-                                    unsigned long ttl_in, unsigned long *ttl_out) {
+/* timestampフィールドを解析し、ttdとcountdownフラグを格納する(案A: リアルタイム評価用)。
+ * パーサー内ではスキップ判定を行わず、dns_record_tにttd情報を保持させてクエリ時に評価する。 */
+static void tinydns_parse_ttd_field(const char *ts_field, size_t ts_len,
+                                    bool *has_ttd, time_t *ttd_out, bool is_ttl_zero) {
     bool has_ts = false;
     time_t cutoff = 0;
     tinydns_parse_timestamp(ts_field, ts_len, &has_ts, &cutoff);
-
-    if (!has_ts) {
-        *ttl_out = ttl_in;
-        return true;
-    }
-
-    time_t now = time(NULL);
-
-    if (ttl_in != 0) {
-        /* アクティベーション時刻としてのtimestamp */
-        if (cutoff >= now) return false;
-        *ttl_out = ttl_in;
-        return true;
-    }
-
-    /* カウントダウンTTL(有効期限としてのtimestamp) */
-    if (cutoff < now) return false;
-    double remaining = difftime(cutoff, now);
-    if (remaining < 2.0) remaining = 2.0;
-    if (remaining > 3600.0) remaining = 3600.0;
-    *ttl_out = (unsigned long)remaining;
-    return true;
+    *has_ttd = has_ts;
+    *ttd_out = cutoff;
+    (void)is_ttl_zero;
 }
 
 /* ============================================================================
@@ -287,7 +259,8 @@ static char *tinydns_expand_x(zone_arena_t *arena, const char *x_field, size_t x
 static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ctx,
                                         const char *line_start, const char *buf,
                                         char *owner, const char *type_str,
-                                        uint16_t type_code, unsigned long ttl) {
+                                        uint16_t type_code, unsigned long ttl,
+                                        const char *ts_field, size_t ts_len) {
     dns_record_t *rec = arena_alloc_record(arena, ctx, line_start, buf);
     if (!rec) return NULL;
     rec->name = owner;
@@ -295,6 +268,13 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
     rec->type_code = type_code;
     rec->ttl_value = (uint32_t)ttl;
     rec->class_val = 1; // IN
+
+    bool has_ttd = false;
+    time_t ttd = 0;
+    tinydns_parse_ttd_field(ts_field, ts_len, &has_ttd, &ttd, ttl == 0);
+    rec->tinydns_ttd = has_ttd ? ttd : 0;
+    rec->tinydns_ttl_countdown = has_ttd && (ttl == 0);
+
     return rec;
 }
 
@@ -335,7 +315,6 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_NS;
             if (flen[3] > 0) ttl = strtoul(f[3], NULL, 10);
-            if (!tinydns_apply_timestamp(f[4], flen[4], ttl, &ttl)) return true; /* スキップ */
 
             if (typech == '.') {
                 // SOA レコード
@@ -349,7 +328,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     snprintf(rname_buf, sizeof(rname_buf), "hostmaster.%s", fqdn);
                     char *rname = tinydns_decode_fqdn(arena, rname_buf, strlen(rname_buf));
 
-                    dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, soa_ttl);
+                    dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, soa_ttl, f[4], flen[4]);
                     if (!soa_rec) return false;
 
                     char s_ser[32], s_ref[32], s_ret[32], s_exp[32], s_min[32];
@@ -372,7 +351,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             // NS レコード
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
-                dns_record_t *ns_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "NS", 2, ttl);
+                dns_record_t *ns_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "NS", 2, ttl, f[4], flen[4]);
                 if (!ns_rec) return false;
                 ns_rec->rdata[0] = x;
                 ns_rec->rdata_count = 1;
@@ -384,7 +363,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 if (is_record_owned_by_zone(x, target_zone, all_zones, all_zone_count)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl);
+                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl, f[4], flen[4]);
                     if (!a_rec) return false;
                     a_rec->rdata[0] = arena_strdup(arena, ipstr);
                     a_rec->rdata_count = 1;
@@ -407,7 +386,6 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
-            if (!tinydns_apply_timestamp(f[3], flen[3], ttl, &ttl)) return true; /* スキップ */
 
             uint8_t ip[4];
             if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
@@ -415,7 +393,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 if (is_record_owned_by_zone(owner, target_zone, all_zones, all_zone_count)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, owner, "A", 1, ttl);
+                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, owner, "A", 1, ttl, f[3], flen[3]);
                     if (!a_rec) return false;
                     a_rec->rdata[0] = arena_strdup(arena, ipstr);
                     a_rec->rdata_count = 1;
@@ -428,7 +406,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     if (is_record_owned_by_zone(ptr_name, target_zone, all_zones, all_zone_count)) {
                         dns_record_t *ptr_rec = tinydns_new_record(arena, ctx, line_start, buf,
                                                                    arena_strdup(arena, ptr_name),
-                                                                   "PTR", 12, ttl);
+                                                                   "PTR", 12, ttl, f[3], flen[3]);
                         if (!ptr_rec) return false;
                         ptr_rec->rdata[0] = owner;
                         ptr_rec->rdata_count = 1;
@@ -464,10 +442,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[4] > 0) ttl = strtoul(f[4], NULL, 10);
-            if (!tinydns_apply_timestamp(f[5], flen[5], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
-                dns_record_t *mx_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "MX", 15, ttl);
+                dns_record_t *mx_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "MX", 15, ttl, f[5], flen[5]);
                 if (!mx_rec) return false;
                 char dist_str[16];
                 snprintf(dist_str, sizeof(dist_str), "%lu", dist);
@@ -482,7 +459,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 if (is_record_owned_by_zone(x, target_zone, all_zones, all_zone_count)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl);
+                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl, f[5], flen[5]);
                     if (!a_rec) return false;
                     a_rec->rdata[0] = arena_strdup(arena, ipstr);
                     a_rec->rdata_count = 1;
@@ -504,7 +481,6 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
-            if (!tinydns_apply_timestamp(f[3], flen[3], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 size_t raw_len = 0;
@@ -520,7 +496,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     return false;
                 }
 
-                dns_record_t *txt_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "TXT", 16, ttl);
+                dns_record_t *txt_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "TXT", 16, ttl, f[3], flen[3]);
                 if (!txt_rec) return false;
 
                 /* ============================================================
@@ -581,12 +557,11 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
-            if (!tinydns_apply_timestamp(f[3], flen[3], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 const char *tname = (typech == 'C') ? "CNAME" : "PTR";
                 uint16_t tcode = (typech == 'C') ? 5 : 12;
-                dns_record_t *rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, tname, tcode, ttl);
+                dns_record_t *rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, tname, tcode, ttl, f[3], flen[3]);
                 if (!rec) return false;
                 rec->rdata[0] = target;
                 rec->rdata_count = 1;
@@ -628,10 +603,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[7] > 0) min = strtoul(f[7], NULL, 10);
             unsigned long ttl = TTL_NEGATIVE;
             if (flen[8] > 0) ttl = strtoul(f[8], NULL, 10);
-            if (!tinydns_apply_timestamp(f[9], flen[9], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
-                dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, ttl);
+                dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, ttl, f[9], flen[9]);
                 if (!soa_rec) return false;
 
                 char s_ser[32], s_ref[32], s_ret[32], s_exp[32], s_min[32];
@@ -687,7 +661,6 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             unsigned long ttl = TTL_POSITIVE;
             if (flen[3] > 0) ttl = strtoul(f[3], NULL, 10);
-            if (!tinydns_apply_timestamp(f[4], flen[4], ttl, &ttl)) return true; /* スキップ */
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 size_t raw_len = 0;
@@ -705,7 +678,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 char type_buf[16];
                 snprintf(type_buf, sizeof(type_buf), "TYPE%lu", type_num);
 
-                dns_record_t *gen_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, type_buf, (uint16_t)type_num, ttl);
+                dns_record_t *gen_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, type_buf, (uint16_t)type_num, ttl, f[4], flen[4]);
                 if (!gen_rec) return false;
                 gen_rec->generic_data = raw_bytes;
                 gen_rec->generic_len = (uint16_t)raw_len;
@@ -737,6 +710,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
  * ============================================================================ */
 int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx) {
     if (!buf || !arena) return -1;
+    arena->is_tinydns_format = true;
 
     // SOA serial 用にファイルの mtime を取得
     uint32_t default_serial = (uint32_t)time(NULL);

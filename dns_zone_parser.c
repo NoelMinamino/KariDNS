@@ -1240,6 +1240,7 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->sorted_unique_names = NULL;
   arena->sorted_unique_count = 0;
   atomic_init(&arena->reader_count, 0);
+  arena->is_tinydns_format = false;
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
