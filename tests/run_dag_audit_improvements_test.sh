@@ -207,7 +207,7 @@ if [ "$FAILED" -eq 0 ]; then
     if [ "$SKIPPED" -gt 0 ]; then
         echo "🎉 ALL TESTS PASSED! ($SKIPPED skipped for $CLIENT_NAME)"
     else
-        echo "🎉 ALL AUDIT IMPROVEMENT TESTS PASSED FOR $CLIENT_NAME!"
+        echo "🎉 ALL DAG AUDIT IMPROVEMENT TESTS PASSED FOR $CLIENT_NAME!"
     fi
     exit 0
 else
