@@ -260,7 +260,8 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
                                         const char *line_start, const char *buf,
                                         char *owner, const char *type_str,
                                         uint16_t type_code, unsigned long ttl,
-                                        const char *ts_field, size_t ts_len) {
+                                        const char *ts_field, size_t ts_len,
+                                        const char *lo_field, size_t lo_len) {
     dns_record_t *rec = arena_alloc_record(arena, ctx, line_start, buf);
     if (!rec) return NULL;
     rec->name = owner;
@@ -275,6 +276,9 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
     rec->tinydns_ttd = has_ttd ? ttd : 0;
     rec->tinydns_ttl_countdown = has_ttd && (ttl == 0);
 
+    rec->tinydns_loc[0] = lo_len > 0 ? lo_field[0] : 0;
+    rec->tinydns_loc[1] = lo_len > 1 ? lo_field[1] : 0;
+
     return rec;
 }
 
@@ -285,7 +289,8 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                                  const char *line_start, const char *buf,
                                  char typech, char *f[TINYDNS_NUMFIELDS],
                                  size_t flen[TINYDNS_NUMFIELDS],
-                                 uint32_t default_serial) {
+                                 uint32_t default_serial,
+                                 unsigned long linenum) {
     const char *target_zone = ctx ? ctx->default_origin : NULL;
     const char **all_zones = ctx ? ctx->all_zone_names : NULL;
     int all_zone_count = ctx ? ctx->all_zone_count : 0;
@@ -328,7 +333,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     snprintf(rname_buf, sizeof(rname_buf), "hostmaster.%s", fqdn);
                     char *rname = tinydns_decode_fqdn(arena, rname_buf, strlen(rname_buf));
 
-                    dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, soa_ttl, f[4], flen[4]);
+                    dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, soa_ttl, f[4], flen[4], f[5], flen[5]);
                     if (!soa_rec) return false;
 
                     char s_ser[32], s_ref[32], s_ret[32], s_exp[32], s_min[32];
@@ -351,7 +356,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             // NS レコード
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
-                dns_record_t *ns_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "NS", 2, ttl, f[4], flen[4]);
+                dns_record_t *ns_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "NS", 2, ttl, f[4], flen[4], f[5], flen[5]);
                 if (!ns_rec) return false;
                 ns_rec->rdata[0] = x;
                 ns_rec->rdata_count = 1;
@@ -363,7 +368,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 if (is_record_owned_by_zone(x, target_zone, all_zones, all_zone_count)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl, f[4], flen[4]);
+                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl, f[4], flen[4], f[5], flen[5]);
                     if (!a_rec) return false;
                     a_rec->rdata[0] = arena_strdup(arena, ipstr);
                     a_rec->rdata_count = 1;
@@ -393,7 +398,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 if (is_record_owned_by_zone(owner, target_zone, all_zones, all_zone_count)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, owner, "A", 1, ttl, f[3], flen[3]);
+                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, owner, "A", 1, ttl, f[3], flen[3], f[4], flen[4]);
                     if (!a_rec) return false;
                     a_rec->rdata[0] = arena_strdup(arena, ipstr);
                     a_rec->rdata_count = 1;
@@ -406,7 +411,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     if (is_record_owned_by_zone(ptr_name, target_zone, all_zones, all_zone_count)) {
                         dns_record_t *ptr_rec = tinydns_new_record(arena, ctx, line_start, buf,
                                                                    arena_strdup(arena, ptr_name),
-                                                                   "PTR", 12, ttl, f[3], flen[3]);
+                                                                   "PTR", 12, ttl, f[3], flen[3], f[4], flen[4]);
                         if (!ptr_rec) return false;
                         ptr_rec->rdata[0] = owner;
                         ptr_rec->rdata_count = 1;
@@ -444,7 +449,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[4] > 0) ttl = strtoul(f[4], NULL, 10);
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
-                dns_record_t *mx_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "MX", 15, ttl, f[5], flen[5]);
+                dns_record_t *mx_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "MX", 15, ttl, f[5], flen[5], f[6], flen[6]);
                 if (!mx_rec) return false;
                 char dist_str[16];
                 snprintf(dist_str, sizeof(dist_str), "%lu", dist);
@@ -459,7 +464,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 if (is_record_owned_by_zone(x, target_zone, all_zones, all_zone_count)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl, f[5], flen[5]);
+                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, x, "A", 1, ttl, f[5], flen[5], f[6], flen[6]);
                     if (!a_rec) return false;
                     a_rec->rdata[0] = arena_strdup(arena, ipstr);
                     a_rec->rdata_count = 1;
@@ -496,7 +501,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     return false;
                 }
 
-                dns_record_t *txt_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "TXT", 16, ttl, f[3], flen[3]);
+                dns_record_t *txt_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "TXT", 16, ttl, f[3], flen[3], f[4], flen[4]);
                 if (!txt_rec) return false;
 
                 /* ============================================================
@@ -561,7 +566,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
                 const char *tname = (typech == 'C') ? "CNAME" : "PTR";
                 uint16_t tcode = (typech == 'C') ? 5 : 12;
-                dns_record_t *rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, tname, tcode, ttl, f[3], flen[3]);
+                dns_record_t *rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, tname, tcode, ttl, f[3], flen[3], f[4], flen[4]);
                 if (!rec) return false;
                 rec->rdata[0] = target;
                 rec->rdata_count = 1;
@@ -605,7 +610,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[8] > 0) ttl = strtoul(f[8], NULL, 10);
 
             if (is_record_owned_by_zone(fqdn, target_zone, all_zones, all_zone_count)) {
-                dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, ttl, f[9], flen[9]);
+                dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, ttl, f[9], flen[9], f[10], flen[10]);
                 if (!soa_rec) return false;
 
                 char s_ser[32], s_ref[32], s_ret[32], s_exp[32], s_min[32];
@@ -678,7 +683,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 char type_buf[16];
                 snprintf(type_buf, sizeof(type_buf), "TYPE%lu", type_num);
 
-                dns_record_t *gen_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, type_buf, (uint16_t)type_num, ttl, f[4], flen[4]);
+                dns_record_t *gen_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, type_buf, (uint16_t)type_num, ttl, f[4], flen[4], f[5], flen[5]);
                 if (!gen_rec) return false;
                 gen_rec->generic_data = raw_bytes;
                 gen_rec->generic_len = (uint16_t)raw_len;
@@ -687,10 +692,40 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             return true;
         }
 
-        case '%': { // location (フェーズ1ではパースは通すが安全側に警告・無視)
-            if (flen[0] > 0) {
-                syslog(LOG_WARNING, "[tinydns] location directive '%%%.*s' ignored in phase 1", (int)flen[0], f[0]);
+        case '%': { // location
+            if (arena->location_count >= 4096) {
+                syslog(LOG_WARNING, "[tinydns] location定義が上限(4096)に達したため、"
+                       "これ以上の%%行は無視します (line %lu)", linenum);
+                return true;
             }
+            tinydns_location_entry_t loc;
+            memset(&loc, 0, sizeof(loc));
+            loc.code[0] = flen[0] > 0 ? f[0][0] : 0;
+            loc.code[1] = flen[0] > 1 ? f[0][1] : 0;
+
+            uint8_t prefix[4] = {0};
+            uint8_t prefix_len = 0;
+            size_t pos = 0;
+            while (prefix_len < 4 && pos < flen[1]) {
+                unsigned long val = 0;
+                size_t start = pos;
+                while (pos < flen[1] && isdigit((unsigned char)f[1][pos])) {
+                    val = val * 10 + (f[1][pos] - '0');
+                    pos++;
+                }
+                if (pos == start) break;
+                prefix[prefix_len++] = (uint8_t)(val & 0xFF);
+                if (pos < flen[1] && f[1][pos] == '.') pos++;
+                else break;
+            }
+            loc.prefix_len = prefix_len;
+            memcpy(loc.prefix, prefix, 4);
+
+            tinydns_location_entry_t *new_locs = realloc(arena->locations,
+                (arena->location_count + 1) * sizeof(tinydns_location_entry_t));
+            if (!new_locs) return false;
+            arena->locations = new_locs;
+            arena->locations[arena->location_count++] = loc;
             return true;
         }
 
@@ -723,6 +758,7 @@ int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context
     }
 
     size_t linestart = 0;
+    unsigned long linenum = 1;
     while (linestart < len) {
         size_t lineend = linestart;
         while (lineend < len && buf[lineend] != '\n') lineend++;
@@ -739,17 +775,20 @@ int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context
 
         if (linelen == 0) {
             linestart = lineend + 1;
+            linenum++;
             continue;
         }
 
         if (line[0] == '#') {
             linestart = lineend + 1;
+            linenum++;
             continue;
         }
 
         // セクション2: 行頭が '-' の行は無効化行として無条件スキップ
         if (line[0] == '-') {
             linestart = lineend + 1;
+            linenum++;
             continue;
         }
 
@@ -772,11 +811,12 @@ int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context
             }
         }
 
-        if (!tinydns_process_line(arena, ctx, line, buf, line[0], f, flen, default_serial)) {
+        if (!tinydns_process_line(arena, ctx, line, buf, line[0], f, flen, default_serial, linenum)) {
             return -1;
         }
 
         linestart = lineend + 1;
+        linenum++;
     }
 
     return (int)arena->count;
