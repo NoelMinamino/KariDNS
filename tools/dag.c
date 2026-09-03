@@ -2977,7 +2977,9 @@ static void sink_printf(rdata_sink_t *sink, const char *fmt, ...) {
             }
         }
     } else {
-        vprintf(fmt, args);
+        if (!g_dag_suppress_stdout) {
+            vprintf(fmt, args);
+        }
     }
     va_end(args);
 }
