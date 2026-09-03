@@ -2374,6 +2374,19 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                     }
                                 }
                             }
+                        } else if (opt_code == 8) { // EDNS Client Subnet (RFC 7871)
+                            if (opt_len >= 4) {
+                                edns->has_ecs = true;
+                                edns->ecs_family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
+                                edns->ecs_source_prefix = req[rdata_offset + 2];
+                                edns->ecs_scope_prefix = req[rdata_offset + 3];
+                                memset(edns->ecs_addr, 0, sizeof(edns->ecs_addr));
+                                size_t addr_len = opt_len - 4;
+                                if (addr_len > sizeof(edns->ecs_addr)) {
+                                    addr_len = sizeof(edns->ecs_addr);
+                                }
+                                memcpy(edns->ecs_addr, req + rdata_offset + 4, addr_len);
+                            }
                         }
                         rdata_offset += opt_len;
                     }

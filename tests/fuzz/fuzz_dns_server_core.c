@@ -183,7 +183,8 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
                  &db_entry_ptr, zone_ptr, res,
                  sizeof(res), &offset, &comp_ctx,
                  &ancount, &nscount, &arcount,
-                 false, false, 0, false, NULL, NULL, NULL);
+                 false, false, 0, false, NULL, NULL, NULL,
+                 NULL, false, NULL, 0);
     if ((res[3] & 0x0F) != 2) {
         // Must be exactly SERVFAIL (2), not (3 | 2 = 3)
         abort();
@@ -222,7 +223,8 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
                  &db_entry_ptr, zone_ptr, res,
                  sizeof(res), &offset, &comp_ctx,
                  &ancount, &nscount, &arcount,
-                 false, false, 0, false, NULL, NULL, NULL);
+                 false, false, 0, false, NULL, NULL, NULL,
+                 NULL, false, NULL, 0);
     if ((res[3] & 0x0F) != 2) {
         // Must be exactly SERVFAIL (2) on CNAME loop exhaustion
         zone_arena_destroy(&loop_arena);

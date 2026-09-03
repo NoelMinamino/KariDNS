@@ -331,6 +331,18 @@ void free_zone_config(zone_config_t *zone) {
   free(zone->forwarders);
   free(zone->file_format);
   free_rate_limit_config(&zone->rrl);
+  if (zone->ecs_tags) {
+    for (int i = 0; i < zone->ecs_tag_count; i++) {
+      free(zone->ecs_tags[i].tag);
+      for (int j = 0; j < zone->ecs_tags[i].cidr_count; j++) {
+        free(zone->ecs_tags[i].cidrs[j].cidr);
+      }
+      free(zone->ecs_tags[i].cidrs);
+    }
+    free(zone->ecs_tags);
+    zone->ecs_tags = NULL;
+    zone->ecs_tag_count = 0;
+  }
   free(zone);
 }
 
@@ -431,6 +443,26 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->logging.responses_channel_name) {
     free(cfg->logging.responses_channel_name);
     cfg->logging.responses_channel_name = NULL;
+  }
+  if (cfg->ecs_trusted_resolvers) {
+    for (int i = 0; i < cfg->ecs_trusted_resolvers_count; i++) {
+      free(cfg->ecs_trusted_resolvers[i]);
+    }
+    free(cfg->ecs_trusted_resolvers);
+    cfg->ecs_trusted_resolvers = NULL;
+    cfg->ecs_trusted_resolvers_count = 0;
+  }
+  if (cfg->ecs_tags) {
+    for (int i = 0; i < cfg->ecs_tag_count; i++) {
+      free(cfg->ecs_tags[i].tag);
+      for (int j = 0; j < cfg->ecs_tags[i].cidr_count; j++) {
+        free(cfg->ecs_tags[i].cidrs[j].cidr);
+      }
+      free(cfg->ecs_tags[i].cidrs);
+    }
+    free(cfg->ecs_tags);
+    cfg->ecs_tags = NULL;
+    cfg->ecs_tag_count = 0;
   }
 }
 
@@ -844,6 +876,101 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   return 0;
 }
 
+static int parse_ecs_tags_block(token_ctx_t *ctx, ecs_tag_def_t **out_tags, int *out_count) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) {
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) {
+      free_token(&tok);
+      break;
+    }
+    if (tok.type != TOKEN_STRING || strcmp(tok.value, "tag") != 0) {
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_STRING) {
+      free_token(&tok);
+      return -1;
+    }
+    char *tag_name = strdup(tok.value);
+    free_token(&tok);
+
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_LBRACE) {
+      free(tag_name);
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+
+    ecs_cidr_entry_t *cidrs = NULL;
+    int cidr_count = 0;
+    bool cidr_err = false;
+    while (1) {
+      tok = get_next_token(ctx);
+      if (tok.type == TOKEN_RBRACE) {
+        free_token(&tok);
+        break;
+      }
+      if (tok.type != TOKEN_STRING) {
+        free_token(&tok);
+        cidr_err = true;
+        break;
+      }
+      cidrs = safe_realloc_or_die(cidrs, sizeof(ecs_cidr_entry_t) * (cidr_count + 1));
+      cidrs[cidr_count++].cidr = strdup(tok.value);
+      free_token(&tok);
+
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free_token(&tok);
+        cidr_err = true;
+        break;
+      }
+      free_token(&tok);
+    }
+    if (cidr_err) {
+      free(tag_name);
+      for (int c = 0; c < cidr_count; c++) free(cidrs[c].cidr);
+      free(cidrs);
+      return -1;
+    }
+
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) {
+      free(tag_name);
+      for (int c = 0; c < cidr_count; c++) free(cidrs[c].cidr);
+      free(cidrs);
+      free_token(&tok);
+      return -1;
+    }
+    free_token(&tok);
+
+    *out_tags = safe_realloc_or_die(*out_tags, sizeof(ecs_tag_def_t) * (*out_count + 1));
+    (*out_tags)[*out_count].tag = tag_name;
+    (*out_tags)[*out_count].cidrs = cidrs;
+    (*out_tags)[*out_count].cidr_count = cidr_count;
+    (*out_count)++;
+  }
+
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return 0;
+}
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_STRING) {
@@ -1068,6 +1195,12 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_zone_config(zone);
         return -1;
       }
+    } else if (strcmp(key, "ecs-tags") == 0) {
+      if (parse_ecs_tags_block(ctx, &zone->ecs_tags, &zone->ecs_tag_count) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
     } else
       skip_unknown_block(ctx);
     free(key);
@@ -1244,6 +1377,42 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
         } else if (strcmp(key, "rate-limit") == 0) {
           if (parse_rate_limit_config(ctx, &config->rrl) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "ecs-enable") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->ecs_enable = true;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->ecs_enable = false;
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "ecs-trusted-resolvers") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_LBRACE) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+          if (parse_string_list_inner(ctx, &config->ecs_trusted_resolvers,
+                                      &config->ecs_trusted_resolvers_count) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "ecs-tags") == 0) {
+          if (parse_ecs_tags_block(ctx, &config->ecs_tags, &config->ecs_tag_count) != 0) {
             free(key);
             return -1;
           }
