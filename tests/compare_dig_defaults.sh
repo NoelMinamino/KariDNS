@@ -33,6 +33,7 @@ rm -rf "$SCRIPT_DIR/$TEST_DIR"
 mkdir -p "$SCRIPT_DIR/$TEST_DIR"
 cd "$SCRIPT_DIR/$TEST_DIR"
 TEST_DIR_ABS=$(pwd)
+sed -E 's/^[[:space:]]*\$INCLUDE[[:space:]]+/; $INCLUDE /g' "${SCRIPT_DIR}/zones/example.com.zone" > example.com.zone
 
 # Configure local KariDNS authoritative server
 cat << EOF > karidns.conf
@@ -53,7 +54,7 @@ view "default" {
     match-clients { any; };
     zone "example.com" {
         type master;
-        file "${SCRIPT_DIR}/zones/example.com.zone";
+        file "${TEST_DIR_ABS}/example.com.zone";
         allow-transfer { any; };
     };
 };
@@ -449,6 +450,13 @@ EOF
     compare_query "Audit: ZONEMD record query" "example.com TYPE63"
     compare_query "Audit: ZONEMD with YAML (+yaml)" "example.com TYPE63 +yaml"
     compare_query "Audit: EDNS padding with explicit size (+padding=512)" "www.example.com A +padding=512 +qr"
+
+    echo "--------------------------------------------------------"
+    echo "19. Audit Improvements (Search list safety, EDNS negotiation)"
+    echo "--------------------------------------------------------"
+    compare_query "Search domain: with +search +domain" "ns1 +search +domain=example.com"
+    compare_query "Search domain: absolute FQDN with +search" "ns1.example.com. +search +domain=example.com"
+    compare_query "EDNS negotiation: on standard query (+ednsnegotiation)" "ns1.example.com A +ednsnegotiation"
 fi
 
 echo "========================================================"
