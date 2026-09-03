@@ -5936,7 +5936,13 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
             printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
             for (int i = 0; i < g_server_count; i++) {
                 server_result_t *r = &g_results[i];
-                printf("%s%s", (i > 0) ? "," : "", r->server_ip);
+                printf("%s", (i > 0) ? "," : "");
+                bool is_ipv6 = (strchr(r->server_ip, ':') != NULL && r->server_ip[0] != '[');
+                if (is_ipv6) {
+                    printf("[%s]", r->server_ip);
+                } else {
+                    printf("%s", r->server_ip);
+                }
                 if (r->msg_total > 1) printf("/%d-%d", r->msg_index, r->msg_total);
                 printf("|%s|%ld:", r->proto, r->elapsed_ms);
                 print_ldnsz_payload(r->resp_buf, r->resp_len);
