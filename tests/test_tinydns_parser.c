@@ -521,6 +521,88 @@ static void test_timestamp_evaluation(void) {
     }
 }
 
+/* ============================================================================
+ * Test 8: location (%) ディレクティブおよびレコードの location フィールド検証
+ * ============================================================================ */
+static void test_location_directive_and_records(void) {
+    printf("--- Test 8: Location Directives and Records ---\n");
+
+    const char *data =
+        "%in:192.168\n"
+        "%ex:10.0.1.2\n"
+        "%df\n"
+        "+www.example.com:192.168.1.10:300::in\n"
+        "+www.example.com:10.0.1.10:300::ex\n"
+        "+www.example.com:1.2.3.4:300\n"
+        "=mail.example.com:192.168.1.20:300::in\n"
+        "@example.com:192.168.1.30:mx1:10:300::in\n"
+        "'txt.example.com:Internal:300::in\n"
+        "^ptr.example.com:internal.example.com:300::in\n"
+        "Calias.example.com:www.example.com:300::in\n"
+        ".example.com:192.168.1.1:a:259200::in\n"
+        "&sub.example.com:192.168.1.2:ns1.sub:86400::in\n"
+        "Zcustom.example.com:ns1.example.com:admin.example.com:1:7200:3600:1209600:300:600::in\n"
+        ":ssh.example.com:44:\\002\\001\\001\\012\\023\\045:3600::in\n";
+
+    char *buf = strdup(data);
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+
+    int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
+    TEST_ASSERT(count > 0, "parse_tinydns_data with locations succeeds");
+    TEST_ASSERT(arena.location_count == 3, "location_count is 3");
+
+    if (arena.location_count >= 3) {
+        TEST_ASSERT(arena.locations[0].code[0] == 'i' && arena.locations[0].code[1] == 'n', "loc 0 code is 'in'");
+        TEST_ASSERT(arena.locations[0].prefix_len == 2, "loc 0 prefix_len is 2");
+        TEST_ASSERT(arena.locations[0].prefix[0] == 192 && arena.locations[0].prefix[1] == 168, "loc 0 prefix 192.168");
+
+        TEST_ASSERT(arena.locations[1].code[0] == 'e' && arena.locations[1].code[1] == 'x', "loc 1 code is 'ex'");
+        TEST_ASSERT(arena.locations[1].prefix_len == 4, "loc 1 prefix_len is 4");
+        TEST_ASSERT(arena.locations[1].prefix[0] == 10 && arena.locations[1].prefix[1] == 0 &&
+                    arena.locations[1].prefix[2] == 1 && arena.locations[1].prefix[3] == 2, "loc 1 prefix 10.0.1.2");
+
+        TEST_ASSERT(arena.locations[2].code[0] == 'd' && arena.locations[2].code[1] == 'f', "loc 2 code is 'df'");
+        TEST_ASSERT(arena.locations[2].prefix_len == 0, "loc 2 prefix_len is 0");
+    }
+
+    // Verify records have correct location codes
+    bool found_in_www = false;
+    bool found_ex_www = false;
+    bool found_def_www = false;
+    for (size_t i = 0; i < arena.count; i++) {
+        dns_record_t *r = &arena.records[i];
+        if (strcmp(r->name, "www.example.com.") == 0 && r->type_code == 1) {
+            if (r->tinydns_loc[0] == 'i' && r->tinydns_loc[1] == 'n') found_in_www = true;
+            if (r->tinydns_loc[0] == 'e' && r->tinydns_loc[1] == 'x') found_ex_www = true;
+            if (r->tinydns_loc[0] == 0 && r->tinydns_loc[1] == 0) found_def_www = true;
+        }
+    }
+    TEST_ASSERT(found_in_www, "Found www A with loc 'in'");
+    TEST_ASSERT(found_ex_www, "Found www A with loc 'ex'");
+    TEST_ASSERT(found_def_www, "Found www A with no loc");
+
+    zone_arena_destroy(&arena);
+    free(buf);
+
+    // 4096 limit test
+    {
+        zone_arena_t arena4k;
+        zone_arena_init(&arena4k);
+        char *bigbuf = malloc(4105 * 32);
+        size_t bpos = 0;
+        for (int i = 0; i < 4100; i++) {
+            bpos += sprintf(bigbuf + bpos, "%%xx:10.0.%d.%d\n", (i >> 8) & 0xFF, i & 0xFF);
+        }
+        parse_tinydns_data(bigbuf, bpos, &arena4k, &ctx);
+        TEST_ASSERT(arena4k.location_count == 4096, "location_count capped at 4096");
+        zone_arena_destroy(&arena4k);
+        free(bigbuf);
+    }
+}
+
 int main(void) {
     printf("==================================================\n");
     printf(" Running KariDNS tinydns Parser Tests (djbdns 1.05)\n");
@@ -533,6 +615,7 @@ int main(void) {
     test_zone_filtering_and_parent_child();
     test_config_file_format();
     test_timestamp_evaluation();
+    test_location_directive_and_records();
 
     printf("==================================================\n");
     printf(" Test Results: %d / %d Passed\n", pass_count, test_count);

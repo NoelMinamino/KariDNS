@@ -101,6 +101,7 @@ typedef struct {
     time_t tinydns_ttd;         /* 0 = timestampなし(全ゾーン共通デフォルト)。
                                    tinydns形式でtimestampフィールドが指定された場合のみ非0 */
     bool tinydns_ttl_countdown; /* true なら「ttl=0 + timestamp」のカウントダウンTTLレコード */
+    char tinydns_loc[2];        /* {0, 0} なら location制限なし */
     
     bool is_cached;
     union {

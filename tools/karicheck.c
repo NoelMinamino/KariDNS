@@ -563,6 +563,26 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     bool has_soa = false;
     bool has_apex_ns = false;
     bool error_found = false;
+
+    if (arena.is_tinydns_format) {
+        for (int i = 0; i < arena.location_count; i++) {
+            const tinydns_location_entry_t *loc = &arena.locations[i];
+            if (loc->prefix_len > 4) {
+                fprintf(stderr, "[ERROR] Location prefix length %u exceeds 4 for location '%.2s' in zone '%s'\n",
+                        loc->prefix_len, loc->code, domain);
+                error_found = true;
+            }
+            for (int j = i + 1; j < arena.location_count; j++) {
+                if (arena.locations[j].code[0] == loc->code[0] &&
+                    arena.locations[j].code[1] == loc->code[1]) {
+                    fprintf(stderr, "[WARNING] Duplicate location code '%.2s' in zone '%s' (%s)\n",
+                            loc->code, domain, file_path);
+                    break;
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < arena.count; i++) {
         uint16_t tcode = arena.records[i].type_code;
         int rcount = arena.records[i].rdata_count;

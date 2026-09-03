@@ -1241,6 +1241,8 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->sorted_unique_count = 0;
   atomic_init(&arena->reader_count, 0);
   arena->is_tinydns_format = false;
+  arena->locations = NULL;
+  arena->location_count = 0;
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
@@ -1262,6 +1264,9 @@ void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->sorted_unique_names);
   arena->sorted_unique_names = NULL;
   arena->sorted_unique_count = 0;
+  free(arena->locations);
+  arena->locations = NULL;
+  arena->location_count = 0;
   zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {
