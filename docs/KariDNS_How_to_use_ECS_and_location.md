@@ -19,7 +19,29 @@ KariDNS provides two distinct, high-performance mechanisms for record-level spli
 | **Tag Definition** | In zone file: `%<loc>:<ip-prefix>` | In `karidns.conf`: `ecs-tags { tag "<name>" { <cidrs>; }; };` |
 | **Scope of Tag Def** | Zone-level only | Global `options {}` or overridden per `zone {}` |
 | **Resolver Security** | Evaluates direct client/resolver socket address | Strict ACL validation via `ecs-trusted-resolvers` |
+| **Coexistence in Zone** | **Mutually Exclusive**: Cannot be used in BIND zones | **Mutually Exclusive**: Cannot be used in tinydns data files |
 | **Memory Allocation** | Zero allocation on hot path | Zero allocation on hot path |
+
+---
+
+### 1.1 Mutual Exclusivity and Non-Coexistence
+
+> [!IMPORTANT]
+> **These two features CANNOT coexist within the same zone file.**
+> They are strictly segregated by zone file format and query evaluation pipeline:
+>
+> 1. **Zone File Level Non-Coexistence**:
+>    - A zone in KariDNS is either a **tinydns zone** (`file-format tinydns;`) or a **BIND zone** (`file-format bind;` / default).
+>    - You **cannot** use `$ECS-SUBNET` inside a tinydns data file (the tinydns parser will treat it as a syntax error).
+>    - You **cannot** use `%` location directives or tinydns trailing `:loc` fields inside a BIND zone file (the BIND parser will reject them).
+>
+> 2. **Query Evaluation Level Non-Coexistence**:
+>    - **tinydns `location`** operates strictly on the **underlying UDP/TCP socket source IP** (the immediate client or recursive resolver). It completely ignores EDNS Client Subnet (Option 8) data even if present.
+>    - **BIND `$ECS-SUBNET`** operates strictly on the **EDNS Client Subnet (Option 8)** option provided by trusted resolvers. It does not map direct socket IPs to location tags.
+>
+> 3. **Server-Wide Multi-Zone Operation**:
+>    - While a single zone cannot mix both features, a single `karidns` process can host multiple zones where some zones use `file-format tinydns;` (using `%` location) and other zones use `file-format bind;` (using `$ECS-SUBNET`).
+>    - Each zone strictly adheres to its own evaluation pipeline, ensuring zero interference between the two mechanisms.
 
 ---
 
@@ -314,3 +336,5 @@ The implementation strictly adheres to KariDNS's core design rules:
 3. **Record Duplicate Deduplication Safety**:
    - `compare_records()` inspects `ecs_subnet_tag`, `tinydns_loc`, `tinydns_ttd`, and `tinydns_ttl_countdown`.
    - Records with identical domain names, types, and RDATA but different tags (e.g. US vs EU endpoints) are preserved as distinct records and are never mistakenly deduplicated or collated during zone loading or dynamic updates.
+4. **Strict Mechanism Isolation**:
+   - The query resolution engine strictly separates the evaluation pipelines: `tinydns_resolve_client_location()` is executed only when `current_zone->is_tinydns_format` is true, while `resolve_ecs_subnet_tag()` is executed only for zones receiving validated EDNS ECS options from trusted resolvers. The two mechanisms never interfere or cross-evaluate.
