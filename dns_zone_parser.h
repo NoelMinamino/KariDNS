@@ -28,6 +28,7 @@ typedef struct parse_context_s {
     char **shared_ttl_io;   // ★最重要: $TTLの書き戻し先。トップレベル呼び出し元が
                             //   自分のスタック変数のアドレスをセットし、以降の再帰
                             //   呼び出し全てで「同じポインタ」を使い回すこと。
+    char **shared_ecs_tag_io; // $ECS-SUBNETの書き戻し先 ($TTLのshared_ttl_ioと同じ挙動)
     char **visited_paths;   // 祖先スタック(現在の呼び出しチェーンのみ、訪問済み集合ではない)
     dev_t *visited_devs;
     ino_t *visited_inos;

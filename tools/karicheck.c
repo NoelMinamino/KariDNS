@@ -429,7 +429,32 @@ static bool is_in_bailiwick(const char *name, const char *domain) {
     return false;
 }
 
-static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format) {
+static bool validate_cidr_syntax(const char *cidr) {
+    if (!cidr) return false;
+    char buf[128];
+    strncpy(buf, cidr, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *slash = strchr(buf, '/');
+    if (!slash) return false;
+    *slash = '\0';
+    const char *ip_part = buf;
+    const char *prefix_part = slash + 1;
+    if (*prefix_part == '\0') return false;
+    char *endptr = NULL;
+    long prefix = strtol(prefix_part, &endptr, 10);
+    if (*endptr != '\0' || prefix < 0) return false;
+
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (inet_pton(AF_INET, ip_part, &a4) == 1) {
+        return prefix <= 32;
+    } else if (inet_pton(AF_INET6, ip_part, &a6) == 1) {
+        return prefix <= 128;
+    }
+    return false;
+}
+
+static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
     char domain_buf[256];
@@ -471,6 +496,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
     parse_error_t err = {0};
     char *root_ttl = NULL;
+    char *root_ecs_tag = NULL;
     char *visited_paths[16];
     dev_t visited_devs[16];
     ino_t visited_inos[16];
@@ -509,7 +535,8 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         .visited_count = 1,
         .visited_cap = 16,
         .load_file_cb = karicheck_load_file_cb,
-        .shared_ttl_io = &root_ttl
+        .shared_ttl_io = &root_ttl,
+        .shared_ecs_tag_io = &root_ecs_tag
     };
     ctx.visited_paths[0] = root_path;
     ctx.visited_devs[0] = root_dev;
@@ -583,7 +610,25 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
     }
 
+    ecs_tag_def_t *active_tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
+    int active_tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+
     for (size_t i = 0; i < arena.count; i++) {
+        if (arena.records[i].ecs_subnet_tag != NULL) {
+            bool tag_found = false;
+            for (int ti = 0; ti < active_tag_count; ti++) {
+                if (strcasecmp(active_tags[ti].tag, arena.records[i].ecs_subnet_tag) == 0) {
+                    tag_found = true;
+                    break;
+                }
+            }
+            if (!tag_found) {
+                fprintf(stderr, "[ERROR] Zone '%s': record '%s' references undefined ECS subnet tag '%s'\n",
+                        domain, arena.records[i].name, arena.records[i].ecs_subnet_tag);
+                error_found = true;
+            }
+        }
+
         uint16_t tcode = arena.records[i].type_code;
         int rcount = arena.records[i].rdata_count;
         char **rdata = arena.records[i].rdata;
@@ -1048,6 +1093,37 @@ static int check_config(const char *config_path, server_config_t *cfg) {
         return 1;
     }
 
+    bool ecs_error = false;
+    bool has_ecs_tags = (cfg->ecs_tag_count > 0);
+    for (int ti = 0; ti < cfg->ecs_tag_count; ti++) {
+        for (int ci = 0; ci < cfg->ecs_tags[ti].cidr_count; ci++) {
+            if (!validate_cidr_syntax(cfg->ecs_tags[ti].cidrs[ci].cidr)) {
+                fprintf(stderr, "[ERROR] Invalid CIDR '%s' in options.ecs-tags tag '%s'\n",
+                        cfg->ecs_tags[ti].cidrs[ci].cidr, cfg->ecs_tags[ti].tag);
+                ecs_error = true;
+            }
+        }
+    }
+    for (zone_config_t *zc = cfg->zones; zc; zc = zc->next) {
+        if (zc->ecs_tag_count > 0) has_ecs_tags = true;
+        for (int ti = 0; ti < zc->ecs_tag_count; ti++) {
+            for (int ci = 0; ci < zc->ecs_tags[ti].cidr_count; ci++) {
+                if (!validate_cidr_syntax(zc->ecs_tags[ti].cidrs[ci].cidr)) {
+                    fprintf(stderr, "[ERROR] Zone '%s': Invalid CIDR '%s' in ecs-tags tag '%s'\n",
+                            zc->domain, zc->ecs_tags[ti].cidrs[ci].cidr, zc->ecs_tags[ti].tag);
+                    ecs_error = true;
+                }
+            }
+        }
+    }
+    if (has_ecs_tags && !cfg->ecs_enable) {
+        fprintf(stderr, "[WARNING] ecs-tags defined, but ecs-enable is not set to 'yes' in options{}\n");
+    }
+    if (ecs_error) {
+        free(buf);
+        return 1;
+    }
+
     printf("[OK] Config file %s is valid.\n", config_path);
     free(buf);
     return 0;
@@ -1095,7 +1171,7 @@ int main(int argc, char **argv) {
                 printf("[INFO] Skipping file validation for program zone '%s'\n", z->domain);
                 checked++;
             } else if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
-                if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format) != 0) {
+                if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg) != 0) {
                     error_count++;
                 }
                 checked++;
@@ -1112,7 +1188,7 @@ int main(int argc, char **argv) {
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
-            return check_zone(domain, argv[3], true, false, NULL);
+            return check_zone(domain, argv[3], true, false, NULL, NULL, NULL);
         } else {
             // From config: karicheck zone <domain> [config_path]
             const char *cfg_path = (argc >= 4) ? argv[3] : default_config;
@@ -1131,7 +1207,7 @@ int main(int argc, char **argv) {
                         printf("[INFO] Zone '%s' is type 'program'; skipping file validation.\n", z->domain);
                         return 0;
                     }
-                    return check_zone(z->domain, z->file, false, z->is_catalog, z->file_format);
+                    return check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg);
                 }
                 z = z->next;
             }

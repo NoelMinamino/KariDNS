@@ -66,8 +66,22 @@ typedef struct zone_config {
   /* --- ゾーンファイルのフォーマット指定 --- */
   char *file_format; /* NULL(既定) は "bind" 扱い。他に "tinydns" を受け付ける */
 
+  /* --- ECS サブネットタグ対応表 (ゾーン単位の上書き) --- */
+  struct ecs_tag_def_s *ecs_tags;
+  int ecs_tag_count;
+
   struct zone_config *next;
 } zone_config_t;
+
+typedef struct {
+  char *cidr;       /* "8.8.8.0/24" のような文字列のまま保持 */
+} ecs_cidr_entry_t;
+
+typedef struct ecs_tag_def_s {
+  char *tag;
+  ecs_cidr_entry_t *cidrs;
+  int cidr_count;
+} ecs_tag_def_t;
 
 typedef struct log_channel {
   char *name;
@@ -134,6 +148,11 @@ typedef struct server_config_s {
   int udp_recvbuf_size;
   int udp_sndbuf_size;
   bool allow_program_zones; /* 既定 false。trueでない限り type program は起動時エラーで拒否 */
+  bool ecs_enable;
+  char **ecs_trusted_resolvers;
+  int ecs_trusted_resolvers_count;
+  ecs_tag_def_t *ecs_tags;
+  int ecs_tag_count;
   _Atomic int reader_count;
 } server_config_t;
 

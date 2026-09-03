@@ -105,6 +105,11 @@ bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_t
     if ((a->ttl == NULL) != (b->ttl == NULL)) return false;
     if (a->ttl && b->ttl && strcmp(a->ttl, b->ttl) != 0) return false;
   }
+  if (a->tinydns_ttd != b->tinydns_ttd) return false;
+  if (a->tinydns_ttl_countdown != b->tinydns_ttl_countdown) return false;
+  if (a->tinydns_loc[0] != b->tinydns_loc[0] || a->tinydns_loc[1] != b->tinydns_loc[1]) return false;
+  if ((a->ecs_subnet_tag == NULL) != (b->ecs_subnet_tag == NULL)) return false;
+  if (a->ecs_subnet_tag && b->ecs_subnet_tag && strcasecmp(a->ecs_subnet_tag, b->ecs_subnet_tag) != 0) return false;
   if (a->rdata_count != b->rdata_count) return false;
   for (int i = 0; i < a->rdata_count; i++) {
     if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
@@ -382,6 +387,7 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     child_ctx.default_origin = child_origin;
     child_ctx.current_depth = ctx->current_depth + 1;
     child_ctx.shared_ttl_io = ctx->shared_ttl_io; 
+    child_ctx.shared_ecs_tag_io = ctx->shared_ecs_tag_io;
 
     int rc = parse_zone_fast(file_content, strlen(file_content), arena, &child_ctx);
 
@@ -548,7 +554,8 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
 
 static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
                              parse_context_t *ctx, const char *origin,
-                             const char *default_ttl, const char *cur_buf) {
+                             const char *default_ttl, const char *cur_buf,
+                             const char *ecs_tag) {
     if (field_idx < 5) {
         if (ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
         return -1;
@@ -631,6 +638,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
 
         dns_record_t *rec = arena_alloc_record(arena, ctx, fields[0], cur_buf);
         if (!rec) return -1;
+        rec->ecs_subnet_tag = (char *)ecs_tag;
 
         char *name_copy = arena_alloc(arena, name_len + 1);
         if (!name_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
@@ -668,9 +676,11 @@ int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t
   char *prev_owner = NULL;
   char *origin = ctx ? (char *)ctx->default_origin : NULL;
   char *local_ttl_storage = NULL;
+  char *local_ecs_tag_storage = NULL;
   char **prev_owner_io = &prev_owner;
   char **origin_io = &origin;
   char **default_ttl_str_io = (ctx && ctx->shared_ttl_io) ? ctx->shared_ttl_io : &local_ttl_storage;
+  char **ecs_tag_io = (ctx && ctx->shared_ecs_tag_io) ? ctx->shared_ecs_tag_io : &local_ecs_tag_storage;
   if (!buf || size == 0 || !arena)
     return -1;
   char *p = buf, *end = buf + size;
@@ -890,7 +900,7 @@ PROCESS_RECORD:
         goto DONE;
     }
     if (fields[0][0] == '$' && strcasecmp(fields[0], "$GENERATE") == 0) {
-        if (process_generate(fields, field_idx, arena, ctx, *origin_io, *default_ttl_str_io, buf) != 0)
+        if (process_generate(fields, field_idx, arena, ctx, *origin_io, *default_ttl_str_io, buf, *ecs_tag_io) != 0)
             return -1;
         if (p < end)
             goto STATE_START_LINE;
@@ -903,8 +913,23 @@ PROCESS_RECORD:
       goto STATE_START_LINE;
     goto DONE;
   }
+  if (fields[0][0] == '$' && strcasecmp(fields[0], "$ECS-SUBNET") == 0) {
+    if (field_idx > 1) {
+      if (strcasecmp(fields[1], "none") == 0 || strcasecmp(fields[1], "default") == 0) {
+        *ecs_tag_io = NULL;
+      } else {
+        *ecs_tag_io = arena_strdup(arena, fields[1]);
+      }
+    } else {
+      *ecs_tag_io = NULL; /* タグ省略時はnone扱い */
+    }
+    if (p < end)
+      goto STATE_START_LINE;
+    goto DONE;
+  }
     dns_record_t *rec = arena_alloc_record(arena, ctx, p, buf);
     if (!rec) return -1;
+    rec->ecs_subnet_tag = *ecs_tag_io;
   rec->name = expand_domain_name(fields[0], *origin_io, arena);
   if (!rec->name) {
       if (ctx && ctx->err_out) {

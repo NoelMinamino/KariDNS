@@ -102,6 +102,7 @@ typedef struct {
                                    tinydns形式でtimestampフィールドが指定された場合のみ非0 */
     bool tinydns_ttl_countdown; /* true なら「ttl=0 + timestamp」のカウントダウンTTLレコード */
     char tinydns_loc[2];        /* {0, 0} なら location制限なし */
+    char *ecs_subnet_tag;       /* NULL = タグなし(常に表示)。arena確保文字列 */
     
     bool is_cached;
     union {
@@ -211,6 +212,13 @@ typedef struct {
     bool saw_invalid_mqtype_response_in_query;
     uint16_t mqtypes[16];
     uint16_t mqtype_count;
+
+    // EDNS Client Subnet (ECS, RFC 7871)
+    bool has_ecs;
+    uint16_t ecs_family;
+    uint8_t ecs_source_prefix;
+    uint8_t ecs_scope_prefix;
+    uint8_t ecs_addr[16];
 } edns_info_t;
 
 // ============================================================================

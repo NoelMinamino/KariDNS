@@ -876,13 +876,20 @@ void release_zone_snapshot(zone_db_snapshot_t *snap) {
 static zone_config_t *find_zone_config_in_view(server_config_t *cfg,
                                                const char *view_name,
                                                const char *domain) {
-  if (!cfg || !view_name || !domain) return NULL;
-  for (view_config_t *v = cfg->views; v; v = v->next) {
-    if (strcasecmp(v->name, view_name) != 0) continue;
-    for (zone_config_t *z = v->zones; z; z = z->next) {
+  if (!cfg || !domain) return NULL;
+  if (cfg->views) {
+    if (!view_name) return NULL;
+    for (view_config_t *v = cfg->views; v; v = v->next) {
+      if (strcasecmp(v->name, view_name) != 0) continue;
+      for (zone_config_t *z = v->zones; z; z = z->next) {
+        if (strcasecmp(z->domain, domain) == 0) return z;
+      }
+      return NULL;
+    }
+  } else {
+    for (zone_config_t *z = cfg->zones; z; z = z->next) {
       if (strcasecmp(z->domain, domain) == 0) return z;
     }
-    return NULL;
   }
   return NULL;
 }
@@ -1294,6 +1301,7 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   z_standby->file_buf_count++;
 
   char *root_ttl = NULL;
+  char *root_ecs_tag = NULL;
   char *visited_paths[16];
   dev_t visited_devs[16];
   ino_t visited_inos[16];
@@ -1320,6 +1328,7 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   ctx.is_standalone_mode = false;
   ctx.load_file_cb = server_load_file_cb;
   ctx.shared_ttl_io = &root_ttl;
+  ctx.shared_ecs_tag_io = &root_ecs_tag;
   ctx.visited_paths = visited_paths;
   ctx.visited_devs = visited_devs;
   ctx.visited_inos = visited_inos;
@@ -2589,6 +2598,7 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     d_rec->tinydns_ttl_countdown = s_rec->tinydns_ttl_countdown;
     d_rec->tinydns_loc[0] = s_rec->tinydns_loc[0];
     d_rec->tinydns_loc[1] = s_rec->tinydns_loc[1];
+    d_rec->ecs_subnet_tag = s_rec->ecs_subnet_tag ? arena_strdup(dst, s_rec->ecs_subnet_tag) : NULL;
     d_rec->rdata_count = s_rec->rdata_count;
     for (int j = 0; j < s_rec->rdata_count; j++)
       d_rec->rdata[j] = arena_strdup(dst, s_rec->rdata[j]);
@@ -2900,6 +2910,30 @@ static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
     *arcount = cp->arcount;
 }
 
+/* ecs-tags を先頭から線形探索し、最初に一致したtagの名前を返す。
+ * ゾーン側にecs_tagsが定義されていればそちらを、なければグローバル
+ * (cfg->ecs_tags)を使う。一致なしならNULL。 */
+static const char *resolve_ecs_subnet_tag(const server_config_t *cfg, const zone_config_t *zcfg,
+                                          const uint8_t *addr, uint16_t family) {
+    ecs_tag_def_t *tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
+    int tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+    if (!tags || tag_count == 0 || !addr) return NULL;
+
+    char ip_buf[INET6_ADDRSTRLEN];
+    int af = (family == 1) ? AF_INET : ((family == 2) ? AF_INET6 : -1);
+    if (af == -1) return NULL;
+    if (!inet_ntop(af, addr, ip_buf, sizeof(ip_buf))) return NULL;
+
+    for (int i = 0; i < tag_count; i++) {
+        for (int j = 0; j < tags[i].cidr_count; j++) {
+            if (match_cidr(ip_buf, tags[i].cidrs[j].cidr)) {
+                return tags[i].tag;
+            }
+        }
+    }
+    return NULL;
+}
+
 /* クライアントIPから、最長一致するlocationコードを1回だけ求める。
  * 該当なし、またはzoneがlocation未使用なら{0,0}を返す(=制限なし扱い)。 */
 static void tinydns_resolve_client_location(const zone_arena_t *zone, const char *client_ip,
@@ -2930,13 +2964,19 @@ static void tinydns_resolve_client_location(const zone_arena_t *zone, const char
  * (通常のレコードならrec->ttl_valueをそのままコピーするだけ)。
  * 含めるべきでなければfalseを返す(呼び出し側はこのレコードを無視する)。
  *
- * rec->tinydns_ttd == 0 かつ location未指定の場合(BINDレコード、または
- * 特別な制限のないtinydnsレコード)は即座にtrueを返す。 */
+ * rec->tinydns_ttd == 0 かつ location未指定・ECSタグ未指定の場合(制限のないレコード)
+ * は即座にtrueを返す。 */
 static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
                                                    const char client_loc[2],
+                                                   const char *client_ecs_tag,
                                                    uint32_t *effective_ttl_out) {
     if (rec->tinydns_loc[0] != 0 || rec->tinydns_loc[1] != 0) {
         if (rec->tinydns_loc[0] != client_loc[0] || rec->tinydns_loc[1] != client_loc[1]) {
+            return false;
+        }
+    }
+    if (rec->ecs_subnet_tag != NULL) {
+        if (client_ecs_tag == NULL || strcasecmp(rec->ecs_subnet_tag, client_ecs_tag) != 0) {
             return false;
         }
     }
@@ -2965,7 +3005,8 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 const char *zone_apex, uint8_t *res,
                                 size_t max_res_len, uint16_t *offset,
                                 compress_ctx_t *comp_ctx, uint16_t *arcount,
-                                const char client_loc[2]) {
+                                const char client_loc[2],
+                                const char *client_ecs_tag) {
   size_t t_len = strlen(target), a_len = strlen(zone_apex);
   if (t_len >= a_len &&
       strcasecmp(target + t_len - a_len, zone_apex) == 0 &&
@@ -2979,7 +3020,7 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
       if ((rec->type_code == 1 || rec->type_code == 28) &&
           strcasecmp(rec->name, target) == 0) {
         uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
         dns_record_t rec_copy = *rec;
         rec_copy.ttl_value = eff_ttl;
         uint16_t saved_offset = *offset;
@@ -3002,7 +3043,8 @@ static void append_additional_rr_glue(zone_arena_t *current_zone, dns_record_t *
                                       compress_ctx_t *comp_ctx, uint16_t *arcount,
                                       const char *glue_targets[16], int *glue_target_count,
                                       bool minimal_responses,
-                                      const char client_loc[2]) {
+                                      const char client_loc[2],
+                                      const char *client_ecs_tag) {
   if (minimal_responses || !rec || !current_zone) return;
   const char *target = NULL;
   if (rec->type_code == 15 && rec->rdata_count >= 2) {
@@ -3028,7 +3070,7 @@ static void append_additional_rr_glue(zone_arena_t *current_zone, dns_record_t *
     }
   }
 
-  append_glue_records(current_zone, target, zone_apex, res, max_res_len, offset, comp_ctx, arcount, client_loc);
+  append_glue_records(current_zone, target, zone_apex, res, max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag);
 }
 
 static bool find_delegation(zone_arena_t *current_zone, const char *qname,
@@ -3036,7 +3078,8 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             size_t max_res_len, uint16_t *offset,
                             compress_ctx_t *comp_ctx, uint16_t *nscount,
                             uint16_t *arcount, bool is_ds_query,
-                            const char client_loc[2]) {
+                            const char client_loc[2],
+                            const char *client_ecs_tag) {
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
     return false;
@@ -3060,7 +3103,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
       if (rec->type_code == 2 &&
           strcasecmp(rec->name, name) == 0) {
         uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
         delegated = true;
         dns_record_t rec_copy = *rec;
         rec_copy.ttl_value = eff_ttl;
@@ -3082,7 +3125,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
             current_zone->records[i].rdata_count > 0) {
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
-                                   max_res_len, offset, comp_ctx, arcount, client_loc)) {
+                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag)) {
             res[2] |= 0x02;
             return true;
           }
@@ -3150,7 +3193,7 @@ static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
   return NULL;
 }
 
-static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2]) {
+static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag) {
   if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
   size_t name_len = strlen(name);
   time_t tinydns_now = (zone && zone->is_tinydns_format) ? time(NULL) : 0;
@@ -3162,7 +3205,7 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char
     dns_record_t *rec = &zone->records[i];
     if (strcasecmp(rec->name, name) == 0) {
       uint32_t eff_ttl;
-      if (tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) return true;
+      if (tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) return true;
     }
   }
 
@@ -3193,7 +3236,7 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char
   return false;
 }
 
-static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2]) {
+static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag) {
   if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
     return zone_apex;
   const char *parent = qname;
@@ -3213,7 +3256,7 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
       }
     }
 
-    if (name_exists_in_zone(zone, parent, client_loc)) {
+    if (name_exists_in_zone(zone, parent, client_loc, client_ecs_tag)) {
       return parent;
     }
   }
@@ -3229,7 +3272,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                          bool minimal_responses,
                          bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
-                         const char *client_ip) {
+                         const char *client_ip, server_config_t *cfg,
+                         bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family) {
   if (qtx_included_out) *qtx_included_out = 0;
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
@@ -3253,11 +3297,17 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     }
     char client_loc[2] = {0, 0};
     tinydns_resolve_client_location(current_zone, client_ip, client_loc);
+
+    const char *client_ecs_tag = NULL;
+    if (ecs_trusted && ecs_addr) {
+      zone_config_t *zcfg = find_zone_config_in_view(cfg, db_entry->view_name, db_entry->domain);
+      client_ecs_tag = resolve_ecs_subnet_tag(cfg, zcfg, ecs_addr, ecs_family);
+    }
     
     // ==== フェーズ1: 委任判定 ====
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc))
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====
@@ -3272,7 +3322,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         dns_record_t *rec = &current_zone->records[i];
         if (strcasecmp(rec->name, current_qname) == 0) {
           uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
           name_exists = true;
           if (rec->type_code == 5) has_cname = true;   // CNAME
           if (rec->type_code == 46) has_rrsig = true;  // RRSIG
@@ -3307,7 +3357,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       dns_record_t *rec = &current_zone->records[i];
       if (strcasecmp(rec->name, current_qname) == 0) {
         uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
         found = true;
         uint16_t rec_type = rec->type_code;
         bool follow_cname = false;
@@ -3347,7 +3397,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             (*ancount)++;
             append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                       res, max_res_len, offset, comp_ctx, arcount,
-                                      glue_targets, &glue_target_count, minimal_responses, client_loc);
+                                      glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
             if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
               if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
                                         res, max_res_len, offset, comp_ctx, ancount)) {
@@ -3373,7 +3423,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           dns_record_t *rec = &current_zone->records[i];
           if (rec->type_code == 39 && strcasecmp(rec->name, dname_parent) == 0) {
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
             dname_found = true;
             size_t prefix_len = dname_parent - current_qname;
             if (rec->rdata_count == 0) break;
@@ -3431,7 +3481,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           dns_record_t *rec = &current_zone->records[i];
           if (strcasecmp(rec->name, wc_name) == 0) {
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
             found = true;
             wc_found = true;
             uint16_t rec_type = rec->type_code;
@@ -3472,7 +3522,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                   (*ancount)++;
                 append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                           res, max_res_len, offset, comp_ctx, arcount,
-                                          glue_targets, &glue_target_count, minimal_responses, client_loc);
+                                          glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
                 if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
                   if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
                                             res, max_res_len, offset, comp_ctx, ancount)) {
@@ -3487,7 +3537,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         if (wc_found)
           break;
 
-        if (name_exists_in_zone(current_zone, parent, client_loc))
+        if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag))
           break;
         }
       }
@@ -3563,7 +3613,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           dns_record_t *rec = &current_zone->records[i];
           if (strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
             qtx_matched = true;
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
@@ -3573,7 +3623,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             (*ancount)++;
             append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                       res, max_res_len, offset, comp_ctx, arcount,
-                                      glue_targets, &glue_target_count, minimal_responses, client_loc);
+                                      glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
             if (dnssec_ok && qtx != 46) {
               if (!attach_covering_rrsig(current_zone, final_idx, current_qname, NULL, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                 this_qtx_failed = true; break;
@@ -3598,7 +3648,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               dns_record_t *rec = &current_zone->records[i];
               if (strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
                 uint32_t eff_ttl;
-                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
                 wc_found = true; qtx_matched = true;
                 dns_record_t rec_copy = *rec;
                 rec_copy.ttl_value = eff_ttl;
@@ -3608,7 +3658,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                 (*ancount)++;
                 append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
                                           res, max_res_len, offset, comp_ctx, arcount,
-                                          glue_targets, &glue_target_count, minimal_responses, client_loc);
+                                          glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
                 if (dnssec_ok && qtx != 46) {
                   if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                     this_qtx_failed = true; break;
@@ -3618,7 +3668,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             }
             if (wc_found || this_qtx_failed) break;
 
-            if (name_exists_in_zone(current_zone, parent, client_loc))
+            if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag))
               break;
           }
         }
@@ -3648,7 +3698,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         if (rec->type_code == 6 &&
             strcasecmp(rec->name, db_entry->domain) == 0) {
           uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
           uint32_t minimum_ttl = 3600;
           if (rec->rdata_count >= 7)
             minimum_ttl = parse_ttl_value(rec->rdata[6]);
@@ -3684,7 +3734,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               strcasecmp(rec->name, current_qname) == 0) {
             if (rec->rdata_count < 1) break; // 壊れたNSECは無視
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
             if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
@@ -3717,7 +3767,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
 
         if (!nsec_failed) {
-          const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc);
+          const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag);
           if (encloser) {
             char wc_name[256];
             int written = snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
@@ -3761,7 +3811,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         if (rec->type_code == 2 &&
             strcasecmp(rec->name, db_entry->domain) == 0) {
           uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, &eff_ttl)) continue;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
           dns_record_t rec_copy = *rec;
           rec_copy.ttl_value = eff_ttl;
           if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
@@ -3773,7 +3823,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             if (rec->rdata_count > 0) {
               append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain, res,
                                         max_res_len, offset, comp_ctx, arcount,
-                                        glue_targets, &glue_target_count, minimal_responses, client_loc);
+                                        glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
             }
           }
         }
@@ -5147,12 +5197,16 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   }
 
   uint32_t qtx_included = 0;
+  bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
+                      cfg->ecs_trusted_resolvers_count > 0 &&
+                      check_acl(client_ip, cfg->ecs_trusted_resolvers, cfg->ecs_trusted_resolvers_count));
   resolve_name(current_qname, qtypes, num_qtypes, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
                cfg_for_ede ? cfg_for_ede->minimal_any : false,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
-               edns.dnssec_ok, view, &qtx_included, client_ip);
+               edns.dnssec_ok, view, &qtx_included, client_ip,
+               cfg, ecs_trusted, edns.ecs_addr, edns.ecs_family);
 
   if (edns.has_mqtype_query) {
     if (res[2] & 0x02) {

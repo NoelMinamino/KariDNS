@@ -82,6 +82,7 @@ jobs:
             sh ./tests/run_phase2_core_audit_test.sh
             sh ./tests/run_phase2_audit_part2_test.sh
             sh ./tests/run_tinydns_location_test.sh
+            sh ./tests/run_bind_ecs_subnet_test.sh
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
