@@ -1921,9 +1921,19 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                             }
                         } else if (key == 1) { // alpn
                             const char *p = val_str;
-                            while (*p) {
-                                const char *comma = strchr(p, ',');
-                                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                            size_t total_vlen = strlen(p);
+                            if (total_vlen >= 2 && p[0] == '"' && p[total_vlen - 1] == '"') {
+                                p++;
+                                total_vlen -= 2;
+                            }
+                            const char *p_end = p + total_vlen;
+                            while (p < p_end) {
+                                const char *comma = memchr(p, ',', (size_t)(p_end - p));
+                                size_t len = comma ? (size_t)(comma - p) : (size_t)(p_end - p);
+                                if (len >= 2 && p[0] == '"' && p[len - 1] == '"') {
+                                    p++;
+                                    len -= 2;
+                                }
                                 if (len > 255) return -1;
                                 if (val_len + 1 + len > sizeof(val_wire)) return -1;
                                 val_wire[val_len++] = (uint8_t)len;
@@ -1982,12 +1992,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                             }
                         } else {
                             // 汎用 keyNNN (RFC 9460 §2.1, Appendix D.2 Figure 5/6):
-                            // val_str は既に dns_zone_parser.c の unescape_string_in_place() で
-                            // character-string decoding 済みであり、そのバイト列がそのまま
-                            // wire-format value になる。
-                            size_t vlen = strlen(val_str);
+                            const char *p = val_str;
+                            size_t vlen = strlen(p);
+                            if (vlen >= 2 && p[0] == '"' && p[vlen - 1] == '"') {
+                                p++;
+                                vlen -= 2;
+                            }
                             if ((size_t)(val_len + vlen) > sizeof(val_wire)) return -1;
-                            memcpy(&val_wire[val_len], val_str, vlen);
+                            memcpy(&val_wire[val_len], p, vlen);
                             val_len += vlen;
                         }
                     }

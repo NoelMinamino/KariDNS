@@ -233,12 +233,102 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
     zone_arena_destroy(&loop_arena);
 }
 
+static void test_response_section_order(void) {
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char zone_text[] = "example.com. 1800 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 1800\n"
+                       "example.com. 1800 IN NS ns1.example.com.\n"
+                       "example.com. 1800 IN NS ns2.v6.example.com.\n"
+                       "example.com. 1800 IN NS ns3.v6.example.com.\n"
+                       "ns1.example.com. 1800 IN A 192.0.2.1\n"
+                       "ns2.v6.example.com. 1800 IN AAAA 2001:db8:1::1\n"
+                       "ns2.v6.example.com. 1800 IN A 192.0.2.2\n"
+                       "ns3.v6.example.com. 1800 IN AAAA 2001:db8:2::1\n"
+                       "ns3.v6.example.com. 1800 IN A 192.0.2.3\n";
+    if (parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx) < 0) {
+        zone_arena_destroy(&arena);
+        abort();
+    }
+    build_zone_index(&arena);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *db_entry_ptr = &db_entry;
+    zone_arena_t *cur_zone = &arena;
+    zone_arena_t **zone_ptr = &cur_zone;
+
+    uint8_t res[1024];
+    memset(res, 0, sizeof(res));
+    uint16_t offset = 12;
+    uint16_t ancount = 0, nscount = 0, arcount = 0;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init_packet(&comp_ctx);
+
+    uint16_t qtype = 2; // NS
+    resolve_name("example.com.", &qtype, 1,
+                 &db_entry_ptr, zone_ptr, res,
+                 sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount,
+                 false, false, 0, false, NULL, NULL, NULL,
+                 NULL, false, NULL, 0);
+
+    if (ancount != 3 || nscount != 0 || arcount != 5) {
+        zone_arena_destroy(&arena);
+        abort();
+    }
+
+    // Verify sections order:
+    // First 3 records in packet (after header) MUST be Answer (NS, type 2)
+    size_t parse_off = 12;
+    for (int i = 0; i < ancount; i++) {
+        dns_record_t rec;
+        uint16_t rtype = 0;
+        if (parse_resource_record(res, offset, &parse_off, &arena, &rec, &rtype) < 0) {
+            zone_arena_destroy(&arena);
+            abort();
+        }
+        if (rtype != 2) { // Must be NS
+            zone_arena_destroy(&arena);
+            abort();
+        }
+    }
+
+    // Next arcount records MUST be Additional (A=1 or AAAA=28), NEVER NS
+    for (int i = 0; i < arcount; i++) {
+        dns_record_t rec;
+        uint16_t rtype = 0;
+        if (parse_resource_record(res, offset, &parse_off, &arena, &rec, &rtype) < 0) {
+            zone_arena_destroy(&arena);
+            abort();
+        }
+        if (rtype != 1 && rtype != 28) { // Must be A or AAAA
+            zone_arena_destroy(&arena);
+            abort();
+        }
+    }
+
+    zone_arena_destroy(&arena);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     static bool mqtype_trunc_tested = false;
     if (!mqtype_trunc_tested) {
         test_mqtype_truncation();
         test_mqtype_qdcount0_formerr();
         test_resolve_name_servfail_rcode_clearing();
+        test_response_section_order();
         mqtype_trunc_tested = true;
     }
 

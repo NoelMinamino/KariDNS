@@ -3037,15 +3037,11 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
   return true;
 }
 
-static void append_additional_rr_glue(zone_arena_t *current_zone, dns_record_t *rec,
-                                      const char *zone_apex, uint8_t *res,
-                                      size_t max_res_len, uint16_t *offset,
-                                      compress_ctx_t *comp_ctx, uint16_t *arcount,
-                                      const char *glue_targets[16], int *glue_target_count,
-                                      bool minimal_responses,
-                                      const char client_loc[2],
-                                      const char *client_ecs_tag) {
-  if (minimal_responses || !rec || !current_zone) return;
+static void collect_additional_rr_glue(dns_record_t *rec,
+                                       const char *glue_targets[16],
+                                       int *glue_target_count,
+                                       bool minimal_responses) {
+  if (minimal_responses || !rec || !glue_targets || !glue_target_count) return;
   const char *target = NULL;
   if (rec->type_code == 15 && rec->rdata_count >= 2) {
     // MX: rdata[0] = preference, rdata[1] = exchange (RFC 1035 §3.3.9)
@@ -3059,18 +3055,14 @@ static void append_additional_rr_glue(zone_arena_t *current_zone, dns_record_t *
   }
   if (!target || *target == '\0') return;
 
-  if (glue_targets && glue_target_count) {
-    for (int k = 0; k < *glue_target_count; k++) {
-      if (glue_targets[k] && strcasecmp(glue_targets[k], target) == 0) {
-        return;
-      }
-    }
-    if (*glue_target_count < 16) {
-      glue_targets[(*glue_target_count)++] = target;
+  for (int k = 0; k < *glue_target_count; k++) {
+    if (glue_targets[k] && strcasecmp(glue_targets[k], target) == 0) {
+      return;
     }
   }
-
-  append_glue_records(current_zone, target, zone_apex, res, max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag);
+  if (*glue_target_count < 16) {
+    glue_targets[(*glue_target_count)++] = target;
+  }
 }
 
 static bool find_delegation(zone_arena_t *current_zone, const char *qname,
@@ -3395,9 +3387,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               return;
             }
             (*ancount)++;
-            append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
-                                      res, max_res_len, offset, comp_ctx, arcount,
-                                      glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
+            collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
             if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
               if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
                                         res, max_res_len, offset, comp_ctx, ancount)) {
@@ -3520,9 +3510,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                   return;
                 } else
                   (*ancount)++;
-                append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
-                                          res, max_res_len, offset, comp_ctx, arcount,
-                                          glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
+                collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
                 if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
                   if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
                                             res, max_res_len, offset, comp_ctx, ancount)) {
@@ -3607,6 +3595,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         uint16_t qtx = qtypes[j];
         bool this_qtx_failed = false;
         bool qtx_matched = false;
+        int saved_glue_target_count = glue_target_count;
         resolve_checkpoint_t cp = save_checkpoint(offset, ancount, nscount, arcount);
 
         for (int i = current_zone->hash_table[final_idx]; i != -1; i = current_zone->records[i].next_record) {
@@ -3621,9 +3610,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               this_qtx_failed = true; break;
             }
             (*ancount)++;
-            append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
-                                      res, max_res_len, offset, comp_ctx, arcount,
-                                      glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
+            collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
             if (dnssec_ok && qtx != 46) {
               if (!attach_covering_rrsig(current_zone, final_idx, current_qname, NULL, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                 this_qtx_failed = true; break;
@@ -3656,9 +3643,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                   this_qtx_failed = true; break;
                 }
                 (*ancount)++;
-                append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain,
-                                          res, max_res_len, offset, comp_ctx, arcount,
-                                          glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
+                collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
                 if (dnssec_ok && qtx != 46) {
                   if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                     this_qtx_failed = true; break;
@@ -3675,6 +3660,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
 
         if (this_qtx_failed) {
           restore_checkpoint(&cp, offset, ancount, nscount, arcount);
+          glue_target_count = saved_glue_target_count;
           break;
         } else {
           if (!qtx_matched) all_matched = false;
@@ -3821,14 +3807,24 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           } else {
             (*nscount)++;
             if (rec->rdata_count > 0) {
-              append_additional_rr_glue(current_zone, &rec_copy, db_entry->domain, res,
-                                        max_res_len, offset, comp_ctx, arcount,
-                                        glue_targets, &glue_target_count, minimal_responses, client_loc, client_ecs_tag);
+              collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
             }
           }
         }
       }
     }
+
+    // ==== フェーズ10: Additional Glue付加 ====
+    if (!minimal_responses && glue_target_count > 0) {
+      for (int k = 0; k < glue_target_count; k++) {
+        if (!append_glue_records(current_zone, glue_targets[k], db_entry->domain,
+                                 res, max_res_len, offset, comp_ctx, arcount,
+                                 client_loc, client_ecs_tag)) {
+          break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
+        }
+      }
+    }
+
     chain_exhausted = false;
     break;
   }

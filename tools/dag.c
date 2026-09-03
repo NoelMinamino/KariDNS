@@ -2077,6 +2077,11 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
         SSL_set_tlsext_host_name(ssl, check_host);
     }
 
+    // RFC 7858 §3.1: DoT クライアントは ALPN "dot" を送信する (DoH時は除く)
+    if (qo && !qo->use_doh) {
+        SSL_set_alpn_protos(ssl, (const unsigned char *)"\x03dot", 4);
+    }
+
     /* 証明書検証を行うモード(tls_ca_fileまたはtls_verify_default_store指定時)
        のみ、ホスト名検証パラメータを明示的に設定する */
     if (qo->tls_ca_file || qo->tls_verify_default_store) {
@@ -2094,7 +2099,19 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
             if (vres != X509_V_OK) {
                 fprintf(stderr, ";; TLS peer certificate verification for %s#%d failed: %s\n",
                         server, port, X509_verify_cert_error_string(vres));
+                SSL_free(ssl);
+                return NULL;
             }
+        }
+        // 証明書検証の有無によらず、ハンドシェイク自体の失敗理由を必ず表示する
+        unsigned long ssl_err = ERR_get_error();
+        if (ssl_err != 0) {
+            fprintf(stderr, ";; TLS handshake with %s#%d failed: %s\n",
+                    server, port, ERR_reason_error_string(ssl_err));
+        } else {
+            int sslerr = SSL_get_error(ssl, 0);
+            fprintf(stderr, ";; TLS handshake with %s#%d failed (SSL error code %d)\n",
+                    server, port, sslerr);
         }
         SSL_free(ssl);
         return NULL;
@@ -2349,6 +2366,45 @@ static void base64url_encode(const uint8_t *data, size_t len, char *out, size_t 
     out[out_len] = '\0';
 }
 
+// HTTP Chunked 転送の次のチャンクを解析するヘルパー関数 (RFC 7230 §4.1)
+static bool parse_http_chunk(const uint8_t *buf, size_t buf_len, size_t *inout_offset,
+                             size_t *out_data_offset, size_t *out_chunk_len, bool *out_is_final) {
+    if (!buf || *inout_offset >= buf_len) return false;
+    const char *p = (const char *)buf + *inout_offset;
+    char *line_end = strstr(p, "\r\n");
+    if (!line_end) return false;
+    char *endptr = NULL;
+    long chunk_sz = strtol(p, &endptr, 16);
+    if (chunk_sz < 0 || endptr == p) return false;
+
+    size_t data_start = (size_t)(line_end - (const char *)buf) + 2;
+    if (chunk_sz == 0) {
+        *out_data_offset = data_start;
+        *out_chunk_len = 0;
+        *out_is_final = true;
+        char *final_end = strstr((const char *)buf + *inout_offset, "\r\n\r\n");
+        if (final_end) {
+            *inout_offset = (size_t)(final_end - (const char *)buf) + 4;
+            return true;
+        }
+        return false;
+    }
+
+    size_t data_end = data_start + (size_t)chunk_sz;
+    if (data_end + 2 > buf_len) return false;
+
+    *out_data_offset = data_start;
+    *out_chunk_len = (size_t)chunk_sz;
+    *out_is_final = false;
+
+    size_t next_off = data_end;
+    if (next_off + 2 <= buf_len && buf[next_off] == '\r' && buf[next_off + 1] == '\n') {
+        next_off += 2;
+    }
+    *inout_offset = next_off;
+    return true;
+}
+
 static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
@@ -2477,25 +2533,12 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
             if (is_chunked) {
                 size_t src = body_offset;
                 bool chunk_complete = false;
-                while (src < http_len) {
-                    char *line_end = strstr((char *)http_buf + src, "\r\n");
-                    if (!line_end) break;
-                    long chunk_sz = strtol((char *)http_buf + src, NULL, 16);
-                    if (chunk_sz < 0) break;
-                    if (chunk_sz == 0) {
-                        if (strstr((char *)http_buf + src, "\r\n\r\n")) {
-                            chunk_complete = true;
-                        }
+                size_t data_off, chunk_len;
+                bool is_final = false;
+                while (parse_http_chunk(http_buf, http_len, &src, &data_off, &chunk_len, &is_final)) {
+                    if (is_final) {
+                        chunk_complete = true;
                         break;
-                    }
-                    size_t chunk_data_start = (size_t)(line_end - (char *)http_buf) + 2;
-                    size_t chunk_data_end = chunk_data_start + (size_t)chunk_sz;
-                    if (chunk_data_end + 2 > http_len) {
-                        break;
-                    }
-                    src = chunk_data_end;
-                    if (src + 2 <= http_len && http_buf[src] == '\r' && http_buf[src+1] == '\n') {
-                        src += 2;
                     }
                 }
                 if (chunk_complete) {
@@ -2559,31 +2602,20 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
         size_t src = body_offset;
         size_t dst = 0;
         bool chunk_complete = false;
-        while (src < http_len) {
-            char *line_end = strstr((char *)http_buf + src, "\r\n");
-            if (!line_end) break;
-            long chunk_sz = strtol((char *)http_buf + src, NULL, 16);
-            if (chunk_sz < 0) goto cleanup;
-            if (chunk_sz == 0) {
+        size_t data_off, chunk_len;
+        bool is_final = false;
+        while (parse_http_chunk(http_buf, http_len, &src, &data_off, &chunk_len, &is_final)) {
+            if (is_final) {
                 chunk_complete = true;
-                break; // 終了チャンク
+                break;
             }
-
-            src = (size_t)(line_end - (char *)http_buf) + 2;
-            if (src + (size_t)chunk_sz > http_len) {
-                chunk_sz = (long)(http_len - src);
-            }
-            size_t copy_sz = (size_t)chunk_sz;
+            size_t copy_sz = chunk_len;
             if (dst + copy_sz > resp_cap) {
                 copy_sz = resp_cap - dst;
             }
             if (copy_sz > 0) {
-                memcpy(resp + dst, http_buf + src, copy_sz);
+                memcpy(resp + dst, http_buf + data_off, copy_sz);
                 dst += copy_sz;
-            }
-            src += (size_t)chunk_sz;
-            if (src + 2 <= http_len && http_buf[src] == '\r' && http_buf[src+1] == '\n') {
-                src += 2;
             }
         }
         if (!chunk_complete) goto cleanup;
@@ -2945,7 +2977,9 @@ static void sink_printf(rdata_sink_t *sink, const char *fmt, ...) {
             }
         }
     } else {
-        vprintf(fmt, args);
+        if (!g_dag_suppress_stdout) {
+            vprintf(fmt, args);
+        }
     }
     va_end(args);
 }
@@ -5744,6 +5778,10 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
                             (use_tcp || eff_qo.use_tls || eff_qo.use_doh);
 
             if (has_more) {
+                if (msg_index >= 100000) {
+                    fprintf(stderr, ";; AXFR aborted: exceeded 100000 messages without a closing SOA\n");
+                    break;
+                }
                 if (sres) g_server_count++;
                 n = do_axfr_recv_next(tcp_sock, &eff_qo, resp, sizeof(resp));
                 if (n <= 0) {
@@ -7034,6 +7072,21 @@ static int run_nssearch(const char *qname, const char *server, int port, bool us
     return 0;
 }
 
+static inline void add_search_candidate(char candidates[8][512], int *count, const char *prefix, const char *suffix) {
+    if (!count || *count >= 8) return;
+    int written;
+    if (suffix && *suffix) {
+        written = snprintf(candidates[*count], sizeof(candidates[0]), "%s.%s", prefix, suffix);
+    } else {
+        written = snprintf(candidates[*count], sizeof(candidates[0]), "%s", prefix);
+    }
+    if (written < 0 || (size_t)written >= sizeof(candidates[0])) {
+        fprintf(stderr, ";; warning: search-list candidate exceeds maximum buffer size, skipping\n");
+        return;
+    }
+    (*count)++;
+}
+
 static int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
                           bool use_tcp, bool force_udp, bool test_all, bool norecurse,
                           bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
@@ -7053,32 +7106,32 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
         if (num_dots < req_ndots) {
             /* 1. サーチドメインを先に追加 */
             if (qo.search_domain && *qo.search_domain) {
-                snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, qo.search_domain);
+                add_search_candidate(search_candidates, &candidate_count, qname, qo.search_domain);
             } else {
                 char domains[4][256];
                 int count = get_system_search_domains(domains, 4);
                 for (int i = 0; i < count && candidate_count < 6; i++) {
-                    snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, domains[i]);
+                    add_search_candidate(search_candidates, &candidate_count, qname, domains[i]);
                 }
             }
             /* 2. 生のドメイン (qname) を最後に追加 */
-            snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
+            add_search_candidate(search_candidates, &candidate_count, qname, NULL);
         } else {
             /* 1. 生のドメイン (qname) を先に追加 */
-            snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
+            add_search_candidate(search_candidates, &candidate_count, qname, NULL);
             /* 2. サーチドメインを最後に追加 */
             if (qo.search_domain && *qo.search_domain) {
-                snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, qo.search_domain);
+                add_search_candidate(search_candidates, &candidate_count, qname, qo.search_domain);
             } else {
                 char domains[4][256];
                 int count = get_system_search_domains(domains, 4);
                 for (int i = 0; i < count && candidate_count < 6; i++) {
-                    snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s.%s", qname, domains[i]);
+                    add_search_candidate(search_candidates, &candidate_count, qname, domains[i]);
                 }
             }
         }
     } else {
-        snprintf(search_candidates[candidate_count++], sizeof(search_candidates[0]), "%s", qname);
+        add_search_candidate(search_candidates, &candidate_count, qname, NULL);
     }
 
     if (!server_arg) return 1;
@@ -7171,6 +7224,11 @@ static int run_single_job(const char *qname, const char *qtype_s, const char *se
             free(server_list_buf);
             return 1;
         }
+    }
+    if (candidate_count == 0) {
+        fprintf(stderr, ";; No valid search candidates remaining\n");
+        free(server_list_buf);
+        return 1;
     }
     qo.query_id = (uint16_t)(arc4random() & 0xFFFF);
 
@@ -7471,6 +7529,14 @@ static void prescan_always_global_options(int argc, char **argv, query_spec_t *g
         else if (strcmp(argv[i], "+allcompare") == 0) g_want_allcompare = true;
         else if (strcmp(argv[i], "+glue") == 0) global_spec->qo.use_glue = true;
         else if (strcmp(argv[i], "+noglue") == 0) global_spec->qo.use_glue = false;
+        else if (strcmp(argv[i], "+search") == 0 || strcmp(argv[i], "+defname") == 0) {
+            global_spec->qo.use_search_list = true;
+            global_spec->qo.use_glue = false;
+        }
+        else if (strncmp(argv[i], "+domain=", 8) == 0) {
+            global_spec->qo.use_search_list = true;
+            global_spec->qo.use_glue = false;
+        }
     }
 }
 
@@ -7848,12 +7914,14 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
             spec->qo.use_glue = false;
         } else if (strcmp(arg, "+search") == 0 || strcmp(arg, "+defname") == 0) {
             spec->qo.use_search_list = true;
+            spec->qo.use_glue = false;
         } else if (strcmp(arg, "+nosearch") == 0 || strcmp(arg, "+nodefname") == 0) {
             spec->qo.use_search_list = false;
         } else if (strncmp(arg, "+domain=", 8) == 0) {
             if (spec->qo.search_domain) free(spec->qo.search_domain);
             spec->qo.search_domain = strdup(arg + 8);
             spec->qo.use_search_list = true;
+            spec->qo.use_glue = false;
         } else if (strncmp(arg, "+ndots=", 7) == 0) {
             spec->qo.ndots = atoi(arg + 7);
         } else if (strcmp(arg, "+class") == 0) {
