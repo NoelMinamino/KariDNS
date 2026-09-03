@@ -24,8 +24,6 @@ load_rc_config "${name}"
 : ${karidns_enable:="NO"}
 : ${karidns_config:="/usr/local/etc/karidns/karidns.conf"}
 : ${karidns_flags:="${karidns_config}"}
-: ${karidns_user:="named"}
-: ${karidns_group:="named"}
 
 required_files="${karidns_config}"
 extra_commands="reload checkconf"
@@ -39,9 +37,16 @@ karidns_prestart()
     if [ -x /usr/local/bin/karicheck ]; then
         /usr/local/bin/karicheck conf "${karidns_config}" || return 1
     fi
+    # Determine runtime user/group for directory ownership (bind or named)
+    _owner="bind"
+    if ! id -u "${_owner}" >/dev/null 2>&1; then
+        _owner="named"
+    fi
+    _group="${_owner}"
+
     # Ensure run / log directory exists
-    install -d -o "${karidns_user}" -g "${karidns_group}" -m 0755 /var/run/karidns
-    install -d -o "${karidns_user}" -g "${karidns_group}" -m 0755 /var/log/named
+    install -d -o "${_owner}" -g "${_group}" -m 0755 /var/run/karidns
+    install -d -o "${_owner}" -g "${_group}" -m 0755 /var/log/named
 }
 
 karidns_reload()
