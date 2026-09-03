@@ -10,7 +10,7 @@ echo "[*] Building targets..."
 make -C "$ROOT" karidns dag
 
 CONF="$DIR/section_order_test.conf"
-ZONE="$DIR/zones/example.com.zone"
+ZONE="$DIR/zones/section_order_example.com.zone"
 
 mkdir -p "$DIR/zones"
 
