@@ -698,6 +698,30 @@ dag example.com A @127.0.0.1 --test-all
 
 ---
 
+## SECURITY & FUZZING
+
+### Historical Vulnerability Fixes
+
+- **APL (TYPE 42) afdlength Stack Buffer Overflow (CWE-121 / CWE-787)**:
+  `format_rdata_for_display()` (used during `+yaml` formatting and `+allcompare` record hash calculation) copied `afdlength` bytes into a fixed `uint8_t addr[16]` buffer without upper-bound clamping. Fixed by clamping copy length: `copy_len = (afdlength > sizeof(addr)) ? sizeof(addr) : afdlength;` and emitting a diagnostic indicator `[APL afdlength=%u invalid for AFI=%u]`.
+  Regression testing is automated via `tests/run_dag_apl_afdlength_overflow_test.sh` and continuous fuzzer `tests/fuzz/fuzz_dag_hash`.
+
+### Fuzzing & Differential Test Harnesses
+
+In addition to `fuzz_dag_response`, the following test harnesses ensure protocol security and parser integrity:
+
+| Target | Description | Scope |
+|---|---|---|
+| `fuzz_dag_hash` | Packet semantic hash & RDATA formatting | `calculate_packet_hashes()` → `format_rdata_for_display()` |
+| `fuzz_dag_chunked_http` | DoH HTTP/1.1 chunked transfer decoder | `decode_http_response_body()` boundary values |
+| `fuzz_dag_rdata_yaml` | Direct RDATA parser & display formatter | `format_rdata_for_display()` with `dopt=NULL` and `+yaml` |
+| `fuzz_dag_axfr_stream` | Multi-message AXFR streaming state machine | Stateful multi-packet `axfr_state_t` sequence transitions |
+| `fuzz_dag_cli_args` | Command-line option & malformation parser | `parse_arg_slice()`, `parse_break_arg()` |
+| `fuzz_dag_batch_file` | Batch query file (`-f`) tokenizer & parser | Line tokenizer and token boundary validation |
+| `rr_differential_test.pl`| Structured RR semantic oracle / diff test | NAPTR, SRV, SOA, CAA, MX field transpositions |
+
+---
+
 ## AUTHORS
 
 Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)

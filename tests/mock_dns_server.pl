@@ -18,6 +18,9 @@
 #   7. axfr.example           -> Returns complete AXFR sequence (SOA -> A -> TXT -> SOA).
 #   8. ipv4only.arpa          -> Returns AAAA 64:ff9b::c000:aa01 for DNS64 prefix testing.
 #   9. crypto.example         -> Returns DNSKEY, RRSIG, DS records for crypto/nocrypto testing.
+#   10. apl-overflow.example  -> Returns APL record with afdlength=127 (regression
+#                                 test for the historical stack-buffer-overflow in
+#                                 format_rdata_for_display()'s APL handling).
 # ==============================================================================
 
 use strict;
@@ -344,6 +347,19 @@ sub process_dns_query {
         my $svcb_rdata = pack('n', 1) . $target_wire;
         # Claim RDLENGTH = 3 (too short for target name)
         my $ans = encode_name($qname) . pack('nnNn', 64, 1, 300, 3) . substr($svcb_rdata, 0, 3);
+        my $hdr = pack('n6', $id, 0x8180, 1, 1, 0, 0);
+        return ($hdr . $question_wire . $ans);
+    }
+
+    # --------------------------------------------------------------------------
+    # Scenario: APL afdlength boundary test (`apl-overflow.example`)
+    # --------------------------------------------------------------------------
+    if ($qname_lower =~ /apl-overflow\.example$/) {
+        # AFI=1 (IPv4), prefix=0, N|afdlength=0x7F (afdlength=127, max representable),
+        # followed by 127 bytes of filler -- mirrors
+        # generate_boundary_rr_corpus.c's "apl_afi1_afdlen127" scenario exactly.
+        my $apl_rdata = pack('n', 1) . pack('C', 0) . pack('C', 0x7F) . ('A' x 127);
+        my $ans = encode_name($qname) . pack('nnNn', 42, 1, 300, length($apl_rdata)) . $apl_rdata;
         my $hdr = pack('n6', $id, 0x8180, 1, 1, 0, 0);
         return ($hdr . $question_wire . $ans);
     }

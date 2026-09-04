@@ -2405,6 +2405,92 @@ static bool parse_http_chunk(const uint8_t *buf, size_t buf_len, size_t *inout_o
     return true;
 }
 
+// HTTPレスポンス(ヘッダ+ボディ)からDNSメッセージをデコードする純粋関数 (RFC 7230 / RFC 8484)
+// http_buf/http_len: 受信済みの生HTTPレスポンス
+// resp/resp_cap: デコード結果(DNSメッセージ)の出力バッファ
+// 戻り値: 成功時はデコードしたバイト数(>=0)。未完了・不正フォーマット時は -1。
+static ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_len,
+                                          uint8_t *resp, size_t resp_cap) {
+    if (!http_buf || http_len < 16 || !resp || resp_cap == 0) return -1;
+
+    const uint8_t *hdr_end_u8 = memmem(http_buf, http_len, "\r\n\r\n", 4);
+    if (!hdr_end_u8) return -1;
+
+    size_t header_len = (size_t)(hdr_end_u8 - http_buf);
+    size_t body_offset = header_len + 4;
+    size_t body_len = http_len - body_offset;
+
+    // RFC 8484 §4.2.1: HTTP 200 OK の検証
+    if (http_len >= 12 && strncmp((const char *)http_buf, "HTTP/", 5) == 0) {
+        const char *status_str = (const char *)http_buf + 8;
+        while (*status_str == ' ') status_str++;
+        int status_code = atoi(status_str);
+        if (status_code != 200) return -1;
+    } else {
+        return -1;
+    }
+
+    // RFC 7230 §3.3.3: Transfer-Encoding takes precedence over Content-Length
+    bool is_chunked = false;
+    for (size_t i = 0; i + 18 <= header_len; i++) {
+        if ((i == 0 || http_buf[i - 1] == '\n') &&
+            strncasecmp((const char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
+            for (size_t j = i + 18; j + 7 <= header_len; j++) {
+                if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
+                if (strncasecmp((const char *)http_buf + j, "chunked", 7) == 0) {
+                    is_chunked = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    if (is_chunked) {
+        size_t src = body_offset;
+        size_t dst = 0;
+        bool chunk_complete = false;
+        size_t data_off, chunk_len;
+        bool is_final = false;
+        while (parse_http_chunk(http_buf, http_len, &src, &data_off, &chunk_len, &is_final)) {
+            if (is_final) {
+                chunk_complete = true;
+                break;
+            }
+            size_t copy_sz = chunk_len;
+            if (dst + copy_sz > resp_cap) {
+                copy_sz = resp_cap - dst;
+            }
+            if (copy_sz > 0) {
+                memcpy(resp + dst, http_buf + data_off, copy_sz);
+                dst += copy_sz;
+            }
+        }
+        if (!chunk_complete) return -1;
+        return (ssize_t)dst;
+    }
+
+    // Content-Length の判定
+    size_t cl_val = 0;
+    bool found_cl = false;
+    for (size_t i = 0; i + 15 <= header_len; i++) {
+        if ((i == 0 || http_buf[i - 1] == '\n') &&
+            strncasecmp((const char *)http_buf + i, "Content-Length:", 15) == 0) {
+            cl_val = (size_t)strtoul((const char *)http_buf + i + 15, NULL, 10);
+            found_cl = true;
+            break;
+        }
+    }
+    if (found_cl) {
+        if (body_len < cl_val) return -1;
+        if (cl_val < body_len) body_len = cl_val;
+    }
+
+    if (body_len > resp_cap) body_len = resp_cap;
+    memcpy(resp, http_buf + body_offset, body_len);
+    return (ssize_t)body_len;
+}
+
 static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t *qo,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_sec) {
@@ -2508,58 +2594,21 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
         http_buf[http_len] = '\0';
 
         // Content-Length または Transfer-Encoding: chunked を動的にチェックしてループを抜ける
-        uint8_t *hdr_end = memmem(http_buf, http_len, "\r\n\r\n", 4);
-        if (hdr_end) {
-            size_t header_len = hdr_end - http_buf;
-            size_t body_offset = header_len + 4;
-            size_t current_body_len = http_len - body_offset;
-            
-            // RFC 7230 §3.3.3: Transfer-Encoding takes precedence over Content-Length
-            bool is_chunked = false;
-            for (size_t i = 0; i + 18 <= header_len; i++) {
-                if ((i == 0 || http_buf[i - 1] == '\n') &&
-                    strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
-                    for (size_t j = i + 18; j + 7 <= header_len; j++) {
-                        if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
-                        if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
-                            is_chunked = true;
-                            break;
-                        }
-                    }
+        if (memmem(http_buf, http_len, "\r\n\r\n", 4)) {
+            // ステータスコードが 200 以外の場合は直ちにループを抜けてエラー処理へ
+            if (http_len >= 12 && strncmp((char *)http_buf, "HTTP/", 5) == 0) {
+                char *status_str = (char *)http_buf + 8;
+                while (*status_str == ' ') status_str++;
+                int status_code = atoi(status_str);
+                if (status_code != 200) {
+                    framing_complete = true;
                     break;
                 }
             }
-
-            if (is_chunked) {
-                size_t src = body_offset;
-                bool chunk_complete = false;
-                size_t data_off, chunk_len;
-                bool is_final = false;
-                while (parse_http_chunk(http_buf, http_len, &src, &data_off, &chunk_len, &is_final)) {
-                    if (is_final) {
-                        chunk_complete = true;
-                        break;
-                    }
-                }
-                if (chunk_complete) {
-                    framing_complete = true;
-                    break;
-                }
-            } else {
-                size_t cl_val = 0;
-                bool has_cl = false;
-                for (size_t i = 0; i + 15 <= header_len; i++) {
-                    if ((i == 0 || http_buf[i - 1] == '\n') &&
-                        strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
-                        cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
-                        has_cl = true;
-                        break;
-                    }
-                }
-                if (has_cl && current_body_len >= cl_val) {
-                    framing_complete = true;
-                    break;
-                }
+            ret_len = decode_http_response_body(http_buf, http_len, resp, resp_cap);
+            if (ret_len >= 0) {
+                framing_complete = true;
+                break;
             }
         }
     }
@@ -2567,9 +2616,6 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     if (http_len < 16) goto cleanup;
     uint8_t *hdr_end_u8 = memmem(http_buf, http_len, "\r\n\r\n", 4);
     if (!hdr_end_u8) goto cleanup;
-    size_t header_len = hdr_end_u8 - http_buf;
-    size_t body_offset = header_len + 4;
-    size_t body_len = http_len - body_offset;
 
     // RFC 8484 §4.2.1: HTTP 200 OK の検証
     if (http_len >= 12 && strncmp((char *)http_buf, "HTTP/", 5) == 0) {
@@ -2582,65 +2628,10 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
         }
     }
 
-    // Transfer-Encoding: chunked の判定
-    bool is_chunked = false;
-    for (size_t i = 0; i + 18 <= header_len; i++) {
-        if ((i == 0 || http_buf[i - 1] == '\n') &&
-            strncasecmp((char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
-            for (size_t j = i + 18; j + 7 <= header_len; j++) {
-                if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
-                if (strncasecmp((char *)http_buf + j, "chunked", 7) == 0) {
-                    is_chunked = true;
-                    break;
-                }
-            }
-            break;
-        }
+    if (ret_len < 0) {
+        ret_len = decode_http_response_body(http_buf, http_len, resp, resp_cap);
+        if (ret_len < 0) goto cleanup;
     }
-
-    if (is_chunked) {
-        size_t src = body_offset;
-        size_t dst = 0;
-        bool chunk_complete = false;
-        size_t data_off, chunk_len;
-        bool is_final = false;
-        while (parse_http_chunk(http_buf, http_len, &src, &data_off, &chunk_len, &is_final)) {
-            if (is_final) {
-                chunk_complete = true;
-                break;
-            }
-            size_t copy_sz = chunk_len;
-            if (dst + copy_sz > resp_cap) {
-                copy_sz = resp_cap - dst;
-            }
-            if (copy_sz > 0) {
-                memcpy(resp + dst, http_buf + data_off, copy_sz);
-                dst += copy_sz;
-            }
-        }
-        if (!chunk_complete) goto cleanup;
-        ret_len = (ssize_t)dst;
-        goto cleanup;
-    }
-
-    size_t cl_val = 0;
-    bool found_cl = false;
-    for (size_t i = 0; i + 15 <= header_len; i++) {
-        if ((i == 0 || http_buf[i - 1] == '\n') &&
-            strncasecmp((char *)http_buf + i, "Content-Length:", 15) == 0) {
-            cl_val = (size_t)strtoul((char *)http_buf + i + 15, NULL, 10);
-            found_cl = true;
-            break;
-        }
-    }
-    if (found_cl) {
-        if (body_len < cl_val) goto cleanup;
-        if (cl_val < body_len) body_len = cl_val;
-    }
-
-    if (body_len > resp_cap) body_len = resp_cap;
-    memcpy(resp, http_buf + body_offset, body_len);
-    ret_len = (ssize_t)body_len;
 
 cleanup:
     if (ret_len <= 0 || !(qo && qo->keep_tcp_open) || !framing_complete) {

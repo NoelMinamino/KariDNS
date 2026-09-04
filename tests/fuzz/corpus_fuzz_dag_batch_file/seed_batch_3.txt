@@ -1,0 +1,1 @@
+test.net TXT @192.0.2.1 -p 10553 +tcp +edns
