@@ -48,7 +48,7 @@ jobs:
                 fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Fuzzing] Continuous Deep Fuzzing (${FUZZ_TIME}s per target, max 2 parallel, rss_limit_mb=2048)"
+            echo "::group::🛡️ [Fuzzing] Continuous Deep Fuzzing (${FUZZ_TIME}s per target, max 2 parallel, rss_limit_mb=2500)"
             FAILED=0
             active_pids=""
             MAX_JOBS=2
@@ -60,9 +60,9 @@ jobs:
                 mkdir -p "$corpus"
                 echo "[+] Fuzzing target: $target (corpus size: $(ls -1 "$corpus" 2>/dev/null | wc -l) files)"
                 if [ -n "$FUZZ_RUNS_INPUT" ]; then
-                    "$bin" -runs="$FUZZ_RUNS_INPUT" -rss_limit_mb=2048 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                    "$bin" -runs="$FUZZ_RUNS_INPUT" -rss_limit_mb=2500 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
                 else
-                    "$bin" -max_total_time="$FUZZ_TIME" -rss_limit_mb=2048 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
+                    "$bin" -max_total_time="$FUZZ_TIME" -rss_limit_mb=2500 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
                 fi
                 active_pids="$active_pids $target:$!"
 

@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -11,6 +12,15 @@ void syslog(int priority, const char *format, ...) {
 #define main dag_main
 #include "../../tools/dag.c"
 #undef main
+
+static bool is_exit_arg(const char *arg) {
+    if (!arg) return false;
+    if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0 ||
+        strcmp(arg, "-v") == 0 || strcmp(arg, "--version") == 0) {
+        return true;
+    }
+    return false;
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size == 0 || size > 4096) return 0;
@@ -25,6 +35,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     } else {
         memcpy(arg, data, size);
         arg[size] = '\0';
+    }
+
+    if (is_exit_arg(arg)) {
+        free(arg);
+        return 0;
     }
 
     query_spec_t spec;
