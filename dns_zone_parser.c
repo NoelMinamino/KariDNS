@@ -1268,6 +1268,8 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->is_tinydns_format = false;
   arena->locations = NULL;
   arena->location_count = 0;
+  arena->prelinked_glue = NULL;
+  arena->prelinked_glue_count = 0;
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
@@ -1292,6 +1294,8 @@ void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->locations);
   arena->locations = NULL;
   arena->location_count = 0;
+  arena->prelinked_glue = NULL;
+  arena->prelinked_glue_count = 0;
   zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {

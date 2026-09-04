@@ -123,6 +123,12 @@ typedef struct view_config {
   struct view_config *next;
 } view_config_t;
 
+typedef enum {
+  ADDITIONAL_AUTH_YES = 0,       /* 原則 (デフォルト): Primary/Slaveゾーン全体からsibling domainも含めて返す */
+  ADDITIONAL_AUTH_IN_DOMAIN = 1, /* in-domain: 自ゾーン(管理するドメイン名)配下のレコードのみ返す */
+  ADDITIONAL_AUTH_NO = 2         /* no: Additionalセクションへのアドレス付加を行わない */
+} additional_from_auth_t;
+
 typedef struct server_config_s {
   int port;
   char **bind_addresses;
@@ -140,6 +146,7 @@ typedef struct server_config_s {
   bool minimal_responses;
   bool minimal_any;
   uint32_t minimal_any_ttl;
+  additional_from_auth_t additional_from_auth;
   int max_mqtypes;
   bool rfc10029_mqtype_enable;
   bool tcp_connection_reuse;

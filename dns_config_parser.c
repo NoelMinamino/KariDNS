@@ -1279,6 +1279,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
+  config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->max_mqtypes = 4;
   config->rfc10029_mqtype_enable = false;
   config->udp_recvbuf_size = 4 * 1024 * 1024;
@@ -1531,6 +1532,30 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             config->minimal_any = true;
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->minimal_any = false;
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "additional-from-auth") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->additional_from_auth = ADDITIONAL_AUTH_YES;
+          else if (strcmp(tok.value, "in-domain") == 0 || strcmp(tok.value, "in-zone") == 0)
+            config->additional_from_auth = ADDITIONAL_AUTH_IN_DOMAIN;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->additional_from_auth = ADDITIONAL_AUTH_NO;
+          else {
+            syslog(LOG_WARNING, "[Config] Unknown additional-from-auth value '%s', defaulting to yes", tok.value);
+            config->additional_from_auth = ADDITIONAL_AUTH_YES;
+          }
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
