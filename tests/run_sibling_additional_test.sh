@@ -129,6 +129,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+sleep 1
+
 # -------------------------------------------------------------
 # Test 1: additional-from-auth yes (BIND compatible)
 # -------------------------------------------------------------
@@ -137,25 +139,31 @@ $BIN -f -c "$CONF_YES" > "$DIR/server_sibling_yes.log" 2>&1 &
 SERVER_PID_YES=$!
 sleep 2
 
+if ! kill -0 "$SERVER_PID_YES" 2>/dev/null; then
+    echo "[FAIL] Server (yes) failed to start. Log output:"
+    cat "$DIR/server_sibling_yes.log" 2>/dev/null || true
+    exit 1
+fi
+
 echo "[*] Querying NS example.jp on port 10053..."
 OUT_YES=$($DAG NS example.jp @127.0.0.1 -p 10053)
 echo "$OUT_YES"
 
 # Verify Answer section
 if ! echo "$OUT_YES" | grep -q "ns1.v6.example.com"; then
-    echo "[FAIL] NS ns1.v6.example.com missing from Answer!"
+    echo "[FAIL] NS record ns1.v6.example.com missing in Answer!"
     exit 1
 fi
 if ! echo "$OUT_YES" | grep -q "ns1.sub.example.net"; then
-    echo "[FAIL] NS ns1.sub.example.net missing from Answer!"
+    echo "[FAIL] NS record ns1.sub.example.net missing in Answer!"
     exit 1
 fi
 if ! echo "$OUT_YES" | grep -q "ns1.city.example.jp"; then
-    echo "[FAIL] NS ns1.city.example.jp missing from Answer!"
+    echo "[FAIL] NS record ns1.city.example.jp missing in Answer!"
     exit 1
 fi
 
-# Verify Additional section contains sibling glue
+# Verify Additional section (all 5 records must be present)
 if ! echo "$OUT_YES" | grep -q "ns1.v6.example.com.*192.0.2.86"; then
     echo "[FAIL] Sibling glue A record for ns1.v6.example.com missing in Additional!"
     exit 1
@@ -179,7 +187,7 @@ fi
 
 echo "[PASS] Test 1: additional-from-auth yes returned all 5 Additional records!"
 
-kill -9 "$SERVER_PID_YES" 2>/dev/null || true
+killall -9 karidns 2>/dev/null || true
 SERVER_PID_YES=""
 sleep 1
 
@@ -190,6 +198,12 @@ echo "[*] Starting KariDNS with additional-from-auth in-domain on port 10054..."
 $BIN -f -c "$CONF_INDOMAIN" > "$DIR/server_sibling_indomain.log" 2>&1 &
 SERVER_PID_IN=$!
 sleep 2
+
+if ! kill -0 "$SERVER_PID_IN" 2>/dev/null; then
+    echo "[FAIL] Server (in-domain) failed to start. Log output:"
+    cat "$DIR/server_sibling_indomain.log" 2>/dev/null || true
+    exit 1
+fi
 
 echo "[*] Querying NS example.jp on port 10054..."
 OUT_IN=$($DAG NS example.jp @127.0.0.1 -p 10054)
@@ -213,7 +227,7 @@ fi
 
 echo "[PASS] Test 2: additional-from-auth in-domain returned ONLY in-domain glue!"
 
-kill -9 "$SERVER_PID_IN" 2>/dev/null || true
+killall -9 karidns 2>/dev/null || true
 SERVER_PID_IN=""
 sleep 1
 
@@ -224,6 +238,12 @@ echo "[*] Starting KariDNS with additional-from-auth no on port 10055..."
 $BIN -f -c "$CONF_NO" > "$DIR/server_sibling_no.log" 2>&1 &
 SERVER_PID_NO=$!
 sleep 2
+
+if ! kill -0 "$SERVER_PID_NO" 2>/dev/null; then
+    echo "[FAIL] Server (no) failed to start. Log output:"
+    cat "$DIR/server_sibling_no.log" 2>/dev/null || true
+    exit 1
+fi
 
 echo "[*] Querying NS example.jp on port 10055..."
 OUT_NO=$($DAG NS example.jp @127.0.0.1 -p 10055)
@@ -237,7 +257,7 @@ fi
 
 echo "[PASS] Test 3: additional-from-auth no returned 0 Additional address records!"
 
-kill -9 "$SERVER_PID_NO" 2>/dev/null || true
+killall -9 karidns 2>/dev/null || true
 SERVER_PID_NO=""
 
 echo "[ALL PASS] Sibling domain Additional glue test suite passed successfully!"
