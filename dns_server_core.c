@@ -1692,7 +1692,14 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   size_t idx = hash & (z_standby->hash_size - 1);
   for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
       if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, entry->domain) == 0) {
-          has_soa = true; break;
+          has_soa = true;
+          if (z_standby->records[i].rdata_count >= 7) {
+              entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
+              entry->refresh = parse_ttl_value(z_standby->records[i].rdata[3]);
+              entry->retry = parse_ttl_value(z_standby->records[i].rdata[4]);
+              entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
+          }
+          break;
       }
   }
   if (!has_soa) {
@@ -3017,13 +3024,24 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         standby->current_pool_idx = 0;
         clone_zone_arena(active, standby);
         session->is_deleting = true;
-      } else if (session->is_ixfr &&
-                 current_serial == session->initial_soa_serial) {
-        session->is_finished = true;
-        standby->count--;
-      } else if (session->is_ixfr) {
-        session->is_deleting = !session->is_deleting;
-        standby->count--;
+      } else if (session->is_ixfr && session->is_deleting) {
+        session->is_deleting = false;
+        for (size_t k = 0; k < standby->count - 1; k++) {
+          if (standby->records[k].type_code == 6 &&
+              strcasecmp(standby->records[k].name, domain) == 0) {
+            standby->records[k] = standby->records[standby->count - 1];
+            standby->count--;
+            break;
+          }
+        }
+      } else if (session->is_ixfr && !session->is_deleting) {
+        if (current_serial == session->initial_soa_serial) {
+          session->is_finished = true;
+          standby->count--;
+        } else {
+          session->is_deleting = true;
+          standby->count--;
+        }
       } else {
         if (strcasecmp(session->initial_soa_name, rec->name) == 0 &&
             session->initial_soa_serial == current_serial) {
@@ -8524,6 +8542,7 @@ int main(int argc, char **argv) {
 
   bool foreground = false;
   const char *config_file = NULL;
+  const char *cli_pid_file = NULL;
 
   for (int i = 1; i < argc; i++) {
       if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
@@ -8533,14 +8552,16 @@ int main(int argc, char **argv) {
           foreground = true;
       } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
           config_file = argv[++i];
+      } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+          cli_pid_file = argv[++i];
       } else {
           config_file = argv[i];
       }
   }
 
   if (!config_file) {
-    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-c <config_file> | <config_file>]\n", argv[0]);
-    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-c <config_file> | <config_file>]", argv[0]);
+    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-p <pid_file>] [-c <config_file> | <config_file>]\n", argv[0]);
+    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-p <pid_file>] [-c <config_file> | <config_file>]", argv[0]);
     return 1;
   }
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
@@ -8565,24 +8586,6 @@ int main(int argc, char **argv) {
     daemonize();
   }
 
-  // Prevent multiple instances using a pidfile lock
-  mkdir("/var/run/karidns", 0755);
-  int pid_fd = open("/var/run/karidns/karidns.pid", O_RDWR | O_CREAT, 0644);
-  if (pid_fd < 0) {
-    syslog(LOG_ERR, "Failed to open pidfile /var/run/karidns/karidns.pid: %s", strerror(errno));
-    return 1;
-  }
-  if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {
-    syslog(LOG_ERR, "Another KariDNS instance is already running (pidfile locked)");
-    fprintf(stderr, "Another KariDNS instance is already running.\n");
-    return 1;
-  }
-  ftruncate(pid_fd, 0);
-  char pid_str[32];
-  snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
-  write(pid_fd, pid_str, strlen(pid_str));
-  // Keep pid_fd open; the lock will be automatically released upon process exit.
-
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGHUP);
@@ -8597,6 +8600,45 @@ int main(int argc, char **argv) {
   }
   free(config_str);
 
+  int pid_fd = -1;
+  const char *effective_pid_file = NULL;
+  if (cli_pid_file) {
+    effective_pid_file = cli_pid_file;
+  } else if (g_config_db.config_a.pid_file) {
+    effective_pid_file = g_config_db.config_a.pid_file;
+  } else if (!foreground) {
+    effective_pid_file = "/var/run/karidns/karidns.pid";
+  }
+
+  if (effective_pid_file && strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0') {
+    char dir_buf[1024];
+    strncpy(dir_buf, effective_pid_file, sizeof(dir_buf) - 1);
+    dir_buf[sizeof(dir_buf) - 1] = '\0';
+    char *slash = strrchr(dir_buf, '/');
+    if (slash && slash != dir_buf) {
+      *slash = '\0';
+      mkdir(dir_buf, 0755);
+    }
+    pid_fd = open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (pid_fd < 0) {
+      syslog(LOG_ERR, "Failed to open pidfile %s: %s", effective_pid_file, strerror(errno));
+      fprintf(stderr, "Failed to open pidfile %s: %s\n", effective_pid_file, strerror(errno));
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {
+      syslog(LOG_ERR, "Another KariDNS instance is already running (pidfile %s locked)", effective_pid_file);
+      fprintf(stderr, "Another KariDNS instance is already running (pidfile %s locked).\n", effective_pid_file);
+      close(pid_fd);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    ftruncate(pid_fd, 0);
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
+    write(pid_fd, pid_str, strlen(pid_str));
+  }
+
   // 特権分離が本サーバの前提とするセキュリティモデルであるため、
   // rootとして起動された場合は user の明示的指定を必須とする。
   if (geteuid() == 0 && !g_config_db.config_a.user) {
@@ -8608,6 +8650,7 @@ int main(int argc, char **argv) {
            "[ERROR] Server started as root but no 'user' directive is set in options{}. "
            "Refusing to start: running as root without privilege drop is not permitted. "
            "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.\n");
+    if (pid_fd >= 0) close(pid_fd);
     free_server_config_fields(&g_config_db.config_a);
     return 1;
   }
@@ -8626,8 +8669,25 @@ int main(int argc, char **argv) {
     struct sockaddr_un un;
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
-    strncpy(un.sun_path, "/var/run/karidns/control.sock", sizeof(un.sun_path) - 1);
-    mkdir("/var/run/karidns", 0755);
+    const char *sock_path = g_config_db.config_a.control.socket_path ?
+                            g_config_db.config_a.control.socket_path :
+                            "/var/run/karidns/control.sock";
+    if (strlen(sock_path) >= sizeof(un.sun_path)) {
+      syslog(LOG_ERR, "Control socket path too long (max %zu bytes): %s", sizeof(un.sun_path) - 1, sock_path);
+      fprintf(stderr, "Control socket path too long (max %zu bytes): %s\n", sizeof(un.sun_path) - 1, sock_path);
+      if (pid_fd >= 0) close(pid_fd);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    char dir_buf[1024];
+    strncpy(dir_buf, sock_path, sizeof(dir_buf) - 1);
+    dir_buf[sizeof(dir_buf) - 1] = '\0';
+    char *slash = strrchr(dir_buf, '/');
+    if (slash && slash != dir_buf) {
+      *slash = '\0';
+      mkdir(dir_buf, 0755);
+    }
+    strncpy(un.sun_path, sock_path, sizeof(un.sun_path) - 1);
     unlink(un.sun_path);
     g_control_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_control_sock >= 0) {
@@ -8663,12 +8723,19 @@ int main(int argc, char **argv) {
   pid_t pid = fork();
   if (pid < 0) {
     syslog(LOG_ERR, "fork for frontend router failed");
+    if (pid_fd >= 0) close(pid_fd);
     exit(1);
   }
 
   if (pid > 0) {
     run_frontend_router(pid);
+    if (pid_fd >= 0) close(pid_fd);
     exit(0);
+  }
+
+  if (pid_fd >= 0) {
+    close(pid_fd);
+    pid_fd = -1;
   }
 
   for (int i = 0; i < g_num_ipc; i++)

@@ -111,6 +111,7 @@ typedef struct {
 
 typedef struct {
   bool enabled;
+  char *socket_path;
   char *algorithm;
   char *secret;
   uint8_t secret_decoded[256];
@@ -137,6 +138,7 @@ typedef struct server_config_s {
   int bind_address_count;
   char *user;
   char *group;
+  char *pid_file;
   view_config_t *views;
   zone_config_t *zones; /* 所有権を持たない参照専用フラットリスト。ビュー内ゾーンへのポインタを共有しており、フィールド書き込みや free_zone_config() は絶対に行わないこと */
   tsig_key_t *keys;

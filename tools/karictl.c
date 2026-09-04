@@ -84,28 +84,60 @@ char* extract_secret_from_config(const char* path) {
     return secret;
 }
 
+char* extract_socket_from_config(const char* path) {
+    char *cfg = read_entire_file(path);
+    if (!cfg) return NULL;
+    
+    char *sock = NULL;
+    char *p = strstr(cfg, "socket");
+    if (p) {
+        p += 6;
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (*p == '"') {
+            p++;
+            char *end = strchr(p, '"');
+            if (end) {
+                size_t sock_len = end - p;
+                if (sock_len > 1024) {
+                    sock_len = 1024;
+                }
+                *end = '\0';
+                sock = strndup(p, sock_len);
+            }
+        }
+    }
+    free(cfg);
+    return sock;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0)) {
         printf("karictl %s\n", KARIDNS_VERSION);
         return 0;
     }
-    const char *conf_path = "/usr/local/etc/karictl.conf";
+    const char *conf_path = "/usr/local/etc/karidns/karictl.conf";
+    bool conf_path_explicit = false;
+    const char *cli_sock_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "f:v")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:v")) != -1) {
         switch (opt) {
             case 'f':
                 conf_path = optarg;
+                conf_path_explicit = true;
+                break;
+            case 's':
+                cli_sock_path = optarg;
                 break;
             case 'v':
                 printf("karictl %s\n", KARIDNS_VERSION);
                 return 0;
             default:
-                fprintf(stderr, "Usage: %s [-f config_path] [-v] <command> [args...]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
                 return 1;
         }
     }
     if (optind >= argc) {
-        fprintf(stderr, "Usage: %s [-f config_path] [-v] <command> [args...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
         fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, tsig-keygen [keyname]\n");
         return 1;
     }
@@ -128,6 +160,10 @@ int main(int argc, char **argv) {
         printf("  secret \"%s\";\n", b64_key);
         printf("};\n");
         return 0;
+    }
+
+    if (!conf_path_explicit && access(conf_path, F_OK) != 0 && access("/usr/local/etc/karictl.conf", F_OK) == 0) {
+        conf_path = "/usr/local/etc/karictl.conf";
     }
 
     char *secret_b64 = extract_secret_from_config(conf_path);
@@ -159,9 +195,14 @@ int main(int argc, char **argv) {
     explicit_bzero(secret_b64, b64_len);
     free(secret_b64);
 
+    char *cfg_sock = extract_socket_from_config(conf_path);
+    const char *target_sock = cli_sock_path ? cli_sock_path :
+                              (cfg_sock ? cfg_sock : "/var/run/karidns/control.sock");
+
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("socket");
+        if (cfg_sock) free(cfg_sock);
         explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 1;
     }
@@ -169,8 +210,19 @@ int main(int argc, char **argv) {
     struct sockaddr_un un;
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
-    strncpy(un.sun_path, "/var/run/karidns/control.sock", sizeof(un.sun_path) - 1);
+    if (strlen(target_sock) >= sizeof(un.sun_path)) {
+        fprintf(stderr, "Control socket path too long (max %zu bytes): %s\n", sizeof(un.sun_path) - 1, target_sock);
+        close(sock);
+        if (cfg_sock) free(cfg_sock);
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
+        return 1;
+    }
+    strncpy(un.sun_path, target_sock, sizeof(un.sun_path) - 1);
     un.sun_path[sizeof(un.sun_path) - 1] = '\0';
+    if (cfg_sock) {
+        free(cfg_sock);
+        cfg_sock = NULL;
+    }
 
     if (connect(sock, (struct sockaddr *)&un, sizeof(un)) < 0) {
         perror("connect");

@@ -3451,6 +3451,48 @@ int main() {
         printf("PASS: Multi-key allow-transfer parsing and IXFR mini-arena lifecycle\n");
     }
 
+    {
+        printf("\n--- Test 46: pid-file and control-channel socket parsing and cleanup ---\n");
+        server_config_t cfg_pid_sock;
+        memset(&cfg_pid_sock, 0, sizeof(cfg_pid_sock));
+        const char *conf_pid_sock =
+            "options {\n"
+            "    port 53;\n"
+            "    bind-address { 127.0.0.1; };\n"
+            "    pid-file \"/tmp/test_karidns.pid\";\n"
+            "};\n"
+            "control-channel {\n"
+            "    socket \"/tmp/test_control.sock\";\n"
+            "    algorithm \"hmac-sha256\";\n"
+            "    secret \"dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl\";\n"
+            "};\n";
+
+        if (parse_named_conf_ext(conf_pid_sock, NULL, &cfg_pid_sock) != 0) {
+            printf("FAIL: pid-file and control-channel socket config parsing failed\n");
+            return 1;
+        }
+
+        if (!cfg_pid_sock.pid_file || strcmp(cfg_pid_sock.pid_file, "/tmp/test_karidns.pid") != 0) {
+            printf("FAIL: cfg_pid_sock.pid_file mismatch: %s\n", cfg_pid_sock.pid_file ? cfg_pid_sock.pid_file : "NULL");
+            free_server_config_fields(&cfg_pid_sock);
+            return 1;
+        }
+
+        if (!cfg_pid_sock.control.socket_path || strcmp(cfg_pid_sock.control.socket_path, "/tmp/test_control.sock") != 0) {
+            printf("FAIL: cfg_pid_sock.control.socket_path mismatch: %s\n",
+                   cfg_pid_sock.control.socket_path ? cfg_pid_sock.control.socket_path : "NULL");
+            free_server_config_fields(&cfg_pid_sock);
+            return 1;
+        }
+
+        free_server_config_fields(&cfg_pid_sock);
+        if (cfg_pid_sock.pid_file != NULL || cfg_pid_sock.control.socket_path != NULL) {
+            printf("FAIL: free_server_config_fields did not clear pointers\n");
+            return 1;
+        }
+        printf("PASS: pid-file and control-channel socket parsing and cleanup\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }

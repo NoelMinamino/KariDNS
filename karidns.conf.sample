@@ -8,6 +8,9 @@ options {
     user "named";
     group "named";
 
+    // PIDファイル ("none" で作成を無効化、未指定時は /var/run/karidns/karidns.pid)
+    // pid-file "/var/run/karidns/karidns.pid";
+
     // UDPソケットバッファサイズ (未指定時のデフォルト: 4M)
     // OSの上限値(kern.ipc.maxsockbuf sysctl)を超えると切り詰められます
     udp-recvbuf-size 4M;
@@ -44,6 +47,8 @@ logging {
 // karictl コントロールチャネルの設定
 // karictlコマンドによる動的リロードやステータス確認を許可する場合に設定します
 control-channel {
+    // コントロール用UNIXドメインソケットパス (未指定時は /var/run/karidns/control.sock)
+    // socket "/var/run/karidns/control.sock";
     algorithm "hmac-sha256";
     // karictl.conf側の key "karictl" に設定した secret と一致させてください
     secret "BASE64_ENCODED_SECRET_HERE=";

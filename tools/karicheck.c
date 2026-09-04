@@ -1150,7 +1150,10 @@ int main(int argc, char **argv) {
     }
 
     const char *cmd = argv[1];
-    const char *default_config = "/usr/local/etc/karidns.conf";
+    const char *default_config = "/usr/local/etc/karidns/karidns.conf";
+    if (access(default_config, F_OK) != 0 && access("/usr/local/etc/karidns.conf", F_OK) == 0) {
+        default_config = "/usr/local/etc/karidns.conf";
+    }
 
     if (strcmp(cmd, "conf") == 0) {
         const char *cfg_path = (argc >= 3) ? argv[2] : default_config;
