@@ -180,7 +180,7 @@ for my $iter (1 .. $iterations) {
         # YAML display test
         $total_checks++;
         my $yaml_out = query_and_capture($current_ans_qname, "NAPTR", 1);
-        if ($yaml_out =~ /rdata:\s*"?(\d+)\s+(\d+)\s+"?([^"\n]*)"?\s+"?([^"\n]*)"?\s+"?([^"\n]*)"?\s+([^\s\n;]+)/) {
+        if ($yaml_out =~ /NAPTR\s+(\d+)\s+(\d+)\s+"([^"]*)"\s+"([^"]*)"\s+"([^"]*)"\s+([^\s\n';]+)/) {
             my ($got_order, $got_pref) = (int($1), int($2));
             if ($got_order == $order && $got_pref == $pref) {
                 $passed_checks++;
@@ -224,7 +224,7 @@ for my $iter (1 .. $iterations) {
 
         $total_checks++;
         my $yaml_out = query_and_capture($current_ans_qname, "SRV", 1);
-        if ($yaml_out =~ /rdata:\s*"?(\d+)\s+(\d+)\s+(\d+)\s+([^\s\n;]+)/) {
+        if ($yaml_out =~ /SRV\s+(\d+)\s+(\d+)\s+(\d+)\s+([^\s\n';]+)/) {
             my ($got_prio, $got_weight, $got_port) = (int($1), int($2), int($3));
             if ($got_prio == $prio && $got_weight == $weight && $got_port == $port_v) {
                 $passed_checks++;
@@ -278,7 +278,7 @@ for my $iter (1 .. $iterations) {
         # YAML SOA format
         $total_checks++;
         my $yaml_out = query_and_capture($current_ans_qname, "SOA", 1);
-        if ($yaml_out =~ /rdata:\s*"?\S+\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/) {
+        if ($yaml_out =~ /SOA\s+\S+\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/) {
             my ($g_s, $g_ref, $g_ret, $g_exp, $g_min) = (int($1), int($2), int($3), int($4), int($5));
             if ($g_s == $serial && $g_ref == $refresh && $g_ret == $retry && $g_exp == $expire && $g_min == $minimum) {
                 $passed_checks++;
@@ -318,9 +318,8 @@ for my $iter (1 .. $iterations) {
 
         $total_checks++;
         my $yaml_out = query_and_capture($current_ans_qname, "CAA", 1);
-        if ($yaml_out =~ /rdata:\s*"?(\d+)\s+([a-z]+)\s+"?([^"\n]*)"?/) {
+        if ($yaml_out =~ /CAA\s+(\d+)\s+([a-z]+)\s+"([^"]*)"/) {
             my ($g_flags, $g_tag, $g_val) = (int($1), $2, $3);
-            $g_val =~ s/"$//;
             if ($g_flags == $flags && $g_tag eq $tag && $g_val eq $val) {
                 $passed_checks++;
             } else {
@@ -358,10 +357,9 @@ for my $iter (1 .. $iterations) {
 
         $total_checks++;
         my $yaml_out = query_and_capture($current_ans_qname, "MX", 1);
-        if ($yaml_out =~ /rdata:\s*"?(\d+)\s+([^\s\n;]+)/) {
+        if ($yaml_out =~ /MX\s+(\d+)\s+([^\s\n';]+)/) {
             my ($g_pref, $g_mx) = (int($1), $2);
             $g_mx =~ s/\.$//;
-            $g_mx =~ s/"$//;
             if ($g_pref == $pref && $g_mx eq $mx) {
                 $passed_checks++;
             } else {
