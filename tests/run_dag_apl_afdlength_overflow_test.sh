@@ -28,6 +28,7 @@ cd "$(dirname "$0")/.."
 PORT="${DAG_APL_TEST_PORT:-15953}"
 MOCK_LOG="mock_apl_overflow.log"
 DAG_LOG="dag_apl_overflow.log"
+BUILD_LOG="build_dag_asan.log"
 
 FAILED=0
 log_fail() { echo "  -> FAIL: $1"; FAILED=1; }
@@ -36,17 +37,23 @@ log_ok()   { echo "  -> OK: $1"; }
 cleanup() {
     [ -n "${MOCK_PID:-}" ] && kill -9 "$MOCK_PID" >/dev/null 2>&1
     pkill -9 -f "mock_dns_server.pl --port $PORT" >/dev/null 2>&1
+    rm -f "$MOCK_LOG" "$DAG_LOG" "$BUILD_LOG"
 }
 trap cleanup EXIT INT TERM
+
+if [ "${DAG:-}" = "dig" ]; then
+    echo "PASS: APL afdlength overflow regression test (skipped for dig)"
+    exit 0
+fi
 
 echo "=========================================="
 echo "APL (TYPE 42) afdlength overflow regression"
 echo "=========================================="
 
 echo "Step 1: Build dag-asan"
-make dag-asan >/dev/null 2>build_dag_asan.log
+make dag-asan >/dev/null 2>"$BUILD_LOG"
 if [ ! -x ./dag-asan ]; then
-    log_fail "could not build dag-asan (see build_dag_asan.log)"
+    log_fail "could not build dag-asan (see $BUILD_LOG)"
     exit 1
 fi
 log_ok "build"

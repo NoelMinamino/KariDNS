@@ -19,6 +19,7 @@ cd "$(dirname "$0")/.."
 
 CONF_FILE="tests/karidns-test.conf"
 CTL_CONF="tests/karictl-test.conf"
+chmod 0600 "$CTL_CONF" 2>/dev/null || true
 ZONE_FILE="tests/zones/example.com.zone"
 ZONE_NAME="example.com"
 
@@ -225,16 +226,11 @@ else
     echo "Step 4: Fuzzer smoke run (${FUZZ_SMOKE_SECONDS:-5}s per target)"
 fi
 echo "=========================================="
-make fuzz >/dev/null 2>&1
-make fuzz_core >/dev/null 2>&1
-make fuzz_zone >/dev/null 2>&1
-make fuzz_conf >/dev/null 2>&1
-make fuzz_tsig >/dev/null 2>&1
-make fuzz_dag >/dev/null 2>&1
-make fuzz_tsig_verify >/dev/null 2>&1
+make fuzz_all >/dev/null 2>&1
 
 pids=""
-for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_dag_response fuzz_tsig_verify; do
+for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
+              fuzz_dag_response fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file; do
     bin="tests/fuzz/$target"
     corpus="tests/fuzz/corpus_$target"
     if [ ! -x "$bin" ]; then

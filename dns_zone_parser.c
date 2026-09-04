@@ -60,7 +60,14 @@ void *arena_alloc(zone_arena_t *arena, size_t size) {
   if (size == 0 || size > (64 * 1024 * 1024)) return NULL; // 単一アロケーション上限
   if (arena->current_pool_idx > SIZE_MAX - size) return NULL; // 加算オーバーフロー防止
 
-  if (arena->current_pool_idx + size > arena->current_pool_cap ||
+  // 16バイトアライメント (max_align_t 相当) を確保
+  size_t aligned_idx = (arena->current_pool_idx + 15) & ~(size_t)15;
+  if (aligned_idx < arena->current_pool_idx) return NULL;
+  size_t aligned_size = (size + 15) & ~(size_t)15;
+  if (aligned_size < size) return NULL;
+  if (aligned_idx > SIZE_MAX - aligned_size) return NULL;
+
+  if (aligned_idx + aligned_size > arena->current_pool_cap ||
       arena->data_pool_count == 0) {
     if (arena->data_pool_count >= 128)
       return NULL;
@@ -71,17 +78,17 @@ void *arena_alloc(zone_arena_t *arena, size_t size) {
       if (arena->current_pool_cap > 64 * 1024 * 1024)
         arena->current_pool_cap = 64 * 1024 * 1024;
     }
-    if (size > arena->current_pool_cap)
-      arena->current_pool_cap = size + (1024 * 1024);
+    if (aligned_size > arena->current_pool_cap)
+      arena->current_pool_cap = aligned_size + (1024 * 1024);
     arena->data_pools[arena->data_pool_count] = malloc(arena->current_pool_cap);
     if (!arena->data_pools[arena->data_pool_count])
       return NULL;
-    arena->current_pool_idx = 0;
+    aligned_idx = 0;
     arena->data_pool_count++;
   }
   void *ptr =
-      &arena->data_pools[arena->data_pool_count - 1][arena->current_pool_idx];
-  arena->current_pool_idx += size;
+      &arena->data_pools[arena->data_pool_count - 1][aligned_idx];
+  arena->current_pool_idx = aligned_idx + aligned_size;
   return ptr;
 }
 
@@ -1268,6 +1275,8 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->is_tinydns_format = false;
   arena->locations = NULL;
   arena->location_count = 0;
+  arena->prelinked_glue = NULL;
+  arena->prelinked_glue_count = 0;
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
@@ -1292,6 +1301,8 @@ void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->locations);
   arena->locations = NULL;
   arena->location_count = 0;
+  arena->prelinked_glue = NULL;
+  arena->prelinked_glue_count = 0;
   zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {

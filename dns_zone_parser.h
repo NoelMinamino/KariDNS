@@ -46,6 +46,12 @@ typedef struct {
     uint8_t prefix_len; /* 0〜4 */
 } tinydns_location_entry_t;
 
+typedef struct {
+  char *target_name;
+  dns_record_t **records;
+  int record_count;
+} prelinked_glue_entry_t;
+
 typedef struct zone_arena_s {
   dns_record_t *records;
   size_t count;
@@ -68,6 +74,8 @@ typedef struct zone_arena_s {
   bool is_tinydns_format; /* parse_tinydns_data()が呼ばれたzone_arenaでのみtrue */
   tinydns_location_entry_t *locations; /* NULL可 */
   int location_count;
+  prelinked_glue_entry_t *prelinked_glue; /* 事前リンクされたAdditionalグルー */
+  int prelinked_glue_count;
 } zone_arena_t;
 
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);

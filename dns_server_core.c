@@ -533,6 +533,27 @@ static resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
 static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
+#define QUERY_LOG_RING_SIZE 8192
+
+typedef struct {
+    _Atomic bool ready;
+    struct timespec ts;
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port;
+    char qname[256];
+    uint16_t qclass;
+    uint16_t qtype;
+    bool has_edns;
+    bool dnssec_ok;
+} query_log_entry_t;
+
+static query_log_entry_t g_query_log_ring[QUERY_LOG_RING_SIZE];
+static _Atomic uint64_t g_query_log_tail = ATOMIC_VAR_INIT(0);
+static _Atomic uint64_t g_query_log_head = ATOMIC_VAR_INIT(0);
+
+static _Atomic uint32_t g_query_log_sec = ATOMIC_VAR_INIT(0);
+static _Atomic uint32_t g_query_log_count = ATOMIC_VAR_INIT(0);
+
 static inline void inc_tcp_clients(void) {
     int current = atomic_fetch_add_explicit(&g_tcp_clients, 1, memory_order_relaxed) + 1;
     int high = atomic_load_explicit(&g_tcp_high_water, memory_order_relaxed);
@@ -669,6 +690,7 @@ static size_t resolve_ip_port_to_sockaddr(const char *ip, int port,
 typedef struct dir_fd_entry {
   char *dirpath;
   int fd;
+  bool is_writable;
   struct dir_fd_entry *next;
 } dir_fd_entry_t;
 static dir_fd_entry_t *g_dir_fd_table = NULL;
@@ -715,9 +737,11 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
   pthread_mutex_lock(&g_dir_fd_lock);
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
     if (strcmp(e->dirpath, dirpath) == 0) {
-      int fd = e->fd;
-      pthread_mutex_unlock(&g_dir_fd_lock);
-      return fd;
+      if (!writable || e->is_writable) {
+        int fd = e->fd;
+        pthread_mutex_unlock(&g_dir_fd_lock);
+        return fd;
+      }
     }
   }
   if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
@@ -764,6 +788,7 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
     return -1;
   }
   e->fd = fd;
+  e->is_writable = writable;
   e->next = g_dir_fd_table;
   g_dir_fd_table = e;
   pthread_mutex_unlock(&g_dir_fd_lock);
@@ -956,6 +981,40 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
     }
   }
   return NULL;
+}
+
+static inline bool domain_names_match_ci(const char *a, const char *b) {
+  if (!a || !b) return false;
+  if (strcasecmp(a, b) == 0) return true;
+  size_t la = strlen(a);
+  size_t lb = strlen(b);
+  if (la == lb + 1 && a[la - 1] == '.' && strncasecmp(a, b, lb) == 0) return true;
+  if (lb == la + 1 && b[lb - 1] == '.' && strncasecmp(a, b, la) == 0) return true;
+  return false;
+}
+
+static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
+  if (!view || !qname) return NULL;
+  size_t q_len = strlen(qname);
+  zone_db_entry_t *best_entry = NULL;
+  size_t longest_match_len = 0;
+  for (size_t i = 0; i < view->zone_count; i++) {
+    zone_db_entry_t *entry = view->entries[i];
+    if (!entry) continue;
+    size_t z_len = strlen(entry->domain);
+    bool match = false;
+    if (q_len == z_len && strcasecmp(qname, entry->domain) == 0) {
+      match = true;
+    } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
+               strcasecmp(qname + q_len - z_len, entry->domain) == 0) {
+      match = true;
+    }
+    if (match && z_len > longest_match_len) {
+      longest_match_len = z_len;
+      best_entry = entry;
+    }
+  }
+  return best_entry;
 }
 
 static inline void rcu_exponential_backoff(int *retries, useconds_t *sleep_time) {
@@ -1272,6 +1331,238 @@ typedef enum {
     RELOAD_ERR_MISSING_SOA = -3,
 } reload_result_t;
 
+#define MAX_PRELINK_TARGETS 256
+#define MAX_MATCH_RECS 32
+
+static void prelink_zone_additional_glue(zone_arena_t *current_zone,
+                                         const char *zone_domain,
+                                         zone_db_snapshot_t *snap,
+                                         view_snapshot_t *view,
+                                         additional_from_auth_t policy) {
+  if (!current_zone || current_zone->count == 0 || !zone_domain || policy == ADDITIONAL_AUTH_NO) {
+    if (current_zone) {
+      current_zone->prelinked_glue = NULL;
+      current_zone->prelinked_glue_count = 0;
+    }
+    return;
+  }
+
+  if (snap && !view) {
+    for (size_t v = 0; v < snap->view_count; v++) {
+      for (size_t i = 0; i < snap->views[v].zone_count; i++) {
+        if (snap->views[v].entries[i] &&
+            domain_names_match_ci(snap->views[v].entries[i]->domain, zone_domain)) {
+          view = &snap->views[v];
+          break;
+        }
+      }
+      if (view) break;
+    }
+    if (!view && snap->view_count > 0) {
+      view = &snap->views[0];
+    }
+  }
+
+  const char *raw_targets[MAX_PRELINK_TARGETS];
+  int raw_target_count = 0;
+
+  for (size_t i = 0; i < current_zone->count; i++) {
+    dns_record_t *rec = &current_zone->records[i];
+    const char *tgt = NULL;
+    if (rec->type_code == 2 && rec->rdata_count >= 1) {
+      tgt = rec->rdata[0];
+    } else if (rec->type_code == 15 && rec->rdata_count >= 2) {
+      tgt = rec->rdata[1];
+    } else if (rec->type_code == 33 && rec->rdata_count >= 4) {
+      tgt = rec->rdata[3];
+    }
+    if (!tgt || *tgt == '\0') continue;
+
+    bool dup = false;
+    for (int k = 0; k < raw_target_count; k++) {
+      if (domain_names_match_ci(raw_targets[k], tgt)) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup && raw_target_count < MAX_PRELINK_TARGETS) {
+      raw_targets[raw_target_count++] = tgt;
+    }
+  }
+
+  if (raw_target_count == 0) {
+    current_zone->prelinked_glue = NULL;
+    current_zone->prelinked_glue_count = 0;
+    return;
+  }
+
+  prelinked_glue_entry_t entries[MAX_PRELINK_TARGETS];
+  int entry_count = 0;
+
+  size_t z_len = strlen(zone_domain);
+  while (z_len > 0 && zone_domain[z_len - 1] == '.') z_len--;
+
+  for (int t = 0; t < raw_target_count; t++) {
+    const char *tgt = raw_targets[t];
+    size_t t_len = strlen(tgt);
+    while (t_len > 0 && tgt[t_len - 1] == '.') t_len--;
+
+    bool in_domain = false;
+    if (t_len >= z_len) {
+      if (strncasecmp(tgt + (t_len - z_len), zone_domain, z_len) == 0) {
+        if (t_len == z_len || tgt[t_len - z_len - 1] == '.') {
+          in_domain = true;
+        }
+      }
+    }
+
+    if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !in_domain) {
+      continue;
+    }
+
+    dns_record_t *found_recs[MAX_MATCH_RECS];
+    int found_count = 0;
+
+    // 1. Search current_zone first
+    if (current_zone->hash_size > 0 && current_zone->hash_table) {
+      uint32_t hashes[2];
+      int h_count = 1;
+      hashes[0] = calc_fnv1a_str(tgt);
+      char alt_tgt[256];
+      size_t raw_len = strlen(tgt);
+      if (raw_len > 0 && tgt[raw_len - 1] == '.') {
+        snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), tgt);
+        hashes[1] = calc_fnv1a_str(alt_tgt);
+        h_count = 2;
+      } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
+        snprintf(alt_tgt, sizeof(alt_tgt), "%s.", tgt);
+        hashes[1] = calc_fnv1a_str(alt_tgt);
+        h_count = 2;
+      }
+
+      for (int h = 0; h < h_count; h++) {
+        size_t idx = hashes[h] & (current_zone->hash_size - 1);
+        for (int j = current_zone->hash_table[idx]; j != -1;
+             j = current_zone->records[j].next_record) {
+          dns_record_t *r = &current_zone->records[j];
+          if ((r->type_code == 1 || r->type_code == 28) &&
+              domain_names_match_ci(r->name, tgt)) {
+            bool rdup = false;
+            for (int f = 0; f < found_count; f++) {
+              if (found_recs[f] == r) { rdup = true; break; }
+            }
+            if (!rdup && found_count < MAX_MATCH_RECS) {
+              found_recs[found_count++] = r;
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Search sibling authoritative zones in view if policy == ADDITIONAL_AUTH_YES
+    if (policy == ADDITIONAL_AUTH_YES && view) {
+      zone_db_entry_t *sib_entry = find_zone_in_view(view, tgt);
+      if (sib_entry) {
+        zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+        if (sib_arena && sib_arena != current_zone && sib_arena->hash_size > 0 && sib_arena->hash_table) {
+          uint32_t hashes[2];
+          int h_count = 1;
+          hashes[0] = calc_fnv1a_str(tgt);
+          char alt_tgt[256];
+          size_t raw_len = strlen(tgt);
+          if (raw_len > 0 && tgt[raw_len - 1] == '.') {
+            snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), tgt);
+            hashes[1] = calc_fnv1a_str(alt_tgt);
+            h_count = 2;
+          } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
+            snprintf(alt_tgt, sizeof(alt_tgt), "%s.", tgt);
+            hashes[1] = calc_fnv1a_str(alt_tgt);
+            h_count = 2;
+          }
+          for (int h = 0; h < h_count; h++) {
+            size_t idx = hashes[h] & (sib_arena->hash_size - 1);
+            for (int j = sib_arena->hash_table[idx]; j != -1;
+                 j = sib_arena->records[j].next_record) {
+              dns_record_t *r = &sib_arena->records[j];
+              if ((r->type_code == 1 || r->type_code == 28) &&
+                  domain_names_match_ci(r->name, tgt)) {
+                bool rdup = false;
+                for (int f = 0; f < found_count; f++) {
+                  if (found_recs[f]->type_code == r->type_code &&
+                      found_recs[f]->rdata_count == r->rdata_count) {
+                    bool match_all = true;
+                    for (int rc = 0; rc < r->rdata_count; rc++) {
+                      if (strcasecmp(found_recs[f]->rdata[rc], r->rdata[rc]) != 0) {
+                        match_all = false; break;
+                      }
+                    }
+                    if (match_all) { rdup = true; break; }
+                  }
+                }
+                if (!rdup && found_count < MAX_MATCH_RECS) {
+                  found_recs[found_count++] = r;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (found_count > 0) {
+      dns_record_t **copied_recs = (dns_record_t **)arena_alloc(current_zone, found_count * sizeof(dns_record_t *));
+      if (!copied_recs) continue;
+
+      int copied_count = 0;
+      for (int f = 0; f < found_count; f++) {
+        dns_record_t *src_rec = found_recs[f];
+        dns_record_t *d_rec = (dns_record_t *)arena_alloc(current_zone, sizeof(dns_record_t));
+        if (!d_rec) break;
+        *d_rec = *src_rec;
+        d_rec->name = arena_strdup(current_zone, src_rec->name);
+        d_rec->ttl = src_rec->ttl ? arena_strdup(current_zone, src_rec->ttl) : NULL;
+        d_rec->class_str = src_rec->class_str ? arena_strdup(current_zone, src_rec->class_str) : NULL;
+        d_rec->type = src_rec->type ? arena_strdup(current_zone, src_rec->type) : NULL;
+        d_rec->ecs_subnet_tag = src_rec->ecs_subnet_tag ? arena_strdup(current_zone, src_rec->ecs_subnet_tag) : NULL;
+        for (int r = 0; r < src_rec->rdata_count && r < MAX_RDATA; r++) {
+          d_rec->rdata[r] = src_rec->rdata[r] ? arena_strdup(current_zone, src_rec->rdata[r]) : NULL;
+        }
+        if (src_rec->generic_len > 0 && src_rec->generic_data) {
+          d_rec->generic_data = (uint8_t *)arena_alloc(current_zone, src_rec->generic_len);
+          if (d_rec->generic_data)
+            memcpy(d_rec->generic_data, src_rec->generic_data, src_rec->generic_len);
+        } else {
+          d_rec->generic_data = NULL;
+        }
+        d_rec->next_record = -1;
+        d_rec->is_cached = false;
+        dns_record_preparse_cache(current_zone, d_rec);
+        copied_recs[copied_count++] = d_rec;
+      }
+
+      if (copied_count > 0) {
+        entries[entry_count].target_name = arena_strdup(current_zone, tgt);
+        entries[entry_count].records = copied_recs;
+        entries[entry_count].record_count = copied_count;
+        entry_count++;
+      }
+    }
+  }
+
+  if (entry_count > 0) {
+    current_zone->prelinked_glue = (prelinked_glue_entry_t *)arena_alloc(current_zone, entry_count * sizeof(prelinked_glue_entry_t));
+    if (current_zone->prelinked_glue) {
+      memcpy(current_zone->prelinked_glue, entries, entry_count * sizeof(prelinked_glue_entry_t));
+      current_zone->prelinked_glue_count = entry_count;
+    } else {
+      current_zone->prelinked_glue_count = 0;
+    }
+  } else {
+    current_zone->prelinked_glue = NULL;
+    current_zone->prelinked_glue_count = 0;
+  }
+}
+
 static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
   if (!entry || !zcfg || !zcfg->file) return RELOAD_ERR_FILE_READ;
   const char *file = zcfg->file;
@@ -1401,7 +1692,14 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   size_t idx = hash & (z_standby->hash_size - 1);
   for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
       if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, entry->domain) == 0) {
-          has_soa = true; break;
+          has_soa = true;
+          if (z_standby->records[i].rdata_count >= 7) {
+              entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
+              entry->refresh = parse_ttl_value(z_standby->records[i].rdata[3]);
+              entry->retry = parse_ttl_value(z_standby->records[i].rdata[4]);
+              entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
+          }
+          break;
       }
   }
   if (!has_soa) {
@@ -1409,6 +1707,12 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
       syslog(LOG_ERR, "[Zone] Missing SOA reloading zone '%s' from '%s'", entry->domain, file);
       return RELOAD_ERR_MISSING_SOA;
   }
+
+  zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
+  server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+  prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
+  if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);
   atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
@@ -2444,6 +2748,9 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     }
     syslog(LOG_INFO, "[Catalog] Processed membership for '%s', desired members: %d", catalog_entry->domain, new_desired_count);
 }
+
+static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
+
 void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
     if (!new_snap) {
@@ -2483,6 +2790,30 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                 }
             }
         }
+    }
+
+    // Pass 2: Pre-link additional glue across authoritative zones in each view
+    zone_db_snapshot_t *relink_snap = acquire_zone_snapshot();
+    if (relink_snap) {
+        for (size_t v = 0; v < relink_snap->view_count; v++) {
+            view_snapshot_t *view = &relink_snap->views[v];
+            for (size_t i = 0; i < view->zone_count; i++) {
+                zone_db_entry_t *entry = view->entries[i];
+                if (!entry) continue;
+                pthread_mutex_lock(&entry->writer_lock);
+                zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+                if (z_active && z_active->count > 0) {
+                    zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
+                    wait_for_readers(z_standby);
+                    clone_zone_arena(z_active, z_standby);
+                    build_zone_index(z_standby);
+                    prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, config->additional_from_auth);
+                    atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+                }
+                pthread_mutex_unlock(&entry->writer_lock);
+            }
+        }
+        release_zone_snapshot(relink_snap);
     }
 }
 
@@ -2557,6 +2888,8 @@ static void zone_arena_clear_data_pools(zone_arena_t *arena) {
     arena->locations = NULL;
     arena->location_count = 0;
   }
+  arena->prelinked_glue = NULL;
+  arena->prelinked_glue_count = 0;
   arena->count = 0;
   arena->data_pool_count = 0;
   arena->current_pool_cap = 0;
@@ -2691,13 +3024,24 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         standby->current_pool_idx = 0;
         clone_zone_arena(active, standby);
         session->is_deleting = true;
-      } else if (session->is_ixfr &&
-                 current_serial == session->initial_soa_serial) {
-        session->is_finished = true;
-        standby->count--;
-      } else if (session->is_ixfr) {
-        session->is_deleting = !session->is_deleting;
-        standby->count--;
+      } else if (session->is_ixfr && session->is_deleting) {
+        session->is_deleting = false;
+        for (size_t k = 0; k < standby->count - 1; k++) {
+          if (standby->records[k].type_code == 6 &&
+              strcasecmp(standby->records[k].name, domain) == 0) {
+            standby->records[k] = standby->records[standby->count - 1];
+            standby->count--;
+            break;
+          }
+        }
+      } else if (session->is_ixfr && !session->is_deleting) {
+        if (current_serial == session->initial_soa_serial) {
+          session->is_finished = true;
+          standby->count--;
+        } else {
+          session->is_deleting = true;
+          standby->count--;
+        }
       } else {
         if (strcasecmp(session->initial_soa_name, rec->name) == 0 &&
             session->initial_soa_serial == current_serial) {
@@ -2791,6 +3135,12 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
           return -1;
         }
+
+        zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
+        server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+        additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+        prelink_zone_additional_glue(standby, entry->domain, cur_snap, NULL, policy);
+        if (cur_snap) release_zone_snapshot(cur_snap);
 
         compute_ixfr_diff(entry, cur_active, standby);
         atomic_store_explicit(&entry->rcu.active, standby,
@@ -3006,7 +3356,37 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 size_t max_res_len, uint16_t *offset,
                                 compress_ctx_t *comp_ctx, uint16_t *arcount,
                                 const char client_loc[2],
-                                const char *client_ecs_tag) {
+                                const char *client_ecs_tag,
+                                additional_from_auth_t policy) {
+  if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
+
+  if (current_zone->prelinked_glue && current_zone->prelinked_glue_count > 0) {
+    for (int e = 0; e < current_zone->prelinked_glue_count; e++) {
+      prelinked_glue_entry_t *entry = &current_zone->prelinked_glue[e];
+      if (entry->target_name && domain_names_match_ci(entry->target_name, target)) {
+        time_t tinydns_now = current_zone->is_tinydns_format ? time(NULL) : 0;
+        for (int r = 0; r < entry->record_count; r++) {
+          dns_record_t *rec = entry->records[r];
+          if (!rec) continue;
+          uint32_t eff_ttl;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+          dns_record_t rec_copy = *rec;
+          rec_copy.ttl_value = eff_ttl;
+          uint16_t saved_offset = *offset;
+          if (serialize_dns_record(res, max_res_len, offset,
+                                   &rec_copy, comp_ctx,
+                                   NULL, 0xFFFFFFFF) < 0) {
+            *offset = saved_offset;
+            return false;
+          } else {
+            (*arcount)++;
+          }
+        }
+        return true;
+      }
+    }
+  }
+
   size_t t_len = strlen(target), a_len = strlen(zone_apex);
   if (t_len >= a_len &&
       strcasecmp(target + t_len - a_len, zone_apex) == 0 &&
@@ -3071,7 +3451,8 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             compress_ctx_t *comp_ctx, uint16_t *nscount,
                             uint16_t *arcount, bool is_ds_query,
                             const char client_loc[2],
-                            const char *client_ecs_tag) {
+                            const char *client_ecs_tag,
+                            additional_from_auth_t policy) {
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
     return false;
@@ -3117,7 +3498,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
             current_zone->records[i].rdata_count > 0) {
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
-                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag)) {
+                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, policy)) {
             res[2] |= 0x02;
             return true;
           }
@@ -3297,9 +3678,10 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     }
     
     // ==== フェーズ1: 委任判定 ====
+    additional_from_auth_t policy = cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES;
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag))
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, policy))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====
@@ -3815,11 +4197,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     }
 
     // ==== フェーズ10: Additional Glue付加 ====
-    if (!minimal_responses && glue_target_count > 0) {
+    if (!minimal_responses && glue_target_count > 0 && policy != ADDITIONAL_AUTH_NO) {
       for (int k = 0; k < glue_target_count; k++) {
         if (!append_glue_records(current_zone, glue_targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
-                                 client_loc, client_ecs_tag)) {
+                                 client_loc, client_ecs_tag, policy)) {
           break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
         }
       }
@@ -3957,6 +4339,12 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
     return 2; // SERVFAIL
   }
+
+  zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
+  server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+  additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+  prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
+  if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);
 
@@ -5483,15 +5871,52 @@ void send_notify_to_all(const char *domain, const char *view_name) {
 // ============================================================================
 
 static void init_logging_channels(server_config_t *cfg) {
+  uid_t target_uid = (uid_t)-1;
+  gid_t target_gid = (gid_t)-1;
+  if (geteuid() == 0 && cfg->user) {
+    struct passwd *pwd = getpwnam(cfg->user);
+    if (pwd) {
+      target_uid = pwd->pw_uid;
+      target_gid = pwd->pw_gid;
+      if (cfg->group) {
+        struct group *grp = getgrnam(cfg->group);
+        if (grp) target_gid = grp->gr_gid;
+      }
+    }
+  }
+
   log_channel_t *ch = cfg->logging.channels;
   while (ch) {
     if (ch->file_path) {
+      if (geteuid() == 0) {
+        char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+        if (split_path_for_openat(ch->file_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+          if (dirbuf[0] != '\0' && strcmp(dirbuf, ".") != 0) {
+            struct stat d_st;
+            if (stat(dirbuf, &d_st) != 0) {
+              mkdir(dirbuf, 0755);
+            }
+            if (target_uid != (uid_t)-1 &&
+                strcmp(dirbuf, "/") != 0 && strcmp(dirbuf, "/var") != 0 &&
+                strcmp(dirbuf, "/var/log") != 0 && strcmp(dirbuf, "/tmp") != 0 &&
+                strcmp(dirbuf, "/etc") != 0) {
+              chown(dirbuf, target_uid, target_gid);
+            }
+          }
+        }
+      }
+
       ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND,
                                   0644, true);
       if (ch->fd >= 0) {
+        if (geteuid() == 0 && target_uid != (uid_t)-1) {
+          fchown(ch->fd, target_uid, target_gid);
+        }
         struct stat st;
         if (fstat(ch->fd, &st) == 0)
           ch->current_size = st.st_size;
+      } else {
+        syslog(LOG_ERR, "[Logging] Failed to open log file '%s': %m", ch->file_path);
       }
       time_t now = time(NULL);
       struct tm tm_info;
@@ -5582,17 +6007,21 @@ static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, s
         rotate = true;
     else if (ch->suffix_timestamp && ch->current_date != today)
         rotate = true;
+
     if (rotate) {
-        if (ch->fd >= 0) {
-            close(ch->fd);
-        }
-        ch->fd = -1;
+        int old_fd = ch->fd;
         int reopen_flags = O_WRONLY | O_CREAT | O_APPEND;
+        bool rotate_rename_failed = false;
+
         if (ch->suffix_timestamp) {
             char new_name[600];
             int r = snprintf(new_name, sizeof(new_name), "%s.%08d", ch->file_path, ch->current_date);
-            if (r > 0 && r < (int)sizeof(new_name))
-                renameat_via_dir_cache(ch->file_path, new_name);
+            if (r > 0 && r < (int)sizeof(new_name)) {
+                if (renameat_via_dir_cache(ch->file_path, new_name) != 0) {
+                    rotate_rename_failed = true;
+                    syslog(LOG_ERR, "[Logging] Failed to rotate log file '%s' to '%s': %m", ch->file_path, new_name);
+                }
+            }
         } else if (ch->versions > 0) {
             for (int i = ch->versions - 1; i >= 0; i--) {
                 char old_name[600], new_name[600];
@@ -5600,15 +6029,43 @@ static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, s
                              ? snprintf(old_name, sizeof(old_name), "%s", ch->file_path)
                              : snprintf(old_name, sizeof(old_name), "%s.%d", ch->file_path, i - 1);
                 int r2 = snprintf(new_name, sizeof(new_name), "%s.%d", ch->file_path, i);
-                if (r1 > 0 && r2 > 0)
-                    renameat_via_dir_cache(old_name, new_name);
+                if (r1 > 0 && r2 > 0) {
+                    if (renameat_via_dir_cache(old_name, new_name) != 0 && i == 0) {
+                        rotate_rename_failed = true;
+                        syslog(LOG_ERR, "[Logging] Failed to rotate active log file '%s' to '%s': %m", old_name, new_name);
+                    }
+                }
             }
         } else {
             reopen_flags |= O_TRUNC;
         }
-        ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
-        ch->current_size = 0;
-        ch->current_date = today;
+
+        if (!rotate_rename_failed || (reopen_flags & O_TRUNC)) {
+            if (old_fd >= 0) close(old_fd);
+            ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
+            if (ch->fd >= 0) {
+                struct stat st;
+                ch->current_size = (fstat(ch->fd, &st) == 0) ? st.st_size : 0;
+                ch->current_date = today;
+            } else {
+                syslog(LOG_ERR, "[Logging] Failed to reopen log file '%s' after rotation: %m", ch->file_path);
+                ch->current_size = 0;
+            }
+        } else {
+            // リネーム失敗時: 古いFDが有効であれば維持してログ欠損を防ぎ、実ファイルサイズと同期
+            if (old_fd >= 0) {
+                struct stat st;
+                if (fstat(old_fd, &st) == 0)
+                    ch->current_size = st.st_size;
+            } else {
+                ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND, 0644, true);
+                if (ch->fd >= 0) {
+                    struct stat st;
+                    if (fstat(ch->fd, &st) == 0)
+                        ch->current_size = st.st_size;
+                }
+            }
+        }
     }
     if (ch->fd >= 0) {
         ssize_t w = write(ch->fd, log_buf, len);
@@ -5691,55 +6148,127 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
+static inline bool check_query_log_rate_limit(uint32_t max_qps) {
+    if (max_qps == 0) return true; // 0 = unlimited
+    time_t now = time(NULL);
+    uint32_t sec = atomic_load_explicit(&g_query_log_sec, memory_order_relaxed);
+    if (sec != (uint32_t)now) {
+        if (atomic_compare_exchange_strong_explicit(&g_query_log_sec, &sec, (uint32_t)now,
+                                                    memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&g_query_log_count, 1, memory_order_relaxed);
+            return true;
+        }
+    }
+    uint32_t count = atomic_fetch_add_explicit(&g_query_log_count, 1, memory_order_relaxed);
+    return (count < max_qps);
+}
+
+void *query_logger_thread_func(void *arg) {
+    (void)arg;
+    while (1) {
+        uint64_t h = atomic_load_explicit(&g_query_log_head, memory_order_relaxed);
+        uint32_t idx = h & (QUERY_LOG_RING_SIZE - 1);
+
+        if (atomic_load_explicit(&g_query_log_ring[idx].ready, memory_order_acquire)) {
+            query_log_entry_t *entry = &g_query_log_ring[idx];
+            server_config_t *cfg = acquire_config_snapshot();
+
+            if (cfg && cfg->logging.queries_channel) {
+                log_channel_t *ch = cfg->logging.queries_channel;
+
+                struct tm tm_info;
+                localtime_r(&entry->ts.tv_sec, &tm_info);
+
+                char time_str[64] = "";
+                if (ch->print_time) {
+                    char buf[32];
+                    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
+                    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf,
+                             entry->ts.tv_nsec / 1000000);
+                }
+
+                char class_str[16];
+                if (entry->qclass == 1)
+                    snprintf(class_str, sizeof(class_str), "IN");
+                else if (entry->qclass == 255)
+                    snprintf(class_str, sizeof(class_str), "ANY");
+                else
+                    snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
+
+                char type_str[32];
+                const char *type_str_tmp = format_type_name(entry->qtype, type_str, sizeof(type_str));
+
+                char edns_str[16] = "";
+                if (entry->has_edns)
+                    snprintf(edns_str, sizeof(edns_str), "+E(0)%s", entry->dnssec_ok ? "D" : "K");
+
+                char safe_qname[512];
+                escape_qname_for_log(entry->qname, safe_qname, sizeof(safe_qname));
+
+                char log_buf[1024];
+                int len = snprintf(log_buf, sizeof(log_buf),
+                                   "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
+                                   ch->print_category ? "queries: " : "",
+                                   ch->print_severity ? "info: " : "", entry->client_ip, entry->client_port,
+                                   safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
+                if (len > 0) {
+                    if (len >= (int)sizeof(log_buf))
+                        len = sizeof(log_buf) - 1;
+                    log_write_rotated(ch, log_buf, len, &tm_info);
+                }
+            }
+            if (cfg) release_config_snapshot(cfg);
+
+            atomic_store_explicit(&entry->ready, false, memory_order_release);
+            atomic_fetch_add_explicit(&g_query_log_head, 1, memory_order_release);
+        } else {
+            usleep(1000);
+        }
+    }
+    return NULL;
+}
+
 static void write_query_log(const char *client_ip, int client_port,
                             const char *qname, uint16_t qclass, uint16_t qtype,
                             bool has_edns, bool dnssec_ok) {
-  server_config_t *cfg = acquire_config_snapshot();
-  if (!cfg || !cfg->logging.queries_channel) {
-    if (cfg) release_config_snapshot(cfg);
-    return;
-  }
-  log_channel_t *ch = cfg->logging.queries_channel;
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  struct tm tm_info;
-  localtime_r(&ts.tv_sec, &tm_info);
-  
-  char time_str[64] = "";
-  if (ch->print_time) {
-    char buf[32];
-    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
-    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf,
-             ts.tv_nsec / 1000000);
-  }
-  char class_str[16];
-  if (qclass == 1)
-    snprintf(class_str, sizeof(class_str), "IN");
-  else if (qclass == 255)
-    snprintf(class_str, sizeof(class_str), "ANY");
-  else
-    snprintf(class_str, sizeof(class_str), "CLASS%d", qclass);
-  char type_str[32];
-  const char *type_str_tmp = format_type_name(qtype, type_str, sizeof(type_str));
-  char edns_str[16] = "";
-  if (has_edns)
-    snprintf(edns_str, sizeof(edns_str), "+E(0)%s", dnssec_ok ? "D" : "K");
-  
-  char safe_qname[512];
-  escape_qname_for_log(qname, safe_qname, sizeof(safe_qname));
+    server_config_t *cfg = acquire_config_snapshot();
+    if (!cfg) return;
+    log_channel_t *ch = cfg->logging.queries_channel;
+    if (!ch) {
+        release_config_snapshot(cfg);
+        return;
+    }
+    uint32_t max_qps = ch->max_qps;
+    release_config_snapshot(cfg);
 
-  char log_buf[1024];
-  int len = snprintf(log_buf, sizeof(log_buf),
-                     "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
-                     ch->print_category ? "queries: " : "",
-                     ch->print_severity ? "info: " : "", client_ip, client_port,
-                     safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
-  if (len > 0) {
-    if (len >= (int)sizeof(log_buf))
-      len = sizeof(log_buf) - 1;
-    log_write_rotated(ch, log_buf, len, &tm_info);
-  }
-  release_config_snapshot(cfg);
+    if (!check_query_log_rate_limit(max_qps)) {
+        return;
+    }
+
+    uint64_t t = atomic_load_explicit(&g_query_log_tail, memory_order_relaxed);
+    uint64_t h = atomic_load_explicit(&g_query_log_head, memory_order_acquire);
+
+    // ロックフリー CAS ループ (バッファフル時はDDoS・高負荷とみなし、潔くログをドロップする)
+    do {
+        if (t - h >= QUERY_LOG_RING_SIZE) return;
+    } while (!atomic_compare_exchange_weak_explicit(&g_query_log_tail, &t, t + 1,
+                                                    memory_order_acq_rel, memory_order_relaxed));
+
+    uint32_t idx = t & (QUERY_LOG_RING_SIZE - 1);
+    query_log_entry_t *entry = &g_query_log_ring[idx];
+
+    clock_gettime(CLOCK_REALTIME, &entry->ts);
+    strncpy(entry->client_ip, client_ip, INET6_ADDRSTRLEN - 1);
+    entry->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
+    entry->client_port = client_port;
+    strncpy(entry->qname, qname, 255);
+    entry->qname[255] = '\0';
+    entry->qclass = qclass;
+    entry->qtype = qtype;
+    entry->has_edns = has_edns;
+    entry->dnssec_ok = dnssec_ok;
+
+    atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
 
 // ============================================================================
@@ -6220,30 +6749,6 @@ static void init_async_io_pool(void) {
   for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
     pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, NULL);
   }
-}
-
-static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
-  if (!view || !qname) return NULL;
-  size_t q_len = strlen(qname);
-  zone_db_entry_t *best_entry = NULL;
-  size_t longest_match_len = 0;
-  for (size_t i = 0; i < view->zone_count; i++) {
-    zone_db_entry_t *entry = view->entries[i];
-    if (!entry) continue;
-    size_t z_len = strlen(entry->domain);
-    bool match = false;
-    if (q_len == z_len && strcasecmp(qname, entry->domain) == 0) {
-      match = true;
-    } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
-               strcasecmp(qname + q_len - z_len, entry->domain) == 0) {
-      match = true;
-    }
-    if (match && z_len > longest_match_len) {
-      longest_match_len = z_len;
-      best_entry = entry;
-    }
-  }
-  return best_entry;
 }
 
 static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
@@ -8037,6 +8542,7 @@ int main(int argc, char **argv) {
 
   bool foreground = false;
   const char *config_file = NULL;
+  const char *cli_pid_file = NULL;
 
   for (int i = 1; i < argc; i++) {
       if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-V") == 0) {
@@ -8044,14 +8550,18 @@ int main(int argc, char **argv) {
           return 0;
       } else if (strcmp(argv[i], "-f") == 0) {
           foreground = true;
+      } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+          config_file = argv[++i];
+      } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+          cli_pid_file = argv[++i];
       } else {
           config_file = argv[i];
       }
   }
 
   if (!config_file) {
-    fprintf(stderr, "Usage: %s [-v | --version] [-f] <config_file>\n", argv[0]);
-    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] <config_file>", argv[0]);
+    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-p <pid_file>] [-c <config_file> | <config_file>]\n", argv[0]);
+    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-p <pid_file>] [-c <config_file> | <config_file>]", argv[0]);
     return 1;
   }
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
@@ -8076,24 +8586,6 @@ int main(int argc, char **argv) {
     daemonize();
   }
 
-  // Prevent multiple instances using a pidfile lock
-  mkdir("/var/run/karidns", 0755);
-  int pid_fd = open("/var/run/karidns/karidns.pid", O_RDWR | O_CREAT, 0644);
-  if (pid_fd < 0) {
-    syslog(LOG_ERR, "Failed to open pidfile /var/run/karidns/karidns.pid: %s", strerror(errno));
-    return 1;
-  }
-  if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {
-    syslog(LOG_ERR, "Another KariDNS instance is already running (pidfile locked)");
-    fprintf(stderr, "Another KariDNS instance is already running.\n");
-    return 1;
-  }
-  ftruncate(pid_fd, 0);
-  char pid_str[32];
-  snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
-  write(pid_fd, pid_str, strlen(pid_str));
-  // Keep pid_fd open; the lock will be automatically released upon process exit.
-
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGHUP);
@@ -8108,6 +8600,45 @@ int main(int argc, char **argv) {
   }
   free(config_str);
 
+  int pid_fd = -1;
+  const char *effective_pid_file = NULL;
+  if (cli_pid_file) {
+    effective_pid_file = cli_pid_file;
+  } else if (g_config_db.config_a.pid_file) {
+    effective_pid_file = g_config_db.config_a.pid_file;
+  } else if (!foreground) {
+    effective_pid_file = "/var/run/karidns/karidns.pid";
+  }
+
+  if (effective_pid_file && strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0') {
+    char dir_buf[1024];
+    strncpy(dir_buf, effective_pid_file, sizeof(dir_buf) - 1);
+    dir_buf[sizeof(dir_buf) - 1] = '\0';
+    char *slash = strrchr(dir_buf, '/');
+    if (slash && slash != dir_buf) {
+      *slash = '\0';
+      mkdir(dir_buf, 0755);
+    }
+    pid_fd = open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (pid_fd < 0) {
+      syslog(LOG_ERR, "Failed to open pidfile %s: %s", effective_pid_file, strerror(errno));
+      fprintf(stderr, "Failed to open pidfile %s: %s\n", effective_pid_file, strerror(errno));
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {
+      syslog(LOG_ERR, "Another KariDNS instance is already running (pidfile %s locked)", effective_pid_file);
+      fprintf(stderr, "Another KariDNS instance is already running (pidfile %s locked).\n", effective_pid_file);
+      close(pid_fd);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    ftruncate(pid_fd, 0);
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
+    write(pid_fd, pid_str, strlen(pid_str));
+  }
+
   // 特権分離が本サーバの前提とするセキュリティモデルであるため、
   // rootとして起動された場合は user の明示的指定を必須とする。
   if (geteuid() == 0 && !g_config_db.config_a.user) {
@@ -8119,6 +8650,7 @@ int main(int argc, char **argv) {
            "[ERROR] Server started as root but no 'user' directive is set in options{}. "
            "Refusing to start: running as root without privilege drop is not permitted. "
            "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.\n");
+    if (pid_fd >= 0) close(pid_fd);
     free_server_config_fields(&g_config_db.config_a);
     return 1;
   }
@@ -8137,8 +8669,25 @@ int main(int argc, char **argv) {
     struct sockaddr_un un;
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
-    strncpy(un.sun_path, "/var/run/karidns/control.sock", sizeof(un.sun_path) - 1);
-    mkdir("/var/run/karidns", 0755);
+    const char *sock_path = g_config_db.config_a.control.socket_path ?
+                            g_config_db.config_a.control.socket_path :
+                            "/var/run/karidns/control.sock";
+    if (strlen(sock_path) >= sizeof(un.sun_path)) {
+      syslog(LOG_ERR, "Control socket path too long (max %zu bytes): %s", sizeof(un.sun_path) - 1, sock_path);
+      fprintf(stderr, "Control socket path too long (max %zu bytes): %s\n", sizeof(un.sun_path) - 1, sock_path);
+      if (pid_fd >= 0) close(pid_fd);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+    char dir_buf[1024];
+    strncpy(dir_buf, sock_path, sizeof(dir_buf) - 1);
+    dir_buf[sizeof(dir_buf) - 1] = '\0';
+    char *slash = strrchr(dir_buf, '/');
+    if (slash && slash != dir_buf) {
+      *slash = '\0';
+      mkdir(dir_buf, 0755);
+    }
+    strncpy(un.sun_path, sock_path, sizeof(un.sun_path) - 1);
     unlink(un.sun_path);
     g_control_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_control_sock >= 0) {
@@ -8174,12 +8723,19 @@ int main(int argc, char **argv) {
   pid_t pid = fork();
   if (pid < 0) {
     syslog(LOG_ERR, "fork for frontend router failed");
+    if (pid_fd >= 0) close(pid_fd);
     exit(1);
   }
 
   if (pid > 0) {
     run_frontend_router(pid);
+    if (pid_fd >= 0) close(pid_fd);
     exit(0);
+  }
+
+  if (pid_fd >= 0) {
+    close(pid_fd);
+    pid_fd = -1;
   }
 
   for (int i = 0; i < g_num_ipc; i++)
@@ -8266,6 +8822,8 @@ int main(int argc, char **argv) {
   tzset();
   pthread_t response_logger_thread;
   if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);
+  pthread_t query_logger_thread;
+  if (pthread_create(&query_logger_thread, NULL, query_logger_thread_func, NULL) != 0) exit(1);
   
   enter_capsicum_sandbox(); // サンドボックス突入
 

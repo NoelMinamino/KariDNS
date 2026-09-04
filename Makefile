@@ -177,17 +177,17 @@ fuzz_dag_batch_file: $(FUZZ_DAG_BATCH_FILE_SRCS)
 fuzz_dag_all: fuzz_dag fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file
 
 fuzz_dag_test: fuzz_dag_all
-	sh tests/run_fuzz_smoke_test.sh dag
+	@sh tests/run_fuzz_smoke_test.sh dag
 
 fuzz_karidns: fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_tsig_verify
 
 fuzz_karidns_test: fuzz_karidns
-	sh tests/run_fuzz_smoke_test.sh karidns
+	@sh tests/run_fuzz_smoke_test.sh karidns
 
 fuzz_all: fuzz_karidns fuzz_dag_all
 
 fuzz_test: fuzz_all
-	sh tests/run_fuzz_smoke_test.sh all
+	@sh tests/run_fuzz_smoke_test.sh all
 
 clean-fuzz:
 	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET) $(FUZZ_TSIG_TARGET) $(FUZZ_DAG_TARGET) $(FUZZ_TSIG_VERIFY_TARGET) \

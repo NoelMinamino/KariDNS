@@ -1,8 +1,11 @@
 // karictl.conf.sample
 //
 // KariDNS コントロールチャネルクライアント (karictl) 用の設定ファイル
-// デフォルトでは /usr/local/etc/karictl.conf が読み込まれます。
-// -f オプションで別のパスを指定することも可能です。
+// デフォルトでは /usr/local/etc/karidns/karictl.conf が読み込まれます。
+// -f オプションで別のパス、-s オプションで別のUNIXドメインソケットパスを指定することも可能です。
+//
+// コントロールソケットのパスを変更する場合:
+// socket "/var/run/karidns/control.sock";
 
 key "karictl" {
     algorithm "hmac-sha256";

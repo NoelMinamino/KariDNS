@@ -2369,40 +2369,82 @@ static void base64url_encode(const uint8_t *data, size_t len, char *out, size_t 
 // HTTP Chunked 転送の次のチャンクを解析するヘルパー関数 (RFC 7230 §4.1)
 static bool parse_http_chunk(const uint8_t *buf, size_t buf_len, size_t *inout_offset,
                              size_t *out_data_offset, size_t *out_chunk_len, bool *out_is_final) {
-    if (!buf || *inout_offset >= buf_len) return false;
-    const char *p = (const char *)buf + *inout_offset;
-    char *line_end = strstr(p, "\r\n");
-    if (!line_end) return false;
-    char *endptr = NULL;
-    long chunk_sz = strtol(p, &endptr, 16);
-    if (chunk_sz < 0 || endptr == p) return false;
+    if (!buf || !inout_offset || !out_data_offset || !out_chunk_len || !out_is_final) return false;
+    if (*inout_offset >= buf_len) return false;
 
-    size_t data_start = (size_t)(line_end - (const char *)buf) + 2;
+    const uint8_t *p = buf + *inout_offset;
+    size_t rem = buf_len - *inout_offset;
+
+    const uint8_t *line_end = memmem(p, rem, "\r\n", 2);
+    if (!line_end) return false;
+
+    // chunk-size (1*HEXDIG) を line_end の手前まで安全にパース
+    const uint8_t *cur = p;
+    while (cur < line_end && (*cur == ' ' || *cur == '\t')) cur++;
+    if (cur == line_end) return false;
+
+    size_t chunk_sz = 0;
+    int hex_digits = 0;
+    while (cur < line_end) {
+        uint8_t c = *cur;
+        int val = -1;
+        if (c >= '0' && c <= '9') val = c - '0';
+        else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+        else break; // chunk-ext (;name=val) または空白
+
+        if (chunk_sz > (SIZE_MAX / 16)) return false;
+        chunk_sz = chunk_sz * 16 + (size_t)val;
+        cur++;
+        hex_digits++;
+    }
+    if (hex_digits == 0) return false;
+
+    size_t data_start = (size_t)(line_end - buf) + 2;
     if (chunk_sz == 0) {
         *out_data_offset = data_start;
         *out_chunk_len = 0;
         *out_is_final = true;
-        char *final_end = strstr((const char *)buf + *inout_offset, "\r\n\r\n");
+        // 最終チャンク: トレイラーヘッダ終端 (\r\n\r\n) を探索
+        const uint8_t *final_end = memmem(p, rem, "\r\n\r\n", 4);
         if (final_end) {
-            *inout_offset = (size_t)(final_end - (const char *)buf) + 4;
+            *inout_offset = (size_t)(final_end - buf) + 4;
             return true;
         }
         return false;
     }
 
-    size_t data_end = data_start + (size_t)chunk_sz;
+    size_t data_end = data_start + chunk_sz;
     if (data_end + 2 > buf_len) return false;
+    // RFC 7230 §4.1: chunk-data の直後は必ず CRLF
+    if (buf[data_end] != '\r' || buf[data_end + 1] != '\n') return false;
 
     *out_data_offset = data_start;
-    *out_chunk_len = (size_t)chunk_sz;
+    *out_chunk_len = chunk_sz;
     *out_is_final = false;
-
-    size_t next_off = data_end;
-    if (next_off + 2 <= buf_len && buf[next_off] == '\r' && buf[next_off + 1] == '\n') {
-        next_off += 2;
-    }
-    *inout_offset = next_off;
+    *inout_offset = data_end + 2;
     return true;
+}
+
+// HTTPレスポンスのステータスコードを安全に抽出 (バッファ境界チェック付き、NUL終端非依存)
+static int parse_http_status_code(const uint8_t *buf, size_t len) {
+    if (!buf || len < 12) return -1;
+    if (strncmp((const char *)buf, "HTTP/", 5) != 0) return -1;
+    const uint8_t *p = buf + 5;
+    const uint8_t *end = buf + len;
+    // HTTPバージョン文字列 (例: "1.1", "2") をスキップ
+    while (p < end && *p != ' ' && *p != '\r' && *p != '\n') p++;
+    // ステータスコード直前の空白をスキップ
+    while (p < end && *p == ' ') p++;
+    int code = 0, digits = 0;
+    while (p < end && *p >= '0' && *p <= '9' && digits < 3) {
+        code = code * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits < 3) return -1;
+    if (p < end && *p >= '0' && *p <= '9') return -1; // 4桁以上は無効
+    return code;
 }
 
 // HTTPレスポンス(ヘッダ+ボディ)からDNSメッセージをデコードする純粋関数 (RFC 7230 / RFC 8484)
@@ -2421,14 +2463,8 @@ static ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_le
     size_t body_len = http_len - body_offset;
 
     // RFC 8484 §4.2.1: HTTP 200 OK の検証
-    if (http_len >= 12 && strncmp((const char *)http_buf, "HTTP/", 5) == 0) {
-        const char *status_str = (const char *)http_buf + 8;
-        while (*status_str == ' ') status_str++;
-        int status_code = atoi(status_str);
-        if (status_code != 200) return -1;
-    } else {
-        return -1;
-    }
+    int status_code = parse_http_status_code(http_buf, header_len);
+    if (status_code != 200) return -1;
 
     // RFC 7230 §3.3.3: Transfer-Encoding takes precedence over Content-Length
     bool is_chunked = false;
@@ -2476,8 +2512,21 @@ static ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_le
     for (size_t i = 0; i + 15 <= header_len; i++) {
         if ((i == 0 || http_buf[i - 1] == '\n') &&
             strncasecmp((const char *)http_buf + i, "Content-Length:", 15) == 0) {
-            cl_val = (size_t)strtoul((const char *)http_buf + i + 15, NULL, 10);
-            found_cl = true;
+            const uint8_t *cur = http_buf + i + 15;
+            const uint8_t *end = http_buf + header_len;
+            while (cur < end && (*cur == ' ' || *cur == '\t')) cur++;
+            size_t val = 0;
+            bool has_digits = false;
+            while (cur < end && *cur >= '0' && *cur <= '9') {
+                if (val > (SIZE_MAX / 10)) { val = SIZE_MAX; break; }
+                val = val * 10 + (*cur - '0');
+                cur++;
+                has_digits = true;
+            }
+            if (has_digits) {
+                cl_val = val;
+                found_cl = true;
+            }
             break;
         }
     }
@@ -2595,15 +2644,11 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
 
         // Content-Length または Transfer-Encoding: chunked を動的にチェックしてループを抜ける
         if (memmem(http_buf, http_len, "\r\n\r\n", 4)) {
-            // ステータスコードが 200 以外の場合は直ちにループを抜けてエラー処理へ
-            if (http_len >= 12 && strncmp((char *)http_buf, "HTTP/", 5) == 0) {
-                char *status_str = (char *)http_buf + 8;
-                while (*status_str == ' ') status_str++;
-                int status_code = atoi(status_str);
-                if (status_code != 200) {
-                    framing_complete = true;
-                    break;
-                }
+            uint8_t *hdr_end = memmem(http_buf, http_len, "\r\n\r\n", 4);
+            int status_code = parse_http_status_code(http_buf, (size_t)(hdr_end - http_buf));
+            if (status_code > 0 && status_code != 200) {
+                framing_complete = true;
+                break;
             }
             ret_len = decode_http_response_body(http_buf, http_len, resp, resp_cap);
             if (ret_len >= 0) {
@@ -2616,16 +2661,15 @@ static ssize_t do_doh_exchange(const char *server, int port, const query_opts_t 
     if (http_len < 16) goto cleanup;
     uint8_t *hdr_end_u8 = memmem(http_buf, http_len, "\r\n\r\n", 4);
     if (!hdr_end_u8) goto cleanup;
+    size_t header_len = (size_t)(hdr_end_u8 - http_buf);
 
     // RFC 8484 §4.2.1: HTTP 200 OK の検証
-    if (http_len >= 12 && strncmp((char *)http_buf, "HTTP/", 5) == 0) {
-        char *status_str = (char *)http_buf + 8;
-        while (*status_str == ' ') status_str++;
-        int status_code = atoi(status_str);
-        if (status_code != 200) {
+    int status_code = parse_http_status_code(http_buf, header_len);
+    if (status_code != 200) {
+        if (status_code > 0) {
             fprintf(stderr, ";; DoH server returned HTTP status %d (expected 200 OK)\n", status_code);
-            goto cleanup;
         }
+        goto cleanup;
     }
 
     if (ret_len < 0) {
@@ -2811,9 +2855,15 @@ static const char *rcode_name(uint16_t rcode) {
         case 0: return "NOERROR"; case 1: return "FORMERR"; case 2: return "SERVFAIL";
         case 3: return "NXDOMAIN"; case 4: return "NOTIMP"; case 5: return "REFUSED";
         case 6: return "YXDOMAIN"; case 7: return "YXRRSET"; case 8: return "NXRRSET";
-        case 9: return "NOTAUTH"; case 16: return "BADVERS/BADSIG"; case 17: return "BADKEY";
-        case 18: return "BADTIME"; case 23: return "BADCOOKIE";
-        default: return "UNKNOWN";
+        case 9: return "NOTAUTH"; case 10: return "NOTZONE"; case 11: return "DSOTYPENI";
+        case 16: return "BADVERS/BADSIG"; case 17: return "BADKEY";
+        case 18: return "BADTIME"; case 19: return "BADMODE"; case 20: return "BADNAME";
+        case 21: return "BADALG"; case 22: return "BADTRUNC"; case 23: return "BADCOOKIE";
+        default: {
+            static _Thread_local char buf[32];
+            snprintf(buf, sizeof(buf), "%u", (unsigned int)rcode);
+            return buf;
+        }
     }
 }
 
@@ -8283,7 +8333,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                                                 sizeof(spec->qo.custom_edns_opts[0].data));
                     if (dec_len == (size_t)-1) {
                         fprintf(stderr, "error: +ednsopt hex payload exceeds buffer size or is invalid\n");
-                        exit(1);
+                        return -1;
                     }
                     spec->qo.custom_edns_opts[spec->qo.custom_edns_opt_count].len = (uint16_t)dec_len;
                 } else {

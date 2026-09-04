@@ -15,7 +15,7 @@ KARIDNS(8)                     KariDNS Manual                     KARIDNS(8)
 ## SYNOPSIS
 
 ```sh
-karidns [-f] [-v | --version] <config_file>
+karidns [-f] [-p pid_file] [-c config_file | config_file] [-v | --version]
 ```
 
 ---
@@ -41,11 +41,14 @@ karidns [-f] [-v | --version] <config_file>
 
 ## OPTIONS & ARGUMENTS
 
-`<config_file>`
-: Positional argument specifying the path to the configuration file (e.g., `/usr/local/etc/karidns/karidns.conf`). This argument is required.
+`<config_file>`, `-c config_file`
+: Specify the path to the configuration file (e.g., `/usr/local/etc/karidns/karidns.conf`). This argument is required.
 
 `-f`
-: Run in the foreground instead of daemonizing into the background.
+: Run in the foreground instead of daemonizing into the background. In foreground mode, PID file creation is disabled by default unless explicitly specified.
+
+`-p pid_file`
+: Path to the PID lock file (overrides `options { pid-file "..."; }`; default: `/var/run/karidns/karidns.pid` when daemonized). Specify `"none"` to disable PID locking.
 
 `-v`, `--version`, `-V`
 : Print the version information and exit.
@@ -67,6 +70,7 @@ options {
     bind-address { 0.0.0.0; ::; };
     user "named";
     group "named";
+    pid-file "/var/run/karidns/karidns.pid"; // "none" to disable
     udp-recvbuf-size 4M;
     udp-sndbuf-size 4M;
 
@@ -91,6 +95,7 @@ logging {
 };
 
 control-channel {
+    socket "/var/run/karidns/control.sock";
     algorithm "hmac-sha256";
     secret "BASE64_SECRET_HERE=";
 };

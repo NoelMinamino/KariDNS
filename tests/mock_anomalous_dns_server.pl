@@ -344,10 +344,17 @@ sub process_query_packet {
         ancount-underflow ancount-overflow compression-loop compression-forward-ptr
         unclosed-label rdata-short-a rdata-short-aaaa rdata-soa-truncated
         rdata-mx-truncated rdata-txt-len-mismatch rdata-svcb-overflow
-        rdata-opt-truncated cookie-badcookie truncated-tc rcode-formerr
-        rcode-servfail rcode-nxdomain rcode-notimp rcode-refused rcode-yxdomain
-        rcode-yxrrset rcode-nxrrset rcode-notauth rcode-notzone ede-prohibited
-        ede-long-text ede-all ede-all2 drop
+        rdata-opt-truncated cookie-badcookie truncated-tc
+        rcode-noerror rcode-formerr rcode-servfail rcode-nxdomain rcode-notimp
+        rcode-refused rcode-yxdomain rcode-yxrrset rcode-nxrrset rcode-notauth
+        rcode-notzone rcode-dsotypeni rcode-unassigned-12 rcode-unassigned-13
+        rcode-unassigned-14 rcode-unassigned-15 rcode-badvers rcode-badsig
+        rcode-badkey rcode-badtime rcode-badmode rcode-badname rcode-badalg
+        rcode-badtrunc rcode-badcookie rcode-private-3841 rcode-private-4095
+        ede-prohibited ede-long-text ede-all ede-all2 drop
+        flag-rd flag-ra flag-ad flag-cd flag-z flag-mbz flag-no-aa flag-aa0
+        flag-no-qr flag-qr0 flag-tc flag-tc-record flag-all flag-all-tc
+        flag-rd-ra flag-ad-cd flag-do flag-co flag-none
     );
     for my $c (0 .. 29) {
         $KNOWN_SCENARIOS{"ede-$c"} = 1;
@@ -363,7 +370,13 @@ sub process_query_packet {
     my $scenario = '';
     my $zone_apex = '';
 
-    if (exists $KNOWN_SCENARIOS{$first_label} || $first_label =~ /^ede-(\d+)$/ || $first_label =~ /^ede-all2?$/) {
+    if (exists $KNOWN_SCENARIOS{$first_label} ||
+        $first_label =~ /^ede-(\d+)$/ ||
+        $first_label =~ /^ede-all2?$/ ||
+        $first_label =~ /^flags?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
+        $first_label =~ /^flags?-[a-z0-9-]+$/ ||
+        $first_label =~ /^rcodes?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
+        $first_label =~ /^rcodes?-[a-z0-9-]+$/) {
         $scenario = $first_label;
         $zone_apex = $rest_domain ne '' ? $rest_domain : $qname_clean;
     } else {
@@ -411,19 +424,51 @@ sub process_query_packet {
             "",
             "[Protocol & Security Flags]",
             "  cookie-badcookie.$display_zone          - BADCOOKIE (RCODE 23) retry negotiation",
-            "  truncated-tc.$display_zone              - TC=1 response triggering TCP fallback",
+            "  truncated-tc.$display_zone              - TC=1 response triggering TCP fallback (0 records)",
+            "  flag-tc.$display_zone                   - TC=1 (Truncation) with answer record attached",
+            "  flag-rd.$display_zone                   - RD=1 (Recursion Desired) unsolicitedly set in response",
+            "  flag-ra.$display_zone                   - RA=1 (Recursion Available) unsolicitedly set in response",
+            "  flag-ad.$display_zone                   - AD=1 (Authentic Data) set in answer",
+            "  flag-cd.$display_zone                   - CD=1 (Checking Disabled) set in answer",
+            "  flag-z.$display_zone                    - Z=1 (Reserved MBZ bit 0x0040) set in answer",
+            "  flag-no-aa.$display_zone                - AA=0 (Authoritative bit cleared) in answer",
+            "  flag-no-qr.$display_zone                - QR=0 (Query bit unset, response masquerade)",
+            "  flag-rd-ra.$display_zone                - Both RD=1 and RA=1 set in answer",
+            "  flag-ad-cd.$display_zone                - Both AD=1 and CD=1 set in answer",
+            "  flag-all.$display_zone                  - All header flags enabled (QR,AA,RD,RA,AD,CD,Z)",
+            "  flag-all-tc.$display_zone               - All header flags enabled including TC",
+            "  flag-do.$display_zone                   - EDNS0 DO=1 (DNSSEC OK) set in OPT RR",
+            "  flag-co.$display_zone                   - EDNS0 Compact Answers OK set in OPT RR",
+            "  flag-0x<HEX>.$display_zone              - Custom 16-bit header flags (e.g. flag-0x85f0)",
             "",
-            "[RFC Standard RCODEs]",
-            "  rcode-formerr.$display_zone             - Returns FORMERR (RCODE 1)",
-            "  rcode-servfail.$display_zone            - Returns SERVFAIL (RCODE 2)",
-            "  rcode-nxdomain.$display_zone            - Returns NXDOMAIN (RCODE 3)",
-            "  rcode-notimp.$display_zone              - Returns NOTIMP (RCODE 4)",
-            "  rcode-refused.$display_zone             - Returns REFUSED (RCODE 5)",
-            "  rcode-yxdomain.$display_zone            - Returns YXDOMAIN (RCODE 6)",
-            "  rcode-yxrrset.$display_zone             - Returns YXRRSET (RCODE 7)",
-            "  rcode-nxrrset.$display_zone             - Returns NXRRSET (RCODE 8)",
-            "  rcode-notauth.$display_zone             - Returns NOTAUTH (RCODE 9)",
-            "  rcode-notzone.$display_zone             - Returns NOTZONE (RCODE 10)",
+            "[DNS Header RCODEs (0-15)]",
+            "  rcode-noerror.$display_zone             - NOERROR (RCODE 0): Success",
+            "  rcode-formerr.$display_zone             - FORMERR (RCODE 1): Format Error",
+            "  rcode-servfail.$display_zone            - SERVFAIL (RCODE 2): Server Failure",
+            "  rcode-nxdomain.$display_zone            - NXDOMAIN (RCODE 3): Non-Existent Domain",
+            "  rcode-notimp.$display_zone              - NOTIMP (RCODE 4): Not Implemented",
+            "  rcode-refused.$display_zone             - REFUSED (RCODE 5): Query Refused",
+            "  rcode-yxdomain.$display_zone            - YXDOMAIN (RCODE 6): Name Exists (RFC 2136)",
+            "  rcode-yxrrset.$display_zone             - YXRRSET (RCODE 7): RR Set Exists (RFC 2136)",
+            "  rcode-nxrrset.$display_zone             - NXRRSET (RCODE 8): RR Set Does Not Exist (RFC 2136)",
+            "  rcode-notauth.$display_zone             - NOTAUTH (RCODE 9): Not Authoritative / Authorized",
+            "  rcode-notzone.$display_zone             - NOTZONE (RCODE 10): Name Not In Zone (RFC 2136)",
+            "  rcode-dsotypeni.$display_zone           - DSOTYPENI (RCODE 11): DSO Type Not Implemented (RFC 8490)",
+            "  rcode-unassigned-12..15.$display_zone   - Unassigned standard header RCODEs 12..15",
+            "",
+            "[EDNS0 Extended RCODEs (16-23+)]",
+            "  rcode-badvers.$display_zone             - BADVERS (RCODE 16): Bad EDNS Version (RFC 6891)",
+            "  rcode-badsig.$display_zone              - BADSIG (RCODE 16): TSIG Signature Failure (RFC 2845)",
+            "  rcode-badkey.$display_zone              - BADKEY (RCODE 17): Key Not Recognized (RFC 2845)",
+            "  rcode-badtime.$display_zone             - BADTIME (RCODE 18): Signature Out of Time (RFC 2845)",
+            "  rcode-badmode.$display_zone             - BADMODE (RCODE 19): Bad TKEY Mode (RFC 2930)",
+            "  rcode-badname.$display_zone             - BADNAME (RCODE 20): Duplicate Key Name (RFC 2930)",
+            "  rcode-badalg.$display_zone              - BADALG (RCODE 21): Algorithm Not Supported (RFC 2930)",
+            "  rcode-badtrunc.$display_zone            - BADTRUNC (RCODE 22): Bad Truncation (RFC 4635)",
+            "  rcode-badcookie.$display_zone           - BADCOOKIE (RCODE 23): Bad/Missing Cookie (RFC 7873)",
+            "  rcode-private-3841..4095.$display_zone  - Private Use Extended RCODEs (RFC 6891)",
+            "  rcode-<DEC>.$display_zone               - Arbitrary decimal RCODE (e.g. rcode-100)",
+            "  rcode-0x<HEX>.$display_zone             - Arbitrary hex RCODE (e.g. rcode-0x0017)",
             "",
             "[Extended DNS Errors (EDE)]",
             "  ede-0 .. ede-29.$display_zone           - Individual EDE Code 0..29",
@@ -625,28 +670,253 @@ sub process_query_packet {
         $pkt .= $question_wire;
         return $pkt;
     }
+    if ($scenario =~ /^flags?-(.*)$/) {
+        my $spec = lc($1);
+        my $flag_val = 0x8400; # Base: QR=1, AA=1
+        my $desc = "Flag test: ";
+        my $edns_do = 0;
+        my $edns_co = 0;
+
+        if ($spec =~ /^0x([0-9a-fA-F]{1,4})$/) {
+            $flag_val = hex($1);
+            $desc .= sprintf("Custom flags 0x%04X", $flag_val);
+        } elsif ($spec =~ /^(\d+)$/) {
+            $flag_val = int($1) & 0xFFFF;
+            $desc .= sprintf("Custom flags %d (0x%04X)", $flag_val, $flag_val);
+        } elsif ($spec eq 'rd') {
+            $flag_val = 0x8500; # QR=1, AA=1, RD=1
+            $desc .= "RD=1 (Recursion Desired) unsolicitedly set in response";
+        } elsif ($spec eq 'ra') {
+            $flag_val = 0x8480; # QR=1, AA=1, RA=1
+            $desc .= "RA=1 (Recursion Available) unsolicitedly set in response";
+        } elsif ($spec eq 'ad') {
+            $flag_val = 0x8420; # QR=1, AA=1, AD=1
+            $desc .= "AD=1 (Authentic Data) set in response";
+        } elsif ($spec eq 'cd') {
+            $flag_val = 0x8410; # QR=1, AA=1, CD=1
+            $desc .= "CD=1 (Checking Disabled) set in response";
+        } elsif ($spec eq 'z' || $spec eq 'mbz') {
+            $flag_val = 0x8440; # QR=1, AA=1, Z=1 (MBZ bit 0x0040)
+            $desc .= "Reserved Z-bit (MBZ 0x0040) set to 1 in response";
+        } elsif ($spec eq 'no-aa' || $spec eq 'aa0') {
+            $flag_val = 0x8000; # QR=1, AA=0
+            $desc .= "AA=0 (Authoritative Answer bit cleared) in response";
+        } elsif ($spec eq 'no-qr' || $spec eq 'qr0') {
+            $flag_val = 0x0400; # QR=0, AA=1 (claims to be query)
+            $desc .= "QR=0 (Query/Response bit cleared, response masquerade) in packet";
+        } elsif ($spec eq 'tc' || $spec eq 'tc-record') {
+            $flag_val = 0x8600; # QR=1, AA=1, TC=1
+            $desc .= "TC=1 (Truncation) with answer records attached";
+        } elsif ($spec eq 'rd-ra') {
+            $flag_val = 0x8580; # QR=1, AA=1, RD=1, RA=1
+            $desc .= "Both RD=1 and RA=1 unsolicitedly set in response";
+        } elsif ($spec eq 'ad-cd') {
+            $flag_val = 0x8430; # QR=1, AA=1, AD=1, CD=1
+            $desc .= "Both AD=1 and CD=1 set in response";
+        } elsif ($spec eq 'all') {
+            $flag_val = 0x85F0; # QR=1, AA=1, RD=1, RA=1, Z=1, AD=1, CD=1
+            $desc .= "ALL header flags set (QR=1, AA=1, RD=1, RA=1, AD=1, CD=1, Z=1 [0x85F0])";
+        } elsif ($spec eq 'all-tc') {
+            $flag_val = 0x87F0; # All flags including TC
+            $desc .= "ALL header flags set including TC (QR=1, AA=1, TC=1, RD=1, RA=1, AD=1, CD=1, Z=1 [0x87F0])";
+        } elsif ($spec eq 'do') {
+            $flag_val = 0x8400;
+            $edns_do = 1;
+            $desc .= "EDNS0 DO=1 (DNSSEC OK) flag set in OPT RR";
+        } elsif ($spec eq 'co') {
+            $flag_val = 0x8400;
+            $edns_co = 1;
+            $desc .= "EDNS0 Compact Answers OK flag set in OPT RR";
+        } elsif ($spec eq 'none') {
+            $flag_val = 0x0000;
+            $desc .= "No flags set (0x0000)";
+        } else {
+            # Combinations like flag-rd-ad
+            $flag_val = 0x8400;
+            $flag_val |= 0x0100 if $spec =~ /rd/;
+            $flag_val |= 0x0080 if $spec =~ /ra/;
+            $flag_val |= 0x0020 if $spec =~ /ad/;
+            $flag_val |= 0x0010 if $spec =~ /cd/;
+            $flag_val |= 0x0040 if $spec =~ /z/;
+            $flag_val |= 0x0200 if $spec =~ /tc/;
+            $flag_val &= ~0x0400 if $spec =~ /no-aa/;
+            $flag_val &= ~0x8000 if $spec =~ /no-qr/;
+            $desc .= sprintf("Combined flags 0x%04X (%s)", $flag_val, $spec);
+        }
+
+        my $answers = '';
+        my $ancount = 0;
+        my $arcount = 0;
+        my $additionals = '';
+
+        if ($qtype == 16) {
+            # QTYPE=TXT: Return explanation in ANSWER section
+            $answers .= encode_txt_rr($qname, $desc, 300);
+            $ancount++;
+        } elsif ($qtype == 255) {
+            # QTYPE=ANY: Return both A and TXT in ANSWER section
+            $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+            $answers .= encode_txt_rr($qname, $desc, 300);
+            $ancount += 2;
+        } else {
+            # Default (A or others): Return A record in ANSWER, TXT in ADDITIONAL
+            $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+            $ancount++;
+            $additionals .= encode_txt_rr($qname, $desc, 300);
+            $arcount++;
+        }
+
+        if ($edns_do || $edns_co) {
+            my $ext_flags = 0;
+            $ext_flags |= 0x8000 if $edns_do; # DO bit
+            $ext_flags |= 0x4000 if $edns_co; # CO bit
+            # OPT pseudo-RR: Name=\x00, TYPE=41, CLASS=4096 (UDP size), TTL=ext_flags (32-bit: rcode/version/flags), RDLEN=0
+            $additionals .= "\x00" . pack('nnNn', 41, 4096, ($ext_flags << 16), 0);
+            $arcount++;
+        }
+
+        my $pkt = $id_raw . pack('n5', $flag_val, 1, $ancount, 0, $arcount);
+        $pkt .= $question_wire;
+        $pkt .= $answers;
+        $pkt .= $additionals;
+        return $pkt;
+    }
 
     # --------------------------------------------------------------------------
     # 5. RFC Standard & Extended RCODEs
     # --------------------------------------------------------------------------
-    my %RCODES = (
-        'rcode-formerr'   => 1,
-        'rcode-servfail'  => 2,
-        'rcode-nxdomain'  => 3,
-        'rcode-notimp'    => 4,
-        'rcode-refused'   => 5,
-        'rcode-yxdomain'  => 6,
-        'rcode-yxrrset'   => 7,
-        'rcode-nxrrset'   => 8,
-        'rcode-notauth'   => 9,
-        'rcode-notzone'   => 10,
+    my %RCODE_INFO = (
+        0  => { name => 'NOERROR',       rfc => 'RFC 1035', desc => 'No Error condition' },
+        1  => { name => 'FORMERR',       rfc => 'RFC 1035', desc => 'Format Error' },
+        2  => { name => 'SERVFAIL',      rfc => 'RFC 1035', desc => 'Server Failure' },
+        3  => { name => 'NXDOMAIN',      rfc => 'RFC 1035', desc => 'Non-Existent Domain' },
+        4  => { name => 'NOTIMP',        rfc => 'RFC 1035', desc => 'Not Implemented' },
+        5  => { name => 'REFUSED',       rfc => 'RFC 1035', desc => 'Query Refused' },
+        6  => { name => 'YXDOMAIN',      rfc => 'RFC 2136', desc => 'Name Exists when it should not' },
+        7  => { name => 'YXRRSET',       rfc => 'RFC 2136', desc => 'RR Set Exists when it should not' },
+        8  => { name => 'NXRRSET',       rfc => 'RFC 2136', desc => 'RR Set that should exist does not' },
+        9  => { name => 'NOTAUTH',       rfc => 'RFC 2136 / RFC 8945', desc => 'Server Not Authoritative for zone / Not Authorized' },
+        10 => { name => 'NOTZONE',       rfc => 'RFC 2136', desc => 'Name not contained in zone' },
+        11 => { name => 'DSOTYPENI',     rfc => 'RFC 8490', desc => 'DSO-TYPE Not Implemented' },
+        12 => { name => 'UNASSIGNED-12', rfc => 'RFC 6891', desc => 'Unassigned standard header RCODE 12' },
+        13 => { name => 'UNASSIGNED-13', rfc => 'RFC 6891', desc => 'Unassigned standard header RCODE 13' },
+        14 => { name => 'UNASSIGNED-14', rfc => 'RFC 6891', desc => 'Unassigned standard header RCODE 14' },
+        15 => { name => 'UNASSIGNED-15', rfc => 'RFC 6891', desc => 'Unassigned standard header RCODE 15' },
+        16 => { name => 'BADVERS/BADSIG', rfc => 'RFC 6891 / RFC 2845', desc => 'Bad OPT Version (BADVERS) / TSIG Signature Failure (BADSIG)' },
+        17 => { name => 'BADKEY',        rfc => 'RFC 2845', desc => 'Key not recognized (TSIG)' },
+        18 => { name => 'BADTIME',       rfc => 'RFC 2845', desc => 'Signature out of time window (TSIG)' },
+        19 => { name => 'BADMODE',       rfc => 'RFC 2930', desc => 'Bad TKEY Mode' },
+        20 => { name => 'BADNAME',       rfc => 'RFC 2930', desc => 'Duplicate key name (TKEY)' },
+        21 => { name => 'BADALG',        rfc => 'RFC 2930', desc => 'Algorithm not supported (TKEY)' },
+        22 => { name => 'BADTRUNC',      rfc => 'RFC 4635', desc => 'Bad Truncation (TSIG)' },
+        23 => { name => 'BADCOOKIE',     rfc => 'RFC 7873', desc => 'Bad / missing Server Cookie' },
     );
-    if (exists $RCODES{$scenario}) {
-        my $rc = $RCODES{$scenario};
-        my $flags_val = 0x8400 | ($rc & 0x0F);
-        my $pkt = $id_raw . pack('n5', $flags_val, 1, 0, 0, 0);
-        $pkt .= $question_wire;
-        return $pkt;
+
+    my %RCODE_ALIASES = (
+        'noerror'       => 0,
+        'formerr'       => 1,
+        'servfail'      => 2,
+        'nxdomain'      => 3,
+        'notimp'        => 4,
+        'refused'       => 5,
+        'yxdomain'      => 6,
+        'yxrrset'       => 7,
+        'nxrrset'       => 8,
+        'notauth'       => 9,
+        'notzone'       => 10,
+        'dsotypeni'     => 11,
+        'unassigned-12' => 12,
+        'unassigned-13' => 13,
+        'unassigned-14' => 14,
+        'unassigned-15' => 15,
+        'badvers'       => 16,
+        'badsig'        => 16,
+        'badkey'        => 17,
+        'badtime'       => 18,
+        'badmode'       => 19,
+        'badname'       => 20,
+        'badalg'        => 21,
+        'badtrunc'      => 22,
+        'badcookie'     => 23,
+        'private-3841'  => 3841,
+        'private-4095'  => 4095,
+    );
+
+    if ($scenario =~ /^rcodes?-(.*)$/) {
+        my $spec = lc($1);
+        my $rcode_val = undef;
+
+        if ($spec =~ /^0x([0-9a-fA-F]+)$/) {
+            $rcode_val = hex($1);
+        } elsif ($spec =~ /^(\d+)$/) {
+            $rcode_val = int($1);
+        } elsif (exists $RCODE_ALIASES{$spec}) {
+            $rcode_val = $RCODE_ALIASES{$spec};
+        }
+
+        if (defined $rcode_val) {
+            $rcode_val &= 0xFFFF;
+            my $header_rc = $rcode_val & 0x0F;
+            my $ext_rc    = ($rcode_val >> 4) & 0xFF;
+            my $flags_val = 0x8400 | $header_rc;
+
+            my $info = $RCODE_INFO{$rcode_val};
+            my $name_str = $info ? $info->{name} : sprintf("RCODE_%d", $rcode_val);
+            my $rfc_str  = $info ? $info->{rfc} : "RFC 6891";
+            my $desc_str = $info ? $info->{desc} : sprintf("Unassigned / Private RCODE %d (0x%04X)", $rcode_val, $rcode_val);
+
+            my $desc = sprintf(
+                "RCODE %d (0x%04X) [%s] %s: %s (header_rc=%d, edns_ext=%d)",
+                $rcode_val, $rcode_val, $name_str, $rfc_str, $desc_str, $header_rc, $ext_rc
+            );
+
+            my $answers = '';
+            my $ancount = 0;
+            my $arcount = 0;
+            my $additionals = '';
+
+            if ($qtype == 16) {
+                # QTYPE=TXT: Return explanation in ANSWER section
+                $answers .= encode_txt_rr($qname, $desc, 300);
+                $ancount++;
+            } elsif ($qtype == 255) {
+                # QTYPE=ANY: Return both A and TXT in ANSWER section
+                $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+                $answers .= encode_txt_rr($qname, $desc, 300);
+                $ancount += 2;
+            } else {
+                # Default (A or others):
+                if ($rcode_val == 0) {
+                    # NOERROR: Return A record in ANSWER
+                    $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+                    $ancount++;
+                }
+                # Attach explanation TXT in ADDITIONAL section for diagnostic experience
+                $additionals .= encode_txt_rr($qname, $desc, 300);
+                $arcount++;
+            }
+
+            # If RCODE > 15 (EDNS Extended RCODE) or client had EDNS, append OPT pseudo-RR
+            my $client_has_edns = (defined($client_cookie) || $req =~ /\x00\x00\x29/s);
+            if ($ext_rc > 0 || $client_has_edns) {
+                my $ttl_ext = ($ext_rc << 24);
+                my $opt_rdata = '';
+                if ($rcode_val == 23) {
+                    # BADCOOKIE (RFC 7873): return Server Cookie in OPT RR
+                    my $srv_c = "\x11\x22\x33\x44\x55\x66\x77\x88";
+                    my $cl_c  = $client_cookie // "\x01\x02\x03\x04\x05\x06\x07\x08";
+                    $opt_rdata = pack('nn', 10, 16) . $cl_c . $srv_c;
+                }
+                $additionals .= "\x00" . pack('nnNn', 41, 4096, $ttl_ext, length($opt_rdata)) . $opt_rdata;
+                $arcount++;
+            }
+
+            my $pkt = $id_raw . pack('n5', $flags_val, 1, $ancount, 0, $arcount);
+            $pkt .= $question_wire;
+            $pkt .= $answers;
+            $pkt .= $additionals;
+            return $pkt;
+        }
     }
 
     # --------------------------------------------------------------------------

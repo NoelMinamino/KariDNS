@@ -212,9 +212,31 @@ run_suite_for_tool() {
         "cookie-badcookie.anomaly.test" "A" "+cookie" "(BADCOOKIE|192\.0\.2\.1|COOKIE:)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Truncated TC=1 UDP response" \
         "truncated-tc.anomaly.test" "A" "" "(flags:.*tc|Truncated, retrying in TCP|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Truncated TC=1 with record attached" \
+        "flag-tc.anomaly.test" "A" "" "(flags:.*tc|Truncated, retrying in TCP|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Unsolicited RD=1 flag in response" \
+        "flag-rd.anomaly.test" "A" "" "(flags:.*rd|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Unsolicited RA=1 flag in response" \
+        "flag-ra.anomaly.test" "A" "" "(flags:.*ra|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "AD=1 (Authentic Data) flag in response" \
+        "flag-ad.anomaly.test" "A" "" "(flags:.*ad|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "CD=1 (Checking Disabled) flag in response" \
+        "flag-cd.anomaly.test" "A" "" "(flags:.*cd|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Reserved Z-bit (MBZ) set in response" \
+        "flag-z.anomaly.test" "A" "" "(flags:.*0x4|MBZ|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Non-authoritative AA=0 in response" \
+        "flag-no-aa.anomaly.test" "A" "" "192\.0\.2\.1"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "All flags enabled (QR,AA,RD,RA,AD,CD,Z)" \
+        "flag-all.anomaly.test" "A" "" "(flags:.*(rd|ra|ad|cd)|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Custom hex flag (0x85f0)" \
+        "flag-0x85f0.anomaly.test" "A" "" "(flags:.*(rd|ra|ad|cd)|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "EDNS0 DO=1 flag in response" \
+        "flag-do.anomaly.test" "A" "+qr" "(flags:.*do|192\.0\.2\.1)"
 
     # Section 6: RFC Standard & Extended RCODEs
-    printf "${BOLD}[6. DNS RCODE Responses]${NC}\n"
+    printf "${BOLD}[6. DNS RCODE Responses (Header 0-15 & EDNS0 Extended 16-23+)]${NC}\n"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 0: NOERROR" \
+        "rcode-noerror.anomaly.test" "A" "" "(NOERROR|192\.0\.2\.1)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 1: FORMERR" \
         "rcode-formerr.anomaly.test" "A" "" "FORMERR"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 2: SERVFAIL" \
@@ -235,6 +257,32 @@ run_suite_for_tool() {
         "rcode-notauth.anomaly.test" "A" "" "NOTAUTH"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 10: NOTZONE" \
         "rcode-notzone.anomaly.test" "A" "" "NOTZONE"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 11: DSOTYPENI" \
+        "rcode-dsotypeni.anomaly.test" "A" "" "DSOTYPENI"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 12: Unassigned Header RCODE" \
+        "rcode-unassigned-12.anomaly.test" "A" "" "(12|UNASSIGNED)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 16: BADVERS / BADSIG" \
+        "rcode-badvers.anomaly.test" "A" "" "(BADVERS|BADSIG|16)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 17: BADKEY (TSIG)" \
+        "rcode-badkey.anomaly.test" "A" "" "(BADKEY|17)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 18: BADTIME (TSIG)" \
+        "rcode-badtime.anomaly.test" "A" "" "(BADTIME|18)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 19: BADMODE (TKEY)" \
+        "rcode-badmode.anomaly.test" "A" "" "(BADMODE|19)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 20: BADNAME (TKEY)" \
+        "rcode-badname.anomaly.test" "A" "" "(BADNAME|20)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 21: BADALG (TKEY)" \
+        "rcode-badalg.anomaly.test" "A" "" "(BADALG|21)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 22: BADTRUNC (TSIG)" \
+        "rcode-badtrunc.anomaly.test" "A" "" "(BADTRUNC|22)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE 23: BADCOOKIE" \
+        "rcode-badcookie.anomaly.test" "A" "" "(BADCOOKIE|23)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Arbitrary decimal RCODE (100)" \
+        "rcode-100.anomaly.test" "A" "" "100"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Arbitrary hex RCODE (0x0017)" \
+        "rcode-0x0017.anomaly.test" "A" "" "(BADCOOKIE|23)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "RCODE Diagnostic Explanation TXT Query" \
+        "rcode-badkey.anomaly.test" "TXT" "" "(BADKEY|RFC 2845)"
 
     # Section 7: Extended DNS Errors (EDE, RFC 8914)
     printf "${BOLD}[7. Extended DNS Errors (EDE)]${NC}\n"

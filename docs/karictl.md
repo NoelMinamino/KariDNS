@@ -15,7 +15,7 @@ KARICTL(8)                     KariDNS Manual                     KARICTL(8)
 ## SYNOPSIS
 
 ```sh
-karictl [-f config_path] <command> [arguments...]
+karictl [-f config_path] [-s socket_path] [-v] <command> [arguments...]
 ```
 
 ---
@@ -29,7 +29,13 @@ karictl [-f config_path] <command> [arguments...]
 ## OPTIONS
 
 `-f config_path`
-: Specify the path to the `karictl` configuration file (default: `/usr/local/etc/karictl.conf`).
+: Specify the path to the `karictl` configuration file (default: `/usr/local/etc/karidns/karictl.conf`).
+
+`-s socket_path`
+: Specify the UNIX domain socket path to connect to (default: `/var/run/karidns/control.sock` or `socket` directive in configuration).
+
+`-v`
+: Display version information and exit.
 
 ---
 
@@ -73,11 +79,13 @@ karictl [-f config_path] <command> [arguments...]
 
 ## CONFIGURATION FILE (`karictl.conf`)
 
-By default, `karictl` reads authentication credentials from `/usr/local/etc/karictl.conf`.
+By default, `karictl` reads authentication credentials from `/usr/local/etc/karidns/karictl.conf`.
 
 ### Configuration Syntax
 
 ```
+socket "/var/run/karidns/control.sock";
+
 key "karictl" {
     algorithm "hmac-sha256";
     secret "BASE64_ENCODED_SECRET_HERE=";
@@ -106,7 +114,7 @@ The `secret` defined in `karictl.conf` must match the secret configured in the `
 
 ## FILES
 
-`/usr/local/etc/karictl.conf`
+`/usr/local/etc/karidns/karictl.conf`
 : Default control channel client configuration file.
 
 `/var/run/karidns/control.sock`

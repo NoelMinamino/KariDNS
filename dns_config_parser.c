@@ -370,6 +370,7 @@ void free_server_config_fields(server_config_t *cfg) {
 
   if (cfg->user) { free(cfg->user); cfg->user = NULL; }
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
+  if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
 
   if (cfg->views != NULL) {
@@ -418,6 +419,7 @@ void free_server_config_fields(server_config_t *cfg) {
   }
   cfg->keys = NULL;
 
+  if (cfg->control.socket_path) { free(cfg->control.socket_path); cfg->control.socket_path = NULL; }
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
   if (cfg->control.secret) { free(cfg->control.secret); cfg->control.secret = NULL; }
   memset(&cfg->control, 0, sizeof(control_channel_config_t));
@@ -1279,6 +1281,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
+  config->additional_from_auth = ADDITIONAL_AUTH_YES;
+  config->query_log_max_qps = 5000;
   config->max_mqtypes = 4;
   config->rfc10029_mqtype_enable = false;
   config->udp_recvbuf_size = 4 * 1024 * 1024;
@@ -1321,7 +1325,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         char *key = strdup(tok.value);
         free_token(&tok);
         if (strcmp(key, "port") == 0 || strcmp(key, "user") == 0 ||
-            strcmp(key, "group") == 0) {
+            strcmp(key, "group") == 0 || strcmp(key, "pid-file") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key);
@@ -1343,10 +1347,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             long pval = strtol(val, &endptr, 10);
             if (*endptr == '\0' && pval > 0 && pval <= 65535) config->port = (int)pval;
             free(val);
-          } else if (strcmp(key, "user") == 0)
+          } else if (strcmp(key, "user") == 0) {
+            if (config->user) free(config->user);
             config->user = val;
-          else
+          } else if (strcmp(key, "group") == 0) {
+            if (config->group) free(config->group);
             config->group = val;
+          } else if (strcmp(key, "pid-file") == 0) {
+            if (config->pid_file) free(config->pid_file);
+            config->pid_file = val;
+          }
         } else if (strcmp(key, "bind-address") == 0) {
           tok = get_next_token(ctx);
           if (tok.type == TOKEN_LBRACE) {
@@ -1531,6 +1541,55 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             config->minimal_any = true;
           else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
             config->minimal_any = false;
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "additional-from-auth") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+            config->additional_from_auth = ADDITIONAL_AUTH_YES;
+          else if (strcmp(tok.value, "in-domain") == 0 || strcmp(tok.value, "in-zone") == 0)
+            config->additional_from_auth = ADDITIONAL_AUTH_IN_DOMAIN;
+          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+            config->additional_from_auth = ADDITIONAL_AUTH_NO;
+          else {
+            syslog(LOG_WARNING, "[Config] Unknown additional-from-auth value '%s', defaulting to yes", tok.value);
+            config->additional_from_auth = ADDITIONAL_AUTH_YES;
+          }
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "query-log-max-qps") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          char *endptr;
+          unsigned long v = strtoul(tok.value, &endptr, 10);
+          if (*endptr == '\0') {
+            config->query_log_max_qps = (uint32_t)v;
+          } else {
+            syslog(LOG_ERR, "[Config] Invalid query-log-max-qps value '%s'", tok.value);
+            fprintf(stderr, "[ERROR] Invalid query-log-max-qps value '%s'\n", tok.value);
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {
@@ -1900,7 +1959,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         char *key_prop = strdup(tok.value);
         free_token(&tok);
         if (strcmp(key_prop, "algorithm") == 0 ||
-            strcmp(key_prop, "secret") == 0) {
+            strcmp(key_prop, "secret") == 0 ||
+            strcmp(key_prop, "socket") == 0 ||
+            strcmp(key_prop, "socket-path") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
             free(key_prop);
@@ -1917,20 +1978,24 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
-          if (strcmp(key_prop, "algorithm") == 0) {
+          if (strcmp(key_prop, "socket") == 0 || strcmp(key_prop, "socket-path") == 0) {
+            if (config->control.socket_path) free(config->control.socket_path);
+            config->control.socket_path = val;
+          } else if (strcmp(key_prop, "algorithm") == 0) {
             if (!tsig_algorithm_is_supported(val)) {
               syslog(LOG_ERR, "[Config] Unsupported TSIG algorithm in controls: %s", val);
               fprintf(stderr, "[ERROR] Unsupported TSIG algorithm in controls: %s\n", val);
               free(key_prop);
               free(val);
-              free_token(&tok);
               return -1;
             }
             if (strstr(val, "md5") || strstr(val, "sha1")) {
               syslog(LOG_WARNING, "[Config] Warning: TSIG algorithm '%s' is deprecated and insecure (RFC 8945)", val);
             }
+            if (config->control.algorithm) free(config->control.algorithm);
             config->control.algorithm = val;
           } else {
+            if (config->control.secret) free(config->control.secret);
             config->control.secret = val;
             size_t slen = strlen(config->control.secret);
             size_t decoded_upper_bound = ((slen + 3) / 4) * 3;
@@ -1938,9 +2003,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
               syslog(LOG_ERR, "[Config] secret too long for algorithm (decodes to %zu bytes, max %zu)", decoded_upper_bound, sizeof(config->control.secret_decoded));
               fprintf(stderr, "[ERROR] secret too long for algorithm\n");
               free(key_prop);
-              free(val);
+              free(config->control.secret);
               config->control.secret = NULL;
-              free_token(&tok);
               return -1;
             }
             int len = EVP_DecodeBlock(config->control.secret_decoded,
@@ -1948,9 +2012,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                                       slen);
             if (len < 0) {
               free(key_prop);
-              free(val);
+              free(config->control.secret);
               config->control.secret = NULL;
-              free_token(&tok);
               return -1;
             }
             int padding = 0;
@@ -2001,6 +2064,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           ch->name = strdup(tok.value);
           free_token(&tok);
           ch->fd = -1;
+          ch->max_qps = config->query_log_max_qps;
+          ch->max_qps_specified = false;
           pthread_mutex_init(&ch->lock, NULL);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_LBRACE) {
@@ -2058,18 +2123,22 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                     size_t mult = 1;
                     size_t len = strlen(tok.value);
                     if (len > 0) {
-                      char last = tok.value[len - 1];
+                      size_t check_len = len;
+                      if (check_len > 1 && (tok.value[check_len - 1] == 'B' || tok.value[check_len - 1] == 'b')) {
+                        check_len--;
+                      }
+                      char last = tok.value[check_len - 1];
                       char numeric_part[64];
                       size_t numeric_len = len;
                       if (last == 'M' || last == 'm') {
                         mult = 1024 * 1024;
-                        numeric_len--;
+                        numeric_len = check_len - 1;
                       } else if (last == 'K' || last == 'k') {
                         mult = 1024;
-                        numeric_len--;
+                        numeric_len = check_len - 1;
                       } else if (last == 'G' || last == 'g') {
                         mult = 1024 * 1024 * 1024;
-                        numeric_len--;
+                        numeric_len = check_len - 1;
                       }
                       if (numeric_len == 0 || numeric_len >= sizeof(numeric_part) || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
                         syslog(LOG_ERR, "[Config] Invalid log channel size value '%s'", tok.value);
@@ -2117,6 +2186,23 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                 ch->print_category = val;
               else
                 ch->print_severity = val;
+            } else if (strcmp(opt, "max-qps") == 0) {
+              tok = get_next_token(ctx);
+              if (tok.type == TOKEN_STRING) {
+                char *endptr;
+                unsigned long v = strtoul(tok.value, &endptr, 10);
+                if (*endptr == '\0') {
+                  ch->max_qps = (uint32_t)v;
+                  ch->max_qps_specified = true;
+                } else {
+                  syslog(LOG_ERR, "[Config] Invalid max-qps value '%s'", tok.value);
+                  fprintf(stderr, "[ERROR] Invalid max-qps value '%s'\n", tok.value);
+                }
+              }
+              free_token(&tok);
+              tok = get_next_token(ctx);
+              if (tok.type == TOKEN_SEMICOLON)
+                free_token(&tok);
             } else
               skip_unknown_block(ctx);
             free(opt);
@@ -2253,6 +2339,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     }
   }
   config->zones = flat_zones;
+
+  for (log_channel_t *c = config->logging.channels; c; c = c->next) {
+    if (!c->max_qps_specified) {
+      c->max_qps = config->query_log_max_qps;
+    }
+  }
 
   return 0;
 }
