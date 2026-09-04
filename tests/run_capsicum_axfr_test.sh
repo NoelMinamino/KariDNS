@@ -102,6 +102,7 @@ echo "\$INCLUDE capsicum_include_test/dir2/common.inc" > tests/zones/capsicum_in
 # root zoneに $INCLUDE dir1/common.inc を追記
 echo "\$INCLUDE capsicum_include_test/dir1/common.inc" >> tests/zones/example.com.zone
 
+chmod 0600 tests/karictl-test.conf 2>/dev/null || true
 ./karictl -f tests/karictl-test.conf reload example.com. || true
 sleep 1
 

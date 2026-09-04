@@ -15,6 +15,7 @@ fi
 
 CONF_FILE="$DIR/karidns-test.conf"
 CTL_CONF="$DIR/karictl-test.conf"
+chmod 0600 "$CTL_CONF" 2>/dev/null || true
 ZONE_FILE="$DIR/zones/example.com.zone"
 TEST_ZONE="$ZONE_FILE"
 
@@ -37,7 +38,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check_asan_log() {
-    if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" server_ixfr.log; then
+    if grep -qE "(AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:)" server_ixfr.log; then
         echo "[FAIL] AddressSanitizer/UndefinedBehaviorSanitizer error detected in server_ixfr.log:"
         cat server_ixfr.log
         exit 1

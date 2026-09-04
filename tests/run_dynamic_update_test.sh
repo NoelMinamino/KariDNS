@@ -16,6 +16,7 @@ fi
 
 CONF="$DIR/dynamic_update_test.conf"
 CTL_CONF="$DIR/karictl-test.conf"
+chmod 0600 "$CTL_CONF" 2>/dev/null || true
 
 cat <<EOF > "$CONF"
 options {
@@ -58,7 +59,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 check_asan_log() {
-    if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" server.log; then
+    if grep -qE "(AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:)" server.log; then
         echo "[FAIL] AddressSanitizer/UndefinedBehaviorSanitizer error detected in server.log:"
         cat server.log
         exit 1

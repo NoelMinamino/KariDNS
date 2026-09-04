@@ -849,6 +849,30 @@ int main() {
         printf("PASS: arena_alloc Addition Overflow Prevention (strict)\n");
     }
 
+    // Test 10c: arena_alloc 16-Byte Alignment Preservation
+    {
+        printf("\n--- Test 10c: arena_alloc 16-Byte Alignment Preservation ---\n");
+        zone_arena_t arena3 = {0};
+        zone_arena_init(&arena3);
+
+        for (size_t odd_sz = 1; odd_sz <= 33; odd_sz += 2) {
+            void *p = arena_alloc(&arena3, odd_sz);
+            if (!p) {
+                printf("FAIL: arena_alloc returned NULL for size %zu\n", odd_sz);
+                zone_arena_destroy(&arena3);
+                return 1;
+            }
+            if (((uintptr_t)p % 16) != 0) {
+                printf("FAIL: arena_alloc returned misaligned pointer %p for size %zu\n", p, odd_sz);
+                zone_arena_destroy(&arena3);
+                return 1;
+            }
+        }
+
+        zone_arena_destroy(&arena3);
+        printf("PASS: arena_alloc 16-Byte Alignment Preservation\n");
+    }
+
     // Test 11: RFC 2136 process_update_sections CLASS validation
     {
         printf("\n--- Test 11: RFC 2136 process_update_sections CLASS validation ---\n");

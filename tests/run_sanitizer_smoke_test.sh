@@ -19,6 +19,7 @@ cd "$(dirname "$0")/.."
 
 CONF_FILE="tests/karidns-test.conf"
 CTL_CONF="tests/karictl-test.conf"
+chmod 0600 "$CTL_CONF" 2>/dev/null || true
 ZONE_FILE="tests/zones/example.com.zone"
 ZONE_NAME="example.com"
 
