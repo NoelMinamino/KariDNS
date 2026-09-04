@@ -9,15 +9,15 @@ DAG="$ROOT/dag"
 echo "[*] Building targets..."
 make -C "$ROOT" karidns dag
 
-CONF_YES="$DIR/sibling_yes.conf"
-CONF_INDOMAIN="$DIR/sibling_indomain.conf"
-CONF_NO="$DIR/sibling_no.conf"
+TMP_DIR="$(mktemp -d /tmp/karidns_sibling_test.XXXXXX)"
 
-ZONE_JP="$DIR/zones/example.jp.zone"
-ZONE_COM="$DIR/zones/example.com.zone"
-ZONE_NET="$DIR/zones/example.net.zone"
+CONF_YES="$TMP_DIR/sibling_yes.conf"
+CONF_INDOMAIN="$TMP_DIR/sibling_indomain.conf"
+CONF_NO="$TMP_DIR/sibling_no.conf"
 
-mkdir -p "$DIR/zones"
+ZONE_JP="$TMP_DIR/example.jp.zone"
+ZONE_COM="$TMP_DIR/example.com.zone"
+ZONE_NET="$TMP_DIR/example.net.zone"
 
 cat << 'EOF' > "$ZONE_JP"
 $ORIGIN example.jp.
@@ -124,7 +124,7 @@ cleanup() {
     [ -n "$SERVER_PID_IN" ] && kill -9 "$SERVER_PID_IN" 2>/dev/null || true
     [ -n "$SERVER_PID_NO" ] && kill -9 "$SERVER_PID_NO" 2>/dev/null || true
     killall -9 karidns 2>/dev/null || true
-    rm -f "$CONF_YES" "$CONF_INDOMAIN" "$CONF_NO" "$ZONE_JP" "$ZONE_COM" "$ZONE_NET"
+    rm -rf "$TMP_DIR" 2>/dev/null || true
     rm -f "$DIR"/server_sibling_*.log
 }
 trap cleanup EXIT INT TERM
