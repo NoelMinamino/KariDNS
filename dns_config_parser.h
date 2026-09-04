@@ -92,6 +92,8 @@ typedef struct log_channel {
   bool print_time;
   bool print_category;
   bool print_severity;
+  uint32_t max_qps;
+  bool max_qps_specified;
   int fd;
   size_t current_size;
   int current_date;
@@ -147,6 +149,7 @@ typedef struct server_config_s {
   bool minimal_any;
   uint32_t minimal_any_ttl;
   additional_from_auth_t additional_from_auth;
+  uint32_t query_log_max_qps;
   int max_mqtypes;
   bool rfc10029_mqtype_enable;
   bool tcp_connection_reuse;

@@ -3143,7 +3143,56 @@ int main() {
             free_server_config_fields(&cfg1);
             return 1;
         }
+        if (cfg1.query_log_max_qps != 5000 || cfg1.logging.queries_channel->max_qps != 5000) {
+            printf("FAIL: default query_log_max_qps should be 5000 (got cfg=%u, ch=%u)\n",
+                   cfg1.query_log_max_qps, cfg1.logging.queries_channel->max_qps);
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
         free_server_config_fields(&cfg1);
+
+        // 1b. options query-log-max-qps and channel max-qps overrides
+        const char *max_qps_conf =
+            "options { port 53; bind-address { 127.0.0.1; }; query-log-max-qps 8000; };\n"
+            "logging {\n"
+            "    channel qlog1 { file \"/tmp/q1.log\"; };\n"
+            "    channel qlog2 { file \"/tmp/q2.log\"; max-qps 1200; };\n"
+            "    channel qlog3 { file \"/tmp/q3.log\"; max-qps 0; };\n"
+            "    category queries { qlog1; };\n"
+            "};\n";
+        server_config_t cfg_qps;
+        memset(&cfg_qps, 0, sizeof(cfg_qps));
+        if (parse_named_conf_ext(max_qps_conf, NULL, &cfg_qps) != 0) {
+            printf("FAIL: max-qps config failed to parse\n");
+            return 1;
+        }
+        if (cfg_qps.query_log_max_qps != 8000) {
+            printf("FAIL: options query-log-max-qps expected 8000, got %u\n", cfg_qps.query_log_max_qps);
+            free_server_config_fields(&cfg_qps);
+            return 1;
+        }
+        log_channel_t *ch1 = NULL, *ch2 = NULL, *ch3 = NULL;
+        for (log_channel_t *c = cfg_qps.logging.channels; c; c = c->next) {
+            if (strcmp(c->name, "qlog1") == 0) ch1 = c;
+            else if (strcmp(c->name, "qlog2") == 0) ch2 = c;
+            else if (strcmp(c->name, "qlog3") == 0) ch3 = c;
+        }
+        if (!ch1 || ch1->max_qps != 8000) {
+            printf("FAIL: qlog1 should inherit 8000 from options, got %u\n", ch1 ? ch1->max_qps : 0);
+            free_server_config_fields(&cfg_qps);
+            return 1;
+        }
+        if (!ch2 || ch2->max_qps != 1200) {
+            printf("FAIL: qlog2 should have explicit 1200, got %u\n", ch2 ? ch2->max_qps : 0);
+            free_server_config_fields(&cfg_qps);
+            return 1;
+        }
+        if (!ch3 || ch3->max_qps != 0) {
+            printf("FAIL: qlog3 should have explicit 0 (unlimited), got %u\n", ch3 ? ch3->max_qps : 999);
+            free_server_config_fields(&cfg_qps);
+            return 1;
+        }
+        free_server_config_fields(&cfg_qps);
 
         // 2. 正常系: allow-transfer に複数 key を指定 (両方の key が配列 tsig_keys に保持される)
         const char *multi_key_conf =

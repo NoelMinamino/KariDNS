@@ -1280,6 +1280,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
+  config->query_log_max_qps = 5000;
   config->max_mqtypes = 4;
   config->rfc10029_mqtype_enable = false;
   config->udp_recvbuf_size = 4 * 1024 * 1024;
@@ -1555,6 +1556,31 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           else {
             syslog(LOG_WARNING, "[Config] Unknown additional-from-auth value '%s', defaulting to yes", tok.value);
             config->additional_from_auth = ADDITIONAL_AUTH_YES;
+          }
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "query-log-max-qps") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          char *endptr;
+          unsigned long v = strtoul(tok.value, &endptr, 10);
+          if (*endptr == '\0') {
+            config->query_log_max_qps = (uint32_t)v;
+          } else {
+            syslog(LOG_ERR, "[Config] Invalid query-log-max-qps value '%s'", tok.value);
+            fprintf(stderr, "[ERROR] Invalid query-log-max-qps value '%s'\n", tok.value);
+            free(key);
+            free_token(&tok);
+            return -1;
           }
           free_token(&tok);
           tok = get_next_token(ctx);
@@ -2026,6 +2052,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           ch->name = strdup(tok.value);
           free_token(&tok);
           ch->fd = -1;
+          ch->max_qps = config->query_log_max_qps;
+          ch->max_qps_specified = false;
           pthread_mutex_init(&ch->lock, NULL);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_LBRACE) {
@@ -2146,6 +2174,23 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                 ch->print_category = val;
               else
                 ch->print_severity = val;
+            } else if (strcmp(opt, "max-qps") == 0) {
+              tok = get_next_token(ctx);
+              if (tok.type == TOKEN_STRING) {
+                char *endptr;
+                unsigned long v = strtoul(tok.value, &endptr, 10);
+                if (*endptr == '\0') {
+                  ch->max_qps = (uint32_t)v;
+                  ch->max_qps_specified = true;
+                } else {
+                  syslog(LOG_ERR, "[Config] Invalid max-qps value '%s'", tok.value);
+                  fprintf(stderr, "[ERROR] Invalid max-qps value '%s'\n", tok.value);
+                }
+              }
+              free_token(&tok);
+              tok = get_next_token(ctx);
+              if (tok.type == TOKEN_SEMICOLON)
+                free_token(&tok);
             } else
               skip_unknown_block(ctx);
             free(opt);
@@ -2282,6 +2327,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     }
   }
   config->zones = flat_zones;
+
+  for (log_channel_t *c = config->logging.channels; c; c = c->next) {
+    if (!c->max_qps_specified) {
+      c->max_qps = config->query_log_max_qps;
+    }
+  }
 
   return 0;
 }

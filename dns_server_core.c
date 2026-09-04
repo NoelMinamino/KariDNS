@@ -533,6 +533,27 @@ static resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
 static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
+#define QUERY_LOG_RING_SIZE 8192
+
+typedef struct {
+    _Atomic bool ready;
+    struct timespec ts;
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port;
+    char qname[256];
+    uint16_t qclass;
+    uint16_t qtype;
+    bool has_edns;
+    bool dnssec_ok;
+} query_log_entry_t;
+
+static query_log_entry_t g_query_log_ring[QUERY_LOG_RING_SIZE];
+static _Atomic uint64_t g_query_log_tail = ATOMIC_VAR_INIT(0);
+static _Atomic uint64_t g_query_log_head = ATOMIC_VAR_INIT(0);
+
+static _Atomic uint32_t g_query_log_sec = ATOMIC_VAR_INIT(0);
+static _Atomic uint32_t g_query_log_count = ATOMIC_VAR_INIT(0);
+
 static inline void inc_tcp_clients(void) {
     int current = atomic_fetch_add_explicit(&g_tcp_clients, 1, memory_order_relaxed) + 1;
     int high = atomic_load_explicit(&g_tcp_high_water, memory_order_relaxed);
@@ -669,6 +690,7 @@ static size_t resolve_ip_port_to_sockaddr(const char *ip, int port,
 typedef struct dir_fd_entry {
   char *dirpath;
   int fd;
+  bool is_writable;
   struct dir_fd_entry *next;
 } dir_fd_entry_t;
 static dir_fd_entry_t *g_dir_fd_table = NULL;
@@ -715,9 +737,11 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
   pthread_mutex_lock(&g_dir_fd_lock);
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
     if (strcmp(e->dirpath, dirpath) == 0) {
-      int fd = e->fd;
-      pthread_mutex_unlock(&g_dir_fd_lock);
-      return fd;
+      if (!writable || e->is_writable) {
+        int fd = e->fd;
+        pthread_mutex_unlock(&g_dir_fd_lock);
+        return fd;
+      }
     }
   }
   if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
@@ -764,6 +788,7 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
     return -1;
   }
   e->fd = fd;
+  e->is_writable = writable;
   e->next = g_dir_fd_table;
   g_dir_fd_table = e;
   pthread_mutex_unlock(&g_dir_fd_lock);
@@ -6105,55 +6130,127 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
+static inline bool check_query_log_rate_limit(uint32_t max_qps) {
+    if (max_qps == 0) return true; // 0 = unlimited
+    time_t now = time(NULL);
+    uint32_t sec = atomic_load_explicit(&g_query_log_sec, memory_order_relaxed);
+    if (sec != (uint32_t)now) {
+        if (atomic_compare_exchange_strong_explicit(&g_query_log_sec, &sec, (uint32_t)now,
+                                                    memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&g_query_log_count, 1, memory_order_relaxed);
+            return true;
+        }
+    }
+    uint32_t count = atomic_fetch_add_explicit(&g_query_log_count, 1, memory_order_relaxed);
+    return (count < max_qps);
+}
+
+void *query_logger_thread_func(void *arg) {
+    (void)arg;
+    while (1) {
+        uint64_t h = atomic_load_explicit(&g_query_log_head, memory_order_relaxed);
+        uint32_t idx = h & (QUERY_LOG_RING_SIZE - 1);
+
+        if (atomic_load_explicit(&g_query_log_ring[idx].ready, memory_order_acquire)) {
+            query_log_entry_t *entry = &g_query_log_ring[idx];
+            server_config_t *cfg = acquire_config_snapshot();
+
+            if (cfg && cfg->logging.queries_channel) {
+                log_channel_t *ch = cfg->logging.queries_channel;
+
+                struct tm tm_info;
+                localtime_r(&entry->ts.tv_sec, &tm_info);
+
+                char time_str[64] = "";
+                if (ch->print_time) {
+                    char buf[32];
+                    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
+                    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf,
+                             entry->ts.tv_nsec / 1000000);
+                }
+
+                char class_str[16];
+                if (entry->qclass == 1)
+                    snprintf(class_str, sizeof(class_str), "IN");
+                else if (entry->qclass == 255)
+                    snprintf(class_str, sizeof(class_str), "ANY");
+                else
+                    snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
+
+                char type_str[32];
+                const char *type_str_tmp = format_type_name(entry->qtype, type_str, sizeof(type_str));
+
+                char edns_str[16] = "";
+                if (entry->has_edns)
+                    snprintf(edns_str, sizeof(edns_str), "+E(0)%s", entry->dnssec_ok ? "D" : "K");
+
+                char safe_qname[512];
+                escape_qname_for_log(entry->qname, safe_qname, sizeof(safe_qname));
+
+                char log_buf[1024];
+                int len = snprintf(log_buf, sizeof(log_buf),
+                                   "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
+                                   ch->print_category ? "queries: " : "",
+                                   ch->print_severity ? "info: " : "", entry->client_ip, entry->client_port,
+                                   safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
+                if (len > 0) {
+                    if (len >= (int)sizeof(log_buf))
+                        len = sizeof(log_buf) - 1;
+                    log_write_rotated(ch, log_buf, len, &tm_info);
+                }
+            }
+            if (cfg) release_config_snapshot(cfg);
+
+            atomic_store_explicit(&entry->ready, false, memory_order_release);
+            atomic_fetch_add_explicit(&g_query_log_head, 1, memory_order_release);
+        } else {
+            usleep(1000);
+        }
+    }
+    return NULL;
+}
+
 static void write_query_log(const char *client_ip, int client_port,
                             const char *qname, uint16_t qclass, uint16_t qtype,
                             bool has_edns, bool dnssec_ok) {
-  server_config_t *cfg = acquire_config_snapshot();
-  if (!cfg || !cfg->logging.queries_channel) {
-    if (cfg) release_config_snapshot(cfg);
-    return;
-  }
-  log_channel_t *ch = cfg->logging.queries_channel;
-  struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  struct tm tm_info;
-  localtime_r(&ts.tv_sec, &tm_info);
-  
-  char time_str[64] = "";
-  if (ch->print_time) {
-    char buf[32];
-    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
-    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf,
-             ts.tv_nsec / 1000000);
-  }
-  char class_str[16];
-  if (qclass == 1)
-    snprintf(class_str, sizeof(class_str), "IN");
-  else if (qclass == 255)
-    snprintf(class_str, sizeof(class_str), "ANY");
-  else
-    snprintf(class_str, sizeof(class_str), "CLASS%d", qclass);
-  char type_str[32];
-  const char *type_str_tmp = format_type_name(qtype, type_str, sizeof(type_str));
-  char edns_str[16] = "";
-  if (has_edns)
-    snprintf(edns_str, sizeof(edns_str), "+E(0)%s", dnssec_ok ? "D" : "K");
-  
-  char safe_qname[512];
-  escape_qname_for_log(qname, safe_qname, sizeof(safe_qname));
+    server_config_t *cfg = acquire_config_snapshot();
+    if (!cfg) return;
+    log_channel_t *ch = cfg->logging.queries_channel;
+    if (!ch) {
+        release_config_snapshot(cfg);
+        return;
+    }
+    uint32_t max_qps = ch->max_qps;
+    release_config_snapshot(cfg);
 
-  char log_buf[1024];
-  int len = snprintf(log_buf, sizeof(log_buf),
-                     "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
-                     ch->print_category ? "queries: " : "",
-                     ch->print_severity ? "info: " : "", client_ip, client_port,
-                     safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
-  if (len > 0) {
-    if (len >= (int)sizeof(log_buf))
-      len = sizeof(log_buf) - 1;
-    log_write_rotated(ch, log_buf, len, &tm_info);
-  }
-  release_config_snapshot(cfg);
+    if (!check_query_log_rate_limit(max_qps)) {
+        return;
+    }
+
+    uint64_t t = atomic_load_explicit(&g_query_log_tail, memory_order_relaxed);
+    uint64_t h = atomic_load_explicit(&g_query_log_head, memory_order_acquire);
+
+    // ロックフリー CAS ループ (バッファフル時はDDoS・高負荷とみなし、潔くログをドロップする)
+    do {
+        if (t - h >= QUERY_LOG_RING_SIZE) return;
+    } while (!atomic_compare_exchange_weak_explicit(&g_query_log_tail, &t, t + 1,
+                                                    memory_order_acq_rel, memory_order_relaxed));
+
+    uint32_t idx = t & (QUERY_LOG_RING_SIZE - 1);
+    query_log_entry_t *entry = &g_query_log_ring[idx];
+
+    clock_gettime(CLOCK_REALTIME, &entry->ts);
+    strncpy(entry->client_ip, client_ip, INET6_ADDRSTRLEN - 1);
+    entry->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
+    entry->client_port = client_port;
+    strncpy(entry->qname, qname, 255);
+    entry->qname[255] = '\0';
+    entry->qclass = qclass;
+    entry->qtype = qtype;
+    entry->has_edns = has_edns;
+    entry->dnssec_ok = dnssec_ok;
+
+    atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
 
 // ============================================================================
@@ -8434,14 +8531,16 @@ int main(int argc, char **argv) {
           return 0;
       } else if (strcmp(argv[i], "-f") == 0) {
           foreground = true;
+      } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+          config_file = argv[++i];
       } else {
           config_file = argv[i];
       }
   }
 
   if (!config_file) {
-    fprintf(stderr, "Usage: %s [-v | --version] [-f] <config_file>\n", argv[0]);
-    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] <config_file>", argv[0]);
+    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-c <config_file> | <config_file>]\n", argv[0]);
+    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-c <config_file> | <config_file>]", argv[0]);
     return 1;
   }
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
@@ -8656,6 +8755,8 @@ int main(int argc, char **argv) {
   tzset();
   pthread_t response_logger_thread;
   if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);
+  pthread_t query_logger_thread;
+  if (pthread_create(&query_logger_thread, NULL, query_logger_thread_func, NULL) != 0) exit(1);
   
   enter_capsicum_sandbox(); // サンドボックス突入
 
