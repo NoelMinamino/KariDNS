@@ -1,0 +1,5 @@
+HTTP/1.1 200 OK
+Content-Type: application/dns-message
+Content-Length: 12
+
+123456789012

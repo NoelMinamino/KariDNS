@@ -1,0 +1,1 @@
+sub.example.org AAAA @8.8.8.8,1.1.1.1 +allcompare +tries=1

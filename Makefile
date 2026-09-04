@@ -62,7 +62,26 @@ FUZZ_DAG_SRCS = tests/fuzz/fuzz_dag_response.c dns_wire.c dns_utils.c dns_zone_p
 FUZZ_TSIG_VERIFY_TARGET = tests/fuzz/fuzz_tsig_verify
 FUZZ_TSIG_VERIFY_SRCS = tests/fuzz/fuzz_tsig_verify.c dns_wire.c dns_utils.c dns_zone_parser.c
 
-.PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools
+FUZZ_DAG_HASH_TARGET = tests/fuzz/fuzz_dag_hash
+FUZZ_DAG_HASH_SRCS = tests/fuzz/fuzz_dag_hash.c dns_wire.c dns_utils.c dns_zone_parser.c
+
+FUZZ_DAG_CHUNKED_HTTP_TARGET = tests/fuzz/fuzz_dag_chunked_http
+FUZZ_DAG_CHUNKED_HTTP_SRCS = tests/fuzz/fuzz_dag_chunked_http.c dns_wire.c dns_utils.c dns_zone_parser.c
+
+FUZZ_DAG_RDATA_YAML_TARGET = tests/fuzz/fuzz_dag_rdata_yaml
+FUZZ_DAG_RDATA_YAML_SRCS = tests/fuzz/fuzz_dag_rdata_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
+
+FUZZ_DAG_AXFR_STREAM_TARGET = tests/fuzz/fuzz_dag_axfr_stream
+FUZZ_DAG_AXFR_STREAM_SRCS = tests/fuzz/fuzz_dag_axfr_stream.c dns_wire.c dns_utils.c dns_zone_parser.c
+
+FUZZ_DAG_CLI_ARGS_TARGET = tests/fuzz/fuzz_dag_cli_args
+FUZZ_DAG_CLI_ARGS_SRCS = tests/fuzz/fuzz_dag_cli_args.c dns_wire.c dns_utils.c dns_zone_parser.c
+
+FUZZ_DAG_BATCH_FILE_TARGET = tests/fuzz/fuzz_dag_batch_file
+FUZZ_DAG_BATCH_FILE_SRCS = tests/fuzz/fuzz_dag_batch_file.c dns_wire.c dns_utils.c dns_zone_parser.c
+
+.PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools \
+	fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 
@@ -136,8 +155,27 @@ fuzz_dag: $(FUZZ_DAG_SRCS)
 fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS) $(LDFLAGS) -lcrypto
 
+fuzz_dag_hash: $(FUZZ_DAG_HASH_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_HASH_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
+fuzz_dag_chunked_http: $(FUZZ_DAG_CHUNKED_HTTP_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_CHUNKED_HTTP_TARGET) $(FUZZ_DAG_CHUNKED_HTTP_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
+fuzz_dag_rdata_yaml: $(FUZZ_DAG_RDATA_YAML_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_RDATA_YAML_TARGET) $(FUZZ_DAG_RDATA_YAML_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
+fuzz_dag_axfr_stream: $(FUZZ_DAG_AXFR_STREAM_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_AXFR_STREAM_TARGET) $(FUZZ_DAG_AXFR_STREAM_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
+fuzz_dag_cli_args: $(FUZZ_DAG_CLI_ARGS_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_CLI_ARGS_TARGET) $(FUZZ_DAG_CLI_ARGS_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
+fuzz_dag_batch_file: $(FUZZ_DAG_BATCH_FILE_SRCS)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_BATCH_FILE_TARGET) $(FUZZ_DAG_BATCH_FILE_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
 clean-fuzz:
-	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET) $(FUZZ_TSIG_TARGET) $(FUZZ_DAG_TARGET) $(FUZZ_TSIG_VERIFY_TARGET)
+	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET) $(FUZZ_TSIG_TARGET) $(FUZZ_DAG_TARGET) $(FUZZ_TSIG_VERIFY_TARGET) \
+		$(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_CHUNKED_HTTP_TARGET) $(FUZZ_DAG_RDATA_YAML_TARGET) $(FUZZ_DAG_AXFR_STREAM_TARGET) $(FUZZ_DAG_CLI_ARGS_TARGET) $(FUZZ_DAG_BATCH_FILE_TARGET)
 
 ASAN_TARGET = karidns-asan
 ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE
