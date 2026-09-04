@@ -5483,15 +5483,52 @@ void send_notify_to_all(const char *domain, const char *view_name) {
 // ============================================================================
 
 static void init_logging_channels(server_config_t *cfg) {
+  uid_t target_uid = (uid_t)-1;
+  gid_t target_gid = (gid_t)-1;
+  if (geteuid() == 0 && cfg->user) {
+    struct passwd *pwd = getpwnam(cfg->user);
+    if (pwd) {
+      target_uid = pwd->pw_uid;
+      target_gid = pwd->pw_gid;
+      if (cfg->group) {
+        struct group *grp = getgrnam(cfg->group);
+        if (grp) target_gid = grp->gr_gid;
+      }
+    }
+  }
+
   log_channel_t *ch = cfg->logging.channels;
   while (ch) {
     if (ch->file_path) {
+      if (geteuid() == 0) {
+        char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+        if (split_path_for_openat(ch->file_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+          if (dirbuf[0] != '\0' && strcmp(dirbuf, ".") != 0) {
+            struct stat d_st;
+            if (stat(dirbuf, &d_st) != 0) {
+              mkdir(dirbuf, 0755);
+            }
+            if (target_uid != (uid_t)-1 &&
+                strcmp(dirbuf, "/") != 0 && strcmp(dirbuf, "/var") != 0 &&
+                strcmp(dirbuf, "/var/log") != 0 && strcmp(dirbuf, "/tmp") != 0 &&
+                strcmp(dirbuf, "/etc") != 0) {
+              chown(dirbuf, target_uid, target_gid);
+            }
+          }
+        }
+      }
+
       ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND,
                                   0644, true);
       if (ch->fd >= 0) {
+        if (geteuid() == 0 && target_uid != (uid_t)-1) {
+          fchown(ch->fd, target_uid, target_gid);
+        }
         struct stat st;
         if (fstat(ch->fd, &st) == 0)
           ch->current_size = st.st_size;
+      } else {
+        syslog(LOG_ERR, "[Logging] Failed to open log file '%s': %m", ch->file_path);
       }
       time_t now = time(NULL);
       struct tm tm_info;
@@ -5582,17 +5619,21 @@ static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, s
         rotate = true;
     else if (ch->suffix_timestamp && ch->current_date != today)
         rotate = true;
+
     if (rotate) {
-        if (ch->fd >= 0) {
-            close(ch->fd);
-        }
-        ch->fd = -1;
+        int old_fd = ch->fd;
         int reopen_flags = O_WRONLY | O_CREAT | O_APPEND;
+        bool rotate_rename_failed = false;
+
         if (ch->suffix_timestamp) {
             char new_name[600];
             int r = snprintf(new_name, sizeof(new_name), "%s.%08d", ch->file_path, ch->current_date);
-            if (r > 0 && r < (int)sizeof(new_name))
-                renameat_via_dir_cache(ch->file_path, new_name);
+            if (r > 0 && r < (int)sizeof(new_name)) {
+                if (renameat_via_dir_cache(ch->file_path, new_name) != 0) {
+                    rotate_rename_failed = true;
+                    syslog(LOG_ERR, "[Logging] Failed to rotate log file '%s' to '%s': %m", ch->file_path, new_name);
+                }
+            }
         } else if (ch->versions > 0) {
             for (int i = ch->versions - 1; i >= 0; i--) {
                 char old_name[600], new_name[600];
@@ -5600,15 +5641,43 @@ static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, s
                              ? snprintf(old_name, sizeof(old_name), "%s", ch->file_path)
                              : snprintf(old_name, sizeof(old_name), "%s.%d", ch->file_path, i - 1);
                 int r2 = snprintf(new_name, sizeof(new_name), "%s.%d", ch->file_path, i);
-                if (r1 > 0 && r2 > 0)
-                    renameat_via_dir_cache(old_name, new_name);
+                if (r1 > 0 && r2 > 0) {
+                    if (renameat_via_dir_cache(old_name, new_name) != 0 && i == 0) {
+                        rotate_rename_failed = true;
+                        syslog(LOG_ERR, "[Logging] Failed to rotate active log file '%s' to '%s': %m", old_name, new_name);
+                    }
+                }
             }
         } else {
             reopen_flags |= O_TRUNC;
         }
-        ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
-        ch->current_size = 0;
-        ch->current_date = today;
+
+        if (!rotate_rename_failed || (reopen_flags & O_TRUNC)) {
+            if (old_fd >= 0) close(old_fd);
+            ch->fd = open_via_dir_cache(ch->file_path, reopen_flags, 0644, true);
+            if (ch->fd >= 0) {
+                struct stat st;
+                ch->current_size = (fstat(ch->fd, &st) == 0) ? st.st_size : 0;
+                ch->current_date = today;
+            } else {
+                syslog(LOG_ERR, "[Logging] Failed to reopen log file '%s' after rotation: %m", ch->file_path);
+                ch->current_size = 0;
+            }
+        } else {
+            // リネーム失敗時: 古いFDが有効であれば維持してログ欠損を防ぎ、実ファイルサイズと同期
+            if (old_fd >= 0) {
+                struct stat st;
+                if (fstat(old_fd, &st) == 0)
+                    ch->current_size = st.st_size;
+            } else {
+                ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_APPEND, 0644, true);
+                if (ch->fd >= 0) {
+                    struct stat st;
+                    if (fstat(ch->fd, &st) == 0)
+                        ch->current_size = st.st_size;
+                }
+            }
+        }
     }
     if (ch->fd >= 0) {
         ssize_t w = write(ch->fd, log_buf, len);
