@@ -2855,9 +2855,15 @@ static const char *rcode_name(uint16_t rcode) {
         case 0: return "NOERROR"; case 1: return "FORMERR"; case 2: return "SERVFAIL";
         case 3: return "NXDOMAIN"; case 4: return "NOTIMP"; case 5: return "REFUSED";
         case 6: return "YXDOMAIN"; case 7: return "YXRRSET"; case 8: return "NXRRSET";
-        case 9: return "NOTAUTH"; case 16: return "BADVERS/BADSIG"; case 17: return "BADKEY";
-        case 18: return "BADTIME"; case 23: return "BADCOOKIE";
-        default: return "UNKNOWN";
+        case 9: return "NOTAUTH"; case 10: return "NOTZONE"; case 11: return "DSOTYPENI";
+        case 16: return "BADVERS/BADSIG"; case 17: return "BADKEY";
+        case 18: return "BADTIME"; case 19: return "BADMODE"; case 20: return "BADNAME";
+        case 21: return "BADALG"; case 22: return "BADTRUNC"; case 23: return "BADCOOKIE";
+        default: {
+            static _Thread_local char buf[32];
+            snprintf(buf, sizeof(buf), "%u", (unsigned int)rcode);
+            return buf;
+        }
     }
 }
 
