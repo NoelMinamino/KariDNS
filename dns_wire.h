@@ -37,6 +37,8 @@ static inline bool parse_u16(const char *s, uint16_t *out) {
 
 // Forward declarations
 struct server_config_s;
+struct evp_pkey_st;
+typedef struct evp_pkey_st EVP_PKEY;
 
 #define DNS_HEADER_SIZE 12
 
@@ -199,6 +201,15 @@ typedef struct tsig_key {
     struct tsig_key *next;
 } tsig_key_t;
 
+// SIG(0) 鍵構造体 (RFC 2931 / RFC 3007)
+typedef struct sig0_key {
+    char *signer_name;    // Signer's Name (鍵の所有者名, e.g. "update.example.com.")
+    uint8_t algorithm;     // DNSSEC Algorithm Number (8=RSASHA256, 13=ECDSAP256SHA256, 15=ED25519 等)
+    uint16_t key_tag;      // KEY RRのキータグ(compute_sig0_keytagで計算 or 手動指定)
+    EVP_PKEY *pkey;        // OpenSSL 秘密鍵オブジェクト
+    int64_t fuzztime;      // テスト用時刻固定機構 (--break / 決定論テスト用)
+} sig0_key_t;
+
 // Extended DNS Errors (RFC 8914) 最大パース数
 // 異常系パケットやファジングテストで多数のEDEオプションが注入された場合でも
 // 途中で切り落とさず確実に追尾・検証できるよう上限を64に設定している。
@@ -283,6 +294,11 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
                        bool is_subsequent,
                        uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
                        size_t *mac_len_out);
+
+// SIG(0) & DNSKEY Tag
+uint16_t compute_dnskey_tag(const uint8_t *rdata, size_t rdlen);
+uint16_t compute_sig0_keytag(const sig0_key_t *key);
+int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_key_t *key);
 
 int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size);
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);

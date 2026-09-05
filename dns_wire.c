@@ -33,6 +33,8 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/md5.h>
+#include <openssl/bn.h>
+#include <openssl/ecdsa.h>
 #include "dns_utils.h"
 #include "dns_zone_parser.h"
 
@@ -886,6 +888,266 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         *mac_len_out = mac_size;
         memcpy(mac_out, mac, mac_size);
     }
+    return 0;
+}
+
+// ============================================================================
+// 6.5 SIG(0) (RFC 2931 / RFC 3007) トランザクション署名 & DNSKEY Key Tag
+// ============================================================================
+
+uint16_t compute_dnskey_tag(const uint8_t *rdata, size_t rdlen) {
+    if (!rdata || rdlen < 4) return 0;
+    if (rdata[3] == 1) { // Algorithm 1 (RSAMD5)
+        return (rdata[rdlen - 3] << 8) | rdata[rdlen - 2];
+    }
+    uint32_t ac = 0;
+    for (size_t i = 0; i < rdlen; i++) {
+        ac += (i & 1) ? rdata[i] : (rdata[i] << 8);
+    }
+    ac += (ac >> 16) & 0xFFFF;
+    return (uint16_t)(ac & 0xFFFF);
+}
+
+static size_t build_key_rdata_from_pkey(EVP_PKEY *pkey, uint8_t algorithm, uint8_t *out, size_t max_out) {
+    if (!pkey || !out || max_out < 4) return 0;
+    size_t pos = 0;
+    out[pos++] = 0; out[pos++] = 0; // Flags = 0x0000
+    out[pos++] = 3;                 // Protocol = 3 (DNSSEC)
+    out[pos++] = algorithm;         // Algorithm
+
+    if (algorithm == 8) { // RSA (RSASHA256) per RFC 3110
+        BIGNUM *n = NULL, *e = NULL;
+        if (EVP_PKEY_get_bn_param(pkey, "n", &n) != 1 ||
+            EVP_PKEY_get_bn_param(pkey, "e", &e) != 1) {
+            if (n) BN_free(n);
+            if (e) BN_free(e);
+            return 0;
+        }
+        int e_len = BN_num_bytes(e);
+        int n_len = BN_num_bytes(n);
+        size_t exp_len_field = (e_len <= 255) ? 1 : 3;
+        if (pos + exp_len_field + (size_t)e_len + (size_t)n_len > max_out) {
+            BN_free(n); BN_free(e);
+            return 0;
+        }
+        if (e_len <= 255) {
+            out[pos++] = (uint8_t)e_len;
+        } else {
+            out[pos++] = 0;
+            out[pos++] = (uint8_t)((e_len >> 8) & 0xFF);
+            out[pos++] = (uint8_t)(e_len & 0xFF);
+        }
+        BN_bn2bin(e, &out[pos]); pos += e_len;
+        BN_bn2bin(n, &out[pos]); pos += n_len;
+        BN_free(n); BN_free(e);
+        return pos;
+    } else if (algorithm == 13) { // ECDSA P-256 (RFC 6605)
+        uint8_t pt_buf[128];
+        size_t pt_len = 0;
+        if (EVP_PKEY_get_octet_string_param(pkey, "encoded-pub-key", pt_buf, sizeof(pt_buf), &pt_len) == 1 &&
+            pt_len == 65 && pt_buf[0] == 0x04) {
+            if (pos + 64 > max_out) return 0;
+            memcpy(&out[pos], pt_buf + 1, 64);
+            pos += 64;
+            return pos;
+        }
+        unsigned char *pub = NULL;
+        size_t pub_len = EVP_PKEY_get1_encoded_public_key(pkey, &pub);
+        if (pub && pub_len == 65 && pub[0] == 0x04) {
+            if (pos + 64 > max_out) { OPENSSL_free(pub); return 0; }
+            memcpy(&out[pos], pub + 1, 64);
+            pos += 64;
+            OPENSSL_free(pub);
+            return pos;
+        }
+        if (pub) OPENSSL_free(pub);
+        return 0;
+    } else if (algorithm == 15) { // Ed25519 (RFC 8080)
+        size_t raw_len = 32;
+        if (pos + raw_len > max_out) return 0;
+        if (EVP_PKEY_get_raw_public_key(pkey, &out[pos], &raw_len) != 1 || raw_len != 32) {
+            return 0;
+        }
+        pos += raw_len;
+        return pos;
+    }
+    return 0;
+}
+
+uint16_t compute_sig0_keytag(const sig0_key_t *key) {
+    if (!key || !key->pkey) return 0;
+    uint8_t rdata[4 + 1024];
+    size_t rdlen = build_key_rdata_from_pkey(key->pkey, key->algorithm, rdata, sizeof(rdata));
+    if (rdlen == 0) return 0;
+    return compute_dnskey_tag(rdata, rdlen);
+}
+
+int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_key_t *key) {
+    if (!packet || !packet_len || !key || !key->pkey || !key->signer_name) return -1;
+    if (*packet_len < DNS_HEADER_SIZE) return -1;
+
+    // 1. ARCOUNTをインクリメント(SIG(0) RRを追加する前提で、ダイジェスト計算に含める)
+    uint16_t orig_arcount = (packet[10] << 8) | packet[11];
+    if (orig_arcount == 65535) return -1;
+    packet[10] = (uint8_t)((orig_arcount + 1) >> 8);
+    packet[11] = (uint8_t)((orig_arcount + 1) & 0xFF);
+
+    // 2. SIG RDATA (署名フィールドを除く部分) を構築
+    uint8_t sig_rdata_prefix[2 + 1 + 1 + 4 + 4 + 4 + 2 + 256];
+    size_t p = 0;
+    sig_rdata_prefix[p++] = 0; sig_rdata_prefix[p++] = 0; // Type Covered = 0
+    sig_rdata_prefix[p++] = key->algorithm;
+    sig_rdata_prefix[p++] = 0; // Labels = 0
+    memset(&sig_rdata_prefix[p], 0, 4); p += 4; // Original TTL = 0
+
+    uint64_t now = (key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
+    uint32_t fudge = 300;
+    uint32_t expire = (uint32_t)(now + fudge);
+    uint32_t inception = (uint32_t)now;
+    sig_rdata_prefix[p++] = (uint8_t)((expire >> 24) & 0xFF);
+    sig_rdata_prefix[p++] = (uint8_t)((expire >> 16) & 0xFF);
+    sig_rdata_prefix[p++] = (uint8_t)((expire >> 8) & 0xFF);
+    sig_rdata_prefix[p++] = (uint8_t)(expire & 0xFF);
+
+    sig_rdata_prefix[p++] = (uint8_t)((inception >> 24) & 0xFF);
+    sig_rdata_prefix[p++] = (uint8_t)((inception >> 16) & 0xFF);
+    sig_rdata_prefix[p++] = (uint8_t)((inception >> 8) & 0xFF);
+    sig_rdata_prefix[p++] = (uint8_t)(inception & 0xFF);
+
+    uint16_t keytag = key->key_tag ? key->key_tag : compute_sig0_keytag(key);
+    sig_rdata_prefix[p++] = (uint8_t)(keytag >> 8);
+    sig_rdata_prefix[p++] = (uint8_t)(keytag & 0xFF);
+
+    // Signer's Name (write_uncompressed_name is downcased canonical wire format)
+    long name_len = write_uncompressed_name(sig_rdata_prefix, p, sizeof(sig_rdata_prefix), key->signer_name);
+    if (name_len < 0) {
+        packet[10] = (uint8_t)(orig_arcount >> 8);
+        packet[11] = (uint8_t)(orig_arcount & 0xFF);
+        return -1;
+    }
+    p += (size_t)name_len;
+
+    // 3. 署名対象データ = 現在のメッセージ全体(ARCOUNT加算済) || sig_rdata_prefix
+    // 4096バイト以下ならスタックバッファでゼロアロケーション
+    size_t to_sign_len = *packet_len + p;
+    uint8_t stack_to_sign[4096];
+    uint8_t *to_sign = (to_sign_len <= sizeof(stack_to_sign)) ? stack_to_sign : malloc(to_sign_len);
+    if (!to_sign) {
+        packet[10] = (uint8_t)(orig_arcount >> 8);
+        packet[11] = (uint8_t)(orig_arcount & 0xFF);
+        return -1;
+    }
+    memcpy(to_sign, packet, *packet_len);
+    memcpy(to_sign + *packet_len, sig_rdata_prefix, p);
+
+    // 4. EVP_DigestSign で署名
+    const EVP_MD *md = NULL;
+    if (key->algorithm == 8 || key->algorithm == 13) {
+        md = EVP_sha256();
+    } else if (key->algorithm == 15) {
+        md = NULL; // Ed25519 requires md = NULL
+    } else {
+        if (to_sign != stack_to_sign) free(to_sign);
+        packet[10] = (uint8_t)(orig_arcount >> 8);
+        packet[11] = (uint8_t)(orig_arcount & 0xFF);
+        return -1;
+    }
+
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        if (to_sign != stack_to_sign) free(to_sign);
+        packet[10] = (uint8_t)(orig_arcount >> 8);
+        packet[11] = (uint8_t)(orig_arcount & 0xFF);
+        return -1;
+    }
+
+    unsigned char raw_sig[1024];
+    size_t raw_sig_len = sizeof(raw_sig);
+    bool ok = false;
+    if (EVP_DigestSignInit(mdctx, NULL, md, NULL, key->pkey) == 1 &&
+        EVP_DigestSign(mdctx, raw_sig, &raw_sig_len, to_sign, to_sign_len) == 1) {
+        ok = true;
+    }
+    EVP_MD_CTX_free(mdctx);
+    if (to_sign != stack_to_sign) free(to_sign);
+    if (!ok) {
+        packet[10] = (uint8_t)(orig_arcount >> 8);
+        packet[11] = (uint8_t)(orig_arcount & 0xFF);
+        return -1;
+    }
+
+    unsigned char sig[1024];
+    size_t sig_len = 0;
+    if (key->algorithm == 13) {
+        const unsigned char *der_ptr = raw_sig;
+        ECDSA_SIG *sig_obj = d2i_ECDSA_SIG(NULL, &der_ptr, (long)raw_sig_len);
+        if (!sig_obj) {
+            packet[10] = (uint8_t)(orig_arcount >> 8);
+            packet[11] = (uint8_t)(orig_arcount & 0xFF);
+            return -1;
+        }
+        const BIGNUM *r = NULL, *s = NULL;
+        ECDSA_SIG_get0(sig_obj, &r, &s);
+        if (!r || !s) {
+            ECDSA_SIG_free(sig_obj);
+            packet[10] = (uint8_t)(orig_arcount >> 8);
+            packet[11] = (uint8_t)(orig_arcount & 0xFF);
+            return -1;
+        }
+        memset(sig, 0, 64);
+        if (BN_bn2binpad(r, sig, 32) != 32 || BN_bn2binpad(s, sig + 32, 32) != 32) {
+            ECDSA_SIG_free(sig_obj);
+            packet[10] = (uint8_t)(orig_arcount >> 8);
+            packet[11] = (uint8_t)(orig_arcount & 0xFF);
+            return -1;
+        }
+        ECDSA_SIG_free(sig_obj);
+        sig_len = 64;
+    } else if (key->algorithm == 15) {
+        if (raw_sig_len != 64) {
+            packet[10] = (uint8_t)(orig_arcount >> 8);
+            packet[11] = (uint8_t)(orig_arcount & 0xFF);
+            return -1;
+        }
+        memcpy(sig, raw_sig, 64);
+        sig_len = 64;
+    } else if (key->algorithm == 8) {
+        if (raw_sig_len > sizeof(sig)) {
+            packet[10] = (uint8_t)(orig_arcount >> 8);
+            packet[11] = (uint8_t)(orig_arcount & 0xFF);
+            return -1;
+        }
+        memcpy(sig, raw_sig, raw_sig_len);
+        sig_len = raw_sig_len;
+    } else {
+        packet[10] = (uint8_t)(orig_arcount >> 8);
+        packet[11] = (uint8_t)(orig_arcount & 0xFF);
+        return -1;
+    }
+
+    // 5. 厳格なバッファ境界チェック
+    size_t off = *packet_len;
+    size_t total_sig_rr_len = 1 + 10 + p + sig_len;
+    if (off + total_sig_rr_len > max_len) {
+        fprintf(stderr, "error: packet buffer too small for SIG(0) RR (need %zu, max %zu)\n",
+                off + total_sig_rr_len, max_len);
+        packet[10] = (uint8_t)(orig_arcount >> 8);
+        packet[11] = (uint8_t)(orig_arcount & 0xFF);
+        return -1;
+    }
+
+    // 6. SIG(0) RR をパケットに追記 (owner=".", TYPE=24, CLASS=255, TTL=0)
+    packet[off++] = 0; // owner = root
+    packet[off++] = 0; packet[off++] = 24;  // TYPE = SIG
+    packet[off++] = 0; packet[off++] = 255; // CLASS = ANY
+    memset(&packet[off], 0, 4); off += 4;   // TTL = 0
+    uint16_t rdlen = (uint16_t)(p + sig_len);
+    packet[off++] = (uint8_t)(rdlen >> 8);
+    packet[off++] = (uint8_t)(rdlen & 0xFF);
+    memcpy(&packet[off], sig_rdata_prefix, p); off += p;
+    memcpy(&packet[off], sig, sig_len); off += sig_len;
+
+    *packet_len = off;
     return 0;
 }
 
