@@ -269,6 +269,12 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
     rec->type_code = type_code;
     rec->ttl_value = (uint32_t)ttl;
     rec->class_val = 1; // IN
+    rec->class_str = "IN";
+    char *ttl_buf = arena_alloc(arena, 16);
+    if (ttl_buf) {
+        snprintf(ttl_buf, 16, "%lu", ttl);
+        rec->ttl = ttl_buf;
+    }
 
     bool has_ttd = false;
     time_t ttd = 0;

@@ -165,6 +165,12 @@ typedef struct {
   uint32_t initial_soa_serial;
   uint32_t client_serial;
   char initial_soa_name[256];
+  // KariDNS Extended AXFR state:
+  bool is_extended_mode;
+  char current_loc_tag[64];
+  bool has_current_loc_tag;
+  char current_ecs_tag[64];
+  bool has_current_ecs_tag;
 } axfr_session_t;
 
 typedef struct {
@@ -593,6 +599,7 @@ static void start_connect_broker(void) {
           struct msghdr msg = {0};
           struct cmsghdr *cmsg;
           char buf[CMSG_SPACE(sizeof(int))];
+          memset(buf, 0, sizeof(buf));
           char data[1] = {0};
           struct iovec io = {.iov_base = data, .iov_len = 1};
           msg.msg_iov = &io;
@@ -623,6 +630,9 @@ static void start_connect_broker(void) {
   }
   close(sv[1]);
   g_broker_sock = sv[0];
+  cap_rights_t broker_rights;
+  cap_rights_init(&broker_rights, CAP_SEND, CAP_RECV, CAP_EVENT, CAP_FCNTL);
+  cap_rights_limit(g_broker_sock, &broker_rights);
 }
 
 static int broker_connect(int family, int type, struct sockaddr *addr,
@@ -647,6 +657,7 @@ static int broker_connect(int family, int type, struct sockaddr *addr,
   struct msghdr msg = {0};
   struct cmsghdr *cmsg;
   char buf[CMSG_SPACE(sizeof(int))];
+  memset(buf, 0, sizeof(buf));
   char data[1] = {1};
   struct iovec io = {.iov_base = data, .iov_len = 1};
   msg.msg_iov = &io;
@@ -1226,6 +1237,8 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
       txn->deleted[d_idx].ttl = arena_strdup(&txn->arena, old_arena->records[i].ttl);
       txn->deleted[d_idx].class_str = arena_strdup(&txn->arena, old_arena->records[i].class_str);
       txn->deleted[d_idx].type = arena_strdup(&txn->arena, old_arena->records[i].type);
+      txn->deleted[d_idx].ecs_subnet_tag = old_arena->records[i].ecs_subnet_tag ? arena_strdup(&txn->arena, old_arena->records[i].ecs_subnet_tag) : NULL;
+      txn->deleted[d_idx].bind_location_tag = old_arena->records[i].bind_location_tag ? arena_strdup(&txn->arena, old_arena->records[i].bind_location_tag) : NULL;
       for (int j = 0; j < old_arena->records[i].rdata_count; j++) {
          txn->deleted[d_idx].rdata[j] = arena_strdup(&txn->arena, old_arena->records[i].rdata[j]);
       }
@@ -1247,6 +1260,8 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
       txn->added[a_idx].ttl = arena_strdup(&txn->arena, new_arena->records[i].ttl);
       txn->added[a_idx].class_str = arena_strdup(&txn->arena, new_arena->records[i].class_str);
       txn->added[a_idx].type = arena_strdup(&txn->arena, new_arena->records[i].type);
+      txn->added[a_idx].ecs_subnet_tag = new_arena->records[i].ecs_subnet_tag ? arena_strdup(&txn->arena, new_arena->records[i].ecs_subnet_tag) : NULL;
+      txn->added[a_idx].bind_location_tag = new_arena->records[i].bind_location_tag ? arena_strdup(&txn->arena, new_arena->records[i].bind_location_tag) : NULL;
       for (int j = 0; j < new_arena->records[i].rdata_count; j++) {
          txn->added[a_idx].rdata[j] = arena_strdup(&txn->arena, new_arena->records[i].rdata[j]);
       }
@@ -1524,6 +1539,7 @@ static void prelink_zone_additional_glue(zone_arena_t *current_zone,
         d_rec->class_str = src_rec->class_str ? arena_strdup(current_zone, src_rec->class_str) : NULL;
         d_rec->type = src_rec->type ? arena_strdup(current_zone, src_rec->type) : NULL;
         d_rec->ecs_subnet_tag = src_rec->ecs_subnet_tag ? arena_strdup(current_zone, src_rec->ecs_subnet_tag) : NULL;
+        d_rec->bind_location_tag = src_rec->bind_location_tag ? arena_strdup(current_zone, src_rec->bind_location_tag) : NULL;
         for (int r = 0; r < src_rec->rdata_count && r < MAX_RDATA; r++) {
           d_rec->rdata[r] = src_rec->rdata[r] ? arena_strdup(current_zone, src_rec->rdata[r]) : NULL;
         }
@@ -1582,6 +1598,12 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   free(z_standby->locations);
   z_standby->locations = NULL;
   z_standby->location_count = 0;
+  free_ecs_tags_array(z_standby->bind_location_tags, z_standby->bind_location_tag_count);
+  z_standby->bind_location_tags = NULL;
+  z_standby->bind_location_tag_count = 0;
+  free_ecs_tags_array(z_standby->bind_ecs_tags, z_standby->bind_ecs_tag_count);
+  z_standby->bind_ecs_tags = NULL;
+  z_standby->bind_ecs_tag_count = 0;
   z_standby->count = 0;
   z_standby->data_pool_count = 0;
   z_standby->current_pool_cap = 0;
@@ -1593,6 +1615,7 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
 
   char *root_ttl = NULL;
   char *root_ecs_tag = NULL;
+  char *root_loc_tag = NULL;
   char *visited_paths[16];
   dev_t visited_devs[16];
   ino_t visited_inos[16];
@@ -1620,6 +1643,7 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   ctx.load_file_cb = server_load_file_cb;
   ctx.shared_ttl_io = &root_ttl;
   ctx.shared_ecs_tag_io = &root_ecs_tag;
+  ctx.shared_loc_tag_io = &root_loc_tag;
   ctx.visited_paths = visited_paths;
   ctx.visited_devs = visited_devs;
   ctx.visited_inos = visited_inos;
@@ -2888,6 +2912,16 @@ static void zone_arena_clear_data_pools(zone_arena_t *arena) {
     arena->locations = NULL;
     arena->location_count = 0;
   }
+  if (arena->bind_location_tags) {
+    free_ecs_tags_array(arena->bind_location_tags, arena->bind_location_tag_count);
+    arena->bind_location_tags = NULL;
+    arena->bind_location_tag_count = 0;
+  }
+  if (arena->bind_ecs_tags) {
+    free_ecs_tags_array(arena->bind_ecs_tags, arena->bind_ecs_tag_count);
+    arena->bind_ecs_tags = NULL;
+    arena->bind_ecs_tag_count = 0;
+  }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
   arena->count = 0;
@@ -2906,6 +2940,18 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
       dst->location_count = src->location_count;
     }
   }
+  if (src->bind_location_tag_count > 0 && src->bind_location_tags) {
+    dst->bind_location_tags = clone_ecs_tags_array(src->bind_location_tags, src->bind_location_tag_count);
+    if (dst->bind_location_tags) {
+      dst->bind_location_tag_count = src->bind_location_tag_count;
+    }
+  }
+  if (src->bind_ecs_tag_count > 0 && src->bind_ecs_tags) {
+    dst->bind_ecs_tags = clone_ecs_tags_array(src->bind_ecs_tags, src->bind_ecs_tag_count);
+    if (dst->bind_ecs_tags) {
+      dst->bind_ecs_tag_count = src->bind_ecs_tag_count;
+    }
+  }
   for (size_t i = 0; i < src->count; i++) {
     if (dst->count >= dst->records_cap) {
       size_t new_cap = dst->records_cap == 0 ? 16 : dst->records_cap * 2;
@@ -2921,10 +2967,13 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     }
     dns_record_t *s_rec = &src->records[i];
     dns_record_t *d_rec = &dst->records[dst->count++];
+    memset(d_rec, 0, sizeof(*d_rec));
     d_rec->name = arena_strdup(dst, s_rec->name);
-    d_rec->ttl = arena_strdup(dst, s_rec->ttl);
+    d_rec->ttl = s_rec->ttl ? arena_strdup(dst, s_rec->ttl) : NULL;
+    d_rec->ttl_value = s_rec->ttl_value;
     d_rec->class_str =
         s_rec->class_str ? arena_strdup(dst, s_rec->class_str) : NULL;
+    d_rec->class_val = s_rec->class_val;
     d_rec->type = s_rec->type ? arena_strdup(dst, s_rec->type) : NULL;
     d_rec->type_code = s_rec->type_code;
     d_rec->tinydns_ttd = s_rec->tinydns_ttd;
@@ -2932,9 +2981,10 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     d_rec->tinydns_loc[0] = s_rec->tinydns_loc[0];
     d_rec->tinydns_loc[1] = s_rec->tinydns_loc[1];
     d_rec->ecs_subnet_tag = s_rec->ecs_subnet_tag ? arena_strdup(dst, s_rec->ecs_subnet_tag) : NULL;
+    d_rec->bind_location_tag = s_rec->bind_location_tag ? arena_strdup(dst, s_rec->bind_location_tag) : NULL;
     d_rec->rdata_count = s_rec->rdata_count;
     for (int j = 0; j < s_rec->rdata_count; j++)
-      d_rec->rdata[j] = arena_strdup(dst, s_rec->rdata[j]);
+      d_rec->rdata[j] = s_rec->rdata[j] ? arena_strdup(dst, s_rec->rdata[j]) : NULL;
     d_rec->generic_len = s_rec->generic_len;
     if (s_rec->generic_len > 0 && s_rec->generic_data) {
       d_rec->generic_data = (uint8_t *)arena_alloc(dst, s_rec->generic_len);
@@ -2946,6 +2996,164 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     d_rec->is_cached = false;
     dns_record_preparse_cache(dst, d_rec);
   }
+}
+
+static const char *strchr_unescaped(const char *s, char c);
+
+static size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def) {
+  if (!def || !buf) return 0;
+  size_t tag_len = strlen(def->tag) + 1;
+  if (tag_len + 2 > buf_cap) return 0;
+  memcpy(buf, def->tag, tag_len);
+  size_t off = tag_len;
+  buf[off++] = (def->cidr_count >> 8) & 0xFF;
+  buf[off++] = def->cidr_count & 0xFF;
+  for (int j = 0; j < def->cidr_count; j++) {
+    size_t c_len = strlen(def->cidrs[j].cidr) + 1;
+    if (off + c_len > buf_cap) return 0;
+    memcpy(buf + off, def->cidrs[j].cidr, c_len);
+    off += c_len;
+  }
+  return off;
+}
+
+static bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out) {
+  if (!data || len < 3 || !defs_out || !count_out) return false;
+  size_t off = 0;
+  const char *tag = (const char *)&data[off];
+  size_t tag_len = strnlen(tag, len - off);
+  if (off + tag_len + 1 + 2 > len) return false;
+  off += tag_len + 1;
+  uint16_t cidr_count = (data[off] << 8) | data[off + 1];
+  off += 2;
+
+  ecs_tag_def_t def;
+  memset(&def, 0, sizeof(def));
+  def.tag = strdup(tag);
+  if (!def.tag) return false;
+  def.cidrs = (cidr_count > 0) ? calloc(cidr_count, sizeof(ecs_cidr_entry_t)) : NULL;
+  if (cidr_count > 0 && !def.cidrs) {
+    free(def.tag);
+    return false;
+  }
+  def.cidr_count = cidr_count;
+
+  for (int j = 0; j < cidr_count; j++) {
+    if (off >= len) {
+      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
+      free(def.cidrs);
+      free(def.tag);
+      return false;
+    }
+    const char *cidr_str = (const char *)&data[off];
+    size_t clen = strnlen(cidr_str, len - off);
+    if (off + clen + 1 > len) {
+      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
+      free(def.cidrs);
+      free(def.tag);
+      return false;
+    }
+    def.cidrs[j].cidr = strdup(cidr_str);
+    if (!def.cidrs[j].cidr) {
+      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
+      free(def.cidrs);
+      free(def.tag);
+      return false;
+    }
+    off += clen + 1;
+  }
+
+  int cur_count = *count_out;
+  ecs_tag_def_t *new_defs = realloc(*defs_out, (cur_count + 1) * sizeof(ecs_tag_def_t));
+  if (!new_defs) {
+    for (int k = 0; k < cidr_count; k++) free(def.cidrs[k].cidr);
+    free(def.cidrs);
+    free(def.tag);
+    return false;
+  }
+  new_defs[cur_count] = def;
+  *defs_out = new_defs;
+  *count_out = cur_count + 1;
+  return true;
+}
+
+static bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_entry_t **locs_out, int *count_out) {
+  if (!data || len < 3 || !locs_out || !count_out) return false;
+  char code[2] = { (char)data[0], (char)data[1] };
+  uint8_t prefix_len = data[2];
+  if (3 + prefix_len > len || prefix_len > 4) return false;
+
+  tinydns_location_entry_t loc;
+  memset(&loc, 0, sizeof(loc));
+  loc.code[0] = code[0];
+  loc.code[1] = code[1];
+  loc.prefix_len = prefix_len;
+  if (prefix_len > 0) {
+    memcpy(loc.prefix, &data[3], prefix_len);
+  }
+
+  int cur_count = *count_out;
+  tinydns_location_entry_t *new_locs = realloc(*locs_out, (cur_count + 1) * sizeof(tinydns_location_entry_t));
+  if (!new_locs) return false;
+  new_locs[cur_count] = loc;
+  *locs_out = new_locs;
+  *count_out = cur_count + 1;
+  return true;
+}
+
+static bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
+  if (!rec || !out_wrap || !wrap_buf) return false;
+  uint8_t tmp_wire[4096];
+  uint16_t tmp_off = 0;
+  compress_ctx_t dummy_comp;
+  memset(&dummy_comp, 0, sizeof(dummy_comp));
+  compress_ctx_init_packet(&dummy_comp);
+  if (serialize_dns_record(tmp_wire, sizeof(tmp_wire), &tmp_off, (dns_record_t *)rec, &dummy_comp, NULL, 0xFFFFFFFF) < 0) {
+    return false;
+  }
+  size_t p = 0;
+  if (skip_wire_name(tmp_wire, tmp_off, 0, &p) != 0) return false;
+  if (p + 10 > tmp_off) return false;
+  uint16_t orig_type = (tmp_wire[p] << 8) | tmp_wire[p+1];
+  uint16_t orig_class = (tmp_wire[p+2] << 8) | tmp_wire[p+3];
+  uint32_t orig_ttl = ((uint32_t)tmp_wire[p+4] << 24) | ((uint32_t)tmp_wire[p+5] << 16) | ((uint32_t)tmp_wire[p+6] << 8) | tmp_wire[p+7];
+  uint16_t orig_rdlen = (tmp_wire[p+8] << 8) | tmp_wire[p+9];
+  if (p + 10 + orig_rdlen > tmp_off) return false;
+  const uint8_t *orig_rdata = &tmp_wire[p+10];
+
+  size_t total_wrap_len = 21 + orig_rdlen;
+  if (total_wrap_len > wrap_buf_cap) return false;
+
+  wrap_buf[0] = (orig_type >> 8) & 0xFF;
+  wrap_buf[1] = orig_type & 0xFF;
+  wrap_buf[2] = (orig_class >> 8) & 0xFF;
+  wrap_buf[3] = orig_class & 0xFF;
+  wrap_buf[4] = (orig_ttl >> 24) & 0xFF;
+  wrap_buf[5] = (orig_ttl >> 16) & 0xFF;
+  wrap_buf[6] = (orig_ttl >> 8) & 0xFF;
+  wrap_buf[7] = orig_ttl & 0xFF;
+  wrap_buf[8] = (uint8_t)rec->tinydns_loc[0];
+  wrap_buf[9] = (uint8_t)rec->tinydns_loc[1];
+  uint64_t ttd = (uint64_t)rec->tinydns_ttd;
+  for (int b = 0; b < 8; b++) {
+    wrap_buf[10 + b] = (ttd >> ((7 - b) * 8)) & 0xFF;
+  }
+  wrap_buf[18] = rec->tinydns_ttl_countdown ? 1 : 0;
+  wrap_buf[19] = (orig_rdlen >> 8) & 0xFF;
+  wrap_buf[20] = orig_rdlen & 0xFF;
+  if (orig_rdlen > 0) {
+    memcpy(&wrap_buf[21], orig_rdata, orig_rdlen);
+  }
+
+  memset(out_wrap, 0, sizeof(*out_wrap));
+  out_wrap->name = rec->name;
+  out_wrap->type_code = DNS_TYPE_KARIDNS_TINYDNS_WRAP;
+  out_wrap->class_val = DNS_CLASS_KARIDNS_EXT;
+  out_wrap->class_str = "KARIDNS";
+  out_wrap->ttl_value = rec->ttl_value;
+  out_wrap->generic_data = wrap_buf;
+  out_wrap->generic_len = total_wrap_len;
+  return true;
 }
 
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
@@ -2962,6 +3170,24 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       return -1;
     offset = next_offset + 4;
   }
+
+  // Check EDNS OPT Option 65153 on the initial packet
+  if (session->soa_count == 0) {
+    uint16_t nscount = (packet[8] << 8) | packet[9];
+    uint16_t arcount = (packet[10] << 8) | packet[11];
+    if (arcount > 0) {
+      edns_info_t edns = {0};
+      if (parse_edns_opt(packet, packet_len, qdcount, ancount, nscount, arcount, &edns) == 0) {
+        if (edns.has_karidns_ext && edns.karidns_ext_version == KARIDNS_EXT_VERSION) {
+          uint32_t exp_hash = calc_fnv1a_str(domain);
+          if (edns.karidns_ext_hash == exp_hash) {
+            session->is_extended_mode = true;
+          }
+        }
+      }
+    }
+  }
+
   size_t domain_len = strlen(domain);
   for (int i = 0; i < ancount; i++) {
     if (standby->count >= standby->records_cap) {
@@ -2978,11 +3204,132 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       standby->records_cap = new_cap;
     }
     dns_record_t *rec = &standby->records[standby->count];
+    memset(rec, 0, sizeof(*rec));
     uint16_t type;
     if (parse_resource_record(packet, packet_len, &offset, standby, rec,
                               &type) != 0)
       return -1;
     standby->count++;
+
+    // KariDNS Extended AXFR record interception:
+    if (rec->class_val == DNS_CLASS_KARIDNS_EXT) {
+      if (type == DNS_TYPE_KARIDNS_LOC_STATE) {
+        standby->count--;
+        if (rec->generic_data && rec->generic_len > 0) {
+          size_t copy_len = rec->generic_len < sizeof(session->current_loc_tag) - 1 ? rec->generic_len : sizeof(session->current_loc_tag) - 1;
+          memcpy(session->current_loc_tag, rec->generic_data, copy_len);
+          session->current_loc_tag[copy_len] = '\0';
+          session->has_current_loc_tag = true;
+        } else {
+          session->current_loc_tag[0] = '\0';
+          session->has_current_loc_tag = false;
+        }
+        continue;
+      } else if (type == DNS_TYPE_KARIDNS_ECS_STATE) {
+        standby->count--;
+        if (rec->generic_data && rec->generic_len > 0) {
+          size_t copy_len = rec->generic_len < sizeof(session->current_ecs_tag) - 1 ? rec->generic_len : sizeof(session->current_ecs_tag) - 1;
+          memcpy(session->current_ecs_tag, rec->generic_data, copy_len);
+          session->current_ecs_tag[copy_len] = '\0';
+          session->has_current_ecs_tag = true;
+        } else {
+          session->current_ecs_tag[0] = '\0';
+          session->has_current_ecs_tag = false;
+        }
+        continue;
+      } else if (type == DNS_TYPE_KARIDNS_LOC_TAGDEF) {
+        standby->count--;
+        unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_location_tags, &standby->bind_location_tag_count);
+        continue;
+      } else if (type == DNS_TYPE_KARIDNS_ECS_TAGDEF) {
+        standby->count--;
+        unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_tags, &standby->bind_ecs_tag_count);
+        continue;
+      } else if (type == DNS_TYPE_KARIDNS_TINYDNS_LOCDEF) {
+        standby->count--;
+        standby->is_tinydns_format = true;
+        unpack_tinydns_loc_rdata(rec->generic_data, rec->generic_len, &standby->locations, &standby->location_count);
+        continue;
+      } else if (type == DNS_TYPE_KARIDNS_TINYDNS_WRAP) {
+        standby->is_tinydns_format = true;
+        if (rec->generic_data && rec->generic_len >= 21) {
+          uint16_t orig_type = (rec->generic_data[0] << 8) | rec->generic_data[1];
+          uint16_t orig_class = (rec->generic_data[2] << 8) | rec->generic_data[3];
+          uint32_t orig_ttl = ((uint32_t)rec->generic_data[4] << 24) | ((uint32_t)rec->generic_data[5] << 16) | ((uint32_t)rec->generic_data[6] << 8) | rec->generic_data[7];
+          char loc[2] = { (char)rec->generic_data[8], (char)rec->generic_data[9] };
+          uint64_t ttd = 0;
+          for (int b = 0; b < 8; b++) {
+            ttd = (ttd << 8) | rec->generic_data[10 + b];
+          }
+          uint8_t flags = rec->generic_data[18];
+          uint16_t orig_rdlen = (rec->generic_data[19] << 8) | rec->generic_data[20];
+          if (21 + orig_rdlen <= rec->generic_len) {
+            uint8_t fake_wire[4096];
+            size_t fake_len = 0;
+            const char *d = rec->name;
+            while (*d) {
+              const char *dot = strchr_unescaped(d, '.');
+              size_t len = dot ? (size_t)(dot - d) : strlen(d);
+              if (len > 63) len = 63;
+              if (fake_len + len + 2 > sizeof(fake_wire) - 100) break;
+              fake_wire[fake_len++] = (uint8_t)len;
+              memcpy(&fake_wire[fake_len], d, len);
+              fake_len += len;
+              if (!dot) break;
+              d = dot + 1;
+            }
+            fake_wire[fake_len++] = 0;
+            fake_wire[fake_len++] = (orig_type >> 8) & 0xFF;
+            fake_wire[fake_len++] = orig_type & 0xFF;
+            fake_wire[fake_len++] = (orig_class >> 8) & 0xFF;
+            fake_wire[fake_len++] = orig_class & 0xFF;
+            fake_wire[fake_len++] = (orig_ttl >> 24) & 0xFF;
+            fake_wire[fake_len++] = (orig_ttl >> 16) & 0xFF;
+            fake_wire[fake_len++] = (orig_ttl >> 8) & 0xFF;
+            fake_wire[fake_len++] = orig_ttl & 0xFF;
+            fake_wire[fake_len++] = (orig_rdlen >> 8) & 0xFF;
+            fake_wire[fake_len++] = orig_rdlen & 0xFF;
+            if (orig_rdlen > 0) {
+              memcpy(&fake_wire[fake_len], &rec->generic_data[21], orig_rdlen);
+              fake_len += orig_rdlen;
+            }
+            size_t fake_off = 0;
+            uint16_t parsed_t;
+            dns_record_t unwrapped;
+            memset(&unwrapped, 0, sizeof(unwrapped));
+            if (parse_resource_record(fake_wire, fake_len, &fake_off, standby, &unwrapped, &parsed_t) == 0) {
+              *rec = unwrapped;
+              type = parsed_t;
+            } else {
+              rec->generic_data = NULL;
+              rec->generic_len = 0;
+              rec->type_code = orig_type;
+              rec->class_val = orig_class;
+              rec->ttl_value = orig_ttl;
+              rec->type = (char *)get_type_str(orig_type, standby);
+              rec->class_str = (orig_class == 1) ? "IN" : "CH";
+              char *ttl_buf = arena_alloc(standby, 16);
+              if (ttl_buf) {
+                snprintf(ttl_buf, 16, "%u", orig_ttl);
+                rec->ttl = ttl_buf;
+              }
+              type = orig_type;
+            }
+          }
+          rec->tinydns_loc[0] = loc[0];
+          rec->tinydns_loc[1] = loc[1];
+          rec->tinydns_ttd = ttd;
+          rec->tinydns_ttl_countdown = (flags & 1) ? true : false;
+        }
+      }
+    }
+
+    if (session->has_current_loc_tag && session->current_loc_tag[0] != '\0') {
+      rec->bind_location_tag = arena_strdup(standby, session->current_loc_tag);
+    }
+    if (session->has_current_ecs_tag && session->current_ecs_tag[0] != '\0') {
+      rec->ecs_subnet_tag = arena_strdup(standby, session->current_ecs_tag);
+    }
     size_t name_len = strlen(rec->name);
     if (name_len < domain_len ||
         strcasecmp(rec->name + name_len - domain_len, domain) != 0)
@@ -3261,12 +3608,18 @@ static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
 }
 
 /* ecs-tags を先頭から線形探索し、最初に一致したtagの名前を返す。
- * ゾーン側にecs_tagsが定義されていればそちらを、なければグローバル
- * (cfg->ecs_tags)を使う。一致なしならNULL。 */
-static const char *resolve_ecs_subnet_tag(const server_config_t *cfg, const zone_config_t *zcfg,
+ * 1. ゾーン定義 (zone->bind_ecs_tags)
+ * 2. ゾーン設定 (zcfg->ecs_tags)
+ * 3. グローバル設定 (cfg->ecs_tags) */
+static const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                           const uint8_t *addr, uint16_t family) {
-    ecs_tag_def_t *tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
-    int tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+    const ecs_tag_def_t *tags = (zone && zone->bind_ecs_tags && zone->bind_ecs_tag_count > 0)
+                                 ? zone->bind_ecs_tags : NULL;
+    int tag_count = tags ? zone->bind_ecs_tag_count : 0;
+    if (!tags) {
+        tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
+        tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+    }
     if (!tags || tag_count == 0 || !addr) return NULL;
 
     char ip_buf[INET6_ADDRSTRLEN];
@@ -3277,6 +3630,33 @@ static const char *resolve_ecs_subnet_tag(const server_config_t *cfg, const zone
     for (int i = 0; i < tag_count; i++) {
         for (int j = 0; j < tags[i].cidr_count; j++) {
             if (match_cidr(ip_buf, tags[i].cidrs[j].cidr)) {
+                return tags[i].tag;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* location-tags を先頭から線形探索し、最初に一致したtagの名前を返す。
+ * 1. ゾーン定義 (zone->bind_location_tags)
+ * 2. ゾーン設定 (zcfg->ecs_tags)
+ * 3. グローバル設定 (cfg->ecs_tags) */
+static const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
+                                             const char *client_ip) {
+    if (!client_ip) return NULL;
+
+    const ecs_tag_def_t *tags = (zone && zone->bind_location_tags && zone->bind_location_tag_count > 0)
+                                 ? zone->bind_location_tags : NULL;
+    int tag_count = tags ? zone->bind_location_tag_count : 0;
+    if (!tags) {
+        tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
+        tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+    }
+    if (!tags || tag_count == 0) return NULL;
+
+    for (int i = 0; i < tag_count; i++) {
+        for (int j = 0; j < tags[i].cidr_count; j++) {
+            if (match_cidr(client_ip, tags[i].cidrs[j].cidr)) {
                 return tags[i].tag;
             }
         }
@@ -3314,11 +3694,12 @@ static void tinydns_resolve_client_location(const zone_arena_t *zone, const char
  * (通常のレコードならrec->ttl_valueをそのままコピーするだけ)。
  * 含めるべきでなければfalseを返す(呼び出し側はこのレコードを無視する)。
  *
- * rec->tinydns_ttd == 0 かつ location未指定・ECSタグ未指定の場合(制限のないレコード)
+ * rec->tinydns_ttd == 0 かつ location未指定・ECSタグ未指定・LOCATIONタグ未指定の場合(制限のないレコード)
  * は即座にtrueを返す。 */
 static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
                                                    const char client_loc[2],
                                                    const char *client_ecs_tag,
+                                                   const char *client_loc_tag,
                                                    uint32_t *effective_ttl_out) {
     if (rec->tinydns_loc[0] != 0 || rec->tinydns_loc[1] != 0) {
         if (rec->tinydns_loc[0] != client_loc[0] || rec->tinydns_loc[1] != client_loc[1]) {
@@ -3327,6 +3708,11 @@ static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_
     }
     if (rec->ecs_subnet_tag != NULL) {
         if (client_ecs_tag == NULL || strcasecmp(rec->ecs_subnet_tag, client_ecs_tag) != 0) {
+            return false;
+        }
+    }
+    if (rec->bind_location_tag != NULL) {
+        if (client_loc_tag == NULL || strcasecmp(rec->bind_location_tag, client_loc_tag) != 0) {
             return false;
         }
     }
@@ -3357,6 +3743,7 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 compress_ctx_t *comp_ctx, uint16_t *arcount,
                                 const char client_loc[2],
                                 const char *client_ecs_tag,
+                                const char *client_loc_tag,
                                 additional_from_auth_t policy) {
   if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
 
@@ -3369,7 +3756,7 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
           dns_record_t *rec = entry->records[r];
           if (!rec) continue;
           uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
           dns_record_t rec_copy = *rec;
           rec_copy.ttl_value = eff_ttl;
           uint16_t saved_offset = *offset;
@@ -3400,7 +3787,7 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
       if ((rec->type_code == 1 || rec->type_code == 28) &&
           strcasecmp(rec->name, target) == 0) {
         uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
         dns_record_t rec_copy = *rec;
         rec_copy.ttl_value = eff_ttl;
         uint16_t saved_offset = *offset;
@@ -3452,6 +3839,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             uint16_t *arcount, bool is_ds_query,
                             const char client_loc[2],
                             const char *client_ecs_tag,
+                            const char *client_loc_tag,
                             additional_from_auth_t policy) {
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
@@ -3476,7 +3864,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
       if (rec->type_code == 2 &&
           strcasecmp(rec->name, name) == 0) {
         uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
         delegated = true;
         dns_record_t rec_copy = *rec;
         rec_copy.ttl_value = eff_ttl;
@@ -3498,7 +3886,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
             current_zone->records[i].rdata_count > 0) {
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
-                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, policy)) {
+                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy)) {
             res[2] |= 0x02;
             return true;
           }
@@ -3566,7 +3954,7 @@ static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
   return NULL;
 }
 
-static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag) {
+static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
   size_t name_len = strlen(name);
   time_t tinydns_now = (zone && zone->is_tinydns_format) ? time(NULL) : 0;
@@ -3578,7 +3966,7 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char
     dns_record_t *rec = &zone->records[i];
     if (strcasecmp(rec->name, name) == 0) {
       uint32_t eff_ttl;
-      if (tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) return true;
+      if (tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) return true;
     }
   }
 
@@ -3609,7 +3997,7 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char
   return false;
 }
 
-static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag) {
+static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
     return zone_apex;
   const char *parent = qname;
@@ -3629,7 +4017,7 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
       }
     }
 
-    if (name_exists_in_zone(zone, parent, client_loc, client_ecs_tag)) {
+    if (name_exists_in_zone(zone, parent, client_loc, client_ecs_tag, client_loc_tag)) {
       return parent;
     }
   }
@@ -3671,17 +4059,18 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     char client_loc[2] = {0, 0};
     tinydns_resolve_client_location(current_zone, client_ip, client_loc);
 
+    zone_config_t *zcfg = (cfg && db_entry) ? find_zone_config_in_view(cfg, db_entry->view_name, db_entry->domain) : NULL;
+    const char *client_loc_tag = resolve_bind_location_tag(current_zone, cfg, zcfg, client_ip);
     const char *client_ecs_tag = NULL;
     if (ecs_trusted && ecs_addr) {
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, db_entry->view_name, db_entry->domain);
-      client_ecs_tag = resolve_ecs_subnet_tag(cfg, zcfg, ecs_addr, ecs_family);
+      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family);
     }
     
     // ==== フェーズ1: 委任判定 ====
     additional_from_auth_t policy = cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES;
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, policy))
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====
@@ -3696,7 +4085,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         dns_record_t *rec = &current_zone->records[i];
         if (strcasecmp(rec->name, current_qname) == 0) {
           uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
           name_exists = true;
           if (rec->type_code == 5) has_cname = true;   // CNAME
           if (rec->type_code == 46) has_rrsig = true;  // RRSIG
@@ -3731,7 +4120,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       dns_record_t *rec = &current_zone->records[i];
       if (strcasecmp(rec->name, current_qname) == 0) {
         uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
         found = true;
         uint16_t rec_type = rec->type_code;
         bool follow_cname = false;
@@ -3795,7 +4184,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           dns_record_t *rec = &current_zone->records[i];
           if (rec->type_code == 39 && strcasecmp(rec->name, dname_parent) == 0) {
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             dname_found = true;
             size_t prefix_len = dname_parent - current_qname;
             if (rec->rdata_count == 0) break;
@@ -3853,7 +4242,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           dns_record_t *rec = &current_zone->records[i];
           if (strcasecmp(rec->name, wc_name) == 0) {
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             found = true;
             wc_found = true;
             uint16_t rec_type = rec->type_code;
@@ -3907,7 +4296,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         if (wc_found)
           break;
 
-        if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag))
+        if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag, client_loc_tag))
           break;
         }
       }
@@ -3984,7 +4373,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           dns_record_t *rec = &current_zone->records[i];
           if (strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             qtx_matched = true;
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
@@ -4017,7 +4406,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               dns_record_t *rec = &current_zone->records[i];
               if (strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
                 uint32_t eff_ttl;
-                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
                 wc_found = true; qtx_matched = true;
                 dns_record_t rec_copy = *rec;
                 rec_copy.ttl_value = eff_ttl;
@@ -4035,7 +4424,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             }
             if (wc_found || this_qtx_failed) break;
 
-            if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag))
+            if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag, client_loc_tag))
               break;
           }
         }
@@ -4066,7 +4455,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         if (rec->type_code == 6 &&
             strcasecmp(rec->name, db_entry->domain) == 0) {
           uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
           uint32_t minimum_ttl = 3600;
           if (rec->rdata_count >= 7)
             minimum_ttl = parse_ttl_value(rec->rdata[6]);
@@ -4102,7 +4491,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               strcasecmp(rec->name, current_qname) == 0) {
             if (rec->rdata_count < 1) break; // 壊れたNSECは無視
             uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
             if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
@@ -4135,7 +4524,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         }
 
         if (!nsec_failed) {
-          const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag);
+          const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag, client_loc_tag);
           if (encloser) {
             char wc_name[256];
             int written = snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
@@ -4179,7 +4568,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         if (rec->type_code == 2 &&
             strcasecmp(rec->name, db_entry->domain) == 0) {
           uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, &eff_ttl)) continue;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
           dns_record_t rec_copy = *rec;
           rec_copy.ttl_value = eff_ttl;
           if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
@@ -4201,7 +4590,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       for (int k = 0; k < glue_target_count; k++) {
         if (!append_glue_records(current_zone, glue_targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
-                                 client_loc, client_ecs_tag, policy)) {
+                                 client_loc, client_ecs_tag, client_loc_tag, policy)) {
           break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
         }
       }
@@ -5681,7 +6070,16 @@ void *axfr_bg_thread_func(void *arg) {
     tv.tv_usec = 0;
     setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
     setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
-    tcp_stream_ctx_t stream_ctx = {0};
+    tcp_stream_ctx_t *stream_ctx = calloc(1, sizeof(tcp_stream_ctx_t));
+    if (!stream_ctx) {
+      close(tcp_fd);
+      syslog(LOG_ERR, "[AXFR] Failed to allocate memory for stream_ctx");
+      if (ctx->entry)
+        atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
+      free(ctx);
+      atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
+      pthread_exit(NULL);
+    }
     axfr_session_t session = {0};
     uint8_t axfr_req[2048];
     uint16_t req_len = 0;
@@ -5755,8 +6153,18 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[req_len++] = 0x00;
     axfr_req[req_len++] = 0x00;
     axfr_req[req_len++] = 0x00;
+    uint32_t domain_hash = calc_fnv1a_str(ctx->domain);
+    axfr_req[req_len++] = 0x00; // RDLEN: 9
+    axfr_req[req_len++] = 0x09;
+    axfr_req[req_len++] = (EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF;
+    axfr_req[req_len++] = EDNS_OPTION_KARIDNS_EXT & 0xFF;
     axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 0x00;
+    axfr_req[req_len++] = 0x05; // Option Length: 5
+    axfr_req[req_len++] = KARIDNS_EXT_VERSION; // 1
+    axfr_req[req_len++] = (domain_hash >> 24) & 0xFF;
+    axfr_req[req_len++] = (domain_hash >> 16) & 0xFF;
+    axfr_req[req_len++] = (domain_hash >> 8) & 0xFF;
+    axfr_req[req_len++] = domain_hash & 0xFF;
     if (ctx->tsig_key) {
       size_t p_len = req_len - 2;
       tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
@@ -5767,7 +6175,7 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[0] = msg_len >> 8;
     axfr_req[1] = msg_len & 0xFF;
     if (send(tcp_fd, axfr_req, req_len, 0) == req_len) {
-      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, &stream_ctx, &session, ctx->tsig_key);
+      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, ctx->tsig_key);
       if (axfr_res == 1) {
         syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
       } else if (axfr_res == 2) {
@@ -5778,6 +6186,7 @@ void *axfr_bg_thread_func(void *arg) {
     } else {
       syslog(LOG_ERR, "[AXFR] Failed to send request for zone %s to %s", ctx->domain, ctx->master_ip);
     }
+    free(stream_ctx);
     close(tcp_fd);
   } else {
     syslog(LOG_ERR, "[AXFR] Failed to connect to %s for zone %s", ctx->master_ip, ctx->domain);
@@ -6411,6 +6820,29 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   size_t tsig_mac_len = req_mac_len;
   if (req_mac_len > 0) memcpy(tsig_mac, req_mac, req_mac_len);
   bool is_subsequent = false;
+  uint16_t req_qd = (req[4] << 8) | req[5];
+  uint16_t req_an = (req[6] << 8) | req[7];
+  uint16_t req_ns = (req[8] << 8) | req[9];
+  uint16_t req_ar = (req[10] << 8) | req[11];
+  edns_info_t req_edns = {0};
+  bool is_extended_axfr = false;
+  if (parse_edns_opt(req, req_len, req_qd, req_an, req_ns, req_ar, &req_edns) == 0) {
+    if (req_edns.has_karidns_ext && req_edns.karidns_ext_version == KARIDNS_EXT_VERSION) {
+      uint32_t exp_hash = calc_fnv1a_str(entry->domain);
+      if (req_edns.karidns_ext_hash == exp_hash) {
+        is_extended_axfr = true;
+      }
+    }
+  }
+  bool opt_sent = false;
+  edns_info_t resp_edns = {0};
+  if (is_extended_axfr) {
+    resp_edns.present = true;
+    resp_edns.has_karidns_ext = true;
+    resp_edns.karidns_ext_version = KARIDNS_EXT_VERSION;
+    resp_edns.karidns_ext_hash = calc_fnv1a_str(entry->domain);
+  }
+
   int soa_idx = -1;
   for (size_t i = 0; i < current_zone->count; i++) {
     if (current_zone->records[i].type_code == 6 &&
@@ -6430,6 +6862,10 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   ixfr_txn_t *txn_list[MAX_IXFR_HISTORY];
   int txn_count = 0;
   uint32_t current_serial = strtoul(current_zone->records[soa_idx].rdata[2], NULL, 10);
+
+  if (is_extended_axfr && is_ixfr) {
+    is_ixfr = false;
+  }
 
   if (is_ixfr && client_serial == current_serial) {
     send_ixfr = true;
@@ -6478,6 +6914,13 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   uint16_t prev_offset = offset; \
   if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
     *res_ancount = htons(answers); \
+    if (is_extended_axfr && !opt_sent) { \
+      uint16_t arcount = 0; \
+      assemble_edns_opt(res, 65535, &prev_offset, &arcount, &resp_edns, 0, true, NULL); \
+      res[10] = (arcount >> 8) & 0xFF; \
+      res[11] = arcount & 0xFF; \
+      opt_sent = true; \
+    } \
     if (tsig_key) { \
       size_t sign_len = prev_offset; \
       tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, NULL, 0, is_subsequent); \
@@ -6504,8 +6947,62 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   answers++; \
 } while (0)
 
+#define EMIT_ZONE_RECORD(r_ptr, cur_loc_io, cur_ecs_io) do { \
+  dns_record_t *rec_item = (r_ptr); \
+  if (!is_extended_axfr) { \
+    if (rec_item->bind_location_tag != NULL || \
+        rec_item->ecs_subnet_tag != NULL || \
+        rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 || \
+        rec_item->tinydns_ttd != 0) { \
+      /* Skip tagged records in fallback mode */ \
+    } else { \
+      SERIALIZE_ADD_RECORD(rec_item); \
+    } \
+  } else { \
+    const char *r_loc = rec_item->bind_location_tag ? rec_item->bind_location_tag : ""; \
+    if (strcasecmp(r_loc, *(cur_loc_io) ? *(cur_loc_io) : "") != 0) { \
+      dns_record_t set_rec; \
+      memset(&set_rec, 0, sizeof(set_rec)); \
+      set_rec.name = entry->domain; \
+      set_rec.type_code = DNS_TYPE_KARIDNS_LOC_STATE; \
+      set_rec.class_val = DNS_CLASS_KARIDNS_EXT; \
+      set_rec.class_str = "KARIDNS"; \
+      set_rec.generic_data = (uint8_t *)r_loc; \
+      set_rec.generic_len = strlen(r_loc); \
+      SERIALIZE_ADD_RECORD(&set_rec); \
+      *(cur_loc_io) = rec_item->bind_location_tag; \
+    } \
+    const char *r_ecs = rec_item->ecs_subnet_tag ? rec_item->ecs_subnet_tag : ""; \
+    if (strcasecmp(r_ecs, *(cur_ecs_io) ? *(cur_ecs_io) : "") != 0) { \
+      dns_record_t set_rec; \
+      memset(&set_rec, 0, sizeof(set_rec)); \
+      set_rec.name = entry->domain; \
+      set_rec.type_code = DNS_TYPE_KARIDNS_ECS_STATE; \
+      set_rec.class_val = DNS_CLASS_KARIDNS_EXT; \
+      set_rec.class_str = "KARIDNS"; \
+      set_rec.generic_data = (uint8_t *)r_ecs; \
+      set_rec.generic_len = strlen(r_ecs); \
+      SERIALIZE_ADD_RECORD(&set_rec); \
+      *(cur_ecs_io) = rec_item->ecs_subnet_tag; \
+    } \
+    if (rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 || rec_item->tinydns_ttd != 0) { \
+      dns_record_t wrap_rec; \
+      uint8_t wrap_buf[4096]; \
+      if (wrap_tinydns_record(rec_item, &wrap_rec, wrap_buf, sizeof(wrap_buf))) { \
+        SERIALIZE_ADD_RECORD(&wrap_rec); \
+      } else { \
+        SERIALIZE_ADD_RECORD(rec_item); \
+      } \
+    } else { \
+      SERIALIZE_ADD_RECORD(rec_item); \
+    } \
+  } \
+} while (0)
+
   if (send_ixfr) {
     SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+    const char *ixfr_loc = NULL;
+    const char *ixfr_ecs = NULL;
     for (int t = 0; t < txn_count; t++) {
       ixfr_txn_t *txn = txn_list[t];
       int soa_del_idx = -1;
@@ -6515,7 +7012,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       if (soa_del_idx >= 0) SERIALIZE_ADD_RECORD(&txn->deleted[soa_del_idx]);
       for (int i = 0; i < txn->deleted_count; i++) {
         if (i == soa_del_idx) continue;
-        SERIALIZE_ADD_RECORD(&txn->deleted[i]);
+        EMIT_ZONE_RECORD(&txn->deleted[i], &ixfr_loc, &ixfr_ecs);
       }
       int soa_add_idx = -1;
       for (int i = 0; i < txn->added_count; i++) {
@@ -6524,34 +7021,114 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       if (soa_add_idx >= 0) SERIALIZE_ADD_RECORD(&txn->added[soa_add_idx]);
       for (int i = 0; i < txn->added_count; i++) {
         if (i == soa_add_idx) continue;
-        SERIALIZE_ADD_RECORD(&txn->added[i]);
+        EMIT_ZONE_RECORD(&txn->added[i], &ixfr_loc, &ixfr_ecs);
       }
     }
     if (txn_count > 0) {
       SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
     }
   } else {
-    for (int step = 0; step < 3; step++) {
-      size_t start_idx = 0, end_idx = 0;
-      if (step == 0) {
-        start_idx = soa_idx;
-        end_idx = soa_idx + 1;
-      } else if (step == 1) {
-        start_idx = 0;
-        end_idx = current_zone->count;
-      } else if (step == 2) {
-        start_idx = soa_idx;
-        end_idx = soa_idx + 1;
+    // 1. Initial SOA
+    SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+
+    // Definitions emitted after first SOA in extended mode
+    if (is_extended_axfr) {
+      for (int i = 0; i < current_zone->bind_location_tag_count; i++) {
+        uint8_t tag_buf[2048];
+        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &current_zone->bind_location_tags[i]);
+        if (dlen > 0) {
+          dns_record_t tag_rec;
+          memset(&tag_rec, 0, sizeof(tag_rec));
+          tag_rec.name = entry->domain;
+          tag_rec.type_code = DNS_TYPE_KARIDNS_LOC_TAGDEF;
+          tag_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+          tag_rec.class_str = "KARIDNS";
+          tag_rec.generic_data = tag_buf;
+          tag_rec.generic_len = dlen;
+          SERIALIZE_ADD_RECORD(&tag_rec);
+        }
       }
-      for (size_t i = start_idx; i < end_idx; i++) {
-        if (step == 1 && (int)i == soa_idx)
-          continue;
-        SERIALIZE_ADD_RECORD(&current_zone->records[i]);
+      for (int i = 0; i < current_zone->bind_ecs_tag_count; i++) {
+        uint8_t tag_buf[2048];
+        size_t dlen = pack_tag_def_rdata(tag_buf, sizeof(tag_buf), &current_zone->bind_ecs_tags[i]);
+        if (dlen > 0) {
+          dns_record_t tag_rec;
+          memset(&tag_rec, 0, sizeof(tag_rec));
+          tag_rec.name = entry->domain;
+          tag_rec.type_code = DNS_TYPE_KARIDNS_ECS_TAGDEF;
+          tag_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+          tag_rec.class_str = "KARIDNS";
+          tag_rec.generic_data = tag_buf;
+          tag_rec.generic_len = dlen;
+          SERIALIZE_ADD_RECORD(&tag_rec);
+        }
+      }
+      for (int i = 0; i < current_zone->location_count; i++) {
+        const tinydns_location_entry_t *loc = &current_zone->locations[i];
+        uint8_t loc_buf[8];
+        loc_buf[0] = loc->code[0];
+        loc_buf[1] = loc->code[1];
+        loc_buf[2] = loc->prefix_len;
+        if (loc->prefix_len > 0) {
+          memcpy(&loc_buf[3], loc->prefix, loc->prefix_len);
+        }
+        dns_record_t loc_rec;
+        memset(&loc_rec, 0, sizeof(loc_rec));
+        loc_rec.name = entry->domain;
+        loc_rec.type_code = DNS_TYPE_KARIDNS_TINYDNS_LOCDEF;
+        loc_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+        loc_rec.class_str = "KARIDNS";
+        loc_rec.generic_data = loc_buf;
+        loc_rec.generic_len = 3 + loc->prefix_len;
+        SERIALIZE_ADD_RECORD(&loc_rec);
       }
     }
+
+    const char *current_stream_loc = NULL;
+    const char *current_stream_ecs = NULL;
+    for (size_t i = 0; i < current_zone->count; i++) {
+      if ((int)i == soa_idx)
+        continue;
+      EMIT_ZONE_RECORD(&current_zone->records[i], &current_stream_loc, &current_stream_ecs);
+    }
+
+    if (is_extended_axfr) {
+      if (current_stream_loc && *current_stream_loc) {
+        dns_record_t set_rec;
+        memset(&set_rec, 0, sizeof(set_rec));
+        set_rec.name = entry->domain;
+        set_rec.type_code = DNS_TYPE_KARIDNS_LOC_STATE;
+        set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+        set_rec.class_str = "KARIDNS";
+        set_rec.generic_data = (uint8_t *)"";
+        set_rec.generic_len = 0;
+        SERIALIZE_ADD_RECORD(&set_rec);
+      }
+      if (current_stream_ecs && *current_stream_ecs) {
+        dns_record_t set_rec;
+        memset(&set_rec, 0, sizeof(set_rec));
+        set_rec.name = entry->domain;
+        set_rec.type_code = DNS_TYPE_KARIDNS_ECS_STATE;
+        set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+        set_rec.class_str = "KARIDNS";
+        set_rec.generic_data = (uint8_t *)"";
+        set_rec.generic_len = 0;
+        SERIALIZE_ADD_RECORD(&set_rec);
+      }
+    }
+
+    // 3. Trailing SOA
+    SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
   }
   if (answers > 0) {
     *res_ancount = htons(answers);
+    if (is_extended_axfr && !opt_sent) {
+      uint16_t arcount = 0;
+      assemble_edns_opt(res, 65535, &offset, &arcount, &resp_edns, 0, true, NULL);
+      res[10] = (arcount >> 8) & 0xFF;
+      res[11] = arcount & 0xFF;
+      opt_sent = true;
+    }
     if (tsig_key) {
       size_t sign_len = offset;
       tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
@@ -7907,6 +8484,7 @@ void *control_thread_func(void *arg) {
                     }
                   } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {
                     syslog(LOG_NOTICE, "[Control] Triggering retransfer for slave zone %s on reload", lr.zcfg->domain);
+                    atomic_store_explicit(&lr.entry->serial, 0, memory_order_release);
                     atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
                     send(cfd, "OK reloaded (slave)\n", 20, 0);
                   } else {
@@ -8039,6 +8617,7 @@ void *control_thread_func(void *arg) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
               } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
+                atomic_store_explicit(&lr.entry->serial, 0, memory_order_release);
                 atomic_store_explicit(&lr.entry->refresh_now, true, memory_order_release);
                 send(cfd, "OK\n", 3, 0);
               } else {
@@ -8146,6 +8725,7 @@ void *control_thread_func(void *arg) {
                                     pthread_attr_t attr;
                                     pthread_attr_init(&attr);
                                     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                                    pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
                                     if (pthread_create(&bg_thread, &attr, axfr_bg_thread_func, bg_ctx) != 0) {
                                         free(bg_ctx);
                                         atomic_store_explicit(&entry->is_transferring, false, memory_order_release);
@@ -8182,6 +8762,10 @@ static void run_frontend_router(pid_t backend_pid) {
   if (g_control_sock >= 0) {
     close(g_control_sock);
     g_control_sock = -1;
+  }
+  if (g_broker_sock >= 0) {
+    close(g_broker_sock);
+    g_broker_sock = -1;
   }
   server_config_t *cfg = acquire_config_snapshot();
   if (cfg && cfg->user) {
@@ -8453,6 +9037,11 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
   setsockopt(g_notify_ipc[0], SOL_SOCKET, SO_SNDBUF, &nbufsize, sizeof(nbufsize));
   setsockopt(g_notify_ipc[1], SOL_SOCKET, SO_RCVBUF, &nbufsize, sizeof(nbufsize));
   setsockopt(g_notify_ipc[1], SOL_SOCKET, SO_SNDBUF, &nbufsize, sizeof(nbufsize));
+  cap_rights_t n_rights_0, n_rights_1;
+  cap_rights_init(&n_rights_0, CAP_RECV, CAP_EVENT);
+  cap_rights_limit(g_notify_ipc[0], &n_rights_0);
+  cap_rights_init(&n_rights_1, CAP_SEND, CAP_EVENT, CAP_FCNTL);
+  cap_rights_limit(g_notify_ipc[1], &n_rights_1);
 
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int bind_count = cfg->bind_address_count;

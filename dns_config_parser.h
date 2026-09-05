@@ -73,15 +73,6 @@ typedef struct zone_config {
   struct zone_config *next;
 } zone_config_t;
 
-typedef struct {
-  char *cidr;       /* "8.8.8.0/24" のような文字列のまま保持 */
-} ecs_cidr_entry_t;
-
-typedef struct ecs_tag_def_s {
-  char *tag;
-  ecs_cidr_entry_t *cidrs;
-  int cidr_count;
-} ecs_tag_def_t;
 
 typedef struct log_channel {
   char *name;

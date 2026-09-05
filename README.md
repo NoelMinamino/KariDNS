@@ -44,6 +44,11 @@ KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD
   - **Minimal ANY & Minimal Responses (RFC 8482):** Prevents ANY query response amplification.
   - **NSID (RFC 5001):** Server identifier transmission via EDNS.
 - **Views:** Split-horizon configuration using `view` blocks and `match-clients` IP matching.
+- **Client Geolocation & Subnet Steering (ECS & Location Tags):**
+  - **BIND Zone Steering:** Granular record-level split-horizon steering based on immediate client IP (`$LOCATION` / `$LOCATION-TAG`) and EDNS0 Client Subnet (`$ECS-SUBNET` / `$ECS-SUBNET-TAG`, RFC 7871) with ACL validation (`ecs-trusted-resolvers`).
+  - **tinydns `%` Location Steering:** Native djbdns-compatible IPv4 longest-prefix matching and record steering.
+  - **KariDNS Extended AXFR:** Primary-to-Secondary zone replication preserving location and ECS directives via EDNS Option 65153 negotiation, with automatic fallback (Plan B) to standard AXFR for non-KariDNS secondaries.
+  - For detailed configuration, usage, and examples, see **[KariDNS: Client Geolocation & Subnet Steering Guide](docs/KariDNS_How_to_use_ECS_and_location.md)**.
 - **Logging:** Non-blocking multi-producer single-consumer (MPSC) logging channels with size- and date-based rotation.
 
 ---
@@ -53,6 +58,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD
 KariDNS implements specifications according to official IETF RFC standards. For a detailed list of supported RFCs, implementation notes, and design boundaries, please consult:
 
 - **[KariDNS RFC Compliance Guideline](KariDNS_RFC_GUIDELINE.md)**
+- **[Client Geolocation & Subnet Steering Guide (ECS & Location)](docs/KariDNS_How_to_use_ECS_and_location.md)**
 - **[Installation & Multi-Platform Distribution Guide (FreeBSD, Linux, macOS, Homebrew)](docs/distribution.md)**
 
 ---
@@ -69,11 +75,11 @@ KariDNS natively parses, validates, and serializes the following standard and ex
 
 ### Zone File Formats & Directives
 - **Standard BIND Format (Default):**
-  - Directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (supports up to 32 files and 16 nesting levels within Capsicum constraints), `$GENERATE`.
+  - Directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (supports up to 32 files and 16 nesting levels within Capsicum constraints), `$GENERATE`, `$LOCATION`, `$LOCATION-TAG`, `$ECS-SUBNET`, `$ECS-SUBNET-TAG`.
 - **djbdns/tinydns Plain-Text Format (`file-format tinydns;`):**
   - Loads zone data directly from djbdns/tinydns plain-text `data` files (not compiled `data.cdb`).
   - Supports record markers `.` (SOA+NS+A), `&` (NS+A), `+` (A), `=` (A+PTR), `-` (disabled/comment), `@` (MX+A), `'` (TXT, 127-byte chunking), `^` (PTR), `C` (CNAME), `Z` (complete SOA), and `:` (generic RR).
-  - Handles parent/child zone delegation with longest-suffix matching and load-time TAI64 `timestamp` / countdown TTL evaluation.
+  - Handles client geolocation steering with `%` location prefixes and trailing `:loc` record tags, parent/child zone delegation with longest-suffix matching, and load-time TAI64 `timestamp` / countdown TTL evaluation.
 
 ---
 

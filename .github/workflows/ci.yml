@@ -86,6 +86,7 @@ jobs:
             sh ./tests/run_response_section_order_test.sh
             sh ./tests/run_sibling_additional_test.sh
             sh ./tests/run_multi_instance_test.sh
+            sh ./tests/run_extended_axfr_test.sh
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"

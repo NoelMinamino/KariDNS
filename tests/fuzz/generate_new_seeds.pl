@@ -54,6 +54,18 @@ make_path($dir_chunked);
     close $fh;
 }
 
+{
+    open my $fh, '>:raw', "$dir_chunked/seed_chunked_overflow_regression.raw" or die $!;
+    # ASan heap-buffer-overflow regression seed (integer overflow in chunk-size line)
+    my $crlf = "\r\n";
+    print $fh "HTTP/1.1 200CHTTP/ 200\n" .
+              "Transfer-Encoding:chunkedontffffffffffffffffffffffffffffffffff${crlf}${crlf}" .
+              "fffffffffffffffe: apls-mes]ag0${crlf}" .
+              "Transfer-Encoding: chunked${crlf}${crlf}" .
+              "01${crlf}c${crlf}0A\r'${crlf}\n";
+    close $fh;
+}
+
 # ------------------------------------------------------------------------------
 # 2. corpus_fuzz_dag_rdata_yaml
 # ------------------------------------------------------------------------------

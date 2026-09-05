@@ -116,6 +116,9 @@ tinydns_location_test: $(TARGET) $(DAG_TARGET) karicheck
 bind_ecs_subnet_test: $(TARGET) $(DAG_TARGET) karicheck
 	sh tests/run_bind_ecs_subnet_test.sh
 
+extended_axfr_test: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
+	sh tests/run_extended_axfr_test.sh
+
 asan_test: tests/test_asan_overflow.c dns_config_parser.o dns_zone_parser.o dns_tinydns_parser.o dns_wire.o
 	clang -fsanitize=address,undefined -O1 -g tests/test_asan_overflow.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c -lcrypto -o test_asan_overflow
 	./test_asan_overflow

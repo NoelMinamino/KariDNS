@@ -497,6 +497,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     parse_error_t err = {0};
     char *root_ttl = NULL;
     char *root_ecs_tag = NULL;
+    char *root_loc_tag = NULL;
     char *visited_paths[16];
     dev_t visited_devs[16];
     ino_t visited_inos[16];
@@ -536,7 +537,8 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         .visited_cap = 16,
         .load_file_cb = karicheck_load_file_cb,
         .shared_ttl_io = &root_ttl,
-        .shared_ecs_tag_io = &root_ecs_tag
+        .shared_ecs_tag_io = &root_ecs_tag,
+        .shared_loc_tag_io = &root_loc_tag
     };
     ctx.visited_paths[0] = root_path;
     ctx.visited_devs[0] = root_dev;
@@ -610,14 +612,21 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
     }
 
-    ecs_tag_def_t *active_tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
-    int active_tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+    ecs_tag_def_t *active_ecs_tags = (arena.bind_ecs_tags && arena.bind_ecs_tag_count > 0) ? arena.bind_ecs_tags :
+                                     ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL));
+    int active_ecs_tag_count = (arena.bind_ecs_tags && arena.bind_ecs_tag_count > 0) ? arena.bind_ecs_tag_count :
+                               ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0));
+
+    ecs_tag_def_t *active_loc_tags = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tags :
+                                     ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL));
+    int active_loc_tag_count = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tag_count :
+                               ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0));
 
     for (size_t i = 0; i < arena.count; i++) {
         if (arena.records[i].ecs_subnet_tag != NULL) {
             bool tag_found = false;
-            for (int ti = 0; ti < active_tag_count; ti++) {
-                if (strcasecmp(active_tags[ti].tag, arena.records[i].ecs_subnet_tag) == 0) {
+            for (int ti = 0; ti < active_ecs_tag_count; ti++) {
+                if (strcasecmp(active_ecs_tags[ti].tag, arena.records[i].ecs_subnet_tag) == 0) {
                     tag_found = true;
                     break;
                 }
@@ -625,6 +634,21 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
             if (!tag_found) {
                 fprintf(stderr, "[ERROR] Zone '%s': record '%s' references undefined ECS subnet tag '%s'\n",
                         domain, arena.records[i].name, arena.records[i].ecs_subnet_tag);
+                error_found = true;
+            }
+        }
+
+        if (arena.records[i].bind_location_tag != NULL) {
+            bool tag_found = false;
+            for (int ti = 0; ti < active_loc_tag_count; ti++) {
+                if (strcasecmp(active_loc_tags[ti].tag, arena.records[i].bind_location_tag) == 0) {
+                    tag_found = true;
+                    break;
+                }
+            }
+            if (!tag_found) {
+                fprintf(stderr, "[ERROR] Zone '%s': record '%s' references undefined location tag '%s'\n",
+                        domain, arena.records[i].name, arena.records[i].bind_location_tag);
                 error_found = true;
             }
         }

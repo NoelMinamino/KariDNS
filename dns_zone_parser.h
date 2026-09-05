@@ -29,6 +29,7 @@ typedef struct parse_context_s {
                             //   自分のスタック変数のアドレスをセットし、以降の再帰
                             //   呼び出し全てで「同じポインタ」を使い回すこと。
     char **shared_ecs_tag_io; // $ECS-SUBNETの書き戻し先 ($TTLのshared_ttl_ioと同じ挙動)
+    char **shared_loc_tag_io; // $LOCATIONの書き戻し先 ($ECS-SUBNETのshared_ecs_tag_ioと同じ挙動)
     char **visited_paths;   // 祖先スタック(現在の呼び出しチェーンのみ、訪問済み集合ではない)
     dev_t *visited_devs;
     ino_t *visited_inos;
@@ -74,6 +75,10 @@ typedef struct zone_arena_s {
   bool is_tinydns_format; /* parse_tinydns_data()が呼ばれたzone_arenaでのみtrue */
   tinydns_location_entry_t *locations; /* NULL可 */
   int location_count;
+  ecs_tag_def_t *bind_location_tags;      /* 追加: $LOCATION-TAG / AXFR復元用 */
+  int bind_location_tag_count;
+  ecs_tag_def_t *bind_ecs_tags;           /* 追加: $ECS-SUBNET-TAG / AXFR復元用 */
+  int bind_ecs_tag_count;
   prelinked_glue_entry_t *prelinked_glue; /* 事前リンクされたAdditionalグルー */
   int prelinked_glue_count;
 } zone_arena_t;
@@ -92,5 +97,7 @@ bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);
 int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);
+void free_ecs_tags_array(ecs_tag_def_t *tags, int count);
+ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count);
 
 #endif

@@ -209,39 +209,24 @@ correctly without duplicate records).
 >   real time. The `ttl=0` "countdown TTL" variant is supported the
 >   same way: the shrinking TTL is computed once at load time, not
 >   recalculated per query.
-> - **`%` location (split-horizon by client IP) is NOT supported.**
->   `%` lines are parsed but ignored with a warning; all records are
->   served to all clients regardless of any `lo` field. If your data
->   file relies on location-based responses, see the workaround below.
-> - **Hot reload limitation**: Because `timestamp` and (if it were
->   supported) `%` location decisions are made at load time, any zone
->   using these features should be reloaded on a schedule (e.g. a cron
->   job calling `karictl reload <zone>`) if near-real-time accuracy is
->   required.
+> - **`%` location (split-horizon by client IP)**: Supported natively
+>   during query resolution. KariDNS compiles `%<loc>:<prefix>` location
+>   lines and trailing `:loc` record fields into memory, performing bitwise
+>   longest-prefix matching against the querying client's source IPv4
+>   address with zero heap allocation on the hot path.
 
-### Workaround for `%` location or real-time `timestamp` semantics
+---
 
-If a zone genuinely depends on djbdns's per-query location matching or
-real-time timestamp evaluation, run the original `tinydns` binary as an
-independent local service and point a KariDNS **forward zone** at it,
-instead of using `file-format tinydns;` for that zone:
+## CLIENT GEOLOCATION & SUBNET STEERING (ECS & LOCATION)
 
-```
-zone "legacy-location.example." {
-    type forward;
-    forwarders { 127.0.0.1 port 5453; };
-};
-```
+KariDNS provides high-performance, record-level split-horizon response steering across both BIND and tinydns zone formats:
 
-This delegates all query handling for that zone to the real `tinydns`,
-which implements these two features exactly as designed. Note that
-`%` location matching depends on seeing the true client source address;
-since KariDNS forwards from its own loopback address, per-client
-location resolution inside `tinydns` will not see the original
-client's IP unless `tinydns` is patched to honor EDNS Client Subnet
-(RFC 7871) and KariDNS is configured to attach it — this is outside
-KariDNS's current feature set and would need to be addressed
-separately if required.
+- **BIND Zone `$LOCATION` & `$LOCATION-TAG`**: Steers responses based on the querying client's immediate socket IP address (IPv4 and IPv6). Tags can be defined directly in zone files (`$LOCATION-TAG <tag> <cidrs>`) or in `karidns.conf` (`ecs-tags`).
+- **BIND Zone `$ECS-SUBNET` & `$ECS-SUBNET-TAG`**: Steers responses based on EDNS0 Client Subnet (ECS, RFC 7871) options supplied by trusted recursive resolvers (`ecs-trusted-resolvers`).
+- **tinydns `location` (`%`)**: Steers responses based on client IPv4 longest-prefix matching declared with `%<loc>:<prefix>` lines and trailing `:loc` record tags.
+- **KariDNS Extended AXFR (Option 65153)**: Replicates zone directives and tags across KariDNS primary and secondary servers, while providing a clean standard AXFR fallback (Plan B) for non-KariDNS clients.
+
+For complete configuration syntax, query evaluation flows, and Extended AXFR details, see **[KariDNS: Client Geolocation & Subnet Steering Guide](KariDNS_How_to_use_ECS_and_location.md)**.
 
 ---
 
@@ -273,6 +258,7 @@ separately if required.
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
 - [`karicheck(1)`](karicheck.md) — Zone file syntax and ZONEMD validation utility
 - [`dag(1)`](dag.md) — DNS anomaly generator and test client
+- [`KariDNS Client Geolocation & Subnet Steering Guide`](KariDNS_How_to_use_ECS_and_location.md) — Comprehensive guide for BIND $LOCATION, $ECS-SUBNET, tinydns location, and Extended AXFR
 - [`KariDNS RFC Guideline`](../KariDNS_RFC_GUIDELINE.md) — Detailed RFC compliance and design boundary document
 
 ---
