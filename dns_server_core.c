@@ -207,6 +207,10 @@ typedef struct {
   zone_rcu_t *rcu_db;
   qlog_ring_t qlog_ring;
   alignas(64) _Atomic uint64_t query_count; // QPS計測用ローカルカウンタ (競合ゼロ)
+
+  // ワーカーローカル・レートリミット用 (排他制御不要・競合ゼロ)
+  time_t log_current_sec;
+  uint32_t log_emitted_this_sec;
 } worker_ctx_t;
 
 typedef struct {
@@ -570,9 +574,20 @@ static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
 static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
 static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
-static _Atomic uint32_t g_current_qps = ATOMIC_VAR_INIT(0);
 static worker_ctx_t *g_worker_ctxs = NULL;
 static int g_worker_count = 0;
+
+static inline uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
+    if (!cfg) return 0;
+    // チャンネル側に 0 より大きい値が明示されている場合のみそれを採用
+    if (cfg->logging.queries_channel && 
+        cfg->logging.queries_channel->max_qps_specified && 
+        cfg->logging.queries_channel->max_qps > 0) {
+        return cfg->logging.queries_channel->max_qps;
+    }
+    // それ以外は options の query_log_max_qps を採用
+    return cfg->query_log_max_qps;
+}
 
 static inline void inc_tcp_clients(void) {
     int current = atomic_fetch_add_explicit(&g_tcp_clients, 1, memory_order_relaxed) + 1;
@@ -6575,21 +6590,40 @@ static inline void write_query_log(worker_ctx_t *ctx,
                                    const struct sockaddr_storage *client_addr,
                                    socklen_t addr_len,
                                    const char *qname, uint16_t qclass, uint16_t qtype,
-                                   bool has_edns, bool dnssec_ok, uint8_t protocol) {
+                                   bool has_edns, bool dnssec_ok, uint8_t protocol,
+                                   uint32_t max_qps) {
     if (!ctx) return;
-    qlog_ring_t *ring = &ctx->qlog_ring;
-    if (!ring->events) return;
 
-    // サーキットブレーカー発動中: 1命令の分岐で即座にバイパス (オーバーヘッドゼロ)
+    // 1. サーキットブレーカーが発動している場合は1命令で完全スキップ
     if (atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
         return;
     }
 
+    // 2. max_qps による即時レートリミット (max_qps が 0 の場合でも暴走防止のためデフォルト5000で制限)
+    uint32_t limit = (max_qps > 0) ? max_qps : 5000;
+    time_t now_sec = time(NULL);
+    if (ctx->log_current_sec != now_sec) {
+        ctx->log_current_sec = now_sec;
+        ctx->log_emitted_this_sec = 0;
+    }
+    uint32_t quota = (limit >= (uint32_t)g_worker_count && g_worker_count > 0)
+                     ? (limit / g_worker_count) : 1;
+    if (ctx->log_emitted_this_sec >= quota) {
+        // 閾値超過: リングバッファ操作やメモリコピーを一切行わず即座にリターン
+        return;
+    }
+    ctx->log_emitted_this_sec++;
+
+    // 3. リングバッファへのプッシュ
+    qlog_ring_t *ring = &ctx->qlog_ring;
+    if (!ring->events) return;
+
     uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
 
-    // バッファ満杯時は待機せず即時ドロップ (ノンブロッキング)
-    if (h - t >= ring->size) {
+    // バッファが80%以上埋まったら即座にブレーカーを発動させてクエリスレッドを保護
+    if (h - t >= (ring->size * 8 / 10)) {
+        atomic_store_explicit(&g_qlog_circuit_broken, true, memory_order_relaxed);
         atomic_fetch_add_explicit(&ring->dropped_count, 1, memory_order_relaxed);
         return;
     }
@@ -6602,6 +6636,7 @@ static inline void write_query_log(worker_ctx_t *ctx,
 #else
     clock_gettime(CLOCK_REALTIME, &ev->ts);
 #endif
+
     if (client_addr) {
         memcpy(&ev->client_addr, client_addr, sizeof(struct sockaddr_storage));
     } else {
@@ -6617,13 +6652,11 @@ static inline void write_query_log(worker_ctx_t *ctx,
     ev->dnssec_ok = dnssec_ok;
 
     if (qname) {
-        strncpy(ev->qname, qname, sizeof(ev->qname) - 1);
-        ev->qname[sizeof(ev->qname) - 1] = '\0';
+        strlcpy(ev->qname, qname, sizeof(ev->qname));
     } else {
         ev->qname[0] = '\0';
     }
 
-    // SPSC: Producerが進める (Release)
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
 }
 
@@ -6639,20 +6672,16 @@ void *query_logger_thread_func(void *arg) {
     struct tm cached_tm;
     memset(&cached_tm, 0, sizeof(cached_tm));
 
-    time_t rate_sec = 0;
-    uint32_t lines_this_sec = 0;
-    uint64_t last_reported_dropped = 0;
     time_t last_drop_report_time = time(NULL);
-    struct timespec last_flush_ts = {0, 0};
+    uint64_t last_reported_dropped = 0;
 
     while (1) {
         server_config_t *cfg = acquire_config_snapshot();
         log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
-        uint32_t max_qps = ch ? ch->max_qps : 0;
 
-        bool any_work = false;
         int num_workers = g_worker_count;
         worker_ctx_t *workers = g_worker_ctxs;
+        bool any_work = false;
 
         if (ch && num_workers > 0 && workers) {
             for (int w = 0; w < num_workers; w++) {
@@ -6662,25 +6691,9 @@ void *query_logger_thread_func(void *arg) {
                 uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
                 uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
 
-                int drained = 0;
-                while (t != h && drained < 128) {
+                while (t != h) {
                     qlog_event_t *ev = &ring->events[t & ring->mask];
                     any_work = true;
-
-                    // レートリミット (max_qps > 0)
-                    if (max_qps > 0) {
-                        if (ev->ts.tv_sec != rate_sec) {
-                            rate_sec = ev->ts.tv_sec;
-                            lines_this_sec = 0;
-                        }
-                        if (lines_this_sec >= max_qps) {
-                            // 流量制限によるドロップ
-                            t++;
-                            drained++;
-                            continue;
-                        }
-                        lines_this_sec++;
-                    }
 
                     // 時刻キャッシュ (秒単位でフォーマットし、ミリ秒のみ追記)
                     if (ev->ts.tv_sec != cached_sec) {
@@ -6714,7 +6727,7 @@ void *query_logger_thread_func(void *arg) {
                     char safe_qname[512];
                     escape_qname_for_log(ev->qname, safe_qname, sizeof(safe_qname));
 
-                    char client_ip[INET6_ADDRSTRLEN] = "";
+                    char client_ip[INET6_ADDRSTRLEN] = "unknown";
                     int client_port = 0;
                     if (ev->client_addr.ss_family == AF_INET) {
                         struct sockaddr_in *sin = (struct sockaddr_in *)&ev->client_addr;
@@ -6744,22 +6757,28 @@ void *query_logger_thread_func(void *arg) {
                     }
 
                     t++;
-                    drained++;
                 }
 
                 atomic_store_explicit(&ring->tail, t, memory_order_release);
             }
 
-            struct timespec now_ts;
-            clock_gettime(CLOCK_MONOTONIC, &now_ts);
-            long elapsed_ms = (now_ts.tv_sec - last_flush_ts.tv_sec) * 1000 +
-                              (now_ts.tv_nsec - last_flush_ts.tv_nsec) / 1000000;
-
-            // バッチサイズが一定以上、未処理エントリなし、または100ms経過でフラッシュ
-            if (batch_len > 0 && (batch_len >= 32768 || !any_work || elapsed_ms >= 100)) {
+            if (batch_len > 0) {
                 log_write_rotated(ch, batch_buf, (int)batch_len, &batch_tm);
                 batch_len = 0;
-                last_flush_ts = now_ts;
+            }
+
+            // サーキットブレーカー自動復帰判定 (リングバッファ滞留率10%未満)
+            bool all_empty = true;
+            for (int w = 0; w < num_workers; w++) {
+                uint32_t t = atomic_load_explicit(&workers[w].qlog_ring.tail, memory_order_relaxed);
+                uint32_t h = atomic_load_explicit(&workers[w].qlog_ring.head, memory_order_relaxed);
+                if (h - t > (workers[w].qlog_ring.size / 10)) {
+                    all_empty = false;
+                    break;
+                }
+            }
+            if (all_empty && atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+                atomic_store_explicit(&g_qlog_circuit_broken, false, memory_order_release);
             }
 
             // 定期的なドロップ統計レポート (5秒間隔)
@@ -6788,9 +6807,8 @@ void *query_logger_thread_func(void *arg) {
 
         if (cfg) release_config_snapshot(cfg);
 
-        if (!any_work) {
-            usleep(5000); // 5ms休止
-        }
+        // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
+        usleep(any_work ? 1000 : 10000);
     }
     return NULL;
 }
@@ -7597,6 +7615,10 @@ worker_startup_success:;
       break;
     }
 
+    server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_relaxed);
+    bool qlog_enabled = (active && active->logging.queries_channel != NULL);
+    uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
+
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
@@ -7752,8 +7774,10 @@ worker_startup_success:;
             }
           }
           atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
-          write_query_log(ctx, client_addr, sizeof(*client_addr),
-                          qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP);
+          if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+              write_query_log(ctx, client_addr, sizeof(*client_addr),
+                              qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
+          }
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           if (is_zone_synthetic_type(snap, client_ip, qname)) {
@@ -7980,8 +8004,10 @@ worker_startup_success:;
           bool has_edns = edns.present;
           bool dnssec_ok = edns.dnssec_ok;
           atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
-          write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
-                          qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_TCP);
+          if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+              write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
+                              qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_TCP, eff_max_qps);
+          }
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
@@ -8763,43 +8789,6 @@ void *control_thread_func(void *arg) {
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
         server_config_t *active = acquire_config_snapshot();
-
-        if (ev_list[i].filter == EVFILT_TIMER) {
-            static uint64_t s_last_total_queries = 0;
-            static int s_low_qps_streak = 0;
-            uint64_t current_total = 0;
-            for (int w = 0; w < g_worker_count; w++) {
-                current_total += atomic_load_explicit(&g_worker_ctxs[w].query_count, memory_order_relaxed);
-            }
-            uint64_t qps = (current_total >= s_last_total_queries) ? (current_total - s_last_total_queries) : 0;
-            s_last_total_queries = current_total;
-            atomic_store_explicit(&g_current_qps, (uint32_t)qps, memory_order_relaxed);
-
-            uint32_t max_qps = 0;
-            if (active) {
-                if (active->logging.queries_channel && active->logging.queries_channel->max_qps_specified) {
-                    max_qps = active->logging.queries_channel->max_qps;
-                } else {
-                    max_qps = active->query_log_max_qps;
-                }
-            }
-
-            if (max_qps > 0 && qps > max_qps) {
-                if (!atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
-                    syslog(LOG_WARNING, "[QueryLog] Circuit breaker TRIPPED (current QPS %" PRIu64 " > max %u). Query logging bypassed.", qps, max_qps);
-                    atomic_store_explicit(&g_qlog_circuit_broken, true, memory_order_relaxed);
-                }
-                s_low_qps_streak = 0;
-            } else {
-                s_low_qps_streak++;
-                if (s_low_qps_streak >= 2) {
-                    if (atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
-                        syslog(LOG_INFO, "[QueryLog] Circuit breaker RESET (current QPS %" PRIu64 " <= max %u). Query logging resumed.", qps, max_qps);
-                        atomic_store_explicit(&g_qlog_circuit_broken, false, memory_order_relaxed);
-                    }
-                }
-            }
-        }
         zone_db_snapshot_t *snap = acquire_zone_snapshot();
         if (snap) {
             for (size_t v = 0; v < snap->view_count; v++) {
