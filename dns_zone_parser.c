@@ -117,6 +117,8 @@ bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_t
   if (a->tinydns_loc[0] != b->tinydns_loc[0] || a->tinydns_loc[1] != b->tinydns_loc[1]) return false;
   if ((a->ecs_subnet_tag == NULL) != (b->ecs_subnet_tag == NULL)) return false;
   if (a->ecs_subnet_tag && b->ecs_subnet_tag && strcasecmp(a->ecs_subnet_tag, b->ecs_subnet_tag) != 0) return false;
+  if ((a->bind_location_tag == NULL) != (b->bind_location_tag == NULL)) return false;
+  if (a->bind_location_tag && b->bind_location_tag && strcasecmp(a->bind_location_tag, b->bind_location_tag) != 0) return false;
   if (a->rdata_count != b->rdata_count) return false;
   for (int i = 0; i < a->rdata_count; i++) {
     if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
@@ -395,6 +397,7 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     child_ctx.current_depth = ctx->current_depth + 1;
     child_ctx.shared_ttl_io = ctx->shared_ttl_io; 
     child_ctx.shared_ecs_tag_io = ctx->shared_ecs_tag_io;
+    child_ctx.shared_loc_tag_io = ctx->shared_loc_tag_io;
 
     int rc = parse_zone_fast(file_content, strlen(file_content), arena, &child_ctx);
 
@@ -433,7 +436,9 @@ dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, cons
         arena->records = new_records;
         arena->records_cap = new_cap;
     }
-    return &arena->records[arena->count++];
+    dns_record_t *rec = &arena->records[arena->count++];
+    memset(rec, 0, sizeof(dns_record_t));
+    return rec;
 }
 
 #define MAX_GENERATE_COUNT 100000
@@ -562,7 +567,7 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
 static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
                              parse_context_t *ctx, const char *origin,
                              const char *default_ttl, const char *cur_buf,
-                             const char *ecs_tag) {
+                             const char *ecs_tag, const char *loc_tag) {
     if (field_idx < 5) {
         if (ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
         return -1;
@@ -646,6 +651,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         dns_record_t *rec = arena_alloc_record(arena, ctx, fields[0], cur_buf);
         if (!rec) return -1;
         rec->ecs_subnet_tag = (char *)ecs_tag;
+        rec->bind_location_tag = (char *)loc_tag;
 
         char *name_copy = arena_alloc(arena, name_len + 1);
         if (!name_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
@@ -684,14 +690,17 @@ int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t
   char *origin = ctx ? (char *)ctx->default_origin : NULL;
   char *local_ttl_storage = NULL;
   char *local_ecs_tag_storage = NULL;
+  char *local_loc_tag_storage = NULL;
   char **prev_owner_io = &prev_owner;
   char **origin_io = &origin;
   char **default_ttl_str_io = (ctx && ctx->shared_ttl_io) ? ctx->shared_ttl_io : &local_ttl_storage;
   char **ecs_tag_io = (ctx && ctx->shared_ecs_tag_io) ? ctx->shared_ecs_tag_io : &local_ecs_tag_storage;
+  char **loc_tag_io = (ctx && ctx->shared_loc_tag_io) ? ctx->shared_loc_tag_io : &local_loc_tag_storage;
   if (!buf || size == 0 || !arena)
     return -1;
   char *p = buf, *end = buf + size;
   int in_parens = 0, in_quotes = 0, field_idx = 0;
+  bool is_tag_def_line = false;
   char *fields[MAX_FIELDS], *token_start = NULL;
 
 STATE_START_LINE:
@@ -699,12 +708,25 @@ STATE_START_LINE:
     goto DONE;
   field_idx = 0;
   in_quotes = 0;
+  is_tag_def_line = false;
+  char *scan = p;
+  while (scan < end && IS_SPACE(*scan)) scan++;
+  if (scan < end && *scan == '$') {
+    if ((end - scan >= 13 && strncasecmp(scan, "$LOCATION-TAG", 13) == 0 && (scan + 13 >= end || IS_SPACE(scan[13]))) ||
+        (end - scan >= 15 && strncasecmp(scan, "$ECS-SUBNET-TAG", 15) == 0 && (scan + 15 >= end || IS_SPACE(scan[15])))) {
+      is_tag_def_line = true;
+    }
+  }
   if (IS_SPACE(*p)) {
     if (*prev_owner_io)
       fields[field_idx++] = *prev_owner_io;
     goto SKIP_WHITESPACE;
   }
 STATE_FIND_TOKEN:
+  if (is_tag_def_line && p < end && (*p == '{' || *p == '}' || *p == ';')) {
+    p++;
+    goto STATE_FIND_TOKEN;
+  }
   if (p >= end) {
     if (in_parens) {
       if (ctx && ctx->err_out) {
@@ -773,7 +795,8 @@ STATE_FIND_TOKEN:
       continue;
     }
     if (!in_quotes) {
-      if (IS_SPACE(*p) || IS_NEWLINE(*p) || *p == ';' || *p == '(' || *p == ')')
+      if (IS_SPACE(*p) || IS_NEWLINE(*p) || *p == ';' || *p == '(' || *p == ')' ||
+          (is_tag_def_line && (*p == '{' || *p == '}')))
         break;
     } else {
       if (IS_NEWLINE(*p)) {
@@ -838,7 +861,7 @@ STATE_FIND_TOKEN:
               fields[field_idx - 1][t_len - 1] = '\0';
       }
   }
-  if (IS_SPACE(delimiter))
+  if (IS_SPACE(delimiter) || (is_tag_def_line && (delimiter == '{' || delimiter == '}')))
     goto SKIP_WHITESPACE;
   if (IS_NEWLINE(delimiter)) {
     if (in_parens)
@@ -870,13 +893,17 @@ STATE_FIND_TOKEN:
     goto STATE_FIND_TOKEN;
   }
   if (delimiter == ';') {
-    char *nl = memchr(p, '\n', end - p);
-    if (!nl) {
-      p = end;
-      goto PROCESS_RECORD;
+    if (!is_tag_def_line) {
+      char *nl = memchr(p, '\n', end - p);
+      if (!nl) {
+        p = end;
+        goto PROCESS_RECORD;
+      }
+      p = nl;
+      goto STATE_FIND_TOKEN;
+    } else {
+      goto STATE_FIND_TOKEN;
     }
-    p = nl;
-    goto STATE_FIND_TOKEN;
   }
 SKIP_WHITESPACE:
   while (p < end && IS_SPACE(*p))
@@ -907,7 +934,7 @@ PROCESS_RECORD:
         goto DONE;
     }
     if (fields[0][0] == '$' && strcasecmp(fields[0], "$GENERATE") == 0) {
-        if (process_generate(fields, field_idx, arena, ctx, *origin_io, *default_ttl_str_io, buf, *ecs_tag_io) != 0)
+        if (process_generate(fields, field_idx, arena, ctx, *origin_io, *default_ttl_str_io, buf, *ecs_tag_io, *loc_tag_io) != 0)
             return -1;
         if (p < end)
             goto STATE_START_LINE;
@@ -922,7 +949,7 @@ PROCESS_RECORD:
   }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$ECS-SUBNET") == 0) {
     if (field_idx > 1) {
-      if (strcasecmp(fields[1], "none") == 0 || strcasecmp(fields[1], "default") == 0) {
+      if (fields[1][0] == '\0' || strcasecmp(fields[1], "none") == 0 || strcasecmp(fields[1], "default") == 0) {
         *ecs_tag_io = NULL;
       } else {
         *ecs_tag_io = arena_strdup(arena, fields[1]);
@@ -934,9 +961,104 @@ PROCESS_RECORD:
       goto STATE_START_LINE;
     goto DONE;
   }
+  if (fields[0][0] == '$' && strcasecmp(fields[0], "$LOCATION") == 0) {
+    if (field_idx > 1) {
+      if (fields[1][0] == '\0' || strcasecmp(fields[1], "none") == 0 || strcasecmp(fields[1], "default") == 0) {
+        *loc_tag_io = NULL;
+      } else {
+        *loc_tag_io = arena_strdup(arena, fields[1]);
+      }
+    } else {
+      *loc_tag_io = NULL; /* タグ省略時はnone扱い */
+    }
+    if (p < end)
+      goto STATE_START_LINE;
+    goto DONE;
+  }
+  if (fields[0][0] == '$' && (strcasecmp(fields[0], "$LOCATION-TAG") == 0 || strcasecmp(fields[0], "$ECS-SUBNET-TAG") == 0)) {
+    bool is_loc = (strcasecmp(fields[0], "$LOCATION-TAG") == 0);
+    if (field_idx < 3) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = is_loc ? "$LOCATION-TAG requires tag name and at least one CIDR"
+                                             : "$ECS-SUBNET-TAG requires tag name and at least one CIDR";
+        ctx->err_out->error_offset = (size_t)(fields[0] - buf);
+        ctx->err_out->token_length = strlen(fields[0]);
+      }
+      return -1;
+    }
+    const char *raw_tag = fields[1];
+    while (*raw_tag == '{' || *raw_tag == ' ' || *raw_tag == '\t') raw_tag++;
+    char clean_tag[64];
+    strncpy(clean_tag, raw_tag, sizeof(clean_tag) - 1);
+    clean_tag[sizeof(clean_tag) - 1] = '\0';
+    size_t ctlen = strlen(clean_tag);
+    while (ctlen > 0 && (clean_tag[ctlen-1] == '}' || clean_tag[ctlen-1] == ';' || clean_tag[ctlen-1] == ' ' || clean_tag[ctlen-1] == '\t')) {
+      clean_tag[--ctlen] = '\0';
+    }
+    if (ctlen == 0) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "Invalid empty tag name in tag definition";
+        ctx->err_out->error_offset = (size_t)(fields[1] - buf);
+        ctx->err_out->token_length = strlen(fields[1]);
+      }
+      return -1;
+    }
+
+    char *cidrs_found[MAX_FIELDS];
+    int cidr_count = 0;
+    for (int fi = 2; fi < field_idx; fi++) {
+      char *raw_cidr = fields[fi];
+      while (*raw_cidr == '{' || *raw_cidr == ' ' || *raw_cidr == '\t') raw_cidr++;
+      char clean_cidr[128];
+      strncpy(clean_cidr, raw_cidr, sizeof(clean_cidr) - 1);
+      clean_cidr[sizeof(clean_cidr) - 1] = '\0';
+      size_t clen = strlen(clean_cidr);
+      while (clen > 0 && (clean_cidr[clen-1] == '}' || clean_cidr[clen-1] == ';' || clean_cidr[clen-1] == ' ' || clean_cidr[clen-1] == '\t')) {
+        clean_cidr[--clen] = '\0';
+      }
+      if (clen == 0) continue;
+      cidrs_found[cidr_count++] = strdup(clean_cidr);
+    }
+    if (cidr_count == 0) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = is_loc ? "$LOCATION-TAG requires at least one CIDR"
+                                             : "$ECS-SUBNET-TAG requires at least one CIDR";
+        ctx->err_out->error_offset = (size_t)(fields[0] - buf);
+        ctx->err_out->token_length = strlen(fields[0]);
+      }
+      return -1;
+    }
+    ecs_tag_def_t **target_tags = is_loc ? &arena->bind_location_tags : &arena->bind_ecs_tags;
+    int *target_count = is_loc ? &arena->bind_location_tag_count : &arena->bind_ecs_tag_count;
+    ecs_tag_def_t *new_tags = realloc(*target_tags, sizeof(ecs_tag_def_t) * (*target_count + 1));
+    if (!new_tags) {
+      for (int c = 0; c < cidr_count; c++) free(cidrs_found[c]);
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory";
+      return -1;
+    }
+    *target_tags = new_tags;
+    ecs_cidr_entry_t *cidrs = malloc(sizeof(ecs_cidr_entry_t) * cidr_count);
+    if (!cidrs) {
+      for (int c = 0; c < cidr_count; c++) free(cidrs_found[c]);
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory";
+      return -1;
+    }
+    for (int c = 0; c < cidr_count; c++) {
+      cidrs[c].cidr = cidrs_found[c];
+    }
+    (*target_tags)[*target_count].tag = strdup(clean_tag);
+    (*target_tags)[*target_count].cidrs = cidrs;
+    (*target_tags)[*target_count].cidr_count = cidr_count;
+    (*target_count)++;
+
+    if (p < end)
+      goto STATE_START_LINE;
+    goto DONE;
+  }
     dns_record_t *rec = arena_alloc_record(arena, ctx, p, buf);
     if (!rec) return -1;
     rec->ecs_subnet_tag = *ecs_tag_io;
+    rec->bind_location_tag = *loc_tag_io;
   rec->name = expand_domain_name(fields[0], *origin_io, arena);
   if (!rec->name) {
       if (ctx && ctx->err_out) {
@@ -1275,6 +1397,10 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->is_tinydns_format = false;
   arena->locations = NULL;
   arena->location_count = 0;
+  arena->bind_location_tags = NULL;
+  arena->bind_location_tag_count = 0;
+  arena->bind_ecs_tags = NULL;
+  arena->bind_ecs_tag_count = 0;
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
 }
@@ -1285,6 +1411,39 @@ void zone_arena_free_include_buffers(zone_arena_t *arena) {
     free(arena->file_paths[i]);
   }
   arena->file_buf_count = 0;
+}
+
+void free_ecs_tags_array(ecs_tag_def_t *tags, int count) {
+  if (!tags) return;
+  for (int i = 0; i < count; i++) {
+    if (tags[i].tag) free(tags[i].tag);
+    if (tags[i].cidrs) {
+      for (int j = 0; j < tags[i].cidr_count; j++) {
+        if (tags[i].cidrs[j].cidr) free(tags[i].cidrs[j].cidr);
+      }
+      free(tags[i].cidrs);
+    }
+  }
+  free(tags);
+}
+
+ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count) {
+  if (!src || count <= 0) return NULL;
+  ecs_tag_def_t *dst = calloc(count, sizeof(ecs_tag_def_t));
+  if (!dst) return NULL;
+  for (int i = 0; i < count; i++) {
+    dst[i].tag = src[i].tag ? strdup(src[i].tag) : NULL;
+    dst[i].cidr_count = src[i].cidr_count;
+    if (src[i].cidr_count > 0 && src[i].cidrs) {
+      dst[i].cidrs = calloc(src[i].cidr_count, sizeof(ecs_cidr_entry_t));
+      if (dst[i].cidrs) {
+        for (int j = 0; j < src[i].cidr_count; j++) {
+          dst[i].cidrs[j].cidr = src[i].cidrs[j].cidr ? strdup(src[i].cidrs[j].cidr) : NULL;
+        }
+      }
+    }
+  }
+  return dst;
 }
 
 void zone_arena_destroy(zone_arena_t *arena) {
@@ -1301,6 +1460,12 @@ void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->locations);
   arena->locations = NULL;
   arena->location_count = 0;
+  free_ecs_tags_array(arena->bind_location_tags, arena->bind_location_tag_count);
+  arena->bind_location_tags = NULL;
+  arena->bind_location_tag_count = 0;
+  free_ecs_tags_array(arena->bind_ecs_tags, arena->bind_ecs_tag_count);
+  arena->bind_ecs_tags = NULL;
+  arena->bind_ecs_tag_count = 0;
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
   zone_arena_free_include_buffers(arena);

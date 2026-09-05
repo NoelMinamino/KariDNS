@@ -81,6 +81,31 @@ typedef struct zone_arena_s zone_arena_t;
 void *arena_alloc(zone_arena_t *arena, size_t size);
 
 // ============================================================================
+// KariDNS 拡張定数 (Private Use 範囲: RFC 6895 / IANA DNS Parameters)
+// ============================================================================
+#define DNS_CLASS_KARIDNS_EXT           65302
+#define DNS_TYPE_KARIDNS_LOC_STATE      65401
+#define DNS_TYPE_KARIDNS_ECS_STATE      65402
+#define DNS_TYPE_KARIDNS_LOC_TAGDEF     65403
+#define DNS_TYPE_KARIDNS_ECS_TAGDEF     65404
+#define DNS_TYPE_KARIDNS_TINYDNS_LOCDEF 65405
+#define DNS_TYPE_KARIDNS_TINYDNS_WRAP   65406
+
+#define EDNS_OPTION_KARIDNS_EXT         65153
+#define KARIDNS_EXT_VERSION             1
+
+// ECS / Location サブネットタグ構造体
+typedef struct {
+  char *cidr;       /* "8.8.8.0/24" のような文字列のまま保持 */
+} ecs_cidr_entry_t;
+
+typedef struct ecs_tag_def_s {
+  char *tag;
+  ecs_cidr_entry_t *cidrs;
+  int cidr_count;
+} ecs_tag_def_t;
+
+// ============================================================================
 // 型定義 (dns_server_core.c から移動)
 // ============================================================================
 
@@ -103,6 +128,7 @@ typedef struct {
     bool tinydns_ttl_countdown; /* true なら「ttl=0 + timestamp」のカウントダウンTTLレコード */
     char tinydns_loc[2];        /* {0, 0} なら location制限なし */
     char *ecs_subnet_tag;       /* NULL = タグなし(常に表示)。arena確保文字列 */
+    char *bind_location_tag;    /* NULL = タグなし(常に表示)。arena確保文字列 ($LOCATION用) */
     
     bool is_cached;
     union {
@@ -219,6 +245,11 @@ typedef struct {
     uint8_t ecs_source_prefix;
     uint8_t ecs_scope_prefix;
     uint8_t ecs_addr[16];
+
+    // KariDNS Extended AXFR (Option 65153)
+    bool has_karidns_ext;
+    uint8_t karidns_ext_version;
+    uint32_t karidns_ext_hash;
 } edns_info_t;
 
 // ============================================================================

@@ -306,11 +306,23 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     uint16_t rdlen = (packet[*offset + 8] << 8) | packet[*offset + 9]; *offset += 10;
     if (*offset + rdlen > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: rdlen %u goes out of bounds (len=%zu)", rdlen, packet_len); return -1; }
 
-    *type_out = type; rec->type_code = type; rec->class_str = (class_val == 1) ? "IN" : "CH"; rec->type = (char *)get_type_str(type, arena);
+    *type_out = type; rec->type_code = type;
+    rec->class_str = (class_val == 1) ? "IN" : ((class_val == DNS_CLASS_KARIDNS_EXT) ? "KARIDNS" : "CH");
+    rec->type = (char *)get_type_str(type, arena);
     rec->ttl_value = ttl;
     rec->class_val = class_val;
     char *ttl_buf = arena_alloc(arena, 16); if (!ttl_buf) return -1; snprintf(ttl_buf, 16, "%u", ttl); rec->ttl = ttl_buf;
     rec->rdata_count = 0;
+    rec->generic_data = NULL;
+    rec->generic_len = 0;
+    rec->tinydns_loc[0] = 0;
+    rec->tinydns_loc[1] = 0;
+    rec->tinydns_ttd = 0;
+    rec->tinydns_ttl_countdown = false;
+    rec->bind_location_tag = NULL;
+    rec->ecs_subnet_tag = NULL;
+    rec->next_record = -1;
+    rec->is_cached = false;
 
     if (type == 6) {
         size_t rdata_p = *offset; char *mname, *rname;
@@ -1178,10 +1190,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     uint16_t rdlength_idx = offset;
     offset += 2; // reserve for rdlength
 
-    if (rec->generic_data && rec->generic_len > 0) {
-        if ((size_t)offset + rec->generic_len > max_res_len) return -1;
-        memcpy(&res[offset], rec->generic_data, rec->generic_len);
-        offset += rec->generic_len;
+    if (rec->generic_data != NULL || rec->class_val == DNS_CLASS_KARIDNS_EXT) {
+        if (rec->generic_len > 0) {
+            if ((size_t)offset + rec->generic_len > max_res_len) return -1;
+            if (rec->generic_data) memcpy(&res[offset], rec->generic_data, rec->generic_len);
+            offset += rec->generic_len;
+        }
     } else {
         switch (rec_type) {
             case 1: { // A
@@ -2399,6 +2413,15 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                 }
                                 memcpy(edns->ecs_addr, req + rdata_offset + 4, addr_len);
                             }
+                        } else if (opt_code == EDNS_OPTION_KARIDNS_EXT) { // 65153
+                            if (opt_len == 5) {
+                                edns->has_karidns_ext = true;
+                                edns->karidns_ext_version = req[rdata_offset];
+                                edns->karidns_ext_hash = ((uint32_t)req[rdata_offset + 1] << 24) |
+                                                         ((uint32_t)req[rdata_offset + 2] << 16) |
+                                                         ((uint32_t)req[rdata_offset + 3] << 8)  |
+                                                         ((uint32_t)req[rdata_offset + 4]);
+                            }
                         }
                         rdata_offset += opt_len;
                     }
@@ -2446,6 +2469,9 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
         keepalive_val = (uint16_t)(timeout_sec * 10);
         include_keepalive = true;
         rdlen += 4 + 2;
+    }
+    if (edns && edns->has_karidns_ext) {
+        rdlen += 4 + 5;
     }
 
     if ((size_t)offset + 11 + rdlen <= max_res_len) {
@@ -2508,6 +2534,17 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
             res[offset++] = 0; res[offset++] = 11; // Option Code: 11
             res[offset++] = 0; res[offset++] = 2;  // Option Length: 2
             res[offset++] = keepalive_val >> 8; res[offset++] = keepalive_val & 0xFF;
+        }
+
+        if (edns && edns->has_karidns_ext) {
+            res[offset++] = (EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF;
+            res[offset++] = EDNS_OPTION_KARIDNS_EXT & 0xFF;
+            res[offset++] = 0; res[offset++] = 5; // Option Length: 5
+            res[offset++] = edns->karidns_ext_version;
+            res[offset++] = (edns->karidns_ext_hash >> 24) & 0xFF;
+            res[offset++] = (edns->karidns_ext_hash >> 16) & 0xFF;
+            res[offset++] = (edns->karidns_ext_hash >> 8) & 0xFF;
+            res[offset++] = edns->karidns_ext_hash & 0xFF;
         }
         
         (*arcount_inout)++;

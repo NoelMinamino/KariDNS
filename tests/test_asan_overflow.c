@@ -3517,6 +3517,240 @@ int main() {
         printf("PASS: pid-file and control-channel socket parsing and cleanup\n");
     }
 
+    // --- Test 47: EDNS Option 65153 (KariDNS Extended AXFR) wire assembly and parsing ---
+    {
+        printf("\n--- Test 47: EDNS Option 65153 (KariDNS Extended AXFR) wire assembly and parsing ---\n");
+        uint8_t pkt[1024];
+        memset(pkt, 0, sizeof(pkt));
+        // Header
+        pkt[0] = 0x12; pkt[1] = 0x34; // ID
+        pkt[2] = 0x00; pkt[3] = 0x00; // standard query
+        pkt[4] = 0x00; pkt[5] = 0x01; // QDCOUNT = 1
+        pkt[6] = 0x00; pkt[7] = 0x00; // ANCOUNT = 0
+        pkt[8] = 0x00; pkt[9] = 0x00; // NSCOUNT = 0
+        pkt[10] = 0x00; pkt[11] = 0x00; // ARCOUNT = 0
+
+        // Question: example.com. IN AXFR
+        uint16_t off = 12;
+        pkt[off++] = 7; memcpy(pkt + off, "example", 7); off += 7;
+        pkt[off++] = 3; memcpy(pkt + off, "com", 3); off += 3;
+        pkt[off++] = 0; // null label
+        pkt[off++] = 0x00; pkt[off++] = 0xFC; // TYPE AXFR (252)
+        pkt[off++] = 0x00; pkt[off++] = 0x01; // CLASS IN (1)
+
+        uint16_t arcount = 0;
+        uint32_t expected_hash = calc_fnv1a_str("example.com.");
+        edns_info_t edns_out;
+        memset(&edns_out, 0, sizeof(edns_out));
+        edns_out.present = true;
+        edns_out.has_karidns_ext = true;
+        edns_out.karidns_ext_version = KARIDNS_EXT_VERSION;
+        edns_out.karidns_ext_hash = expected_hash;
+
+        assemble_edns_opt(pkt, sizeof(pkt), &off, &arcount, &edns_out, 0, true, NULL);
+        if (arcount != 1) {
+            printf("FAIL: assemble_edns_opt did not increment arcount\n");
+            return 1;
+        }
+        pkt[10] = (arcount >> 8) & 0xFF;
+        pkt[11] = arcount & 0xFF;
+
+        edns_info_t edns_in;
+        memset(&edns_in, 0, sizeof(edns_in));
+        int pr = parse_edns_opt(pkt, off, 1, 0, 0, arcount, &edns_in);
+        if (pr != 0) {
+            printf("FAIL: parse_edns_opt returned %d\n", pr);
+            return 1;
+        }
+        if (!edns_in.has_karidns_ext) {
+            printf("FAIL: parse_edns_opt did not detect has_karidns_ext\n");
+            return 1;
+        }
+        if (edns_in.karidns_ext_version != KARIDNS_EXT_VERSION) {
+            printf("FAIL: karidns_ext_version mismatch: got %u expected %u\n",
+                   edns_in.karidns_ext_version, KARIDNS_EXT_VERSION);
+            return 1;
+        }
+        if (edns_in.karidns_ext_hash != expected_hash) {
+            printf("FAIL: karidns_ext_hash mismatch: got 0x%08X expected 0x%08X\n",
+                   edns_in.karidns_ext_hash, expected_hash);
+            return 1;
+        }
+
+        // Test boundary check with buffer too small for OPT RR
+        uint8_t small_pkt[64];
+        uint16_t small_off = 12;
+        uint16_t small_ar = 0;
+        assemble_edns_opt(small_pkt, small_off + 10, &small_off, &small_ar, &edns_out, 0, true, NULL);
+        if (small_ar != 0) {
+            printf("FAIL: assemble_edns_opt overflowed small buffer\n");
+            return 1;
+        }
+
+        printf("PASS: EDNS Option 65153 wire assembly and parsing\n");
+    }
+
+    // --- Test 48: CLASS 65302 serialization, bounds check, and zone tag directives ---
+    {
+        printf("\n--- Test 48: CLASS 65302 serialization, bounds check, and zone tag directives ---\n");
+        // 1. Serialization and bound checking for CLASS 65302 marker records
+        dns_record_t rec_state = {
+            .name = "example.com.",
+            .type = "TYPE65401",
+            .type_code = DNS_TYPE_KARIDNS_LOC_STATE,
+            .class_val = DNS_CLASS_KARIDNS_EXT,
+            .ttl = "0",
+            .ttl_value = 0,
+            .generic_len = 0,
+            .generic_data = NULL
+        };
+        if (assert_bound_checked(&rec_state) != 0) {
+            printf("FAIL: assert_bound_checked failed for DNS_TYPE_KARIDNS_LOC_STATE\n");
+            return 1;
+        }
+
+        uint8_t tag_payload[32] = "tokyo 192.0.2.0/24";
+        dns_record_t rec_def = {
+            .name = "example.com.",
+            .type = "TYPE65403",
+            .type_code = DNS_TYPE_KARIDNS_LOC_TAGDEF,
+            .class_val = DNS_CLASS_KARIDNS_EXT,
+            .ttl = "0",
+            .ttl_value = 0,
+            .generic_len = (uint16_t)strlen((char *)tag_payload),
+            .generic_data = tag_payload
+        };
+        if (assert_bound_checked(&rec_def) != 0) {
+            printf("FAIL: assert_bound_checked failed for DNS_TYPE_KARIDNS_LOC_TAGDEF\n");
+            return 1;
+        }
+
+        uint8_t wrap_payload[16] = {0x00, 0x01, 0x00, 0x04, 192, 0, 2, 1}; // original type A, rdlen 4, IP
+        dns_record_t rec_wrap = {
+            .name = "www.example.com.",
+            .type = "TYPE65406",
+            .type_code = DNS_TYPE_KARIDNS_TINYDNS_WRAP,
+            .class_val = DNS_CLASS_KARIDNS_EXT,
+            .ttl = "300",
+            .ttl_value = 300,
+            .generic_len = 8,
+            .generic_data = wrap_payload
+        };
+        if (assert_bound_checked(&rec_wrap) != 0) {
+            printf("FAIL: assert_bound_checked failed for DNS_TYPE_KARIDNS_TINYDNS_WRAP\n");
+            return 1;
+        }
+
+        // 2. Zone parser handling of $LOCATION-TAG, $LOCATION, and $ECS-SUBNET-TAG
+        const char *test_zone =
+            "$ORIGIN example.com.\n"
+            "$TTL 300\n"
+            "@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400\n"
+            "@ IN NS ns1.example.com.\n"
+            "$LOCATION-TAG tokyo 192.0.2.0/24 2001:db8:1::/48\n"
+            "$LOCATION-TAG osaka 198.51.100.0/24\n"
+            "$ECS-SUBNET-TAG eu-tier 203.0.113.0/24\n"
+            "$LOCATION tokyo\n"
+            "www 300 IN A 192.0.2.10\n"
+            "$LOCATION osaka\n"
+            "www 300 IN A 198.51.100.20\n"
+            "$LOCATION \"\"\n"
+            "$ECS-SUBNET eu-tier\n"
+            "api 300 IN A 203.0.113.50\n"
+            "$ECS-SUBNET \"\"\n"
+            "def 300 IN A 10.0.0.1\n";
+
+        char *zone_copy = strdup(test_zone);
+        zone_arena_t arena;
+        memset(&arena, 0, sizeof(arena));
+        zone_arena_init(&arena);
+        parse_error_t err;
+        memset(&err, 0, sizeof(err));
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "example.com.",
+            .is_standalone_mode = true,
+            .err_out = &err
+        };
+
+        int pr = parse_zone_fast(zone_copy, strlen(zone_copy), &arena, &ctx);
+        if (pr < 0) {
+            printf("FAIL: parse_zone_fast failed: %s\n", err.error_message ? err.error_message : "unknown");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Validate tag definitions in arena
+        if (arena.bind_location_tag_count != 2) {
+            printf("FAIL: expected 2 bind_location_tags, got %d\n", arena.bind_location_tag_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (strcmp(arena.bind_location_tags[0].tag, "tokyo") != 0 || arena.bind_location_tags[0].cidr_count != 2) {
+            printf("FAIL: bind_location_tags[0] mismatch\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (strcmp(arena.bind_location_tags[1].tag, "osaka") != 0 || arena.bind_location_tags[1].cidr_count != 1) {
+            printf("FAIL: bind_location_tags[1] mismatch\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (arena.bind_ecs_tag_count != 1) {
+            printf("FAIL: expected 1 bind_ecs_tags, got %d\n", arena.bind_ecs_tag_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        if (strcmp(arena.bind_ecs_tags[0].tag, "eu-tier") != 0 || arena.bind_ecs_tags[0].cidr_count != 1) {
+            printf("FAIL: bind_ecs_tags[0] mismatch\n");
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Validate records tagged properly
+        bool found_tokyo = false, found_osaka = false, found_ecs = false, found_def = false;
+        for (size_t i = 0; i < arena.count; i++) {
+            dns_record_t *r = &arena.records[i];
+            if (strcmp(r->name, "www.example.com.") == 0) {
+                if (r->bind_location_tag && strcmp(r->bind_location_tag, "tokyo") == 0) found_tokyo = true;
+                if (r->bind_location_tag && strcmp(r->bind_location_tag, "osaka") == 0) found_osaka = true;
+            } else if (strcmp(r->name, "api.example.com.") == 0) {
+                if (r->ecs_subnet_tag && strcmp(r->ecs_subnet_tag, "eu-tier") == 0) found_ecs = true;
+            } else if (strcmp(r->name, "def.example.com.") == 0) {
+                if (r->bind_location_tag == NULL && r->ecs_subnet_tag == NULL) found_def = true;
+            }
+        }
+
+        if (!found_tokyo || !found_osaka || !found_ecs || !found_def) {
+            printf("FAIL: record tag mapping mismatch (tokyo=%d, osaka=%d, ecs=%d, def=%d)\n",
+                   found_tokyo, found_osaka, found_ecs, found_def);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+
+        // Test clone_ecs_tags_array & free_ecs_tags_array lifecycle
+        ecs_tag_def_t *cloned = clone_ecs_tags_array(arena.bind_ecs_tags, arena.bind_ecs_tag_count);
+        if (!cloned || strcmp(cloned[0].tag, "eu-tier") != 0 || cloned[0].cidr_count != 1) {
+            printf("FAIL: clone_ecs_tags_array failed\n");
+            if (cloned) free_ecs_tags_array(cloned, arena.bind_ecs_tag_count);
+            free(zone_copy);
+            zone_arena_destroy(&arena);
+            return 1;
+        }
+        free_ecs_tags_array(cloned, arena.bind_ecs_tag_count);
+
+        free(zone_copy);
+        zone_arena_destroy(&arena);
+        printf("PASS: CLASS 65302 serialization, bounds check, and zone tag directives\n");
+    }
+
     printf("All tests passed safely.\n");
     return 0;
 }
