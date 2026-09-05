@@ -7614,6 +7614,26 @@ static bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
     return false;
 }
 
+static inline void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
+  uint8_t *p = (uint8_t *)&ip_be;
+  for (int i = 0; i < 4; i++) {
+    uint8_t v = p[i];
+    if (v >= 100) {
+      *dst++ = '0' + (v / 100);
+      v %= 100;
+      *dst++ = '0' + (v / 10);
+      *dst++ = '0' + (v % 10);
+    } else if (v >= 10) {
+      *dst++ = '0' + (v / 10);
+      *dst++ = '0' + (v % 10);
+    } else {
+      *dst++ = '0' + v;
+    }
+    if (i < 3) *dst++ = '.';
+  }
+  *dst = '\0';
+}
+
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
   cpuset_t cpuset;
@@ -7803,13 +7823,13 @@ worker_startup_success:;
             }
 
             char client_ip[INET6_ADDRSTRLEN] = "";
-            if (client_addr->ss_family == AF_INET)
-              inet_ntop(AF_INET, &((struct sockaddr_in *)client_addr)->sin_addr,
-                        client_ip, INET6_ADDRSTRLEN);
-            else if (client_addr->ss_family == AF_INET6)
+            if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
+              fast_ipv4_to_str(((struct sockaddr_in *)client_addr)->sin_addr.s_addr, client_ip);
+            } else if (client_addr->ss_family == AF_INET6) {
               inet_ntop(AF_INET6,
                         &((struct sockaddr_in6 *)client_addr)->sin6_addr,
                         client_ip, INET6_ADDRSTRLEN);
+            }
 
             // --- 高速ワンパス走査 ---
             char qname[256] = "";
@@ -7928,60 +7948,61 @@ worker_startup_success:;
                 process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
                                   qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
             if (res_len > 0) {
-              bool slip_triggered = false;
-              rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
-              if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
-                if (rlog_enabled) {
-                  submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
-                                      res_buf[3] & 0x0F, has_edns, dnssec_ok);
+              bool drop_packet = false;
+              bool tc_packet = false;
+
+              if (__builtin_expect(rrl_cfg != NULL, 0)) {
+                bool slip_triggered = false;
+                rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
+                if (!rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
+                  if (slip_triggered) {
+                    tc_packet = true;
+                  } else {
+                    drop_packet = true;
+                  }
                 }
-                udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
-                *res_msg = *ipc_msg;
-                res_msg->payload_len = res_len;
-                batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
-                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
-                batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
-                batch->tx_msgs[n_tx].msg_hdr.msg_namelen = 0;
-                batch->tx_msgs[n_tx].msg_hdr.msg_control = NULL;
-                batch->tx_msgs[n_tx].msg_hdr.msg_controllen = 0;
-                n_tx++;
-                if (n_tx == UDP_BATCH_SIZE) {
-                  sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
-                  n_tx = 0;
-                }
-              } else if (slip_triggered) {
-                if (rlog_enabled) {
-                  submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
-                                      res_buf[3] & 0x0F, has_edns, dnssec_ok);
-                }
-                res_buf[2] |= 0x02; // Set TC bit
-                res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
-                res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
-                res_buf[10] = 0; res_buf[11] = 0; // ARCOUNT = 0
-                
-                int qlen = (int)question_end;
-                if (qlen > res_len) qlen = res_len; // Safe fallback
-                if (qlen > payload_received) qlen = payload_received;
-                
-                udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
-                *res_msg = *ipc_msg;
-                res_msg->payload_len = qlen;
-                batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
-                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
-                batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
-                batch->tx_msgs[n_tx].msg_hdr.msg_namelen = 0;
-                batch->tx_msgs[n_tx].msg_hdr.msg_control = NULL;
-                batch->tx_msgs[n_tx].msg_hdr.msg_controllen = 0;
-                n_tx++;
-                if (n_tx == UDP_BATCH_SIZE) {
-                  sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
-                  n_tx = 0;
-                }
-              } else {
+              }
+
+              if (__builtin_expect(drop_packet, 0)) {
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
                                       qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
                 }
+                continue;
+              }
+
+              if (rlog_enabled) {
+                submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                    res_buf[3] & 0x0F, has_edns, dnssec_ok);
+              }
+
+              udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
+              *res_msg = *ipc_msg;
+
+              if (__builtin_expect(tc_packet, 0)) {
+                res_buf[2] |= 0x02; // Set TC bit
+                res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
+                res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
+                res_buf[10] = 0; res_buf[11] = 0; // ARCOUNT = 0
+                int qlen = (int)question_end;
+                if (qlen > res_len) qlen = res_len;
+                if (qlen > payload_received) qlen = payload_received;
+                res_msg->payload_len = qlen;
+                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
+              } else {
+                res_msg->payload_len = res_len;
+                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
+              }
+
+              batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
+              batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
+              batch->tx_msgs[n_tx].msg_hdr.msg_namelen = 0;
+              batch->tx_msgs[n_tx].msg_hdr.msg_control = NULL;
+              batch->tx_msgs[n_tx].msg_hdr.msg_controllen = 0;
+              n_tx++;
+              if (n_tx == UDP_BATCH_SIZE) {
+                sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
+                n_tx = 0;
               }
             } else {
               if (rlog_enabled) {
@@ -9294,21 +9315,36 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     exit(1);
   }
   for (int k = 0; k < UDP_BATCH_SIZE; k++) {
-    memset(&fctx->rx_msgs[k], 0, sizeof(fctx->rx_msgs[k]));
+    udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
+    fctx->rx_iov[k].iov_base = fctx->rx_buffers[k] + sizeof(udp_ipc_t);
+    fctx->rx_iov[k].iov_len = BUFFER_SIZE;
     fctx->rx_msgs[k].msg_hdr.msg_iov = &fctx->rx_iov[k];
     fctx->rx_msgs[k].msg_hdr.msg_iovlen = 1;
+    fctx->rx_msgs[k].msg_hdr.msg_name = &msg->client_addr;
+    fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+    fctx->rx_msgs[k].msg_hdr.msg_control = NULL;
+    fctx->rx_msgs[k].msg_hdr.msg_controllen = 0;
 
-    memset(&fctx->ipc_tx_msgs[k], 0, sizeof(fctx->ipc_tx_msgs[k]));
     fctx->ipc_tx_msgs[k].msg_hdr.msg_iov = &fctx->ipc_tx_iov[k];
     fctx->ipc_tx_msgs[k].msg_hdr.msg_iovlen = 1;
+    fctx->ipc_tx_msgs[k].msg_hdr.msg_name = NULL;
+    fctx->ipc_tx_msgs[k].msg_hdr.msg_namelen = 0;
+    fctx->ipc_tx_msgs[k].msg_hdr.msg_control = NULL;
+    fctx->ipc_tx_msgs[k].msg_hdr.msg_controllen = 0;
 
-    memset(&fctx->ipc_rx_msgs[k], 0, sizeof(fctx->ipc_rx_msgs[k]));
+    fctx->ipc_rx_iov[k].iov_base = fctx->ipc_rx_buffers[k];
+    fctx->ipc_rx_iov[k].iov_len = sizeof(fctx->ipc_rx_buffers[k]);
     fctx->ipc_rx_msgs[k].msg_hdr.msg_iov = &fctx->ipc_rx_iov[k];
     fctx->ipc_rx_msgs[k].msg_hdr.msg_iovlen = 1;
+    fctx->ipc_rx_msgs[k].msg_hdr.msg_name = NULL;
+    fctx->ipc_rx_msgs[k].msg_hdr.msg_namelen = 0;
+    fctx->ipc_rx_msgs[k].msg_hdr.msg_control = NULL;
+    fctx->ipc_rx_msgs[k].msg_hdr.msg_controllen = 0;
 
-    memset(&fctx->cli_tx_msgs[k], 0, sizeof(fctx->cli_tx_msgs[k]));
     fctx->cli_tx_msgs[k].msg_hdr.msg_iov = &fctx->cli_tx_iov[k];
     fctx->cli_tx_msgs[k].msg_hdr.msg_iovlen = 1;
+    fctx->cli_tx_msgs[k].msg_hdr.msg_control = NULL;
+    fctx->cli_tx_msgs[k].msg_hdr.msg_controllen = 0;
   }
 
   uint8_t buffer[65536];
@@ -9348,12 +9384,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
         int fd = local_udp_fds[ud];
         while (1) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
-            fctx->rx_iov[k].iov_base = fctx->rx_buffers[k] + sizeof(udp_ipc_t);
             fctx->rx_iov[k].iov_len = BUFFER_SIZE;
-            fctx->rx_msgs[k].msg_hdr.msg_name = &fctx->rx_addrs[k];
             fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
-            fctx->rx_msgs[k].msg_hdr.msg_control = NULL;
-            fctx->rx_msgs[k].msg_hdr.msg_controllen = 0;
           }
           int n_recv = recvmmsg(fd, fctx->rx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
           if (n_recv <= 0)
@@ -9366,16 +9398,11 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
               msg->sock_fd_idx = ud;
               msg->addr_len = fctx->rx_msgs[k].msg_hdr.msg_namelen;
-              msg->client_addr = fctx->rx_addrs[k];
               msg->has_source_addr = false;
               msg->payload_len = (uint16_t)len;
 
               fctx->ipc_tx_iov[tx_count].iov_base = fctx->rx_buffers[k];
               fctx->ipc_tx_iov[tx_count].iov_len = sizeof(udp_ipc_t) + len;
-              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_name = NULL;
-              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_namelen = 0;
-              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_control = NULL;
-              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_controllen = 0;
               tx_count++;
             }
           }
@@ -9418,12 +9445,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
         int fd = g_ipc_fds[router_id][worker_idx][0];
         while (1) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
-            fctx->ipc_rx_iov[k].iov_base = fctx->ipc_rx_buffers[k];
             fctx->ipc_rx_iov[k].iov_len = sizeof(fctx->ipc_rx_buffers[k]);
-            fctx->ipc_rx_msgs[k].msg_hdr.msg_name = NULL;
-            fctx->ipc_rx_msgs[k].msg_hdr.msg_namelen = 0;
-            fctx->ipc_rx_msgs[k].msg_hdr.msg_control = NULL;
-            fctx->ipc_rx_msgs[k].msg_hdr.msg_controllen = 0;
           }
           int n_recv = recvmmsg(fd, fctx->ipc_rx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
           if (n_recv <= 0)
@@ -9456,8 +9478,6 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &msg->client_addr;
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = msg->addr_len;
-            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = NULL;
-            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = 0;
             tx_count++;
           }
           if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) {
