@@ -58,7 +58,7 @@
 #define BUFFER_SIZE 4096
 
 
-#define MAX_BIND_ADDRS 32
+#define MAX_BIND_ADDRS 64
 
 // Frontend/Backendプロセス間のUDPパケット受け渡し用ヘッダ
 typedef struct {
@@ -7911,7 +7911,6 @@ worker_startup_success:;
               client_port =
                   ntohs(((struct sockaddr_in6 *)client_addr)->sin6_port);
 
-            atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
             if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
                 write_query_log(ctx, client_addr, sizeof(*client_addr),
                                 qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
@@ -7977,7 +7976,11 @@ worker_startup_success:;
               }
 
               udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
-              *res_msg = *ipc_msg;
+              res_msg->sock_fd_idx = ipc_msg->sock_fd_idx;
+              res_msg->addr_len = ipc_msg->addr_len;
+              res_msg->has_source_addr = false;
+              size_t copy_len = (ipc_msg->addr_len <= sizeof(res_msg->client_addr)) ? ipc_msg->addr_len : sizeof(res_msg->client_addr);
+              memcpy(&res_msg->client_addr, &ipc_msg->client_addr, copy_len);
 
               if (__builtin_expect(tc_packet, 0)) {
                 res_buf[2] |= 0x02; // Set TC bit
@@ -8011,6 +8014,7 @@ worker_startup_success:;
               }
             }
           }
+          atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
           if (snap) {
             release_zone_snapshot(snap);
           }
@@ -9200,6 +9204,13 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
 }
 
 static void run_frontend_router(pid_t backend_pid, int router_id) {
+  cpuset_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(router_id, &cpuset);
+  if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cpuset), &cpuset) < 0) {
+    syslog(LOG_WARNING, "[Frontend %d] Failed to set CPU affinity: %m", router_id);
+  }
+
   if (g_control_sock >= 0) {
     close(g_control_sock);
     g_control_sock = -1;
@@ -9878,7 +9889,7 @@ int main(int argc, char **argv) {
   g_worker_count = num_workers;
   for (int i = 0; i < num_workers; i++) {
     ctxs[i].thread_id = i;
-    ctxs[i].core_id = i % num_workers;
+    ctxs[i].core_id = (g_num_frontend_routers + i) % total_cores;
     ctxs[i].qlog_ring.size = qlog_buf_size;
     ctxs[i].qlog_ring.mask = qlog_buf_size - 1;
     ctxs[i].qlog_ring.events = calloc(qlog_buf_size, sizeof(qlog_event_t));
