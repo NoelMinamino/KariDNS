@@ -2400,13 +2400,19 @@ static bool parse_http_chunk(const uint8_t *buf, size_t buf_len, size_t *inout_o
     }
     if (hex_digits == 0) return false;
 
+    // chunk-sizeの直後: 空白スキップ後、行末かまたは ';' で始まる chunk-ext のみ許容 (RFC 7230 §4.1)
+    while (cur < line_end && (*cur == ' ' || *cur == '\t')) cur++;
+    if (cur < line_end && *cur != ';') return false;
+
     size_t data_start = (size_t)(line_end - buf) + 2;
     if (chunk_sz == 0) {
         *out_data_offset = data_start;
         *out_chunk_len = 0;
         *out_is_final = true;
-        // 最終チャンク: トレイラーヘッダ終端 (\r\n\r\n) を探索
-        const uint8_t *final_end = memmem(p, rem, "\r\n\r\n", 4);
+        size_t after_line = (size_t)(line_end - p);
+        if (after_line + 2 > rem) return false;
+        // 最終チャンク: line_end から始まるトレイラーヘッダ終端 (\r\n\r\n) を探索
+        const uint8_t *final_end = memmem(line_end, rem - after_line, "\r\n\r\n", 4);
         if (final_end) {
             *inout_offset = (size_t)(final_end - buf) + 4;
             return true;
@@ -2414,8 +2420,11 @@ static bool parse_http_chunk(const uint8_t *buf, size_t buf_len, size_t *inout_o
         return false;
     }
 
+    // chunk_data + CRLF (2バイト) がバッファ内に収まるかを安全に検証 (オーバーフロー防止)
+    if (data_start > buf_len || buf_len - data_start < 2) return false;
+    if (chunk_sz > buf_len - data_start - 2) return false;
+
     size_t data_end = data_start + chunk_sz;
-    if (data_end + 2 > buf_len) return false;
     // RFC 7230 §4.1: chunk-data の直後は必ず CRLF
     if (buf[data_end] != '\r' || buf[data_end + 1] != '\n') return false;
 
@@ -2444,6 +2453,7 @@ static int parse_http_status_code(const uint8_t *buf, size_t len) {
     }
     if (digits < 3) return -1;
     if (p < end && *p >= '0' && *p <= '9') return -1; // 4桁以上は無効
+    if (p < end && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') return -1;
     return code;
 }
 
@@ -2473,12 +2483,18 @@ static ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_le
             strncasecmp((const char *)http_buf + i, "Transfer-Encoding:", 18) == 0) {
             for (size_t j = i + 18; j + 7 <= header_len; j++) {
                 if (http_buf[j] == '\r' || http_buf[j] == '\n') break;
-                if (strncasecmp((const char *)http_buf + j, "chunked", 7) == 0) {
-                    is_chunked = true;
-                    break;
+                bool prev_delim = (j == i + 18 || http_buf[j - 1] == ' ' || http_buf[j - 1] == '\t' || http_buf[j - 1] == ',');
+                if (prev_delim && strncasecmp((const char *)http_buf + j, "chunked", 7) == 0) {
+                    bool next_delim = (j + 7 == header_len || http_buf[j + 7] == ' ' || http_buf[j + 7] == '\t' ||
+                                       http_buf[j + 7] == '\r' || http_buf[j + 7] == '\n' || http_buf[j + 7] == ',' ||
+                                       http_buf[j + 7] == ';');
+                    if (next_delim) {
+                        is_chunked = true;
+                        break;
+                    }
                 }
             }
-            break;
+            if (is_chunked) break;
         }
     }
 
@@ -2493,13 +2509,15 @@ static ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_le
                 chunk_complete = true;
                 break;
             }
-            size_t copy_sz = chunk_len;
-            if (dst + copy_sz > resp_cap) {
-                copy_sz = resp_cap - dst;
+            if (data_off > http_len || chunk_len > http_len - data_off) {
+                return -1;
             }
-            if (copy_sz > 0) {
-                memcpy(resp + dst, http_buf + data_off, copy_sz);
-                dst += copy_sz;
+            if (dst > resp_cap || chunk_len > resp_cap - dst) {
+                return -1;
+            }
+            if (chunk_len > 0) {
+                memcpy(resp + dst, http_buf + data_off, chunk_len);
+                dst += chunk_len;
             }
         }
         if (!chunk_complete) return -1;
@@ -2524,18 +2542,28 @@ static ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_le
                 has_digits = true;
             }
             if (has_digits) {
+                while (cur < end && (*cur == ' ' || *cur == '\t')) cur++;
+                if (cur < end && *cur != '\r' && *cur != '\n') {
+                    return -1; // 不正なContent-Length値
+                }
+                if (found_cl && cl_val != val) {
+                    return -1; // RFC 7230 §3.3.2: 異なるContent-Lengthの重複
+                }
                 cl_val = val;
                 found_cl = true;
+            } else {
+                return -1; // 数字の無いContent-Lengthヘッダは不正
             }
-            break;
         }
     }
     if (found_cl) {
+        if (cl_val > resp_cap) return -1;
         if (body_len < cl_val) return -1;
         if (cl_val < body_len) body_len = cl_val;
     }
 
-    if (body_len > resp_cap) body_len = resp_cap;
+    if (body_len > resp_cap) return -1;
+    if (body_offset > http_len || body_len > http_len - body_offset) return -1;
     memcpy(resp, http_buf + body_offset, body_len);
     return (ssize_t)body_len;
 }
