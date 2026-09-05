@@ -587,6 +587,7 @@ _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
 #define RESP_LOG_RING_SIZE 8192
+#define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_channel != NULL)
 
 typedef enum {
     LOG_ACT_SENT,
@@ -7755,6 +7756,7 @@ worker_startup_success:;
     server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_relaxed);
     bool qlog_enabled = (active && active->logging.queries_channel != NULL);
     uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
+    bool rlog_enabled = response_log_enabled(active);
 
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].filter == EVFILT_TIMER) {
@@ -7779,6 +7781,7 @@ worker_startup_success:;
             break;
           }
 
+          zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int n_tx = 0;
           for (int p = 0; p < n_recv; p++) {
             ssize_t received = (ssize_t)batch->rx_msgs[p].msg_len;
@@ -7808,12 +7811,20 @@ worker_startup_success:;
                         &((struct sockaddr_in6 *)client_addr)->sin6_addr,
                         client_ip, INET6_ADDRSTRLEN);
 
+            // --- 高速ワンパス走査 ---
             char qname[256] = "";
             uint16_t qtype = 0;
+            uint16_t qclass = 1;
+            size_t question_end = DNS_HEADER_SIZE;
+            bool has_edns = false;
+            bool dnssec_ok = false;
+
             if (payload_received > DNS_HEADER_SIZE) {
               size_t offset = DNS_HEADER_SIZE;
               size_t recv_len = (size_t)payload_received;
               size_t written = 0;
+
+              // 1回のループで qname と question_end を同時に確定
               while (offset < recv_len) {
                 uint8_t len = req_buf[offset];
                 if (len == 0 || (len & 0xC0) == 0xC0) {
@@ -7823,33 +7834,54 @@ worker_startup_success:;
                 if (offset + len + 1 > recv_len) break;
                 offset++;
                 if (written > 0 && qname[written - 1] != '.') {
-                  if (written < 255)
-                    qname[written++] = '.';
+                  if (written < 255) qname[written++] = '.';
                 }
                 if (offset + len <= recv_len) {
                   for (size_t b = 0; b < len; b++) {
                     uint8_t c = req_buf[offset + b];
-                    if (c == '.' || c == '\\') {
-                      if (written + 2 < 255) {
-                        qname[written++] = '\\';
-                        qname[written++] = (char)c;
-                      }
-                    } else {
-                      if (written < 255) {
-                        qname[written++] = (char)c;
-                      }
+                    if (written < 254) {
+                      if (c == '.' || c == '\\') qname[written++] = '\\';
+                      qname[written++] = (char)c;
                     }
                   }
                 }
                 offset += len;
               }
-              if (offset + 1 < recv_len)
-                qtype = (req_buf[offset] << 8) | req_buf[offset + 1];
               if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-                if (written < 255)
-                  qname[written++] = '.';
+                if (written < 255) qname[written++] = '.';
               }
               qname[written] = '\0';
+
+              if (offset + 4 <= recv_len) {
+                qtype = (req_buf[offset] << 8) | req_buf[offset + 1];
+                qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
+                offset += 4;
+                question_end = offset;
+              }
+
+              // EDNSの走査 (Questionの直後から無駄なくスキャン)
+              uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
+              if (arcount > 0 && offset < recv_len) {
+                // 通常のクエリでは qd=1, an=0, ns=0 のため、offset は既に Additional Section の先頭
+                if (offset + 10 <= recv_len) {
+                  // OPTレコードの判定 (名前がルート 0x00 かつ TYPE 41)
+                  size_t opt_offset = offset;
+                  if (req_buf[opt_offset] == 0) {
+                    opt_offset++;
+                    if (opt_offset + 10 <= recv_len) {
+                      uint16_t rt = (req_buf[opt_offset] << 8) | req_buf[opt_offset + 1];
+                      if (rt == 41) {
+                        has_edns = true;
+                        uint32_t ttl = ((uint32_t)req_buf[opt_offset + 4] << 24) |
+                                       ((uint32_t)req_buf[opt_offset + 5] << 16) |
+                                       ((uint32_t)req_buf[opt_offset + 6] << 8) |
+                                       req_buf[opt_offset + 7];
+                        if (ttl & 0x00008000) dnssec_ok = true;
+                      }
+                    }
+                  }
+                }
+              }
             }
 
             int client_port = 0;
@@ -7858,80 +7890,13 @@ worker_startup_success:;
             else if (client_addr->ss_family == AF_INET6)
               client_port =
                   ntohs(((struct sockaddr_in6 *)client_addr)->sin6_port);
-            uint16_t qclass = 1;
-            bool has_edns = false;
-            bool dnssec_ok = false;
-            size_t question_end = DNS_HEADER_SIZE; // default fallback
-            if (payload_received > DNS_HEADER_SIZE) {
-              size_t offset = DNS_HEADER_SIZE;
-              while (offset < (size_t)payload_received) {
-                uint8_t len = req_buf[offset];
-                if (len == 0 || (len & 0xC0) == 0xC0) {
-                  offset += (len == 0) ? 1 : 2;
-                  break;
-                }
-                if (offset + len + 1 > (size_t)payload_received) break;
-                offset += len + 1;
-              }
-              question_end = offset + 4;
-              if (offset + 3 < (size_t)payload_received)
-                qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
-              uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
-              if (arcount > 0) {
-                size_t o = DNS_HEADER_SIZE;
-                uint16_t qd = (req_buf[4] << 8) | req_buf[5];
-                uint16_t an = (req_buf[6] << 8) | req_buf[7];
-                uint16_t ns = (req_buf[8] << 8) | req_buf[9];
-                for (int k = 0; k < qd; k++) {
-                  while (o < (size_t)payload_received && req_buf[o] != 0 &&
-                         (req_buf[o] & 0xC0) != 0xC0) {
-                    if (o + req_buf[o] + 1 > (size_t)payload_received) break;
-                    o += req_buf[o] + 1;
-                  }
-                  if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
-                    o += 2;
-                  else
-                    o++;
-                  o += 4;
-                }
-                for (int k = 0; k < an + ns + arcount; k++) {
-                  if (o >= (size_t)payload_received)
-                    break;
-                  while (o < (size_t)payload_received && req_buf[o] != 0 &&
-                         (req_buf[o] & 0xC0) != 0xC0) {
-                    if (o + req_buf[o] + 1 > (size_t)payload_received) break;
-                    o += req_buf[o] + 1;
-                  }
-                  if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
-                    o += 2;
-                  else
-                    o++;
-                  if (o + 10 <= (size_t)payload_received) {
-                    uint16_t rt = (req_buf[o] << 8) | req_buf[o + 1];
-                    uint32_t ttl = ((uint32_t)req_buf[o + 4] << 24) |
-                                   ((uint32_t)req_buf[o + 5] << 16) |
-                                   ((uint32_t)req_buf[o + 6] << 8) |
-                                   req_buf[o + 7];
-                    uint16_t rdl = (req_buf[o + 8] << 8) | req_buf[o + 9];
-                    if (rt == 41) {
-                      has_edns = true;
-                      if (ttl & 0x00008000)
-                        dnssec_ok = true;
-                      break;
-                    }
-                    o += 10 + rdl;
-                  } else
-                    break;
-                }
-              }
-            }
+
             atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
             if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
                 write_query_log(ctx, client_addr, sizeof(*client_addr),
                                 qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
             }
 
-            zone_db_snapshot_t *snap = acquire_zone_snapshot();
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
               task.is_tcp = false;
@@ -7947,10 +7912,12 @@ worker_startup_success:;
               task.has_edns = has_edns;
               task.dnssec_ok = dnssec_ok;
               task.question_end = question_end;
-              task.snap = snap;
+              task.snap = acquire_zone_snapshot();
               if (!enqueue_async_io_task(&task)) {
-                release_zone_snapshot(snap);
-                submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+                release_zone_snapshot(task.snap);
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+                }
               }
               continue;
             }
@@ -7960,13 +7927,14 @@ worker_startup_success:;
             int res_len =
                 process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
                                   qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
-            release_zone_snapshot(snap);
             if (res_len > 0) {
               bool slip_triggered = false;
               rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
               if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
-                submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
-                                    res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                      res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                }
                 udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
                 *res_msg = *ipc_msg;
                 res_msg->payload_len = res_len;
@@ -7982,8 +7950,10 @@ worker_startup_success:;
                   n_tx = 0;
                 }
               } else if (slip_triggered) {
-                submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
-                                    res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                      res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                }
                 res_buf[2] |= 0x02; // Set TC bit
                 res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
                 res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
@@ -8008,13 +7978,20 @@ worker_startup_success:;
                   n_tx = 0;
                 }
               } else {
-                submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
-                                    qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
+                                      qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                }
               }
             } else {
-              submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
-                                  0, 0, 0, false, false);
+              if (rlog_enabled) {
+                submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
+                                    0, 0, 0, false, false);
+              }
             }
+          }
+          if (snap) {
+            release_zone_snapshot(snap);
           }
           if (n_tx > 0) {
             sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
@@ -9710,13 +9687,24 @@ int main(int argc, char **argv) {
   atomic_init(&g_config_db.active, &g_config_db.config_a);
   rebuild_zone_db_from_config(&g_config_db.config_a, false);
 
-  int num_workers = sysconf(_SC_NPROCESSORS_ONLN);
-  if (num_workers <= 0)
-    num_workers = 2;
-
-  g_num_frontend_routers = (num_workers <= 2) ? 1 : ((num_workers >= 8) ? 4 : 2);
+  int total_cores = sysconf(_SC_NPROCESSORS_ONLN);
+  if (total_cores <= 0)
+    total_cores = 1;
+  int num_workers = 1;
+  if (total_cores <= 3) {
+    g_num_frontend_routers = 1;
+    num_workers = (total_cores >= 3) ? 2 : 1;
+  } else if (total_cores <= 6) {
+    g_num_frontend_routers = 2;
+    num_workers = total_cores - 2;
+  } else {
+    g_num_frontend_routers = 2;
+    num_workers = total_cores - 2;
+  }
   if (g_num_frontend_routers > MAX_FRONTEND_ROUTERS)
     g_num_frontend_routers = MAX_FRONTEND_ROUTERS;
+  if (num_workers > MAX_WORKERS)
+    num_workers = MAX_WORKERS;
 
   setup_ipc_tables(num_workers);
 
