@@ -290,8 +290,15 @@ run_check "TSIG keyfile flag (-k)" "$DAG @127.0.0.1 -p $PORT www.example.com A -
 run_check "TSIG signing time override (+fuzztime)" "$DAG @127.0.0.1 -p $PORT www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +fuzztime=1646972129 +qr" "(BADTIME|62 2a ab 61|1646972129|ADDITIONAL)"
 if [ "$DAG" = "dig" ]; then
     run_skip "TSIG signature (+tsig=)"
+    run_skip "SIG(0) mutual exclusion with TSIG"
+    run_skip "SIG(0) option validation (+sig0-pkey requires +sig0-name)"
+    run_skip "SIG(0) non-existent key file validation"
 else
     run_check "TSIG signature (+tsig=)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tsig=hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +qr" "(TSIG|testkey|ADDITIONAL)"
+    run_check "SIG(0) mutual exclusion with TSIG (-y and +sig0-pkey)" "$DAG @127.0.0.1 -p $PORT example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +sig0-pkey=dummy.key +sig0-name=key.example. +timeout=1" "(error: TSIG \(-k/-y\) and SIG\(0\) \(\+sig0-pkey\) cannot be combined)"
+    openssl ecparam -name prime256v1 -genkey -noout -out sig0_test.key 2>/dev/null || true
+    run_check "SIG(0) requires +sig0-name when +sig0-pkey is given" "$DAG @127.0.0.1 -p $PORT example.com A +sig0-pkey=sig0_test.key +timeout=1" "(error: SIG\(0\) requires a signer name)"
+    run_check "SIG(0) non-existent private key file fails" "$DAG @127.0.0.1 -p $PORT example.com A +sig0-pkey=nonexistent.key +sig0-name=key.example. +timeout=1" "(error: could not open SIG\(0\) private key file)"
 fi
 
 echo "========================================================"
@@ -504,6 +511,11 @@ if command -v perl >/dev/null 2>&1; then
     run_check "Semantic: Structured RR Differential & Semantic Oracle (tests/run_dag_rr_differential_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_rr_differential_test.sh\"" "PASS: RR Differential test suite passed successfully\."
 fi
 run_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
+if [ "$DAG" = "dig" ]; then
+    run_skip "RFC 3007 / RFC 2931: SIG(0) Transaction Signing (tests/run_dag_sig0_update_test.sh)"
+else
+    run_check "RFC 3007 / RFC 2931: SIG(0) Transaction Signing (tests/run_dag_sig0_update_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_sig0_update_test.sh\"" "ALL SIG\(0\) TESTS PASSED SUCCESSFULLY!"
+fi
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then

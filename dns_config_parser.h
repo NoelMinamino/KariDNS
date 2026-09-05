@@ -143,6 +143,7 @@ typedef struct server_config_s {
   uint32_t minimal_any_ttl;
   additional_from_auth_t additional_from_auth;
   uint32_t query_log_max_qps;
+  uint32_t query_log_buffer_size;
   int max_mqtypes;
   bool rfc10029_mqtype_enable;
   bool tcp_connection_reuse;

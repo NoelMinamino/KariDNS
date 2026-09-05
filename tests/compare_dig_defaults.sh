@@ -365,6 +365,23 @@ EOF
     compare_query "TSIG keyfile flag (-k)" "www.example.com A -k tsig_key.conf"
     compare_query "TSIG signing time override (+fuzztime)" "www.example.com A -y hmac-sha256:testkey:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +fuzztime=1646972129"
 
+    # SIG(0) Transaction Signing (RFC 2931 / RFC 3007)
+    # BIND dig and dag both use -k <file.private> to auto-detect SIG(0) keys
+    if command -v dnssec-keygen >/dev/null 2>&1; then
+        K_ECDSA=$(dnssec-keygen -a ECDSAP256SHA256 -b 256 -n USER -K . update-key.example.com. 2>/dev/null || true)
+        if [ -n "$K_ECDSA" ] && [ -f "$K_ECDSA.private" ]; then
+            compare_query "SIG(0) ECDSA P-256 via -k" "www.example.com A -k $K_ECDSA.private"
+        fi
+        K_ED=$(dnssec-keygen -a ED25519 -n USER -K . ed-key.example.com. 2>/dev/null || true)
+        if [ -n "$K_ED" ] && [ -f "$K_ED.private" ]; then
+            compare_query "SIG(0) Ed25519 via -k" "www.example.com A -k $K_ED.private"
+        fi
+        K_RSA=$(dnssec-keygen -a RSASHA256 -b 2048 -n USER -K . rsa-key.example.com. 2>/dev/null || true)
+        if [ -n "$K_RSA" ] && [ -f "$K_RSA.private" ]; then
+            compare_query "SIG(0) RSA 2048 via -k" "www.example.com A -k $K_RSA.private"
+        fi
+    fi
+
     echo "--------------------------------------------------------"
     echo "9. IDN (Internationalized Domain Names)"
     echo "--------------------------------------------------------"
@@ -401,6 +418,9 @@ EOF
     compare_query "YAML: LOC record (+yaml)" "office.example.com LOC +yaml"
     compare_query "YAML: LOC record (where-is-the-iss.dedyn.io)" "where-is-the-iss.dedyn.io LOC +yaml +timeout=3"
     compare_query "YAML: Trace query (+trace +yaml)" "example.com +trace +yaml +timeout=3"
+    if [ -n "$K_ECDSA" ] && [ -f "$K_ECDSA.private" ]; then
+        compare_query "YAML: SIG(0) signed query resolution" "www.example.com A -k $K_ECDSA.private +yaml"
+    fi
 
     echo "--------------------------------------------------------"
     echo "12. DNS64 Prefix Discovery (+dns64prefix)"

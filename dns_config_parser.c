@@ -1283,6 +1283,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_any_ttl = 86400;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->query_log_max_qps = 5000;
+  config->query_log_buffer_size = 32768;
   config->max_mqtypes = 4;
   config->rfc10029_mqtype_enable = false;
   config->udp_recvbuf_size = 4 * 1024 * 1024;
@@ -1586,6 +1587,31 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           } else {
             syslog(LOG_ERR, "[Config] Invalid query-log-max-qps value '%s'", tok.value);
             fprintf(stderr, "[ERROR] Invalid query-log-max-qps value '%s'\n", tok.value);
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "query-log-buffer-size") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          char *endptr;
+          unsigned long v = strtoul(tok.value, &endptr, 10);
+          if (*endptr == '\0' && v >= 1024 && v <= 1048576 && ((v & (v - 1)) == 0)) {
+            config->query_log_buffer_size = (uint32_t)v;
+          } else {
+            syslog(LOG_ERR, "[Config] Invalid query-log-buffer-size value '%s' (must be a power of 2 between 1024 and 1048576)", tok.value);
+            fprintf(stderr, "[ERROR] Invalid query-log-buffer-size value '%s' (must be a power of 2 between 1024 and 1048576)\n", tok.value);
             free(key);
             free_token(&tok);
             return -1;

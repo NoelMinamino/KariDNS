@@ -3173,11 +3173,16 @@ int main() {
             free_server_config_fields(&cfg1);
             return 1;
         }
+        if (cfg1.query_log_buffer_size != 32768) {
+            printf("FAIL: default query_log_buffer_size should be 32768 (got %u)\n", cfg1.query_log_buffer_size);
+            free_server_config_fields(&cfg1);
+            return 1;
+        }
         free_server_config_fields(&cfg1);
 
         // 1b. options query-log-max-qps and channel max-qps overrides
         const char *max_qps_conf =
-            "options { port 53; bind-address { 127.0.0.1; }; query-log-max-qps 8000; };\n"
+            "options { port 53; bind-address { 127.0.0.1; }; query-log-max-qps 8000; query-log-buffer-size 65536; };\n"
             "logging {\n"
             "    channel qlog1 { file \"/tmp/q1.log\"; };\n"
             "    channel qlog2 { file \"/tmp/q2.log\"; max-qps 1200; };\n"
@@ -3192,6 +3197,11 @@ int main() {
         }
         if (cfg_qps.query_log_max_qps != 8000) {
             printf("FAIL: options query-log-max-qps expected 8000, got %u\n", cfg_qps.query_log_max_qps);
+            free_server_config_fields(&cfg_qps);
+            return 1;
+        }
+        if (cfg_qps.query_log_buffer_size != 65536) {
+            printf("FAIL: options query-log-buffer-size expected 65536, got %u\n", cfg_qps.query_log_buffer_size);
             free_server_config_fields(&cfg_qps);
             return 1;
         }

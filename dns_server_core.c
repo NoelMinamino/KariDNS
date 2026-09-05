@@ -17,6 +17,7 @@
 #include <sched.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdalign.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -155,6 +156,8 @@ typedef struct {
   size_t accumulated;
   uint16_t msg_len;
   char client_ip[INET6_ADDRSTRLEN];
+  struct sockaddr_storage client_addr;
+  socklen_t client_len;
 } tcp_stream_ctx_t;
 
 typedef struct {
@@ -173,10 +176,41 @@ typedef struct {
   bool has_current_ecs_tag;
 } axfr_session_t;
 
+// クエリログ用 固定長イベント構造体 (バイナリ保持)
+typedef struct {
+    struct timespec ts;
+    struct sockaddr_storage client_addr;
+    socklen_t addr_len;
+    uint16_t qtype;
+    uint16_t qclass;
+    uint8_t  rcode;
+    uint8_t  flags;
+    uint8_t  protocol; // IPPROTO_UDP or IPPROTO_TCP
+    bool     has_edns;
+    bool     dnssec_ok;
+    char     qname[256];
+} qlog_event_t;
+
+// Per-Worker SPSC (Single-Producer Single-Consumer) リングバッファ
+typedef struct {
+    qlog_event_t *events;
+    uint32_t size;
+    uint32_t mask;
+    alignas(64) _Atomic uint32_t head; // Producer (Worker) のみ更新
+    alignas(64) _Atomic uint32_t tail; // Consumer (Logger thread) のみ更新
+    alignas(64) _Atomic uint64_t dropped_count;
+} qlog_ring_t;
+
 typedef struct {
   int thread_id;
   int core_id;
   zone_rcu_t *rcu_db;
+  qlog_ring_t qlog_ring;
+  alignas(64) _Atomic uint64_t query_count; // QPS計測用ローカルカウンタ (競合ゼロ)
+
+  // ワーカーローカル・レートリミット用 (排他制御不要・競合ゼロ)
+  time_t log_current_sec;
+  uint32_t log_emitted_this_sec;
 } worker_ctx_t;
 
 typedef struct {
@@ -539,26 +573,21 @@ static resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
 static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
-#define QUERY_LOG_RING_SIZE 8192
+static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
+static worker_ctx_t *g_worker_ctxs = NULL;
+static int g_worker_count = 0;
 
-typedef struct {
-    _Atomic bool ready;
-    struct timespec ts;
-    char client_ip[INET6_ADDRSTRLEN];
-    int client_port;
-    char qname[256];
-    uint16_t qclass;
-    uint16_t qtype;
-    bool has_edns;
-    bool dnssec_ok;
-} query_log_entry_t;
-
-static query_log_entry_t g_query_log_ring[QUERY_LOG_RING_SIZE];
-static _Atomic uint64_t g_query_log_tail = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t g_query_log_head = ATOMIC_VAR_INIT(0);
-
-static _Atomic uint32_t g_query_log_sec = ATOMIC_VAR_INIT(0);
-static _Atomic uint32_t g_query_log_count = ATOMIC_VAR_INIT(0);
+static inline uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
+    if (!cfg) return 0;
+    // チャンネル側に 0 より大きい値が明示されている場合のみそれを採用
+    if (cfg->logging.queries_channel && 
+        cfg->logging.queries_channel->max_qps_specified && 
+        cfg->logging.queries_channel->max_qps > 0) {
+        return cfg->logging.queries_channel->max_qps;
+    }
+    // それ以外は options の query_log_max_qps を採用
+    return cfg->query_log_max_qps;
+}
 
 static inline void inc_tcp_clients(void) {
     int current = atomic_fetch_add_explicit(&g_tcp_clients, 1, memory_order_relaxed) + 1;
@@ -1007,20 +1036,26 @@ static inline bool domain_names_match_ci(const char *a, const char *b) {
 static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
   if (!view || !qname) return NULL;
   size_t q_len = strlen(qname);
+  while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+
   zone_db_entry_t *best_entry = NULL;
   size_t longest_match_len = 0;
   for (size_t i = 0; i < view->zone_count; i++) {
     zone_db_entry_t *entry = view->entries[i];
     if (!entry) continue;
     size_t z_len = strlen(entry->domain);
+    while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
+
     bool match = false;
-    if (q_len == z_len && strcasecmp(qname, entry->domain) == 0) {
+    if (z_len == 0 && (strcmp(entry->domain, ".") == 0 || entry->domain[0] == '\0')) {
+      match = true;
+    } else if (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) {
       match = true;
     } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
-               strcasecmp(qname + q_len - z_len, entry->domain) == 0) {
+               strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0) {
       match = true;
     }
-    if (match && z_len > longest_match_len) {
+    if (match && (!best_entry || z_len > longest_match_len)) {
       longest_match_len = z_len;
       best_entry = entry;
     }
@@ -3744,9 +3779,11 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 const char client_loc[2],
                                 const char *client_ecs_tag,
                                 const char *client_loc_tag,
-                                additional_from_auth_t policy) {
+                                additional_from_auth_t policy,
+                                view_snapshot_t *view) {
   if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
 
+  // 1. Fast path: check prelinked glue
   if (current_zone->prelinked_glue && current_zone->prelinked_glue_count > 0) {
     for (int e = 0; e < current_zone->prelinked_glue_count; e++) {
       prelinked_glue_entry_t *entry = &current_zone->prelinked_glue[e];
@@ -3774,33 +3811,138 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
     }
   }
 
+  // 2. In-zone search (covers in-domain glue and out-of-zone glue in current_zone)
   size_t t_len = strlen(target), a_len = strlen(zone_apex);
-  if (t_len >= a_len &&
-      strcasecmp(target + t_len - a_len, zone_apex) == 0 &&
-      (t_len == a_len || target[t_len - a_len - 1] == '.')) {
+  while (t_len > 0 && target[t_len - 1] == '.') t_len--;
+  while (a_len > 0 && zone_apex[a_len - 1] == '.') a_len--;
+
+  bool is_in_domain = (t_len >= a_len &&
+                       strncasecmp(target + (t_len - a_len), zone_apex, a_len) == 0 &&
+                       (t_len == a_len || target[t_len - a_len - 1] == '.'));
+
+  if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !is_in_domain) {
+    return true;
+  }
+
+  bool in_zone_found = false;
+  if (current_zone->hash_size > 0 && current_zone->hash_table) {
     time_t tinydns_now = (current_zone && current_zone->is_tinydns_format) ? time(NULL) : 0;
-    uint32_t tgt_hash = calc_fnv1a_str(target);
-    size_t tgt_idx = tgt_hash & (current_zone->hash_size - 1);
-    for (int j = current_zone->hash_table[tgt_idx]; j != -1;
-         j = current_zone->records[j].next_record) {
-      dns_record_t *rec = &current_zone->records[j];
-      if ((rec->type_code == 1 || rec->type_code == 28) &&
-          strcasecmp(rec->name, target) == 0) {
-        uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-        dns_record_t rec_copy = *rec;
-        rec_copy.ttl_value = eff_ttl;
-        uint16_t saved_offset = *offset;
-        if (serialize_dns_record(res, max_res_len, offset,
-                                 &rec_copy, comp_ctx,
-                                 NULL, 0xFFFFFFFF) < 0) {
-          *offset = saved_offset;
-          return false;
-        } else
-          (*arcount)++;
+    uint32_t hashes[2];
+    int h_count = 1;
+    hashes[0] = calc_fnv1a_str(target);
+    char alt_tgt[256];
+    size_t raw_len = strlen(target);
+    if (raw_len > 0 && target[raw_len - 1] == '.') {
+      snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), target);
+      hashes[1] = calc_fnv1a_str(alt_tgt);
+      h_count = 2;
+    } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
+      snprintf(alt_tgt, sizeof(alt_tgt), "%s.", target);
+      hashes[1] = calc_fnv1a_str(alt_tgt);
+      h_count = 2;
+    }
+
+    dns_record_t *added_recs[32];
+    int added_count = 0;
+
+    for (int h = 0; h < h_count; h++) {
+      size_t idx = hashes[h] & (current_zone->hash_size - 1);
+      if (h == 1 && idx == (hashes[0] & (current_zone->hash_size - 1))) continue;
+      for (int j = current_zone->hash_table[idx]; j != -1;
+           j = current_zone->records[j].next_record) {
+        dns_record_t *rec = &current_zone->records[j];
+        if ((rec->type_code == 1 || rec->type_code == 28) &&
+            domain_names_match_ci(rec->name, target)) {
+          bool dup = false;
+          for (int a = 0; a < added_count; a++) {
+            if (added_recs[a] == rec) { dup = true; break; }
+          }
+          if (dup) continue;
+          if (added_count < 32) added_recs[added_count++] = rec;
+
+          uint32_t eff_ttl;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+          dns_record_t rec_copy = *rec;
+          rec_copy.ttl_value = eff_ttl;
+          uint16_t saved_offset = *offset;
+          if (serialize_dns_record(res, max_res_len, offset,
+                                   &rec_copy, comp_ctx,
+                                   NULL, 0xFFFFFFFF) < 0) {
+            *offset = saved_offset;
+            return false;
+          } else {
+            (*arcount)++;
+            in_zone_found = true;
+          }
+        }
       }
     }
   }
+
+  if (in_zone_found) {
+    return true;
+  }
+
+  // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
+  if (policy == ADDITIONAL_AUTH_YES && view) {
+    zone_db_entry_t *sib_entry = find_zone_in_view(view, target);
+    if (sib_entry) {
+      zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+      if (sib_arena && sib_arena != current_zone && sib_arena->hash_size > 0 && sib_arena->hash_table) {
+        time_t tinydns_now = sib_arena->is_tinydns_format ? time(NULL) : 0;
+        uint32_t hashes[2];
+        int h_count = 1;
+        hashes[0] = calc_fnv1a_str(target);
+        char alt_tgt[256];
+        size_t raw_len = strlen(target);
+        if (raw_len > 0 && target[raw_len - 1] == '.') {
+          snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), target);
+          hashes[1] = calc_fnv1a_str(alt_tgt);
+          h_count = 2;
+        } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
+          snprintf(alt_tgt, sizeof(alt_tgt), "%s.", target);
+          hashes[1] = calc_fnv1a_str(alt_tgt);
+          h_count = 2;
+        }
+
+        dns_record_t *added_recs[32];
+        int added_count = 0;
+
+        for (int h = 0; h < h_count; h++) {
+          size_t idx = hashes[h] & (sib_arena->hash_size - 1);
+          if (h == 1 && idx == (hashes[0] & (sib_arena->hash_size - 1))) continue;
+          for (int j = sib_arena->hash_table[idx]; j != -1;
+               j = sib_arena->records[j].next_record) {
+            dns_record_t *rec = &sib_arena->records[j];
+            if ((rec->type_code == 1 || rec->type_code == 28) &&
+                domain_names_match_ci(rec->name, target)) {
+              bool dup = false;
+              for (int a = 0; a < added_count; a++) {
+                if (added_recs[a] == rec) { dup = true; break; }
+              }
+              if (dup) continue;
+              if (added_count < 32) added_recs[added_count++] = rec;
+
+              uint32_t eff_ttl;
+              if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+              dns_record_t rec_copy = *rec;
+              rec_copy.ttl_value = eff_ttl;
+              uint16_t saved_offset = *offset;
+              if (serialize_dns_record(res, max_res_len, offset,
+                                       &rec_copy, comp_ctx,
+                                       NULL, 0xFFFFFFFF) < 0) {
+                *offset = saved_offset;
+                return false;
+              } else {
+                (*arcount)++;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   return true;
 }
 
@@ -3840,7 +3982,8 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             const char client_loc[2],
                             const char *client_ecs_tag,
                             const char *client_loc_tag,
-                            additional_from_auth_t policy) {
+                            additional_from_auth_t policy,
+                            view_snapshot_t *view) {
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
     return false;
@@ -3886,7 +4029,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
             current_zone->records[i].rdata_count > 0) {
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
-                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy)) {
+                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, view)) {
             res[2] |= 0x02;
             return true;
           }
@@ -4070,7 +4213,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     additional_from_auth_t policy = cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES;
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy))
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, view))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====
@@ -4313,26 +4456,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       if (in_zone)
         continue;
       else {
-        zone_db_entry_t *new_db_entry = NULL;
-        size_t longest_match_len = 0;
-        if (view) {
-          for (size_t i = 0; i < view->zone_count; i++) {
-            size_t check_z_len = strlen(view->entries[i]->domain);
-            bool match = false;
-            if (cq_len == check_z_len &&
-                strcasecmp(current_qname, view->entries[i]->domain) == 0)
-              match = true;
-            else if (cq_len > check_z_len &&
-                     current_qname[cq_len - check_z_len - 1] == '.' &&
-                     strcasecmp(current_qname + cq_len - check_z_len,
-                                view->entries[i]->domain) == 0)
-              match = true;
-            if (match && check_z_len > longest_match_len) {
-              longest_match_len = check_z_len;
-              new_db_entry = view->entries[i];
-            }
-          }
-        }
+        zone_db_entry_t *new_db_entry = find_zone_in_view(view, current_qname);
         if (new_db_entry) {
           zone_arena_t *new_zone = NULL;
           do {
@@ -4590,7 +4714,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       for (int k = 0; k < glue_target_count; k++) {
         if (!append_glue_records(current_zone, glue_targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
-                                 client_loc, client_ecs_tag, client_loc_tag, policy)) {
+                                 client_loc, client_ecs_tag, client_loc_tag, policy, view)) {
           break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
         }
       }
@@ -5312,31 +5436,14 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   char current_qname[256];
   strncpy(current_qname, qname, 255);
   current_qname[255] = '\0';
-  size_t q_len = strlen(current_qname);
   zone_arena_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
-  size_t longest_match_len = 0;
   view_snapshot_t *view = NULL;
 
   if (snap) {
     view = select_view(snap, client_ip);
     if (view) {
-      for (size_t i = 0; i < view->zone_count; i++) {
-        size_t z_len = strlen(view->entries[i]->domain);
-        bool match = false;
-        
-        if (q_len == z_len &&
-            strcasecmp(current_qname, view->entries[i]->domain) == 0)
-          match = true;
-        else if (q_len > z_len && current_qname[q_len - z_len - 1] == '.' &&
-                 strcasecmp(current_qname + q_len - z_len,
-                            view->entries[i]->domain) == 0)
-          match = true;
-        if (match && z_len > longest_match_len) {
-          longest_match_len = z_len;
-          db_entry = view->entries[i];
-        }
-      }
+      db_entry = find_zone_in_view(view, current_qname);
     }
   }
 
@@ -6557,127 +6664,231 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
-static inline bool check_query_log_rate_limit(uint32_t max_qps) {
-    if (max_qps == 0) return true; // 0 = unlimited
-    time_t now = time(NULL);
-    uint32_t sec = atomic_load_explicit(&g_query_log_sec, memory_order_relaxed);
-    if (sec != (uint32_t)now) {
-        if (atomic_compare_exchange_strong_explicit(&g_query_log_sec, &sec, (uint32_t)now,
-                                                    memory_order_relaxed, memory_order_relaxed)) {
-            atomic_store_explicit(&g_query_log_count, 1, memory_order_relaxed);
-            return true;
-        }
+static inline void write_query_log(worker_ctx_t *ctx,
+                                   const struct sockaddr_storage *client_addr,
+                                   socklen_t addr_len,
+                                   const char *qname, uint16_t qclass, uint16_t qtype,
+                                   bool has_edns, bool dnssec_ok, uint8_t protocol,
+                                   uint32_t max_qps) {
+    if (!ctx) return;
+
+    // 1. サーキットブレーカーが発動している場合は1命令で完全スキップ
+    if (atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+        return;
     }
-    uint32_t count = atomic_fetch_add_explicit(&g_query_log_count, 1, memory_order_relaxed);
-    return (count < max_qps);
+
+    // 2. max_qps による即時レートリミット (max_qps が 0 の場合でも暴走防止のためデフォルト5000で制限)
+    uint32_t limit = (max_qps > 0) ? max_qps : 5000;
+    time_t now_sec = time(NULL);
+    if (ctx->log_current_sec != now_sec) {
+        ctx->log_current_sec = now_sec;
+        ctx->log_emitted_this_sec = 0;
+    }
+    uint32_t quota = (limit >= (uint32_t)g_worker_count && g_worker_count > 0)
+                     ? (limit / g_worker_count) : 1;
+    if (ctx->log_emitted_this_sec >= quota) {
+        // 閾値超過: リングバッファ操作やメモリコピーを一切行わず即座にリターン
+        return;
+    }
+    ctx->log_emitted_this_sec++;
+
+    // 3. リングバッファへのプッシュ
+    qlog_ring_t *ring = &ctx->qlog_ring;
+    if (!ring->events) return;
+
+    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+
+    // バッファが80%以上埋まったら即座にブレーカーを発動させてクエリスレッドを保護
+    if (h - t >= (ring->size * 8 / 10)) {
+        atomic_store_explicit(&g_qlog_circuit_broken, true, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ring->dropped_count, 1, memory_order_relaxed);
+        return;
+    }
+
+    uint32_t idx = h & ring->mask;
+    qlog_event_t *ev = &ring->events[idx];
+
+#ifdef CLOCK_REALTIME_FAST
+    clock_gettime(CLOCK_REALTIME_FAST, &ev->ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ev->ts);
+#endif
+
+    if (client_addr) {
+        memcpy(&ev->client_addr, client_addr, sizeof(struct sockaddr_storage));
+    } else {
+        memset(&ev->client_addr, 0, sizeof(struct sockaddr_storage));
+    }
+    ev->addr_len = addr_len;
+    ev->qtype = qtype;
+    ev->qclass = qclass;
+    ev->rcode = 0;
+    ev->flags = 0;
+    ev->protocol = protocol;
+    ev->has_edns = has_edns;
+    ev->dnssec_ok = dnssec_ok;
+
+    if (qname) {
+        strlcpy(ev->qname, qname, sizeof(ev->qname));
+    } else {
+        ev->qname[0] = '\0';
+    }
+
+    atomic_store_explicit(&ring->head, h + 1, memory_order_release);
 }
 
 void *query_logger_thread_func(void *arg) {
     (void)arg;
+    static char batch_buf[65536];
+    size_t batch_len = 0;
+    struct tm batch_tm;
+    memset(&batch_tm, 0, sizeof(batch_tm));
+
+    time_t cached_sec = 0;
+    char cached_time_prefix[64] = "";
+    struct tm cached_tm;
+    memset(&cached_tm, 0, sizeof(cached_tm));
+
+    time_t last_drop_report_time = time(NULL);
+    uint64_t last_reported_dropped = 0;
+
     while (1) {
-        uint64_t h = atomic_load_explicit(&g_query_log_head, memory_order_relaxed);
-        uint32_t idx = h & (QUERY_LOG_RING_SIZE - 1);
+        server_config_t *cfg = acquire_config_snapshot();
+        log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
 
-        if (atomic_load_explicit(&g_query_log_ring[idx].ready, memory_order_acquire)) {
-            query_log_entry_t *entry = &g_query_log_ring[idx];
-            server_config_t *cfg = acquire_config_snapshot();
+        int num_workers = g_worker_count;
+        worker_ctx_t *workers = g_worker_ctxs;
+        bool any_work = false;
 
-            if (cfg && cfg->logging.queries_channel) {
-                log_channel_t *ch = cfg->logging.queries_channel;
+        if (ch && num_workers > 0 && workers) {
+            for (int w = 0; w < num_workers; w++) {
+                qlog_ring_t *ring = &workers[w].qlog_ring;
+                if (!ring->events) continue;
 
-                struct tm tm_info;
-                localtime_r(&entry->ts.tv_sec, &tm_info);
+                uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+                uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
 
-                char time_str[64] = "";
-                if (ch->print_time) {
-                    char buf[32];
-                    strftime(buf, sizeof(buf), "%d-%b-%Y %H:%M:%S", &tm_info);
-                    snprintf(time_str, sizeof(time_str), "%s.%03ld ", buf,
-                             entry->ts.tv_nsec / 1000000);
+                while (t != h) {
+                    qlog_event_t *ev = &ring->events[t & ring->mask];
+                    any_work = true;
+
+                    // 時刻キャッシュ (秒単位でフォーマットし、ミリ秒のみ追記)
+                    if (ev->ts.tv_sec != cached_sec) {
+                        cached_sec = ev->ts.tv_sec;
+                        localtime_r(&cached_sec, &cached_tm);
+                        strftime(cached_time_prefix, sizeof(cached_time_prefix), "%d-%b-%Y %H:%M:%S", &cached_tm);
+                        batch_tm = cached_tm;
+                    }
+
+                    char time_str[64] = "";
+                    if (ch->print_time) {
+                        snprintf(time_str, sizeof(time_str), "%s.%03ld ", cached_time_prefix,
+                                 ev->ts.tv_nsec / 1000000);
+                    }
+
+                    char class_str[16];
+                    if (ev->qclass == 1)
+                        snprintf(class_str, sizeof(class_str), "IN");
+                    else if (ev->qclass == 255)
+                        snprintf(class_str, sizeof(class_str), "ANY");
+                    else
+                        snprintf(class_str, sizeof(class_str), "CLASS%d", ev->qclass);
+
+                    char type_str[32];
+                    const char *type_str_tmp = format_type_name(ev->qtype, type_str, sizeof(type_str));
+
+                    char edns_str[16] = "";
+                    if (ev->has_edns)
+                        snprintf(edns_str, sizeof(edns_str), "+E(0)%s", ev->dnssec_ok ? "D" : "K");
+
+                    char safe_qname[512];
+                    escape_qname_for_log(ev->qname, safe_qname, sizeof(safe_qname));
+
+                    char client_ip[INET6_ADDRSTRLEN] = "unknown";
+                    int client_port = 0;
+                    if (ev->client_addr.ss_family == AF_INET) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&ev->client_addr;
+                        inet_ntop(AF_INET, &sin->sin_addr, client_ip, sizeof(client_ip));
+                        client_port = ntohs(sin->sin_port);
+                    } else if (ev->client_addr.ss_family == AF_INET6) {
+                        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ev->client_addr;
+                        inet_ntop(AF_INET6, &sin6->sin6_addr, client_ip, sizeof(client_ip));
+                        client_port = ntohs(sin6->sin6_port);
+                    }
+
+                    char line_buf[1024];
+                    int len = snprintf(line_buf, sizeof(line_buf),
+                                       "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
+                                       ch->print_category ? "queries: " : "",
+                                       ch->print_severity ? "info: " : "", client_ip, client_port,
+                                       safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
+
+                    if (len > 0) {
+                        if (len >= (int)sizeof(line_buf)) len = sizeof(line_buf) - 1;
+                        if (batch_len + len > sizeof(batch_buf)) {
+                            log_write_rotated(ch, batch_buf, (int)batch_len, &batch_tm);
+                            batch_len = 0;
+                        }
+                        memcpy(batch_buf + batch_len, line_buf, len);
+                        batch_len += len;
+                    }
+
+                    t++;
                 }
 
-                char class_str[16];
-                if (entry->qclass == 1)
-                    snprintf(class_str, sizeof(class_str), "IN");
-                else if (entry->qclass == 255)
-                    snprintf(class_str, sizeof(class_str), "ANY");
-                else
-                    snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
+                atomic_store_explicit(&ring->tail, t, memory_order_release);
+            }
 
-                char type_str[32];
-                const char *type_str_tmp = format_type_name(entry->qtype, type_str, sizeof(type_str));
+            if (batch_len > 0) {
+                log_write_rotated(ch, batch_buf, (int)batch_len, &batch_tm);
+                batch_len = 0;
+            }
 
-                char edns_str[16] = "";
-                if (entry->has_edns)
-                    snprintf(edns_str, sizeof(edns_str), "+E(0)%s", entry->dnssec_ok ? "D" : "K");
-
-                char safe_qname[512];
-                escape_qname_for_log(entry->qname, safe_qname, sizeof(safe_qname));
-
-                char log_buf[1024];
-                int len = snprintf(log_buf, sizeof(log_buf),
-                                   "%s%s%sclient %s#%d (%s): query: %s %s %s %s\n", time_str,
-                                   ch->print_category ? "queries: " : "",
-                                   ch->print_severity ? "info: " : "", entry->client_ip, entry->client_port,
-                                   safe_qname, safe_qname, class_str, type_str_tmp, edns_str);
-                if (len > 0) {
-                    if (len >= (int)sizeof(log_buf))
-                        len = sizeof(log_buf) - 1;
-                    log_write_rotated(ch, log_buf, len, &tm_info);
+            // サーキットブレーカー自動復帰判定 (リングバッファ滞留率10%未満)
+            bool all_empty = true;
+            for (int w = 0; w < num_workers; w++) {
+                uint32_t t = atomic_load_explicit(&workers[w].qlog_ring.tail, memory_order_relaxed);
+                uint32_t h = atomic_load_explicit(&workers[w].qlog_ring.head, memory_order_relaxed);
+                if (h - t > (workers[w].qlog_ring.size / 10)) {
+                    all_empty = false;
+                    break;
                 }
             }
-            if (cfg) release_config_snapshot(cfg);
+            if (all_empty && atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+                atomic_store_explicit(&g_qlog_circuit_broken, false, memory_order_release);
+            }
 
-            atomic_store_explicit(&entry->ready, false, memory_order_release);
-            atomic_fetch_add_explicit(&g_query_log_head, 1, memory_order_release);
-        } else {
-            usleep(1000);
+            // 定期的なドロップ統計レポート (5秒間隔)
+            time_t now = time(NULL);
+            if (now - last_drop_report_time >= 5) {
+                last_drop_report_time = now;
+                uint64_t total_dropped = 0;
+                for (int w = 0; w < num_workers; w++) {
+                    total_dropped += atomic_load_explicit(&workers[w].qlog_ring.dropped_count, memory_order_relaxed);
+                }
+                if (total_dropped > last_reported_dropped) {
+                    uint64_t diff = total_dropped - last_reported_dropped;
+                    last_reported_dropped = total_dropped;
+                    syslog(LOG_WARNING, "[QueryLog] Dropped %" PRIu64 " queries due to ring buffer overflow (high load)", diff);
+                }
+            }
+        } else if (num_workers > 0 && workers) {
+            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ
+            for (int w = 0; w < num_workers; w++) {
+                qlog_ring_t *ring = &workers[w].qlog_ring;
+                if (!ring->events) continue;
+                uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+                atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+            }
         }
+
+        if (cfg) release_config_snapshot(cfg);
+
+        // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
+        usleep(any_work ? 1000 : 10000);
     }
     return NULL;
-}
-
-static void write_query_log(const char *client_ip, int client_port,
-                            const char *qname, uint16_t qclass, uint16_t qtype,
-                            bool has_edns, bool dnssec_ok) {
-    server_config_t *cfg = acquire_config_snapshot();
-    if (!cfg) return;
-    log_channel_t *ch = cfg->logging.queries_channel;
-    if (!ch) {
-        release_config_snapshot(cfg);
-        return;
-    }
-    uint32_t max_qps = ch->max_qps;
-    release_config_snapshot(cfg);
-
-    if (!check_query_log_rate_limit(max_qps)) {
-        return;
-    }
-
-    uint64_t t = atomic_load_explicit(&g_query_log_tail, memory_order_relaxed);
-    uint64_t h = atomic_load_explicit(&g_query_log_head, memory_order_acquire);
-
-    // ロックフリー CAS ループ (バッファフル時はDDoS・高負荷とみなし、潔くログをドロップする)
-    do {
-        if (t - h >= QUERY_LOG_RING_SIZE) return;
-    } while (!atomic_compare_exchange_weak_explicit(&g_query_log_tail, &t, t + 1,
-                                                    memory_order_acq_rel, memory_order_relaxed));
-
-    uint32_t idx = t & (QUERY_LOG_RING_SIZE - 1);
-    query_log_entry_t *entry = &g_query_log_ring[idx];
-
-    clock_gettime(CLOCK_REALTIME, &entry->ts);
-    strncpy(entry->client_ip, client_ip, INET6_ADDRSTRLEN - 1);
-    entry->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
-    entry->client_port = client_port;
-    strncpy(entry->qname, qname, 255);
-    entry->qname[255] = '\0';
-    entry->qclass = qclass;
-    entry->qtype = qtype;
-    entry->has_edns = has_edns;
-    entry->dnssec_ok = dnssec_ok;
-
-    atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
 
 // ============================================================================
@@ -7482,6 +7693,10 @@ worker_startup_success:;
       break;
     }
 
+    server_config_t *active = atomic_load_explicit(&g_config_db.active, memory_order_relaxed);
+    bool qlog_enabled = (active && active->logging.queries_channel != NULL);
+    uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
+
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
@@ -7636,8 +7851,11 @@ worker_startup_success:;
               }
             }
           }
-          write_query_log(client_ip, client_port, qname, qclass, qtype,
-                          has_edns, dnssec_ok);
+          atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
+          if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+              write_query_log(ctx, client_addr, sizeof(*client_addr),
+                              qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
+          }
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           if (is_zone_synthetic_type(snap, client_ip, qname)) {
@@ -7744,6 +7962,8 @@ worker_startup_success:;
                  10000, ctx_tcp);
           kevent(kq, &ev_timeout, 1, NULL, 0, NULL);
 
+          memcpy(&ctx_tcp->client_addr, &client_addr, sizeof(client_addr));
+          ctx_tcp->client_len = client_len;
           if (client_addr.ss_family == AF_INET)
             inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr,
                       ctx_tcp->client_ip, INET6_ADDRSTRLEN);
@@ -7861,8 +8081,11 @@ worker_startup_success:;
           }
           bool has_edns = edns.present;
           bool dnssec_ok = edns.dnssec_ok;
-          write_query_log(ctx_tcp->client_ip, client_port, qname, qclass, qtype,
-                          has_edns, dnssec_ok);
+          atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
+          if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+              write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
+                              qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_TCP, eff_max_qps);
+          }
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
@@ -9338,20 +9561,35 @@ int main(int argc, char **argv) {
   if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
     exit(1);
 
+  server_config_t *cfg = &g_config_db.config_a;
+  uint32_t qlog_buf_size = cfg->query_log_buffer_size;
+  if (qlog_buf_size < 1024 || (qlog_buf_size & (qlog_buf_size - 1)) != 0) {
+    qlog_buf_size = 32768;
+  }
+
   pthread_t *threads = calloc(num_workers, sizeof(pthread_t));
   worker_ctx_t *ctxs = calloc(num_workers, sizeof(worker_ctx_t));
   if (!threads || !ctxs)
     exit(1);
+  g_worker_ctxs = ctxs;
+  g_worker_count = num_workers;
   for (int i = 0; i < num_workers; i++) {
     ctxs[i].thread_id = i;
     ctxs[i].core_id = i % num_workers;
+    ctxs[i].qlog_ring.size = qlog_buf_size;
+    ctxs[i].qlog_ring.mask = qlog_buf_size - 1;
+    ctxs[i].qlog_ring.events = calloc(qlog_buf_size, sizeof(qlog_event_t));
+    atomic_init(&ctxs[i].qlog_ring.head, 0);
+    atomic_init(&ctxs[i].qlog_ring.tail, 0);
+    atomic_init(&ctxs[i].qlog_ring.dropped_count, 0);
+    atomic_init(&ctxs[i].query_count, 0);
+    if (!ctxs[i].qlog_ring.events)
+      exit(EXIT_FAILURE);
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
       exit(EXIT_FAILURE);
   }
   while (atomic_load(&g_bound_workers) < num_workers)
     sched_yield();
-
-  server_config_t *cfg = &g_config_db.config_a;
 
   // 重要: type "program" ゾーンの子プロセスへの権限降格(program-user)は
   // fork元(karidns自身)がまだroot権限を持っている間でなければ成立しない
@@ -9422,6 +9660,15 @@ int main(int argc, char **argv) {
   for (int i = 0; i < num_workers; i++)
     pthread_join(threads[i], NULL);
   pthread_join(control_thread, NULL);
+
+  for (int i = 0; i < num_workers; i++) {
+    if (ctxs[i].qlog_ring.events) {
+      free(ctxs[i].qlog_ring.events);
+      ctxs[i].qlog_ring.events = NULL;
+    }
+  }
+  free(ctxs);
+  free(threads);
 
   server_config_t *active = acquire_config_snapshot();
   if (active) {
