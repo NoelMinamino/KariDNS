@@ -79,6 +79,8 @@ typedef struct zone_arena_s {
   int bind_location_tag_count;
   ecs_tag_def_t *bind_ecs_tags;           /* 追加: $ECS-SUBNET-TAG / AXFR復元用 */
   int bind_ecs_tag_count;
+  char **bind_ecs_trusted_resolvers;      /* AXFR(拡張モード)で受信した値。NULL可 */
+  int bind_ecs_trusted_resolver_count;
   prelinked_glue_entry_t *prelinked_glue; /* 事前リンクされたAdditionalグルー */
   int prelinked_glue_count;
 } zone_arena_t;

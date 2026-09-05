@@ -343,6 +343,26 @@ void free_zone_config(zone_config_t *zone) {
     zone->ecs_tags = NULL;
     zone->ecs_tag_count = 0;
   }
+  if (zone->location_tags) {
+    for (int i = 0; i < zone->location_tag_count; i++) {
+      free(zone->location_tags[i].tag);
+      for (int j = 0; j < zone->location_tags[i].cidr_count; j++) {
+        free(zone->location_tags[i].cidrs[j].cidr);
+      }
+      free(zone->location_tags[i].cidrs);
+    }
+    free(zone->location_tags);
+    zone->location_tags = NULL;
+    zone->location_tag_count = 0;
+  }
+  if (zone->ecs_trusted_resolvers) {
+    for (int i = 0; i < zone->ecs_trusted_resolvers_count; i++) {
+      free(zone->ecs_trusted_resolvers[i]);
+    }
+    free(zone->ecs_trusted_resolvers);
+    zone->ecs_trusted_resolvers = NULL;
+    zone->ecs_trusted_resolvers_count = 0;
+  }
   free(zone);
 }
 
@@ -465,6 +485,18 @@ void free_server_config_fields(server_config_t *cfg) {
     free(cfg->ecs_tags);
     cfg->ecs_tags = NULL;
     cfg->ecs_tag_count = 0;
+  }
+  if (cfg->location_tags) {
+    for (int i = 0; i < cfg->location_tag_count; i++) {
+      free(cfg->location_tags[i].tag);
+      for (int j = 0; j < cfg->location_tags[i].cidr_count; j++) {
+        free(cfg->location_tags[i].cidrs[j].cidr);
+      }
+      free(cfg->location_tags[i].cidrs);
+    }
+    free(cfg->location_tags);
+    cfg->location_tags = NULL;
+    cfg->location_tag_count = 0;
   }
 }
 
@@ -1203,6 +1235,19 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_zone_config(zone);
         return -1;
       }
+    } else if (strcmp(key, "location-tags") == 0) {
+      if (parse_ecs_tags_block(ctx, &zone->location_tags, &zone->location_tag_count) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+    } else if (strcmp(key, "ecs-trusted-resolvers") == 0) {
+      if (parse_string_list(ctx, &zone->ecs_trusted_resolvers,
+                            &zone->ecs_trusted_resolvers_count) != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
     } else
       skip_unknown_block(ctx);
     free(key);
@@ -1424,6 +1469,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
         } else if (strcmp(key, "ecs-tags") == 0) {
           if (parse_ecs_tags_block(ctx, &config->ecs_tags, &config->ecs_tag_count) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "location-tags") == 0) {
+          if (parse_ecs_tags_block(ctx, &config->location_tags, &config->location_tag_count) != 0) {
             free(key);
             return -1;
           }

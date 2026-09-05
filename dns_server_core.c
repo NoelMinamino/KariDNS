@@ -1679,6 +1679,14 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   free_ecs_tags_array(z_standby->bind_ecs_tags, z_standby->bind_ecs_tag_count);
   z_standby->bind_ecs_tags = NULL;
   z_standby->bind_ecs_tag_count = 0;
+  if (z_standby->bind_ecs_trusted_resolvers) {
+    for (int i = 0; i < z_standby->bind_ecs_trusted_resolver_count; i++) {
+      free(z_standby->bind_ecs_trusted_resolvers[i]);
+    }
+    free(z_standby->bind_ecs_trusted_resolvers);
+    z_standby->bind_ecs_trusted_resolvers = NULL;
+    z_standby->bind_ecs_trusted_resolver_count = 0;
+  }
   z_standby->count = 0;
   z_standby->data_pool_count = 0;
   z_standby->current_pool_cap = 0;
@@ -2997,6 +3005,14 @@ static void zone_arena_clear_data_pools(zone_arena_t *arena) {
     arena->bind_ecs_tags = NULL;
     arena->bind_ecs_tag_count = 0;
   }
+  if (arena->bind_ecs_trusted_resolvers) {
+    for (int i = 0; i < arena->bind_ecs_trusted_resolver_count; i++) {
+      free(arena->bind_ecs_trusted_resolvers[i]);
+    }
+    free(arena->bind_ecs_trusted_resolvers);
+    arena->bind_ecs_trusted_resolvers = NULL;
+    arena->bind_ecs_trusted_resolver_count = 0;
+  }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
   arena->count = 0;
@@ -3025,6 +3041,20 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
     dst->bind_ecs_tags = clone_ecs_tags_array(src->bind_ecs_tags, src->bind_ecs_tag_count);
     if (dst->bind_ecs_tags) {
       dst->bind_ecs_tag_count = src->bind_ecs_tag_count;
+    }
+  }
+  if (src->bind_ecs_trusted_resolver_count > 0 && src->bind_ecs_trusted_resolvers) {
+    dst->bind_ecs_trusted_resolvers = malloc(src->bind_ecs_trusted_resolver_count * sizeof(char *));
+    if (dst->bind_ecs_trusted_resolvers) {
+      dst->bind_ecs_trusted_resolver_count = 0;
+      for (int i = 0; i < src->bind_ecs_trusted_resolver_count; i++) {
+        if (src->bind_ecs_trusted_resolvers[i]) {
+          dst->bind_ecs_trusted_resolvers[dst->bind_ecs_trusted_resolver_count] = strdup(src->bind_ecs_trusted_resolvers[i]);
+          if (dst->bind_ecs_trusted_resolvers[dst->bind_ecs_trusted_resolver_count]) {
+            dst->bind_ecs_trusted_resolver_count++;
+          }
+        }
+      }
     }
   }
   for (size_t i = 0; i < src->count; i++) {
@@ -3149,6 +3179,31 @@ static bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t 
   new_defs[cur_count] = def;
   *defs_out = new_defs;
   *count_out = cur_count + 1;
+  return true;
+}
+
+static bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***resolvers_out, int *count_out) {
+  if (!data || len < 1 || !resolvers_out || !count_out) return false;
+  size_t off = 0;
+  int count = data[off++];
+  if (count <= 0) return true;
+
+  int cur_count = *count_out;
+  char **new_res = realloc(*resolvers_out, (cur_count + count) * sizeof(char *));
+  if (!new_res) return false;
+  *resolvers_out = new_res;
+
+  for (int i = 0; i < count && off < len; i++) {
+    size_t slen = data[off++];
+    if (off + slen > len) return false;
+    char *s = malloc(slen + 1);
+    if (!s) return false;
+    memcpy(s, &data[off], slen);
+    s[slen] = '\0';
+    (*resolvers_out)[cur_count++] = s;
+    *count_out = cur_count;
+    off += slen;
+  }
   return true;
 }
 
@@ -3319,6 +3374,10 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       } else if (type == DNS_TYPE_KARIDNS_ECS_TAGDEF) {
         standby->count--;
         unpack_tag_def_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_tags, &standby->bind_ecs_tag_count);
+        continue;
+      } else if (type == DNS_TYPE_KARIDNS_ECS_TRUSTED) {
+        standby->count--;
+        unpack_trusted_resolvers_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_trusted_resolvers, &standby->bind_ecs_trusted_resolver_count);
         continue;
       } else if (type == DNS_TYPE_KARIDNS_TINYDNS_LOCDEF) {
         standby->count--;
@@ -3714,8 +3773,8 @@ static const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server
 
 /* location-tags を先頭から線形探索し、最初に一致したtagの名前を返す。
  * 1. ゾーン定義 (zone->bind_location_tags)
- * 2. ゾーン設定 (zcfg->ecs_tags)
- * 3. グローバル設定 (cfg->ecs_tags) */
+ * 2. ゾーン設定 (zcfg->location_tags)
+ * 3. グローバル設定 (cfg->location_tags) */
 static const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                              const char *client_ip) {
     if (!client_ip) return NULL;
@@ -3724,8 +3783,9 @@ static const char *resolve_bind_location_tag(const zone_arena_t *zone, const ser
                                  ? zone->bind_location_tags : NULL;
     int tag_count = tags ? zone->bind_location_tag_count : 0;
     if (!tags) {
-        tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
-        tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
+        /* 修正: ecs_tags ではなく location_tags を参照する */
+        tags = (zcfg && zcfg->location_tags) ? zcfg->location_tags : (cfg ? cfg->location_tags : NULL);
+        tag_count = (zcfg && zcfg->location_tags) ? zcfg->location_tag_count : (cfg ? cfg->location_tag_count : 0);
     }
     if (!tags || tag_count == 0) return NULL;
 
@@ -3737,6 +3797,25 @@ static const char *resolve_bind_location_tag(const zone_arena_t *zone, const ser
         }
     }
     return NULL;
+}
+
+static bool check_acl(const char *client_ip, char **acl_list, int acl_count);
+
+static bool is_ecs_trusted_resolver(const zone_arena_t *zone, const server_config_t *cfg,
+                                    const zone_config_t *zcfg, const char *client_ip) {
+    if (!client_ip) return false;
+
+    char **resolvers = (zone && zone->bind_ecs_trusted_resolvers && zone->bind_ecs_trusted_resolver_count > 0)
+                        ? zone->bind_ecs_trusted_resolvers : NULL;
+    int count = resolvers ? zone->bind_ecs_trusted_resolver_count : 0;
+    if (!resolvers) {
+        resolvers = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers
+                                                           : (cfg ? cfg->ecs_trusted_resolvers : NULL);
+        count = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers_count
+                                                       : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
+    }
+    if (!resolvers || count == 0) return false;
+    return check_acl(client_ip, resolvers, count);
 }
 
 /* クライアントIPから、最長一致するlocationコードを1回だけ求める。
@@ -5450,8 +5529,6 @@ static void spawn_program_zone_plugins(server_config_t *cfg) {
   g_program_plugins_count = idx;
 }
 
-static bool check_acl(const char *client_ip, char **acl_list, int acl_count);
-
 static view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
   for (size_t i = 0; i < snap->view_count; i++) {
     if (check_acl(client_ip, snap->views[i].match_clients, snap->views[i].match_clients_count)) {
@@ -6121,9 +6198,9 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   }
 
   uint32_t qtx_included = 0;
+  zone_config_t *zcfg = (db_entry && view) ? find_zone_config_in_view(cfg, view->name, db_entry->domain) : NULL;
   bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
-                      cfg->ecs_trusted_resolvers_count > 0 &&
-                      check_acl(client_ip, cfg->ecs_trusted_resolvers, cfg->ecs_trusted_resolvers_count));
+                      is_ecs_trusted_resolver(current_zone, cfg, zcfg, client_ip));
   resolve_name(current_qname, qtypes, num_qtypes, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
@@ -7318,6 +7395,41 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
           SERIALIZE_ADD_RECORD(&tag_rec);
         }
       }
+      server_config_t *axfr_cfg = acquire_config_snapshot();
+      zone_config_t *axfr_zcfg = axfr_cfg ? find_zone_config_in_view(axfr_cfg, entry->view_name, entry->domain) : NULL;
+      char **trusted_res = (current_zone->bind_ecs_trusted_resolver_count > 0 && current_zone->bind_ecs_trusted_resolvers)
+                            ? current_zone->bind_ecs_trusted_resolvers : NULL;
+      int trusted_count = trusted_res ? current_zone->bind_ecs_trusted_resolver_count : 0;
+      if (!trusted_res) {
+        trusted_res = (axfr_zcfg && axfr_zcfg->ecs_trusted_resolvers) ? axfr_zcfg->ecs_trusted_resolvers
+                                                                       : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers : NULL);
+        trusted_count = (axfr_zcfg && axfr_zcfg->ecs_trusted_resolvers) ? axfr_zcfg->ecs_trusted_resolvers_count
+                                                                   : (axfr_cfg ? axfr_cfg->ecs_trusted_resolvers_count : 0);
+      }
+      if (trusted_count > 0 && trusted_res) {
+        uint8_t trusted_buf[2048];
+        size_t toffset = 0;
+        trusted_buf[toffset++] = (uint8_t)(trusted_count > 255 ? 255 : trusted_count);
+        for (int i = 0; i < trusted_count && toffset < sizeof(trusted_buf); i++) {
+          if (!trusted_res[i]) continue;
+          size_t slen = strlen(trusted_res[i]);
+          if (slen > 255) slen = 255;
+          if (toffset + 1 + slen > sizeof(trusted_buf)) break;
+          trusted_buf[toffset++] = (uint8_t)slen;
+          memcpy(&trusted_buf[toffset], trusted_res[i], slen);
+          toffset += slen;
+        }
+        dns_record_t trusted_rec;
+        memset(&trusted_rec, 0, sizeof(trusted_rec));
+        trusted_rec.name = entry->domain;
+        trusted_rec.type_code = DNS_TYPE_KARIDNS_ECS_TRUSTED;
+        trusted_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+        trusted_rec.class_str = "KARIDNS";
+        trusted_rec.generic_data = trusted_buf;
+        trusted_rec.generic_len = toffset;
+        SERIALIZE_ADD_RECORD(&trusted_rec);
+      }
+      if (axfr_cfg) release_config_snapshot(axfr_cfg);
       for (int i = 0; i < current_zone->location_count; i++) {
         const tinydns_location_entry_t *loc = &current_zone->locations[i];
         uint8_t loc_buf[8];

@@ -3651,6 +3651,22 @@ int main() {
             return 1;
         }
 
+        uint8_t trusted_payload[16] = {0x01, 0x09, '1', '2', '7', '.', '0', '.', '0', '.', '1'};
+        dns_record_t rec_trusted = {
+            .name = "example.com.",
+            .type = "TYPE65407",
+            .type_code = DNS_TYPE_KARIDNS_ECS_TRUSTED,
+            .class_val = DNS_CLASS_KARIDNS_EXT,
+            .ttl = "0",
+            .ttl_value = 0,
+            .generic_len = 11,
+            .generic_data = trusted_payload
+        };
+        if (assert_bound_checked(&rec_trusted) != 0) {
+            printf("FAIL: assert_bound_checked failed for DNS_TYPE_KARIDNS_ECS_TRUSTED\n");
+            return 1;
+        }
+
         // 2. Zone parser handling of $LOCATION-TAG, $LOCATION, and $ECS-SUBNET-TAG
         const char *test_zone =
             "$ORIGIN example.com.\n"
@@ -3756,8 +3772,20 @@ int main() {
         }
         free_ecs_tags_array(cloned, arena.bind_ecs_tag_count);
 
+        // Test bind_ecs_trusted_resolvers lifecycle in zone_arena
+        arena.bind_ecs_trusted_resolvers = malloc(2 * sizeof(char *));
+        if (arena.bind_ecs_trusted_resolvers) {
+            arena.bind_ecs_trusted_resolvers[0] = strdup("127.0.0.1");
+            arena.bind_ecs_trusted_resolvers[1] = strdup("192.0.2.1/32");
+            arena.bind_ecs_trusted_resolver_count = 2;
+        }
+
         free(zone_copy);
         zone_arena_destroy(&arena);
+        if (arena.bind_ecs_trusted_resolvers != NULL || arena.bind_ecs_trusted_resolver_count != 0) {
+            printf("FAIL: zone_arena_destroy did not reset bind_ecs_trusted_resolvers\n");
+            return 1;
+        }
         printf("PASS: CLASS 65302 serialization, bounds check, and zone tag directives\n");
     }
 

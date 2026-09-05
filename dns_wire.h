@@ -92,6 +92,7 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 #define DNS_TYPE_KARIDNS_ECS_TAGDEF     65404
 #define DNS_TYPE_KARIDNS_TINYDNS_LOCDEF 65405
 #define DNS_TYPE_KARIDNS_TINYDNS_WRAP   65406
+#define DNS_TYPE_KARIDNS_ECS_TRUSTED    65407
 
 #define EDNS_OPTION_KARIDNS_EXT         65153
 #define KARIDNS_EXT_VERSION             1
