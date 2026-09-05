@@ -567,12 +567,15 @@ static _Atomic int g_bound_workers = 0;
 static _Atomic bool g_privilege_drop_complete = false;
 #define MAX_ZONE_AXFR 4
 
+#define NUM_FRONTEND_ROUTERS 2
+#define MAX_FRONTEND_ROUTERS 4
+#define MAX_WORKERS 128
+
 // Frontend/Backend IPC用グローバル変数
-static int g_udp_fds[MAX_BIND_ADDRS];
-static int g_num_udp_fds = 0;
-static int (*g_ipc_fds)[2] = NULL;
+static int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
+static int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
+static int g_num_workers = 0;
 char g_startup_cwd[PATH_MAX] = "";
-static int g_num_ipc = 0;
 static int g_notify_ipc[2];
 static int g_control_sock = -1;
 static _Atomic(bool) g_frontend_alive = true;
@@ -7701,14 +7704,17 @@ void *worker_thread_func(void *arg) {
   }
   release_config_snapshot(active_cfg);
 
-  // FrontendからのUDP転送を受け取るIPCパイプをkqueueに登録 (udata=1)
-  int my_ipc_fd = g_ipc_fds[ctx->thread_id][1];
+  // 全FrontendからのUDP転送を受け取るIPCパイプをkqueueに登録 (udata=1)
+  int w = ctx->thread_id;
   cap_rights_t ipc_rights;
   cap_rights_init(&ipc_rights, CAP_EVENT, CAP_READ, CAP_WRITE, CAP_RECV, CAP_SEND);
-  cap_rights_limit(my_ipc_fd, &ipc_rights);
-  struct kevent ev_ipc;
-  EV_SET(&ev_ipc, my_ipc_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)1);
-  kevent(kq, &ev_ipc, 1, NULL, 0, NULL);
+  for (int f = 0; f < g_num_frontend_routers; f++) {
+    int my_ipc_fd = g_ipc_fds[f][w][1];
+    cap_rights_limit(my_ipc_fd, &ipc_rights);
+    struct kevent ev_ipc;
+    EV_SET(&ev_ipc, my_ipc_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)1);
+    kevent(kq, &ev_ipc, 1, NULL, 0, NULL);
+  }
 
   atomic_fetch_add(&g_bound_workers, 1);
   goto worker_startup_success;
@@ -9065,15 +9071,137 @@ void *control_thread_func(void *arg) {
 }
 
 // ============================================================================
-// 13. Frontend Router Thread (特権維持・UDP送受信ルーティング)
+// 13. Frontend Router Process (マルチプロセス UDP送受信ルーティング)
 // ============================================================================
 
-static void run_frontend_router(pid_t backend_pid) {
-  // 注意: Frontend側は現状workerスレッドを持たないため、この関数内で
-  // 順次 setuid してからネットワーク処理ループに入る設計となっており、
-  // Backend側のようなレースウィンドウは存在しない。
-  // 将来マルチスレッド化する場合は「bind→バリア待機→特権drop→処理開始許可」
-  // のパターンを踏襲すること。
+static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
+  if (desired_rcv > 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
+      syslog(LOG_WARNING, "[Network] Failed to set SO_RCVBUF to %d: %m", desired_rcv);
+    } else {
+      int actual_rcv = 0;
+      socklen_t optlen = sizeof(actual_rcv);
+      if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) == 0) {
+        if (actual_rcv < desired_rcv) {
+          syslog(LOG_WARNING,
+                 "[Network] UDP SO_RCVBUF truncated by OS: requested %d bytes, got %d bytes "
+                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
+                 desired_rcv, actual_rcv);
+        }
+      }
+    }
+  }
+  if (desired_snd > 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &desired_snd, sizeof(desired_snd)) != 0) {
+      syslog(LOG_WARNING, "[Network] Failed to set SO_SNDBUF to %d: %m", desired_snd);
+    } else {
+      int actual_snd = 0;
+      socklen_t optlen = sizeof(actual_snd);
+      if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) == 0) {
+        if (actual_snd < desired_snd) {
+          syslog(LOG_WARNING,
+                 "[Network] UDP SO_SNDBUF truncated by OS: requested %d bytes, got %d bytes "
+                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
+                 desired_snd, actual_snd);
+        }
+      }
+    }
+  }
+}
+
+static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS]) {
+  int num_fds = 0;
+  int port = cfg->port > 0 ? cfg->port : DNS_PORT;
+  int bind_count = cfg->bind_address_count;
+  int opt = 1;
+  int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
+  int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+
+  for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
+    struct sockaddr_in addr4;
+    struct sockaddr_in6 addr6;
+    bool is_v4 = false;
+    bool is_v6 = false;
+    memset(&addr4, 0, sizeof(addr4));
+    memset(&addr6, 0, sizeof(addr6));
+    if (bind_count == 0) {
+      addr4.sin_family = AF_INET;
+      addr4.sin_addr.s_addr = INADDR_ANY;
+      addr4.sin_port = htons(port);
+      addr6.sin6_family = AF_INET6;
+      addr6.sin6_addr = in6addr_any;
+      addr6.sin6_port = htons(port);
+      is_v4 = true;
+      is_v6 = true;
+    } else {
+      if (inet_pton(AF_INET, cfg->bind_addresses[i], &addr4.sin_addr) == 1) {
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(port);
+        is_v4 = true;
+      } else if (inet_pton(AF_INET6, cfg->bind_addresses[i],
+                           &addr6.sin6_addr) == 1) {
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons(port);
+        is_v6 = true;
+      }
+    }
+
+    if (is_v4 && num_fds < MAX_BIND_ADDRS) {
+      int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+      if (udp_fd >= 0) {
+        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+        fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_REUSEPORT_LB
+        int opt_lb = 1;
+        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+          int opt_reuse = 1;
+          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+        }
+#else
+        int opt_reuse = 1;
+        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+        if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
+          out_fds[num_fds++] = udp_fd;
+        } else {
+          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv4 socket to %s:%d: %m",
+                 (bind_count > 0 ? cfg->bind_addresses[i] : "0.0.0.0"), port);
+          close(udp_fd);
+          exit(EXIT_FAILURE);
+        }
+      }
+    }
+    if (is_v6 && num_fds < MAX_BIND_ADDRS) {
+      int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+      if (udp_fd >= 0) {
+        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+        fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT_LB
+        int opt_lb = 1;
+        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+          int opt_reuse = 1;
+          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+        }
+#else
+        int opt_reuse = 1;
+        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+        if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+          out_fds[num_fds++] = udp_fd;
+        } else {
+          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv6 socket to %s:%d: %m",
+                 (bind_count > 0 ? cfg->bind_addresses[i] : "::"), port);
+          close(udp_fd);
+          exit(EXIT_FAILURE);
+        }
+      }
+    }
+  }
+  return num_fds;
+}
+
+static void run_frontend_router(pid_t backend_pid, int router_id) {
   if (g_control_sock >= 0) {
     close(g_control_sock);
     g_control_sock = -1;
@@ -9082,11 +9210,34 @@ static void run_frontend_router(pid_t backend_pid) {
     close(g_broker_sock);
     g_broker_sock = -1;
   }
+
+  // 自身が使用しない不要なIPCソケット端点を確実にクローズ (指示2)
+  for (int f = 0; f < g_num_frontend_routers; f++) {
+    for (int w = 0; w < g_num_workers; w++) {
+      if (f != router_id) {
+        close(g_ipc_fds[f][w][0]);
+        close(g_ipc_fds[f][w][1]);
+      } else {
+        close(g_ipc_fds[f][w][1]); // 自身のWorker側端点をクローズ
+      }
+    }
+  }
+  if (router_id != 0) {
+    close(g_notify_ipc[0]);
+  }
+  close(g_notify_ipc[1]);
+
   server_config_t *cfg = acquire_config_snapshot();
+
+  // 特権破棄前に、外部UDPソケットをSO_REUSEPORT_LBでオープン・バインド (指示1: インデックス整合性の完全統一)
+  int local_udp_fds[MAX_BIND_ADDRS];
+  int local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds);
+
+  // 特権破棄 (setgid / setuid)
   if (cfg && cfg->user) {
     struct passwd *pwd = getpwnam(cfg->user);
     if (!pwd) {
-      syslog(LOG_ERR, "[Frontend] user '%s' not found, aborting privilege drop", cfg->user);
+      syslog(LOG_ERR, "[Frontend %d] user '%s' not found, aborting privilege drop", router_id, cfg->user);
       release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
@@ -9094,39 +9245,39 @@ static void run_frontend_router(pid_t backend_pid) {
     if (cfg->group) {
       struct group *grp = getgrnam(cfg->group);
       if (!grp) {
-        syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+        syslog(LOG_ERR, "[Frontend %d] group '%s' not found, aborting privilege drop", router_id, cfg->group);
         release_config_snapshot(cfg);
         exit(EXIT_FAILURE);
       }
       target_gid = grp->gr_gid;
     }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend] setuid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend %d] setgroups failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend %d] setgid failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend %d] setuid failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
     
     if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid || getgid() != target_gid || getegid() != target_gid) {
-      syslog(LOG_ERR, "[Frontend] privilege drop verification failed");
+      syslog(LOG_ERR, "[Frontend %d] privilege drop verification failed", router_id);
       release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
   } else if (cfg && cfg->group) {
     struct group *grp = getgrnam(cfg->group);
     if (!grp) {
-      syslog(LOG_ERR, "[Frontend] group '%s' not found, aborting privilege drop", cfg->group);
+      syslog(LOG_ERR, "[Frontend %d] group '%s' not found, aborting privilege drop", router_id, cfg->group);
       release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend] setgroups failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend] setgid failed: %m"); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend %d] setgroups failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
+    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend %d] setgid failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
     
     if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
-      syslog(LOG_ERR, "[Frontend] privilege drop verification failed (group only)");
+      syslog(LOG_ERR, "[Frontend %d] privilege drop verification failed (group only)", router_id);
       release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
   } else if (geteuid() == 0) {
-    syslog(LOG_ERR, "[Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
-    fprintf(stderr, "[ERROR] [Frontend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
+    syslog(LOG_ERR, "[Frontend %d] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop", router_id);
+    fprintf(stderr, "[ERROR] [Frontend %d] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n", router_id);
     release_config_snapshot(cfg);
     exit(EXIT_FAILURE);
   }
@@ -9136,23 +9287,25 @@ static void run_frontend_router(pid_t backend_pid) {
   if (kq < 0)
     exit(1);
 
-  for (int i = 0; i < g_num_udp_fds; i++) {
+  for (int i = 0; i < local_num_udp_fds; i++) {
     struct kevent ev;
-    EV_SET(&ev, g_udp_fds[i], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
+    EV_SET(&ev, local_udp_fds[i], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
            (void *)(uintptr_t)i);
     kevent(kq, &ev, 1, NULL, 0, NULL);
   }
-  for (int i = 0; i < g_num_ipc; i++) {
+  for (int i = 0; i < g_num_workers; i++) {
     struct kevent ev;
-    EV_SET(&ev, g_ipc_fds[i][0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
+    EV_SET(&ev, g_ipc_fds[router_id][i][0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
            (void *)(uintptr_t)(MAX_BIND_ADDRS + i));
     kevent(kq, &ev, 1, NULL, 0, NULL);
   }
   signal(SIGCHLD, SIG_DFL);
-  struct kevent ev_notify;
-  EV_SET(&ev_notify, g_notify_ipc[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
-         (void *)(uintptr_t)999);
-  kevent(kq, &ev_notify, 1, NULL, 0, NULL);
+  if (router_id == 0) {
+    struct kevent ev_notify;
+    EV_SET(&ev_notify, g_notify_ipc[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
+           (void *)(uintptr_t)999);
+    kevent(kq, &ev_notify, 1, NULL, 0, NULL);
+  }
 
   struct kevent ev_proc;
   EV_SET(&ev_proc, backend_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)1000);
@@ -9160,7 +9313,7 @@ static void run_frontend_router(pid_t backend_pid) {
 
   frontend_router_ctx_t *fctx = calloc(1, sizeof(*fctx));
   if (!fctx) {
-    syslog(LOG_CRIT, "[Frontend] Failed to allocate router context");
+    syslog(LOG_CRIT, "[Frontend %d] Failed to allocate router context", router_id);
     exit(1);
   }
   for (int k = 0; k < UDP_BATCH_SIZE; k++) {
@@ -9184,7 +9337,7 @@ static void run_frontend_router(pid_t backend_pid) {
   uint8_t buffer[65536];
   int rr = 0; // ラウンドロビン分配用
   struct kevent ev_list[128];
-  syslog(LOG_NOTICE, "[Frontend] UDP Router process started.");
+  syslog(LOG_NOTICE, "[Frontend %d] UDP Router process started.", router_id);
 
   while (1) {
     int n = kevent(kq, NULL, 0, ev_list, 128, NULL);
@@ -9197,23 +9350,25 @@ static void run_frontend_router(pid_t backend_pid) {
     for (int i = 0; i < n; i++) {
       uintptr_t ud = (uintptr_t)ev_list[i].udata;
       if (ud == 1000) {
-        while (1) {
-          ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), MSG_DONTWAIT);
-          if (len < 0) break; // キューが空になった (EAGAIN等)
-          if (len >= (ssize_t)sizeof(udp_ipc_t)) {
-            udp_ipc_t *msg = (udp_ipc_t *)buffer;
-            if (msg->sock_fd_idx == -2) {
-              syslog(LOG_NOTICE, "[Frontend] Received stop command from backend. Shutting down cleanly.");
-              exit(0);
+        if (router_id == 0) {
+          while (1) {
+            ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), MSG_DONTWAIT);
+            if (len < 0) break; // キューが空になった (EAGAIN等)
+            if (len >= (ssize_t)sizeof(udp_ipc_t)) {
+              udp_ipc_t *msg = (udp_ipc_t *)buffer;
+              if (msg->sock_fd_idx == -2) {
+                syslog(LOG_NOTICE, "[Frontend %d] Received stop command from backend. Shutting down cleanly.", router_id);
+                exit(0);
+              }
             }
           }
         }
-        syslog(LOG_CRIT, "[Frontend] Backend process (pid=%d) exited unexpectedly. Shutting down.", backend_pid);
+        syslog(LOG_CRIT, "[Frontend %d] Backend process (pid=%d) exited unexpectedly. Shutting down.", router_id, backend_pid);
         exit(1);
       }
       if (ud < MAX_BIND_ADDRS) {
         // (1) UDP Inbound -> IPC to Backend Worker (recvmmsg / sendmmsg バッチ化)
-        int fd = g_udp_fds[ud];
+        int fd = local_udp_fds[ud];
         while (1) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
             fctx->rx_iov[k].iov_base = fctx->rx_buffers[k] + sizeof(udp_ipc_t);
@@ -9247,13 +9402,13 @@ static void run_frontend_router(pid_t backend_pid) {
               tx_count++;
             }
           }
-          if (tx_count > 0) {
+          if (tx_count > 0 && g_num_workers > 0) {
             int target_worker = rr;
-            sendmmsg(g_ipc_fds[target_worker][0], fctx->ipc_tx_msgs, tx_count, MSG_DONTWAIT);
-            rr = (rr + 1) % g_num_ipc;
+            sendmmsg(g_ipc_fds[router_id][target_worker][0], fctx->ipc_tx_msgs, tx_count, MSG_DONTWAIT);
+            rr = (rr + 1) % g_num_workers;
           }
         }
-      } else if (ud == 999) {
+      } else if (ud == 999 && router_id == 0) {
         // (2) Notify Outbound -> Dynamic UDP Socket
         while (1) {
           ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), 0);
@@ -9262,7 +9417,7 @@ static void run_frontend_router(pid_t backend_pid) {
 
           udp_ipc_t *msg = (udp_ipc_t *)buffer;
           if (msg->sock_fd_idx == -2) {
-            syslog(LOG_NOTICE, "[Frontend] Received stop command from backend. Shutting down cleanly.");
+            syslog(LOG_NOTICE, "[Frontend %d] Received stop command from backend. Shutting down cleanly.", router_id);
             exit(0);
           }
           int sock = socket(msg->client_addr.ss_family, SOCK_DGRAM, 0);
@@ -9272,7 +9427,7 @@ static void run_frontend_router(pid_t backend_pid) {
                                       ? sizeof(struct sockaddr_in)
                                       : sizeof(struct sockaddr_in6);
               if (bind(sock, (struct sockaddr *)&msg->source_addr, src_len) < 0) {
-                syslog(LOG_WARNING, "[Frontend] Failed to bind NOTIFY socket to notify-source: %m");
+                syslog(LOG_WARNING, "[Frontend %d] Failed to bind NOTIFY socket to notify-source: %m", router_id);
               }
             }
             sendto(sock, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
@@ -9280,10 +9435,10 @@ static void run_frontend_router(pid_t backend_pid) {
             close(sock);
           }
         }
-      } else {
+      } else if (ud >= MAX_BIND_ADDRS && ud < 999) {
         // (3) IPC Inbound from Backend -> UDP Outbound (recvmmsg / sendmmsg バッチ化)
         int worker_idx = ud - MAX_BIND_ADDRS;
-        int fd = g_ipc_fds[worker_idx][0];
+        int fd = g_ipc_fds[router_id][worker_idx][0];
         while (1) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
             fctx->ipc_rx_iov[k].iov_base = fctx->ipc_rx_buffers[k];
@@ -9307,15 +9462,15 @@ static void run_frontend_router(pid_t backend_pid) {
             udp_ipc_t *msg = (udp_ipc_t *)fctx->ipc_rx_buffers[k];
             ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
             if (msg->payload_len > max_valid_payload) {
-              syslog(LOG_WARNING, "[Frontend] Dropping backend reply with inconsistent payload_len");
+              syslog(LOG_WARNING, "[Frontend %d] Dropping backend reply with inconsistent payload_len", router_id);
               continue;
             }
-            if (msg->sock_fd_idx < 0 || msg->sock_fd_idx >= g_num_udp_fds) {
+            if (msg->sock_fd_idx < 0 || msg->sock_fd_idx >= local_num_udp_fds) {
               continue;
             }
 
             if (cur_sock_idx != -1 && msg->sock_fd_idx != cur_sock_idx && tx_count > 0) {
-              sendmmsg(g_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
+              sendmmsg(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
               tx_count = 0;
             }
             cur_sock_idx = msg->sock_fd_idx;
@@ -9328,8 +9483,8 @@ static void run_frontend_router(pid_t backend_pid) {
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = 0;
             tx_count++;
           }
-          if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < g_num_udp_fds) {
-            sendmmsg(g_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
+          if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) {
+            sendmmsg(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
             tx_count = 0;
           }
         }
@@ -9371,58 +9526,30 @@ static void daemonize(void) {
     cap_rights_limit(stdio_fd, &io_rights);
 }
 
-static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
-  if (desired_rcv > 0) {
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
-      syslog(LOG_WARNING, "[Network] Failed to set SO_RCVBUF to %d: %m", desired_rcv);
-    } else {
-      int actual_rcv = 0;
-      socklen_t optlen = sizeof(actual_rcv);
-      if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) == 0) {
-        if (actual_rcv < desired_rcv) {
-          syslog(LOG_WARNING,
-                 "[Network] UDP SO_RCVBUF truncated by OS: requested %d bytes, got %d bytes "
-                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
-                 desired_rcv, actual_rcv);
-        }
+static void setup_ipc_tables(int num_workers) {
+  g_num_workers = num_workers;
+  for (int f = 0; f < g_num_frontend_routers; f++) {
+    for (int w = 0; w < num_workers; w++) {
+      if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ipc_fds[f][w]) < 0) {
+        syslog(LOG_CRIT, "[IPC] Failed to create socketpair for router %d worker %d: %m", f, w);
+        exit(1);
       }
+      fcntl(g_ipc_fds[f][w][0], F_SETFL,
+            fcntl(g_ipc_fds[f][w][0], F_GETFL, 0) | O_NONBLOCK);
+      fcntl(g_ipc_fds[f][w][1], F_SETFL,
+            fcntl(g_ipc_fds[f][w][1], F_GETFL, 0) | O_NONBLOCK);
+      int bufsize = 4 * 1024 * 1024; // 4MB
+      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
     }
   }
-  if (desired_snd > 0) {
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &desired_snd, sizeof(desired_snd)) != 0) {
-      syslog(LOG_WARNING, "[Network] Failed to set SO_SNDBUF to %d: %m", desired_snd);
-    } else {
-      int actual_snd = 0;
-      socklen_t optlen = sizeof(actual_snd);
-      if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) == 0) {
-        if (actual_snd < desired_snd) {
-          syslog(LOG_WARNING,
-                 "[Network] UDP SO_SNDBUF truncated by OS: requested %d bytes, got %d bytes "
-                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
-                 desired_snd, actual_snd);
-        }
-      }
-    }
-  }
-}
 
-static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
-  g_num_ipc = num_workers;
-  g_ipc_fds = calloc(num_workers, sizeof(int[2]));
-  for (int i = 0; i < num_workers; i++) {
-    socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ipc_fds[i]);
-    fcntl(g_ipc_fds[i][0], F_SETFL,
-          fcntl(g_ipc_fds[i][0], F_GETFL, 0) | O_NONBLOCK);
-    fcntl(g_ipc_fds[i][1], F_SETFL,
-          fcntl(g_ipc_fds[i][1], F_GETFL, 0) | O_NONBLOCK);
-    int bufsize = 2 * 1024 * 1024; // 2MB
-    setsockopt(g_ipc_fds[i][0], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-    setsockopt(g_ipc_fds[i][0], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-    setsockopt(g_ipc_fds[i][1], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-    setsockopt(g_ipc_fds[i][1], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) < 0) {
+    syslog(LOG_CRIT, "[IPC] Failed to create notify socketpair: %m");
+    exit(1);
   }
-
-  socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc);
   fcntl(g_notify_ipc[0], F_SETFL,
         fcntl(g_notify_ipc[0], F_GETFL, 0) | O_NONBLOCK);
   fcntl(g_notify_ipc[1], F_SETFL,
@@ -9437,86 +9564,6 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
   cap_rights_limit(g_notify_ipc[0], &n_rights_0);
   cap_rights_init(&n_rights_1, CAP_SEND, CAP_EVENT, CAP_FCNTL);
   cap_rights_limit(g_notify_ipc[1], &n_rights_1);
-
-  int port = cfg->port > 0 ? cfg->port : DNS_PORT;
-  int bind_count = cfg->bind_address_count;
-  int opt = 1;
-  int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
-  int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
-
-  for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
-    struct sockaddr_in addr4;
-    struct sockaddr_in6 addr6;
-    bool is_v4 = false;
-    bool is_v6 = false;
-    memset(&addr4, 0, sizeof(addr4));
-    memset(&addr6, 0, sizeof(addr6));
-    if (bind_count == 0) {
-      addr4.sin_family = AF_INET;
-      addr4.sin_addr.s_addr = INADDR_ANY;
-      addr4.sin_port = htons(port);
-      addr6.sin6_family = AF_INET6;
-      addr6.sin6_addr = in6addr_any;
-      addr6.sin6_port = htons(port);
-      is_v4 = true;
-      is_v6 = true;
-    } else {
-      if (inet_pton(AF_INET, cfg->bind_addresses[i], &addr4.sin_addr) == 1) {
-        addr4.sin_family = AF_INET;
-        addr4.sin_port = htons(port);
-        is_v4 = true;
-      } else if (inet_pton(AF_INET6, cfg->bind_addresses[i],
-                           &addr6.sin6_addr) == 1) {
-        addr6.sin6_family = AF_INET6;
-        addr6.sin6_port = htons(port);
-        is_v6 = true;
-      }
-    }
-
-    if (is_v4 && g_num_udp_fds < MAX_BIND_ADDRS) {
-      int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-      if (udp_fd >= 0) {
-        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
-        fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
-#ifdef SO_REUSEPORT_LB
-        int opt_lb = 1;
-        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
-          int opt_reuse = 1;
-          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-        }
-#else
-        int opt_reuse = 1;
-        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-#endif
-        if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0)
-          g_udp_fds[g_num_udp_fds++] = udp_fd;
-        else
-          close(udp_fd);
-      }
-    }
-    if (is_v6 && g_num_udp_fds < MAX_BIND_ADDRS) {
-      int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
-      if (udp_fd >= 0) {
-        setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
-        fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
-        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT_LB
-        int opt_lb = 1;
-        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
-          int opt_reuse = 1;
-          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-        }
-#else
-        int opt_reuse = 1;
-        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-#endif
-        if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0)
-          g_udp_fds[g_num_udp_fds++] = udp_fd;
-        else
-          close(udp_fd);
-      }
-    }
-  }
 }
 
 int main(int argc, char **argv) {
@@ -9667,7 +9714,11 @@ int main(int argc, char **argv) {
   if (num_workers <= 0)
     num_workers = 2;
 
-  setup_udp_and_ipc(&g_config_db.config_a, num_workers);
+  g_num_frontend_routers = (num_workers <= 2) ? 1 : ((num_workers >= 8) ? 4 : 2);
+  if (g_num_frontend_routers > MAX_FRONTEND_ROUTERS)
+    g_num_frontend_routers = MAX_FRONTEND_ROUTERS;
+
+  setup_ipc_tables(num_workers);
 
   if (g_config_db.config_a.control.enabled) {
     struct sockaddr_un un;
@@ -9724,29 +9775,81 @@ int main(int argc, char **argv) {
     }
   }
 
-  pid_t pid = fork();
-  if (pid < 0) {
-    syslog(LOG_ERR, "fork for frontend router failed");
+  pid_t backend_pid = fork();
+  if (backend_pid < 0) {
+    syslog(LOG_CRIT, "fork for backend process failed: %m");
     if (pid_fd >= 0) close(pid_fd);
     exit(1);
   }
 
-  if (pid > 0) {
-    run_frontend_router(pid);
+  if (backend_pid > 0) {
+    // === Parent Process (Process Manager / Supervisor) ===
+    pid_t router_pids[MAX_FRONTEND_ROUTERS];
+    for (int r = 0; r < g_num_frontend_routers; r++) {
+      pid_t rpid = fork();
+      if (rpid < 0) {
+        syslog(LOG_CRIT, "fork for frontend router %d failed: %m", r);
+        kill(backend_pid, SIGTERM);
+        for (int k = 0; k < r; k++) kill(router_pids[k], SIGTERM);
+        if (pid_fd >= 0) close(pid_fd);
+        exit(1);
+      }
+      if (rpid == 0) {
+        // Frontend Router Process
+        run_frontend_router(backend_pid, r);
+        if (pid_fd >= 0) close(pid_fd);
+        exit(0);
+      }
+      router_pids[r] = rpid;
+    }
+
+    // 親プロセス（Manager）はすべての不要なIPCソケット・制御ソケットを確実にクローズ (指示2)
+    for (int f = 0; f < g_num_frontend_routers; f++) {
+      for (int w = 0; w < num_workers; w++) {
+        close(g_ipc_fds[f][w][0]);
+        close(g_ipc_fds[f][w][1]);
+      }
+    }
+    close(g_notify_ipc[0]);
+    close(g_notify_ipc[1]);
+    if (g_control_sock >= 0) {
+      close(g_control_sock);
+      g_control_sock = -1;
+    }
+
+    // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止)
+    while (1) {
+      int status;
+      pid_t dead = wait(&status);
+      if (dead > 0) {
+        syslog(LOG_CRIT, "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, status);
+        kill(backend_pid, SIGTERM);
+        for (int r = 0; r < g_num_frontend_routers; r++) {
+          kill(router_pids[r], SIGTERM);
+        }
+        break;
+      }
+      if (dead < 0 && errno == ECHILD) {
+        break;
+      }
+    }
     if (pid_fd >= 0) close(pid_fd);
     exit(0);
   }
 
+  // === Backend Process (backend_pid == 0) ===
   if (pid_fd >= 0) {
     close(pid_fd);
     pid_fd = -1;
   }
 
-  for (int i = 0; i < g_num_ipc; i++)
-    close(g_ipc_fds[i][0]);
-  for (int i = 0; i < g_num_udp_fds; i++)
-    close(g_udp_fds[i]);
-  close(g_notify_ipc[0]);
+  // 指示2: Backendプロセス側もFrontend用端点を直ちにclose
+  for (int f = 0; f < g_num_frontend_routers; f++) {
+    for (int w = 0; w < num_workers; w++) {
+      close(g_ipc_fds[f][w][0]); // Frontend側端点をクローズ
+    }
+  }
+  close(g_notify_ipc[0]); // Frontend側端点をクローズ
   init_async_io_pool();
 
   pthread_t control_thread;
