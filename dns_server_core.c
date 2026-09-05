@@ -1036,20 +1036,26 @@ static inline bool domain_names_match_ci(const char *a, const char *b) {
 static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
   if (!view || !qname) return NULL;
   size_t q_len = strlen(qname);
+  while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+
   zone_db_entry_t *best_entry = NULL;
   size_t longest_match_len = 0;
   for (size_t i = 0; i < view->zone_count; i++) {
     zone_db_entry_t *entry = view->entries[i];
     if (!entry) continue;
     size_t z_len = strlen(entry->domain);
+    while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
+
     bool match = false;
-    if (q_len == z_len && strcasecmp(qname, entry->domain) == 0) {
+    if (z_len == 0 && (strcmp(entry->domain, ".") == 0 || entry->domain[0] == '\0')) {
+      match = true;
+    } else if (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) {
       match = true;
     } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
-               strcasecmp(qname + q_len - z_len, entry->domain) == 0) {
+               strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0) {
       match = true;
     }
-    if (match && z_len > longest_match_len) {
+    if (match && (!best_entry || z_len > longest_match_len)) {
       longest_match_len = z_len;
       best_entry = entry;
     }
@@ -3773,9 +3779,11 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
                                 const char client_loc[2],
                                 const char *client_ecs_tag,
                                 const char *client_loc_tag,
-                                additional_from_auth_t policy) {
+                                additional_from_auth_t policy,
+                                view_snapshot_t *view) {
   if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
 
+  // 1. Fast path: check prelinked glue
   if (current_zone->prelinked_glue && current_zone->prelinked_glue_count > 0) {
     for (int e = 0; e < current_zone->prelinked_glue_count; e++) {
       prelinked_glue_entry_t *entry = &current_zone->prelinked_glue[e];
@@ -3803,33 +3811,138 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
     }
   }
 
+  // 2. In-zone search (covers in-domain glue and out-of-zone glue in current_zone)
   size_t t_len = strlen(target), a_len = strlen(zone_apex);
-  if (t_len >= a_len &&
-      strcasecmp(target + t_len - a_len, zone_apex) == 0 &&
-      (t_len == a_len || target[t_len - a_len - 1] == '.')) {
+  while (t_len > 0 && target[t_len - 1] == '.') t_len--;
+  while (a_len > 0 && zone_apex[a_len - 1] == '.') a_len--;
+
+  bool is_in_domain = (t_len >= a_len &&
+                       strncasecmp(target + (t_len - a_len), zone_apex, a_len) == 0 &&
+                       (t_len == a_len || target[t_len - a_len - 1] == '.'));
+
+  if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !is_in_domain) {
+    return true;
+  }
+
+  bool in_zone_found = false;
+  if (current_zone->hash_size > 0 && current_zone->hash_table) {
     time_t tinydns_now = (current_zone && current_zone->is_tinydns_format) ? time(NULL) : 0;
-    uint32_t tgt_hash = calc_fnv1a_str(target);
-    size_t tgt_idx = tgt_hash & (current_zone->hash_size - 1);
-    for (int j = current_zone->hash_table[tgt_idx]; j != -1;
-         j = current_zone->records[j].next_record) {
-      dns_record_t *rec = &current_zone->records[j];
-      if ((rec->type_code == 1 || rec->type_code == 28) &&
-          strcasecmp(rec->name, target) == 0) {
-        uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-        dns_record_t rec_copy = *rec;
-        rec_copy.ttl_value = eff_ttl;
-        uint16_t saved_offset = *offset;
-        if (serialize_dns_record(res, max_res_len, offset,
-                                 &rec_copy, comp_ctx,
-                                 NULL, 0xFFFFFFFF) < 0) {
-          *offset = saved_offset;
-          return false;
-        } else
-          (*arcount)++;
+    uint32_t hashes[2];
+    int h_count = 1;
+    hashes[0] = calc_fnv1a_str(target);
+    char alt_tgt[256];
+    size_t raw_len = strlen(target);
+    if (raw_len > 0 && target[raw_len - 1] == '.') {
+      snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), target);
+      hashes[1] = calc_fnv1a_str(alt_tgt);
+      h_count = 2;
+    } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
+      snprintf(alt_tgt, sizeof(alt_tgt), "%s.", target);
+      hashes[1] = calc_fnv1a_str(alt_tgt);
+      h_count = 2;
+    }
+
+    dns_record_t *added_recs[32];
+    int added_count = 0;
+
+    for (int h = 0; h < h_count; h++) {
+      size_t idx = hashes[h] & (current_zone->hash_size - 1);
+      if (h == 1 && idx == (hashes[0] & (current_zone->hash_size - 1))) continue;
+      for (int j = current_zone->hash_table[idx]; j != -1;
+           j = current_zone->records[j].next_record) {
+        dns_record_t *rec = &current_zone->records[j];
+        if ((rec->type_code == 1 || rec->type_code == 28) &&
+            domain_names_match_ci(rec->name, target)) {
+          bool dup = false;
+          for (int a = 0; a < added_count; a++) {
+            if (added_recs[a] == rec) { dup = true; break; }
+          }
+          if (dup) continue;
+          if (added_count < 32) added_recs[added_count++] = rec;
+
+          uint32_t eff_ttl;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+          dns_record_t rec_copy = *rec;
+          rec_copy.ttl_value = eff_ttl;
+          uint16_t saved_offset = *offset;
+          if (serialize_dns_record(res, max_res_len, offset,
+                                   &rec_copy, comp_ctx,
+                                   NULL, 0xFFFFFFFF) < 0) {
+            *offset = saved_offset;
+            return false;
+          } else {
+            (*arcount)++;
+            in_zone_found = true;
+          }
+        }
       }
     }
   }
+
+  if (in_zone_found) {
+    return true;
+  }
+
+  // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
+  if (policy == ADDITIONAL_AUTH_YES && view) {
+    zone_db_entry_t *sib_entry = find_zone_in_view(view, target);
+    if (sib_entry) {
+      zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+      if (sib_arena && sib_arena != current_zone && sib_arena->hash_size > 0 && sib_arena->hash_table) {
+        time_t tinydns_now = sib_arena->is_tinydns_format ? time(NULL) : 0;
+        uint32_t hashes[2];
+        int h_count = 1;
+        hashes[0] = calc_fnv1a_str(target);
+        char alt_tgt[256];
+        size_t raw_len = strlen(target);
+        if (raw_len > 0 && target[raw_len - 1] == '.') {
+          snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), target);
+          hashes[1] = calc_fnv1a_str(alt_tgt);
+          h_count = 2;
+        } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
+          snprintf(alt_tgt, sizeof(alt_tgt), "%s.", target);
+          hashes[1] = calc_fnv1a_str(alt_tgt);
+          h_count = 2;
+        }
+
+        dns_record_t *added_recs[32];
+        int added_count = 0;
+
+        for (int h = 0; h < h_count; h++) {
+          size_t idx = hashes[h] & (sib_arena->hash_size - 1);
+          if (h == 1 && idx == (hashes[0] & (sib_arena->hash_size - 1))) continue;
+          for (int j = sib_arena->hash_table[idx]; j != -1;
+               j = sib_arena->records[j].next_record) {
+            dns_record_t *rec = &sib_arena->records[j];
+            if ((rec->type_code == 1 || rec->type_code == 28) &&
+                domain_names_match_ci(rec->name, target)) {
+              bool dup = false;
+              for (int a = 0; a < added_count; a++) {
+                if (added_recs[a] == rec) { dup = true; break; }
+              }
+              if (dup) continue;
+              if (added_count < 32) added_recs[added_count++] = rec;
+
+              uint32_t eff_ttl;
+              if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+              dns_record_t rec_copy = *rec;
+              rec_copy.ttl_value = eff_ttl;
+              uint16_t saved_offset = *offset;
+              if (serialize_dns_record(res, max_res_len, offset,
+                                       &rec_copy, comp_ctx,
+                                       NULL, 0xFFFFFFFF) < 0) {
+                *offset = saved_offset;
+                return false;
+              } else {
+                (*arcount)++;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   return true;
 }
 
@@ -3869,7 +3982,8 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             const char client_loc[2],
                             const char *client_ecs_tag,
                             const char *client_loc_tag,
-                            additional_from_auth_t policy) {
+                            additional_from_auth_t policy,
+                            view_snapshot_t *view) {
   if (!current_zone || current_zone->hash_size == 0 ||
       !current_zone->hash_table)
     return false;
@@ -3915,7 +4029,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
             current_zone->records[i].rdata_count > 0) {
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
-                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy)) {
+                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, view)) {
             res[2] |= 0x02;
             return true;
           }
@@ -4099,7 +4213,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     additional_from_auth_t policy = cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES;
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, db_entry->domain, res,
-                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy))
+                        max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, view))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====
@@ -4342,26 +4456,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       if (in_zone)
         continue;
       else {
-        zone_db_entry_t *new_db_entry = NULL;
-        size_t longest_match_len = 0;
-        if (view) {
-          for (size_t i = 0; i < view->zone_count; i++) {
-            size_t check_z_len = strlen(view->entries[i]->domain);
-            bool match = false;
-            if (cq_len == check_z_len &&
-                strcasecmp(current_qname, view->entries[i]->domain) == 0)
-              match = true;
-            else if (cq_len > check_z_len &&
-                     current_qname[cq_len - check_z_len - 1] == '.' &&
-                     strcasecmp(current_qname + cq_len - check_z_len,
-                                view->entries[i]->domain) == 0)
-              match = true;
-            if (match && check_z_len > longest_match_len) {
-              longest_match_len = check_z_len;
-              new_db_entry = view->entries[i];
-            }
-          }
-        }
+        zone_db_entry_t *new_db_entry = find_zone_in_view(view, current_qname);
         if (new_db_entry) {
           zone_arena_t *new_zone = NULL;
           do {
@@ -4619,7 +4714,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       for (int k = 0; k < glue_target_count; k++) {
         if (!append_glue_records(current_zone, glue_targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
-                                 client_loc, client_ecs_tag, client_loc_tag, policy)) {
+                                 client_loc, client_ecs_tag, client_loc_tag, policy, view)) {
           break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
         }
       }
@@ -5341,31 +5436,14 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   char current_qname[256];
   strncpy(current_qname, qname, 255);
   current_qname[255] = '\0';
-  size_t q_len = strlen(current_qname);
   zone_arena_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
-  size_t longest_match_len = 0;
   view_snapshot_t *view = NULL;
 
   if (snap) {
     view = select_view(snap, client_ip);
     if (view) {
-      for (size_t i = 0; i < view->zone_count; i++) {
-        size_t z_len = strlen(view->entries[i]->domain);
-        bool match = false;
-        
-        if (q_len == z_len &&
-            strcasecmp(current_qname, view->entries[i]->domain) == 0)
-          match = true;
-        else if (q_len > z_len && current_qname[q_len - z_len - 1] == '.' &&
-                 strcasecmp(current_qname + q_len - z_len,
-                            view->entries[i]->domain) == 0)
-          match = true;
-        if (match && z_len > longest_match_len) {
-          longest_match_len = z_len;
-          db_entry = view->entries[i];
-        }
-      }
+      db_entry = find_zone_in_view(view, current_qname);
     }
   }
 

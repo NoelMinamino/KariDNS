@@ -118,11 +118,55 @@ zone "example.net" {
 };
 EOF
 
+ZONE_PARENT="$TMP_DIR/example-parent.jp.zone"
+ZONE_SIBLING="$TMP_DIR/example-sibling.jp.zone"
+CONF_SIBLING="$TMP_DIR/sibling_dynamic.conf"
+
+cat << 'EOF' > "$ZONE_PARENT"
+$ORIGIN example-parent.jp.
+$TTL 1800
+@           IN SOA   ns1.city.example-parent.jp. hostmaster.example-parent.jp. 2026090501 7200 3600 1209600 1800
+@           IN NS    ns-ext.example.org.
+@           IN NS    ns1.city.example-parent.jp.
+@           IN NS    ns-sibling.v6.example-sibling.jp.
+ns-ext.example.org. IN A 192.0.2.88
+ns-ext.example.org. IN AAAA 2001:db8:1::88
+ns1.city    IN A     192.0.2.61
+EOF
+
+cat << 'EOF' > "$ZONE_SIBLING"
+$ORIGIN example-sibling.jp.
+$TTL 1800
+@           IN SOA   ns1.example-sibling.jp. hostmaster.example-sibling.jp. 2026090501 7200 3600 1209600 1800
+@           IN NS    ns1.example-sibling.jp.
+ns-sibling.v6    IN A     198.51.100.226
+ns-sibling.v6    IN AAAA  2001:db8:2::226
+EOF
+
+cat << EOF > "$CONF_SIBLING"
+options {
+    port 10056;
+    bind-address { 127.0.0.1; };
+    additional-from-auth yes;
+    user "nobody";
+    group "nobody";
+};
+zone "example-parent.jp" {
+    type master;
+    file "$ZONE_PARENT";
+};
+zone "example-sibling.jp" {
+    type master;
+    file "$ZONE_SIBLING";
+};
+EOF
+
 cleanup() {
     echo "[*] Cleaning up test processes..."
     [ -n "$SERVER_PID_YES" ] && kill -9 "$SERVER_PID_YES" 2>/dev/null || true
     [ -n "$SERVER_PID_IN" ] && kill -9 "$SERVER_PID_IN" 2>/dev/null || true
     [ -n "$SERVER_PID_NO" ] && kill -9 "$SERVER_PID_NO" 2>/dev/null || true
+    [ -n "$SERVER_PID_SIBLING" ] && kill -9 "$SERVER_PID_SIBLING" 2>/dev/null || true
     killall -9 karidns 2>/dev/null || true
     rm -rf "$TMP_DIR" 2>/dev/null || true
     rm -f "$DIR"/server_sibling_*.log
@@ -259,6 +303,53 @@ echo "[PASS] Test 3: additional-from-auth no returned 0 Additional address recor
 
 killall -9 karidns 2>/dev/null || true
 SERVER_PID_NO=""
+sleep 1
+
+# -------------------------------------------------------------
+# Test 4: Sibling domain dynamic resolution with example domains
+# -------------------------------------------------------------
+echo "[*] Starting KariDNS for example-parent.jp & example-sibling.jp on port 10056..."
+$BIN -f -c "$CONF_SIBLING" > "$DIR/server_sibling_dyn.log" 2>&1 &
+SERVER_PID_SIBLING=$!
+sleep 2
+
+if ! kill -0 "$SERVER_PID_SIBLING" 2>/dev/null; then
+    echo "[FAIL] Server (sibling dynamic) failed to start. Log output:"
+    cat "$DIR/server_sibling_dyn.log" 2>/dev/null || true
+    exit 1
+fi
+
+echo "[*] Querying NS example-parent.jp on port 10056..."
+OUT_SIBLING=$($DAG NS example-parent.jp @127.0.0.1 -p 10056)
+echo "$OUT_SIBLING"
+
+# Verify all Additional records
+if ! echo "$OUT_SIBLING" | grep -q "ns-ext.example.org.*192.0.2.88"; then
+    echo "[FAIL] A record for ns-ext.example.org missing in Additional!"
+    exit 1
+fi
+if ! echo "$OUT_SIBLING" | grep -q "ns-ext.example.org.*2001:db8:1::88"; then
+    echo "[FAIL] AAAA record for ns-ext.example.org missing in Additional!"
+    exit 1
+fi
+if ! echo "$OUT_SIBLING" | grep -q "ns1.city.example-parent.jp.*192.0.2.61"; then
+    echo "[FAIL] A record for ns1.city.example-parent.jp missing in Additional!"
+    exit 1
+fi
+if ! echo "$OUT_SIBLING" | grep -q "ns-sibling.v6.example-sibling.jp.*198.51.100.226"; then
+    echo "[FAIL] Sibling A record for ns-sibling.v6.example-sibling.jp missing in Additional!"
+    exit 1
+fi
+if ! echo "$OUT_SIBLING" | grep -q "ns-sibling.v6.example-sibling.jp.*2001:db8:2::226"; then
+    echo "[FAIL] Sibling AAAA record for ns-sibling.v6.example-sibling.jp missing in Additional!"
+    exit 1
+fi
+
+echo "[PASS] Test 4: Sibling domain (ns-sibling.v6.example-sibling.jp A/AAAA) successfully resolved in Additional!"
+
+killall -9 karidns 2>/dev/null || true
+SERVER_PID_SIBLING=""
 
 echo "[ALL PASS] Sibling domain Additional glue test suite passed successfully!"
 exit 0
+
