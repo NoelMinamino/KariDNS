@@ -4466,99 +4466,6 @@ static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axf
     return true;
 }
 
-static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
-                                     uint16_t qdcount, uint16_t ancount,
-                                     uint16_t nscount, uint16_t arcount) {
-    size_t scan_offset = 12;
-    int total = qdcount + ancount + nscount + arcount;
-    for (int i = 0; i < total; i++) {
-        if (scan_offset >= pkt_len) return;
-        bool is_opt = (i >= qdcount + ancount + nscount);
-        size_t next;
-        if (skip_wire_name(pkt, pkt_len, scan_offset, &next) != 0) return;
-        scan_offset = next;
-        if (i < qdcount) { scan_offset += 4; continue; }
-        if (scan_offset + 10 > pkt_len) return;
-        uint16_t rtype = (pkt[scan_offset] << 8) | pkt[scan_offset+1];
-        uint16_t rdlen = (pkt[scan_offset+8] << 8) | pkt[scan_offset+9];
-        size_t rdata_off = scan_offset + 10;
-        if (is_opt && rtype == 41) {
-            size_t p = rdata_off, end = rdata_off + rdlen;
-            if (end > pkt_len) end = pkt_len;
-            while (p + 4 <= end) {
-                uint16_t code = (pkt[p] << 8) | pkt[p+1];
-                uint16_t olen = (pkt[p+2] << 8) | pkt[p+3];
-                p += 4;
-                if (p + olen > end) break;
-                if (code == 3) {
-                    printf("; NSID: ");
-                    for (uint16_t j = 0; j < olen; j++) printf("%02x", pkt[p + j]);
-                    printf(" (\"");
-                    for (uint16_t j = 0; j < olen; j++) {
-                        unsigned char c = pkt[p + j];
-                        printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
-                    }
-                    printf("\")\n");
-                } else if (code == 8 && olen >= 4) {
-                    uint16_t family = (pkt[p] << 8) | pkt[p+1];
-                    uint8_t src_prefix = pkt[p+2];
-                    uint8_t scope_prefix = pkt[p+3];
-                    char abuf[64] = "?";
-                    uint8_t addr[16] = {0};
-                    int addr_bytes = olen - 4;
-                    if (addr_bytes > 16) addr_bytes = 16;
-                    memcpy(addr, &pkt[p + 4], addr_bytes);
-                    if (family == 1) inet_ntop(AF_INET, addr, abuf, sizeof(abuf));
-                    else if (family == 2) inet_ntop(AF_INET6, addr, abuf, sizeof(abuf));
-                    printf("; CLIENT-SUBNET: %s/%u/%u\n", abuf, src_prefix, scope_prefix);
-                } else if (code == 9) {
-                    if (olen >= 4) {
-                        uint32_t exp_sec = ((uint32_t)pkt[p]<<24)|((uint32_t)pkt[p+1]<<16)|((uint32_t)pkt[p+2]<<8)|pkt[p+3];
-                        printf("; EXPIRE: %u (seconds)\n", exp_sec);
-                    } else {
-                        printf("; EXPIRE\n");
-                    }
-                } else if (code == 11) {
-                    if (olen >= 2) {
-                        uint16_t to = (pkt[p] << 8) | pkt[p+1];
-                        printf("; KEEPALIVE: %u\n", to);
-                    } else {
-                        printf("; KEEPALIVE\n");
-                    }
-                } else if (code == 12) {
-                    printf("; PADDING: %u octets\n", olen);
-                } else if (code == 20 || code == 21) {
-                    printf("; %s: ", code == 20 ? "MQTYPE-Query" : "MQTYPE-Response");
-                    if (olen % 2 != 0) {
-                        printf("(malformed, length %u is not even)\n", olen);
-                    } else if (olen == 0) {
-                        printf("(empty)\n");
-                    } else {
-                        for (uint16_t j = 0; j < olen; j += 2) {
-                            uint16_t mq = (pkt[p + j] << 8) | pkt[p + j + 1];
-                            char tbuf[16];
-                            const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
-                            if (j > 0) printf(" ");
-                            printf("%s", mq_name);
-                        }
-                        printf("\n");
-                    }
-                } else if (code != 10 && code != 15) {
-                    printf("; OPTION: %u", code);
-                    if (olen > 0) {
-                        printf(": ");
-                        for (uint16_t j = 0; j < olen; j++) printf("%02x ", pkt[p + j]);
-                    }
-                    printf("\n");
-                }
-                p += olen;
-            }
-            return;
-        }
-        scan_offset = rdata_off + rdlen;
-    }
-}
-
 // YAML single-quoted scalar内で安全な形にエスケープする（'を''に置換するのみ）
 static void yaml_single_quote_escape(const char *src, char *dst, size_t dst_cap) {
     if (!dst || dst_cap == 0) return;
@@ -4595,6 +4502,152 @@ static void yaml_double_quote_escape(const char *src, char *dst, size_t dst_cap)
         }
     }
     dst[d] = '\0';
+}
+
+static void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
+                                         uint16_t code, uint16_t olen,
+                                         const char *indent,
+                                         const display_opts_t *dopt) {
+    if (!indent) indent = "";
+    bool is_yaml = (indent[0] != ';');
+
+    if (code == 10) { // COOKIE
+        if (is_yaml && olen >= 8) {
+            char c_cookie[64] = "";
+            char s_cookie[128] = "";
+            for (int j = 0; j < 8; j++) snprintf(c_cookie + j * 2, 3, "%02x", pkt[p + j]);
+            bool c_match = true;
+            if (dopt && dopt->has_expected_client_cookie) {
+                c_match = (memcmp(dopt->expected_client_cookie, &pkt[p], 8) == 0);
+            }
+            if (olen > 8) {
+                for (int j = 8; j < olen && (j - 8) * 2 < (int)sizeof(s_cookie) - 3; j++) {
+                    snprintf(s_cookie + (j - 8) * 2, 3, "%02x", pkt[p + j]);
+                }
+            }
+            printf("%sCOOKIE:\n", indent);
+            printf("%s  CLIENT: %s\n", indent, c_cookie);
+            if (s_cookie[0] != '\0') {
+                printf("%s  SERVER: %s\n", indent, s_cookie);
+            }
+            if (dopt && dopt->has_expected_client_cookie) {
+                printf("%s  STATUS: %s\n", indent, c_match ? "good" : "bad");
+            }
+        }
+        return;
+    } else if (code == 3) { // NSID
+        printf("%sNSID: ", indent);
+        for (uint16_t j = 0; j < olen; j++) printf("%02x", pkt[p + j]);
+        printf(" (\"");
+        for (uint16_t j = 0; j < olen; j++) {
+            unsigned char c = pkt[p + j];
+            printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+        }
+        printf("\")\n");
+    } else if (code == 8 && olen >= 4) { // CLIENT-SUBNET
+        uint16_t family = (pkt[p] << 8) | pkt[p+1];
+        uint8_t src_prefix = pkt[p+2];
+        uint8_t scope_prefix = pkt[p+3];
+        char abuf[64] = "?";
+        uint8_t addr[16] = {0};
+        int addr_bytes = olen - 4;
+        if (addr_bytes > 16) addr_bytes = 16;
+        memcpy(addr, &pkt[p + 4], addr_bytes);
+        if (family == 1) inet_ntop(AF_INET, addr, abuf, sizeof(abuf));
+        else if (family == 2) inet_ntop(AF_INET6, addr, abuf, sizeof(abuf));
+        printf("%sCLIENT-SUBNET: %s/%u/%u\n", indent, abuf, src_prefix, scope_prefix);
+    } else if (code == 9) { // EXPIRE
+        if (olen >= 4) {
+            uint32_t exp_sec = ((uint32_t)pkt[p]<<24)|((uint32_t)pkt[p+1]<<16)|((uint32_t)pkt[p+2]<<8)|pkt[p+3];
+            printf("%sEXPIRE: %u (seconds)\n", indent, exp_sec);
+        } else {
+            printf("%sEXPIRE%s\n", indent, is_yaml ? ":" : "");
+        }
+    } else if (code == 11) { // KEEPALIVE
+        if (olen >= 2) {
+            uint16_t to = (pkt[p] << 8) | pkt[p+1];
+            printf("%sKEEPALIVE: %u\n", indent, to);
+        } else {
+            printf("%sKEEPALIVE%s\n", indent, is_yaml ? ":" : "");
+        }
+    } else if (code == 12) { // PADDING
+        printf("%sPADDING: %u octets\n", indent, olen);
+    } else if (code == 15) { // EDE
+        if (is_yaml && olen >= 2) {
+            uint16_t info_code = (pkt[p] << 8) | pkt[p+1];
+            const char *msg = get_ede_error_string(info_code);
+            printf("%sEDE:\n", indent);
+            printf("%s  INFO-CODE: %u (%s)\n", indent, info_code, msg);
+            if (olen > 2) {
+                char ede_text[512];
+                size_t tlen = olen - 2;
+                if (tlen >= sizeof(ede_text)) tlen = sizeof(ede_text) - 1;
+                memcpy(ede_text, &pkt[p + 2], tlen);
+                ede_text[tlen] = '\0';
+                char text_esc[512];
+                yaml_double_quote_escape(ede_text, text_esc, sizeof(text_esc));
+                printf("%s  EXTRA-TEXT: \"%s\"\n", indent, text_esc);
+            }
+        }
+        return;
+    } else if (code == 20 || code == 21) { // MQTYPE
+        printf("%s%s: ", indent, code == 20 ? "MQTYPE-Query" : "MQTYPE-Response");
+        if (olen % 2 != 0) {
+            printf("(malformed, length %u is not even)\n", olen);
+        } else if (olen == 0) {
+            printf("(empty)\n");
+        } else {
+            for (uint16_t j = 0; j < olen; j += 2) {
+                uint16_t mq = (pkt[p + j] << 8) | pkt[p + j + 1];
+                char tbuf[16];
+                const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
+                if (j > 0) printf(" ");
+                printf("%s", mq_name);
+            }
+            printf("\n");
+        }
+    } else {
+        printf("%sOPTION: %u", indent, code);
+        if (olen > 0) {
+            printf(": ");
+            for (uint16_t j = 0; j < olen; j++) printf("%02x ", pkt[p + j]);
+        }
+        printf("\n");
+    }
+}
+
+static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
+                                     uint16_t qdcount, uint16_t ancount,
+                                     uint16_t nscount, uint16_t arcount,
+                                     const display_opts_t *dopt) {
+    size_t scan_offset = 12;
+    int total = qdcount + ancount + nscount + arcount;
+    for (int i = 0; i < total; i++) {
+        if (scan_offset >= pkt_len) return;
+        bool is_opt = (i >= qdcount + ancount + nscount);
+        size_t next;
+        if (skip_wire_name(pkt, pkt_len, scan_offset, &next) != 0) return;
+        scan_offset = next;
+        if (i < qdcount) { scan_offset += 4; continue; }
+        if (scan_offset + 10 > pkt_len) return;
+        uint16_t rtype = (pkt[scan_offset] << 8) | pkt[scan_offset+1];
+        uint16_t rdlen = (pkt[scan_offset+8] << 8) | pkt[scan_offset+9];
+        size_t rdata_off = scan_offset + 10;
+        if (is_opt && rtype == 41) {
+            size_t p = rdata_off, end = rdata_off + rdlen;
+            if (end > pkt_len) end = pkt_len;
+            while (p + 4 <= end) {
+                uint16_t code = (pkt[p] << 8) | pkt[p+1];
+                uint16_t olen = (pkt[p+2] << 8) | pkt[p+3];
+                p += 4;
+                if (p + olen > end) break;
+                decode_and_print_edns_option(pkt, p, code, olen, "; ", dopt);
+                p += olen;
+            }
+            return;
+        }
+        scan_offset = rdata_off + rdlen;
+    }
 }
 
 static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp, const display_opts_t *dopt) {
@@ -4738,105 +4791,7 @@ static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *
                     uint16_t olen = (pkt[p+2] << 8) | pkt[p+3];
                     p += 4;
                     if (p + olen > end) break;
-                    if (code == 10) { // COOKIE
-                        if (olen >= 8) {
-                            char c_cookie[64] = "";
-                            char s_cookie[128] = "";
-                            for (int j = 0; j < 8; j++) snprintf(c_cookie + j * 2, 3, "%02x", pkt[p + j]);
-                            bool c_match = true;
-                            if (dopt->has_expected_client_cookie) {
-                                c_match = (memcmp(dopt->expected_client_cookie, &pkt[p], 8) == 0);
-                            }
-                            if (olen > 8) {
-                                for (int j = 8; j < olen && (j - 8) * 2 < (int)sizeof(s_cookie) - 3; j++) {
-                                    snprintf(s_cookie + (j - 8) * 2, 3, "%02x", pkt[p + j]);
-                                }
-                            }
-                            printf("          COOKIE:\n");
-                            printf("            CLIENT: %s\n", c_cookie);
-                            if (s_cookie[0] != '\0') {
-                                printf("            SERVER: %s\n", s_cookie);
-                            }
-                            if (dopt->has_expected_client_cookie) {
-                                printf("            STATUS: %s\n", c_match ? "good" : "bad");
-                            }
-                        }
-                    } else if (code == 3) { // NSID
-                        printf("          NSID: ");
-                        for (uint16_t j = 0; j < olen; j++) printf("%02x", pkt[p + j]);
-                        printf(" (\"");
-                        for (uint16_t j = 0; j < olen; j++) {
-                            unsigned char c = pkt[p + j];
-                            printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
-                        }
-                        printf("\")\n");
-                    } else if (code == 8 && olen >= 4) { // CLIENT-SUBNET
-                        uint16_t family = (pkt[p] << 8) | pkt[p+1];
-                        uint8_t src_prefix = pkt[p+2];
-                        uint8_t scope_prefix = pkt[p+3];
-                        char abuf[64] = "?";
-                        uint8_t addr[16] = {0};
-                        int addr_bytes = olen - 4;
-                        if (addr_bytes > 16) addr_bytes = 16;
-                        memcpy(addr, &pkt[p + 4], addr_bytes);
-                        if (family == 1) inet_ntop(AF_INET, addr, abuf, sizeof(abuf));
-                        else if (family == 2) inet_ntop(AF_INET6, addr, abuf, sizeof(abuf));
-                        printf("          CLIENT-SUBNET: %s/%u/%u\n", abuf, src_prefix, scope_prefix);
-                    } else if (code == 9) { // EXPIRE
-                        if (olen >= 4) {
-                            uint32_t exp_sec = ((uint32_t)pkt[p]<<24)|((uint32_t)pkt[p+1]<<16)|((uint32_t)pkt[p+2]<<8)|pkt[p+3];
-                            printf("          EXPIRE: %u (seconds)\n", exp_sec);
-                        } else {
-                            printf("          EXPIRE:\n");
-                        }
-                    } else if (code == 11) { // KEEPALIVE
-                        if (olen >= 2) {
-                            uint16_t to = (pkt[p] << 8) | pkt[p+1];
-                            printf("          KEEPALIVE: %u\n", to);
-                        } else {
-                            printf("          KEEPALIVE:\n");
-                        }
-                    } else if (code == 12) { // PADDING
-                        printf("          PADDING: %u octets\n", olen);
-                    } else if (code == 15 && olen >= 2) { // EDE
-                        uint16_t info_code = (pkt[p] << 8) | pkt[p+1];
-                        const char *msg = get_ede_error_string(info_code);
-                        printf("          EDE:\n");
-                        printf("            INFO-CODE: %u (%s)\n", info_code, msg);
-                        if (olen > 2) {
-                            char ede_text[512];
-                            size_t tlen = olen - 2;
-                            if (tlen >= sizeof(ede_text)) tlen = sizeof(ede_text) - 1;
-                            memcpy(ede_text, &pkt[p + 2], tlen);
-                            ede_text[tlen] = '\0';
-                            char text_esc[512];
-                            yaml_double_quote_escape(ede_text, text_esc, sizeof(text_esc));
-                            printf("            EXTRA-TEXT: \"%s\"\n", text_esc);
-                        }
-                    } else if (code == 20 || code == 21) { // MQTYPE
-                        printf("          %s: ", code == 20 ? "MQTYPE-Query" : "MQTYPE-Response");
-                        if (olen % 2 != 0) {
-                            printf("(malformed, length %u is not even)\n", olen);
-                        } else if (olen == 0) {
-                            printf("(empty)\n");
-                        } else {
-                            for (uint16_t j = 0; j < olen; j += 2) {
-                                uint16_t mq = (pkt[p + j] << 8) | pkt[p + j + 1];
-                                char tbuf[16];
-                                const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
-                                if (j > 0) printf(" ");
-                                printf("%s", mq_name);
-                            }
-                            printf("\n");
-                        }
-                    } else if (code != 15) {
-                        printf("          OPTION: %u", code);
-                        if (olen > 0) {
-                            printf(": ");
-                            for (uint16_t j = 0; j < olen; j++) printf("%02x ", pkt[p + j]);
-                        }
-                        printf("\n");
-                    }
+                    decode_and_print_edns_option(pkt, p, code, olen, "          ", dopt);
                     p += olen;
                 }
             }
@@ -4974,7 +4929,7 @@ static void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opt
             }
             printf("\n");
         }
-        print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount);
+        print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount, dopt);
     }
 
     if (qdcount > 0) {
@@ -5163,7 +5118,7 @@ static void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axf
             }
             printf("\n");
         }
-        print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount);
+        print_opt_extra_options(pkt, pkt_len, qdcount, ancount, nscount, arcount, dopt);
         for (uint16_t i = 0; i < edns.ede_count; i++) {
             const char *msg = get_ede_error_string(edns.ede_list[i].code);
             if (edns.ede_list[i].text[0]) printf("; EDE: %d (%s): (%s)\n", edns.ede_list[i].code, msg, edns.ede_list[i].text);
