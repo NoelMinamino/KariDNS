@@ -71,6 +71,39 @@ typedef struct {
   // この構造体の直後にパケットのペイロードが続く
 } udp_ipc_t;
 
+#define UDP_BATCH_SIZE 16
+#define UDP_IPC_BUFFER_SIZE (sizeof(udp_ipc_t) + BUFFER_SIZE)
+
+// ワーカーローカル用 UDPバッチコンテキスト (ヒープ保持)
+typedef struct {
+  struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
+  struct iovec   rx_iov[UDP_BATCH_SIZE];
+  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
+
+  struct mmsghdr tx_msgs[UDP_BATCH_SIZE];
+  struct iovec   tx_iov[UDP_BATCH_SIZE];
+  uint8_t        tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+} udp_batch_ctx_t;
+
+// Frontend ルーター用 UDPバッチコンテキスト (ヒープ保持)
+typedef struct {
+  struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
+  struct iovec   rx_iov[UDP_BATCH_SIZE];
+  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
+
+  struct mmsghdr ipc_tx_msgs[UDP_BATCH_SIZE];
+  struct iovec   ipc_tx_iov[UDP_BATCH_SIZE];
+
+  struct mmsghdr ipc_rx_msgs[UDP_BATCH_SIZE];
+  struct iovec   ipc_rx_iov[UDP_BATCH_SIZE];
+  uint8_t        ipc_rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+
+  struct mmsghdr cli_tx_msgs[UDP_BATCH_SIZE];
+  struct iovec   cli_tx_iov[UDP_BATCH_SIZE];
+} frontend_router_ctx_t;
+
 // ============================================================================
 // 2. データ構造定義
 // ============================================================================
@@ -211,6 +244,9 @@ typedef struct {
   // ワーカーローカル・レートリミット用 (排他制御不要・競合ゼロ)
   time_t log_current_sec;
   uint32_t log_emitted_this_sec;
+
+  // UDPバッチ送受信用バッファ (ヒープ保持: スタック枯渇防止)
+  udp_batch_ctx_t batch;
 } worker_ctx_t;
 
 typedef struct {
@@ -5926,26 +5962,30 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       return copy_len;
     }
 
-    if (qclass != 1 && qclass != 255) {
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                memory_order_release);
-    size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0xF0) | 0x05; // REFUSED
-    add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
-    uint16_t offset = copy_len;
-    uint16_t arcount = 0;
-    res[6] = 0; res[7] = 0; // ANCOUNT = 0
-    res[8] = 0; res[9] = 0; // NSCOUNT = 0
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
+    if (__builtin_expect(qclass == 1, 1)) {
+      // IN class (fast path)
+    } else if (qclass == 255) {
+      // ANY class
+    } else {
+      if (current_zone)
+        atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
+                                  memory_order_release);
+      size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
+      memcpy(res, req, copy_len);
+      res[2] |= 0x80;
+      res[3] = (res[3] & 0xF0) | 0x05; // REFUSED
+      add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
+      uint16_t offset = copy_len;
+      uint16_t arcount = 0;
+      res[6] = 0; res[7] = 0; // ANCOUNT = 0
+      res[8] = 0; res[9] = 0; // NSCOUNT = 0
+      if (edns.present) {
+        assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
+      }
+      res[10] = arcount >> 8;
+      res[11] = arcount & 0xFF;
+      return offset;
     }
-    res[10] = arcount >> 8;
-    res[11] = arcount & 0xFF;
-    return offset;
-  }
   q_offset += 4;
   memcpy(res, req, q_offset);
   res[2] |= 0x84;
@@ -6673,7 +6713,7 @@ static inline void write_query_log(worker_ctx_t *ctx,
     if (!ctx) return;
 
     // 1. サーキットブレーカーが発動している場合は1命令で完全スキップ
-    if (atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
+    if (__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
         return;
     }
 
@@ -7685,6 +7725,19 @@ worker_startup_success:;
   compress_ctx_t thread_compress_ctx = {0};
   struct kevent ev_list[MAX_EVENTS];
 
+  udp_batch_ctx_t *batch = &ctx->batch;
+  for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+    memset(&batch->rx_msgs[k], 0, sizeof(batch->rx_msgs[k]));
+    batch->rx_iov[k].iov_base = batch->rx_buffers[k];
+    batch->rx_iov[k].iov_len = sizeof(batch->rx_buffers[k]);
+    batch->rx_msgs[k].msg_hdr.msg_iov = &batch->rx_iov[k];
+    batch->rx_msgs[k].msg_hdr.msg_iovlen = 1;
+
+    memset(&batch->tx_msgs[k], 0, sizeof(batch->tx_msgs[k]));
+    batch->tx_msgs[k].msg_hdr.msg_iov = &batch->tx_iov[k];
+    batch->tx_msgs[k].msg_hdr.msg_iovlen = 1;
+  }
+
   while (1) {
     int n_events = kevent(kq, NULL, 0, ev_list, MAX_EVENTS, NULL);
     if (n_events < 0) {
@@ -7704,223 +7757,262 @@ worker_startup_success:;
         // EVFILT_READイベントで安全にリソースを回収(free)させる
         shutdown(client_fd, SHUT_RDWR);
       } else if (ev_list[i].udata == (void *)1) {
-        // UDP (IPC経由)
+        // UDP (IPC経由: recvmmsg / sendmmsg によるバッチ送受信)
         int active_fd = ev_list[i].ident; // my_ipc_fd
         while (1) {
-          uint8_t req_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
-          ssize_t received =
-              recv(active_fd, req_buf_full, sizeof(req_buf_full), 0);
-          if (received <= 0) {
-            if (received == 0) atomic_store(&g_frontend_alive, false);
+          for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+            batch->rx_iov[k].iov_len = sizeof(batch->rx_buffers[k]);
+          }
+          int n_recv = recvmmsg(active_fd, batch->rx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
+          if (n_recv <= 0) {
+            if (n_recv == 0) {
+              atomic_store(&g_frontend_alive, false);
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+              atomic_store(&g_frontend_alive, false);
+            }
             break;
           }
-          if (received < (ssize_t)sizeof(udp_ipc_t))
-            continue;
 
-          udp_ipc_t *ipc_msg = (udp_ipc_t *)req_buf_full;
-          if (ipc_msg->payload_len > received - (ssize_t)sizeof(udp_ipc_t) ||
-              ipc_msg->payload_len < DNS_HEADER_SIZE)
-            continue;
-          uint8_t *req_buf = req_buf_full + sizeof(udp_ipc_t);
-          ssize_t payload_received = ipc_msg->payload_len;
-          struct sockaddr_storage *client_addr = &ipc_msg->client_addr;
+          int n_tx = 0;
+          for (int p = 0; p < n_recv; p++) {
+            ssize_t received = (ssize_t)batch->rx_msgs[p].msg_len;
+            if (received < (ssize_t)sizeof(udp_ipc_t))
+              continue;
 
-          char client_ip[INET6_ADDRSTRLEN] = "";
-          if (client_addr->ss_family == AF_INET)
-            inet_ntop(AF_INET, &((struct sockaddr_in *)client_addr)->sin_addr,
-                      client_ip, INET6_ADDRSTRLEN);
-          else if (client_addr->ss_family == AF_INET6)
-            inet_ntop(AF_INET6,
-                      &((struct sockaddr_in6 *)client_addr)->sin6_addr,
-                      client_ip, INET6_ADDRSTRLEN);
+            udp_ipc_t *ipc_msg = (udp_ipc_t *)batch->rx_buffers[p];
+            if (ipc_msg->payload_len > received - (ssize_t)sizeof(udp_ipc_t) ||
+                ipc_msg->payload_len < DNS_HEADER_SIZE)
+              continue;
+            uint8_t *req_buf = batch->rx_buffers[p] + sizeof(udp_ipc_t);
+            ssize_t payload_received = ipc_msg->payload_len;
+            struct sockaddr_storage *client_addr = &ipc_msg->client_addr;
 
-          char qname[256] = "";
-          uint16_t qtype = 0;
-          if (payload_received > DNS_HEADER_SIZE) {
-            size_t offset = DNS_HEADER_SIZE;
-            size_t recv_len = (size_t)payload_received;
-            size_t written = 0;
-            while (offset < recv_len) {
-              uint8_t len = req_buf[offset];
-              if (len == 0 || (len & 0xC0) == 0xC0) {
-                offset += (len == 0) ? 1 : 2;
-                break;
+            // クエリパケットの検証: QRビットが0(クエリ)であることを期待
+            uint8_t flags = req_buf[2];
+            if (!__builtin_expect((flags & 0x80) == 0, 1)) {
+              continue;
+            }
+
+            char client_ip[INET6_ADDRSTRLEN] = "";
+            if (client_addr->ss_family == AF_INET)
+              inet_ntop(AF_INET, &((struct sockaddr_in *)client_addr)->sin_addr,
+                        client_ip, INET6_ADDRSTRLEN);
+            else if (client_addr->ss_family == AF_INET6)
+              inet_ntop(AF_INET6,
+                        &((struct sockaddr_in6 *)client_addr)->sin6_addr,
+                        client_ip, INET6_ADDRSTRLEN);
+
+            char qname[256] = "";
+            uint16_t qtype = 0;
+            if (payload_received > DNS_HEADER_SIZE) {
+              size_t offset = DNS_HEADER_SIZE;
+              size_t recv_len = (size_t)payload_received;
+              size_t written = 0;
+              while (offset < recv_len) {
+                uint8_t len = req_buf[offset];
+                if (len == 0 || (len & 0xC0) == 0xC0) {
+                  offset += (len == 0) ? 1 : 2;
+                  break;
+                }
+                if (offset + len + 1 > recv_len) break;
+                offset++;
+                if (written > 0 && qname[written - 1] != '.') {
+                  if (written < 255)
+                    qname[written++] = '.';
+                }
+                if (offset + len <= recv_len) {
+                  for (size_t b = 0; b < len; b++) {
+                    uint8_t c = req_buf[offset + b];
+                    if (c == '.' || c == '\\') {
+                      if (written + 2 < 255) {
+                        qname[written++] = '\\';
+                        qname[written++] = (char)c;
+                      }
+                    } else {
+                      if (written < 255) {
+                        qname[written++] = (char)c;
+                      }
+                    }
+                  }
+                }
+                offset += len;
               }
-              if (offset + len + 1 > recv_len) break;
-              offset++;
-              if (written > 0 && qname[written - 1] != '.') {
+              if (offset + 1 < recv_len)
+                qtype = (req_buf[offset] << 8) | req_buf[offset + 1];
+              if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
                 if (written < 255)
                   qname[written++] = '.';
               }
-              if (offset + len <= recv_len) {
-                for (size_t b = 0; b < len; b++) {
-                  uint8_t c = req_buf[offset + b];
-                  if (c == '.' || c == '\\') {
-                    if (written + 2 < 255) {
-                      qname[written++] = '\\';
-                      qname[written++] = (char)c;
-                    }
-                  } else {
-                    if (written < 255) {
-                      qname[written++] = (char)c;
-                    }
-                  }
-                }
-              }
-              offset += len;
+              qname[written] = '\0';
             }
-            if (offset + 1 < recv_len)
-              qtype = (req_buf[offset] << 8) | req_buf[offset + 1];
-            if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-              if (written < 255)
-                qname[written++] = '.';
-            }
-            qname[written] = '\0';
-          }
 
-          int client_port = 0;
-          if (client_addr->ss_family == AF_INET)
-            client_port = ntohs(((struct sockaddr_in *)client_addr)->sin_port);
-          else if (client_addr->ss_family == AF_INET6)
-            client_port =
-                ntohs(((struct sockaddr_in6 *)client_addr)->sin6_port);
-          uint16_t qclass = 1;
-          bool has_edns = false;
-          bool dnssec_ok = false;
-          size_t question_end = DNS_HEADER_SIZE; // default fallback
-          if (payload_received > DNS_HEADER_SIZE) {
-            size_t offset = DNS_HEADER_SIZE;
-            while (offset < (size_t)payload_received) {
-              uint8_t len = req_buf[offset];
-              if (len == 0 || (len & 0xC0) == 0xC0) {
-                offset += (len == 0) ? 1 : 2;
-                break;
-              }
-              if (offset + len + 1 > (size_t)payload_received) break;
-              offset += len + 1;
-            }
-            question_end = offset + 4;
-            if (offset + 3 < (size_t)payload_received)
-              qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
-            uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
-            if (arcount > 0) {
-              size_t o = DNS_HEADER_SIZE;
-              uint16_t qd = (req_buf[4] << 8) | req_buf[5];
-              uint16_t an = (req_buf[6] << 8) | req_buf[7];
-              uint16_t ns = (req_buf[8] << 8) | req_buf[9];
-              for (int k = 0; k < qd; k++) {
-                while (o < (size_t)payload_received && req_buf[o] != 0 &&
-                       (req_buf[o] & 0xC0) != 0xC0) {
-                  if (o + req_buf[o] + 1 > (size_t)payload_received) break;
-                  o += req_buf[o] + 1;
-                }
-                if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
-                  o += 2;
-                else
-                  o++;
-                o += 4;
-              }
-              for (int k = 0; k < an + ns + arcount; k++) {
-                if (o >= (size_t)payload_received)
+            int client_port = 0;
+            if (client_addr->ss_family == AF_INET)
+              client_port = ntohs(((struct sockaddr_in *)client_addr)->sin_port);
+            else if (client_addr->ss_family == AF_INET6)
+              client_port =
+                  ntohs(((struct sockaddr_in6 *)client_addr)->sin6_port);
+            uint16_t qclass = 1;
+            bool has_edns = false;
+            bool dnssec_ok = false;
+            size_t question_end = DNS_HEADER_SIZE; // default fallback
+            if (payload_received > DNS_HEADER_SIZE) {
+              size_t offset = DNS_HEADER_SIZE;
+              while (offset < (size_t)payload_received) {
+                uint8_t len = req_buf[offset];
+                if (len == 0 || (len & 0xC0) == 0xC0) {
+                  offset += (len == 0) ? 1 : 2;
                   break;
-                while (o < (size_t)payload_received && req_buf[o] != 0 &&
-                       (req_buf[o] & 0xC0) != 0xC0) {
-                  if (o + req_buf[o] + 1 > (size_t)payload_received) break;
-                  o += req_buf[o] + 1;
                 }
-                if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
-                  o += 2;
-                else
-                  o++;
-                if (o + 10 <= (size_t)payload_received) {
-                  uint16_t rt = (req_buf[o] << 8) | req_buf[o + 1];
-                  uint32_t ttl = ((uint32_t)req_buf[o + 4] << 24) |
-                                 ((uint32_t)req_buf[o + 5] << 16) |
-                                 ((uint32_t)req_buf[o + 6] << 8) |
-                                 req_buf[o + 7];
-                  uint16_t rdl = (req_buf[o + 8] << 8) | req_buf[o + 9];
-                  if (rt == 41) {
-                    has_edns = true;
-                    if (ttl & 0x00008000)
-                      dnssec_ok = true;
+                if (offset + len + 1 > (size_t)payload_received) break;
+                offset += len + 1;
+              }
+              question_end = offset + 4;
+              if (offset + 3 < (size_t)payload_received)
+                qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
+              uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
+              if (arcount > 0) {
+                size_t o = DNS_HEADER_SIZE;
+                uint16_t qd = (req_buf[4] << 8) | req_buf[5];
+                uint16_t an = (req_buf[6] << 8) | req_buf[7];
+                uint16_t ns = (req_buf[8] << 8) | req_buf[9];
+                for (int k = 0; k < qd; k++) {
+                  while (o < (size_t)payload_received && req_buf[o] != 0 &&
+                         (req_buf[o] & 0xC0) != 0xC0) {
+                    if (o + req_buf[o] + 1 > (size_t)payload_received) break;
+                    o += req_buf[o] + 1;
+                  }
+                  if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
+                    o += 2;
+                  else
+                    o++;
+                  o += 4;
+                }
+                for (int k = 0; k < an + ns + arcount; k++) {
+                  if (o >= (size_t)payload_received)
                     break;
+                  while (o < (size_t)payload_received && req_buf[o] != 0 &&
+                         (req_buf[o] & 0xC0) != 0xC0) {
+                    if (o + req_buf[o] + 1 > (size_t)payload_received) break;
+                    o += req_buf[o] + 1;
                   }
-                  o += 10 + rdl;
-                } else
-                  break;
+                  if (o < (size_t)payload_received && (req_buf[o] & 0xC0) == 0xC0)
+                    o += 2;
+                  else
+                    o++;
+                  if (o + 10 <= (size_t)payload_received) {
+                    uint16_t rt = (req_buf[o] << 8) | req_buf[o + 1];
+                    uint32_t ttl = ((uint32_t)req_buf[o + 4] << 24) |
+                                   ((uint32_t)req_buf[o + 5] << 16) |
+                                   ((uint32_t)req_buf[o + 6] << 8) |
+                                   req_buf[o + 7];
+                    uint16_t rdl = (req_buf[o + 8] << 8) | req_buf[o + 9];
+                    if (rt == 41) {
+                      has_edns = true;
+                      if (ttl & 0x00008000)
+                        dnssec_ok = true;
+                      break;
+                    }
+                    o += 10 + rdl;
+                  } else
+                    break;
+                }
               }
             }
-          }
-          atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
-          if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
-              write_query_log(ctx, client_addr, sizeof(*client_addr),
-                              qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
-          }
-
-          zone_db_snapshot_t *snap = acquire_zone_snapshot();
-          if (is_zone_synthetic_type(snap, client_ip, qname)) {
-            async_io_task_t task = {0};
-            task.is_tcp = false;
-            task.active_fd = active_fd;
-            task.ipc_hdr = *ipc_msg;
-            task.req_len = payload_received > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : payload_received;
-            memcpy(task.req_buf, req_buf, task.req_len);
-            strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
-            task.client_port = client_port;
-            strncpy(task.qname, qname, sizeof(task.qname) - 1);
-            task.qtype = qtype;
-            task.qclass = qclass;
-            task.has_edns = has_edns;
-            task.dnssec_ok = dnssec_ok;
-            task.question_end = question_end;
-            task.snap = snap;
-            if (!enqueue_async_io_task(&task)) {
-              release_zone_snapshot(snap);
-              submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+            atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
+            if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
+                write_query_log(ctx, client_addr, sizeof(*client_addr),
+                                qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
             }
-            continue;
-          }
 
-          uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
-          uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
-          rate_limit_config_t *rrl_cfg = NULL;
-          int res_len =
-              process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
-                                qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
-          release_zone_snapshot(snap);
-          if (res_len > 0) {
-            bool slip_triggered = false;
-            rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
-            if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
-              submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
-                                  res_buf[3] & 0x0F, has_edns, dnssec_ok);
-              udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
-              *res_msg = *ipc_msg;
-              res_msg->payload_len = res_len;
-              send(active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0);
-            } else if (slip_triggered) {
-              submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
-                                  res_buf[3] & 0x0F, has_edns, dnssec_ok);
-              res_buf[2] |= 0x02; // Set TC bit
-              res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
-              res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
-              res_buf[10] = 0; res_buf[11] = 0; // ARCOUNT = 0
-              
-              int qlen = (int)question_end;
-              if (qlen > res_len) qlen = res_len; // Safe fallback
-              if (qlen > payload_received) qlen = payload_received;
-              
-              udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
-              *res_msg = *ipc_msg;
-              res_msg->payload_len = qlen;
-              send(active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0);
+            zone_db_snapshot_t *snap = acquire_zone_snapshot();
+            if (is_zone_synthetic_type(snap, client_ip, qname)) {
+              async_io_task_t task = {0};
+              task.is_tcp = false;
+              task.active_fd = active_fd;
+              task.ipc_hdr = *ipc_msg;
+              task.req_len = payload_received > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : payload_received;
+              memcpy(task.req_buf, req_buf, task.req_len);
+              strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
+              task.client_port = client_port;
+              strncpy(task.qname, qname, sizeof(task.qname) - 1);
+              task.qtype = qtype;
+              task.qclass = qclass;
+              task.has_edns = has_edns;
+              task.dnssec_ok = dnssec_ok;
+              task.question_end = question_end;
+              task.snap = snap;
+              if (!enqueue_async_io_task(&task)) {
+                release_zone_snapshot(snap);
+                submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+              }
+              continue;
+            }
+
+            uint8_t *res_buf = batch->tx_buffers[n_tx] + sizeof(udp_ipc_t);
+            rate_limit_config_t *rrl_cfg = NULL;
+            int res_len =
+                process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
+                                  qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
+            release_zone_snapshot(snap);
+            if (res_len > 0) {
+              bool slip_triggered = false;
+              rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
+              if (rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
+                submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                    res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
+                *res_msg = *ipc_msg;
+                res_msg->payload_len = res_len;
+                batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
+                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
+                batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
+                batch->tx_msgs[n_tx].msg_hdr.msg_namelen = 0;
+                batch->tx_msgs[n_tx].msg_hdr.msg_control = NULL;
+                batch->tx_msgs[n_tx].msg_hdr.msg_controllen = 0;
+                n_tx++;
+                if (n_tx == UDP_BATCH_SIZE) {
+                  sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
+                  n_tx = 0;
+                }
+              } else if (slip_triggered) {
+                submit_response_log(LOG_ACT_SENT, client_ip, client_port, qname, qclass, qtype,
+                                    res_buf[3] & 0x0F, has_edns, dnssec_ok);
+                res_buf[2] |= 0x02; // Set TC bit
+                res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
+                res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
+                res_buf[10] = 0; res_buf[11] = 0; // ARCOUNT = 0
+                
+                int qlen = (int)question_end;
+                if (qlen > res_len) qlen = res_len; // Safe fallback
+                if (qlen > payload_received) qlen = payload_received;
+                
+                udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
+                *res_msg = *ipc_msg;
+                res_msg->payload_len = qlen;
+                batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
+                batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
+                batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
+                batch->tx_msgs[n_tx].msg_hdr.msg_namelen = 0;
+                batch->tx_msgs[n_tx].msg_hdr.msg_control = NULL;
+                batch->tx_msgs[n_tx].msg_hdr.msg_controllen = 0;
+                n_tx++;
+                if (n_tx == UDP_BATCH_SIZE) {
+                  sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
+                  n_tx = 0;
+                }
+              } else {
+                submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
+                                    qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+              }
             } else {
-              submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
-                                  qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
+              submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
+                                  0, 0, 0, false, false);
             }
-          } else {
-            submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
-                                0, 0, 0, false, false);
+          }
+          if (n_tx > 0) {
+            sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
+            n_tx = 0;
           }
         }
       } else if (ev_list[i].udata == (void *)2) {
@@ -9066,6 +9158,29 @@ static void run_frontend_router(pid_t backend_pid) {
   EV_SET(&ev_proc, backend_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)1000);
   kevent(kq, &ev_proc, 1, NULL, 0, NULL);
 
+  frontend_router_ctx_t *fctx = calloc(1, sizeof(*fctx));
+  if (!fctx) {
+    syslog(LOG_CRIT, "[Frontend] Failed to allocate router context");
+    exit(1);
+  }
+  for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+    memset(&fctx->rx_msgs[k], 0, sizeof(fctx->rx_msgs[k]));
+    fctx->rx_msgs[k].msg_hdr.msg_iov = &fctx->rx_iov[k];
+    fctx->rx_msgs[k].msg_hdr.msg_iovlen = 1;
+
+    memset(&fctx->ipc_tx_msgs[k], 0, sizeof(fctx->ipc_tx_msgs[k]));
+    fctx->ipc_tx_msgs[k].msg_hdr.msg_iov = &fctx->ipc_tx_iov[k];
+    fctx->ipc_tx_msgs[k].msg_hdr.msg_iovlen = 1;
+
+    memset(&fctx->ipc_rx_msgs[k], 0, sizeof(fctx->ipc_rx_msgs[k]));
+    fctx->ipc_rx_msgs[k].msg_hdr.msg_iov = &fctx->ipc_rx_iov[k];
+    fctx->ipc_rx_msgs[k].msg_hdr.msg_iovlen = 1;
+
+    memset(&fctx->cli_tx_msgs[k], 0, sizeof(fctx->cli_tx_msgs[k]));
+    fctx->cli_tx_msgs[k].msg_hdr.msg_iov = &fctx->cli_tx_iov[k];
+    fctx->cli_tx_msgs[k].msg_hdr.msg_iovlen = 1;
+  }
+
   uint8_t buffer[65536];
   int rr = 0; // ラウンドロビン分配用
   struct kevent ev_list[128];
@@ -9097,24 +9212,46 @@ static void run_frontend_router(pid_t backend_pid) {
         exit(1);
       }
       if (ud < MAX_BIND_ADDRS) {
-        // (1) UDP Inbound -> IPC to Backend Worker
+        // (1) UDP Inbound -> IPC to Backend Worker (recvmmsg / sendmmsg バッチ化)
         int fd = g_udp_fds[ud];
         while (1) {
-          udp_ipc_t *msg = (udp_ipc_t *)buffer;
-          msg->addr_len = sizeof(struct sockaddr_storage);
-          ssize_t len =
-              recvfrom(fd, buffer + sizeof(udp_ipc_t),
-                       BUFFER_SIZE, 0,
-                       (struct sockaddr *)&msg->client_addr, &msg->addr_len);
-          if (len < 0)
+          for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+            fctx->rx_iov[k].iov_base = fctx->rx_buffers[k] + sizeof(udp_ipc_t);
+            fctx->rx_iov[k].iov_len = BUFFER_SIZE;
+            fctx->rx_msgs[k].msg_hdr.msg_name = &fctx->rx_addrs[k];
+            fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+            fctx->rx_msgs[k].msg_hdr.msg_control = NULL;
+            fctx->rx_msgs[k].msg_hdr.msg_controllen = 0;
+          }
+          int n_recv = recvmmsg(fd, fctx->rx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
+          if (n_recv <= 0)
             break; // EAGAIN
 
-          msg->sock_fd_idx = ud;
-          msg->payload_len = len;
-          if (len >= DNS_HEADER_SIZE) {
-            send(g_ipc_fds[rr][0], buffer, sizeof(udp_ipc_t) + len, 0);
+          int tx_count = 0;
+          for (int k = 0; k < n_recv; k++) {
+            ssize_t len = (ssize_t)fctx->rx_msgs[k].msg_len;
+            if (len >= DNS_HEADER_SIZE) {
+              udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
+              msg->sock_fd_idx = ud;
+              msg->addr_len = fctx->rx_msgs[k].msg_hdr.msg_namelen;
+              msg->client_addr = fctx->rx_addrs[k];
+              msg->has_source_addr = false;
+              msg->payload_len = (uint16_t)len;
+
+              fctx->ipc_tx_iov[tx_count].iov_base = fctx->rx_buffers[k];
+              fctx->ipc_tx_iov[tx_count].iov_len = sizeof(udp_ipc_t) + len;
+              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_name = NULL;
+              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_namelen = 0;
+              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_control = NULL;
+              fctx->ipc_tx_msgs[tx_count].msg_hdr.msg_controllen = 0;
+              tx_count++;
+            }
           }
-          rr = (rr + 1) % g_num_ipc;
+          if (tx_count > 0) {
+            int target_worker = rr;
+            sendmmsg(g_ipc_fds[target_worker][0], fctx->ipc_tx_msgs, tx_count, MSG_DONTWAIT);
+            rr = (rr + 1) % g_num_ipc;
+          }
         }
       } else if (ud == 999) {
         // (2) Notify Outbound -> Dynamic UDP Socket
@@ -9144,21 +9281,56 @@ static void run_frontend_router(pid_t backend_pid) {
           }
         }
       } else {
-        // (3) IPC Inbound from Backend -> UDP Outbound
+        // (3) IPC Inbound from Backend -> UDP Outbound (recvmmsg / sendmmsg バッチ化)
         int worker_idx = ud - MAX_BIND_ADDRS;
         int fd = g_ipc_fds[worker_idx][0];
         while (1) {
-          ssize_t len = recv(fd, buffer, sizeof(buffer), 0);
-          if (len < (ssize_t)sizeof(udp_ipc_t))
+          for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+            fctx->ipc_rx_iov[k].iov_base = fctx->ipc_rx_buffers[k];
+            fctx->ipc_rx_iov[k].iov_len = sizeof(fctx->ipc_rx_buffers[k]);
+            fctx->ipc_rx_msgs[k].msg_hdr.msg_name = NULL;
+            fctx->ipc_rx_msgs[k].msg_hdr.msg_namelen = 0;
+            fctx->ipc_rx_msgs[k].msg_hdr.msg_control = NULL;
+            fctx->ipc_rx_msgs[k].msg_hdr.msg_controllen = 0;
+          }
+          int n_recv = recvmmsg(fd, fctx->ipc_rx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
+          if (n_recv <= 0)
             break; // EAGAIN
-          udp_ipc_t *msg = (udp_ipc_t *)buffer;
-          ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
-          if (msg->payload_len > max_valid_payload) {
-            syslog(LOG_WARNING, "[Frontend] Dropping backend reply with inconsistent payload_len");
-          } else if (msg->sock_fd_idx >= 0 && msg->sock_fd_idx < g_num_udp_fds) {
-            sendto(g_udp_fds[msg->sock_fd_idx], buffer + sizeof(udp_ipc_t),
-                   msg->payload_len, 0, (struct sockaddr *)&msg->client_addr,
-                   msg->addr_len);
+
+          int cur_sock_idx = -1;
+          int tx_count = 0;
+
+          for (int k = 0; k < n_recv; k++) {
+            ssize_t len = (ssize_t)fctx->ipc_rx_msgs[k].msg_len;
+            if (len < (ssize_t)sizeof(udp_ipc_t))
+              continue;
+            udp_ipc_t *msg = (udp_ipc_t *)fctx->ipc_rx_buffers[k];
+            ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
+            if (msg->payload_len > max_valid_payload) {
+              syslog(LOG_WARNING, "[Frontend] Dropping backend reply with inconsistent payload_len");
+              continue;
+            }
+            if (msg->sock_fd_idx < 0 || msg->sock_fd_idx >= g_num_udp_fds) {
+              continue;
+            }
+
+            if (cur_sock_idx != -1 && msg->sock_fd_idx != cur_sock_idx && tx_count > 0) {
+              sendmmsg(g_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
+              tx_count = 0;
+            }
+            cur_sock_idx = msg->sock_fd_idx;
+
+            fctx->cli_tx_iov[tx_count].iov_base = fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t);
+            fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
+            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &msg->client_addr;
+            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = msg->addr_len;
+            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = NULL;
+            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = 0;
+            tx_count++;
+          }
+          if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < g_num_udp_fds) {
+            sendmmsg(g_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
+            tx_count = 0;
           }
         }
       }
@@ -9306,6 +9478,16 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
       if (udp_fd >= 0) {
         setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
         fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_REUSEPORT_LB
+        int opt_lb = 1;
+        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+          int opt_reuse = 1;
+          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+        }
+#else
+        int opt_reuse = 1;
+        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
         if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0)
           g_udp_fds[g_num_udp_fds++] = udp_fd;
         else
@@ -9318,6 +9500,16 @@ static void setup_udp_and_ipc(server_config_t *cfg, int num_workers) {
         setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
         fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
         setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT_LB
+        int opt_lb = 1;
+        if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+          int opt_reuse = 1;
+          setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+        }
+#else
+        int opt_reuse = 1;
+        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
         if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0)
           g_udp_fds[g_num_udp_fds++] = udp_fd;
         else
