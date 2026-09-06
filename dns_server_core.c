@@ -7849,6 +7849,11 @@ void *worker_thread_func(void *arg) {
     kevent(kq, &ev_ipc, 1, NULL, 0, NULL);
   }
 
+  pid_t parent_pid = getppid();
+  struct kevent ev_parent;
+  EV_SET(&ev_parent, parent_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)(uintptr_t)1001);
+  kevent(kq, &ev_parent, 1, NULL, 0, NULL);
+
   atomic_fetch_add(&g_bound_workers, 1);
   goto worker_startup_success;
 
@@ -7861,6 +7866,8 @@ worker_startup_success:;
   // イベントループ(=信頼できないネットワーク入力の処理)を開始しない。
   while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
     sched_yield();
+  if (getppid() != parent_pid)
+    _exit(0);
   compress_ctx_t thread_compress_ctx = {0};
   struct kevent ev_list[MAX_EVENTS];
 
@@ -7891,7 +7898,9 @@ worker_startup_success:;
     bool rlog_enabled = response_log_enabled(active);
 
     for (int i = 0; i < n_events; i++) {
-      if (ev_list[i].filter == EVFILT_TIMER) {
+      if (ev_list[i].udata == (void *)(uintptr_t)1001) {
+        _exit(0);
+      } else if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
         // SHUT_RDWRによりソケットをEOF状態にし、同一バッチ内または次回の
         // EVFILT_READイベントで安全にリソースを回収(free)させる
@@ -9428,9 +9437,16 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     kevent(kq, &ev_notify, 1, NULL, 0, NULL);
   }
 
+  pid_t parent_pid = getppid();
   struct kevent ev_proc;
   EV_SET(&ev_proc, backend_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)1000);
   kevent(kq, &ev_proc, 1, NULL, 0, NULL);
+  struct kevent ev_parent;
+  EV_SET(&ev_parent, parent_pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXIT, 0, (void *)1001);
+  kevent(kq, &ev_parent, 1, NULL, 0, NULL);
+  if (getppid() != parent_pid) {
+    exit(0);
+  }
 
   frontend_router_ctx_t *fctx = calloc(1, sizeof(*fctx));
   if (!fctx) {
@@ -9501,6 +9517,10 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
         }
         syslog(LOG_CRIT, "[Frontend %d] Backend process (pid=%d) exited unexpectedly. Shutting down.", router_id, backend_pid);
         exit(1);
+      }
+      if (ud == 1001) {
+        syslog(LOG_NOTICE, "[Frontend %d] Parent supervisor process exited. Shutting down.", router_id);
+        exit(0);
       }
       if (ud < MAX_BIND_ADDRS) {
         // (1) UDP Inbound -> IPC to Backend Worker (recvmmsg / sendmmsg バッチ化)
@@ -9927,8 +9947,11 @@ int main(int argc, char **argv) {
       }
       if (rpid == 0) {
         // Frontend Router Process
+        if (pid_fd >= 0) {
+          close(pid_fd);
+          pid_fd = -1;
+        }
         run_frontend_router(backend_pid, r);
-        if (pid_fd >= 0) close(pid_fd);
         exit(0);
       }
       router_pids[r] = rpid;
