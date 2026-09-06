@@ -86,12 +86,20 @@ typedef struct {
   uint8_t        tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
 } udp_batch_ctx_t;
 
+// Frontend ルーター用 UDP制御メッセージバッファ共用体 (アライメント保証)
+#define ROUTER_CMSG_BUF_SIZE 128
+typedef union {
+  struct cmsghdr cmsg;
+  uint8_t buf[ROUTER_CMSG_BUF_SIZE];
+} router_cmsg_buf_t;
+
 // Frontend ルーター用 UDPバッチコンテキスト (ヒープ保持)
 typedef struct {
   struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
   struct iovec   rx_iov[UDP_BATCH_SIZE];
   uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
   struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
+  router_cmsg_buf_t rx_cbuf[UDP_BATCH_SIZE];
 
   struct mmsghdr ipc_tx_msgs[UDP_BATCH_SIZE];
   struct iovec   ipc_tx_iov[UDP_BATCH_SIZE];
@@ -102,6 +110,7 @@ typedef struct {
 
   struct mmsghdr cli_tx_msgs[UDP_BATCH_SIZE];
   struct iovec   cli_tx_iov[UDP_BATCH_SIZE];
+  router_cmsg_buf_t cli_tx_cbuf[UDP_BATCH_SIZE];
 } frontend_router_ctx_t;
 
 // ============================================================================
@@ -4926,12 +4935,14 @@ static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t q
     return (offset <= len) ? offset : len;
 }
 
-static void bump_soa_serial_in_arena(zone_arena_t *arena) {
+static uint32_t bump_soa_serial_in_arena(zone_arena_t *arena) {
+  uint32_t new_serial = 0;
   for (size_t i = 0; i < arena->count; i++) {
     if (arena->records[i].type_code == 6 && arena->records[i].rdata_count >= 3) {
       if (arena->records[i].rdata[2]) {
         uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
         serial++;
+        new_serial = serial;
         char buf[32];
         snprintf(buf, sizeof(buf), "%u", serial);
         arena->records[i].rdata[2] = arena_strdup(arena, buf);
@@ -4941,6 +4952,7 @@ static void bump_soa_serial_in_arena(zone_arena_t *arena) {
       break;
     }
   }
+  return new_serial;
 }
 
 static int handle_dynamic_update(const uint8_t *req, size_t req_len,
@@ -4963,7 +4975,10 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
     return rcode;
   }
 
-  bump_soa_serial_in_arena(z_standby);
+  uint32_t new_serial = bump_soa_serial_in_arena(z_standby);
+  if (new_serial != 0) {
+    atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
+  }
 
   if (build_zone_index(z_standby) != 0) {
     zone_arena_clear_data_pools(z_standby);
@@ -5042,7 +5057,9 @@ static void compute_program_zone_fingerprint(const zone_config_t *z, char *out, 
 static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                                        uint8_t *res, size_t max_res_len) {
   if (req_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
-  size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
+  uint16_t qdcount = (req[4] << 8) | req[5];
+  size_t q_end = (size_t)get_question_end_offset(req, req_len, qdcount);
+  size_t copy_len = q_end > max_res_len ? max_res_len : q_end;
   memcpy(res, req, copy_len);
   res[2] |= 0x80;              // QR=1
   res[3] = (res[3] & 0xF0) | 2; // RCODE=2 (SERVFAIL), RA/Z/AD/CDは維持
@@ -6312,18 +6329,20 @@ void *axfr_bg_thread_func(void *arg) {
     uint8_t axfr_req[2048];
     uint16_t req_len = 0;
     uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
-    axfr_req[2] = id >> 8;
-    axfr_req[3] = id & 0xFF;
-    axfr_req[4] = 0x00;
-    axfr_req[5] = 0x00;
-    axfr_req[6] = 0x00;
-    axfr_req[7] = 0x01;
-    axfr_req[8] = 0x00;
-    axfr_req[9] = 0x00;
-    axfr_req[10] = 0x00;
-    axfr_req[11] = 0x00;
-    axfr_req[DNS_HEADER_SIZE] = 0x00;
-    axfr_req[13] = 0x01;
+    uint8_t *dns_hdr = &axfr_req[2];
+    uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
+    dns_hdr[0] = id >> 8;
+    dns_hdr[1] = id & 0xFF;
+    dns_hdr[2] = 0x00;
+    dns_hdr[3] = 0x00;
+    dns_hdr[4] = 0x00;
+    dns_hdr[5] = 0x01;
+    dns_hdr[6] = 0x00;
+    dns_hdr[7] = 0x00;
+    dns_hdr[8] = 0x00;
+    dns_hdr[9] = active_serial ? 0x01 : 0x00;
+    dns_hdr[10] = 0x00;
+    dns_hdr[11] = 0x00;
     req_len = 14;
     const char *d = ctx->domain;
     while (*d) {
@@ -6341,7 +6360,6 @@ void *axfr_bg_thread_func(void *arg) {
       d = dot + 1;
     }
     axfr_req[req_len++] = 0;
-    uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
     axfr_req[req_len++] = 0x00;
     axfr_req[req_len++] = active_serial ? 251 : 252;
     session.is_ixfr = active_serial ? true : false;
@@ -6349,8 +6367,6 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[req_len++] = 0x00;
     axfr_req[req_len++] = 1;
     if (active_serial) {
-      axfr_req[10] = 0;
-      axfr_req[11] = 1;
       axfr_req[req_len++] = 0xC0;
       axfr_req[req_len++] = 0x0C;
       axfr_req[req_len++] = 0x00;
@@ -6393,6 +6409,7 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[req_len++] = (domain_hash >> 16) & 0xFF;
     axfr_req[req_len++] = (domain_hash >> 8) & 0xFF;
     axfr_req[req_len++] = domain_hash & 0xFF;
+    dns_hdr[11]++;
     if (ctx->tsig_key) {
       size_t p_len = req_len - 2;
       tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
@@ -8099,7 +8116,10 @@ worker_startup_success:;
               udp_ipc_t *res_msg = (udp_ipc_t *)batch->tx_buffers[n_tx];
               res_msg->sock_fd_idx = ipc_msg->sock_fd_idx;
               res_msg->addr_len = ipc_msg->addr_len;
-              res_msg->has_source_addr = false;
+              res_msg->has_source_addr = ipc_msg->has_source_addr;
+              if (ipc_msg->has_source_addr) {
+                res_msg->source_addr = ipc_msg->source_addr;
+              }
               size_t copy_len = (ipc_msg->addr_len <= sizeof(res_msg->client_addr)) ? ipc_msg->addr_len : sizeof(res_msg->client_addr);
               memcpy(&res_msg->client_addr, &ipc_msg->client_addr, copy_len);
 
@@ -8210,20 +8230,32 @@ worker_startup_success:;
           free(ctx_tcp);
           continue;
         }
-        uint8_t *msg;
-        uint16_t msg_len;
-        int ret = read_dns_tcp_message(client_fd, ctx_tcp, &msg, &msg_len);
-        if (ret < 0) {
+        int processed_queries = 0;
+        bool client_closed = false;
+
+        while (processed_queries < 16) {
+          uint8_t *msg = NULL;
+          uint16_t msg_len = 0;
+          int ret = read_dns_tcp_message(client_fd, ctx_tcp, &msg, &msg_len);
+          if (ret < 0) {
+            struct kevent ev_del;
+            EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+            kevent(kq, &ev_del, 1, NULL, 0, NULL);
+            close(client_fd);
+            dec_tcp_clients();
+            free(ctx_tcp);
+            client_closed = true;
+            break;
+          }
+          if (ret == 0) {
+            break;
+          }
+
+          processed_queries++;
           struct kevent ev_del;
           EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
           kevent(kq, &ev_del, 1, NULL, 0, NULL);
-          close(client_fd);
-          dec_tcp_clients();
-          free(ctx_tcp);
-        } else if (ret == 1) {
-          struct kevent ev_del;
-          EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-          kevent(kq, &ev_del, 1, NULL, 0, NULL);
+
           char qname[256] = "";
           uint16_t qtype = 0;
           if (msg_len > DNS_HEADER_SIZE) {
@@ -8433,6 +8465,13 @@ worker_startup_success:;
                   atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
                   int cflags = fcntl(client_fd, F_GETFL, 0);
                   fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
+
+                  // Item 1: AXFR UAF防止 - pthread_create直前にkqueueのEVFILT_READ / EVFILT_TIMERを削除
+                  struct kevent ev_del_axfr[2];
+                  EV_SET(&ev_del_axfr[0], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                  EV_SET(&ev_del_axfr[1], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+                  kevent(kq, ev_del_axfr, 2, NULL, 0, NULL);
+
                   pthread_t t;
                   if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
                     free(args);
@@ -8441,6 +8480,10 @@ worker_startup_success:;
                     allowed = false;
                   } else {
                     pthread_detach(t);
+                    release_zone_snapshot(snap);
+                    free(ctx_tcp);
+                    client_closed = true;
+                    break;
                   }
                 } else {
                   atomic_fetch_sub(&entry->active_axfr, 1);
@@ -8506,15 +8549,18 @@ worker_startup_success:;
 
               close(client_fd);
               dec_tcp_clients();
+              free(ctx_tcp);
+              client_closed = true;
+              break;
             } else {
               release_zone_snapshot(snap);
             }
-            free(ctx_tcp);
           } else {
             if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
-              struct kevent ev_del;
-              EV_SET(&ev_del, client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-              kevent(kq, &ev_del, 1, NULL, 0, NULL);
+              struct kevent ev_del_syn[2];
+              EV_SET(&ev_del_syn[0], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+              EV_SET(&ev_del_syn[1], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+              kevent(kq, ev_del_syn, 2, NULL, 0, NULL);
 
               async_io_task_t task = {0};
               task.is_tcp = true;
@@ -8537,7 +8583,8 @@ worker_startup_success:;
                 close(client_fd);
                 dec_tcp_clients();
               }
-              continue;
+              client_closed = true;
+              break;
             }
             uint8_t *tcp_res = malloc(65535);
             if (tcp_res) {
@@ -8562,25 +8609,35 @@ worker_startup_success:;
             
             server_config_t *cfg = acquire_config_snapshot();
             bool reuse = (cfg && cfg->tcp_connection_reuse);
-            uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
             release_config_snapshot(cfg);
-            if (reuse) {
-              ctx_tcp->state = TCP_STATE_READ_LEN;
-              ctx_tcp->accumulated = 0;
-              ctx_tcp->msg_len = 0;
-              
-              struct kevent ev_timeout;
-              EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
-                     idle_timeout, ctx_tcp);
-              kevent(kq, &ev_timeout, 1, NULL, 0, NULL);
-              
-              // Event EVFILT_READ is already added with EV_ADD | EV_CLEAR
-            } else {
+            if (!reuse) {
               close(client_fd);
               dec_tcp_clients();
               free(ctx_tcp);
+              client_closed = true;
+              break;
             }
+
+            ctx_tcp->state = TCP_STATE_READ_LEN;
+            ctx_tcp->accumulated = 0;
+            ctx_tcp->msg_len = 0;
           }
+        }
+
+        if (!client_closed) {
+          server_config_t *cfg = acquire_config_snapshot();
+          uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
+          release_config_snapshot(cfg);
+
+          struct kevent evs[2];
+          EV_SET(&evs[0], client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
+                 idle_timeout, ctx_tcp);
+          int nev = 1;
+          if (processed_queries >= 16) {
+            EV_SET(&evs[1], client_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, ctx_tcp);
+            nev = 2;
+          }
+          kevent(kq, evs, nev, NULL, 0, NULL);
         }
       }
     }
@@ -8848,6 +8905,9 @@ void *control_thread_func(void *arg) {
         char *nl = strchr(c->buf, '\n');
         if (nl) {
           *nl = '\0';
+          if (nl > c->buf && *(nl - 1) == '\r') {
+            *(nl - 1) = '\0';
+          }
           if (c->state == CTRL_STATE_AUTH_WAIT) {
             server_config_t *cfg = acquire_config_snapshot();
             bool auth_ok = false;
@@ -9232,7 +9292,7 @@ static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
   }
 }
 
-static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS]) {
+static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
   int num_fds = 0;
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int bind_count = cfg->bind_address_count;
@@ -9245,6 +9305,7 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
     struct sockaddr_in6 addr6;
     bool is_v4 = false;
     bool is_v6 = false;
+    bool is_wildcard = false;
     memset(&addr4, 0, sizeof(addr4));
     memset(&addr6, 0, sizeof(addr6));
     if (bind_count == 0) {
@@ -9256,16 +9317,19 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
       addr6.sin6_port = htons(port);
       is_v4 = true;
       is_v6 = true;
+      is_wildcard = true;
     } else {
       if (inet_pton(AF_INET, cfg->bind_addresses[i], &addr4.sin_addr) == 1) {
         addr4.sin_family = AF_INET;
         addr4.sin_port = htons(port);
         is_v4 = true;
+        if (addr4.sin_addr.s_addr == INADDR_ANY) is_wildcard = true;
       } else if (inet_pton(AF_INET6, cfg->bind_addresses[i],
                            &addr6.sin6_addr) == 1) {
         addr6.sin6_family = AF_INET6;
         addr6.sin6_port = htons(port);
         is_v6 = true;
+        if (IN6_IS_ADDR_UNSPECIFIED(&addr6.sin6_addr)) is_wildcard = true;
       }
     }
 
@@ -9284,7 +9348,14 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
         int opt_reuse = 1;
         setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
 #endif
+        int opt_dst = 1;
+#ifdef IP_RECVDSTADDR
+        setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
+#elif defined(IP_PKTINFO)
+        setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
+#endif
         if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
+          out_is_wildcard[num_fds] = is_wildcard;
           out_fds[num_fds++] = udp_fd;
         } else {
           syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv4 socket to %s:%d: %m",
@@ -9310,7 +9381,14 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
         int opt_reuse = 1;
         setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
 #endif
+        int opt_pktinfo = 1;
+#ifdef IPV6_RECVPKTINFO
+        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#elif defined(IPV6_PKTINFO)
+        setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#endif
         if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+          out_is_wildcard[num_fds] = is_wildcard;
           out_fds[num_fds++] = udp_fd;
         } else {
           syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv6 socket to %s:%d: %m",
@@ -9361,7 +9439,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 
   // 特権破棄前に、外部UDPソケットをSO_REUSEPORT_LBでオープン・バインド (指示1: インデックス整合性の完全統一)
   int local_udp_fds[MAX_BIND_ADDRS];
-  int local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds);
+  bool local_udp_is_wildcard[MAX_BIND_ADDRS];
+  int local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds, local_udp_is_wildcard);
 
   // 特権破棄 (setgid / setuid)
   if (cfg && cfg->user) {
@@ -9461,8 +9540,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     fctx->rx_msgs[k].msg_hdr.msg_iovlen = 1;
     fctx->rx_msgs[k].msg_hdr.msg_name = &msg->client_addr;
     fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
-    fctx->rx_msgs[k].msg_hdr.msg_control = NULL;
-    fctx->rx_msgs[k].msg_hdr.msg_controllen = 0;
+    fctx->rx_msgs[k].msg_hdr.msg_control = fctx->rx_cbuf[k].buf;
+    fctx->rx_msgs[k].msg_hdr.msg_controllen = sizeof(fctx->rx_cbuf[k].buf);
 
     fctx->ipc_tx_msgs[k].msg_hdr.msg_iov = &fctx->ipc_tx_iov[k];
     fctx->ipc_tx_msgs[k].msg_hdr.msg_iovlen = 1;
@@ -9529,6 +9608,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
             fctx->rx_iov[k].iov_len = BUFFER_SIZE;
             fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+            fctx->rx_msgs[k].msg_hdr.msg_control = fctx->rx_cbuf[k].buf;
+            fctx->rx_msgs[k].msg_hdr.msg_controllen = sizeof(fctx->rx_cbuf[k].buf);
           }
           int n_recv = recvmmsg(fd, fctx->rx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
           if (n_recv <= 0)
@@ -9542,7 +9623,45 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               msg->sock_fd_idx = ud;
               msg->addr_len = fctx->rx_msgs[k].msg_hdr.msg_namelen;
               msg->has_source_addr = false;
+              memset(&msg->source_addr, 0, sizeof(msg->source_addr));
               msg->payload_len = (uint16_t)len;
+
+              for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&fctx->rx_msgs[k].msg_hdr);
+                   cmsg != NULL;
+                   cmsg = CMSG_NXTHDR(&fctx->rx_msgs[k].msg_hdr, cmsg)) {
+#ifdef IP_RECVDSTADDR
+                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVDSTADDR &&
+                    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_addr))) {
+                  struct sockaddr_in *sin = (struct sockaddr_in *)&msg->source_addr;
+                  sin->sin_family = AF_INET;
+                  memcpy(&sin->sin_addr, CMSG_DATA(cmsg), sizeof(struct in_addr));
+                  msg->has_source_addr = true;
+                  break;
+                }
+#endif
+#ifdef IP_PKTINFO
+                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO &&
+                    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+                  struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
+                  struct sockaddr_in *sin = (struct sockaddr_in *)&msg->source_addr;
+                  sin->sin_family = AF_INET;
+                  sin->sin_addr = pi->ipi_addr;
+                  msg->has_source_addr = true;
+                  break;
+                }
+#endif
+#ifdef IPV6_PKTINFO
+                if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO &&
+                    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
+                  struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
+                  struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg->source_addr;
+                  sin6->sin6_family = AF_INET6;
+                  sin6->sin6_addr = pi6->ipi6_addr;
+                  msg->has_source_addr = true;
+                  break;
+                }
+#endif
+              }
 
               fctx->ipc_tx_iov[tx_count].iov_base = fctx->rx_buffers[k];
               fctx->ipc_tx_iov[tx_count].iov_len = sizeof(udp_ipc_t) + len;
@@ -9621,6 +9740,52 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &msg->client_addr;
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = msg->addr_len;
+
+            bool is_wildcard = (cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) ? local_udp_is_wildcard[cur_sock_idx] : false;
+#ifdef IP_SENDSRCADDR
+            if (is_wildcard && msg->has_source_addr && msg->source_addr.ss_family == AF_INET) {
+              memset(&fctx->cli_tx_cbuf[tx_count], 0, sizeof(fctx->cli_tx_cbuf[tx_count]));
+              struct cmsghdr *cmsg = (struct cmsghdr *)fctx->cli_tx_cbuf[tx_count].buf;
+              cmsg->cmsg_level = IPPROTO_IP;
+              cmsg->cmsg_type = IP_SENDSRCADDR;
+              cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
+              struct in_addr *src = (struct in_addr *)CMSG_DATA(cmsg);
+              *src = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in_addr));
+            }
+#elif defined(IP_PKTINFO)
+            if (is_wildcard && msg->has_source_addr && msg->source_addr.ss_family == AF_INET) {
+              memset(&fctx->cli_tx_cbuf[tx_count], 0, sizeof(fctx->cli_tx_cbuf[tx_count]));
+              struct cmsghdr *cmsg = (struct cmsghdr *)fctx->cli_tx_cbuf[tx_count].buf;
+              cmsg->cmsg_level = IPPROTO_IP;
+              cmsg->cmsg_type = IP_PKTINFO;
+              cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+              struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
+              memset(pi, 0, sizeof(*pi));
+              pi->ipi_spec_dst = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+            }
+#endif
+#ifdef IPV6_PKTINFO
+            else if (is_wildcard && msg->has_source_addr && msg->source_addr.ss_family == AF_INET6) {
+              memset(&fctx->cli_tx_cbuf[tx_count], 0, sizeof(fctx->cli_tx_cbuf[tx_count]));
+              struct cmsghdr *cmsg = (struct cmsghdr *)fctx->cli_tx_cbuf[tx_count].buf;
+              cmsg->cmsg_level = IPPROTO_IPV6;
+              cmsg->cmsg_type = IPV6_PKTINFO;
+              cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+              struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
+              memset(pi6, 0, sizeof(*pi6));
+              pi6->ipi6_addr = ((struct sockaddr_in6 *)&msg->source_addr)->sin6_addr;
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
+            }
+#endif
+            else {
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = NULL;
+              fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = 0;
+            }
             tx_count++;
           }
           if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) {

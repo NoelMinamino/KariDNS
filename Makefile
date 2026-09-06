@@ -100,8 +100,19 @@ karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_p
 
 $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS): dns_wire.h dns_config_parser.h dns_zone_parser.h dns_utils.h
 
+.SUFFIXES: .c .o
+
+.c.o:
+	$(CC) $(CFLAGS) -c $< -o $@
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+tools/dag.o: tools/dag.c
+	$(CC) $(CFLAGS) -c tools/dag.c -o tools/dag.o
+
+tools/karictl.o: tools/karictl.c
+	$(CC) $(CFLAGS) -c tools/karictl.c -o tools/karictl.o
 
 tinydns_test: tests/test_tinydns_parser.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_tinydns_parser.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c -lcrypto -o test_tinydns_parser
@@ -132,7 +143,7 @@ hash_test: tests/test_hash_table.c
 	./test_hash_table
 
 clean: clean-fuzz
-	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
+	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table
 
 run: $(TARGET)
