@@ -2670,6 +2670,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
         if (scan_offset >= req_len) break;
         bool is_opt = (i >= qdcount + ancount_req + nscount_req);
         
+        size_t name_start = scan_offset;
         while (scan_offset < req_len) {
             uint8_t raw = req[scan_offset];
             uint8_t label_type = raw & 0xC0;
@@ -2684,6 +2685,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                 return -1;
             }
         }
+        size_t name_len = scan_offset - name_start;
         
         if (i < qdcount) {
             scan_offset += 4;
@@ -2697,7 +2699,9 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                req[scan_offset+7];
                 uint16_t rdlen = (req[scan_offset+8] << 8) | req[scan_offset+9];
                 
+                if (!is_opt && rtype == 41) return -1; // RFC 6891 §6.1.1: OPT only allowed in Additional section
                 if (is_opt && rtype == 41) {
+                    if (name_len != 1 || req[name_start] != 0) return -1; // RFC 6891 §6.1.2: OPT owner MUST be 0 (root)
                     opt_rr_count++;
                     if (opt_rr_count > 1) return -1; // RFC 6891 §6.1.1: 複数OPT RRはFORMERR
                     edns->present = true;
@@ -3069,6 +3073,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
         if (class_val == 255) { // ANY (Delete RRset/Domain)
             if (rdlen != 0) return 1;
             if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
+            if (type == 2 && strcasecmp(name, zone_name) == 0) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
             
             uint32_t h = calc_fnv1a_str(name);
             size_t hidx = h & (standby->hash_size - 1);
@@ -3077,6 +3082,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 if (strcasecmp(standby->records[k].name, name) == 0) {
                     if (type == 255 || standby->records[k].type_code == type) {
                         if (standby->records[k].type_code == 6) { continue; } // protect SOA
+                        if (standby->records[k].type_code == 2 && strcasecmp(name, zone_name) == 0) { continue; } // protect apex NS
                         standby->records[k].name = NULL; // Tombstone delete
                     }
                 }
@@ -3131,17 +3137,17 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
             if (found_exact) continue; // no-op
 
-            // CNAME exclusivity check (RFC 2136 §3.4.2.3 / RFC 1034 §3.6.2)
+            // CNAME/DNAME exclusivity check (RFC 2136 §3.4.2.3, RFC 1034 §3.6.2, RFC 6672 §2.3)
             for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
                 if (!standby->records[k].name) continue;
                 if (strcasecmp(standby->records[k].name, parsed_rec.name) == 0) {
-                    if (parsed_rec.type_code == 5 /* CNAME */) {
+                    if (parsed_rec.type_code == 5 /* CNAME */ || parsed_rec.type_code == 39 /* DNAME */) {
                         if (standby->records[k].type_code != 46 && standby->records[k].type_code != 47) {
-                            return 5; // REFUSED: CNAME cannot coexist with other types
+                            return 5; // REFUSED: CNAME/DNAME cannot coexist with other types
                         }
                     } else if (parsed_rec.type_code != 46 && parsed_rec.type_code != 47) {
-                        if (standby->records[k].type_code == 5 /* CNAME */) {
-                            return 5; // REFUSED: Cannot add record to name with existing CNAME
+                        if (standby->records[k].type_code == 5 /* CNAME */ || standby->records[k].type_code == 39 /* DNAME */) {
+                            return 5; // REFUSED: Cannot add record to name with existing CNAME/DNAME
                         }
                     }
                 }
@@ -3157,6 +3163,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
             dns_record_t *new_rec = &standby->records[standby->count];
             *new_rec = parsed_rec;
+            dns_record_preparse_cache(standby, new_rec);
 
             // In-flight chain linking
             uint32_t h = calc_fnv1a_str(new_rec->name);
