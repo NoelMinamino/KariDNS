@@ -12,6 +12,9 @@
 #include <syslog.h>
 #include <time.h>
 #include <math.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define TTL_NS 259200UL
 #define TTL_POSITIVE 86400UL
@@ -171,6 +174,29 @@ static bool tinydns_ip4_scan(const char *s, size_t len, uint8_t ip[4]) {
         ip[oct] = (uint8_t)(val & 0xFF); // 範囲チェックなし、下位8bit採用
     }
     return true;
+}
+
+/* ============================================================================
+ * IPv6 ヘルパー: 32文字の生16進数デコード & 逆順ニブルPTRドメイン名生成
+ * ============================================================================ */
+static bool tinydns_decode_ipv6_hex32(const char *field, size_t flen, uint8_t out[16]) {
+    if (flen != 32) return false;
+    for (int i = 0; i < 16; i++) {
+        int hi = hex_char_to_val(field[i * 2]);
+        int lo = hex_char_to_val(field[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+static void tinydns_ipv6_ptr_name(const uint8_t ip6[16], char *out, size_t out_size, const char *suffix) {
+    size_t pos = 0;
+    for (int i = 15; i >= 0; i--) {
+        pos += (size_t)snprintf(out + pos, out_size > pos ? out_size - pos : 0, "%x.%x.",
+                                ip6[i] & 0x0F, (ip6[i] >> 4) & 0x0F);
+    }
+    snprintf(out + pos, out_size > pos ? out_size - pos : 0, "%s.", suffix);
 }
 
 #define TAI64_UNIX_EPOCH_OFFSET 4611686018427387904ULL /* 0x4000000000000000 */
@@ -694,6 +720,220 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 gen_rec->generic_data = raw_bytes;
                 gen_rec->generic_len = (uint16_t)raw_len;
                 gen_rec->rdata_count = 0;
+            }
+            return true;
+        }
+
+        case '3':   // AAAA のみ (3fqdn:ip6:ttl:timestamp:lo)
+        case '6': { // AAAA + PTR (6fqdn:ip6:ttl:timestamp:lo)
+            char *owner = tinydns_decode_fqdn(arena, f[0], flen[0]);
+            if (!owner) {
+                if (ctx && ctx->err_out) {
+                    ctx->err_out->error_message = "Invalid FQDN in tinydns 3/6 record";
+                    ctx->err_out->error_offset = (size_t)(line_start - buf);
+                    ctx->err_out->token_length = flen[0];
+                }
+                return false;
+            }
+
+            unsigned long ttl = TTL_POSITIVE;
+            if (flen[2] > 0) ttl = strtoul(f[2], NULL, 10);
+
+            uint8_t ip6[16];
+            if (tinydns_decode_ipv6_hex32(f[1], flen[1], ip6)) {
+                if (is_record_owned_by_zone(owner, target_zone, all_zones, all_zone_count)) {
+                    struct in6_addr addr;
+                    memcpy(&addr, ip6, 16);
+                    char ip6str[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, &addr, ip6str, sizeof(ip6str));
+                    dns_record_t *aaaa_rec = tinydns_new_record(arena, ctx, line_start, buf, owner,
+                                                                 "AAAA", 28, ttl, f[3], flen[3], f[4], flen[4]);
+                    if (!aaaa_rec) return false;
+                    aaaa_rec->rdata[0] = arena_strdup(arena, ip6str);
+                    aaaa_rec->rdata_count = 1;
+                }
+
+                if (typech == '6') {
+                    char ptr_name_arpa[96];
+                    tinydns_ipv6_ptr_name(ip6, ptr_name_arpa, sizeof(ptr_name_arpa), "ip6.arpa");
+                    if (is_record_owned_by_zone(ptr_name_arpa, target_zone, all_zones, all_zone_count)) {
+                        dns_record_t *ptr_rec = tinydns_new_record(arena, ctx, line_start, buf,
+                                                                    arena_strdup(arena, ptr_name_arpa),
+                                                                    "PTR", 12, ttl, f[3], flen[3], f[4], flen[4]);
+                        if (!ptr_rec) return false;
+                        ptr_rec->rdata[0] = owner;
+                        ptr_rec->rdata_count = 1;
+                    }
+
+                    char ptr_name_int[96];
+                    tinydns_ipv6_ptr_name(ip6, ptr_name_int, sizeof(ptr_name_int), "ip6.int");
+                    if (is_record_owned_by_zone(ptr_name_int, target_zone, all_zones, all_zone_count)) {
+                        dns_record_t *ptr_rec2 = tinydns_new_record(arena, ctx, line_start, buf,
+                                                                     arena_strdup(arena, ptr_name_int),
+                                                                     "PTR", 12, ttl, f[3], flen[3], f[4], flen[4]);
+                        if (!ptr_rec2) return false;
+                        ptr_rec2->rdata[0] = owner;
+                        ptr_rec2->rdata_count = 1;
+                    }
+                }
+            }
+            return true;
+        }
+
+        case 'S': { // SRV (Sfqdn:ip:x:port:weight:priority:ttl:timestamp:lo)
+            char *owner = tinydns_decode_fqdn(arena, f[0], flen[0]);
+            if (!owner) {
+                if (ctx && ctx->err_out) {
+                    ctx->err_out->error_message = "Invalid FQDN in tinydns S record";
+                    ctx->err_out->error_offset = (size_t)(line_start - buf);
+                    ctx->err_out->token_length = flen[0];
+                }
+                return false;
+            }
+
+            unsigned long port = 0, weight = 0, priority = 0, ttl = TTL_POSITIVE;
+            if (flen[3] > 0) port = strtoul(f[3], NULL, 10);
+            if (flen[4] > 0) weight = strtoul(f[4], NULL, 10);
+            if (flen[5] > 0) priority = strtoul(f[5], NULL, 10);
+            if (flen[6] > 0) ttl = strtoul(f[6], NULL, 10);
+
+            char *target = tinydns_decode_fqdn(arena, f[2], flen[2]);
+            if (!target) {
+                if (ctx && ctx->err_out) {
+                    ctx->err_out->error_message = "Invalid target FQDN in tinydns S record";
+                    ctx->err_out->error_offset = (size_t)(line_start - buf);
+                    ctx->err_out->token_length = flen[2];
+                }
+                return false;
+            }
+
+            uint8_t ip[4];
+            if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
+                if (is_record_owned_by_zone(target, target_zone, all_zones, all_zone_count)) {
+                    char ipstr[16];
+                    snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+                    dns_record_t *a_rec = tinydns_new_record(arena, ctx, line_start, buf, target,
+                                                             "A", 1, ttl, f[7], flen[7], f[8], flen[8]);
+                    if (!a_rec) return false;
+                    a_rec->rdata[0] = arena_strdup(arena, ipstr);
+                    a_rec->rdata_count = 1;
+                }
+            }
+
+            if (is_record_owned_by_zone(owner, target_zone, all_zones, all_zone_count)) {
+                dns_record_t *srv_rec = tinydns_new_record(arena, ctx, line_start, buf, owner,
+                                                           "SRV", 33, ttl, f[7], flen[7], f[8], flen[8]);
+                if (!srv_rec) return false;
+                char priobuf[16], weightbuf[16], portbuf[16];
+                snprintf(priobuf, sizeof(priobuf), "%lu", priority);
+                snprintf(weightbuf, sizeof(weightbuf), "%lu", weight);
+                snprintf(portbuf, sizeof(portbuf), "%lu", port);
+
+                srv_rec->rdata[0] = arena_strdup(arena, priobuf);
+                srv_rec->rdata[1] = arena_strdup(arena, weightbuf);
+                srv_rec->rdata[2] = arena_strdup(arena, portbuf);
+                srv_rec->rdata[3] = target;
+                srv_rec->rdata_count = 4;
+            }
+            return true;
+        }
+
+        case 'N': { // NAPTR (Nfqdn:order:pref:flags:service:regexp:replacement:ttl:timestamp:lo)
+            char *owner = tinydns_decode_fqdn(arena, f[0], flen[0]);
+            if (!owner) {
+                if (ctx && ctx->err_out) {
+                    ctx->err_out->error_message = "Invalid FQDN in tinydns N record";
+                    ctx->err_out->error_offset = (size_t)(line_start - buf);
+                    ctx->err_out->token_length = flen[0];
+                }
+                return false;
+            }
+
+            unsigned long order = 0, pref = 0, ttl = TTL_POSITIVE;
+            if (flen[1] > 0) order = strtoul(f[1], NULL, 10);
+            if (flen[2] > 0) pref = strtoul(f[2], NULL, 10);
+            if (flen[7] > 0) ttl = strtoul(f[7], NULL, 10);
+
+            if (is_record_owned_by_zone(owner, target_zone, all_zones, all_zone_count)) {
+                size_t flags_len = 0, service_len = 0, regexp_len = 0;
+                uint8_t *flags_bytes = tinydns_decode_bytes(arena, f[3], flen[3], &flags_len);
+                uint8_t *service_bytes = tinydns_decode_bytes(arena, f[4], flen[4], &service_len);
+                uint8_t *regexp_bytes = tinydns_decode_bytes(arena, f[5], flen[5], &regexp_len);
+                if ((!flags_bytes && flen[3] > 0) ||
+                    (!service_bytes && flen[4] > 0) ||
+                    (!regexp_bytes && flen[5] > 0)) return false;
+
+                char *replacement = tinydns_decode_fqdn(arena, f[6], flen[6]);
+                if (!replacement) {
+                    if (ctx && ctx->err_out) {
+                        ctx->err_out->error_message = "Invalid replacement FQDN in tinydns N record";
+                        ctx->err_out->error_offset = (size_t)(line_start - buf);
+                        ctx->err_out->token_length = flen[6];
+                    }
+                    return false;
+                }
+
+                dns_record_t *naptr_rec = tinydns_new_record(arena, ctx, line_start, buf, owner,
+                                                             "NAPTR", 35, ttl, f[8], flen[8], f[9], flen[9]);
+                if (!naptr_rec) return false;
+
+                char orderbuf[16], prefbuf[16];
+                snprintf(orderbuf, sizeof(orderbuf), "%lu", order);
+                snprintf(prefbuf, sizeof(prefbuf), "%lu", pref);
+
+                naptr_rec->rdata[0] = arena_strdup(arena, orderbuf);
+                naptr_rec->rdata[1] = arena_strdup(arena, prefbuf);
+                naptr_rec->rdata[2] = flags_bytes ? (char *)flags_bytes : arena_strdup(arena, "");
+                naptr_rec->rdata[3] = service_bytes ? (char *)service_bytes : arena_strdup(arena, "");
+                naptr_rec->rdata[4] = regexp_bytes ? (char *)regexp_bytes : arena_strdup(arena, "");
+                naptr_rec->rdata[5] = replacement;
+                naptr_rec->rdata_count = 6;
+            }
+            return true;
+        }
+
+        case '_': { // SSHFP (_fqdn:algorithm:fp_type:fingerprint:ttl:timestamp:lo)
+            char *owner = tinydns_decode_fqdn(arena, f[0], flen[0]);
+            if (!owner) {
+                if (ctx && ctx->err_out) {
+                    ctx->err_out->error_message = "Invalid FQDN in tinydns _ record";
+                    ctx->err_out->error_offset = (size_t)(line_start - buf);
+                    ctx->err_out->token_length = flen[0];
+                }
+                return false;
+            }
+
+            unsigned long alg = 0, fptype = 0, ttl = TTL_POSITIVE;
+            if (flen[1] > 0) alg = strtoul(f[1], NULL, 10);
+            if (flen[2] > 0) fptype = strtoul(f[2], NULL, 10);
+            if (flen[4] > 0) ttl = strtoul(f[4], NULL, 10);
+
+            if (is_record_owned_by_zone(owner, target_zone, all_zones, all_zone_count)) {
+                char *fp_hex = (char *)arena_alloc(arena, flen[3] + 1);
+                if (!fp_hex) return false;
+                memcpy(fp_hex, f[3], flen[3]);
+                fp_hex[flen[3]] = '\0';
+
+                // 16進数文字列の妥当性確認 (バイナリ変換可能性)
+                uint8_t dummy_fp[64];
+                size_t fp_len = hex_decode(fp_hex, dummy_fp, sizeof(dummy_fp));
+                if (flen[3] > 0 && (fp_len == 0 || fp_len == (size_t)-1)) {
+                    // デコード不能な不正な16進数の場合はレコード生成をスキップ (緩いパース哲学)
+                    return true;
+                }
+
+                dns_record_t *sshfp_rec = tinydns_new_record(arena, ctx, line_start, buf, owner,
+                                                             "SSHFP", 44, ttl, f[5], flen[5], f[6], flen[6]);
+                if (!sshfp_rec) return false;
+
+                char alg_buf[16], fptype_buf[16];
+                snprintf(alg_buf, sizeof(alg_buf), "%lu", alg);
+                snprintf(fptype_buf, sizeof(fptype_buf), "%lu", fptype);
+
+                sshfp_rec->rdata[0] = arena_strdup(arena, alg_buf);
+                sshfp_rec->rdata[1] = arena_strdup(arena, fptype_buf);
+                sshfp_rec->rdata[2] = fp_hex;
+                sshfp_rec->rdata_count = 3;
             }
             return true;
         }

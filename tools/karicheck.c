@@ -610,6 +610,150 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                 }
             }
         }
+
+        // Tinydns third-party patch syntax validations on raw lines
+        size_t linestart = 0;
+        size_t buflen = strlen(buf);
+        unsigned long linenum = 1;
+        while (linestart < buflen) {
+            size_t lineend = linestart;
+            while (lineend < buflen && buf[lineend] != '\n') lineend++;
+            size_t linelen = lineend - linestart;
+            const char *line = buf + linestart;
+
+            while (linelen > 0 && (line[linelen - 1] == ' ' || line[linelen - 1] == '\t' ||
+                                   line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
+                linelen--;
+            }
+
+            if (linelen > 0 && line[0] != '#' && line[0] != '-') {
+                char ch = line[0];
+                if (ch == '3' || ch == '6' || ch == 'S' || ch == 'N' || ch == '_') {
+                    // Extract fields separated by ':'
+                    char fld[12][256];
+                    size_t flen[12];
+                    int fcount = 0;
+                    size_t j = 1;
+                    while (fcount < 12 && j <= linelen) {
+                        size_t k = j;
+                        while (k < linelen && line[k] != ':') k++;
+                        size_t clen = k - j;
+                        if (clen >= sizeof(fld[fcount])) clen = sizeof(fld[fcount]) - 1;
+                        memcpy(fld[fcount], line + j, clen);
+                        fld[fcount][clen] = '\0';
+                        flen[fcount] = clen;
+                        fcount++;
+                        j = k + 1;
+                    }
+                    while (fcount < 12) {
+                        fld[fcount][0] = '\0';
+                        flen[fcount] = 0;
+                        fcount++;
+                    }
+
+                    if (ch == '3' || ch == '6') {
+                        // f[1] is ip6: must be 32 hex chars
+                        bool hex_ok = (flen[1] == 32);
+                        if (hex_ok) {
+                            for (size_t x = 0; x < 32; x++) {
+                                if (hex_char_to_val(fld[1][x]) < 0) {
+                                    hex_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!hex_ok) {
+                            fprintf(stderr, "[ERROR] Zone '%s' (line %lu): type '%c' requires a 32-character hexadecimal IPv6 address, got '%.*s'\n",
+                                    domain, linenum, ch, (int)flen[1], fld[1]);
+                            error_found = true;
+                        }
+                        if (ch == '6') {
+                            fprintf(stdout, "[INFO] Zone '%s' (line %lu): type '6' generates deprecated PTR in 'ip6.int'; consider using type '3' with explicit '^' PTR record instead\n",
+                                    domain, linenum);
+                        }
+                    } else if (ch == 'S') {
+                        // Sfqdn:ip:x:port:weight:priority:ttl:timestamp:lo
+                        if (flen[3] > 0) {
+                            char *endp;
+                            unsigned long p = strtoul(fld[3], &endp, 10);
+                            if (*endp != '\0' || p > 65535) {
+                                fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SRV port '%s' out of range (0-65535)\n",
+                                        domain, linenum, fld[3]);
+                                error_found = true;
+                            }
+                        }
+                        if (flen[4] > 0) {
+                            char *endp;
+                            unsigned long w = strtoul(fld[4], &endp, 10);
+                            if (*endp != '\0' || w > 65535) {
+                                fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SRV weight '%s' out of range (0-65535)\n",
+                                        domain, linenum, fld[4]);
+                                error_found = true;
+                            }
+                        }
+                        if (flen[5] > 0) {
+                            char *endp;
+                            unsigned long prio = strtoul(fld[5], &endp, 10);
+                            if (*endp != '\0' || prio > 65535) {
+                                fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SRV priority '%s' out of range (0-65535)\n",
+                                        domain, linenum, fld[5]);
+                                error_found = true;
+                            }
+                        }
+                    } else if (ch == 'N') {
+                        // Nfqdn:order:pref:flags:service:regexp:replacement:ttl:timestamp:lo
+                        if (flen[1] > 0) {
+                            char *endp;
+                            unsigned long ord = strtoul(fld[1], &endp, 10);
+                            if (*endp != '\0' || ord > 65535) {
+                                fprintf(stderr, "[ERROR] Zone '%s' (line %lu): NAPTR order '%s' out of range (0-65535)\n",
+                                        domain, linenum, fld[1]);
+                                error_found = true;
+                            }
+                        }
+                        if (flen[2] > 0) {
+                            char *endp;
+                            unsigned long pref = strtoul(fld[2], &endp, 10);
+                            if (*endp != '\0' || pref > 65535) {
+                                fprintf(stderr, "[ERROR] Zone '%s' (line %lu): NAPTR preference '%s' out of range (0-65535)\n",
+                                        domain, linenum, fld[2]);
+                                error_found = true;
+                            }
+                        }
+                    } else if (ch == '_') {
+                        // _fqdn:algorithm:fp_type:fingerprint:ttl:timestamp:lo
+                        if (flen[1] > 0) {
+                            char *endp;
+                            unsigned long alg = strtoul(fld[1], &endp, 10);
+                            if (*endp != '\0' || alg > 255) {
+                                fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SSHFP algorithm '%s' out of range (0-255)\n",
+                                        domain, linenum, fld[1]);
+                                error_found = true;
+                            }
+                        }
+                        if (flen[2] > 0) {
+                            char *endp;
+                            unsigned long fpt = strtoul(fld[2], &endp, 10);
+                            if (*endp != '\0' || fpt > 255) {
+                                fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SSHFP fp_type '%s' out of range (0-255)\n",
+                                        domain, linenum, fld[2]);
+                                error_found = true;
+                            }
+                        }
+                        uint8_t fp_bin[64];
+                        size_t dec_len = hex_decode(fld[3], fp_bin, sizeof(fp_bin));
+                        if (flen[3] == 0 || dec_len == 0 || dec_len == (size_t)-1) {
+                            fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SSHFP invalid fingerprint hex string '%s'\n",
+                                    domain, linenum, fld[3]);
+                            error_found = true;
+                        }
+                    }
+                }
+            }
+
+            linestart = lineend + 1;
+            linenum++;
+        }
     }
 
     ecs_tag_def_t *active_ecs_tags = (arena.bind_ecs_tags && arena.bind_ecs_tag_count > 0) ? arena.bind_ecs_tags :
@@ -761,6 +905,82 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
         if (tcode == 19 && rcount < 1) { // X25
             fprintf(stderr, "[WARNING] X25 record requires at least 1 field for name '%s'\n", arena.records[i].name);
+        }
+        if (tcode == 33) { // SRV
+            if (rcount < 4) {
+                fprintf(stderr, "[ERROR] SRV record requires 4 fields (priority, weight, port, target) for name '%s' in zone '%s'\n",
+                        arena.records[i].name, domain);
+                error_found = true;
+            } else {
+                char *endp;
+                unsigned long prio = strtoul(rdata[0], &endp, 10);
+                if (*endp != '\0' || prio > 65535) {
+                    fprintf(stderr, "[ERROR] SRV priority '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
+                            rdata[0], arena.records[i].name, domain);
+                    error_found = true;
+                }
+                unsigned long weight = strtoul(rdata[1], &endp, 10);
+                if (*endp != '\0' || weight > 65535) {
+                    fprintf(stderr, "[ERROR] SRV weight '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
+                            rdata[1], arena.records[i].name, domain);
+                    error_found = true;
+                }
+                unsigned long port = strtoul(rdata[2], &endp, 10);
+                if (*endp != '\0' || port > 65535) {
+                    fprintf(stderr, "[ERROR] SRV port '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
+                            rdata[2], arena.records[i].name, domain);
+                    error_found = true;
+                }
+            }
+        }
+        if (tcode == 35) { // NAPTR
+            if (rcount < 6) {
+                fprintf(stderr, "[ERROR] NAPTR record requires 6 fields (order, preference, flags, service, regexp, replacement) for name '%s' in zone '%s'\n",
+                        arena.records[i].name, domain);
+                error_found = true;
+            } else {
+                char *endp;
+                unsigned long ord = strtoul(rdata[0], &endp, 10);
+                if (*endp != '\0' || ord > 65535) {
+                    fprintf(stderr, "[ERROR] NAPTR order '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
+                            rdata[0], arena.records[i].name, domain);
+                    error_found = true;
+                }
+                unsigned long pref = strtoul(rdata[1], &endp, 10);
+                if (*endp != '\0' || pref > 65535) {
+                    fprintf(stderr, "[ERROR] NAPTR preference '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
+                            rdata[1], arena.records[i].name, domain);
+                    error_found = true;
+                }
+            }
+        }
+        if (tcode == 44) { // SSHFP
+            if (rcount < 3) {
+                fprintf(stderr, "[ERROR] SSHFP record requires 3 fields (algorithm, fp_type, fingerprint) for name '%s' in zone '%s'\n",
+                        arena.records[i].name, domain);
+                error_found = true;
+            } else {
+                char *endp;
+                unsigned long alg = strtoul(rdata[0], &endp, 10);
+                if (*endp != '\0' || alg > 255) {
+                    fprintf(stderr, "[ERROR] SSHFP algorithm '%s' out of range (0-255) for name '%s' in zone '%s'\n",
+                            rdata[0], arena.records[i].name, domain);
+                    error_found = true;
+                }
+                unsigned long fpt = strtoul(rdata[1], &endp, 10);
+                if (*endp != '\0' || fpt > 255) {
+                    fprintf(stderr, "[ERROR] SSHFP fp_type '%s' out of range (0-255) for name '%s' in zone '%s'\n",
+                            rdata[1], arena.records[i].name, domain);
+                    error_found = true;
+                }
+                uint8_t fp_bin[64];
+                size_t dec_len = hex_decode(rdata[2], fp_bin, sizeof(fp_bin));
+                if (dec_len == 0 || dec_len == (size_t)-1) {
+                    fprintf(stderr, "[ERROR] SSHFP invalid fingerprint hex string '%s' for name '%s' in zone '%s'\n",
+                            rdata[2], arena.records[i].name, domain);
+                    error_found = true;
+                }
+            }
         }
 
         // --- RFC 1912 Operational Checks ---
