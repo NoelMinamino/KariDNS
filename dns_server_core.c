@@ -111,6 +111,7 @@ typedef struct {
 
   struct mmsghdr cli_tx_msgs[UDP_BATCH_SIZE];
   struct iovec   cli_tx_iov[UDP_BATCH_SIZE];
+  struct sockaddr_storage cli_tx_addrs[UDP_BATCH_SIZE];
   router_cmsg_buf_t cli_tx_cbuf[UDP_BATCH_SIZE];
 } frontend_router_ctx_t;
 
@@ -679,7 +680,20 @@ static void start_connect_broker(void) {
       if (sock >= 0) {
         size_t addr_len = (req.family == AF_INET) ? sizeof(struct sockaddr_in)
                                                   : sizeof(struct sockaddr_in6);
-        if (connect(sock, (struct sockaddr *)&req.addr, addr_len) == 0) {
+        fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
+        int ret = connect(sock, (struct sockaddr *)&req.addr, addr_len);
+        if (ret < 0 && errno == EINPROGRESS) {
+          struct pollfd pfd = { .fd = sock, .events = POLLOUT };
+          if (poll(&pfd, 1, 4000) > 0) {
+            int so_error = 0;
+            socklen_t elen = sizeof(so_error);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &elen) == 0 && so_error == 0) {
+              ret = 0;
+            }
+          }
+        }
+        if (ret == 0) {
+          fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) & ~O_NONBLOCK);
           struct msghdr msg = {0};
           struct cmsghdr *cmsg;
           char buf[CMSG_SPACE(sizeof(int))];
@@ -4555,6 +4569,12 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
                          uint8_t *out_ecs_scope_prefix) {
   if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
   if (qtx_included_out) *qtx_included_out = 0;
+  uint16_t initial_offset = *offset;
+  uint16_t initial_ancount = *ancount;
+  uint16_t initial_nscount = *nscount;
+  uint16_t initial_arcount = *arcount;
+  uint8_t temp_scope_prefix = 0;
+  bool ecs_used = false;
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
   current_qname[255] = '\0';
@@ -4570,6 +4590,11 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
     if (!current_zone || current_zone->hash_size == 0 ||
         !current_zone->hash_table) {
       res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
+      *offset = initial_offset;
+      *ancount = initial_ancount;
+      *nscount = initial_nscount;
+      *arcount = initial_arcount;
+      if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
       return;
     }
 
@@ -4588,7 +4613,9 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
     const char *client_loc_tag = resolve_bind_location_tag(current_zone, cfg, zcfg, client_ip);
     const char *client_ecs_tag = NULL;
     if (ecs_trusted && ecs_addr) {
-      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family, out_ecs_scope_prefix);
+      uint8_t cur_scope = 0;
+      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family, &cur_scope);
+      if (cur_scope > temp_scope_prefix) temp_scope_prefix = cur_scope;
     }
     
     // ==== フェーズ1: 委任判定 ====
@@ -4660,9 +4687,11 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
         dns_record_t rec_copy = *rec;
         rec_copy.ttl_value = eff_ttl;
         if (follow_cname) {
+          if (rec->ecs_subnet_tag != NULL) ecs_used = true;
           if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {
             res[2] |= 0x02;
+            if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
             return;
           } else
             (*ancount)++;
@@ -4670,6 +4699,7 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
             if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 5,
                                       res, max_res_len, offset, comp_ctx, ancount)) {
               res[2] |= 0x02;
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
           }
@@ -4684,9 +4714,11 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
         } else {
           if (qtypes[0] == 255 || qtypes[0] == rec_type) {
             type_matched = true;
+            if (rec->ecs_subnet_tag != NULL) ecs_used = true;
             if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                      NULL, 0xFFFFFFFF) < 0) {
               res[2] |= 0x02;
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
             (*ancount)++;
@@ -4736,7 +4768,12 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
             if (prefix_len + target_len > 255) { res[3] = (res[3] & 0xF0) | 6; return; }
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
-            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
+            if (rec->ecs_subnet_tag != NULL) ecs_used = true;
+            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+              res[2] |= 0x02;
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+              return;
+            }
             (*ancount)++;
             if (dnssec_ok) {
               if (!attach_covering_rrsig(current_zone, p_idx, dname_parent, NULL, 39, res, max_res_len, offset, comp_ctx, ancount)) { res[2] |= 0x02; return; }
@@ -4805,9 +4842,11 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
                 dns_record_t rec_copy = *rec;
                 rec_copy.ttl_value = eff_ttl;
                 if (follow_cname) {
+                  if (rec->ecs_subnet_tag != NULL) ecs_used = true;
                   if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                            current_qname, 0xFFFFFFFF) < 0) {
                     res[2] |= 0x02;
+                    if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                     return;
                   } else
                     (*ancount)++;
@@ -4815,6 +4854,7 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
                     if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, 5,
                                               res, max_res_len, offset, comp_ctx, ancount)) {
                       res[2] |= 0x02;
+                      if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                       return;
                     }
                   }
@@ -4829,9 +4869,11 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
                 } else {
                   if (qtypes[0] == 255 || qtypes[0] == rec_type) {
                     type_matched = true;
+                    if (rec->ecs_subnet_tag != NULL) ecs_used = true;
                     if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                              current_qname, 0xFFFFFFFF) < 0) {
                       res[2] |= 0x02;
+                      if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                       return;
                     } else
                       (*ancount)++;
@@ -4929,6 +4971,7 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
             qtx_matched = true;
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
+            if (rec->ecs_subnet_tag != NULL) ecs_used = true;
             if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
               this_qtx_failed = true; break;
             }
@@ -4967,6 +5010,7 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
                   wc_found = true; qtx_matched = true;
                   dns_record_t rec_copy = *rec;
                   rec_copy.ttl_value = eff_ttl;
+                  if (rec->ecs_subnet_tag != NULL) ecs_used = true;
                   if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
                     this_qtx_failed = true; break;
                   }
@@ -5239,8 +5283,20 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
     chain_exhausted = false;
     break;
   }
-  if (chain_exhausted)
+  if (chain_exhausted) {
     res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
+    *offset = initial_offset;
+    *ancount = initial_ancount;
+    *nscount = initial_nscount;
+    *arcount = initial_arcount;
+    if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
+  } else {
+    if (ecs_used && out_ecs_scope_prefix) {
+      *out_ecs_scope_prefix = temp_scope_prefix;
+    } else if (out_ecs_scope_prefix) {
+      *out_ecs_scope_prefix = 0;
+    }
+  }
 }
 
 // ============================================================================
@@ -5996,6 +6052,9 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
     return DNS_HEADER_SIZE;
   }
   edns.ede_count = 0; // 反射防止
+  if (edns.present && edns.udp_payload_size < 512) {
+    edns.udp_payload_size = 512;
+  }
 
   server_config_t *cfg_for_ede = cfg;
   
@@ -6331,11 +6390,15 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   }
   compress_ctx_init_packet(comp_ctx);
 
-  if (edns.present && !is_tcp) {
-    if (edns.udp_payload_size > 1232)
-      edns.udp_payload_size = 1232;
-    if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
-      max_res_len = edns.udp_payload_size;
+  if (edns.present) {
+    if (edns.udp_payload_size < 512)
+      edns.udp_payload_size = 512;
+    if (!is_tcp) {
+      if (edns.udp_payload_size > 1232)
+        edns.udp_payload_size = 1232;
+      if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
+        max_res_len = edns.udp_payload_size;
+    }
   }
 
   uint8_t ext_rcode_out = 0;
@@ -6904,7 +6967,7 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
   req[0] = id >> 8;
   req[1] = id & 0xFF;
-  req[2] = 0x20;
+  req[2] = 0x24; // Opcode = NOTIFY (0x20) | AA = 1 (0x04) (RFC 1996 §3.4)
   req[3] = 0;
   req[4] = 0;
   req[5] = 1;
@@ -10336,7 +10399,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 
             fctx->cli_tx_iov[tx_count].iov_base = fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t);
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
-            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &msg->client_addr;
+            memcpy(&fctx->cli_tx_addrs[tx_count], &msg->client_addr, msg->addr_len);
+            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &fctx->cli_tx_addrs[tx_count];
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = msg->addr_len;
 
             bool is_wildcard = (cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) ? local_udp_is_wildcard[cur_sock_idx] : false;
