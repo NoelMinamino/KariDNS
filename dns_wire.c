@@ -711,7 +711,10 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         }
     }
     unsigned int mac_len = 0; unsigned char mac[EVP_MAX_MD_SIZE];
-    if (key->secret_decoded_len > 0) {
+    if (tsig_error == 16 || tsig_error == 17) {
+        // RFC 8945 §5.3.1: If error is BADSIG or BADKEY, MAC size MUST be 0 and MAC data MUST be empty
+        mac_len = 0;
+    } else if (key->secret_decoded_len > 0) {
         const EVP_MD *evp_md = tsig_algorithm_from_name(alg);
         if (!evp_md) {
             if (use_malloc) free(pre_mac);
@@ -742,7 +745,10 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     packet[p_offset++] = (now >> 8) & 0xFF; packet[p_offset++] = now & 0xFF;
     packet[p_offset++] = fudge >> 8; packet[p_offset++] = fudge & 0xFF;
     packet[p_offset++] = mac_len >> 8; packet[p_offset++] = mac_len & 0xFF;
-    memcpy(&packet[p_offset], mac, mac_len); p_offset += mac_len;
+    if (mac_len > 0) {
+        memcpy(&packet[p_offset], mac, mac_len);
+        p_offset += mac_len;
+    }
     packet[p_offset++] = packet[0]; packet[p_offset++] = packet[1]; // Orig ID
     packet[p_offset++] = tsig_error >> 8; packet[p_offset++] = tsig_error & 0xFF; // Error
     if (tsig_error == 18) {
