@@ -306,12 +306,29 @@ static bool resolve_qtype(const char *s, uint16_t *out_type) {
             upper_s[i] = (char)toupper((unsigned char)s[i]);
         }
         upper_s[len] = '\0';
+        // dig互換: TYPE<n> (0-65535) をサポート
+        if (strncmp(upper_s, "TYPE", 4) == 0 && isdigit((unsigned char)upper_s[4])) {
+            char *endptr = NULL;
+            long val = strtol(upper_s + 4, &endptr, 10);
+            if (*endptr == '\0' && val >= 0 && val <= 65535) {
+                if (out_type) *out_type = (uint16_t)val;
+                return true;
+            }
+        }
         uint16_t t = get_type_code(upper_s);
         if (t != 0) {
             if (out_type) *out_type = t;
             return true;
         }
     } else {
+        if (strncasecmp(s, "TYPE", 4) == 0 && isdigit((unsigned char)s[4])) {
+            char *endptr = NULL;
+            long val = strtol(s + 4, &endptr, 10);
+            if (*endptr == '\0' && val >= 0 && val <= 65535) {
+                if (out_type) *out_type = (uint16_t)val;
+                return true;
+            }
+        }
         uint16_t t = get_type_code(s);
         if (t != 0) {
             if (out_type) *out_type = t;
@@ -330,11 +347,22 @@ static bool is_known_qtype(const char *s) {
     return resolve_qtype(s, NULL);
 }
 
-static uint16_t parse_qtype(const char *s) {
-    uint16_t t;
-    if (resolve_qtype(s, &t)) return t;
+static bool is_qtype_syntax_or_known(const char *s) {
+    if (!s) return false;
+    if (is_known_qtype(s)) return true;
+    if (strncasecmp(s, "TYPE", 4) == 0 && isdigit((unsigned char)s[4])) {
+        const char *p = s + 4;
+        while (*p && isdigit((unsigned char)*p)) p++;
+        if (*p == '\0') return true;
+    }
+    return false;
+}
+
+static int parse_qtype(const char *s) {
+    uint16_t t = 0;
+    if (resolve_qtype(s, &t)) return (int)t;
     fprintf(stderr, "dag: unknown query type '%s'\n", s);
-    return 0;
+    return -1;
 }
 
 static void print_ldnsz_payload(const uint8_t *buf, size_t len) {
@@ -5464,8 +5492,9 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
         qo->is_ixfr = true;
         qo->ixfr_serial = strtoul(qtype_s + 5, NULL, 10);
     } else {
-        qtype = parse_qtype(qtype_s);
-        if (qtype == 0) return -1;
+        int parsed_t = parse_qtype(qtype_s);
+        if (parsed_t < 0) return -1;
+        qtype = (uint16_t)parsed_t;
         if (qtype == 251) {
             qo->is_ixfr = true;
             qo->ixfr_serial = 0; // シリアル指定なし時は 0 (全転送/差分開始シリアル)
@@ -7096,8 +7125,8 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             }
         } else {
             int qtype_val = parse_qtype(qtype_s);
-            if (qtype_val == 0) return 1;
-            qlen = build_and_sign_query(qbuf, sizeof(qbuf), qname, qtype_val, &qo, hop_req_mac, &hop_req_mac_len);
+            if (qtype_val < 0) return 1;
+            qlen = build_and_sign_query(qbuf, sizeof(qbuf), qname, (uint16_t)qtype_val, &qo, hop_req_mac, &hop_req_mac_len);
             if (qlen == 0) break;
         }
         
@@ -8736,7 +8765,8 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 uint16_t mqtypes[16];
                 int mq_count = 0;
                 while (token && mq_count < 16) {
-                    mqtypes[mq_count++] = parse_qtype(token);
+                    int mq = parse_qtype(token);
+                    if (mq >= 0) mqtypes[mq_count++] = (uint16_t)mq;
                     token = strtok(NULL, ",");
                 }
                 free(mqstr);
@@ -8891,7 +8921,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     uint16_t cls_val = 0;
     if (is_known_qclass_str(arg, &cls_val)) {
         spec->qo.qclass = cls_val;
-    } else if (is_known_qtype(arg)) {
+    } else if (is_qtype_syntax_or_known(arg)) {
         if (!spec->qtype_s) {
             spec->qtype_s = arg;
         } else if (!spec->qname) {
@@ -9233,7 +9263,7 @@ int main(int argc, char **argv) {
             // 位置引数
             if (is_known_qclass_str(arg, NULL)) {
                 is_class_arg = true;
-            } else if (is_known_qtype(arg)) {
+            } else if (is_qtype_syntax_or_known(arg)) {
                 is_type_arg = true;
             } else {
                 is_name_arg = true;
