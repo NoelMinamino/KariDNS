@@ -11,6 +11,9 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define TTL_NS 259200UL
 #define TTL_POSITIVE 86400UL
@@ -603,6 +606,154 @@ static void test_location_directive_and_records(void) {
     }
 }
 
+/* ============================================================================
+ * Test 9: サードパーティパッチ追加書式検証 (Type 3, 6, S, N, _)
+ * ============================================================================ */
+static void test_third_party_patch_records(void) {
+    printf("--- Test 9: Third-party Patch Records Parsing (3, 6, S, N, _) ---\n");
+
+    const char *data =
+        // Type 3: AAAA only
+        "3aaaa.example.com:20010db8000000000000000000000001:3600\n"
+        // Type 6: AAAA + PTR (ip6.arpa + ip6.int)
+        "6dual.example.com:20010db8000000000000000000000002:7200\n"
+        // Type S: SRV (+ target A)
+        "S_sip._tcp.example.com:192.168.1.50:sip.example.com:5060:10:20:1800\n"
+        // Type N: NAPTR (note: colons inside fields must be escaped as \072 in tinydns)
+        "Nnaptr.example.com:100:10:s:SIP+D2U:!^.*$!sip\\072info@example.com!:.:3600\n"
+        // Type _: SSHFP (owner is ssh.example.com)
+        "_ssh.example.com:1:1:123456789abcdef67890123456789abcdef67890:3600\n"
+        // Negative / loose parsing cases: should be skipped without error
+        "3badhex.example.com:20010db80000000000000000000000zz:3600\n"
+        "3short.example.com:20010db801:3600\n"
+        "_badssh.example.com:1:1:nothex:3600\n";
+
+    char *buf = strdup(data);
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .default_origin = NULL, // 全ゾーン許容 (ip6.arpa/int の逆引きPTRを含む)
+        .err_out = &err
+    };
+
+    int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
+    TEST_ASSERT(count > 0, "parse_tinydns_data should succeed for 3, 6, S, N, _");
+    printf("Parsed %d records into arena\n", count);
+
+    bool found_type3 = false;
+    bool found_type6_aaaa = false;
+    bool found_type6_arpa = false;
+    bool found_type6_int = false;
+    bool found_srv = false;
+    bool found_srv_a = false;
+    bool found_naptr = false;
+    bool found_sshfp = false;
+    bool found_bad = false;
+
+    for (size_t i = 0; i < arena.count; i++) {
+        dns_record_t *r = &arena.records[i];
+
+        // Type 3: AAAA
+        if (strcmp(r->name, "aaaa.example.com.") == 0 && r->type_code == 28) {
+            found_type3 = true;
+            TEST_ASSERT(strcmp(r->rdata[0], "2001:db8::1") == 0, "Type 3 AAAA IPv6 normalized");
+            TEST_ASSERT(r->ttl_value == 3600, "Type 3 TTL");
+        }
+
+        // Type 6: AAAA
+        if (strcmp(r->name, "dual.example.com.") == 0 && r->type_code == 28) {
+            found_type6_aaaa = true;
+            TEST_ASSERT(strcmp(r->rdata[0], "2001:db8::2") == 0, "Type 6 AAAA IPv6 normalized");
+            TEST_ASSERT(r->ttl_value == 7200, "Type 6 TTL");
+        }
+
+        // Type 6: PTR in ip6.arpa
+        if (strcmp(r->name, "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.") == 0 &&
+            r->type_code == 12) {
+            found_type6_arpa = true;
+            TEST_ASSERT(strcmp(r->rdata[0], "dual.example.com.") == 0, "Type 6 PTR ip6.arpa target");
+            TEST_ASSERT(r->ttl_value == 7200, "Type 6 PTR ip6.arpa TTL");
+        }
+
+        // Type 6: PTR in ip6.int
+        if (strcmp(r->name, "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.int.") == 0 &&
+            r->type_code == 12) {
+            found_type6_int = true;
+            TEST_ASSERT(strcmp(r->rdata[0], "dual.example.com.") == 0, "Type 6 PTR ip6.int target");
+            TEST_ASSERT(r->ttl_value == 7200, "Type 6 PTR ip6.int TTL");
+        }
+
+        // Type S: SRV
+        if (strcmp(r->name, "_sip._tcp.example.com.") == 0 && r->type_code == 33) {
+            found_srv = true;
+            TEST_ASSERT(r->rdata_count == 4, "SRV rdata_count is 4");
+            TEST_ASSERT(strcmp(r->rdata[0], "20") == 0, "SRV priority");
+            TEST_ASSERT(strcmp(r->rdata[1], "10") == 0, "SRV weight");
+            TEST_ASSERT(strcmp(r->rdata[2], "5060") == 0, "SRV port");
+            TEST_ASSERT(strcmp(r->rdata[3], "sip.example.com.") == 0, "SRV target");
+            TEST_ASSERT(r->ttl_value == 1800, "SRV TTL");
+        }
+
+        // Type S: target A
+        if (strcmp(r->name, "sip.example.com.") == 0 && r->type_code == 1) {
+            found_srv_a = true;
+            TEST_ASSERT(strcmp(r->rdata[0], "192.168.1.50") == 0, "SRV target A IP");
+            TEST_ASSERT(r->ttl_value == 1800, "SRV target A TTL");
+        }
+
+        // Type N: NAPTR
+        if (strcmp(r->name, "naptr.example.com.") == 0 && r->type_code == 35) {
+            found_naptr = true;
+            TEST_ASSERT(r->rdata_count == 6, "NAPTR rdata_count is 6");
+            TEST_ASSERT(strcmp(r->rdata[0], "100") == 0, "NAPTR order");
+            TEST_ASSERT(strcmp(r->rdata[1], "10") == 0, "NAPTR pref");
+            TEST_ASSERT(strcmp(r->rdata[2], "s") == 0, "NAPTR flags");
+            TEST_ASSERT(strcmp(r->rdata[3], "SIP+D2U") == 0, "NAPTR service");
+            TEST_ASSERT(strcmp(r->rdata[4], "!^.*$!sip:info@example.com!") == 0, "NAPTR regexp");
+            TEST_ASSERT(strcmp(r->rdata[5], ".") == 0, "NAPTR replacement root");
+            TEST_ASSERT(r->ttl_value == 3600, "NAPTR TTL");
+        }
+
+        // Type _: SSHFP
+        if (strcmp(r->name, "ssh.example.com.") == 0 && r->type_code == 44) {
+            found_sshfp = true;
+            TEST_ASSERT(r->rdata_count == 3, "SSHFP rdata_count is 3");
+            TEST_ASSERT(strcmp(r->rdata[0], "1") == 0, "SSHFP algorithm");
+            TEST_ASSERT(strcmp(r->rdata[1], "1") == 0, "SSHFP fp_type");
+            TEST_ASSERT(strcmp(r->rdata[2], "123456789abcdef67890123456789abcdef67890") == 0, "SSHFP fingerprint hex");
+            TEST_ASSERT(r->ttl_value == 3600, "SSHFP TTL");
+        }
+
+        if (strstr(r->name, "bad") != NULL || strstr(r->name, "short") != NULL) {
+            found_bad = true;
+        }
+
+        // Wire serialization dry-run check
+        uint8_t wire[512];
+        uint16_t offset = 0;
+        compress_ctx_t comp;
+        memset(&comp, 0, sizeof(comp));
+        compress_ctx_init_packet(&comp);
+        int wire_res = serialize_dns_record(wire, sizeof(wire), &offset, r, &comp, NULL, 0xFFFFFFFF);
+        TEST_ASSERT(wire_res == 0, "Record wire serialization must succeed");
+    }
+
+    TEST_ASSERT(found_type3, "Found Type 3 AAAA");
+    TEST_ASSERT(found_type6_aaaa, "Found Type 6 AAAA");
+    TEST_ASSERT(found_type6_arpa, "Found Type 6 PTR ip6.arpa");
+    TEST_ASSERT(found_type6_int, "Found Type 6 PTR ip6.int");
+    TEST_ASSERT(found_srv, "Found Type S SRV");
+    TEST_ASSERT(found_srv_a, "Found Type S target A");
+    TEST_ASSERT(found_naptr, "Found Type N NAPTR");
+    TEST_ASSERT(found_sshfp, "Found Type _ SSHFP");
+    TEST_ASSERT(!found_bad, "Bad records must not be created");
+
+    zone_arena_destroy(&arena);
+    free(buf);
+}
+
 int main(void) {
     printf("==================================================\n");
     printf(" Running KariDNS tinydns Parser Tests (djbdns 1.05)\n");
@@ -616,6 +767,7 @@ int main(void) {
     test_config_file_format();
     test_timestamp_evaluation();
     test_location_directive_and_records();
+    test_third_party_patch_records();
 
     printf("==================================================\n");
     printf(" Test Results: %d / %d Passed\n", pass_count, test_count);
