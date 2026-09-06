@@ -4,6 +4,7 @@
 #include "dns_utils.h"
 #include <arpa/inet.h>
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -575,6 +576,7 @@ static void release_config_snapshot(server_config_t *snap) {
 int g_control_kq = -1;
 int g_cwd_fd = -1;
 static const char *g_config_path = NULL;
+static int g_cli_port_override = 0;
 static _Atomic int g_bound_workers = 0;
 static _Atomic bool g_privilege_drop_complete = false;
 #define MAX_ZONE_AXFR 4
@@ -3327,9 +3329,14 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
   uint16_t qdcount = (packet[4] << 8) | packet[5],
            ancount = (packet[6] << 8) | packet[7];
   size_t offset = DNS_HEADER_SIZE;
+  // RFC 5936 §2.2: Even on subsequent messages (session->soa_count > 0),
+  // master implementations may include the question section (QDCOUNT > 0).
+  // Safely skip any question records present in the packet.
   for (int i = 0; i < qdcount; i++) {
     size_t next_offset;
     if (skip_wire_name(packet, packet_len, offset, &next_offset) != 0)
+      return -1;
+    if (next_offset + 4 > packet_len)
       return -1;
     offset = next_offset + 4;
   }
@@ -3764,12 +3771,13 @@ static const char *strchr_unescaped(const char *s, char c) {
   return NULL;
 }
 
-static bool attach_covering_rrsig(zone_arena_t *zone, size_t hash_idx,
-                                  const char *match_name,
-                                  const char *owner_name_override,
-                                  uint16_t type_covered, uint8_t *res,
-                                  size_t max_res_len, uint16_t *offset,
-                                  compress_ctx_t *comp_ctx, uint16_t *count) {
+static bool attach_covering_rrsig_ext(zone_arena_t *zone, size_t hash_idx,
+                                      const char *match_name,
+                                      const char *owner_name_override,
+                                      uint16_t type_covered, uint8_t *res,
+                                      size_t max_res_len, uint16_t *offset,
+                                      compress_ctx_t *comp_ctx, uint16_t *count,
+                                      uint32_t override_ttl) {
   for (int i = zone->hash_table[hash_idx]; i != -1;
        i = zone->records[i].next_record) {
     dns_record_t *rec = &zone->records[i];
@@ -3781,12 +3789,23 @@ static bool attach_covering_rrsig(zone_arena_t *zone, size_t hash_idx,
     if (get_type_code(rec->rdata[0]) != type_covered)
       continue;
     if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx,
-                             owner_name_override, 0xFFFFFFFF) < 0)
+                             owner_name_override, override_ttl) < 0)
       return false; // バッファ溢れのみ呼び出し元に伝える
     (*count)++;
     // 鍵ロールオーバー中は同一タイプに複数のRRSIGが存在し得るためbreakしない
   }
   return true;
+}
+
+static inline bool attach_covering_rrsig(zone_arena_t *zone, size_t hash_idx,
+                                         const char *match_name,
+                                         const char *owner_name_override,
+                                         uint16_t type_covered, uint8_t *res,
+                                         size_t max_res_len, uint16_t *offset,
+                                         compress_ctx_t *comp_ctx, uint16_t *count) {
+  return attach_covering_rrsig_ext(zone, hash_idx, match_name, owner_name_override,
+                                   type_covered, res, max_res_len, offset, comp_ctx, count,
+                                   0xFFFFFFFF);
 }
 
 static bool zone_uses_nsec3(zone_arena_t *zone, const char *apex_name) {
@@ -5075,8 +5094,9 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
           } else
             (*nscount)++;
           if (dnssec_ok) {
-            if (!attach_covering_rrsig(current_zone, apex_idx, db_entry->domain, NULL, 6,
-                                       res, max_res_len, offset, comp_ctx, nscount)) {
+            // RFC 2181 §5.2 / RFC 4035 §3.1.5: RRSIG TTL must match covered SOA minimum_ttl
+            if (!attach_covering_rrsig_ext(current_zone, apex_idx, db_entry->domain, NULL, 6,
+                                           res, max_res_len, offset, comp_ctx, nscount, minimum_ttl)) {
               res[2] |= 0x02;
               return;
             }
@@ -6275,6 +6295,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
     }
+    bool has_tsig = packet_has_tsig(req, req_len);
     bool auth = false;
     tsig_key_t *matched_key = NULL;
     tsig_key_t *attempted_key = NULL;
@@ -6289,7 +6310,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
             break;
           }
         }
-        if (auth && zcfg->tsig_key && zcfg->tsig_key[0] != '\0') {
+        if (zcfg->tsig_key && zcfg->tsig_key[0] != '\0') {
           tsig_key_t *k = cfg->keys;
           while (k) {
             if (strcmp(k->name, zcfg->tsig_key) == 0) {
@@ -6306,8 +6327,28 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
             if (err != 0) {
               auth = false;
               tsig_error_code = err > 0 ? err : 16;
+              matched_key = NULL;
             }
           }
+        }
+      }
+    }
+    // RFC 2845 / RFC 8945 §5.4: If packet has TSIG, MUST NOT accept based solely on IP match if TSIG verification failed
+    if (has_tsig && (!matched_key || tsig_error_code != 0)) {
+      auth = false;
+      if (!attempted_key) {
+        tsig_key_t *k = cfg->keys;
+        while (k) {
+          int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
+          if (err == 0) {
+            attempted_key = k;
+            tsig_error_code = 9; // key known but not allowed on zone
+            break;
+          }
+          k = k->next;
+        }
+        if (!attempted_key) {
+          tsig_error_code = 17; // BADKEY
         }
       }
     }
@@ -6325,7 +6366,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
         kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
       }
     } else {
-      if (attempted_key) {
+      if (attempted_key || has_tsig) {
           res[3] = (res[3] & 0xF0) | 9; // NOTAUTH
           add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Invalid TSIG");
       } else {
@@ -6371,6 +6412,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
     }
+    bool has_tsig = packet_has_tsig(req, req_len);
     bool auth = false;
     bool zone_is_master = false;
     tsig_key_t *matched_key = NULL;
@@ -6409,7 +6451,26 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
           }
           k = k->next;
         }
+        if (has_tsig && !attempted_key) {
+          k = cfg->keys;
+          while (k) {
+            int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
+            if (err == 0) {
+              attempted_key = k;
+              tsig_error_code = 9; // NOTAUTH (key valid but not authorized for update)
+              break;
+            }
+            k = k->next;
+          }
+          if (!attempted_key) {
+            tsig_error_code = 17; // BADKEY
+          }
+        }
       }
+    }
+    // RFC 2845 / RFC 8945 §5.4: If packet has TSIG, MUST NOT accept based solely on IP match if TSIG verification failed!
+    if (has_tsig && (!matched_key || tsig_error_code != 0)) {
+      auth = false;
     }
     
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
@@ -6423,7 +6484,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       rcode = 9; // NOTAUTH (RFC 2136 §3.8: Server is not the primary for the zone)
       add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not the primary for the zone");
     } else {
-      if (attempted_key) {
+      if (attempted_key || has_tsig) {
         rcode = 9; // NOTAUTH
         add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Invalid TSIG");
       } else {
@@ -7769,8 +7830,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     res_buf[2] |= 0x84;
     res_buf[3] |= 0x05;
     uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
-    send(client_fd, len_prefix, 2, 0);
-    send(client_fd, res_buf, copy_len, 0);
+    send_tcp_robust(client_fd, len_prefix, 2);
+    send_tcp_robust(client_fd, res_buf, copy_len);
     return;
   }
   zone_arena_t *current_zone = NULL;
@@ -8374,8 +8435,8 @@ static void *async_io_worker_func(void *arg) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
           uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
-          send(task.client_fd, len_prefix, 2, 0);
-          send(task.client_fd, tcp_res, res_len, 0);
+          send_tcp_robust(task.client_fd, len_prefix, 2);
+          send_tcp_robust(task.client_fd, tcp_res, res_len);
         } else {
           submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                               0, 0, 0, false, false);
@@ -9269,8 +9330,10 @@ process_tcp_client: ;
               }
               release_zone_snapshot(snap);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
-              send(client_fd, len_prefix, 2, 0);
-              send(client_fd, res_buf, copy_len, 0);
+              if (send_tcp_robust(client_fd, len_prefix, 2) < 0 ||
+                  send_tcp_robust(client_fd, res_buf, copy_len) < 0) {
+                // fall through to close/free
+              }
               
               submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, 
                                   qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
@@ -9324,8 +9387,15 @@ process_tcp_client: ;
                 submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                     tcp_res[3] & 0x0F, has_edns, dnssec_ok);
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
-                send(client_fd, len_prefix, 2, 0);
-                send(client_fd, tcp_res, res_len, 0);
+                if (send_tcp_robust(client_fd, len_prefix, 2) < 0 ||
+                    send_tcp_robust(client_fd, tcp_res, res_len) < 0) {
+                  free(tcp_res);
+                  close(client_fd);
+                  dec_tcp_clients();
+                  free(ctx_tcp);
+                  client_closed = true;
+                  break;
+                }
               } else {
                 submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>", 
                                     0, 0, 0, false, false);
@@ -9451,6 +9521,9 @@ static void perform_config_reload_ext(bool skip_unchanged) {
   
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
+    if (g_cli_port_override > 0) {
+      standby->port = g_cli_port_override;
+    }
     if (geteuid() == 0 && !standby->user) {
       syslog(LOG_ERR,
              "[Config] Reload rejected: running as root but new configuration has no 'user' directive in options{}.");
@@ -10785,6 +10858,13 @@ int main(int argc, char **argv) {
       } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
           config_file = argv[++i];
       } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+          const char *val = argv[++i];
+          if (isdigit((unsigned char)val[0])) {
+              g_cli_port_override = atoi(val);
+          } else {
+              cli_pid_file = val;
+          }
+      } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
           cli_pid_file = argv[++i];
       } else {
           config_file = argv[i];
@@ -10792,8 +10872,8 @@ int main(int argc, char **argv) {
   }
 
   if (!config_file) {
-    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-p <pid_file>] [-c <config_file> | <config_file>]\n", argv[0]);
-    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-p <pid_file>] [-c <config_file> | <config_file>]", argv[0]);
+    fprintf(stderr, "Usage: %s [-v | --version] [-f] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]\n", argv[0]);
+    syslog(LOG_ERR, "Usage: %s [-v | --version] [-f] [-p <port|pid_file>] [-P <pid_file>] [-c <config_file> | <config_file>]", argv[0]);
     return 1;
   }
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
@@ -10829,6 +10909,10 @@ int main(int argc, char **argv) {
     return 1;
   }
   free(config_str);
+
+  if (g_cli_port_override > 0) {
+    g_config_db.config_a.port = g_cli_port_override;
+  }
 
   if (!foreground) {
     daemonize();
@@ -11050,7 +11134,11 @@ int main(int argc, char **argv) {
       int status;
       dead = wait(&status);
       if (dead > 0) {
-        syslog(LOG_CRIT, "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, status);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+          syslog(LOG_NOTICE, "[Manager] Child process %d exited cleanly. Clean shutdown initiated.", dead);
+        } else {
+          syslog(LOG_CRIT, "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, status);
+        }
         break;
       }
       if (dead < 0 && errno == ECHILD) {

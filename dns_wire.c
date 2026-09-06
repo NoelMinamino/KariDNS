@@ -2670,7 +2670,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
         if (scan_offset >= req_len) break;
         bool is_opt = (i >= qdcount + ancount_req + nscount_req);
         
-        size_t name_start = scan_offset;
+        size_t rr_name_start = scan_offset;
         while (scan_offset < req_len) {
             uint8_t raw = req[scan_offset];
             uint8_t label_type = raw & 0xC0;
@@ -2685,7 +2685,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                 return -1;
             }
         }
-        size_t name_len = scan_offset - name_start;
+        size_t rr_name_len = scan_offset - rr_name_start;
         
         if (i < qdcount) {
             scan_offset += 4;
@@ -2701,7 +2701,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                 
                 if (!is_opt && rtype == 41) return -1; // RFC 6891 §6.1.1: OPT only allowed in Additional section
                 if (is_opt && rtype == 41) {
-                    if (name_len != 1 || req[name_start] != 0) return -1; // RFC 6891 §6.1.2: OPT owner MUST be 0 (root)
+                    if (rr_name_len != 1 || req[rr_name_start] != 0) return -1; // RFC 6891 §6.1.2: OPT owner MUST be 0 (root)
                     opt_rr_count++;
                     if (opt_rr_count > 1) return -1; // RFC 6891 §6.1.1: 複数OPT RRはFORMERR
                     edns->present = true;
