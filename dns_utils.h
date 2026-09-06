@@ -14,6 +14,8 @@
 #include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
+extern _Atomic bool g_capsicum_enabled;
 extern char g_startup_cwd[PATH_MAX];
 extern char g_workspace_root[PATH_MAX];
 

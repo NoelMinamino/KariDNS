@@ -807,7 +807,7 @@ typedef struct dir_fd_entry {
 } dir_fd_entry_t;
 static dir_fd_entry_t *g_dir_fd_table = NULL;
 static pthread_mutex_t g_dir_fd_lock = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic bool g_capsicum_enabled = false;
+// g_capsicum_enabled is defined in dns_utils.c and declared in dns_utils.h
 
 static bool split_path_for_openat(const char *path, char *dir_out,
                                   size_t dir_out_sz, char *base_out,

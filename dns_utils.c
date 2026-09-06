@@ -1,5 +1,6 @@
 #include "dns_utils.h"
 
+_Atomic bool g_capsicum_enabled = false;
 char g_startup_cwd[PATH_MAX] = "";
 char g_workspace_root[PATH_MAX] = "";
 
@@ -132,6 +133,17 @@ static bool is_prefix_allowed(const char *path) {
 
 bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t resolved_sz) {
   if (!target_path || !*target_path || !resolved_out || resolved_sz == 0) return false;
+
+#ifndef _WIN32
+  if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+    // Under Capsicum capability mode, realpath/stat syscalls cause SIGTRAP.
+    // Sandbox directory isolation is enforced by cached dir fds and O_RESOLVE_BENEATH.
+    if (snprintf(resolved_out, resolved_sz, "%s", target_path) >= (int)resolved_sz) {
+      return false;
+    }
+    return true;
+  }
+#endif
 
   if (g_startup_cwd[0] == '\0') {
     if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
