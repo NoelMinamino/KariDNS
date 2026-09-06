@@ -1159,12 +1159,12 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     } else if (strcmp(key, "program") == 0) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
-      if (tok.value[0] != '/') {
-        fprintf(stderr, "[Config Error] 'program' path must be an absolute path (starting with '/'): %s\n",
-                tok.value);
-        free(key); free_zone_config(zone); free_token(&tok); return -1;
+      char safe_prog[PATH_MAX];
+      if (is_path_safe_under_cwd(tok.value, safe_prog, sizeof(safe_prog))) {
+        zone->program_path = strdup(safe_prog);
+      } else {
+        zone->program_path = strdup(tok.value);
       }
-      zone->program_path = strdup(tok.value);
       free_token(&tok);
       if (!zone->program_path) { free(key); free_zone_config(zone); if (ctx) ctx->error_occurred = true; return -1; }
       tok = get_next_token(ctx);

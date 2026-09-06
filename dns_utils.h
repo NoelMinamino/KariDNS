@@ -11,6 +11,15 @@
 #define KARIDNS_VERSION "0.2.1"
 #endif
 
+#include <limits.h>
+#include <unistd.h>
+#include <sys/stat.h>
+extern char g_startup_cwd[PATH_MAX];
+extern char g_workspace_root[PATH_MAX];
+
+void init_workspace_root(void);
+bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t resolved_sz);
+
 uint16_t get_type_code(const char *type_str);
 char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);

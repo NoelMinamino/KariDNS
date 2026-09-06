@@ -1,5 +1,166 @@
 #include "dns_utils.h"
 
+char g_startup_cwd[PATH_MAX] = "";
+char g_workspace_root[PATH_MAX] = "";
+
+static bool is_forbidden_system_path(const char *path) {
+  if (!path) return true;
+  if (strcmp(path, "/etc/passwd") == 0 || strcmp(path, "/etc/shadow") == 0 ||
+      strcmp(path, "/etc/master.passwd") == 0 || strcmp(path, "/etc/pwd.db") == 0 ||
+      strcmp(path, "/etc/spwd.db") == 0 || strcmp(path, "/etc/sudoers") == 0 ||
+      strcmp(path, "/etc/group") == 0) {
+    return true;
+  }
+  if (strncmp(path, "/etc/ssl/private", 16) == 0 ||
+      strncmp(path, "/etc/ssh", 8) == 0 ||
+      strncmp(path, "/root", 5) == 0 ||
+      strncmp(path, "/boot", 5) == 0 ||
+      strncmp(path, "/dev", 4) == 0 ||
+      strncmp(path, "/sys", 4) == 0 ||
+      strncmp(path, "/proc", 5) == 0) {
+    return true;
+  }
+  return false;
+}
+
+void init_workspace_root(void) {
+  if (g_workspace_root[0] != '\0') return;
+  if (g_startup_cwd[0] == '\0') {
+    if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
+      g_startup_cwd[0] = '\0';
+      return;
+    }
+  }
+  char cur[PATH_MAX];
+  if (snprintf(cur, sizeof(cur), "%s", g_startup_cwd) >= (int)sizeof(cur)) {
+    return;
+  }
+  char best_root[PATH_MAX] = "";
+
+  // Walk up checking for project root markers (Makefile, .git, or karidns.conf.sample)
+  while (cur[0] != '\0' && strcmp(cur, "/") != 0) {
+    char check_path[PATH_MAX];
+    struct stat st;
+    bool is_root = false;
+    snprintf(check_path, sizeof(check_path), "%s/Makefile", cur);
+    if (stat(check_path, &st) == 0) is_root = true;
+    if (!is_root) {
+      snprintf(check_path, sizeof(check_path), "%s/.git", cur);
+      if (stat(check_path, &st) == 0) is_root = true;
+    }
+    if (!is_root) {
+      snprintf(check_path, sizeof(check_path), "%s/karidns.conf.sample", cur);
+      if (stat(check_path, &st) == 0) is_root = true;
+    }
+    if (is_root) {
+      snprintf(best_root, sizeof(best_root), "%s", cur);
+      break;
+    }
+    char *slash = strrchr(cur, '/');
+    if (!slash || slash == cur) break;
+    *slash = '\0';
+  }
+  if (best_root[0] != '\0') {
+    snprintf(g_workspace_root, sizeof(g_workspace_root), "%s", best_root);
+  } else {
+    snprintf(g_workspace_root, sizeof(g_workspace_root), "%s", g_startup_cwd);
+  }
+}
+
+static bool is_prefix_allowed(const char *path) {
+  if (!path || !*path) return false;
+  if (is_forbidden_system_path(path)) {
+    return false;
+  }
+  init_workspace_root();
+  if (g_workspace_root[0] != '\0') {
+    size_t base_len = strlen(g_workspace_root);
+    if (strncmp(path, g_workspace_root, base_len) == 0 &&
+        (path[base_len] == '\0' || path[base_len] == '/')) {
+      return true;
+    }
+  }
+  if (g_startup_cwd[0] != '\0') {
+    size_t base_len = strlen(g_startup_cwd);
+    if (strncmp(path, g_startup_cwd, base_len) == 0 &&
+        (path[base_len] == '\0' || path[base_len] == '/')) {
+      return true;
+    }
+  }
+  if (strncmp(path, "/tmp/", 5) == 0 || strcmp(path, "/tmp") == 0 ||
+      strncmp(path, "/var/", 5) == 0 || strcmp(path, "/var") == 0 ||
+      strncmp(path, "/usr/local/", 11) == 0 || strcmp(path, "/usr/local") == 0 ||
+      strncmp(path, "/etc/karidns/", 13) == 0 || strcmp(path, "/etc/karidns") == 0 ||
+      strncmp(path, "/etc/named/", 11) == 0 || strcmp(path, "/etc/named") == 0) {
+    return true;
+  }
+  return false;
+}
+
+bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t resolved_sz) {
+  if (!target_path || !*target_path || !resolved_out || resolved_sz == 0) return false;
+
+  if (g_startup_cwd[0] == '\0') {
+    if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
+      g_startup_cwd[0] = '\0';
+    }
+  }
+
+  char combined[PATH_MAX];
+  if (target_path[0] == '/') {
+    if (snprintf(combined, sizeof(combined), "%s", target_path) >= (int)sizeof(combined)) {
+      return false;
+    }
+  } else {
+    if (g_startup_cwd[0] == '\0') return false;
+    if (snprintf(combined, sizeof(combined), "%s/%s", g_startup_cwd, target_path) >= (int)sizeof(combined)) {
+      return false;
+    }
+  }
+
+  // 1. 既存ファイルの場合は realpath でシンボリックリンクや ../ を完全に解決・正規化
+  char real_buf[PATH_MAX];
+  if (realpath(combined, real_buf) != NULL) {
+    if (!is_prefix_allowed(real_buf)) {
+      return false; // ベース外への脱出を検知
+    }
+    if (snprintf(resolved_out, resolved_sz, "%s", real_buf) >= (int)resolved_sz) {
+      return false;
+    }
+    return true;
+  }
+
+  // 2. ファイルがまだ存在しない場合（新規作成ログファイル等）のフォールバック
+  const char *slash = strrchr(combined, '/');
+  if (slash) {
+    char dirbuf[PATH_MAX];
+    size_t dlen = (size_t)(slash - combined);
+    if (dlen == 0) dlen = 1;
+    if (dlen < sizeof(dirbuf)) {
+      memcpy(dirbuf, combined, dlen);
+      dirbuf[dlen] = '\0';
+      char resolved_dir[PATH_MAX];
+      if (realpath(dirbuf, resolved_dir) != NULL) {
+        if (is_prefix_allowed(resolved_dir)) {
+          if (snprintf(resolved_out, resolved_sz, "%s/%s", resolved_dir, slash + 1) >= (int)resolved_sz) {
+            return false;
+          }
+          return true;
+        }
+      }
+    }
+  }
+
+  if (is_prefix_allowed(combined)) {
+    if (snprintf(resolved_out, resolved_sz, "%s", combined) >= (int)resolved_sz) {
+      return false;
+    }
+    return true;
+  }
+
+  return false;
+}
+
 uint16_t get_type_code(const char *type_str) {
   if (!type_str)
     return 0;
