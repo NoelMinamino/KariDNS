@@ -8831,7 +8831,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
                 }
                 if (idx != -1) {
                     for (int m = 0; m < mq_count; m++) {
-                        if (spec->qo.custom_edns_opts[idx].len + 2 <= sizeof(spec->qo.custom_edns_opts[idx].data)) {
+                        if ((size_t)spec->qo.custom_edns_opts[idx].len + 2 <= sizeof(spec->qo.custom_edns_opts[idx].data)) {
                             size_t cur_len = spec->qo.custom_edns_opts[idx].len;
                             spec->qo.custom_edns_opts[idx].data[cur_len] = (uint8_t)(mqtypes[m] >> 8);
                             spec->qo.custom_edns_opts[idx].data[cur_len + 1] = (uint8_t)(mqtypes[m] & 0xFF);

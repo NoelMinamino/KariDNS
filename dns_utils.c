@@ -23,6 +23,20 @@ static bool is_forbidden_system_path(const char *path) {
   return false;
 }
 
+static char *karidns_realpath(const char *path, char *resolved) {
+#ifdef _WIN32
+  if (!path || !resolved) return NULL;
+  char *res = _fullpath(resolved, path, PATH_MAX);
+  if (!res) return NULL;
+  for (char *p = resolved; *p; p++) {
+    if (*p == '\\') *p = '/';
+  }
+  return resolved;
+#else
+  return realpath(path, resolved);
+#endif
+}
+
 void init_workspace_root(void) {
   if (g_workspace_root[0] != '\0') return;
   if (g_startup_cwd[0] == '\0') {
@@ -31,6 +45,11 @@ void init_workspace_root(void) {
       return;
     }
   }
+#ifdef _WIN32
+  for (char *p = g_startup_cwd; *p; p++) {
+    if (*p == '\\') *p = '/';
+  }
+#endif
   char cur[PATH_MAX];
   if (snprintf(cur, sizeof(cur), "%s", g_startup_cwd) >= (int)sizeof(cur)) {
     return;
@@ -39,6 +58,12 @@ void init_workspace_root(void) {
 
   // Walk up checking for project root markers (Makefile, .git, or karidns.conf.sample)
   while (cur[0] != '\0' && strcmp(cur, "/") != 0) {
+#ifdef _WIN32
+    if ((strlen(cur) == 2 && cur[1] == ':') ||
+        (strlen(cur) == 3 && cur[1] == ':' && (cur[2] == '/' || cur[2] == '\\'))) {
+      break;
+    }
+#endif
     char check_path[PATH_MAX];
     struct stat st;
     bool is_root = false;
@@ -57,6 +82,9 @@ void init_workspace_root(void) {
       break;
     }
     char *slash = strrchr(cur, '/');
+#ifdef _WIN32
+    if (!slash) slash = strrchr(cur, '\\');
+#endif
     if (!slash || slash == cur) break;
     *slash = '\0';
   }
@@ -65,6 +93,11 @@ void init_workspace_root(void) {
   } else {
     snprintf(g_workspace_root, sizeof(g_workspace_root), "%s", g_startup_cwd);
   }
+#ifdef _WIN32
+  for (char *p = g_workspace_root; *p; p++) {
+    if (*p == '\\') *p = '/';
+  }
+#endif
 }
 
 static bool is_prefix_allowed(const char *path) {
@@ -76,14 +109,14 @@ static bool is_prefix_allowed(const char *path) {
   if (g_workspace_root[0] != '\0') {
     size_t base_len = strlen(g_workspace_root);
     if (strncmp(path, g_workspace_root, base_len) == 0 &&
-        (path[base_len] == '\0' || path[base_len] == '/')) {
+        (path[base_len] == '\0' || path[base_len] == '/' || path[base_len] == '\\')) {
       return true;
     }
   }
   if (g_startup_cwd[0] != '\0') {
     size_t base_len = strlen(g_startup_cwd);
     if (strncmp(path, g_startup_cwd, base_len) == 0 &&
-        (path[base_len] == '\0' || path[base_len] == '/')) {
+        (path[base_len] == '\0' || path[base_len] == '/' || path[base_len] == '\\')) {
       return true;
     }
   }
@@ -104,10 +137,22 @@ bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t 
     if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
       g_startup_cwd[0] = '\0';
     }
+#ifdef _WIN32
+    for (char *p = g_startup_cwd; *p; p++) {
+      if (*p == '\\') *p = '/';
+    }
+#endif
   }
 
   char combined[PATH_MAX];
-  if (target_path[0] == '/') {
+  bool is_abs = (target_path[0] == '/' || target_path[0] == '\\');
+#ifdef _WIN32
+  if (((target_path[0] >= 'a' && target_path[0] <= 'z') ||
+       (target_path[0] >= 'A' && target_path[0] <= 'Z')) && target_path[1] == ':') {
+    is_abs = true;
+  }
+#endif
+  if (is_abs) {
     if (snprintf(combined, sizeof(combined), "%s", target_path) >= (int)sizeof(combined)) {
       return false;
     }
@@ -117,10 +162,15 @@ bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t 
       return false;
     }
   }
+#ifdef _WIN32
+  for (char *p = combined; *p; p++) {
+    if (*p == '\\') *p = '/';
+  }
+#endif
 
-  // 1. 既存ファイルの場合は realpath でシンボリックリンクや ../ を完全に解決・正規化
+  // 1. 既存ファイルの場合は karidns_realpath でシンボリックリンクや ../ を完全に解決・正規化
   char real_buf[PATH_MAX];
-  if (realpath(combined, real_buf) != NULL) {
+  if (karidns_realpath(combined, real_buf) != NULL) {
     if (!is_prefix_allowed(real_buf)) {
       return false; // ベース外への脱出を検知
     }
@@ -132,6 +182,9 @@ bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t 
 
   // 2. ファイルがまだ存在しない場合（新規作成ログファイル等）のフォールバック
   const char *slash = strrchr(combined, '/');
+#ifdef _WIN32
+  if (!slash) slash = strrchr(combined, '\\');
+#endif
   if (slash) {
     char dirbuf[PATH_MAX];
     size_t dlen = (size_t)(slash - combined);
@@ -140,7 +193,7 @@ bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t 
       memcpy(dirbuf, combined, dlen);
       dirbuf[dlen] = '\0';
       char resolved_dir[PATH_MAX];
-      if (realpath(dirbuf, resolved_dir) != NULL) {
+      if (karidns_realpath(dirbuf, resolved_dir) != NULL) {
         if (is_prefix_allowed(resolved_dir)) {
           if (snprintf(resolved_out, resolved_sz, "%s/%s", resolved_dir, slash + 1) >= (int)resolved_sz) {
             return false;
