@@ -553,6 +553,7 @@ if command -v perl >/dev/null 2>&1; then
     register_parallel_check "EDE & Truncation: Full EDE 0-29 and UDP TC fallback (tests/run_dag_ede_truncation_regression_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_ede_truncation_regression_test.sh\"" "ALL DAG EDE & TRUNCATION TESTS PASSED"
     register_parallel_check "Audit: Audit findings P2-1, P3-1, P3-2, P3-4, P4-1 (tests/run_dag_audit_improvements_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_audit_improvements_test.sh\"" "ALL (DAG )?AUDIT IMPROVEMENT TESTS PASSED"
     register_parallel_check "Security: APL afdlength stack-overflow regression (tests/run_dag_apl_afdlength_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_apl_afdlength_overflow_test.sh\"" "PASS: APL afdlength overflow regression test"
+    register_parallel_check "Security: +trace CNAME deep recursion stack safety (tests/run_dag_trace_deep_cname_stack_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_deep_cname_stack_test.sh\"" "ALL TRACE DEEP CNAME STACK TESTS PASSED"
     register_parallel_check "Semantic: Structured RR Differential & Semantic Oracle (tests/run_dag_rr_differential_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_rr_differential_test.sh\"" "PASS: RR Differential test suite passed successfully\."
 fi
 register_parallel_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
