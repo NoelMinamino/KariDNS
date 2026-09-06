@@ -1065,5 +1065,9 @@ int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context
         linenum++;
     }
 
+    for (size_t i = 0; i < arena->count; i++) {
+        dns_record_preparse_cache(arena, &arena->records[i]);
+    }
+
     return (int)arena->count;
 }

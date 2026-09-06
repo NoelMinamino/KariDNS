@@ -97,6 +97,19 @@ int build_zone_index(zone_arena_t *arena);
 bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);
+
+#define FNV1A_WILDCARD_PREFIX_HASH 0x23de6ae9u
+
+static inline uint32_t calc_fnv1a_continue(uint32_t hash, const char *str) {
+    for (const char *p = str; *p; p++) {
+        uint8_t c = (uint8_t)*p;
+        if (c >= 'A' && c <= 'Z')
+            c |= 0x20;
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    return hash;
+}
 int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);
 void free_ecs_tags_array(ecs_tag_def_t *tags, int count);

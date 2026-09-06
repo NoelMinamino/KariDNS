@@ -4103,6 +4103,7 @@ static void collect_additional_rr_glue(dns_record_t *rec,
 }
 
 static bool find_delegation(zone_arena_t *current_zone, const char *qname,
+                            uint32_t qname_hash,
                             const char *zone_apex, uint8_t *res,
                             size_t max_res_len, uint16_t *offset,
                             compress_ctx_t *comp_ctx, uint16_t *nscount,
@@ -4126,7 +4127,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
         name++;
       continue;
     }
-    uint32_t hash = calc_fnv1a_str(name);
+    uint32_t hash = (name == qname) ? qname_hash : calc_fnv1a_str(name);
     size_t idx = hash & (current_zone->hash_size - 1);
     bool delegated = false;
     for (int i = current_zone->hash_table[idx]; i != -1;
@@ -4310,6 +4311,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
   current_qname[255] = '\0';
+  size_t current_qname_len = strlen(current_qname);
+  uint32_t current_qname_hash = calc_fnv1a_str(current_qname);
   const char *glue_targets[16];
   int glue_target_count = 0;
   memset(glue_targets, 0, sizeof(glue_targets));
@@ -4322,6 +4325,10 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
       res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
       return;
     }
+
+    uint32_t apex_hash = 0;
+    size_t apex_idx = 0;
+    bool apex_hash_computed = false;
 
     time_t tinydns_now = 0;
     if (current_zone->is_tinydns_format) {
@@ -4340,13 +4347,13 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     // ==== フェーズ1: 委任判定 ====
     additional_from_auth_t policy = cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES;
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
-    if (find_delegation(current_zone, current_qname, db_entry->domain, res,
+    if (find_delegation(current_zone, current_qname, current_qname_hash, db_entry->domain, res,
                         max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, view))
       return;
       
     // ==== フェーズ2: QNAME完全一致検索 ====
     bool found = false, type_matched = false, cname_followed = false;
-    uint32_t hash = calc_fnv1a_str(current_qname);
+    uint32_t hash = current_qname_hash;
     size_t idx = hash & (current_zone->hash_size - 1);
     bool has_any = (qtypes[0] == 255);
     if (has_any && minimal_any) {
@@ -4417,6 +4424,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           if (rec->rdata_count > 0) {
             strncpy(current_qname, rec->rdata[0], sizeof(current_qname));
             current_qname[255] = '\0';
+            current_qname_len = strlen(current_qname);
+            current_qname_hash = calc_fnv1a_str(current_qname);
             cname_followed = true;
           }
           break;
@@ -4487,6 +4496,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             (*ancount)++;
             strncpy(current_qname, synth_name, sizeof(current_qname));
             current_qname[255] = '\0';
+            current_qname_len = (size_t)written;
+            current_qname_hash = calc_fnv1a_str(current_qname);
             cname_followed = true; found = true; break;
           }
         }
@@ -4502,80 +4513,85 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         while ((parent = strchr_unescaped(parent, '.')) != NULL) {
           parent++;
           if (*parent == '\0') break;
-          size_t parent_len = strlen(parent);
+          size_t parent_len = current_qname_len - (size_t)(parent - current_qname);
           if (parent_len + 3 > sizeof(wc_name)) break;
-          memcpy(&wc_name[2], parent, parent_len + 1);
-          uint32_t wc_hash = calc_fnv1a_str(wc_name);
-        size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
-        bool wc_found = false;
-        for (int i = current_zone->hash_table[wc_idx]; i != -1;
-             i = current_zone->records[i].next_record) {
-          dns_record_t *rec = &current_zone->records[i];
-          if (strcasecmp(rec->name, wc_name) == 0) {
-            uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-            found = true;
-            wc_found = true;
-            uint16_t rec_type = rec->type_code;
-            bool follow_cname = false;
-            if (rec_type == 5) {
-              if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
-            }
-            dns_record_t rec_copy = *rec;
-            rec_copy.ttl_value = eff_ttl;
-            if (follow_cname) {
-              if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
-                                       current_qname, 0xFFFFFFFF) < 0) {
-                res[2] |= 0x02;
-                return;
-              } else
-                (*ancount)++;
-              if (dnssec_ok) {
-                if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, 5,
-                                          res, max_res_len, offset, comp_ctx, ancount)) {
-                  res[2] |= 0x02;
-                  return;
+          uint32_t wc_hash = calc_fnv1a_continue(FNV1A_WILDCARD_PREFIX_HASH, parent);
+          size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
+          bool wc_found = false;
+          if (current_zone->hash_table[wc_idx] != -1) {
+            memcpy(&wc_name[2], parent, parent_len + 1);
+            for (int i = current_zone->hash_table[wc_idx]; i != -1;
+                 i = current_zone->records[i].next_record) {
+              dns_record_t *rec = &current_zone->records[i];
+              if (strcasecmp(rec->name, wc_name) == 0) {
+                uint32_t eff_ttl;
+                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+                found = true;
+                wc_found = true;
+                uint16_t rec_type = rec->type_code;
+                bool follow_cname = false;
+                if (rec_type == 5) {
+                  if (qtypes[0] != 5 && qtypes[0] != 255) { follow_cname = true; }
                 }
-              }
-              if (rec->rdata_count > 0) {
-                strncpy(current_qname, rec->rdata[0], sizeof(current_qname));
-                current_qname[255] = '\0';
-                cname_followed = true;
-              }
-              break;
-            } else {
-              if (qtypes[0] == 255 || qtypes[0] == rec_type) {
-                type_matched = true;
-                if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
-                                         current_qname, 0xFFFFFFFF) < 0) {
-                  res[2] |= 0x02;
-                  return;
-                } else
-                  (*ancount)++;
-                collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-                if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
-                  if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
-                                            res, max_res_len, offset, comp_ctx, ancount)) {
+                dns_record_t rec_copy = *rec;
+                rec_copy.ttl_value = eff_ttl;
+                if (follow_cname) {
+                  if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
+                                           current_qname, 0xFFFFFFFF) < 0) {
                     res[2] |= 0x02;
                     return;
+                  } else
+                    (*ancount)++;
+                  if (dnssec_ok) {
+                    if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, 5,
+                                              res, max_res_len, offset, comp_ctx, ancount)) {
+                      res[2] |= 0x02;
+                      return;
+                    }
+                  }
+                  if (rec->rdata_count > 0) {
+                    strncpy(current_qname, rec->rdata[0], sizeof(current_qname));
+                    current_qname[255] = '\0';
+                    current_qname_len = strlen(current_qname);
+                    current_qname_hash = calc_fnv1a_str(current_qname);
+                    cname_followed = true;
+                  }
+                  break;
+                } else {
+                  if (qtypes[0] == 255 || qtypes[0] == rec_type) {
+                    type_matched = true;
+                    if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
+                                             current_qname, 0xFFFFFFFF) < 0) {
+                      res[2] |= 0x02;
+                      return;
+                    } else
+                      (*ancount)++;
+                    collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
+                    if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
+                      if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
+                                                res, max_res_len, offset, comp_ctx, ancount)) {
+                        res[2] |= 0x02;
+                        return;
+                      }
+                    }
                   }
                 }
               }
             }
           }
-        }
-        if (wc_found)
-          break;
+          if (wc_found)
+            break;
 
-        if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag, client_loc_tag))
-          break;
+          // ★重要: RFC 4592 準拠 (親存在チェック)
+          if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag, client_loc_tag))
+            break;
         }
       }
     }
     
     // ==== フェーズ5: CNAMEチェーン処理・クロスゾーン切り替え ====
     if (cname_followed) {
-      size_t cq_len = strlen(current_qname), z_len = strlen(db_entry->domain);
+      size_t cq_len = current_qname_len, z_len = strlen(db_entry->domain);
       bool in_zone = false;
       if (cq_len >= z_len &&
           strcasecmp(current_qname + cq_len - z_len, db_entry->domain) == 0 &&
@@ -4612,7 +4628,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     bool all_matched = type_matched;
     uint32_t included_mask = 0;
     if (found && num_qtypes > 1) {
-      uint32_t final_hash = calc_fnv1a_str(current_qname);
+      uint32_t final_hash = current_qname_hash;
       size_t final_idx = final_hash & (current_zone->hash_size - 1);
       for (int j = 1; j < num_qtypes; j++) {
         uint16_t qtx = qtypes[j];
@@ -4648,34 +4664,37 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           wc_name[0] = '*'; wc_name[1] = '.';
           while ((parent = strchr_unescaped(parent, '.')) != NULL) {
             parent++; if (*parent == '\0') break;
-            size_t parent_len = strlen(parent);
+            size_t parent_len = current_qname_len - (size_t)(parent - current_qname);
             if (parent_len + 3 > sizeof(wc_name)) break;
-            memcpy(&wc_name[2], parent, parent_len + 1);
-            uint32_t wc_hash = calc_fnv1a_str(wc_name);
+            uint32_t wc_hash = calc_fnv1a_continue(FNV1A_WILDCARD_PREFIX_HASH, parent);
             size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
             bool wc_found = false;
-            for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
-              dns_record_t *rec = &current_zone->records[i];
-              if (strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
-                uint32_t eff_ttl;
-                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-                wc_found = true; qtx_matched = true;
-                dns_record_t rec_copy = *rec;
-                rec_copy.ttl_value = eff_ttl;
-                if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
-                  this_qtx_failed = true; break;
-                }
-                (*ancount)++;
-                collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-                if (dnssec_ok && qtx != 46) {
-                  if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
+            if (current_zone->hash_table[wc_idx] != -1) {
+              memcpy(&wc_name[2], parent, parent_len + 1);
+              for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
+                dns_record_t *rec = &current_zone->records[i];
+                if (strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
+                  uint32_t eff_ttl;
+                  if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+                  wc_found = true; qtx_matched = true;
+                  dns_record_t rec_copy = *rec;
+                  rec_copy.ttl_value = eff_ttl;
+                  if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
                     this_qtx_failed = true; break;
+                  }
+                  (*ancount)++;
+                  collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
+                  if (dnssec_ok && qtx != 46) {
+                    if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
+                      this_qtx_failed = true; break;
+                    }
                   }
                 }
               }
             }
             if (wc_found || this_qtx_failed) break;
 
+            // ★重要: RFC 4592 準拠 (親存在チェック)
             if (name_exists_in_zone(current_zone, parent, client_loc, client_ecs_tag, client_loc_tag))
               break;
           }
@@ -4699,8 +4718,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         res[3] = (res[3] & 0xF0) | 3;
       else
         res[3] &= 0xF0;
-      uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
-      size_t apex_idx = apex_hash & (current_zone->hash_size - 1);
+      if (!apex_hash_computed) {
+        apex_hash = calc_fnv1a_str(db_entry->domain);
+        apex_idx = apex_hash & (current_zone->hash_size - 1);
+        apex_hash_computed = true;
+      }
       for (int i = current_zone->hash_table[apex_idx]; i != -1;
            i = current_zone->records[i].next_record) {
         dns_record_t *rec = &current_zone->records[i];
@@ -4812,8 +4834,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     bool needs_ns = false;
     if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
     if (type_matched && !minimal_responses && needs_ns) {
-      uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
-      size_t apex_idx = apex_hash & (current_zone->hash_size - 1);
+      if (!apex_hash_computed) {
+        apex_hash = calc_fnv1a_str(db_entry->domain);
+        apex_idx = apex_hash & (current_zone->hash_size - 1);
+        apex_hash_computed = true;
+      }
       for (int i = current_zone->hash_table[apex_idx]; i != -1;
            i = current_zone->records[i].next_record) {
         dns_record_t *rec = &current_zone->records[i];
@@ -9872,6 +9897,7 @@ static void setup_ipc_tables(int num_workers) {
 }
 
 int main(int argc, char **argv) {
+  assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   arc4random_buf(g_server_cookie_secret, sizeof(g_server_cookie_secret));
   arc4random_buf(g_rrl_hash_key, sizeof(g_rrl_hash_key));
   // SipHash-2-4 self-test against official reference test vector

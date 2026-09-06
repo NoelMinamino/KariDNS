@@ -28,6 +28,7 @@ static void unescape_string_in_place(char *str) {
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <assert.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -1510,6 +1511,7 @@ static int cmp_canonical_name_ptr(const void *a, const void *b) {
 }
 
 int build_zone_index(zone_arena_t *arena) {
+  assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   if (arena->hash_table) {
     free(arena->hash_table);
     arena->hash_table = NULL;

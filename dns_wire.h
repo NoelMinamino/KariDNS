@@ -133,6 +133,9 @@ typedef struct {
     char *ecs_subnet_tag;       /* NULL = タグなし(常に表示)。arena確保文字列 */
     char *bind_location_tag;    /* NULL = タグなし(常に表示)。arena確保文字列 ($LOCATION用) */
     
+    uint8_t *name_wire;         /* 事前構築オーナー名ワイヤー列 (NULL可) */
+    uint16_t name_wire_len;
+    
     bool is_cached;
     union {
         struct {
@@ -144,15 +147,22 @@ typedef struct {
         struct {
             char *mname;
             char *rname;
+            uint8_t *mname_wire;
+            uint16_t mname_wire_len;
+            uint8_t *rname_wire;
+            uint16_t rname_wire_len;
             uint32_t serial;
             uint32_t refresh;
             uint32_t retry;
             uint32_t expire;
             uint32_t minimum;
+            uint8_t numbers_wire[20];
         } soa;
         struct {
             uint16_t pref;
             char *target;
+            uint8_t *target_wire;
+            uint16_t target_wire_len;
         } mx;
         struct {
             uint16_t type_covered;
@@ -171,7 +181,17 @@ typedef struct {
             uint16_t weight;
             uint16_t port;
             char *target;
+            uint8_t *target_wire;
+            uint16_t target_wire_len;
         } srv;
+        struct {
+            uint8_t *wire_data;
+            uint16_t wire_len;
+        } txt; // TXT, SPF, AVC
+        struct {
+            uint8_t *wire_name;
+            uint16_t wire_name_len;
+        } name; // NS, PTR, CNAME, DNAME, MD, MF, MB, MG, MR, NSAP-PTR
     } cache;
 } dns_record_t;
 
