@@ -1,3 +1,4 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 
@@ -891,6 +892,35 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         memcpy(mac_out, mac, mac_size);
     }
     return 0;
+}
+
+bool packet_has_tsig(const uint8_t *packet, size_t packet_len) {
+    if (!packet || packet_len < DNS_HEADER_SIZE) return false;
+    uint16_t arcount = (packet[10] << 8) | packet[11];
+    if (arcount == 0) return false;
+    size_t offset = DNS_HEADER_SIZE;
+    uint16_t qdcount = (packet[4] << 8) | packet[5];
+    uint16_t ancount = (packet[6] << 8) | packet[7];
+    uint16_t nscount = (packet[8] << 8) | packet[9];
+    for (int i = 0; i < qdcount; i++) {
+        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
+        offset += 4;
+    }
+    size_t last_rr_offset = 0;
+    for (int i = 0; i < ancount + nscount + arcount; i++) {
+        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
+        if (offset >= packet_len) return false;
+        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
+        if (offset + 10 > packet_len) return false;
+        uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
+        offset += 10 + rdlen;
+    }
+    if (last_rr_offset == 0 || offset > packet_len) return false;
+    size_t tsig_p = last_rr_offset;
+    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return false;
+    if (tsig_p + 10 > packet_len) return false;
+    uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p + 1];
+    return (type == 250);
 }
 
 // ============================================================================
@@ -2800,8 +2830,9 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     uint16_t keepalive_val = 0;
     bool include_keepalive = false;
     if (is_tcp && edns && edns->has_keepalive_query && cfg && cfg->tcp_connection_reuse) {
-        int timeout_sec = cfg->tcp_idle_timeout > 0 ? (int)(cfg->tcp_idle_timeout / 1000) : 10;
-        keepalive_val = (uint16_t)(timeout_sec * 10);
+        uint32_t ms = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
+        keepalive_val = (uint16_t)(ms / 100);
+        if (keepalive_val == 0) keepalive_val = 1;
         include_keepalive = true;
         rdlen += 4 + 2;
     }
@@ -2811,7 +2842,7 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
 
     uint8_t ecs_addr_bytes = 0;
     if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {
-        ecs_addr_bytes = (edns->ecs_source_prefix + 7) / 8;
+        ecs_addr_bytes = (edns->ecs_scope_prefix + 7) / 8;
         if (edns->ecs_family == 1 && ecs_addr_bytes > 4) ecs_addr_bytes = 4;
         else if (edns->ecs_family == 2 && ecs_addr_bytes > 16) ecs_addr_bytes = 16;
         else if (edns->ecs_family != 1 && edns->ecs_family != 2) ecs_addr_bytes = 0;
@@ -3099,6 +3130,22 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 }
             }
             if (found_exact) continue; // no-op
+
+            // CNAME exclusivity check (RFC 2136 §3.4.2.3 / RFC 1034 §3.6.2)
+            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
+                if (!standby->records[k].name) continue;
+                if (strcasecmp(standby->records[k].name, parsed_rec.name) == 0) {
+                    if (parsed_rec.type_code == 5 /* CNAME */) {
+                        if (standby->records[k].type_code != 46 && standby->records[k].type_code != 47) {
+                            return 5; // REFUSED: CNAME cannot coexist with other types
+                        }
+                    } else if (parsed_rec.type_code != 46 && parsed_rec.type_code != 47) {
+                        if (standby->records[k].type_code == 5 /* CNAME */) {
+                            return 5; // REFUSED: Cannot add record to name with existing CNAME
+                        }
+                    }
+                }
+            }
 
             if (standby->count >= standby->records_cap) {
                 size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;

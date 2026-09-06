@@ -315,6 +315,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
                        bool is_subsequent,
                        uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
                        size_t *mac_len_out);
+bool packet_has_tsig(const uint8_t *packet, size_t packet_len);
 
 // SIG(0) & DNSKEY Tag
 uint16_t compute_dnskey_tag(const uint8_t *rdata, size_t rdlen);

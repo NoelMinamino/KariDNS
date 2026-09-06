@@ -1,3 +1,4 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"
@@ -200,6 +201,7 @@ typedef struct {
   char client_ip[INET6_ADDRSTRLEN];
   struct sockaddr_storage client_addr;
   socklen_t client_len;
+  bool quota_yield;
 } tcp_stream_ctx_t;
 
 typedef struct {
@@ -654,13 +656,17 @@ static inline void dec_tcp_clients(void) {
 
 // Broker
 static int g_broker_sock = -1;
+static pid_t g_broker_pid = -1;
 static void start_connect_broker(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
     return;
   pid_t pid = fork();
-  if (pid < 0)
+  if (pid < 0) {
+    close(sv[0]);
+    close(sv[1]);
     return;
+  }
   if (pid == 0) {
     close(sv[0]);
     struct {
@@ -704,10 +710,12 @@ static void start_connect_broker(void) {
         sendmsg(sv[1], &msg, 0);
       }
     }
+    close(sv[1]);
     exit(0);
   }
   close(sv[1]);
   g_broker_sock = sv[0];
+  g_broker_pid = pid;
   cap_rights_t broker_rights;
   cap_rights_init(&broker_rights, CAP_SEND, CAP_RECV, CAP_EVENT, CAP_FCNTL);
   cap_rights_limit(g_broker_sock, &broker_rights);
@@ -790,6 +798,8 @@ static bool split_path_for_openat(const char *path, char *dir_out,
                                   size_t dir_out_sz, char *base_out,
                                   size_t base_out_sz) {
   if (!path || !*path)
+    return false;
+  if (strstr(path, "../") != NULL || strstr(path, "/..") != NULL || strcmp(path, "..") == 0)
     return false;
   size_t plen = strlen(path);
   if (plen >= PATH_MAX)
@@ -3508,10 +3518,6 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           }
         }
       } else if (session->soa_count == 2 && session->is_ixfr) {
-        standby->count = 0;
-        standby->data_pool_count = 0;
-        standby->current_pool_cap = 0;
-        standby->current_pool_idx = 0;
         clone_zone_arena(active, standby);
         session->is_deleting = true;
       } else if (session->is_ixfr && session->is_deleting) {
@@ -3577,37 +3583,75 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
     prior_mac_len = req_mac_len;
   }
   bool is_subsequent = false;
+  uint8_t *unsigned_msgs = NULL;
+  size_t unsigned_msgs_len = 0;
+  size_t unsigned_msgs_cap = 0;
 
   while (1) {
     int ret = read_dns_tcp_message(tcp_fd, stream_ctx, &msg, &msg_len);
     if (ret < 0 || ret == 0) {
+      if (unsigned_msgs) free(unsigned_msgs);
       zone_arena_destroy(&tmp_arena);
       return -1;
     }
     if (tsig_key) {
-      uint8_t current_mac[64];
-      size_t current_mac_len = 0;
-      if (tsig_verify_packet(msg, msg_len, tsig_key,
-                             prior_mac_len > 0 ? prior_mac : NULL, prior_mac_len,
-                             NULL, 0,
-                             is_subsequent,
-                             current_mac, &current_mac_len) != 0) {
-        syslog(LOG_ERR, "[AXFR] TSIG failed");
-        zone_arena_destroy(&tmp_arena);
-        return -1;
-      }
-      if (current_mac_len > 0 && current_mac_len <= sizeof(prior_mac)) {
-        memcpy(prior_mac, current_mac, current_mac_len);
-        prior_mac_len = current_mac_len;
-        is_subsequent = true;
+      bool has_tsig = packet_has_tsig(msg, msg_len);
+      if (!has_tsig) {
+        if (!is_subsequent) {
+          syslog(LOG_ERR, "[AXFR] First message missing TSIG");
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          return -1;
+        }
+        if (unsigned_msgs_len + msg_len > unsigned_msgs_cap) {
+          size_t new_cap = unsigned_msgs_cap == 0 ? 65536 : unsigned_msgs_cap * 2;
+          while (new_cap < unsigned_msgs_len + msg_len) new_cap *= 2;
+          uint8_t *new_buf = realloc(unsigned_msgs, new_cap);
+          if (!new_buf) {
+            if (unsigned_msgs) free(unsigned_msgs);
+            zone_arena_destroy(&tmp_arena);
+            return -1;
+          }
+          unsigned_msgs = new_buf;
+          unsigned_msgs_cap = new_cap;
+        }
+        memcpy(unsigned_msgs + unsigned_msgs_len, msg, msg_len);
+        unsigned_msgs_len += msg_len;
+      } else {
+        uint8_t current_mac[64];
+        size_t current_mac_len = 0;
+        if (tsig_verify_packet(msg, msg_len, tsig_key,
+                               prior_mac_len > 0 ? prior_mac : NULL, prior_mac_len,
+                               unsigned_msgs_len > 0 ? unsigned_msgs : NULL, unsigned_msgs_len,
+                               is_subsequent,
+                               current_mac, &current_mac_len) != 0) {
+          syslog(LOG_ERR, "[AXFR] TSIG failed");
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          return -1;
+        }
+        unsigned_msgs_len = 0;
+        if (current_mac_len > 0 && current_mac_len <= sizeof(prior_mac)) {
+          memcpy(prior_mac, current_mac, current_mac_len);
+          prior_mac_len = current_mac_len;
+          is_subsequent = true;
+        }
       }
     }
     if (parse_xfr_packet(msg, msg_len, &tmp_arena, active, session,
                          entry->domain) != 0) {
+      if (unsigned_msgs) free(unsigned_msgs);
       zone_arena_destroy(&tmp_arena);
       return -1;
     }
     if (session->is_finished) {
+      if (tsig_key && unsigned_msgs_len > 0) {
+        syslog(LOG_ERR, "[AXFR] Final message unsigned or intermediate TSIG missing");
+        if (unsigned_msgs) free(unsigned_msgs);
+        zone_arena_destroy(&tmp_arena);
+        return -1;
+      }
+      if (unsigned_msgs) { free(unsigned_msgs); unsigned_msgs = NULL; }
       if (tmp_arena.count > 0) {
         uint32_t serial = 0, refresh = 0, retry = 0, expire = 0;
         bool has_soa = false;
@@ -3643,6 +3687,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         if (build_zone_index(standby) != 0) {
           zone_arena_clear_data_pools(standby);
           pthread_mutex_unlock(&entry->writer_lock);
+          if (unsigned_msgs) free(unsigned_msgs);
           zone_arena_destroy(&tmp_arena);
           syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after XFR for '%s'", entry->domain);
           return -1;
@@ -3674,6 +3719,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
     }
   }
 
+  if (unsigned_msgs) free(unsigned_msgs);
   zone_arena_destroy(&tmp_arena);
 
   // Hook for catalog zone processing
@@ -4327,7 +4373,175 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
   return zone_apex;
 }
 
-static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtypes,
+static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    size_t out_len = 0;
+    uint32_t buffer = 0;
+    int bits_left = 0;
+    for (size_t i = 0; i < len; i++) {
+        buffer = (buffer << 8) | data[i];
+        bits_left += 8;
+        while (bits_left >= 5) {
+            if (out_len + 1 >= out_cap) { out[out_len] = '\0'; return; }
+            out[out_len++] = alphabet[(buffer >> (bits_left - 5)) & 0x1F];
+            bits_left -= 5;
+        }
+    }
+    if (bits_left > 0 && out_len + 1 < out_cap) {
+        out[out_len++] = alphabet[(buffer << (5 - bits_left)) & 0x1F];
+    }
+    out[out_len] = '\0';
+}
+
+static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
+    if (!hex || strcmp(hex, "-") == 0 || strcmp(hex, "") == 0) return 0;
+    size_t hlen = strlen(hex);
+    size_t count = 0;
+    for (size_t i = 0; i + 1 < hlen && count < max_out; i += 2) {
+        char byte_str[3] = { hex[i], hex[i+1], '\0' };
+        out[count++] = (uint8_t)strtoul(byte_str, NULL, 16);
+    }
+    return count;
+}
+
+static size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire) {
+    if (!name || max_wire < 1) return 0;
+    size_t pos = 0;
+    const char *p = name;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
+        if (label_len == 0) break;
+        if (label_len > 63 || pos + 1 + label_len >= max_wire) return 0;
+        wire[pos++] = (uint8_t)label_len;
+        for (size_t i = 0; i < label_len; i++) {
+            char c = p[i];
+            if (c >= 'A' && c <= 'Z') c += 32;
+            wire[pos++] = (uint8_t)c;
+        }
+        if (!dot) break;
+        p = dot + 1;
+    }
+    if (pos >= max_wire) return 0;
+    wire[pos++] = 0; // Root label
+    return pos;
+}
+
+static bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
+                               const uint8_t *salt, size_t salt_len,
+                               char *out_b32, size_t out_b32_sz) {
+    if (algo != 1) return false;
+    uint8_t wire[256];
+    size_t wire_len = name_to_canonical_wire(name, wire, sizeof(wire));
+    if (wire_len == 0) return false;
+
+    uint8_t digest[20];
+    SHA_CTX ctx;
+    SHA1_Init(&ctx);
+    SHA1_Update(&ctx, wire, wire_len);
+    if (salt_len > 0) SHA1_Update(&ctx, salt, salt_len);
+    SHA1_Final(digest, &ctx);
+
+    for (uint16_t i = 0; i < iterations; i++) {
+        SHA1_Init(&ctx);
+        SHA1_Update(&ctx, digest, 20);
+        if (salt_len > 0) SHA1_Update(&ctx, salt, salt_len);
+        SHA1_Final(digest, &ctx);
+    }
+    base32hex_encode(digest, 20, out_b32, out_b32_sz);
+    return true;
+}
+
+static bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash) {
+    if (!owner_hash || !next_hash || !target_hash) return false;
+    int cmp_owner_next = strcasecmp(owner_hash, next_hash);
+    int cmp_owner_tgt = strcasecmp(owner_hash, target_hash);
+    int cmp_tgt_next = strcasecmp(target_hash, next_hash);
+
+    if (cmp_owner_next < 0) {
+        return (cmp_owner_tgt < 0 && cmp_tgt_next < 0);
+    } else if (cmp_owner_next > 0) {
+        return (cmp_owner_tgt < 0 || cmp_tgt_next < 0);
+    } else {
+        return (cmp_owner_tgt != 0);
+    }
+}
+
+static dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex) {
+    char owner_name[300];
+    snprintf(owner_name, sizeof(owner_name), "%s.%s", hash_b32, apex);
+    uint32_t h = calc_fnv1a_str(owner_name);
+    size_t idx = h & (zone->hash_size - 1);
+    for (int i = zone->hash_table[idx]; i != -1; i = zone->records[i].next_record) {
+        dns_record_t *rec = &zone->records[i];
+        if (rec->type_code == 50 && domain_names_match_ci(rec->name, owner_name)) {
+            return rec;
+        }
+    }
+    return NULL;
+}
+
+static dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash) {
+    for (size_t i = 0; i < zone->count; i++) {
+        dns_record_t *rec = &zone->records[i];
+        if (rec->type_code == 50 && rec->name && rec->rdata_count >= 5 && rec->rdata[4]) {
+            char owner_hash[64];
+            const char *dot = strchr(rec->name, '.');
+            if (!dot) continue;
+            size_t hlen = (size_t)(dot - rec->name);
+            if (hlen >= sizeof(owner_hash)) continue;
+            memcpy(owner_hash, rec->name, hlen);
+            owner_hash[hlen] = '\0';
+            if (nsec3_covers_hash(owner_hash, rec->rdata[4], target_hash)) {
+                return rec;
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz) {
+    if (!qname || !encloser || !out || out_sz == 0) return false;
+    size_t qlen = strlen(qname);
+    size_t elen = strlen(encloser);
+    while (qlen > 0 && qname[qlen - 1] == '.') qlen--;
+    while (elen > 0 && encloser[elen - 1] == '.') elen--;
+    if (qlen <= elen) return false;
+    if (strncasecmp(qname + qlen - elen, encloser, elen) != 0) return false;
+    if (qname[qlen - elen - 1] != '.') return false;
+
+    const char *p = qname + qlen - elen - 2;
+    while (p >= qname && *p != '.') p--;
+    const char *start = p + 1;
+    size_t nc_len = (qname + qlen) - start;
+    if (nc_len + 1 >= out_sz) return false;
+    memcpy(out, start, nc_len);
+    out[nc_len] = '\0';
+    return true;
+}
+
+static bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+                                uint8_t *res, size_t max_res_len, uint16_t *offset,
+                                compress_ctx_t *comp_ctx, uint16_t *nscount,
+                                dns_record_t **attached, int *attached_count) {
+    if (!rec) return true;
+    for (int i = 0; i < *attached_count; i++) {
+        if (attached[i] == rec) return true;
+    }
+    if (*attached_count < 8) attached[(*attached_count)++] = rec;
+
+    if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+        return false;
+    }
+    (*nscount)++;
+    uint32_t c_hash = calc_fnv1a_str(rec->name);
+    size_t c_idx = c_hash & (zone->hash_size - 1);
+    return attach_covering_rrsig(zone, c_idx, rec->name, NULL, 50,
+                                 res, max_res_len, offset, comp_ctx, nscount);
+}
+
+static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_arena_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
@@ -4432,6 +4646,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
          i = current_zone->records[i].next_record) {
       dns_record_t *rec = &current_zone->records[i];
       if (strcasecmp(rec->name, current_qname) == 0) {
+        uint16_t r_class = rec->class_val ? rec->class_val : 1;
+        bool class_matches = (qclass == 255 || qclass == r_class);
+        if (!class_matches) continue;
         uint32_t eff_ttl;
         if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
         found = true;
@@ -4573,6 +4790,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                  i = current_zone->records[i].next_record) {
               dns_record_t *rec = &current_zone->records[i];
               if (strcasecmp(rec->name, wc_name) == 0) {
+                uint16_t r_class = rec->class_val ? rec->class_val : 1;
+                bool class_matches = (qclass == 255 || qclass == r_class);
+                if (!class_matches) continue;
                 uint32_t eff_ttl;
                 if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
                 found = true;
@@ -4701,7 +4921,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         bool qtx_signed = false;
         for (int i = current_zone->hash_table[final_idx]; i != -1; i = current_zone->records[i].next_record) {
           dns_record_t *rec = &current_zone->records[i];
-          if (strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
+          uint16_t r_class = rec->class_val ? rec->class_val : 1;
+          bool class_matches = (qclass == 255 || qclass == r_class);
+          if (class_matches && strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
             uint32_t eff_ttl;
             if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             qtx_matched = true;
@@ -4737,7 +4959,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
               memcpy(&wc_name[2], parent, parent_len + 1);
               for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
                 dns_record_t *rec = &current_zone->records[i];
-                if (strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
+                uint16_t r_class = rec->class_val ? rec->class_val : 1;
+                bool class_matches = (qclass == 255 || qclass == r_class);
+                if (class_matches && strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
                   uint32_t eff_ttl;
                   if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
                   wc_found = true; qtx_matched = true;
@@ -4889,6 +5113,80 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           }
         }
       }
+    } else if (dnssec_ok && zone_uses_nsec3(current_zone, db_entry->domain)) {
+      dns_record_t *param_rec = NULL;
+      if (!apex_hash_computed) {
+        apex_hash = calc_fnv1a_str(db_entry->domain);
+        apex_idx = apex_hash & (current_zone->hash_size - 1);
+        apex_hash_computed = true;
+      }
+      for (int i = current_zone->hash_table[apex_idx]; i != -1; i = current_zone->records[i].next_record) {
+        if (current_zone->records[i].type_code == 51 &&
+            domain_names_match_ci(current_zone->records[i].name, db_entry->domain)) {
+          param_rec = &current_zone->records[i];
+          break;
+        }
+      }
+      if (param_rec && param_rec->rdata_count >= 4) {
+        uint8_t algo = (uint8_t)atoi(param_rec->rdata[0]);
+        uint16_t iterations = (uint16_t)atoi(param_rec->rdata[2]);
+        uint8_t salt[64];
+        size_t salt_len = hex_to_bytes(param_rec->rdata[3], salt, sizeof(salt));
+
+        dns_record_t *attached_nsec3[8];
+        int attached_nsec3_cnt = 0;
+
+        if (found && !all_matched) {
+          // NODATA: matching NSEC3 for current_qname
+          char q_hash[64];
+          if (compute_nsec3_hash(current_qname, algo, iterations, salt, salt_len, q_hash, sizeof(q_hash))) {
+            dns_record_t *m_rec = find_matching_nsec3(current_zone, q_hash, db_entry->domain);
+            if (m_rec) {
+              if (!attach_nsec3_record(current_zone, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+                nsec_failed = true;
+              }
+            }
+          }
+        } else if (!found) {
+          // NXDOMAIN: Closest Encloser, Next Closer, Wildcard
+          const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag, client_loc_tag);
+          if (!encloser) encloser = db_entry->domain;
+          char ce_hash[64];
+          if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
+            dns_record_t *ce_rec = find_matching_nsec3(current_zone, ce_hash, db_entry->domain);
+            if (ce_rec) {
+              if (!attach_nsec3_record(current_zone, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+                nsec_failed = true;
+              }
+            }
+          }
+
+          char nc_name[256];
+          if (!nsec_failed && find_next_closer_name(current_qname, encloser, nc_name, sizeof(nc_name))) {
+            char nc_hash[64];
+            if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
+              dns_record_t *nc_cover = find_covering_nsec3(current_zone, nc_hash);
+              if (nc_cover) {
+                if (!attach_nsec3_record(current_zone, nc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+                  nsec_failed = true;
+                }
+              }
+            }
+          }
+
+          char wc_name[256];
+          snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
+          char wc_hash[64];
+          if (!nsec_failed && compute_nsec3_hash(wc_name, algo, iterations, salt, salt_len, wc_hash, sizeof(wc_hash))) {
+            dns_record_t *wc_cover = find_covering_nsec3(current_zone, wc_hash);
+            if (wc_cover) {
+              if (!attach_nsec3_record(current_zone, wc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+                nsec_failed = true;
+              }
+            }
+          }
+        }
+      }
     }
     
     if (nsec_failed) {
@@ -5032,6 +5330,7 @@ static uint32_t bump_soa_serial_in_arena(zone_arena_t *arena) {
       if (arena->records[i].rdata[2]) {
         uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
         serial++;
+        if (serial == 0) serial = 1;
         new_serial = serial;
         char buf[32];
         snprintf(buf, sizeof(buf), "%u", serial);
@@ -5848,7 +6147,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->masters_count > 0) {
         for (int k = 0; k < zcfg->masters_count; k++) {
-          if (strcmp(client_ip, zcfg->masters[k].ip) == 0) {
+          if (match_cidr(client_ip, zcfg->masters[k].ip)) {
             auth = true;
             break;
           }
@@ -6154,6 +6453,8 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       // IN class (fast path)
     } else if (qclass == 255) {
       // ANY class
+    } else if (qclass == 3) {
+      // CH class
     } else {
       if (current_zone)
         atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
@@ -6243,6 +6544,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   uint16_t offset = q_offset, ancount = 0, nscount = 0, arcount = 0;
 
   if (is_badcookie) {
+    res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
     res[3] = (res[3] & 0xF0) | 0x07;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
@@ -6308,7 +6610,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   zone_config_t *zcfg = (db_entry && view) ? find_zone_config_in_view(cfg, view->name, db_entry->domain) : NULL;
   bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
                       is_ecs_trusted_resolver(current_zone, cfg, zcfg, client_ip));
-  resolve_name(current_qname, qtypes, num_qtypes, &db_entry, &current_zone, res, max_res_len,
+  resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, max_res_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
                cfg_for_ede ? cfg_for_ede->minimal_any : false,
@@ -6538,15 +6840,64 @@ void *axfr_bg_thread_func(void *arg) {
   pthread_exit(NULL);
 }
 
+static void send_single_notify(const uint8_t *req, size_t req_len,
+                               const struct sockaddr *dest_addr, socklen_t addr_len,
+                               const char *notify_source) {
+  udp_ipc_t msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
+  memcpy(&msg.client_addr, dest_addr, addr_len);
+  msg.addr_len = addr_len;
+  msg.payload_len = req_len;
+
+  int family = dest_addr->sa_family;
+  if (notify_source && *notify_source) {
+    if (family == AF_INET &&
+        inet_pton(AF_INET, notify_source,
+                  &((struct sockaddr_in *)&msg.source_addr)->sin_addr) == 1) {
+      msg.source_addr.ss_family = AF_INET;
+      msg.has_source_addr = true;
+    } else if (family == AF_INET6 &&
+               inet_pton(AF_INET6, notify_source,
+                         &((struct sockaddr_in6 *)&msg.source_addr)->sin6_addr) == 1) {
+      msg.source_addr.ss_family = AF_INET6;
+      msg.has_source_addr = true;
+    }
+  }
+
+  uint8_t buf[2048];
+  memcpy(buf, &msg, sizeof(msg));
+  memcpy(buf + sizeof(msg), req, req_len);
+  send(g_notify_ipc[1], buf, sizeof(msg) + req_len, 0);
+}
+
+static bool is_addr_notified(const struct sockaddr_storage *addrs, int count, const struct sockaddr *target) {
+  for (int i = 0; i < count; i++) {
+    if (addrs[i].ss_family != target->sa_family) continue;
+    if (target->sa_family == AF_INET) {
+      struct sockaddr_in *a = (struct sockaddr_in *)&addrs[i];
+      struct sockaddr_in *b = (struct sockaddr_in *)target;
+      if (a->sin_port == b->sin_port && a->sin_addr.s_addr == b->sin_addr.s_addr) return true;
+    } else if (target->sa_family == AF_INET6) {
+      struct sockaddr_in6 *a = (struct sockaddr_in6 *)&addrs[i];
+      struct sockaddr_in6 *b = (struct sockaddr_in6 *)target;
+      if (a->sin6_port == b->sin6_port && memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(struct in6_addr)) == 0) return true;
+    }
+  }
+  return false;
+}
+
 void send_notify_to_all(const char *domain, const char *view_name) {
   server_config_t *active = acquire_config_snapshot();
-  if (!active)
-    return;
-  zone_config_t *zone = find_zone_config_in_view(active, view_name, domain);
-  if (!zone || zone->also_notify_count == 0) {
-    release_config_snapshot(active);
+  zone_db_snapshot_t *snap = acquire_zone_snapshot();
+  if (!active && !snap) {
+    if (active) release_config_snapshot(active);
+    if (snap) release_zone_snapshot(snap);
     return;
   }
+
+  zone_config_t *zone = active ? find_zone_config_in_view(active, view_name, domain) : NULL;
+  const char *notify_source = zone ? zone->notify_source : NULL;
 
   uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   memset(req, 0, DNS_HEADER_SIZE);
@@ -6565,53 +6916,152 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   req[offset++] = 0;
   req[offset++] = 1;
 
-  for (int i = 0; i < zone->also_notify_count; i++) {
-    struct sockaddr_storage dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    int domain_family = AF_INET;
-    if (inet_pton(AF_INET, zone->also_notify[i].ip,
-                  &((struct sockaddr_in *)&dest_addr)->sin_addr) == 1) {
-      domain_family = AF_INET;
-      dest_addr.ss_family = AF_INET;
-      ((struct sockaddr_in *)&dest_addr)->sin_port =
-          htons(zone->also_notify[i].port);
-    } else if (inet_pton(AF_INET6, zone->also_notify[i].ip,
-                         &((struct sockaddr_in6 *)&dest_addr)->sin6_addr) ==
-               1) {
-      domain_family = AF_INET6;
-      dest_addr.ss_family = AF_INET6;
-      ((struct sockaddr_in6 *)&dest_addr)->sin6_port =
-          htons(zone->also_notify[i].port);
-    } else
-      continue;
+  struct sockaddr_storage notified_addrs[64];
+  int notified_count = 0;
 
-    udp_ipc_t msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
-    msg.client_addr = dest_addr;
-    msg.addr_len = (domain_family == AF_INET) ? sizeof(struct sockaddr_in)
-                                              : sizeof(struct sockaddr_in6);
-    msg.payload_len = offset;
-    if (zone->notify_source && *zone->notify_source) {
-      if (domain_family == AF_INET &&
-          inet_pton(AF_INET, zone->notify_source,
-                    &((struct sockaddr_in *)&msg.source_addr)->sin_addr) == 1) {
-        msg.source_addr.ss_family = AF_INET;
-        msg.has_source_addr = true;
-      } else if (domain_family == AF_INET6 &&
-                 inet_pton(AF_INET6, zone->notify_source,
-                           &((struct sockaddr_in6 *)&msg.source_addr)->sin6_addr) == 1) {
-        msg.source_addr.ss_family = AF_INET6;
-        msg.has_source_addr = true;
+  // 1. Send to also-notify servers
+  if (zone) {
+    for (int i = 0; i < zone->also_notify_count && notified_count < 64; i++) {
+      struct sockaddr_storage dest_addr;
+      memset(&dest_addr, 0, sizeof(dest_addr));
+      if (inet_pton(AF_INET, zone->also_notify[i].ip,
+                    &((struct sockaddr_in *)&dest_addr)->sin_addr) == 1) {
+        dest_addr.ss_family = AF_INET;
+        ((struct sockaddr_in *)&dest_addr)->sin_port = htons(zone->also_notify[i].port);
+      } else if (inet_pton(AF_INET6, zone->also_notify[i].ip,
+                           &((struct sockaddr_in6 *)&dest_addr)->sin6_addr) == 1) {
+        dest_addr.ss_family = AF_INET6;
+        ((struct sockaddr_in6 *)&dest_addr)->sin6_port = htons(zone->also_notify[i].port);
+      } else {
+        continue;
+      }
+      if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
+        socklen_t slen = (dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+        send_single_notify(req, offset, (struct sockaddr *)&dest_addr, slen, notify_source);
+        notified_addrs[notified_count++] = dest_addr;
       }
     }
-
-    uint8_t buf[2048];
-    memcpy(buf, &msg, sizeof(msg));
-    memcpy(buf + sizeof(msg), req, offset);
-    send(g_notify_ipc[1], buf, sizeof(msg) + offset, 0);
   }
-  release_config_snapshot(active);
+
+  // 2. Send to NS records (RFC 1996 §3.2)
+  if (snap) {
+    view_snapshot_t *view = NULL;
+    if (view_name) {
+      for (size_t v = 0; v < snap->view_count; v++) {
+        if (strcasecmp(snap->views[v].name, view_name) == 0) {
+          view = &snap->views[v];
+          break;
+        }
+      }
+    }
+    if (!view && snap->view_count > 0) {
+      view = &snap->views[0];
+    }
+    if (view) {
+      zone_db_entry_t *entry = find_zone_in_view(view, domain);
+      if (entry) {
+        zone_arena_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+        if (arena && arena->hash_size > 0 && arena->hash_table) {
+          // Find SOA MNAME to exclude master itself
+          const char *mname = NULL;
+          uint32_t apex_hash = calc_fnv1a_str(entry->domain);
+          size_t apex_idx = apex_hash & (arena->hash_size - 1);
+          for (int i = arena->hash_table[apex_idx]; i != -1; i = arena->records[i].next_record) {
+            if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, entry->domain)) {
+              if (arena->records[i].rdata_count >= 1 && arena->records[i].rdata[0]) {
+                mname = arena->records[i].rdata[0];
+              }
+              break;
+            }
+          }
+
+          // Scan apex NS records
+          for (int i = arena->hash_table[apex_idx]; i != -1; i = arena->records[i].next_record) {
+            dns_record_t *rec = &arena->records[i];
+            if (rec->type_code == 2 && domain_names_match_ci(rec->name, entry->domain)) {
+              if (rec->rdata_count < 1 || !rec->rdata[0]) continue;
+              const char *ns_target = rec->rdata[0];
+              if (mname && domain_names_match_ci(ns_target, mname)) continue;
+
+              // Resolve in-zone glue or sibling zone glue
+              // A. In arena
+              uint32_t t_hash = calc_fnv1a_str(ns_target);
+              size_t t_idx = t_hash & (arena->hash_size - 1);
+              bool found_target = false;
+              for (int j = arena->hash_table[t_idx]; j != -1; j = arena->records[j].next_record) {
+                dns_record_t *g_rec = &arena->records[j];
+                if ((g_rec->type_code == 1 || g_rec->type_code == 28) && domain_names_match_ci(g_rec->name, ns_target)) {
+                  struct sockaddr_storage dest_addr;
+                  memset(&dest_addr, 0, sizeof(dest_addr));
+                  if (g_rec->type_code == 1 && g_rec->rdata_count >= 1) {
+                    if (inet_pton(AF_INET, g_rec->rdata[0], &((struct sockaddr_in *)&dest_addr)->sin_addr) == 1) {
+                      dest_addr.ss_family = AF_INET;
+                      ((struct sockaddr_in *)&dest_addr)->sin_port = htons(53);
+                      if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
+                        send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in), notify_source);
+                        if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
+                      }
+                      found_target = true;
+                    }
+                  } else if (g_rec->type_code == 28 && g_rec->rdata_count >= 1) {
+                    if (inet_pton(AF_INET6, g_rec->rdata[0], &((struct sockaddr_in6 *)&dest_addr)->sin6_addr) == 1) {
+                      dest_addr.ss_family = AF_INET6;
+                      ((struct sockaddr_in6 *)&dest_addr)->sin6_port = htons(53);
+                      if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
+                        send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in6), notify_source);
+                        if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
+                      }
+                      found_target = true;
+                    }
+                  }
+                }
+              }
+
+              // B. If not found in arena, check sibling zone in view
+              if (!found_target && view) {
+                zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
+                if (sib_entry && sib_entry != entry) {
+                  zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+                  if (sib_arena && sib_arena->hash_size > 0 && sib_arena->hash_table) {
+                    size_t s_idx = t_hash & (sib_arena->hash_size - 1);
+                    for (int j = sib_arena->hash_table[s_idx]; j != -1; j = sib_arena->records[j].next_record) {
+                      dns_record_t *g_rec = &sib_arena->records[j];
+                      if ((g_rec->type_code == 1 || g_rec->type_code == 28) && domain_names_match_ci(g_rec->name, ns_target)) {
+                        struct sockaddr_storage dest_addr;
+                        memset(&dest_addr, 0, sizeof(dest_addr));
+                        if (g_rec->type_code == 1 && g_rec->rdata_count >= 1) {
+                          if (inet_pton(AF_INET, g_rec->rdata[0], &((struct sockaddr_in *)&dest_addr)->sin_addr) == 1) {
+                            dest_addr.ss_family = AF_INET;
+                            ((struct sockaddr_in *)&dest_addr)->sin_port = htons(53);
+                            if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
+                              send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in), notify_source);
+                              if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
+                            }
+                          }
+                        } else if (g_rec->type_code == 28 && g_rec->rdata_count >= 1) {
+                          if (inet_pton(AF_INET6, g_rec->rdata[0], &((struct sockaddr_in6 *)&dest_addr)->sin6_addr) == 1) {
+                            dest_addr.ss_family = AF_INET6;
+                            ((struct sockaddr_in6 *)&dest_addr)->sin6_port = htons(53);
+                            if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
+                              send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in6), notify_source);
+                              if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (snap) release_zone_snapshot(snap);
+  if (active) release_config_snapshot(active);
 }
 
 // ============================================================================
@@ -6850,6 +7300,7 @@ void *response_logger_thread_func(void *arg) {
                 char class_str[16];
                 if (entry->qclass == 1) snprintf(class_str, sizeof(class_str), "IN");
                 else if (entry->qclass == 255) snprintf(class_str, sizeof(class_str), "ANY");
+                else if (entry->qclass == 3) snprintf(class_str, sizeof(class_str), "CH");
                 else snprintf(class_str, sizeof(class_str), "CLASS%d", entry->qclass);
                 
                 char type_str[32];
@@ -7024,6 +7475,8 @@ void *query_logger_thread_func(void *arg) {
                         snprintf(class_str, sizeof(class_str), "IN");
                     else if (ev->qclass == 255)
                         snprintf(class_str, sizeof(class_str), "ANY");
+                    else if (ev->qclass == 3)
+                        snprintf(class_str, sizeof(class_str), "CH");
                     else
                         snprintf(class_str, sizeof(class_str), "CLASS%d", ev->qclass);
 
@@ -8013,6 +8466,11 @@ worker_startup_success:;
         _exit(0);
       } else if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
+        tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
+        if (ctx_tcp && ctx_tcp->quota_yield) {
+          ctx_tcp->quota_yield = false;
+          goto process_tcp_client;
+        }
         // SHUT_RDWRによりソケットをEOF状態にし、同一バッチ内または次回の
         // EVFILT_READイベントで安全にリソースを回収(free)させる
         shutdown(client_fd, SHUT_RDWR);
@@ -8312,6 +8770,7 @@ worker_startup_success:;
           kevent(kq, &ev_client, 1, NULL, 0, NULL);
         }
       } else {
+process_tcp_client: ;
         // TCP 既存処理
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
@@ -8724,8 +9183,10 @@ worker_startup_success:;
           release_config_snapshot(cfg);
 
           struct kevent evs[2];
+          uint32_t to_ms = (processed_queries >= 16) ? 1 : idle_timeout;
+          ctx_tcp->quota_yield = (processed_queries >= 16);
           EV_SET(&evs[0], client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
-                 idle_timeout, ctx_tcp);
+                 to_ms, ctx_tcp);
           int nev = 1;
           if (processed_queries >= 16) {
             EV_SET(&evs[1], client_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, ctx_tcp);
@@ -9939,6 +10400,29 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 // 14. メインエントリーポイント & UDP/IPC 初期化
 // ============================================================================
 
+static pid_t g_supervisor_pid = 0;
+static char g_pid_file_path[1024] = "";
+static int g_pid_fd = -1;
+static volatile sig_atomic_t g_supervisor_should_exit = 0;
+
+static void supervisor_sig_handler(int sig) {
+  (void)sig;
+  g_supervisor_should_exit = 1;
+}
+
+static void cleanup_pid_file(void) {
+  if (g_supervisor_pid != 0 && getpid() == g_supervisor_pid) {
+    if (g_pid_fd >= 0) {
+      close(g_pid_fd);
+      g_pid_fd = -1;
+    }
+    if (g_pid_file_path[0] != '\0') {
+      unlink(g_pid_file_path);
+      g_pid_file_path[0] = '\0';
+    }
+  }
+}
+
 static void daemonize(void) {
   pid_t pid = fork();
   if (pid < 0)
@@ -10033,6 +10517,13 @@ int main(int argc, char **argv) {
   // Force OpenSSL lazy initialization before entering Capsicum sandbox
   uint8_t dummy_cookie[16];
   generate_server_cookie("127.0.0.1", (const uint8_t *)"12345678", dummy_cookie, time(NULL));
+  {
+    SHA_CTX dummy_sha;
+    uint8_t dummy_digest[20];
+    SHA1_Init(&dummy_sha);
+    SHA1_Update(&dummy_sha, "dummy", 5);
+    SHA1_Final(dummy_digest, &dummy_sha);
+  }
 
   bool foreground = false;
   const char *config_file = NULL;
@@ -10094,7 +10585,6 @@ int main(int argc, char **argv) {
   }
   free(config_str);
 
-  int pid_fd = -1;
   const char *effective_pid_file = NULL;
   if (cli_pid_file) {
     effective_pid_file = cli_pid_file;
@@ -10105,6 +10595,11 @@ int main(int argc, char **argv) {
   }
 
   if (effective_pid_file && strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0') {
+    strncpy(g_pid_file_path, effective_pid_file, sizeof(g_pid_file_path) - 1);
+    g_pid_file_path[sizeof(g_pid_file_path) - 1] = '\0';
+    g_supervisor_pid = getpid();
+    atexit(cleanup_pid_file);
+
     char dir_buf[1024];
     strncpy(dir_buf, effective_pid_file, sizeof(dir_buf) - 1);
     dir_buf[sizeof(dir_buf) - 1] = '\0';
@@ -10113,24 +10608,25 @@ int main(int argc, char **argv) {
       *slash = '\0';
       mkdir(dir_buf, 0755);
     }
-    pid_fd = open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (pid_fd < 0) {
+    g_pid_fd = open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (g_pid_fd < 0) {
       syslog(LOG_ERR, "Failed to open pidfile %s: %s", effective_pid_file, strerror(errno));
       fprintf(stderr, "Failed to open pidfile %s: %s\n", effective_pid_file, strerror(errno));
+      cleanup_pid_file();
       free_server_config_fields(&g_config_db.config_a);
       return 1;
     }
-    if (flock(pid_fd, LOCK_EX | LOCK_NB) < 0) {
+    if (flock(g_pid_fd, LOCK_EX | LOCK_NB) < 0) {
       syslog(LOG_ERR, "Another KariDNS instance is already running (pidfile %s locked)", effective_pid_file);
       fprintf(stderr, "Another KariDNS instance is already running (pidfile %s locked).\n", effective_pid_file);
-      close(pid_fd);
+      cleanup_pid_file();
       free_server_config_fields(&g_config_db.config_a);
       return 1;
     }
-    ftruncate(pid_fd, 0);
+    ftruncate(g_pid_fd, 0);
     char pid_str[32];
     snprintf(pid_str, sizeof(pid_str), "%d\n", (int)getpid());
-    write(pid_fd, pid_str, strlen(pid_str));
+    write(g_pid_fd, pid_str, strlen(pid_str));
   }
 
   // 特権分離が本サーバの前提とするセキュリティモデルであるため、
@@ -10144,7 +10640,7 @@ int main(int argc, char **argv) {
            "[ERROR] Server started as root but no 'user' directive is set in options{}. "
            "Refusing to start: running as root without privilege drop is not permitted. "
            "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.\n");
-    if (pid_fd >= 0) close(pid_fd);
+    cleanup_pid_file();
     free_server_config_fields(&g_config_db.config_a);
     return 1;
   }
@@ -10184,7 +10680,7 @@ int main(int argc, char **argv) {
     if (strlen(sock_path) >= sizeof(un.sun_path)) {
       syslog(LOG_ERR, "Control socket path too long (max %zu bytes): %s", sizeof(un.sun_path) - 1, sock_path);
       fprintf(stderr, "Control socket path too long (max %zu bytes): %s\n", sizeof(un.sun_path) - 1, sock_path);
-      if (pid_fd >= 0) close(pid_fd);
+      cleanup_pid_file();
       free_server_config_fields(&g_config_db.config_a);
       return 1;
     }
@@ -10232,12 +10728,21 @@ int main(int argc, char **argv) {
   pid_t backend_pid = fork();
   if (backend_pid < 0) {
     syslog(LOG_CRIT, "fork for backend process failed: %m");
-    if (pid_fd >= 0) close(pid_fd);
+    if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+    cleanup_pid_file();
     exit(1);
   }
 
   if (backend_pid > 0) {
     // === Parent Process (Process Manager / Supervisor) ===
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = supervisor_sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
     pid_t router_pids[MAX_FRONTEND_ROUTERS];
     for (int r = 0; r < g_num_frontend_routers; r++) {
       pid_t rpid = fork();
@@ -10245,14 +10750,20 @@ int main(int argc, char **argv) {
         syslog(LOG_CRIT, "fork for frontend router %d failed: %m", r);
         kill(backend_pid, SIGTERM);
         for (int k = 0; k < r; k++) kill(router_pids[k], SIGTERM);
-        if (pid_fd >= 0) close(pid_fd);
+        if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+        cleanup_pid_file();
         exit(1);
       }
       if (rpid == 0) {
         // Frontend Router Process
-        if (pid_fd >= 0) {
-          close(pid_fd);
-          pid_fd = -1;
+        g_pid_file_path[0] = '\0';
+        if (g_pid_fd >= 0) {
+          close(g_pid_fd);
+          g_pid_fd = -1;
+        }
+        if (g_broker_sock >= 0) {
+          close(g_broker_sock);
+          g_broker_sock = -1;
         }
         run_frontend_router(backend_pid, r);
         exit(0);
@@ -10273,31 +10784,52 @@ int main(int argc, char **argv) {
       close(g_control_sock);
       g_control_sock = -1;
     }
+    if (g_broker_sock >= 0) {
+      close(g_broker_sock);
+      g_broker_sock = -1;
+    }
 
     // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止)
-    while (1) {
+    pid_t dead = 0;
+    while (!g_supervisor_should_exit) {
       int status;
-      pid_t dead = wait(&status);
+      dead = wait(&status);
       if (dead > 0) {
         syslog(LOG_CRIT, "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, status);
-        kill(backend_pid, SIGTERM);
-        for (int r = 0; r < g_num_frontend_routers; r++) {
-          kill(router_pids[r], SIGTERM);
-        }
         break;
       }
       if (dead < 0 && errno == ECHILD) {
         break;
       }
+      if (dead < 0 && errno == EINTR) {
+        continue;
+      }
     }
-    if (pid_fd >= 0) close(pid_fd);
+    if (g_supervisor_should_exit && dead <= 0) {
+      syslog(LOG_INFO, "[Manager] Received termination signal. Shutting down children.");
+    }
+    kill(backend_pid, SIGTERM);
+    for (int r = 0; r < g_num_frontend_routers; r++) {
+      kill(router_pids[r], SIGTERM);
+    }
+    if (g_broker_pid > 0) {
+      kill(g_broker_pid, SIGTERM);
+    }
+    while (1) {
+      pid_t w = wait(NULL);
+      if (w > 0) continue;
+      if (w < 0 && errno == EINTR) continue;
+      break;
+    }
+    cleanup_pid_file();
     exit(0);
   }
 
   // === Backend Process (backend_pid == 0) ===
-  if (pid_fd >= 0) {
-    close(pid_fd);
-    pid_fd = -1;
+  g_pid_file_path[0] = '\0';
+  if (g_pid_fd >= 0) {
+    close(g_pid_fd);
+    g_pid_fd = -1;
   }
 
   // 指示2: Backendプロセス側もFrontend用端点を直ちにclose
