@@ -68,8 +68,11 @@ EOF
 SERVER_PID=$!
 sleep 1
 
+WORKER_PIDS=""
+
 cleanup() {
     echo "=== Cleaning up ==="
+    [ -n "$WORKER_PIDS" ] && kill $WORKER_PIDS 2>/dev/null || true
     [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
     killall -9 karidns 2>/dev/null || true
     rm -rf "$SCRIPT_DIR/$TEST_DIR" 2>/dev/null || true
@@ -454,68 +457,215 @@ run_check "UDP socket bind to source IP (-b)" "$DAG -b 127.0.0.1 @127.0.0.1 -p $
 echo "========================================================"
 echo "20. Dedicated Security & Regression Test Scripts"
 echo "========================================================"
+
+# Clean up Section 1-19 server before starting parallel test suite in Section 20
+if [ -n "$SERVER_PID" ]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    pkill -P "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+fi
+
+QUEUE_DIR="$TEST_DIR_ABS/pqueue"
+CLAIM_DIR="$TEST_DIR_ABS/pclaims"
+RESULTS_DIR="$TEST_DIR_ABS/presults"
+rm -rf "$QUEUE_DIR" "$CLAIM_DIR" "$RESULTS_DIR"
+mkdir -p "$QUEUE_DIR" "$CLAIM_DIR" "$RESULTS_DIR"
+
+P_INDEX=0
+
+register_parallel_check() {
+    P_INDEX=$((P_INDEX + 1))
+    TID=$(printf "%03d" "$P_INDEX")
+    NAME="$1"
+    CMD="$2"
+    EXPECT="$3"
+
+    echo "$NAME" > "$QUEUE_DIR/${TID}.name"
+    echo "$EXPECT" > "$QUEUE_DIR/${TID}.expect"
+    echo "$CMD" > "$QUEUE_DIR/${TID}.cmd"
+    touch "$QUEUE_DIR/${TID}.ready"
+}
+
+register_parallel_skip() {
+    P_INDEX=$((P_INDEX + 1))
+    TID=$(printf "%03d" "$P_INDEX")
+    NAME="$1"
+    REASON="${2:-dag-only feature}"
+
+    echo "$NAME" > "$QUEUE_DIR/${TID}.name"
+    echo "$REASON" > "$QUEUE_DIR/${TID}.skip"
+    echo "SKIP" > "$RESULTS_DIR/${TID}.status"
+    touch "$RESULTS_DIR/${TID}.done"
+}
+
 if [ "$DAG" != "dig" ]; then
-    run_check "Regression: --update-del type omission (tests/run_dag_update_del_no_type_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_no_type_test.sh\"" "PASS:"
-    run_check "Regression: --update-del-exact TTL & type safety (tests/run_dag_update_del_exact_ttl_notype_crash_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
-    run_check "Help examples: --break usage examples validation (tests/run_dag_break_help_examples_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_break_help_examples_test.sh\"" "PASS:"
-    run_check "Override: duplicate --break kind override validation (tests/run_break_duplicate_kind_override_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_break_duplicate_kind_override_test.sh\"" "PASS:"
+    register_parallel_check "Regression: --update-del type omission (tests/run_dag_update_del_no_type_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_no_type_test.sh\"" "PASS:"
+    register_parallel_check "Regression: --update-del-exact TTL & type safety (tests/run_dag_update_del_exact_ttl_notype_crash_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_update_del_exact_ttl_notype_crash_test.sh\"" "PASS:"
+    register_parallel_check "Help examples: --break usage examples validation (tests/run_dag_break_help_examples_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_break_help_examples_test.sh\"" "PASS:"
+    register_parallel_check "Override: duplicate --break kind override validation (tests/run_break_duplicate_kind_override_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_break_duplicate_kind_override_test.sh\"" "PASS:"
 fi
-run_check "CLI Options & Prereq/Break validation (tests/run_dag_cli_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cli_options_test.sh\"" "ALL CLI OPTION TESTS PASSED"
-run_check "Hex payload overflow safety (tests/run_dag_hex_payload_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_hex_payload_overflow_test.sh\"" "ALL HEX PAYLOAD OVERFLOW TESTS PASSED"
-run_check "YAML RDATA output structure (tests/run_dag_yaml_rdata_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rdata_test.sh\"" "ALL YAML RDATA TESTS PASSED"
-run_check "YAML apostrophe escaping (tests/run_dag_yaml_apostrophe_escaping_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_apostrophe_escaping_test.sh\"" "ALL YAML APOSTROPHE ESCAPING TESTS PASSED"
+register_parallel_check "CLI Options & Prereq/Break validation (tests/run_dag_cli_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cli_options_test.sh\"" "ALL CLI OPTION TESTS PASSED"
+register_parallel_check "Hex payload overflow safety (tests/run_dag_hex_payload_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_hex_payload_overflow_test.sh\"" "ALL HEX PAYLOAD OVERFLOW TESTS PASSED"
+register_parallel_check "YAML RDATA output structure (tests/run_dag_yaml_rdata_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rdata_test.sh\"" "ALL YAML RDATA TESTS PASSED"
+register_parallel_check "YAML apostrophe escaping (tests/run_dag_yaml_apostrophe_escaping_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_apostrophe_escaping_test.sh\"" "ALL YAML APOSTROPHE ESCAPING TESTS PASSED"
 if command -v perl >/dev/null 2>&1; then
-    run_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"
-    run_check "Security: UDP transaction ID mismatch discard (tests/run_dag_udp_id_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_id_mismatch_discard_test.sh\"" "PASS:"
-    run_check "Security: DNS Cookie mismatch discard (tests/run_dag_cookie_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cookie_mismatch_discard_test.sh\"" "PASS:"
-    run_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
-    run_check "RFC 7873: BADCOOKIE TCP transport fallback (tests/run_dag_badcookie_transport_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_badcookie_transport_test.sh\"" "ALL BADCOOKIE / EXPIRE / KEEPOPEN TESTS PASSED"
-    run_check "RFC 7050: DNS64 prefix discovery (tests/run_dag_dns64prefix_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dns64prefix_test.sh\"" "PASS:"
-    run_check "RFC 7050: DNS64 prefix in +short and +yaml mode (tests/run_dag_dns64prefix_short_yaml_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dns64prefix_short_yaml_test.sh\"" "ALL DNS64PREFIX SHORT/YAML TESTS PASSED"
-    run_check "Diagnostic: Malformed packet detection in default mode (tests/run_malformed_detection_default_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_malformed_detection_default_test.sh\"" "PASS:"
+    register_parallel_check "Security: UDP spoofing source rejection (tests/run_dag_udp_spoofing_source_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_spoofing_source_test.sh\"" "PASS:"
+    register_parallel_check "Security: UDP transaction ID mismatch discard (tests/run_dag_udp_id_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_udp_id_mismatch_discard_test.sh\"" "PASS:"
+    register_parallel_check "Security: DNS Cookie mismatch discard (tests/run_dag_cookie_mismatch_discard_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_cookie_mismatch_discard_test.sh\"" "PASS:"
+    register_parallel_check "RFC 8945: TSIG AXFR unsigned intermediate digest chaining (tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_axfr_tsig_unsigned_intermediate_test.sh\"" "PASS:"
+    register_parallel_check "RFC 7873: BADCOOKIE TCP transport fallback (tests/run_dag_badcookie_transport_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_badcookie_transport_test.sh\"" "ALL BADCOOKIE / EXPIRE / KEEPOPEN TESTS PASSED"
+    register_parallel_check "RFC 7050: DNS64 prefix discovery (tests/run_dag_dns64prefix_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dns64prefix_test.sh\"" "PASS:"
+    register_parallel_check "RFC 7050: DNS64 prefix in +short and +yaml mode (tests/run_dag_dns64prefix_short_yaml_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dns64prefix_short_yaml_test.sh\"" "ALL DNS64PREFIX SHORT/YAML TESTS PASSED"
+    register_parallel_check "Diagnostic: Malformed packet detection in default mode (tests/run_malformed_detection_default_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_malformed_detection_default_test.sh\"" "PASS:"
 fi
-run_check "Transport: TCP Keepopen & EDNS0 Keepalive (tests/run_dag_keepopen_keepalive_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_keepalive_test.sh\"" "ALL KEEPOPEN & KEEPALIVE TESTS PASSED"
-run_check "Transport: TCP Keepopen partial read cache invalidation (tests/run_dag_keepopen_partial_read_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_partial_read_test.sh\"" "ALL KEEPOPEN PARTIAL READ TESTS PASSED"
-run_check "Transport: TLS Keepopen & DoT continuity (tests/run_dag_keepopen_tls_partial_read_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_tls_partial_read_test.sh\"" "ALL KEEPOPEN TLS TESTS PASSED"
-run_check "Formatting: YAML EDE double-quote escaping (tests/run_dag_yaml_ede_escaping_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_ede_escaping_test.sh\"" "ALL YAML EDE ESCAPING TESTS PASSED"
-run_check "Formatting: YAML Cookie STATUS verification (tests/run_dag_yaml_cookie_status_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_cookie_status_test.sh\"" "ALL YAML COOKIE STATUS TESTS PASSED"
-run_check "Formatting: YAML socket_family accuracy (tests/run_dag_yaml_socket_family_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_socket_family_test.sh\"" "ALL YAML SOCKET_FAMILY TESTS PASSED"
-run_check "Formatting: YAML -4/-6 socket_family priority (tests/run_dag_yaml_socket_family_force_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_socket_family_force_test.sh\"" "ALL YAML SOCKET_FAMILY FORCE TESTS PASSED"
-run_check "Formatting: YAML clean stream without spurious errors (tests/run_dag_yaml_no_spurious_resolve_error_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_no_spurious_resolve_error_test.sh\"" "ALL YAML CLEAN STREAM TESTS PASSED"
-run_check "Formatting: +multiline DS single-line formatting (tests/run_dag_multiline_ds_single_line_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multiline_ds_single_line_test.sh\"" "ALL MULTILINE DS TESTS PASSED"
-run_check "Transport: -b bind address family mismatch detection (tests/run_dag_bind_address_family_mismatch_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_bind_address_family_mismatch_test.sh\"" "ALL BIND ADDRESS FAMILY MISMATCH TESTS PASSED"
-run_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
-run_check "Formatting: YAML +nocrypto suppression (tests/run_dag_yaml_nocrypto_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_nocrypto_test.sh\"" "ALL YAML NOCRYPTO TESTS PASSED"
-run_check "Formatting: YAML +expandaaaa AAAA expansion (tests/run_dag_yaml_expandaaaa_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_expandaaaa_test.sh\"" "ALL YAML EXPANDAAAA TESTS PASSED"
-run_check "Formatting: YAML RRSIG structured decoding (tests/run_dag_yaml_rrsig_decode_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rrsig_decode_test.sh\"" "ALL YAML RRSIG DECODE TESTS PASSED"
-run_check "Protocol: Long label (63 bytes) name expansion (tests/run_dag_long_label_name_expansion_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_long_label_name_expansion_test.sh\"" "ALL LONG LABEL EXPANSION TESTS PASSED"
-run_check "Features: Multi-server Semantic Match across compression (tests/run_dag_multi_server_semantic_match_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multi_server_semantic_match_test.sh\"" "ALL MULTI-SERVER SEMANTIC MATCH TESTS PASSED"
-run_check "RFC & CLI Fixes validation (tests/run_dag_fixes_validation_test.sh)" "sh \"$SCRIPT_DIR/run_dag_fixes_validation_test.sh\" \"$DAG\"" "All tests PASSED successfully\."
-run_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"
+register_parallel_check "Transport: TCP Keepopen & EDNS0 Keepalive (tests/run_dag_keepopen_keepalive_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_keepalive_test.sh\"" "ALL KEEPOPEN & KEEPALIVE TESTS PASSED"
+register_parallel_check "Transport: TCP Keepopen partial read cache invalidation (tests/run_dag_keepopen_partial_read_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_partial_read_test.sh\"" "ALL KEEPOPEN PARTIAL READ TESTS PASSED"
+register_parallel_check "Transport: TLS Keepopen & DoT continuity (tests/run_dag_keepopen_tls_partial_read_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_keepopen_tls_partial_read_test.sh\"" "ALL KEEPOPEN TLS TESTS PASSED"
+register_parallel_check "Formatting: YAML EDE double-quote escaping (tests/run_dag_yaml_ede_escaping_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_ede_escaping_test.sh\"" "ALL YAML EDE ESCAPING TESTS PASSED"
+register_parallel_check "Formatting: YAML Cookie STATUS verification (tests/run_dag_yaml_cookie_status_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_cookie_status_test.sh\"" "ALL YAML COOKIE STATUS TESTS PASSED"
+register_parallel_check "Formatting: YAML socket_family accuracy (tests/run_dag_yaml_socket_family_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_socket_family_test.sh\"" "ALL YAML SOCKET_FAMILY TESTS PASSED"
+register_parallel_check "Formatting: YAML -4/-6 socket_family priority (tests/run_dag_yaml_socket_family_force_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_socket_family_force_test.sh\"" "ALL YAML SOCKET_FAMILY FORCE TESTS PASSED"
+register_parallel_check "Formatting: YAML clean stream without spurious errors (tests/run_dag_yaml_no_spurious_resolve_error_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_no_spurious_resolve_error_test.sh\"" "ALL YAML CLEAN STREAM TESTS PASSED"
+register_parallel_check "Formatting: +multiline DS single-line formatting (tests/run_dag_multiline_ds_single_line_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multiline_ds_single_line_test.sh\"" "ALL MULTILINE DS TESTS PASSED"
+register_parallel_check "Transport: -b bind address family mismatch detection (tests/run_dag_bind_address_family_mismatch_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_bind_address_family_mismatch_test.sh\"" "ALL BIND ADDRESS FAMILY MISMATCH TESTS PASSED"
+register_parallel_check "Transport: TCP connection establishment timeout (tests/run_dag_tcp_connect_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_tcp_connect_timeout_test.sh\"" "PASS:"
+register_parallel_check "Formatting: YAML +nocrypto suppression (tests/run_dag_yaml_nocrypto_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_nocrypto_test.sh\"" "ALL YAML NOCRYPTO TESTS PASSED"
+register_parallel_check "Formatting: YAML +expandaaaa AAAA expansion (tests/run_dag_yaml_expandaaaa_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_expandaaaa_test.sh\"" "ALL YAML EXPANDAAAA TESTS PASSED"
+register_parallel_check "Formatting: YAML RRSIG structured decoding (tests/run_dag_yaml_rrsig_decode_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_rrsig_decode_test.sh\"" "ALL YAML RRSIG DECODE TESTS PASSED"
+register_parallel_check "Protocol: Long label (63 bytes) name expansion (tests/run_dag_long_label_name_expansion_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_long_label_name_expansion_test.sh\"" "ALL LONG LABEL EXPANSION TESTS PASSED"
+register_parallel_check "Features: Multi-server Semantic Match across compression (tests/run_dag_multi_server_semantic_match_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multi_server_semantic_match_test.sh\"" "ALL MULTI-SERVER SEMANTIC MATCH TESTS PASSED"
+register_parallel_check "RFC & CLI Fixes validation (tests/run_dag_fixes_validation_test.sh)" "sh \"$SCRIPT_DIR/run_dag_fixes_validation_test.sh\" \"$DAG\"" "All tests PASSED successfully\."
+register_parallel_check "Compatibility: BIND 9 dig sample comparison (tests/run_dag_compat_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_compat_test.sh\"" "ALL DAG COMPATIBILITY TESTS PASSED"
 if command -v perl >/dev/null 2>&1; then
-    run_check "Plugin Zones: 'type program' zone loader (tests/run_program_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_program_zone_test.sh\"" "ALL PROGRAM ZONE TESTS PASSED"
-    run_check "Forward Zones: 'type forward' zone relay (tests/run_forward_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_forward_zone_test.sh\"" "ALL FORWARD ZONE TESTS PASSED"
-    run_check "Anomalous Packets: Comprehensive DNS packet wire suite (tests/run_dag_dig_anomalous_suite.sh)" "DAG_BIN=\"$DAG\" DIG_BIN=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dig_anomalous_suite.sh\" \"$([ "$DAG" = "dig" ] && echo "dig" || echo "dag")\"" "ALL ANOMALOUS PACKET TESTS PASSED SUCCESSFULLY"
-    run_check "Transport: Multi-Message AXFR & Plain-HTTP DoH mock (tests/run_dag_doh_dot_axfr_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_dot_axfr_test.sh\"" "ALL DOT/DOH AXFR & MEMORY TESTS PASSED"
-    run_check "Protocol: IXFR Up-to-Date single SOA completion (tests/run_dag_ixfr_uptodate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_ixfr_uptodate_test.sh\"" "ALL IXFR UP-TO-DATE COMPLETION TESTS PASSED"
-    run_check "Transport: DoH connection cache cleanup & error recovery (tests/run_dag_doh_cache_cleanup_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_cache_cleanup_test.sh\"" "ALL DOH CACHE CLEANUP TESTS PASSED"
-    run_check "Protocol: +trace glue fallback & CNAME chain tracing (tests/run_dag_trace_cname_glue_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_cname_glue_test.sh\"" "ALL TRACE GLUE & CNAME TESTS PASSED"
-    run_check "CLI: +trace and +nssearch options (--hex, +udp) (tests/run_dag_trace_nssearch_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_opts_test.sh\"" "ALL TRACE & NSSEARCH OPTIONS TESTS PASSED"
-    run_check "Transport: +trace and +nssearch over TCP (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
-    run_check "Audit: Edge cases regression test suite (tests/run_dag_edge_cases_audit_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_edge_cases_audit_test.sh\"" "ALL EDGE CASES AUDIT REGRESSION TESTS PASSED"
-    run_check "Audit: Edge cases Phase 3 audit suite (tests/run_dag_edge_cases_phase3_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_edge_cases_phase3_test.sh\"" "ALL DAG EDGE CASES PHASE 3 TESTS PASSED"
-    run_check "Transport: Multi-server query partial timeout handling (tests/run_dag_multi_server_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multi_server_timeout_test.sh\"" "ALL DAG MULTI-SERVER TIMEOUT TESTS PASSED"
-    run_check "EDE & Truncation: Full EDE 0-29 and UDP TC fallback (tests/run_dag_ede_truncation_regression_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_ede_truncation_regression_test.sh\"" "ALL DAG EDE & TRUNCATION TESTS PASSED"
-    run_check "Audit: Audit findings P2-1, P3-1, P3-2, P3-4, P4-1 (tests/run_dag_audit_improvements_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_audit_improvements_test.sh\"" "ALL (DAG )?AUDIT IMPROVEMENT TESTS PASSED"
-    run_check "Security: APL afdlength stack-overflow regression (tests/run_dag_apl_afdlength_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_apl_afdlength_overflow_test.sh\"" "PASS: APL afdlength overflow regression test"
-    run_check "Semantic: Structured RR Differential & Semantic Oracle (tests/run_dag_rr_differential_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_rr_differential_test.sh\"" "PASS: RR Differential test suite passed successfully\."
+    register_parallel_check "Plugin Zones: 'type program' zone loader (tests/run_program_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_program_zone_test.sh\"" "ALL PROGRAM ZONE TESTS PASSED"
+    register_parallel_check "Forward Zones: 'type forward' zone relay (tests/run_forward_zone_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_forward_zone_test.sh\"" "ALL FORWARD ZONE TESTS PASSED"
+    register_parallel_check "Anomalous Packets: Comprehensive DNS packet wire suite (tests/run_dag_dig_anomalous_suite.sh)" "DAG_BIN=\"$DAG\" DIG_BIN=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_dig_anomalous_suite.sh\" \"$([ "$DAG" = "dig" ] && echo "dig" || echo "dag")\"" "ALL ANOMALOUS PACKET TESTS PASSED SUCCESSFULLY"
+    register_parallel_check "Transport: Multi-Message AXFR & Plain-HTTP DoH mock (tests/run_dag_doh_dot_axfr_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_dot_axfr_test.sh\"" "ALL DOT/DOH AXFR & MEMORY TESTS PASSED"
+    register_parallel_check "Protocol: IXFR Up-to-Date single SOA completion (tests/run_dag_ixfr_uptodate_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_ixfr_uptodate_test.sh\"" "ALL IXFR UP-TO-DATE COMPLETION TESTS PASSED"
+    register_parallel_check "Transport: DoH connection cache cleanup & error recovery (tests/run_dag_doh_cache_cleanup_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_doh_cache_cleanup_test.sh\"" "ALL DOH CACHE CLEANUP TESTS PASSED"
+    register_parallel_check "Protocol: +trace glue fallback & CNAME chain tracing (tests/run_dag_trace_cname_glue_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_cname_glue_test.sh\"" "ALL TRACE GLUE & CNAME TESTS PASSED"
+    register_parallel_check "CLI: +trace and +nssearch options (--hex, +udp) (tests/run_dag_trace_nssearch_opts_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_opts_test.sh\"" "ALL TRACE & NSSEARCH OPTIONS TESTS PASSED"
+    register_parallel_check "Transport: +trace and +nssearch over TCP (tests/run_dag_trace_nssearch_tcp_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_trace_nssearch_tcp_test.sh\"" "ALL TRACE/NSSEARCH TCP TESTS PASSED"
+    register_parallel_check "Audit: Edge cases regression test suite (tests/run_dag_edge_cases_audit_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_edge_cases_audit_test.sh\"" "ALL EDGE CASES AUDIT REGRESSION TESTS PASSED"
+    register_parallel_check "Audit: Edge cases Phase 3 audit suite (tests/run_dag_edge_cases_phase3_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_edge_cases_phase3_test.sh\"" "ALL DAG EDGE CASES PHASE 3 TESTS PASSED"
+    register_parallel_check "Transport: Multi-server query partial timeout handling (tests/run_dag_multi_server_timeout_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_multi_server_timeout_test.sh\"" "ALL DAG MULTI-SERVER TIMEOUT TESTS PASSED"
+    register_parallel_check "EDE & Truncation: Full EDE 0-29 and UDP TC fallback (tests/run_dag_ede_truncation_regression_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_ede_truncation_regression_test.sh\"" "ALL DAG EDE & TRUNCATION TESTS PASSED"
+    register_parallel_check "Audit: Audit findings P2-1, P3-1, P3-2, P3-4, P4-1 (tests/run_dag_audit_improvements_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_audit_improvements_test.sh\"" "ALL (DAG )?AUDIT IMPROVEMENT TESTS PASSED"
+    register_parallel_check "Security: APL afdlength stack-overflow regression (tests/run_dag_apl_afdlength_overflow_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_apl_afdlength_overflow_test.sh\"" "PASS: APL afdlength overflow regression test"
+    register_parallel_check "Semantic: Structured RR Differential & Semantic Oracle (tests/run_dag_rr_differential_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_rr_differential_test.sh\"" "PASS: RR Differential test suite passed successfully\."
 fi
-run_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
+register_parallel_check "Formatting: YAML EDNS options parity (tests/run_dag_yaml_edns_options_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_yaml_edns_options_test.sh\"" "ALL YAML EDNS OPTIONS TESTS PASSED"
 if [ "$DAG" = "dig" ]; then
-    run_skip "RFC 3007 / RFC 2931: SIG(0) Transaction Signing (tests/run_dag_sig0_update_test.sh)"
+    register_parallel_skip "RFC 3007 / RFC 2931: SIG(0) Transaction Signing (tests/run_dag_sig0_update_test.sh)" "dig does not support SIG(0)"
 else
-    run_check "RFC 3007 / RFC 2931: SIG(0) Transaction Signing (tests/run_dag_sig0_update_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_sig0_update_test.sh\"" "ALL SIG\(0\) TESTS PASSED SUCCESSFULLY!"
+    register_parallel_check "RFC 3007 / RFC 2931: SIG(0) Transaction Signing (tests/run_dag_sig0_update_test.sh)" "DAG=\"$DAG\" sh \"$SCRIPT_DIR/run_dag_sig0_update_test.sh\"" "ALL SIG\(0\) TESTS PASSED SUCCESSFULLY!"
 fi
+
+PARALLEL_JOBS="${PARALLEL_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
+case "$PARALLEL_JOBS" in
+    ''|*[!0-9]*) PARALLEL_JOBS=4 ;;
+    *)
+        if [ "$PARALLEL_JOBS" -lt 2 ]; then
+            PARALLEL_JOBS=2
+        elif [ "$PARALLEL_JOBS" -gt 8 ]; then
+            PARALLEL_JOBS=8
+        fi
+        ;;
+esac
+
+echo "Running Section 20 ($P_INDEX suites) in parallel with $PARALLEL_JOBS workers..."
+
+WORKER_PIDS=""
+w=1
+while [ "$w" -le "$PARALLEL_JOBS" ]; do
+    (
+        while :; do
+            claimed=""
+            for ticket in "$QUEUE_DIR"/*.ready; do
+                [ -f "$ticket" ] || break
+                t_base=$(basename "$ticket")
+                tid="${t_base%.ready}"
+                if mv "$ticket" "$CLAIM_DIR/${tid}.claim" 2>/dev/null; then
+                    claimed="$tid"
+                    break
+                fi
+            done
+            [ -z "$claimed" ] && break
+
+            c_cmd=$(cat "$QUEUE_DIR/${claimed}.cmd")
+            c_expect=$(cat "$QUEUE_DIR/${claimed}.expect")
+
+            c_out=$(eval "$c_cmd" 2>&1 || true)
+            echo "$c_out" > "$RESULTS_DIR/${claimed}.out"
+            if echo "$c_out" | grep -E -q "$c_expect"; then
+                echo "OK" > "$RESULTS_DIR/${claimed}.status"
+            else
+                echo "FAILED" > "$RESULTS_DIR/${claimed}.status"
+            fi
+            touch "$RESULTS_DIR/${claimed}.done"
+        done
+    ) &
+    WORKER_PIDS="$WORKER_PIDS $!"
+    w=$((w + 1))
+done
+
+# In-order streaming of results
+for name_file in "$QUEUE_DIR"/*.name; do
+    [ -f "$name_file" ] || continue
+    t_base=$(basename "$name_file")
+    tid="${t_base%.name}"
+    NAME=$(cat "$name_file")
+
+    if [ -f "$QUEUE_DIR/${tid}.skip" ]; then
+        REASON=$(cat "$QUEUE_DIR/${tid}.skip")
+        echo "Test: $NAME ... SKIP ($REASON)"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    while [ ! -f "$RESULTS_DIR/${tid}.done" ]; do
+        any_alive=0
+        for p in $WORKER_PIDS; do
+            if kill -0 "$p" 2>/dev/null; then
+                any_alive=1
+                break
+            fi
+        done
+        if [ "$any_alive" -eq 0 ] && [ ! -f "$RESULTS_DIR/${tid}.done" ]; then
+            echo "FAILED (workers terminated unexpectedly)" > "$RESULTS_DIR/${tid}.status"
+            touch "$RESULTS_DIR/${tid}.done"
+            break
+        fi
+        sleep 0.1
+    done
+
+    STATUS=$(cat "$RESULTS_DIR/${tid}.status" 2>/dev/null || echo "FAILED")
+    EXPECT=$(cat "$QUEUE_DIR/${tid}.expect")
+    CMD=$(cat "$QUEUE_DIR/${tid}.cmd")
+
+    echo -n "Test: $NAME ... "
+    if [ "$STATUS" = "OK" ]; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "  Command: $CMD"
+        echo "  Expected: $EXPECT"
+        echo "  Output:"
+        if [ -f "$RESULTS_DIR/${tid}.out" ]; then
+            sed 's/^/    /' "$RESULTS_DIR/${tid}.out"
+        else
+            echo "    (no output captured)"
+        fi
+        FAILED=$((FAILED + 1))
+    fi
+done
+
+for p in $WORKER_PIDS; do
+    wait "$p" 2>/dev/null || true
+done
+WORKER_PIDS=""
+rm -rf "$QUEUE_DIR" "$CLAIM_DIR" "$RESULTS_DIR" 2>/dev/null || true
 
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then

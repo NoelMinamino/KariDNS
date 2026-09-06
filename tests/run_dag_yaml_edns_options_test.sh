@@ -8,8 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building dag and karidns with make ==="
-make -C "$ROOT_DIR" dag karidns
+if [ ! -x "$ROOT_DIR/dag" ] || [ ! -x "$ROOT_DIR/karidns" ]; then
+    echo "=== Building dag and karidns with make ==="
+    make -C "$ROOT_DIR" dag karidns
+fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
 KARIDNS="${KARIDNS:-$ROOT_DIR/karidns}"
@@ -65,15 +67,12 @@ PORT=$((19000 + $$ % 10000))
 CONF_FILE="/tmp/karidns_yaml_edns_$$.conf"
 LOG_FILE="/tmp/karidns_yaml_edns_$$.log"
 
-# Kill any existing server processes before starting
-killall -9 karidns 2>/dev/null || true
-killall -9 karidns-asan 2>/dev/null || true
-sleep 0.5
-
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
     rm -f "$CONF_FILE" "$LOG_FILE" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

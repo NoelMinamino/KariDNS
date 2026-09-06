@@ -8,8 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building dag and karidns with make ==="
-make -C "$ROOT_DIR" dag karidns
+if [ ! -x "$ROOT_DIR/dag" ] || [ ! -x "$ROOT_DIR/karidns" ]; then
+    echo "=== Building dag and karidns with make ==="
+    make -C "$ROOT_DIR" dag karidns
+fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
 KARIDNS="${KARIDNS:-$ROOT_DIR/karidns}"
@@ -67,6 +69,21 @@ run_skip() {
     echo "Test: $NAME ... SKIP ($REASON)"
 }
 
+CONF_FILE="/tmp/karidns_badcookie_test_$$.conf"
+LOG_FILE="/tmp/karidns_badcookie_test_$$.log"
+PORT=$((15000 + $$ % 10000))
+SERVER_PID=""
+
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$CONF_FILE" "$LOG_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 echo "=== 1. Testing +keepopen Option Acceptance & Help Message ==="
 if [ "$DAG" = "dig" ]; then
     run_skip "--help contains +keepopen RFC 7766 note"
@@ -81,11 +98,6 @@ echo "=== 2. Testing +expire EDNS Option (RFC 7314) Generation ==="
 run_check "+expire emits EDNS option 9 in query" "$DAG @127.0.0.1 -p 10053 example.com A +expire +qr +timeout=1" "(00 09 00 00|EXPIRE)"
 
 echo "=== 3. Testing Real Queries against KariDNS ==="
-CONF_FILE="/tmp/karidns_badcookie_test.conf"
-PORT=15399
-
-killall -9 karidns 2>/dev/null || true
-sleep 0.5
 
 cat <<EOF > "$CONF_FILE"
 options {
@@ -101,7 +113,7 @@ zone "example.com" {
 };
 EOF
 
-"$KARIDNS" -f "$CONF_FILE" > /tmp/karidns_badcookie_test.log 2>&1 &
+"$KARIDNS" -f "$CONF_FILE" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 
@@ -130,9 +142,7 @@ else
     run_check "+tcp +keepopen consecutive queries on KariDNS" "$DAG @127.0.0.1 -p $PORT example.com A +tcp +keepopen example.com TXT @127.0.0.1 -p $PORT +tcp +keepopen +timeout=2" "\(TCP\)"
 fi
 
-kill $SERVER_PID 2>/dev/null || true
-killall -9 karidns 2>/dev/null || true
-rm -f "$CONF_FILE" /tmp/karidns_badcookie_test.log
+cleanup
 
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then
