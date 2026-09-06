@@ -618,9 +618,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                                ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0));
 
     ecs_tag_def_t *active_loc_tags = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tags :
-                                     ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL));
+                                     ((zcfg && zcfg->location_tags) ? zcfg->location_tags : (cfg ? cfg->location_tags : NULL));
     int active_loc_tag_count = (arena.bind_location_tags && arena.bind_location_tag_count > 0) ? arena.bind_location_tag_count :
-                               ((zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0));
+                               ((zcfg && zcfg->location_tags) ? zcfg->location_tag_count : (cfg ? cfg->location_tag_count : 0));
 
     for (size_t i = 0; i < arena.count; i++) {
         if (arena.records[i].ecs_subnet_tag != NULL) {
@@ -1128,6 +1128,15 @@ static int check_config(const char *config_path, server_config_t *cfg) {
             }
         }
     }
+    for (int ti = 0; ti < cfg->location_tag_count; ti++) {
+        for (int ci = 0; ci < cfg->location_tags[ti].cidr_count; ci++) {
+            if (!validate_cidr_syntax(cfg->location_tags[ti].cidrs[ci].cidr)) {
+                fprintf(stderr, "[ERROR] Invalid CIDR '%s' in options.location-tags tag '%s'\n",
+                        cfg->location_tags[ti].cidrs[ci].cidr, cfg->location_tags[ti].tag);
+                ecs_error = true;
+            }
+        }
+    }
     for (zone_config_t *zc = cfg->zones; zc; zc = zc->next) {
         if (zc->ecs_tag_count > 0) has_ecs_tags = true;
         for (int ti = 0; ti < zc->ecs_tag_count; ti++) {
@@ -1135,6 +1144,15 @@ static int check_config(const char *config_path, server_config_t *cfg) {
                 if (!validate_cidr_syntax(zc->ecs_tags[ti].cidrs[ci].cidr)) {
                     fprintf(stderr, "[ERROR] Zone '%s': Invalid CIDR '%s' in ecs-tags tag '%s'\n",
                             zc->domain, zc->ecs_tags[ti].cidrs[ci].cidr, zc->ecs_tags[ti].tag);
+                    ecs_error = true;
+                }
+            }
+        }
+        for (int ti = 0; ti < zc->location_tag_count; ti++) {
+            for (int ci = 0; ci < zc->location_tags[ti].cidr_count; ci++) {
+                if (!validate_cidr_syntax(zc->location_tags[ti].cidrs[ci].cidr)) {
+                    fprintf(stderr, "[ERROR] Zone '%s': Invalid CIDR '%s' in location-tags tag '%s'\n",
+                            zc->domain, zc->location_tags[ti].cidrs[ci].cidr, zc->location_tags[ti].tag);
                     ecs_error = true;
                 }
             }

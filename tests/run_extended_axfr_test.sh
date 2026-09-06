@@ -28,8 +28,8 @@ KARICTL="$ROOT_DIR/karictl"
 DAG="$ROOT_DIR/dag"
 KARICHECK="$ROOT_DIR/karicheck"
 
-echo "=== Building karidns, karictl, and dag with make ==="
-make -C "$ROOT_DIR" karidns karictl dag
+echo "=== Building karidns, karictl, dag, and karicheck with make ==="
+make -C "$ROOT_DIR" karidns karictl dag karicheck
 
 FAILED=0
 PORT1=$((25000 + $$ % 3500))
@@ -108,6 +108,40 @@ cat << 'EOF' > "$TMP_DIR/ext_tiny.data"
 +def.tiny.example.com:10.99.99.1:300
 EOF
 
+# Master Zone 3: BIND format with zone-level location-tags
+cat << 'EOF' > "$TMP_DIR/locconf.zone"
+$TTL 300
+$ORIGIN locconf.example.com.
+@       IN  SOA ns1.locconf.example.com. hostmaster.locconf.example.com. (
+            2026090501 ; Serial
+            3600 600 86400 300
+)
+@       IN  NS  ns1.locconf.example.com.
+ns1     IN  A   127.0.0.1
+
+$LOCATION conf-tag
+locitem IN  A   10.99.1.1
+$LOCATION ""
+locitem IN  A   10.99.0.1
+EOF
+
+# Master Zone 4: BIND format with zone-level ecs-tags (isolation negative test)
+cat << 'EOF' > "$TMP_DIR/locneg.zone"
+$TTL 300
+$ORIGIN locneg.example.com.
+@       IN  SOA ns1.locneg.example.com. hostmaster.locneg.example.com. (
+            2026090501 ; Serial
+            3600 600 86400 300
+)
+@       IN  NS  ns1.locneg.example.com.
+ns1     IN  A   127.0.0.1
+
+$LOCATION neg-tag
+locnegitem IN  A   10.88.1.1
+$LOCATION ""
+locnegitem IN  A   10.88.0.1
+EOF
+
 # Master Server Configuration (Port $PORT1)
 cat << EOF > "$TMP_DIR/master.conf"
 options {
@@ -115,7 +149,7 @@ options {
     bind-address { 127.0.0.1; };
     $USER_OPT
     ecs-enable yes;
-    ecs-trusted-resolvers { 127.0.0.1; };
+    ecs-trusted-resolvers { 192.0.2.100; };
 };
 
 control-channel {
@@ -128,6 +162,7 @@ zone "ext.example.com" {
     type master;
     file "$TMP_DIR/ext_bind.zone";
     allow-transfer { 127.0.0.1; };
+    ecs-trusted-resolvers { 127.0.0.1; };
 };
 
 zone "tiny.example.com" {
@@ -136,16 +171,39 @@ zone "tiny.example.com" {
     file-format tinydns;
     allow-transfer { 127.0.0.1; };
 };
+
+zone "locconf.example.com" {
+    type master;
+    file "$TMP_DIR/locconf.zone";
+    allow-transfer { 127.0.0.1; };
+    location-tags {
+        tag "conf-tag" { 127.0.0.1/32; };
+    };
+    ecs-tags {
+        tag "conf-tag" { 192.0.2.55/32; };
+    };
+};
+
+zone "locneg.example.com" {
+    type master;
+    file "$TMP_DIR/locneg.zone";
+    allow-transfer { 127.0.0.1; };
+    ecs-tags {
+        tag "neg-tag" { 127.0.0.1/32; };
+    };
+};
 EOF
 
 # Secondary Server Configuration (Port $PORT2)
+# Notice: global options specifies 192.0.2.200 (not 127.0.0.1).
+# 127.0.0.1 will be trusted ONLY for ext.example.com via extended AXFR (TYPE 65407)!
 cat << EOF > "$TMP_DIR/slave.conf"
 options {
     port $PORT2;
     bind-address { 127.0.0.1; };
     $USER_OPT
     ecs-enable yes;
-    ecs-trusted-resolvers { 127.0.0.1; };
+    ecs-trusted-resolvers { 192.0.2.200; };
 };
 
 control-channel {
@@ -279,7 +337,7 @@ LEAK_FOUND=0
 if echo "$STD_AXFR" | grep -E -q "10\.1\.1\.1|10\.2\.2\.2|172\.16\.1\.1|172\.16\.2\.2"; then
     LEAK_FOUND=1
 fi
-if echo "$STD_AXFR" | grep -E -q "65401|65402|65403|65404|65405|65406|65302"; then
+if echo "$STD_AXFR" | grep -E -q "65401|65402|65403|65404|65405|65406|65407|65302"; then
     LEAK_FOUND=1
 fi
 
@@ -402,6 +460,40 @@ if echo "$NEW_LOC" | grep -q "10.5.5.5" && echo "$NEW_ECS" | grep -q "172.20.20.
     echo "OK (Updated location and ECS tag records active on Secondary)"
 else
     echo "FAILED (NEW_LOC='$NEW_LOC', NEW_ECS='$NEW_ECS')"
+    FAILED=$((FAILED + 1))
+fi
+
+# ------------------------------------------------------------------------------
+# Test 5: location-tags in Config & Strict Isolation from ecs-tags
+# ------------------------------------------------------------------------------
+echo ""
+echo "=== Test 5: location-tags in Config & Strict Isolation from ecs-tags ==="
+
+echo -n "Verifying location-tags configured in zone{} block resolves \$LOCATION ... "
+LOCCONF_ANS=$("$DAG" @127.0.0.1 -p "$PORT1" locitem.locconf.example.com A +short 2>&1 || true)
+if echo "$LOCCONF_ANS" | grep -q "10.99.1.1" && echo "$LOCCONF_ANS" | grep -q "10.99.0.1"; then
+    echo "OK (Resolved via zone.location-tags)"
+else
+    echo "FAILED (Unexpected answer: '$LOCCONF_ANS')"
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Verifying ecs-tags does NOT resolve \$LOCATION (regression guard for old bug) ... "
+LOCNEG_ANS=$("$DAG" @127.0.0.1 -p "$PORT1" locnegitem.locneg.example.com A +short 2>&1 || true)
+if [ "$LOCNEG_ANS" = "10.88.0.1" ]; then
+    echo "OK (Strictly isolated: ecs-tags not used for \$LOCATION)"
+else
+    echo "FAILED (ecs-tags was mistakenly used for \$LOCATION! Answer: '$LOCNEG_ANS')"
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Verifying karicheck validates configuration with location-tags ... "
+KARICHECK_OUT=$("$KARICHECK" conf "$TMP_DIR/master.conf" 2>&1 || true)
+if echo "$KARICHECK_OUT" | grep -q "is valid"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "$KARICHECK_OUT"
     FAILED=$((FAILED + 1))
 fi
 

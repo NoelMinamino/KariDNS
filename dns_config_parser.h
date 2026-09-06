@@ -70,6 +70,14 @@ typedef struct zone_config {
   struct ecs_tag_def_s *ecs_tags;
   int ecs_tag_count;
 
+  /* --- Location タグ対応表 (ゾーン単位の上書き) --- */
+  struct ecs_tag_def_s *location_tags;
+  int location_tag_count;
+
+  /* --- ECS 信頼リゾルバ (ゾーン単位の上書き) --- */
+  char **ecs_trusted_resolvers;
+  int ecs_trusted_resolvers_count;
+
   struct zone_config *next;
 } zone_config_t;
 
@@ -157,6 +165,8 @@ typedef struct server_config_s {
   int ecs_trusted_resolvers_count;
   ecs_tag_def_t *ecs_tags;
   int ecs_tag_count;
+  ecs_tag_def_t *location_tags;
+  int location_tag_count;
   _Atomic int reader_count;
 } server_config_t;
 

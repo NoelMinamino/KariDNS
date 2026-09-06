@@ -1401,6 +1401,8 @@ void zone_arena_init(zone_arena_t *arena) {
   arena->bind_location_tag_count = 0;
   arena->bind_ecs_tags = NULL;
   arena->bind_ecs_tag_count = 0;
+  arena->bind_ecs_trusted_resolvers = NULL;
+  arena->bind_ecs_trusted_resolver_count = 0;
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
 }
@@ -1466,6 +1468,14 @@ void zone_arena_destroy(zone_arena_t *arena) {
   free_ecs_tags_array(arena->bind_ecs_tags, arena->bind_ecs_tag_count);
   arena->bind_ecs_tags = NULL;
   arena->bind_ecs_tag_count = 0;
+  if (arena->bind_ecs_trusted_resolvers) {
+    for (int i = 0; i < arena->bind_ecs_trusted_resolver_count; i++) {
+      free(arena->bind_ecs_trusted_resolvers[i]);
+    }
+    free(arena->bind_ecs_trusted_resolvers);
+    arena->bind_ecs_trusted_resolvers = NULL;
+    arena->bind_ecs_trusted_resolver_count = 0;
+  }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
   zone_arena_free_include_buffers(arena);
