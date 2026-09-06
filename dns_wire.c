@@ -114,11 +114,11 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         size_t idx = hash & COMPRESS_HASH_MASK;
         
         bool compressed = false;
-        if (*offset >= 0x4000) return -1;
         
         for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
             compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) break;
+            if (entry->offset >= 0x4000) continue; // RFC 1035 §4.1.4: 14-bit pointer limit
             if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, label)) {
                 if ((size_t)(*offset + 2) > max_len) return -1;
                 uint16_t ptr = 0xC000 | entry->offset;
@@ -130,13 +130,15 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         }
         if (compressed) return 0;
         
-        for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
-            compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
-            if (entry->generation != ctx->current_generation) {
-                entry->generation = ctx->current_generation;
-                entry->hash = hash;
-                entry->offset = *offset;
-                break;
+        if (*offset < 0x4000) {
+            for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
+                compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
+                if (entry->generation != ctx->current_generation) {
+                    entry->generation = ctx->current_generation;
+                    entry->hash = hash;
+                    entry->offset = *offset;
+                    break;
+                }
             }
         }
         
@@ -2807,6 +2809,16 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
         rdlen += 4 + 5;
     }
 
+    uint8_t ecs_addr_bytes = 0;
+    if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {
+        ecs_addr_bytes = (edns->ecs_source_prefix + 7) / 8;
+        if (edns->ecs_family == 1 && ecs_addr_bytes > 4) ecs_addr_bytes = 4;
+        else if (edns->ecs_family == 2 && ecs_addr_bytes > 16) ecs_addr_bytes = 16;
+        else if (edns->ecs_family != 1 && edns->ecs_family != 2) ecs_addr_bytes = 0;
+        else if (ecs_addr_bytes > sizeof(edns->ecs_addr)) ecs_addr_bytes = sizeof(edns->ecs_addr);
+        rdlen += 4 + 4 + ecs_addr_bytes;
+    }
+
     if ((size_t)offset + 11 + rdlen <= max_res_len) {
         res[offset++] = 0; // Root name
         res[offset++] = 0; res[offset++] = 41; // TYPE OPT
@@ -2878,6 +2890,19 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
             res[offset++] = (edns->karidns_ext_hash >> 16) & 0xFF;
             res[offset++] = (edns->karidns_ext_hash >> 8) & 0xFF;
             res[offset++] = edns->karidns_ext_hash & 0xFF;
+        }
+
+        if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {
+            uint16_t opt_len = 4 + ecs_addr_bytes;
+            res[offset++] = 0; res[offset++] = 8; // Option Code: 8 (EDNS Client Subnet)
+            res[offset++] = opt_len >> 8; res[offset++] = opt_len & 0xFF; // Option Length
+            res[offset++] = edns->ecs_family >> 8; res[offset++] = edns->ecs_family & 0xFF;
+            res[offset++] = edns->ecs_source_prefix;
+            res[offset++] = edns->ecs_scope_prefix;
+            if (ecs_addr_bytes > 0) {
+                memcpy(res + offset, edns->ecs_addr, ecs_addr_bytes);
+                offset += ecs_addr_bytes;
+            }
         }
         
         (*arcount_inout)++;

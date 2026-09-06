@@ -3558,7 +3558,8 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
 
 int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tcp_stream_ctx_t *stream_ctx, axfr_session_t *session,
-                      tsig_key_t *tsig_key) {
+                      tsig_key_t *tsig_key,
+                      const uint8_t *req_mac, size_t req_mac_len) {
   uint8_t *msg;
   uint16_t msg_len;
 
@@ -3569,16 +3570,37 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   zone_arena_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   int ret_code = -1;
 
+  uint8_t prior_mac[64];
+  size_t prior_mac_len = 0;
+  if (req_mac && req_mac_len > 0 && req_mac_len <= sizeof(prior_mac)) {
+    memcpy(prior_mac, req_mac, req_mac_len);
+    prior_mac_len = req_mac_len;
+  }
+  bool is_subsequent = false;
+
   while (1) {
     int ret = read_dns_tcp_message(tcp_fd, stream_ctx, &msg, &msg_len);
     if (ret < 0 || ret == 0) {
       zone_arena_destroy(&tmp_arena);
       return -1;
     }
-    if (tsig_key && tsig_verify_packet(msg, msg_len, tsig_key, NULL, 0, NULL, 0, false, NULL, NULL) != 0) {
-      syslog(LOG_ERR, "[AXFR] TSIG failed");
-      zone_arena_destroy(&tmp_arena);
-      return -1;
+    if (tsig_key) {
+      uint8_t current_mac[64];
+      size_t current_mac_len = 0;
+      if (tsig_verify_packet(msg, msg_len, tsig_key,
+                             prior_mac_len > 0 ? prior_mac : NULL, prior_mac_len,
+                             NULL, 0,
+                             is_subsequent,
+                             current_mac, &current_mac_len) != 0) {
+        syslog(LOG_ERR, "[AXFR] TSIG failed");
+        zone_arena_destroy(&tmp_arena);
+        return -1;
+      }
+      if (current_mac_len > 0 && current_mac_len <= sizeof(prior_mac)) {
+        memcpy(prior_mac, current_mac, current_mac_len);
+        prior_mac_len = current_mac_len;
+        is_subsequent = true;
+      }
     }
     if (parse_xfr_packet(msg, msg_len, &tmp_arena, active, session,
                          entry->domain) != 0) {
@@ -3755,7 +3777,8 @@ static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
  * 2. ゾーン設定 (zcfg->ecs_tags)
  * 3. グローバル設定 (cfg->ecs_tags) */
 static const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
-                                          const uint8_t *addr, uint16_t family) {
+                                          const uint8_t *addr, uint16_t family, uint8_t *out_scope_prefix) {
+    if (out_scope_prefix) *out_scope_prefix = 0;
     const ecs_tag_def_t *tags = (zone && zone->bind_ecs_tags && zone->bind_ecs_tag_count > 0)
                                  ? zone->bind_ecs_tags : NULL;
     int tag_count = tags ? zone->bind_ecs_tag_count : 0;
@@ -3773,6 +3796,14 @@ static const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server
     for (int i = 0; i < tag_count; i++) {
         for (int j = 0; j < tags[i].cidr_count; j++) {
             if (match_cidr(ip_buf, tags[i].cidrs[j].cidr)) {
+                if (out_scope_prefix) {
+                    const char *slash = strchr(tags[i].cidrs[j].cidr, '/');
+                    if (slash) {
+                        *out_scope_prefix = (uint8_t)atoi(slash + 1);
+                    } else {
+                        *out_scope_prefix = (family == 1) ? 32 : 128;
+                    }
+                }
                 return tags[i].tag;
             }
         }
@@ -4306,7 +4337,9 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                          bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
-                         bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family) {
+                         bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,
+                         uint8_t *out_ecs_scope_prefix) {
+  if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
   if (qtx_included_out) *qtx_included_out = 0;
   char current_qname[256];
   strncpy(current_qname, qname, sizeof(current_qname));
@@ -4341,7 +4374,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     const char *client_loc_tag = resolve_bind_location_tag(current_zone, cfg, zcfg, client_ip);
     const char *client_ecs_tag = NULL;
     if (ecs_trusted && ecs_addr) {
-      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family);
+      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family, out_ecs_scope_prefix);
     }
     
     // ==== フェーズ1: 委任判定 ====
@@ -4355,6 +4388,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
     bool found = false, type_matched = false, cname_followed = false;
     uint32_t hash = current_qname_hash;
     size_t idx = hash & (current_zone->hash_size - 1);
+    uint16_t signed_types[64];
+    int signed_types_count = 0;
     bool has_any = (qtypes[0] == 255);
     if (has_any && minimal_any) {
       bool name_exists = false, has_cname = false, has_rrsig = false;
@@ -4439,11 +4474,23 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             }
             (*ancount)++;
             collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-            if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
-              if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
-                                        res, max_res_len, offset, comp_ctx, ancount)) {
-                res[2] |= 0x02;
-                return;
+            if (dnssec_ok && rec_type != 46) {
+              bool already_signed = false;
+              for (int s = 0; s < signed_types_count; s++) {
+                if (signed_types[s] == rec_type) {
+                  already_signed = true;
+                  break;
+                }
+              }
+              if (!already_signed) {
+                if (signed_types_count < (int)(sizeof(signed_types) / sizeof(signed_types[0]))) {
+                  signed_types[signed_types_count++] = rec_type;
+                }
+                if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
+                                          res, max_res_len, offset, comp_ctx, ancount)) {
+                  res[2] |= 0x02;
+                  return;
+                }
               }
             }
           }
@@ -4520,6 +4567,8 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
           bool wc_found = false;
           if (current_zone->hash_table[wc_idx] != -1) {
             memcpy(&wc_name[2], parent, parent_len + 1);
+            uint16_t wc_signed_types[64];
+            int wc_signed_types_count = 0;
             for (int i = current_zone->hash_table[wc_idx]; i != -1;
                  i = current_zone->records[i].next_record) {
               dns_record_t *rec = &current_zone->records[i];
@@ -4567,11 +4616,23 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                     } else
                       (*ancount)++;
                     collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-                    if (dnssec_ok && rec_type != 46 && qtypes[0] != 255) {
-                      if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
-                                                res, max_res_len, offset, comp_ctx, ancount)) {
-                        res[2] |= 0x02;
-                        return;
+                    if (dnssec_ok && rec_type != 46) {
+                      bool already_signed = false;
+                      for (int s = 0; s < wc_signed_types_count; s++) {
+                        if (wc_signed_types[s] == rec_type) {
+                          already_signed = true;
+                          break;
+                        }
+                      }
+                      if (!already_signed) {
+                        if (wc_signed_types_count < (int)(sizeof(wc_signed_types) / sizeof(wc_signed_types[0]))) {
+                          wc_signed_types[wc_signed_types_count++] = rec_type;
+                        }
+                        if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
+                                                  res, max_res_len, offset, comp_ctx, ancount)) {
+                          res[2] |= 0x02;
+                          return;
+                        }
                       }
                     }
                   }
@@ -4637,6 +4698,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
         int saved_glue_target_count = glue_target_count;
         resolve_checkpoint_t cp = save_checkpoint(offset, ancount, nscount, arcount);
 
+        bool qtx_signed = false;
         for (int i = current_zone->hash_table[final_idx]; i != -1; i = current_zone->records[i].next_record) {
           dns_record_t *rec = &current_zone->records[i];
           if (strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
@@ -4650,10 +4712,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             }
             (*ancount)++;
             collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-            if (dnssec_ok && qtx != 46) {
+            if (dnssec_ok && qtx != 46 && !qtx_signed) {
               if (!attach_covering_rrsig(current_zone, final_idx, current_qname, NULL, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                 this_qtx_failed = true; break;
               }
+              qtx_signed = true;
             }
           }
         }
@@ -4669,6 +4732,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             uint32_t wc_hash = calc_fnv1a_continue(FNV1A_WILDCARD_PREFIX_HASH, parent);
             size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
             bool wc_found = false;
+            bool wc_qtx_signed = false;
             if (current_zone->hash_table[wc_idx] != -1) {
               memcpy(&wc_name[2], parent, parent_len + 1);
               for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
@@ -4684,10 +4748,11 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
                   }
                   (*ancount)++;
                   collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-                  if (dnssec_ok && qtx != 46) {
+                  if (dnssec_ok && qtx != 46 && !wc_qtx_signed) {
                     if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
                       this_qtx_failed = true; break;
                     }
+                    wc_qtx_signed = true;
                   }
                 }
               }
@@ -6249,7 +6314,8 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
                cfg_for_ede ? cfg_for_ede->minimal_any : false,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
                edns.dnssec_ok, view, &qtx_included, client_ip,
-               cfg, ecs_trusted, edns.ecs_addr, edns.ecs_family);
+               cfg, ecs_trusted, edns.ecs_addr, edns.ecs_family,
+               &edns.ecs_scope_prefix);
 
   if (edns.has_mqtype_query) {
     if (res[2] & 0x02) {
@@ -6435,17 +6501,20 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[req_len++] = (domain_hash >> 8) & 0xFF;
     axfr_req[req_len++] = domain_hash & 0xFF;
     dns_hdr[11]++;
+    uint8_t req_mac[64];
+    size_t req_mac_len = 0;
     if (ctx->tsig_key) {
       size_t p_len = req_len - 2;
       tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
-                       ctx->tsig_key, 0, NULL, NULL, NULL, 0, false);
+                       ctx->tsig_key, 0, req_mac, &req_mac_len, NULL, 0, false);
       req_len = p_len + 2;
     }
     uint16_t msg_len = req_len - 2;
     axfr_req[0] = msg_len >> 8;
     axfr_req[1] = msg_len & 0xFF;
     if (send(tcp_fd, axfr_req, req_len, 0) == req_len) {
-      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, ctx->tsig_key);
+      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, ctx->tsig_key,
+                                       req_mac_len > 0 ? req_mac : NULL, req_mac_len);
       if (axfr_res == 1) {
         syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
       } else if (axfr_res == 2) {
@@ -9521,6 +9590,24 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
   if (kq < 0)
     exit(1);
 
+  int notify_v4_sock = -1;
+  int notify_v6_sock = -1;
+  for (int i = 0; i < local_num_udp_fds; i++) {
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (getsockname(local_udp_fds[i], (struct sockaddr *)&ss, &slen) == 0) {
+      if (ss.ss_family == AF_INET) {
+        if (notify_v4_sock == -1 || local_udp_is_wildcard[i]) {
+          notify_v4_sock = local_udp_fds[i];
+        }
+      } else if (ss.ss_family == AF_INET6) {
+        if (notify_v6_sock == -1 || local_udp_is_wildcard[i]) {
+          notify_v6_sock = local_udp_fds[i];
+        }
+      }
+    }
+  }
+
   for (int i = 0; i < local_num_udp_fds; i++) {
     struct kevent ev;
     EV_SET(&ev, local_udp_fds[i], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
@@ -9700,9 +9787,9 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
           }
         }
       } else if (ud == 999 && router_id == 0) {
-        // (2) Notify Outbound -> Dynamic UDP Socket
+        // (2) Notify Outbound -> Pre-opened UDP Sockets (Capsicum safe)
         while (1) {
-          ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), 0);
+          ssize_t len = recv(g_notify_ipc[0], buffer, sizeof(buffer), MSG_DONTWAIT);
           if (len < (ssize_t)sizeof(udp_ipc_t))
             break; // EAGAIN
 
@@ -9711,19 +9798,44 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             syslog(LOG_NOTICE, "[Frontend %d] Received stop command from backend. Shutting down cleanly.", router_id);
             exit(0);
           }
-          int sock = socket(msg->client_addr.ss_family, SOCK_DGRAM, 0);
-          if (sock >= 0) {
-            if (msg->has_source_addr) {
-              socklen_t src_len = (msg->source_addr.ss_family == AF_INET)
-                                      ? sizeof(struct sockaddr_in)
-                                      : sizeof(struct sockaddr_in6);
-              if (bind(sock, (struct sockaddr *)&msg->source_addr, src_len) < 0) {
-                syslog(LOG_WARNING, "[Frontend %d] Failed to bind NOTIFY socket to notify-source: %m", router_id);
+          int target_sock = -1;
+          if (msg->has_source_addr) {
+            for (int k = 0; k < local_num_udp_fds; k++) {
+              struct sockaddr_storage ss;
+              socklen_t slen = sizeof(ss);
+              if (getsockname(local_udp_fds[k], (struct sockaddr *)&ss, &slen) == 0 &&
+                  ss.ss_family == msg->source_addr.ss_family) {
+                if (ss.ss_family == AF_INET) {
+                  struct sockaddr_in *sin1 = (struct sockaddr_in *)&ss;
+                  struct sockaddr_in *sin2 = (struct sockaddr_in *)&msg->source_addr;
+                  if (sin1->sin_addr.s_addr == sin2->sin_addr.s_addr) {
+                    target_sock = local_udp_fds[k];
+                    break;
+                  }
+                } else if (ss.ss_family == AF_INET6) {
+                  struct sockaddr_in6 *sin1 = (struct sockaddr_in6 *)&ss;
+                  struct sockaddr_in6 *sin2 = (struct sockaddr_in6 *)&msg->source_addr;
+                  if (memcmp(&sin1->sin6_addr, &sin2->sin6_addr, sizeof(struct in6_addr)) == 0) {
+                    target_sock = local_udp_fds[k];
+                    break;
+                  }
+                }
               }
             }
-            sendto(sock, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
+          }
+          if (target_sock < 0) {
+            if (msg->client_addr.ss_family == AF_INET) {
+              target_sock = notify_v4_sock;
+            } else if (msg->client_addr.ss_family == AF_INET6) {
+              target_sock = notify_v6_sock;
+            }
+          }
+          if (target_sock >= 0) {
+            sendto(target_sock, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
                    (struct sockaddr *)&msg->client_addr, msg->addr_len);
-            close(sock);
+          } else {
+            syslog(LOG_WARNING, "[Frontend %d] No suitable socket found to send NOTIFY (family=%d)",
+                   router_id, (int)msg->client_addr.ss_family);
           }
         }
       } else if (ud >= MAX_BIND_ADDRS && ud < 999) {
