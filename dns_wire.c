@@ -3117,7 +3117,10 @@ int process_update_sections(const uint8_t *req, size_t req_len,
 void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
     if (!rec || !rec->rdata_count) return;
 
-    if (!rec->name_wire && rec->name && arena) {
+    rec->name_wire = NULL;
+    rec->name_wire_len = 0;
+    memset(&rec->cache, 0, sizeof(rec->cache));
+    if (rec->name && arena) {
         uint8_t tmp_name[256];
         long wlen = write_uncompressed_name_ext(tmp_name, 0, sizeof(tmp_name), rec->name, false);
         if (wlen > 0) {

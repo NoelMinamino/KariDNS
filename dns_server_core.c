@@ -4496,7 +4496,7 @@ static void resolve_name(const char *qname, const uint16_t *qtypes, int num_qtyp
             (*ancount)++;
             strncpy(current_qname, synth_name, sizeof(current_qname));
             current_qname[255] = '\0';
-            current_qname_len = (size_t)written;
+            current_qname_len = prefix_len + (size_t)written;
             current_qname_hash = calc_fnv1a_str(current_qname);
             cname_followed = true; found = true; break;
           }
