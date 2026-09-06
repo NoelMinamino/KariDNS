@@ -1134,8 +1134,15 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
           return -1;
         }
       }
-      else if (strcmp(key, "file") == 0)
-        zone->file = val;
+      else if (strcmp(key, "file") == 0) {
+        char safe_file[PATH_MAX];
+        if (is_path_safe_under_cwd(val, safe_file, sizeof(safe_file))) {
+          zone->file = strdup(safe_file);
+          free(val);
+        } else {
+          zone->file = val;
+        }
+      }
       else if (strcmp(key, "file-format") == 0) {
         if (strcasecmp(val, "bind") != 0 && strcasecmp(val, "tinydns") != 0) {
           syslog(LOG_ERR, "[Config] zone '%s': file-format must be 'bind' or 'tinydns' (got '%s')", zone->domain, val);
@@ -2169,7 +2176,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                 free_token(&tok);
                 return -1;
               }
-              ch->file_path = strdup(tok.value);
+              char safe_log[PATH_MAX];
+              if (is_path_safe_under_cwd(tok.value, safe_log, sizeof(safe_log))) {
+                ch->file_path = strdup(safe_log);
+              } else {
+                ch->file_path = strdup(tok.value);
+              }
               free_token(&tok);
               while (1) {
                 tok = get_next_token(ctx);
