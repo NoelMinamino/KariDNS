@@ -7,6 +7,7 @@
 #include <sys/ucred.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <time.h>
 #include <sys/utsname.h>
@@ -198,21 +199,11 @@ int main(int argc, char **argv) {
     char *cfg_sock = extract_socket_from_config(conf_path);
     const char *target_sock = cli_sock_path ? cli_sock_path :
                               (cfg_sock ? cfg_sock : "/var/run/karidns/control.sock");
-
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        if (cfg_sock) free(cfg_sock);
-        explicit_bzero(secret_decoded, sizeof(secret_decoded));
-        return 1;
-    }
-
     struct sockaddr_un un;
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
     if (strlen(target_sock) >= sizeof(un.sun_path)) {
         fprintf(stderr, "Control socket path too long (max %zu bytes): %s\n", sizeof(un.sun_path) - 1, target_sock);
-        close(sock);
         if (cfg_sock) free(cfg_sock);
         explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 1;
@@ -224,9 +215,30 @@ int main(int argc, char **argv) {
         cfg_sock = NULL;
     }
 
-    if (connect(sock, (struct sockaddr *)&un, sizeof(un)) < 0) {
-        perror("connect");
+    int sock = -1;
+    int conn_res = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0) {
+            perror("socket");
+            explicit_bzero(secret_decoded, sizeof(secret_decoded));
+            return 1;
+        }
+        if (connect(sock, (struct sockaddr *)&un, sizeof(un)) == 0) {
+            conn_res = 0;
+            break;
+        }
         close(sock);
+        sock = -1;
+        if ((errno == ECONNREFUSED || errno == EAGAIN) && attempt < 9) {
+            usleep(25000); // 25ms backoff on connection congestion
+            continue;
+        }
+        break;
+    }
+
+    if (conn_res < 0) {
+        perror("connect");
         explicit_bzero(secret_decoded, sizeof(secret_decoded));
         return 1;
     }

@@ -24,19 +24,16 @@ PLUGIN_SCRIPT="${SCRIPT_DIR}/mock_anomalous_dns_server.pl"
 
 TARGET="${1:-dag}"
 
-# Ensure clean slate before running
-killall -9 karidns karidns-asan 2>/dev/null || true
-
 TMP_DIR="$(mktemp -d /tmp/karidns_anomalous_test.XXXXXX)"
 PORT=$((32000 + $$ % 5000))
 SERVER_PID=""
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
-        kill -9 "$SERVER_PID" 2>/dev/null || true
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
     fi
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

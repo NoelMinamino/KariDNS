@@ -8,8 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building dag and karidns with make ==="
-make -C "$ROOT_DIR" dag karidns
+if [ ! -x "$ROOT_DIR/dag" ] || [ ! -x "$ROOT_DIR/karidns" ]; then
+    echo "=== Building dag and karidns with make ==="
+    make -C "$ROOT_DIR" dag karidns
+fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
 KARIDNS="${KARIDNS:-$ROOT_DIR/karidns}"
@@ -61,6 +63,22 @@ run_check() {
     fi
 }
 
+CONF_FILE="/tmp/karidns_trace_tcp_test_$$.conf"
+ZONE_FILE="/tmp/karidns_trace_tcp_test_$$.zone"
+LOG_FILE="/tmp/karidns_trace_test_$$.log"
+PORT=$((15000 + $$ % 10000))
+SERVER_PID=""
+
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$CONF_FILE" "$ZONE_FILE" "$LOG_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 echo "=== 1. Testing Help Message for +trace & +nssearch ==="
 if [ "$DAG" != "dig" ] && [ "$(basename "$DAG")" != "dig" ]; then
     run_check "--help contains +trace TCP note" "$DAG --help" "honors \+tcp; falls back to TCP on truncated responses"
@@ -70,13 +88,6 @@ else
 fi
 
 echo "=== 2. Testing +nssearch +tcp & +trace +tcp with Single KariDNS Instance ==="
-CONF_FILE="/tmp/karidns_trace_tcp_test.conf"
-ZONE_FILE="/tmp/karidns_trace_tcp_test.zone"
-PORT=15398
-
-# Clean up any existing instances before start
-killall -9 karidns 2>/dev/null || true
-sleep 0.5
 
 cat <<EOF > "$ZONE_FILE"
 \$TTL 86400
@@ -107,7 +118,7 @@ zone "example.com" {
 };
 EOF
 
-"$KARIDNS" -f "$CONF_FILE" > /tmp/karidns_trace_test.log 2>&1 &
+"$KARIDNS" -f "$CONF_FILE" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 
@@ -117,9 +128,7 @@ run_check "+nssearch +tcp queries nameservers for SOA" "$DAG @127.0.0.1 -p $PORT
 # Test that querying karidns with +trace +tcp successfully communicates via TCP
 run_check "+trace +tcp receives response from root probe" "$DAG @127.0.0.1 -p $PORT example.com +trace +tcp +timeout=2" "Received [0-9]+ bytes from 127\.0\.0\.1#$PORT"
 
-kill $SERVER_PID 2>/dev/null || true
-killall -9 karidns 2>/dev/null || true
-rm -f "$CONF_FILE" "$ZONE_FILE" /tmp/karidns_trace_test.log
+cleanup
 
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then

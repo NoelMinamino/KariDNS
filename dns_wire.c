@@ -1,3 +1,4 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
 #include "dns_wire.h"
 #include "dns_config_parser.h"
 
@@ -114,11 +115,11 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         size_t idx = hash & COMPRESS_HASH_MASK;
         
         bool compressed = false;
-        if (*offset >= 0x4000) return -1;
         
         for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
             compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) break;
+            if (entry->offset >= 0x4000) continue; // RFC 1035 §4.1.4: 14-bit pointer limit
             if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, label)) {
                 if ((size_t)(*offset + 2) > max_len) return -1;
                 uint16_t ptr = 0xC000 | entry->offset;
@@ -130,13 +131,15 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         }
         if (compressed) return 0;
         
-        for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
-            compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
-            if (entry->generation != ctx->current_generation) {
-                entry->generation = ctx->current_generation;
-                entry->hash = hash;
-                entry->offset = *offset;
-                break;
+        if (*offset < 0x4000) {
+            for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
+                compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
+                if (entry->generation != ctx->current_generation) {
+                    entry->generation = ctx->current_generation;
+                    entry->hash = hash;
+                    entry->offset = *offset;
+                    break;
+                }
             }
         }
         
@@ -708,7 +711,10 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         }
     }
     unsigned int mac_len = 0; unsigned char mac[EVP_MAX_MD_SIZE];
-    if (key->secret_decoded_len > 0) {
+    if (tsig_error == 16 || tsig_error == 17) {
+        // RFC 8945 §5.3.1: If error is BADSIG or BADKEY, MAC size MUST be 0 and MAC data MUST be empty
+        mac_len = 0;
+    } else if (key->secret_decoded_len > 0) {
         const EVP_MD *evp_md = tsig_algorithm_from_name(alg);
         if (!evp_md) {
             if (use_malloc) free(pre_mac);
@@ -739,7 +745,10 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     packet[p_offset++] = (now >> 8) & 0xFF; packet[p_offset++] = now & 0xFF;
     packet[p_offset++] = fudge >> 8; packet[p_offset++] = fudge & 0xFF;
     packet[p_offset++] = mac_len >> 8; packet[p_offset++] = mac_len & 0xFF;
-    memcpy(&packet[p_offset], mac, mac_len); p_offset += mac_len;
+    if (mac_len > 0) {
+        memcpy(&packet[p_offset], mac, mac_len);
+        p_offset += mac_len;
+    }
     packet[p_offset++] = packet[0]; packet[p_offset++] = packet[1]; // Orig ID
     packet[p_offset++] = tsig_error >> 8; packet[p_offset++] = tsig_error & 0xFF; // Error
     if (tsig_error == 18) {
@@ -889,6 +898,35 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         memcpy(mac_out, mac, mac_size);
     }
     return 0;
+}
+
+bool packet_has_tsig(const uint8_t *packet, size_t packet_len) {
+    if (!packet || packet_len < DNS_HEADER_SIZE) return false;
+    uint16_t arcount = (packet[10] << 8) | packet[11];
+    if (arcount == 0) return false;
+    size_t offset = DNS_HEADER_SIZE;
+    uint16_t qdcount = (packet[4] << 8) | packet[5];
+    uint16_t ancount = (packet[6] << 8) | packet[7];
+    uint16_t nscount = (packet[8] << 8) | packet[9];
+    for (int i = 0; i < qdcount; i++) {
+        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
+        offset += 4;
+    }
+    size_t last_rr_offset = 0;
+    for (int i = 0; i < ancount + nscount + arcount; i++) {
+        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
+        if (offset >= packet_len) return false;
+        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
+        if (offset + 10 > packet_len) return false;
+        uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
+        offset += 10 + rdlen;
+    }
+    if (last_rr_offset == 0 || offset > packet_len) return false;
+    size_t tsig_p = last_rr_offset;
+    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return false;
+    if (tsig_p + 10 > packet_len) return false;
+    uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p + 1];
+    return (type == 250);
 }
 
 // ============================================================================
@@ -1422,8 +1460,20 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
 
     if ((size_t)offset + DNS_HEADER_SIZE > max_res_len) return -1; // TC bit needed
 
-    if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx, max_res_len) != 0) {
-        return -1;
+    if (!owner_name && rec->name_wire) {
+        if (!comp_ctx) {
+            if ((size_t)(offset + rec->name_wire_len) > max_res_len) return -1;
+            memcpy(&res[offset], rec->name_wire, rec->name_wire_len);
+            offset += rec->name_wire_len;
+        } else {
+            if (compress_name(res, &offset, rec->name_wire, comp_ctx, max_res_len) != 0) {
+                return -1;
+            }
+        }
+    } else {
+        if (write_dns_name_str(res, &offset, owner_name ? owner_name : rec->name, comp_ctx, max_res_len) != 0) {
+            return -1;
+        }
     }
 
     if ((size_t)offset + 10 > max_res_len) return -1;
@@ -1487,11 +1537,27 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR
+                if (rec->is_cached && rec->cache.name.wire_name) {
+                    if (!comp_ctx) {
+                        if ((size_t)offset + rec->cache.name.wire_name_len > max_res_len) return -1;
+                        memcpy(&res[offset], rec->cache.name.wire_name, rec->cache.name.wire_name_len);
+                        offset += rec->cache.name.wire_name_len;
+                    } else {
+                        if (compress_name(res, &offset, rec->cache.name.wire_name, comp_ctx, max_res_len) != 0) return -1;
+                    }
+                    break;
+                }
                 if (rec->rdata_count == 0) return -1;
                 if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || (size_t)offset > max_res_len) return -1;
                 break;
             }
             case 39: { // DNAME (RFC 6672: 圧縮禁止)
+                if (rec->is_cached && rec->cache.name.wire_name) {
+                    if ((size_t)offset + rec->cache.name.wire_name_len > max_res_len) return -1;
+                    memcpy(&res[offset], rec->cache.name.wire_name, rec->cache.name.wire_name_len);
+                    offset += rec->cache.name.wire_name_len;
+                    break;
+                }
                 if (rec->rdata_count == 0) return -1;
                 long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
                 if (w < 0) return -1;
@@ -1502,6 +1568,18 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (rec->rdata_count < 2) return -1;
                 if ((size_t)offset + 2 > max_res_len) return -1;
                 uint16_t pref;
+                if (rec->is_cached && rec->cache.mx.target_wire) {
+                    pref = rec->cache.mx.pref;
+                    res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
+                    if (!comp_ctx) {
+                        if ((size_t)offset + rec->cache.mx.target_wire_len > max_res_len) return -1;
+                        memcpy(&res[offset], rec->cache.mx.target_wire, rec->cache.mx.target_wire_len);
+                        offset += rec->cache.mx.target_wire_len;
+                    } else {
+                        if (compress_name(res, &offset, rec->cache.mx.target_wire, comp_ctx, max_res_len) != 0) return -1;
+                    }
+                    break;
+                }
                 const char *target;
                 if (rec->is_cached) {
                     pref = rec->cache.mx.pref;
@@ -1517,6 +1595,15 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 33: { // SRV (RFC 2782: 圧縮禁止)
                 if (rec->rdata_count < 4) return -1;
                 if ((size_t)offset + 6 > max_res_len) return -1;
+                if (rec->is_cached && rec->cache.srv.target_wire) {
+                    res[offset++] = rec->cache.srv.priority >> 8; res[offset++] = rec->cache.srv.priority & 0xFF;
+                    res[offset++] = rec->cache.srv.weight >> 8;   res[offset++] = rec->cache.srv.weight & 0xFF;
+                    res[offset++] = rec->cache.srv.port >> 8;     res[offset++] = rec->cache.srv.port & 0xFF;
+                    if ((size_t)offset + rec->cache.srv.target_wire_len > max_res_len) return -1;
+                    memcpy(&res[offset], rec->cache.srv.target_wire, rec->cache.srv.target_wire_len);
+                    offset += rec->cache.srv.target_wire_len;
+                    break;
+                }
                 uint16_t prio, weight, port;
                 const char *target;
                 if (rec->is_cached) {
@@ -1685,6 +1772,22 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 6: { // SOA
                 if (rec->rdata_count < 7) return -1;
+                if (rec->is_cached && rec->cache.soa.mname_wire && rec->cache.soa.rname_wire) {
+                    if (!comp_ctx) {
+                        if ((size_t)offset + rec->cache.soa.mname_wire_len + rec->cache.soa.rname_wire_len + 20 > max_res_len) return -1;
+                        memcpy(&res[offset], rec->cache.soa.mname_wire, rec->cache.soa.mname_wire_len);
+                        offset += rec->cache.soa.mname_wire_len;
+                        memcpy(&res[offset], rec->cache.soa.rname_wire, rec->cache.soa.rname_wire_len);
+                        offset += rec->cache.soa.rname_wire_len;
+                    } else {
+                        if (compress_name(res, &offset, rec->cache.soa.mname_wire, comp_ctx, max_res_len) != 0 ||
+                            compress_name(res, &offset, rec->cache.soa.rname_wire, comp_ctx, max_res_len) != 0) return -1;
+                        if ((size_t)offset + 20 > max_res_len) return -1;
+                    }
+                    memcpy(&res[offset], rec->cache.soa.numbers_wire, 20);
+                    offset += 20;
+                    break;
+                }
                 const char *mname;
                 const char *rname;
                 uint32_t numbers[5];
@@ -1714,6 +1817,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 16: case 99: case 258: { // TXT, SPF, AVC
+                if (rec->is_cached && rec->cache.txt.wire_data) {
+                    if ((size_t)offset + rec->cache.txt.wire_len > max_res_len) return -1;
+                    memcpy(&res[offset], rec->cache.txt.wire_data, rec->cache.txt.wire_len);
+                    offset += rec->cache.txt.wire_len;
+                    break;
+                }
                 if (rec->rdata_count == 0) return -1;
                 size_t required = 0;
                 for (int j = 0; j < rec->rdata_count; j++) {
@@ -2567,6 +2676,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
         if (scan_offset >= req_len) break;
         bool is_opt = (i >= qdcount + ancount_req + nscount_req);
         
+        size_t rr_name_start = scan_offset;
         while (scan_offset < req_len) {
             uint8_t raw = req[scan_offset];
             uint8_t label_type = raw & 0xC0;
@@ -2581,6 +2691,7 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                 return -1;
             }
         }
+        size_t rr_name_len = scan_offset - rr_name_start;
         
         if (i < qdcount) {
             scan_offset += 4;
@@ -2594,7 +2705,9 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                req[scan_offset+7];
                 uint16_t rdlen = (req[scan_offset+8] << 8) | req[scan_offset+9];
                 
+                if (!is_opt && rtype == 41) return -1; // RFC 6891 §6.1.1: OPT only allowed in Additional section
                 if (is_opt && rtype == 41) {
+                    if (rr_name_len != 1 || req[rr_name_start] != 0) return -1; // RFC 6891 §6.1.2: OPT owner MUST be 0 (root)
                     opt_rr_count++;
                     if (opt_rr_count > 1) return -1; // RFC 6891 §6.1.1: 複数OPT RRはFORMERR
                     edns->present = true;
@@ -2727,13 +2840,24 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     uint16_t keepalive_val = 0;
     bool include_keepalive = false;
     if (is_tcp && edns && edns->has_keepalive_query && cfg && cfg->tcp_connection_reuse) {
-        int timeout_sec = cfg->tcp_idle_timeout > 0 ? (int)(cfg->tcp_idle_timeout / 1000) : 10;
-        keepalive_val = (uint16_t)(timeout_sec * 10);
+        uint32_t ms = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
+        keepalive_val = (uint16_t)(ms / 100);
+        if (keepalive_val == 0) keepalive_val = 1;
         include_keepalive = true;
         rdlen += 4 + 2;
     }
     if (edns && edns->has_karidns_ext) {
         rdlen += 4 + 5;
+    }
+
+    uint8_t ecs_addr_bytes = 0;
+    if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {
+        ecs_addr_bytes = (edns->ecs_scope_prefix + 7) / 8;
+        if (edns->ecs_family == 1 && ecs_addr_bytes > 4) ecs_addr_bytes = 4;
+        else if (edns->ecs_family == 2 && ecs_addr_bytes > 16) ecs_addr_bytes = 16;
+        else if (edns->ecs_family != 1 && edns->ecs_family != 2) ecs_addr_bytes = 0;
+        else if (ecs_addr_bytes > sizeof(edns->ecs_addr)) ecs_addr_bytes = sizeof(edns->ecs_addr);
+        rdlen += 4 + 4 + ecs_addr_bytes;
     }
 
     if ((size_t)offset + 11 + rdlen <= max_res_len) {
@@ -2807,6 +2931,19 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
             res[offset++] = (edns->karidns_ext_hash >> 16) & 0xFF;
             res[offset++] = (edns->karidns_ext_hash >> 8) & 0xFF;
             res[offset++] = edns->karidns_ext_hash & 0xFF;
+        }
+
+        if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {
+            uint16_t opt_len = 4 + ecs_addr_bytes;
+            res[offset++] = 0; res[offset++] = 8; // Option Code: 8 (EDNS Client Subnet)
+            res[offset++] = opt_len >> 8; res[offset++] = opt_len & 0xFF; // Option Length
+            res[offset++] = edns->ecs_family >> 8; res[offset++] = edns->ecs_family & 0xFF;
+            res[offset++] = edns->ecs_source_prefix;
+            res[offset++] = edns->ecs_scope_prefix;
+            if (ecs_addr_bytes > 0) {
+                memcpy(res + offset, edns->ecs_addr, ecs_addr_bytes);
+                offset += ecs_addr_bytes;
+            }
         }
         
         (*arcount_inout)++;
@@ -2942,6 +3079,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
         if (class_val == 255) { // ANY (Delete RRset/Domain)
             if (rdlen != 0) return 1;
             if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
+            if (type == 2 && strcasecmp(name, zone_name) == 0) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
             
             uint32_t h = calc_fnv1a_str(name);
             size_t hidx = h & (standby->hash_size - 1);
@@ -2950,6 +3088,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 if (strcasecmp(standby->records[k].name, name) == 0) {
                     if (type == 255 || standby->records[k].type_code == type) {
                         if (standby->records[k].type_code == 6) { continue; } // protect SOA
+                        if (standby->records[k].type_code == 2 && strcasecmp(name, zone_name) == 0) { continue; } // protect apex NS
                         standby->records[k].name = NULL; // Tombstone delete
                     }
                 }
@@ -3004,6 +3143,22 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
             if (found_exact) continue; // no-op
 
+            // CNAME/DNAME exclusivity check (RFC 2136 §3.4.2.3, RFC 1034 §3.6.2, RFC 6672 §2.3)
+            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
+                if (!standby->records[k].name) continue;
+                if (strcasecmp(standby->records[k].name, parsed_rec.name) == 0) {
+                    if (parsed_rec.type_code == 5 /* CNAME */ || parsed_rec.type_code == 39 /* DNAME */) {
+                        if (standby->records[k].type_code != 46 && standby->records[k].type_code != 47) {
+                            return 5; // REFUSED: CNAME/DNAME cannot coexist with other types
+                        }
+                    } else if (parsed_rec.type_code != 46 && parsed_rec.type_code != 47) {
+                        if (standby->records[k].type_code == 5 /* CNAME */ || standby->records[k].type_code == 39 /* DNAME */) {
+                            return 5; // REFUSED: Cannot add record to name with existing CNAME/DNAME
+                        }
+                    }
+                }
+            }
+
             if (standby->count >= standby->records_cap) {
                 size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
                 if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return 2;
@@ -3014,6 +3169,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
             dns_record_t *new_rec = &standby->records[standby->count];
             *new_rec = parsed_rec;
+            dns_record_preparse_cache(standby, new_rec);
 
             // In-flight chain linking
             uint32_t h = calc_fnv1a_str(new_rec->name);
@@ -3045,6 +3201,22 @@ int process_update_sections(const uint8_t *req, size_t req_len,
 // ============================================================================
 void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
     if (!rec || !rec->rdata_count) return;
+
+    rec->name_wire = NULL;
+    rec->name_wire_len = 0;
+    memset(&rec->cache, 0, sizeof(rec->cache));
+    if (rec->name && arena) {
+        uint8_t tmp_name[256];
+        long wlen = write_uncompressed_name_ext(tmp_name, 0, sizeof(tmp_name), rec->name, false);
+        if (wlen > 0) {
+            uint8_t *name_buf = arena_alloc(arena, (size_t)wlen);
+            if (name_buf) {
+                memcpy(name_buf, tmp_name, (size_t)wlen);
+                rec->name_wire = name_buf;
+                rec->name_wire_len = (uint16_t)wlen;
+            }
+        }
+    }
     
     rec->is_cached = false;
     
@@ -3055,6 +3227,61 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
         case 28: // AAAA
             if (inet_pton(AF_INET6, rec->rdata[0], &rec->cache.aaaa.addr) == 1) rec->is_cached = true;
             break;
+        case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
+            if (rec->rdata_count >= 1 && rec->rdata[0] && arena) {
+                uint8_t tmp_wire[256];
+                long wlen = write_uncompressed_name_ext(tmp_wire, 0, sizeof(tmp_wire), rec->rdata[0], false);
+                if (wlen > 0) {
+                    uint8_t *wire_buf = arena_alloc(arena, (size_t)wlen);
+                    if (wire_buf) {
+                        memcpy(wire_buf, tmp_wire, (size_t)wlen);
+                        rec->cache.name.wire_name = wire_buf;
+                        rec->cache.name.wire_name_len = (uint16_t)wlen;
+                        rec->is_cached = true;
+                    }
+                }
+            }
+            break;
+        }
+        case 16: case 99: case 258: { // TXT, SPF, AVC
+            if (rec->rdata_count > 0 && arena) {
+                size_t required = 0;
+                for (int j = 0; j < rec->rdata_count; j++) {
+                    if (!rec->rdata[j]) continue;
+                    size_t len = strlen(rec->rdata[j]);
+                    size_t chunks = (len + 254) / 255;
+                    if (chunks == 0) chunks = 1;
+                    required += chunks + len;
+                }
+                if (required > 0 && required <= 65535) {
+                    uint8_t *txt_buf = arena_alloc(arena, required);
+                    if (txt_buf) {
+                        size_t off = 0;
+                        for (int j = 0; j < rec->rdata_count; j++) {
+                            if (!rec->rdata[j]) continue;
+                            size_t len = strlen(rec->rdata[j]);
+                            const char *str = rec->rdata[j];
+                            if (len == 0) {
+                                txt_buf[off++] = 0;
+                            } else {
+                                while (len > 0) {
+                                    size_t chunk_len = (len > 255) ? 255 : len;
+                                    txt_buf[off++] = (uint8_t)chunk_len;
+                                    memcpy(&txt_buf[off], str, chunk_len);
+                                    off += chunk_len;
+                                    str += chunk_len;
+                                    len -= chunk_len;
+                                }
+                            }
+                        }
+                        rec->cache.txt.wire_data = txt_buf;
+                        rec->cache.txt.wire_len = (uint16_t)required;
+                        rec->is_cached = true;
+                    }
+                }
+            }
+            break;
+        }
         case 6: // SOA
             if (rec->rdata_count >= 7) {
                 rec->cache.soa.mname = rec->rdata[0];
@@ -3064,6 +3291,44 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                 rec->cache.soa.retry = parse_ttl_value(rec->rdata[4]);
                 rec->cache.soa.expire = parse_ttl_value(rec->rdata[5]);
                 rec->cache.soa.minimum = parse_ttl_value(rec->rdata[6]);
+                rec->cache.soa.mname_wire = NULL;
+                rec->cache.soa.mname_wire_len = 0;
+                rec->cache.soa.rname_wire = NULL;
+                rec->cache.soa.rname_wire_len = 0;
+
+                uint32_t s = rec->cache.soa.serial;
+                uint32_t ref = rec->cache.soa.refresh;
+                uint32_t ret = rec->cache.soa.retry;
+                uint32_t exp = rec->cache.soa.expire;
+                uint32_t min = rec->cache.soa.minimum;
+                rec->cache.soa.numbers_wire[0] = (s >> 24) & 0xFF;   rec->cache.soa.numbers_wire[1] = (s >> 16) & 0xFF;
+                rec->cache.soa.numbers_wire[2] = (s >> 8) & 0xFF;    rec->cache.soa.numbers_wire[3] = s & 0xFF;
+                rec->cache.soa.numbers_wire[4] = (ref >> 24) & 0xFF; rec->cache.soa.numbers_wire[5] = (ref >> 16) & 0xFF;
+                rec->cache.soa.numbers_wire[6] = (ref >> 8) & 0xFF;  rec->cache.soa.numbers_wire[7] = ref & 0xFF;
+                rec->cache.soa.numbers_wire[8] = (ret >> 24) & 0xFF; rec->cache.soa.numbers_wire[9] = (ret >> 16) & 0xFF;
+                rec->cache.soa.numbers_wire[10] = (ret >> 8) & 0xFF; rec->cache.soa.numbers_wire[11] = ret & 0xFF;
+                rec->cache.soa.numbers_wire[12] = (exp >> 24) & 0xFF; rec->cache.soa.numbers_wire[13] = (exp >> 16) & 0xFF;
+                rec->cache.soa.numbers_wire[14] = (exp >> 8) & 0xFF;  rec->cache.soa.numbers_wire[15] = exp & 0xFF;
+                rec->cache.soa.numbers_wire[16] = (min >> 24) & 0xFF; rec->cache.soa.numbers_wire[17] = (min >> 16) & 0xFF;
+                rec->cache.soa.numbers_wire[18] = (min >> 8) & 0xFF;  rec->cache.soa.numbers_wire[19] = min & 0xFF;
+
+                if (rec->rdata[0] && rec->rdata[1] && arena) {
+                    uint8_t m_wire[256], r_wire[256];
+                    long mw = write_uncompressed_name_ext(m_wire, 0, sizeof(m_wire), rec->rdata[0], false);
+                    long rw = write_uncompressed_name_ext(r_wire, 0, sizeof(r_wire), rec->rdata[1], false);
+                    if (mw > 0 && rw > 0) {
+                        uint8_t *mbuf = arena_alloc(arena, (size_t)mw);
+                        uint8_t *rbuf = arena_alloc(arena, (size_t)rw);
+                        if (mbuf && rbuf) {
+                            memcpy(mbuf, m_wire, (size_t)mw);
+                            memcpy(rbuf, r_wire, (size_t)rw);
+                            rec->cache.soa.mname_wire = mbuf;
+                            rec->cache.soa.mname_wire_len = (uint16_t)mw;
+                            rec->cache.soa.rname_wire = rbuf;
+                            rec->cache.soa.rname_wire_len = (uint16_t)rw;
+                        }
+                    }
+                }
                 rec->is_cached = true;
             }
             break;
@@ -3071,6 +3336,20 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             if (rec->rdata_count >= 2) {
                 if (parse_u16(rec->rdata[0], &rec->cache.mx.pref)) {
                     rec->cache.mx.target = rec->rdata[1];
+                    rec->cache.mx.target_wire = NULL;
+                    rec->cache.mx.target_wire_len = 0;
+                    if (rec->rdata[1] && arena) {
+                        uint8_t tmp_wire[256];
+                        long wlen = write_uncompressed_name_ext(tmp_wire, 0, sizeof(tmp_wire), rec->rdata[1], false);
+                        if (wlen > 0) {
+                            uint8_t *wire_buf = arena_alloc(arena, (size_t)wlen);
+                            if (wire_buf) {
+                                memcpy(wire_buf, tmp_wire, (size_t)wlen);
+                                rec->cache.mx.target_wire = wire_buf;
+                                rec->cache.mx.target_wire_len = (uint16_t)wlen;
+                            }
+                        }
+                    }
                     rec->is_cached = true;
                 }
             }
@@ -3113,6 +3392,20 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                     parse_u16(rec->rdata[1], &rec->cache.srv.weight) &&
                     parse_u16(rec->rdata[2], &rec->cache.srv.port)) {
                     rec->cache.srv.target = rec->rdata[3];
+                    rec->cache.srv.target_wire = NULL;
+                    rec->cache.srv.target_wire_len = 0;
+                    if (rec->rdata[3] && arena) {
+                        uint8_t tmp_wire[256];
+                        long wlen = write_uncompressed_name_ext(tmp_wire, 0, sizeof(tmp_wire), rec->rdata[3], false);
+                        if (wlen > 0) {
+                            uint8_t *wire_buf = arena_alloc(arena, (size_t)wlen);
+                            if (wire_buf) {
+                                memcpy(wire_buf, tmp_wire, (size_t)wlen);
+                                rec->cache.srv.target_wire = wire_buf;
+                                rec->cache.srv.target_wire_len = (uint16_t)wlen;
+                            }
+                        }
+                    }
                     rec->is_cached = true;
                 }
             }

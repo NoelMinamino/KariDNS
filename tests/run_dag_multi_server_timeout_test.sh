@@ -16,9 +16,10 @@ SERVER_PID=""
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
-        kill -9 "$SERVER_PID" 2>/dev/null || true
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
     fi
-    killall -9 karidns 2>/dev/null || true
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

@@ -8,8 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building dag and karidns with make ==="
-make -C "$ROOT_DIR" dag karidns
+if [ ! -x "$ROOT_DIR/dag" ] || [ ! -x "$ROOT_DIR/karidns" ]; then
+    echo "=== Building dag and karidns with make ==="
+    make -C "$ROOT_DIR" dag karidns
+fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
 KARIDNS="${KARIDNS:-$ROOT_DIR/karidns}"
@@ -61,11 +63,20 @@ run_skip() {
 }
 
 ZONE_FILE="$ROOT_DIR/tests/zones/example.com.zone"
-CONF_FILE="/tmp/karidns_yaml_test.conf"
-PORT=15397
+PORT=$((15000 + $$ % 10000))
+CONF_FILE="/tmp/karidns_yaml_test_$$.conf"
+LOG_FILE="/tmp/karidns_yaml_test_$$.log"
+SERVER_PID=""
 
-killall -9 karidns 2>/dev/null || true
-sleep 0.5
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$CONF_FILE" "$LOG_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 
 cat <<EOF > "$CONF_FILE"
 options {
@@ -81,7 +92,7 @@ zone "example.com" {
 };
 EOF
 
-"$KARIDNS" -f "$CONF_FILE" > /tmp/karidns_yaml_test.log 2>&1 &
+"$KARIDNS" -f "$CONF_FILE" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 
@@ -105,9 +116,7 @@ run_check "YAML Answer RDATA for NAPTR record (order!=pref)" "$DAG @127.0.0.1 -p
 # Authority section for NXDOMAIN
 run_check "YAML Authority section for NXDOMAIN" "$DAG @127.0.0.1 -p $PORT nonexistent.example.com A +yaml" "(AUTHORITY_SECTION:|- 'example\.com\..*SOA|authority:)"
 
-kill $SERVER_PID 2>/dev/null || true
-killall -9 karidns 2>/dev/null || true
-rm -f "$CONF_FILE" /tmp/karidns_yaml_test.log
+cleanup
 
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then

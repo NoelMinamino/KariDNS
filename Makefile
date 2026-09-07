@@ -24,7 +24,7 @@ BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib 
 VERSION ?= 0.2.1
 
 CC ?= cc
-CFLAGS += -O3 -flto -march=native -Wall -Wextra -std=c11 -D_GNU_SOURCE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+CFLAGS += -O3 -flto -march=native -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 LDFLAGS = -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
@@ -100,8 +100,19 @@ karicheck: tools/karicheck.c dns_config_parser.o dns_zone_parser.o dns_tinydns_p
 
 $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS): dns_wire.h dns_config_parser.h dns_zone_parser.h dns_utils.h
 
+.SUFFIXES: .c .o
+
+.c.o:
+	$(CC) $(CFLAGS) -c $< -o $@
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+tools/dag.o: tools/dag.c
+	$(CC) $(CFLAGS) -c tools/dag.c -o tools/dag.o
+
+tools/karictl.o: tools/karictl.c
+	$(CC) $(CFLAGS) -c tools/karictl.c -o tools/karictl.o
 
 tinydns_test: tests/test_tinydns_parser.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_tinydns_parser.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c -lcrypto -o test_tinydns_parser
@@ -131,8 +142,11 @@ hash_test: tests/test_hash_table.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_hash_table.c -o test_hash_table
 	./test_hash_table
 
+bench_serialize: tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.o dns_tinydns_parser.o dns_config_parser.o
+	$(CC) $(CFLAGS) tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.o dns_tinydns_parser.o dns_config_parser.o -o bench_serialize $(LDFLAGS) -lssl -lcrypto -lz
+
 clean: clean-fuzz
-	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
+	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table
 
 run: $(TARGET)

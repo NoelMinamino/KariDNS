@@ -21,8 +21,10 @@ if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
     IS_DIG=1
     CLIENT_NAME="BIND 9 dig ($(dig -v 2>&1 | head -n 1))"
 else
+    if [ ! -x "$ROOT_DIR/dag" ]; then
     echo "=== Building dag with make ==="
-    make -C "$ROOT_DIR" dag
+        make -C "$ROOT_DIR" dag
+fi
     if [ ! -x "$DAG" ]; then
         DAG="$ROOT_DIR/dag"
     fi

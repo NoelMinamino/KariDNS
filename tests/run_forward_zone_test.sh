@@ -13,9 +13,6 @@ KARICHECK="${BIN_DIR}/karicheck"
 DAG="${DAG:-$BIN_DIR/dag}"
 MOCK_SERVER="${BASE_DIR}/tests/mock_dns_server.pl"
 
-# Ensure clean slate before running
-killall -9 karidns karidns-asan 2>/dev/null || true
-
 TMP_DIR="$(mktemp -d /tmp/karidns_forward_test.XXXXXX)"
 SERVER_PID=""
 MOCK_PID1=""
@@ -25,7 +22,9 @@ MOCK_TC_PID=""
 
 cleanup() {
     if [ -n "$SERVER_PID" ]; then
-        kill -9 "$SERVER_PID" 2>/dev/null || true
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
     fi
     if [ -n "$MOCK_PID1" ]; then
         kill -9 "$MOCK_PID1" 2>/dev/null || true
@@ -39,8 +38,6 @@ cleanup() {
     if [ -n "$MOCK_TC_PID" ]; then
         kill -9 "$MOCK_TC_PID" 2>/dev/null || true
     fi
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

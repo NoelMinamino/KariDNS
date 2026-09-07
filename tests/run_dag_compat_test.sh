@@ -8,10 +8,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MOCK_PL="$SCRIPT_DIR/mock_dns_server.pl"
-PORT=10530
+PORT=$((10500 + $$ % 10000))
 
-echo "=== Building tools/dag with make ==="
-make -C "$ROOT_DIR" dag
+if [ ! -x "$ROOT_DIR/dag" ]; then
+    echo "=== Building tools/dag with make ==="
+    make -C "$ROOT_DIR" dag
+fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
 if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then

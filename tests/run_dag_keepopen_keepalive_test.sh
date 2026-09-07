@@ -8,8 +8,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building dag and karidns with make ==="
-make -C "$ROOT_DIR" dag karidns
+if [ ! -x "$ROOT_DIR/dag" ] || [ ! -x "$ROOT_DIR/karidns" ]; then
+    echo "=== Building dag and karidns with make ==="
+    make -C "$ROOT_DIR" dag karidns
+fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
 KARIDNS="${KARIDNS:-$ROOT_DIR/karidns}"
@@ -60,17 +62,28 @@ run_skip() {
     echo "Test: $NAME ... SKIP ($REASON)"
 }
 
+CONF_FILE="/tmp/karidns_keepopen_test_$$.conf"
+LOG_FILE="/tmp/karidns_keepopen_test_$$.log"
+BATCH_FILE="/tmp/dag_batch_keepopen_$$.txt"
+PORT=$((15000 + $$ % 10000))
+SERVER_PID=""
+
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        pkill -P "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$CONF_FILE" "$LOG_FILE" "$BATCH_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 echo "=== 1. Testing +keepalive (EDNS TCP Keepalive, RFC 7828) Option Generation ==="
 # +keepalive generates Option Code 11 (0x000B) with length 0
 run_check "+keepalive emits EDNS Option 11 (00 0b 00 00)" "$DAG @127.0.0.1 -p 10053 example.com A +keepalive +qr +timeout=1" "(00 0b 00 00|KEEPALIVE)"
 run_check "+nokeepalive suppresses Option 11" "$DAG @127.0.0.1 -p 10053 example.com A +nokeepalive +qr +timeout=1" "(opcode: QUERY|status: NOERROR)"
 
 echo "=== 2. Starting KariDNS Server for Live TCP/Keepopen Tests ==="
-CONF_FILE="/tmp/karidns_keepopen_test.conf"
-PORT=15488
-
-killall -9 karidns 2>/dev/null || true
-sleep 0.5
 
 cat <<EOF > "$CONF_FILE"
 options {
@@ -88,7 +101,7 @@ zone "example.com" {
 };
 EOF
 
-"$KARIDNS" -f "$CONF_FILE" > /tmp/karidns_keepopen_test.log 2>&1 &
+"$KARIDNS" -f "$CONF_FILE" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 sleep 0.5
 
@@ -103,7 +116,6 @@ else
 fi
 
 echo "=== 4. Testing +keepopen Batch Mode (-f) ==="
-BATCH_FILE="/tmp/dag_batch_keepopen.txt"
 cat <<EOF > "$BATCH_FILE"
 example.com A
 example.com TXT
@@ -130,9 +142,7 @@ else
         "(KEEPALIVE: 100|KEEPALIVE)"
 fi
 
-kill $SERVER_PID 2>/dev/null || true
-killall -9 karidns 2>/dev/null || true
-rm -f "$CONF_FILE" /tmp/karidns_keepopen_test.log
+cleanup
 
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then

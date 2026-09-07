@@ -1,5 +1,50 @@
 #include "dns_utils.h"
 
+_Atomic bool g_capsicum_enabled = false;
+
+bool split_path_for_openat(const char *path, char *dir_out,
+                          size_t dir_out_sz, char *base_out,
+                          size_t base_out_sz) {
+  if (!path || !*path)
+    return false;
+  size_t plen = strlen(path);
+  if (plen >= PATH_MAX)
+    return false;
+  const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+  if (!slash) slash = strrchr(path, '\\');
+#endif
+  if (!slash) {
+    if (strlen(path) >= base_out_sz)
+      return false;
+    if (snprintf(dir_out, dir_out_sz, ".") >= (int)dir_out_sz)
+      return false;
+    memcpy(base_out, path, plen + 1);
+  } else {
+    size_t dir_len = (size_t)(slash - path);
+    if (dir_len == 0)
+      dir_len = 1;
+    if (dir_len >= dir_out_sz)
+      return false;
+    memcpy(dir_out, path, dir_len);
+    dir_out[dir_len] = '\0';
+    const char *base = slash + 1;
+    size_t base_len = strlen(base);
+    if (base_len == 0 || base_len >= base_out_sz)
+      return false;
+    memcpy(base_out, base, base_len + 1);
+  }
+  if (strcmp(base_out, "..") == 0 || strcmp(base_out, ".") == 0)
+    return false;
+  if (strstr(base_out, "/") != NULL)
+    return false;
+#ifdef _WIN32
+  if (strstr(base_out, "\\") != NULL)
+    return false;
+#endif
+  return true;
+}
+
 uint16_t get_type_code(const char *type_str) {
   if (!type_str)
     return 0;

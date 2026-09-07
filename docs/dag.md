@@ -737,6 +737,10 @@ dag example.com A @127.0.0.1 --test-all
   `format_rdata_for_display()` (used during `+yaml` formatting and `+allcompare` record hash calculation) copied `afdlength` bytes into a fixed `uint8_t addr[16]` buffer without upper-bound clamping. Fixed by clamping copy length: `copy_len = (afdlength > sizeof(addr)) ? sizeof(addr) : afdlength;` and emitting a diagnostic indicator `[APL afdlength=%u invalid for AFI=%u]`.
   Regression testing is automated via `tests/run_dag_apl_afdlength_overflow_test.sh` and continuous fuzzer `tests/fuzz/fuzz_dag_hash`.
 
+- **`+trace` CNAME Tracking Stack Exhaustion via Deep Recursion (CWE-674 / CWE-789)**:
+  `run_trace_query_impl()` recursively invoked itself up to `TRACE_MAX_CNAME_DEPTH` (16) times when traversing CNAME delegation chains. Each recursive frame allocated ~270 KB of stack buffers (`root_qbuf`, `root_resp`, `qbuf`, `resp` at 65,535 bytes each plus local arrays), consuming up to 4.3 MB of stack under unoptimized (`-O0`) or instrumented (ASan/TSan) builds where Tail Call Optimization (TCO) is inhibited. Fixed by converting the CNAME resolution into an iterative loop (`cname_depth` loop) and allocating the four 65 KB I/O buffers on the heap with guaranteed cleanup, reducing per-call stack usage to a single ~16 KB frame.
+  Regression testing is automated via `tests/run_dag_trace_deep_cname_stack_test.sh`.
+
 ### Fuzzing & Differential Test Harnesses
 
 In addition to `fuzz_dag_response`, the following test harnesses ensure protocol security and parser integrity:

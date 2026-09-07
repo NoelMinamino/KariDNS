@@ -15,8 +15,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building dag with make ==="
-make -C "$ROOT_DIR" dag
+if [ ! -x "$ROOT_DIR/dag" ]; then
+    echo "=== Building dag with make ==="
+    make -C "$ROOT_DIR" dag
+fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"
 
@@ -484,10 +486,14 @@ PL_EOF
 # ==============================================================================
 # 8. Transport, Parser & CAA Escape Fixes (TYPE0, +showsearch, CAA, +tls-ca)
 # ==============================================================================
-    echo "=== 8. Testing TYPE0 rejection, +showsearch, CAA escape, and TLS-CA error ==="
+    echo "=== 8. Testing TYPE0 query, +showsearch, CAA escape, and TLS-CA error ==="
 
-    run_check "TYPE0 is rejected as invalid/unknown query type" \
-        "$DAG @127.0.0.1 -p 10053 example.com TYPE0 +timeout=1" \
+    run_check "TYPE0 is sent as valid query type (dig compatibility)" \
+        "$DAG @127.0.0.1 -p 10053 example.com TYPE0 +timeout=1 +qr" \
+        ";example\.com\.[[:space:]]+IN[[:space:]]+TYPE0"
+
+    run_check "TYPE65536 is rejected as invalid/unknown query type" \
+        "$DAG @127.0.0.1 -p 10053 example.com TYPE65536 +timeout=1" \
         "(invalid|unknown|error|Usage)"
 
     run_check "+showsearch flag is accepted and enables search list (+qr)" \

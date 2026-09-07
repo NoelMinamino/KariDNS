@@ -11,6 +11,16 @@
 #define KARIDNS_VERSION "0.2.1"
 #endif
 
+#include <limits.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <stdatomic.h>
+extern _Atomic bool g_capsicum_enabled;
+
+bool split_path_for_openat(const char *path, char *dir_out,
+                          size_t dir_out_sz, char *base_out,
+                          size_t base_out_sz);
+
 uint16_t get_type_code(const char *type_str);
 char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
