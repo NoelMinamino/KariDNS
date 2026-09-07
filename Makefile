@@ -141,7 +141,6 @@ include_test: tests/test_conf_include.c dns_config_parser.c dns_wire.c dns_zone_
 path_safety_test: tests/test_secure_path.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_secure_path.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c -lcrypto -o test_secure_path
 	./test_secure_path
-	rm -f test_secure_path
 
 hash_test: tests/test_hash_table.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_hash_table.c -o test_hash_table

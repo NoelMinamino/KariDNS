@@ -6,23 +6,8 @@ ROOT="$DIR/.."
 KARICHECK="$ROOT/karicheck"
 TEST_BIN="$ROOT/test_secure_path"
 
-echo "[*] Building karicheck and test_secure_path..."
-make -C "$ROOT" karicheck
-
-# Compile test_secure_path
-cc -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -g \
-    -I"$ROOT" \
-    "$DIR/test_secure_path.c" \
-    "$ROOT/dns_config_parser.c" \
-    "$ROOT/dns_zone_parser.c" \
-    "$ROOT/dns_tinydns_parser.c" \
-    "$ROOT/dns_wire.c" \
-    "$ROOT/dns_utils.c" \
-    -lcrypto -lpthread -lm -o "$TEST_BIN"
-
-echo "[*] Running C unit tests for path safety and Capsicum consistency..."
-"$TEST_BIN"
-rm -f "$TEST_BIN"
+echo "[*] Building karicheck and running path safety unit tests..."
+make -C "$ROOT" karicheck path_safety_test
 
 echo "[*] Running karicheck CLI integration tests for path resolution..."
 TMP_CONF=$(mktemp /tmp/karidns_path_test.XXXXXX.conf)
