@@ -589,6 +589,7 @@ static _Atomic bool g_privilege_drop_complete = false;
 static int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
 static int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
 static int g_num_workers = 0;
+char g_startup_cwd[PATH_MAX] = "";
 static int g_notify_ipc[2];
 static int g_control_sock = -1;
 static _Atomic(bool) g_frontend_alive = true;
@@ -878,13 +879,8 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode,
                               bool writable) {
-  char safe_path[PATH_MAX];
-  if (!is_path_safe_under_cwd(path, safe_path, sizeof(safe_path))) {
-    errno = EACCES;
-    return -1;
-  }
   char dirbuf[PATH_MAX], basebuf[PATH_MAX];
-  if (!split_path_for_openat(safe_path, dirbuf, sizeof(dirbuf), basebuf,
+  if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf,
                              sizeof(basebuf))) {
     errno = EINVAL;
     return -1;
@@ -896,13 +892,8 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
 }
 
 static int stat_via_dir_cache(const char *path, struct stat *sb) {
-  char safe_path[PATH_MAX];
-  if (!is_path_safe_under_cwd(path, safe_path, sizeof(safe_path))) {
-    errno = EACCES;
-    return -1;
-  }
   char dirbuf[PATH_MAX], basebuf[PATH_MAX];
-  if (!split_path_for_openat(safe_path, dirbuf, sizeof(dirbuf), basebuf,
+  if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf,
                              sizeof(basebuf))) {
     errno = EINVAL;
     return -1;
@@ -914,17 +905,11 @@ static int stat_via_dir_cache(const char *path, struct stat *sb) {
 }
 
 static int renameat_via_dir_cache(const char *old_path, const char *new_path) {
-  char safe_old[PATH_MAX], safe_new[PATH_MAX];
-  if (!is_path_safe_under_cwd(old_path, safe_old, sizeof(safe_old)) ||
-      !is_path_safe_under_cwd(new_path, safe_new, sizeof(safe_new))) {
-    errno = EACCES;
-    return -1;
-  }
   char odir[PATH_MAX], obase[PATH_MAX], ndir[PATH_MAX], nbase[PATH_MAX];
-  if (!split_path_for_openat(safe_old, odir, sizeof(odir), obase,
+  if (!split_path_for_openat(old_path, odir, sizeof(odir), obase,
                              sizeof(obase)))
     return -1;
-  if (!split_path_for_openat(safe_new, ndir, sizeof(ndir), nbase,
+  if (!split_path_for_openat(new_path, ndir, sizeof(ndir), nbase,
                              sizeof(nbase)))
     return -1;
   int ofd = get_or_open_dir_fd(odir, true);
@@ -6179,14 +6164,6 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
     syslog(LOG_ERR, "[Plugin] zone '%s' program_path is NULL; refusing to spawn", zcfg->domain);
     return false;
   }
-  char prog_path[PATH_MAX];
-  if (!is_path_safe_under_cwd(zcfg->program_path, prog_path, sizeof(prog_path))) {
-    syslog(LOG_ERR, "[Plugin] zone '%s' program_path '%s' is outside safe boundary; refusing to spawn",
-           zcfg->domain, zcfg->program_path);
-    fprintf(stderr, "[ERROR] [Plugin] zone '%s' program path is outside safe boundary: %s\n",
-            zcfg->domain, zcfg->program_path);
-    return false;
-  }
 
   int in_pipe[2];  // parent(karidns) write -> child(script) stdin
   int out_pipe[2]; // child(script) stdout -> parent(karidns) read
@@ -6238,12 +6215,12 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
 
     char *argv[64];
     int ai = 0;
-    argv[ai++] = (char *)prog_path;
+    argv[ai++] = (char *)zcfg->program_path;
     for (int i = 0; i < zcfg->program_args_count && ai < 63; i++)
       argv[ai++] = zcfg->program_args[i];
     argv[ai] = NULL;
 
-    execv(prog_path, argv);
+    execv(zcfg->program_path, argv);
     _exit(127);
   }
 
@@ -6274,7 +6251,7 @@ static bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out)
   atomic_init(&out->dead, false);
 
   syslog(LOG_INFO, "[Plugin] Spawned program zone '%s' -> pid=%d exec='%s'",
-         zcfg->domain, pid, prog_path);
+         zcfg->domain, pid, zcfg->program_path);
   return true;
 }
 
@@ -7518,13 +7495,8 @@ static void init_logging_channels(server_config_t *cfg) {
   while (ch) {
     if (ch->file_path) {
       if (geteuid() == 0) {
-        char safe_ch[PATH_MAX];
-        const char *ch_path = ch->file_path;
-        if (is_path_safe_under_cwd(ch->file_path, safe_ch, sizeof(safe_ch))) {
-          ch_path = safe_ch;
-        }
         char dirbuf[PATH_MAX], basebuf[PATH_MAX];
-        if (split_path_for_openat(ch_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+        if (split_path_for_openat(ch->file_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
           if (dirbuf[0] != '\0' && strcmp(dirbuf, ".") != 0) {
             struct stat d_st;
             if (stat(dirbuf, &d_st) != 0) {
@@ -11113,23 +11085,18 @@ int main(int argc, char **argv) {
   if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
     g_startup_cwd[0] = '\0';
   }
-  init_workspace_root();
   signal(SIGPIPE, SIG_IGN);
   g_cwd_fd = open(".", O_DIRECTORY | O_CLOEXEC | O_RDONLY);
   if (g_cwd_fd >= 0) {
     cap_rights_t cwd_rights;
-    cap_rights_init(&cwd_rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT, CAP_FCNTL);
+    cap_rights_init(&cwd_rights, CAP_LOOKUP, CAP_READ, CAP_WRITE, CAP_CREATE,
+                    CAP_FSTAT, CAP_FSTATFS, CAP_FTRUNCATE, CAP_SEEK,
+                    CAP_RENAMEAT_SOURCE, CAP_RENAMEAT_TARGET, CAP_UNLINKAT,
+                    CAP_FCNTL);
     cap_rights_limit(g_cwd_fd, &cwd_rights);
   }
 
-  static char s_abs_config_path[PATH_MAX];
-  if (is_path_safe_under_cwd(config_file, s_abs_config_path, sizeof(s_abs_config_path))) {
-    g_config_path = s_abs_config_path;
-  } else {
-    syslog(LOG_ERR, "[Config] Configuration file path '%s' is outside allowed workspace/safe boundary", config_file);
-    fprintf(stderr, "[ERROR] Configuration file path '%s' is outside allowed workspace/safe boundary\n", config_file);
-    return 1;
-  }
+  g_config_path = config_file;
 
   openlog("KariDNS", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
   syslog(LOG_INFO, "Starting KariDNS %s...", KARIDNS_VERSION);

@@ -90,12 +90,7 @@ static void check_ds_digest_type(int digest_type, int algorithm, int key_tag,
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
     (void)mode;
     (void)writable;
-    char safe_path[PATH_MAX];
-    if (!is_path_safe_under_cwd(path, safe_path, sizeof(safe_path))) {
-        errno = EACCES;
-        return -1;
-    }
-    return open(safe_path, flags);
+    return open(path, flags);
 }
 
 // Helper to read entire file
@@ -1267,17 +1262,18 @@ static int check_config(const char *config_path, server_config_t *cfg) {
                 if (cfg->user && !z->program_user) {
                     z->program_user = strdup(cfg->user);
                 }
-                char safe_prog[PATH_MAX];
-                if (!is_path_safe_under_cwd(z->program_path, safe_prog, sizeof(safe_prog))) {
+                if (z->program_path[0] != '/') {
                     fprintf(stderr,
-                        "[ERROR] Zone '%s': 'program' path '%s' is outside allowed workspace/safe directory.\n",
-                        z->domain, z->program_path ? z->program_path : "(null)");
+                        "[ERROR] Zone '%s': 'program' must be an absolute path (got '%s'). "
+                        "A relative name would be resolved via $PATH at runtime, which is "
+                        "not deterministic for a network-facing daemon.\n",
+                        z->domain, z->program_path);
                     free(buf);
                     return 1;
                 }
-                if (access(safe_prog, X_OK) != 0) {
+                if (access(z->program_path, X_OK) != 0) {
                     fprintf(stderr, "[WARNING] Zone '%s' program '%s' is not executable (access X_OK failed: %s)\n",
-                            z->domain, safe_prog, strerror(errno));
+                            z->domain, z->program_path, strerror(errno));
                 }
                 if (z->program_user && cfg->user &&
                     strcasecmp(z->program_user, cfg->user) != 0) {
@@ -1324,16 +1320,6 @@ static int check_config(const char *config_path, server_config_t *cfg) {
                         }
                     }
                 }
-            }
-        }
-        if (z->file) {
-            char safe_file[PATH_MAX];
-            if (!is_path_safe_under_cwd(z->file, safe_file, sizeof(safe_file))) {
-                fprintf(stderr,
-                    "[ERROR] Zone '%s': 'file' path '%s' is outside allowed workspace/safe directory.\n",
-                    z->domain, z->file);
-                free(buf);
-                return 1;
             }
         }
         z = z->next;
@@ -1410,10 +1396,6 @@ static void print_usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
-    if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
-        g_startup_cwd[0] = '\0';
-    }
-    init_workspace_root();
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
@@ -1492,10 +1474,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
             return 1;
         }
-    } else if (argc == 2 && strstr(cmd, ".conf") != NULL) {
-        server_config_t cfg;
-        memset(&cfg, 0, sizeof(cfg));
-        return check_config(cmd, &cfg);
     } else {
         print_usage(argv[0]);
         return 1;

@@ -42,7 +42,7 @@ jobs:
 
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-            make -j"$NCPU" all asan tsan tools-asan fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_dag fuzz_tsig_verify asan_test tinydns_test hash_test include_test path_safety_test
+            make -j"$NCPU" all asan tsan tools-asan fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_dag fuzz_tsig_verify asan_test tinydns_test hash_test include_test
             echo "::endgroup::"
 
             echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
@@ -50,7 +50,6 @@ jobs:
             ./test_tinydns_parser
             ./test_hash_table
             ./test_conf_include
-            ./test_secure_path
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
@@ -76,7 +75,6 @@ jobs:
             sh ./tests/run_ixfr_roundtrip_test.sh
             sh ./tests/run_catalog_zone_test.sh
             sh ./tests/run_capsicum_axfr_test.sh
-            sh ./tests/run_secure_path_regression_test.sh
             sh ./tests/run_dynamic_update_test.sh
             sh ./tests/run_roundtrip_test.sh
             sh ./tests/run_karicheck_glue_test.sh
