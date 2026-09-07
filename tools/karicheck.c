@@ -1265,12 +1265,7 @@ static int check_config(const char *config_path, server_config_t *cfg) {
             program_zone_count++;
             if (z->program_path) {
                 if (cfg->user && !z->program_user) {
-                    fprintf(stderr,
-                        "[ERROR] Zone '%s': 'options.user' is set but this program zone has no "
-                        "'program-user'. Without it, the plugin process would run as root. "
-                        "Set 'program-user' explicitly for this zone.\n", z->domain);
-                    free(buf);
-                    return 1;
+                    z->program_user = strdup(cfg->user);
                 }
                 char safe_prog[PATH_MAX];
                 if (!is_path_safe_under_cwd(z->program_path, safe_prog, sizeof(safe_prog))) {

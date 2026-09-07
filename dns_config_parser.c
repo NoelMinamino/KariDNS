@@ -2404,6 +2404,17 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     config->views = default_view;
   }
 
+  // Inherit options.user as default program-user if unspecified
+  for (view_config_t *v = config->views; v; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (z->type && strcasecmp(z->type, "program") == 0) {
+        if (!z->program_user && config->user) {
+          z->program_user = strdup(config->user);
+        }
+      }
+    }
+  }
+
   // Create a flattened list of zones in config->zones for backward compatibility
   // (AXFR, RRL, control-channel etc).
   // ※ このリストは所有権を持たない走査・参照専用リストです。

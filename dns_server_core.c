@@ -6343,6 +6343,9 @@ static void spawn_program_zone_plugins(server_config_t *cfg) {
         syslog(LOG_ERR, "[Plugin] zone '%s' has type program but no 'program' path set; skipping (will SERVFAIL)", z->domain);
         continue;
       }
+      if (!z->program_user && cfg->user) {
+        z->program_user = strdup(cfg->user);
+      }
       if (spawn_one_program_plugin(z, &g_program_plugins[idx])) idx++;
     }
   }
