@@ -40,6 +40,14 @@ static char *karidns_realpath(const char *path, char *resolved) {
 
 void init_workspace_root(void) {
   if (g_workspace_root[0] != '\0') return;
+#ifndef _WIN32
+  if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
+    if (g_workspace_root[0] == '\0' && g_startup_cwd[0] != '\0') {
+      snprintf(g_workspace_root, sizeof(g_workspace_root), "%s", g_startup_cwd);
+    }
+    return;
+  }
+#endif
   if (g_startup_cwd[0] == '\0') {
     if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
       g_startup_cwd[0] = '\0';
@@ -230,18 +238,19 @@ static bool normalize_path_clean(const char *in, char *out, size_t out_sz) {
 bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t resolved_sz) {
   if (!target_path || !*target_path || !resolved_out || resolved_sz == 0) return false;
 
+  char normalized[PATH_MAX];
+  if (!normalize_path_clean(target_path, normalized, sizeof(normalized))) {
+    return false;
+  }
+  if (!is_prefix_allowed(normalized)) {
+    return false;
+  }
+
 #ifndef _WIN32
   if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
     // Under Capsicum capability mode, realpath/stat syscalls cause SIGTRAP.
     // Pure in-memory normalization avoids syscalls while producing identical absolute paths
     // matching cached directory FDs.
-    char normalized[PATH_MAX];
-    if (!normalize_path_clean(target_path, normalized, sizeof(normalized))) {
-      return false;
-    }
-    if (!is_prefix_allowed(normalized)) {
-      return false;
-    }
     if (snprintf(resolved_out, resolved_sz, "%s", normalized) >= (int)resolved_sz) {
       return false;
     }
@@ -249,85 +258,39 @@ bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t 
   }
 #endif
 
-  if (g_startup_cwd[0] == '\0') {
-    if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
-      g_startup_cwd[0] = '\0';
-    }
-#ifdef _WIN32
-    for (char *p = g_startup_cwd; *p; p++) {
-      if (*p == '\\') *p = '/';
-    }
-#endif
-  }
-
-  char combined[PATH_MAX];
-  bool is_abs = (target_path[0] == '/' || target_path[0] == '\\');
-#ifdef _WIN32
-  if (((target_path[0] >= 'a' && target_path[0] <= 'z') ||
-       (target_path[0] >= 'A' && target_path[0] <= 'Z')) && target_path[1] == ':') {
-    is_abs = true;
-  }
-#endif
-  if (is_abs) {
-    if (snprintf(combined, sizeof(combined), "%s", target_path) >= (int)sizeof(combined)) {
-      return false;
+  // If not in Capsicum mode, verify symlink target doesn't escape the workspace
+  char real_buf[PATH_MAX];
+  if (karidns_realpath(normalized, real_buf) != NULL) {
+    if (!is_prefix_allowed(real_buf)) {
+      return false; // Symlink target escapes allowed workspace prefix
     }
   } else {
-    if (g_startup_cwd[0] == '\0') return false;
-    if (snprintf(combined, sizeof(combined), "%s/%s", g_startup_cwd, target_path) >= (int)sizeof(combined)) {
-      return false;
-    }
-  }
+    // If target doesn't exist yet (e.g. creating new log file), check directory part
+    const char *slash = strrchr(normalized, '/');
 #ifdef _WIN32
-  for (char *p = combined; *p; p++) {
-    if (*p == '\\') *p = '/';
-  }
+    if (!slash) slash = strrchr(normalized, '\\');
 #endif
-
-  // 1. 既存ファイルの場合は karidns_realpath でシンボリックリンクや ../ を完全に解決・正規化
-  char real_buf[PATH_MAX];
-  if (karidns_realpath(combined, real_buf) != NULL) {
-    if (!is_prefix_allowed(real_buf)) {
-      return false; // ベース外への脱出を検知
-    }
-    if (snprintf(resolved_out, resolved_sz, "%s", real_buf) >= (int)resolved_sz) {
-      return false;
-    }
-    return true;
-  }
-
-  // 2. ファイルがまだ存在しない場合（新規作成ログファイル等）のフォールバック
-  const char *slash = strrchr(combined, '/');
-#ifdef _WIN32
-  if (!slash) slash = strrchr(combined, '\\');
-#endif
-  if (slash) {
-    char dirbuf[PATH_MAX];
-    size_t dlen = (size_t)(slash - combined);
-    if (dlen == 0) dlen = 1;
-    if (dlen < sizeof(dirbuf)) {
-      memcpy(dirbuf, combined, dlen);
-      dirbuf[dlen] = '\0';
-      char resolved_dir[PATH_MAX];
-      if (karidns_realpath(dirbuf, resolved_dir) != NULL) {
-        if (is_prefix_allowed(resolved_dir)) {
-          if (snprintf(resolved_out, resolved_sz, "%s/%s", resolved_dir, slash + 1) >= (int)resolved_sz) {
-            return false;
+    if (slash) {
+      char dirbuf[PATH_MAX];
+      size_t dlen = (size_t)(slash - normalized);
+      if (dlen == 0) dlen = 1;
+      if (dlen < sizeof(dirbuf)) {
+        memcpy(dirbuf, normalized, dlen);
+        dirbuf[dlen] = '\0';
+        char resolved_dir[PATH_MAX];
+        if (karidns_realpath(dirbuf, resolved_dir) != NULL) {
+          if (!is_prefix_allowed(resolved_dir)) {
+            return false; // Symlink directory escapes allowed workspace prefix
           }
-          return true;
         }
       }
     }
   }
 
-  if (is_prefix_allowed(combined)) {
-    if (snprintf(resolved_out, resolved_sz, "%s", combined) >= (int)resolved_sz) {
-      return false;
-    }
-    return true;
+  if (snprintf(resolved_out, resolved_sz, "%s", normalized) >= (int)resolved_sz) {
+    return false;
   }
-
-  return false;
+  return true;
 }
 
 uint16_t get_type_code(const char *type_str) {
