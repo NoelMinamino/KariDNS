@@ -133,7 +133,10 @@ static bool is_prefix_allowed(const char *path) {
       strncmp(path, "/var/", 5) == 0 || strcmp(path, "/var") == 0 ||
       strncmp(path, "/usr/local/", 11) == 0 || strcmp(path, "/usr/local") == 0 ||
       strncmp(path, "/etc/karidns/", 13) == 0 || strcmp(path, "/etc/karidns") == 0 ||
-      strncmp(path, "/etc/named/", 11) == 0 || strcmp(path, "/etc/named") == 0) {
+      strncmp(path, "/etc/named/", 11) == 0 || strcmp(path, "/etc/named") == 0 ||
+      strncmp(path, "/bin/", 5) == 0 || strcmp(path, "/bin") == 0 ||
+      strncmp(path, "/usr/bin/", 9) == 0 || strcmp(path, "/usr/bin") == 0 ||
+      strncmp(path, "/usr/sbin/", 10) == 0 || strcmp(path, "/usr/sbin") == 0) {
     return true;
   }
   return false;

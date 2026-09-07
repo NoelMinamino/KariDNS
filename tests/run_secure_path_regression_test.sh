@@ -25,7 +25,7 @@ zone "example.com" {
 };
 EOF
 
-if ! "$KARICHECK" "$TMP_CONF" > /dev/null 2>&1; then
+if ! "$KARICHECK" conf "$TMP_CONF" > /dev/null 2>&1; then
     echo "[FAIL] karicheck rejected legitimate relative path './tests/zones/example.com.zone'!"
     exit 1
 fi
@@ -43,7 +43,7 @@ zone "example.com" {
 };
 EOF
 
-if ! "$KARICHECK" "$TMP_CONF" > /dev/null 2>&1; then
+if ! "$KARICHECK" conf "$TMP_CONF" > /dev/null 2>&1; then
     echo "[FAIL] karicheck rejected legitimate '../' path within workspace!"
     exit 1
 fi
@@ -61,7 +61,7 @@ zone "example.com" {
 };
 EOF
 
-if "$KARICHECK" "$TMP_CONF" > /dev/null 2>&1; then
+if "$KARICHECK" conf "$TMP_CONF" > /dev/null 2>&1; then
     echo "[FAIL] karicheck allowed path traversal escaping workspace ('/etc/passwd')!"
     exit 1
 fi
@@ -80,7 +80,7 @@ zone "anomaly.test." {
 };
 EOF
 
-if ! "$KARICHECK" "$TMP_CONF" > /dev/null 2>&1; then
+if ! "$KARICHECK" conf "$TMP_CONF" > /dev/null 2>&1; then
     echo "[FAIL] karicheck failed on program zone inheriting options.user!"
     exit 1
 fi

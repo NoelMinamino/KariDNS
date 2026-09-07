@@ -1326,6 +1326,16 @@ static int check_config(const char *config_path, server_config_t *cfg) {
                 }
             }
         }
+        if (z->file) {
+            char safe_file[PATH_MAX];
+            if (!is_path_safe_under_cwd(z->file, safe_file, sizeof(safe_file))) {
+                fprintf(stderr,
+                    "[ERROR] Zone '%s': 'file' path '%s' is outside allowed workspace/safe directory.\n",
+                    z->domain, z->file);
+                free(buf);
+                return 1;
+            }
+        }
         z = z->next;
     }
 
@@ -1482,6 +1492,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
             return 1;
         }
+    } else if (argc == 2 && strstr(cmd, ".conf") != NULL) {
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        return check_config(cmd, &cfg);
     } else {
         print_usage(argv[0]);
         return 1;
