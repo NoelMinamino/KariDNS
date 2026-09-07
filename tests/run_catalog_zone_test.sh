@@ -8,6 +8,9 @@ BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="catalog_test_dir"
 
+echo "[*] Building required binaries (karidns, karictl, dag, karicheck)..."
+make -C "$BIN_DIR" karidns karictl dag karicheck
+
 # Setup workspace
 rm -rf "$SCRIPT_DIR/$TEST_DIR"
 mkdir -p "$SCRIPT_DIR/$TEST_DIR"

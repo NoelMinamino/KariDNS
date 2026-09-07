@@ -6,8 +6,8 @@ if [ ! -x "$KARICHECK" ]; then
     if [ -x "./tools/karicheck" ]; then
         KARICHECK="./tools/karicheck"
     else
-        echo "karicheck binary not found. Run make first."
-        exit 1
+        echo "[+] Building karicheck..."
+        make karicheck
     fi
 fi
 
