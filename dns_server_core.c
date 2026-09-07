@@ -809,41 +809,6 @@ static dir_fd_entry_t *g_dir_fd_table = NULL;
 static pthread_mutex_t g_dir_fd_lock = PTHREAD_MUTEX_INITIALIZER;
 // g_capsicum_enabled is defined in dns_utils.c and declared in dns_utils.h
 
-static bool split_path_for_openat(const char *path, char *dir_out,
-                                  size_t dir_out_sz, char *base_out,
-                                  size_t base_out_sz) {
-  if (!path || !*path)
-    return false;
-  size_t plen = strlen(path);
-  if (plen >= PATH_MAX)
-    return false;
-  const char *slash = strrchr(path, '/');
-  if (!slash) {
-    if (strlen(path) >= base_out_sz)
-      return false;
-    if (snprintf(dir_out, dir_out_sz, ".") >= (int)dir_out_sz)
-      return false;
-    memcpy(base_out, path, plen + 1);
-  } else {
-    size_t dir_len = (size_t)(slash - path);
-    if (dir_len == 0)
-      dir_len = 1;
-    if (dir_len >= dir_out_sz)
-      return false;
-    memcpy(dir_out, path, dir_len);
-    dir_out[dir_len] = '\0';
-    const char *base = slash + 1;
-    size_t base_len = strlen(base);
-    if (base_len == 0 || base_len >= base_out_sz)
-      return false;
-    memcpy(base_out, base, base_len + 1);
-  }
-  if (strcmp(base_out, "..") == 0 || strcmp(base_out, ".") == 0)
-    return false;
-  if (strstr(base_out, "/") != NULL)
-    return false;
-  return true;
-}
 
 static int get_or_open_dir_fd(const char *dirpath, bool writable) {
   pthread_mutex_lock(&g_dir_fd_lock);

@@ -82,7 +82,7 @@ FUZZ_DAG_BATCH_FILE_SRCS = tests/fuzz/fuzz_dag_batch_file.c dns_wire.c dns_utils
 
 .PHONY: all clean run fuzz fuzz_core clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools \
 	fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
-	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test
+	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test path_safety_test
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 
@@ -138,6 +138,11 @@ include_test: tests/test_conf_include.c dns_config_parser.c dns_wire.c dns_zone_
 	clang -fsanitize=address,undefined -O1 -g tests/test_conf_include.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c -lcrypto -o test_conf_include
 	./test_conf_include
 
+path_safety_test: tests/test_secure_path.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
+	clang -fsanitize=address,undefined -O1 -g tests/test_secure_path.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c -lcrypto -o test_secure_path
+	./test_secure_path
+	rm -f test_secure_path
+
 hash_test: tests/test_hash_table.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_hash_table.c -o test_hash_table
 	./test_hash_table
@@ -147,7 +152,7 @@ bench_serialize: tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.
 
 clean: clean-fuzz
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
-	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table
+	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table test_secure_path
 
 run: $(TARGET)
 	./$(TARGET)

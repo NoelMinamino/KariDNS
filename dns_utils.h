@@ -21,6 +21,9 @@ extern char g_workspace_root[PATH_MAX];
 
 void init_workspace_root(void);
 bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t resolved_sz);
+bool split_path_for_openat(const char *path, char *dir_out,
+                          size_t dir_out_sz, char *base_out,
+                          size_t base_out_sz);
 
 uint16_t get_type_code(const char *type_str);
 char *get_base_dir(const char *path);
