@@ -202,13 +202,12 @@ correctly without duplicate records).
 >   127-byte TXT character-string chunking, and the same lenient IPv4
 >   octet parsing (no range validation, trailing garbage tolerated) as
 >   the original `tinydns-data`.
-> - **`timestamp` field**: Supported as a **load-time** approximation.
->   A record whose `timestamp` is in the future is excluded until the
->   zone is next reloaded (`SIGHUP` / `karictl reload`); the original
->   djbdns behavior re-evaluates this on every single query in
->   real time. The `ttl=0` "countdown TTL" variant is supported the
->   same way: the shrinking TTL is computed once at load time, not
->   recalculated per query.
+> - **`timestamp` field**: Supported with **real-time query evaluation**,
+>   identical to original djbdns behavior. A record whose `timestamp` is in
+>   the future is excluded dynamically on every query (not just at load time).
+>   The `ttl=0` "countdown TTL" variant is likewise computed on every query:
+>   the remaining seconds until the timestamp are clamped to [2, 3600] and
+>   served as the record TTL.
 > - **`%` location (split-horizon by client IP)**: Supported natively
 >   during query resolution. KariDNS compiles `%<loc>:<prefix>` location
 >   lines and trailing `:loc` record fields into memory, performing bitwise
