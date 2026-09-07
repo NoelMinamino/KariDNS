@@ -7,6 +7,7 @@
 #include <sys/ucred.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <time.h>
 #include <sys/utsname.h>
