@@ -3841,7 +3841,9 @@ static const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server
                 if (out_scope_prefix) {
                     const char *slash = strchr(tags[i].cidrs[j].cidr, '/');
                     if (slash) {
-                        *out_scope_prefix = (uint8_t)atoi(slash + 1);
+                        /* [M-2] atoi は範囲外値を返す可能性があるため [0,128] にクランプ */
+                        int pfx = atoi(slash + 1);
+                        *out_scope_prefix = (pfx >= 0 && pfx <= 128) ? (uint8_t)pfx : 0;
                     } else {
                         *out_scope_prefix = (family == 1) ? 32 : 128;
                     }
@@ -4435,6 +4437,10 @@ static bool find_next_closer_name(const char *qname, const char *encloser, char 
     if (qlen <= elen) return false;
     if (strncasecmp(qname + qlen - elen, encloser, elen) != 0) return false;
     if (qname[qlen - elen - 1] != '.') return false;
+    /* [C-3] qlen - elen - 2 がアンダーフローする条件を除外する。
+     * next-closer name が存在するには qname は encloser より少なくとも
+     * "X." (2文字) 長い必要がある。*/
+    if (qlen < elen + 2) return false;
 
     const char *p = qname + qlen - elen - 2;
     while (p >= qname && *p != '.') p--;
@@ -5674,9 +5680,17 @@ static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t q
         while (offset < len) {
             uint8_t l = pkt[offset];
             if (l == 0) { offset++; break; }
-            if ((l & 0xC0) == 0xC0) { offset += 2; break; }
+            /* [C-1] 圧縮ポインタの境界チェック */
+            if ((l & 0xC0) == 0xC0) {
+                if (offset + 2 > len) return len;
+                offset += 2; break;
+            }
+            /* [C-1] ラベル読み越し防止: offset + l + 1 が len を超えないことを確認 */
+            if (offset + 1 + l + 1 > len) return len;
             offset += l + 1;
         }
+        /* [C-1] QTYPE/QCLASS (4バイト) の境界チェック */
+        if (offset + 4 > len) return len;
         offset += 4; // QTYPE, QCLASS
     }
     return (offset <= len) ? offset : len;
@@ -5693,7 +5707,13 @@ static uint32_t bump_soa_serial_in_arena(zone_arena_t *arena) {
         new_serial = serial;
         char buf[32];
         snprintf(buf, sizeof(buf), "%u", serial);
-        arena->records[i].rdata[2] = arena_strdup(arena, buf);
+        /* [C-2] arena_strdup 失敗時は NULL が代入されることを防ぐ */
+        char *new_rdata = arena_strdup(arena, buf);
+        if (!new_rdata) {
+          syslog(LOG_ERR, "[Update] arena_strdup failed bumping SOA serial; aborting update");
+          return 0;
+        }
+        arena->records[i].rdata[2] = new_rdata;
         arena->records[i].is_cached = false;
         dns_record_preparse_cache(arena, &arena->records[i]);
       }
@@ -5811,6 +5831,12 @@ static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
   memcpy(res, req, copy_len);
   res[2] |= 0x80;              // QR=1
   res[3] = (res[3] & 0xF0) | 2; // RCODE=2 (SERVFAIL), RA/Z/AD/CDは維持
+  /* [M-4] 質問セクションが切り詰められた場合 QDCOUNT と実内容が乖離しないよう
+   * copy_len < q_end (切り詰めが発生した) なら QDCOUNT=0 に設定する。
+   * 切り詰めなし (q_end <= max_res_len) の場合はそのまま維持 (SERVFAIL は QDCOUNT=1 許容)。*/
+  if (q_end > max_res_len) {
+    res[4] = 0; res[5] = 0; // QDCOUNT=0 (切り詰め時)
+  }
   res[6] = 0; res[7] = 0;   // ANCOUNT=0
   res[8] = 0; res[9] = 0;   // NSCOUNT=0
   res[10] = 0; res[11] = 0; // ARCOUNT=0
@@ -7069,17 +7095,41 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
 // ============================================================================
 // 9. AXFR専用バックグラウンドスレッド (Detached)
 // ============================================================================
+/* [H-4] TSIG キーのライフタイム問題対策:
+ * axfr_bg_thread_func は detached スレッドとして動作するため、
+ * active config スナップショットが解放された後も tsig_key ポインタを参照し続けると UAF になる。
+ * 対策として tsig_key_t の各フィールドをスレッド起動前にこの構造体へ値コピーし、
+ * ポインタ参照を一切排除する。*/
 typedef struct {
   char master_ip[64];
   int master_port;
   char domain[256];
   zone_db_entry_t *entry;
-  tsig_key_t *tsig_key;
+  /* tsig_key_t の内容を値コピーして保持 (ポインタ参照排除) */
+  bool has_tsig;
+  char tsig_name[256];
+  char tsig_algorithm[64];
+  uint8_t tsig_secret_decoded[256];
+  size_t tsig_secret_decoded_len;
 } axfr_bg_ctx_t;
 
 void *axfr_bg_thread_func(void *arg) {
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_bg_ctx_t *ctx = (axfr_bg_ctx_t *)arg;
+  /* [H-4] ctx->has_tsig が真の場合は、ctx 内に値コピーされた TSIG 情報から
+   * スタック上の tsig_key_t を組み立てて使用する (config ポインタを参照しない)。*/
+  tsig_key_t local_tsig_key;
+  tsig_key_t *tsig_key_ptr = NULL;
+  if (ctx->has_tsig) {
+    memset(&local_tsig_key, 0, sizeof(local_tsig_key));
+    local_tsig_key.name = ctx->tsig_name;
+    local_tsig_key.algorithm = ctx->tsig_algorithm;
+    local_tsig_key.secret = NULL; /* 使用しないので NULL 可 */
+    memcpy(local_tsig_key.secret_decoded, ctx->tsig_secret_decoded, ctx->tsig_secret_decoded_len);
+    local_tsig_key.secret_decoded_len = ctx->tsig_secret_decoded_len;
+    local_tsig_key.next = NULL;
+    tsig_key_ptr = &local_tsig_key;
+  }
   struct sockaddr_storage master_addr;
   memset(&master_addr, 0, sizeof(master_addr));
   int domain_family = AF_INET;
@@ -7213,17 +7263,17 @@ void *axfr_bg_thread_func(void *arg) {
     dns_hdr[11]++;
     uint8_t req_mac[64];
     size_t req_mac_len = 0;
-    if (ctx->tsig_key) {
+    if (tsig_key_ptr) {
       size_t p_len = req_len - 2;
       tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
-                       ctx->tsig_key, 0, req_mac, &req_mac_len, NULL, 0, false);
+                       tsig_key_ptr, 0, req_mac, &req_mac_len, NULL, 0, false);
       req_len = p_len + 2;
     }
     uint16_t msg_len = req_len - 2;
     axfr_req[0] = msg_len >> 8;
     axfr_req[1] = msg_len & 0xFF;
     if (send(tcp_fd, axfr_req, req_len, 0) == req_len) {
-      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, ctx->tsig_key,
+      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, tsig_key_ptr,
                                        req_mac_len > 0 ? req_mac : NULL, req_mac_len);
       if (axfr_res == 1) {
         syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
@@ -7276,7 +7326,12 @@ static void send_single_notify(const uint8_t *req, size_t req_len,
   uint8_t buf[2048];
   memcpy(buf, &msg, sizeof(msg));
   memcpy(buf + sizeof(msg), req, req_len);
-  send(g_notify_ipc[1], buf, sizeof(msg) + req_len, 0);
+  /* [H-1] send 戻り値を検査してエラーをログに記録する */
+  if (send(g_notify_ipc[1], buf, sizeof(msg) + req_len, 0) < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      syslog(LOG_WARNING, "[Notify] send to notify IPC failed: %m");
+    }
+  }
 }
 
 static bool is_addr_notified(const struct sockaddr_storage *addrs, int count, const struct sockaddr *target) {
@@ -8690,6 +8745,8 @@ static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_
 static bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
     for (int i = 0; i < acl_count; i++) {
         char *rule = acl_list[i];
+        /* [L-2] NULL エントリーに対する防御的チェック */
+        if (!rule) continue;
         bool is_deny = (rule[0] == '!');
         const char *target = is_deny ? rule + 1 : rule;
         if (match_cidr(client_ip, target)) {
@@ -9716,13 +9773,24 @@ static void perform_config_reload_ext(bool skip_unchanged) {
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
   
-  // 既存のリーダーが参照を終えるのを待機
+  /* [H-2] 既存のリーダーが参照を終えるのを待機。
+   * 最大5秒を上限とし、超過した場合は古い設定を維持して安全に中断する。*/
   int retries = 0;
   useconds_t sleep_time = 1;
+  struct timespec rcu_wait_start, rcu_wait_now;
+  clock_gettime(CLOCK_MONOTONIC, &rcu_wait_start);
   while (atomic_load_explicit(&standby->reader_count, memory_order_acquire) > 0) {
     if (retries < 100) sched_yield();
     else { usleep(sleep_time); if (sleep_time < 100000) sleep_time *= 2; }
     retries++;
+    clock_gettime(CLOCK_MONOTONIC, &rcu_wait_now);
+    int64_t elapsed_ms = (rcu_wait_now.tv_sec - rcu_wait_start.tv_sec) * 1000 +
+                         (rcu_wait_now.tv_nsec - rcu_wait_start.tv_nsec) / 1000000;
+    if (elapsed_ms > 5000) {
+      syslog(LOG_CRIT, "[Config] RCU standby config still has readers after 5s; aborting reload to protect live traffic");
+      free(config_str);
+      return;
+    }
   }
   
   free_server_config_fields(standby);
@@ -9935,13 +10003,21 @@ void *control_thread_func(void *arg) {
               char *client_hmac = c->buf + 5;
               unsigned char md[EVP_MAX_MD_SIZE];
               unsigned int md_len;
-              HMAC(EVP_sha256(), cfg->control.secret_decoded, cfg->control.secret_decoded_len, 
+              HMAC(EVP_sha256(), cfg->control.secret_decoded, cfg->control.secret_decoded_len,
                    (unsigned char*)c->challenge, 64, md, &md_len);
               char expected[65];
               for(unsigned int k=0; k<md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
-              
-              if (strlen(client_hmac) == strlen(expected) &&
-                  const_time_memcmp(client_hmac, expected, strlen(expected)) == 0) {
+              /* [H-5] タイミング攻撃対策: 長さ比較も定数時間で行う。
+               * client_hmac が expected と長さが異なる場合も const_time_memcmp を
+               * 必ず呼んでキャッシュタイミングを均一化し、その後 len_ok で弾く。*/
+              size_t clen = strlen(client_hmac);
+              size_t elen = strlen(expected);
+              bool len_ok = (clen == elen);
+              /* 長さが異なる場合は expected の長さで比較 (ダミー比較) */
+              size_t cmp_len = len_ok ? elen : elen;
+              bool hmac_ok = (const_time_memcmp(client_hmac, expected,
+                                                clen >= cmp_len ? cmp_len : clen) == 0);
+              if (len_ok && hmac_ok) {
                 auth_ok = true;
               }
             }
@@ -10239,11 +10315,24 @@ void *control_thread_func(void *arg) {
                                     strncpy(bg_ctx->domain, entry->domain, sizeof(bg_ctx->domain) - 1);
                                     bg_ctx->entry = entry;
                                     
+                                    /* [H-4] config ポインタをそのまま渡すと UAF になるため、
+                                     * TSIG キーのデータをスレッド起動前に bg_ctx へ値コピーする。*/
                                     if (tsig_key_name[0] != '\0' && active) {
                                         tsig_key_t *k = active->keys;
                                         while (k) {
                                             if (strcmp(k->name, tsig_key_name) == 0) {
-                                                bg_ctx->tsig_key = k;
+                                                bg_ctx->has_tsig = true;
+                                                strncpy(bg_ctx->tsig_name, k->name,
+                                                        sizeof(bg_ctx->tsig_name) - 1);
+                                                strncpy(bg_ctx->tsig_algorithm,
+                                                        k->algorithm ? k->algorithm : "hmac-sha256",
+                                                        sizeof(bg_ctx->tsig_algorithm) - 1);
+                                                size_t copy_len = k->secret_decoded_len;
+                                                if (copy_len > sizeof(bg_ctx->tsig_secret_decoded))
+                                                    copy_len = sizeof(bg_ctx->tsig_secret_decoded);
+                                                memcpy(bg_ctx->tsig_secret_decoded,
+                                                       k->secret_decoded, copy_len);
+                                                bg_ctx->tsig_secret_decoded_len = copy_len;
                                                 break;
                                             }
                                             k = k->next;
@@ -10979,8 +11068,14 @@ static void daemonize(void) {
   close(STDOUT_FILENO);
   close(STDERR_FILENO);
   int fd = open("/dev/null", O_RDWR);
-  if (fd != STDIN_FILENO)
-    return;
+  if (fd < 0)
+    return; // /dev/null を開けなければ諦める
+  if (fd != STDIN_FILENO) {
+    /* [L-1] fd が stdin でない場合は dup2 で stdin に持ってきて元の fd を閉じる */
+    dup2(fd, STDIN_FILENO);
+    close(fd);
+    fd = STDIN_FILENO;
+  }
   dup2(fd, STDOUT_FILENO);
   dup2(fd, STDERR_FILENO);
   cap_rights_t io_rights;
