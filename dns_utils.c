@@ -131,14 +131,118 @@ static bool is_prefix_allowed(const char *path) {
   return false;
 }
 
+static bool normalize_path_clean(const char *in, char *out, size_t out_sz) {
+  if (!in || !*in || !out || out_sz == 0) return false;
+  char buf[PATH_MAX];
+  bool is_abs = (in[0] == '/' || in[0] == '\\');
+#ifdef _WIN32
+  if (((in[0] >= 'a' && in[0] <= 'z') || (in[0] >= 'A' && in[0] <= 'Z')) && in[1] == ':') {
+    is_abs = true;
+  }
+#endif
+  if (is_abs) {
+    if (snprintf(buf, sizeof(buf), "%s", in) >= (int)sizeof(buf)) return false;
+  } else {
+    if (g_startup_cwd[0] == '\0') {
+      if (!getcwd(g_startup_cwd, sizeof(g_startup_cwd))) {
+        g_startup_cwd[0] = '\0';
+        return false;
+      }
+#ifdef _WIN32
+      for (char *p = g_startup_cwd; *p; p++) {
+        if (*p == '\\') *p = '/';
+      }
+#endif
+    }
+    if (snprintf(buf, sizeof(buf), "%s/%s", g_startup_cwd, in) >= (int)sizeof(buf)) return false;
+  }
+
+#ifdef _WIN32
+  for (char *p = buf; *p; p++) {
+    if (*p == '\\') *p = '/';
+  }
+#endif
+
+  // Tokenize by '/' and process '.' and '..'
+  char *segments[128];
+  int seg_count = 0;
+  char temp[PATH_MAX];
+  snprintf(temp, sizeof(temp), "%s", buf);
+
+  char *p = temp;
+#ifdef _WIN32
+  char drive_prefix[4] = "";
+  if (((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':') {
+    drive_prefix[0] = p[0];
+    drive_prefix[1] = ':';
+    drive_prefix[2] = '\0';
+    p += 2;
+  }
+#endif
+  while (*p) {
+    while (*p == '/') p++;
+    if (!*p) break;
+    char *start = p;
+    while (*p && *p != '/') p++;
+    if (*p) {
+      *p = '\0';
+      p++;
+    }
+    if (strcmp(start, ".") == 0) {
+      continue;
+    } else if (strcmp(start, "..") == 0) {
+      if (seg_count > 0) {
+        seg_count--;
+      }
+    } else {
+      if (seg_count < 128) {
+        segments[seg_count++] = start;
+      } else {
+        return false;
+      }
+    }
+  }
+
+  // Reconstruct absolute path
+  size_t written = 0;
+#ifdef _WIN32
+  if (drive_prefix[0] != '\0') {
+    written = (size_t)snprintf(out, out_sz, "%s", drive_prefix);
+    if (written >= out_sz) return false;
+  }
+#endif
+  if (written + 1 >= out_sz) return false;
+  out[written++] = '/';
+  out[written] = '\0';
+  for (int i = 0; i < seg_count; i++) {
+    size_t slen = strlen(segments[i]);
+    if (written + slen + (written > 1 && out[written - 1] != '/' ? 1 : 0) >= out_sz) return false;
+    if (written > 1 && out[written - 1] != '/') {
+      out[written++] = '/';
+    }
+    memcpy(out + written, segments[i], slen);
+    written += slen;
+    out[written] = '\0';
+  }
+  return true;
+}
+
 bool is_path_safe_under_cwd(const char *target_path, char *resolved_out, size_t resolved_sz) {
   if (!target_path || !*target_path || !resolved_out || resolved_sz == 0) return false;
 
 #ifndef _WIN32
   if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
     // Under Capsicum capability mode, realpath/stat syscalls cause SIGTRAP.
-    // Sandbox directory isolation is enforced by cached dir fds and O_RESOLVE_BENEATH.
-    if (snprintf(resolved_out, resolved_sz, "%s", target_path) >= (int)resolved_sz) {
+    // Pure in-memory normalization avoids syscalls while producing identical absolute paths
+    // matching cached directory FDs.
+    char normalized[PATH_MAX];
+    if (!normalize_path_clean(target_path, normalized, sizeof(normalized))) {
+      return false;
+    }
+    if (!is_prefix_allowed(normalized)) {
+      return false;
+    }
+    if (snprintf(resolved_out, resolved_sz, "%s", normalized) >= (int)resolved_sz) {
       return false;
     }
     return true;

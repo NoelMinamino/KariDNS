@@ -913,17 +913,13 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode,
                               bool writable) {
-  const char *target = path;
   char safe_path[PATH_MAX];
-  if (!atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
-    if (!is_path_safe_under_cwd(path, safe_path, sizeof(safe_path))) {
-      errno = EACCES;
-      return -1;
-    }
-    target = safe_path;
+  if (!is_path_safe_under_cwd(path, safe_path, sizeof(safe_path))) {
+    errno = EACCES;
+    return -1;
   }
   char dirbuf[PATH_MAX], basebuf[PATH_MAX];
-  if (!split_path_for_openat(target, dirbuf, sizeof(dirbuf), basebuf,
+  if (!split_path_for_openat(safe_path, dirbuf, sizeof(dirbuf), basebuf,
                              sizeof(basebuf))) {
     errno = EINVAL;
     return -1;
@@ -935,17 +931,13 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
 }
 
 static int stat_via_dir_cache(const char *path, struct stat *sb) {
-  const char *target = path;
   char safe_path[PATH_MAX];
-  if (!atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
-    if (!is_path_safe_under_cwd(path, safe_path, sizeof(safe_path))) {
-      errno = EACCES;
-      return -1;
-    }
-    target = safe_path;
+  if (!is_path_safe_under_cwd(path, safe_path, sizeof(safe_path))) {
+    errno = EACCES;
+    return -1;
   }
   char dirbuf[PATH_MAX], basebuf[PATH_MAX];
-  if (!split_path_for_openat(target, dirbuf, sizeof(dirbuf), basebuf,
+  if (!split_path_for_openat(safe_path, dirbuf, sizeof(dirbuf), basebuf,
                              sizeof(basebuf))) {
     errno = EINVAL;
     return -1;
@@ -957,23 +949,17 @@ static int stat_via_dir_cache(const char *path, struct stat *sb) {
 }
 
 static int renameat_via_dir_cache(const char *old_path, const char *new_path) {
-  const char *target_old = old_path;
-  const char *target_new = new_path;
   char safe_old[PATH_MAX], safe_new[PATH_MAX];
-  if (!atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
-    if (!is_path_safe_under_cwd(old_path, safe_old, sizeof(safe_old)) ||
-        !is_path_safe_under_cwd(new_path, safe_new, sizeof(safe_new))) {
-      errno = EACCES;
-      return -1;
-    }
-    target_old = safe_old;
-    target_new = safe_new;
+  if (!is_path_safe_under_cwd(old_path, safe_old, sizeof(safe_old)) ||
+      !is_path_safe_under_cwd(new_path, safe_new, sizeof(safe_new))) {
+    errno = EACCES;
+    return -1;
   }
   char odir[PATH_MAX], obase[PATH_MAX], ndir[PATH_MAX], nbase[PATH_MAX];
-  if (!split_path_for_openat(target_old, odir, sizeof(odir), obase,
+  if (!split_path_for_openat(safe_old, odir, sizeof(odir), obase,
                              sizeof(obase)))
     return -1;
-  if (!split_path_for_openat(target_new, ndir, sizeof(ndir), nbase,
+  if (!split_path_for_openat(safe_new, ndir, sizeof(ndir), nbase,
                              sizeof(nbase)))
     return -1;
   int ofd = get_or_open_dir_fd(odir, true);
