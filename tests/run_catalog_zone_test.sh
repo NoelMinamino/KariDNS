@@ -80,6 +80,7 @@ key "karictl" {
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
 EOF
+chmod 600 karictl.conf
 
 # Build & Run with ktrace if available
 if which ktrace >/dev/null 2>&1; then

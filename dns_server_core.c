@@ -9820,7 +9820,7 @@ void *control_thread_func(void *arg) {
     pthread_exit(NULL);
   }
   if (g_control_sock >= 0) {
-    EV_SET(&ev_set[0], g_control_sock, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    EV_SET(&ev_set[0], g_control_sock, EVFILT_READ, EV_ADD, 0, 0, NULL);
     if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1) {
       close(kq);
       pthread_exit(NULL);
@@ -9837,10 +9837,15 @@ void *control_thread_func(void *arg) {
     }
     for (int i = 0; i < n; i++) {
       if (g_control_sock >= 0 && ev_list[i].ident == (uintptr_t)g_control_sock) {
-        struct sockaddr_un cli_addr;
-        socklen_t cli_len = sizeof(cli_addr);
-        int cfd = accept(g_control_sock, (struct sockaddr *)&cli_addr, &cli_len);
-        if (cfd >= 0) {
+        int ctrl_accept_count = 0;
+        while (ctrl_accept_count < 64) {
+          struct sockaddr_un cli_addr;
+          socklen_t cli_len = sizeof(cli_addr);
+          int cfd = accept(g_control_sock, (struct sockaddr *)&cli_addr, &cli_len);
+          if (cfd < 0) {
+            break;
+          }
+          ctrl_accept_count++;
           struct xucred cr;
           socklen_t cr_len = sizeof(cr);
           if (getsockopt(cfd, 0, LOCAL_PEERCRED, &cr, &cr_len) == 0 && cr.cr_version == XUCRED_VERSION) {
@@ -11237,7 +11242,7 @@ int main(int argc, char **argv) {
     if (g_control_sock >= 0) {
       mode_t old_mask = umask(0177);
       if (bind(g_control_sock, (struct sockaddr *)&un, sizeof(un)) == 0) {
-        listen(g_control_sock, 5);
+        listen(g_control_sock, 128);
         server_config_t *cfg = &g_config_db.config_a;
         if (cfg->user) {
           struct passwd *pwd = getpwnam(cfg->user);
