@@ -9837,6 +9837,11 @@ void *control_thread_func(void *arg) {
     }
     for (int i = 0; i < n; i++) {
       if (g_control_sock >= 0 && ev_list[i].ident == (uintptr_t)g_control_sock) {
+        // リスニングソケットをノンブロッキング化して accept でのハングを完全防止
+        int sflags = fcntl(g_control_sock, F_GETFL, 0);
+        if (!(sflags & O_NONBLOCK)) {
+          fcntl(g_control_sock, F_SETFL, sflags | O_NONBLOCK);
+        }
         int ctrl_accept_count = 0;
         while (ctrl_accept_count < 64) {
           struct sockaddr_un cli_addr;
@@ -9845,6 +9850,8 @@ void *control_thread_func(void *arg) {
           if (cfd < 0) {
             break;
           }
+          // クライアント側ソケットも直ちにノンブロッキング化
+          fcntl(cfd, F_SETFL, fcntl(cfd, F_GETFL, 0) | O_NONBLOCK);
           ctrl_accept_count++;
           struct xucred cr;
           socklen_t cr_len = sizeof(cr);
@@ -9863,7 +9870,6 @@ void *control_thread_func(void *arg) {
             continue;
           }
 
-          fcntl(cfd, F_SETFL, fcntl(cfd, F_GETFL, 0) | O_NONBLOCK);
           cap_rights_t rights;
           cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT);
           cap_rights_limit(cfd, &rights);
@@ -11242,6 +11248,7 @@ int main(int argc, char **argv) {
     if (g_control_sock >= 0) {
       mode_t old_mask = umask(0177);
       if (bind(g_control_sock, (struct sockaddr *)&un, sizeof(un)) == 0) {
+        fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         listen(g_control_sock, 128);
         server_config_t *cfg = &g_config_db.config_a;
         if (cfg->user) {
