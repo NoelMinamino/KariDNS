@@ -46,6 +46,7 @@ Legend:
 | RFC 7314 | Extension Mechanisms for DNS (EDNS) EXPIRE Option | ❌ No (Server) / ✅ Full (Client `dag`) | Server does not emit option 9. `dag` client supports sending and parsing EDNS EXPIRE option (`+expire`) |
 | RFC 5001 | DNS Name Server Identifier (NSID) Option | ✅ Full (requires `nsid` config) | Server responds with a configured identifier string via EDNS option code 3 when queried with an empty NSID option, provided `nsid "<value>";` is set. `dag` client supports requesting and decoding NSID (`+nsid`) |
 | RFC 7828 | The edns-tcp-keepalive EDNS0 Extension | ✅ Full (opt-in, tied to `tcp-connection-reuse`) | When `tcp-connection-reuse yes;` is set and a client requests the option over TCP, the server echoes its configured idle timeout (`tcp-idle-timeout`, encoded in 100ms units per §3.2). Never included in UDP responses (RFC 7828 §3.2.1). `dag` client fully supports sending and decoding `+keepalive` |
+| RFC 7871 | Client Subnet in DNS Queries (ECS) | ✅ Full (Server, scope limited to authoritative record steering) / ✅ Full (Client `dag`) | Server parses the ECS option (FAMILY/SOURCE PREFIX-LENGTH/SCOPE PREFIX-LENGTH/ADDRESS) from trusted resolvers only (`ecs-enable`, `ecs-trusted-resolvers`), uses it for `$ECS-SUBNET-TAG` split-horizon record selection (`resolve_ecs_subnet_tag()` in `dns_server_core.c`, ECS parsing in `dns_wire.c`), and echoes SCOPE PREFIX-LENGTH in the response per §7.1.2. This is authoritative-side record steering, not recursive-resolver ECS forwarding/caching. `dag` client supports sending and parsing ECS options (`+subnet=addr/prefix`) |
 
 ---
 
@@ -153,7 +154,6 @@ Legend:
 | RFC 8484 | DNS over HTTPS (DoH) | ➖ N/A (Server) / ✅ Full (Client `dag`) | Server does not terminate DoH directly. `dag` client natively supports DoH (`+https`, `+https-get`, `+https-post`, `+http-plain`) |
 | RFC 9250 | DNS over QUIC (DoQ) | ➖ N/A | Out of scope given the current authoritative-server design |
 | RFC 9498 | Fully Encrypted Authority | ➖ N/A | Depends on encrypted-transport infrastructure outside the current design's scope |
-| RFC 7871 | Client Subnet in DNS Queries (ECS) | ❌ No (Server) / ✅ Full (Client `dag`) | Server uses `view`/`match-clients` for source-IP-based split horizon without ECS. `dag` client supports sending and parsing ECS options (`+subnet=addr/prefix`) |
 | RFC 7830 | The EDNS(0) Padding Option | ❌ No (Server) / ✅ Full (Client `dag`) | Server does not pad responses. `dag` client supports sending and displaying EDNS padding (`+padding=N`) |
 | RFC 8020 | NXDOMAIN: There Really Is Nothing Underneath | ➖ N/A | Recursive-resolver caching guidance; does not apply to an authoritative server |
 | RFC 9156 | DNS Query Name Minimisation to Improve Privacy | ➖ N/A | Obsoletes RFC 7816. Recursive-resolver caching and upstream query minimization; authoritative servers handle minimized queries transparently |

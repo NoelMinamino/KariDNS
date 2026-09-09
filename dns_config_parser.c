@@ -380,6 +380,33 @@ static void free_partial_view(view_config_t *view) {
   free(view);
 }
 
+/* [T7] 定義済み TSIG キーリストを線形探索するヘルパー */
+static bool key_name_is_defined(const tsig_key_t *keys, const char *name) {
+  if (!name) return false;
+  for (const tsig_key_t *k = keys; k; k = k->next) {
+    if (k->name && strcmp(k->name, name) == 0) return true;
+  }
+  return false;
+}
+
+/* [T7] allow-update エントリーが IP/CIDR/any/none 系のトークンかどうかの簡易判定。
+ * 完全な判定ではないため警告目的のみで使用すること。*/
+static bool looks_like_acl_address_token(const char *tok) {
+  if (!tok) return true;
+  if (strcmp(tok, "any") == 0 || strcmp(tok, "none") == 0) return true;
+  const char *p = (tok[0] == '!') ? tok + 1 : tok;
+  char buf[128];
+  strncpy(buf, p, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+  char *slash = strchr(buf, '/');
+  if (slash) *slash = '\0';
+  struct in_addr a4;
+  struct in6_addr a6;
+  if (inet_pton(AF_INET, buf, &a4) == 1) return true;
+  if (inet_pton(AF_INET6, buf, &a6) == 1) return true;
+  return false;
+}
+
 void free_server_config_fields(server_config_t *cfg) {
   if (!cfg) return;
   for (int j = 0; j < cfg->bind_address_count; j++)
@@ -2393,6 +2420,45 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       if (z->type && strcasecmp(z->type, "program") == 0) {
         if (!z->program_user && config->user) {
           z->program_user = strdup(config->user);
+        }
+      }
+    }
+  }
+
+  /* [T7] TSIGキー参照の未定義検出 (checkconf相当の健全性チェック) */
+  for (view_config_t *v = config->views; v; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      /* tsig-key ディレクティブ: 存在しないキー名は起動失敗 */
+      if (z->tsig_key && !key_name_is_defined(config->keys, z->tsig_key)) {
+        syslog(LOG_ERR, "[Config] Zone '%s': tsig-key '%s' is not defined in any key {} block",
+               z->domain, z->tsig_key);
+        fprintf(stderr, "[ERROR] Zone '%s': tsig-key '%s' is not defined in any key {} block\n",
+                z->domain, z->tsig_key);
+        return -1;
+      }
+      /* allow-transfer key: 存在しないキー名は起動失敗 */
+      for (int i = 0; i < z->tsig_keys_count; i++) {
+        if (!key_name_is_defined(config->keys, z->tsig_keys[i])) {
+          syslog(LOG_ERR, "[Config] Zone '%s': allow-transfer key '%s' is not defined in any key {} block",
+                 z->domain, z->tsig_keys[i]);
+          fprintf(stderr, "[ERROR] Zone '%s': allow-transfer key '%s' is not defined in any key {} block\n",
+                  z->domain, z->tsig_keys[i]);
+          return -1;
+        }
+      }
+      /* allow-update: IP/CIDR以外のエントリーがキー定義に一致しない場合は警告(起動は継続) */
+      for (int i = 0; i < z->allow_update_count; i++) {
+        const char *entry = z->allow_update[i];
+        if (looks_like_acl_address_token(entry)) continue;
+        if (!key_name_is_defined(config->keys, entry)) {
+          syslog(LOG_WARNING,
+                 "[Config] Zone '%s': allow-update entry '%s' does not match any defined key "
+                 "and is not a valid IP/CIDR; likely a typo",
+                 z->domain, entry);
+          fprintf(stderr,
+                  "[WARNING] Zone '%s': allow-update entry '%s' does not match any defined key "
+                  "and is not a valid IP/CIDR; likely a typo\n",
+                  z->domain, entry);
         }
       }
     }

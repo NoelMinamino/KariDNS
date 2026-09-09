@@ -1,0 +1,9 @@
+$TTL 3600
+$ORIGIN dynttl.test.
+@       IN SOA  ns1.dynttl.test. admin.dynttl.test. 1 3600 900 1209600 86400
+        IN NS   ns1.dynttl.test.
+ns1     IN A    127.0.0.1
+
+; UPDATE前は単一レコードのみ(TTL 300)。UPDATEで別TTLのレコードを追加した際、
+; 既存のこのレコードも巻き込んで再正規化されることを検証する。
+dynhost 300 IN A 192.0.2.100
