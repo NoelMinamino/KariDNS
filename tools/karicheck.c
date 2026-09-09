@@ -18,6 +18,18 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
+/* [T6] RFC 2181 §5.2 TTL不整合検出用ソート比較関数
+ * build_zone_index() 実行前の生データを qsort で正規化前に冗丸を検出する */
+static int cmp_rec_by_name_type(const void *pa, const void *pb) {
+    const dns_record_t *ra = *(const dns_record_t **)pa;
+    const dns_record_t *rb = *(const dns_record_t **)pb;
+    if (!ra->name || !rb->name) return ra->name ? 1 : (rb->name ? -1 : 0);
+    int c = strcasecmp(ra->name, rb->name);
+    if (c != 0) return c;
+    if (ra->type_code != rb->type_code) return (ra->type_code < rb->type_code) ? -1 : 1;
+    return 0;
+}
+
 typedef struct { int alg_num; const char *name; const char *status; } dnssec_alg_info_t;
 
 static const dnssec_alg_info_t KNOWN_DNSSEC_ALGS[] = {
@@ -566,7 +578,35 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         return 1;
     }
 
-    if (build_zone_index(&arena) != 0) {
+    /* [T6] RFC 2181 §5.2: build_zone_index() による TTL 自動正規化が行われる"前"に、
+     * ソースゾーンファイル上の生データで RRset 内 TTL 不整合を検出し警告する。
+     * (正規化後に検査すると値が湰っているため、必ずこの位置で実施すること) */
+    if (arena.count > 0) {
+        dns_record_t **sorted = malloc(sizeof(dns_record_t *) * arena.count);
+        if (sorted) {
+            for (size_t k = 0; k < arena.count; k++) sorted[k] = &arena.records[k];
+            qsort(sorted, arena.count, sizeof(dns_record_t *), cmp_rec_by_name_type);
+            for (size_t k = 0; k + 1 < arena.count; k++) {
+                if (!sorted[k]->name || !sorted[k + 1]->name) continue;
+                /* RRSIG(46)同士の比較は被覆タイプが異なる場合に誤検知する可能性があるため除外 */
+                if (sorted[k]->type_code == 46 && sorted[k + 1]->type_code == 46) continue;
+                if (sorted[k]->type_code == sorted[k + 1]->type_code &&
+                    strcasecmp(sorted[k]->name, sorted[k + 1]->name) == 0 &&
+                    sorted[k]->ttl_value != sorted[k + 1]->ttl_value) {
+                    fprintf(stderr,
+                        "[WARNING] RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
+                        "zone file; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
+                        "KariDNS will normalize this to the minimum value at load time, "
+                        "but the zone file should be corrected.\n",
+                        sorted[k]->name, sorted[k]->type_code,
+                        sorted[k]->ttl_value, sorted[k + 1]->ttl_value);
+                }
+            }
+            free(sorted);
+        }
+    }
+
+    if (build_zone_index(&arena, true) != 0) {
         fprintf(stderr, "[ERROR] Memory allocation failed during index build for '%s'\n", domain);
         free((void*)ctx.base_dir);
         zone_arena_destroy(&arena);
@@ -590,6 +630,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
     fprintf(stdout, "[OK] Zone '%s' parsed successfully (%zu records)\n", domain, arena.count);
     bool has_soa = false;
+    int soa_count = 0; /* [T3] SOA重複検出用 */
     bool has_apex_ns = false;
     bool error_found = false;
 
@@ -828,6 +869,8 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
 
         if (tcode == 6 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_soa = true;
+            /* [T3] SOA重複検出: apexに2度以上の SOAは破損ゾーンファイル */
+            soa_count++;
         }
         if (tcode == 2 && strcasecmp(arena.records[i].name, domain) == 0) {
             has_apex_ns = true;
@@ -951,6 +994,86 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                     fprintf(stderr, "[ERROR] NAPTR preference '%s' out of range (0-65535) for name '%s' in zone '%s'\n",
                             rdata[1], arena.records[i].name, domain);
                     error_found = true;
+                }
+                /* [T5] RFC 3403 §4.1: flags は [A-Za-z0-9] のみ許容 */
+                const char *naptr_flags = rdata[2];
+                size_t naptr_flags_len = strlen(naptr_flags);
+                bool naptr_flags_ok = true;
+                for (size_t fi = 0; fi < naptr_flags_len; fi++) {
+                    char c = naptr_flags[fi];
+                    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+                        naptr_flags_ok = false;
+                        break;
+                    }
+                }
+                if (!naptr_flags_ok) {
+                    fprintf(stderr, "[ERROR] NAPTR flags '%s' for name '%s' in zone '%s' must contain only "
+                            "[A-Za-z0-9] characters (RFC 3403 §4.1)\n",
+                            naptr_flags, arena.records[i].name, domain);
+                    error_found = true;
+                }
+                /* [T5] RFC 2915 §2: regexp と replacement は同時に非空であってはならない */
+                bool naptr_has_regexp = (strlen(rdata[4]) > 0);
+                bool naptr_has_replacement = (strlen(rdata[5]) > 0 && strcmp(rdata[5], ".") != 0);
+                if (naptr_has_regexp && naptr_has_replacement) {
+                    fprintf(stderr, "[ERROR] NAPTR record for '%s' in zone '%s' sets both a regexp and a "
+                            "non-root replacement field; RFC 2915 requires exactly one of them to be empty\n",
+                            arena.records[i].name, domain);
+                    error_found = true;
+                }
+            }
+        }
+        if (tcode == 257) { // CAA (RFC 8659)
+            /* [T4] RFC 8659 CAAレコード検証 */
+            if (rcount < 3) {
+                fprintf(stderr, "[ERROR] CAA record requires 3 fields (flags, tag, value) for name '%s' in zone '%s'\n",
+                        arena.records[i].name, domain);
+                error_found = true;
+            } else {
+                char *endp;
+                unsigned long caa_flags = strtoul(rdata[0], &endp, 10);
+                if (*endp != '\0' || caa_flags > 255) {
+                    fprintf(stderr, "[ERROR] CAA flags '%s' out of range (0-255) for name '%s' in zone '%s'\n",
+                            rdata[0], arena.records[i].name, domain);
+                    error_found = true;
+                } else if ((caa_flags & ~0x80UL) != 0) {
+                    /* RFC 8659 §4: bit0(critical=0x80)以外の未定義ビット */
+                    fprintf(stderr, "[WARNING] CAA record for '%s' sets undefined flag bits (0x%02lx); "
+                            "only the critical bit (0x80) is defined by RFC 8659\n",
+                            arena.records[i].name, caa_flags);
+                }
+                const char *caa_tag = rdata[1];
+                size_t caa_tag_len = strlen(caa_tag);
+                bool caa_tag_ok = (caa_tag_len >= 1 && caa_tag_len <= 15);
+                for (size_t ti = 0; caa_tag_ok && ti < caa_tag_len; ti++) {
+                    char c = caa_tag[ti];
+                    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
+                        caa_tag_ok = false;
+                }
+                if (!caa_tag_ok) {
+                    fprintf(stderr, "[ERROR] CAA tag '%s' for name '%s' does not match RFC 8659 syntax "
+                            "(1-15 chars, [a-zA-Z0-9] only)\n",
+                            caa_tag, arena.records[i].name);
+                    error_found = true;
+                } else {
+                    bool known_tag = (strcasecmp(caa_tag, "issue") == 0 ||
+                                      strcasecmp(caa_tag, "issuewild") == 0 ||
+                                      strcasecmp(caa_tag, "iodef") == 0 ||
+                                      strcasecmp(caa_tag, "contactemail") == 0 ||
+                                      strcasecmp(caa_tag, "contactphone") == 0);
+                    if (!known_tag) {
+                        bool is_critical = ((strtoul(rdata[0], NULL, 10) & 0x80) != 0);
+                        if (is_critical) {
+                            fprintf(stderr, "[ERROR] CAA record for '%s' has unknown tag '%s' with the critical flag set; "
+                                    "RFC 8659 requires issuers to refuse issuance\n",
+                                    arena.records[i].name, caa_tag);
+                            error_found = true;
+                        } else {
+                            fprintf(stderr, "[WARNING] CAA record for '%s' has unrecognized tag '%s' "
+                                    "(not one of issue/issuewild/iodef/contactemail/contactphone)\n",
+                                    arena.records[i].name, caa_tag);
+                        }
+                    }
                 }
             }
         }
@@ -1155,6 +1278,13 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         zone_arena_destroy(&arena);
         free(root_path);
         return 1;
+    }
+    /* [T3] SOA重複検出: apexに 2以上の SOAは失敗 */
+    if (soa_count > 1) {
+        fprintf(stderr, "[ERROR] Zone '%s' (%s) has %d SOA records at the apex; "
+                "exactly one SOA record is required\n",
+                domain, file_path, soa_count);
+        error_found = true;
     }
 
     if (!has_apex_ns) {

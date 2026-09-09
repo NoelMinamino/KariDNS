@@ -1235,9 +1235,21 @@ PROCESS_RECORD:
         rec->rdata[3] = expand_domain_name(rec->rdata[3], *origin_io, arena);
       }
     } else if (rec->type_code == 55) { // HIP
-      if (rec->rdata_count >= 4) {
-        for (int i = 3; i < rec->rdata_count; i++) {
+      // Base64トークンをドメイン名展開から除外し、Rendezvous Serverのみ展開する
+      bool in_pubkey = true;
+      for (int i = 2; i < rec->rdata_count; i++) {
+        // ドットを含む場合はドメイン名 (Rendezvous Server) と判定
+        if (strchr(rec->rdata[i], '.') != NULL) {
+          in_pubkey = false;
+        }
+        if (!in_pubkey) {
           rec->rdata[i] = expand_domain_name(rec->rdata[i], *origin_io, arena);
+        } else {
+          // Base64の末尾パディング '=' に達した後のトークンはRendezvous Server
+          size_t tlen = strlen(rec->rdata[i]);
+          if (tlen > 0 && rec->rdata[i][tlen - 1] == '=') {
+            in_pubkey = false;
+          }
         }
       }
     } else if (rec->type_code == 64 || rec->type_code == 65) { // SVCB / HTTPS
@@ -1510,7 +1522,91 @@ static int cmp_canonical_name_ptr(const void *a, const void *b) {
   return compare_canonical_name(s1, s2);
 }
 
-int build_zone_index(zone_arena_t *arena) {
+/* [T9] RFC 2181 s5.2: same owner+type RRset TTLs normalized to minimum.
+ * RFC 4035 s2.2: RRSIG TTL aligned to the covered RRset (post phase-1) TTL. */
+static void harmonize_rrset_ttls(zone_arena_t *arena) {
+  if (!arena->hash_table || arena->hash_size == 0 || arena->count == 0) return;
+
+  bool *processed = calloc(arena->count, sizeof(bool));
+  if (!processed) return; /* OOM: skip normalization safely */
+
+  /* Phase 1: Non-RRSIG records - group by owner+type, normalize to min TTL */
+  for (size_t i = 0; i < arena->count; i++) {
+    if (processed[i]) continue;
+    dns_record_t *ri = &arena->records[i];
+    if (!ri->name || ri->type_code == 46) continue;
+
+    uint32_t hash = calc_fnv1a_str(ri->name);
+    size_t idx = hash & (arena->hash_size - 1);
+
+    uint32_t min_ttl = ri->ttl_value;
+    for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
+      if ((size_t)j == i) continue;
+      dns_record_t *rj = &arena->records[j];
+      if (rj->type_code != ri->type_code || !rj->name) continue;
+      if (strcasecmp(rj->name, ri->name) != 0) continue;
+      if (rj->ttl_value < min_ttl) min_ttl = rj->ttl_value;
+    }
+
+    if (ri->ttl_value != min_ttl) {
+      syslog(LOG_WARNING, "[Zone] RRset '%s' type %u: inconsistent TTLs normalized to %u (RFC 2181 s5.2)",
+             ri->name, ri->type_code, min_ttl);
+    }
+    ri->ttl_value = min_ttl;
+    processed[i] = true;
+
+    for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
+      if ((size_t)j == i || processed[j]) continue;
+      dns_record_t *rj = &arena->records[j];
+      if (rj->type_code != ri->type_code || !rj->name) continue;
+      if (strcasecmp(rj->name, ri->name) != 0) continue;
+      rj->ttl_value = min_ttl;
+      processed[j] = true;
+    }
+  }
+
+  /* Phase 2: RRSIG records - align TTL to the covered RRset's (normalized) TTL */
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *ri = &arena->records[i];
+    if (!ri->name || ri->type_code != 46) continue;
+
+    uint16_t covered = 0;
+    if (ri->is_cached) {
+      covered = ri->cache.rrsig.type_covered;
+    } else if (ri->rdata_count >= 1 && ri->rdata[0]) {
+      covered = (uint16_t)get_type_code(ri->rdata[0]);
+    }
+    if (covered == 0) continue; /* unknown covered type: skip */
+
+    uint32_t hash = calc_fnv1a_str(ri->name);
+    size_t idx = hash & (arena->hash_size - 1);
+    for (int j = arena->hash_table[idx]; j != -1; j = arena->records[j].next_record) {
+      dns_record_t *rj = &arena->records[j];
+      if (rj->type_code != covered || !rj->name) continue;
+      if (strcasecmp(rj->name, ri->name) != 0) continue;
+      if (ri->ttl_value != rj->ttl_value) {
+        syslog(LOG_WARNING, "[Zone] RRSIG covering type %u at '%s': TTL %u adjusted to %u (RFC 4035 s2.2)",
+               covered, ri->name, ri->ttl_value, rj->ttl_value);
+      }
+      ri->ttl_value = rj->ttl_value;
+      break;
+    }
+  }
+
+  free(processed);
+
+  /* Sync the string ttl field to ttl_value for tools that re-export zone text */
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *rec = &arena->records[i];
+    if (!rec->name) continue;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u", rec->ttl_value);
+    char *new_ttl = arena_strdup(arena, buf);
+    if (new_ttl) rec->ttl = new_ttl;
+  }
+}
+
+int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   if (arena->hash_table) {
     free(arena->hash_table);
@@ -1548,6 +1644,10 @@ int build_zone_index(zone_arena_t *arena) {
     if (rec->type_code == 47 && rec->rdata_count >= 1 && rec->rdata[0]) {
       nsec_cnt++;
     }
+  }
+
+  if (harmonize_ttls) {
+    harmonize_rrset_ttls(arena);
   }
 
   if (nsec_cnt > 0) {

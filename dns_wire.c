@@ -888,11 +888,11 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, p_offset, calc_mac, &calc_mac_len);
     if (use_malloc) free(pre_mac);
     if (mac_size != calc_mac_len) {
-        if (mac_size < 10 || mac_size < calc_mac_len / 2 || mac_size > calc_mac_len) return 16; // BADSIG (Truncated too much or invalid size)
-        if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
-    } else {
-        if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+        /* [T8] サイズ検証: 站切り消しすぎまたは範囲外のサイズは即座に BADSIG */
+        if (mac_size < 10 || mac_size < calc_mac_len / 2 || mac_size > calc_mac_len) return 16; // BADSIG
     }
+    /* [T8] 元の if/else 両分岐の重複 const_time_memcmp を統合 */
+    if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
     if (mac_out && mac_len_out) {
         *mac_len_out = mac_size;
         memcpy(mac_out, mac, mac_size);
@@ -1963,14 +1963,12 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint8_t alg, fptype;
                 if (!parse_u8(rec->rdata[0], &alg) ||
                     !parse_u8(rec->rdata[1], &fptype)) return -1;
-                uint8_t fp[64]; 
-                size_t fp_len = hex_decode(rec->rdata[2], fp, sizeof(fp));
-                if (fp_len == (size_t)-1) return -1;
-                if ((size_t)offset + 2 + fp_len > max_res_len) return -1;
+                if ((size_t)offset + 2 > max_res_len) return -1;
                 res[offset++] = alg;
                 res[offset++] = fptype;
-                memcpy(&res[offset], fp, fp_len);
-                offset += fp_len;
+                size_t off = offset;
+                if (decode_concat_hex_rdata(&rec->rdata[2], rec->rdata_count - 2, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
             case 46: { // RRSIG
@@ -2089,19 +2087,13 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!cert_type_to_num(rec->rdata[0], &cert_type) ||
                     !parse_u16(rec->rdata[1], &key_tag) ||
                     !parse_u8(rec->rdata[2], &algorithm)) return -1;
-                const char *b64 = rec->rdata[3];
-                size_t b64_len = strlen(b64);
-                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-                if ((size_t)offset + 5 + decoded_upper_bound > max_res_len) return -1;
+                if ((size_t)offset + 5 > max_res_len) return -1;
                 res[offset++] = cert_type >> 8; res[offset++] = cert_type & 0xFF;
                 res[offset++] = key_tag >> 8; res[offset++] = key_tag & 0xFF;
                 res[offset++] = algorithm;
-                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
-                if (declen < 0) return -1;
-                int padding = 0;
-                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
-                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
-                offset += (declen - padding);
+                size_t off = offset;
+                if (decode_concat_b64_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
             case 35: { // NAPTR
@@ -2150,10 +2142,27 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 size_t hit_len = hex_decode(rec->rdata[1], hit, sizeof(hit));
                 if (hit_len == (size_t)-1) return -1;
                 
-                const char *pk_b64 = rec->rdata[2];
-                size_t pk_b64_len = strlen(pk_b64);
+                // rdata[2] 以降の Base64 トークンを連結
+                char pk_b64[4096] = "";
+                size_t pk_b64_len = 0;
+                int r_idx = 2;
+                bool pk_finished = false;
+                while (r_idx < rec->rdata_count && !pk_finished) {
+                    if (strchr(rec->rdata[r_idx], '.') != NULL) {
+                        break; // ドメイン名に到達したら終了
+                    }
+                    size_t tlen = strlen(rec->rdata[r_idx]);
+                    if (pk_b64_len + tlen >= sizeof(pk_b64)) return -1;
+                    memcpy(pk_b64 + pk_b64_len, rec->rdata[r_idx], tlen);
+                    pk_b64_len += tlen;
+                    pk_b64[pk_b64_len] = '\0';
+                    if (tlen > 0 && rec->rdata[r_idx][tlen - 1] == '=') {
+                        pk_finished = true;
+                    }
+                    r_idx++;
+                }
+
                 size_t decoded_upper_bound = ((pk_b64_len + 3) / 4) * 3;
-                
                 if ((size_t)offset + 4 + hit_len + decoded_upper_bound > max_res_len) return -1;
                 
                 res[offset++] = (uint8_t)hit_len;
@@ -2177,14 +2186,14 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[pk_len_offset + 1] = pk_len & 0xFF;
                 offset += pk_len;
                 
-                for (int i = 3; i < rec->rdata_count; i++) {
-                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[i]);
+                // 残りのトークンを Rendezvous Server (非圧縮ドメイン名) として書き出す
+                for (; r_idx < rec->rdata_count; r_idx++) {
+                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[r_idx]);
                     if (w < 0) return -1;
                     offset += w;
                 }
                 break;
-            }
-            case 64: case 65: { // HTTPS / SVCB (RFC 9460)
+            }            case 64: case 65: { // HTTPS / SVCB (RFC 9460)
                 if (rec->rdata_count < 2) return -1;
                 if ((size_t)offset + 2 > max_res_len) return -1;
                 uint16_t svc_prio;
@@ -2482,16 +2491,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 61: case 49: { // OPENPGPKEY, DHCID
                 if (rec->rdata_count < 1) return -1;
-                const char *b64 = rec->rdata[0];
-                size_t b64_len = strlen(b64);
-                size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
-                if ((size_t)offset + decoded_upper_bound > max_res_len) return -1;
-                int declen = EVP_DecodeBlock(&res[offset], (const unsigned char *)b64, b64_len);
-                if (declen < 0) return -1;
-                int padding = 0;
-                if (b64_len > 0 && b64[b64_len - 1] == '=') padding++;
-                if (b64_len > 1 && b64[b64_len - 2] == '=') padding++;
-                offset += (declen - padding);
+                size_t off = offset;
+                if (decode_concat_b64_rdata(rec->rdata, rec->rdata_count, res, max_res_len, &off) != 0) return -1;
+                offset = off;
                 break;
             }
             case 108: case 109: { // EUI48, EUI64
@@ -2999,7 +3001,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     if (strcasecmp(zname, zone_name) != 0) return 9; // NOTAUTH
 
     // Prerequisite Section (3.2)
-    if (build_zone_index(standby) != 0) return 2; // SERVFAIL on OOM
+    if (build_zone_index(standby, true) != 0) return 2; // SERVFAIL on OOM
 
     for (int i = 0; i < prcount; i++) {
         size_t rec_start_offset = offset;
@@ -3080,7 +3082,9 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             if (rdlen != 0) return 1;
             if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
             if (type == 2 && strcasecmp(name, zone_name) == 0) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
-            
+            /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 (ADD分岐と同一のチェックを削除系にも追加) */
+            if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
+
             uint32_t h = calc_fnv1a_str(name);
             size_t hidx = h & (standby->hash_size - 1);
             for (int k = standby->hash_table[hidx]; k != -1; k = standby->records[k].next_record) {
@@ -3095,6 +3099,8 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             }
         } else if (class_val == 254) { // NONE (Delete exact RR)
             if (type == 6) return 5; // REFUSED
+            /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 */
+            if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
             
             size_t temp_offset = rec_start_offset;
             dns_record_t parsed_rec;

@@ -1775,7 +1775,7 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
       return RELOAD_ERR_PARSE;
   }
 
-  if (build_zone_index(z_standby) != 0) {
+  if (build_zone_index(z_standby, true) != 0) {
       pthread_mutex_unlock(&entry->writer_lock);
       syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after reload for '%s'", entry->domain);
       return RELOAD_ERR_PARSE;
@@ -2911,7 +2911,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                     zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
                     wait_for_readers(z_standby);
                     clone_zone_arena(z_active, z_standby);
-                    build_zone_index(z_standby);
+                    build_zone_index(z_standby, true);
                     prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, config->additional_from_auth);
                     atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
                 }
@@ -3668,7 +3668,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 
         clone_zone_arena(&tmp_arena, standby);
 
-        if (build_zone_index(standby) != 0) {
+        if (build_zone_index(standby, true) != 0) {
           zone_arena_clear_data_pools(standby);
           pthread_mutex_unlock(&entry->writer_lock);
           if (unsigned_msgs) free(unsigned_msgs);
@@ -5748,7 +5748,7 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
     atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
   }
 
-  if (build_zone_index(z_standby) != 0) {
+  if (build_zone_index(z_standby, true) != 0) {
     zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);

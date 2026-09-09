@@ -38,7 +38,7 @@ static void test_mqtype_truncation(void) {
         zone_arena_destroy(&arena);
         return;
     }
-    build_zone_index(&arena);
+    build_zone_index(&arena, true);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
@@ -209,7 +209,7 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
         zone_arena_destroy(&loop_arena);
         abort();
     }
-    build_zone_index(&loop_arena);
+    build_zone_index(&loop_arena, true);
 
     zone_arena_t *current_zone = &loop_arena;
     zone_ptr = &current_zone;
@@ -258,7 +258,7 @@ static void test_response_section_order(void) {
         zone_arena_destroy(&arena);
         abort();
     }
-    build_zone_index(&arena);
+    build_zone_index(&arena, true);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));

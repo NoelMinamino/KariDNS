@@ -84,7 +84,7 @@ int main() {
     // Test 4: allow-transfer key correctly sets zone->tsig_keys
     memset(&cfg, 0, sizeof(cfg));
     char conf_acl[1024];
-    strcpy(conf_acl, "zone \"example.com\" { type master; file \"dummy\"; allow-transfer { key \"mykey\"; }; };");
+    strcpy(conf_acl, "key \"mykey\" { algorithm hmac-sha256; secret \"dGVzdA==\"; }; zone \"example.com\" { type master; file \"dummy\"; allow-transfer { key \"mykey\"; }; };");
     char* copy_acl = strdup(conf_acl);
     int res_acl = parse_named_conf(copy_acl, &cfg);
     free(copy_acl);
@@ -237,7 +237,7 @@ int main() {
         if (assert_bound_checked(&rec_isdn)) return 1;
 
         // NSAP (Type 22)
-        // ゾーンパーサーで0xとドットが除去された後の正規化されたHex文字列を想定
+        // ゾーンパ�Eサーで0xとドットが除去された後�E正規化されたHex斁E���Eを想宁E
         dns_record_t rec_nsap = {0};
         rec_nsap.name = (char*)"example.com"; rec_nsap.type_code = 22; rec_nsap.rdata_count = 1;
         rec_nsap.rdata[0] = (char*)"47000580005a0000000001e133ffffff00016100";
@@ -453,7 +453,7 @@ int main() {
         RUN_GEN_TEST("$GENERATE 10-1 host-$ A 10.0.0.$", true);
         // 異常系: step 0
         RUN_GEN_TEST("$GENERATE 1-10/0 host-$ A 10.0.0.$", true);
-        // 異常系: MAX_GENERATE_COUNT 超え
+        // 異常系: MAX_GENERATE_COUNT 趁E��
         RUN_GEN_TEST("$GENERATE 1-999999 host-$ A 10.0.0.$", true);
         // 異常系: width異常
         RUN_GEN_TEST("$GENERATE 1-10 host-${0,999,d} A 10.0.0.$", true);
@@ -467,7 +467,7 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ TXT ${0,64,d}", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,30,d}.${0,34,d} A 10.0.0.$", false);
-        // 異常系 / エッジケース: テンプレート末尾カンマ・欠落・未クローズ (Fuzzer Crash regression)
+        // 異常系 / エチE��ケース: チE��プレート末尾カンマ�E欠落・未クローズ (Fuzzer Crash regression)
         RUN_GEN_TEST("$GENERATE 1-2 host-${,60, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${,, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${ A 10.0.0.$", true);
@@ -475,7 +475,7 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-2 host-${1,2,d A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,60,", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,,", true);
-        // 異常系: range 構文の不正 (start/stop/step の省略やゴミ)
+        // 異常系: range 構文の不正 (start/stop/step の省略めE��チE
         RUN_GEN_TEST("$GENERATE - host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1- host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE -5 host-$ A 10.0.0.$", true);
@@ -614,7 +614,7 @@ int main() {
         }
 
         // 5. Properly closed quote at EOF (no trailing newline, but valid closing quote)
-        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 末尾に改行なし、ただし正しく閉じている
+        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 末尾に改行なし、ただし正しく閉じてぁE��
         int r5 = parse_zone_fast(buf5, strlen(buf5), &arena, &ctx);
         if (r5 < 0) {
             printf("FAIL: Test 5 (properly closed quote at EOF) failed. err=%s\n", err.error_message ? err.error_message : "NULL");
@@ -816,8 +816,8 @@ int main() {
         zone_arena_t arena = {0};
         zone_arena_init(&arena);
         // 1. Single allocation limit (64MB)
-        // size自体が上限(64MB)を超えるケース。1つ目のガード
-        // `size > (64 * 1024 * 1024)` で弾かれることを確認する。
+        // size自体が上限(64MB)を趁E��るケース、Eつ目のガーチE
+        // `size > (64 * 1024 * 1024)` で弾かれることを確認する、E
         void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
         if (p1 != NULL) {
             printf("FAIL: arena_alloc accepted allocation > 64MB\n");
@@ -831,10 +831,10 @@ int main() {
     // Test 10b: arena_alloc Addition Overflow Prevention (strict)
     {
         printf("\n--- Test 10b: arena_alloc Addition Overflow Prevention (strict) ---\n");
-        // current_pool_idx を SIZE_MAX 近傍まで意図的に進めた状態を偽装し、
-        // size自体は64MB未満だが current_pool_idx + size が size_t の範囲で
-        // オーバーフローするケースを作る。これにより1つ目のガードをすり抜けて
-        // 2つ目のガード (current_pool_idx > SIZE_MAX - size) を確実に踏ませる。
+        // current_pool_idx めESIZE_MAX 近傍まで意図皁E��進めた状態を偽裁E��、E
+        // size自体�E64MB未満だぁEcurrent_pool_idx + size ぁEsize_t の篁E��で
+        // オーバ�Eフローするケースを作る。これにより1つ目のガードをすり抜けて
+        // 2つ目のガーチE(current_pool_idx > SIZE_MAX - size) を確実に踏ませる、E
         zone_arena_t arena2 = {0};
         zone_arena_init(&arena2);
         arena2.current_pool_idx = SIZE_MAX - 100;
@@ -2012,7 +2012,7 @@ int main() {
             return 1;
         }
 
-        if (build_zone_index(&arena) != 0) {
+        if (build_zone_index(&arena, true) != 0) {
             printf("FAIL: build_zone_index failed on nsec test zone\n");
             free(zone_copy);
             zone_arena_destroy(&arena);
@@ -2069,7 +2069,7 @@ int main() {
             return 1;
         }
 
-        if (build_zone_index(&arena) != 0) {
+        if (build_zone_index(&arena, true) != 0) {
             printf("FAIL: build_zone_index failed on wildcard test zone\n");
             free(zone_copy);
             zone_arena_destroy(&arena);
@@ -2282,7 +2282,7 @@ int main() {
             return 1;
         }
 
-        if (build_zone_index(&arena) != 0) {
+        if (build_zone_index(&arena, true) != 0) {
             printf("FAIL: build_zone_index failed for test 30\n");
             free(zone_copy);
             zone_arena_destroy(&arena);
@@ -2508,7 +2508,7 @@ int main() {
             zone_arena_destroy(&arena);
             return 1;
         }
-        if (build_zone_index(&arena) != 0) {
+        if (build_zone_index(&arena, true) != 0) {
             printf("FAIL: build_zone_index failed for Test 34\n");
             free(zone_copy);
             zone_arena_destroy(&arena);
@@ -2653,7 +2653,7 @@ int main() {
             zone_arena_destroy(&arena);
             return 1;
         }
-        if (build_zone_index(&arena) != 0) {
+        if (build_zone_index(&arena, true) != 0) {
             printf("FAIL: build_zone_index failed for SOA + RRSIG zone\n");
             free(zone_copy);
             zone_arena_destroy(&arena);
@@ -2730,7 +2730,7 @@ int main() {
             zone_arena_destroy(&arena);
             return 1;
         }
-        if (build_zone_index(&arena) != 0) {
+        if (build_zone_index(&arena, true) != 0) {
             printf("FAIL: build_zone_index failed for delegation DS zone\n");
             free(zone_copy);
             zone_arena_destroy(&arena);
@@ -2863,7 +2863,7 @@ int main() {
 
     // --- Test 39: Duplicate zone/view/key block rejection & FIFO key order ---
     {
-        // 1. 正常系: 異なるドメイン名を持つ複数トップレベルゾーン
+        // 1. 正常系: 異なるドメイン名を持つ褁E��トップレベルゾーン
         const char *valid_zones_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
@@ -2881,7 +2881,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vz);
 
-        // 2. 正常系: 異なるビュー名を持つ複数ビュー
+        // 2. 正常系: 異なるビュー名を持つ褁E��ビュー
         const char *valid_views_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
@@ -2899,7 +2899,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vv);
 
-        // 3. 正常系: ビュー内の異なるゾーン
+        // 3. 正常系: ビュー冁E�E異なるゾーン
         const char *valid_view_zones_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" {\n"
@@ -2914,7 +2914,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vvz);
 
-        // 4. 正常系: 複数TSIGキー（FIFO定義順序の検証）
+        // 4. 正常系: 褁E��TSIGキー�E�EIFO定義頁E���E検証�E�E
         const char *valid_keys_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "key \"key1\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
@@ -2935,7 +2935,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vk);
 
-        // 5. 異常系: 重複トップレベルゾーン
+        // 5. 異常系: 重褁E��チE�Eレベルゾーン
         const char *dup_zone_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
@@ -2961,7 +2961,7 @@ int main() {
             return 1;
         }
 
-        // 7. 異常系: 重複ビュー
+        // 7. 異常系: 重褁E��ュー
         const char *dup_view_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
@@ -2974,7 +2974,7 @@ int main() {
             return 1;
         }
 
-        // 8. 異常系: 同一ビュー内の重複ゾーン
+        // 8. 異常系: 同一ビュー冁E�E重褁E��ーン
         const char *dup_view_zone_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" {\n"
@@ -3030,7 +3030,7 @@ int main() {
         }
         free_server_config_fields(&cfg2);
 
-        // 3. 正常系: master そのまま
+        // 3. 正常系: master そ�Eまま
         const char *master_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example3.com\" { type master; file \"/tmp/z3.zone\"; };\n";
@@ -3048,7 +3048,7 @@ int main() {
         }
         free_server_config_fields(&cfg_m);
 
-        // 4. 正常系: slave そのまま
+        // 4. 正常系: slave そ�Eまま
         const char *slave_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example4.com\" { type slave; masters { 192.0.2.1; }; };\n";
@@ -3146,7 +3146,7 @@ int main() {
 
     // --- Test 42: Logging category channel validation & multiple TSIG keys in allow-transfer ---
     {
-        // 1. 正常系: 正しいチャンネル名を参照する logging category
+        // 1. 正常系: 正しいチャンネル名を参�Eする logging category
         const char *valid_logging_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "logging {\n"
@@ -3228,8 +3228,10 @@ int main() {
         }
         free_server_config_fields(&cfg_qps);
 
-        // 2. 正常系: allow-transfer に複数 key を指定 (両方の key が配列 tsig_keys に保持される)
+        // 2. 正常系: allow-transfer に褁E�� key を指宁E(両方の key が�E刁Etsig_keys に保持されめE
         const char *multi_key_conf =
+            "key \"key1\" { algorithm hmac-sha256; secret \"dGVzdA==\"; };\n"
+            "key \"key2\" { algorithm hmac-sha256; secret \"dGVzdA==\"; };\n"
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example.com\" {\n"
             "    type master;\n"
@@ -3253,7 +3255,7 @@ int main() {
         }
         free_server_config_fields(&cfg2);
 
-        // 3. 異常系: 未定義チャンネル名を参照する category queries
+        // 3. 異常系: 未定義チャンネル名を参�Eする category queries
         const char *undef_qchannel_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "logging {\n"
@@ -3268,7 +3270,7 @@ int main() {
             return 1;
         }
 
-        // 4. 異常系: 未定義チャンネル名を参照する category responses
+        // 4. 異常系: 未定義チャンネル名を参�Eする category responses
         const char *undef_rchannel_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "logging {\n"
@@ -3792,3 +3794,4 @@ int main() {
     printf("All tests passed safely.\n");
     return 0;
 }
+
