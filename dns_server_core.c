@@ -539,6 +539,66 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   return allow;
 }
 
+static bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, const rate_limit_config_t *cfg) {
+  if (!cfg || !cfg->configured) return false;
+  if (cfg->responses_per_second == 0) return false;
+
+  char ip_str[INET6_ADDRSTRLEN] = {0};
+  if (client_addr->ss_family == AF_INET) {
+    inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
+  } else if (client_addr->ss_family == AF_INET6) {
+    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
+  }
+
+  if (cfg->exempt_clients_count > 0) {
+    for (int i = 0; i < cfg->exempt_clients_count; i++) {
+      if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return false;
+    }
+  }
+
+  uint64_t hash = 0;
+  uint64_t full_hash = 0;
+  if (client_addr->ss_family == AF_INET) {
+    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr;
+    ip &= htonl(0xFFFFFF00); // /24 mask
+    hash = siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
+    full_hash = hash;
+  } else if (client_addr->ss_family == AF_INET6) {
+    uint8_t ip6[16];
+    memcpy(ip6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, 16);
+    memset(&ip6[7], 0, 9); // /56 mask (7 bytes)
+    hash = siphash24(ip6, 16, g_rrl_hash_key);
+    full_hash = hash;
+  }
+
+  size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
+  bool exhausted = false;
+
+  for (int probe = 0; probe < 4; probe++) {
+    size_t idx = (base_idx + (size_t)probe) & (RRL_TABLE_SIZE - 1);
+    rrl_bucket_t *b = &g_rrl_table[idx];
+    if (b->client_hash == full_hash) {
+      while (atomic_flag_test_and_set_explicit(&b->lock, memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ volatile("pause" ::: "memory");
+#else
+        sched_yield();
+#endif
+      }
+      if (b->client_hash == full_hash) {
+        // トークン残量が 0 以下（枯渇状態）なら true
+        if (b->tokens[0] <= 0) {
+          exhausted = true;
+        }
+      }
+      atomic_flag_clear_explicit(&b->lock, memory_order_release);
+      break;
+    }
+  }
+
+  return exhausted;
+}
+
 typedef struct {
   char *name;
   char **match_clients;
@@ -6921,7 +6981,15 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
       if (current_zone)
         atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
-
+      rate_limit_config_t *rrl = zcfg->rrl.configured ? &zcfg->rrl : (cfg ? &cfg->rrl : NULL);
+      if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
+        struct sockaddr_storage ss;
+        if (resolve_ip_port_to_sockaddr(client_ip, 0, &ss) > 0) {
+          if (rrl_is_client_exhausted(&ss, rrl)) {
+            return 0; // スクリプトを叩かずにドロップ
+          }
+        }
+      }
       int plugin_result_len = dispatch_to_program_zone(
           zcfg->domain, req, req_len, res, max_res_len, client_ip, is_tcp);
 
