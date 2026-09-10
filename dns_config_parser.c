@@ -921,6 +921,8 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
     } else if (strcmp(key, "log-only") == 0) {
       rrl->log_only = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (strcmp(key, "early-drop") == 0) {
+      rrl->early_drop = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
     } else {
       syslog(LOG_WARNING, "[Config] Unknown rate-limit option '%s'", key);
     }
