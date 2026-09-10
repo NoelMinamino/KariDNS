@@ -8113,7 +8113,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     return;
   }
 
-  uint8_t *res = malloc(65535);
+  uint8_t *res = calloc(1, 65535);
   if (!res) {
     atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
                               memory_order_release);
@@ -8164,7 +8164,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   uint16_t answers = 0;
   uint16_t *res_ancount = (uint16_t *)&res[6];
   memset(res, 0, 65535);
-  memcpy(res, req, q_offset);
+  memcpy(res, req, q_offset); // ここで q_offset までコピーしていることを確認
   res[2] |= 0x84;
   res[3] &= 0xF0;
   res[8] = 0;
@@ -8289,15 +8289,26 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     uint8_t len_prefix[2] = {prev_offset >> 8, prev_offset & 0xFF}; \
     if (send_tcp_robust(client_fd, len_prefix, 2) < 0) goto axfr_error; \
     if (send_tcp_robust(client_fd, res, prev_offset) < 0) goto axfr_error; \
-    offset = DNS_HEADER_SIZE; \
+    \
+    /* 次のパケットの準備（QDCOUNT=1 と質問セクションを必ず引き継ぐ） */ \
+    offset = q_offset; \
     answers = 0; \
     memset(res, 0, 65535); \
-    res[0] = req[0]; res[1] = req[1]; /* Transaction ID */ \
+    memcpy(res, req, q_offset); /* クエリのヘッダと質問セクションをそのままコピー */ \
     res[2] |= 0x84; res[3] &= 0xF0; \
-    res[4] = 0; res[5] = 0; /* QDCOUNT = 0 (RFC 5936 §2.2) */ \
     res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
+    \
     memset(&comp_ctx, 0, sizeof(comp_ctx)); \
     compress_ctx_init_packet(&comp_ctx); \
+    /* q_offset までスキップした状態で、自身(質問セクション)の名前を圧縮テーブルに登録 */ \
+    size_t dummy_off = DNS_HEADER_SIZE; \
+    char *dummy_name = NULL; \
+    /* 【修正】第5引数を active から current_zone に変更 */ \
+    if (expand_wire_name(res, q_offset, dummy_off, &dummy_off, current_zone, &dummy_name) == 0 && dummy_name) { \
+        uint16_t reg_off = DNS_HEADER_SIZE; \
+        write_dns_name_str(res, &reg_off, dummy_name, &comp_ctx, 65535); \
+    } \
+    \
     if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
       syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer", \
              (rec_ptr)->name ? (rec_ptr)->name : "(null)", (rec_ptr)->type_code); \

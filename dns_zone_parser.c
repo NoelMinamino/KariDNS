@@ -8,8 +8,13 @@ static void unescape_string_in_place(char *str) {
     while (*read) {
         if (*read == '\\' && *(read + 1)) {
             read++;
-            if (*read >= '0' && *read <= '9' && *(read+1) >= '0' && *(read+1) <= '9' && *(read+2) >= '0' && *(read+2) <= '9') {
-                int val = (*read - '0') * 100 + (*(read+1) - '0') * 10 + (*(read+2) - '0');
+            // 【修正箇所】 8進数 (0-7) 3桁の検証と計算
+            if (*read >= '0' && *read <= '7' && 
+                *(read+1) >= '0' && *(read+1) <= '7' && 
+                *(read+2) >= '0' && *(read+2) <= '7') {
+                
+                // 8進数の各桁を重み付け (64, 8, 1) して加算
+                int val = (*read - '0') * 64 + (*(read+1) - '0') * 8 + (*(read+2) - '0');
                 if (val <= 255) {
                     *write++ = (char)val;
                     read += 3;

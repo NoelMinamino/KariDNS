@@ -50,33 +50,50 @@ void compress_ctx_init_packet(compress_ctx_t *ctx) {
 }
 
 
-
 static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, const uint8_t *name) {
-    const uint8_t *p = packet_buf + offset, *n = name; int jump_count = 0;
+    const uint8_t *p = packet_buf + offset;
+    const uint8_t *n = name;
+    int jump_count = 0;
+
     while (*n != 0) {
+        // パケット側が圧縮ポインタの場合はジャンプ
         if ((*p & 0xC0) == 0xC0) {
             if (++jump_count > MAX_JUMPS) return false;
             uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
+            // 無限ループや未来へのジャンプを防止
             if (next_offset >= offset) return false;
-            offset = next_offset; p = packet_buf + offset; continue;
+            offset = next_offset;
+            p = packet_buf + offset;
+            continue;
         }
+
+        // ラベル長の比較
         if (*p != *n) return false;
-        uint8_t len = *p; p++; n++;
+        
+        uint8_t len = *p;
+        p++; n++;
+
+        // ラベルの文字列比較 (case-insensitive)
         for (uint8_t i = 0; i < len; i++) {
-            uint8_t c1 = *p++, c2 = *n++;
+            uint8_t c1 = *p++;
+            uint8_t c2 = *n++;
             if (c1 >= 'A' && c1 <= 'Z') c1 |= 0x20;
             if (c2 >= 'A' && c2 <= 'Z') c2 |= 0x20;
             if (c1 != c2) return false;
         }
     }
+
+    // name 側が終端(0)に達した場合、パケット側も最終的に 0 に到達しなければならない
     jump_count = 0;
     while ((*p & 0xC0) == 0xC0) {
         if (++jump_count > MAX_JUMPS) return false;
         uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
         if (next_offset >= offset) return false;
-        offset = next_offset; p = packet_buf + offset;
+        offset = next_offset;
+        p = packet_buf + offset;
     }
-    return *p == 0;
+    
+    return (*p == 0);
 }
 
 int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx, size_t max_len) {
@@ -96,7 +113,6 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
     for (int i = label_count - 1; i >= 0; i--) {
         const uint8_t *label = labels[i];
         uint8_t len = *label;
-        
         for (int j = len; j > 0; j--) {
             uint8_t c = label[j];
             if (c >= 'A' && c <= 'Z') c |= 0x20;
@@ -105,7 +121,6 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         }
         current_hash ^= len;
         current_hash *= 16777619u;
-        
         hashes[i] = current_hash;
     }
     
@@ -113,13 +128,16 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         const uint8_t *label = labels[i];
         uint32_t hash = hashes[i];
         size_t idx = hash & COMPRESS_HASH_MASK;
-        
         bool compressed = false;
         
+        // 1. 既存の圧縮ポインタを検索
         for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
             compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
             if (entry->generation != ctx->current_generation) break;
-            if (entry->offset >= 0x4000) continue; // RFC 1035 §4.1.4: 14-bit pointer limit
+            
+            // 【重要】自分自身または未来のオフセットを指している場合は絶対に無視する
+            if (entry->offset >= *offset || entry->offset >= 0x4000) continue; 
+            
             if (entry->hash == hash && suffix_equals(packet_buf, entry->offset, label)) {
                 if ((size_t)(*offset + 2) > max_len) return -1;
                 uint16_t ptr = 0xC000 | entry->offset;
@@ -131,23 +149,31 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
         }
         if (compressed) return 0;
         
-        if (*offset < 0x4000) {
-            for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
-                compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
-                if (entry->generation != ctx->current_generation) {
-                    entry->generation = ctx->current_generation;
-                    entry->hash = hash;
-                    entry->offset = *offset;
-                    break;
-                }
-            }
-        }
-        
+        // 2. 見つからなかったので、現在の *offset を「現在のラベル開始位置」として記憶
+        uint16_t label_start_offset = *offset;
+
         uint8_t len = *label;
         if ((size_t)(*offset + 1 + len) > max_len) return -1;
         packet_buf[(*offset)++] = len;
         for (uint8_t k = 1; k <= len; k++) {
             packet_buf[(*offset)++] = label[k];
+        }
+
+        // 3. ラベルを書き込んだ後（あるいは確定した位置）でハッシュテーブルに登録する
+        if (label_start_offset < 0x4000) {
+            for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
+                compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
+                // すでに登録済みの場合はスキップ
+                if (entry->generation == ctx->current_generation && entry->hash == hash && entry->offset == label_start_offset) {
+                    break;
+                }
+                if (entry->generation != ctx->current_generation) {
+                    entry->generation = ctx->current_generation;
+                    entry->hash = hash;
+                    entry->offset = label_start_offset; // 最新の確実なオフセットを登録
+                    break;
+                }
+            }
         }
     }
     
@@ -412,10 +438,11 @@ static int parse_label(const char *name, uint8_t *label_out, const char **next_p
         if (*p == '\\') {
             p++;
             if (!*p) return -1; // dangling backslash
-            if (*p >= '0' && *p <= '9') {
+            // 【修正】'0' から '7' までの3桁の「8進数」としてパースする
+            if (*p >= '0' && *p <= '7') {
                 int val = 0;
-                for (int i = 0; i < 3 && *p >= '0' && *p <= '9'; i++) {
-                    val = val * 10 + (*p - '0');
+                for (int i = 0; i < 3 && *p >= '0' && *p <= '7'; i++) {
+                    val = (val << 3) + (*p - '0'); // 8進数なので << 3 (つまり * 8)
                     p++;
                 }
                 if (val > 255) return -1;
