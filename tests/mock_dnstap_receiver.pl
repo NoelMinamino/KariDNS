@@ -64,7 +64,7 @@ die "[mock_dnstap] Accept failed: $!\n" unless $client;
 print "[mock_dnstap] Client connected\n";
 
 # Handshake: Receive READY frame
-# Format: escape (4B, 0) + len (4B) + type (4B, 1) + field (4B, 1) + ct_len (4B) + content_type
+# Format: escape (4B, 0) + len (4B) + type (4B, 4) + field (4B, 1) + ct_len (4B) + content_type
 my $hdr;
 read_exact($client, \$hdr, 8) or die "[mock_dnstap] Failed to read READY header\n";
 my ($esc, $ready_len) = unpack('NN', $hdr);
@@ -73,26 +73,26 @@ die "[mock_dnstap] Invalid escape in READY frame: $esc\n" if $esc != 0;
 my $ready_payload;
 read_exact($client, \$ready_payload, $ready_len) or die "[mock_dnstap] Failed to read READY payload\n";
 my ($ready_type, $ready_field, $ct_len) = unpack('NNN', substr($ready_payload, 0, 12));
-die "[mock_dnstap] Expected READY type 1, got $ready_type\n" if $ready_type != 1;
+die "[mock_dnstap] Expected READY type 4, got $ready_type\n" if $ready_type != 4;
 my $content_type = substr($ready_payload, 12, $ct_len);
 print "[mock_dnstap] Received READY with content-type: $content_type\n";
 
 # Send ACCEPT frame
-# escape (4B, 0) + len (4B) + type (4B, 2) + field (4B, 1) + ct_len (4B) + content_type
-my $accept_payload = pack('NNN', 2, 1, length($content_type)) . $content_type;
+# escape (4B, 0) + len (4B) + type (4B, 1) + field (4B, 1) + ct_len (4B) + content_type
+my $accept_payload = pack('NNN', 1, 1, length($content_type)) . $content_type;
 my $accept_frame = pack('NN', 0, length($accept_payload)) . $accept_payload;
 $client->syswrite($accept_frame) or die "[mock_dnstap] Failed to send ACCEPT frame: $!\n";
 print "[mock_dnstap] Sent ACCEPT frame\n";
 
 # Receive START frame
-# escape (4B, 0) + len (4B, 4) + type (4B, 3)
+# escape (4B, 0) + len (4B) + type (4B, 2) + optional field/content_type
 read_exact($client, \$hdr, 8) or die "[mock_dnstap] Failed to read START header\n";
 my ($start_esc, $start_len) = unpack('NN', $hdr);
 die "[mock_dnstap] Invalid START escape: $start_esc\n" if $start_esc != 0;
 my $start_payload;
 read_exact($client, \$start_payload, $start_len) or die "[mock_dnstap] Failed to read START payload\n";
-my $start_type = unpack('N', $start_payload);
-die "[mock_dnstap] Expected START type 3, got $start_type\n" if $start_type != 3;
+my $start_type = unpack('N', substr($start_payload, 0, 4));
+die "[mock_dnstap] Expected START type 2, got $start_type\n" if $start_type != 2;
 print "[mock_dnstap] Handshake completed successfully. Receiving data frames...\n";
 
 # Data loop
@@ -125,7 +125,7 @@ while (1) {
         read_exact($client, \$ctrl_buf, $ctrl_len) or last;
         my $ctrl_type = unpack('N', $ctrl_buf);
         print "[mock_dnstap] Received control frame type $ctrl_type\n";
-        if ($ctrl_type == 4) { # STOP
+        if ($ctrl_type == 3) { # STOP
             # Send FINISH frame
             my $finish = pack('NNN', 0, 4, 5);
             $client->syswrite($finish);
