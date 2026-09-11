@@ -8,7 +8,7 @@
 #include <stdio.h>
 
 #ifndef KARIDNS_VERSION
-#define KARIDNS_VERSION "0.2.1"
+#define KARIDNS_VERSION "0.3.0"
 #endif
 
 #include <limits.h>
