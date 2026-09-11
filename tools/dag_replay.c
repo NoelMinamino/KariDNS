@@ -51,6 +51,7 @@ typedef struct {
     uint8_t pkt[MAX_REPLAY_PACKET_LEN];
     size_t pkt_len;
     uint64_t seq;
+    char transport[16];
 } replay_task_t;
 
 typedef struct {
@@ -100,6 +101,7 @@ typedef struct {
     bool do_diff;
     bool output_json;
     char transport[16];
+    bool transport_explicit;
     int max_queries;
     bool ignore_ttl;
     int timeout_ms;
@@ -136,8 +138,11 @@ static inline size_t pb_decode_varint(const uint8_t *buf, size_t len, uint64_t *
     return 0;
 }
 
-bool parse_pcap_packet(const uint8_t *data, size_t len, uint32_t linktype, uint8_t *out_dns, size_t *out_dns_len) {
+bool parse_pcap_packet_ex(const uint8_t *data, size_t len, uint32_t linktype,
+                          uint8_t *out_dns, size_t *out_dns_len,
+                          char *out_transport, size_t out_transport_len) {
     if (!data || len < 14 || !out_dns || !out_dns_len) return false;
+    if (out_transport && out_transport_len > 0) out_transport[0] = '\0';
 
     size_t ip_offset = 0;
     if (linktype == 1) { // LINKTYPE_ETHERNET
@@ -200,6 +205,10 @@ bool parse_pcap_packet(const uint8_t *data, size_t len, uint32_t linktype, uint8
             dns_len = udp_len - 8;
         }
         dns_offset = l4_offset + 8;
+        if (out_transport && out_transport_len > 0) {
+            strncpy(out_transport, "udp", out_transport_len - 1);
+            out_transport[out_transport_len - 1] = '\0';
+        }
     } else if (l4_proto == 6) { // TCP
         if (l4_offset + 20 > len) return false;
         uint8_t tcp_hdr_len = ((data[l4_offset + 12] >> 4) & 0x0F) * 4;
@@ -209,6 +218,10 @@ bool parse_pcap_packet(const uint8_t *data, size_t len, uint32_t linktype, uint8
         uint16_t tcp_dns_len = ((uint16_t)data[dns_offset] << 8) | data[dns_offset + 1];
         dns_offset += 2;
         dns_len = (dns_offset + tcp_dns_len <= len) ? tcp_dns_len : (len - dns_offset);
+        if (out_transport && out_transport_len > 0) {
+            strncpy(out_transport, "tcp", out_transport_len - 1);
+            out_transport[out_transport_len - 1] = '\0';
+        }
     } else {
         return false;
     }
@@ -227,8 +240,14 @@ bool parse_pcap_packet(const uint8_t *data, size_t len, uint32_t linktype, uint8
     return true;
 }
 
-bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, size_t *out_dns_len) {
+bool parse_pcap_packet(const uint8_t *data, size_t len, uint32_t linktype, uint8_t *out_dns, size_t *out_dns_len) {
+    return parse_pcap_packet_ex(data, len, linktype, out_dns, out_dns_len, NULL, 0);
+}
+
+bool parse_dnstap_data_frame_ex(const uint8_t *data, size_t len, uint8_t *out_dns, size_t *out_dns_len,
+                                char *out_transport, size_t out_transport_len) {
     if (!data || len == 0 || !out_dns || !out_dns_len) return false;
+    if (out_transport && out_transport_len > 0) out_transport[0] = '\0';
     size_t off = 0;
     const uint8_t *msg_data = NULL;
     size_t msg_len = 0;
@@ -252,7 +271,7 @@ bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, 
             if (c == 0) break;
             off += c;
             if (off + field_len > len) break;
-            if (field_num == 14) { // message
+            if (field_num == 14) { // dnstap.Dnstap.message
                 msg_data = data + off;
                 msg_len = (size_t)field_len;
                 break;
@@ -274,6 +293,7 @@ bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, 
     off = 0;
     const uint8_t *query_msg = NULL;
     size_t query_len = 0;
+    uint32_t socket_protocol = 0;
 
     while (off < msg_len) {
         uint64_t key = 0;
@@ -288,6 +308,9 @@ bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, 
             size_t c = pb_decode_varint(msg_data + off, msg_len - off, &v);
             if (c == 0) break;
             off += c;
+            if (field_num == 3) { // socket_protocol (1 = UDP, 2 = TCP)
+                socket_protocol = (uint32_t)v;
+            }
         } else if (wire_type == 2) {
             uint64_t field_len = 0;
             size_t c = pb_decode_varint(msg_data + off, msg_len - off, &field_len);
@@ -297,7 +320,6 @@ bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, 
             if (field_num == 10) { // query_message
                 query_msg = msg_data + off;
                 query_len = (size_t)field_len;
-                break;
             }
             off += field_len;
         } else if (wire_type == 5) {
@@ -312,9 +334,31 @@ bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, 
     }
 
     if (!query_msg || query_len < 12 || query_len > MAX_REPLAY_PACKET_LEN) return false;
+
+    // Must be a query (QR == 0) and have at least 1 question
+    if ((query_msg[2] & 0x80) != 0) return false;
+    uint16_t qdcount = ((uint16_t)query_msg[4] << 8) | query_msg[5];
+    if (qdcount == 0) return false;
+
     memcpy(out_dns, query_msg, query_len);
     *out_dns_len = query_len;
+
+    if (out_transport && out_transport_len > 0) {
+        if (socket_protocol == 2) {
+            strncpy(out_transport, "tcp", out_transport_len - 1);
+            out_transport[out_transport_len - 1] = '\0';
+        } else if (socket_protocol == 1) {
+            strncpy(out_transport, "udp", out_transport_len - 1);
+            out_transport[out_transport_len - 1] = '\0';
+        } else {
+            out_transport[0] = '\0';
+        }
+    }
     return true;
+}
+
+bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, size_t *out_dns_len) {
+    return parse_dnstap_data_frame_ex(data, len, out_dns, out_dns_len, NULL, 0);
 }
 
 #define MAX_SECTION_RRS 128
@@ -1040,7 +1084,9 @@ static void *replay_worker_func(void *arg) {
         pthread_cond_signal(&q->not_full);
         pthread_mutex_unlock(&q->lock);
 
-        const char *t1 = opts->server1_transport[0] ? opts->server1_transport : opts->transport;
+        const char *t1 = opts->server1_transport[0] ? opts->server1_transport :
+                         (opts->transport_explicit ? opts->transport :
+                          (task.transport[0] ? task.transport : opts->transport));
         int tmo = opts->timeout_ms > 0 ? opts->timeout_ms : 2000;
 
         // Server 1 query
@@ -1057,7 +1103,9 @@ static void *replay_worker_func(void *arg) {
         ssize_t r2 = -1;
         double rtt2_ms = 0.0;
         if (opts->has_server2) {
-            const char *t2 = opts->server2_transport[0] ? opts->server2_transport : opts->transport;
+            const char *t2 = opts->server2_transport[0] ? opts->server2_transport :
+                             (opts->transport_explicit ? opts->transport :
+                              (task.transport[0] ? task.transport : opts->transport));
             struct timespec ts2_start, ts2_end;
             clock_gettime(CLOCK_MONOTONIC, &ts2_start);
             r2 = replay_exchange(opts->server2_host, opts->server2_port, t2,
@@ -1165,7 +1213,7 @@ static void parse_host_port(const char *arg, char *out_host, size_t host_cap, in
     }
 }
 
-static bool enqueue_task(replay_queue_t *q, const uint8_t *pkt, size_t len, uint64_t seq) {
+static bool enqueue_task(replay_queue_t *q, const uint8_t *pkt, size_t len, uint64_t seq, const char *transport) {
     if (!pkt || len == 0 || len > MAX_REPLAY_PACKET_LEN) return false;
     pthread_mutex_lock(&q->lock);
     while (q->count >= REPLAY_QUEUE_CAPACITY && !q->done) {
@@ -1179,6 +1227,12 @@ static bool enqueue_task(replay_queue_t *q, const uint8_t *pkt, size_t len, uint
     memcpy(t->pkt, pkt, len);
     t->pkt_len = len;
     t->seq = seq;
+    if (transport && transport[0]) {
+        strncpy(t->transport, transport, sizeof(t->transport) - 1);
+        t->transport[sizeof(t->transport) - 1] = '\0';
+    } else {
+        t->transport[0] = '\0';
+    }
     q->tail = (q->tail + 1) % REPLAY_QUEUE_CAPACITY;
     q->count++;
     pthread_cond_signal(&q->not_empty);
@@ -1306,6 +1360,7 @@ int run_replay_mode(int argc, char **argv) {
         } else if (strcmp(argv[idx], "--transport") == 0) {
             if (idx + 1 < argc) {
                 strncpy(opts.transport, argv[++idx], sizeof(opts.transport) - 1);
+                opts.transport_explicit = true;
             }
         } else if (strcmp(argv[idx], "--max-queries") == 0) {
             if (idx + 1 < argc) {
@@ -1411,9 +1466,10 @@ int run_replay_mode(int argc, char **argv) {
                 if (incl_len > 65536) break;
                 if (fread(io_buf, 1, incl_len, fp) != incl_len) break;
 
-                if (parse_pcap_packet(io_buf, incl_len, linktype, dns_wire, &dns_len)) {
+                char pkt_transport[16] = "";
+                if (parse_pcap_packet_ex(io_buf, incl_len, linktype, dns_wire, &dns_len, pkt_transport, sizeof(pkt_transport))) {
                     seq++;
-                    if (!enqueue_task(queue, dns_wire, dns_len, seq)) {
+                    if (!enqueue_task(queue, dns_wire, dns_len, seq, pkt_transport)) {
                         break;
                     }
                     if (opts.max_queries > 0 && (int)seq >= opts.max_queries) break;
@@ -1454,9 +1510,10 @@ int run_replay_mode(int argc, char **argv) {
             if (len > 65536) break;
             if (fread(io_buf, 1, len, fp) != len) break;
 
-            if (parse_dnstap_data_frame(io_buf, len, dns_wire, &dns_len)) {
+            char frame_transport[16] = "";
+            if (parse_dnstap_data_frame_ex(io_buf, len, dns_wire, &dns_len, frame_transport, sizeof(frame_transport))) {
                 seq++;
-                if (!enqueue_task(queue, dns_wire, dns_len, seq)) {
+                if (!enqueue_task(queue, dns_wire, dns_len, seq, frame_transport)) {
                     break;
                 }
                 if (opts.max_queries > 0 && (int)seq >= opts.max_queries) break;
@@ -1499,10 +1556,16 @@ int run_replay_mode(int argc, char **argv) {
                 } else if (strstr(p, "+nodnssec") != NULL || strstr(p, "+nodo") != NULL) {
                     line_dnssec = false;
                 }
+                char line_transport[16] = "";
+                if (strstr(p, "+tcp") != NULL) {
+                    strncpy(line_transport, "tcp", sizeof(line_transport) - 1);
+                } else if (strstr(p, "+udp") != NULL) {
+                    strncpy(line_transport, "udp", sizeof(line_transport) - 1);
+                }
                 size_t wlen = build_text_query(qname, qtype, line_dnssec, dns_wire, sizeof(dns_wire));
                 if (wlen > 0) {
                     seq++;
-                    if (!enqueue_task(queue, dns_wire, wlen, seq)) {
+                    if (!enqueue_task(queue, dns_wire, wlen, seq, line_transport)) {
                         break;
                     }
                     if (opts.max_queries > 0 && (int)seq >= opts.max_queries) break;

@@ -23,6 +23,8 @@ dag [-h | --help]
 
 dag [--break-help]
 
+dag --replay <traffic_file> --server1 <host[:port]> [replay-opts...]
+
 dag [global-queryopt...] [query...]
 ```
 
@@ -42,7 +44,9 @@ dag [global-queryopt...] [query...]
    Encodes the raw wire-format query and response using zlib compression and Base64URL encoding, generating inspection URLs for [ldns.jp](https://ldns.jp/) or multi-server binary diff URLs.
 4. **Transports & Protocol Extensions**:
    Support for **DNS over TLS (DoT)**, **DNS over HTTPS (DoH)**, **Plain HTTP DNS**, **HAProxy PROXYv2**, **EDNS Client Subnet (ECS)**, **DNS Cookies**, **Extended DNS Errors (EDE)**, **Multiple QTYPE (RFC 10029)**, **Dynamic Updates (RFC 2136)**, and **Transaction Security (TSIG / SIG(0))**.
-5. **Memory Arenas**:
+5. **Traffic Replay & Differential Engine (`--replay`)**:
+   Asynchronously replays recorded DNS queries from PCAP traces, dnstap Frame Streams, or text query lists against target nameservers, providing order-independent semantic differential testing across dual servers and automatic protocol preservation (TCP/UDP). See [`dag_replay(1)`](dag_replay.md) for full reference.
+6. **Memory Arenas**:
    Uses bump-allocated memory arenas (`zone_arena_t`) for scratch allocations during query processing.
 
 ### Default Lookup Behavior
@@ -754,6 +758,12 @@ In addition to `fuzz_dag_response`, the following test harnesses ensure protocol
 | `fuzz_dag_cli_args` | Command-line option & malformation parser | `parse_arg_slice()`, `parse_break_arg()` |
 | `fuzz_dag_batch_file` | Batch query file (`-f`) tokenizer & parser | Line tokenizer and token boundary validation |
 | `rr_differential_test.pl`| Structured RR semantic oracle / diff test | NAPTR, SRV, SOA, CAA, MX field transpositions |
+
+---
+
+## SEE ALSO
+
+[`dag_replay(1)`](dag_replay.md), [`karidns(8)`](karidns.md), [`karicheck(1)`](karicheck.md), [`karictl(8)`](karictl.md)
 
 ---
 

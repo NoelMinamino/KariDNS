@@ -226,6 +226,9 @@ typedef struct {
   char client_ip[INET6_ADDRSTRLEN];
   struct sockaddr_storage client_addr;
   socklen_t client_len;
+  struct sockaddr_storage server_addr;
+  socklen_t server_len;
+  bool has_server_addr;
   bool quota_yield;
 } tcp_stream_ctx_t;
 
@@ -282,6 +285,7 @@ typedef struct {
     bool has_server_addr;
     size_t wire_len;
     uint8_t wire[UDP_DEFAULT_MAX_RES_LEN > 4096 ? UDP_DEFAULT_MAX_RES_LEN : 4096];
+    alignas(8) _Atomic bool ready;
 } dnstap_event_t;
 
 typedef struct {
@@ -738,6 +742,7 @@ static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
 static int g_dnstap_sock = -1;
 static _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
 static _Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
+static dnstap_ring_t g_aux_dnstap_ring;
 static worker_ctx_t *g_worker_ctxs = NULL;
 static int g_worker_count = 0;
 
@@ -8224,10 +8229,10 @@ void *query_logger_thread_func(void *arg) {
 // 10.5 dnstap Frame Streams & Protobuf Implementation
 // ============================================================================
 #define FSTRM_CONTROL_ESCAPE               0x00000000U
-#define FSTRM_CONTROL_READY                0x00000001U
-#define FSTRM_CONTROL_ACCEPT               0x00000002U
-#define FSTRM_CONTROL_START                0x00000003U
-#define FSTRM_CONTROL_STOP                 0x00000004U
+#define FSTRM_CONTROL_ACCEPT               0x00000001U
+#define FSTRM_CONTROL_START                0x00000002U
+#define FSTRM_CONTROL_STOP                 0x00000003U
+#define FSTRM_CONTROL_READY                0x00000004U
 #define FSTRM_CONTROL_FINISH               0x00000005U
 #define FSTRM_CONTROL_FIELD_CONTENT_TYPE   0x00000001U
 
@@ -8266,7 +8271,7 @@ static int dnstap_connect_and_handshake(const char *socket_path, const char *ide
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    // Send READY frame: escape(4B, 0) + len(4B, 34) + type(4B, 1) + field(4B, 1) + ct_len(4B, 22) + "protobuf:dnstap.Dnstap" (22B)
+    // Send READY frame: escape(4B, 0) + len(4B, 34) + type(4B, 4) + field(4B, 1) + ct_len(4B, 22) + "protobuf:dnstap.Dnstap" (22B)
     uint32_t ct_len = (uint32_t)(sizeof(DNSTAP_CONTENT_TYPE) - 1);
     uint32_t payload_len = 4 + 4 + 4 + ct_len;
     uint32_t ready_hdr[5];
@@ -8313,12 +8318,21 @@ static int dnstap_connect_and_handshake(const char *socket_path, const char *ide
         return -1;
     }
 
-    // Send START frame: escape(4B, 0) + len(4B, 4) + type(4B, 3)
-    uint32_t start_buf[3];
-    start_buf[0] = htonl(FSTRM_CONTROL_ESCAPE);
-    start_buf[1] = htonl(4);
-    start_buf[2] = htonl(FSTRM_CONTROL_START);
-    if (write(sock, start_buf, sizeof(start_buf)) != sizeof(start_buf)) {
+    // Send START frame: escape(4B, 0) + len(4B, 34) + type(4B, 2) + field(4B, 1) + ct_len(4B, 22) + "protobuf:dnstap.Dnstap" (22B)
+    uint32_t start_hdr[5];
+    start_hdr[0] = htonl(FSTRM_CONTROL_ESCAPE);
+    start_hdr[1] = htonl(payload_len);
+    start_hdr[2] = htonl(FSTRM_CONTROL_START);
+    start_hdr[3] = htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE);
+    start_hdr[4] = htonl(ct_len);
+
+    struct iovec s_iov[2];
+    s_iov[0].iov_base = start_hdr;
+    s_iov[0].iov_len = sizeof(start_hdr);
+    s_iov[1].iov_base = (void *)DNSTAP_CONTENT_TYPE;
+    s_iov[1].iov_len = ct_len;
+
+    if (writev(sock, s_iov, 2) < 0) {
         close(sock);
         return -1;
     }
@@ -8437,23 +8451,12 @@ static bool dnstap_send_frame(const dnstap_event_t *ev) {
     return true;
 }
 
-static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
-                                       const uint8_t *wire, size_t wire_len,
-                                       const struct sockaddr_storage *client_addr,
-                                       socklen_t client_addr_len,
-                                       const struct sockaddr_storage *server_addr,
-                                       bool has_server_addr, uint8_t protocol) {
-    if (!ctx || !atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) return;
-    dnstap_ring_t *ring = &ctx->dnstap_ring;
-    if (!ring->events) return;
-
-    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
-    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
-    if (h - t >= ring->size) {
-        atomic_fetch_add_explicit(&ring->dropped, 1, memory_order_relaxed);
-        return;
-    }
-    dnstap_event_t *ev = &ring->events[h & ring->mask];
+static inline void fill_dnstap_event(dnstap_event_t *ev, uint8_t message_type,
+                                     const uint8_t *wire, size_t wire_len,
+                                     const struct sockaddr_storage *client_addr,
+                                     socklen_t client_addr_len,
+                                     const struct sockaddr_storage *server_addr,
+                                     bool has_server_addr, uint8_t protocol) {
     clock_gettime(CLOCK_REALTIME, &ev->ts);
     ev->message_type = message_type;
     ev->protocol = protocol;
@@ -8479,7 +8482,50 @@ static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
     }
     memcpy(ev->wire, wire, copy_len);
     ev->wire_len = copy_len;
-    atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+}
+
+static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
+                                       const uint8_t *wire, size_t wire_len,
+                                       const struct sockaddr_storage *client_addr,
+                                       socklen_t client_addr_len,
+                                       const struct sockaddr_storage *server_addr,
+                                       bool has_server_addr, uint8_t protocol) {
+    if (!atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) return;
+
+    if (ctx) {
+        // Fast path: Worker-local SPSC ring buffer (no locks, no CAS, zero contention)
+        dnstap_ring_t *ring = &ctx->dnstap_ring;
+        if (!ring->events) return;
+
+        uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+        uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+        if (h - t >= ring->size) {
+            atomic_fetch_add_explicit(&ring->dropped, 1, memory_order_relaxed);
+            return;
+        }
+        dnstap_event_t *ev = &ring->events[h & ring->mask];
+        fill_dnstap_event(ev, message_type, wire, wire_len, client_addr, client_addr_len,
+                          server_addr, has_server_addr, protocol);
+        atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+    } else {
+        // Aux path: MPSC ring buffer for non-worker threads (AXFR streaming, async I/O)
+        if (!g_aux_dnstap_ring.events) return;
+
+        uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_relaxed);
+        uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_acquire);
+        do {
+            if (h - t >= g_aux_dnstap_ring.size) {
+                atomic_fetch_add_explicit(&g_aux_dnstap_ring.dropped, 1, memory_order_relaxed);
+                return;
+            }
+        } while (!atomic_compare_exchange_weak_explicit(&g_aux_dnstap_ring.head, &h, h + 1,
+                                                        memory_order_acq_rel, memory_order_relaxed));
+
+        dnstap_event_t *ev = &g_aux_dnstap_ring.events[h & g_aux_dnstap_ring.mask];
+        fill_dnstap_event(ev, message_type, wire, wire_len, client_addr, client_addr_len,
+                          server_addr, has_server_addr, protocol);
+        atomic_store_explicit(&ev->ready, true, memory_order_release);
+    }
 }
 
 void *dnstap_sender_thread_func(void *arg) {
@@ -8488,15 +8534,41 @@ void *dnstap_sender_thread_func(void *arg) {
         bool any_work = false;
         int num_workers = g_worker_count;
         worker_ctx_t *workers = g_worker_ctxs;
-        if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed) &&
-            num_workers > 0 && workers) {
-            for (int w = 0; w < num_workers; w++) {
-                dnstap_ring_t *ring = &workers[w].dnstap_ring;
-                if (!ring->events) continue;
-                uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-                uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+        if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
+            if (num_workers > 0 && workers) {
+                for (int w = 0; w < num_workers; w++) {
+                    dnstap_ring_t *ring = &workers[w].dnstap_ring;
+                    if (!ring->events) continue;
+                    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+                    uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+                    while (t != h) {
+                        dnstap_event_t *ev = &ring->events[t & ring->mask];
+                        any_work = true;
+                        if (!dnstap_send_frame(ev)) {
+                            atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
+                            if (g_dnstap_sock >= 0) {
+                                close(g_dnstap_sock);
+                                g_dnstap_sock = -1;
+                            }
+                            syslog(LOG_WARNING, "[dnstap] write failed, disabling dnstap until restart: %s",
+                                   strerror(errno));
+                            fprintf(stderr, "[dnstap] write failed: %s\n", strerror(errno));
+                            break;
+                        }
+                        t++;
+                    }
+                    atomic_store_explicit(&ring->tail, t, memory_order_release);
+                    if (!atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) break;
+                }
+            }
+            if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed) && g_aux_dnstap_ring.events) {
+                uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
+                uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
                 while (t != h) {
-                    dnstap_event_t *ev = &ring->events[t & ring->mask];
+                    dnstap_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+                    if (!atomic_load_explicit(&ev->ready, memory_order_acquire)) {
+                        break;
+                    }
                     any_work = true;
                     if (!dnstap_send_frame(ev)) {
                         atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
@@ -8509,16 +8581,23 @@ void *dnstap_sender_thread_func(void *arg) {
                         fprintf(stderr, "[dnstap] write failed: %s\n", strerror(errno));
                         break;
                     }
+                    atomic_store_explicit(&ev->ready, false, memory_order_release);
                     t++;
                 }
-                atomic_store_explicit(&ring->tail, t, memory_order_release);
+                atomic_store_explicit(&g_aux_dnstap_ring.tail, t, memory_order_release);
             }
-        } else if (num_workers > 0 && workers) {
-            for (int w = 0; w < num_workers; w++) {
-                dnstap_ring_t *ring = &workers[w].dnstap_ring;
-                if (!ring->events) continue;
-                uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
-                atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+        } else {
+            if (num_workers > 0 && workers) {
+                for (int w = 0; w < num_workers; w++) {
+                    dnstap_ring_t *ring = &workers[w].dnstap_ring;
+                    if (!ring->events) continue;
+                    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+                    atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+                }
+            }
+            if (g_aux_dnstap_ring.events) {
+                uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_relaxed);
+                atomic_store_explicit(&g_aux_dnstap_ring.tail, h, memory_order_relaxed);
             }
         }
         usleep(any_work ? 1000 : 10000);
@@ -8568,6 +8647,11 @@ typedef struct {
   int client_fd;
   char client_ip[INET6_ADDRSTRLEN];
   int client_port;
+  struct sockaddr_storage client_addr;
+  socklen_t client_len;
+  struct sockaddr_storage server_addr;
+  socklen_t server_len;
+  bool has_server_addr;
   char qname[256];
   uint16_t qclass;
   uint16_t qtype;
@@ -8604,7 +8688,9 @@ static ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
 
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
-                        uint8_t *req_mac, size_t req_mac_len) {
+                        uint8_t *req_mac, size_t req_mac_len,
+                        const struct sockaddr_storage *client_addr, socklen_t client_len,
+                        const struct sockaddr_storage *server_addr, bool has_server_addr) {
   if (!entry) {
     uint8_t res_buf[UDP_DEFAULT_MAX_RES_LEN];
     size_t copy_len = req_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : req_len;
@@ -8612,6 +8698,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     res_buf[2] |= 0x84;
     res_buf[3] |= 0x05;
     uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
+    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
+                       client_addr, client_len, server_addr, has_server_addr, IPPROTO_TCP);
     send_tcp_robust(client_fd, len_prefix, 2);
     send_tcp_robust(client_fd, res_buf, copy_len);
     return;
@@ -8808,6 +8896,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       prev_offset = sign_len; \
     } \
     uint8_t len_prefix[2] = {prev_offset >> 8, prev_offset & 0xFF}; \
+    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res, prev_offset, \
+                       client_addr, client_len, server_addr, has_server_addr, IPPROTO_TCP); \
     if (send_tcp_robust(client_fd, len_prefix, 2) < 0) goto axfr_error; \
     if (send_tcp_robust(client_fd, res, prev_offset) < 0) goto axfr_error; \
     \
@@ -9063,6 +9153,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       offset = sign_len;
     }
     uint8_t len_prefix[2] = {offset >> 8, offset & 0xFF};
+    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res, offset,
+                       client_addr, client_len, server_addr, has_server_addr, IPPROTO_TCP);
     if (send_tcp_robust(client_fd, len_prefix, 2) < 0)
       goto axfr_error;
     if (send_tcp_robust(client_fd, res, offset) < 0)
@@ -9093,7 +9185,9 @@ void *axfr_worker_thread(void *arg) {
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
-                     args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len);
+                     args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len,
+                     &args->client_addr, args->client_len,
+                     args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
   
   submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname, 
                       args->qclass, args->qtype, 0, args->has_edns, args->dnssec_ok);
@@ -9121,6 +9215,11 @@ typedef struct {
   size_t req_len;
   char client_ip[INET6_ADDRSTRLEN];
   int client_port;
+  struct sockaddr_storage client_addr;
+  socklen_t client_len;
+  struct sockaddr_storage server_addr;
+  socklen_t server_len;
+  bool has_server_addr;
   char qname[256];
   uint16_t qtype;
   uint16_t qclass;
@@ -9190,6 +9289,9 @@ static void *async_io_worker_func(void *arg) {
         if (rrl_check((struct sockaddr_storage *)&task.ipc_hdr.client_addr, cls, rrl_cfg, &slip_triggered)) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, res_len,
+                             &task.client_addr, task.client_len,
+                             task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_UDP);
           udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = res_len;
@@ -9204,6 +9306,9 @@ static void *async_io_worker_func(void *arg) {
           int qlen = (int)task.question_end;
           if (qlen > res_len) qlen = res_len;
           if (qlen > (int)task.req_len) qlen = (int)task.req_len;
+          write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, qlen,
+                             &task.client_addr, task.client_len,
+                             task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_UDP);
           udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = qlen;
@@ -9227,6 +9332,9 @@ static void *async_io_worker_func(void *arg) {
         if (res_len > 0) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
+          write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, tcp_res, res_len,
+                             &task.client_addr, task.client_len,
+                             task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_TCP);
           uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
           send_tcp_robust(task.client_fd, len_prefix, 2);
           send_tcp_robust(task.client_fd, tcp_res, res_len);
@@ -9627,6 +9735,10 @@ worker_startup_success:;
               memcpy(task.req_buf, req_buf, task.req_len);
               strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
+              task.client_addr = *client_addr;
+              task.client_len = sizeof(*client_addr);
+              task.has_server_addr = ipc_msg->has_source_addr;
+              if (ipc_msg->has_source_addr) task.server_addr = ipc_msg->source_addr;
               strncpy(task.qname, qname, sizeof(task.qname) - 1);
               task.qtype = qtype;
               task.qclass = qclass;
@@ -9781,6 +9893,13 @@ worker_startup_success:;
 
           memcpy(&ctx_tcp->client_addr, &client_addr, sizeof(client_addr));
           ctx_tcp->client_len = client_len;
+          struct sockaddr_storage saddr;
+          socklen_t slen = sizeof(saddr);
+          if (getsockname(client_fd, (struct sockaddr *)&saddr, &slen) == 0) {
+            memcpy(&ctx_tcp->server_addr, &saddr, sizeof(saddr));
+            ctx_tcp->server_len = slen;
+            ctx_tcp->has_server_addr = true;
+          }
           if (client_addr.ss_family == AF_INET)
             inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr,
                       ctx_tcp->client_ip, INET6_ADDRSTRLEN);
@@ -9932,7 +10051,8 @@ process_tcp_client: ;
                               qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_TCP, eff_max_qps);
           }
           write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, msg, msg_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
-                             NULL, false, IPPROTO_TCP);
+                             ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL,
+                             ctx_tcp->has_server_addr, IPPROTO_TCP);
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
@@ -10043,6 +10163,11 @@ process_tcp_client: ;
                   strncpy(args->client_ip, ctx_tcp->client_ip, INET6_ADDRSTRLEN - 1);
                   args->client_ip[INET6_ADDRSTRLEN - 1] = '\0';
                   args->client_port = client_port;
+                  memcpy(&args->client_addr, &ctx_tcp->client_addr, sizeof(ctx_tcp->client_addr));
+                  args->client_len = ctx_tcp->client_len;
+                  memcpy(&args->server_addr, &ctx_tcp->server_addr, sizeof(ctx_tcp->server_addr));
+                  args->server_len = ctx_tcp->server_len;
+                  args->has_server_addr = ctx_tcp->has_server_addr;
                   strncpy(args->qname, qname, 255);
                   args->qname[255] = '\0';
                   args->qclass = qclass;
@@ -10141,6 +10266,10 @@ process_tcp_client: ;
               }
               release_zone_snapshot(snap);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
+              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
+                                 &ctx_tcp->client_addr, ctx_tcp->client_len,
+                                 ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL,
+                                 ctx_tcp->has_server_addr, IPPROTO_TCP);
               if (send_tcp_robust(client_fd, len_prefix, 2) < 0 ||
                   send_tcp_robust(client_fd, res_buf, copy_len) < 0) {
                 // fall through to close/free
@@ -10171,6 +10300,10 @@ process_tcp_client: ;
               memcpy(task.req_buf, msg, task.req_len);
               strncpy(task.client_ip, ctx_tcp->client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
+              task.client_addr = ctx_tcp->client_addr;
+              task.client_len = ctx_tcp->client_len;
+              task.has_server_addr = ctx_tcp->has_server_addr;
+              if (ctx_tcp->has_server_addr) task.server_addr = ctx_tcp->server_addr;
               strncpy(task.qname, qname, sizeof(task.qname) - 1);
               task.qtype = qtype;
               task.qclass = qclass;
@@ -10198,7 +10331,7 @@ process_tcp_client: ;
                 submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                     tcp_res[3] & 0x0F, has_edns, dnssec_ok);
                 write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, tcp_res, res_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
-                                   NULL, false, IPPROTO_TCP);
+                                   ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL, ctx_tcp->has_server_addr, IPPROTO_TCP);
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
                 if (send_tcp_robust(client_fd, len_prefix, 2) < 0 ||
                     send_tcp_robust(client_fd, tcp_res, res_len) < 0) {
@@ -12151,6 +12284,20 @@ int main(int argc, char **argv) {
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
       exit(EXIT_FAILURE);
   }
+
+  uint32_t dnstap_aux_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
+  if ((dnstap_aux_buf_size & (dnstap_aux_buf_size - 1)) != 0) {
+    uint32_t p = 1;
+    while (p < dnstap_aux_buf_size) p <<= 1;
+    dnstap_aux_buf_size = p;
+  }
+  g_aux_dnstap_ring.size = dnstap_aux_buf_size;
+  g_aux_dnstap_ring.mask = dnstap_aux_buf_size - 1;
+  g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_event_t));
+  atomic_init(&g_aux_dnstap_ring.head, 0);
+  atomic_init(&g_aux_dnstap_ring.tail, 0);
+  atomic_init(&g_aux_dnstap_ring.dropped, 0);
+
   while (atomic_load(&g_bound_workers) < num_workers)
     sched_yield();
 
@@ -12246,6 +12393,36 @@ int main(int argc, char **argv) {
     pthread_join(threads[i], NULL);
   pthread_join(control_thread, NULL);
 
+  // シャットダウン前にリングバッファ内の未送信dnstapイベントを確実にドレイン
+  if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
+    if (num_workers > 0 && ctxs) {
+      for (int w = 0; w < num_workers; w++) {
+        dnstap_ring_t *ring = &ctxs[w].dnstap_ring;
+        if (!ring->events) continue;
+        uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+        uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+        while (t != h) {
+          dnstap_send_frame(&ring->events[t & ring->mask]);
+          t++;
+        }
+        atomic_store_explicit(&ring->tail, t, memory_order_release);
+      }
+    }
+    if (g_aux_dnstap_ring.events) {
+      uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
+      uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
+      while (t != h) {
+        dnstap_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+        if (atomic_load_explicit(&ev->ready, memory_order_acquire)) {
+          dnstap_send_frame(ev);
+          atomic_store_explicit(&ev->ready, false, memory_order_release);
+        }
+        t++;
+      }
+      atomic_store_explicit(&g_aux_dnstap_ring.tail, t, memory_order_release);
+    }
+  }
+
   for (int i = 0; i < num_workers; i++) {
     if (ctxs[i].qlog_ring.events) {
       free(ctxs[i].qlog_ring.events);
@@ -12255,6 +12432,10 @@ int main(int argc, char **argv) {
       free(ctxs[i].dnstap_ring.events);
       ctxs[i].dnstap_ring.events = NULL;
     }
+  }
+  if (g_aux_dnstap_ring.events) {
+    free(g_aux_dnstap_ring.events);
+    g_aux_dnstap_ring.events = NULL;
   }
   if (g_dnstap_sock >= 0) {
     close(g_dnstap_sock);
