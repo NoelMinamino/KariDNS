@@ -35,6 +35,7 @@ cp "${DAG_BIN}" "${PKG_DIR}/dag.exe"
 [ -f "LICENSE" ] && cp "LICENSE" "${PKG_DIR}/"
 mkdir -p "${PKG_DIR}/docs"
 [ -f "docs/dag.md" ] && cp "docs/dag.md" "${PKG_DIR}/docs/"
+[ -f "docs/dag_replay.md" ] && cp "docs/dag_replay.md" "${PKG_DIR}/docs/"
 
 # Auto-bundle non-system runtime DLLs if dynamically linked
 if command -v ldd >/dev/null 2>&1; then

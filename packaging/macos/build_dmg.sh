@@ -36,9 +36,9 @@ fi
 
 # Build native binary for the current runner architecture
 echo "==> Compiling dag for ${ARCH}..."
-clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -pie -DKARIDNS_VERSION=\"${VERSION}\" \
+clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DKARIDNS_VERSION=\"${VERSION}\" \
       ${SSL_INC} ${IDN_INC} ${IDN_DEF} \
-      tools/dag.c dns_wire.c dns_utils.c dns_zone_parser.c \
+      tools/dag.c tools/dag_replay.c dns_wire.c dns_utils.c dns_zone_parser.c \
       -o "${STAGE_DIR}/dag" \
       ${SSL_LIB} ${IDN_LIB} -pthread -lcrypto -lssl -lz -lm
 
@@ -50,6 +50,7 @@ cp "${STAGE_DIR}/dag" "${TAR_STAGE}/dag-${VERSION}/"
 cp LICENSE "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
 cp README.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
+cp docs/dag_replay.md "${TAR_STAGE}/dag-${VERSION}/" 2>/dev/null || true
 
 tar -czf "${OUT_DIR}/dag-${VERSION}-macos-${ARCH}.tar.gz" -C "${TAR_STAGE}" "dag-${VERSION}"
 rm -rf "${TAR_STAGE}"
@@ -62,6 +63,7 @@ cp "${STAGE_DIR}/dag" "${DMG_STAGE}/bin/dag"
 cp LICENSE "${DMG_STAGE}/" 2>/dev/null || true
 cp README.md "${DMG_STAGE}/" 2>/dev/null || true
 cp docs/dag.md "${DMG_STAGE}/" 2>/dev/null || true
+cp docs/dag_replay.md "${DMG_STAGE}/" 2>/dev/null || true
 
 cat << 'EOF' > "${DMG_STAGE}/INSTALL.txt"
 DAG (DNS Anomaly Generator) - Installation Guide

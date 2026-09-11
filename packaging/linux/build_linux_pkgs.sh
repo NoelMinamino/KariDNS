@@ -35,6 +35,7 @@ cp dag "${TAR_DIR}/dag-${VERSION}/"
 cp LICENSE "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp README.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 cp docs/dag.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
+cp docs/dag_replay.md "${TAR_DIR}/dag-${VERSION}/" 2>/dev/null || true
 tar -czf "${OUT_DIR}/dag-${VERSION}-linux-${RPM_ARCH}.tar.gz" -C "${TAR_DIR}" "dag-${VERSION}"
 rm -rf "${TAR_DIR}"
 
