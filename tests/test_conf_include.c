@@ -289,6 +289,26 @@ int main(void) {
         printf("  -> PASS (quoted \"include\" preserved as string literal)\n");
     }
 
+    // Test 12: Zone with undefined tsig-key triggers validation failure after default view creation
+    {
+        printf("[Test 12] Zone with undefined tsig-key error and cleanup idempotency...\n");
+        const char *conf =
+            "zone \"fail.example.com\" {\n"
+            "    type master;\n"
+            "    file \"fail.zone\";\n"
+            "    tsig-key \"nonexistent-key\";\n"
+            "};\n";
+
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        int res = parse_named_conf(conf, &cfg);
+        assert(res != 0);
+        // Ensure calling free_server_config_fields multiple times (as fuzz_conf_parser does) is safe
+        free_server_config_fields(&cfg);
+        free_server_config_fields(&cfg);
+        printf("  -> PASS (no heap-use-after-free or double free on validation rejection)\n");
+    }
+
     // Clean up temporary test files
     unlink("tests_inc_tmp/keys.conf");
     unlink("tests_inc_tmp/main_key.conf");

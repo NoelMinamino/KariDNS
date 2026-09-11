@@ -420,7 +420,7 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
 
-  if (cfg->views != NULL) {
+  if (cfg->zones_are_flat) {
     zone_config_t *curr_flat = cfg->zones;
     while (curr_flat) {
       zone_config_t *next = curr_flat->next;
@@ -428,23 +428,7 @@ void free_server_config_fields(server_config_t *cfg) {
       curr_flat = next;
     }
     cfg->zones = NULL;
-
-    view_config_t *v = cfg->views;
-    while (v) {
-      view_config_t *next_v = v->next;
-      if (v->name) free(v->name);
-      for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
-      if (v->match_clients) free(v->match_clients);
-      zone_config_t *curr = v->zones;
-      while (curr) {
-        zone_config_t *next = curr->next;
-        free_zone_config(curr);
-        curr = next;
-      }
-      free(v);
-      v = next_v;
-    }
-    cfg->views = NULL;
+    cfg->zones_are_flat = false;
   } else {
     zone_config_t *curr = cfg->zones;
     while (curr) {
@@ -454,6 +438,23 @@ void free_server_config_fields(server_config_t *cfg) {
     }
     cfg->zones = NULL;
   }
+
+  view_config_t *v = cfg->views;
+  while (v) {
+    view_config_t *next_v = v->next;
+    if (v->name) free(v->name);
+    for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
+    if (v->match_clients) free(v->match_clients);
+    zone_config_t *curr = v->zones;
+    while (curr) {
+      zone_config_t *next = curr->next;
+      free_zone_config(curr);
+      curr = next;
+    }
+    free(v);
+    v = next_v;
+  }
+  cfg->views = NULL;
 
   tsig_key_t *k = cfg->keys;
   while (k) {
@@ -1394,6 +1395,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->bind_addresses = NULL;
   config->bind_address_count = 0;
   config->zones = NULL;
+  config->zones_are_flat = false;
   config->views = NULL;
   config->keys = NULL;
   config->user = NULL;
@@ -2478,6 +2480,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     default_view->match_clients[0] = strdup("any");
     default_view->match_clients_count = 1;
     default_view->zones = config->zones;
+    config->zones = NULL;
     config->views = default_view;
   }
 
@@ -2554,6 +2557,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     }
   }
   config->zones = flat_zones;
+  config->zones_are_flat = true;
 
   for (log_channel_t *c = config->logging.channels; c; c = c->next) {
     if (!c->max_qps_specified) {
