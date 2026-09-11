@@ -470,6 +470,10 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
   if (cfg->control.secret) { free(cfg->control.secret); cfg->control.secret = NULL; }
   memset(&cfg->control, 0, sizeof(control_channel_config_t));
+  if (cfg->dnstap.socket_path) { free(cfg->dnstap.socket_path); cfg->dnstap.socket_path = NULL; }
+  if (cfg->dnstap.identity) { free(cfg->dnstap.identity); cfg->dnstap.identity = NULL; }
+  if (cfg->dnstap.version) { free(cfg->dnstap.version); cfg->dnstap.version = NULL; }
+  memset(&cfg->dnstap, 0, sizeof(dnstap_config_t));
   free_rate_limit_config(&cfg->rrl);
   memset(&cfg->rrl, 0, sizeof(rate_limit_config_t));
 
@@ -1332,6 +1336,58 @@ static int parse_buffer_size_value(const char *str) {
   return (int)val;
 }
 
+static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
+  free_token(&tok);
+  config->dnstap.enabled = true;
+  config->dnstap.queue_size = 4096;
+  while (1) {
+    tok = get_next_token(ctx);
+    if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
+    if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+    char *key_prop = strdup(tok.value);
+    free_token(&tok);
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_STRING) { free(key_prop); free_token(&tok); return -1; }
+    char *val = strdup(tok.value);
+    free_token(&tok);
+    tok = get_next_token(ctx);
+    if (tok.type != TOKEN_SEMICOLON) { free(key_prop); free(val); free_token(&tok); return -1; }
+    free_token(&tok);
+
+    if (strcmp(key_prop, "socket") == 0 || strcmp(key_prop, "socket-path") == 0) {
+      if (config->dnstap.socket_path) free(config->dnstap.socket_path);
+      config->dnstap.socket_path = val;
+    } else if (strcmp(key_prop, "identity") == 0) {
+      if (config->dnstap.identity) free(config->dnstap.identity);
+      config->dnstap.identity = val;
+    } else if (strcmp(key_prop, "version") == 0) {
+      if (config->dnstap.version) free(config->dnstap.version);
+      config->dnstap.version = val;
+    } else if (strcmp(key_prop, "queue-size") == 0 || strcmp(key_prop, "queue_size") == 0) {
+      config->dnstap.queue_size = (uint32_t)strtoul(val, NULL, 10);
+      free(val);
+    } else if (strcmp(key_prop, "log-queries") == 0 || strcmp(key_prop, "auth-query") == 0) {
+      config->dnstap.log_auth_query = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+      free(val);
+    } else if (strcmp(key_prop, "log-responses") == 0 || strcmp(key_prop, "auth-response") == 0) {
+      config->dnstap.log_auth_response = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+      free(val);
+    } else if (strcmp(key_prop, "require-connect") == 0) {
+      config->dnstap.require_connect = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+      free(val);
+    } else {
+      free(val);
+    }
+    free(key_prop);
+  }
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
   memset(config, 0, sizeof(server_config_t));
   config->port = 53;
@@ -1790,7 +1846,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
-          free_token(&tok);
+        } else if (strcmp(key, "dnstap") == 0) {
+          if (parse_dnstap_block(ctx, config) != 0) {
+            free(key);
+            return -1;
+          }
         } else
           skip_unknown_block(ctx);
         free(key);
@@ -2133,6 +2193,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         return -1;
       }
       free_token(&tok);
+    } else if (strcmp(tok.value, "dnstap") == 0) {
+      free_token(&tok);
+      if (parse_dnstap_block(ctx, config) != 0) {
+        return -1;
+      }
     } else if (strcmp(tok.value, "logging") == 0) {
       free_token(&tok);
       tok = get_next_token(ctx);

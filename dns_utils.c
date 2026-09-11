@@ -393,6 +393,14 @@ const char *format_type_name(uint16_t type, char *buf, size_t buf_size) {
     return buf;
 }
 
+const char *dns_type_to_string(uint16_t type_code) {
+    const char *n = lookup_type_name(type_code);
+    if (n) return n;
+    static _Thread_local char buf[32];
+    snprintf(buf, sizeof(buf), "TYPE%u", type_code);
+    return buf;
+}
+
 int hex_char_to_val(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;

@@ -63,6 +63,7 @@ typedef struct {
     uint64_t ede_na;
     uint64_t ede_ns;
     uint64_t ede_oth;
+    uint64_t dnstap_truncated;
 } karidns_status_t;
 
 // ============================================================================
@@ -341,5 +342,49 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
                              int *out_prcount, int *out_upcount);
+
+// ============================================================================
+// Protocol Buffers Encoder (Minimal, Dependency-Free)
+// ============================================================================
+#define PB_WT_VARINT  0
+#define PB_WT_FIXED64 1
+#define PB_WT_LEN     2
+#define PB_WT_FIXED32 5
+
+size_t pb_encode_varint(uint8_t *out, size_t out_cap, uint64_t value);
+size_t pb_encode_tag(uint8_t *out, size_t out_cap, uint32_t field_no, uint8_t wire_type);
+size_t pb_encode_bytes_field(uint8_t *out, size_t out_cap, uint32_t field_no,
+                              const uint8_t *data, size_t data_len);
+size_t pb_encode_varint_field(uint8_t *out, size_t out_cap, uint32_t field_no, uint64_t value);
+size_t pb_encode_fixed32_field(uint8_t *out, size_t out_cap, uint32_t field_no, uint32_t value);
+
+// ============================================================================
+// DNS Observatory Snapshot (POD for IPC transfer)
+// ============================================================================
+typedef struct {
+    char domain[256];
+    char view_name[64];
+    bool is_secondary;
+    uint32_t soa_serial;
+    int slaves_configured;
+    time_t last_notify_time;
+    time_t last_transfer_time;
+    uint64_t queries_total;
+    uint64_t tcp_queries;
+    uint64_t responses_noerror;
+    uint64_t responses_nxdomain;
+    uint64_t responses_nodata;
+    uint64_t responses_servfail;
+    uint64_t responses_refused;
+    uint64_t edns_queries;
+    uint64_t dnssec_do_queries;
+    uint64_t ecs_queries;
+    uint64_t rrl_dropped;
+    uint64_t rrl_slipped;
+    uint64_t notify_sent;
+    uint64_t notify_ack;
+    uint64_t axfr_success;
+    uint64_t ixfr_success;
+} zone_observatory_snapshot_t;
 
 #endif // DNS_WIRE_H

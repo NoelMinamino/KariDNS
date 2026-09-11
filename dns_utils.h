@@ -24,6 +24,7 @@ bool split_path_for_openat(const char *path, char *dir_out,
 uint16_t get_type_code(const char *type_str);
 char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
+const char *dns_type_to_string(uint16_t type_code);
 
 
 int hex_char_to_val(char c);
@@ -34,5 +35,15 @@ int hex_char_to_val(char c);
 size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap);
 int compare_canonical_name(const char *name1, const char *name2);
 bool serial_is_newer(uint32_t s1, uint32_t s2);
+
+static inline bool domain_names_match_ci(const char *a, const char *b) {
+    if (!a || !b) return false;
+    if (strcasecmp(a, b) == 0) return true;
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    if (la == lb + 1 && a[la - 1] == '.' && strncasecmp(a, b, lb) == 0) return true;
+    if (lb == la + 1 && b[lb - 1] == '.' && strncasecmp(a, b, la) == 0) return true;
+    return false;
+}
 
 #endif

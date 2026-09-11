@@ -120,8 +120,9 @@ int main(int argc, char **argv) {
     bool conf_path_explicit = false;
     const char *cli_sock_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "f:s:v")) != -1) {
+    while ((opt = getopt(argc, argv, "c:f:s:v")) != -1) {
         switch (opt) {
+            case 'c':
             case 'f':
                 conf_path = optarg;
                 conf_path_explicit = true;
@@ -133,13 +134,13 @@ int main(int argc, char **argv) {
                 printf("karictl %s\n", KARIDNS_VERSION);
                 return 0;
             default:
-                fprintf(stderr, "Usage: %s [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-c config_path] [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
                 return 1;
         }
     }
     if (optind >= argc) {
         fprintf(stderr, "Usage: %s [-f config_path] [-s socket_path] [-v] <command> [args...]\n", argv[0]);
-        fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, tsig-keygen [keyname]\n");
+        fprintf(stderr, "Commands: status, reload [zone], reconfig, stop, notify <zone>, retransfer <zone>, zonestatus <zone>, observatory [zone], tsig-keygen [keyname]\n");
         return 1;
     }
 
@@ -362,11 +363,82 @@ int main(int argc, char **argv) {
             printf("EDE NotAuthoritative (20): %lu\n", st.ede_na);
             printf("EDE NotSupported (21): %lu\n", st.ede_ns);
             printf("EDE Other: %lu\n", st.ede_oth);
+            printf("dnstap truncated: %lu\n", (unsigned long)st.dnstap_truncated);
             printf("-----------------------------------\n");
         } else {
             if (total >= sizeof(buf)) total = sizeof(buf) - 1;
             buf[total] = '\0';
             printf("%s", buf);
+        }
+    } else if (strcmp(argv[optind], "observatory") == 0) {
+        size_t total = 0;
+        while (total < sizeof(buf) - 1) {
+            r = recv(sock, buf + total, 1, 0);
+            if (r <= 0) break;
+            total += r;
+            if (buf[total - 1] == '\n') break;
+        }
+        buf[total] = '\0';
+        if (strncmp(buf, "ERROR", 5) == 0) {
+            printf("%s", buf);
+            close(sock);
+            return 3;
+        }
+        uint32_t count = 0;
+        if (sscanf(buf, "OK %u", &count) != 1) {
+            printf("Invalid response: %s", buf);
+            close(sock);
+            return 3;
+        }
+        if (count == 0) {
+            printf("No matching zones found.\n");
+        } else {
+            for (uint32_t i = 0; i < count; i++) {
+                zone_observatory_snapshot_t snap;
+                size_t got = 0;
+                while (got < sizeof(snap)) {
+                    ssize_t n = recv(sock, (char *)&snap + got, sizeof(snap) - got, 0);
+                    if (n <= 0) break;
+                    got += n;
+                }
+                if (got < sizeof(snap)) {
+                    fprintf(stderr, "Truncated observatory response\n");
+                    close(sock);
+                    return 3;
+                }
+                char notify_time_str[64] = "never";
+                if (snap.last_notify_time > 0) {
+                    time_t t = (time_t)snap.last_notify_time;
+                    struct tm *tm_n = localtime(&t);
+                    strftime(notify_time_str, sizeof(notify_time_str), "%Y-%m-%d %H:%M:%S", tm_n);
+                }
+                char transfer_time_str[64] = "never";
+                if (snap.last_transfer_time > 0) {
+                    time_t t = (time_t)snap.last_transfer_time;
+                    struct tm *tm_x = localtime(&t);
+                    strftime(transfer_time_str, sizeof(transfer_time_str), "%Y-%m-%d %H:%M:%S", tm_x);
+                }
+
+                printf("Zone: %s (view: %s)\n", snap.domain, snap.view_name[0] ? snap.view_name : "default");
+                printf("  Role:                  %s\n", snap.is_secondary ? "secondary" : "primary");
+                printf("  SOA Serial:            %u\n", snap.soa_serial);
+                printf("  Queries Total:         %lu (TCP: %lu)\n", (unsigned long)snap.queries_total, (unsigned long)snap.tcp_queries);
+                printf("  Responses:             NOERROR=%lu NXDOMAIN=%lu NODATA=%lu SERVFAIL=%lu REFUSED=%lu\n",
+                       (unsigned long)snap.responses_noerror, (unsigned long)snap.responses_nxdomain, (unsigned long)snap.responses_nodata,
+                       (unsigned long)snap.responses_servfail, (unsigned long)snap.responses_refused);
+                printf("  EDNS / Extensions:     EDNS=%lu DO=%lu ECS=%lu\n",
+                       (unsigned long)snap.edns_queries, (unsigned long)snap.dnssec_do_queries, (unsigned long)snap.ecs_queries);
+                printf("  Rate Limiting:         Dropped=%lu Slipped=%lu\n",
+                       (unsigned long)snap.rrl_dropped, (unsigned long)snap.rrl_slipped);
+                if (snap.is_secondary) {
+                    printf("  Transfers (In):        AXFR=%lu IXFR=%lu (Last: %s)\n",
+                           (unsigned long)snap.axfr_success, (unsigned long)snap.ixfr_success, transfer_time_str);
+                } else {
+                    printf("  NOTIFY (Out):          Sent=%lu Configured-Slaves=%u (Last: %s)\n",
+                           (unsigned long)snap.notify_sent, snap.slaves_configured, notify_time_str);
+                }
+                if (i + 1 < count) printf("\n");
+            }
         }
     } else {
         r = recv(sock, buf, sizeof(buf) - 1, 0);

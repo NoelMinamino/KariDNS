@@ -58,8 +58,15 @@ grep -i "Nested parentheses" out3.txt || {
 echo "[+] Case 3 passed."
 
 echo "[+] 4. Verifying valid zone passes regression check..."
+set +e
 "$BIN_DIR/karicheck" zone example.com "$ZONES_DIR/ttl_suffix_test.zone" > out4.txt 2>&1
+RET4=$?
+set -e
 cat out4.txt
+if [ $RET4 -ne 0 ]; then
+    echo "FAIL: Expected valid zone to pass karicheck"
+    exit 1
+fi
 echo "[+] Valid zone check passed."
 
 rm -f out1.txt out2.txt out3.txt out4.txt

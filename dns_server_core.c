@@ -43,6 +43,7 @@
 #include <unistd.h>
 #include <sys/un.h>
 #include <sys/ucred.h>
+#include <sys/uio.h>
 
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
 
@@ -159,6 +160,27 @@ typedef struct {
 } catalog_member_id_t;
 
 typedef struct {
+    _Atomic uint64_t queries_total;
+    _Atomic uint64_t responses_noerror;
+    _Atomic uint64_t responses_nxdomain;
+    _Atomic uint64_t responses_nodata;   // NOERRORかつANCOUNT=0 (RFC 2308)
+    _Atomic uint64_t responses_servfail;
+    _Atomic uint64_t responses_refused;
+    _Atomic uint64_t tcp_queries;
+    _Atomic uint64_t ecs_queries;
+    _Atomic uint64_t edns_queries;
+    _Atomic uint64_t dnssec_do_queries;
+    _Atomic uint64_t rrl_dropped;
+    _Atomic uint64_t rrl_slipped;
+    _Atomic uint64_t notify_sent;
+    _Atomic uint64_t notify_ack;
+    _Atomic uint64_t axfr_success;
+    _Atomic uint64_t ixfr_success;
+    _Atomic time_t   last_transfer_time;
+    _Atomic time_t   last_notify_time;
+} zone_observatory_t;
+
+typedef struct {
   char domain[256];
   char view_name[64];
   zone_rcu_t rcu;
@@ -174,6 +196,7 @@ typedef struct {
   _Atomic(int) active_axfr;
   _Atomic int snapshot_refs;
   ixfr_history_t ixfr_history;
+  zone_observatory_t observatory;
   catalog_member_id_t *catalog_members;
   int catalog_member_count;
   bool is_catalog_member;
@@ -247,11 +270,35 @@ typedef struct {
     alignas(64) _Atomic uint64_t dropped_count;
 } qlog_ring_t;
 
+// dnstap用イベント (Wire Formatをそのままコピーするため生パケットバッファを持つ)
+typedef struct {
+    struct timespec ts;
+    uint8_t message_type;   // 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
+    uint8_t protocol;       // IPPROTO_UDP or IPPROTO_TCP
+    struct sockaddr_storage client_addr;
+    socklen_t client_addr_len;
+    struct sockaddr_storage server_addr;
+    socklen_t server_addr_len;
+    bool has_server_addr;
+    size_t wire_len;
+    uint8_t wire[UDP_DEFAULT_MAX_RES_LEN > 4096 ? UDP_DEFAULT_MAX_RES_LEN : 4096];
+} dnstap_event_t;
+
+typedef struct {
+    dnstap_event_t *events;
+    uint32_t size;
+    uint32_t mask;
+    alignas(64) _Atomic uint32_t head;
+    alignas(64) _Atomic uint32_t tail;
+    alignas(64) _Atomic uint64_t dropped;
+} dnstap_ring_t;
+
 typedef struct {
   int thread_id;
   int core_id;
   zone_rcu_t *rcu_db;
   qlog_ring_t qlog_ring;
+  dnstap_ring_t dnstap_ring;
   alignas(64) _Atomic uint64_t query_count; // QPS計測用ローカルカウンタ (競合ゼロ)
 
   // ワーカーローカル・レートリミット用 (排他制御不要・競合ゼロ)
@@ -688,6 +735,9 @@ static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
 static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
 static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
+static int g_dnstap_sock = -1;
+static _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
+static _Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
 static worker_ctx_t *g_worker_ctxs = NULL;
 static int g_worker_count = 0;
 
@@ -1002,6 +1052,11 @@ static void limit_client_socket_rights(int fd) {
 
 static void enter_capsicum_sandbox(void) {
 #ifndef SANITIZER_BUILD
+  if (g_dnstap_sock >= 0) {
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
+    cap_rights_limit(g_dnstap_sock, &rights);
+  }
   int trapmode = PROC_TRAPCAP_CTL_ENABLE;
   procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);
   if (cap_enter() != 0) {
@@ -1119,16 +1174,6 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
     }
   }
   return NULL;
-}
-
-static inline bool domain_names_match_ci(const char *a, const char *b) {
-  if (!a || !b) return false;
-  if (strcasecmp(a, b) == 0) return true;
-  size_t la = strlen(a);
-  size_t lb = strlen(b);
-  if (la == lb + 1 && a[la - 1] == '.' && strncasecmp(a, b, lb) == 0) return true;
-  if (lb == la + 1 && b[lb - 1] == '.' && strncasecmp(a, b, la) == 0) return true;
-  return false;
 }
 
 static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
@@ -3748,6 +3793,13 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                               memory_order_release);
         wait_for_readers(cur_active);
         pthread_mutex_unlock(&entry->writer_lock);
+
+        if (session->is_ixfr) {
+          atomic_fetch_add_explicit(&entry->observatory.ixfr_success, 1, memory_order_relaxed);
+        } else {
+          atomic_fetch_add_explicit(&entry->observatory.axfr_success, 1, memory_order_relaxed);
+        }
+        atomic_store_explicit(&entry->observatory.last_transfer_time, (uint64_t)time(NULL), memory_order_relaxed);
 
         void send_notify_to_all(const char *domain, const char *view_name);
         send_notify_to_all(entry->domain, entry->view_name);
@@ -6393,7 +6445,8 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
                             bool is_tcp, rate_limit_config_t **out_rrl_cfg,
-                            zone_db_snapshot_t *snap, server_config_t *cfg) {
+                            zone_db_snapshot_t *snap, server_config_t *cfg,
+                            zone_db_entry_t **out_matched_entry) {
   if (req_len < DNS_HEADER_SIZE) {
     return 0; // 不正な短いパケットは無応答で破棄
   }
@@ -6443,6 +6496,23 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   edns.ede_count = 0; // 反射防止
   if (edns.present && edns.udp_payload_size < 512) {
     edns.udp_payload_size = 512;
+  }
+
+  if (out_matched_entry) *out_matched_entry = db_entry;
+  if (db_entry) {
+    atomic_fetch_add_explicit(&db_entry->observatory.queries_total, 1, memory_order_relaxed);
+    if (is_tcp) {
+      atomic_fetch_add_explicit(&db_entry->observatory.tcp_queries, 1, memory_order_relaxed);
+    }
+    if (edns.present) {
+      atomic_fetch_add_explicit(&db_entry->observatory.edns_queries, 1, memory_order_relaxed);
+      if (edns.dnssec_ok) {
+        atomic_fetch_add_explicit(&db_entry->observatory.dnssec_do_queries, 1, memory_order_relaxed);
+      }
+      if (edns.has_ecs) {
+        atomic_fetch_add_explicit(&db_entry->observatory.ecs_queries, 1, memory_order_relaxed);
+      }
+    }
   }
 
   server_config_t *cfg_for_ede = cfg;
@@ -7148,15 +7218,38 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   return offset;
 }
 
+static inline void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount) {
+    if (!entry) return;
+    if (rcode == 0) {
+        if (ancount == 0) {
+            atomic_fetch_add_explicit(&entry->observatory.responses_nodata, 1, memory_order_relaxed);
+        } else {
+            atomic_fetch_add_explicit(&entry->observatory.responses_noerror, 1, memory_order_relaxed);
+        }
+    } else if (rcode == 3) {
+        atomic_fetch_add_explicit(&entry->observatory.responses_nxdomain, 1, memory_order_relaxed);
+    } else if (rcode == 2) {
+        atomic_fetch_add_explicit(&entry->observatory.responses_servfail, 1, memory_order_relaxed);
+    } else if (rcode == 5) {
+        atomic_fetch_add_explicit(&entry->observatory.responses_refused, 1, memory_order_relaxed);
+    }
+}
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,
                       bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap) {
   server_config_t *cfg = acquire_config_snapshot();
+  zone_db_entry_t *matched_entry = NULL;
   int ret = process_dns_query_impl(req, req_len, res, max_res_len, qname, qtype,
-                                   client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg);
+                                   client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry);
   release_config_snapshot(cfg);
+  if (ret >= DNS_HEADER_SIZE && matched_entry) {
+    uint8_t rcode = res[3] & 0x0F;
+    uint16_t ancount = ((uint16_t)res[6] << 8) | (uint16_t)res[7];
+    record_observatory_response(matched_entry, rcode, ancount);
+  }
   return ret;
 }
 
@@ -7587,6 +7680,26 @@ void send_notify_to_all(const char *domain, const char *view_name) {
             }
           }
         }
+      }
+    }
+  }
+
+  if (snap && notified_count > 0) {
+    view_snapshot_t *v_snap = NULL;
+    if (view_name) {
+      for (size_t v = 0; v < snap->view_count; v++) {
+        if (strcasecmp(snap->views[v].name, view_name) == 0) {
+          v_snap = &snap->views[v];
+          break;
+        }
+      }
+    }
+    if (!v_snap && snap->view_count > 0) v_snap = &snap->views[0];
+    if (v_snap) {
+      zone_db_entry_t *entry = find_zone_in_view(v_snap, domain);
+      if (entry) {
+        atomic_fetch_add_explicit(&entry->observatory.notify_sent, notified_count, memory_order_relaxed);
+        atomic_store_explicit(&entry->observatory.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);
       }
     }
   }
@@ -8105,6 +8218,346 @@ void *query_logger_thread_func(void *arg) {
         usleep(any_work ? 1000 : 10000);
     }
     return NULL;
+}
+
+// ============================================================================
+// 10.5 dnstap Frame Streams & Protobuf Implementation
+// ============================================================================
+#define FSTRM_CONTROL_ESCAPE               0x00000000U
+#define FSTRM_CONTROL_READY                0x00000001U
+#define FSTRM_CONTROL_ACCEPT               0x00000002U
+#define FSTRM_CONTROL_START                0x00000003U
+#define FSTRM_CONTROL_STOP                 0x00000004U
+#define FSTRM_CONTROL_FINISH               0x00000005U
+#define FSTRM_CONTROL_FIELD_CONTENT_TYPE   0x00000001U
+
+static const char DNSTAP_CONTENT_TYPE[] = "protobuf:dnstap.Dnstap";
+static char g_dnstap_identity[256];
+static char g_dnstap_version[256];
+
+static int dnstap_connect_and_handshake(const char *socket_path, const char *identity, const char *version) {
+    if (!socket_path || !*socket_path) return -1;
+    if (identity) {
+        strncpy(g_dnstap_identity, identity, sizeof(g_dnstap_identity) - 1);
+        g_dnstap_identity[sizeof(g_dnstap_identity) - 1] = '\0';
+    } else {
+        g_dnstap_identity[0] = '\0';
+    }
+    if (version) {
+        strncpy(g_dnstap_version, version, sizeof(g_dnstap_version) - 1);
+        g_dnstap_version[sizeof(g_dnstap_version) - 1] = '\0';
+    } else {
+        g_dnstap_version[0] = '\0';
+    }
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, socket_path, sizeof(sun.sun_path) - 1);
+
+    if (connect(sock, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    // Send READY frame: escape(4B, 0) + len(4B, 34) + type(4B, 1) + field(4B, 1) + ct_len(4B, 22) + "protobuf:dnstap.Dnstap" (22B)
+    uint32_t ct_len = (uint32_t)(sizeof(DNSTAP_CONTENT_TYPE) - 1);
+    uint32_t payload_len = 4 + 4 + 4 + ct_len;
+    uint32_t ready_hdr[5];
+    ready_hdr[0] = htonl(FSTRM_CONTROL_ESCAPE);
+    ready_hdr[1] = htonl(payload_len);
+    ready_hdr[2] = htonl(FSTRM_CONTROL_READY);
+    ready_hdr[3] = htonl(FSTRM_CONTROL_FIELD_CONTENT_TYPE);
+    ready_hdr[4] = htonl(ct_len);
+
+    struct iovec r_iov[2];
+    r_iov[0].iov_base = ready_hdr;
+    r_iov[0].iov_len = sizeof(ready_hdr);
+    r_iov[1].iov_base = (void *)DNSTAP_CONTENT_TYPE;
+    r_iov[1].iov_len = ct_len;
+
+    if (writev(sock, r_iov, 2) < 0) {
+        close(sock);
+        return -1;
+    }
+
+    // Receive ACCEPT frame
+    uint32_t esc = 0, acc_len_be = 0;
+    if (recv(sock, &esc, 4, MSG_WAITALL) != 4 || ntohl(esc) != FSTRM_CONTROL_ESCAPE) {
+        close(sock);
+        return -1;
+    }
+    if (recv(sock, &acc_len_be, 4, MSG_WAITALL) != 4) {
+        close(sock);
+        return -1;
+    }
+    uint32_t acc_len = ntohl(acc_len_be);
+    if (acc_len < 4 || acc_len > 1024) {
+        close(sock);
+        return -1;
+    }
+    uint8_t acc_buf[1024];
+    if (recv(sock, acc_buf, acc_len, MSG_WAITALL) != (ssize_t)acc_len) {
+        close(sock);
+        return -1;
+    }
+    uint32_t acc_type = ntohl(*(uint32_t *)acc_buf);
+    if (acc_type != FSTRM_CONTROL_ACCEPT) {
+        close(sock);
+        return -1;
+    }
+
+    // Send START frame: escape(4B, 0) + len(4B, 4) + type(4B, 3)
+    uint32_t start_buf[3];
+    start_buf[0] = htonl(FSTRM_CONTROL_ESCAPE);
+    start_buf[1] = htonl(4);
+    start_buf[2] = htonl(FSTRM_CONTROL_START);
+    if (write(sock, start_buf, sizeof(start_buf)) != sizeof(start_buf)) {
+        close(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
+static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, size_t out_cap) {
+    uint8_t msg_buf[4200];
+    size_t msg_offset = 0;
+
+    // Message.type (field 1, required, varint): 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
+    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, ev->message_type);
+
+    // Message.socket_family (field 2, varint): 1 = INET, 2 = INET6
+    uint32_t fam = (ev->client_addr.ss_family == AF_INET6) ? 2 : 1;
+    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 2, fam);
+
+    // Message.socket_protocol (field 3, varint): 1 = UDP, 2 = TCP
+    uint32_t proto = (ev->protocol == IPPROTO_TCP) ? 2 : 1;
+    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 3, proto);
+
+    // Message.query_address (field 4, bytes) & query_port (field 6, varint)
+    if (ev->client_addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&ev->client_addr;
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
+                                            (const uint8_t *)&sin->sin_addr, 4);
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
+                                             ntohs(sin->sin_port));
+    } else if (ev->client_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ev->client_addr;
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
+                                            (const uint8_t *)&sin6->sin6_addr, 16);
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
+                                             ntohs(sin6->sin6_port));
+    }
+
+    // Message.response_address (field 5, bytes) & response_port (field 7, varint)
+    if (ev->has_server_addr) {
+        if (ev->server_addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&ev->server_addr;
+            msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
+                                                (const uint8_t *)&sin->sin_addr, 4);
+            if (sin->sin_port != 0) {
+                msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
+                                                     ntohs(sin->sin_port));
+            }
+        } else if (ev->server_addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ev->server_addr;
+            msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
+                                                (const uint8_t *)&sin6->sin6_addr, 16);
+            if (sin6->sin6_port != 0) {
+                msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
+                                                     ntohs(sin6->sin6_port));
+            }
+        }
+    }
+
+    if (ev->message_type == 1 /* AUTH_QUERY */) {
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)ev->ts.tv_sec);
+        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)ev->ts.tv_nsec);
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, ev->wire, ev->wire_len);
+    } else { // AUTH_RESPONSE
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 12, (uint64_t)ev->ts.tv_sec);
+        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)ev->ts.tv_nsec);
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, ev->wire, ev->wire_len);
+    }
+
+    // Top-level Dnstap: field 1 (identity), field 2 (version), field 15 (type = 1, MESSAGE, required), field 14 (message)
+    size_t out_offset = 0;
+    if (g_dnstap_identity[0]) {
+        out_offset += pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 1,
+                                            (const uint8_t *)g_dnstap_identity, strlen(g_dnstap_identity));
+    }
+    if (g_dnstap_version[0]) {
+        out_offset += pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 2,
+                                            (const uint8_t *)g_dnstap_version, strlen(g_dnstap_version));
+    }
+    out_offset += pb_encode_varint_field(out_buf + out_offset, out_cap - out_offset, 15, 1);
+    out_offset += pb_encode_bytes_field(out_buf + out_offset, out_cap - out_offset, 14, msg_buf, msg_offset);
+
+    return out_offset;
+}
+
+static bool dnstap_send_frame(const dnstap_event_t *ev) {
+    if (g_dnstap_sock < 0) return false;
+    uint8_t payload[4600];
+    size_t plen = dnstap_build_message(ev, payload, sizeof(payload));
+    if (plen == 0) return true;
+
+    uint32_t be_len = htonl((uint32_t)plen);
+    struct iovec iov[2];
+    iov[0].iov_base = &be_len;
+    iov[0].iov_len = 4;
+    iov[1].iov_base = payload;
+    iov[1].iov_len = plen;
+
+    size_t total_written = 0;
+    size_t total_to_write = 4 + plen;
+    while (total_written < total_to_write) {
+        ssize_t w = writev(g_dnstap_sock, iov, 2);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        total_written += w;
+        if (total_written < 4) {
+            iov[0].iov_base = (uint8_t *)&be_len + total_written;
+            iov[0].iov_len = 4 - total_written;
+        } else {
+            iov[0].iov_len = 0;
+            iov[1].iov_base = payload + (total_written - 4);
+            iov[1].iov_len = plen - (total_written - 4);
+        }
+    }
+    return true;
+}
+
+static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
+                                       const uint8_t *wire, size_t wire_len,
+                                       const struct sockaddr_storage *client_addr,
+                                       socklen_t client_addr_len,
+                                       const struct sockaddr_storage *server_addr,
+                                       bool has_server_addr, uint8_t protocol) {
+    if (!ctx || !atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) return;
+    dnstap_ring_t *ring = &ctx->dnstap_ring;
+    if (!ring->events) return;
+
+    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+    if (h - t >= ring->size) {
+        atomic_fetch_add_explicit(&ring->dropped, 1, memory_order_relaxed);
+        return;
+    }
+    dnstap_event_t *ev = &ring->events[h & ring->mask];
+    clock_gettime(CLOCK_REALTIME, &ev->ts);
+    ev->message_type = message_type;
+    ev->protocol = protocol;
+    if (client_addr) {
+        memcpy(&ev->client_addr, client_addr, sizeof(*client_addr));
+        ev->client_addr_len = client_addr_len;
+    } else {
+        memset(&ev->client_addr, 0, sizeof(ev->client_addr));
+        ev->client_addr_len = 0;
+    }
+    ev->has_server_addr = has_server_addr;
+    if (has_server_addr && server_addr) {
+        memcpy(&ev->server_addr, server_addr, sizeof(*server_addr));
+        ev->server_addr_len = sizeof(*server_addr);
+    } else {
+        memset(&ev->server_addr, 0, sizeof(ev->server_addr));
+        ev->server_addr_len = 0;
+    }
+    size_t copy_len = wire_len;
+    if (copy_len > sizeof(ev->wire)) {
+        copy_len = sizeof(ev->wire);
+        atomic_fetch_add_explicit(&g_dnstap_truncated_total, 1, memory_order_relaxed);
+    }
+    memcpy(ev->wire, wire, copy_len);
+    ev->wire_len = copy_len;
+    atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+}
+
+void *dnstap_sender_thread_func(void *arg) {
+    (void)arg;
+    while (1) {
+        bool any_work = false;
+        int num_workers = g_worker_count;
+        worker_ctx_t *workers = g_worker_ctxs;
+        if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed) &&
+            num_workers > 0 && workers) {
+            for (int w = 0; w < num_workers; w++) {
+                dnstap_ring_t *ring = &workers[w].dnstap_ring;
+                if (!ring->events) continue;
+                uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+                uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+                while (t != h) {
+                    dnstap_event_t *ev = &ring->events[t & ring->mask];
+                    any_work = true;
+                    if (!dnstap_send_frame(ev)) {
+                        atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
+                        if (g_dnstap_sock >= 0) {
+                            close(g_dnstap_sock);
+                            g_dnstap_sock = -1;
+                        }
+                        syslog(LOG_WARNING, "[dnstap] write failed, disabling dnstap until restart: %s",
+                               strerror(errno));
+                        fprintf(stderr, "[dnstap] write failed: %s\n", strerror(errno));
+                        break;
+                    }
+                    t++;
+                }
+                atomic_store_explicit(&ring->tail, t, memory_order_release);
+            }
+        } else if (num_workers > 0 && workers) {
+            for (int w = 0; w < num_workers; w++) {
+                dnstap_ring_t *ring = &workers[w].dnstap_ring;
+                if (!ring->events) continue;
+                uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+                atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+            }
+        }
+        usleep(any_work ? 1000 : 10000);
+    }
+    return NULL;
+}
+
+static void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out) {
+    if (!e || !out) return;
+    strlcpy(out->domain, e->domain, sizeof(out->domain));
+    strlcpy(out->view_name, e->view_name, sizeof(out->view_name));
+    out->is_secondary = e->is_secondary;
+    out->soa_serial = (uint32_t)atomic_load_explicit(&e->serial, memory_order_relaxed);
+
+    zone_config_t *zc = find_zone_config_in_view(cfg, e->view_name, e->domain);
+    out->slaves_configured = zc ? zc->also_notify_count : 0;
+
+    out->last_notify_time = atomic_load_explicit(&e->observatory.last_notify_time, memory_order_relaxed);
+    out->last_transfer_time = atomic_load_explicit(&e->observatory.last_transfer_time, memory_order_relaxed);
+    if (out->last_transfer_time == 0) {
+        out->last_transfer_time = atomic_load_explicit(&e->last_successful_transfer, memory_order_relaxed);
+    }
+
+    out->queries_total = atomic_load_explicit(&e->observatory.queries_total, memory_order_relaxed);
+    out->tcp_queries = atomic_load_explicit(&e->observatory.tcp_queries, memory_order_relaxed);
+    out->responses_noerror = atomic_load_explicit(&e->observatory.responses_noerror, memory_order_relaxed);
+    out->responses_nxdomain = atomic_load_explicit(&e->observatory.responses_nxdomain, memory_order_relaxed);
+    out->responses_nodata = atomic_load_explicit(&e->observatory.responses_nodata, memory_order_relaxed);
+    out->responses_servfail = atomic_load_explicit(&e->observatory.responses_servfail, memory_order_relaxed);
+    out->responses_refused = atomic_load_explicit(&e->observatory.responses_refused, memory_order_relaxed);
+    out->edns_queries = atomic_load_explicit(&e->observatory.edns_queries, memory_order_relaxed);
+    out->dnssec_do_queries = atomic_load_explicit(&e->observatory.dnssec_do_queries, memory_order_relaxed);
+    out->ecs_queries = atomic_load_explicit(&e->observatory.ecs_queries, memory_order_relaxed);
+    out->rrl_dropped = atomic_load_explicit(&e->observatory.rrl_dropped, memory_order_relaxed);
+    out->rrl_slipped = atomic_load_explicit(&e->observatory.rrl_slipped, memory_order_relaxed);
+    out->notify_sent = atomic_load_explicit(&e->observatory.notify_sent, memory_order_relaxed);
+    out->notify_ack = atomic_load_explicit(&e->observatory.notify_ack, memory_order_relaxed);
+    out->axfr_success = atomic_load_explicit(&e->observatory.axfr_success, memory_order_relaxed);
+    out->ixfr_success = atomic_load_explicit(&e->observatory.ixfr_success, memory_order_relaxed);
 }
 
 // ============================================================================
@@ -9162,6 +9615,8 @@ worker_startup_success:;
                 write_query_log(ctx, client_addr, sizeof(*client_addr),
                                 qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
             }
+            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, sizeof(*client_addr),
+                               ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
@@ -9206,6 +9661,15 @@ worker_startup_success:;
                   } else {
                     drop_packet = true;
                   }
+                  view_snapshot_t *rrl_v = select_view(snap, client_ip);
+                  zone_db_entry_t *rrl_z = rrl_v ? find_zone_in_view(rrl_v, qname) : NULL;
+                  if (rrl_z) {
+                    if (tc_packet) {
+                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
+                    } else {
+                      atomic_fetch_add_explicit(&rrl_z->observatory.rrl_dropped, 1, memory_order_relaxed);
+                    }
+                  }
                 }
               }
 
@@ -9246,6 +9710,9 @@ worker_startup_success:;
                 res_msg->payload_len = res_len;
                 batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
               }
+
+              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, client_addr, sizeof(*client_addr),
+                                 ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
               batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
               batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
@@ -9464,6 +9931,8 @@ process_tcp_client: ;
               write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
                               qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_TCP, eff_max_qps);
           }
+          write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, msg, msg_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
+                             NULL, false, IPPROTO_TCP);
 
           zone_db_snapshot_t *snap = acquire_zone_snapshot();
           view_snapshot_t *xfr_view = select_view(snap, ctx_tcp->client_ip);
@@ -9728,6 +10197,8 @@ process_tcp_client: ;
               if (res_len > 0) {
                 submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                     tcp_res[3] & 0x0F, has_edns, dnssec_ok);
+                write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, tcp_res, res_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
+                                   NULL, false, IPPROTO_TCP);
                 uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
                 if (send_tcp_robust(client_fd, len_prefix, 2) < 0 ||
                     send_tcp_robust(client_fd, tcp_res, res_len) < 0) {
@@ -10233,6 +10704,7 @@ void *control_thread_func(void *arg) {
               st.ede_na = atomic_load_explicit(&g_ede_not_authoritative_total, memory_order_relaxed);
               st.ede_ns = atomic_load_explicit(&g_ede_not_supported_total, memory_order_relaxed);
               st.ede_oth = atomic_load_explicit(&g_ede_other_total, memory_order_relaxed);
+              st.dnstap_truncated = atomic_load_explicit(&g_dnstap_truncated_total, memory_order_relaxed);
               
               struct iovec iov[2];
               iov[0].iov_base = "OK ";
@@ -10266,6 +10738,45 @@ void *control_thread_func(void *arg) {
               }
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
+            } else if (strcmp(cmd, "observatory") == 0) {
+              zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              server_config_t *active_cfg = acquire_config_snapshot();
+              char canon_buf[256];
+              const char *canon_arg = (arg && strlen(arg) > 0) ? find_configured_domain(arg, canon_buf, sizeof(canon_buf)) : NULL;
+
+              uint32_t match_count = 0;
+              if (snap) {
+                for (size_t v = 0; v < snap->view_count; v++) {
+                  if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
+                  for (size_t z = 0; z < snap->views[v].zone_count; z++) {
+                    zone_db_entry_t *e = snap->views[v].entries[z];
+                    if (!e) continue;
+                    if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
+                    match_count++;
+                  }
+                }
+              }
+
+              char resp_hdr[64];
+              int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %u\n", match_count);
+              send(cfd, resp_hdr, hlen, 0);
+
+              if (snap && match_count > 0) {
+                for (size_t v = 0; v < snap->view_count; v++) {
+                  if (view_arg && strcasecmp(snap->views[v].name, view_arg) != 0) continue;
+                  for (size_t z = 0; z < snap->views[v].zone_count; z++) {
+                    zone_db_entry_t *e = snap->views[v].entries[z];
+                    if (!e) continue;
+                    if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
+                    zone_observatory_snapshot_t snap_item;
+                    memset(&snap_item, 0, sizeof(snap_item));
+                    fill_observatory_snapshot(e, active_cfg, &snap_item);
+                    send(cfd, &snap_item, sizeof(snap_item), 0);
+                  }
+                }
+              }
+              if (active_cfg) release_config_snapshot(active_cfg);
+              if (snap) release_zone_snapshot(snap);
             } else if (strcmp(cmd, "notify") == 0 && arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
@@ -11516,14 +12027,21 @@ int main(int argc, char **argv) {
 
     // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止)
     pid_t dead = 0;
+    int child_exit_code = 0;
     while (!g_supervisor_should_exit) {
       int status;
       dead = wait(&status);
       if (dead > 0) {
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-          syslog(LOG_NOTICE, "[Manager] Child process %d exited cleanly. Clean shutdown initiated.", dead);
+        if (WIFEXITED(status)) {
+          int code = WEXITSTATUS(status);
+          if (code != 0) child_exit_code = code;
+          syslog(code == 0 ? LOG_NOTICE : LOG_CRIT,
+                 "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, code);
+        } else if (WIFSIGNALED(status)) {
+          child_exit_code = 128 + WTERMSIG(status);
+          syslog(LOG_CRIT, "[Manager] Child process %d killed by signal %d. Terminating all children.", dead, WTERMSIG(status));
         } else {
-          syslog(LOG_CRIT, "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, status);
+          child_exit_code = 1;
         }
         break;
       }
@@ -11545,13 +12063,31 @@ int main(int argc, char **argv) {
       kill(g_broker_pid, SIGTERM);
     }
     while (1) {
-      pid_t w = wait(NULL);
-      if (w > 0) continue;
+      int status;
+      pid_t w = wait(&status);
+      if (w > 0) {
+        if (WIFEXITED(status)) {
+          int code = WEXITSTATUS(status);
+          if (code != 0) {
+            if (w == backend_pid || child_exit_code == 0) {
+              child_exit_code = code;
+            }
+          }
+        } else if (WIFSIGNALED(status)) {
+          if (child_exit_code == 0 && WTERMSIG(status) != SIGTERM) {
+            child_exit_code = 128 + WTERMSIG(status);
+          }
+        }
+        continue;
+      }
       if (w < 0 && errno == EINTR) continue;
       break;
     }
+    if (!g_supervisor_should_exit && child_exit_code == 0) {
+      child_exit_code = 1;
+    }
     cleanup_pid_file();
-    exit(0);
+    exit(child_exit_code);
   }
 
   // === Backend Process (backend_pid == 0) ===
@@ -11595,8 +12131,22 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].qlog_ring.head, 0);
     atomic_init(&ctxs[i].qlog_ring.tail, 0);
     atomic_init(&ctxs[i].qlog_ring.dropped_count, 0);
+
+    uint32_t dnstap_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
+    if ((dnstap_buf_size & (dnstap_buf_size - 1)) != 0) {
+      uint32_t p = 1;
+      while (p < dnstap_buf_size) p <<= 1;
+      dnstap_buf_size = p;
+    }
+    ctxs[i].dnstap_ring.size = dnstap_buf_size;
+    ctxs[i].dnstap_ring.mask = dnstap_buf_size - 1;
+    ctxs[i].dnstap_ring.events = calloc(dnstap_buf_size, sizeof(dnstap_event_t));
+    atomic_init(&ctxs[i].dnstap_ring.head, 0);
+    atomic_init(&ctxs[i].dnstap_ring.tail, 0);
+    atomic_init(&ctxs[i].dnstap_ring.dropped, 0);
+
     atomic_init(&ctxs[i].query_count, 0);
-    if (!ctxs[i].qlog_ring.events)
+    if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
       exit(EXIT_FAILURE);
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
       exit(EXIT_FAILURE);
@@ -11664,6 +12214,28 @@ int main(int argc, char **argv) {
   if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);
   pthread_t query_logger_thread;
   if (pthread_create(&query_logger_thread, NULL, query_logger_thread_func, NULL) != 0) exit(1);
+
+  if (cfg->dnstap.enabled && cfg->dnstap.socket_path) {
+    g_dnstap_sock = dnstap_connect_and_handshake(cfg->dnstap.socket_path, cfg->dnstap.identity, cfg->dnstap.version);
+    if (g_dnstap_sock >= 0) {
+      atomic_store_explicit(&g_dnstap_connected, true, memory_order_release);
+      syslog(LOG_NOTICE, "[dnstap] connected and handshaked to %s", cfg->dnstap.socket_path);
+      fprintf(stderr, "[dnstap] connected and handshaked to %s\n", cfg->dnstap.socket_path);
+    } else {
+      syslog(LOG_WARNING, "[dnstap] failed to connect to %s, dnstap disabled", cfg->dnstap.socket_path);
+      fprintf(stderr, "[dnstap] failed to connect to %s, dnstap disabled\n", cfg->dnstap.socket_path);
+      if (cfg->dnstap.require_connect) {
+        syslog(LOG_ERR, "[dnstap] require-connect is enabled and connection failed, aborting startup");
+        fprintf(stderr, "[dnstap] require-connect is enabled and connection failed, aborting startup\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+  }
+  pthread_t dnstap_sender_thread;
+  if (pthread_create(&dnstap_sender_thread, NULL, dnstap_sender_thread_func, NULL) != 0) {
+    syslog(LOG_ERR, "[dnstap] failed to create sender thread");
+    exit(1);
+  }
   
   enter_capsicum_sandbox(); // サンドボックス突入
 
@@ -11679,6 +12251,14 @@ int main(int argc, char **argv) {
       free(ctxs[i].qlog_ring.events);
       ctxs[i].qlog_ring.events = NULL;
     }
+    if (ctxs[i].dnstap_ring.events) {
+      free(ctxs[i].dnstap_ring.events);
+      ctxs[i].dnstap_ring.events = NULL;
+    }
+  }
+  if (g_dnstap_sock >= 0) {
+    close(g_dnstap_sock);
+    g_dnstap_sock = -1;
   }
   free(ctxs);
   free(threads);
