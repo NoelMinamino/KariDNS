@@ -24,7 +24,6 @@
 #define recv(s, b, l, f) recv((s), (char *)(b), (int)(l), (f))
 #define sendto(s, b, l, f, to, tolen) sendto((s), (const char *)(b), (int)(l), (f), (to), (int)(tolen))
 #define recvfrom(s, b, l, f, from, fromlen) recvfrom((s), (char *)(b), (int)(l), (f), (from), (int *)(fromlen))
-#define usleep(us) Sleep((DWORD)(((us) + 999) / 1000))
 #ifndef strcasecmp
 #define strcasecmp _stricmp
 #endif
@@ -886,6 +885,15 @@ void diff_dns_responses(const uint8_t *resp1, size_t len1, const uint8_t *resp2,
     out_diff->cname_chain_diff = (out_diff->diff_flags & DIFF_CNAME_CHAIN) != 0;
 }
 
+static inline void replay_sleep_us(uint32_t us) {
+    if (us == 0) return;
+#ifdef _WIN32
+    Sleep((DWORD)((us + 999) / 1000));
+#else
+    usleep((useconds_t)us);
+#endif
+}
+
 static inline void set_replay_socket_timeouts(int sock, int timeout_ms) {
     if (timeout_ms <= 0) timeout_ms = 2000;
 #ifdef _WIN32
@@ -1422,7 +1430,7 @@ int run_replay_mode(int argc, char **argv) {
                             break;
                         }
                     }
-                    if (rate_delay_us > 0) usleep(rate_delay_us);
+                    if (rate_delay_us > 0) replay_sleep_us(rate_delay_us);
                 }
             }
         }
@@ -1465,7 +1473,7 @@ int run_replay_mode(int argc, char **argv) {
                         break;
                     }
                 }
-                if (rate_delay_us > 0) usleep(rate_delay_us);
+                if (rate_delay_us > 0) replay_sleep_us(rate_delay_us);
             }
         }
     } else {
@@ -1511,7 +1519,7 @@ int run_replay_mode(int argc, char **argv) {
                             break;
                         }
                     }
-                    if (rate_delay_us > 0) usleep(rate_delay_us);
+                    if (rate_delay_us > 0) replay_sleep_us(rate_delay_us);
                 }
             }
         }
