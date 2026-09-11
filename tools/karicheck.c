@@ -489,41 +489,61 @@ static void lint_glue_consistency(const char *domain, zone_arena_t *arena, int *
     char checked_targets[64][256];
     int checked_count = 0;
 
+    // 1. Check in-bailiwick NS, MX, and SRV targets for missing glue (ERROR)
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *rec = &arena->records[i];
-        if (rec->type_code != 2) continue; // NS record
-        if (rec->rdata_count < 1 || !rec->rdata[0]) continue;
-        const char *ns_target = rec->rdata[0];
-        if (!is_subdomain_of(ns_target, domain)) continue;
+        const char *target = NULL;
+        const char *type_str = NULL;
+        if (rec->type_code == 2 && rec->rdata_count >= 1) {
+            target = rec->rdata[0];
+            type_str = "NS";
+        } else if (rec->type_code == 15 && rec->rdata_count >= 2) {
+            target = rec->rdata[1];
+            type_str = "MX";
+        } else if (rec->type_code == 33 && rec->rdata_count >= 4) {
+            target = rec->rdata[3];
+            type_str = "SRV";
+        }
+        if (!target || !is_subdomain_of(target, domain)) continue;
 
         bool already_checked = false;
         for (int c = 0; c < checked_count; c++) {
-            if (domain_names_match_ci(checked_targets[c], ns_target)) {
+            if (domain_names_match_ci(checked_targets[c], target)) {
                 already_checked = true;
                 break;
             }
         }
         if (already_checked) continue;
         if (checked_count < 64) {
-            strncpy(checked_targets[checked_count++], ns_target, 255);
+            strncpy(checked_targets[checked_count++], target, 255);
         }
+
+        // If target points to a CNAME, it will be flagged as ERROR by lint_cname_targets (RFC 2181 §10.3).
+        bool target_is_cname = false;
+        for (size_t j = 0; j < arena->count; j++) {
+            if (arena->records[j].type_code == 5 && domain_names_match_ci(arena->records[j].name, target)) {
+                target_is_cname = true;
+                break;
+            }
+        }
+        if (target_is_cname) continue;
 
         bool found_address = false;
         for (size_t j = 0; j < arena->count; j++) {
             dns_record_t *ar = &arena->records[j];
-            if ((ar->type_code == 1 || ar->type_code == 28) && domain_names_match_ci(ar->name, ns_target)) {
+            if ((ar->type_code == 1 || ar->type_code == 28) && domain_names_match_ci(ar->name, target)) {
                 found_address = true;
                 if (ar->rdata_count >= 1 && ar->rdata[0]) {
                     if (ar->type_code == 1) {
                         struct in_addr a;
                         if (inet_pton(AF_INET, ar->rdata[0], &a) != 1) {
-                            fprintf(stderr, "[ERROR] In-bailiwick glue record '%s' has invalid IPv4 address '%s'\n", ns_target, ar->rdata[0]);
+                            fprintf(stderr, "[ERROR] In-bailiwick glue record '%s' has invalid IPv4 address '%s'\n", target, ar->rdata[0]);
                             (*out_errors)++;
                         }
                     } else if (ar->type_code == 28) {
                         struct in6_addr a6;
                         if (inet_pton(AF_INET6, ar->rdata[0], &a6) != 1) {
-                            fprintf(stderr, "[ERROR] In-bailiwick glue record '%s' has invalid IPv6 address '%s'\n", ns_target, ar->rdata[0]);
+                            fprintf(stderr, "[ERROR] In-bailiwick glue record '%s' has invalid IPv6 address '%s'\n", target, ar->rdata[0]);
                             (*out_errors)++;
                         }
                     }
@@ -531,7 +551,17 @@ static void lint_glue_consistency(const char *domain, zone_arena_t *arena, int *
             }
         }
         if (!found_address) {
-            fprintf(stderr, "[WARNING] In-bailiwick NS target '%s' lacks A/AAAA glue record in zone '%s'\n", ns_target, domain);
+            fprintf(stderr, "[ERROR] In-bailiwick %s target '%s' lacks A/AAAA glue record in zone '%s'\n", type_str, target, domain);
+            (*out_errors)++;
+        }
+    }
+
+    // 2. Check for out-of-bailiwick address records (WARNING)
+    for (size_t i = 0; i < arena->count; i++) {
+        dns_record_t *r = &arena->records[i];
+        if (r->type_code != 1 && r->type_code != 28) continue;
+        if (!is_subdomain_of(r->name, domain)) {
+            fprintf(stderr, "[WARNING] Out-of-bailiwick glue record '%s' in zone '%s'\n", r->name, domain);
             (*out_warnings)++;
         }
     }
@@ -594,6 +624,32 @@ static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, i
 
 static void lint_cname_targets(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
     (void)domain;
+    // 1. RFC 2181 section 10.3: NS and MX targets must not point to CNAME (ERROR)
+    for (size_t i = 0; i < arena->count; i++) {
+        dns_record_t *rec = &arena->records[i];
+        const char *target = NULL;
+        const char *type_name = NULL;
+        if (rec->type_code == 2 && rec->rdata_count >= 1) {
+            target = rec->rdata[0];
+            type_name = "NS";
+        } else if (rec->type_code == 15 && rec->rdata_count >= 2) {
+            target = rec->rdata[1];
+            type_name = "MX";
+        }
+        if (!target) continue;
+
+        for (size_t j = 0; j < arena->count; j++) {
+            dns_record_t *c = &arena->records[j];
+            if (c->type_code == 5 && domain_names_match_ci(c->name, target)) {
+                fprintf(stderr, "[ERROR] %s record '%s' points to CNAME target '%s' (RFC 2181 section 10.3)\n",
+                        type_name, rec->name, target);
+                (*out_errors)++;
+                break;
+            }
+        }
+    }
+
+    // 2. CNAME loops (ERROR) and CNAME chains (WARNING)
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *cname = &arena->records[i];
         if (cname->type_code != 5) continue;
@@ -1296,17 +1352,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         }
 
         // --- RFC 1912 Operational Checks ---
-        if (tcode == 15 && rcount >= 2) { // MX
-            if (is_cname(&arena, rdata[1])) {
-                fprintf(stderr, "[WARNING] MX record for '%s' points to a CNAME '%s' (RFC 1912)\n", arena.records[i].name, rdata[1]);
-            }
-        }
         if (tcode == 2 && rcount >= 1) { // NS
-            if (is_cname(&arena, rdata[0])) {
-                fprintf(stderr, "[WARNING] NS record for '%s' points to a CNAME '%s' (RFC 1912)\n", arena.records[i].name, rdata[0]);
-            }
             const char *ns_target = rdata[0];
-            if (is_in_bailiwick(ns_target, domain)) {
+            if (is_in_bailiwick(ns_target, domain) && !is_cname(&arena, ns_target)) {
                 bool glue_found = false;
                 if (arena.hash_table && arena.hash_size > 0) {
                     uint32_t hash = calc_fnv1a_str(ns_target);

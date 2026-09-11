@@ -44,15 +44,11 @@ echo "=== Running KariDNS dnstap Capture Test ==="
 KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 
-# Build binaries if missing
-if [ ! -f "$KARIDNS" ]; then
-    echo "[+] Building karidns..."
-    make -C "$ROOT_DIR" karidns
-fi
-if [ ! -f "$DAG" ]; then
-    echo "[+] Building dag..."
-    make -C "$ROOT_DIR" dag
-fi
+# Build binaries
+echo "[+] Building karidns..."
+make -C "$ROOT_DIR" karidns
+echo "[+] Building dag..."
+make -C "$ROOT_DIR" dag
 
 # 1. Create Zone File
 cat << 'EOF' > "$ZONE_PATH"
@@ -163,6 +159,47 @@ if grep -q "version=0.2.1" "$LOG_PATH"; then
     echo "  PASS: dnstap version matched '0.2.1'."
 else
     echo "FAIL: dnstap version mismatch."
+    exit 1
+fi
+
+# 8. Test require-connect yes enforcement
+echo "[+] Testing require-connect yes enforcement..."
+if [ -n "$PID_SERVER" ]; then
+    kill -TERM "$PID_SERVER" 2>/dev/null || true
+    wait "$PID_SERVER" 2>/dev/null || true
+    PID_SERVER=""
+fi
+PORT_REQ=$((PORT + 10))
+CONF_REQUIRE_CONNECT="$TMP_DIR/karidns_require_connect.conf"
+cat << EOF > "$CONF_REQUIRE_CONNECT"
+options {
+    port $PORT_REQ;
+    bind-address { 127.0.0.1; };
+    $USER_OPT
+};
+
+dnstap {
+    socket "$TMP_DIR/non_existent_dnstap.sock";
+    require-connect yes;
+    log-queries yes;
+};
+
+zone "example.com" {
+    type primary;
+    file "$ZONE_PATH";
+};
+EOF
+
+set +e
+"$KARIDNS" -f -c "$CONF_REQUIRE_CONNECT" > "$TMP_DIR/require_connect.log" 2>&1
+RC_EXIT=$?
+set -e
+
+if [ $RC_EXIT -ne 0 ]; then
+    echo "  PASS: karidns aborted on start with non-zero exit code ($RC_EXIT) when dnstap socket was missing and require-connect was enabled."
+else
+    echo "FAIL: karidns unexpectedly succeeded or did not abort when require-connect was enabled. Server log:"
+    cat "$TMP_DIR/require_connect.log" 2>/dev/null || true
     exit 1
 fi
 

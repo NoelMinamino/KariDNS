@@ -16,14 +16,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     diff_result_t diff;
     memset(&diff, 0, sizeof(diff));
+    bool ignore_ttl = (data[0] & 1);
 
     // Test identical responses (reflexivity test)
-    diff_dns_responses(data, size, data, size, &diff);
+    diff_dns_responses(data, size, data, size, ignore_ttl, &diff);
 
     // Test degenerate/NULL inputs
-    diff_dns_responses(NULL, 0, data, size, &diff);
-    diff_dns_responses(data, size, NULL, 0, &diff);
-    diff_dns_responses(NULL, 0, NULL, 0, &diff);
+    diff_dns_responses(NULL, 0, data, size, ignore_ttl, &diff);
+    diff_dns_responses(data, size, NULL, 0, ignore_ttl, &diff);
+    diff_dns_responses(NULL, 0, NULL, 0, ignore_ttl, &diff);
 
     // Test splitting data into two responses
     if (size >= 2) {
@@ -36,13 +37,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         size_t len2 = (size - 1) - len1;
 
         memset(&diff, 0, sizeof(diff));
-        diff_dns_responses(resp1, len1, resp2, len2, &diff);
+        diff_dns_responses(resp1, len1, resp2, len2, ignore_ttl, &diff);
     }
 
     // Test equal halves split
     size_t half = size / 2;
     memset(&diff, 0, sizeof(diff));
-    diff_dns_responses(data, half, data + half, size - half, &diff);
+    diff_dns_responses(data, half, data + half, size - half, ignore_ttl, &diff);
 
     return 0;
 }

@@ -19,22 +19,34 @@ cd "$ROOT_DIR"
 
 echo "=== Running karicheck Semantic Lint Test Suite ==="
 
-# Build karicheck if missing
-if [ ! -f ./karicheck ]; then
-    echo "[+] Building karicheck..."
-    make karicheck
-fi
+# Build karicheck
+echo "[+] Building karicheck..."
+make karicheck
 
 FAILED=0
 
-# Test 1: In-bailiwick Glue Consistency
+# Test 1: In-bailiwick Glue Consistency (ERROR)
 echo "[+] Test 1: In-bailiwick glue check (missing_glue.zone)..."
-OUT1=$(./karicheck zone missing-glue.example. tests/zones/missing_glue.zone 2>&1 || true)
-if echo "$OUT1" | grep -q "lacks A/AAAA glue record"; then
-    echo "  PASS: Missing in-bailiwick glue warning detected."
+set +e
+OUT1=$(./karicheck zone missing-glue.example. tests/zones/missing_glue.zone 2>&1)
+EXIT1=$?
+set -e
+if [ $EXIT1 -ne 0 ] && echo "$OUT1" | grep -q "lacks A/AAAA glue record" && echo "$OUT1" | grep -q "\[ERROR\]"; then
+    echo "  PASS: Missing in-bailiwick glue error correctly detected (exit=$EXIT1)."
 else
-    echo "  FAIL: Expected glue warning missing:"
+    echo "  FAIL: Expected glue error missing (exit=$EXIT1):"
     echo "$OUT1"
+    FAILED=1
+fi
+
+# Test 1b: Out-of-bailiwick Glue Detection (WARNING)
+echo "[+] Test 1b: Out-of-bailiwick glue check (orphan_glue.zone)..."
+OUT1B=$(./karicheck zone example.com. tests/zones/orphan_glue.zone 2>&1 || true)
+if echo "$OUT1B" | grep -q "Out-of-bailiwick glue record 'ns1.example.net.' in zone 'example.com.'"; then
+    echo "  PASS: Out-of-bailiwick glue warning detected."
+else
+    echo "  FAIL: Expected out-of-bailiwick glue warning missing:"
+    echo "$OUT1B"
     FAILED=1
 fi
 
@@ -86,6 +98,20 @@ if [ $EXIT4 -ne 0 ] && echo "$OUT4" | grep -q "CNAME loop detected" && echo "$OU
 else
     echo "  FAIL: CNAME loop or chain missing (exit=$EXIT4):"
     echo "$OUT4"
+    FAILED=1
+fi
+
+# Test 4b: RFC 2181 §10.3 NS/MX points to CNAME target (ERROR)
+echo "[+] Test 4b: RFC 2181 §10.3 NS/MX CNAME target check..."
+set +e
+OUT4B=$(./karicheck zone example.com. tests/zones/test_lint_cname_target.zone 2>&1)
+EXIT4B=$?
+set -e
+if [ $EXIT4B -ne 0 ] && echo "$OUT4B" | grep -q "NS record 'example.com.' points to CNAME target" && echo "$OUT4B" | grep -q "MX record 'example.com.' points to CNAME target" && echo "$OUT4B" | grep -q "2 error(s)"; then
+    echo "  PASS: RFC 2181 §10.3 NS and MX CNAME target errors detected (exit=$EXIT4B)."
+else
+    echo "  FAIL: RFC 2181 §10.3 CNAME target errors missing (exit=$EXIT4B):"
+    echo "$OUT4B"
     FAILED=1
 fi
 

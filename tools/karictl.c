@@ -363,6 +363,7 @@ int main(int argc, char **argv) {
             printf("EDE NotAuthoritative (20): %lu\n", st.ede_na);
             printf("EDE NotSupported (21): %lu\n", st.ede_ns);
             printf("EDE Other: %lu\n", st.ede_oth);
+            printf("dnstap truncated: %lu\n", (unsigned long)st.dnstap_truncated);
             printf("-----------------------------------\n");
         } else {
             if (total >= sizeof(buf)) total = sizeof(buf) - 1;

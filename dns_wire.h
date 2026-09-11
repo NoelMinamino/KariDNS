@@ -63,6 +63,7 @@ typedef struct {
     uint64_t ede_na;
     uint64_t ede_ns;
     uint64_t ede_oth;
+    uint64_t dnstap_truncated;
 } karidns_status_t;
 
 // ============================================================================

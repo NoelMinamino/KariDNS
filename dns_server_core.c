@@ -10704,6 +10704,7 @@ void *control_thread_func(void *arg) {
               st.ede_na = atomic_load_explicit(&g_ede_not_authoritative_total, memory_order_relaxed);
               st.ede_ns = atomic_load_explicit(&g_ede_not_supported_total, memory_order_relaxed);
               st.ede_oth = atomic_load_explicit(&g_ede_other_total, memory_order_relaxed);
+              st.dnstap_truncated = atomic_load_explicit(&g_dnstap_truncated_total, memory_order_relaxed);
               
               struct iovec iov[2];
               iov[0].iov_base = "OK ";
@@ -12026,14 +12027,21 @@ int main(int argc, char **argv) {
 
     // 子プロセスの死活監視ループ (いずれかの子プロセスが終了した場合は全子プロセスを停止)
     pid_t dead = 0;
+    int child_exit_code = 0;
     while (!g_supervisor_should_exit) {
       int status;
       dead = wait(&status);
       if (dead > 0) {
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-          syslog(LOG_NOTICE, "[Manager] Child process %d exited cleanly. Clean shutdown initiated.", dead);
+        if (WIFEXITED(status)) {
+          int code = WEXITSTATUS(status);
+          if (code != 0) child_exit_code = code;
+          syslog(code == 0 ? LOG_NOTICE : LOG_CRIT,
+                 "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, code);
+        } else if (WIFSIGNALED(status)) {
+          child_exit_code = 128 + WTERMSIG(status);
+          syslog(LOG_CRIT, "[Manager] Child process %d killed by signal %d. Terminating all children.", dead, WTERMSIG(status));
         } else {
-          syslog(LOG_CRIT, "[Manager] Child process %d exited (status=%d). Terminating all children.", dead, status);
+          child_exit_code = 1;
         }
         break;
       }
@@ -12055,13 +12063,31 @@ int main(int argc, char **argv) {
       kill(g_broker_pid, SIGTERM);
     }
     while (1) {
-      pid_t w = wait(NULL);
-      if (w > 0) continue;
+      int status;
+      pid_t w = wait(&status);
+      if (w > 0) {
+        if (WIFEXITED(status)) {
+          int code = WEXITSTATUS(status);
+          if (code != 0) {
+            if (w == backend_pid || child_exit_code == 0) {
+              child_exit_code = code;
+            }
+          }
+        } else if (WIFSIGNALED(status)) {
+          if (child_exit_code == 0 && WTERMSIG(status) != SIGTERM) {
+            child_exit_code = 128 + WTERMSIG(status);
+          }
+        }
+        continue;
+      }
       if (w < 0 && errno == EINTR) continue;
       break;
     }
+    if (!g_supervisor_should_exit && child_exit_code == 0) {
+      child_exit_code = 1;
+    }
     cleanup_pid_file();
-    exit(0);
+    exit(child_exit_code);
   }
 
   // === Backend Process (backend_pid == 0) ===
@@ -12198,6 +12224,11 @@ int main(int argc, char **argv) {
     } else {
       syslog(LOG_WARNING, "[dnstap] failed to connect to %s, dnstap disabled", cfg->dnstap.socket_path);
       fprintf(stderr, "[dnstap] failed to connect to %s, dnstap disabled\n", cfg->dnstap.socket_path);
+      if (cfg->dnstap.require_connect) {
+        syslog(LOG_ERR, "[dnstap] require-connect is enabled and connection failed, aborting startup");
+        fprintf(stderr, "[dnstap] require-connect is enabled and connection failed, aborting startup\n");
+        exit(EXIT_FAILURE);
+      }
     }
   }
   pthread_t dnstap_sender_thread;
