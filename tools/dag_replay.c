@@ -5,15 +5,42 @@
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <ctype.h>
 #include <sys/types.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <io.h>
+#define close(s) closesocket(s)
+#ifndef MSG_WAITALL
+#define MSG_WAITALL 0
+#endif
+
+/* Winsock API casting wrappers for uint8_t* buffers to avoid signedness warnings */
+#define send(s, b, l, f) send((s), (const char *)(b), (int)(l), (f))
+#define recv(s, b, l, f) recv((s), (char *)(b), (int)(l), (f))
+#define sendto(s, b, l, f, to, tolen) sendto((s), (const char *)(b), (int)(l), (f), (to), (int)(tolen))
+#define recvfrom(s, b, l, f, from, fromlen) recvfrom((s), (char *)(b), (int)(l), (f), (from), (int *)(fromlen))
+#define usleep(us) Sleep((DWORD)(((us) + 999) / 1000))
+#ifndef strcasecmp
+#define strcasecmp _stricmp
+#endif
+#ifndef strncasecmp
+#define strncasecmp _strnicmp
+#endif
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <strings.h>
+#endif
 
 #include "dag_replay.h"
 
@@ -859,6 +886,21 @@ void diff_dns_responses(const uint8_t *resp1, size_t len1, const uint8_t *resp2,
     out_diff->cname_chain_diff = (out_diff->diff_flags & DIFF_CNAME_CHAIN) != 0;
 }
 
+static inline void set_replay_socket_timeouts(int sock, int timeout_ms) {
+    if (timeout_ms <= 0) timeout_ms = 2000;
+#ifdef _WIN32
+    DWORD tv = (DWORD)timeout_ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
                                      const uint8_t *pkt, size_t pkt_len,
                                      uint8_t *resp, size_t resp_cap, int timeout_ms) {
@@ -900,16 +942,10 @@ static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
         }
     }
 
-    if (timeout_ms <= 0) timeout_ms = 2000;
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
     if (!use_tcp) {
         int fd = socket(ss.ss_family, SOCK_DGRAM, 0);
         if (fd < 0) return -1;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        set_replay_socket_timeouts(fd, timeout_ms);
 
         ssize_t sent = sendto(fd, pkt, pkt_len, 0, (struct sockaddr *)&ss, slen);
         if (sent != (ssize_t)pkt_len) {
@@ -922,8 +958,7 @@ static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
     } else {
         int fd = socket(ss.ss_family, SOCK_STREAM, 0);
         if (fd < 0) return -1;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        set_replay_socket_timeouts(fd, timeout_ms);
 
         if (connect(fd, (struct sockaddr *)&ss, slen) != 0) {
             close(fd);
@@ -935,10 +970,14 @@ static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
             return -1;
         }
         uint8_t rlen_buf[2];
-        ssize_t n = recv(fd, rlen_buf, 2, MSG_WAITALL);
-        if (n != 2) {
-            close(fd);
-            return -1;
+        size_t got_len = 0;
+        while (got_len < 2) {
+            ssize_t n = recv(fd, rlen_buf + got_len, 2 - got_len, 0);
+            if (n <= 0) {
+                close(fd);
+                return -1;
+            }
+            got_len += (size_t)n;
         }
         uint16_t expected_len = ((uint16_t)rlen_buf[0] << 8) | rlen_buf[1];
         if (expected_len > resp_cap) expected_len = (uint16_t)resp_cap;
@@ -1341,7 +1380,7 @@ int run_replay_mode(int argc, char **argv) {
     fseek(fp, 0, SEEK_SET);
 
     uint64_t seq = 0;
-    useconds_t rate_delay_us = (opts.rate_qps > 0) ? (1000000 / opts.rate_qps) : 0;
+    uint32_t rate_delay_us = (opts.rate_qps > 0) ? (uint32_t)(1000000 / opts.rate_qps) : 0;
 
     if (nread == 4 && ((magic[0] == 0xa1 && magic[1] == 0xb2 && magic[2] == 0xc3 && magic[3] == 0xd4) ||
                        (magic[0] == 0xd4 && magic[1] == 0xc3 && magic[2] == 0xb2 && magic[3] == 0xa1))) {
@@ -1597,6 +1636,10 @@ int run_replay_mode(int argc, char **argv) {
     pthread_mutex_destroy(&ws.stats_lock);
     free(queue);
     free(io_buf);
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
 
     return 0;
 }
