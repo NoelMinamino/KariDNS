@@ -1,0 +1,7 @@
+$ORIGIN example.com.
+$TTL 300
+@   IN  SOA ns1.example.com. hostmaster.example.com. ( 2026091101 3600 900 1209600 300 )
+    IN  NS  ns1.example.com.
+ns1 IN  A   127.0.0.1
+bad IN  CNAME target.example.com.
+bad IN  TXT   "coexisting data"

@@ -87,6 +87,9 @@ jobs:
             sh ./tests/run_sibling_additional_test.sh
             sh ./tests/run_multi_instance_test.sh
             sh ./tests/run_extended_axfr_test.sh
+            sh ./tests/run_dnstap_capture_test.sh
+            sh ./tests/run_karicheck_semantic_lint_test.sh
+            sh ./tests/run_karictl_observatory_test.sh
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"

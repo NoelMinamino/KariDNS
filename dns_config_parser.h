@@ -118,6 +118,17 @@ typedef struct {
   size_t secret_decoded_len;
 } control_channel_config_t;
 
+typedef struct {
+  bool enabled;          // dnstap{} ブロックが存在すれば true
+  char *socket_path;
+  char *identity;
+  char *version;
+  bool log_auth_query;   // auth-query yes; (デフォルト false)
+  bool log_auth_response;// auth-response yes; (デフォルト false)
+  bool require_connect;  // require-connect yes; (デフォルト false)
+  uint32_t queue_size;   // queue-size 4096; (既定 4096)
+} dnstap_config_t;
+
 typedef struct view_config {
   char *name;
   char **match_clients;
@@ -144,6 +155,7 @@ typedef struct server_config_s {
   tsig_key_t *keys;
   logging_config_t logging;
   control_channel_config_t control;
+  dnstap_config_t dnstap;
   rate_limit_config_t rrl;
   bool serve_stale;
   bool send_extended_errors;

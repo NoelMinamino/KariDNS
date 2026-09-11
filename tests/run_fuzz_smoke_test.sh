@@ -90,7 +90,8 @@ run_fuzz_group() {
 if [ "$MODE" = "dag" ] || [ "$MODE" = "all" ]; then
     run_fuzz_group "DAG Fuzzer Smoke Run" \
         fuzz_dag_response fuzz_dag_hash fuzz_dag_chunked_http \
-        fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file
+        fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
+        fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff
 fi
 
 if [ "$MODE" = "karidns" ] || [ "$MODE" = "all" ]; then

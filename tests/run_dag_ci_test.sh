@@ -668,6 +668,15 @@ done
 WORKER_PIDS=""
 rm -rf "$QUEUE_DIR" "$CLAIM_DIR" "$RESULTS_DIR" 2>/dev/null || true
 
+if [ "$CLIENT_ARG" != "dig" ]; then
+    echo "========================================================"
+    echo "Running dag DNS Replay & Differential Testing Suite..."
+    echo "========================================================"
+    if ! sh "$SCRIPT_DIR/run_dag_replay_diff_test.sh"; then
+        FAILED=$((FAILED + 1))
+    fi
+fi
+
 echo "========================================================"
 if [ "$FAILED" -eq 0 ]; then
     if [ "$SKIPPED" -gt 0 ]; then

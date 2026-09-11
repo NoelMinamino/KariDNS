@@ -100,6 +100,7 @@ static inline void *dag_memmem(const void *haystack, size_t haystacklen,
 #include "../dns_wire.h"
 #include "../dns_utils.h"
 #include "../dns_zone_parser.h"
+#include "dag_replay.h"
 
 #define TRACE_MAX_CNAME_DEPTH 16
 
@@ -1710,21 +1711,22 @@ static int connect_udp(const char *server, int port, int pref_family, const char
 }
 
 static int connect_tcp(const char *server, int port, const query_opts_t *qo, int timeout_sec) {
-    const char *bind_addr = qo->bind_addr;
-    int bind_port = qo->bind_port;
+    const char *bind_addr = (qo && qo->bind_addr[0]) ? qo->bind_addr : NULL;
+    int bind_port = qo ? qo->bind_port : 0;
+    int pref_family = qo ? qo->pref_family : AF_UNSPEC;
     struct sockaddr_storage dest; socklen_t dest_len; int family = AF_INET;
-    if (!resolve_server_addr(server, port, qo->pref_family, (struct sockaddr_storage *)&dest, &dest_len, &family, true)) return -1;
+    if (!resolve_server_addr(server, port, pref_family, (struct sockaddr_storage *)&dest, &dest_len, &family, true)) return -1;
     g_last_socket_family = family;
     int sock = socket(family, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
 
-    if (qo->tcp_mss > 0) {
+    if (qo && qo->tcp_mss > 0) {
         int mss = qo->tcp_mss;
 #ifdef TCP_MAXSEG
         setsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, (const char *)&mss, sizeof(mss));
 #endif
     }
-    if (qo->tcp_window > 0) {
+    if (qo && qo->tcp_window > 0) {
         int wsize = qo->tcp_window;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&wsize, sizeof(wsize));
         setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&wsize, sizeof(wsize));
@@ -1803,13 +1805,25 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
                                 const uint8_t *pkt, size_t pkt_len,
                                 uint8_t *resp, size_t resp_cap, int timeout_sec) {
     struct sockaddr_storage dest; socklen_t dest_len;
-    int sock = connect_udp(server, port, qo->pref_family, qo->bind_addr, qo->bind_port, &dest, &dest_len);
+    int pref_family = qo ? qo->pref_family : AF_UNSPEC;
+    const char *bind_addr = (qo && qo->bind_addr[0]) ? qo->bind_addr : NULL;
+    int bind_port = qo ? qo->bind_port : 0;
+    int sock = connect_udp(server, port, pref_family, bind_addr, bind_port, &dest, &dest_len);
     if (sock < 0) return -1;
 
-    uint8_t wire_buf[65535 + 64];
+    uint8_t stack_buf[2048];
+    uint8_t *wire_buf = stack_buf;
+    size_t needed = pkt_len + 64;
+    if (needed > sizeof(stack_buf)) {
+        wire_buf = malloc(needed);
+        if (!wire_buf) {
+            close(sock);
+            return -1;
+        }
+    }
     size_t wire_len = 0;
     if (qo && qo->use_proxy) {
-        wire_len = build_proxyv2_header(wire_buf, sizeof(wire_buf), qo, false);
+        wire_len = build_proxyv2_header(wire_buf, needed, qo, false);
     }
     size_t send_len = pkt_len;
     long short_len = 3;
@@ -1820,7 +1834,11 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
     memcpy(wire_buf + wire_len, pkt, send_len);
     wire_len += send_len;
 
-    if (send(sock, wire_buf, wire_len, 0) < 0) {
+    ssize_t send_rc = send(sock, wire_buf, wire_len, 0);
+    if (wire_buf != stack_buf) {
+        free(wire_buf);
+    }
+    if (send_rc < 0) {
         fprintf(stderr, ";; UDP setup with %s#%d(%s) failed: %s\n", server, port, server, strerror(errno));
         close(sock); return -1;
     }
@@ -2849,9 +2867,9 @@ static ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t 
     return n;
 }
 
-static ssize_t do_dns_exchange_by_transport(const char *server, int port, const query_opts_t *qo,
-                                            bool use_tcp, const uint8_t *pkt, size_t pkt_len,
-                                            uint8_t *resp, size_t resp_cap, int timeout_sec) {
+ssize_t do_dns_exchange_by_transport(const char *server, int port, const query_opts_t *qo,
+                                      bool use_tcp, const uint8_t *pkt, size_t pkt_len,
+                                      uint8_t *resp, size_t resp_cap, int timeout_sec) {
     if (qo && qo->use_doh) {
         return do_doh_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
     } else if (qo && qo->use_tls) {
@@ -6948,7 +6966,7 @@ static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff
     }
 }
 
-static int run_trace_query_impl(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
+static int run_trace_query_impl(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, const query_opts_t *qo, const char *hex_payload, const display_opts_t *dopt) {
     bool eff_use_tcp = (!force_udp && use_tcp);
     const char *eff_server = server ? server : get_system_resolver();
     display_opts_t trace_dopt = *dopt;
@@ -6985,7 +7003,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         char target_ips[32][64];
         int target_count = 0;
 
-        query_opts_t root_qo = qo;
+        query_opts_t root_qo = *qo;
         root_qo.rd_flag = true;
         uint8_t root_req_mac[64];
         size_t root_req_mac_len = 0;
@@ -7138,7 +7156,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             goto cleanup;
         }
 
-        query_opts_t hop_qo = qo;
+        query_opts_t hop_qo = *qo;
         hop_qo.rd_flag = false;
         bool follow_cname = false;
 
@@ -7377,7 +7395,7 @@ cleanup:
     return ret;
 }
 
-static int run_trace_query(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, query_opts_t qo, const char *hex_payload, const display_opts_t *dopt) {
+static int run_trace_query(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, const query_opts_t *qo, const char *hex_payload, const display_opts_t *dopt) {
     return run_trace_query_impl(qname, server, qtype_s, port, use_tcp, force_udp, no_hexdump_query, no_hexdump_response, qo, hex_payload, dopt);
 }
 
@@ -9178,7 +9196,7 @@ static int execute_query_spec(query_spec_t *spec) {
     int exit_code = 0;
     if (spec->do_trace) {
         exit_code = run_trace_query(spec->qname, spec->server_arg, spec->qtype_s, spec->port, spec->use_tcp, spec->force_udp,
-                                    spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
+                                    spec->no_hexdump_query, spec->no_hexdump_response, &spec->qo, spec->hex_payload, &spec->dopt);
     } else if (spec->do_nssearch) {
         exit_code = run_nssearch(spec->qname, spec->server_arg, spec->port, spec->use_tcp, spec->force_udp,
                                  spec->no_hexdump_query, spec->no_hexdump_response, spec->qo, spec->hex_payload, &spec->dopt);
@@ -9195,6 +9213,17 @@ static int execute_query_spec(query_spec_t *spec) {
 
     return exit_code;
 }
+
+#if defined(main) || defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+#ifndef _WIN32
+__attribute__((weak))
+#endif
+int run_replay_mode(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    return 1;
+}
+#endif
 
 int main(int argc, char **argv) {
 #ifndef _WIN32
@@ -9213,6 +9242,9 @@ int main(int argc, char **argv) {
 #endif
     setlocale(LC_ALL, "");
     zone_arena_init(&g_dag_arena);
+    if (argc >= 2 && strcmp(argv[1], "--replay") == 0) {
+        return run_replay_mode(argc, argv);
+    }
     if (argc >= 2 && strcmp(argv[1], "--break-help") == 0) { print_break_help(); return 0; }
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) { usage(argv[0]); return 0; }
 

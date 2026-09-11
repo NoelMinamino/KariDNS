@@ -3445,3 +3445,55 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             break;
     }
 }
+
+// ============================================================================
+// Protocol Buffers Encoder (Minimal, Dependency-Free)
+// ============================================================================
+size_t pb_encode_varint(uint8_t *out, size_t out_cap, uint64_t value) {
+    size_t i = 0;
+    while (value >= 0x80) {
+        if (i >= out_cap) return 0;
+        out[i++] = (uint8_t)((value & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    if (i >= out_cap) return 0;
+    out[i++] = (uint8_t)(value & 0x7F);
+    return i;
+}
+
+size_t pb_encode_tag(uint8_t *out, size_t out_cap, uint32_t field_no, uint8_t wire_type) {
+    uint64_t tag = ((uint64_t)field_no << 3) | (wire_type & 0x07);
+    return pb_encode_varint(out, out_cap, tag);
+}
+
+size_t pb_encode_bytes_field(uint8_t *out, size_t out_cap, uint32_t field_no,
+                              const uint8_t *data, size_t data_len) {
+    size_t tag_len = pb_encode_tag(out, out_cap, field_no, PB_WT_LEN);
+    if (tag_len == 0) return 0;
+    size_t len_len = pb_encode_varint(out + tag_len, out_cap - tag_len, data_len);
+    if (len_len == 0) return 0;
+    size_t total = tag_len + len_len + data_len;
+    if (total > out_cap) return 0;
+    if (data_len > 0 && data) {
+        memcpy(out + tag_len + len_len, data, data_len);
+    }
+    return total;
+}
+
+size_t pb_encode_varint_field(uint8_t *out, size_t out_cap, uint32_t field_no, uint64_t value) {
+    size_t tag_len = pb_encode_tag(out, out_cap, field_no, PB_WT_VARINT);
+    if (tag_len == 0) return 0;
+    size_t val_len = pb_encode_varint(out + tag_len, out_cap - tag_len, value);
+    if (val_len == 0) return 0;
+    return tag_len + val_len;
+}
+
+size_t pb_encode_fixed32_field(uint8_t *out, size_t out_cap, uint32_t field_no, uint32_t value) {
+    size_t tag_len = pb_encode_tag(out, out_cap, field_no, PB_WT_FIXED32);
+    if (tag_len == 0 || tag_len + 4 > out_cap) return 0;
+    out[tag_len + 0] = (uint8_t)(value & 0xFF);
+    out[tag_len + 1] = (uint8_t)((value >> 8) & 0xFF);
+    out[tag_len + 2] = (uint8_t)((value >> 16) & 0xFF);
+    out[tag_len + 3] = (uint8_t)((value >> 24) & 0xFF);
+    return tag_len + 4;
+}
