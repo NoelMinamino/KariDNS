@@ -326,4 +326,47 @@ else
     exit 1
 fi
 
+# 15. Test 11: Protocol reproduction (TCP vs UDP in text and dnstap replay)
+echo "[+] Test 11: Replay protocol reproduction (TCP vs UDP)..."
+Q_PROTO="$TMP_DIR/q_proto.txt"
+cat << 'EOF' > "$Q_PROTO"
+sec.example.com A
+sec.example.com A +tcp
+EOF
+OUT11_TEXT=$(./dag --replay "$Q_PROTO" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json)
+echo "$OUT11_TEXT"
+if echo "$OUT11_TEXT" | grep -q '"total_queries": 2' && echo "$OUT11_TEXT" | grep -q '"identical_queries": 2'; then
+    echo "  PASS: Text query replay with +tcp reproduced successfully."
+else
+    echo "FAIL: Text query replay with +tcp failed."
+    exit 1
+fi
+
+# Create synthetic dnstap Frame Streams file with 1 UDP and 1 TCP query
+DNSTAP_FILE="$TMP_DIR/test_traffic.dnstap"
+perl -e '
+use strict;
+my $wire = pack("n", 0x1234) . "\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03sec\x07example\x03com\x00\x00\x01\x00\x01";
+my $ct = "protobuf:dnstap.Dnstap";
+my $start_p = pack("NNN", 2, 1, length($ct)) . $ct;
+open(my $fh, ">:raw", $ARGV[0]) or die $!;
+print $fh pack("NN", 0, length($start_p)) . $start_p;
+
+for my $proto (1, 2) { # 1 = UDP, 2 = TCP
+    my $msg = "\x08\x01" . pack("C*", 0x18, $proto) . "\x52" . pack("C", length($wire)) . $wire;
+    my $dnstap = "\x72" . pack("C", length($msg)) . $msg;
+    print $fh pack("N", length($dnstap)) . $dnstap;
+}
+close($fh);
+' "$DNSTAP_FILE"
+
+OUT11_DNSTAP=$(./dag --replay "$DNSTAP_FILE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json)
+echo "$OUT11_DNSTAP"
+if echo "$OUT11_DNSTAP" | grep -q '"total_queries": 2' && echo "$OUT11_DNSTAP" | grep -q '"identical_queries": 2'; then
+    echo "  PASS: dnstap Frame Streams replay preserved and reproduced UDP and TCP transports."
+else
+    echo "FAIL: dnstap Frame Streams replay protocol reproduction failed."
+    exit 1
+fi
+
 echo "=== All dag DNS Replay & Differential Tests Passed! ==="

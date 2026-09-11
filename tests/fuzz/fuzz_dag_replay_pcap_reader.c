@@ -27,14 +27,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         65535 // Unknown / invalid linktype
     };
 
+    char transport[16];
     for (size_t i = 0; i < sizeof(linktypes) / sizeof(linktypes[0]); i++) {
         dns_len = sizeof(dns_buf);
         (void)parse_pcap_packet(data, size, linktypes[i], dns_buf, &dns_len);
+        dns_len = sizeof(dns_buf);
+        (void)parse_pcap_packet_ex(data, size, linktypes[i], dns_buf, &dns_len, transport, sizeof(transport));
     }
 
     // Test dnstap protobuf data frame parsing
     dns_len = sizeof(dns_buf);
     (void)parse_dnstap_data_frame(data, size, dns_buf, &dns_len);
+    dns_len = sizeof(dns_buf);
+    (void)parse_dnstap_data_frame_ex(data, size, dns_buf, &dns_len, transport, sizeof(transport));
 
     // Dynamic linktype selection using first 4 bytes if available
     if (size >= 4) {
@@ -44,6 +49,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                                    ((uint32_t)data[3] << 24);
         dns_len = sizeof(dns_buf);
         (void)parse_pcap_packet(data + 4, size - 4, dynamic_linktype, dns_buf, &dns_len);
+        dns_len = sizeof(dns_buf);
+        (void)parse_pcap_packet_ex(data + 4, size - 4, dynamic_linktype, dns_buf, &dns_len, transport, sizeof(transport));
     }
 
     return 0;

@@ -41,7 +41,9 @@ typedef struct {
 int run_replay_mode(int argc, char **argv);
 
 bool parse_pcap_packet(const uint8_t *data, size_t len, uint32_t linktype, uint8_t *out_dns, size_t *out_dns_len);
+bool parse_pcap_packet_ex(const uint8_t *data, size_t len, uint32_t linktype, uint8_t *out_dns, size_t *out_dns_len, char *out_transport, size_t out_transport_len);
 bool parse_dnstap_data_frame(const uint8_t *data, size_t len, uint8_t *out_dns, size_t *out_dns_len);
+bool parse_dnstap_data_frame_ex(const uint8_t *data, size_t len, uint8_t *out_dns, size_t *out_dns_len, char *out_transport, size_t out_transport_len);
 void diff_dns_responses(const uint8_t *resp1, size_t len1, const uint8_t *resp2, size_t len2, bool ignore_ttl, diff_result_t *out_diff);
 
 #endif /* DAG_REPLAY_H */
