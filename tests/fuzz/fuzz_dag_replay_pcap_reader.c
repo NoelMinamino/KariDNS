@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include "../../tools/dag_replay.h"
+#include "../../tools/dag_pcap_l4.h"
 
 void syslog(int priority, const char *format, ...) {
     (void)priority;
@@ -28,11 +29,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     };
 
     char transport[16];
+    pcap_l4_info_t l4;
     for (size_t i = 0; i < sizeof(linktypes) / sizeof(linktypes[0]); i++) {
         dns_len = sizeof(dns_buf);
         (void)parse_pcap_packet(data, size, linktypes[i], dns_buf, &dns_len);
         dns_len = sizeof(dns_buf);
         (void)parse_pcap_packet_ex(data, size, linktypes[i], dns_buf, &dns_len, transport, sizeof(transport));
+        (void)pcap_extract_l4(data, size, linktypes[i], &l4);
     }
 
     // Test dnstap protobuf data frame parsing
@@ -40,6 +43,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     (void)parse_dnstap_data_frame(data, size, dns_buf, &dns_len);
     dns_len = sizeof(dns_buf);
     (void)parse_dnstap_data_frame_ex(data, size, dns_buf, &dns_len, transport, sizeof(transport));
+    dnstap_frame_info_t dinfo;
+    (void)parse_dnstap_data_frame_full(data, size, &dinfo);
 
     // Dynamic linktype selection using first 4 bytes if available
     if (size >= 4) {
@@ -51,6 +56,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         (void)parse_pcap_packet(data + 4, size - 4, dynamic_linktype, dns_buf, &dns_len);
         dns_len = sizeof(dns_buf);
         (void)parse_pcap_packet_ex(data + 4, size - 4, dynamic_linktype, dns_buf, &dns_len, transport, sizeof(transport));
+        (void)pcap_extract_l4(data + 4, size - 4, dynamic_linktype, &l4);
     }
 
     return 0;

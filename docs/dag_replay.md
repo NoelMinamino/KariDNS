@@ -16,7 +16,7 @@ DAG-REPLAY(1)                  KariDNS Manual                  DAG-REPLAY(1)
 
 ```sh
 dag --replay <traffic_file> --server1 <host[:port]> [--server2 <host[:port]>]
-    [--diff] [--ignore-ttl] [--output-diff <file>]
+    [--compare-recorded] [--diff] [--ignore-ttl] [--output-diff <file>]
     [--rate <qps>] [--workers <N>] [--timeout-ms <ms>]
     [--stop-after <N>] [--max-queries <N>]
     [--transport <udp|tcp>] [--server1-transport <transport>] [--server2-transport <transport>]
@@ -31,7 +31,7 @@ dag --replay <traffic_file> --server1 <host[:port]> [--server2 <host[:port]>]
 
 It reads DNS queries from live traffic capture files (**PCAP**, **dnstap / Frame Streams**) or plain text query lists, transmits them concurrently across one or two target DNS nameservers, and evaluates response consistency.
 
-When dual servers are specified (`--server1` and `--server2`), `dag --replay` performs **semantic, order-independent differential comparison** of the responses across every DNS section (Header, Question, Answer, Authority, and Additional). It categorizes differences into granular bitmask flags, detects subtle protocol inconsistencies (such as glue record omissions, DNSSEC RRSIG/NSEC differences, and CNAME chain discrepancies), and outputs structured statistics in human-readable or JSON format.
+When dual servers are specified (`--server1` and `--server2`), or when single server with recorded responses is specified (`--compare-recorded`), `dag --replay` performs **semantic, order-independent differential comparison** of the responses across every DNS section (Header, Question, Answer, Authority, and Additional). It categorizes differences into granular bitmask flags, detects subtle protocol inconsistencies (such as glue record omissions, DNSSEC RRSIG/NSEC differences, and CNAME chain discrepancies), and outputs structured statistics in human-readable or JSON format.
 
 ---
 
@@ -43,7 +43,10 @@ When dual servers are specified (`--server1` and `--server2`), `dag --replay` pe
 : Address and optional port of the primary target nameserver (default port: `53`). Supports IPv4 addresses, IPv6 addresses, and hostnames.
 
 `--server2 <host[:port]>`
-: Address and optional port of the secondary comparison nameserver (default port: `53`). Specifying `--server2` automatically enables differential testing mode (`--diff`).
+: Address and optional port of the secondary comparison nameserver (default port: `53`). Specifying `--server2` automatically enables differential testing mode (`--diff`). Mutually exclusive with `--compare-recorded`.
+
+`--compare-recorded`
+: Compare live responses from `--server1` against the original recorded responses stored within the capture file (`.pcap` or `.dnstap`). Does not require a secondary live server. Mutually exclusive with `--server2`. Not supported for text query files (`queries.txt`). It is strongly recommended to specify `--ignore-ttl` with this option to avoid false differences caused by normal cache/TTL aging.
 
 ### Replay & Engine Control
 
@@ -68,10 +71,10 @@ When dual servers are specified (`--server1` and `--server2`), `dag --replay` pe
 ### Differential Testing Options
 
 `--diff`
-: Explicitly enable differential response comparison. Automatically activated when `--server2` is provided.
+: Explicitly enable differential response comparison. Automatically activated when `--server2` or `--compare-recorded` is provided.
 
 `--ignore-ttl`
-: Ignore TTL differences when comparing resource records across servers. When enabled, two identical record sets with differing TTL values (e.g., due to caching state or differing zone minimum TTL configurations) are treated as identical.
+: Ignore TTL differences when comparing resource records across servers or against recorded responses. When enabled, two identical record sets with differing TTL values (e.g., due to caching state, TTL countdown, or differing zone minimum TTL configurations) are treated as identical. Strongly recommended when using `--compare-recorded`.
 
 `--stop-after <N>`
 : Early termination threshold. Immediately halts replay after encountering `N` mismatched query responses between `--server1` and `--server2`. Useful for automated CI regressions where an early failure should abort immediately.
@@ -354,6 +357,25 @@ dag --replay queries.txt \
     --server1 127.0.0.1:53 --server1-transport udp \
     --server2 127.0.0.1:53 --server2-transport tcp \
     --diff
+```
+
+### 6. Single-Server Recorded Response Comparison
+
+Verify live server behavior against baseline responses recorded in a PCAP or dnstap capture without spinning up a second server:
+
+```sh
+dag --replay traffic.dnstap \
+    --server1 127.0.0.1:53 \
+    --compare-recorded \
+    --ignore-ttl
+```
+
+```sh
+dag --replay traffic.pcap \
+    --server1 127.0.0.1:53 \
+    --compare-recorded \
+    --ignore-ttl \
+    --output json
 ```
 
 ---
