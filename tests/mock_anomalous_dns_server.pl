@@ -770,8 +770,8 @@ sub process_query_packet {
             my $ext_flags = 0;
             $ext_flags |= 0x8000 if $edns_do; # DO bit
             $ext_flags |= 0x4000 if $edns_co; # CO bit
-            # OPT pseudo-RR: Name=\x00, TYPE=41, CLASS=4096 (UDP size), TTL=ext_flags (32-bit: rcode/version/flags), RDLEN=0
-            $additionals .= "\x00" . pack('nnNn', 41, 4096, ($ext_flags << 16), 0);
+            # OPT pseudo-RR: Name=\x00, TYPE=41, CLASS=4096 (UDP size), TTL=ext_flags (32-bit: lower 16 bits are EDNS flags), RDLEN=0
+            $additionals .= "\x00" . pack('nnNn', 41, 4096, $ext_flags, 0);
             $arcount++;
         }
 
