@@ -526,6 +526,10 @@ sub process_query_packet {
     # 0. Intentional Drop / No Response
     # --------------------------------------------------------------------------
     if ($scenario eq 'drop') {
+        if ($is_tcp) {
+            # Delay TCP connection teardown so client waits/freezes instead of instant EOF
+            sleep(2);
+        }
         return ""; # 0 length tells KariDNS not to send anything
     }
 
