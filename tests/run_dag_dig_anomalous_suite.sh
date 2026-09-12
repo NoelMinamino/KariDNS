@@ -229,6 +229,12 @@ run_suite_for_tool() {
         "flag-0x85f0.anomaly.test" "A" "" "(flags:.*(rd|ra|ad|cd)|192\.0\.2\.1)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "EDNS0 DO=1 flag in response" \
         "flag-do.anomaly.test" "A" "+qr" "(flags:.*do|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "EDNS0 CO=1 (Compact Answers) flag in response" \
+        "flag-co.anomaly.test" "A" "+qr" "(flags:.*co|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Both EDNS0 DO=1 and CO=1 flags in response" \
+        "flag-do-co.anomaly.test" "A" "+qr" "(flags:.*(do.*co|co.*do)|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "ALL header flags + EDNS0 DO=1 and CO=1 ('+' syntax)" \
+        "flag-all+do+co.anomaly.test" "A" "+qr" "(flags:.*(do.*co|co.*do)|192\.0\.2\.1)"
 
     # Section 6: RFC Standard & Extended RCODEs
     printf "${BOLD}[6. DNS RCODE Responses (Header 0-15 & EDNS0 Extended 16-23+)]${NC}\n"

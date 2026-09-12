@@ -354,7 +354,8 @@ sub process_query_packet {
         ede-prohibited ede-long-text ede-all ede-all2 drop
         flag-rd flag-ra flag-ad flag-cd flag-z flag-mbz flag-no-aa flag-aa0
         flag-no-qr flag-qr0 flag-tc flag-tc-record flag-all flag-all-tc
-        flag-rd-ra flag-ad-cd flag-do flag-co flag-none
+        flag-rd-ra flag-ad-cd flag-do flag-co flag-do-co flag-all-do-co
+        flag-all-do flag-all-co flag-all-tc-do-co flag-none
     );
     for my $c (0 .. 29) {
         $KNOWN_SCENARIOS{"ede-$c"} = 1;
@@ -374,7 +375,7 @@ sub process_query_packet {
         $first_label =~ /^ede-(\d+)$/ ||
         $first_label =~ /^ede-all2?$/ ||
         $first_label =~ /^flags?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
-        $first_label =~ /^flags?-[a-z0-9-]+$/ ||
+        $first_label =~ /^flags?-[a-z0-9+_-]+$/i ||
         $first_label =~ /^rcodes?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
         $first_label =~ /^rcodes?-[a-z0-9-]+$/) {
         $scenario = $first_label;
@@ -439,6 +440,9 @@ sub process_query_packet {
             "  flag-all-tc.$display_zone               - All header flags enabled including TC",
             "  flag-do.$display_zone                   - EDNS0 DO=1 (DNSSEC OK) set in OPT RR",
             "  flag-co.$display_zone                   - EDNS0 Compact Answers OK set in OPT RR",
+            "  flag-do-co.$display_zone                - Both EDNS0 DO=1 and CO=1 set in OPT RR",
+            "  flag-all-do-co.$display_zone            - All header flags (0x85F0) + EDNS0 DO=1 and CO=1",
+            "  flag-all+do+co.$display_zone            - All header flags + DO=1 + CO=1 ('+' syntax)",
             "  flag-0x<HEX>.$display_zone              - Custom 16-bit header flags (e.g. flag-0x85f0)",
             "",
             "[DNS Header RCODEs (0-15)]",
@@ -727,21 +731,61 @@ sub process_query_packet {
             $flag_val = 0x8400;
             $edns_co = 1;
             $desc .= "EDNS0 Compact Answers OK flag set in OPT RR";
+        } elsif ($spec eq 'do-co' || $spec eq 'do+co') {
+            $flag_val = 0x8400;
+            $edns_do = 1;
+            $edns_co = 1;
+            $desc .= "Both EDNS0 DO=1 and CO=1 flags set in OPT RR";
+        } elsif ($spec eq 'all-do-co' || $spec eq 'all+do+co') {
+            $flag_val = 0x85F0;
+            $edns_do = 1;
+            $edns_co = 1;
+            $desc .= "ALL header flags (0x85F0) and both EDNS0 DO=1 and CO=1 flags set in OPT RR";
+        } elsif ($spec eq 'all-do' || $spec eq 'all+do') {
+            $flag_val = 0x85F0;
+            $edns_do = 1;
+            $desc .= "ALL header flags (0x85F0) and EDNS0 DO=1 flag set in OPT RR";
+        } elsif ($spec eq 'all-co' || $spec eq 'all+co') {
+            $flag_val = 0x85F0;
+            $edns_co = 1;
+            $desc .= "ALL header flags (0x85F0) and EDNS0 CO=1 flag set in OPT RR";
+        } elsif ($spec eq 'all-tc-do-co' || $spec eq 'all-tc+do+co') {
+            $flag_val = 0x87F0;
+            $edns_do = 1;
+            $edns_co = 1;
+            $desc .= "ALL header flags including TC (0x87F0) and both EDNS0 DO=1 and CO=1 set in OPT RR";
         } elsif ($spec eq 'none') {
             $flag_val = 0x0000;
             $desc .= "No flags set (0x0000)";
         } else {
-            # Combinations like flag-rd-ad
+            # Combinations like flag-rd-ad, flag-rd+do, flag-ad-co, etc.
+            my $norm = $spec;
+            $norm =~ s/[+_]/-/g;
+
             $flag_val = 0x8400;
-            $flag_val |= 0x0100 if $spec =~ /rd/;
-            $flag_val |= 0x0080 if $spec =~ /ra/;
-            $flag_val |= 0x0020 if $spec =~ /ad/;
-            $flag_val |= 0x0010 if $spec =~ /cd/;
-            $flag_val |= 0x0040 if $spec =~ /z/;
-            $flag_val |= 0x0200 if $spec =~ /tc/;
-            $flag_val &= ~0x0400 if $spec =~ /no-aa/;
-            $flag_val &= ~0x8000 if $spec =~ /no-qr/;
-            $desc .= sprintf("Combined flags 0x%04X (%s)", $flag_val, $spec);
+            if ($norm =~ /\ball-tc\b/) {
+                $flag_val = 0x87F0;
+            } elsif ($norm =~ /\ball\b/) {
+                $flag_val = 0x85F0;
+            } else {
+                $flag_val |= 0x0100 if $norm =~ /\brd\b/;
+                $flag_val |= 0x0080 if $norm =~ /\bra\b/;
+                $flag_val |= 0x0020 if $norm =~ /\bad\b/;
+                $flag_val |= 0x0010 if $norm =~ /\bcd\b/;
+                $flag_val |= 0x0040 if $norm =~ /\b(?:z|mbz)\b/;
+                $flag_val |= 0x0200 if $norm =~ /\btc(?:-record)?\b/;
+                $flag_val &= ~0x0400 if $norm =~ /\b(?:no-aa|aa0)\b/;
+                $flag_val &= ~0x8000 if $norm =~ /\b(?:no-qr|qr0)\b/;
+            }
+
+            $edns_do = 1 if $norm =~ /\bdo\b/;
+            $edns_co = 1 if $norm =~ /\bco\b/;
+
+            my @parts;
+            push @parts, sprintf("header 0x%04X", $flag_val);
+            push @parts, "EDNS0 DO=1" if $edns_do;
+            push @parts, "EDNS0 CO=1" if $edns_co;
+            $desc .= sprintf("Combined flags (%s) [%s]", join(", ", @parts), $spec);
         }
 
         my $answers = '';
