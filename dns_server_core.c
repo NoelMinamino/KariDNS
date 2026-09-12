@@ -273,7 +273,8 @@ typedef struct {
     alignas(64) _Atomic uint64_t dropped_count;
 } qlog_ring_t;
 
-// dnstap用イベント (Wire Formatをそのままコピーするため生パケットバッファを持つ)
+// dnstapイベントの共通メタデータ部分。wireバッファのサイズに依存しないため、
+// worker用リング(dnstap_event_t)とaux用リング(dnstap_aux_event_t)の双方で共有する。
 typedef struct {
     struct timespec ts;
     uint8_t message_type;   // 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
@@ -283,9 +284,15 @@ typedef struct {
     struct sockaddr_storage server_addr;
     socklen_t server_addr_len;
     bool has_server_addr;
+} dnstap_event_meta_t;
+
+// dnstap用イベント: UDPワーカーのSPSCリング専用。UDPクエリ/応答は
+// 実運用上4096Bを超えないため、ワーカー数×スロット数分のメモリコストを
+// 抑えるためここは小さいバッファのまま据え置く。
+typedef struct {
+    dnstap_event_meta_t meta;
     size_t wire_len;
     uint8_t wire[UDP_DEFAULT_MAX_RES_LEN > 4096 ? UDP_DEFAULT_MAX_RES_LEN : 4096];
-    alignas(8) _Atomic bool ready;
 } dnstap_event_t;
 
 typedef struct {
@@ -296,6 +303,27 @@ typedef struct {
     alignas(64) _Atomic uint32_t tail;
     alignas(64) _Atomic uint64_t dropped;
 } dnstap_ring_t;
+
+// dnstap用イベント: AXFR/非同期I/Oスレッド用のMPSC aux リング専用。
+// AXFR応答やDNSSEC付き大きいTCP応答はしばしば4096Bを超えるため、
+// TCP DNSメッセージの理論最大値(65535B)を格納できるバッファを持たせる。
+// このリングはAXFR等の同時実行数程度のスロット数で足りるため、
+// worker数に比例しない小さな追加メモリで済む。
+typedef struct {
+    dnstap_event_meta_t meta;
+    size_t wire_len;
+    uint8_t wire[65535];
+    alignas(8) _Atomic bool ready;
+} dnstap_aux_event_t;
+
+typedef struct {
+    dnstap_aux_event_t *events;
+    uint32_t size;
+    uint32_t mask;
+    alignas(64) _Atomic uint32_t head;
+    alignas(64) _Atomic uint32_t tail;
+    alignas(64) _Atomic uint64_t dropped;
+} dnstap_aux_ring_t;
 
 typedef struct {
   int thread_id;
@@ -742,7 +770,7 @@ static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
 static int g_dnstap_sock = -1;
 static _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
 static _Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
-static dnstap_ring_t g_aux_dnstap_ring;
+static dnstap_aux_ring_t g_aux_dnstap_ring;
 static worker_ctx_t *g_worker_ctxs = NULL;
 static int g_worker_count = 0;
 
@@ -8340,30 +8368,32 @@ static int dnstap_connect_and_handshake(const char *socket_path, const char *ide
     return sock;
 }
 
-static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, size_t out_cap) {
-    uint8_t msg_buf[4200];
+static size_t dnstap_build_message(const dnstap_event_meta_t *meta,
+                                   const uint8_t *wire, size_t wire_len,
+                                   uint8_t *out_buf, size_t out_cap) {
+    uint8_t msg_buf[65535 + 256];
     size_t msg_offset = 0;
 
     // Message.type (field 1, required, varint): 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
-    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, ev->message_type);
+    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, meta->message_type);
 
     // Message.socket_family (field 2, varint): 1 = INET, 2 = INET6
-    uint32_t fam = (ev->client_addr.ss_family == AF_INET6) ? 2 : 1;
+    uint32_t fam = (meta->client_addr.ss_family == AF_INET6) ? 2 : 1;
     msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 2, fam);
 
     // Message.socket_protocol (field 3, varint): 1 = UDP, 2 = TCP
-    uint32_t proto = (ev->protocol == IPPROTO_TCP) ? 2 : 1;
+    uint32_t proto = (meta->protocol == IPPROTO_TCP) ? 2 : 1;
     msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 3, proto);
 
     // Message.query_address (field 4, bytes) & query_port (field 6, varint)
-    if (ev->client_addr.ss_family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)&ev->client_addr;
+    if (meta->client_addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&meta->client_addr;
         msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
                                             (const uint8_t *)&sin->sin_addr, 4);
         msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
                                              ntohs(sin->sin_port));
-    } else if (ev->client_addr.ss_family == AF_INET6) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ev->client_addr;
+    } else if (meta->client_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&meta->client_addr;
         msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
                                             (const uint8_t *)&sin6->sin6_addr, 16);
         msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
@@ -8371,17 +8401,17 @@ static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, s
     }
 
     // Message.response_address (field 5, bytes) & response_port (field 7, varint)
-    if (ev->has_server_addr) {
-        if (ev->server_addr.ss_family == AF_INET) {
-            struct sockaddr_in *sin = (struct sockaddr_in *)&ev->server_addr;
+    if (meta->has_server_addr) {
+        if (meta->server_addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&meta->server_addr;
             msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
                                                 (const uint8_t *)&sin->sin_addr, 4);
             if (sin->sin_port != 0) {
                 msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
                                                      ntohs(sin->sin_port));
             }
-        } else if (ev->server_addr.ss_family == AF_INET6) {
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ev->server_addr;
+        } else if (meta->server_addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&meta->server_addr;
             msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
                                                 (const uint8_t *)&sin6->sin6_addr, 16);
             if (sin6->sin6_port != 0) {
@@ -8391,14 +8421,14 @@ static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, s
         }
     }
 
-    if (ev->message_type == 1 /* AUTH_QUERY */) {
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)ev->ts.tv_sec);
-        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)ev->ts.tv_nsec);
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, ev->wire, ev->wire_len);
+    if (meta->message_type == 1 /* AUTH_QUERY */) {
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)meta->ts.tv_sec);
+        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)meta->ts.tv_nsec);
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, wire, wire_len);
     } else { // AUTH_RESPONSE
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 12, (uint64_t)ev->ts.tv_sec);
-        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)ev->ts.tv_nsec);
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, ev->wire, ev->wire_len);
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 12, (uint64_t)meta->ts.tv_sec);
+        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)meta->ts.tv_nsec);
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, wire, wire_len);
     }
 
     // Top-level Dnstap: field 1 (identity), field 2 (version), field 15 (type = 1, MESSAGE, required), field 14 (message)
@@ -8417,17 +8447,18 @@ static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, s
     return out_offset;
 }
 
-static bool dnstap_send_frame(const dnstap_event_t *ev) {
+static bool dnstap_send_frame(const dnstap_event_meta_t *meta,
+                              const uint8_t *wire, size_t wire_len,
+                              uint8_t *scratch_buf, size_t scratch_cap) {
     if (g_dnstap_sock < 0) return false;
-    uint8_t payload[4600];
-    size_t plen = dnstap_build_message(ev, payload, sizeof(payload));
+    size_t plen = dnstap_build_message(meta, wire, wire_len, scratch_buf, scratch_cap);
     if (plen == 0) return true;
 
     uint32_t be_len = htonl((uint32_t)plen);
     struct iovec iov[2];
     iov[0].iov_base = &be_len;
     iov[0].iov_len = 4;
-    iov[1].iov_base = payload;
+    iov[1].iov_base = scratch_buf;
     iov[1].iov_len = plen;
 
     size_t total_written = 0;
@@ -8444,44 +8475,46 @@ static bool dnstap_send_frame(const dnstap_event_t *ev) {
             iov[0].iov_len = 4 - total_written;
         } else {
             iov[0].iov_len = 0;
-            iov[1].iov_base = payload + (total_written - 4);
+            iov[1].iov_base = scratch_buf + (total_written - 4);
             iov[1].iov_len = plen - (total_written - 4);
         }
     }
     return true;
 }
 
-static inline void fill_dnstap_event(dnstap_event_t *ev, uint8_t message_type,
-                                     const uint8_t *wire, size_t wire_len,
+static inline void fill_dnstap_event(dnstap_event_meta_t *meta,
+                                     uint8_t *wire_dst, size_t wire_dst_cap, size_t *out_wire_len,
+                                     uint8_t message_type,
+                                     const uint8_t *wire_src, size_t wire_src_len,
                                      const struct sockaddr_storage *client_addr,
                                      socklen_t client_addr_len,
                                      const struct sockaddr_storage *server_addr,
                                      bool has_server_addr, uint8_t protocol) {
-    clock_gettime(CLOCK_REALTIME, &ev->ts);
-    ev->message_type = message_type;
-    ev->protocol = protocol;
+    clock_gettime(CLOCK_REALTIME, &meta->ts);
+    meta->message_type = message_type;
+    meta->protocol = protocol;
     if (client_addr) {
-        memcpy(&ev->client_addr, client_addr, sizeof(*client_addr));
-        ev->client_addr_len = client_addr_len;
+        memcpy(&meta->client_addr, client_addr, sizeof(*client_addr));
+        meta->client_addr_len = client_addr_len;
     } else {
-        memset(&ev->client_addr, 0, sizeof(ev->client_addr));
-        ev->client_addr_len = 0;
+        memset(&meta->client_addr, 0, sizeof(meta->client_addr));
+        meta->client_addr_len = 0;
     }
-    ev->has_server_addr = has_server_addr;
+    meta->has_server_addr = has_server_addr;
     if (has_server_addr && server_addr) {
-        memcpy(&ev->server_addr, server_addr, sizeof(*server_addr));
-        ev->server_addr_len = sizeof(*server_addr);
+        memcpy(&meta->server_addr, server_addr, sizeof(*server_addr));
+        meta->server_addr_len = sizeof(*server_addr);
     } else {
-        memset(&ev->server_addr, 0, sizeof(ev->server_addr));
-        ev->server_addr_len = 0;
+        memset(&meta->server_addr, 0, sizeof(meta->server_addr));
+        meta->server_addr_len = 0;
     }
-    size_t copy_len = wire_len;
-    if (copy_len > sizeof(ev->wire)) {
-        copy_len = sizeof(ev->wire);
+    size_t copy_len = wire_src_len;
+    if (copy_len > wire_dst_cap) {
+        copy_len = wire_dst_cap;
         atomic_fetch_add_explicit(&g_dnstap_truncated_total, 1, memory_order_relaxed);
     }
-    memcpy(ev->wire, wire, copy_len);
-    ev->wire_len = copy_len;
+    memcpy(wire_dst, wire_src, copy_len);
+    *out_wire_len = copy_len;
 }
 
 static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
@@ -8504,7 +8537,8 @@ static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
             return;
         }
         dnstap_event_t *ev = &ring->events[h & ring->mask];
-        fill_dnstap_event(ev, message_type, wire, wire_len, client_addr, client_addr_len,
+        fill_dnstap_event(&ev->meta, ev->wire, sizeof(ev->wire), &ev->wire_len,
+                          message_type, wire, wire_len, client_addr, client_addr_len,
                           server_addr, has_server_addr, protocol);
         atomic_store_explicit(&ring->head, h + 1, memory_order_release);
     } else {
@@ -8512,17 +8546,26 @@ static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
         if (!g_aux_dnstap_ring.events) return;
 
         uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_relaxed);
-        uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_acquire);
-        do {
+        for (;;) {
+            // CASのリトライ毎にtailを読み直す。stale tailによる
+            // "満杯判定漏れ→未送信スロット上書き" を防止するため、
+            // headだけでなくtailも毎回最新値で判定する。
+            uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_acquire);
             if (h - t >= g_aux_dnstap_ring.size) {
                 atomic_fetch_add_explicit(&g_aux_dnstap_ring.dropped, 1, memory_order_relaxed);
                 return;
             }
-        } while (!atomic_compare_exchange_weak_explicit(&g_aux_dnstap_ring.head, &h, h + 1,
-                                                        memory_order_acq_rel, memory_order_relaxed));
+            if (atomic_compare_exchange_weak_explicit(&g_aux_dnstap_ring.head, &h, h + 1,
+                                                       memory_order_acq_rel, memory_order_relaxed)) {
+                break; // スロット予約成功。h は予約したインデックス。
+            }
+            // CAS失敗時、hには最新のhead値が書き戻されるので、次のループでtailを
+            // 読み直してから再判定する。
+        }
 
-        dnstap_event_t *ev = &g_aux_dnstap_ring.events[h & g_aux_dnstap_ring.mask];
-        fill_dnstap_event(ev, message_type, wire, wire_len, client_addr, client_addr_len,
+        dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[h & g_aux_dnstap_ring.mask];
+        fill_dnstap_event(&ev->meta, ev->wire, sizeof(ev->wire), &ev->wire_len,
+                          message_type, wire, wire_len, client_addr, client_addr_len,
                           server_addr, has_server_addr, protocol);
         atomic_store_explicit(&ev->ready, true, memory_order_release);
     }
@@ -8530,6 +8573,7 @@ static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
 
 void *dnstap_sender_thread_func(void *arg) {
     (void)arg;
+    static uint8_t g_dnstap_scratch_buf[65535 + 128]; // 送信スレッドは1本のみなので競合しない
     while (1) {
         bool any_work = false;
         int num_workers = g_worker_count;
@@ -8544,7 +8588,8 @@ void *dnstap_sender_thread_func(void *arg) {
                     while (t != h) {
                         dnstap_event_t *ev = &ring->events[t & ring->mask];
                         any_work = true;
-                        if (!dnstap_send_frame(ev)) {
+                        if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len,
+                                               g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf))) {
                             atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
                             if (g_dnstap_sock >= 0) {
                                 close(g_dnstap_sock);
@@ -8565,12 +8610,13 @@ void *dnstap_sender_thread_func(void *arg) {
                 uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
                 uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
                 while (t != h) {
-                    dnstap_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+                    dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
                     if (!atomic_load_explicit(&ev->ready, memory_order_acquire)) {
                         break;
                     }
                     any_work = true;
-                    if (!dnstap_send_frame(ev)) {
+                    if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len,
+                                           g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf))) {
                         atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
                         if (g_dnstap_sock >= 0) {
                             close(g_dnstap_sock);
@@ -12293,7 +12339,7 @@ int main(int argc, char **argv) {
   }
   g_aux_dnstap_ring.size = dnstap_aux_buf_size;
   g_aux_dnstap_ring.mask = dnstap_aux_buf_size - 1;
-  g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_event_t));
+  g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_aux_event_t));
   atomic_init(&g_aux_dnstap_ring.head, 0);
   atomic_init(&g_aux_dnstap_ring.tail, 0);
   atomic_init(&g_aux_dnstap_ring.dropped, 0);
@@ -12395,6 +12441,7 @@ int main(int argc, char **argv) {
 
   // シャットダウン前にリングバッファ内の未送信dnstapイベントを確実にドレイン
   if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
+    uint8_t shutdown_scratch_buf[65535 + 128];
     if (num_workers > 0 && ctxs) {
       for (int w = 0; w < num_workers; w++) {
         dnstap_ring_t *ring = &ctxs[w].dnstap_ring;
@@ -12402,7 +12449,8 @@ int main(int argc, char **argv) {
         uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
         uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
         while (t != h) {
-          dnstap_send_frame(&ring->events[t & ring->mask]);
+          dnstap_event_t *ev = &ring->events[t & ring->mask];
+          dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, shutdown_scratch_buf, sizeof(shutdown_scratch_buf));
           t++;
         }
         atomic_store_explicit(&ring->tail, t, memory_order_release);
@@ -12412,9 +12460,9 @@ int main(int argc, char **argv) {
       uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
       uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
       while (t != h) {
-        dnstap_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+        dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
         if (atomic_load_explicit(&ev->ready, memory_order_acquire)) {
-          dnstap_send_frame(ev);
+          dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, shutdown_scratch_buf, sizeof(shutdown_scratch_buf));
           atomic_store_explicit(&ev->ready, false, memory_order_release);
         }
         t++;

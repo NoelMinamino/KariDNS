@@ -59,6 +59,12 @@ $ORIGIN example.com.
 ns1 IN  A   127.0.0.1
 www IN  A   192.0.2.1
 EOF
+
+# Add large TXT records to make AXFR payload exceed 4096 bytes (testing >4096B aux ring support)
+TXT_CHUNK="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    echo "txt$i IN TXT \"$TXT_CHUNK\"" >> "$ZONE_PATH"
+done
 chmod 644 "$ZONE_PATH"
 
 # 2. Create Conf File
@@ -171,6 +177,15 @@ if grep -q "version=0.3.0" "$LOG_PATH"; then
     echo "  PASS: dnstap version matched '0.3.0'."
 else
     echo "FAIL: dnstap version mismatch."
+    exit 1
+fi
+
+# Verify large AXFR response was captured without truncation (> 4096 bytes)
+LARGE_WIRE_LEN=$(grep "type=AUTH_RESPONSE" "$LOG_PATH" | tail -n 1 | sed -n 's/.*wire_len=\([0-9]*\).*/\1/p')
+if [ -n "$LARGE_WIRE_LEN" ] && [ "$LARGE_WIRE_LEN" -gt 4096 ]; then
+    echo "  PASS: Captured large AXFR response wire_len=$LARGE_WIRE_LEN (> 4096B) without truncation."
+else
+    echo "FAIL: Expected large AXFR response wire_len > 4096, got '$LARGE_WIRE_LEN'."
     exit 1
 fi
 
