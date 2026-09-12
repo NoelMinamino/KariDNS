@@ -148,6 +148,8 @@ zone "anomaly.test." {
 > - **Pre-filtering & Packet Validation**: KariDNS enforces standard basic DNS header validation (QDCOUNT, valid OPCODES, EDNS version <= 0, valid QCLASS) prior to dispatching queries to the program plugin. Corrupted queries that violate fundamental DNS framing are responded to directly by KariDNS (e.g. FORMERR / NOTIMP / REFUSED) before reaching the plugin.
 > - **TCP & AXFR Semantics**: TCP queries (including `AXFR` / `IXFR`) sent to a program zone are forwarded directly to the plugin as a single query-response transaction. Multi-envelope streaming AXFR is not supported.
 > - **Security & Isolation**: Plugin child processes are spawned prior to Capsicum capability mode and drop privileges (`program-user`). All internal control channels, frontend IPC, and network sockets are strictly closed via `closefrom(3)` before executing the plugin.
+>
+> For full architectural details, IPC wire specifications, and complete runnable examples in Perl, Python, C, Rust, and Go, see **[KariDNS: Complete Guide to 'type program' Zones](KariDNS_how_to_use_type_program_zone.md)**.
 
 ---
 
@@ -257,6 +259,7 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
 - [`karicheck(1)`](karicheck.md) — Zone file syntax and ZONEMD validation utility
 - [`dag(1)`](dag.md) — DNS anomaly generator and test client
+- [`KariDNS 'type program' Zone Guide`](KariDNS_how_to_use_type_program_zone.md) — Complete guide to external dynamic program zone plugins (IPC specs, Perl/Python/C/Rust/Go implementations)
 - [`KariDNS Client Geolocation & Subnet Steering Guide`](KariDNS_How_to_use_ECS_and_location.md) — Comprehensive guide for BIND $LOCATION, $ECS-SUBNET, tinydns location, and Extended AXFR
 - [`KariDNS RFC Guideline`](../KariDNS_RFC_GUIDELINE.md) — Detailed RFC compliance and design boundary document
 
