@@ -571,3 +571,10 @@ stdout.write(b'\x00\x00')
 stdout.flush()
 ```
 KariDNS will release the connection and suppress response transmission entirely.
+
+---
+
+## AUTHORS
+
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
+

@@ -383,3 +383,10 @@ dag --replay traffic.pcap \
 ## SEE ALSO
 
 [`dag(1)`](dag.md), [`karidns(8)`](karidns.md), [`karicheck(1)`](karicheck.md), [`karictl(8)`](karictl.md)
+
+---
+
+## AUTHORS
+
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
+

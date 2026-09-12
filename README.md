@@ -5,7 +5,7 @@
 [![Platform: FreeBSD](https://img.shields.io/badge/Platform-FreeBSD-red.svg)](https://www.freebsd.org/)
 [![Build CI](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml/badge.svg)](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml)
 
-KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD kernel features—including `kqueue` for event handling and `Capsicum` for sandboxing—together with an RCU-based data model and pre-allocated memory arenas.
+KariDNS is an authoritative DNS server designed for FreeBSD, developed in collaboration with AI (Google Gemini, Anthropic Claude). It utilizes FreeBSD kernel features—including `kqueue` for event handling and `Capsicum` for sandboxing—together with an RCU-based data model and pre-allocated memory arenas.
 
 ---
 
@@ -417,4 +417,4 @@ zone "anomaly.test" {
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
-*Copyright (c) 2026 Noel Minamino*
+*Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)*

@@ -48,8 +48,8 @@
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
 
 // karidns
-// Copyright (c) 2026 Noel Minamino
-// Lisence: MIT
+// Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
+// License: MIT
 // All codes are developed by Gemini Pro, Claude Sonnet with Human Idea and
 // test.
 
