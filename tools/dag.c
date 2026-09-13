@@ -13,94 +13,8 @@
  * Builds a DNS query, sends it over UDP/TCP, and pretty-prints the response
  * with a hexdump. Supports intentional packet malformation via --break.
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <errno.h>
-#include <time.h>
-#include <ctype.h>
-#include <locale.h>
-#include <limits.h>
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <iphlpapi.h>
-#include <io.h>
-#define close(s) closesocket(s)
-#ifndef MSG_WAITALL
-#define MSG_WAITALL 0
-#endif
-
-/* Winsock API casting wrappers for uint8_t* buffers to avoid signedness warnings */
-#define send(s, b, l, f) send((s), (const char *)(b), (int)(l), (f))
-#define recv(s, b, l, f) recv((s), (char *)(b), (int)(l), (f))
-#define sendto(s, b, l, f, to, tolen) sendto((s), (const char *)(b), (int)(l), (f), (to), (tolen))
-
-/* Portable gmtime_r for Windows */
-static inline struct tm *dag_gmtime_r(const time_t *timep, struct tm *result) {
-    if (gmtime_s(result, timep) == 0) return result;
-    return NULL;
-}
-#undef gmtime_r
-#define gmtime_r dag_gmtime_r
-
-/* Portable memmem for Windows */
-static inline void *dag_memmem(const void *haystack, size_t haystacklen,
-                               const void *needle, size_t needlelen) {
-    if (!haystack || !needle || needlelen == 0 || haystacklen < needlelen) return NULL;
-    const unsigned char *h = (const unsigned char *)haystack;
-    const unsigned char *n = (const unsigned char *)needle;
-    for (size_t i = 0; i <= haystacklen - needlelen; i++) {
-        if (h[i] == n[0] && memcmp(&h[i], n, needlelen) == 0) {
-            return (void *)&h[i];
-        }
-    }
-    return NULL;
-}
-#undef memmem
-#define memmem dag_memmem
-
-#else
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/time.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <sys/resource.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <strings.h>
-#include <signal.h>
-#include <sys/wait.h>
-#endif
-
-#include <zlib.h>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-#include <openssl/evp.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509_vfy.h>
-#include <openssl/x509v3.h>
-#include <openssl/rand.h>
-#include <openssl/pem.h>
-#include <openssl/ec.h>
-#include <openssl/rsa.h>
-#include <openssl/bn.h>
-#ifdef HAVE_LIBIDN2
-#include <idn2.h>
-#endif
-#include "../dns_wire.h"
-#include "../dns_utils.h"
-#include "../dns_zone_parser.h"
-#include "dag_replay.h"
+#include "dag_internal.h"
+#include "dag_output_yaml.h"
 
 #define TRACE_MAX_CNAME_DEPTH 16
 
@@ -117,66 +31,7 @@ static inline void set_socket_timeouts(int sock, int timeout_sec) {
 #endif
 }
 
-#if !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(__APPLE__)
-#if defined(__linux__)
-#include <sys/random.h>
-#include <fcntl.h>
-#endif
-
-/* Portable strlcpy for Linux / non-BSD platforms */
-static inline size_t dag_strlcpy(char *dst, const char *src, size_t siz) {
-    char *d = dst;
-    const char *s = src;
-    size_t n = siz;
-
-    if (n != 0) {
-        while (--n != 0) {
-            if ((*d++ = *s++) == '\0')
-                break;
-        }
-    }
-    if (n == 0) {
-        if (siz != 0)
-            *d = '\0';
-        while (*s++)
-            ;
-    }
-    return (s - src - 1);
-}
-#undef strlcpy
-#define strlcpy dag_strlcpy
-
-/* Portable arc4random for Linux / non-BSD platforms */
-static inline uint32_t dag_arc4random(void) {
-    uint32_t val = 0;
-    if (RAND_bytes((unsigned char *)&val, sizeof(val)) == 1) {
-        return val;
-    }
-#if defined(__linux__)
-    if (getrandom(&val, sizeof(val), 0) == (ssize_t)sizeof(val)) {
-        return val;
-    }
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, &val, sizeof(val));
-        close(fd);
-        if (n == (ssize_t)sizeof(val)) return val;
-    }
-#endif
-    static bool warned = false;
-    if (!warned) {
-        fprintf(stderr, ";; WARNING: all CSPRNG sources failed; falling back to a "
-                        "non-cryptographic PRNG. Query IDs/cookies may be predictable.\n");
-        warned = true;
-    }
-    return (uint32_t)rand();
-}
-#undef arc4random
-#define arc4random dag_arc4random
-#endif
-
-static bool g_dag_suppress_stdout = false;
-#define printf(...) do { if (!g_dag_suppress_stdout) { fprintf(stdout, __VA_ARGS__); } } while(0)
+bool g_dag_suppress_stdout = false;
 /* ========================================================================
  * 1. Arena (dag only ever bump-allocates scratch strings; never freed)
  * ==================================================================== */
@@ -237,8 +92,8 @@ static server_result_t *alloc_result_row(void) {
     return row;
 }
 static bool g_want_allcompare = false;
-static char g_last_server_ip[INET6_ADDRSTRLEN + 1] = {0};
-static zone_arena_t g_dag_arena;
+char g_last_server_ip[INET6_ADDRSTRLEN + 1] = {0};
+zone_arena_t g_dag_arena;
 
 static void reset_dag_arena(void) {
     zone_arena_destroy(&g_dag_arena);
@@ -262,7 +117,7 @@ static const char *dag_strcasestr(const char *haystack, const char *needle) {
 /* ========================================================================
  * 2. EDE strings / basic helpers
  * ==================================================================== */
-static const char *get_ede_error_string(uint16_t code) {
+const char *get_ede_error_string(uint16_t code) {
     switch (code) {
         case 0: return "Other Error";
         case 1: return "Unsupported DNSKEY Algorithm";
@@ -602,171 +457,8 @@ static void print_break_help(void) {
 /* ========================================================================
  * 4. Query options (EDNS request side) -- built entirely in this file
  * ==================================================================== */
-typedef enum { PREREQ_NXDOMAIN, PREREQ_YXDOMAIN, PREREQ_NXRRSET, PREREQ_YXRRSET } prereq_kind_t;
-typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL, UPDATE_OP_DEL_EXACT } update_op_kind_t;
 
-#define MAX_PREREQS 16
-#define MAX_UPDATE_OPS 16
-
-typedef struct {
-    uint16_t qclass;
-    bool want_opt;
-    uint8_t edns_version;
-    uint16_t udp_payload_size;
-    bool dnssec_ok;
-    bool compact_answers_ok;
-    uint16_t ednsflags_z;
-
-    bool want_nsid;
-    bool want_expire_opt;
-
-    bool want_cookie;
-    uint8_t client_cookie[8];
-    uint8_t server_cookie[32];
-    size_t server_cookie_len;
-    bool retry_on_badcookie;
-
-    int pref_family;
-    char bind_addr[64];
-    int bind_port;
-
-    bool want_subnet;
-    int subnet_family;      /* 1 = IPv4, 2 = IPv6 */
-    uint8_t subnet_addr[16];
-    int subnet_prefix;
-
-    struct {
-        uint16_t code;
-        uint16_t len;
-        uint8_t data[512];
-    } custom_edns_opts[8];
-    int custom_edns_opt_count;
-
-    bool want_padding;
-    int padding_size;
-
-    int timeout_sec;
-    int tries;
-
-    bool is_ixfr;
-    uint32_t ixfr_serial;
-
-    bool want_tsig;
-    bool tsig_specified;
-    tsig_key_t tsig_key;
-
-    bool want_sig0;
-    bool sig0_specified;
-    sig0_key_t sig0_key;
-
-    struct {
-        update_op_kind_t kind;
-        char *raw;
-    } update_ops[MAX_UPDATE_OPS];
-    int update_op_count;
-    struct {
-        prereq_kind_t kind;
-        char name[256];
-        char type_str[32];
-        char rdata[512];
-    } prereqs[MAX_PREREQS];
-    int prereq_count;
-    uint16_t query_id;
-    int qid_override;
-    int opcode_override;
-    bool header_only;
-    bool ra_flag;
-    bool rd_flag;
-    bool aa_flag;
-    bool ad_flag;
-    bool cd_flag;
-    bool tc_flag;
-    bool z_flag;
-    bool send_keepalive;
-    bool keep_tcp_open;
-    bool use_tcp;
-    bool edns_negotiation;
-    int64_t fuzztime;
-    const char *explicit_qname;
-    const char *orig_qname;
-    const char *orig_qtype_s;
-    bool mem_debug;
-    bool check_dns64prefix;
-    bool server_explicit;
-
-    bool use_search_list;
-    char *search_domain;
-    int ndots;
-
-    bool idnin;
-    bool ignore_tc;
-    bool nofail;
-    bool use_glue;
-
-    // PROXYv2
-    bool use_proxy;
-    bool proxy_use_local_cmd;
-    int proxy_family;
-    char proxy_src_addr[64];
-    int proxy_src_port;
-    char proxy_dst_addr[64];
-    int proxy_dst_port;
-
-    int tcp_mss;
-    int tcp_window;
-
-    // TLS (DoT)
-    bool use_tls;
-    char *tls_ca_file;
-    bool tls_verify_default_store;
-    char *tls_certfile;
-    char *tls_keyfile;
-    char *tls_hostname;
-
-    // DoH
-    bool use_doh;
-    enum { DOH_POST, DOH_GET } doh_method;
-    bool doh_tls;
-    char *doh_path;
-} query_opts_t;
-
-typedef struct {
-    bool show_question;   // default true
-    bool show_answer;     // default true
-    bool show_authority;  // default true
-    bool show_additional; // default true
-    bool show_comments;   // default true (";; ->>HEADER<<-" 等)
-    bool show_stats;      // default true
-    bool show_cmd;        // default true (";; global options:" ヘッダ相当)
-    bool short_mode;
-    bool identify;
-    bool multiline;
-    bool yaml;
-    bool ttlid;
-    bool explicit_ttlid;
-    bool expire;
-    bool showsearch;
-    bool idnout;
-
-    bool time_unit_usec;
-    bool besteffort;
-    bool show_class;
-    bool show_crypto;
-    bool show_query_message;
-    bool rrcomments;
-    bool onesoa;
-    bool show_badcookie_msg;
-    bool show_badvers_msg;
-    bool expandaaaa;
-    int split_width;
-    bool force_unknown_format;
-    bool ttlunits;
-    bool has_expected_client_cookie;
-    uint8_t expected_client_cookie[8];
-    bool check_dns64prefix;
-} display_opts_t;
-
-static const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size) {
+const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size) {
     if (ttl == 0) {
         snprintf(buf, buf_size, "0s");
         return buf;
@@ -1587,7 +1279,7 @@ static size_t build_and_sign_query(uint8_t *pkt, size_t max_len,
 /* ========================================================================
  * 6. Networking
  * ==================================================================== */
-static int g_last_socket_family = AF_INET;
+int g_last_socket_family = AF_INET;
 
 /*
  * server引数(IPv4リテラル / IPv6リテラル / FQDN)をsockaddr_storageへ解決する。
@@ -2919,12 +2611,11 @@ static ssize_t do_dns_exchange_auto(const char *server, int port, const query_op
     return n;
 }
 
-static const char *format_class_name(uint16_t klass, char *buf, size_t buf_size);
 
 /* ========================================================================
  * 7. Response pretty-printing (dig-style)
  * ==================================================================== */
-static const char *rcode_name(uint16_t rcode) {
+const char *rcode_name(uint16_t rcode) {
     // Note: RCODEs 6 (YXDOMAIN), 7 (YXRRSET), 8 (NXRRSET) are only meaningful in
     // RFC 2136 DNS UPDATE responses (opcode_name(opcode) == "UPDATE"). In normal 
     // QUERY responses, they are undefined. We unconditionally return their UPDATE
@@ -2945,7 +2636,7 @@ static const char *rcode_name(uint16_t rcode) {
     }
 }
 
-static const char *opcode_name(uint8_t opcode) {
+const char *opcode_name(uint8_t opcode) {
     switch (opcode) {
         case 0: return "QUERY"; case 1: return "IQUERY"; case 2: return "STATUS";
         case 4: return "NOTIFY"; case 5: return "UPDATE";
@@ -4240,7 +3931,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
     }
 }
 
-static void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
+void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                                      size_t abs_offset, uint16_t rdlen,
                                      char *out, size_t out_cap, const display_opts_t *dopt) {
     if (!out || out_cap == 0) return;
@@ -4397,7 +4088,7 @@ static void calculate_packet_hashes(const uint8_t *pkt, size_t pkt_len, uint32_t
     if (record_hash_out) *record_hash_out = record_hash;
 }
 
-static const char *format_class_name(uint16_t klass, char *buf, size_t buf_size) {
+const char *format_class_name(uint16_t klass, char *buf, size_t buf_size) {
     switch (klass) {
         case 1: return "IN";
         case 3: return "CH";
@@ -4521,45 +4212,8 @@ static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axf
     return true;
 }
 
-// YAML single-quoted scalar内で安全な形にエスケープする（'を''に置換するのみ）
-static void yaml_single_quote_escape(const char *src, char *dst, size_t dst_cap) {
-    if (!dst || dst_cap == 0) return;
-    if (!src) { dst[0] = '\0'; return; }
-    size_t d = 0;
-    for (size_t s = 0; src[s] != '\0' && d + 1 < dst_cap; s++) {
-        if (src[s] == '\'') {
-            if (d + 2 >= dst_cap) break;
-            dst[d++] = '\'';
-            dst[d++] = '\'';
-        } else {
-            dst[d++] = src[s];
-        }
-    }
-    dst[d] = '\0';
-}
 
-// YAML double-quoted scalar内で安全な形にエスケープする（" \ および制御文字を処理）
-static void yaml_double_quote_escape(const char *src, char *dst, size_t dst_cap) {
-    if (!dst || dst_cap == 0) return;
-    if (!src) { dst[0] = '\0'; return; }
-    size_t d = 0;
-    for (size_t s = 0; src[s] != '\0' && d + 1 < dst_cap; s++) {
-        unsigned char c = (unsigned char)src[s];
-        if (c == '"' || c == '\\') {
-            if (d + 2 >= dst_cap) break;
-            dst[d++] = '\\';
-            dst[d++] = (char)c;
-        } else if (c < 0x20) {
-            if (d + 4 >= dst_cap) break;
-            d += (size_t)snprintf(dst + d, dst_cap - d, "\\x%02x", c);
-        } else {
-            dst[d++] = (char)c;
-        }
-    }
-    dst[d] = '\0';
-}
-
-static void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
+void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
                                          uint16_t code, uint16_t olen,
                                          const char *indent,
                                          const display_opts_t *dopt) {
@@ -4705,245 +4359,6 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
     }
 }
 
-static void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp, const display_opts_t *dopt) {
-    if (pkt_len < 12) return;
-    uint16_t id = (pkt[0] << 8) | pkt[1];
-    uint16_t flags = (pkt[2] << 8) | pkt[3];
-    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
-    uint16_t ancount = (pkt[6] << 8) | pkt[7];
-    uint16_t nscount = (pkt[8] << 8) | pkt[9];
-    uint16_t arcount = (pkt[10] << 8) | pkt[11];
-
-    bool qr = (flags >> 15) & 1;
-    bool aa = (flags >> 10) & 1;
-    bool tc = (flags >> 9) & 1;
-    bool rd = (flags >> 8) & 1;
-    bool ra = (flags >> 7) & 1;
-    bool z  = (flags >> 6) & 1;
-    bool ad = (flags >> 5) & 1;
-    bool cd = (flags >> 4) & 1;
-    uint8_t opcode = (flags >> 11) & 0xF;
-    uint8_t rcode = flags & 0xF;
-
-    time_t now = time(NULL);
-    struct tm tm_utc;
-    gmtime_r(&now, &tm_utc);
-    char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S.000Z", &tm_utc);
-
-    const char *resp_type = "RESPONSE";
-    if (qr) {
-        if (aa || !ra) resp_type = "AUTH_RESPONSE";
-        else resp_type = "RECURSIVE_RESPONSE";
-    } else {
-        resp_type = "QUERY";
-    }
-
-    const char *family_str = (g_last_socket_family == AF_INET6) ? "INET6" : "INET";
-    const char *proto_str = is_tcp ? "TCP" : "UDP";
-
-    printf("- type: MESSAGE\n");
-    printf("  message:\n");
-    printf("    type: %s\n", resp_type);
-    printf("    query_time: !!timestamp %s\n", time_str);
-    printf("    response_time: !!timestamp %s\n", time_str);
-    printf("    message_size: %zub\n", pkt_len);
-    printf("    socket_family: %s\n", family_str);
-    printf("    socket_protocol: %s\n", proto_str);
-    printf("    response_address: \"%s\"\n", (g_last_server_ip[0] ? g_last_server_ip : (server ? server : "127.0.0.1")));
-    printf("    response_port: %u\n", port ? port : 53);
-    printf("    query_address: \"0.0.0.0\"\n");
-    printf("    query_port: 0\n");
-    printf("    response_message_data:\n");
-    printf("      opcode: %s\n", opcode_name(opcode));
-    printf("      status: %s\n", rcode_name(rcode));
-    printf("      id: %u\n", id);
-
-    printf("      flags:");
-    if (qr) printf(" qr");
-    if (aa) printf(" aa");
-    if (tc) printf(" tc");
-    if (rd) printf(" rd");
-    if (ra) printf(" ra");
-    if (z)  printf(" z");
-    if (ad) printf(" ad");
-    if (cd) printf(" cd");
-    printf("\n");
-
-    printf("      QUESTION: %u\n", qdcount);
-    printf("      ANSWER: %u\n", ancount);
-    printf("      AUTHORITY: %u\n", nscount);
-    printf("      ADDITIONAL: %u\n", arcount);
-
-    // Scan for OPT record in additional section
-    size_t scan_off = 12;
-    for (int i = 0; i < qdcount; i++) {
-        size_t nxt;
-        if (skip_wire_name(pkt, pkt_len, scan_off, &nxt) != 0) break;
-        scan_off = nxt + 4;
-        if (scan_off > pkt_len) break;
-    }
-    int non_qd_total = ancount + nscount + arcount;
-    bool has_opt = false;
-    uint8_t opt_ver = 0;
-    uint16_t opt_udp = 0;
-    uint16_t opt_ext_flags = 0;
-
-    for (int i = 0; i < non_qd_total; i++) {
-        if (scan_off >= pkt_len) break;
-        char *rname = NULL;
-        size_t nxt;
-        if (expand_wire_name(pkt, pkt_len, scan_off, &nxt, &g_dag_arena, &rname) != 0) break;
-        if (nxt + 10 > pkt_len) break;
-        uint16_t type = (pkt[nxt] << 8) | pkt[nxt+1];
-        uint16_t klass = (pkt[nxt+2] << 8) | pkt[nxt+3];
-        uint32_t ttl = ((uint32_t)pkt[nxt+4]<<24)|((uint32_t)pkt[nxt+5]<<16)|((uint32_t)pkt[nxt+6]<<8)|pkt[nxt+7];
-        uint16_t rdlen = (pkt[nxt+8] << 8) | pkt[nxt+9];
-        size_t rdata_start = nxt + 10;
-        if (rdata_start + rdlen > pkt_len) break;
-
-        if (i >= ancount + nscount && type == 41) { // OPT in additional
-            has_opt = true;
-            opt_udp = klass;
-            opt_ver = (ttl >> 16) & 0xFF;
-            opt_ext_flags = (ttl & 0xFFFF);
-            break;
-        }
-        scan_off = rdata_start + rdlen;
-    }
-
-    if (has_opt) {
-        printf("      OPT_PSEUDOSECTION:\n");
-        printf("        EDNS:\n");
-        printf("          version: %u\n", opt_ver);
-        printf("          flags:");
-        if (opt_ext_flags & 0x8000) printf(" do");
-        if (opt_ext_flags & 0x0040) printf(" co");
-        printf("\n");
-        printf("          udp: %u\n", opt_udp);
-
-        size_t opt_scan_off = 12;
-        for (int i = 0; i < qdcount; i++) {
-            size_t nxt;
-            if (skip_wire_name(pkt, pkt_len, opt_scan_off, &nxt) != 0) break;
-            opt_scan_off = nxt + 4;
-            if (opt_scan_off > pkt_len) break;
-        }
-        for (int i = 0; i < non_qd_total; i++) {
-            if (opt_scan_off >= pkt_len) break;
-            size_t nxt;
-            if (skip_wire_name(pkt, pkt_len, opt_scan_off, &nxt) != 0) break;
-            if (nxt + 10 > pkt_len) break;
-            uint16_t type = (pkt[nxt] << 8) | pkt[nxt+1];
-            uint16_t rdlen = (pkt[nxt+8] << 8) | pkt[nxt+9];
-            size_t rdata_start = nxt + 10;
-            if (rdata_start + rdlen > pkt_len) break;
-
-            if (i >= ancount + nscount && type == 41) { // OPT in additional
-                size_t p = rdata_start, end = rdata_start + rdlen;
-                while (p + 4 <= end) {
-                    uint16_t code = (pkt[p] << 8) | pkt[p+1];
-                    uint16_t olen = (pkt[p+2] << 8) | pkt[p+3];
-                    p += 4;
-                    if (p + olen > end) break;
-                    decode_and_print_edns_option(pkt, p, code, olen, "          ", dopt);
-                    p += olen;
-                }
-            }
-            opt_scan_off = rdata_start + rdlen;
-        }
-    }
-
-    size_t offset = 12;
-    if (qdcount > 0) {
-        if (opcode == 5) {
-            printf("      ZONE_SECTION:\n");
-        } else {
-            printf("      QUESTION_SECTION:\n");
-        }
-        for (int i = 0; i < qdcount; i++) {
-            char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
-            if (next + 4 > pkt_len) break;
-            uint16_t qtype = (pkt[next] << 8) | pkt[next+1];
-            uint16_t qclass = (pkt[next+2] << 8) | pkt[next+3];
-            char tname_buf[32];
-            char cname_buf[16];
-            char name_esc[512];
-            yaml_single_quote_escape(name ? name : ".", name_esc, sizeof(name_esc));
-            const char *tname = format_type_name(qtype, tname_buf, sizeof(tname_buf));
-            const char *cname = format_class_name(qclass, cname_buf, sizeof(cname_buf));
-            printf("        - '%s %s %s'\n", name_esc, cname, tname);
-            offset = next + 4;
-        }
-    }
-
-    struct { const char *section_yaml_name; int count; } sec_defs[] = {
-        { (opcode == 5) ? "PREREQUISITE_SECTION" : "ANSWER_SECTION", ancount },
-        { (opcode == 5) ? "UPDATE_SECTION" : "AUTHORITY_SECTION", nscount },
-        { "ADDITIONAL_SECTION", arcount }
-    };
-
-    for (int s = 0; s < 3; s++) {
-        if (sec_defs[s].count <= 0) continue;
-        size_t sec_offset = offset;
-        int non_opt_count = 0;
-        for (int i = 0; i < sec_defs[s].count; i++) {
-            char *name = NULL; size_t next;
-            if (expand_wire_name(pkt, pkt_len, sec_offset, &next, &g_dag_arena, &name) != 0) break;
-            if (next + 10 > pkt_len) break;
-            uint16_t type = (pkt[next] << 8) | pkt[next+1];
-            uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
-            if (s != 2 || type != 41) non_opt_count++;
-            sec_offset = next + 10 + rdlen;
-        }
-
-        if (non_opt_count > 0) {
-            printf("      %s:\n", sec_defs[s].section_yaml_name);
-            for (int i = 0; i < sec_defs[s].count; i++) {
-                char *name = NULL; size_t next;
-                if (expand_wire_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
-                if (next + 10 > pkt_len) break;
-                uint16_t type = (pkt[next] << 8) | pkt[next+1];
-                uint16_t klass = (pkt[next+2] << 8) | pkt[next+3];
-                uint32_t ttl = ((uint32_t)pkt[next+4]<<24)|((uint32_t)pkt[next+5]<<16)|((uint32_t)pkt[next+6]<<8)|pkt[next+7];
-                uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
-                size_t rdata_start = next + 10;
-                if (rdata_start + rdlen > pkt_len) break;
-
-                if (type == 41 && s == 2) {
-                    offset = rdata_start + rdlen;
-                    continue;
-                }
-
-                char tname_buf[32];
-                char cname_buf[16];
-                char ttl_str[32];
-                if (dopt && dopt->ttlunits) {
-                    format_ttl_units(ttl, ttl_str, sizeof(ttl_str));
-                } else {
-                    snprintf(ttl_str, sizeof(ttl_str), "%u", ttl);
-                }
-
-                const char *tname = format_type_name(type, tname_buf, sizeof(tname_buf));
-                const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
-
-                static char rdata_raw[65536];
-                format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw), dopt);
-
-                char name_esc[512];
-                static char rdata_esc[131072];
-                yaml_single_quote_escape(name ? name : ".", name_esc, sizeof(name_esc));
-                yaml_single_quote_escape(rdata_raw, rdata_esc, sizeof(rdata_esc));
-
-                printf("        - '%s %s %s %s %s'\n", name_esc, ttl_str, cname, tname, rdata_esc);
-                offset = rdata_start + rdlen;
-            }
-        } else {
-            offset = sec_offset;
-        }
-    }
-}
 
 static void format_edns_flags(bool dnssec_ok, bool compact_answers_ok, char *buf, size_t buf_size) {
     buf[0] = '\0';
@@ -5351,76 +4766,6 @@ static bool detect_dns64_prefix_from_aaaa(const uint8_t *addr16, char *out_pstr,
     return true;
 }
 
-static void print_response_yaml_dns64(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp) {
-    if (pkt_len < 12) return;
-    uint16_t id = (pkt[0] << 8) | pkt[1];
-    uint16_t flags = (pkt[2] << 8) | pkt[3];
-    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
-    uint16_t ancount = (pkt[6] << 8) | pkt[7];
-    uint16_t nscount = (pkt[8] << 8) | pkt[9];
-    uint16_t arcount = (pkt[10] << 8) | pkt[11];
-
-    bool qr = (flags >> 15) & 1;
-    bool aa = (flags >> 10) & 1;
-    bool tc = (flags >> 9) & 1;
-    bool rd = (flags >> 8) & 1;
-    bool ra = (flags >> 7) & 1;
-    bool z  = (flags >> 6) & 1;
-    bool ad = (flags >> 5) & 1;
-    bool cd = (flags >> 4) & 1;
-    uint8_t opcode = (flags >> 11) & 0xF;
-    uint8_t rcode = flags & 0xF;
-
-    time_t now = time(NULL);
-    struct tm tm_utc;
-    gmtime_r(&now, &tm_utc);
-    char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S.000Z", &tm_utc);
-
-    const char *resp_type = "RESPONSE";
-    if (qr) {
-        if (aa) resp_type = "AUTH_RESPONSE";
-        else resp_type = "RECURSIVE_RESPONSE";
-    } else {
-        resp_type = "QUERY";
-    }
-
-    const char *family_str = (g_last_socket_family == AF_INET6) ? "INET6" : "INET";
-    const char *proto_str = is_tcp ? "TCP" : "UDP";
-
-    printf("- type: MESSAGE\n");
-    printf("  message:\n");
-    printf("    type: %s\n", resp_type);
-    printf("    query_time: !!timestamp %s\n", time_str);
-    printf("    response_time: !!timestamp %s\n", time_str);
-    printf("    message_size: %zub\n", pkt_len);
-    printf("    socket_family: %s\n", family_str);
-    printf("    socket_protocol: %s\n", proto_str);
-    printf("    response_address: \"%s\"\n", server ? server : "127.0.0.1");
-    printf("    response_port: %u\n", port ? port : 53);
-    printf("    query_address: \"0.0.0.0\"\n");
-    printf("    query_port: 0\n");
-    printf("    response_message_data:\n");
-    printf("      opcode: %s\n", opcode_name(opcode));
-    printf("      status: %s\n", rcode_name(rcode));
-    printf("      id: %u\n", id);
-
-    printf("      flags:");
-    if (qr) printf(" qr");
-    if (aa) printf(" aa");
-    if (tc) printf(" tc");
-    if (rd) printf(" rd");
-    if (ra) printf(" ra");
-    if (z)  printf(" z");
-    if (ad) printf(" ad");
-    if (cd) printf(" cd");
-    printf("\n");
-
-    printf("      QUESTION: %u\n", qdcount);
-    printf("      ANSWER: %u\n", ancount);
-    printf("      AUTHORITY: %u\n", nscount);
-    printf("      ADDITIONAL: %u\n", arcount);
-}
 
 static void run_dns64prefix_check(const char *server, int port, const query_opts_t *qo, bool use_tcp,
                                    bool no_hexdump_query, bool no_hexdump_response,

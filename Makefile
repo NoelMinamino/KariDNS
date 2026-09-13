@@ -33,7 +33,7 @@ SRCS = dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.
 OBJS = $(SRCS:.c=.o)
 
 DAG_TARGET = dag
-DAG_SRCS = tools/dag.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c
+DAG_SRCS = tools/dag.c tools/dag_output_yaml.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 DAG_OBJS = $(DAG_SRCS:.c=.o)
 
@@ -57,28 +57,28 @@ FUZZ_TSIG_TARGET = tests/fuzz/fuzz_tsig_sign
 FUZZ_TSIG_SRCS = tests/fuzz/fuzz_tsig_sign.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_TARGET = tests/fuzz/fuzz_dag_response
-FUZZ_DAG_SRCS = tests/fuzz/fuzz_dag_response.c dns_wire.c dns_utils.c dns_zone_parser.c
+FUZZ_DAG_SRCS = tests/fuzz/fuzz_dag_response.c tools/dag_output_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_TSIG_VERIFY_TARGET = tests/fuzz/fuzz_tsig_verify
 FUZZ_TSIG_VERIFY_SRCS = tests/fuzz/fuzz_tsig_verify.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_HASH_TARGET = tests/fuzz/fuzz_dag_hash
-FUZZ_DAG_HASH_SRCS = tests/fuzz/fuzz_dag_hash.c dns_wire.c dns_utils.c dns_zone_parser.c
+FUZZ_DAG_HASH_SRCS = tests/fuzz/fuzz_dag_hash.c tools/dag_output_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_CHUNKED_HTTP_TARGET = tests/fuzz/fuzz_dag_chunked_http
-FUZZ_DAG_CHUNKED_HTTP_SRCS = tests/fuzz/fuzz_dag_chunked_http.c dns_wire.c dns_utils.c dns_zone_parser.c
+FUZZ_DAG_CHUNKED_HTTP_SRCS = tests/fuzz/fuzz_dag_chunked_http.c tools/dag_output_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_RDATA_YAML_TARGET = tests/fuzz/fuzz_dag_rdata_yaml
-FUZZ_DAG_RDATA_YAML_SRCS = tests/fuzz/fuzz_dag_rdata_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
+FUZZ_DAG_RDATA_YAML_SRCS = tests/fuzz/fuzz_dag_rdata_yaml.c tools/dag_output_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_AXFR_STREAM_TARGET = tests/fuzz/fuzz_dag_axfr_stream
-FUZZ_DAG_AXFR_STREAM_SRCS = tests/fuzz/fuzz_dag_axfr_stream.c dns_wire.c dns_utils.c dns_zone_parser.c
+FUZZ_DAG_AXFR_STREAM_SRCS = tests/fuzz/fuzz_dag_axfr_stream.c tools/dag_output_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_CLI_ARGS_TARGET = tests/fuzz/fuzz_dag_cli_args
-FUZZ_DAG_CLI_ARGS_SRCS = tests/fuzz/fuzz_dag_cli_args.c dns_wire.c dns_utils.c dns_zone_parser.c
+FUZZ_DAG_CLI_ARGS_SRCS = tests/fuzz/fuzz_dag_cli_args.c tools/dag_output_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_BATCH_FILE_TARGET = tests/fuzz/fuzz_dag_batch_file
-FUZZ_DAG_BATCH_FILE_SRCS = tests/fuzz/fuzz_dag_batch_file.c dns_wire.c dns_utils.c dns_zone_parser.c
+FUZZ_DAG_BATCH_FILE_SRCS = tests/fuzz/fuzz_dag_batch_file.c tools/dag_output_yaml.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_DAG_REPLAY_PCAP_READER_TARGET = tests/fuzz/fuzz_dag_replay_pcap_reader
 FUZZ_DAG_REPLAY_PCAP_READER_SRCS = tests/fuzz/fuzz_dag_replay_pcap_reader.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c
@@ -166,8 +166,11 @@ dns_tinydns_parser.o: dns_tinydns_parser.c
 dns_utils.o: dns_utils.c
 	$(CC) $(CFLAGS) -c dns_utils.c -o dns_utils.o
 
-tools/dag.o: tools/dag.c
+tools/dag.o: tools/dag.c tools/dag_internal.h tools/dag_output_yaml.h
 	$(CC) $(CFLAGS) -c tools/dag.c -o tools/dag.o
+
+tools/dag_output_yaml.o: tools/dag_output_yaml.c tools/dag_output_yaml.h tools/dag_internal.h
+	$(CC) $(CFLAGS) -c tools/dag_output_yaml.c -o tools/dag_output_yaml.o
 
 tools/dag_pcap_l4.o: tools/dag_pcap_l4.c tools/dag_pcap_l4.h
 	$(CC) $(CFLAGS) -c tools/dag_pcap_l4.c -o tools/dag_pcap_l4.o
@@ -319,7 +322,7 @@ KARICHECK_ASAN_SRCS = tools/karicheck.c dns_config_parser.c dns_zone_parser.c dn
 karicheck-asan: $(KARICHECK_ASAN_SRCS)
 	$(CC) $(ASAN_CFLAGS) $(KARICHECK_ASAN_SRCS) -o $@ $(LDFLAGS) -lcrypto
 
-DAG_ASAN_SRCS = tools/dag.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c
+DAG_ASAN_SRCS = tools/dag.c tools/dag_output_yaml.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c
 dag-asan: $(DAG_ASAN_SRCS)
 	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
