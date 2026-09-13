@@ -322,6 +322,32 @@ typedef struct {
     bool check_dns64prefix;
 } display_opts_t;
 
+typedef struct query_spec_s {
+    const char *server_arg;
+    int port;
+    const char *batch_file;
+    bool use_tcp;
+    bool force_udp;
+    bool use_ldnsz;
+    bool do_trace;
+    bool do_nssearch;
+    bool norecurse;
+    bool adflag;
+    bool cdflag;
+    bool aaflag;
+    bool tcflag;
+    bool zflag;
+    bool test_all;
+    bool no_hexdump_query;
+    bool no_hexdump_response;
+    const char *hex_payload;
+    const char *qname;
+    const char *qtype_s;
+    char rev_name[128];
+    query_opts_t qo;
+    display_opts_t dopt;
+} query_spec_t;
+
 /* Functions shared between dag modules */
 const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size);
 const char *format_class_name(uint16_t klass, char *buf, size_t buf_size);
@@ -335,5 +361,11 @@ void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
                                   uint16_t code, uint16_t olen,
                                   const char *indent,
                                   const display_opts_t *dopt);
+void init_query_spec(query_spec_t *spec);
+void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src);
+void free_query_opts(query_opts_t *qo);
+void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec);
+int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec);
+int execute_query_spec(query_spec_t *spec);
 
 #endif /* DAG_INTERNAL_H */

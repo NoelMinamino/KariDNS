@@ -15,6 +15,7 @@
  */
 #include "dag_internal.h"
 #include "dag_output_yaml.h"
+#include "dag_batch.h"
 
 #define TRACE_MAX_CNAME_DEPTH 16
 
@@ -7293,33 +7294,9 @@ typedef struct {
     int end;
 } arg_slice_t;
 
-typedef struct query_spec_s {
-    const char *server_arg;
-    int port;
-    const char *batch_file;
-    bool use_tcp;
-    bool force_udp;
-    bool use_ldnsz;
-    bool do_trace;
-    bool do_nssearch;
-    bool norecurse;
-    bool adflag;
-    bool cdflag;
-    bool aaflag;
-    bool tcflag;
-    bool zflag;
-    bool test_all;
-    bool no_hexdump_query;
-    bool no_hexdump_response;
-    const char *hex_payload;
-    const char *qname;
-    const char *qtype_s;
-    char rev_name[128];
-    query_opts_t qo;
-    display_opts_t dopt;
-} query_spec_t;
 
-static void init_query_spec(query_spec_t *spec) {
+
+void init_query_spec(query_spec_t *spec) {
     memset(spec, 0, sizeof(*spec));
     spec->port = 53;
     spec->dopt.show_question = true;
@@ -7433,7 +7410,7 @@ static int get_arg_consume_count(int argc, char **argv, int i) {
     return 1;
 }
 
-static void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec) {
+void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "+cmd") == 0) global_spec->dopt.show_cmd = true;
         else if (strcmp(argv[i], "+nocmd") == 0) global_spec->dopt.show_cmd = false;
@@ -8350,7 +8327,7 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     return 1;
 }
 
-static int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec) {
+int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec) {
     for (int i = start; i < end; ) {
         int rc = parse_query_arg_token(argc, argv, i, spec);
         if (rc < 0) return -1;
@@ -8360,7 +8337,7 @@ static int parse_arg_slice(int start, int end, int argc, char **argv, query_spec
 }
 
 
-static void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
+void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
     if (!dst || !src) return;
     *dst = *src;
     if (src->tls_ca_file) dst->tls_ca_file = strdup(src->tls_ca_file);
@@ -8383,7 +8360,7 @@ static void deep_copy_query_opts(query_opts_t *dst, const query_opts_t *src) {
     }
 }
 
-static void free_query_opts(query_opts_t *qo) {
+void free_query_opts(query_opts_t *qo) {
     if (!qo) return;
     if (qo->tls_ca_file) { free(qo->tls_ca_file); qo->tls_ca_file = NULL; }
     if (qo->tls_certfile) { free(qo->tls_certfile); qo->tls_certfile = NULL; }
@@ -8404,105 +8381,9 @@ static void free_query_opts(query_opts_t *qo) {
     qo->update_op_count = 0;
 }
 
-static int execute_query_spec(query_spec_t *spec);
 
-static int execute_batch_spec(const query_spec_t *spec) {
-    if (!spec->batch_file) return 0;
-    FILE *bf = fopen(spec->batch_file, "r");
-    if (!bf) {
-        fprintf(stderr, "error: could not open batch file '%s': %s\n", spec->batch_file, strerror(errno));
-        return 8;
-    }
-    char line[1024];
-    int line_num = 0;
-    while (fgets(line, sizeof(line), bf)) {
-        line_num++;
-        char *p = line;
-        while (isspace((unsigned char)*p)) p++;
-        if (*p == '\0' || *p == '#' || *p == ';') continue;
-        
-        char *line_argv[64];
-        int line_argc = 0;
-        line_argv[line_argc++] = "dag";
-        char *tok = strtok(p, " \t\r\n");
-        while (tok && line_argc < 63) {
-            line_argv[line_argc++] = tok;
-            tok = strtok(NULL, " \t\r\n");
-        }
-        line_argv[line_argc] = NULL;
 
-        if (line_argc > 1) {
-            bool has_cli_only_opt = false;
-            for (int k = 1; k < line_argc; k++) {
-                if (strcmp(line_argv[k], "-h") == 0 || strcmp(line_argv[k], "--help") == 0 ||
-                    strcmp(line_argv[k], "-v") == 0 || strcmp(line_argv[k], "--version") == 0) {
-                    fprintf(stderr, "warning: batch line %d ignores CLI-only option '%s'\n", line_num, line_argv[k]);
-                    has_cli_only_opt = true;
-                    break;
-                }
-            }
-            if (has_cli_only_opt) continue;
-
-#ifndef _WIN32
-            pid_t pid = fork();
-            if (pid == 0) {
-                query_spec_t local_spec;
-                init_query_spec(&local_spec);
-                deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
-                local_spec.dopt = spec->dopt;
-                if (spec->server_arg) local_spec.server_arg = spec->server_arg;
-                if (spec->port != 53) local_spec.port = spec->port;
-                prescan_always_global_options(line_argc, line_argv, &local_spec);
-                int rc = 0;
-                if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
-                    rc = execute_query_spec(&local_spec);
-                } else {
-                    fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
-                    rc = 1;
-                }
-                free_query_opts(&local_spec.qo);
-                exit(rc < 0 ? 1 : 0);
-            } else if (pid > 0) {
-                int status = 0;
-                waitpid(pid, &status, 0);
-            } else {
-                // Fallback if fork fails
-                query_spec_t local_spec;
-                init_query_spec(&local_spec);
-                deep_copy_query_opts(&local_spec.qo, &spec->qo);
-                local_spec.dopt = spec->dopt;
-                if (spec->server_arg) local_spec.server_arg = spec->server_arg;
-                if (spec->port != 53) local_spec.port = spec->port;
-                prescan_always_global_options(line_argc, line_argv, &local_spec);
-                if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
-                    execute_query_spec(&local_spec);
-                } else {
-                    fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
-                }
-                free_query_opts(&local_spec.qo);
-            }
-#else
-            query_spec_t local_spec;
-            init_query_spec(&local_spec);
-            deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
-            local_spec.dopt = spec->dopt;
-            if (spec->server_arg) local_spec.server_arg = spec->server_arg;
-            if (spec->port != 53) local_spec.port = spec->port;
-            prescan_always_global_options(line_argc, line_argv, &local_spec);
-            if (parse_arg_slice(1, line_argc, line_argc, line_argv, &local_spec) >= 0) {
-                execute_query_spec(&local_spec);
-            } else {
-                fprintf(stderr, "warning: failed to parse batch line %d\n", line_num);
-            }
-            free_query_opts(&local_spec.qo);
-#endif
-        }
-    }
-    fclose(bf);
-    return 0;
-}
-
-static int execute_query_spec(query_spec_t *spec) {
+int execute_query_spec(query_spec_t *spec) {
     if ((spec->qo.want_tsig || spec->qo.tsig_specified) && (spec->qo.want_sig0 || spec->qo.sig0_specified)) {
         fprintf(stderr, "error: TSIG (-k/-y) and SIG(0) (+sig0-pkey) cannot be combined in this version of dag\n");
         return 1;
