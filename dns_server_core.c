@@ -687,6 +687,9 @@ typedef struct {
   int *hash_table;
   int *chain_next;
   size_t hash_size;
+  int *suffix_hash_table;   // 末尾ドット正規化済みキーによるインデックス (Task 2)
+  int *suffix_chain_next;
+  size_t suffix_hash_size;
 } view_snapshot_t;
 
 typedef struct {
@@ -1209,34 +1212,85 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
   return NULL;
 }
 
-static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
-  if (!view || !qname) return NULL;
-  size_t q_len = strlen(qname);
-  while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+static inline uint32_t calc_fnv1a_strn(const char *str, size_t len) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    uint8_t c = (uint8_t)str[i];
+    if (c >= 'A' && c <= 'Z')
+      c |= 0x20;
+    hash ^= c;
+    hash *= 16777619u;
+  }
+  return hash;
+}
 
-  zone_db_entry_t *best_entry = NULL;
-  size_t longest_match_len = 0;
-  for (size_t i = 0; i < view->zone_count; i++) {
+static zone_db_entry_t *view_suffix_hash_lookup(view_snapshot_t *view, const char *key, size_t key_len) {
+  if (!view || !view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
+    return NULL;
+  }
+  uint32_t hash = calc_fnv1a_strn(key, key_len);
+  size_t idx = hash & (view->suffix_hash_size - 1);
+  for (int i = view->suffix_hash_table[idx]; i != -1; i = view->suffix_chain_next[i]) {
     zone_db_entry_t *entry = view->entries[i];
     if (!entry) continue;
     size_t z_len = strlen(entry->domain);
     while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
-
-    bool match = false;
-    if (z_len == 0 && (strcmp(entry->domain, ".") == 0 || entry->domain[0] == '\0')) {
-      match = true;
-    } else if (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) {
-      match = true;
-    } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
-               strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0) {
-      match = true;
-    }
-    if (match && (!best_entry || z_len > longest_match_len)) {
-      longest_match_len = z_len;
-      best_entry = entry;
+    if (z_len == key_len && strncasecmp(entry->domain, key, key_len) == 0) {
+      return entry;
     }
   }
-  return best_entry;
+  return NULL;
+}
+
+static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
+  if (!view || !qname) return NULL;
+  if (!view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
+    // Suffix hash table not built (e.g. manually constructed mock view in fuzzers/tests)
+    // Fall back to linear scan
+    size_t q_len = strlen(qname);
+    while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+
+    zone_db_entry_t *best_entry = NULL;
+    size_t longest_match_len = 0;
+    for (size_t i = 0; i < view->zone_count; i++) {
+      zone_db_entry_t *entry = view->entries[i];
+      if (!entry) continue;
+      size_t z_len = strlen(entry->domain);
+      while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
+
+      bool match = false;
+      if (z_len == 0 && (strcmp(entry->domain, ".") == 0 || entry->domain[0] == '\0')) {
+        match = true;
+      } else if (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) {
+        match = true;
+      } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
+                 strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0) {
+        match = true;
+      }
+      if (match && (!best_entry || z_len > longest_match_len)) {
+        longest_match_len = z_len;
+        best_entry = entry;
+      }
+    }
+    return best_entry;
+  }
+
+  size_t q_len = strlen(qname);
+  while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+
+  const char *cursor = qname;
+  size_t remaining = q_len;
+  while (remaining > 0) {
+    zone_db_entry_t *hit = view_suffix_hash_lookup(view, cursor, remaining);
+    if (hit) return hit;
+    // 次のラベル境界まで進める（cursor内、remaining文字の範囲でドットを探す）
+    const char *dot = memchr(cursor, '.', remaining);
+    if (!dot) break;
+    remaining -= (size_t)(dot - cursor) + 1;
+    cursor = dot + 1;
+  }
+  // ルートゾーン（"." または空文字列）へのフォールバック
+  return view_suffix_hash_lookup(view, "", 0);
 }
 
 static inline void rcu_exponential_backoff(int *retries, useconds_t *sleep_time) {
@@ -1381,6 +1435,8 @@ static void *gc_snapshot_thread(void *arg) {
       }
       if (snap->views[v].hash_table) free(snap->views[v].hash_table);
       if (snap->views[v].chain_next) free(snap->views[v].chain_next);
+      if (snap->views[v].suffix_hash_table) free(snap->views[v].suffix_hash_table);
+      if (snap->views[v].suffix_chain_next) free(snap->views[v].suffix_chain_next);
     }
     free(snap->views);
   }
@@ -2538,9 +2594,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         if (des_chain_next) free(des_chain_next);
 
         zone_db_entry_t **new_entries = calloc(added_count > 0 ? added_count : 1, sizeof(zone_db_entry_t*));
+        if (!new_entries) {
+            free(added_members); free(removed_members); free(coo_evicted_members);
+            abort_rebuild_snapshot(new_snap, "catalog new_entries");
+            return NULL;
+        }
+        int actual_added_count = 0;
         for (int i = 0; i < added_count; i++) {
-            zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
             zone_db_entry_t *entry = create_new_zone_entry(added_members[i].domain, catalog_view_name);
+            if (!entry) {
+                syslog(LOG_ERR, "[Catalog] Failed to allocate memory for member '%s' owned by %s, skipping",
+                       added_members[i].domain, catalog_entry_to_update->domain);
+                continue;
+            }
             strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
@@ -2561,8 +2627,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 strncpy(entry->cached_tsig_key_name, catalog_cfg->tsig_key, sizeof(entry->cached_tsig_key_name) - 1);
             }
             atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
-            new_entries[i] = entry;
+            new_entries[actual_added_count++] = entry;
         }
+        added_count = actual_added_count;
 
         new_snap->view_count = old_snap ? old_snap->view_count : 0;
         if (new_snap->view_count > 0) {
@@ -2724,8 +2791,23 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 for (size_t i = 0; i < vs->zone_count; i++) vs->chain_next[i] = -1;
             }
         }
+
+        vs->suffix_hash_size = p;
+        if (vs->suffix_hash_size > 0) {
+            vs->suffix_hash_table = malloc(vs->suffix_hash_size * sizeof(int));
+            if (vs->suffix_hash_table) {
+                for (size_t i = 0; i < vs->suffix_hash_size; i++) vs->suffix_hash_table[i] = -1;
+            }
+        }
+        if (vs->zone_count > 0) {
+            vs->suffix_chain_next = malloc(vs->zone_count * sizeof(int));
+            if (vs->suffix_chain_next) {
+                for (size_t i = 0; i < vs->zone_count; i++) vs->suffix_chain_next[i] = -1;
+            }
+        }
         
-        if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next)) {
+        if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next) ||
+            (vs->suffix_hash_size > 0 && !vs->suffix_hash_table) || (vs->zone_count > 0 && !vs->suffix_chain_next)) {
             syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name);
             void *gc_snapshot_thread(void *arg);
             gc_snapshot_thread(new_snap); // Clean up the new snapshot cleanly
@@ -2735,10 +2817,23 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
         if (vs->hash_table && vs->chain_next) {
             for (size_t i = 0; i < vs->zone_count; i++) {
+                if (!vs->entries[i]) continue;
                 uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
                 size_t idx = hash & (vs->hash_size - 1);
                 vs->chain_next[i] = vs->hash_table[idx];
                 vs->hash_table[idx] = i;
+            }
+        }
+
+        if (vs->suffix_hash_table && vs->suffix_chain_next) {
+            for (size_t i = 0; i < vs->zone_count; i++) {
+                if (!vs->entries[i]) continue;
+                size_t z_len = strlen(vs->entries[i]->domain);
+                while (z_len > 0 && vs->entries[i]->domain[z_len - 1] == '.') z_len--;
+                uint32_t hash = calc_fnv1a_strn(vs->entries[i]->domain, z_len);
+                size_t idx = hash & (vs->suffix_hash_size - 1);
+                vs->suffix_chain_next[i] = vs->suffix_hash_table[idx];
+                vs->suffix_hash_table[idx] = i;
             }
         }
     }
