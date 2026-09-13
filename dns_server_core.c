@@ -3647,6 +3647,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           if (21 + orig_rdlen <= rec->generic_len) {
             uint8_t fake_wire[4096];
             size_t fake_len = 0;
+            bool reconstructed = false;
             const char *d = rec->name;
             while (*d) {
               const char *dot = strchr_unescaped(d, '.');
@@ -3670,18 +3671,29 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
             fake_wire[fake_len++] = orig_ttl & 0xFF;
             fake_wire[fake_len++] = (orig_rdlen >> 8) & 0xFF;
             fake_wire[fake_len++] = orig_rdlen & 0xFF;
-            if (orig_rdlen > 0) {
+            /* SECURITY FIX: orig_rdlen comes from the wrapped rdata sent by the
+             * AXFR/IXFR peer and can be up to 65535, far larger than the fixed
+             * fake_wire[4096] stack buffer. Previously this was copied
+             * unconditionally, allowing a malicious/compromised zone-transfer
+             * source to overflow the stack. Verify it fits before copying, and
+             * fall back to the existing synthetic-record path otherwise. */
+            if (orig_rdlen > 0 && fake_len + (size_t)orig_rdlen <= sizeof(fake_wire)) {
               memcpy(&fake_wire[fake_len], &rec->generic_data[21], orig_rdlen);
               fake_len += orig_rdlen;
+            } else if (orig_rdlen > 0) {
+              fake_len = 0; /* force fallback below; do not attempt to parse */
             }
             size_t fake_off = 0;
             uint16_t parsed_t;
             dns_record_t unwrapped;
             memset(&unwrapped, 0, sizeof(unwrapped));
-            if (parse_resource_record(fake_wire, fake_len, &fake_off, standby, &unwrapped, &parsed_t) == 0) {
+            if (fake_len > 0 &&
+                parse_resource_record(fake_wire, fake_len, &fake_off, standby, &unwrapped, &parsed_t) == 0) {
               *rec = unwrapped;
               type = parsed_t;
-            } else {
+              reconstructed = true;
+            }
+            if (!reconstructed) {
               rec->generic_data = NULL;
               rec->generic_len = 0;
               rec->type_code = orig_type;
