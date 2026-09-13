@@ -50,6 +50,7 @@
 #include "dns_catalog_zone.h"
 #include "dns_edns_ecs.h"
 #include "dns_rrl.h"
+#include "dns_tsig_acl.h"
 
 // karidns
 // Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
@@ -7901,20 +7902,6 @@ static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_
   }
   release_config_snapshot(cfg);
   return is_synth;
-}
-
-bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
-    for (int i = 0; i < acl_count; i++) {
-        char *rule = acl_list[i];
-        /* [L-2] NULL エントリーに対する防御的チェック */
-        if (!rule) continue;
-        bool is_deny = (rule[0] == '!');
-        const char *target = is_deny ? rule + 1 : rule;
-        if (match_cidr(client_ip, target)) {
-            return !is_deny;
-        }
-    }
-    return false;
 }
 
 static inline void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
