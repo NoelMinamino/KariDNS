@@ -235,11 +235,7 @@ void hexdump(const uint8_t *buf, size_t len) {
 }
 
 /* ========================================================================
- * 3. --break (fuzz) option handling
- * ==================================================================== */
-
-/* ========================================================================
- * 4. Query options (EDNS request side) -- built entirely in this file
+ * 3. Response formatting helpers
  * ==================================================================== */
 
 const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size) {
