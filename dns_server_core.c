@@ -2129,6 +2129,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (size_t v = 0; v < old_snap->view_count; v++) {
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
+                    if (!entry) continue;
                     if (entry->catalog_member_count > 0) {
                         max_valid_members += entry->catalog_member_count;
                     }
@@ -2146,6 +2147,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (size_t v = 0; v < old_snap->view_count; v++) {
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
+                    if (!entry) continue;
                     if (entry->catalog_member_count > 0) {
                         zone_config_t *zcfg = find_zone_config_in_view(active_config, entry->view_name, entry->domain);
                         if (zcfg && zcfg->is_catalog) {
@@ -2216,6 +2218,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
                         for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
                             zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
+                            if (!entry) continue;
                             if (entry->is_catalog_member) {
                                 bool is_valid = false;
                                 for (int k = 0; k < valid_member_count; k++) {
@@ -2257,6 +2260,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     for (size_t ov = 0; ov < old_snap->view_count; ov++) {
                         if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
                             for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
+                                if (!old_snap->views[ov].entries[oi]) continue;
                                 if (strcasecmp(old_snap->views[ov].entries[oi]->domain, z->domain) == 0) {
                                     entry = old_snap->views[ov].entries[oi];
                                     atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
@@ -2277,6 +2281,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         reload_master_zone(entry, z);
                     }
                 }
+                if (!entry) {
+                    syslog(LOG_ERR, "[Core] Failed to allocate memory for zone '%s' in view '%s', skipping this zone this reload cycle",
+                           z->domain, v->name);
+                    continue;
+                }
                 vs->entries[zidx++] = entry;
             }
 
@@ -2285,6 +2294,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
                         for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
                             zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
+                            if (!entry) continue;
                             if (entry->is_catalog_member) {
                                 bool is_valid = false;
                                 for (int k = 0; k < valid_member_count; k++) {
@@ -2311,6 +2321,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
+            vs->zone_count = zidx;
         }
         if (valid_members) free(valid_members);
 
