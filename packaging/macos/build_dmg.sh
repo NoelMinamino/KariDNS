@@ -14,33 +14,16 @@ echo "==> Building dag binary for macOS (${ARCH}, version ${VERSION})..."
 mkdir -p "${OUT_DIR}"
 STAGE_DIR="$(mktemp -d -t dag-dmg-stage-XXXXXX)"
 
-# Determine OpenSSL & libidn2 paths from Homebrew
-OPENSSL_DIR="$(brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /usr/local/opt/openssl)"
-IDN2_DIR="$(brew --prefix libidn2 2>/dev/null || echo /usr/local/opt/libidn2)"
-
-SSL_INC=""
-SSL_LIB=""
-if [ -d "$OPENSSL_DIR" ]; then
-    SSL_INC="-I${OPENSSL_DIR}/include"
-    SSL_LIB="-L${OPENSSL_DIR}/lib"
+if [ ! -f dag ]; then
+    echo "==> Building dag binary for macOS (${ARCH}, version ${VERSION})..."
+    make clean || true
+    make VERSION="${VERSION}" dag
+else
+    echo "==> Using existing dag binary for macOS (${ARCH}, version ${VERSION})..."
 fi
 
-IDN_INC=""
-IDN_LIB=""
-IDN_DEF=""
-if [ -d "$IDN2_DIR" ]; then
-    IDN_INC="-I${IDN2_DIR}/include"
-    IDN_LIB="-L${IDN2_DIR}/lib -lidn2"
-    IDN_DEF="-DHAVE_LIBIDN2"
-fi
+cp dag "${STAGE_DIR}/dag"
 
-# Build native binary for the current runner architecture
-echo "==> Compiling dag for ${ARCH}..."
-clang -O3 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DKARIDNS_VERSION=\"${VERSION}\" \
-      ${SSL_INC} ${IDN_INC} ${IDN_DEF} \
-      tools/dag.c tools/dag_replay.c dns_wire.c dns_utils.c dns_zone_parser.c \
-      -o "${STAGE_DIR}/dag" \
-      ${SSL_LIB} ${IDN_LIB} -pthread -lcrypto -lssl -lz -lm
 
 # 1. Create Standalone Binary Tarball
 echo "==> Packaging tar.gz release for macOS ${ARCH}..."
