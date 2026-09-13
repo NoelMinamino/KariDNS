@@ -2673,6 +2673,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset = off;
                 break;
             }
+            case 128: { // NXNAME (RFC 9824 Compact Denial of Existence): 0-length RDATA
+                break;
+            }
             default: {
                 // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード
                 // 低レイヤー関数であるためログ出力は行わず、上位層にエラー状態のみを伝播させる

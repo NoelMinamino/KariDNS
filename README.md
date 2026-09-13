@@ -5,7 +5,7 @@
 [![Platform: FreeBSD](https://img.shields.io/badge/Platform-FreeBSD-red.svg)](https://www.freebsd.org/)
 [![Build CI](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml/badge.svg)](https://github.com/NoelMinamino/KariDNS/actions/workflows/ci.yml)
 
-KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD kernel features—including `kqueue` for event handling and `Capsicum` for sandboxing—together with an RCU-based data model and pre-allocated memory arenas.
+KariDNS is an authoritative DNS server designed for FreeBSD, developed in collaboration with AI (Google Gemini, Anthropic Claude). It utilizes FreeBSD kernel features—including `kqueue` for event handling and `Capsicum` for sandboxing—together with an RCU-based data model and pre-allocated memory arenas.
 
 ---
 
@@ -28,7 +28,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD. It utilizes FreeBSD
 - **Authoritative Zone Roles & Formats:**
   - **Master (Primary) & Slave (Secondary):** Supports standard BIND-style zone files and djbdns/tinydns-style plain-text `data` files (`file-format tinydns;`). Supports AXFR (RFC 5936) and IXFR (RFC 1995) zone transfers, inbound and outbound NOTIFY (RFC 1996) with TSIG authentication.
   - **Forward Zones (`type forward`):** Transparent query forwarding to multiple upstream nameservers with per-zone timeouts, shared deadline budgeting, automatic failover, transaction ID randomization, and response verification.
-  - **Program Zone Plugins (`type program`):** Test-only dynamic external process-backed zones communicating over stdin/stdout pipes with strict privilege dropping and automatic circuit-breaker failure isolation.
+  - **Program Zone Plugins (`type program`):** Test-only dynamic external process-backed zones communicating over stdin/stdout pipes with strict privilege dropping and automatic circuit-breaker failure isolation. For IPC protocol specifications and multi-language implementation examples (Perl, Python, C, Rust, Go), see **[KariDNS: 'type program' Zone Guide](docs/KariDNS_how_to_use_type_program_zone.md)**.
 - **Dynamic DNS Update:** Ephemeral DNS UPDATE handling (RFC 2136 / RFC 3007) with prerequisite evaluation and TSIG verification.
 - **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, DS, CDS, CDNSKEY, CSYNC, etc.). Includes RFC 8976 (ZONEMD) digest validation.
 - **Security & Rate Limiting:**
@@ -59,6 +59,7 @@ KariDNS implements specifications according to official IETF RFC standards. For 
 
 - **[KariDNS RFC Compliance Guideline](KariDNS_RFC_GUIDELINE.md)**
 - **[Client Geolocation & Subnet Steering Guide (ECS & Location)](docs/KariDNS_How_to_use_ECS_and_location.md)**
+- **['type program' Zone Plugin Guide](docs/KariDNS_how_to_use_type_program_zone.md)**
 - **[Installation & Multi-Platform Distribution Guide (FreeBSD, Linux, macOS, Homebrew)](docs/distribution.md)**
 
 ---
@@ -399,6 +400,7 @@ zone "corp.example.org" {
 };
 
 # Dynamic external program plugin zone (testing/anomaly fuzzing)
+# For IPC specifications and runnable examples, see docs/KariDNS_how_to_use_type_program_zone.md
 zone "anomaly.test" {
     type program;
     program "/usr/local/bin/mock_dns_server.pl";
@@ -415,4 +417,4 @@ zone "anomaly.test" {
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
-*Copyright (c) 2026 Noel Minamino*
+*Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)*

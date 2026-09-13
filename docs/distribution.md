@@ -143,3 +143,10 @@ dag example.local A @8.8.8.8,1.1.1.1,9.9.9.9
 # Anomaly testing / packet fuzzing
 dag example.local A @127.0.0.1 --break id_zero
 ```
+
+---
+
+## AUTHORS
+
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
+

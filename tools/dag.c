@@ -2949,7 +2949,11 @@ static const char *opcode_name(uint8_t opcode) {
     switch (opcode) {
         case 0: return "QUERY"; case 1: return "IQUERY"; case 2: return "STATUS";
         case 4: return "NOTIFY"; case 5: return "UPDATE";
-        default: return "UNKNOWN";
+        default: {
+            static _Thread_local char buf[32];
+            snprintf(buf, sizeof(buf), "%u", (unsigned int)opcode);
+            return buf;
+        }
     }
 }
 

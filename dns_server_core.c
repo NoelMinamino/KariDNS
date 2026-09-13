@@ -48,8 +48,8 @@
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
 
 // karidns
-// Copyright (c) 2026 Noel Minamino
-// Lisence: MIT
+// Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
+// License: MIT
 // All codes are developed by Gemini Pro, Claude Sonnet with Human Idea and
 // test.
 
@@ -273,7 +273,8 @@ typedef struct {
     alignas(64) _Atomic uint64_t dropped_count;
 } qlog_ring_t;
 
-// dnstap用イベント (Wire Formatをそのままコピーするため生パケットバッファを持つ)
+// dnstapイベントの共通メタデータ部分。wireバッファのサイズに依存しないため、
+// worker用リング(dnstap_event_t)とaux用リング(dnstap_aux_event_t)の双方で共有する。
 typedef struct {
     struct timespec ts;
     uint8_t message_type;   // 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
@@ -283,9 +284,15 @@ typedef struct {
     struct sockaddr_storage server_addr;
     socklen_t server_addr_len;
     bool has_server_addr;
+} dnstap_event_meta_t;
+
+// dnstap用イベント: UDPワーカーのSPSCリング専用。UDPクエリ/応答は
+// 実運用上4096Bを超えないため、ワーカー数×スロット数分のメモリコストを
+// 抑えるためここは小さいバッファのまま据え置く。
+typedef struct {
+    dnstap_event_meta_t meta;
     size_t wire_len;
     uint8_t wire[UDP_DEFAULT_MAX_RES_LEN > 4096 ? UDP_DEFAULT_MAX_RES_LEN : 4096];
-    alignas(8) _Atomic bool ready;
 } dnstap_event_t;
 
 typedef struct {
@@ -296,6 +303,27 @@ typedef struct {
     alignas(64) _Atomic uint32_t tail;
     alignas(64) _Atomic uint64_t dropped;
 } dnstap_ring_t;
+
+// dnstap用イベント: AXFR/非同期I/Oスレッド用のMPSC aux リング専用。
+// AXFR応答やDNSSEC付き大きいTCP応答はしばしば4096Bを超えるため、
+// TCP DNSメッセージの理論最大値(65535B)を格納できるバッファを持たせる。
+// このリングはAXFR等の同時実行数程度のスロット数で足りるため、
+// worker数に比例しない小さな追加メモリで済む。
+typedef struct {
+    dnstap_event_meta_t meta;
+    size_t wire_len;
+    uint8_t wire[65535];
+    alignas(8) _Atomic bool ready;
+} dnstap_aux_event_t;
+
+typedef struct {
+    dnstap_aux_event_t *events;
+    uint32_t size;
+    uint32_t mask;
+    alignas(64) _Atomic uint32_t head;
+    alignas(64) _Atomic uint32_t tail;
+    alignas(64) _Atomic uint64_t dropped;
+} dnstap_aux_ring_t;
 
 typedef struct {
   int thread_id;
@@ -410,6 +438,18 @@ static uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]) 
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
+static inline uint64_t rrl_hash_client_addr(const struct sockaddr_storage *client_addr) {
+  if (client_addr->ss_family == AF_INET) {
+    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr & htonl(0xFFFFFF00); // /24 mask
+    return siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
+  } else if (client_addr->ss_family == AF_INET6) {
+    // /56 mask (7 bytes prefix). Directly read sin6_addr without stack memcpy/memset
+    const uint8_t *s6 = (const uint8_t *)&((const struct sockaddr_in6 *)client_addr)->sin6_addr;
+    return siphash24(s6, 7, g_rrl_hash_key);
+  }
+  return 0;
+}
+
 static rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len) {
   if (res_len < DNS_HEADER_SIZE) return RRL_RESP_ERROR;
   uint8_t rcode = res_buf[3] & 0x0F;
@@ -436,32 +476,21 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   if (rate == 0) return true; // 0 means no limit
 
   char ip_str[INET6_ADDRSTRLEN] = {0};
-  if (client_addr->ss_family == AF_INET) {
-    inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
-  } else if (client_addr->ss_family == AF_INET6) {
-    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
-  }
-
-  if (cfg->exempt_clients_count > 0) {
-    for (int i = 0; i < cfg->exempt_clients_count; i++) {
-      if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return true;
+  if (cfg->exempt_clients_count > 0 || cfg->log_only) {
+    if (client_addr->ss_family == AF_INET) {
+      inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
+    } else if (client_addr->ss_family == AF_INET6) {
+      inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
+    }
+    if (cfg->exempt_clients_count > 0) {
+      for (int i = 0; i < cfg->exempt_clients_count; i++) {
+        if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return true;
+      }
     }
   }
 
-  uint64_t hash = 0;
-  uint64_t full_hash = 0;
-  if (client_addr->ss_family == AF_INET) {
-    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr;
-    ip &= htonl(0xFFFFFF00); // /24 mask
-    hash = siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
-    full_hash = hash;
-  } else if (client_addr->ss_family == AF_INET6) {
-    uint8_t ip6[16];
-    memcpy(ip6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, 16);
-    memset(&ip6[7], 0, 9); // /56 mask (7 bytes)
-    hash = siphash24(ip6, 16, g_rrl_hash_key);
-    full_hash = hash;
-  }
+  uint64_t full_hash = rrl_hash_client_addr(client_addr);
+  uint64_t hash = full_hash;
 
 #define RRL_PROBE_WAYS 4
 
@@ -473,7 +502,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   if (window_sec > 3600) window_sec = 3600;
 
   rrl_bucket_t *selected_bucket = NULL;
-  bool is_new_entry = false;
   size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
 
   // 1st Pass: Look for exact hash match
@@ -489,7 +517,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
     }
     if (b->client_hash == full_hash) {
       selected_bucket = b;
-      is_new_entry = false;
       break;
     }
     atomic_flag_clear_explicit(&b->lock, memory_order_release);
@@ -509,7 +536,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       }
       if (b->client_hash == 0 || (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000)) {
         selected_bucket = b;
-        is_new_entry = true;
         break;
       }
       atomic_flag_clear_explicit(&b->lock, memory_order_release);
@@ -523,7 +549,7 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   }
 
   rrl_bucket_t *b = selected_bucket;
-  if (is_new_entry) {
+  if (b->client_hash != full_hash) {
     b->client_hash = full_hash;
     for (int i = 0; i < 4; i++) {
       b->last_refill_ms[i] = now_ms;
@@ -546,7 +572,7 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       cfg->nxdomains_per_second,
       cfg->errors_per_second
     };
-    for(int i=0; i<4; i++) {
+    for (int i = 0; i < 4; i++) {
       if (rates[i] == 0) continue;
       int64_t elapsed_ms = now_ms - b->last_refill_ms[i];
       if (elapsed_ms > 0) {
@@ -594,33 +620,20 @@ static bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, 
   if (!cfg || !cfg->configured) return false;
   if (cfg->responses_per_second == 0) return false;
 
-  char ip_str[INET6_ADDRSTRLEN] = {0};
-  if (client_addr->ss_family == AF_INET) {
-    inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
-  } else if (client_addr->ss_family == AF_INET6) {
-    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
-  }
-
   if (cfg->exempt_clients_count > 0) {
+    char ip_str[INET6_ADDRSTRLEN] = {0};
+    if (client_addr->ss_family == AF_INET) {
+      inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
+    } else if (client_addr->ss_family == AF_INET6) {
+      inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
+    }
     for (int i = 0; i < cfg->exempt_clients_count; i++) {
       if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return false;
     }
   }
 
-  uint64_t hash = 0;
-  uint64_t full_hash = 0;
-  if (client_addr->ss_family == AF_INET) {
-    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr;
-    ip &= htonl(0xFFFFFF00); // /24 mask
-    hash = siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
-    full_hash = hash;
-  } else if (client_addr->ss_family == AF_INET6) {
-    uint8_t ip6[16];
-    memcpy(ip6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, 16);
-    memset(&ip6[7], 0, 9); // /56 mask (7 bytes)
-    hash = siphash24(ip6, 16, g_rrl_hash_key);
-    full_hash = hash;
-  }
+  uint64_t full_hash = rrl_hash_client_addr(client_addr);
+  uint64_t hash = full_hash;
 
   size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
   bool exhausted = false;
@@ -643,10 +656,9 @@ static bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, 
         }
       }
       atomic_flag_clear_explicit(&b->lock, memory_order_release);
-      break;
+      if (exhausted) break;
     }
   }
-
   return exhausted;
 }
 
@@ -659,6 +671,9 @@ typedef struct {
   int *hash_table;
   int *chain_next;
   size_t hash_size;
+  int *suffix_hash_table;   // 末尾ドット正規化済みキーによるインデックス (Task 2)
+  int *suffix_chain_next;
+  size_t suffix_hash_size;
 } view_snapshot_t;
 
 typedef struct {
@@ -742,7 +757,7 @@ static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
 static int g_dnstap_sock = -1;
 static _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
 static _Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
-static dnstap_ring_t g_aux_dnstap_ring;
+static dnstap_aux_ring_t g_aux_dnstap_ring;
 static worker_ctx_t *g_worker_ctxs = NULL;
 static int g_worker_count = 0;
 
@@ -1181,34 +1196,85 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
   return NULL;
 }
 
-static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
-  if (!view || !qname) return NULL;
-  size_t q_len = strlen(qname);
-  while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+static inline uint32_t calc_fnv1a_strn(const char *str, size_t len) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    uint8_t c = (uint8_t)str[i];
+    if (c >= 'A' && c <= 'Z')
+      c |= 0x20;
+    hash ^= c;
+    hash *= 16777619u;
+  }
+  return hash;
+}
 
-  zone_db_entry_t *best_entry = NULL;
-  size_t longest_match_len = 0;
-  for (size_t i = 0; i < view->zone_count; i++) {
+static zone_db_entry_t *view_suffix_hash_lookup(view_snapshot_t *view, const char *key, size_t key_len) {
+  if (!view || !view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
+    return NULL;
+  }
+  uint32_t hash = calc_fnv1a_strn(key, key_len);
+  size_t idx = hash & (view->suffix_hash_size - 1);
+  for (int i = view->suffix_hash_table[idx]; i != -1; i = view->suffix_chain_next[i]) {
     zone_db_entry_t *entry = view->entries[i];
     if (!entry) continue;
     size_t z_len = strlen(entry->domain);
     while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
-
-    bool match = false;
-    if (z_len == 0 && (strcmp(entry->domain, ".") == 0 || entry->domain[0] == '\0')) {
-      match = true;
-    } else if (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) {
-      match = true;
-    } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
-               strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0) {
-      match = true;
-    }
-    if (match && (!best_entry || z_len > longest_match_len)) {
-      longest_match_len = z_len;
-      best_entry = entry;
+    if (z_len == key_len && strncasecmp(entry->domain, key, key_len) == 0) {
+      return entry;
     }
   }
-  return best_entry;
+  return NULL;
+}
+
+static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
+  if (!view || !qname) return NULL;
+  if (!view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
+    // Suffix hash table not built (e.g. manually constructed mock view in fuzzers/tests)
+    // Fall back to linear scan
+    size_t q_len = strlen(qname);
+    while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+
+    zone_db_entry_t *best_entry = NULL;
+    size_t longest_match_len = 0;
+    for (size_t i = 0; i < view->zone_count; i++) {
+      zone_db_entry_t *entry = view->entries[i];
+      if (!entry) continue;
+      size_t z_len = strlen(entry->domain);
+      while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
+
+      bool match = false;
+      if (z_len == 0 && (strcmp(entry->domain, ".") == 0 || entry->domain[0] == '\0')) {
+        match = true;
+      } else if (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) {
+        match = true;
+      } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
+                 strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0) {
+        match = true;
+      }
+      if (match && (!best_entry || z_len > longest_match_len)) {
+        longest_match_len = z_len;
+        best_entry = entry;
+      }
+    }
+    return best_entry;
+  }
+
+  size_t q_len = strlen(qname);
+  while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+
+  const char *cursor = qname;
+  size_t remaining = q_len;
+  while (remaining > 0) {
+    zone_db_entry_t *hit = view_suffix_hash_lookup(view, cursor, remaining);
+    if (hit) return hit;
+    // 次のラベル境界まで進める（cursor内、remaining文字の範囲でドットを探す）
+    const char *dot = memchr(cursor, '.', remaining);
+    if (!dot) break;
+    remaining -= (size_t)(dot - cursor) + 1;
+    cursor = dot + 1;
+  }
+  // ルートゾーン（"." または空文字列）へのフォールバック
+  return view_suffix_hash_lookup(view, "", 0);
 }
 
 static inline void rcu_exponential_backoff(int *retries, useconds_t *sleep_time) {
@@ -1353,6 +1419,8 @@ static void *gc_snapshot_thread(void *arg) {
       }
       if (snap->views[v].hash_table) free(snap->views[v].hash_table);
       if (snap->views[v].chain_next) free(snap->views[v].chain_next);
+      if (snap->views[v].suffix_hash_table) free(snap->views[v].suffix_hash_table);
+      if (snap->views[v].suffix_chain_next) free(snap->views[v].suffix_chain_next);
     }
     free(snap->views);
   }
@@ -1425,9 +1493,14 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
       for (int j = 0; j < old_arena->records[i].rdata_count; j++) {
          txn->deleted[d_idx].rdata[j] = arena_strdup(&txn->arena, old_arena->records[i].rdata[j]);
       }
-      if (old_arena->records[i].generic_len > 0) {
+      if (old_arena->records[i].generic_len > 0 && old_arena->records[i].generic_data) {
          txn->deleted[d_idx].generic_data = arena_alloc(&txn->arena, old_arena->records[i].generic_len);
-         memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
+         if (txn->deleted[d_idx].generic_data)
+           memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
+      } else if (old_arena->records[i].generic_data) {
+         txn->deleted[d_idx].generic_data = (uint8_t *)"";
+      } else {
+         txn->deleted[d_idx].generic_data = NULL;
       }
       txn->deleted[d_idx].is_cached = false;
       dns_record_preparse_cache(&txn->arena, &txn->deleted[d_idx]);
@@ -1448,9 +1521,14 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
       for (int j = 0; j < new_arena->records[i].rdata_count; j++) {
          txn->added[a_idx].rdata[j] = arena_strdup(&txn->arena, new_arena->records[i].rdata[j]);
       }
-      if (new_arena->records[i].generic_len > 0) {
+      if (new_arena->records[i].generic_len > 0 && new_arena->records[i].generic_data) {
          txn->added[a_idx].generic_data = arena_alloc(&txn->arena, new_arena->records[i].generic_len);
-         memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
+         if (txn->added[a_idx].generic_data)
+           memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
+      } else if (new_arena->records[i].generic_data) {
+         txn->added[a_idx].generic_data = (uint8_t *)"";
+      } else {
+         txn->added[a_idx].generic_data = NULL;
       }
       txn->added[a_idx].is_cached = false;
       dns_record_preparse_cache(&txn->arena, &txn->added[a_idx]);
@@ -1730,6 +1808,8 @@ static void prelink_zone_additional_glue(zone_arena_t *current_zone,
           d_rec->generic_data = (uint8_t *)arena_alloc(current_zone, src_rec->generic_len);
           if (d_rec->generic_data)
             memcpy(d_rec->generic_data, src_rec->generic_data, src_rec->generic_len);
+        } else if (src_rec->generic_data) {
+          d_rec->generic_data = (uint8_t *)"";
         } else {
           d_rec->generic_data = NULL;
         }
@@ -1925,7 +2005,9 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
 
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                      ? zcfg->additional_from_auth
+                                      : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
@@ -2045,6 +2127,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (size_t v = 0; v < old_snap->view_count; v++) {
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
+                    if (!entry) continue;
                     if (entry->catalog_member_count > 0) {
                         max_valid_members += entry->catalog_member_count;
                     }
@@ -2062,6 +2145,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (size_t v = 0; v < old_snap->view_count; v++) {
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
+                    if (!entry) continue;
                     if (entry->catalog_member_count > 0) {
                         zone_config_t *zcfg = find_zone_config_in_view(active_config, entry->view_name, entry->domain);
                         if (zcfg && zcfg->is_catalog) {
@@ -2132,6 +2216,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
                         for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
                             zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
+                            if (!entry) continue;
                             if (entry->is_catalog_member) {
                                 bool is_valid = false;
                                 for (int k = 0; k < valid_member_count; k++) {
@@ -2173,6 +2258,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     for (size_t ov = 0; ov < old_snap->view_count; ov++) {
                         if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
                             for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
+                                if (!old_snap->views[ov].entries[oi]) continue;
                                 if (strcasecmp(old_snap->views[ov].entries[oi]->domain, z->domain) == 0) {
                                     entry = old_snap->views[ov].entries[oi];
                                     atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
@@ -2193,6 +2279,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         reload_master_zone(entry, z);
                     }
                 }
+                if (!entry) {
+                    syslog(LOG_ERR, "[Core] Failed to allocate memory for zone '%s' in view '%s', skipping this zone this reload cycle",
+                           z->domain, v->name);
+                    continue;
+                }
                 vs->entries[zidx++] = entry;
             }
 
@@ -2201,6 +2292,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
                         for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
                             zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
+                            if (!entry) continue;
                             if (entry->is_catalog_member) {
                                 bool is_valid = false;
                                 for (int k = 0; k < valid_member_count; k++) {
@@ -2227,6 +2319,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     }
                 }
             }
+            vs->zone_count = zidx;
         }
         if (valid_members) free(valid_members);
 
@@ -2510,9 +2603,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         if (des_chain_next) free(des_chain_next);
 
         zone_db_entry_t **new_entries = calloc(added_count > 0 ? added_count : 1, sizeof(zone_db_entry_t*));
+        if (!new_entries) {
+            free(added_members); free(removed_members); free(coo_evicted_members);
+            abort_rebuild_snapshot(new_snap, "catalog new_entries");
+            return NULL;
+        }
+        int actual_added_count = 0;
         for (int i = 0; i < added_count; i++) {
-            zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);
             zone_db_entry_t *entry = create_new_zone_entry(added_members[i].domain, catalog_view_name);
+            if (!entry) {
+                syslog(LOG_ERR, "[Catalog] Failed to allocate memory for member '%s' owned by %s, skipping",
+                       added_members[i].domain, catalog_entry_to_update->domain);
+                continue;
+            }
             strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
@@ -2533,8 +2636,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 strncpy(entry->cached_tsig_key_name, catalog_cfg->tsig_key, sizeof(entry->cached_tsig_key_name) - 1);
             }
             atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
-            new_entries[i] = entry;
+            new_entries[actual_added_count++] = entry;
         }
+        added_count = actual_added_count;
 
         new_snap->view_count = old_snap ? old_snap->view_count : 0;
         if (new_snap->view_count > 0) {
@@ -2696,8 +2800,23 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 for (size_t i = 0; i < vs->zone_count; i++) vs->chain_next[i] = -1;
             }
         }
+
+        vs->suffix_hash_size = p;
+        if (vs->suffix_hash_size > 0) {
+            vs->suffix_hash_table = malloc(vs->suffix_hash_size * sizeof(int));
+            if (vs->suffix_hash_table) {
+                for (size_t i = 0; i < vs->suffix_hash_size; i++) vs->suffix_hash_table[i] = -1;
+            }
+        }
+        if (vs->zone_count > 0) {
+            vs->suffix_chain_next = malloc(vs->zone_count * sizeof(int));
+            if (vs->suffix_chain_next) {
+                for (size_t i = 0; i < vs->zone_count; i++) vs->suffix_chain_next[i] = -1;
+            }
+        }
         
-        if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next)) {
+        if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next) ||
+            (vs->suffix_hash_size > 0 && !vs->suffix_hash_table) || (vs->zone_count > 0 && !vs->suffix_chain_next)) {
             syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name);
             void *gc_snapshot_thread(void *arg);
             gc_snapshot_thread(new_snap); // Clean up the new snapshot cleanly
@@ -2707,10 +2826,23 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
         if (vs->hash_table && vs->chain_next) {
             for (size_t i = 0; i < vs->zone_count; i++) {
+                if (!vs->entries[i]) continue;
                 uint32_t hash = calc_fnv1a_str(vs->entries[i]->domain);
                 size_t idx = hash & (vs->hash_size - 1);
                 vs->chain_next[i] = vs->hash_table[idx];
                 vs->hash_table[idx] = i;
+            }
+        }
+
+        if (vs->suffix_hash_table && vs->suffix_chain_next) {
+            for (size_t i = 0; i < vs->zone_count; i++) {
+                if (!vs->entries[i]) continue;
+                size_t z_len = strlen(vs->entries[i]->domain);
+                while (z_len > 0 && vs->entries[i]->domain[z_len - 1] == '.') z_len--;
+                uint32_t hash = calc_fnv1a_strn(vs->entries[i]->domain, z_len);
+                size_t idx = hash & (vs->suffix_hash_size - 1);
+                vs->suffix_chain_next[i] = vs->suffix_hash_table[idx];
+                vs->suffix_hash_table[idx] = i;
             }
         }
     }
@@ -3022,7 +3154,11 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                     wait_for_readers(z_standby);
                     clone_zone_arena(z_active, z_standby);
                     build_zone_index(z_standby, true);
-                    prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, config->additional_from_auth);
+                    zone_config_t *zcfg = find_zone_config_in_view(config, view->name, entry->domain);
+                    additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                                        ? zcfg->additional_from_auth
+                                                        : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
+                    prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, policy);
                     atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
                 }
                 pthread_mutex_unlock(&entry->writer_lock);
@@ -3203,8 +3339,11 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
       d_rec->generic_data = (uint8_t *)arena_alloc(dst, s_rec->generic_len);
       if (d_rec->generic_data)
         memcpy(d_rec->generic_data, s_rec->generic_data, s_rec->generic_len);
-    } else
+    } else if (s_rec->generic_data) {
+      d_rec->generic_data = (uint8_t *)"";
+    } else {
       d_rec->generic_data = NULL;
+    }
     d_rec->next_record = -1;
     d_rec->is_cached = false;
     dns_record_preparse_cache(dst, d_rec);
@@ -3513,6 +3652,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           if (21 + orig_rdlen <= rec->generic_len) {
             uint8_t fake_wire[4096];
             size_t fake_len = 0;
+            bool reconstructed = false;
             const char *d = rec->name;
             while (*d) {
               const char *dot = strchr_unescaped(d, '.');
@@ -3536,18 +3676,29 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
             fake_wire[fake_len++] = orig_ttl & 0xFF;
             fake_wire[fake_len++] = (orig_rdlen >> 8) & 0xFF;
             fake_wire[fake_len++] = orig_rdlen & 0xFF;
-            if (orig_rdlen > 0) {
+            /* SECURITY FIX: orig_rdlen comes from the wrapped rdata sent by the
+             * AXFR/IXFR peer and can be up to 65535, far larger than the fixed
+             * fake_wire[4096] stack buffer. Previously this was copied
+             * unconditionally, allowing a malicious/compromised zone-transfer
+             * source to overflow the stack. Verify it fits before copying, and
+             * fall back to the existing synthetic-record path otherwise. */
+            if (orig_rdlen > 0 && fake_len + (size_t)orig_rdlen <= sizeof(fake_wire)) {
               memcpy(&fake_wire[fake_len], &rec->generic_data[21], orig_rdlen);
               fake_len += orig_rdlen;
+            } else if (orig_rdlen > 0) {
+              fake_len = 0; /* force fallback below; do not attempt to parse */
             }
             size_t fake_off = 0;
             uint16_t parsed_t;
             dns_record_t unwrapped;
             memset(&unwrapped, 0, sizeof(unwrapped));
-            if (parse_resource_record(fake_wire, fake_len, &fake_off, standby, &unwrapped, &parsed_t) == 0) {
+            if (fake_len > 0 &&
+                parse_resource_record(fake_wire, fake_len, &fake_off, standby, &unwrapped, &parsed_t) == 0) {
               *rec = unwrapped;
               type = parsed_t;
-            } else {
+              reconstructed = true;
+            }
+            if (!reconstructed) {
               rec->generic_data = NULL;
               rec->generic_len = 0;
               rec->type_code = orig_type;
@@ -3789,7 +3940,10 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 
         zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
         server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-        additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+        zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
+        additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                            ? zcfg->additional_from_auth
+                                            : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
         prelink_zone_additional_glue(standby, entry->domain, cur_snap, NULL, policy);
         if (cur_snap) release_zone_snapshot(cur_snap);
 
@@ -4864,7 +5018,9 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
     }
     
     // ==== フェーズ1: 委任判定 ====
-    additional_from_auth_t policy = cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES;
+    additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                        ? zcfg->additional_from_auth
+                                        : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, current_qname_hash, db_entry->domain, res,
                         max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
@@ -5874,7 +6030,10 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+  zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
+  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                      ? zcfg->additional_from_auth
+                                      : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
@@ -8340,30 +8499,32 @@ static int dnstap_connect_and_handshake(const char *socket_path, const char *ide
     return sock;
 }
 
-static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, size_t out_cap) {
-    uint8_t msg_buf[4200];
+static size_t dnstap_build_message(const dnstap_event_meta_t *meta,
+                                   const uint8_t *wire, size_t wire_len,
+                                   uint8_t *out_buf, size_t out_cap) {
+    uint8_t msg_buf[65535 + 256];
     size_t msg_offset = 0;
 
     // Message.type (field 1, required, varint): 1 = AUTH_QUERY, 2 = AUTH_RESPONSE
-    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, ev->message_type);
+    msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 1, meta->message_type);
 
     // Message.socket_family (field 2, varint): 1 = INET, 2 = INET6
-    uint32_t fam = (ev->client_addr.ss_family == AF_INET6) ? 2 : 1;
+    uint32_t fam = (meta->client_addr.ss_family == AF_INET6) ? 2 : 1;
     msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 2, fam);
 
     // Message.socket_protocol (field 3, varint): 1 = UDP, 2 = TCP
-    uint32_t proto = (ev->protocol == IPPROTO_TCP) ? 2 : 1;
+    uint32_t proto = (meta->protocol == IPPROTO_TCP) ? 2 : 1;
     msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 3, proto);
 
     // Message.query_address (field 4, bytes) & query_port (field 6, varint)
-    if (ev->client_addr.ss_family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)&ev->client_addr;
+    if (meta->client_addr.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&meta->client_addr;
         msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
                                             (const uint8_t *)&sin->sin_addr, 4);
         msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
                                              ntohs(sin->sin_port));
-    } else if (ev->client_addr.ss_family == AF_INET6) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ev->client_addr;
+    } else if (meta->client_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&meta->client_addr;
         msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 4,
                                             (const uint8_t *)&sin6->sin6_addr, 16);
         msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 6,
@@ -8371,17 +8532,17 @@ static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, s
     }
 
     // Message.response_address (field 5, bytes) & response_port (field 7, varint)
-    if (ev->has_server_addr) {
-        if (ev->server_addr.ss_family == AF_INET) {
-            struct sockaddr_in *sin = (struct sockaddr_in *)&ev->server_addr;
+    if (meta->has_server_addr) {
+        if (meta->server_addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&meta->server_addr;
             msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
                                                 (const uint8_t *)&sin->sin_addr, 4);
             if (sin->sin_port != 0) {
                 msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 7,
                                                      ntohs(sin->sin_port));
             }
-        } else if (ev->server_addr.ss_family == AF_INET6) {
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ev->server_addr;
+        } else if (meta->server_addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&meta->server_addr;
             msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 5,
                                                 (const uint8_t *)&sin6->sin6_addr, 16);
             if (sin6->sin6_port != 0) {
@@ -8391,14 +8552,14 @@ static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, s
         }
     }
 
-    if (ev->message_type == 1 /* AUTH_QUERY */) {
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)ev->ts.tv_sec);
-        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)ev->ts.tv_nsec);
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, ev->wire, ev->wire_len);
+    if (meta->message_type == 1 /* AUTH_QUERY */) {
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 8, (uint64_t)meta->ts.tv_sec);
+        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 9, (uint32_t)meta->ts.tv_nsec);
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 10, wire, wire_len);
     } else { // AUTH_RESPONSE
-        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 12, (uint64_t)ev->ts.tv_sec);
-        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)ev->ts.tv_nsec);
-        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, ev->wire, ev->wire_len);
+        msg_offset += pb_encode_varint_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 12, (uint64_t)meta->ts.tv_sec);
+        msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)meta->ts.tv_nsec);
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, wire, wire_len);
     }
 
     // Top-level Dnstap: field 1 (identity), field 2 (version), field 15 (type = 1, MESSAGE, required), field 14 (message)
@@ -8417,17 +8578,18 @@ static size_t dnstap_build_message(const dnstap_event_t *ev, uint8_t *out_buf, s
     return out_offset;
 }
 
-static bool dnstap_send_frame(const dnstap_event_t *ev) {
+static bool dnstap_send_frame(const dnstap_event_meta_t *meta,
+                              const uint8_t *wire, size_t wire_len,
+                              uint8_t *scratch_buf, size_t scratch_cap) {
     if (g_dnstap_sock < 0) return false;
-    uint8_t payload[4600];
-    size_t plen = dnstap_build_message(ev, payload, sizeof(payload));
+    size_t plen = dnstap_build_message(meta, wire, wire_len, scratch_buf, scratch_cap);
     if (plen == 0) return true;
 
     uint32_t be_len = htonl((uint32_t)plen);
     struct iovec iov[2];
     iov[0].iov_base = &be_len;
     iov[0].iov_len = 4;
-    iov[1].iov_base = payload;
+    iov[1].iov_base = scratch_buf;
     iov[1].iov_len = plen;
 
     size_t total_written = 0;
@@ -8444,44 +8606,46 @@ static bool dnstap_send_frame(const dnstap_event_t *ev) {
             iov[0].iov_len = 4 - total_written;
         } else {
             iov[0].iov_len = 0;
-            iov[1].iov_base = payload + (total_written - 4);
+            iov[1].iov_base = scratch_buf + (total_written - 4);
             iov[1].iov_len = plen - (total_written - 4);
         }
     }
     return true;
 }
 
-static inline void fill_dnstap_event(dnstap_event_t *ev, uint8_t message_type,
-                                     const uint8_t *wire, size_t wire_len,
+static inline void fill_dnstap_event(dnstap_event_meta_t *meta,
+                                     uint8_t *wire_dst, size_t wire_dst_cap, size_t *out_wire_len,
+                                     uint8_t message_type,
+                                     const uint8_t *wire_src, size_t wire_src_len,
                                      const struct sockaddr_storage *client_addr,
                                      socklen_t client_addr_len,
                                      const struct sockaddr_storage *server_addr,
                                      bool has_server_addr, uint8_t protocol) {
-    clock_gettime(CLOCK_REALTIME, &ev->ts);
-    ev->message_type = message_type;
-    ev->protocol = protocol;
+    clock_gettime(CLOCK_REALTIME, &meta->ts);
+    meta->message_type = message_type;
+    meta->protocol = protocol;
     if (client_addr) {
-        memcpy(&ev->client_addr, client_addr, sizeof(*client_addr));
-        ev->client_addr_len = client_addr_len;
+        memcpy(&meta->client_addr, client_addr, sizeof(*client_addr));
+        meta->client_addr_len = client_addr_len;
     } else {
-        memset(&ev->client_addr, 0, sizeof(ev->client_addr));
-        ev->client_addr_len = 0;
+        memset(&meta->client_addr, 0, sizeof(meta->client_addr));
+        meta->client_addr_len = 0;
     }
-    ev->has_server_addr = has_server_addr;
+    meta->has_server_addr = has_server_addr;
     if (has_server_addr && server_addr) {
-        memcpy(&ev->server_addr, server_addr, sizeof(*server_addr));
-        ev->server_addr_len = sizeof(*server_addr);
+        memcpy(&meta->server_addr, server_addr, sizeof(*server_addr));
+        meta->server_addr_len = sizeof(*server_addr);
     } else {
-        memset(&ev->server_addr, 0, sizeof(ev->server_addr));
-        ev->server_addr_len = 0;
+        memset(&meta->server_addr, 0, sizeof(meta->server_addr));
+        meta->server_addr_len = 0;
     }
-    size_t copy_len = wire_len;
-    if (copy_len > sizeof(ev->wire)) {
-        copy_len = sizeof(ev->wire);
+    size_t copy_len = wire_src_len;
+    if (copy_len > wire_dst_cap) {
+        copy_len = wire_dst_cap;
         atomic_fetch_add_explicit(&g_dnstap_truncated_total, 1, memory_order_relaxed);
     }
-    memcpy(ev->wire, wire, copy_len);
-    ev->wire_len = copy_len;
+    memcpy(wire_dst, wire_src, copy_len);
+    *out_wire_len = copy_len;
 }
 
 static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
@@ -8504,7 +8668,8 @@ static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
             return;
         }
         dnstap_event_t *ev = &ring->events[h & ring->mask];
-        fill_dnstap_event(ev, message_type, wire, wire_len, client_addr, client_addr_len,
+        fill_dnstap_event(&ev->meta, ev->wire, sizeof(ev->wire), &ev->wire_len,
+                          message_type, wire, wire_len, client_addr, client_addr_len,
                           server_addr, has_server_addr, protocol);
         atomic_store_explicit(&ring->head, h + 1, memory_order_release);
     } else {
@@ -8512,17 +8677,26 @@ static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
         if (!g_aux_dnstap_ring.events) return;
 
         uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_relaxed);
-        uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_acquire);
-        do {
+        for (;;) {
+            // CASのリトライ毎にtailを読み直す。stale tailによる
+            // "満杯判定漏れ→未送信スロット上書き" を防止するため、
+            // headだけでなくtailも毎回最新値で判定する。
+            uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_acquire);
             if (h - t >= g_aux_dnstap_ring.size) {
                 atomic_fetch_add_explicit(&g_aux_dnstap_ring.dropped, 1, memory_order_relaxed);
                 return;
             }
-        } while (!atomic_compare_exchange_weak_explicit(&g_aux_dnstap_ring.head, &h, h + 1,
-                                                        memory_order_acq_rel, memory_order_relaxed));
+            if (atomic_compare_exchange_weak_explicit(&g_aux_dnstap_ring.head, &h, h + 1,
+                                                       memory_order_acq_rel, memory_order_relaxed)) {
+                break; // スロット予約成功。h は予約したインデックス。
+            }
+            // CAS失敗時、hには最新のhead値が書き戻されるので、次のループでtailを
+            // 読み直してから再判定する。
+        }
 
-        dnstap_event_t *ev = &g_aux_dnstap_ring.events[h & g_aux_dnstap_ring.mask];
-        fill_dnstap_event(ev, message_type, wire, wire_len, client_addr, client_addr_len,
+        dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[h & g_aux_dnstap_ring.mask];
+        fill_dnstap_event(&ev->meta, ev->wire, sizeof(ev->wire), &ev->wire_len,
+                          message_type, wire, wire_len, client_addr, client_addr_len,
                           server_addr, has_server_addr, protocol);
         atomic_store_explicit(&ev->ready, true, memory_order_release);
     }
@@ -8530,6 +8704,7 @@ static inline void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
 
 void *dnstap_sender_thread_func(void *arg) {
     (void)arg;
+    static uint8_t g_dnstap_scratch_buf[65535 + 128]; // 送信スレッドは1本のみなので競合しない
     while (1) {
         bool any_work = false;
         int num_workers = g_worker_count;
@@ -8544,7 +8719,8 @@ void *dnstap_sender_thread_func(void *arg) {
                     while (t != h) {
                         dnstap_event_t *ev = &ring->events[t & ring->mask];
                         any_work = true;
-                        if (!dnstap_send_frame(ev)) {
+                        if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len,
+                                               g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf))) {
                             atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
                             if (g_dnstap_sock >= 0) {
                                 close(g_dnstap_sock);
@@ -8565,12 +8741,13 @@ void *dnstap_sender_thread_func(void *arg) {
                 uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
                 uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
                 while (t != h) {
-                    dnstap_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+                    dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
                     if (!atomic_load_explicit(&ev->ready, memory_order_acquire)) {
                         break;
                     }
                     any_work = true;
-                    if (!dnstap_send_frame(ev)) {
+                    if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len,
+                                           g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf))) {
                         atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
                         if (g_dnstap_sock >= 0) {
                             close(g_dnstap_sock);
@@ -12293,7 +12470,7 @@ int main(int argc, char **argv) {
   }
   g_aux_dnstap_ring.size = dnstap_aux_buf_size;
   g_aux_dnstap_ring.mask = dnstap_aux_buf_size - 1;
-  g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_event_t));
+  g_aux_dnstap_ring.events = calloc(dnstap_aux_buf_size, sizeof(dnstap_aux_event_t));
   atomic_init(&g_aux_dnstap_ring.head, 0);
   atomic_init(&g_aux_dnstap_ring.tail, 0);
   atomic_init(&g_aux_dnstap_ring.dropped, 0);
@@ -12395,6 +12572,7 @@ int main(int argc, char **argv) {
 
   // シャットダウン前にリングバッファ内の未送信dnstapイベントを確実にドレイン
   if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
+    uint8_t shutdown_scratch_buf[65535 + 128];
     if (num_workers > 0 && ctxs) {
       for (int w = 0; w < num_workers; w++) {
         dnstap_ring_t *ring = &ctxs[w].dnstap_ring;
@@ -12402,7 +12580,8 @@ int main(int argc, char **argv) {
         uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
         uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
         while (t != h) {
-          dnstap_send_frame(&ring->events[t & ring->mask]);
+          dnstap_event_t *ev = &ring->events[t & ring->mask];
+          dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, shutdown_scratch_buf, sizeof(shutdown_scratch_buf));
           t++;
         }
         atomic_store_explicit(&ring->tail, t, memory_order_release);
@@ -12412,9 +12591,9 @@ int main(int argc, char **argv) {
       uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
       uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
       while (t != h) {
-        dnstap_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+        dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
         if (atomic_load_explicit(&ev->ready, memory_order_acquire)) {
-          dnstap_send_frame(ev);
+          dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, shutdown_scratch_buf, sizeof(shutdown_scratch_buf));
           atomic_store_explicit(&ev->ready, false, memory_order_release);
         }
         t++;

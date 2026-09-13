@@ -675,6 +675,13 @@ if [ "$CLIENT_ARG" != "dig" ]; then
     if ! sh "$SCRIPT_DIR/run_dag_replay_diff_test.sh"; then
         FAILED=$((FAILED + 1))
     fi
+
+    echo "========================================================"
+    echo "Running dag --replay --compare-recorded Testing Suite..."
+    echo "========================================================"
+    if ! sh "$SCRIPT_DIR/run_dag_replay_compare_recorded_test.sh"; then
+        FAILED=$((FAILED + 1))
+    fi
 fi
 
 echo "========================================================"

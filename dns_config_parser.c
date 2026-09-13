@@ -1277,6 +1277,34 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_zone_config(zone);
         return -1;
       }
+    } else if (strcmp(key, "additional-from-auth") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      zone->additional_from_auth_specified = true;
+      if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
+        zone->additional_from_auth = ADDITIONAL_AUTH_YES;
+      else if (strcmp(tok.value, "in-domain") == 0 || strcmp(tok.value, "in-zone") == 0)
+        zone->additional_from_auth = ADDITIONAL_AUTH_IN_DOMAIN;
+      else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
+        zone->additional_from_auth = ADDITIONAL_AUTH_NO;
+      else {
+        syslog(LOG_WARNING, "[Config] zone '%s': Unknown additional-from-auth value '%s', defaulting to yes", zone->domain, tok.value);
+        zone->additional_from_auth = ADDITIONAL_AUTH_YES;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
     } else
       skip_unknown_block(ctx);
     free(key);

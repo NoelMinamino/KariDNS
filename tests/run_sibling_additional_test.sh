@@ -161,12 +161,73 @@ zone "example-sibling.jp" {
 };
 EOF
 
+ZONE_OVR_INDOMAIN="$TMP_DIR/ovr-indomain.jp.zone"
+ZONE_OVR_NO="$TMP_DIR/ovr-no.jp.zone"
+ZONE_OVR_YES="$TMP_DIR/ovr-yes.jp.zone"
+
+cat << 'EOF' > "$ZONE_OVR_INDOMAIN"
+$ORIGIN ovr-indomain.jp.
+$TTL 86400
+@           IN SOA   ns1.ovr-indomain.jp. hostmaster.ovr-indomain.jp. 2026090401 7200 3600 1209600 86400
+@           IN NS    ns1.v6.example.com.
+@           IN NS    ns1.city.ovr-indomain.jp.
+ns1.city    IN A     192.0.2.15
+EOF
+
+cat << 'EOF' > "$ZONE_OVR_NO"
+$ORIGIN ovr-no.jp.
+$TTL 86400
+@           IN SOA   ns1.ovr-no.jp. hostmaster.ovr-no.jp. 2026090401 7200 3600 1209600 86400
+@           IN NS    ns1.v6.example.com.
+@           IN NS    ns1.city.ovr-no.jp.
+ns1.city    IN A     192.0.2.15
+EOF
+
+cat << 'EOF' > "$ZONE_OVR_YES"
+$ORIGIN ovr-yes.jp.
+$TTL 86400
+@           IN SOA   ns1.ovr-yes.jp. hostmaster.ovr-yes.jp. 2026090401 7200 3600 1209600 86400
+@           IN NS    ns1.v6.example.com.
+@           IN NS    ns1.city.ovr-yes.jp.
+ns1.city    IN A     192.0.2.15
+EOF
+
+CONF_OVERRIDE="$TMP_DIR/sibling_override.conf"
+cat << EOF > "$CONF_OVERRIDE"
+options {
+    port 10057;
+    bind-address { 127.0.0.1; };
+    additional-from-auth yes;
+    user "nobody";
+    group "nobody";
+};
+zone "example.com" {
+    type master;
+    file "$ZONE_COM";
+};
+zone "ovr-indomain.jp" {
+    type master;
+    file "$ZONE_OVR_INDOMAIN";
+    additional-from-auth in-domain;
+};
+zone "ovr-no.jp" {
+    type master;
+    file "$ZONE_OVR_NO";
+    additional-from-auth no;
+};
+zone "ovr-yes.jp" {
+    type master;
+    file "$ZONE_OVR_YES";
+};
+EOF
+
 cleanup() {
     echo "[*] Cleaning up test processes..."
     [ -n "$SERVER_PID_YES" ] && kill -9 "$SERVER_PID_YES" 2>/dev/null || true
     [ -n "$SERVER_PID_IN" ] && kill -9 "$SERVER_PID_IN" 2>/dev/null || true
     [ -n "$SERVER_PID_NO" ] && kill -9 "$SERVER_PID_NO" 2>/dev/null || true
     [ -n "$SERVER_PID_SIBLING" ] && kill -9 "$SERVER_PID_SIBLING" 2>/dev/null || true
+    [ -n "$SERVER_PID_OVERRIDE" ] && kill -9 "$SERVER_PID_OVERRIDE" 2>/dev/null || true
     killall -9 karidns 2>/dev/null || true
     rm -rf "$TMP_DIR" 2>/dev/null || true
     rm -f "$DIR"/server_sibling_*.log
@@ -349,6 +410,58 @@ echo "[PASS] Test 4: Sibling domain (ns-sibling.v6.example-sibling.jp A/AAAA) su
 
 killall -9 karidns 2>/dev/null || true
 SERVER_PID_SIBLING=""
+sleep 1
+
+# -------------------------------------------------------------
+# Test 5: Zone-level additional-from-auth override
+# -------------------------------------------------------------
+echo "[*] Starting KariDNS with zone-level additional-from-auth overrides on port 10057..."
+$BIN -f -c "$CONF_OVERRIDE" > "$DIR/server_sibling_ovr.log" 2>&1 &
+SERVER_PID_OVERRIDE=$!
+sleep 2
+
+if ! kill -0 "$SERVER_PID_OVERRIDE" 2>/dev/null; then
+    echo "[FAIL] Server (zone override) failed to start. Log output:"
+    cat "$DIR/server_sibling_ovr.log" 2>/dev/null || true
+    exit 1
+fi
+
+echo "[*] Querying NS ovr-indomain.jp on port 10057..."
+OUT_OVR_IN=$($DAG NS ovr-indomain.jp @127.0.0.1 -p 10057)
+echo "$OUT_OVR_IN"
+if ! echo "$OUT_OVR_IN" | grep -q "ns1.city.ovr-indomain.jp.*192.0.2.15"; then
+    echo "[FAIL] In-domain glue missing for ovr-indomain.jp!"
+    exit 1
+fi
+if echo "$OUT_OVR_IN" | grep -q "192.0.2.86"; then
+    echo "[FAIL] Sibling glue present for ovr-indomain.jp with additional-from-auth in-domain!"
+    exit 1
+fi
+
+echo "[*] Querying NS ovr-no.jp on port 10057..."
+OUT_OVR_NO=$($DAG NS ovr-no.jp @127.0.0.1 -p 10057)
+echo "$OUT_OVR_NO"
+if echo "$OUT_OVR_NO" | grep -E "192.0.2.15|192.0.2.86"; then
+    echo "[FAIL] Address records returned for ovr-no.jp with additional-from-auth no!"
+    exit 1
+fi
+
+echo "[*] Querying NS ovr-yes.jp on port 10057..."
+OUT_OVR_YES=$($DAG NS ovr-yes.jp @127.0.0.1 -p 10057)
+echo "$OUT_OVR_YES"
+if ! echo "$OUT_OVR_YES" | grep -q "ns1.city.ovr-yes.jp.*192.0.2.15"; then
+    echo "[FAIL] In-domain glue missing for ovr-yes.jp!"
+    exit 1
+fi
+if ! echo "$OUT_OVR_YES" | grep -q "ns1.v6.example.com.*192.0.2.86"; then
+    echo "[FAIL] Sibling glue missing for ovr-yes.jp (inherited yes)!"
+    exit 1
+fi
+
+echo "[PASS] Test 5: Zone-level additional-from-auth overrides successfully verified!"
+
+killall -9 karidns 2>/dev/null || true
+SERVER_PID_OVERRIDE=""
 
 echo "[ALL PASS] Sibling domain Additional glue test suite passed successfully!"
 exit 0

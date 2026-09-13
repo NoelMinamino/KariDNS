@@ -255,3 +255,10 @@ dag example.com AXFR @127.0.0.1 -p 53 +tcp
 - **Zero Hot-Path Allocations (Rule 1)**: Tag resolution and prefix matching are implemented with bitwise comparisons and stack buffers; no `malloc` or `free` calls occur during query processing.
 - **Capsicum Sandbox Safety (Rule 2)**: All tags and network structures are compiled prior to sandbox entry (`cap_enter(2)`).
 - **Lock-Free RCU Updates**: Dynamic zone reloads (`karictl reload`) swap arena snapshots atomically, ensuring zero-downtime steering updates.
+
+---
+
+## AUTHORS
+
+Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
+

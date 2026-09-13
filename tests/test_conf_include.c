@@ -309,6 +309,62 @@ int main(void) {
         printf("  -> PASS (no heap-use-after-free or double free on validation rejection)\n");
     }
 
+    // Test 13: Zone-level additional-from-auth parsing
+    {
+        printf("[Test 13] Zone-level additional-from-auth parsing...\n");
+        const char *conf =
+            "options {\n"
+            "    additional-from-auth yes;\n"
+            "};\n"
+            "zone \"z1.example.com\" {\n"
+            "    type master;\n"
+            "    file \"z1.zone\";\n"
+            "    additional-from-auth no;\n"
+            "};\n"
+            "zone \"z2.example.com\" {\n"
+            "    type master;\n"
+            "    file \"z2.zone\";\n"
+            "    additional-from-auth in-domain;\n"
+            "};\n"
+            "zone \"z3.example.com\" {\n"
+            "    type master;\n"
+            "    file \"z3.zone\";\n"
+            "    additional-from-auth yes;\n"
+            "};\n"
+            "zone \"z4.example.com\" {\n"
+            "    type master;\n"
+            "    file \"z4.zone\";\n"
+            "};\n";
+
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        int res = parse_named_conf(conf, &cfg);
+        assert(res == 0);
+        assert(cfg.additional_from_auth == ADDITIONAL_AUTH_YES);
+
+        zone_config_t *z1 = cfg.zones;
+        assert(z1 != NULL && strcmp(z1->domain, "z1.example.com.") == 0);
+        assert(z1->additional_from_auth_specified == true);
+        assert(z1->additional_from_auth == ADDITIONAL_AUTH_NO);
+
+        zone_config_t *z2 = z1->next;
+        assert(z2 != NULL && strcmp(z2->domain, "z2.example.com.") == 0);
+        assert(z2->additional_from_auth_specified == true);
+        assert(z2->additional_from_auth == ADDITIONAL_AUTH_IN_DOMAIN);
+
+        zone_config_t *z3 = z2->next;
+        assert(z3 != NULL && strcmp(z3->domain, "z3.example.com.") == 0);
+        assert(z3->additional_from_auth_specified == true);
+        assert(z3->additional_from_auth == ADDITIONAL_AUTH_YES);
+
+        zone_config_t *z4 = z3->next;
+        assert(z4 != NULL && strcmp(z4->domain, "z4.example.com.") == 0);
+        assert(z4->additional_from_auth_specified == false);
+
+        free_server_config_fields(&cfg);
+        printf("  -> PASS (zone-level additional-from-auth correctly parsed)\n");
+    }
+
     // Clean up temporary test files
     unlink("tests_inc_tmp/keys.conf");
     unlink("tests_inc_tmp/main_key.conf");
