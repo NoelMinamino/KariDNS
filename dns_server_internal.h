@@ -45,6 +45,7 @@
 
 #include "dns_dnstap.h"
 #include "dns_edns_ecs.h"
+#include "dns_rrl.h"
 
 #define DNS_PORT 53
 #define MAX_EVENTS 1024
