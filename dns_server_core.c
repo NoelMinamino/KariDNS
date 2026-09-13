@@ -3574,7 +3574,6 @@ static void setup_ipc_tables(int num_workers) {
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   init_server_cookie_secret();
-  rrl_init();
   // SipHash-2-4 self-test against official reference test vector
   // Key: 00010203...0f, Message: 000102...0e (15 bytes)
   // Expected output: 0xa129ca6149be45e5
@@ -3962,6 +3961,7 @@ int main(int argc, char **argv) {
   }
   close(g_notify_ipc[0]); // Frontend側端点をクローズ
   init_async_io_pool();
+  rrl_init();
 
   pthread_t control_thread;
   if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
@@ -4178,5 +4178,6 @@ int main(int argc, char **argv) {
     }
     free_server_config_fields(active);
   }
+  rrl_shutdown();
   return 0;
 }

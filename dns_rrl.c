@@ -11,6 +11,8 @@
 #include <string.h>
 #include <syslog.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #define RRL_TABLE_SIZE 65536
 
@@ -29,8 +31,52 @@ _Atomic uint64_t g_rrl_slip_total = 0;
 
 static uint64_t g_rrl_hash_key[2];
 
+static _Atomic int64_t g_rrl_now_ms_cache = 0;
+static pthread_t g_rrl_clock_thread;
+static _Atomic bool g_rrl_clock_thread_running = false;
+static _Atomic bool g_rrl_clock_thread_started = false;
+
+static int64_t rrl_now_ms_raw(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void *rrl_clock_updater_thread(void *arg) {
+  (void)arg;
+  while (atomic_load_explicit(&g_rrl_clock_thread_running, memory_order_acquire)) {
+    atomic_store_explicit(&g_rrl_now_ms_cache, rrl_now_ms_raw(), memory_order_relaxed);
+#ifdef _WIN32
+    Sleep(20);
+#else
+    struct timespec sleep_ts = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000 }; // 20ms interval
+    nanosleep(&sleep_ts, NULL);
+#endif
+  }
+  return NULL;
+}
+
 void rrl_init(void) {
   arc4random_buf(g_rrl_hash_key, sizeof(g_rrl_hash_key));
+  atomic_store_explicit(&g_rrl_now_ms_cache, rrl_now_ms_raw(), memory_order_relaxed);
+  bool expected = false;
+  if (atomic_compare_exchange_strong_explicit(&g_rrl_clock_thread_started, &expected, true, memory_order_acq_rel, memory_order_acquire)) {
+    atomic_store_explicit(&g_rrl_clock_thread_running, true, memory_order_release);
+    if (pthread_create(&g_rrl_clock_thread, NULL, rrl_clock_updater_thread, NULL) != 0) {
+      atomic_store_explicit(&g_rrl_clock_thread_running, false, memory_order_release);
+      atomic_store_explicit(&g_rrl_clock_thread_started, false, memory_order_release);
+    }
+  }
+}
+
+void rrl_shutdown(void) {
+  if (atomic_load_explicit(&g_rrl_clock_thread_started, memory_order_acquire)) {
+    if (atomic_load_explicit(&g_rrl_clock_thread_running, memory_order_acquire)) {
+      atomic_store_explicit(&g_rrl_clock_thread_running, false, memory_order_release);
+      pthread_join(g_rrl_clock_thread, NULL);
+    }
+    atomic_store_explicit(&g_rrl_clock_thread_started, false, memory_order_release);
+  }
 }
 
 #define ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
@@ -124,9 +170,10 @@ bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_class_t 
 
 #define RRL_PROBE_WAYS 4
 
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  int64_t now_ms = atomic_load_explicit(&g_rrl_now_ms_cache, memory_order_relaxed);
+  if (__builtin_expect(now_ms == 0, 0)) {
+    now_ms = rrl_now_ms_raw();
+  }
 
   uint32_t window_sec = (cfg->window_seconds > 0) ? (uint32_t)cfg->window_seconds : 15;
   if (window_sec > 3600) window_sec = 3600;
