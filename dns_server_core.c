@@ -48,6 +48,7 @@
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
 #include "dns_server_internal.h"
 #include "dns_catalog_zone.h"
+#include "dns_edns_ecs.h"
 
 // karidns
 // Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
@@ -109,10 +110,6 @@ static rrl_bucket_t g_rrl_table[RRL_TABLE_SIZE];
 
 _Atomic uint64_t g_rrl_dropped_total = 0;
 _Atomic uint64_t g_rrl_slip_total = 0;
-_Atomic uint64_t g_ede_prohibited_total = 0;
-_Atomic uint64_t g_ede_not_authoritative_total = 0;
-_Atomic uint64_t g_ede_not_supported_total = 0;
-_Atomic uint64_t g_ede_other_total = 0;
 
 static uint64_t g_rrl_hash_key[2];
 
@@ -2738,187 +2735,6 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
 
 static const char *strchr_unescaped(const char *s, char c);
 
-static size_t pack_tag_def_rdata(uint8_t *buf, size_t buf_cap, const ecs_tag_def_t *def) {
-  if (!def || !buf) return 0;
-  size_t tag_len = strlen(def->tag) + 1;
-  if (tag_len + 2 > buf_cap) return 0;
-  memcpy(buf, def->tag, tag_len);
-  size_t off = tag_len;
-  buf[off++] = (def->cidr_count >> 8) & 0xFF;
-  buf[off++] = def->cidr_count & 0xFF;
-  for (int j = 0; j < def->cidr_count; j++) {
-    size_t c_len = strlen(def->cidrs[j].cidr) + 1;
-    if (off + c_len > buf_cap) return 0;
-    memcpy(buf + off, def->cidrs[j].cidr, c_len);
-    off += c_len;
-  }
-  return off;
-}
-
-static bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_out, int *count_out) {
-  if (!data || len < 3 || !defs_out || !count_out) return false;
-  size_t off = 0;
-  const char *tag = (const char *)&data[off];
-  size_t tag_len = strnlen(tag, len - off);
-  if (off + tag_len + 1 + 2 > len) return false;
-  off += tag_len + 1;
-  uint16_t cidr_count = (data[off] << 8) | data[off + 1];
-  off += 2;
-
-  ecs_tag_def_t def;
-  memset(&def, 0, sizeof(def));
-  def.tag = strdup(tag);
-  if (!def.tag) return false;
-  def.cidrs = (cidr_count > 0) ? calloc(cidr_count, sizeof(ecs_cidr_entry_t)) : NULL;
-  if (cidr_count > 0 && !def.cidrs) {
-    free(def.tag);
-    return false;
-  }
-  def.cidr_count = cidr_count;
-
-  for (int j = 0; j < cidr_count; j++) {
-    if (off >= len) {
-      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
-      free(def.cidrs);
-      free(def.tag);
-      return false;
-    }
-    const char *cidr_str = (const char *)&data[off];
-    size_t clen = strnlen(cidr_str, len - off);
-    if (off + clen + 1 > len) {
-      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
-      free(def.cidrs);
-      free(def.tag);
-      return false;
-    }
-    def.cidrs[j].cidr = strdup(cidr_str);
-    if (!def.cidrs[j].cidr) {
-      for (int k = 0; k < j; k++) free(def.cidrs[k].cidr);
-      free(def.cidrs);
-      free(def.tag);
-      return false;
-    }
-    off += clen + 1;
-  }
-
-  int cur_count = *count_out;
-  ecs_tag_def_t *new_defs = realloc(*defs_out, (cur_count + 1) * sizeof(ecs_tag_def_t));
-  if (!new_defs) {
-    for (int k = 0; k < cidr_count; k++) free(def.cidrs[k].cidr);
-    free(def.cidrs);
-    free(def.tag);
-    return false;
-  }
-  new_defs[cur_count] = def;
-  *defs_out = new_defs;
-  *count_out = cur_count + 1;
-  return true;
-}
-
-static bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***resolvers_out, int *count_out) {
-  if (!data || len < 1 || !resolvers_out || !count_out) return false;
-  size_t off = 0;
-  int count = data[off++];
-  if (count <= 0) return true;
-
-  int cur_count = *count_out;
-  char **new_res = realloc(*resolvers_out, (cur_count + count) * sizeof(char *));
-  if (!new_res) return false;
-  *resolvers_out = new_res;
-
-  for (int i = 0; i < count && off < len; i++) {
-    size_t slen = data[off++];
-    if (off + slen > len) return false;
-    char *s = malloc(slen + 1);
-    if (!s) return false;
-    memcpy(s, &data[off], slen);
-    s[slen] = '\0';
-    (*resolvers_out)[cur_count++] = s;
-    *count_out = cur_count;
-    off += slen;
-  }
-  return true;
-}
-
-static bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_entry_t **locs_out, int *count_out) {
-  if (!data || len < 3 || !locs_out || !count_out) return false;
-  char code[2] = { (char)data[0], (char)data[1] };
-  uint8_t prefix_len = data[2];
-  if (3 + prefix_len > len || prefix_len > 4) return false;
-
-  tinydns_location_entry_t loc;
-  memset(&loc, 0, sizeof(loc));
-  loc.code[0] = code[0];
-  loc.code[1] = code[1];
-  loc.prefix_len = prefix_len;
-  if (prefix_len > 0) {
-    memcpy(loc.prefix, &data[3], prefix_len);
-  }
-
-  int cur_count = *count_out;
-  tinydns_location_entry_t *new_locs = realloc(*locs_out, (cur_count + 1) * sizeof(tinydns_location_entry_t));
-  if (!new_locs) return false;
-  new_locs[cur_count] = loc;
-  *locs_out = new_locs;
-  *count_out = cur_count + 1;
-  return true;
-}
-
-static bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_t *wrap_buf, size_t wrap_buf_cap) {
-  if (!rec || !out_wrap || !wrap_buf) return false;
-  uint8_t tmp_wire[4096];
-  uint16_t tmp_off = 0;
-  compress_ctx_t dummy_comp;
-  memset(&dummy_comp, 0, sizeof(dummy_comp));
-  compress_ctx_init_packet(&dummy_comp);
-  if (serialize_dns_record(tmp_wire, sizeof(tmp_wire), &tmp_off, (dns_record_t *)rec, &dummy_comp, NULL, 0xFFFFFFFF) < 0) {
-    return false;
-  }
-  size_t p = 0;
-  if (skip_wire_name(tmp_wire, tmp_off, 0, &p) != 0) return false;
-  if (p + 10 > tmp_off) return false;
-  uint16_t orig_type = (tmp_wire[p] << 8) | tmp_wire[p+1];
-  uint16_t orig_class = (tmp_wire[p+2] << 8) | tmp_wire[p+3];
-  uint32_t orig_ttl = ((uint32_t)tmp_wire[p+4] << 24) | ((uint32_t)tmp_wire[p+5] << 16) | ((uint32_t)tmp_wire[p+6] << 8) | tmp_wire[p+7];
-  uint16_t orig_rdlen = (tmp_wire[p+8] << 8) | tmp_wire[p+9];
-  if (p + 10 + orig_rdlen > tmp_off) return false;
-  const uint8_t *orig_rdata = &tmp_wire[p+10];
-
-  size_t total_wrap_len = 21 + orig_rdlen;
-  if (total_wrap_len > wrap_buf_cap) return false;
-
-  wrap_buf[0] = (orig_type >> 8) & 0xFF;
-  wrap_buf[1] = orig_type & 0xFF;
-  wrap_buf[2] = (orig_class >> 8) & 0xFF;
-  wrap_buf[3] = orig_class & 0xFF;
-  wrap_buf[4] = (orig_ttl >> 24) & 0xFF;
-  wrap_buf[5] = (orig_ttl >> 16) & 0xFF;
-  wrap_buf[6] = (orig_ttl >> 8) & 0xFF;
-  wrap_buf[7] = orig_ttl & 0xFF;
-  wrap_buf[8] = (uint8_t)rec->tinydns_loc[0];
-  wrap_buf[9] = (uint8_t)rec->tinydns_loc[1];
-  uint64_t ttd = (uint64_t)rec->tinydns_ttd;
-  for (int b = 0; b < 8; b++) {
-    wrap_buf[10 + b] = (ttd >> ((7 - b) * 8)) & 0xFF;
-  }
-  wrap_buf[18] = rec->tinydns_ttl_countdown ? 1 : 0;
-  wrap_buf[19] = (orig_rdlen >> 8) & 0xFF;
-  wrap_buf[20] = orig_rdlen & 0xFF;
-  if (orig_rdlen > 0) {
-    memcpy(&wrap_buf[21], orig_rdata, orig_rdlen);
-  }
-
-  memset(out_wrap, 0, sizeof(*out_wrap));
-  out_wrap->name = rec->name;
-  out_wrap->type_code = DNS_TYPE_KARIDNS_TINYDNS_WRAP;
-  out_wrap->class_val = DNS_CLASS_KARIDNS_EXT;
-  out_wrap->class_str = "KARIDNS";
-  out_wrap->ttl_value = rec->ttl_value;
-  out_wrap->generic_data = wrap_buf;
-  out_wrap->generic_len = total_wrap_len;
-  return true;
-}
-
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
                      zone_arena_t *standby, zone_arena_t *active,
                      axfr_session_t *session, const char *domain) {
@@ -3469,119 +3285,6 @@ static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
     *ancount = cp->ancount;
     *nscount = cp->nscount;
     *arcount = cp->arcount;
-}
-
-/* ecs-tags を先頭から線形探索し、最初に一致したtagの名前を返す。
- * 1. ゾーン定義 (zone->bind_ecs_tags)
- * 2. ゾーン設定 (zcfg->ecs_tags)
- * 3. グローバル設定 (cfg->ecs_tags) */
-static const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
-                                          const uint8_t *addr, uint16_t family, uint8_t *out_scope_prefix) {
-    if (out_scope_prefix) *out_scope_prefix = 0;
-    const ecs_tag_def_t *tags = (zone && zone->bind_ecs_tags && zone->bind_ecs_tag_count > 0)
-                                 ? zone->bind_ecs_tags : NULL;
-    int tag_count = tags ? zone->bind_ecs_tag_count : 0;
-    if (!tags) {
-        tags = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tags : (cfg ? cfg->ecs_tags : NULL);
-        tag_count = (zcfg && zcfg->ecs_tags) ? zcfg->ecs_tag_count : (cfg ? cfg->ecs_tag_count : 0);
-    }
-    if (!tags || tag_count == 0 || !addr) return NULL;
-
-    char ip_buf[INET6_ADDRSTRLEN];
-    int af = (family == 1) ? AF_INET : ((family == 2) ? AF_INET6 : -1);
-    if (af == -1) return NULL;
-    if (!inet_ntop(af, addr, ip_buf, sizeof(ip_buf))) return NULL;
-
-    for (int i = 0; i < tag_count; i++) {
-        for (int j = 0; j < tags[i].cidr_count; j++) {
-            if (match_cidr(ip_buf, tags[i].cidrs[j].cidr)) {
-                if (out_scope_prefix) {
-                    const char *slash = strchr(tags[i].cidrs[j].cidr, '/');
-                    if (slash) {
-                        /* [M-2] atoi は範囲外値を返す可能性があるため [0,128] にクランプ */
-                        int pfx = atoi(slash + 1);
-                        *out_scope_prefix = (pfx >= 0 && pfx <= 128) ? (uint8_t)pfx : 0;
-                    } else {
-                        *out_scope_prefix = (family == 1) ? 32 : 128;
-                    }
-                }
-                return tags[i].tag;
-            }
-        }
-    }
-    return NULL;
-}
-
-/* location-tags を先頭から線形探索し、最初に一致したtagの名前を返す。
- * 1. ゾーン定義 (zone->bind_location_tags)
- * 2. ゾーン設定 (zcfg->location_tags)
- * 3. グローバル設定 (cfg->location_tags) */
-static const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
-                                             const char *client_ip) {
-    if (!client_ip) return NULL;
-
-    const ecs_tag_def_t *tags = (zone && zone->bind_location_tags && zone->bind_location_tag_count > 0)
-                                 ? zone->bind_location_tags : NULL;
-    int tag_count = tags ? zone->bind_location_tag_count : 0;
-    if (!tags) {
-        /* 修正: ecs_tags ではなく location_tags を参照する */
-        tags = (zcfg && zcfg->location_tags) ? zcfg->location_tags : (cfg ? cfg->location_tags : NULL);
-        tag_count = (zcfg && zcfg->location_tags) ? zcfg->location_tag_count : (cfg ? cfg->location_tag_count : 0);
-    }
-    if (!tags || tag_count == 0) return NULL;
-
-    for (int i = 0; i < tag_count; i++) {
-        for (int j = 0; j < tags[i].cidr_count; j++) {
-            if (match_cidr(client_ip, tags[i].cidrs[j].cidr)) {
-                return tags[i].tag;
-            }
-        }
-    }
-    return NULL;
-}
-
-static bool check_acl(const char *client_ip, char **acl_list, int acl_count);
-
-static bool is_ecs_trusted_resolver(const zone_arena_t *zone, const server_config_t *cfg,
-                                    const zone_config_t *zcfg, const char *client_ip) {
-    if (!client_ip) return false;
-
-    char **resolvers = (zone && zone->bind_ecs_trusted_resolvers && zone->bind_ecs_trusted_resolver_count > 0)
-                        ? zone->bind_ecs_trusted_resolvers : NULL;
-    int count = resolvers ? zone->bind_ecs_trusted_resolver_count : 0;
-    if (!resolvers) {
-        resolvers = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers
-                                                           : (cfg ? cfg->ecs_trusted_resolvers : NULL);
-        count = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers_count
-                                                       : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
-    }
-    if (!resolvers || count == 0) return false;
-    return check_acl(client_ip, resolvers, count);
-}
-
-/* クライアントIPから、最長一致するlocationコードを1回だけ求める。
- * 該当なし、またはzoneがlocation未使用なら{0,0}を返す(=制限なし扱い)。 */
-static void tinydns_resolve_client_location(const zone_arena_t *zone, const char *client_ip,
-                                            char out_loc[2]) {
-    out_loc[0] = 0;
-    out_loc[1] = 0;
-    if (!zone || zone->location_count == 0 || !client_ip) return;
-
-    struct in_addr addr;
-    if (inet_pton(AF_INET, client_ip, &addr) != 1) return; /* IPv6は非対応(仕様通り) */
-    const uint8_t *ipb = (const uint8_t *)&addr.s_addr;
-
-    for (int plen = 4; plen >= 0; plen--) {
-        for (int li = 0; li < zone->location_count; li++) {
-            const tinydns_location_entry_t *loc = &zone->locations[li];
-            if (loc->prefix_len != plen) continue;
-            if (plen == 0 || memcmp(loc->prefix, ipb, plen) == 0) {
-                out_loc[0] = loc->code[0];
-                out_loc[1] = loc->code[1];
-                return;
-            }
-        }
-    }
 }
 
 /* レコードが「今このクエリ時点で」応答に含めるべきかを判定する。
@@ -5265,72 +4968,6 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
   if (first_wc_zone_needs_release && first_wc_zone) {
     atomic_fetch_sub_explicit(&first_wc_zone->reader_count, 1, memory_order_release);
   }
-}
-
-// ============================================================================
-// Server Cookie 生成 (RFC 9018準拠)
-// ============================================================================
-static uint8_t g_server_cookie_secret[16];
-
-static bool generate_server_cookie(const char *client_ip, const uint8_t client_cookie[8], uint8_t server_cookie[16], uint32_t timestamp) {
-    uint8_t hash[SHA256_DIGEST_LENGTH];
-    unsigned int hash_len = 0;
-    
-    server_cookie[0] = 1; // Version
-    server_cookie[1] = 0; // Reserved
-    server_cookie[2] = 0;
-    server_cookie[3] = 0;
-    server_cookie[4] = (timestamp >> 24) & 0xFF;
-    server_cookie[5] = (timestamp >> 16) & 0xFF;
-    server_cookie[6] = (timestamp >> 8) & 0xFF;
-    server_cookie[7] = timestamp & 0xFF;
-
-    uint8_t data[64];
-    size_t data_len = 0;
-    
-    struct sockaddr_storage addr;
-    memset(&addr, 0, sizeof(addr));
-    if (client_ip && inet_pton(AF_INET, client_ip, &((struct sockaddr_in *)&addr)->sin_addr) == 1) {
-        memcpy(data, &((struct sockaddr_in *)&addr)->sin_addr, 4);
-        data_len = 4;
-    } else if (client_ip && inet_pton(AF_INET6, client_ip, &((struct sockaddr_in6 *)&addr)->sin6_addr) == 1) {
-        memcpy(data, &((struct sockaddr_in6 *)&addr)->sin6_addr, 16);
-        data_len = 16;
-    } else {
-        syslog(LOG_WARNING, "[Cookie] client_ip could not be parsed as IPv4/IPv6; refusing to bind cookie to address");
-        return false;
-    }
-    memcpy(data + data_len, client_cookie, 8);
-    data_len += 8;
-    memcpy(data + data_len, server_cookie, 8); // Include Version, Reserved, Timestamp
-    data_len += 8;
-    
-    HMAC(EVP_sha256(), g_server_cookie_secret, sizeof(g_server_cookie_secret),
-         data, data_len, hash, &hash_len);
-    
-    memcpy(server_cookie + 8, hash, 8);
-    return true;
-}
-
-static void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
-    if (!enabled || !edns->present) return;
-    if (edns->ede_count >= MAX_EDE_COUNT) return;
-
-    edns->ede_list[edns->ede_count].code = code;
-    if (text) {
-        strncpy(edns->ede_list[edns->ede_count].text, text, sizeof(edns->ede_list[0].text) - 1);
-        edns->ede_list[edns->ede_count].text[sizeof(edns->ede_list[0].text) - 1] = '\0';
-    } else {
-        edns->ede_list[edns->ede_count].text[0] = '\0';
-    }
-    edns->ede_count++;
-
-    switch (code) {
-        case 18: atomic_fetch_add_explicit(&g_ede_prohibited_total, 1, memory_order_relaxed); break;
-        case 20: atomic_fetch_add_explicit(&g_ede_not_authoritative_total, 1, memory_order_relaxed); break;
-        case 21: atomic_fetch_add_explicit(&g_ede_not_supported_total, 1, memory_order_relaxed); break;
-        case 0:  atomic_fetch_add_explicit(&g_ede_other_total, 1, memory_order_relaxed); break;
-    }
 }
 
 static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount) {
@@ -8547,7 +8184,7 @@ static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_
   return is_synth;
 }
 
-static bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
+bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
     for (int i = 0; i < acl_count; i++) {
         char *rule = acl_list[i];
         /* [L-2] NULL エントリーに対する防御的チェック */
@@ -11014,7 +10651,7 @@ static void setup_ipc_tables(int num_workers) {
 
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
-  arc4random_buf(g_server_cookie_secret, sizeof(g_server_cookie_secret));
+  init_server_cookie_secret();
   arc4random_buf(g_rrl_hash_key, sizeof(g_rrl_hash_key));
   // SipHash-2-4 self-test against official reference test vector
   // Key: 00010203...0f, Message: 000102...0e (15 bytes)

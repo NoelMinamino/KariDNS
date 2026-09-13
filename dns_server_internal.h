@@ -44,6 +44,7 @@
 #include <sys/uio.h>
 
 #include "dns_dnstap.h"
+#include "dns_edns_ecs.h"
 
 #define DNS_PORT 53
 #define MAX_EVENTS 1024
@@ -313,5 +314,6 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
 int stat_via_dir_cache(const char *path, struct stat *sb);
+bool check_acl(const char *client_ip, char **acl_list, int acl_count);
 
 #endif /* DNS_SERVER_INTERNAL_H */
