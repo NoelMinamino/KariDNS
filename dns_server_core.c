@@ -438,6 +438,18 @@ static uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]) 
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
+static inline uint64_t rrl_hash_client_addr(const struct sockaddr_storage *client_addr) {
+  if (client_addr->ss_family == AF_INET) {
+    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr & htonl(0xFFFFFF00); // /24 mask
+    return siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
+  } else if (client_addr->ss_family == AF_INET6) {
+    // /56 mask (7 bytes prefix). Directly read sin6_addr without stack memcpy/memset
+    const uint8_t *s6 = (const uint8_t *)&((const struct sockaddr_in6 *)client_addr)->sin6_addr;
+    return siphash24(s6, 7, g_rrl_hash_key);
+  }
+  return 0;
+}
+
 static rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len) {
   if (res_len < DNS_HEADER_SIZE) return RRL_RESP_ERROR;
   uint8_t rcode = res_buf[3] & 0x0F;
@@ -464,32 +476,21 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   if (rate == 0) return true; // 0 means no limit
 
   char ip_str[INET6_ADDRSTRLEN] = {0};
-  if (client_addr->ss_family == AF_INET) {
-    inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
-  } else if (client_addr->ss_family == AF_INET6) {
-    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
-  }
-
-  if (cfg->exempt_clients_count > 0) {
-    for (int i = 0; i < cfg->exempt_clients_count; i++) {
-      if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return true;
+  if (cfg->exempt_clients_count > 0 || cfg->log_only) {
+    if (client_addr->ss_family == AF_INET) {
+      inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
+    } else if (client_addr->ss_family == AF_INET6) {
+      inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
+    }
+    if (cfg->exempt_clients_count > 0) {
+      for (int i = 0; i < cfg->exempt_clients_count; i++) {
+        if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return true;
+      }
     }
   }
 
-  uint64_t hash = 0;
-  uint64_t full_hash = 0;
-  if (client_addr->ss_family == AF_INET) {
-    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr;
-    ip &= htonl(0xFFFFFF00); // /24 mask
-    hash = siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
-    full_hash = hash;
-  } else if (client_addr->ss_family == AF_INET6) {
-    uint8_t ip6[16];
-    memcpy(ip6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, 16);
-    memset(&ip6[7], 0, 9); // /56 mask (7 bytes)
-    hash = siphash24(ip6, 16, g_rrl_hash_key);
-    full_hash = hash;
-  }
+  uint64_t full_hash = rrl_hash_client_addr(client_addr);
+  uint64_t hash = full_hash;
 
 #define RRL_PROBE_WAYS 4
 
@@ -501,7 +502,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   if (window_sec > 3600) window_sec = 3600;
 
   rrl_bucket_t *selected_bucket = NULL;
-  bool is_new_entry = false;
   size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
 
   // 1st Pass: Look for exact hash match
@@ -517,7 +517,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
     }
     if (b->client_hash == full_hash) {
       selected_bucket = b;
-      is_new_entry = false;
       break;
     }
     atomic_flag_clear_explicit(&b->lock, memory_order_release);
@@ -537,7 +536,6 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       }
       if (b->client_hash == 0 || (now_ms - b->last_refill_ms[cls] > (int64_t)window_sec * 1000)) {
         selected_bucket = b;
-        is_new_entry = true;
         break;
       }
       atomic_flag_clear_explicit(&b->lock, memory_order_release);
@@ -551,7 +549,7 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
   }
 
   rrl_bucket_t *b = selected_bucket;
-  if (is_new_entry) {
+  if (b->client_hash != full_hash) {
     b->client_hash = full_hash;
     for (int i = 0; i < 4; i++) {
       b->last_refill_ms[i] = now_ms;
@@ -574,7 +572,7 @@ static bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_c
       cfg->nxdomains_per_second,
       cfg->errors_per_second
     };
-    for(int i=0; i<4; i++) {
+    for (int i = 0; i < 4; i++) {
       if (rates[i] == 0) continue;
       int64_t elapsed_ms = now_ms - b->last_refill_ms[i];
       if (elapsed_ms > 0) {
@@ -622,33 +620,20 @@ static bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, 
   if (!cfg || !cfg->configured) return false;
   if (cfg->responses_per_second == 0) return false;
 
-  char ip_str[INET6_ADDRSTRLEN] = {0};
-  if (client_addr->ss_family == AF_INET) {
-    inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
-  } else if (client_addr->ss_family == AF_INET6) {
-    inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
-  }
-
   if (cfg->exempt_clients_count > 0) {
+    char ip_str[INET6_ADDRSTRLEN] = {0};
+    if (client_addr->ss_family == AF_INET) {
+      inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
+    } else if (client_addr->ss_family == AF_INET6) {
+      inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
+    }
     for (int i = 0; i < cfg->exempt_clients_count; i++) {
       if (match_cidr(ip_str, cfg->exempt_clients[i].ip)) return false;
     }
   }
 
-  uint64_t hash = 0;
-  uint64_t full_hash = 0;
-  if (client_addr->ss_family == AF_INET) {
-    uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr;
-    ip &= htonl(0xFFFFFF00); // /24 mask
-    hash = siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
-    full_hash = hash;
-  } else if (client_addr->ss_family == AF_INET6) {
-    uint8_t ip6[16];
-    memcpy(ip6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, 16);
-    memset(&ip6[7], 0, 9); // /56 mask (7 bytes)
-    hash = siphash24(ip6, 16, g_rrl_hash_key);
-    full_hash = hash;
-  }
+  uint64_t full_hash = rrl_hash_client_addr(client_addr);
+  uint64_t hash = full_hash;
 
   size_t base_idx = hash & (RRL_TABLE_SIZE - 1);
   bool exhausted = false;
@@ -671,10 +656,9 @@ static bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, 
         }
       }
       atomic_flag_clear_explicit(&b->lock, memory_order_release);
-      break;
+      if (exhausted) break;
     }
   }
-
   return exhausted;
 }
 
