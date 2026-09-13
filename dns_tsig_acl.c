@@ -6,8 +6,13 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#endif
 
 bool check_acl(const char *client_ip, char **acl_list, int acl_count) {
     if (!client_ip || !acl_list || acl_count <= 0) return false;

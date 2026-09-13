@@ -6,7 +6,12 @@
 #include <string.h>
 #include <assert.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 // Stub for open_via_dir_cache when running unit tests outside full server
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
