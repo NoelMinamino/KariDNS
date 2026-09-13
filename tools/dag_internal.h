@@ -477,10 +477,20 @@ size_t build_and_sign_query(uint8_t *pkt, size_t max_len,
                            const char *qname, uint16_t qtype,
                            const query_opts_t *qo,
                            uint8_t *req_mac, size_t *req_mac_len);
-ssize_t do_dns_exchange_auto(const char *server, int port, const query_opts_t *qo,
-                             const uint8_t *pkt, size_t pkt_len,
-                             uint8_t *resp, size_t resp_cap, int timeout_sec,
-                             bool force_tcp);
+/* Socket timing helpers */
+static inline void set_socket_timeouts(int sock, int timeout_sec) {
+    int tsec = timeout_sec > 0 ? timeout_sec : 5;
+#ifdef _WIN32
+    DWORD tv = (DWORD)(tsec * 1000);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#else
+    struct timeval tv = { .tv_sec = tsec, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 typedef struct axfr_state_s axfr_state_t;
 
 void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state, const display_opts_t *dopt);
@@ -492,5 +502,9 @@ void calculate_packet_hashes(const uint8_t *pkt, size_t pkt_len, uint32_t *wire_
 
 ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap);
 ssize_t do_tls_recv_response(SSL *ssl, uint8_t *resp, size_t resp_cap);
+ssize_t do_dns_exchange_auto(const char *server, int port, const query_opts_t *qo,
+                             const uint8_t *pkt, size_t pkt_len,
+                             uint8_t *resp, size_t resp_cap, int timeout_sec,
+                             bool force_tcp);
 
 #endif /* DAG_INTERNAL_H */
