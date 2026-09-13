@@ -308,6 +308,22 @@ typedef struct {
   char new_catalog[256];
 } pending_coo_t;
 
+typedef struct program_plugin {
+  char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
+  pid_t pid;
+  int stdin_fd;           /* karidns -> script への書き込み側 */
+  int stdout_fd;          /* script -> karidns への読み込み側 */
+  pthread_mutex_t lock;    /* 1子プロセスを複数workerから同時に叩かないための直列化 */
+  uint32_t timeout_ms;
+  uint32_t max_failures;
+  _Atomic unsigned int consecutive_failures;
+  _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
+  char config_fingerprint[512]; /* M-4: reload時の設定変更検知用 */
+} program_plugin_t;
+
+extern program_plugin_t *g_program_plugins;
+extern int g_program_plugins_count;
+
 #define RESP_LOG_RING_SIZE 8192
 
 typedef enum {
@@ -366,5 +382,6 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
                         uint16_t qclass, uint16_t qtype, uint8_t rcode,
                         bool has_edns, bool dnssec_ok);
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len);
+size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_storage *out);
 
 #endif /* DNS_SERVER_INTERNAL_H */
