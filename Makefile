@@ -29,7 +29,7 @@ LDFLAGS = -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
 TARGET = karidns
-SRCS = dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
+SRCS = dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
 OBJS = $(SRCS:.c=.o)
 
 DAG_TARGET = dag
@@ -45,7 +45,7 @@ FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
 FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
-FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
+FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
 
 FUZZ_ZONE_TARGET = tests/fuzz/fuzz_zone_parser
 FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_wire.c
@@ -138,6 +138,9 @@ dns_tsig_acl.o: dns_tsig_acl.c
 
 dns_priv_sandbox.o: dns_priv_sandbox.c
 	$(CC) $(CFLAGS) -c dns_priv_sandbox.c -o dns_priv_sandbox.o
+
+dns_dynamic_update.o: dns_dynamic_update.c
+	$(CC) $(CFLAGS) -c dns_dynamic_update.c -o dns_dynamic_update.o
 
 dns_wire.o: dns_wire.c
 	$(CC) $(CFLAGS) -c dns_wire.c -o dns_wire.o

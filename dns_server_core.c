@@ -52,6 +52,7 @@
 #include "dns_rrl.h"
 #include "dns_tsig_acl.h"
 #include "dns_priv_sandbox.h"
+#include "dns_dynamic_update.h"
 
 // karidns
 // Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
@@ -94,7 +95,7 @@ static program_plugin_t *g_program_plugins = NULL;
 static int g_program_plugins_count = 0;
 
 static _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
-static config_rcu_t g_config_db;
+config_rcu_t g_config_db;
 
 server_config_t *acquire_config_snapshot(void) {
   server_config_t *snap = NULL;
@@ -128,7 +129,7 @@ static int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
 static int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
 static int g_num_workers = 0;
 char g_startup_cwd[PATH_MAX] = "";
-static int g_notify_ipc[2];
+int g_notify_ipc[2];
 static int g_control_sock = -1;
 static _Atomic(bool) g_frontend_alive = true;
 
@@ -472,7 +473,7 @@ static zone_db_entry_t *view_suffix_hash_lookup(view_snapshot_t *view, const cha
   return NULL;
 }
 
-static zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
+zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
   if (!view || !qname) return NULL;
   if (!view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
     // Suffix hash table not built (e.g. manually constructed mock view in fuzzers/tests)
@@ -592,7 +593,7 @@ static zone_db_entry_t *create_new_zone_entry(const char *domain, const char *vi
   return z;
 }
 
-static void wait_for_readers(zone_arena_t *arena) {
+void wait_for_readers(zone_arena_t *arena) {
   int retries = 0;
   useconds_t sleep_time = 1;
   while (atomic_load_explicit(&arena->reader_count, memory_order_acquire) > 0) {
@@ -674,7 +675,7 @@ static void *gc_snapshot_thread(void *arg) {
   return NULL;
 }
 
-static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
+void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
   if (!old_arena->hash_table || !new_arena->hash_table) return;
   uint32_t old_serial = 0, new_serial = 0;
   for (size_t i = 0; i < old_arena->count; i++) {
@@ -856,7 +857,7 @@ typedef enum {
 #define MAX_PRELINK_TARGETS 256
 #define MAX_MATCH_RECS 32
 
-static void prelink_zone_additional_glue(zone_arena_t *current_zone,
+void prelink_zone_additional_glue(zone_arena_t *current_zone,
                                          const char *zone_domain,
                                          zone_db_snapshot_t *snap,
                                          view_snapshot_t *view,
@@ -2038,8 +2039,6 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     return new_snap;
 }
 
-static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
-
 void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
     if (!new_snap) {
@@ -2158,7 +2157,7 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
   }
 }
 
-static void zone_arena_clear_data_pools(zone_arena_t *arena) {
+void zone_arena_clear_data_pools(zone_arena_t *arena) {
   if (!arena) return;
   for (int i = 0; i < arena->data_pool_count; i++) {
     if (arena->data_pools[i]) {
@@ -2207,7 +2206,7 @@ static void zone_arena_clear_data_pools(zone_arena_t *arena) {
   arena->current_pool_idx = 0;
 }
 
-static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
+void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
   zone_arena_clear_data_pools(dst);
   dst->is_tinydns_format = src->is_tinydns_format;
   if (src->location_count > 0 && src->locations) {
@@ -4551,94 +4550,6 @@ static size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t q
     return (offset <= len) ? offset : len;
 }
 
-static uint32_t bump_soa_serial_in_arena(zone_arena_t *arena) {
-  uint32_t new_serial = 0;
-  for (size_t i = 0; i < arena->count; i++) {
-    if (arena->records[i].type_code == 6 && arena->records[i].rdata_count >= 3) {
-      if (arena->records[i].rdata[2]) {
-        uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
-        serial++;
-        if (serial == 0) serial = 1;
-        new_serial = serial;
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%u", serial);
-        /* [C-2] arena_strdup 失敗時は NULL が代入されることを防ぐ */
-        char *new_rdata = arena_strdup(arena, buf);
-        if (!new_rdata) {
-          syslog(LOG_ERR, "[Update] arena_strdup failed bumping SOA serial; aborting update");
-          return 0;
-        }
-        arena->records[i].rdata[2] = new_rdata;
-        arena->records[i].is_cached = false;
-        dns_record_preparse_cache(arena, &arena->records[i]);
-      }
-      break;
-    }
-  }
-  return new_serial;
-}
-
-static int handle_dynamic_update(const uint8_t *req, size_t req_len,
-                                  zone_db_entry_t *entry,
-                                  const char *client_ip,
-                                  const char *matched_key_name) {
-  pthread_mutex_lock(&entry->writer_lock);
-
-  zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  wait_for_readers(z_standby);
-
-  clone_zone_arena(z_active, z_standby);
-
-  int prcount = 0, upcount = 0;
-  int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &prcount, &upcount);
-  if (rcode != 0) {
-    zone_arena_clear_data_pools(z_standby);
-    pthread_mutex_unlock(&entry->writer_lock);
-    return rcode;
-  }
-
-  uint32_t new_serial = bump_soa_serial_in_arena(z_standby);
-  if (new_serial != 0) {
-    atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
-  }
-
-  if (build_zone_index(z_standby, true) != 0) {
-    zone_arena_clear_data_pools(z_standby);
-    pthread_mutex_unlock(&entry->writer_lock);
-    syslog(LOG_ERR, "[Zone] Memory allocation failed while building index after Update for '%s'", entry->domain);
-    return 2; // SERVFAIL
-  }
-
-  zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
-  server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
-  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                      ? zcfg->additional_from_auth
-                                      : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
-  if (cur_snap) release_zone_snapshot(cur_snap);
-
-  compute_ixfr_diff(entry, z_active, z_standby);
-
-  atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
-  pthread_mutex_unlock(&entry->writer_lock);
-
-  atomic_store_explicit(&entry->notify_now, true, memory_order_release);
-  if (g_control_kq != -1) {
-    struct kevent ev;
-    EV_SET(&ev, 2, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
-    kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
-  }
-
-  syslog(LOG_NOTICE,
-         "[Update] client=%s key=%s zone='%s' prcount=%d upcount=%d "
-         "(in-memory only, will revert on reload)",
-         client_ip, matched_key_name, entry->domain, prcount, upcount);
-
-  return 0; // NOERROR
-}
-
 static program_plugin_t *find_program_plugin(const char *domain) {
   if (!domain) return NULL;
   for (int i = 0; i < g_program_plugins_count; i++) {
@@ -6203,255 +6114,6 @@ void *axfr_bg_thread_func(void *arg) {
   free(ctx);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
-}
-
-static void send_single_notify(const uint8_t *req, size_t req_len,
-                               const struct sockaddr *dest_addr, socklen_t addr_len,
-                               const char *notify_source) {
-  udp_ipc_t msg;
-  memset(&msg, 0, sizeof(msg));
-  msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
-  memcpy(&msg.client_addr, dest_addr, addr_len);
-  msg.addr_len = addr_len;
-  msg.payload_len = req_len;
-
-  int family = dest_addr->sa_family;
-  if (notify_source && *notify_source) {
-    if (family == AF_INET &&
-        inet_pton(AF_INET, notify_source,
-                  &((struct sockaddr_in *)&msg.source_addr)->sin_addr) == 1) {
-      msg.source_addr.ss_family = AF_INET;
-      msg.has_source_addr = true;
-    } else if (family == AF_INET6 &&
-               inet_pton(AF_INET6, notify_source,
-                         &((struct sockaddr_in6 *)&msg.source_addr)->sin6_addr) == 1) {
-      msg.source_addr.ss_family = AF_INET6;
-      msg.has_source_addr = true;
-    }
-  }
-
-  uint8_t buf[2048];
-  memcpy(buf, &msg, sizeof(msg));
-  memcpy(buf + sizeof(msg), req, req_len);
-  /* [H-1] send 戻り値を検査してエラーをログに記録する */
-  if (send(g_notify_ipc[1], buf, sizeof(msg) + req_len, 0) < 0) {
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      syslog(LOG_WARNING, "[Notify] send to notify IPC failed: %m");
-    }
-  }
-}
-
-static bool is_addr_notified(const struct sockaddr_storage *addrs, int count, const struct sockaddr *target) {
-  for (int i = 0; i < count; i++) {
-    if (addrs[i].ss_family != target->sa_family) continue;
-    if (target->sa_family == AF_INET) {
-      struct sockaddr_in *a = (struct sockaddr_in *)&addrs[i];
-      struct sockaddr_in *b = (struct sockaddr_in *)target;
-      if (a->sin_port == b->sin_port && a->sin_addr.s_addr == b->sin_addr.s_addr) return true;
-    } else if (target->sa_family == AF_INET6) {
-      struct sockaddr_in6 *a = (struct sockaddr_in6 *)&addrs[i];
-      struct sockaddr_in6 *b = (struct sockaddr_in6 *)target;
-      if (a->sin6_port == b->sin6_port && memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(struct in6_addr)) == 0) return true;
-    }
-  }
-  return false;
-}
-
-void send_notify_to_all(const char *domain, const char *view_name) {
-  server_config_t *active = acquire_config_snapshot();
-  zone_db_snapshot_t *snap = acquire_zone_snapshot();
-  if (!active && !snap) {
-    if (active) release_config_snapshot(active);
-    if (snap) release_zone_snapshot(snap);
-    return;
-  }
-
-  zone_config_t *zone = active ? find_zone_config_in_view(active, view_name, domain) : NULL;
-  const char *notify_source = zone ? zone->notify_source : NULL;
-
-  uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
-  memset(req, 0, DNS_HEADER_SIZE);
-  uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
-  req[0] = id >> 8;
-  req[1] = id & 0xFF;
-  req[2] = 0x24; // Opcode = NOTIFY (0x20) | AA = 1 (0x04) (RFC 1996 §3.4)
-  req[3] = 0;
-  req[4] = 0;
-  req[5] = 1;
-  size_t offset = DNS_HEADER_SIZE;
-  long w = write_uncompressed_name(req, offset, sizeof(req), domain);
-  if (w > 0) offset += (size_t)w;
-  req[offset++] = 0;
-  req[offset++] = 6;
-  req[offset++] = 0;
-  req[offset++] = 1;
-
-  struct sockaddr_storage notified_addrs[64];
-  int notified_count = 0;
-
-  // 1. Send to also-notify servers
-  if (zone) {
-    for (int i = 0; i < zone->also_notify_count && notified_count < 64; i++) {
-      struct sockaddr_storage dest_addr;
-      memset(&dest_addr, 0, sizeof(dest_addr));
-      if (inet_pton(AF_INET, zone->also_notify[i].ip,
-                    &((struct sockaddr_in *)&dest_addr)->sin_addr) == 1) {
-        dest_addr.ss_family = AF_INET;
-        ((struct sockaddr_in *)&dest_addr)->sin_port = htons(zone->also_notify[i].port);
-      } else if (inet_pton(AF_INET6, zone->also_notify[i].ip,
-                           &((struct sockaddr_in6 *)&dest_addr)->sin6_addr) == 1) {
-        dest_addr.ss_family = AF_INET6;
-        ((struct sockaddr_in6 *)&dest_addr)->sin6_port = htons(zone->also_notify[i].port);
-      } else {
-        continue;
-      }
-      if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
-        socklen_t slen = (dest_addr.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-        send_single_notify(req, offset, (struct sockaddr *)&dest_addr, slen, notify_source);
-        notified_addrs[notified_count++] = dest_addr;
-      }
-    }
-  }
-
-  // 2. Send to NS records (RFC 1996 §3.2)
-  if (snap) {
-    view_snapshot_t *view = NULL;
-    if (view_name) {
-      for (size_t v = 0; v < snap->view_count; v++) {
-        if (strcasecmp(snap->views[v].name, view_name) == 0) {
-          view = &snap->views[v];
-          break;
-        }
-      }
-    }
-    if (!view && snap->view_count > 0) {
-      view = &snap->views[0];
-    }
-    if (view) {
-      zone_db_entry_t *entry = find_zone_in_view(view, domain);
-      if (entry) {
-        zone_arena_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-        if (arena && arena->hash_size > 0 && arena->hash_table) {
-          // Find SOA MNAME to exclude master itself
-          const char *mname = NULL;
-          uint32_t apex_hash = calc_fnv1a_str(entry->domain);
-          size_t apex_idx = apex_hash & (arena->hash_size - 1);
-          for (int i = arena->hash_table[apex_idx]; i != -1; i = arena->records[i].next_record) {
-            if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, entry->domain)) {
-              if (arena->records[i].rdata_count >= 1 && arena->records[i].rdata[0]) {
-                mname = arena->records[i].rdata[0];
-              }
-              break;
-            }
-          }
-
-          // Scan apex NS records
-          for (int i = arena->hash_table[apex_idx]; i != -1; i = arena->records[i].next_record) {
-            dns_record_t *rec = &arena->records[i];
-            if (rec->type_code == 2 && domain_names_match_ci(rec->name, entry->domain)) {
-              if (rec->rdata_count < 1 || !rec->rdata[0]) continue;
-              const char *ns_target = rec->rdata[0];
-              if (mname && domain_names_match_ci(ns_target, mname)) continue;
-
-              // Resolve in-zone glue or sibling zone glue
-              // A. In arena
-              uint32_t t_hash = calc_fnv1a_str(ns_target);
-              size_t t_idx = t_hash & (arena->hash_size - 1);
-              bool found_target = false;
-              for (int j = arena->hash_table[t_idx]; j != -1; j = arena->records[j].next_record) {
-                dns_record_t *g_rec = &arena->records[j];
-                if ((g_rec->type_code == 1 || g_rec->type_code == 28) && domain_names_match_ci(g_rec->name, ns_target)) {
-                  struct sockaddr_storage dest_addr;
-                  memset(&dest_addr, 0, sizeof(dest_addr));
-                  if (g_rec->type_code == 1 && g_rec->rdata_count >= 1) {
-                    if (inet_pton(AF_INET, g_rec->rdata[0], &((struct sockaddr_in *)&dest_addr)->sin_addr) == 1) {
-                      dest_addr.ss_family = AF_INET;
-                      ((struct sockaddr_in *)&dest_addr)->sin_port = htons(53);
-                      if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
-                        send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in), notify_source);
-                        if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
-                      }
-                      found_target = true;
-                    }
-                  } else if (g_rec->type_code == 28 && g_rec->rdata_count >= 1) {
-                    if (inet_pton(AF_INET6, g_rec->rdata[0], &((struct sockaddr_in6 *)&dest_addr)->sin6_addr) == 1) {
-                      dest_addr.ss_family = AF_INET6;
-                      ((struct sockaddr_in6 *)&dest_addr)->sin6_port = htons(53);
-                      if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
-                        send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in6), notify_source);
-                        if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
-                      }
-                      found_target = true;
-                    }
-                  }
-                }
-              }
-
-              // B. If not found in arena, check sibling zone in view
-              if (!found_target && view) {
-                zone_db_entry_t *sib_entry = find_zone_in_view(view, ns_target);
-                if (sib_entry && sib_entry != entry) {
-                  zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
-                  if (sib_arena && sib_arena->hash_size > 0 && sib_arena->hash_table) {
-                    size_t s_idx = t_hash & (sib_arena->hash_size - 1);
-                    for (int j = sib_arena->hash_table[s_idx]; j != -1; j = sib_arena->records[j].next_record) {
-                      dns_record_t *g_rec = &sib_arena->records[j];
-                      if ((g_rec->type_code == 1 || g_rec->type_code == 28) && domain_names_match_ci(g_rec->name, ns_target)) {
-                        struct sockaddr_storage dest_addr;
-                        memset(&dest_addr, 0, sizeof(dest_addr));
-                        if (g_rec->type_code == 1 && g_rec->rdata_count >= 1) {
-                          if (inet_pton(AF_INET, g_rec->rdata[0], &((struct sockaddr_in *)&dest_addr)->sin_addr) == 1) {
-                            dest_addr.ss_family = AF_INET;
-                            ((struct sockaddr_in *)&dest_addr)->sin_port = htons(53);
-                            if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
-                              send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in), notify_source);
-                              if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
-                            }
-                          }
-                        } else if (g_rec->type_code == 28 && g_rec->rdata_count >= 1) {
-                          if (inet_pton(AF_INET6, g_rec->rdata[0], &((struct sockaddr_in6 *)&dest_addr)->sin6_addr) == 1) {
-                            dest_addr.ss_family = AF_INET6;
-                            ((struct sockaddr_in6 *)&dest_addr)->sin6_port = htons(53);
-                            if (!is_addr_notified(notified_addrs, notified_count, (struct sockaddr *)&dest_addr)) {
-                              send_single_notify(req, offset, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in6), notify_source);
-                              if (notified_count < 64) notified_addrs[notified_count++] = dest_addr;
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (snap && notified_count > 0) {
-    view_snapshot_t *v_snap = NULL;
-    if (view_name) {
-      for (size_t v = 0; v < snap->view_count; v++) {
-        if (strcasecmp(snap->views[v].name, view_name) == 0) {
-          v_snap = &snap->views[v];
-          break;
-        }
-      }
-    }
-    if (!v_snap && snap->view_count > 0) v_snap = &snap->views[0];
-    if (v_snap) {
-      zone_db_entry_t *entry = find_zone_in_view(v_snap, domain);
-      if (entry) {
-        atomic_fetch_add_explicit(&entry->observatory.notify_sent, notified_count, memory_order_relaxed);
-        atomic_store_explicit(&entry->observatory.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);
-      }
-    }
-  }
-
-  if (snap) release_zone_snapshot(snap);
-  if (active) release_config_snapshot(active);
 }
 
 // ============================================================================

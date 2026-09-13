@@ -50,6 +50,8 @@
 #include "dns_priv_sandbox.h"
 
 extern int g_cwd_fd;
+extern int g_control_kq;
+extern int g_notify_ipc[2];
 
 #define DNS_PORT 53
 #define MAX_EVENTS 1024
@@ -298,6 +300,8 @@ typedef struct {
   server_config_t config_b;
 } config_rcu_t;
 
+extern config_rcu_t g_config_db;
+
 typedef struct {
   char domain[256];
   char old_catalog[256];
@@ -316,5 +320,16 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              zone_config_t *catalog_cfg,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
+
+void wait_for_readers(zone_arena_t *arena);
+void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
+void zone_arena_clear_data_pools(zone_arena_t *arena);
+void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
+zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
+void prelink_zone_additional_glue(zone_arena_t *current_zone,
+                                  const char *zone_domain,
+                                  zone_db_snapshot_t *snap,
+                                  view_snapshot_t *view,
+                                  additional_from_auth_t policy);
 
 #endif /* DNS_SERVER_INTERNAL_H */
