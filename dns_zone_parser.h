@@ -1,4 +1,4 @@
-﻿#ifndef DNS_ZONE_PARSER_H
+#ifndef DNS_ZONE_PARSER_H
 #define DNS_ZONE_PARSER_H
 
 #include <stddef.h>
@@ -81,7 +81,8 @@ typedef struct zone_arena_s {
   int bind_ecs_tag_count;
   char **bind_ecs_trusted_resolvers;      /* AXFR(諡｡蠑ｵ繝｢繝ｼ繝・縺ｧ蜿嶺ｿ｡縺励◆蛟､縲・ULL蜿ｯ */
   int bind_ecs_trusted_resolver_count;
-  prelinked_glue_entry_t *prelinked_glue; /* 莠句燕繝ｪ繝ｳ繧ｯ縺輔ｌ縺蘗dditional繧ｰ繝ｫ繝ｼ */
+  acl_entry_t *bind_ecs_trusted_resolvers_parsed;
+  prelinked_glue_entry_t *prelinked_glue; /* 莠句燕繝ｪ繝ｯ繧ｯ縺輔ℓ縺蘗dditional繧ｰ繝ｫ繝ｼ */
   int prelinked_glue_count;
 } zone_arena_t;
 

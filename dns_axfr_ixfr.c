@@ -9,6 +9,7 @@
 #include "dns_edns_ecs.h"
 #include "dns_priv_sandbox.h"
 #include "dns_dynamic_update.h"
+#include "dns_tsig_acl.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -261,6 +262,13 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       } else if (type == DNS_TYPE_KARIDNS_ECS_TRUSTED) {
         standby->count--;
         unpack_trusted_resolvers_rdata(rec->generic_data, rec->generic_len, &standby->bind_ecs_trusted_resolvers, &standby->bind_ecs_trusted_resolver_count);
+        if (standby->bind_ecs_trusted_resolvers_parsed) {
+          free(standby->bind_ecs_trusted_resolvers_parsed);
+          standby->bind_ecs_trusted_resolvers_parsed = NULL;
+        }
+        if (standby->bind_ecs_trusted_resolver_count > 0 && standby->bind_ecs_trusted_resolvers) {
+          standby->bind_ecs_trusted_resolvers_parsed = acl_list_parse(standby->bind_ecs_trusted_resolvers, standby->bind_ecs_trusted_resolver_count);
+        }
         continue;
       } else if (type == DNS_TYPE_KARIDNS_TINYDNS_LOCDEF) {
         standby->count--;

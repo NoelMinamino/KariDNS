@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #endif
+#include "dns_cidr.h"
 
 // ============================================================================
 // 数値フィールド安全パースヘルパー (0-255, 0-65535 範囲検証付き)
@@ -101,6 +102,7 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 // ECS / Location サブネットタグ構造体
 typedef struct {
   char *cidr;       /* "8.8.8.0/24" のような文字列のまま保持 */
+  cidr_entry_t parsed;
 } ecs_cidr_entry_t;
 
 typedef struct ecs_tag_def_s {

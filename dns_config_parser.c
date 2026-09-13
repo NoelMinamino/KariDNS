@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include "dns_wire.h"
+#include "dns_tsig_acl.h"
 
 static void *safe_realloc_or_die(void *ptr, size_t size) {
   void *p = realloc(ptr, size);
@@ -296,6 +297,11 @@ void free_rate_limit_config(rate_limit_config_t *rrl) {
     free(rrl->exempt_clients);
     rrl->exempt_clients = NULL;
   }
+  if (rrl->exempt_clients_parsed) {
+    free(rrl->exempt_clients_parsed);
+    rrl->exempt_clients_parsed = NULL;
+  }
+  rrl->exempt_clients_count = 0;
 }
 
 void free_zone_config(zone_config_t *zone) {
@@ -307,6 +313,10 @@ void free_zone_config(zone_config_t *zone) {
   for (int i = 0; i < zone->masters_count; i++)
     free(zone->masters[i].ip);
   free(zone->masters);
+  if (zone->masters_parsed) {
+    free(zone->masters_parsed);
+    zone->masters_parsed = NULL;
+  }
   free(zone->tsig_key);
   for (int i = 0; i < zone->tsig_keys_count; i++)
     free(zone->tsig_keys[i]);
@@ -318,9 +328,17 @@ void free_zone_config(zone_config_t *zone) {
   for (int i = 0; i < zone->allow_transfer_count; i++)
     free(zone->allow_transfer[i]);
   free(zone->allow_transfer);
+  if (zone->allow_transfer_parsed) {
+    free(zone->allow_transfer_parsed);
+    zone->allow_transfer_parsed = NULL;
+  }
   for (int i = 0; i < zone->allow_update_count; i++)
     free(zone->allow_update[i]);
   free(zone->allow_update);
+  if (zone->allow_update_parsed) {
+    free(zone->allow_update_parsed);
+    zone->allow_update_parsed = NULL;
+  }
   free(zone->program_path);
   for (int i = 0; i < zone->program_args_count; i++)
     free(zone->program_args[i]);
@@ -363,6 +381,10 @@ void free_zone_config(zone_config_t *zone) {
     zone->ecs_trusted_resolvers = NULL;
     zone->ecs_trusted_resolvers_count = 0;
   }
+  if (zone->ecs_trusted_resolvers_parsed) {
+    free(zone->ecs_trusted_resolvers_parsed);
+    zone->ecs_trusted_resolvers_parsed = NULL;
+  }
   free(zone);
 }
 
@@ -371,6 +393,10 @@ static void free_partial_view(view_config_t *view) {
   if (view->name) free(view->name);
   for (int i = 0; i < view->match_clients_count; i++) free(view->match_clients[i]);
   if (view->match_clients) free(view->match_clients);
+  if (view->match_clients_parsed) {
+    free(view->match_clients_parsed);
+    view->match_clients_parsed = NULL;
+  }
   zone_config_t *z = view->zones;
   while (z) {
     zone_config_t *next = z->next;
@@ -445,6 +471,7 @@ void free_server_config_fields(server_config_t *cfg) {
     if (v->name) free(v->name);
     for (int i = 0; i < v->match_clients_count; i++) free(v->match_clients[i]);
     if (v->match_clients) free(v->match_clients);
+    if (v->match_clients_parsed) free(v->match_clients_parsed);
     zone_config_t *curr = v->zones;
     while (curr) {
       zone_config_t *next = curr->next;
@@ -505,6 +532,10 @@ void free_server_config_fields(server_config_t *cfg) {
     free(cfg->ecs_trusted_resolvers);
     cfg->ecs_trusted_resolvers = NULL;
     cfg->ecs_trusted_resolvers_count = 0;
+  }
+  if (cfg->ecs_trusted_resolvers_parsed) {
+    free(cfg->ecs_trusted_resolvers_parsed);
+    cfg->ecs_trusted_resolvers_parsed = NULL;
   }
   if (cfg->ecs_tags) {
     for (int i = 0; i < cfg->ecs_tag_count; i++) {
@@ -866,6 +897,7 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   rrl->slip = 2;
   rrl->exempt_clients = NULL;
   rrl->exempt_clients_count = 0;
+  rrl->exempt_clients_parsed = NULL;
 
   while (1) {
     tok = get_next_token(ctx);
@@ -941,6 +973,16 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     return -1;
   }
   free_token(&tok);
+
+  if (rrl->exempt_clients_count > 0 && rrl->exempt_clients) {
+    rrl->exempt_clients_parsed = calloc(rrl->exempt_clients_count, sizeof(cidr_entry_t));
+    if (rrl->exempt_clients_parsed) {
+      for (int i = 0; i < rrl->exempt_clients_count; i++) {
+        cidr_entry_parse(&rrl->exempt_clients_parsed[i], rrl->exempt_clients[i].ip);
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -995,7 +1037,12 @@ static int parse_ecs_tags_block(token_ctx_t *ctx, ecs_tag_def_t **out_tags, int 
         break;
       }
       cidrs = safe_realloc_or_die(cidrs, sizeof(ecs_cidr_entry_t) * (cidr_count + 1));
-      cidrs[cidr_count++].cidr = strdup(tok.value);
+      memset(&cidrs[cidr_count], 0, sizeof(ecs_cidr_entry_t));
+      cidrs[cidr_count].cidr = strdup(tok.value);
+      if (cidrs[cidr_count].cidr) {
+        cidr_entry_parse(&cidrs[cidr_count].parsed, cidrs[cidr_count].cidr);
+      }
+      cidr_count++;
       free_token(&tok);
 
       tok = get_next_token(ctx);
@@ -1096,6 +1143,15 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_zone_config(zone);
         return -1;
       }
+      if (zone->masters_count > 0 && zone->masters) {
+        free(zone->masters_parsed);
+        zone->masters_parsed = calloc(zone->masters_count, sizeof(cidr_entry_t));
+        if (zone->masters_parsed) {
+          for (int i = 0; i < zone->masters_count; i++) {
+            cidr_entry_parse(&zone->masters_parsed[i], zone->masters[i].ip);
+          }
+        }
+      }
     } else if (strcmp(key, "also-notify") == 0) {
       if (parse_ip_port_list(ctx, &zone->also_notify,
                              &zone->also_notify_count) != 0) {
@@ -1107,10 +1163,14 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       if (parse_acl_list(ctx, &zone->allow_transfer, &zone->allow_transfer_count, ACL_KEY_AS_TSIG_FIELD, &zone->tsig_keys, &zone->tsig_keys_count) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
+      free(zone->allow_transfer_parsed);
+      zone->allow_transfer_parsed = acl_list_parse(zone->allow_transfer, zone->allow_transfer_count);
     } else if (strcmp(key, "allow-update") == 0) {
       if (parse_acl_list(ctx, &zone->allow_update, &zone->allow_update_count, ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
+      free(zone->allow_update_parsed);
+      zone->allow_update_parsed = acl_list_parse(zone->allow_update, zone->allow_update_count);
     } else if (strcmp(key, "type") == 0 || strcmp(key, "file") == 0 ||
                strcmp(key, "file-format") == 0 ||
                strcmp(key, "tsig-key") == 0 ||
@@ -1277,6 +1337,8 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_zone_config(zone);
         return -1;
       }
+      free(zone->ecs_trusted_resolvers_parsed);
+      zone->ecs_trusted_resolvers_parsed = acl_list_parse(zone->ecs_trusted_resolvers, zone->ecs_trusted_resolvers_count);
     } else if (strcmp(key, "additional-from-auth") == 0) {
       tok = get_next_token(ctx);
       if (tok.type != TOKEN_STRING) {
@@ -1577,6 +1639,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
+          free(config->ecs_trusted_resolvers_parsed);
+          config->ecs_trusted_resolvers_parsed = acl_list_parse(config->ecs_trusted_resolvers, config->ecs_trusted_resolvers_count);
         } else if (strcmp(key, "ecs-tags") == 0) {
           if (parse_ecs_tags_block(ctx, &config->ecs_tags, &config->ecs_tag_count) != 0) {
             free(key);
@@ -1914,6 +1978,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_partial_view(view);
             return -1;
           }
+          free(view->match_clients_parsed);
+          view->match_clients_parsed = acl_list_parse(view->match_clients, view->match_clients_count);
         } else if (strcmp(tok.value, "zone") == 0) {
           free_token(&tok);
           zone_config_t *z = NULL;
@@ -2507,6 +2573,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     default_view->match_clients = safe_calloc_or_die(1, sizeof(char *));
     default_view->match_clients[0] = strdup("any");
     default_view->match_clients_count = 1;
+    default_view->match_clients_parsed = acl_list_parse(default_view->match_clients, default_view->match_clients_count);
     default_view->zones = config->zones;
     config->zones = NULL;
     config->views = default_view;

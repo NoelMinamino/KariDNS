@@ -2343,7 +2343,11 @@ void spawn_program_zone_plugins(server_config_t *cfg) {
 
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
   for (size_t i = 0; i < snap->view_count; i++) {
-    if (check_acl(client_ip, snap->views[i].match_clients, snap->views[i].match_clients_count)) {
+    if (snap->views[i].match_clients_parsed && snap->views[i].match_clients_count > 0) {
+      if (check_acl_bin(client_ip, snap->views[i].match_clients_parsed, snap->views[i].match_clients_count)) {
+        return &snap->views[i];
+      }
+    } else if (check_acl(client_ip, snap->views[i].match_clients, snap->views[i].match_clients_count)) {
       return &snap->views[i];
     }
   }
@@ -2575,7 +2579,8 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->masters_count > 0) {
         for (int k = 0; k < zcfg->masters_count; k++) {
-          if (match_cidr(client_ip, zcfg->masters[k].ip)) {
+          if (zcfg->masters_parsed ? cidr_entry_match_str(&zcfg->masters_parsed[k], client_ip)
+                                   : match_cidr(client_ip, zcfg->masters[k].ip)) {
             auth = true;
             break;
           }
@@ -2696,7 +2701,11 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
         }
       }
       if (zcfg && zcfg->allow_update_count > 0) {
-        if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
+        if (zcfg->allow_update_parsed) {
+          if (check_acl_bin(client_ip, zcfg->allow_update_parsed, zcfg->allow_update_count)) {
+            auth = true;
+          }
+        } else if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
           auth = true;
         }
         tsig_key_t *k = cfg->keys;

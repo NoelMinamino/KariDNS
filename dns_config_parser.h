@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include "dns_wire.h"
+#include "dns_cidr.h"
 
 typedef struct {
   char *ip;
@@ -28,6 +29,7 @@ typedef struct {
   uint32_t slip;
   ip_port_t *exempt_clients;
   int exempt_clients_count;
+  cidr_entry_t *exempt_clients_parsed;
 } rate_limit_config_t;
 
 typedef enum {
@@ -43,6 +45,7 @@ typedef struct zone_config {
   bool is_catalog;
   ip_port_t *masters;
   int masters_count;
+  cidr_entry_t *masters_parsed;
   char *tsig_key;
   char **tsig_keys;
   int tsig_keys_count;
@@ -51,8 +54,10 @@ typedef struct zone_config {
   char *notify_source;
   char **allow_transfer;
   int allow_transfer_count;
+  acl_entry_t *allow_transfer_parsed;
   char **allow_update;
   int allow_update_count;
+  acl_entry_t *allow_update_parsed;
   rate_limit_config_t rrl;
 
   /* --- ここから追加: type "program" 用 --- */
@@ -84,6 +89,7 @@ typedef struct zone_config {
   /* --- ECS 信頼リゾルバ (ゾーン単位の上書き) --- */
   char **ecs_trusted_resolvers;
   int ecs_trusted_resolvers_count;
+  acl_entry_t *ecs_trusted_resolvers_parsed;
 
   /* --- additional-from-auth (ゾーン単位の上書き) --- */
   additional_from_auth_t additional_from_auth;
@@ -143,6 +149,7 @@ typedef struct view_config {
   char *name;
   char **match_clients;
   int match_clients_count;
+  acl_entry_t *match_clients_parsed;
   zone_config_t *zones;
   struct view_config *next;
 } view_config_t;
@@ -181,6 +188,7 @@ typedef struct server_config_s {
   bool ecs_enable;
   char **ecs_trusted_resolvers;
   int ecs_trusted_resolvers_count;
+  acl_entry_t *ecs_trusted_resolvers_parsed;
   ecs_tag_def_t *ecs_tags;
   int ecs_tag_count;
   ecs_tag_def_t *location_tags;

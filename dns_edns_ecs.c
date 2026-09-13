@@ -2,6 +2,7 @@
 #include "dns_edns_ecs.h"
 #include "dns_server_internal.h"
 #include "dns_utils.h"
+#include "dns_tsig_acl.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -145,6 +146,7 @@ bool unpack_tag_def_rdata(const uint8_t *data, size_t len, ecs_tag_def_t **defs_
       free(def.tag);
       return false;
     }
+    cidr_entry_parse(&def.cidrs[j].parsed, def.cidrs[j].cidr);
     off += clen + 1;
   }
 
@@ -278,20 +280,33 @@ const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config
     }
     if (!tags || tag_count == 0 || !addr) return NULL;
 
-    char ip_buf[INET6_ADDRSTRLEN];
     int af = (family == 1) ? AF_INET : ((family == 2) ? AF_INET6 : -1);
     if (af == -1) return NULL;
-    if (!inet_ntop(af, addr, ip_buf, sizeof(ip_buf))) return NULL;
 
     for (int i = 0; i < tag_count; i++) {
         for (int j = 0; j < tags[i].cidr_count; j++) {
-            if (match_cidr(ip_buf, tags[i].cidrs[j].cidr)) {
+            const ecs_cidr_entry_t *ce = &tags[i].cidrs[j];
+            bool match = false;
+            if (ce->parsed.valid) {
+                match = cidr_entry_match(&ce->parsed, af, addr);
+            } else if (ce->cidr) {
+                char ip_buf[INET6_ADDRSTRLEN];
+                if (inet_ntop(af, addr, ip_buf, sizeof(ip_buf))) {
+                    match = match_cidr(ip_buf, ce->cidr);
+                }
+            }
+            if (match) {
                 if (out_scope_prefix) {
-                    const char *slash = strchr(tags[i].cidrs[j].cidr, '/');
-                    if (slash) {
-                        /* [M-2] atoi は範囲外値を返す可能性があるため [0,128] にクランプ */
-                        int pfx = atoi(slash + 1);
-                        *out_scope_prefix = (pfx >= 0 && pfx <= 128) ? (uint8_t)pfx : 0;
+                    if (ce->parsed.valid && !ce->parsed.is_any) {
+                        *out_scope_prefix = ce->parsed.prefix;
+                    } else if (ce->cidr) {
+                        const char *slash = strchr(ce->cidr, '/');
+                        if (slash) {
+                            int pfx = atoi(slash + 1);
+                            *out_scope_prefix = (pfx >= 0 && pfx <= 128) ? (uint8_t)pfx : 0;
+                        } else {
+                            *out_scope_prefix = (family == 1) ? 32 : 128;
+                        }
                     } else {
                         *out_scope_prefix = (family == 1) ? 32 : 128;
                     }
@@ -311,15 +326,33 @@ const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_con
                                  ? zone->bind_location_tags : NULL;
     int tag_count = tags ? zone->bind_location_tag_count : 0;
     if (!tags) {
-        /* 修正: ecs_tags ではなく location_tags を参照する */
         tags = (zcfg && zcfg->location_tags) ? zcfg->location_tags : (cfg ? cfg->location_tags : NULL);
         tag_count = (zcfg && zcfg->location_tags) ? zcfg->location_tag_count : (cfg ? cfg->location_tag_count : 0);
     }
     if (!tags || tag_count == 0) return NULL;
 
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    int af = 0;
+    const uint8_t *addr_bytes = NULL;
+    if (inet_pton(AF_INET, client_ip, &addr4) == 1) {
+        af = AF_INET;
+        addr_bytes = (const uint8_t *)&addr4.s_addr;
+    } else if (inet_pton(AF_INET6, client_ip, &addr6) == 1) {
+        af = AF_INET6;
+        addr_bytes = (const uint8_t *)&addr6.s6_addr;
+    } else {
+        return NULL;
+    }
+
     for (int i = 0; i < tag_count; i++) {
         for (int j = 0; j < tags[i].cidr_count; j++) {
-            if (match_cidr(client_ip, tags[i].cidrs[j].cidr)) {
+            const ecs_cidr_entry_t *ce = &tags[i].cidrs[j];
+            if (ce->parsed.valid) {
+                if (cidr_entry_match(&ce->parsed, af, addr_bytes)) {
+                    return tags[i].tag;
+                }
+            } else if (ce->cidr && match_cidr(client_ip, ce->cidr)) {
                 return tags[i].tag;
             }
         }
@@ -331,9 +364,22 @@ bool is_ecs_trusted_resolver(const zone_arena_t *zone, const server_config_t *cf
                              const zone_config_t *zcfg, const char *client_ip) {
     if (!client_ip) return false;
 
+    const acl_entry_t *parsed = (zone && zone->bind_ecs_trusted_resolvers_parsed && zone->bind_ecs_trusted_resolver_count > 0)
+                                 ? zone->bind_ecs_trusted_resolvers_parsed : NULL;
+    int count = parsed ? zone->bind_ecs_trusted_resolver_count : 0;
+    if (!parsed) {
+        parsed = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_parsed
+                                                              : (cfg ? cfg->ecs_trusted_resolvers_parsed : NULL);
+        count = (zcfg && zcfg->ecs_trusted_resolvers_parsed) ? zcfg->ecs_trusted_resolvers_count
+                                                             : (cfg ? cfg->ecs_trusted_resolvers_count : 0);
+    }
+    if (parsed && count > 0) {
+        return check_acl_bin(client_ip, parsed, count);
+    }
+
     char **resolvers = (zone && zone->bind_ecs_trusted_resolvers && zone->bind_ecs_trusted_resolver_count > 0)
                         ? zone->bind_ecs_trusted_resolvers : NULL;
-    int count = resolvers ? zone->bind_ecs_trusted_resolver_count : 0;
+    count = resolvers ? zone->bind_ecs_trusted_resolver_count : 0;
     if (!resolvers) {
         resolvers = (zcfg && zcfg->ecs_trusted_resolvers) ? zcfg->ecs_trusted_resolvers
                                                            : (cfg ? cfg->ecs_trusted_resolvers : NULL);

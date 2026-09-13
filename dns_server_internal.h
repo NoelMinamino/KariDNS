@@ -279,6 +279,7 @@ typedef struct {
   char *name;
   char **match_clients;
   int match_clients_count;
+  acl_entry_t *match_clients_parsed;
   zone_db_entry_t **entries;
   size_t zone_count;
   int *hash_table;
