@@ -2005,7 +2005,9 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
 
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                      ? zcfg->additional_from_auth
+                                      : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
@@ -3152,7 +3154,11 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                     wait_for_readers(z_standby);
                     clone_zone_arena(z_active, z_standby);
                     build_zone_index(z_standby, true);
-                    prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, config->additional_from_auth);
+                    zone_config_t *zcfg = find_zone_config_in_view(config, view->name, entry->domain);
+                    additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                                        ? zcfg->additional_from_auth
+                                                        : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
+                    prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, policy);
                     atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
                 }
                 pthread_mutex_unlock(&entry->writer_lock);
@@ -3934,7 +3940,10 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
 
         zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
         server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-        additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+        zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
+        additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                            ? zcfg->additional_from_auth
+                                            : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
         prelink_zone_additional_glue(standby, entry->domain, cur_snap, NULL, policy);
         if (cur_snap) release_zone_snapshot(cur_snap);
 
@@ -5009,7 +5018,9 @@ static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qty
     }
     
     // ==== フェーズ1: 委任判定 ====
-    additional_from_auth_t policy = cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES;
+    additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                        ? zcfg->additional_from_auth
+                                        : (cfg ? cfg->additional_from_auth : ADDITIONAL_AUTH_YES);
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, current_qname_hash, db_entry->domain, res,
                         max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
@@ -6019,7 +6030,10 @@ static int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-  additional_from_auth_t policy = active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES;
+  zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
+  additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                      ? zcfg->additional_from_auth
+                                      : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
   if (cur_snap) release_zone_snapshot(cur_snap);
 

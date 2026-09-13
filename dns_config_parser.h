@@ -30,6 +30,12 @@ typedef struct {
   int exempt_clients_count;
 } rate_limit_config_t;
 
+typedef enum {
+  ADDITIONAL_AUTH_YES = 0,       /* 原則 (デフォルト): Primary/Slaveゾーン全体からsibling domainも含めて返す */
+  ADDITIONAL_AUTH_IN_DOMAIN = 1, /* in-domain: 自ゾーン(管理するドメイン名)配下のレコードのみ返す */
+  ADDITIONAL_AUTH_NO = 2         /* no: Additionalセクションへのアドレス付加を行わない */
+} additional_from_auth_t;
+
 typedef struct zone_config {
   char *domain;
   char *file;
@@ -78,6 +84,10 @@ typedef struct zone_config {
   /* --- ECS 信頼リゾルバ (ゾーン単位の上書き) --- */
   char **ecs_trusted_resolvers;
   int ecs_trusted_resolvers_count;
+
+  /* --- additional-from-auth (ゾーン単位の上書き) --- */
+  additional_from_auth_t additional_from_auth;
+  bool additional_from_auth_specified;
 
   struct zone_config *next;
 } zone_config_t;
@@ -136,12 +146,6 @@ typedef struct view_config {
   zone_config_t *zones;
   struct view_config *next;
 } view_config_t;
-
-typedef enum {
-  ADDITIONAL_AUTH_YES = 0,       /* 原則 (デフォルト): Primary/Slaveゾーン全体からsibling domainも含めて返す */
-  ADDITIONAL_AUTH_IN_DOMAIN = 1, /* in-domain: 自ゾーン(管理するドメイン名)配下のレコードのみ返す */
-  ADDITIONAL_AUTH_NO = 2         /* no: Additionalセクションへのアドレス付加を行わない */
-} additional_from_auth_t;
 
 typedef struct server_config_s {
   int port;
