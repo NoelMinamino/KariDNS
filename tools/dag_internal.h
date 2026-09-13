@@ -150,6 +150,16 @@ static inline uint32_t dag_arc4random(void) {
 #define arc4random dag_arc4random
 #endif
 
+static inline const char *dag_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (*needle == '\0') return haystack;
+    size_t needle_len = strlen(needle);
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, needle_len) == 0) return haystack;
+    }
+    return NULL;
+}
+
 extern bool g_dag_suppress_stdout;
 #define printf(...) do { if (!g_dag_suppress_stdout) { fprintf(stdout, __VA_ARGS__); } } while(0)
 
@@ -158,6 +168,35 @@ extern char g_last_server_ip[INET6_ADDRSTRLEN + 1];
 extern int g_last_socket_family;
 
 /* Types */
+typedef enum {
+    BRK_NONE = 0,
+    BRK_COMPRESSION_LOOP,
+    BRK_COMPRESSION_FORWARD,
+    BRK_LABEL_TOO_LONG,
+    BRK_RESERVED_LENGTH_BITS,
+    BRK_OVERSIZED_QNAME,
+    BRK_QDCOUNT,
+    BRK_TRUNCATED_QUESTION,
+    BRK_OPT_RDLEN,
+    BRK_ARCOUNT,
+    BRK_OPCODE,
+    BRK_QR_BIT,
+    BRK_NOTIFY_NO_QUESTION,
+    BRK_TOO_SHORT,
+    BRK_TCP_LENGTH_OVERCLAIM,
+    BRK_TCP_ZERO_LENGTH,
+    BRK_TCP_IDLE_HOLD,
+    BRK_UPDATE_META_TYPE
+} break_kind_t;
+
+typedef struct {
+    break_kind_t kind;
+    long param;
+    bool has_param;
+} break_opt_t;
+
+#define MAX_BREAKS 8
+
 typedef enum {
     MATCH_BASE = 0,
     MATCH_EXACT,       // バイナリ完全一致 (クエリID除く)
@@ -404,6 +443,26 @@ void free_query_opts(query_opts_t *qo);
 void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec);
 int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec);
 int execute_query_spec(query_spec_t *spec);
+
+/* Break helpers */
+extern break_opt_t g_breaks[MAX_BREAKS];
+extern int g_break_count;
+
+bool has_break(break_kind_t kind, long *param_out, bool *has_param_out);
+bool is_structural_break(break_kind_t k);
+bool is_tcp_only_break(break_kind_t k);
+bool any_structural_break(break_kind_t *which_out);
+void parse_break_arg(const char *arg);
+void print_break_help(void);
+
+bool resolve_qtype(const char *s, uint16_t *out_type);
+const char *dnssec_algo_name(uint8_t alg);
+bool parse_subnet_arg(const char *arg, query_opts_t *qo);
+uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
+                          const query_opts_t *qo, uint16_t *opt_rdlen_field_out);
+size_t build_query_packet(uint8_t *pkt, size_t max_len,
+                          const char *qname, uint16_t qtype,
+                          const query_opts_t *qo);
 
 /* Timing helpers */
 static inline int timespec_diff_ms(const struct timespec *start, const struct timespec *end) {
