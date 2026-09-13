@@ -16,6 +16,7 @@
 #include "dag_internal.h"
 #include "dag_output_yaml.h"
 #include "dag_batch.h"
+#include "dag_axfr_client.h"
 
 #define TRACE_MAX_CNAME_DEPTH 16
 
@@ -1611,19 +1612,7 @@ static ssize_t do_udp_exchange(const char *server, int port, const query_opts_t 
     }
 }
 
-typedef struct {
-    int sock;
-    SSL *ssl;
-    char server[256];
-    int port;
-    int pref_family;
-    int family;
-    char bind_addr[64];
-    int bind_port;
-    bool is_tls;
-} tcp_conn_cache_t;
-
-static tcp_conn_cache_t g_cached_conn = {
+tcp_conn_cache_t g_cached_conn = {
     .sock = -1,
     .ssl = NULL,
     .server = {0},
@@ -1710,7 +1699,7 @@ static int do_tcp_send_request(const char *server, int port, const query_opts_t 
     return sock;
 }
 
-static ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
+ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap) {
     uint8_t rlen_buf[2];
     size_t got_len = 0;
     while (got_len < 2) {
@@ -1872,7 +1861,7 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     return ssl;
 }
 
-static ssize_t do_tls_recv_response(SSL *ssl, uint8_t *resp, size_t resp_cap) {
+ssize_t do_tls_recv_response(SSL *ssl, uint8_t *resp, size_t resp_cap) {
     if (!ssl) return -1;
     uint8_t rlen_buf[2];
     int got = 0;
@@ -2574,28 +2563,6 @@ ssize_t do_dns_exchange_by_transport(const char *server, int port, const query_o
     }
 }
 
-static ssize_t do_axfr_recv_next(int tcp_sock, const query_opts_t *qo, uint8_t *resp, size_t resp_cap) {
-    if (qo && qo->use_tls) {
-        if (g_cached_conn.is_tls && g_cached_conn.ssl) {
-            return do_tls_recv_response(g_cached_conn.ssl, resp, resp_cap);
-        }
-        return -1;
-    } else if (qo && qo->use_doh) {
-        if (g_cached_conn.is_tls && g_cached_conn.ssl) {
-            return do_tls_recv_response(g_cached_conn.ssl, resp, resp_cap);
-        } else if (g_cached_conn.sock >= 0) {
-            return do_tcp_recv_response(g_cached_conn.sock, resp, resp_cap);
-        }
-        return -1;
-    } else {
-        if (tcp_sock >= 0) {
-            return do_tcp_recv_response(tcp_sock, resp, resp_cap);
-        } else if (g_cached_conn.sock >= 0 && !g_cached_conn.is_tls) {
-            return do_tcp_recv_response(g_cached_conn.sock, resp, resp_cap);
-        }
-        return -1;
-    }
-}
 
 static ssize_t do_dns_exchange_auto(const char *server, int port, const query_opts_t *qo,
                                      const uint8_t *pkt, size_t pkt_len,
@@ -3948,50 +3915,6 @@ static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
     format_rdata_common(pkt, pkt_len, type, abs_offset, rdlen, &sink, dopt);
 }
 
-typedef struct {
-    bool is_axfr;
-    bool is_ixfr;
-    char first_soa_name[256];
-    uint8_t first_soa_norm[1024];
-    size_t first_soa_norm_len;
-    int soa_seen_count;
-    bool axfr_complete;
-} axfr_state_t;
-
-static void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_len, const char *name, const uint8_t *hdr, uint16_t rdlen) {
-    if (!state || !state->is_axfr) return;
-    const uint8_t *rdata = hdr + 10;
-    
-    char *mname = NULL, *rname = NULL;
-    size_t next1, next2;
-    if (expand_wire_name(pkt, pkt_len, rdata - pkt, &next1, &g_dag_arena, &mname) != 0) return;
-    if (expand_wire_name(pkt, pkt_len, next1, &next2, &g_dag_arena, &rname) != 0) return;
-    if (next2 + 20 > (size_t)(rdata - pkt) + rdlen) return;
-
-    size_t mlen = strlen(mname);
-    size_t rlen = strlen(rname);
-    size_t norm_len = mlen + 1 + rlen + 1 + 20;
-    if (norm_len > sizeof(state->first_soa_norm)) return;
-
-    uint8_t norm[1024];
-    memcpy(norm, mname, mlen + 1);
-    memcpy(norm + mlen + 1, rname, rlen + 1);
-    memcpy(norm + mlen + 1 + rlen + 1, pkt + next2, 20);
-
-    if (state->soa_seen_count == 0) {
-        snprintf(state->first_soa_name, sizeof(state->first_soa_name), "%s", name);
-        memcpy(state->first_soa_norm, norm, norm_len);
-        state->first_soa_norm_len = norm_len;
-        state->soa_seen_count = 1;
-    } else {
-        if (strcasecmp(state->first_soa_name, name) == 0 &&
-            norm_len == state->first_soa_norm_len &&
-            memcmp(norm, state->first_soa_norm, norm_len) == 0) {
-            state->axfr_complete = true;
-        }
-        state->soa_seen_count++;
-    }
-}
 
 static uint32_t calc_wire_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
     uint32_t h = 2166136261u;

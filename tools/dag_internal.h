@@ -348,6 +348,20 @@ typedef struct query_spec_s {
     display_opts_t dopt;
 } query_spec_t;
 
+typedef struct {
+    int sock;
+    SSL *ssl;
+    char server[256];
+    int port;
+    int pref_family;
+    int family;
+    char bind_addr[64];
+    int bind_port;
+    bool is_tls;
+} tcp_conn_cache_t;
+
+extern tcp_conn_cache_t g_cached_conn;
+
 /* Functions shared between dag modules */
 const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size);
 const char *format_class_name(uint16_t klass, char *buf, size_t buf_size);
@@ -367,5 +381,8 @@ void free_query_opts(query_opts_t *qo);
 void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec);
 int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec);
 int execute_query_spec(query_spec_t *spec);
+
+ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap);
+ssize_t do_tls_recv_response(SSL *ssl, uint8_t *resp, size_t resp_cap);
 
 #endif /* DAG_INTERNAL_H */
