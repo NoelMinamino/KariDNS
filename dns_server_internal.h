@@ -47,6 +47,9 @@
 #include "dns_edns_ecs.h"
 #include "dns_rrl.h"
 #include "dns_tsig_acl.h"
+#include "dns_priv_sandbox.h"
+
+extern int g_cwd_fd;
 
 #define DNS_PORT 53
 #define MAX_EVENTS 1024
@@ -313,8 +316,5 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              zone_config_t *catalog_cfg,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
-
-int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
-int stat_via_dir_cache(const char *path, struct stat *sb);
 
 #endif /* DNS_SERVER_INTERNAL_H */
