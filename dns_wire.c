@@ -409,6 +409,8 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
             blob = (uint8_t *)arena_alloc(arena, rdlen);
             if (!blob) return -1;
             memcpy(blob, &packet[*offset], rdlen);
+        } else {
+            blob = (uint8_t *)"";
         }
         rec->generic_data = blob;
         rec->generic_len = rdlen;
@@ -2671,6 +2673,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 size_t off = offset;
                 if (decode_concat_b64_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
                 offset = off;
+                break;
+            }
+            case 128: { // NXNAME (RFC 9824 Compact Denial of Existence): 0-length RDATA
                 break;
             }
             default: {

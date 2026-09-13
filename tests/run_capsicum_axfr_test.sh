@@ -54,7 +54,7 @@ echo "[OK] AXFR without TSIG correctly refused."
 
 echo "Running AXFR transfer with TSIG..."
 axfr_output=$(./dag example.com AXFR @127.0.0.1 -p 10053 -y transfer-key:dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl +tcp)
-actual_types=$(echo "$axfr_output" | grep -oE '[[:space:]]IN[[:space:]]+[A-Z0-9]+[[:space:]]' | awk '{print $2}' | sort -u)
+actual_types=$(echo "$axfr_output" | grep -oE '[[:space:]]IN[[:space:]]+[A-Z0-9\-]+[[:space:]]' | awk '{print $2}' | sort -u)
 
 # 5. サーバープロセスがまだ生きているか確認(クラッシュ検出)
 if ! kill -0 $SERVER_PID 2>/dev/null; then
@@ -74,7 +74,7 @@ if kdump -f karidns.trace | grep -E 'ECAPMODE|TRAP_CAP'; then
 fi
 
 # 期待される型がすべてAXFR応答に含まれているか突き合わせる (再利用)
-expected_types=$(grep -E '^[^[:space:]]*[[:space:]]+(IN[[:space:]]+)?[A-Z0-9]+[[:space:]]' tests/zones/example.com.zone \
+expected_types=$(grep -E '^[^[:space:]]*[[:space:]]+(IN[[:space:]]+)?[A-Z0-9\-]+[[:space:]]' tests/zones/example.com.zone \
     tests/zones/example.com.hosts tests/zones/example.com.dnskey \
     | grep -v '^[[:space:]]*;' \
     | awk '{for(i=1;i<=NF;i++) if ($i=="IN") {print $(i+1); break}}' \

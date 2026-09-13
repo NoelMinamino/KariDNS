@@ -1493,9 +1493,14 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
       for (int j = 0; j < old_arena->records[i].rdata_count; j++) {
          txn->deleted[d_idx].rdata[j] = arena_strdup(&txn->arena, old_arena->records[i].rdata[j]);
       }
-      if (old_arena->records[i].generic_len > 0) {
+      if (old_arena->records[i].generic_len > 0 && old_arena->records[i].generic_data) {
          txn->deleted[d_idx].generic_data = arena_alloc(&txn->arena, old_arena->records[i].generic_len);
-         memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
+         if (txn->deleted[d_idx].generic_data)
+           memcpy(txn->deleted[d_idx].generic_data, old_arena->records[i].generic_data, old_arena->records[i].generic_len);
+      } else if (old_arena->records[i].generic_data) {
+         txn->deleted[d_idx].generic_data = (uint8_t *)"";
+      } else {
+         txn->deleted[d_idx].generic_data = NULL;
       }
       txn->deleted[d_idx].is_cached = false;
       dns_record_preparse_cache(&txn->arena, &txn->deleted[d_idx]);
@@ -1516,9 +1521,14 @@ static void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, z
       for (int j = 0; j < new_arena->records[i].rdata_count; j++) {
          txn->added[a_idx].rdata[j] = arena_strdup(&txn->arena, new_arena->records[i].rdata[j]);
       }
-      if (new_arena->records[i].generic_len > 0) {
+      if (new_arena->records[i].generic_len > 0 && new_arena->records[i].generic_data) {
          txn->added[a_idx].generic_data = arena_alloc(&txn->arena, new_arena->records[i].generic_len);
-         memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
+         if (txn->added[a_idx].generic_data)
+           memcpy(txn->added[a_idx].generic_data, new_arena->records[i].generic_data, new_arena->records[i].generic_len);
+      } else if (new_arena->records[i].generic_data) {
+         txn->added[a_idx].generic_data = (uint8_t *)"";
+      } else {
+         txn->added[a_idx].generic_data = NULL;
       }
       txn->added[a_idx].is_cached = false;
       dns_record_preparse_cache(&txn->arena, &txn->added[a_idx]);
@@ -1798,6 +1808,8 @@ static void prelink_zone_additional_glue(zone_arena_t *current_zone,
           d_rec->generic_data = (uint8_t *)arena_alloc(current_zone, src_rec->generic_len);
           if (d_rec->generic_data)
             memcpy(d_rec->generic_data, src_rec->generic_data, src_rec->generic_len);
+        } else if (src_rec->generic_data) {
+          d_rec->generic_data = (uint8_t *)"";
         } else {
           d_rec->generic_data = NULL;
         }
@@ -3321,8 +3333,11 @@ static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
       d_rec->generic_data = (uint8_t *)arena_alloc(dst, s_rec->generic_len);
       if (d_rec->generic_data)
         memcpy(d_rec->generic_data, s_rec->generic_data, s_rec->generic_len);
-    } else
+    } else if (s_rec->generic_data) {
+      d_rec->generic_data = (uint8_t *)"";
+    } else {
       d_rec->generic_data = NULL;
+    }
     d_rec->next_record = -1;
     d_rec->is_cached = false;
     dns_record_preparse_cache(dst, d_rec);

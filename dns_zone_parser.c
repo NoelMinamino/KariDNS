@@ -1166,7 +1166,7 @@ PROCESS_RECORD:
 
   rec->generic_len = 0;
   rec->generic_data = NULL;
-  if (rec->rdata_count >= 2 && strcmp(rec->rdata[0], "\\#") == 0) {
+  if (rec->rdata_count >= 2 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0)) {
     long declared_len = atol(rec->rdata[1]);
     if (declared_len < 0 || declared_len > 65535) {
       if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) out of range (0-65535)";
@@ -1194,6 +1194,8 @@ PROCESS_RECORD:
         }
         rec->generic_data = blob;
       }
+    } else if (rec->generic_len == 0) {
+      rec->generic_data = (uint8_t *)"";
     }
   } else if (rec->type) {
     if (rec->type_code == 5 || rec->type_code == 12 || rec->type_code == 2 ||
