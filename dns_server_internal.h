@@ -52,6 +52,7 @@
 extern int g_cwd_fd;
 extern int g_control_kq;
 extern int g_notify_ipc[2];
+extern char g_startup_cwd[PATH_MAX];
 
 #define DNS_PORT 53
 #define MAX_EVENTS 1024

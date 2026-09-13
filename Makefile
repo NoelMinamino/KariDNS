@@ -29,7 +29,7 @@ LDFLAGS = -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
 TARGET = karidns
-SRCS = dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
+SRCS = dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_snapshot_rcu.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
 OBJS = $(SRCS:.c=.o)
 
 DAG_TARGET = dag
@@ -45,7 +45,7 @@ FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
 FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c dns_utils.c dns_zone_parser.c
 
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
-FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
+FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_snapshot_rcu.c dns_wire.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c
 
 FUZZ_ZONE_TARGET = tests/fuzz/fuzz_zone_parser
 FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_wire.c
@@ -147,6 +147,9 @@ dns_axfr_ixfr.o: dns_axfr_ixfr.c
 
 dns_query_engine.o: dns_query_engine.c
 	$(CC) $(CFLAGS) -c dns_query_engine.c -o dns_query_engine.o
+
+dns_snapshot_rcu.o: dns_snapshot_rcu.c
+	$(CC) $(CFLAGS) -c dns_snapshot_rcu.c -o dns_snapshot_rcu.o
 
 dns_wire.o: dns_wire.c
 	$(CC) $(CFLAGS) -c dns_wire.c -o dns_wire.o
