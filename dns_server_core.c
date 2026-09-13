@@ -46,6 +46,8 @@
 #include <sys/uio.h>
 
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
+#include "dns_server_internal.h"
+#include "dns_catalog_zone.h"
 
 // karidns
 // Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
@@ -120,101 +122,6 @@ typedef struct {
 // ============================================================================
 // 2. データ構造定義
 // ============================================================================
-
-// Zoneデータメモリプール (アリーナ)
-
-typedef struct {
-  _Atomic(zone_arena_t *) active;
-  zone_arena_t arena_a;
-  zone_arena_t arena_b;
-} zone_rcu_t;
-
-#define MAX_IXFR_HISTORY 32
-#define MAX_ZONE_AXFR 4
-#define MAX_TCP_CLIENTS 1000
-
-typedef struct {
-  uint32_t old_serial;
-  uint32_t new_serial;
-  dns_record_t *deleted;
-  int deleted_count;
-  dns_record_t *added;
-  int added_count;
-  _Atomic int ref_count;
-  zone_arena_t arena; // mini-arena for strings/blob
-} ixfr_txn_t;
-
-typedef struct {
-  ixfr_txn_t *entries[MAX_IXFR_HISTORY];
-  int head;
-  int count;
-  pthread_mutex_t lock;
-} ixfr_history_t;
-
-typedef struct {
-  char unique_id[256];
-  char domain[256];
-  char **groups;
-  int group_count;
-  char coo_target[256];
-} catalog_member_id_t;
-
-typedef struct {
-    _Atomic uint64_t queries_total;
-    _Atomic uint64_t responses_noerror;
-    _Atomic uint64_t responses_nxdomain;
-    _Atomic uint64_t responses_nodata;   // NOERRORかつANCOUNT=0 (RFC 2308)
-    _Atomic uint64_t responses_servfail;
-    _Atomic uint64_t responses_refused;
-    _Atomic uint64_t tcp_queries;
-    _Atomic uint64_t ecs_queries;
-    _Atomic uint64_t edns_queries;
-    _Atomic uint64_t dnssec_do_queries;
-    _Atomic uint64_t rrl_dropped;
-    _Atomic uint64_t rrl_slipped;
-    _Atomic uint64_t notify_sent;
-    _Atomic uint64_t notify_ack;
-    _Atomic uint64_t axfr_success;
-    _Atomic uint64_t ixfr_success;
-    _Atomic time_t   last_transfer_time;
-    _Atomic time_t   last_notify_time;
-} zone_observatory_t;
-
-typedef struct {
-  char domain[256];
-  char view_name[64];
-  zone_rcu_t rcu;
-  pthread_mutex_t writer_lock;
-  _Atomic(uint32_t) serial;
-  _Atomic(uint32_t) refresh;
-  _Atomic(uint32_t) retry;
-  _Atomic(uint32_t) expire;
-  _Atomic(time_t) next_check;
-  _Atomic bool refresh_now;
-  _Atomic bool notify_now;
-  _Atomic bool is_transferring;
-  _Atomic(int) active_axfr;
-  _Atomic int snapshot_refs;
-  ixfr_history_t ixfr_history;
-  zone_observatory_t observatory;
-  catalog_member_id_t *catalog_members;
-  int catalog_member_count;
-  bool is_catalog_member;
-  bool is_secondary;
-  char catalog_member_unique_id[256];
-  char **groups;
-  int group_count;
-  char cached_master_ip[64];
-  int cached_master_port;
-  char cached_tsig_key_name[64];
-  // LOCK-ONLY FIELD: 読み書きは g_zone_db_rebuild_lock 保持区間内でのみ行うこと。
-  // クエリ処理・バックグラウンドスケジューラなど、スナップショットをロックフリーで
-  // 読む経路からは絶対に参照しないこと(catalog_members/groups と同じ規約)。
-  char owning_catalog_domain[256];
-  _Atomic(time_t) last_successful_transfer;
-  _Atomic(time_t) last_stale_log_time;
-  time_t last_loaded_mtime;
-} zone_db_entry_t;
 
 // TCPストリーム解析ステート
 typedef enum { TCP_STATE_READ_LEN, TCP_STATE_READ_BODY } tcp_state_t;
@@ -341,19 +248,7 @@ typedef struct {
   udp_batch_ctx_t batch;
 } worker_ctx_t;
 
-typedef struct {
-  _Atomic(server_config_t *) active;
-  server_config_t config_a;
-  server_config_t config_b;
-} config_rcu_t;
-
 pthread_mutex_t g_zone_db_rebuild_lock = PTHREAD_MUTEX_INITIALIZER;
-
-typedef struct {
-    char domain[256];
-    char old_catalog[256];
-    char new_catalog[256];
-} pending_coo_t;
 
 // Protected by g_zone_db_rebuild_lock
 pending_coo_t *g_pending_coo = NULL;
@@ -662,29 +557,10 @@ static bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, 
   return exhausted;
 }
 
-typedef struct {
-  char *name;
-  char **match_clients;
-  int match_clients_count;
-  zone_db_entry_t **entries;
-  size_t zone_count;
-  int *hash_table;
-  int *chain_next;
-  size_t hash_size;
-  int *suffix_hash_table;   // 末尾ドット正規化済みキーによるインデックス (Task 2)
-  int *suffix_chain_next;
-  size_t suffix_hash_size;
-} view_snapshot_t;
-
-typedef struct {
-  view_snapshot_t *views;
-  size_t view_count;
-  _Atomic(int) reader_count;
-} zone_db_snapshot_t;
 static _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
 static config_rcu_t g_config_db;
 
-static server_config_t *acquire_config_snapshot(void) {
+server_config_t *acquire_config_snapshot(void) {
   server_config_t *snap = NULL;
   do {
     snap = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
@@ -696,7 +572,7 @@ static server_config_t *acquire_config_snapshot(void) {
   return snap;
 }
 
-static void release_config_snapshot(server_config_t *snap) {
+void release_config_snapshot(server_config_t *snap) {
   if (snap) atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
 }
 int g_control_kq = -1;
@@ -1021,7 +897,7 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode,
   return openat(dfd, basebuf, flags | O_RESOLVE_BENEATH, mode);
 }
 
-static int stat_via_dir_cache(const char *path, struct stat *sb) {
+int stat_via_dir_cache(const char *path, struct stat *sb) {
   char dirbuf[PATH_MAX], basebuf[PATH_MAX];
   if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf,
                              sizeof(basebuf))) {
@@ -1111,9 +987,9 @@ void release_zone_snapshot(zone_db_snapshot_t *snap) {
     atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
 }
 
-static zone_config_t *find_zone_config_in_view(server_config_t *cfg,
-                                               const char *view_name,
-                                               const char *domain) {
+zone_config_t *find_zone_config_in_view(server_config_t *cfg,
+                                        const char *view_name,
+                                        const char *domain) {
   if (!cfg || !domain) return NULL;
   if (cfg->views) {
     if (!view_name) return NULL;
@@ -2025,77 +1901,6 @@ static reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t 
   return RELOAD_OK;
 }
 
-static inline uint32_t calc_catalog_member_hash(const char *domain, const char *unique_id) {
-  uint32_t hash = calc_fnv1a_str(domain);
-  if (unique_id) {
-    for (const char *p = unique_id; *p; p++) {
-      hash ^= (uint8_t)*p;
-      hash *= 16777619u;
-    }
-  }
-  return hash;
-}
-
-void free_catalog_member_ids(catalog_member_id_t *arr, int count) {
-  if (!arr) return;
-  for (int i = 0; i < count; i++) {
-    if (arr[i].groups) {
-      for (int j = 0; j < arr[i].group_count; j++) {
-        free(arr[i].groups[j]);
-      }
-      free(arr[i].groups);
-    }
-  }
-  free(arr);
-}
-
-zone_db_entry_t *find_catalog_parent_in_snapshot(view_snapshot_t *view, const char *catalog_domain) {
-    if (!view || !catalog_domain) return NULL;
-    if (view->hash_size > 0 && view->hash_table && view->chain_next) {
-        uint32_t hash = calc_fnv1a_str(catalog_domain);
-        size_t idx = hash & (view->hash_size - 1);
-        for (int i = view->hash_table[idx]; i != -1; i = view->chain_next[i]) {
-            if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
-                return view->entries[i];
-            }
-        }
-        return NULL;
-    }
-    for (size_t i = 0; i < view->zone_count; i++) {
-        if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
-            return view->entries[i];
-        }
-    }
-    return NULL;
-}
-
-void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, const char *unique_id, const char *domain) {
-    if (!catalog_entry || !catalog_entry->catalog_members) return;
-    for (int i = 0; i < catalog_entry->catalog_member_count; i++) {
-        if (strcasecmp(catalog_entry->catalog_members[i].domain, domain) == 0 && 
-            strcmp(catalog_entry->catalog_members[i].unique_id, unique_id) == 0) {
-            
-            // Explicitly free the dynamically allocated `groups` strings of the targeted element
-            if (catalog_entry->catalog_members[i].groups) {
-                for (int g = 0; g < catalog_entry->catalog_members[i].group_count; g++) {
-                    free(catalog_entry->catalog_members[i].groups[g]);
-                }
-                free(catalog_entry->catalog_members[i].groups);
-            }
-            
-            // Shift the remaining elements forward
-            int elements_after = catalog_entry->catalog_member_count - i - 1;
-            if (elements_after > 0) {
-                memmove(&catalog_entry->catalog_members[i], 
-                        &catalog_entry->catalog_members[i + 1], 
-                        elements_after * sizeof(catalog_member_id_t));
-            }
-            catalog_entry->catalog_member_count--;
-            break;
-        }
-    }
-}
-
 static void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason) {
     syslog(LOG_ERR, "[Core] Memory allocation failed during snapshot rebuild (%s), aborting", reason);
     if (new_snap) {
@@ -2861,239 +2666,6 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     }
 
     return new_snap;
-}
-
-
-static void normalize_domain_fqdn_local(const char *in, char *out, size_t out_cap) {
-    size_t len = strlen(in);
-    if (len > 0 && in[len - 1] != '.' && len + 1 < out_cap) {
-        memcpy(out, in, len);
-        out[len] = '.';
-        out[len + 1] = '\0';
-    } else {
-        snprintf(out, out_cap, "%s", in);
-    }
-}
-
-static void free_catalog_desired_list(catalog_member_id_t *list, int count) {
-    if (!list) return;
-    for (int i = 0; i < count; i++) {
-        if (list[i].groups) {
-            for (int j = 0; j < list[i].group_count; j++) {
-                if (list[i].groups[j]) free(list[i].groups[j]);
-            }
-            free(list[i].groups);
-        }
-    }
-    free(list);
-}
-
-void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name) {
-    if (!catalog_entry || !catalog_cfg) return;
-
-    zone_arena_t *arena = atomic_load_explicit(&catalog_entry->rcu.active, memory_order_acquire);
-    if (!arena) return;
-
-    atomic_fetch_add_explicit(&arena->reader_count, 1, memory_order_acquire);
-
-    // Verify version.<catalog_zone>. TXT "2"
-    char version_txt[256];
-    snprintf(version_txt, sizeof(version_txt), "version.%s", catalog_entry->domain);
-    bool found_version = false;
-    for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, version_txt) == 0) {
-            if (arena->records[i].rdata_count > 0 && strcmp(arena->records[i].rdata[0], "2") == 0) {
-                found_version = true;
-                break;
-            }
-        }
-    }
-
-    if (!found_version) {
-        syslog(LOG_ERR, "[Catalog] Zone '%s' is missing '%s TXT \"2\"', aborting catalog update", catalog_entry->domain, version_txt);
-        atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-        return;
-    }
-
-    // Build desired members list
-    int max_possible = arena->count;
-    catalog_member_id_t *new_desired = calloc(max_possible, sizeof(catalog_member_id_t));
-    if (!new_desired) {
-        syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building member list", catalog_entry->domain);
-        atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-        return;
-    }
-    int new_desired_count = 0;
-
-    char suffix[256];
-    snprintf(suffix, sizeof(suffix), ".zones.%s", catalog_entry->domain);
-    size_t suffix_len = strlen(suffix);
-
-    server_config_t *cfg = acquire_config_snapshot();
-    for (size_t i = 0; i < arena->count; i++) {
-        if (arena->records[i].type_code == 12) { // PTR
-            size_t name_len = strlen(arena->records[i].name);
-            if (name_len > suffix_len && strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) == 0) {
-                if (arena->records[i].rdata_count > 0) {
-                    char *target = arena->records[i].rdata[0];
-                    char norm_target[256];
-                    normalize_domain_fqdn_local(target, norm_target, sizeof(norm_target));
-                    
-                    // Collision check with static config
-                    zone_config_t *zcfg = find_zone_config_in_view(cfg, view_name, norm_target);
-                    if (zcfg) {
-                        syslog(LOG_WARNING, "[Catalog] Zone '%s' generated member '%s' which collides with static config. Skipping.", catalog_entry->domain, norm_target);
-                        continue;
-                    }
-                    
-                    // Extract unique_id
-                    size_t prefix_len = name_len - suffix_len;
-                    if (prefix_len < sizeof(new_desired[new_desired_count].unique_id)) {
-                        strncpy(new_desired[new_desired_count].unique_id, arena->records[i].name, prefix_len);
-                        new_desired[new_desired_count].unique_id[prefix_len] = '\0';
-                        strncpy(new_desired[new_desired_count].domain, norm_target, sizeof(new_desired[new_desired_count].domain) - 1);
-                        new_desired_count++;
-                    }
-                }
-            }
-        }
-    }
-    release_config_snapshot(cfg);
-
-    // RFC 9432 §5.1: 壊れたカタログゾーンの検出
-    // (1) 同一 <unique-N> に複数のPTRレコードが存在しないか
-    bool catalog_broken = false;
-    for (size_t i = 0; i < arena->count && !catalog_broken; i++) {
-        if (arena->records[i].type_code != 12) continue;
-        size_t name_len = strlen(arena->records[i].name);
-        if (name_len <= suffix_len ||
-            strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) != 0)
-            continue;
-        int count_for_this_name = 0;
-        for (size_t j = 0; j < arena->count; j++) {
-            if (arena->records[j].type_code == 12 &&
-                strcasecmp(arena->records[j].name, arena->records[i].name) == 0) {
-                count_for_this_name++;
-            }
-        }
-        if (count_for_this_name > 1) {
-            syslog(LOG_ERR, "[Catalog] Zone '%s': member node '%s' has %d PTR records (RFC 9432 requires exactly 1); catalog zone is broken and will NOT be processed",
-                   catalog_entry->domain, arena->records[i].name, count_for_this_name);
-            catalog_broken = true;
-        }
-    }
-
-    // (2) 異なる<unique-N>が同一ターゲットを指していないか
-    for (int a = 0; a < new_desired_count && !catalog_broken; a++) {
-        for (int b = a + 1; b < new_desired_count; b++) {
-            if (strcasecmp(new_desired[a].domain, new_desired[b].domain) == 0) {
-                syslog(LOG_ERR, "[Catalog] Zone '%s': member zone '%s' is referenced by both '%s' and '%s' labels; catalog zone is broken and will NOT be processed",
-                       catalog_entry->domain, new_desired[a].domain, new_desired[a].unique_id, new_desired[b].unique_id);
-                catalog_broken = true;
-                break;
-            }
-        }
-    }
-
-    if (catalog_broken) {
-        free_catalog_desired_list(new_desired, new_desired_count);
-        atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-        return; // カタログゾーン全体の更新を中止(既存の状態を維持)
-    }
-
-    for (int d = 0; d < new_desired_count; d++) {
-        char group_name[512];
-        snprintf(group_name, sizeof(group_name), "group.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
-        
-        int grp_count = 0;
-        for (size_t i = 0; i < arena->count; i++) {
-            if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, group_name) == 0) {
-                grp_count++;
-            }
-        }
-        
-        if (grp_count > 0) {
-            new_desired[d].groups = calloc(grp_count, sizeof(char *));
-            if (!new_desired[d].groups) {
-                syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building group list for member '%s'", catalog_entry->domain, new_desired[d].domain);
-                free_catalog_desired_list(new_desired, new_desired_count);
-                atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-                return;
-            }
-            new_desired[d].group_count = 0;
-            for (size_t i = 0; i < arena->count; i++) {
-                if (arena->records[i].type_code == 16 && strcasecmp(arena->records[i].name, group_name) == 0) {
-                    if (arena->records[i].rdata_count > 0) {
-                        char *g = strdup(arena->records[i].rdata[0]);
-                        if (!g) {
-                            syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory duplicating group string", catalog_entry->domain);
-                            free_catalog_desired_list(new_desired, new_desired_count);
-                            atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-                            return;
-                        }
-                        new_desired[d].groups[new_desired[d].group_count++] = g;
-                    }
-                }
-            }
-            for (int i = 0; i < new_desired[d].group_count - 1; i++) {
-                for (int j = i + 1; j < new_desired[d].group_count; j++) {
-                    if (strcmp(new_desired[d].groups[i], new_desired[d].groups[j]) > 0) {
-                        char *tmp = new_desired[d].groups[i];
-                        new_desired[d].groups[i] = new_desired[d].groups[j];
-                        new_desired[d].groups[j] = tmp;
-                    }
-                }
-            }
-        }
-        char coo_name[512];
-        snprintf(coo_name, sizeof(coo_name), "coo.%s.zones.%s", new_desired[d].unique_id, catalog_entry->domain);
-        
-        int coo_count = 0;
-        char coo_rdata[256] = {0};
-        for (size_t i = 0; i < arena->count; i++) {
-            if (arena->records[i].type_code == 12 && strcasecmp(arena->records[i].name, coo_name) == 0) {
-                if (arena->records[i].rdata_count > 0) {
-                    strncpy(coo_rdata, arena->records[i].rdata[0], sizeof(coo_rdata) - 1);
-                }
-                coo_count++;
-            }
-        }
-        
-        if (coo_count == 1) {
-            normalize_domain_fqdn_local(coo_rdata, new_desired[d].coo_target, sizeof(new_desired[d].coo_target));
-        } else if (coo_count > 1) {
-            syslog(LOG_ERR, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'; catalog zone is broken and will NOT be processed", new_desired[d].domain, catalog_entry->domain);
-            free_catalog_desired_list(new_desired, new_desired_count);
-            atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-            return;
-        } else {
-            new_desired[d].coo_target[0] = '\0';
-        }
-    }
-
-    if (new_desired_count > 0) {
-        catalog_member_id_t *shrunk = calloc(new_desired_count, sizeof(catalog_member_id_t));
-        if (!shrunk) {
-            syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory finalizing member list", catalog_entry->domain);
-            free_catalog_desired_list(new_desired, new_desired_count);
-            atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-            return;
-        }
-        for (int i = 0; i < new_desired_count; i++) shrunk[i] = new_desired[i];
-        free(new_desired);
-        new_desired = shrunk;
-    } else {
-        free(new_desired);
-        new_desired = NULL;
-    }
-
-    atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
-    zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
-    if (!new_snap) {
-        syslog(LOG_ERR, "[Catalog] Failed to rebuild zone DB snapshot; catalog membership update skipped for '%s'", catalog_entry->domain);
-        return;
-    }
-    syslog(LOG_INFO, "[Catalog] Processed membership for '%s', desired members: %d", catalog_entry->domain, new_desired_count);
 }
 
 static void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
