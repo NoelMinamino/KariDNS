@@ -158,6 +158,29 @@ extern char g_last_server_ip[INET6_ADDRSTRLEN + 1];
 extern int g_last_socket_family;
 
 /* Types */
+typedef enum {
+    MATCH_BASE = 0,
+    MATCH_EXACT,       // バイナリ完全一致 (クエリID除く)
+    MATCH_SEMANTIC,    // ハッシュ一致 (順序やTTL違い)
+    MATCH_DIFF         // 差異あり
+} match_status_t;
+
+typedef struct {
+    char server_ip[64];
+    char proto[8];
+    uint8_t rcode;
+    uint16_t qdcount, ancount, nscount, arcount;
+    bool qr, aa, tc, rd, ra, ad, cd;
+    ssize_t resp_len;
+    uint8_t resp_buf[65535];
+    uint32_t semantic_hash; // 順不同ハッシュの合計値 (Wire format)
+    uint32_t record_hash;   // 順不同レコードハッシュの合計値 (Canonical Text)
+    long elapsed_ms;
+    match_status_t match_status;
+    int msg_index;
+    int msg_total;
+} server_result_t;
+
 typedef enum { PREREQ_NXDOMAIN, PREREQ_YXDOMAIN, PREREQ_NXRRSET, PREREQ_YXRRSET } prereq_kind_t;
 typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL, UPDATE_OP_DEL_EXACT } update_op_kind_t;
 
@@ -381,6 +404,32 @@ void free_query_opts(query_opts_t *qo);
 void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec);
 int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec);
 int execute_query_spec(query_spec_t *spec);
+
+/* Timing helpers */
+static inline int timespec_diff_ms(const struct timespec *start, const struct timespec *end) {
+    return (int)((end->tv_sec - start->tv_sec) * 1000 + (end->tv_nsec - start->tv_nsec) / 1000000);
+}
+
+void reset_dag_arena(void);
+void hexdump(const uint8_t *buf, size_t len);
+int parse_qtype(const char *s);
+size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap);
+size_t build_and_sign_query(uint8_t *pkt, size_t max_len,
+                           const char *qname, uint16_t qtype,
+                           const query_opts_t *qo,
+                           uint8_t *req_mac, size_t *req_mac_len);
+ssize_t do_dns_exchange_auto(const char *server, int port, const query_opts_t *qo,
+                             const uint8_t *pkt, size_t pkt_len,
+                             uint8_t *resp, size_t resp_cap, int timeout_sec,
+                             bool force_tcp);
+typedef struct axfr_state_s axfr_state_t;
+
+void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state, const display_opts_t *dopt);
+const char *get_system_resolver(void);
+
+extern int g_server_count;
+server_result_t *alloc_result_row(void);
+void calculate_packet_hashes(const uint8_t *pkt, size_t pkt_len, uint32_t *wire_hash_out, uint32_t *record_hash_out);
 
 ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap);
 ssize_t do_tls_recv_response(SSL *ssl, uint8_t *resp, size_t resp_cap);
