@@ -841,7 +841,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
   return false;
 }
 
-static void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
+void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_arena_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,

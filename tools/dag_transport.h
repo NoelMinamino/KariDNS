@@ -41,4 +41,7 @@ ssize_t do_dns_exchange_auto(const char *server, int port, const query_opts_t *q
                              uint8_t *resp, size_t resp_cap, int timeout_sec,
                              bool force_tcp);
 
+ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_len,
+                                  uint8_t *resp, size_t resp_cap);
+
 #endif /* DAG_TRANSPORT_H */

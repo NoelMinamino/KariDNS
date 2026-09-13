@@ -1023,8 +1023,8 @@ static int parse_http_status_code(const uint8_t *buf, size_t len) {
 // http_buf/http_len: 受信済みの生HTTPレスポンス
 // resp/resp_cap: デコード結果(DNSメッセージ)の出力バッファ
 // 戻り値: 成功時はデコードしたバイト数(>=0)。未完了・不正フォーマット時は -1。
-static ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_len,
-                                          uint8_t *resp, size_t resp_cap) {
+ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_len,
+                                  uint8_t *resp, size_t resp_cap) {
     if (!http_buf || http_len < 16 || !resp || resp_cap == 0) return -1;
 
     const uint8_t *hdr_end_u8 = memmem(http_buf, http_len, "\r\n\r\n", 4);
