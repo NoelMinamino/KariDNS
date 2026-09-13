@@ -43,6 +43,8 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 
+#include "dns_dnstap.h"
+
 #define DNS_PORT 53
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 4096
@@ -52,11 +54,137 @@
 #define MAX_ZONE_AXFR 4
 #define MAX_TCP_CLIENTS 1000
 
+// Frontend/Backendプロセス間のUDPパケット受け渡し用ヘッダ
+typedef struct {
+  int sock_fd_idx;
+  socklen_t addr_len;
+  struct sockaddr_storage client_addr;
+  struct sockaddr_storage source_addr;
+  bool has_source_addr;
+  uint16_t payload_len;
+} udp_ipc_t;
+
+#define UDP_BATCH_SIZE 16
+#define UDP_IPC_BUFFER_SIZE (sizeof(udp_ipc_t) + BUFFER_SIZE)
+
+// ワーカーローカル用 UDPバッチコンテキスト (ヒープ保持)
+typedef struct {
+  struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
+  struct iovec   rx_iov[UDP_BATCH_SIZE];
+  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
+
+  struct mmsghdr tx_msgs[UDP_BATCH_SIZE];
+  struct iovec   tx_iov[UDP_BATCH_SIZE];
+  uint8_t        tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+} udp_batch_ctx_t;
+
+// Frontend ルーター用 UDP制御メッセージバッファ共用体
+#define ROUTER_CMSG_BUF_SIZE 128
+typedef union {
+  struct cmsghdr cmsg;
+  uint8_t buf[ROUTER_CMSG_BUF_SIZE];
+} router_cmsg_buf_t;
+
+// Frontend ルーター用 UDPバッチコンテキスト
+typedef struct {
+  struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
+  struct iovec   rx_iov[UDP_BATCH_SIZE];
+  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
+  router_cmsg_buf_t rx_cbuf[UDP_BATCH_SIZE];
+
+  struct mmsghdr ipc_tx_msgs[UDP_BATCH_SIZE];
+  struct iovec   ipc_tx_iov[UDP_BATCH_SIZE];
+
+  struct mmsghdr ipc_rx_msgs[UDP_BATCH_SIZE];
+  struct iovec   ipc_rx_iov[UDP_BATCH_SIZE];
+  uint8_t        ipc_rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+
+  struct mmsghdr cli_tx_msgs[UDP_BATCH_SIZE];
+  struct iovec   cli_tx_iov[UDP_BATCH_SIZE];
+  struct sockaddr_storage cli_tx_addrs[UDP_BATCH_SIZE];
+  router_cmsg_buf_t cli_tx_cbuf[UDP_BATCH_SIZE];
+} frontend_router_ctx_t;
+
+// TCPストリーム解析ステート
+typedef enum { TCP_STATE_READ_LEN, TCP_STATE_READ_BODY } tcp_state_t;
+typedef struct {
+  tcp_state_t state;
+  uint8_t buf[65536 + 2];
+  size_t accumulated;
+  uint16_t msg_len;
+  char client_ip[INET6_ADDRSTRLEN];
+  struct sockaddr_storage client_addr;
+  socklen_t client_len;
+  struct sockaddr_storage server_addr;
+  socklen_t server_len;
+  bool has_server_addr;
+  bool quota_yield;
+} tcp_stream_ctx_t;
+
+typedef struct {
+  bool is_finished;
+  bool is_ixfr;
+  bool is_deleting;
+  int soa_count;
+  uint32_t initial_soa_serial;
+  uint32_t client_serial;
+  char initial_soa_name[256];
+  bool is_extended_mode;
+  char current_loc_tag[64];
+  bool has_current_loc_tag;
+  char current_ecs_tag[64];
+  bool has_current_ecs_tag;
+} axfr_session_t;
+
+// クエリログ用 固定長イベント構造体 (バイナリ保持)
+typedef struct {
+    struct timespec ts;
+    struct sockaddr_storage client_addr;
+    socklen_t addr_len;
+    uint16_t qtype;
+    uint16_t qclass;
+    uint8_t  rcode;
+    uint8_t  flags;
+    uint8_t  protocol; // IPPROTO_UDP or IPPROTO_TCP
+    bool     has_edns;
+    bool     dnssec_ok;
+    char     qname[256];
+} qlog_event_t;
+
+// Per-Worker SPSC (Single-Producer Single-Consumer) リングバッファ
+typedef struct {
+    qlog_event_t *events;
+    uint32_t size;
+    uint32_t mask;
+    alignas(64) _Atomic uint32_t head;
+    alignas(64) _Atomic uint32_t tail;
+    alignas(64) _Atomic uint64_t dropped_count;
+} qlog_ring_t;
+
 typedef struct {
   _Atomic(zone_arena_t *) active;
   zone_arena_t arena_a;
   zone_arena_t arena_b;
 } zone_rcu_t;
+
+struct worker_ctx {
+  int thread_id;
+  int core_id;
+  zone_rcu_t *rcu_db;
+  qlog_ring_t qlog_ring;
+  dnstap_ring_t dnstap_ring;
+  alignas(64) _Atomic uint64_t query_count;
+
+  time_t log_current_sec;
+  uint32_t log_emitted_this_sec;
+
+  udp_batch_ctx_t batch;
+};
+
+extern worker_ctx_t *g_worker_ctxs;
+extern int g_worker_count;
 
 typedef struct {
   uint32_t old_serial;
