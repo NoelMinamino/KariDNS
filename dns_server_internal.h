@@ -308,6 +308,30 @@ typedef struct {
   char new_catalog[256];
 } pending_coo_t;
 
+#define RESP_LOG_RING_SIZE 8192
+
+typedef enum {
+    LOG_ACT_SENT,
+    LOG_ACT_DROP_RRL,
+    LOG_ACT_DROP_MALFORMED
+} log_action_t;
+
+typedef struct {
+    _Atomic bool ready;
+    struct timespec ts;
+    log_action_t action;
+    char client_ip[INET6_ADDRSTRLEN];
+    int client_port;
+    char qname[256];
+    uint16_t qclass;
+    uint16_t qtype;
+    uint8_t rcode;
+    bool has_edns;
+    bool dnssec_ok;
+} resp_log_entry_t;
+
+extern _Atomic int g_xfers_running;
+
 // Shared internal function prototypes
 server_config_t *acquire_config_snapshot(void);
 void release_config_snapshot(server_config_t *snap);
@@ -325,11 +349,22 @@ void wait_for_readers(zone_arena_t *arena);
 void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
+void free_ixfr_txn(ixfr_txn_t *txn);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
 void prelink_zone_additional_glue(zone_arena_t *current_zone,
                                   const char *zone_domain,
                                   zone_db_snapshot_t *snap,
                                   view_snapshot_t *view,
                                   additional_from_auth_t policy);
+
+int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out);
+ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len);
+const char *strchr_unescaped(const char *s, char c);
+void dec_tcp_clients(void);
+void inc_tcp_clients(void);
+void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname,
+                        uint16_t qclass, uint16_t qtype, uint8_t rcode,
+                        bool has_edns, bool dnssec_ok);
+int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len);
 
 #endif /* DNS_SERVER_INTERNAL_H */
