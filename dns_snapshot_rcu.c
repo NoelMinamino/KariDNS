@@ -7,6 +7,7 @@
 #include "dns_zone_parser.h"
 #include "dns_wire.h"
 #include "dns_utils.h"
+#include "dns_tsig_acl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -342,6 +343,10 @@ void *gc_snapshot_thread(void *arg) {
         }
         free(snap->views[v].match_clients);
       }
+      if (snap->views[v].match_clients_parsed) {
+        free(snap->views[v].match_clients_parsed);
+        snap->views[v].match_clients_parsed = NULL;
+      }
       if (snap->views[v].hash_table) free(snap->views[v].hash_table);
       if (snap->views[v].chain_next) free(snap->views[v].chain_next);
       if (snap->views[v].suffix_hash_table) free(snap->views[v].suffix_hash_table);
@@ -665,6 +670,10 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
     z_standby->bind_ecs_trusted_resolvers = NULL;
     z_standby->bind_ecs_trusted_resolver_count = 0;
   }
+  if (z_standby->bind_ecs_trusted_resolvers_parsed) {
+    free(z_standby->bind_ecs_trusted_resolvers_parsed);
+    z_standby->bind_ecs_trusted_resolvers_parsed = NULL;
+  }
   z_standby->count = 0;
   z_standby->data_pool_count = 0;
   z_standby->current_pool_cap = 0;
@@ -924,8 +933,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 for (int i = 0; i < v->match_clients_count; i++) {
                     vs->match_clients[i] = strdup(v->match_clients[i]);
                 }
+                vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
             } else {
                 vs->match_clients = NULL;
+                vs->match_clients_parsed = NULL;
             }
 
             int static_count = 0;
@@ -1414,6 +1425,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     for (int i = 0; i < vs->match_clients_count; i++) {
                         vs->match_clients[i] = strdup(old_snap->views[v].match_clients[i]);
                     }
+                    vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
+                } else {
+                    vs->match_clients = NULL;
+                    vs->match_clients_parsed = NULL;
                 }
 
                 if (strcasecmp(vs->name, catalog_view_name) == 0) {
@@ -1691,6 +1706,10 @@ void zone_arena_clear_data_pools(zone_arena_t *arena) {
     arena->bind_ecs_trusted_resolvers = NULL;
     arena->bind_ecs_trusted_resolver_count = 0;
   }
+  if (arena->bind_ecs_trusted_resolvers_parsed) {
+    free(arena->bind_ecs_trusted_resolvers_parsed);
+    arena->bind_ecs_trusted_resolvers_parsed = NULL;
+  }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
   arena->count = 0;
@@ -1732,6 +1751,9 @@ void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst) {
             dst->bind_ecs_trusted_resolver_count++;
           }
         }
+      }
+      if (dst->bind_ecs_trusted_resolver_count > 0) {
+        dst->bind_ecs_trusted_resolvers_parsed = acl_list_parse(dst->bind_ecs_trusted_resolvers, dst->bind_ecs_trusted_resolver_count);
       }
     }
   }

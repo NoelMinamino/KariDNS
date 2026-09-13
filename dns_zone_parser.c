@@ -1043,7 +1043,7 @@ PROCESS_RECORD:
       return -1;
     }
     *target_tags = new_tags;
-    ecs_cidr_entry_t *cidrs = malloc(sizeof(ecs_cidr_entry_t) * cidr_count);
+    ecs_cidr_entry_t *cidrs = calloc(cidr_count, sizeof(ecs_cidr_entry_t));
     if (!cidrs) {
       for (int c = 0; c < cidr_count; c++) free(cidrs_found[c]);
       if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory";
@@ -1051,6 +1051,9 @@ PROCESS_RECORD:
     }
     for (int c = 0; c < cidr_count; c++) {
       cidrs[c].cidr = cidrs_found[c];
+      if (cidrs[c].cidr) {
+        cidr_entry_parse(&cidrs[c].parsed, cidrs[c].cidr);
+      }
     }
     (*target_tags)[*target_count].tag = strdup(clean_tag);
     (*target_tags)[*target_count].cidrs = cidrs;
@@ -1400,31 +1403,9 @@ DONE:
 }
 
 void zone_arena_init(zone_arena_t *arena) {
-  arena->records_cap = 0;
-  arena->records = NULL;
-  arena->data_pool_count = 0;
-  arena->current_pool_cap = 0;
-  arena->current_pool_idx = 0;
-  arena->count = 0;
-  arena->file_buf_count = 0;
-  arena->hash_size = 0;
-  arena->hash_table = NULL;
-  arena->nsec_records = NULL;
-  arena->nsec_count = 0;
-  arena->sorted_unique_names = NULL;
-  arena->sorted_unique_count = 0;
+  if (!arena) return;
+  memset(arena, 0, sizeof(*arena));
   atomic_init(&arena->reader_count, 0);
-  arena->is_tinydns_format = false;
-  arena->locations = NULL;
-  arena->location_count = 0;
-  arena->bind_location_tags = NULL;
-  arena->bind_location_tag_count = 0;
-  arena->bind_ecs_tags = NULL;
-  arena->bind_ecs_tag_count = 0;
-  arena->bind_ecs_trusted_resolvers = NULL;
-  arena->bind_ecs_trusted_resolver_count = 0;
-  arena->prelinked_glue = NULL;
-  arena->prelinked_glue_count = 0;
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
@@ -1461,6 +1442,7 @@ ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count) {
       if (dst[i].cidrs) {
         for (int j = 0; j < src[i].cidr_count; j++) {
           dst[i].cidrs[j].cidr = src[i].cidrs[j].cidr ? strdup(src[i].cidrs[j].cidr) : NULL;
+          dst[i].cidrs[j].parsed = src[i].cidrs[j].parsed;
         }
       }
     }
@@ -1495,6 +1477,10 @@ void zone_arena_destroy(zone_arena_t *arena) {
     free(arena->bind_ecs_trusted_resolvers);
     arena->bind_ecs_trusted_resolvers = NULL;
     arena->bind_ecs_trusted_resolver_count = 0;
+  }
+  if (arena->bind_ecs_trusted_resolvers_parsed) {
+    free(arena->bind_ecs_trusted_resolvers_parsed);
+    arena->bind_ecs_trusted_resolvers_parsed = NULL;
   }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;

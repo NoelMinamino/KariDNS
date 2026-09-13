@@ -1799,7 +1799,14 @@ process_tcp_client: ;
               bool has_acl = (zcfg->allow_transfer_count > 0);
               bool has_tsig = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
               
-              bool acl_ok = has_acl ? check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count) : false;
+              bool acl_ok = false;
+              if (has_acl) {
+                if (zcfg->allow_transfer_parsed) {
+                  acl_ok = check_acl_bin(ctx_tcp->client_ip, zcfg->allow_transfer_parsed, zcfg->allow_transfer_count);
+                } else {
+                  acl_ok = check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count);
+                }
+              }
               bool tsig_ok = false;
               
               if (has_tsig) {
