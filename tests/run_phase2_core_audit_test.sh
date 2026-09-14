@@ -49,7 +49,7 @@ run_check() {
 }
 
 echo "=== Building KariDNS and dag ==="
-(cd "$BASE_DIR" && make -j4 karidns dag)
+[ -x "$BASE_DIR/karidns" ] && [ -x "$BASE_DIR/dag" ] || (cd "$BASE_DIR" && make -j4 karidns dag)
 
 # Create a slow mock backend for program zone
 cat << 'EOF' > "$TMP_DIR/slow_plugin.pl"

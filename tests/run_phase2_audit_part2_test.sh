@@ -50,7 +50,7 @@ run_check() {
 }
 
 echo "=== Building KariDNS and dag ==="
-(cd "$BASE_DIR" && make -j4 karidns dag)
+[ -x "$BASE_DIR/karidns" ] && [ -x "$BASE_DIR/dag" ] || (cd "$BASE_DIR" && make -j4 karidns dag)
 
 # Create primary zone file
 cat << 'EOF' > "$TMP_DIR/example.com.zone"

@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 KARICHECK="$ROOT/karicheck"
 
-echo "[*] Building karicheck..."
-make -C "$ROOT" karicheck
+[ -x "$ROOT/karicheck" ] || {
+    echo "[*] Building karicheck..."
+    [ -x "$ROOT/karicheck" ] || make -C "$ROOT" karicheck
+}
 
 CONF_SLAVE_UPD="$DIR/conf_slave_update.conf"
 CONF_MASTER_UPD="$DIR/conf_master_update.conf"

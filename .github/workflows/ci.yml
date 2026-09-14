@@ -42,7 +42,7 @@ jobs:
 
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-            make -j"$NCPU" all asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test bench_serialize
+            make -j"$NCPU" all asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test bench_serialize
             echo "::endgroup::"
 
             echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
@@ -50,6 +50,7 @@ jobs:
             ./test_tinydns_parser
             ./test_hash_table
             ./test_conf_include
+            ./test_response_cache
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
@@ -90,6 +91,29 @@ jobs:
             sh ./tests/run_dnstap_capture_test.sh
             sh ./tests/run_karicheck_semantic_lint_test.sh
             sh ./tests/run_karictl_observatory_test.sh
+            sh ./tests/run_axfr_multikey_tsig_test.sh
+            sh ./tests/run_config_duplicate_rejection_test.sh
+            sh ./tests/run_cve_coo_test.sh
+            sh ./tests/run_dag_batch_advanced_opts_test.sh
+            sh ./tests/run_dag_fuzzer_test.sh
+            sh ./tests/run_dnssec_negative_soa_rrsig_test.sh
+            sh ./tests/run_domain_length_rfc1035_test.sh
+            sh ./tests/run_ds_delegation_test.sh
+            sh ./tests/run_karictl_reload_reconfig_test.sh
+            sh ./tests/run_logging_channel_validation_test.sh
+            sh ./tests/run_mx_srv_glue_test.sh
+            sh ./tests/run_notify_source_test.sh
+            sh ./tests/run_privilege_drop_root_test.sh
+            sh ./tests/run_query_log_rate_limit_test.sh
+            sh ./tests/run_response_cache_test.sh
+            sh ./tests/run_rrl_window_test.sh
+            sh ./tests/run_tinydns_timestamp_test.sh
+            sh ./tests/run_ttl_harmonization_test.sh
+            sh ./tests/run_ttl_harmonization_update_test.sh
+            sh ./tests/run_ttl_rfc2181_clamp_test.sh
+            sh ./tests/run_update_slave_notauth_test.sh
+            sh ./tests/run_zone_oom_partial_load_test.sh
+            sh ./tests/run_zone_type_secondary_test.sh
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"

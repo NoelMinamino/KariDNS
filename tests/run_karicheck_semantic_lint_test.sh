@@ -21,7 +21,7 @@ echo "=== Running karicheck Semantic Lint Test Suite ==="
 
 # Build karicheck
 echo "[+] Building karicheck..."
-make karicheck
+[ -x karicheck ] || make karicheck
 
 FAILED=0
 

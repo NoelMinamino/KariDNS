@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 
-echo "[*] Building targets..."
-make -C "$ROOT" karidns
+[ -x "$ROOT/karidns" ] || {
+    echo "[*] Building targets..."
+    [ -x "$ROOT/karidns" ] || make -C "$ROOT" karidns
+}
 
 CONF="$DIR/rrl_window_test.conf"
 ZONE="$DIR/zones/rrl_window_test.zone"

@@ -7,7 +7,7 @@ BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
 
 echo "[*] Building required binary (karicheck)..."
-make -C "$BIN_DIR" karicheck
+[ -x "$BIN_DIR/karicheck" ] || make -C "$BIN_DIR" karicheck
 
 echo "[+] 1. Testing unclosed parenthesis zone (should fail with Unbalanced parenthesis)..."
 set +e

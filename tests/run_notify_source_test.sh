@@ -7,8 +7,10 @@ BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
 KARICTL="$ROOT/karictl"
 
-echo "[*] Building targets..."
-make -C "$ROOT" karidns dag karictl
+[ -x "$ROOT/karidns" ] && [ -x "$ROOT/dag" ] && [ -x "$ROOT/karictl" ] || {
+    echo "[*] Building targets..."
+    make -C "$ROOT" karidns dag karictl
+}
 
 CONF="$DIR/notify_source_test.conf"
 ZONE="$DIR/zones/notify_source_test.zone"

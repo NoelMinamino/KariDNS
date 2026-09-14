@@ -8,7 +8,7 @@ DAG="$ROOT/dag"
 PORT=15492
 
 echo "[*] Building karidns and dag..."
-make -C "$ROOT" karidns dag
+[ -x "$ROOT/karidns" ] && [ -x "$ROOT/dag" ] || make -C "$ROOT" karidns dag
 
 CONF_FILE="$DIR/axfr_multikey_test.conf"
 ZONE_FILE="$DIR/axfr_multikey_test.zone"

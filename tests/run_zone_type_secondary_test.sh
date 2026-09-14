@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 KARICHECK="$ROOT/karicheck"
 
-echo "[*] Building karicheck..."
-make -C "$ROOT" karicheck
+[ -x "$ROOT/karicheck" ] || {
+    echo "[*] Building karicheck..."
+    [ -x "$ROOT/karicheck" ] || make -C "$ROOT" karicheck
+}
 
 CONF_PRIMARY="$DIR/conf_type_primary.conf"
 CONF_SECONDARY="$DIR/conf_type_secondary.conf"

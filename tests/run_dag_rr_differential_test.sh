@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 DAG="${DAG:-./dag}"
 
 if [ ! -x "$DAG" ]; then
-    make dag >/dev/null 2>&1 || true
+    [ -x ./dag ] || make dag >/dev/null 2>&1 || true
 fi
 
 if [ ! -x "$DAG" ]; then

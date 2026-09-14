@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 KARICHECK="$ROOT/karicheck"
 
-echo "[*] Building karicheck..."
-make -C "$ROOT" karicheck
+[ -x "$ROOT/karicheck" ] || {
+    echo "[*] Building karicheck..."
+    [ -x "$ROOT/karicheck" ] || make -C "$ROOT" karicheck
+}
 
 CONF_VALID_LOG="$DIR/conf_valid_log.conf"
 CONF_UNDEF_QLOG="$DIR/conf_undef_qlog.conf"

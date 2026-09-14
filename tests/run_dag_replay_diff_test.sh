@@ -43,10 +43,14 @@ fi
 echo "=== Running dag DNS Replay & Differential Testing Suite ==="
 
 # Build binaries
-echo "[+] Building karidns..."
-make karidns
-echo "[+] Building dag..."
-make dag
+[ -x ./karidns ] || {
+    echo "[+] Building karidns..."
+    make karidns
+}
+[ -x ./dag ] || {
+    echo "[+] Building dag..."
+    make dag
+}
 
 # 1. Prepare Zones
 # Zone 1

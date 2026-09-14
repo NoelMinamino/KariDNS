@@ -13,8 +13,10 @@ ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="ttl_harmonization_test_dir"
 ZONE_FILE="$ZONES_DIR/ttl_harmonize_basic.zone"
 
-echo "[*] Building required binaries (karidns, dag, karicheck)..."
-make -C "$BIN_DIR" karidns dag karicheck
+[ -x "$BIN_DIR/karidns" ] && [ -x "$BIN_DIR/dag" ] && [ -x "$BIN_DIR/karicheck" ] || {
+    echo "[*] Building required binaries (karidns, dag, karicheck)..."
+    [ -x "$BIN_DIR/karidns" ] && [ -x "$BIN_DIR/dag" ] && [ -x "$BIN_DIR/karicheck" ] || make -C "$BIN_DIR" karidns dag karicheck
+}
 
 rm -rf "$SCRIPT_DIR/$TEST_DIR"
 mkdir -p "$SCRIPT_DIR/$TEST_DIR"

@@ -52,10 +52,10 @@ trap cleanup EXIT INT TERM
 echo "=========================================="
 echo "Step 0: Build"
 echo "=========================================="
-make all >/dev/null || { log_fail "make all"; exit 1; } 
-make asan >/dev/null || { log_fail "make asan"; exit 1; }
-make tsan >/dev/null || { log_fail "make tsan"; exit 1; }
-make tools-asan >/dev/null || { log_fail "make tools-asan (karicheck-asan/dag-asan/karictl-asan)"; exit 1; }
+[ -x karidns ] && [ -x dag ] && [ -x karictl ] && [ -x karicheck ] || make all >/dev/null || { log_fail "make all"; exit 1; }
+[ -x karidns-asan ] || make asan >/dev/null || { log_fail "make asan"; exit 1; }
+[ -x karidns-tsan ] || make tsan >/dev/null || { log_fail "make tsan"; exit 1; }
+[ -x karicheck-asan ] && [ -x dag-asan ] && [ -x karictl-asan ] || make tools-asan >/dev/null || { log_fail "make tools-asan (karicheck-asan/dag-asan/karictl-asan)"; exit 1; }
 log_ok "build"
 
 echo ""
@@ -96,7 +96,11 @@ echo ""
 echo "=========================================="
 echo "Step 1: Unit-level ASan/UBSan (dns_wire / dns_zone_parser / dns_config_parser)"
 echo "=========================================="
-make asan_test > unit_asan.log 2>&1
+if [ -x test_asan_overflow ]; then
+    ./test_asan_overflow > unit_asan.log 2>&1
+else
+    make asan_test > unit_asan.log 2>&1
+fi
 if [ $? -ne 0 ] || grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)" unit_asan.log; then
     log_fail "make asan_test (see unit_asan.log)"
     tail -n 40 unit_asan.log
@@ -226,7 +230,7 @@ else
     echo "Step 4: Fuzzer smoke run (${FUZZ_SMOKE_SECONDS:-5}s per target)"
 fi
 echo "=========================================="
-make fuzz_all >/dev/null 2>&1
+[ -x tests/fuzz/fuzz_dns_wire ] || make fuzz_all >/dev/null 2>&1
 
 pids=""
 for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \

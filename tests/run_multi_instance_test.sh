@@ -27,8 +27,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building karidns, karictl, and dag with make ==="
-make -C "$ROOT_DIR" karidns karictl dag
+[ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] || {
+    echo "=== Building karidns, karictl, and dag with make ==="
+    [ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] || make -C "$ROOT_DIR" karidns karictl dag
+}
 
 KARIDNS="$ROOT_DIR/karidns"
 KARICTL="$ROOT_DIR/karictl"

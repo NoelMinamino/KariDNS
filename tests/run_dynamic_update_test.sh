@@ -6,8 +6,8 @@ BIN="$DIR/../karidns-asan"
 KARICTL="$DIR/../karictl-asan"
 DAG="$DIR/../dag"
 
-make dag
-make asan
+[ -x dag ] || make dag
+[ -x karidns-asan ] || make asan
 if [ ! -x "$BIN" ]; then
     echo "failed: karidns-asan not found."
     exit 1
