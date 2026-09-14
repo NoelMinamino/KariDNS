@@ -2327,6 +2327,18 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
   if (arena->bind_location_tags != NULL && arena->bind_location_tag_count > 0) return;
   if (arena->bind_ecs_tags != NULL && arena->bind_ecs_tag_count > 0) return;
 
+  zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, NULL, domain) : NULL;
+  if (zcfg) {
+    if (zcfg->location_tags != NULL && zcfg->location_tag_count > 0) return;
+    if (zcfg->ecs_tags != NULL && zcfg->ecs_tag_count > 0) return;
+    if (zcfg->type && strcasecmp(zcfg->type, "master") != 0 && strcasecmp(zcfg->type, "primary") != 0 &&
+        strcasecmp(zcfg->type, "slave") != 0 && strcasecmp(zcfg->type, "secondary") != 0) return;
+  }
+  if (cfg) {
+    if (cfg->location_tags != NULL && cfg->location_tag_count > 0) return;
+    if (cfg->ecs_tags != NULL && cfg->ecs_tag_count > 0) return;
+  }
+
   free_zone_response_cache(arena);
 
   size_t bucket_count = 16;
@@ -2358,6 +2370,23 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
 
     const char *qname = rec->name;
     uint32_t name_hash = calc_fnv1a_str(qname);
+
+    // Skip caching if any record for this qname is location-tagged, ECS-tagged, or time-sensitive
+    bool has_dynamic_record = false;
+    if (arena->hash_size > 0 && arena->hash_table) {
+      size_t name_idx = name_hash & (arena->hash_size - 1);
+      for (int r_idx = arena->hash_table[name_idx]; r_idx != -1; r_idx = arena->records[r_idx].next_record) {
+        dns_record_t *r = &arena->records[r_idx];
+        if (strcasecmp(r->name, qname) == 0) {
+          if (r->bind_location_tag != NULL || r->ecs_subnet_tag != NULL ||
+              r->tinydns_loc[0] != 0 || r->tinydns_ttd != 0 || r->tinydns_ttl_countdown) {
+            has_dynamic_record = true;
+            break;
+          }
+        }
+      }
+    }
+    if (has_dynamic_record) continue;
     size_t hash_idx = (name_hash ^ (uint32_t)qtype) & (bucket_count - 1);
 
     bool already_cached = false;
