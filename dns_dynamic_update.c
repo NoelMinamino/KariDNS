@@ -55,7 +55,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  wait_for_readers(z_standby);
+  rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
 
   clone_zone_arena(z_active, z_standby);
 
@@ -90,6 +90,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   compute_ixfr_diff(entry, z_active, z_standby);
 
+  entry->rcu.retire_epoch = rcu_writer_advance_epoch();
   atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
   pthread_mutex_unlock(&entry->writer_lock);
 

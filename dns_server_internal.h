@@ -192,6 +192,7 @@ typedef struct {
   _Atomic(zone_arena_t *) active;
   zone_arena_t arena_a;
   zone_arena_t arena_b;
+  uint64_t retire_epoch;
 } zone_rcu_t;
 
 struct worker_ctx {
@@ -201,12 +202,15 @@ struct worker_ctx {
   qlog_ring_t qlog_ring;
   dnstap_ring_t dnstap_ring;
   alignas(64) _Atomic uint64_t query_count;
+  alignas(64) _Atomic uint64_t rcu_observed_epoch;
 
   time_t log_current_sec;
   uint32_t log_emitted_this_sec;
 
   udp_batch_ctx_t batch;
 };
+
+#include "dns_epoch_rcu.h"
 
 extern worker_ctx_t *g_worker_ctxs;
 extern int g_worker_count;
@@ -310,12 +314,14 @@ typedef struct {
   view_snapshot_t *views;
   size_t view_count;
   _Atomic(int) reader_count;
+  uint64_t retire_epoch;
 } zone_db_snapshot_t;
 
 typedef struct {
   _Atomic(server_config_t *) active;
   server_config_t config_a;
   server_config_t config_b;
+  uint64_t retire_epoch;
 } config_rcu_t;
 
 extern config_rcu_t g_config_db;

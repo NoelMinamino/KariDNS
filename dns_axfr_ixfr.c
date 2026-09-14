@@ -555,7 +555,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         zone_arena_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
         zone_arena_t *standby = (cur_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
                                                                     : &entry->rcu.arena_a;
-        wait_for_readers(standby);
+        rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
 
         if (has_soa) {
           entry->serial = serial;
@@ -587,9 +587,9 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         if (cur_snap) release_zone_snapshot(cur_snap);
 
         compute_ixfr_diff(entry, cur_active, standby);
+        entry->rcu.retire_epoch = rcu_writer_advance_epoch();
         atomic_store_explicit(&entry->rcu.active, standby,
                               memory_order_release);
-        wait_for_readers(cur_active);
         pthread_mutex_unlock(&entry->writer_lock);
 
         if (session->is_ixfr) {

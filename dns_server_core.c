@@ -77,19 +77,11 @@
 config_rcu_t g_config_db;
 
 server_config_t *acquire_config_snapshot(void) {
-  server_config_t *snap = NULL;
-  do {
-    snap = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-    if (!snap) return NULL;
-    atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
-    if (snap == atomic_load_explicit(&g_config_db.active, memory_order_acquire)) break;
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
-  } while (1);
-  return snap;
+  return atomic_load_explicit(&g_config_db.active, memory_order_acquire);
 }
 
 void release_config_snapshot(server_config_t *snap) {
-  if (snap) atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+  (void)snap;
 }
 int g_control_kq = -1;
 int g_cwd_fd = -1;
@@ -964,6 +956,7 @@ typedef struct {
   bool dnssec_ok;
   size_t question_end;
   zone_db_snapshot_t *snap;
+  worker_ctx_t *owner_ctx;
 } async_io_task_t;
 
 typedef struct {
@@ -1058,6 +1051,9 @@ static void *async_io_worker_func(void *arg) {
         submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                             0, 0, 0, false, false);
       }
+      if (task.owner_ctx) {
+        rcu_reader_exit(task.owner_ctx);
+      }
     } else {
       // TCP async resolution
       uint8_t *tcp_res = malloc(65535);
@@ -1085,6 +1081,9 @@ static void *async_io_worker_func(void *arg) {
       }
       close(task.client_fd);
       dec_tcp_clients();
+      if (task.owner_ctx) {
+        rcu_reader_exit(task.owner_ctx);
+      }
     }
   }
   return NULL;
@@ -1355,6 +1354,7 @@ worker_startup_success:;
             }
 
             char client_ip[INET6_ADDRSTRLEN] = "";
+            rcu_reader_enter(ctx);
             if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
               fast_ipv4_to_str(client_addr->sin.sin_addr.s_addr, client_ip);
             } else if (client_addr->ss_family == AF_INET6) {
@@ -1452,6 +1452,7 @@ worker_startup_success:;
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
+              task.owner_ctx = ctx;
               task.is_tcp = false;
               task.active_fd = active_fd;
               task.ipc_hdr = *ipc_msg;
@@ -1474,6 +1475,7 @@ worker_startup_success:;
               task.snap = acquire_zone_snapshot();
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
+                rcu_reader_exit(ctx);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
@@ -1516,6 +1518,7 @@ worker_startup_success:;
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
                                       qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
                 }
+                rcu_reader_exit(ctx);
                 continue;
               }
 
@@ -1562,11 +1565,13 @@ worker_startup_success:;
                 sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
                 n_tx = 0;
               }
+              rcu_reader_exit(ctx);
             } else {
               if (rlog_enabled) {
                 submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
                                     0, 0, 0, false, false);
               }
+              rcu_reader_exit(ctx);
             }
           }
           atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
@@ -1771,6 +1776,7 @@ process_tcp_client: ;
           }
           bool has_edns = edns.present;
           bool dnssec_ok = edns.dnssec_ok;
+          rcu_reader_enter(ctx);
           atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
           if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
               write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
@@ -1914,7 +1920,6 @@ process_tcp_client: ;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
                   args->snap = snap;
-                  atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
                   int cflags = fcntl(client_fd, F_GETFL, 0);
                   fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
 
@@ -1928,7 +1933,6 @@ process_tcp_client: ;
                   if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
                     free(args);
                     atomic_fetch_sub(&entry->active_axfr, 1);
-                    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
                     allowed = false;
                   } else {
                     pthread_detach(t);
@@ -1941,6 +1945,7 @@ process_tcp_client: ;
                         ev_list[j].filter = 0;
                       }
                     }
+                    rcu_reader_exit(ctx);
                     break;
                   }
                 } else {
@@ -2015,6 +2020,7 @@ process_tcp_client: ;
               dec_tcp_clients();
               free(ctx_tcp);
               client_closed = true;
+              rcu_reader_exit(ctx);
               break;
             } else {
               release_zone_snapshot(snap);
@@ -2027,6 +2033,7 @@ process_tcp_client: ;
               kevent(kq, ev_del_syn, 2, NULL, 0, NULL);
 
               async_io_task_t task = {0};
+              task.owner_ctx = ctx;
               task.is_tcp = true;
               task.client_fd = client_fd;
               task.req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
@@ -2048,6 +2055,7 @@ process_tcp_client: ;
 
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(snap);
+                rcu_reader_exit(ctx);
                 close(client_fd);
                 dec_tcp_clients();
               }
@@ -2073,6 +2081,7 @@ process_tcp_client: ;
                   dec_tcp_clients();
                   free(ctx_tcp);
                   client_closed = true;
+                  rcu_reader_exit(ctx);
                   break;
                 }
               } else {
@@ -2092,9 +2101,11 @@ process_tcp_client: ;
               dec_tcp_clients();
               free(ctx_tcp);
               client_closed = true;
+              rcu_reader_exit(ctx);
               break;
             }
 
+            rcu_reader_exit(ctx);
             ctx_tcp->state = TCP_STATE_READ_LEN;
             ctx_tcp->accumulated = 0;
             ctx_tcp->msg_len = 0;
@@ -2189,25 +2200,8 @@ static void perform_config_reload_ext(bool skip_unchanged) {
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
   
-  /* [H-2] 既存のリーダーが参照を終えるのを待機。
-   * 最大5秒を上限とし、超過した場合は古い設定を維持して安全に中断する。*/
-  int retries = 0;
-  useconds_t sleep_time = 1;
-  struct timespec rcu_wait_start, rcu_wait_now;
-  clock_gettime(CLOCK_MONOTONIC, &rcu_wait_start);
-  while (atomic_load_explicit(&standby->reader_count, memory_order_acquire) > 0) {
-    if (retries < 100) sched_yield();
-    else { usleep(sleep_time); if (sleep_time < 100000) sleep_time *= 2; }
-    retries++;
-    clock_gettime(CLOCK_MONOTONIC, &rcu_wait_now);
-    int64_t elapsed_ms = (rcu_wait_now.tv_sec - rcu_wait_start.tv_sec) * 1000 +
-                         (rcu_wait_now.tv_nsec - rcu_wait_start.tv_nsec) / 1000000;
-    if (elapsed_ms > 5000) {
-      syslog(LOG_CRIT, "[Config] RCU standby config still has readers after 5s; aborting reload to protect live traffic");
-      free(config_str);
-      return;
-    }
-  }
+  /* [H-2] 既存のリーダーが参照を終えるのを待機。*/
+  rcu_writer_wait_until_safe(g_config_db.retire_epoch, 5000);
   
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
@@ -2224,6 +2218,7 @@ static void perform_config_reload_ext(bool skip_unchanged) {
       return;
     }
     init_logging_channels(standby);
+    g_config_db.retire_epoch = rcu_writer_advance_epoch();
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
     rebuild_zone_db_from_config(standby, skip_unchanged);
@@ -4014,6 +4009,7 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].dnstap_ring.dropped, 0);
 
     atomic_init(&ctxs[i].query_count, 0);
+    atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
     if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
       exit(EXIT_FAILURE);
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
@@ -4184,9 +4180,6 @@ int main(int argc, char **argv) {
   server_config_t *active = acquire_config_snapshot();
   if (active) {
     release_config_snapshot(active);
-    while (atomic_load_explicit(&active->reader_count, memory_order_acquire) > 0) {
-      sched_yield();
-    }
     free_server_config_fields(active);
   }
   rrl_shutdown();

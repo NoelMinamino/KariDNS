@@ -875,7 +875,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
   char first_wc_qname[256] = {0};
   zone_arena_t *first_wc_zone = NULL;
   char first_wc_apex[256] = {0};
-  bool first_wc_zone_needs_release = false;
   for (int depth = 0; depth < 16; depth++) {
     zone_db_entry_t *db_entry = *db_entry_ptr;
     zone_arena_t *current_zone = *current_zone_ptr;
@@ -887,9 +886,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       *nscount = initial_nscount;
       *arcount = initial_arcount;
       if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
-      if (first_wc_zone_needs_release && first_wc_zone) {
-        atomic_fetch_sub_explicit(&first_wc_zone->reader_count, 1, memory_order_release);
-      }
       return;
     }
 
@@ -923,9 +919,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     bool is_ds_query = (num_qtypes > 0 && qtypes[0] == 43);
     if (find_delegation(current_zone, current_qname, current_qname_hash, db_entry->domain, res,
                         max_res_len, offset, comp_ctx, nscount, arcount, is_ds_query, client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
-      if (first_wc_zone_needs_release && first_wc_zone) {
-        atomic_fetch_sub_explicit(&first_wc_zone->reader_count, 1, memory_order_release);
-      }
       return;
     }
       
@@ -1159,9 +1152,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                                            current_qname, 0xFFFFFFFF) < 0) {
                     res[2] |= 0x02;
                     if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
-                    if (first_wc_zone_needs_release && first_wc_zone) {
-                      atomic_fetch_sub_explicit(&first_wc_zone->reader_count, 1, memory_order_release);
-                    }
                     return;
                   } else
                     (*ancount)++;
@@ -1170,9 +1160,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                                               res, max_res_len, offset, comp_ctx, ancount)) {
                       res[2] |= 0x02;
                       if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
-                      if (first_wc_zone_needs_release && first_wc_zone) {
-                        atomic_fetch_sub_explicit(&first_wc_zone->reader_count, 1, memory_order_release);
-                      }
                       return;
                     }
                   }
@@ -1243,31 +1230,11 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       else {
         zone_db_entry_t *new_db_entry = find_zone_in_view(view, current_qname);
         if (new_db_entry) {
-          zone_arena_t *new_zone = NULL;
-          do {
-            new_zone = atomic_load_explicit(&new_db_entry->rcu.active,
-                                            memory_order_acquire);
-            atomic_fetch_add_explicit(&new_zone->reader_count, 1,
-                                      memory_order_acquire);
-            if (new_zone == atomic_load_explicit(&new_db_entry->rcu.active,
-                                                 memory_order_acquire))
-              break;
-            atomic_fetch_sub_explicit(&new_zone->reader_count, 1,
-                                      memory_order_release);
-          } while (1);
-          if (first_wc_zone == current_zone) {
-            first_wc_zone_needs_release = true;
-          } else {
-            atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                      memory_order_release);
-          }
+          zone_arena_t *new_zone = atomic_load_explicit(&new_db_entry->rcu.active, memory_order_acquire);
           *db_entry_ptr = new_db_entry;
           *current_zone_ptr = new_zone;
           continue;
         } else {
-          if (first_wc_zone_needs_release && first_wc_zone) {
-            atomic_fetch_sub_explicit(&first_wc_zone->reader_count, 1, memory_order_release);
-          }
           return;
         }
       }
@@ -1774,9 +1741,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     } else if (out_ecs_scope_prefix) {
       *out_ecs_scope_prefix = 0;
     }
-  }
-  if (first_wc_zone_needs_release && first_wc_zone) {
-    atomic_fetch_sub_explicit(&first_wc_zone->reader_count, 1, memory_order_release);
   }
 }
 
@@ -2794,17 +2758,7 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   }
 
   if (db_entry) {
-    do {
-      current_zone =
-          atomic_load_explicit(&db_entry->rcu.active, memory_order_acquire);
-      atomic_fetch_add_explicit(&current_zone->reader_count, 1,
-                                memory_order_acquire);
-      if (current_zone ==
-          atomic_load_explicit(&db_entry->rcu.active, memory_order_acquire))
-        break;
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                memory_order_release);
-    } while (1);
+    current_zone = atomic_load_explicit(&db_entry->rcu.active, memory_order_acquire);
   }
   compress_ctx_init_packet(comp_ctx);
 
@@ -2861,14 +2815,9 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
 
   size_t q_offset = DNS_HEADER_SIZE;
   if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) {
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
     return -1;
   }
   if (q_offset + 4 > req_len) {
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                memory_order_release);
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
@@ -2889,8 +2838,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
         time_t last_ok = atomic_load_explicit(&db_entry->last_successful_transfer, memory_order_acquire);
         if (last_ok > 0 && (time(NULL) - last_ok) > (time_t)db_entry->expire) {
             if (!cfg_for_ede->serve_stale) {
-                if (current_zone)
-                    atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
                 size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
                 memcpy(res, req, copy_len);
                 res[2] |= 0x80;
@@ -2916,9 +2863,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
 
     // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
     if (!is_tcp && qtype == 252) {
-      if (current_zone)
-        atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                  memory_order_release);
       size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
       memcpy(res, req, copy_len);
       res[2] |= 0x80; // QR = 1
@@ -2937,9 +2881,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
     } else if (qclass == 3) {
       // CH class
     } else {
-      if (current_zone)
-        atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                                  memory_order_release);
       size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
       memcpy(res, req, copy_len);
       res[2] |= 0x80;
@@ -2967,8 +2908,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
     server_config_t *cfg_lookup = cfg;
     zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "program") == 0) {
-      if (current_zone)
-        atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
       rate_limit_config_t *rrl = zcfg->rrl.configured ? &zcfg->rrl : (cfg ? &cfg->rrl : NULL);
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
         struct sockaddr_storage ss;
@@ -2989,9 +2928,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       return plugin_result_len;
     }
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "forward") == 0) {
-      if (current_zone)
-        atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
-
       int fwd_len = dispatch_forward_zone(zcfg, req, req_len, res, max_res_len);
       return fwd_len;
     }
@@ -3026,7 +2962,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
       *res_arcount = htons(arcount);
     }
-    atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
     return offset;
   }
 
@@ -3039,8 +2974,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
     }
     *res_arcount = htons(arcount);
-    if (current_zone)
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
     return offset;
   }
 
@@ -3050,8 +2983,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
 
   if (edns.has_mqtype_query) {
     if (edns.mqtype_count == 0 || is_non_data_rrtype(qtype)) {
-      if (current_zone)
-        atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
       res[2] |= 0x80;
       res[3] = (res[3] & 0xF0) | 1; // FORMERR
       res[6] = 0; res[7] = 0;
@@ -3066,11 +2997,10 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
     for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
        uint16_t mq = edns.mqtypes[i];
        if (is_non_data_rrtype(mq)) {
-          if (current_zone)
-            atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
           res[2] |= 0x80;
           res[3] = (res[3] & 0xF0) | 1;
-          res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
+          res[6] = 0; res[7] = 0;
+          res[8] = 0; res[9] = 0;
           offset = q_offset; arcount = 0;
           if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
           *res_arcount = htons(arcount);
@@ -3079,11 +3009,10 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
        bool dup = false;
        for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == mq) { dup = true; break; } }
        if (dup) {
-          if (current_zone)
-            atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
           res[2] |= 0x80;
           res[3] = (res[3] & 0xF0) | 1;
-          res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
+          res[6] = 0; res[7] = 0;
+          res[8] = 0; res[9] = 0;
           offset = q_offset; arcount = 0;
           if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
           *res_arcount = htons(arcount);
@@ -3130,9 +3059,6 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
   *res_ancount = htons(ancount);
   *res_nscount = htons(nscount);
   *res_arcount = htons(arcount);
-  if (current_zone)
-    atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                              memory_order_release);
   return offset;
 }
 

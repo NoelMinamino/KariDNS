@@ -33,22 +33,11 @@ int g_pending_coo_capacity = 0;
 static _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
 
 zone_db_snapshot_t *acquire_zone_snapshot(void) {
-  zone_db_snapshot_t *snap = NULL;
-  do {
-    snap = atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
-    if (!snap)
-      return NULL;
-    atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
-    if (snap == atomic_load_explicit(&g_zone_db_active, memory_order_acquire))
-      break;
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
-  } while (1);
-  return snap;
+  return atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
 }
 
 void release_zone_snapshot(zone_db_snapshot_t *snap) {
-  if (snap)
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+  (void)snap;
 }
 
 zone_config_t *find_zone_config_in_view(server_config_t *cfg,
@@ -211,56 +200,6 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
   return view_suffix_hash_lookup(view, "", 0);
 }
 
-static inline void rcu_exponential_backoff(int *retries, useconds_t *sleep_time) {
-  if (*retries < 100) {
-    sched_yield();
-  } else {
-    usleep(*sleep_time);
-    if (*sleep_time < 100000) *sleep_time *= 2;
-  }
-  (*retries)++;
-}
-
-static void wait_for_snapshot_readers(zone_db_snapshot_t *snap) {
-  int retries = 0;
-  useconds_t sleep_time = 1;
-  int stall_count = 0;
-  int last_reader_count = -1;
-  int total_seconds = 0;
-
-  while (true) {
-    int current_readers = atomic_load_explicit(&snap->reader_count, memory_order_acquire);
-    if (current_readers <= 0) break;
-
-    rcu_exponential_backoff(&retries, &sleep_time);
-
-    // After exponential backoff maxes out at 100000us (0.1s), we check progress every 1s (10 retries)
-    if (sleep_time >= 100000 && (retries % 10) == 0) {
-      total_seconds++;
-      syslog(LOG_WARNING, "[RCU] wait_for_snapshot_readers stalled (readers=%d, no_progress=%ds, total=%ds)",
-             current_readers, stall_count, total_seconds);
-
-      if (last_reader_count == current_readers) {
-        stall_count++;
-      } else {
-        stall_count = 0; // Progress made
-      }
-      last_reader_count = current_readers;
-
-#if defined(SANITIZER_BUILD)
-      if (stall_count >= 10) {
-        syslog(LOG_ERR, "[RCU] FATAL: reader_count leak detected (stalled > 10s with no progress). Aborting.");
-        abort();
-      }
-      if (total_seconds >= 60) {
-        syslog(LOG_ERR, "[RCU] FATAL: absolute timeout reached (60s). Aborting.");
-        abort();
-      }
-#endif
-    }
-  }
-}
-
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name) {
   zone_db_entry_t *z = calloc(1, sizeof(zone_db_entry_t));
   if (!z) return NULL;
@@ -281,13 +220,7 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
 }
 
 void wait_for_readers(zone_arena_t *arena) {
-  int retries = 0;
-  useconds_t sleep_time = 1;
-  while (atomic_load_explicit(&arena->reader_count, memory_order_acquire) > 0) {
-    rcu_exponential_backoff(&retries, &sleep_time);
-    if (sleep_time >= 100000 && (retries % 10) == 0)
-      syslog(LOG_WARNING, "[RCU] wait_for_readers stalled");
-  }
+  (void)arena;
 }
 
 void free_zone_db_entry(zone_db_entry_t *entry) {
@@ -303,8 +236,6 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   while (atomic_load(&entry->active_axfr) > 0) {
     rcu_exponential_backoff(&axfr_retries, &axfr_sleep);
   }
-  wait_for_readers(&entry->rcu.arena_a);
-  wait_for_readers(&entry->rcu.arena_b);
   pthread_mutex_destroy(&entry->writer_lock);
   pthread_mutex_destroy(&entry->ixfr_history.lock);
   for (int idx = 0; idx < MAX_IXFR_HISTORY; idx++) {
@@ -321,7 +252,7 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
 void *gc_snapshot_thread(void *arg) {
   zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
   if (!snap) return NULL;
-  wait_for_snapshot_readers(snap);
+  rcu_writer_wait_until_safe(snap->retire_epoch, 60000);
   if (snap->views) {
     for (size_t v = 0; v < snap->view_count; v++) {
       if (snap->views[v].entries) {
@@ -650,7 +581,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   pthread_mutex_lock(&entry->writer_lock);
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  wait_for_readers(z_standby);
+  rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
 
   zone_arena_free_include_buffers(z_standby);
   free(z_standby->locations);
@@ -813,6 +744,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);
+  entry->rcu.retire_epoch = rcu_writer_advance_epoch();
   atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
   struct stat st_loaded;
   if (stat_via_dir_cache(file, &st_loaded) == 0) {
@@ -1581,6 +1513,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
     }
 
+    uint64_t retire_epoch = 0;
+    if (old_snap) {
+        retire_epoch = rcu_writer_advance_epoch();
+        old_snap->retire_epoch = retire_epoch;
+    }
     atomic_store_explicit(&g_zone_db_active, new_snap, memory_order_release);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 
@@ -1648,7 +1585,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                 zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
                 if (z_active && z_active->count > 0) {
                     zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-                    wait_for_readers(z_standby);
+                    rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
                     clone_zone_arena(z_active, z_standby);
                     build_zone_index(z_standby, true);
                     zone_config_t *zcfg = find_zone_config_in_view(config, view->name, entry->domain);
@@ -1656,6 +1593,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                                                         ? zcfg->additional_from_auth
                                                         : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
                     prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, policy);
+                    entry->rcu.retire_epoch = rcu_writer_advance_epoch();
                     atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
                 }
                 pthread_mutex_unlock(&entry->writer_lock);
