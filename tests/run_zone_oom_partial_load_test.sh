@@ -40,7 +40,8 @@ trap cleanup EXIT INT TERM
 
 # Build the OOM wrapper shared library
 echo "=== Building OOM wrapper shared library ==="
-cc -shared -fPIC -I"$ROOT_DIR" -o "$TMP_DIR/oom_zone_wrapper.so" "$ROOT_DIR/tests/oom_zone_wrapper.c" -ldl -lpthread
+INCLUDES="-I$ROOT_DIR -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include"
+cc -shared -fPIC $INCLUDES -o "$TMP_DIR/oom_zone_wrapper.so" "$ROOT_DIR/tests/oom_zone_wrapper.c" -ldl -lpthread
 
 # Prepare 3 zone files
 cat << 'EOF' > "$TMP_DIR/zone1.example.com.zone"
