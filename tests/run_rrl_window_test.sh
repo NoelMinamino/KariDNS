@@ -86,7 +86,7 @@ send_instant_burst() {
     vec($rin, fileno($sock), 1) = 1;
     my $buf;
 
-    while (select(my $rout = $rin, undef, undef, 0.15) > 0) {
+    while (select(my $rout = $rin, undef, undef, 0.02) > 0) {
         if (recv($sock, $buf, 4096, 0)) {
             $received++;
         }
