@@ -45,17 +45,16 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg,
                                         const char *domain) {
   if (!cfg || !domain) return NULL;
   if (cfg->views) {
-    if (!view_name) return NULL;
     for (view_config_t *v = cfg->views; v; v = v->next) {
-      if (strcasecmp(v->name, view_name) != 0) continue;
+      if (view_name && view_name[0] != '\0' && strcasecmp(v->name, view_name) != 0) continue;
       for (zone_config_t *z = v->zones; z; z = z->next) {
-        if (strcasecmp(z->domain, domain) == 0) return z;
+        if (domain_names_match_ci(z->domain, domain)) return z;
       }
-      return NULL;
+      if (view_name && view_name[0] != '\0') return NULL;
     }
   } else {
     for (zone_config_t *z = cfg->zones; z; z = z->next) {
-      if (strcasecmp(z->domain, domain) == 0) return z;
+      if (domain_names_match_ci(z->domain, domain)) return z;
     }
   }
   return NULL;
