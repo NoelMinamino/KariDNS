@@ -6,8 +6,7 @@ set -e
 rm -rf tests/zones/capsicum_include_test || true
 killall -9 karidns karidns-asan 2>/dev/null || true
 sleep 1
-make clean
-make karidns dag karictl
+[ -x karidns ] && [ -x dag ] && [ -x karictl ] || make karidns dag karictl
 
 # 1.5. テスト用ディレクトリを事前に作成・キャッシュさせるための準備
 mkdir -p tests/zones/capsicum_include_test/dir1

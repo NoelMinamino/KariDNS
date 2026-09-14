@@ -1450,6 +1450,16 @@ ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count) {
   return dst;
 }
 
+void free_zone_response_cache(zone_arena_t *arena) {
+  if (!arena) return;
+  if (arena->response_cache.buckets) {
+    free(arena->response_cache.buckets);
+    arena->response_cache.buckets = NULL;
+    arena->response_cache.bucket_count = 0;
+    arena->response_cache.entry_count = 0;
+  }
+}
+
 void zone_arena_destroy(zone_arena_t *arena) {
   free(arena->records);
   for (int i = 0; i < arena->data_pool_count; i++)
@@ -1484,6 +1494,7 @@ void zone_arena_destroy(zone_arena_t *arena) {
   }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
+  free_zone_response_cache(arena);
   zone_arena_free_include_buffers(arena);
 }
 uint32_t calc_fnv1a_str(const char *str) {

@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 
-echo "[*] Building karidns..."
-make -C "$ROOT" karidns
+[ -x "$ROOT/karidns" ] || {
+    echo "[*] Building karidns..."
+    [ -x "$ROOT/karidns" ] || make -C "$ROOT" karidns
+}
 
 CONF_NO_USER="$DIR/conf_no_user.conf"
 CONF_WITH_USER="$DIR/conf_with_user.conf"

@@ -26,8 +26,8 @@ fi
 DAG="$REPO_DIR/dag"
 KARIDNS="$REPO_DIR/karidns"
 
-make -C "$REPO_DIR" dag
-make -C "$REPO_DIR" karidns
+[ -x "$REPO_DIR/dag" ] || make -C "$REPO_DIR" dag
+[ -x "$REPO_DIR/karidns" ] || make -C "$REPO_DIR" karidns
 
 rm -rf "$SCRIPT_DIR/$TEST_DIR"
 mkdir -p "$SCRIPT_DIR/$TEST_DIR"

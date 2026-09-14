@@ -6,8 +6,10 @@ ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
 
-echo "[*] Building targets..."
-make -C "$ROOT" karidns dag
+[ -x "$ROOT/karidns" ] && [ -x "$ROOT/dag" ] || {
+    echo "[*] Building targets..."
+    [ -x "$ROOT/karidns" ] && [ -x "$ROOT/dag" ] || make -C "$ROOT" karidns dag
+}
 
 TMP_DIR="$(mktemp -d /tmp/karidns_sibling_test.XXXXXX)"
 

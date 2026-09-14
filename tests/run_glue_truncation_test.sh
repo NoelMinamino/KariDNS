@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-make karidns-asan dag-asan
+[ -x karidns-asan ] && [ -x dag-asan ] || make karidns-asan dag-asan
 
 ./karidns-asan -f tests/karidns-test.conf > server_asan.log 2>&1 &
 cleanup() {

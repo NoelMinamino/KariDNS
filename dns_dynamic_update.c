@@ -55,7 +55,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  wait_for_readers(z_standby);
+  rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
 
   clone_zone_arena(z_active, z_standby);
 
@@ -86,10 +86,12 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
                                       ? zcfg->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
+  build_zone_response_cache(z_standby, active_cfg_prelink, entry->domain);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);
 
+  entry->rcu.retire_epoch = rcu_writer_advance_epoch();
   atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
   pthread_mutex_unlock(&entry->writer_lock);
 
@@ -114,20 +116,21 @@ static void send_single_notify(const uint8_t *req, size_t req_len,
   udp_ipc_t msg;
   memset(&msg, 0, sizeof(msg));
   msg.sock_fd_idx = -1; // -1 = NOTIFY / Dynamic UDP
-  memcpy(&msg.client_addr, dest_addr, addr_len);
-  msg.addr_len = addr_len;
-  msg.payload_len = req_len;
+  size_t copy_len = addr_len <= sizeof(msg.client_addr) ? addr_len : sizeof(msg.client_addr);
+  memcpy(&msg.client_addr, dest_addr, copy_len);
+  msg.addr_len = (uint16_t)addr_len;
+  msg.payload_len = (uint16_t)req_len;
 
   int family = dest_addr->sa_family;
   if (notify_source && *notify_source) {
     if (family == AF_INET &&
         inet_pton(AF_INET, notify_source,
-                  &((struct sockaddr_in *)&msg.source_addr)->sin_addr) == 1) {
+                  &msg.source_addr.sin.sin_addr) == 1) {
       msg.source_addr.ss_family = AF_INET;
       msg.has_source_addr = true;
     } else if (family == AF_INET6 &&
                inet_pton(AF_INET6, notify_source,
-                         &((struct sockaddr_in6 *)&msg.source_addr)->sin6_addr) == 1) {
+                         &msg.source_addr.sin6.sin6_addr) == 1) {
       msg.source_addr.ss_family = AF_INET6;
       msg.has_source_addr = true;
     }

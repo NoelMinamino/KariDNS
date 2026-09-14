@@ -45,10 +45,14 @@ KARIDNS="$ROOT_DIR/karidns"
 DAG="$ROOT_DIR/dag"
 
 # Build binaries
-echo "[+] Building karidns..."
-make -C "$ROOT_DIR" karidns
-echo "[+] Building dag..."
-make -C "$ROOT_DIR" dag
+[ -x "$KARIDNS" ] || {
+    echo "[+] Building karidns..."
+    make -C "$ROOT_DIR" karidns
+}
+[ -x "$DAG" ] || {
+    echo "[+] Building dag..."
+    make -C "$ROOT_DIR" dag
+}
 
 # 1. Create Zone File
 cat << 'EOF' > "$ZONE_PATH"

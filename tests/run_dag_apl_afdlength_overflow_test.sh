@@ -51,7 +51,7 @@ echo "APL (TYPE 42) afdlength overflow regression"
 echo "=========================================="
 
 echo "Step 1: Build dag-asan"
-make dag-asan >/dev/null 2>"$BUILD_LOG"
+[ -x dag-asan ] || make dag-asan >/dev/null 2>"$BUILD_LOG"
 if [ ! -x ./dag-asan ]; then
     log_fail "could not build dag-asan (see $BUILD_LOG)"
     exit 1

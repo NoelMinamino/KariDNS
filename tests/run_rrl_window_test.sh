@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 
-echo "[*] Building targets..."
-make -C "$ROOT" karidns
+[ -x "$ROOT/karidns" ] || {
+    echo "[*] Building targets..."
+    [ -x "$ROOT/karidns" ] || make -C "$ROOT" karidns
+}
 
 CONF="$DIR/rrl_window_test.conf"
 ZONE="$DIR/zones/rrl_window_test.zone"
@@ -68,14 +70,15 @@ send_instant_burst() {
 
     socket(my $sock, PF_INET, SOCK_DGRAM, getprotobyname("udp")) or die "socket: $!";
     my $dest = sockaddr_in($port, inet_aton($ip));
+    connect($sock, $dest) or die "connect: $!";
 
     my $qname = "\x03www\x03rrl\x04test\x00";
     my $pkt_base = $qname . pack("nn", 1, 1);
 
-    # Send all $count packets immediately in a tight loop (< 1ms total)
-    for my $id (1..$count) {
-        my $hdr = pack("nnnnnn", $id, 0x0100, 1, 0, 0, 0);
-        send($sock, $hdr . $pkt_base, 0, $dest);
+    # Pre-generate all packets so send loop is purely connected UDP writes (< 1ms total)
+    my @pkts = map { pack("nnnnnn", $_, 0x0100, 1, 0, 0, 0) . $pkt_base } (1..$count);
+    for my $p (@pkts) {
+        send($sock, $p, 0);
     }
 
     # Collect responses with short drain timeout
@@ -84,9 +87,10 @@ send_instant_burst() {
     vec($rin, fileno($sock), 1) = 1;
     my $buf;
 
-    while (select(my $rout = $rin, undef, undef, 0.15) > 0) {
-        if (recv($sock, $buf, 4096, 0)) {
+    while (select(my $rout = $rin, undef, undef, 0.05) > 0) {
+        while (defined recv($sock, $buf, 4096, 0)) {
             $received++;
+            last unless select(my $r2 = $rin, undef, undef, 0.001) > 0;
         }
     }
     print "$received\n";

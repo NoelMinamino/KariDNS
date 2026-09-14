@@ -23,7 +23,7 @@ if [ "$DAG" = "dig" ] || [ "$(basename "$DAG")" = "dig" ]; then
 else
     if [ ! -x "$ROOT_DIR/dag" ]; then
     echo "=== Building dag with make ==="
-        make -C "$ROOT_DIR" dag
+        [ -x "$ROOT_DIR/dag" ] || make -C "$ROOT_DIR" dag
 fi
     if [ ! -x "$DAG" ]; then
         DAG="$ROOT_DIR/dag"

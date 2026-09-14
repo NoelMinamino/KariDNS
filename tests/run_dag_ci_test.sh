@@ -20,9 +20,9 @@ if [ "$CLIENT_ARG" = "dig" ]; then
     fi
     DAG="dig"
     CLIENT_NAME="BIND 9 dig ($(dig -v 2>&1 | head -n 1))"
-    make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
+    [ -x "$BIN_DIR/karidns" ] && [ -x "$BIN_DIR/dag" ] && [ -x "$BIN_DIR/karictl" ] && [ -x "$BIN_DIR/karicheck" ] || make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
 else
-    make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
+    [ -x "$BIN_DIR/karidns" ] && [ -x "$BIN_DIR/dag" ] && [ -x "$BIN_DIR/karictl" ] && [ -x "$BIN_DIR/karicheck" ] || make -C "$BIN_DIR" all || { echo "Error: make all failed"; exit 1; }
     DAG="$BIN_DIR/dag"
     CLIENT_NAME="KariDNS dag"
 fi

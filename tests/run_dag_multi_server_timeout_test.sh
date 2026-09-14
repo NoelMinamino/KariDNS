@@ -51,7 +51,7 @@ run_check() {
 }
 
 echo "=== Building dag and karidns ==="
-(cd "$BASE_DIR" && make -j4 dag karidns)
+[ -x "$BASE_DIR/dag" ] && [ -x "$BASE_DIR/karidns" ] || (cd "$BASE_DIR" && make -j4 dag karidns)
 
 cat << 'EOF' > "$TMP_DIR/test.zone"
 $TTL 300

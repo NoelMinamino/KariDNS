@@ -51,7 +51,7 @@ run_check() {
 }
 
 echo "=== Building dag and karidns ==="
-(cd "$BASE_DIR" && make -j4 dag karidns)
+[ -x "$BASE_DIR/dag" ] && [ -x "$BASE_DIR/karidns" ] || (cd "$BASE_DIR" && make -j4 dag karidns)
 
 # 1. LOC Record Parsing Under Non-C Locale (Task 1)
 echo "=== 1. Testing LOC Record Formatting and Locale Independence (Task 1) ==="

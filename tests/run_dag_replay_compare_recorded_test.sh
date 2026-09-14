@@ -36,10 +36,14 @@ fi
 echo "=== Running dag --replay --compare-recorded Test Suite ==="
 
 # Build binaries
-echo "[+] Building karidns..."
-make karidns
-echo "[+] Building dag..."
-make dag
+[ -x ./karidns ] || {
+    echo "[+] Building karidns..."
+    make karidns
+}
+[ -x ./dag ] || {
+    echo "[+] Building dag..."
+    make dag
+}
 
 # Prepare Zone
 cat << 'EOF' > "$ZONE1"

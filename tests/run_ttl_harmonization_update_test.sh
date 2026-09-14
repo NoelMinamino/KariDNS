@@ -8,8 +8,10 @@ ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="ttl_harmonization_update_test_dir"
 ORIG_ZONE="$ZONES_DIR/ttl_harmonize_update.zone"
 
-echo "[*] Building required binaries (karidns, dag)..."
-make -C "$BIN_DIR" karidns dag
+[ -x "$BIN_DIR/karidns" ] && [ -x "$BIN_DIR/dag" ] || {
+    echo "[*] Building required binaries (karidns, dag)..."
+    [ -x "$BIN_DIR/karidns" ] && [ -x "$BIN_DIR/dag" ] || make -C "$BIN_DIR" karidns dag
+}
 
 rm -rf "$SCRIPT_DIR/$TEST_DIR"
 mkdir -p "$SCRIPT_DIR/$TEST_DIR"

@@ -53,6 +53,25 @@ typedef struct {
   int record_count;
 } prelinked_glue_entry_t;
 
+typedef struct response_cache_entry_s {
+  char *name;
+  uint32_t name_hash;
+  uint16_t qtype;
+  uint16_t qclass;
+  uint16_t ancount;
+  uint16_t nscount;
+  uint16_t arcount;
+  uint16_t body_len;
+  uint8_t *body;
+  struct response_cache_entry_s *next;
+} response_cache_entry_t;
+
+typedef struct {
+  response_cache_entry_t **buckets;
+  size_t bucket_count;
+  size_t entry_count;
+} response_cache_table_t;
+
 typedef struct zone_arena_s {
   dns_record_t *records;
   size_t count;
@@ -63,7 +82,7 @@ typedef struct zone_arena_s {
   size_t current_pool_idx;
   char *file_bufs[32];
   char *display_bufs[32];
-  char *file_paths[32];   // 霑ｽ蜉: file_bufs[i] 縺ｫ蟇ｾ蠢懊☆繧玖ｧ｣豎ｺ貂医∩邨ｶ蟇ｾ繝代せ
+  char *file_paths[32];   // file_bufs[i] に対応する解決済み絶対パス
   int file_buf_count;
   int *hash_table;
   size_t hash_size;
@@ -72,18 +91,19 @@ typedef struct zone_arena_s {
   char **sorted_unique_names;
   size_t sorted_unique_count;
   _Atomic int reader_count;
-  bool is_tinydns_format; /* parse_tinydns_data()縺悟他縺ｰ繧後◆zone_arena縺ｧ縺ｮ縺ｿtrue */
-  tinydns_location_entry_t *locations; /* NULL蜿ｯ */
+  bool is_tinydns_format; /* parse_tinydns_data()が呼ばれたzone_arenaでのみtrue */
+  tinydns_location_entry_t *locations; /* NULL可 */
   int location_count;
-  ecs_tag_def_t *bind_location_tags;      /* 霑ｽ蜉: $LOCATION-TAG / AXFR蠕ｩ蜈・畑 */
+  ecs_tag_def_t *bind_location_tags;      /* $LOCATION-TAG / AXFR復元用 */
   int bind_location_tag_count;
-  ecs_tag_def_t *bind_ecs_tags;           /* 霑ｽ蜉: $ECS-SUBNET-TAG / AXFR蠕ｩ蜈・畑 */
+  ecs_tag_def_t *bind_ecs_tags;           /* $ECS-SUBNET-TAG / AXFR復元用 */
   int bind_ecs_tag_count;
-  char **bind_ecs_trusted_resolvers;      /* AXFR(諡｡蠑ｵ繝｢繝ｼ繝・縺ｧ蜿嶺ｿ｡縺励◆蛟､縲・ULL蜿ｯ */
+  char **bind_ecs_trusted_resolvers;      /* AXFR(拡張モード)で受信した値、NULL可 */
   int bind_ecs_trusted_resolver_count;
   acl_entry_t *bind_ecs_trusted_resolvers_parsed;
-  prelinked_glue_entry_t *prelinked_glue; /* 莠句燕繝ｪ繝ｯ繧ｯ縺輔ℓ縺蘗dditional繧ｰ繝ｫ繝ｼ */
+  prelinked_glue_entry_t *prelinked_glue; /* 事前リンクされたAdditionalグルー */
   int prelinked_glue_count;
+  response_cache_table_t response_cache;  /* 事前レンダリング済みワイヤ形式応答キャッシュ */
 } zone_arena_t;
 
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
@@ -92,6 +112,8 @@ dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, cons
 void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
+void free_zone_response_cache(zone_arena_t *arena);
+void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *domain);
 void *arena_alloc(zone_arena_t *arena, size_t size);
 char *arena_strdup(zone_arena_t *arena, const char *str);
 /* RFC 2181 s5.2 / RFC 4035 s2.2: harmonize_ttls=true normalizes RRset TTLs. */

@@ -15,8 +15,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Building karidns, karictl, and dag with make ==="
-make -C "$ROOT_DIR" karidns karictl dag
+[ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] || {
+    echo "=== Building karidns, karictl, and dag with make ==="
+    [ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] || make -C "$ROOT_DIR" karidns karictl dag
+}
 
 KARIDNS="$ROOT_DIR/karidns"
 KARICTL="$ROOT_DIR/karictl"
@@ -38,7 +40,8 @@ trap cleanup EXIT INT TERM
 
 # Build the OOM wrapper shared library
 echo "=== Building OOM wrapper shared library ==="
-cc -shared -fPIC -I"$ROOT_DIR" -o "$TMP_DIR/oom_zone_wrapper.so" "$ROOT_DIR/tests/oom_zone_wrapper.c" -ldl -lpthread
+INCLUDES="-I$ROOT_DIR -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/include -I/opt/homebrew/include -I/usr/local/include"
+cc -shared -fPIC $INCLUDES -o "$TMP_DIR/oom_zone_wrapper.so" "$ROOT_DIR/tests/oom_zone_wrapper.c" -ldl -lpthread
 
 # Prepare 3 zone files
 cat << 'EOF' > "$TMP_DIR/zone1.example.com.zone"

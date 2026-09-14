@@ -28,8 +28,10 @@ KARICTL="$ROOT_DIR/karictl"
 DAG="$ROOT_DIR/dag"
 KARICHECK="$ROOT_DIR/karicheck"
 
-echo "=== Building karidns, karictl, dag, and karicheck with make ==="
-make -C "$ROOT_DIR" karidns karictl dag karicheck
+[ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] && [ -x "$ROOT_DIR/karicheck" ] || {
+    echo "=== Building karidns, karictl, dag, and karicheck with make ==="
+    make -C "$ROOT_DIR" karidns karictl dag karicheck
+}
 
 FAILED=0
 PORT1=$((25000 + $$ % 3500))

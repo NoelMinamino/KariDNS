@@ -43,7 +43,7 @@ run_check() {
 }
 
 echo "=== Building dag ==="
-(cd "$BASE_DIR" && make -j4 dag)
+[ -x "$BASE_DIR/dag" ] || (cd "$BASE_DIR" && make -j4 dag)
 
 # Create Mock Perl Server responding with EDE 0-29 and UDP TC=1
 cat << 'EOF' > "$TMP_DIR/mock_ede_server.pl"

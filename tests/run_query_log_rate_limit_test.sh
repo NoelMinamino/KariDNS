@@ -6,9 +6,10 @@ ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
 
-echo "[*] Building targets..."
-rm -f "$BIN" "$DAG"
-make -C "$ROOT" karidns dag
+[ -x "$BIN" ] && [ -x "$DAG" ] || {
+    echo "[*] Building targets..."
+    make -C "$ROOT" karidns dag
+}
 
 CONF_LIMITED="$DIR/query_log_rate_limit_limited.conf"
 CONF_UNLIMITED="$DIR/query_log_rate_limit_unlimited.conf"

@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 KARICHECK="$ROOT/karicheck"
 
-echo "[*] Building karicheck..."
-make -C "$ROOT" karicheck
+[ -x "$ROOT/karicheck" ] || {
+    echo "[*] Building karicheck..."
+    [ -x "$ROOT/karicheck" ] || make -C "$ROOT" karicheck
+}
 
 BAD_LABEL_ZONE="$DIR/zones/bad_label_len.zone"
 BAD_NAME_ZONE="$DIR/zones/bad_name_len.zone"
@@ -20,6 +22,7 @@ $ORIGIN example.com.
 $TTL 3600
 @   IN SOA  ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600
 @   IN NS   ns1.example.com.
+ns1 IN A    192.0.2.1
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1
 EOF
 
@@ -29,6 +32,7 @@ $ORIGIN example.com.
 $TTL 3600
 @   IN SOA  ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600
 @   IN NS   ns1.example.com.
+ns1 IN A    192.0.2.1
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee IN A 192.0.2.1
 EOF
 
@@ -38,6 +42,7 @@ $ORIGIN example.com.
 $TTL 3600
 @   IN SOA  ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600
 @   IN NS   ns1.example.com.
+ns1 IN A    192.0.2.1
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1
 EOF
 

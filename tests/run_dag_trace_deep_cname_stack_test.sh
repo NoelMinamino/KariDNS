@@ -21,7 +21,7 @@ if [ ! -x "$DAG" ]; then
     elif [ -x "$ROOT_DIR/dag" ]; then
         DAG="$ROOT_DIR/dag"
     else
-        make -C "$ROOT_DIR" dag >/dev/null 2>&1 || true
+        [ -x "$ROOT_DIR/dag" ] || make -C "$ROOT_DIR" dag >/dev/null 2>&1 || true
         DAG="$ROOT_DIR/dag"
     fi
 fi

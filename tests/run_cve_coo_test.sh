@@ -3,6 +3,8 @@ set -e
 
 echo "[+] Starting CVE CoO buffer overflow tests..."
 
+[ -x ./karidns ] || [ -x ../karidns ] || make -C "$(dirname "$0")/.." karidns
+
 TEST_DIR="coo_cve_test_dir"
 rm -rf $TEST_DIR
 mkdir -p $TEST_DIR
@@ -49,7 +51,7 @@ view "default" {
 EOF
 
 # Build the OOM wrapper
-cc -shared -fPIC -o oom_coo_wrapper.so ../tests/oom_coo_wrapper.c -ldl
+cc -shared -fPIC -o oom_coo_wrapper.so ../tests/oom_coo_wrapper.c -ldl 2>/dev/null || cc -shared -fPIC -o oom_coo_wrapper.so ../tests/oom_coo_wrapper.c
 
 echo "[+] Starting KariDNS with OOM wrapper..."
 OOM_FAIL_AFTER_NTH_MATCHING_CALL=0 LD_PRELOAD=./oom_coo_wrapper.so ../karidns -f karidns.conf > karidns.log 2>&1 &

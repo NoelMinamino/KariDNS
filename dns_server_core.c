@@ -77,19 +77,11 @@
 config_rcu_t g_config_db;
 
 server_config_t *acquire_config_snapshot(void) {
-  server_config_t *snap = NULL;
-  do {
-    snap = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
-    if (!snap) return NULL;
-    atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
-    if (snap == atomic_load_explicit(&g_config_db.active, memory_order_acquire)) break;
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
-  } while (1);
-  return snap;
+  return atomic_load_explicit(&g_config_db.active, memory_order_acquire);
 }
 
 void release_config_snapshot(server_config_t *snap) {
-  if (snap) atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+  (void)snap;
 }
 int g_control_kq = -1;
 int g_cwd_fd = -1;
@@ -347,24 +339,6 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
     }
   }
 }
-
-const char *strchr_unescaped(const char *s, char c) {
-  if (!s) return NULL;
-  for (const char *p = s; *p != '\0'; p++) {
-    if (*p == '\\') {
-      if (*(p + 1) == '\0') {
-        break; // Trailing backslash at end of string
-      }
-      p++; // Skip escaped character
-      continue;
-    }
-    if (*p == c) {
-      return p;
-    }
-  }
-  return NULL;
-}
-
 
 // ============================================================================
 // 9. AXFR専用バックグラウンドスレッド (Detached)
@@ -964,6 +938,7 @@ typedef struct {
   bool dnssec_ok;
   size_t question_end;
   zone_db_snapshot_t *snap;
+  worker_ctx_t *owner_ctx;
 } async_io_task_t;
 
 typedef struct {
@@ -1058,6 +1033,9 @@ static void *async_io_worker_func(void *arg) {
         submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                             0, 0, 0, false, false);
       }
+      if (task.owner_ctx) {
+        rcu_reader_exit(task.owner_ctx);
+      }
     } else {
       // TCP async resolution
       uint8_t *tcp_res = malloc(65535);
@@ -1085,6 +1063,9 @@ static void *async_io_worker_func(void *arg) {
       }
       close(task.client_fd);
       dec_tcp_clients();
+      if (task.owner_ctx) {
+        rcu_reader_exit(task.owner_ctx);
+      }
     }
   }
   return NULL;
@@ -1346,7 +1327,7 @@ worker_startup_success:;
               continue;
             uint8_t *req_buf = batch->rx_buffers[p] + sizeof(udp_ipc_t);
             ssize_t payload_received = ipc_msg->payload_len;
-            struct sockaddr_storage *client_addr = &ipc_msg->client_addr;
+            ipc_sockaddr_t *client_addr = &ipc_msg->client_addr;
 
             // クエリパケットの検証: QRビットが0(クエリ)であることを期待
             uint8_t flags = req_buf[2];
@@ -1355,11 +1336,12 @@ worker_startup_success:;
             }
 
             char client_ip[INET6_ADDRSTRLEN] = "";
+            rcu_reader_enter(ctx);
             if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
-              fast_ipv4_to_str(((struct sockaddr_in *)client_addr)->sin_addr.s_addr, client_ip);
+              fast_ipv4_to_str(client_addr->sin.sin_addr.s_addr, client_ip);
             } else if (client_addr->ss_family == AF_INET6) {
               inet_ntop(AF_INET6,
-                        &((struct sockaddr_in6 *)client_addr)->sin6_addr,
+                        &client_addr->sin6.sin6_addr,
                         client_ip, INET6_ADDRSTRLEN);
             }
 
@@ -1438,20 +1420,21 @@ worker_startup_success:;
 
             int client_port = 0;
             if (client_addr->ss_family == AF_INET)
-              client_port = ntohs(((struct sockaddr_in *)client_addr)->sin_port);
+              client_port = ntohs(client_addr->sin.sin_port);
             else if (client_addr->ss_family == AF_INET6)
               client_port =
-                  ntohs(((struct sockaddr_in6 *)client_addr)->sin6_port);
+                  ntohs(client_addr->sin6.sin6_port);
 
             if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
-                write_query_log(ctx, client_addr, sizeof(*client_addr),
+                write_query_log(ctx, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
                                 qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
             }
-            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, sizeof(*client_addr),
-                               ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
+                               ipc_msg->has_source_addr ? (struct sockaddr_storage *)&ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
+              task.owner_ctx = ctx;
               task.is_tcp = false;
               task.active_fd = active_fd;
               task.ipc_hdr = *ipc_msg;
@@ -1459,10 +1442,12 @@ worker_startup_success:;
               memcpy(task.req_buf, req_buf, task.req_len);
               strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
-              task.client_addr = *client_addr;
-              task.client_len = sizeof(*client_addr);
+              memcpy(&task.client_addr, client_addr, ipc_msg->addr_len <= sizeof(task.client_addr) ? ipc_msg->addr_len : sizeof(task.client_addr));
+              task.client_len = ipc_msg->addr_len;
               task.has_server_addr = ipc_msg->has_source_addr;
-              if (ipc_msg->has_source_addr) task.server_addr = ipc_msg->source_addr;
+              if (ipc_msg->has_source_addr) {
+                memcpy(&task.server_addr, &ipc_msg->source_addr, sizeof(ipc_msg->source_addr));
+              }
               strncpy(task.qname, qname, sizeof(task.qname) - 1);
               task.qtype = qtype;
               task.qclass = qclass;
@@ -1472,6 +1457,7 @@ worker_startup_success:;
               task.snap = acquire_zone_snapshot();
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
+                rcu_reader_exit(ctx);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
@@ -1514,6 +1500,7 @@ worker_startup_success:;
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, 
                                       qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
                 }
+                rcu_reader_exit(ctx);
                 continue;
               }
 
@@ -1547,8 +1534,8 @@ worker_startup_success:;
                 batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
               }
 
-              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, client_addr, sizeof(*client_addr),
-                                 ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
+                                 ipc_msg->has_source_addr ? (struct sockaddr_storage *)&ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
               batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
               batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
@@ -1560,11 +1547,13 @@ worker_startup_success:;
                 sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
                 n_tx = 0;
               }
+              rcu_reader_exit(ctx);
             } else {
               if (rlog_enabled) {
                 submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 
                                     0, 0, 0, false, false);
               }
+              rcu_reader_exit(ctx);
             }
           }
           atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
@@ -1769,6 +1758,7 @@ process_tcp_client: ;
           }
           bool has_edns = edns.present;
           bool dnssec_ok = edns.dnssec_ok;
+          rcu_reader_enter(ctx);
           atomic_fetch_add_explicit(&ctx->query_count, 1, memory_order_relaxed);
           if (qlog_enabled && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) {
               write_query_log(ctx, &ctx_tcp->client_addr, ctx_tcp->client_len,
@@ -1912,7 +1902,6 @@ process_tcp_client: ;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
                   args->snap = snap;
-                  atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
                   int cflags = fcntl(client_fd, F_GETFL, 0);
                   fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
 
@@ -1926,7 +1915,6 @@ process_tcp_client: ;
                   if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
                     free(args);
                     atomic_fetch_sub(&entry->active_axfr, 1);
-                    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
                     allowed = false;
                   } else {
                     pthread_detach(t);
@@ -1939,6 +1927,7 @@ process_tcp_client: ;
                         ev_list[j].filter = 0;
                       }
                     }
+                    rcu_reader_exit(ctx);
                     break;
                   }
                 } else {
@@ -2013,6 +2002,7 @@ process_tcp_client: ;
               dec_tcp_clients();
               free(ctx_tcp);
               client_closed = true;
+              rcu_reader_exit(ctx);
               break;
             } else {
               release_zone_snapshot(snap);
@@ -2025,6 +2015,7 @@ process_tcp_client: ;
               kevent(kq, ev_del_syn, 2, NULL, 0, NULL);
 
               async_io_task_t task = {0};
+              task.owner_ctx = ctx;
               task.is_tcp = true;
               task.client_fd = client_fd;
               task.req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
@@ -2046,6 +2037,7 @@ process_tcp_client: ;
 
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(snap);
+                rcu_reader_exit(ctx);
                 close(client_fd);
                 dec_tcp_clients();
               }
@@ -2071,6 +2063,7 @@ process_tcp_client: ;
                   dec_tcp_clients();
                   free(ctx_tcp);
                   client_closed = true;
+                  rcu_reader_exit(ctx);
                   break;
                 }
               } else {
@@ -2090,9 +2083,11 @@ process_tcp_client: ;
               dec_tcp_clients();
               free(ctx_tcp);
               client_closed = true;
+              rcu_reader_exit(ctx);
               break;
             }
 
+            rcu_reader_exit(ctx);
             ctx_tcp->state = TCP_STATE_READ_LEN;
             ctx_tcp->accumulated = 0;
             ctx_tcp->msg_len = 0;
@@ -2187,25 +2182,8 @@ static void perform_config_reload_ext(bool skip_unchanged) {
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
   
-  /* [H-2] 既存のリーダーが参照を終えるのを待機。
-   * 最大5秒を上限とし、超過した場合は古い設定を維持して安全に中断する。*/
-  int retries = 0;
-  useconds_t sleep_time = 1;
-  struct timespec rcu_wait_start, rcu_wait_now;
-  clock_gettime(CLOCK_MONOTONIC, &rcu_wait_start);
-  while (atomic_load_explicit(&standby->reader_count, memory_order_acquire) > 0) {
-    if (retries < 100) sched_yield();
-    else { usleep(sleep_time); if (sleep_time < 100000) sleep_time *= 2; }
-    retries++;
-    clock_gettime(CLOCK_MONOTONIC, &rcu_wait_now);
-    int64_t elapsed_ms = (rcu_wait_now.tv_sec - rcu_wait_start.tv_sec) * 1000 +
-                         (rcu_wait_now.tv_nsec - rcu_wait_start.tv_nsec) / 1000000;
-    if (elapsed_ms > 5000) {
-      syslog(LOG_CRIT, "[Config] RCU standby config still has readers after 5s; aborting reload to protect live traffic");
-      free(config_str);
-      return;
-    }
-  }
+  /* [H-2] 既存のリーダーが参照を終えるのを待機。*/
+  rcu_writer_wait_until_safe(g_config_db.retire_epoch, 5000);
   
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
@@ -2222,6 +2200,7 @@ static void perform_config_reload_ext(bool skip_unchanged) {
       return;
     }
     init_logging_channels(standby);
+    g_config_db.retire_epoch = rcu_writer_advance_epoch();
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
     rebuild_zone_db_from_config(standby, skip_unchanged);
@@ -2967,6 +2946,112 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
       }
     }
   }
+
+  // Pre-bind any explicit notify-source configured on zones if not already bound
+  if (cfg) {
+    for (view_config_t *v = cfg->views; v; v = v->next) {
+      for (zone_config_t *z = v->zones; z; z = z->next) {
+        if (!z->notify_source || !*z->notify_source) continue;
+        if (num_fds >= MAX_BIND_ADDRS) break;
+
+        struct sockaddr_in addr4;
+        struct sockaddr_in6 addr6;
+        bool is_v4 = false;
+        bool is_v6 = false;
+        memset(&addr4, 0, sizeof(addr4));
+        memset(&addr6, 0, sizeof(addr6));
+
+        if (inet_pton(AF_INET, z->notify_source, &addr4.sin_addr) == 1) {
+          addr4.sin_family = AF_INET;
+          addr4.sin_port = htons(port);
+          is_v4 = true;
+        } else if (inet_pton(AF_INET6, z->notify_source, &addr6.sin6_addr) == 1) {
+          addr6.sin6_family = AF_INET6;
+          addr6.sin6_port = htons(port);
+          is_v6 = true;
+        }
+
+        bool already_bound = false;
+        for (int k = 0; k < num_fds; k++) {
+          struct sockaddr_storage ss;
+          socklen_t slen = sizeof(ss);
+          if (getsockname(out_fds[k], (struct sockaddr *)&ss, &slen) == 0) {
+            if (is_v4 && ss.ss_family == AF_INET) {
+              if (((struct sockaddr_in *)&ss)->sin_addr.s_addr == addr4.sin_addr.s_addr) {
+                already_bound = true;
+                break;
+              }
+            } else if (is_v6 && ss.ss_family == AF_INET6) {
+              if (memcmp(&((struct sockaddr_in6 *)&ss)->sin6_addr, &addr6.sin6_addr, sizeof(struct in6_addr)) == 0) {
+                already_bound = true;
+                break;
+              }
+            }
+          }
+        }
+        if (already_bound) continue;
+
+        if (is_v4 && num_fds < MAX_BIND_ADDRS) {
+          int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+          if (udp_fd >= 0) {
+            setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+            fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_REUSEPORT_LB
+            int opt_lb = 1;
+            if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+              int opt_reuse = 1;
+              setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+            }
+#else
+            int opt_reuse = 1;
+            setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+            int opt_dst = 1;
+#ifdef IP_RECVDSTADDR
+            setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
+#elif defined(IP_PKTINFO)
+            setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
+#endif
+            if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
+              out_is_wildcard[num_fds] = (addr4.sin_addr.s_addr == INADDR_ANY);
+              out_fds[num_fds++] = udp_fd;
+            } else {
+              close(udp_fd);
+            }
+          }
+        } else if (is_v6 && num_fds < MAX_BIND_ADDRS) {
+          int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+          if (udp_fd >= 0) {
+            setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+            fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT_LB
+            int opt_lb = 1;
+            if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+              int opt_reuse = 1;
+              setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+            }
+#else
+            int opt_reuse = 1;
+            setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+            int opt_pktinfo = 1;
+#ifdef IPV6_RECVPKTINFO
+            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#elif defined(IPV6_PKTINFO)
+            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#endif
+            if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+              out_is_wildcard[num_fds] = IN6_IS_ADDR_UNSPECIFIED(&addr6.sin6_addr);
+              out_fds[num_fds++] = udp_fd;
+            } else {
+              close(udp_fd);
+            }
+          }
+        }
+      }
+    }
+  }
   return num_fds;
 }
 
@@ -3125,7 +3210,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     fctx->rx_msgs[k].msg_hdr.msg_iov = &fctx->rx_iov[k];
     fctx->rx_msgs[k].msg_hdr.msg_iovlen = 1;
     fctx->rx_msgs[k].msg_hdr.msg_name = &msg->client_addr;
-    fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+    fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(msg->client_addr);
     fctx->rx_msgs[k].msg_hdr.msg_control = fctx->rx_cbuf[k].buf;
     fctx->rx_msgs[k].msg_hdr.msg_controllen = sizeof(fctx->rx_cbuf[k].buf);
 
@@ -3192,8 +3277,9 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
         int fd = local_udp_fds[ud];
         while (1) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+            udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
             fctx->rx_iov[k].iov_len = BUFFER_SIZE;
-            fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+            fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(msg->client_addr);
             fctx->rx_msgs[k].msg_hdr.msg_control = fctx->rx_cbuf[k].buf;
             fctx->rx_msgs[k].msg_hdr.msg_controllen = sizeof(fctx->rx_cbuf[k].buf);
           }
@@ -3207,7 +3293,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             if (len >= DNS_HEADER_SIZE) {
               udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
               msg->sock_fd_idx = ud;
-              msg->addr_len = fctx->rx_msgs[k].msg_hdr.msg_namelen;
+              msg->addr_len = (uint16_t)fctx->rx_msgs[k].msg_hdr.msg_namelen;
               msg->has_source_addr = false;
               memset(&msg->source_addr, 0, sizeof(msg->source_addr));
               msg->payload_len = (uint16_t)len;
@@ -3218,9 +3304,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 #ifdef IP_RECVDSTADDR
                 if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVDSTADDR &&
                     cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_addr))) {
-                  struct sockaddr_in *sin = (struct sockaddr_in *)&msg->source_addr;
-                  sin->sin_family = AF_INET;
-                  memcpy(&sin->sin_addr, CMSG_DATA(cmsg), sizeof(struct in_addr));
+                  msg->source_addr.sin.sin_family = AF_INET;
+                  memcpy(&msg->source_addr.sin.sin_addr, CMSG_DATA(cmsg), sizeof(struct in_addr));
                   msg->has_source_addr = true;
                   break;
                 }
@@ -3229,9 +3314,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                 if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO &&
                     cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
                   struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
-                  struct sockaddr_in *sin = (struct sockaddr_in *)&msg->source_addr;
-                  sin->sin_family = AF_INET;
-                  sin->sin_addr = pi->ipi_addr;
+                  msg->source_addr.sin.sin_family = AF_INET;
+                  msg->source_addr.sin.sin_addr = pi->ipi_addr;
                   msg->has_source_addr = true;
                   break;
                 }
@@ -3240,9 +3324,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                 if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO &&
                     cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
                   struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
-                  struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg->source_addr;
-                  sin6->sin6_family = AF_INET6;
-                  sin6->sin6_addr = pi6->ipi6_addr;
+                  msg->source_addr.sin6.sin6_family = AF_INET6;
+                  msg->source_addr.sin6.sin6_addr = pi6->ipi6_addr;
                   msg->has_source_addr = true;
                   break;
                 }
@@ -3282,7 +3365,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                   ss.ss_family == msg->source_addr.ss_family) {
                 if (ss.ss_family == AF_INET) {
                   struct sockaddr_in *sin1 = (struct sockaddr_in *)&ss;
-                  struct sockaddr_in *sin2 = (struct sockaddr_in *)&msg->source_addr;
+                  struct sockaddr_in *sin2 = &msg->source_addr.sin;
                   if (sin1->sin_addr.s_addr == sin2->sin_addr.s_addr) {
                     target_sock = local_udp_fds[k];
                     target_sock_idx = k;
@@ -3290,7 +3373,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                   }
                 } else if (ss.ss_family == AF_INET6) {
                   struct sockaddr_in6 *sin1 = (struct sockaddr_in6 *)&ss;
-                  struct sockaddr_in6 *sin2 = (struct sockaddr_in6 *)&msg->source_addr;
+                  struct sockaddr_in6 *sin2 = &msg->source_addr.sin6;
                   if (memcmp(&sin1->sin6_addr, &sin2->sin6_addr, sizeof(struct in6_addr)) == 0) {
                     target_sock = local_udp_fds[k];
                     target_sock_idx = k;
@@ -3298,6 +3381,71 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                   }
                 }
               }
+            }
+          }
+          if (target_sock < 0 && msg->has_source_addr) {
+            for (int k = 0; k < local_num_udp_fds; k++) {
+              if (local_udp_is_wildcard[k]) {
+                struct sockaddr_storage ss;
+                socklen_t slen = sizeof(ss);
+                if (getsockname(local_udp_fds[k], (struct sockaddr *)&ss, &slen) == 0 &&
+                    ss.ss_family == msg->source_addr.ss_family) {
+                  target_sock = local_udp_fds[k];
+                  target_sock_idx = k;
+                  break;
+                }
+              }
+            }
+          }
+          if (target_sock < 0 && msg->has_source_addr) {
+            int s = socket(msg->source_addr.ss_family, SOCK_DGRAM, 0);
+            if (s >= 0) {
+              int opt_reuse = 1;
+              setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt_reuse, sizeof(opt_reuse));
+#ifdef SO_REUSEPORT
+              setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+#ifdef SO_REUSEPORT_LB
+              setsockopt(s, SOL_SOCKET, SO_REUSEPORT_LB, &opt_reuse, sizeof(opt_reuse));
+#endif
+              uint16_t src_port = 0;
+              if (notify_v4_sock >= 0) {
+                struct sockaddr_storage pss;
+                socklen_t plen = sizeof(pss);
+                if (getsockname(notify_v4_sock, (struct sockaddr *)&pss, &plen) == 0) {
+                  src_port = ntohs(((struct sockaddr_in *)&pss)->sin_port);
+                }
+              }
+              struct sockaddr_storage bind_sa;
+              memset(&bind_sa, 0, sizeof(bind_sa));
+              socklen_t b_len = 0;
+              if (msg->source_addr.ss_family == AF_INET) {
+                struct sockaddr_in *b_in = (struct sockaddr_in *)&bind_sa;
+                b_in->sin_family = AF_INET;
+                b_in->sin_addr = msg->source_addr.sin.sin_addr;
+                b_in->sin_port = htons(src_port);
+                b_len = sizeof(struct sockaddr_in);
+              } else if (msg->source_addr.ss_family == AF_INET6) {
+                struct sockaddr_in6 *b_in6 = (struct sockaddr_in6 *)&bind_sa;
+                b_in6->sin6_family = AF_INET6;
+                b_in6->sin6_addr = msg->source_addr.sin6.sin6_addr;
+                b_in6->sin6_port = htons(src_port);
+                b_len = sizeof(struct sockaddr_in6);
+              }
+              if (b_len > 0) {
+                if (bind(s, (struct sockaddr *)&bind_sa, b_len) < 0) {
+                  if (msg->source_addr.ss_family == AF_INET) {
+                    ((struct sockaddr_in *)&bind_sa)->sin_port = 0;
+                  } else {
+                    ((struct sockaddr_in6 *)&bind_sa)->sin6_port = 0;
+                  }
+                  bind(s, (struct sockaddr *)&bind_sa, b_len);
+                }
+              }
+              sendto(s, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
+                     (struct sockaddr *)&msg->client_addr, msg->addr_len);
+              close(s);
+              continue;
             }
           }
           if (target_sock < 0) {
@@ -3337,7 +3485,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_type = IP_SENDSRCADDR;
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
               struct in_addr *src = (struct in_addr *)CMSG_DATA(cmsg);
-              *src = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              *src = msg->source_addr.sin.sin_addr;
               out_msg.msg_control = cbuf.buf;
               out_msg.msg_controllen = CMSG_SPACE(sizeof(struct in_addr));
             }
@@ -3349,7 +3497,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
               struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
               memset(pi, 0, sizeof(*pi));
-              pi->ipi_spec_dst = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              pi->ipi_spec_dst = msg->source_addr.sin.sin_addr;
               out_msg.msg_control = cbuf.buf;
               out_msg.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
             }
@@ -3362,7 +3510,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
               struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
               memset(pi6, 0, sizeof(*pi6));
-              pi6->ipi6_addr = ((struct sockaddr_in6 *)&msg->source_addr)->sin6_addr;
+              pi6->ipi6_addr = msg->source_addr.sin6.sin6_addr;
               out_msg.msg_control = cbuf.buf;
               out_msg.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
             }
@@ -3415,7 +3563,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 
             fctx->cli_tx_iov[tx_count].iov_base = fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t);
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
-            memcpy(&fctx->cli_tx_addrs[tx_count], &msg->client_addr, msg->addr_len);
+            size_t copy_len = (msg->addr_len <= sizeof(fctx->cli_tx_addrs[tx_count])) ? msg->addr_len : sizeof(fctx->cli_tx_addrs[tx_count]);
+            memcpy(&fctx->cli_tx_addrs[tx_count], &msg->client_addr, copy_len);
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &fctx->cli_tx_addrs[tx_count];
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = msg->addr_len;
 
@@ -3428,7 +3577,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_type = IP_SENDSRCADDR;
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
               struct in_addr *src = (struct in_addr *)CMSG_DATA(cmsg);
-              *src = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              *src = msg->source_addr.sin.sin_addr;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in_addr));
             }
@@ -3441,7 +3590,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
               struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
               memset(pi, 0, sizeof(*pi));
-              pi->ipi_spec_dst = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              pi->ipi_spec_dst = msg->source_addr.sin.sin_addr;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
             }
@@ -3455,7 +3604,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
               struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
               memset(pi6, 0, sizeof(*pi6));
-              pi6->ipi6_addr = ((struct sockaddr_in6 *)&msg->source_addr)->sin6_addr;
+              pi6->ipi6_addr = msg->source_addr.sin6.sin6_addr;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
             }
@@ -3540,6 +3689,10 @@ static void daemonize(void) {
 
 static void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
+  server_config_t *cfg = &g_config_db.config_a;
+  int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
+  int sndbuf_size = (cfg && cfg->udp_sndbuf_size > 0) ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+
   for (int f = 0; f < g_num_frontend_routers; f++) {
     for (int w = 0; w < num_workers; w++) {
       if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ipc_fds[f][w]) < 0) {
@@ -3550,11 +3703,10 @@ static void setup_ipc_tables(int num_workers) {
             fcntl(g_ipc_fds[f][w][0], F_GETFL, 0) | O_NONBLOCK);
       fcntl(g_ipc_fds[f][w][1], F_SETFL,
             fcntl(g_ipc_fds[f][w][1], F_GETFL, 0) | O_NONBLOCK);
-      int bufsize = 4 * 1024 * 1024; // 4MB
-      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
     }
   }
 
@@ -4010,6 +4162,7 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].dnstap_ring.dropped, 0);
 
     atomic_init(&ctxs[i].query_count, 0);
+    atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
     if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
       exit(EXIT_FAILURE);
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
@@ -4180,9 +4333,6 @@ int main(int argc, char **argv) {
   server_config_t *active = acquire_config_snapshot();
   if (active) {
     release_config_snapshot(active);
-    while (atomic_load_explicit(&active->reader_count, memory_order_acquire) > 0) {
-      sched_yield();
-    }
     free_server_config_fields(active);
   }
   rrl_shutdown();

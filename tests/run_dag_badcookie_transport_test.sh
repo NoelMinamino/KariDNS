@@ -10,7 +10,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if [ ! -x "$ROOT_DIR/dag" ] || [ ! -x "$ROOT_DIR/karidns" ]; then
     echo "=== Building dag and karidns with make ==="
-    make -C "$ROOT_DIR" dag karidns
+    [ -x "$ROOT_DIR/dag" ] || make -C "$ROOT_DIR" dag karidns
 fi
 
 DAG="${1:-${DAG:-$ROOT_DIR/dag}}"

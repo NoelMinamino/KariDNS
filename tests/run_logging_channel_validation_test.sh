@@ -5,8 +5,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
 KARICHECK="$ROOT/karicheck"
 
-echo "[*] Building karicheck..."
-make -C "$ROOT" karicheck
+[ -x "$ROOT/karicheck" ] || {
+    echo "[*] Building karicheck..."
+    [ -x "$ROOT/karicheck" ] || make -C "$ROOT" karicheck
+}
 
 CONF_VALID_LOG="$DIR/conf_valid_log.conf"
 CONF_UNDEF_QLOG="$DIR/conf_undef_qlog.conf"
@@ -60,6 +62,14 @@ logging {
 EOF
 
 cat << 'EOF' > "$CONF_MULTI_KEY"
+key "key1" {
+    algorithm hmac-sha256;
+    secret "dGVzdDE=";
+};
+key "key2" {
+    algorithm hmac-sha256;
+    secret "dGVzdDI=";
+};
 options {
     port 10053;
     bind-address { 127.0.0.1; };

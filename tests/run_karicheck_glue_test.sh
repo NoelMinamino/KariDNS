@@ -6,7 +6,7 @@ echo "=== Running karicheck Delegation & Glue Verification Tests ==="
 # Check karicheck binary exists, if not build it
 if [ ! -f ./karicheck ]; then
     echo "[+] Building karicheck..."
-    make karicheck
+    [ -x karicheck ] || make karicheck
 fi
 
 # Test 1: missing_glue.zone should produce a warning about missing glue A/AAAA
