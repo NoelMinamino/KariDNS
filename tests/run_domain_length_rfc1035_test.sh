@@ -22,6 +22,7 @@ $ORIGIN example.com.
 $TTL 3600
 @   IN SOA  ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600
 @   IN NS   ns1.example.com.
+ns1 IN A    192.0.2.1
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1
 EOF
 
@@ -31,6 +32,7 @@ $ORIGIN example.com.
 $TTL 3600
 @   IN SOA  ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600
 @   IN NS   ns1.example.com.
+ns1 IN A    192.0.2.1
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee IN A 192.0.2.1
 EOF
 
@@ -40,6 +42,7 @@ $ORIGIN example.com.
 $TTL 3600
 @   IN SOA  ns1.example.com. hostmaster.example.com. 2026082401 7200 3600 1209600 3600
 @   IN NS   ns1.example.com.
+ns1 IN A    192.0.2.1
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa IN A 192.0.2.1
 EOF
 
