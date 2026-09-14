@@ -41,8 +41,8 @@ bool cidr_entry_parse(cidr_entry_t *entry, const char *cidr_str);
 /* Match raw network bytes against parsed CIDR (family: AF_INET or AF_INET6) */
 bool cidr_entry_match(const cidr_entry_t *net, int family, const uint8_t *addr_bytes);
 
-/* Match sockaddr_storage against parsed CIDR */
-bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const struct sockaddr_storage *sa);
+/* Match sockaddr / sockaddr_storage / ipc_sockaddr against parsed CIDR */
+bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const void *sa);
 
 /* Match client IP string (e.g. "192.0.2.1", "2001:db8::1") against parsed CIDR */
 bool cidr_entry_match_str(const cidr_entry_t *net, const char *addr_str);

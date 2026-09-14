@@ -88,16 +88,16 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
                        uint8_t *wire_dst, size_t wire_dst_cap, size_t *out_wire_len,
                        uint8_t message_type,
                        const uint8_t *wire_src, size_t wire_src_len,
-                       const struct sockaddr_storage *client_addr,
+                       const void *client_addr,
                        socklen_t client_addr_len,
-                       const struct sockaddr_storage *server_addr,
+                       const void *server_addr,
                        bool has_server_addr, uint8_t protocol);
 
 void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
                         const uint8_t *wire, size_t wire_len,
-                        const struct sockaddr_storage *client_addr,
+                        const void *client_addr,
                         socklen_t client_addr_len,
-                        const struct sockaddr_storage *server_addr,
+                        const void *server_addr,
                         bool has_server_addr, uint8_t protocol);
 
 void *dnstap_sender_thread_func(void *arg);

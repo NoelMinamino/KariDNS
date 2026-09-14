@@ -73,11 +73,13 @@ uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]) {
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
-static inline uint64_t rrl_hash_client_addr(const struct sockaddr_storage *client_addr) {
-  if (client_addr->ss_family == AF_INET) {
+static inline uint64_t rrl_hash_client_addr(const void *client_addr_ptr) {
+  const struct sockaddr *client_addr = (const struct sockaddr *)client_addr_ptr;
+  if (!client_addr) return 0;
+  if (client_addr->sa_family == AF_INET) {
     uint32_t ip = ((const struct sockaddr_in *)client_addr)->sin_addr.s_addr & htonl(0xFFFFFF00); // /24 mask
     return siphash24((const uint8_t *)&ip, 4, g_rrl_hash_key);
-  } else if (client_addr->ss_family == AF_INET6) {
+  } else if (client_addr->sa_family == AF_INET6) {
     // /56 mask (7 bytes prefix). Directly read sin6_addr without stack memcpy/memset
     const uint8_t *s6 = (const uint8_t *)&((const struct sockaddr_in6 *)client_addr)->sin6_addr;
     return siphash24(s6, 7, g_rrl_hash_key);
@@ -97,9 +99,11 @@ rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len) {
   return RRL_RESP_ERROR;
 }
 
-bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_class_t cls, const rate_limit_config_t *cfg, bool *out_slip) {
+bool rrl_check(const void *client_addr_ptr, rrl_response_class_t cls, const rate_limit_config_t *cfg, bool *out_slip) {
   *out_slip = false;
   if (!cfg || !cfg->configured) return true;
+  const struct sockaddr *client_addr = (const struct sockaddr *)client_addr_ptr;
+  if (!client_addr) return true;
 
   uint32_t rate = 0;
   switch (cls) {
@@ -116,9 +120,9 @@ bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_class_t 
     }
   } else if (cfg->exempt_clients_count > 0 && cfg->exempt_clients) {
     char ip_str_exempt[INET6_ADDRSTRLEN] = {0};
-    if (client_addr->ss_family == AF_INET) {
+    if (client_addr->sa_family == AF_INET) {
       inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str_exempt, INET_ADDRSTRLEN);
-    } else if (client_addr->ss_family == AF_INET6) {
+    } else if (client_addr->sa_family == AF_INET6) {
       inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str_exempt, INET6_ADDRSTRLEN);
     }
     for (int i = 0; i < cfg->exempt_clients_count; i++) {
@@ -128,9 +132,9 @@ bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_class_t 
 
   char ip_str[INET6_ADDRSTRLEN] = {0};
   if (cfg->log_only) {
-    if (client_addr->ss_family == AF_INET) {
+    if (client_addr->sa_family == AF_INET) {
       inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
-    } else if (client_addr->ss_family == AF_INET6) {
+    } else if (client_addr->sa_family == AF_INET6) {
       inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
     }
   }
@@ -262,9 +266,11 @@ bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_class_t 
   return allow;
 }
 
-bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, const rate_limit_config_t *cfg) {
+bool rrl_is_client_exhausted(const void *client_addr_ptr, const rate_limit_config_t *cfg) {
   if (!cfg || !cfg->configured) return false;
   if (cfg->responses_per_second == 0) return false;
+  const struct sockaddr *client_addr = (const struct sockaddr *)client_addr_ptr;
+  if (!client_addr) return false;
 
   if (cfg->exempt_clients_count > 0 && cfg->exempt_clients_parsed) {
     for (int i = 0; i < cfg->exempt_clients_count; i++) {
@@ -272,9 +278,9 @@ bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, const r
     }
   } else if (cfg->exempt_clients_count > 0 && cfg->exempt_clients) {
     char ip_str[INET6_ADDRSTRLEN] = {0};
-    if (client_addr->ss_family == AF_INET) {
+    if (client_addr->sa_family == AF_INET) {
       inet_ntop(AF_INET, &((const struct sockaddr_in *)client_addr)->sin_addr, ip_str, INET_ADDRSTRLEN);
-    } else if (client_addr->ss_family == AF_INET6) {
+    } else if (client_addr->sa_family == AF_INET6) {
       inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)client_addr)->sin6_addr, ip_str, INET6_ADDRSTRLEN);
     }
     for (int i = 0; i < cfg->exempt_clients_count; i++) {

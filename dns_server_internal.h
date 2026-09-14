@@ -63,9 +63,9 @@ extern char g_startup_cwd[PATH_MAX];
 #define MAX_ZONE_AXFR 4
 #define MAX_TCP_CLIENTS 1000
 
-// Frontend/Backendプロセス間のUDPパケット受け渡し用コンパクトソケットアドレス (IPv4: 16B, IPv6: 28B)
+// Frontend/Backendプロセス間のUDPパケット受け渡し用コンパクトソケットアドレス (IPv4: 16B, IPv6: 28B, 8B aligned)
 typedef union {
-  struct sockaddr sa;
+  alignas(8) struct sockaddr sa;
   struct sockaddr_in sin;
   struct sockaddr_in6 sin6;
   struct {
@@ -78,15 +78,15 @@ typedef union {
   };
 } ipc_sockaddr_t;
 
-// Frontend/Backendプロセス間のUDPパケット受け渡し用ヘッダ (68 bytes)
+// Frontend/Backendプロセス間のUDPパケット受け渡し用ヘッダ (80 bytes, 8B aligned)
 typedef struct {
   int32_t sock_fd_idx;
   uint16_t addr_len;
   uint16_t payload_len;
   bool has_source_addr;
-  uint8_t reserved[3];
-  ipc_sockaddr_t client_addr;
-  ipc_sockaddr_t source_addr;
+  uint8_t reserved[7];
+  alignas(8) ipc_sockaddr_t client_addr;
+  alignas(8) ipc_sockaddr_t source_addr;
 } udp_ipc_t;
 
 #define UDP_BATCH_SIZE 16

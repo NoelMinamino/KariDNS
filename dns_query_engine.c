@@ -3128,6 +3128,102 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     return offset;
   }
 
+  // UDP IXFR (RFC 1995 §4.2):
+  // If client's SOA serial matches server's current serial (up-to-date), send single SOA response (NOERROR).
+  // If update is needed (or diff required), set TC=1 and send current SOA to prompt client to retry over TCP.
+  if (!is_tcp && qtype == 251) {
+    uint32_t client_serial = 0;
+    bool has_client_soa = false;
+    uint16_t req_ancount = (req[6] << 8) | req[7];
+    uint16_t req_nscount = (req[8] << 8) | req[9];
+    size_t p = q_offset;
+    size_t next_p;
+
+    // Skip any answer records if present in the request
+    for (uint16_t i = 0; i < req_ancount; i++) {
+      if (skip_wire_name(req, req_len, p, &next_p) != 0) break;
+      p = next_p;
+      if (p + 10 > req_len) break;
+      uint16_t rdlen = (req[p + 8] << 8) | req[p + 9];
+      p += 10 + rdlen;
+      if (p > req_len) break;
+    }
+
+    if (req_nscount > 0 && p < req_len) {
+      if (skip_wire_name(req, req_len, p, &next_p) == 0) {
+        p = next_p;
+        if (p + 10 <= req_len) {
+          uint16_t auth_type = (req[p] << 8) | req[p + 1];
+          uint16_t auth_rdlen = (req[p + 8] << 8) | req[p + 9];
+          p += 10;
+          if (auth_type == 6 && p + auth_rdlen <= req_len) {
+            size_t rp = p;
+            if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
+              rp = next_p;
+              if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
+                rp = next_p;
+                if (rp + 4 <= p + auth_rdlen) {
+                  client_serial = ((uint32_t)req[rp] << 24) |
+                                  ((uint32_t)req[rp + 1] << 16) |
+                                  ((uint32_t)req[rp + 2] << 8) |
+                                  req[rp + 3];
+                  has_client_soa = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    dns_record_t *soa_rec = NULL;
+    uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
+    size_t apex_idx = apex_hash & (current_zone->hash_size - 1);
+    for (int i = current_zone->hash_table[apex_idx]; i != -1;
+         i = current_zone->records[i].next_record) {
+      if (current_zone->records[i].type_code == 6 &&
+          strcasecmp(current_zone->records[i].name, db_entry->domain) == 0) {
+        soa_rec = &current_zone->records[i];
+        break;
+      }
+    }
+    if (!soa_rec) {
+      for (size_t i = 0; i < current_zone->count; i++) {
+        if (current_zone->records[i].type_code == 6 &&
+            strcasecmp(current_zone->records[i].name, db_entry->domain) == 0) {
+          soa_rec = &current_zone->records[i];
+          break;
+        }
+      }
+    }
+
+    uint32_t current_serial = 0;
+    if (soa_rec && soa_rec->rdata_count >= 3) {
+      current_serial = strtoul(soa_rec->rdata[2], NULL, 10);
+    } else {
+      current_serial = atomic_load_explicit(&db_entry->serial, memory_order_relaxed);
+    }
+
+    bool is_up_to_date = (has_client_soa && client_serial == current_serial);
+    if (!is_up_to_date) {
+      res[2] |= 0x02; // Set TC (Truncated) bit to prompt TCP retry
+    }
+
+    if (soa_rec) {
+      dns_record_t rec_copy = *soa_rec;
+      if (serialize_dns_record(res, max_res_len, &offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) >= 0) {
+        ancount = 1;
+      }
+    }
+    *res_ancount = htons(ancount);
+    *res_nscount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+    }
+    *res_arcount = htons(arcount);
+    return offset;
+  }
+
   // Pre-rendered wire-format response cache (Fast Path)
   if (!edns.present && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
       current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {

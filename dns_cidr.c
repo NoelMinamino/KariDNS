@@ -108,15 +108,16 @@ bool cidr_entry_match(const cidr_entry_t *net, int family, const uint8_t *addr_b
     return false;
 }
 
-bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const struct sockaddr_storage *sa) {
-    if (!net || !net->valid || !sa) return false;
+bool cidr_entry_match_sockaddr(const cidr_entry_t *net, const void *sa_ptr) {
+    if (!net || !net->valid || !sa_ptr) return false;
     if (net->is_any) return true;
 
-    if (sa->ss_family == AF_INET) {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+    const struct sockaddr *sa = (const struct sockaddr *)sa_ptr;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)sa_ptr;
         return cidr_entry_match(net, AF_INET, (const uint8_t *)&sin->sin_addr.s_addr);
-    } else if (sa->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa_ptr;
         return cidr_entry_match(net, AF_INET6, (const uint8_t *)&sin6->sin6_addr.s6_addr);
     }
     return false;

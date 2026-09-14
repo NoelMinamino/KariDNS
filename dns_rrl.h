@@ -22,7 +22,7 @@ void rrl_init(void);
 void rrl_shutdown(void);
 uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]);
 rrl_response_class_t get_rrl_class(const uint8_t *res_buf, size_t res_len);
-bool rrl_check(const struct sockaddr_storage *client_addr, rrl_response_class_t cls, const rate_limit_config_t *cfg, bool *out_slip);
-bool rrl_is_client_exhausted(const struct sockaddr_storage *client_addr, const rate_limit_config_t *cfg);
+bool rrl_check(const void *client_addr, rrl_response_class_t cls, const rate_limit_config_t *cfg, bool *out_slip);
+bool rrl_is_client_exhausted(const void *client_addr, const rate_limit_config_t *cfg);
 
 #endif /* DNS_RRL_H */

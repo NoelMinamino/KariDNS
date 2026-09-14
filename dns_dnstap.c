@@ -228,15 +228,19 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
                        uint8_t *wire_dst, size_t wire_dst_cap, size_t *out_wire_len,
                        uint8_t message_type,
                        const uint8_t *wire_src, size_t wire_src_len,
-                       const struct sockaddr_storage *client_addr,
+                       const void *client_addr,
                        socklen_t client_addr_len,
-                       const struct sockaddr_storage *server_addr,
+                       const void *server_addr,
                        bool has_server_addr, uint8_t protocol) {
     clock_gettime(CLOCK_REALTIME, &meta->ts);
     meta->message_type = message_type;
     meta->protocol = protocol;
-    if (client_addr) {
-        memcpy(&meta->client_addr, client_addr, sizeof(*client_addr));
+    if (client_addr && client_addr_len > 0) {
+        size_t copy_len = client_addr_len < sizeof(meta->client_addr) ? client_addr_len : sizeof(meta->client_addr);
+        memcpy(&meta->client_addr, client_addr, copy_len);
+        if (copy_len < sizeof(meta->client_addr)) {
+            memset((uint8_t *)&meta->client_addr + copy_len, 0, sizeof(meta->client_addr) - copy_len);
+        }
         meta->client_addr_len = client_addr_len;
     } else {
         memset(&meta->client_addr, 0, sizeof(meta->client_addr));
@@ -244,8 +248,10 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
     }
     meta->has_server_addr = has_server_addr;
     if (has_server_addr && server_addr) {
-        memcpy(&meta->server_addr, server_addr, sizeof(*server_addr));
-        meta->server_addr_len = sizeof(*server_addr);
+        socklen_t srv_len = sizeof(meta->server_addr);
+        size_t copy_len = srv_len < sizeof(meta->server_addr) ? srv_len : sizeof(meta->server_addr);
+        memcpy(&meta->server_addr, server_addr, copy_len);
+        meta->server_addr_len = sizeof(meta->server_addr);
     } else {
         memset(&meta->server_addr, 0, sizeof(meta->server_addr));
         meta->server_addr_len = 0;
@@ -261,9 +267,9 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
 
 void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
                         const uint8_t *wire, size_t wire_len,
-                        const struct sockaddr_storage *client_addr,
+                        const void *client_addr,
                         socklen_t client_addr_len,
-                        const struct sockaddr_storage *server_addr,
+                        const void *server_addr,
                         bool has_server_addr, uint8_t protocol) {
     if (!atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) return;
 

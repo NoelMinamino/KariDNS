@@ -3993,10 +3993,13 @@ static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spe
     if (arg[0] == '-' || arg[0] == '+') {
         if (strcmp(arg, "+tcp") == 0 || strcmp(arg, "--tcp") == 0 || strcmp(arg, "+vc") == 0) {
             spec->use_tcp = true; spec->qo.use_tcp = true;
+            spec->force_udp = false;
         } else if (strcmp(arg, "+novc") == 0 || strcmp(arg, "+notcp") == 0) {
             spec->use_tcp = false; spec->qo.use_tcp = false;
+            spec->force_udp = true;
         } else if (strcmp(arg, "+udp") == 0) {
             spec->force_udp = true;
+            spec->use_tcp = false; spec->qo.use_tcp = false;
         } else if (strcmp(arg, "+ignore") == 0) {
             spec->qo.ignore_tc = true;
         } else if (strcmp(arg, "+noignore") == 0) {

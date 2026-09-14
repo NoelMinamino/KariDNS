@@ -628,7 +628,7 @@ void *response_logger_thread_func(void *arg) {
 }
 
 static inline void write_query_log(worker_ctx_t *ctx,
-                                   const struct sockaddr_storage *client_addr,
+                                   const void *client_addr,
                                    socklen_t addr_len,
                                    const char *qname, uint16_t qclass, uint16_t qtype,
                                    bool has_edns, bool dnssec_ok, uint8_t protocol,
@@ -678,10 +678,14 @@ static inline void write_query_log(worker_ctx_t *ctx,
     clock_gettime(CLOCK_REALTIME, &ev->ts);
 #endif
 
-    if (client_addr) {
-        memcpy(&ev->client_addr, client_addr, sizeof(struct sockaddr_storage));
+    if (client_addr && addr_len > 0) {
+        size_t copy_len = addr_len < sizeof(ev->client_addr) ? addr_len : sizeof(ev->client_addr);
+        memcpy(&ev->client_addr, client_addr, copy_len);
+        if (copy_len < sizeof(ev->client_addr)) {
+            memset((uint8_t *)&ev->client_addr + copy_len, 0, sizeof(ev->client_addr) - copy_len);
+        }
     } else {
-        memset(&ev->client_addr, 0, sizeof(struct sockaddr_storage));
+        memset(&ev->client_addr, 0, sizeof(ev->client_addr));
     }
     ev->addr_len = addr_len;
     ev->qtype = qtype;
@@ -998,7 +1002,7 @@ static void *async_io_worker_func(void *arg) {
       if (res_len > 0) {
         bool slip_triggered = false;
         rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
-        if (rrl_check((struct sockaddr_storage *)&task.ipc_hdr.client_addr, cls, rrl_cfg, &slip_triggered)) {
+        if (rrl_check(&task.ipc_hdr.client_addr, cls, rrl_cfg, &slip_triggered)) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, res_len,
@@ -1426,11 +1430,11 @@ worker_startup_success:;
                   ntohs(client_addr->sin6.sin6_port);
 
             if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
-                write_query_log(ctx, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
+                write_query_log(ctx, client_addr, ipc_msg->addr_len,
                                 qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
             }
-            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
-                               ipc_msg->has_source_addr ? (struct sockaddr_storage *)&ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, ipc_msg->addr_len,
+                               ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
@@ -1477,7 +1481,7 @@ worker_startup_success:;
               if (__builtin_expect(rrl_cfg != NULL, 0)) {
                 bool slip_triggered = false;
                 rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
-                if (!rrl_check((struct sockaddr_storage *)&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
+                if (!rrl_check(&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
                   if (slip_triggered) {
                     tc_packet = true;
                   } else {
@@ -1534,8 +1538,8 @@ worker_startup_success:;
                 batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
               }
 
-              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
-                                 ipc_msg->has_source_addr ? (struct sockaddr_storage *)&ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, client_addr, ipc_msg->addr_len,
+                                 ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
               batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
               batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
