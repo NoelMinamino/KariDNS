@@ -2318,6 +2318,131 @@ view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
   return NULL;
 }
 
+void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *domain) {
+  if (!arena || arena->count == 0) return;
+
+  // If per-client location/ECS features or tinydns format are active, skip static wire cache
+  if (arena->is_tinydns_format) return;
+  if (arena->locations != NULL && arena->location_count > 0) return;
+  if (arena->bind_location_tags != NULL && arena->bind_location_tag_count > 0) return;
+  if (arena->bind_ecs_tags != NULL && arena->bind_ecs_tag_count > 0) return;
+
+  free_zone_response_cache(arena);
+
+  size_t bucket_count = 16;
+  while (bucket_count < arena->count * 2) {
+    bucket_count <<= 1;
+    if (bucket_count >= 65536) break;
+  }
+
+  arena->response_cache.buckets = calloc(bucket_count, sizeof(response_cache_entry_t *));
+  if (!arena->response_cache.buckets) return;
+  arena->response_cache.bucket_count = bucket_count;
+  arena->response_cache.entry_count = 0;
+
+  bool minimal_responses = cfg ? cfg->minimal_responses : false;
+  bool minimal_any = cfg ? cfg->minimal_any : false;
+  uint32_t minimal_any_ttl = cfg ? cfg->minimal_any_ttl : 86400;
+
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *rec = &arena->records[i];
+    if (!rec->name || rec->name[0] == '\0') continue;
+    if (rec->name[0] == '*' && (rec->name[1] == '.' || rec->name[1] == '\0')) continue;
+
+    uint16_t qtype = rec->type_code;
+    if (is_non_data_rrtype(qtype)) continue;
+    if (qtype == 46 || qtype == 47 || qtype == 50) continue; // RRSIG, NSEC, NSEC3
+
+    uint16_t qclass = rec->class_val ? rec->class_val : 1;
+    if (qclass != 1) continue;
+
+    const char *qname = rec->name;
+    uint32_t name_hash = calc_fnv1a_str(qname);
+    size_t hash_idx = (name_hash ^ (uint32_t)qtype) & (bucket_count - 1);
+
+    bool already_cached = false;
+    for (response_cache_entry_t *e = arena->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
+      if (e->qtype == qtype && e->qclass == qclass && e->name_hash == name_hash &&
+          strcasecmp(e->name, qname) == 0) {
+        already_cached = true;
+        break;
+      }
+    }
+    if (already_cached) continue;
+
+    uint8_t dummy_res[4096];
+    memset(dummy_res, 0, DNS_HEADER_SIZE);
+
+    long wlen = write_uncompressed_name(dummy_res, DNS_HEADER_SIZE, sizeof(dummy_res), qname);
+    if (wlen <= 0) continue;
+    uint16_t q_offset = (uint16_t)(DNS_HEADER_SIZE + wlen);
+    if (q_offset + 4 > sizeof(dummy_res)) continue;
+    dummy_res[q_offset] = (uint8_t)(qtype >> 8);
+    dummy_res[q_offset + 1] = (uint8_t)(qtype & 0xFF);
+    dummy_res[q_offset + 2] = (uint8_t)(qclass >> 8);
+    dummy_res[q_offset + 3] = (uint8_t)(qclass & 0xFF);
+    q_offset += 4;
+
+    uint16_t offset = q_offset;
+    uint16_t ancount = 0, nscount = 0, arcount = 0;
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+
+    zone_db_entry_t dummy_entry;
+    memset(&dummy_entry, 0, sizeof(dummy_entry));
+    if (domain) {
+      strncpy(dummy_entry.domain, domain, sizeof(dummy_entry.domain) - 1);
+    }
+    zone_db_entry_t *db_entry_ptr = &dummy_entry;
+    zone_arena_t *current_zone_ptr = arena;
+
+    uint16_t qtypes_arr[1] = { qtype };
+    dummy_res[2] = 0x84; // QR=1, AA=1
+    dummy_res[3] = 0x00; // NOERROR
+
+    resolve_name(qname, qclass, qtypes_arr, 1,
+                 &db_entry_ptr, &current_zone_ptr,
+                 dummy_res, sizeof(dummy_res),
+                 &offset, &comp_ctx, &ancount, &nscount, &arcount,
+                 minimal_responses, minimal_any, minimal_any_ttl,
+                 false /* dnssec_ok */, NULL /* view */, NULL /* qtx_included */,
+                 NULL /* client_ip */, cfg, false /* ecs_trusted */,
+                 NULL, 0, 0, NULL);
+
+    uint8_t rcode = dummy_res[3] & 0x0F;
+    bool tc = (dummy_res[2] & 0x02) != 0;
+
+    if (rcode == 0 && !tc && ancount > 0 && offset <= UDP_DEFAULT_MAX_RES_LEN && offset > q_offset) {
+      uint16_t body_len = offset - q_offset;
+      uint8_t *body = (uint8_t *)arena_alloc(arena, body_len);
+      if (!body) continue;
+      memcpy(body, dummy_res + q_offset, body_len);
+
+      char *cached_name = arena_strdup(arena, qname);
+      if (!cached_name) continue;
+
+      response_cache_entry_t *entry = (response_cache_entry_t *)arena_alloc(arena, sizeof(response_cache_entry_t));
+      if (!entry) continue;
+
+      entry->name = cached_name;
+      entry->name_hash = name_hash;
+      entry->qtype = qtype;
+      entry->qclass = qclass;
+      entry->ancount = ancount;
+      entry->nscount = nscount;
+      entry->arcount = arcount;
+      entry->body_len = body_len;
+      entry->body = body;
+      entry->next = arena->response_cache.buckets[hash_idx];
+      arena->response_cache.buckets[hash_idx] = entry;
+      arena->response_cache.entry_count++;
+    }
+  }
+}
+
+
 static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
@@ -2975,6 +3100,26 @@ static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *r
     }
     *res_arcount = htons(arcount);
     return offset;
+  }
+
+  // Pre-rendered wire-format response cache (Fast Path)
+  if (!edns.present && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
+      current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {
+    uint32_t qname_hash = calc_fnv1a_str(current_qname);
+    size_t hash_idx = (qname_hash ^ (uint32_t)qtype) & (current_zone->response_cache.bucket_count - 1);
+    for (response_cache_entry_t *e = current_zone->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
+      if (e->qtype == qtype && e->qclass == qclass && e->name_hash == qname_hash &&
+          strcasecmp(e->name, current_qname) == 0) {
+        if ((size_t)q_offset + e->body_len <= max_res_len) {
+          *res_ancount = htons(e->ancount);
+          *res_nscount = htons(e->nscount);
+          *res_arcount = htons(e->arcount);
+          memcpy(res + q_offset, e->body, e->body_len);
+          return q_offset + e->body_len;
+        }
+        break;
+      }
+    }
   }
 
   uint16_t qtypes[17];

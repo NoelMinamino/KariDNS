@@ -2964,6 +2964,112 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
       }
     }
   }
+
+  // Pre-bind any explicit notify-source configured on zones if not already bound
+  if (cfg) {
+    for (view_config_t *v = cfg->views; v; v = v->next) {
+      for (zone_config_t *z = v->zones; z; z = z->next) {
+        if (!z->notify_source || !*z->notify_source) continue;
+        if (num_fds >= MAX_BIND_ADDRS) break;
+
+        struct sockaddr_in addr4;
+        struct sockaddr_in6 addr6;
+        bool is_v4 = false;
+        bool is_v6 = false;
+        memset(&addr4, 0, sizeof(addr4));
+        memset(&addr6, 0, sizeof(addr6));
+
+        if (inet_pton(AF_INET, z->notify_source, &addr4.sin_addr) == 1) {
+          addr4.sin_family = AF_INET;
+          addr4.sin_port = htons(port);
+          is_v4 = true;
+        } else if (inet_pton(AF_INET6, z->notify_source, &addr6.sin6_addr) == 1) {
+          addr6.sin6_family = AF_INET6;
+          addr6.sin6_port = htons(port);
+          is_v6 = true;
+        }
+
+        bool already_bound = false;
+        for (int k = 0; k < num_fds; k++) {
+          struct sockaddr_storage ss;
+          socklen_t slen = sizeof(ss);
+          if (getsockname(out_fds[k], (struct sockaddr *)&ss, &slen) == 0) {
+            if (is_v4 && ss.ss_family == AF_INET) {
+              if (((struct sockaddr_in *)&ss)->sin_addr.s_addr == addr4.sin_addr.s_addr) {
+                already_bound = true;
+                break;
+              }
+            } else if (is_v6 && ss.ss_family == AF_INET6) {
+              if (memcmp(&((struct sockaddr_in6 *)&ss)->sin6_addr, &addr6.sin6_addr, sizeof(struct in6_addr)) == 0) {
+                already_bound = true;
+                break;
+              }
+            }
+          }
+        }
+        if (already_bound) continue;
+
+        if (is_v4 && num_fds < MAX_BIND_ADDRS) {
+          int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+          if (udp_fd >= 0) {
+            setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+            fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_REUSEPORT_LB
+            int opt_lb = 1;
+            if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+              int opt_reuse = 1;
+              setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+            }
+#else
+            int opt_reuse = 1;
+            setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+            int opt_dst = 1;
+#ifdef IP_RECVDSTADDR
+            setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
+#elif defined(IP_PKTINFO)
+            setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
+#endif
+            if (bind(udp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
+              out_is_wildcard[num_fds] = (addr4.sin_addr.s_addr == INADDR_ANY);
+              out_fds[num_fds++] = udp_fd;
+            } else {
+              close(udp_fd);
+            }
+          }
+        } else if (is_v6 && num_fds < MAX_BIND_ADDRS) {
+          int udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+          if (udp_fd >= 0) {
+            setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+            fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT_LB
+            int opt_lb = 1;
+            if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+              int opt_reuse = 1;
+              setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+            }
+#else
+            int opt_reuse = 1;
+            setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+            int opt_pktinfo = 1;
+#ifdef IPV6_RECVPKTINFO
+            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#elif defined(IPV6_PKTINFO)
+            setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#endif
+            if (bind(udp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+              out_is_wildcard[num_fds] = IN6_IS_ADDR_UNSPECIFIED(&addr6.sin6_addr);
+              out_fds[num_fds++] = udp_fd;
+            } else {
+              close(udp_fd);
+            }
+          }
+        }
+      }
+    }
+  }
   return num_fds;
 }
 
@@ -3293,6 +3399,71 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                   }
                 }
               }
+            }
+          }
+          if (target_sock < 0 && msg->has_source_addr) {
+            for (int k = 0; k < local_num_udp_fds; k++) {
+              if (local_udp_is_wildcard[k]) {
+                struct sockaddr_storage ss;
+                socklen_t slen = sizeof(ss);
+                if (getsockname(local_udp_fds[k], (struct sockaddr *)&ss, &slen) == 0 &&
+                    ss.ss_family == msg->source_addr.ss_family) {
+                  target_sock = local_udp_fds[k];
+                  target_sock_idx = k;
+                  break;
+                }
+              }
+            }
+          }
+          if (target_sock < 0 && msg->has_source_addr) {
+            int s = socket(msg->source_addr.ss_family, SOCK_DGRAM, 0);
+            if (s >= 0) {
+              int opt_reuse = 1;
+              setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt_reuse, sizeof(opt_reuse));
+#ifdef SO_REUSEPORT
+              setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+#ifdef SO_REUSEPORT_LB
+              setsockopt(s, SOL_SOCKET, SO_REUSEPORT_LB, &opt_reuse, sizeof(opt_reuse));
+#endif
+              uint16_t src_port = 0;
+              if (notify_v4_sock >= 0) {
+                struct sockaddr_storage pss;
+                socklen_t plen = sizeof(pss);
+                if (getsockname(notify_v4_sock, (struct sockaddr *)&pss, &plen) == 0) {
+                  src_port = ntohs(((struct sockaddr_in *)&pss)->sin_port);
+                }
+              }
+              struct sockaddr_storage bind_sa;
+              memset(&bind_sa, 0, sizeof(bind_sa));
+              socklen_t b_len = 0;
+              if (msg->source_addr.ss_family == AF_INET) {
+                struct sockaddr_in *b_in = (struct sockaddr_in *)&bind_sa;
+                b_in->sin_family = AF_INET;
+                b_in->sin_addr = msg->source_addr.sin.sin_addr;
+                b_in->sin_port = htons(src_port);
+                b_len = sizeof(struct sockaddr_in);
+              } else if (msg->source_addr.ss_family == AF_INET6) {
+                struct sockaddr_in6 *b_in6 = (struct sockaddr_in6 *)&bind_sa;
+                b_in6->sin6_family = AF_INET6;
+                b_in6->sin6_addr = msg->source_addr.sin6.sin6_addr;
+                b_in6->sin6_port = htons(src_port);
+                b_len = sizeof(struct sockaddr_in6);
+              }
+              if (b_len > 0) {
+                if (bind(s, (struct sockaddr *)&bind_sa, b_len) < 0) {
+                  if (msg->source_addr.ss_family == AF_INET) {
+                    ((struct sockaddr_in *)&bind_sa)->sin_port = 0;
+                  } else {
+                    ((struct sockaddr_in6 *)&bind_sa)->sin6_port = 0;
+                  }
+                  bind(s, (struct sockaddr *)&bind_sa, b_len);
+                }
+              }
+              sendto(s, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
+                     (struct sockaddr *)&msg->client_addr, msg->addr_len);
+              close(s);
+              continue;
             }
           }
           if (target_sock < 0) {

@@ -86,6 +86,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
                                       ? zcfg->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
+  build_zone_response_cache(z_standby, active_cfg_prelink, entry->domain);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);

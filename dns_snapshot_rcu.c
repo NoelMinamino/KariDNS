@@ -739,8 +739,9 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                       ? zcfg->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  release_config_snapshot(active_cfg_prelink);
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
+  build_zone_response_cache(z_standby, active_cfg_prelink, entry->domain);
+  release_config_snapshot(active_cfg_prelink);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);
@@ -1593,6 +1594,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                                                         ? zcfg->additional_from_auth
                                                         : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
                     prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, policy);
+                    build_zone_response_cache(z_standby, config, entry->domain);
                     entry->rcu.retire_epoch = rcu_writer_advance_epoch();
                     atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
                 }
@@ -1650,6 +1652,7 @@ void zone_arena_clear_data_pools(zone_arena_t *arena) {
   }
   arena->prelinked_glue = NULL;
   arena->prelinked_glue_count = 0;
+  free_zone_response_cache(arena);
   arena->count = 0;
   arena->data_pool_count = 0;
   arena->current_pool_cap = 0;

@@ -38,4 +38,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                   uint8_t ecs_source_prefix,
                   uint8_t *out_ecs_scope_prefix);
 
+void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *domain);
+
 #endif /* DNS_QUERY_ENGINE_H */

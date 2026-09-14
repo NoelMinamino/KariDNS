@@ -584,6 +584,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                                             ? zcfg->additional_from_auth
                                             : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
         prelink_zone_additional_glue(standby, entry->domain, cur_snap, NULL, policy);
+        build_zone_response_cache(standby, active_cfg_prelink, entry->domain);
         if (cur_snap) release_zone_snapshot(cur_snap);
 
         compute_ixfr_diff(entry, cur_active, standby);
