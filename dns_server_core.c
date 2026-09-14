@@ -1346,7 +1346,7 @@ worker_startup_success:;
               continue;
             uint8_t *req_buf = batch->rx_buffers[p] + sizeof(udp_ipc_t);
             ssize_t payload_received = ipc_msg->payload_len;
-            struct sockaddr_storage *client_addr = &ipc_msg->client_addr;
+            ipc_sockaddr_t *client_addr = &ipc_msg->client_addr;
 
             // クエリパケットの検証: QRビットが0(クエリ)であることを期待
             uint8_t flags = req_buf[2];
@@ -1356,10 +1356,10 @@ worker_startup_success:;
 
             char client_ip[INET6_ADDRSTRLEN] = "";
             if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
-              fast_ipv4_to_str(((struct sockaddr_in *)client_addr)->sin_addr.s_addr, client_ip);
+              fast_ipv4_to_str(client_addr->sin.sin_addr.s_addr, client_ip);
             } else if (client_addr->ss_family == AF_INET6) {
               inet_ntop(AF_INET6,
-                        &((struct sockaddr_in6 *)client_addr)->sin6_addr,
+                        &client_addr->sin6.sin6_addr,
                         client_ip, INET6_ADDRSTRLEN);
             }
 
@@ -1438,17 +1438,17 @@ worker_startup_success:;
 
             int client_port = 0;
             if (client_addr->ss_family == AF_INET)
-              client_port = ntohs(((struct sockaddr_in *)client_addr)->sin_port);
+              client_port = ntohs(client_addr->sin.sin_port);
             else if (client_addr->ss_family == AF_INET6)
               client_port =
-                  ntohs(((struct sockaddr_in6 *)client_addr)->sin6_port);
+                  ntohs(client_addr->sin6.sin6_port);
 
             if (qlog_enabled && !__builtin_expect(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed), 0)) {
-                write_query_log(ctx, client_addr, sizeof(*client_addr),
+                write_query_log(ctx, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
                                 qname, qclass, qtype, has_edns, dnssec_ok, IPPROTO_UDP, eff_max_qps);
             }
-            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, sizeof(*client_addr),
-                               ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+            write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
+                               ipc_msg->has_source_addr ? (struct sockaddr_storage *)&ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
@@ -1459,10 +1459,12 @@ worker_startup_success:;
               memcpy(task.req_buf, req_buf, task.req_len);
               strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
-              task.client_addr = *client_addr;
-              task.client_len = sizeof(*client_addr);
+              memcpy(&task.client_addr, client_addr, ipc_msg->addr_len <= sizeof(task.client_addr) ? ipc_msg->addr_len : sizeof(task.client_addr));
+              task.client_len = ipc_msg->addr_len;
               task.has_server_addr = ipc_msg->has_source_addr;
-              if (ipc_msg->has_source_addr) task.server_addr = ipc_msg->source_addr;
+              if (ipc_msg->has_source_addr) {
+                memcpy(&task.server_addr, &ipc_msg->source_addr, sizeof(ipc_msg->source_addr));
+              }
               strncpy(task.qname, qname, sizeof(task.qname) - 1);
               task.qtype = qtype;
               task.qclass = qclass;
@@ -1547,8 +1549,8 @@ worker_startup_success:;
                 batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + res_len;
               }
 
-              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, client_addr, sizeof(*client_addr),
-                                 ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
+              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, res_msg->payload_len, (struct sockaddr_storage *)client_addr, ipc_msg->addr_len,
+                                 ipc_msg->has_source_addr ? (struct sockaddr_storage *)&ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
               batch->tx_iov[n_tx].iov_base = batch->tx_buffers[n_tx];
               batch->tx_msgs[n_tx].msg_hdr.msg_name = NULL;
@@ -3125,7 +3127,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     fctx->rx_msgs[k].msg_hdr.msg_iov = &fctx->rx_iov[k];
     fctx->rx_msgs[k].msg_hdr.msg_iovlen = 1;
     fctx->rx_msgs[k].msg_hdr.msg_name = &msg->client_addr;
-    fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+    fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(msg->client_addr);
     fctx->rx_msgs[k].msg_hdr.msg_control = fctx->rx_cbuf[k].buf;
     fctx->rx_msgs[k].msg_hdr.msg_controllen = sizeof(fctx->rx_cbuf[k].buf);
 
@@ -3192,8 +3194,9 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
         int fd = local_udp_fds[ud];
         while (1) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+            udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
             fctx->rx_iov[k].iov_len = BUFFER_SIZE;
-            fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+            fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(msg->client_addr);
             fctx->rx_msgs[k].msg_hdr.msg_control = fctx->rx_cbuf[k].buf;
             fctx->rx_msgs[k].msg_hdr.msg_controllen = sizeof(fctx->rx_cbuf[k].buf);
           }
@@ -3207,7 +3210,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             if (len >= DNS_HEADER_SIZE) {
               udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
               msg->sock_fd_idx = ud;
-              msg->addr_len = fctx->rx_msgs[k].msg_hdr.msg_namelen;
+              msg->addr_len = (uint16_t)fctx->rx_msgs[k].msg_hdr.msg_namelen;
               msg->has_source_addr = false;
               memset(&msg->source_addr, 0, sizeof(msg->source_addr));
               msg->payload_len = (uint16_t)len;
@@ -3218,9 +3221,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 #ifdef IP_RECVDSTADDR
                 if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVDSTADDR &&
                     cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_addr))) {
-                  struct sockaddr_in *sin = (struct sockaddr_in *)&msg->source_addr;
-                  sin->sin_family = AF_INET;
-                  memcpy(&sin->sin_addr, CMSG_DATA(cmsg), sizeof(struct in_addr));
+                  msg->source_addr.sin.sin_family = AF_INET;
+                  memcpy(&msg->source_addr.sin.sin_addr, CMSG_DATA(cmsg), sizeof(struct in_addr));
                   msg->has_source_addr = true;
                   break;
                 }
@@ -3229,9 +3231,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                 if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO &&
                     cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
                   struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
-                  struct sockaddr_in *sin = (struct sockaddr_in *)&msg->source_addr;
-                  sin->sin_family = AF_INET;
-                  sin->sin_addr = pi->ipi_addr;
+                  msg->source_addr.sin.sin_family = AF_INET;
+                  msg->source_addr.sin.sin_addr = pi->ipi_addr;
                   msg->has_source_addr = true;
                   break;
                 }
@@ -3240,9 +3241,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                 if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO &&
                     cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
                   struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
-                  struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg->source_addr;
-                  sin6->sin6_family = AF_INET6;
-                  sin6->sin6_addr = pi6->ipi6_addr;
+                  msg->source_addr.sin6.sin6_family = AF_INET6;
+                  msg->source_addr.sin6.sin6_addr = pi6->ipi6_addr;
                   msg->has_source_addr = true;
                   break;
                 }
@@ -3282,7 +3282,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                   ss.ss_family == msg->source_addr.ss_family) {
                 if (ss.ss_family == AF_INET) {
                   struct sockaddr_in *sin1 = (struct sockaddr_in *)&ss;
-                  struct sockaddr_in *sin2 = (struct sockaddr_in *)&msg->source_addr;
+                  struct sockaddr_in *sin2 = &msg->source_addr.sin;
                   if (sin1->sin_addr.s_addr == sin2->sin_addr.s_addr) {
                     target_sock = local_udp_fds[k];
                     target_sock_idx = k;
@@ -3290,7 +3290,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
                   }
                 } else if (ss.ss_family == AF_INET6) {
                   struct sockaddr_in6 *sin1 = (struct sockaddr_in6 *)&ss;
-                  struct sockaddr_in6 *sin2 = (struct sockaddr_in6 *)&msg->source_addr;
+                  struct sockaddr_in6 *sin2 = &msg->source_addr.sin6;
                   if (memcmp(&sin1->sin6_addr, &sin2->sin6_addr, sizeof(struct in6_addr)) == 0) {
                     target_sock = local_udp_fds[k];
                     target_sock_idx = k;
@@ -3337,7 +3337,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_type = IP_SENDSRCADDR;
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
               struct in_addr *src = (struct in_addr *)CMSG_DATA(cmsg);
-              *src = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              *src = msg->source_addr.sin.sin_addr;
               out_msg.msg_control = cbuf.buf;
               out_msg.msg_controllen = CMSG_SPACE(sizeof(struct in_addr));
             }
@@ -3349,7 +3349,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
               struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
               memset(pi, 0, sizeof(*pi));
-              pi->ipi_spec_dst = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              pi->ipi_spec_dst = msg->source_addr.sin.sin_addr;
               out_msg.msg_control = cbuf.buf;
               out_msg.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
             }
@@ -3362,7 +3362,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
               struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
               memset(pi6, 0, sizeof(*pi6));
-              pi6->ipi6_addr = ((struct sockaddr_in6 *)&msg->source_addr)->sin6_addr;
+              pi6->ipi6_addr = msg->source_addr.sin6.sin6_addr;
               out_msg.msg_control = cbuf.buf;
               out_msg.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
             }
@@ -3415,7 +3415,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 
             fctx->cli_tx_iov[tx_count].iov_base = fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t);
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
-            memcpy(&fctx->cli_tx_addrs[tx_count], &msg->client_addr, msg->addr_len);
+            size_t copy_len = (msg->addr_len <= sizeof(fctx->cli_tx_addrs[tx_count])) ? msg->addr_len : sizeof(fctx->cli_tx_addrs[tx_count]);
+            memcpy(&fctx->cli_tx_addrs[tx_count], &msg->client_addr, copy_len);
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &fctx->cli_tx_addrs[tx_count];
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = msg->addr_len;
 
@@ -3428,7 +3429,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_type = IP_SENDSRCADDR;
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
               struct in_addr *src = (struct in_addr *)CMSG_DATA(cmsg);
-              *src = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              *src = msg->source_addr.sin.sin_addr;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in_addr));
             }
@@ -3441,7 +3442,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
               struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
               memset(pi, 0, sizeof(*pi));
-              pi->ipi_spec_dst = ((struct sockaddr_in *)&msg->source_addr)->sin_addr;
+              pi->ipi_spec_dst = msg->source_addr.sin.sin_addr;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
             }
@@ -3455,7 +3456,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
               cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
               struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
               memset(pi6, 0, sizeof(*pi6));
-              pi6->ipi6_addr = ((struct sockaddr_in6 *)&msg->source_addr)->sin6_addr;
+              pi6->ipi6_addr = msg->source_addr.sin6.sin6_addr;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_control = fctx->cli_tx_cbuf[tx_count].buf;
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
             }
@@ -3540,6 +3541,10 @@ static void daemonize(void) {
 
 static void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
+  server_config_t *cfg = &g_config_db.config_a;
+  int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
+  int sndbuf_size = (cfg && cfg->udp_sndbuf_size > 0) ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+
   for (int f = 0; f < g_num_frontend_routers; f++) {
     for (int w = 0; w < num_workers; w++) {
       if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ipc_fds[f][w]) < 0) {
@@ -3550,11 +3555,10 @@ static void setup_ipc_tables(int num_workers) {
             fcntl(g_ipc_fds[f][w][0], F_GETFL, 0) | O_NONBLOCK);
       fcntl(g_ipc_fds[f][w][1], F_SETFL,
             fcntl(g_ipc_fds[f][w][1], F_GETFL, 0) | O_NONBLOCK);
-      int bufsize = 4 * 1024 * 1024; // 4MB
-      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+      setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+      setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
     }
   }
 
