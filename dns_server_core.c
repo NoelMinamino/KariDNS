@@ -340,24 +340,6 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
   }
 }
 
-const char *strchr_unescaped(const char *s, char c) {
-  if (!s) return NULL;
-  for (const char *p = s; *p != '\0'; p++) {
-    if (*p == '\\') {
-      if (*(p + 1) == '\0') {
-        break; // Trailing backslash at end of string
-      }
-      p++; // Skip escaped character
-      continue;
-    }
-    if (*p == c) {
-      return p;
-    }
-  }
-  return NULL;
-}
-
-
 // ============================================================================
 // 9. AXFR専用バックグラウンドスレッド (Detached)
 

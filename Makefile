@@ -240,8 +240,10 @@ hash_test: tests/test_hash_table.c
 	clang -fsanitize=address,undefined -O1 -g tests/test_hash_table.c -o test_hash_table
 	./test_hash_table
 
-response_cache_test: tests/test_response_cache.c
-	clang -fsanitize=address,undefined -O1 -g -I. tests/test_response_cache.c -lcrypto -o test_response_cache
+RESPONSE_CACHE_TEST_SRCS = tests/test_response_cache.c dns_query_engine.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
+
+response_cache_test: $(RESPONSE_CACHE_TEST_SRCS)
+	clang -fsanitize=address,undefined -O1 -g -I. $(RESPONSE_CACHE_TEST_SRCS) -lcrypto -lpthread -lm -o test_response_cache
 	./test_response_cache
 
 bench_serialize: tests/bench_serialize.c dns_wire.o dns_utils.o dns_zone_parser.o dns_tinydns_parser.o dns_config_parser.o dns_cidr.o dns_tsig_acl.o

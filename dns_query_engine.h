@@ -18,6 +18,13 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap);
 
+int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
+                          size_t max_res_len, const char *qname, uint16_t qtype,
+                          const char *client_ip, compress_ctx_t *comp_ctx,
+                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          zone_db_snapshot_t *snap, server_config_t *cfg,
+                          zone_db_entry_t **out_matched_entry);
+
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
 bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out);
 void spawn_program_zone_plugins(server_config_t *cfg);

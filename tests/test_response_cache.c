@@ -6,14 +6,56 @@
 #include <stdlib.h>
 #include <assert.h>
 
+#include "dns_wire.h"
+#include "dns_config_parser.h"
+#include "dns_zone_parser.h"
+#include "dns_snapshot_rcu.h"
+#include "dns_query_engine.h"
+#include "dns_server_internal.h"
+
+int g_control_kq = -1;
+int g_notify_ipc[2] = {-1, -1};
+int g_broker_sock = -1;
+config_rcu_t g_config_db;
+_Atomic int g_xfers_running = 0;
+int g_worker_count = 0;
+worker_ctx_t *g_worker_ctxs = NULL;
+int g_cwd_fd = -1;
+char g_startup_cwd[PATH_MAX] = "";
+
 void syslog(int priority, const char *format, ...) {
     (void)priority;
     (void)format;
 }
 
-#define main karidns_main
-#include "../dns_server_core.c"
-#undef main
+server_config_t *acquire_config_snapshot(void) { return NULL; }
+void release_config_snapshot(server_config_t *snap) { (void)snap; }
+
+int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len) {
+    (void)family; (void)type; (void)addr; (void)addr_len; return -1;
+}
+
+ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
+    (void)fd; (void)buf; return len;
+}
+
+int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out) {
+    (void)fd; (void)ctx; (void)msg_out; (void)msg_len_out; return -1;
+}
+
+void submit_response_log(log_action_t action, const char *client_ip, int client_port,
+                        const char *qname, uint16_t qclass, uint16_t qtype,
+                        uint8_t rcode, bool has_edns, bool dnssec_ok) {
+    (void)action; (void)client_ip; (void)client_port; (void)qname;
+    (void)qclass; (void)qtype; (void)rcode; (void)has_edns; (void)dnssec_ok;
+}
+
+void dec_tcp_clients(void) {}
+void inc_tcp_clients(void) {}
+
+size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_storage *out) {
+    (void)ip; (void)port; (void)out; return 0;
+}
 
 static void build_simple_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype) {
     memset(buf, 0, 512);

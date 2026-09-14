@@ -2443,7 +2443,7 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
 }
 
 
-static int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
+int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
                             bool is_tcp, rate_limit_config_t **out_rrl_cfg,

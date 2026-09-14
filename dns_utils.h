@@ -35,6 +35,7 @@ int hex_char_to_val(char c);
 size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap);
 int compare_canonical_name(const char *name1, const char *name2);
 bool serial_is_newer(uint32_t s1, uint32_t s2);
+const char *strchr_unescaped(const char *s, char c);
 
 static inline bool domain_names_match_ci(const char *a, const char *b) {
     if (!a || !b) return false;

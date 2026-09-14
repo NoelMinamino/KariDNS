@@ -482,4 +482,22 @@ bool serial_is_newer(uint32_t s1, uint32_t s2) {
     return ((int32_t)(s1 - s2)) > 0;
 }
 
+const char *strchr_unescaped(const char *s, char c) {
+    if (!s) return NULL;
+    for (const char *p = s; *p != '\0'; p++) {
+        if (*p == '\\') {
+            if (*(p + 1) == '\0') {
+                break; // Trailing backslash at end of string
+            }
+            p++; // Skip escaped character
+            continue;
+        }
+        if (*p == c) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+
 
