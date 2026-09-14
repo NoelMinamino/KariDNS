@@ -210,6 +210,12 @@ static void test_wire_cache_consistency(void) {
         // Byte-for-byte comparison
         assert(len_cached == len_uncached);
         assert(memcmp(res_cached, res_uncached, len_cached) == 0);
+
+        if (strcmp(test_cases[i].qname, "example.com.") == 0 && test_cases[i].qtype == 6) {
+            uint16_t ans_ptr = ((uint16_t)res_cached[req_len] << 8) | res_cached[req_len + 1];
+            assert(ans_ptr == 0xC00C);
+        }
+
         printf("  [PASS] %s (%s) matches uncached response byte-for-byte (length=%d bytes)\n",
                test_cases[i].qname, test_cases[i].desc, len_cached);
     }

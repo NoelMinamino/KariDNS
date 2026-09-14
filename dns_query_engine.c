@@ -2389,6 +2389,7 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
     compress_ctx_t comp_ctx;
     memset(&comp_ctx, 0, sizeof(comp_ctx));
     compress_ctx_init_packet(&comp_ctx);
+    register_wire_name_for_compression(dummy_res, DNS_HEADER_SIZE, &comp_ctx);
 
     zone_db_entry_t dummy_entry;
     memset(&dummy_entry, 0, sizeof(dummy_entry));
@@ -3024,6 +3025,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   q_offset += 4;
   memcpy(res, req, q_offset);
+  register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
   res[2] |= 0x84;
   res[3] &= 0xF0;
   uint16_t *res_ancount = (uint16_t *)&res[6],

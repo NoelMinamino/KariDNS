@@ -182,6 +182,58 @@ int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, co
     return 0;
 }
 
+void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t start_offset, compress_ctx_t *ctx) {
+    if (!packet_buf || !ctx) return;
+    // 1. ラベルの開始オフセットを列挙する (compress_name()のlabels[]収集ループと同じ考え方だが、
+    //    ソースは独立したnameバッファではなく packet_buf 内の既存バイト列)
+    uint16_t label_offsets[128];
+    int label_count = 0;
+    uint16_t p = start_offset;
+    while (packet_buf[p] != 0) {
+        if (label_count >= 127) return; // 異常に長い名前は無視 (安全側)
+        if (p >= 0x4000) return;        // 圧縮ポインタで表現できない範囲は登録不要
+        label_offsets[label_count++] = p;
+        p += 1 + packet_buf[p];
+    }
+
+    // 2. compress_name() と全く同じ手順でハッシュを計算する
+    //    (ルート側から遡って計算し、labels[i] はそのラベルを"根"とする残りの名前のハッシュを持つ)
+    uint32_t hashes[128];
+    uint32_t current_hash = 2166136261u;
+    for (int i = label_count - 1; i >= 0; i--) {
+        uint16_t off = label_offsets[i];
+        uint8_t len = packet_buf[off];
+        for (int j = len; j > 0; j--) {
+            uint8_t c = packet_buf[off + j];
+            if (c >= 'A' && c <= 'Z') c |= 0x20;
+            current_hash ^= c;
+            current_hash *= 16777619u;
+        }
+        current_hash ^= len;
+        current_hash *= 16777619u;
+        hashes[i] = current_hash;
+    }
+
+    // 3. compress_name() のステップ3と同じテーブル登録ロジック (書き込みは一切行わない)
+    for (int i = 0; i < label_count; i++) {
+        uint16_t off = label_offsets[i];
+        uint32_t hash = hashes[i];
+        size_t idx = hash & COMPRESS_HASH_MASK;
+        for (int k = 0; k < MAX_PROBE_DEPTH; k++) {
+            compress_entry_t *entry = &ctx->table[(idx + k) & COMPRESS_HASH_MASK];
+            if (entry->generation == ctx->current_generation && entry->hash == hash && entry->offset == off) {
+                break; // 登録済み
+            }
+            if (entry->generation != ctx->current_generation) {
+                entry->generation = ctx->current_generation;
+                entry->hash = hash;
+                entry->offset = off;
+                break;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // 6. AXFR クライアント & ワイヤーデシリアライザ (スタック安全・バグ修正済)
 // ============================================================================
