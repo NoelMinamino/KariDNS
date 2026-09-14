@@ -129,11 +129,13 @@ typedef struct {
 static inline size_t pb_decode_varint(const uint8_t *buf, size_t len, uint64_t *val) {
     if (!buf || len == 0 || !val) return 0;
     uint64_t result = 0;
-    size_t shift = 0;
+    unsigned int shift = 0;
     size_t i = 0;
     while (i < len && i < 10) {
         uint8_t byte = buf[i];
-        result |= ((uint64_t)(byte & 0x7F)) << shift;
+        if (shift < 64) {
+            result |= ((uint64_t)(byte & 0x7F)) << shift;
+        }
         i++;
         if (!(byte & 0x80)) {
             *val = result;
@@ -228,7 +230,7 @@ bool parse_dnstap_data_frame_ex(const uint8_t *data, size_t len, uint8_t *out_dn
             size_t c = pb_decode_varint(data + off, len - off, &field_len);
             if (c == 0) break;
             off += c;
-            if (off + field_len > len) break;
+            if (field_len > len - off) break;
             if (field_num == 14) { // dnstap.Dnstap.message
                 msg_data = data + off;
                 msg_len = (size_t)field_len;
@@ -236,10 +238,10 @@ bool parse_dnstap_data_frame_ex(const uint8_t *data, size_t len, uint8_t *out_dn
             }
             off += field_len;
         } else if (wire_type == 5) {
-            if (off + 4 > len) break;
+            if (len - off < 4) break;
             off += 4;
         } else if (wire_type == 1) {
-            if (off + 8 > len) break;
+            if (len - off < 8) break;
             off += 8;
         } else {
             break;
@@ -274,17 +276,17 @@ bool parse_dnstap_data_frame_ex(const uint8_t *data, size_t len, uint8_t *out_dn
             size_t c = pb_decode_varint(msg_data + off, msg_len - off, &field_len);
             if (c == 0) break;
             off += c;
-            if (off + field_len > msg_len) break;
+            if (field_len > msg_len - off) break;
             if (field_num == 10) { // query_message
                 query_msg = msg_data + off;
                 query_len = (size_t)field_len;
             }
             off += field_len;
         } else if (wire_type == 5) {
-            if (off + 4 > msg_len) break;
+            if (msg_len - off < 4) break;
             off += 4;
         } else if (wire_type == 1) {
-            if (off + 8 > msg_len) break;
+            if (msg_len - off < 8) break;
             off += 8;
         } else {
             break;
@@ -345,7 +347,7 @@ bool parse_dnstap_data_frame_full(const uint8_t *data, size_t len, dnstap_frame_
             size_t c = pb_decode_varint(data + off, len - off, &field_len);
             if (c == 0) break;
             off += c;
-            if (off + field_len > len) break;
+            if (field_len > len - off) break;
             if (field_num == 14) { // dnstap.Dnstap.message
                 msg_data = data + off;
                 msg_len = (size_t)field_len;
@@ -353,10 +355,10 @@ bool parse_dnstap_data_frame_full(const uint8_t *data, size_t len, dnstap_frame_
             }
             off += field_len;
         } else if (wire_type == 5) {
-            if (off + 4 > len) break;
+            if (len - off < 4) break;
             off += 4;
         } else if (wire_type == 1) {
-            if (off + 8 > len) break;
+            if (len - off < 8) break;
             off += 8;
         } else {
             break;
@@ -406,7 +408,7 @@ bool parse_dnstap_data_frame_full(const uint8_t *data, size_t len, dnstap_frame_
             size_t c = pb_decode_varint(msg_data + off, msg_len - off, &field_len);
             if (c == 0) break;
             off += c;
-            if (off + field_len > msg_len) break;
+            if (field_len > msg_len - off) break;
             if (field_num == 4) { // query_address
                 if (field_len <= 16) {
                     memcpy(q_addr, msg_data + off, (size_t)field_len);
@@ -426,10 +428,10 @@ bool parse_dnstap_data_frame_full(const uint8_t *data, size_t len, dnstap_frame_
             }
             off += field_len;
         } else if (wire_type == 5) {
-            if (off + 4 > msg_len) break;
+            if (msg_len - off < 4) break;
             off += 4;
         } else if (wire_type == 1) {
-            if (off + 8 > msg_len) break;
+            if (msg_len - off < 8) break;
             off += 8;
         } else {
             break;
