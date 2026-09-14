@@ -62,6 +62,14 @@ logging {
 EOF
 
 cat << 'EOF' > "$CONF_MULTI_KEY"
+key "key1" {
+    algorithm hmac-sha256;
+    secret "dGVzdDE=";
+};
+key "key2" {
+    algorithm hmac-sha256;
+    secret "dGVzdDI=";
+};
 options {
     port 10053;
     bind-address { 127.0.0.1; };
