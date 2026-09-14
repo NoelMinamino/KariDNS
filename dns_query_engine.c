@@ -863,8 +863,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
   uint8_t temp_scope_prefix = 0;
   bool ecs_used = false;
   char current_qname[256];
-  strncpy(current_qname, qname, sizeof(current_qname));
-  current_qname[255] = '\0';
+  strlcpy(current_qname, qname, sizeof(current_qname));
   size_t current_qname_len = strlen(current_qname);
   uint32_t current_qname_hash = calc_fnv1a_str(current_qname);
   const char *glue_targets[16];
@@ -1001,8 +1000,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
           }
           if (rec->rdata_count > 0) {
-            strncpy(current_qname, rec->rdata[0], sizeof(current_qname));
-            current_qname[255] = '\0';
+            strlcpy(current_qname, rec->rdata[0], sizeof(current_qname));
             current_qname_len = strlen(current_qname);
             current_qname_hash = calc_fnv1a_str(current_qname);
             cname_followed = true;
@@ -1092,8 +1090,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             synth_cname.rdata[0] = synth_name;
             if (serialize_dns_record(res, max_res_len, offset, &synth_cname, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
             (*ancount)++;
-            strncpy(current_qname, synth_name, sizeof(current_qname));
-            current_qname[255] = '\0';
+            strlcpy(current_qname, synth_name, sizeof(current_qname));
             current_qname_len = prefix_len + (size_t)written;
             current_qname_hash = calc_fnv1a_str(current_qname);
             cname_followed = true; found = true; break;
@@ -1164,8 +1161,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                     }
                   }
                   if (rec->rdata_count > 0) {
-                    strncpy(current_qname, rec->rdata[0], sizeof(current_qname));
-                    current_qname[255] = '\0';
+                    strlcpy(current_qname, rec->rdata[0], sizeof(current_qname));
                     current_qname_len = strlen(current_qname);
                     current_qname_hash = calc_fnv1a_str(current_qname);
                     cname_followed = true;
@@ -2487,8 +2483,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
   size_t tsig_mac_len = 0;
   char current_qname[256];
-  strncpy(current_qname, qname, 255);
-  current_qname[255] = '\0';
+  strlcpy(current_qname, qname, sizeof(current_qname));
   zone_arena_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
   view_snapshot_t *view = NULL;
