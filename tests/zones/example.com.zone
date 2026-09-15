@@ -323,8 +323,8 @@ user-mr     IN MR mail2.example.com.
 ; NULL (RFC 883/1035, Type 10)
 null-node   IN NULL \# 4 01020304
 
-; NXT (RFC 2535, Type 30)
-nxt-node    IN NXT \# 4 01020304
+; NXT (RFC 2535, Type 30) - valid text format: Next Domain Name + type list
+nxt-node    IN NXT atma-node.example.failed. A
 
 ; EID (Endpoint Identifier, Type 31)
 eid-node    IN EID \# 4 01020304
@@ -332,17 +332,20 @@ eid-node    IN EID \# 4 01020304
 ; NIMLOC (Nimrod Locator, Type 32)
 nimloc-node IN NIMLOC \# 4 01020304
 
-; ATMA (ATM Address, Type 34)
-atma-node   IN ATMA \# 4 01020304
+; ATMA (ATM Address, Type 34, RFC 2163)
+; format=0 (E.164) + ASCII digits
+atma-node   IN ATMA 0 16175551234
 
-; A6 (RFC 2874, Type 38)
-a6-node     IN A6 \# 4 01020304
+; A6 (IPv6 with prefix chain, Type 38, RFC 2874)
+; prefix-length=0 → full IPv6 address, no prefix name required
+a6-node     IN A6 0 2001:db8::1
 
 ; SINK (Type 40)
 sink-node   IN SINK \# 4 01020304
 
-; DOA (Digital Object Architecture, Type 259)
-doa-node    IN DOA \# 4 01020304
+; DOA (Digital Object Architecture, Type 259, RFC 7169)
+; enterprise=0 type=0 location=0 media-type="" data=base64("hello")
+doa-node    IN DOA 0 0 0 "" aGVsbG8=
 
 ; NXNAME (Compact Denial of Existence draft, Type 128)
 _compact    IN NXNAME \# 0
