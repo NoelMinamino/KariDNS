@@ -45,6 +45,23 @@ bool split_path_for_openat(const char *path, char *dir_out,
   return true;
 }
 
+bool is_meta_rrtype(uint16_t type_code) {
+    switch (type_code) {
+        case 41:  /* OPT */
+        case 128: /* NXNAME (RFC 9824) */
+        case 249: /* TKEY */
+        case 250: /* TSIG */
+        case 251: /* IXFR */
+        case 252: /* AXFR */
+        case 253: /* MAILB */
+        case 254: /* MAILA */
+        case 255: /* ANY */
+            return true;
+        default:
+            return false;
+    }
+}
+
 uint16_t get_type_code(const char *type_str) {
   if (!type_str)
     return 0;

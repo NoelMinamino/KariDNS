@@ -1537,6 +1537,19 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
 
+    /* Defense in depth: meta-types (OPT/TKEY/TSIG/IXFR/AXFR/MAILB/MAILA/ANY,
+     * and NXNAME per RFC 9824) must never be put on the wire as a stored
+     * RRset. dns_zone_parser.c already refuses to load such a record, but
+     * this is the single chokepoint shared by normal answers (via
+     * dns_query_engine.c) and zone transfers (via dns_axfr_ixfr.c), so it
+     * is rejected here too in case a meta-type record ever reaches this
+     * function through another path (e.g. dynamic update). Serving one of
+     * these to a compliant secondary such as BIND or NSD causes the
+     * transfer to be rejected with FORMERR. */
+    if (is_meta_rrtype(rec_type)) {
+        return -1;
+    }
+
     if ((size_t)offset + DNS_HEADER_SIZE > max_res_len) return -1; // TC bit needed
 
     if (!owner_name && rec->name_wire) {

@@ -1444,10 +1444,13 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
             }
         }
 
-        // NXNAME (128, RFC 9824) is a Meta-Type: must NOT appear as standalone RRset.
-        if (tcode == 128) {
-            fprintf(stderr, "[ERROR] NXNAME (128) is a meta-type (RFC 9824) and must not appear "
-                    "as a standalone RRset in zone '%s' (name '%s')\n", domain, arena.records[i].name);
+        // Meta-types (OPT/TKEY/TSIG/IXFR/AXFR/MAILB/MAILA/ANY, and NXNAME
+        // per RFC 9824) must NOT appear as standalone RRsets in zone data.
+        // Shared with the runtime loader's check in dns_zone_parser.c so
+        // karicheck and the actual server never disagree on this.
+        if (is_meta_rrtype(tcode)) {
+            fprintf(stderr, "[ERROR] type %u is a meta-type and must not appear "
+                    "as a standalone RRset in zone '%s' (name '%s')\n", tcode, domain, arena.records[i].name);
             error_found = true;
         }
 

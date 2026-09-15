@@ -1122,6 +1122,21 @@ PROCESS_RECORD:
     }
     return -1;
   }
+
+  /* Meta-types (OPT/TKEY/TSIG/IXFR/AXFR/MAILB/MAILA/ANY, and NXNAME per
+   * RFC 9824) are QTYPE-only / synthesized-on-the-fly pseudo-RRs. They must
+   * never be stored as zone data: doing so causes the record to be answered
+   * and AXFR/IXFR'd to secondaries verbatim, and compliant secondaries such
+   * as BIND and NSD will reject such a transfer with FORMERR. Reject the
+   * zone load here instead of only warning at check-time. */
+  if (is_meta_rrtype(rec->type_code)) {
+    if (ctx && ctx->err_out) {
+      ctx->err_out->error_message = "Meta-type RR must not be defined as zone data";
+      ctx->err_out->error_offset = rec->type - buf;
+      ctx->err_out->token_length = strlen(rec->type);
+    }
+    return -1;
+  }
   
   rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
   rec->class_val = 1; // Default to IN

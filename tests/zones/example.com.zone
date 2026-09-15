@@ -347,9 +347,6 @@ sink-node   IN SINK \# 4 01020304
 ; enterprise=0 type=0 location=0 media-type="" data=base64("hello")
 doa-node    IN DOA 0 0 0 "" aGVsbG8=
 
-; NXNAME (Compact Denial of Existence draft, Type 128)
-_compact    IN NXNAME \# 0
-
 ; RFC 3597 Generic Unknown Record (TYPE65280)
 generic-rr  IN TYPE65280 \# 4 c0000201
 
@@ -366,7 +363,7 @@ generic-rr  IN TYPE65280 \# 4 c0000201
 ; IXFR (Type 251, RFC 1995): 差分ゾーン転送要求専用のQTYPE。
 ; MAILB (Type 253, RFC 1035): メールボックス関連全レコード問い合わせ用QTYPE。
 ; MAILA (Type 254, RFC 1035): メールエージェント問い合わせ用QTYPE。
-
+; NXNAME (Type 128, RFC 9824): コンパクト否定応答(Compact Denial of Existence)用のメタレコード。
 ; ----------------------------------------------------------------------------
 ; $GENERATE の使用例
 ; ----------------------------------------------------------------------------

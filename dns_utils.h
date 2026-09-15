@@ -26,6 +26,15 @@ char *get_base_dir(const char *path);
 const char *format_type_name(uint16_t type, char *buf, size_t buf_size);
 const char *dns_type_to_string(uint16_t type_code);
 
+/* Returns true for QTYPE-only / pseudo-RR "meta-types" (OPT, TKEY, TSIG,
+ * IXFR, AXFR, MAILB, MAILA, ANY, and NXNAME per RFC 9824) that MUST NOT be
+ * defined as stored zone data nor appear in AXFR/IXFR transfers. NXNAME in
+ * particular must only be synthesized dynamically per-query for compact
+ * denial-of-existence negative answers. Compliant secondaries such as BIND
+ * and NSD will reject a transfer containing one of these as a standalone
+ * RRset with FORMERR. */
+bool is_meta_rrtype(uint16_t type_code);
+
 
 int hex_char_to_val(char c);
 
