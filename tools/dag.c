@@ -1566,6 +1566,103 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             }
             break;
         }
+        case 30: { // NXT (RFC 2535 §5.1): Next Domain Name + simple type bitmap
+            // 名前部分 (非圧縮ドメイン名)
+            char *nxt_name = NULL;
+            size_t name_end;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &name_end, &g_dag_arena, &nxt_name) != 0 ||
+                name_end > abs_offset + rdlen) {
+                sink_printf(sink, "(malformed NXT)");
+                return;
+            }
+            sink_printf(sink, "%s", nxt_name ? nxt_name : ".");
+            // タイプビットマップ: ビット n = タイプ n (RFC 2535 §5.2 シンプル形式)
+            size_t boff = name_end;
+            size_t bend = abs_offset + rdlen;
+            for (size_t i = boff; i < bend; i++) {
+                uint8_t byte = pkt[i];
+                for (int bit = 7; bit >= 0; bit--) {
+                    if (byte & (1u << bit)) {
+                        uint16_t tc = (uint16_t)((i - boff) * 8 + (7 - bit));
+                        if (tc == 0) continue;
+                        char tbuf[32];
+                        sink_printf(sink, " %s", format_type_name(tc, tbuf, sizeof(tbuf)));
+                    }
+                }
+            }
+            return;
+        }
+        case 34: { // ATMA (RFC 2163 §2): format byte + address
+            // dig と同じ表示: フォーマットバイトを除いた残りのバイト列を hex 表示
+            if (rdlen < 2) { sink_printf(sink, "(malformed ATMA)"); return; }
+            sink_split_hex(sink, &pkt[abs_offset + 1], rdlen - 1, 0);
+            return;
+        }
+        case 38: { // A6 (RFC 2874 §3): prefix-length + suffix + optional prefix name
+            if (rdlen < 1) { sink_printf(sink, "(malformed A6)"); return; }
+            uint8_t a6_plen = pkt[abs_offset];
+            if (a6_plen > 128) { sink_printf(sink, "(malformed A6 prefix-length=%u)", a6_plen); return; }
+            sink_printf(sink, "%u", a6_plen);
+            size_t a6_suffix = (size_t)((128 - a6_plen + 7) / 8);
+            if (a6_suffix > 0) {
+                if (abs_offset + 1 + a6_suffix > abs_offset + rdlen) {
+                    sink_printf(sink, " (truncated suffix)");
+                    return;
+                }
+                // 下位バイトとして IPv6 アドレスを復元し inet_ntop で表示
+                uint8_t a6_addr[16] = {0};
+                memcpy(&a6_addr[16 - a6_suffix], &pkt[abs_offset + 1], a6_suffix);
+                char a6_ipbuf[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, a6_addr, a6_ipbuf, sizeof(a6_ipbuf));
+                sink_printf(sink, " %s", a6_ipbuf);
+            }
+            // プレフィックス名 (prefix_len > 0 のとき)
+            if (a6_plen > 0) {
+                size_t pfx_off = abs_offset + 1 + a6_suffix;
+                if (pfx_off < abs_offset + rdlen) {
+                    char *pfx_name = NULL;
+                    size_t pfx_end;
+                    if (expand_wire_name(pkt, pkt_len, pfx_off, &pfx_end, &g_dag_arena, &pfx_name) == 0 &&
+                        pfx_end <= abs_offset + rdlen) {
+                        sink_printf(sink, " %s", pfx_name ? pfx_name : ".");
+                    }
+                }
+            }
+            return;
+        }
+        case 259: { // DOA (RFC 7169 §4.4.2): Enterprise+Type+Location+MediaType+Data
+            if (rdlen < 10) { sink_printf(sink, "(malformed DOA)"); return; }
+            uint32_t doa_ent  = ((uint32_t)pkt[abs_offset]   << 24) | ((uint32_t)pkt[abs_offset+1] << 16) |
+                                ((uint32_t)pkt[abs_offset+2]  <<  8) |  (uint32_t)pkt[abs_offset+3];
+            uint32_t doa_type = ((uint32_t)pkt[abs_offset+4] << 24) | ((uint32_t)pkt[abs_offset+5] << 16) |
+                                ((uint32_t)pkt[abs_offset+6]  <<  8) |  (uint32_t)pkt[abs_offset+7];
+            uint8_t  doa_loc  = pkt[abs_offset + 8];
+            uint8_t  mlen     = pkt[abs_offset + 9];
+            if (abs_offset + 10 + mlen > abs_offset + rdlen) {
+                sink_printf(sink, "(malformed DOA media-type)");
+                return;
+            }
+            sink_printf(sink, "%u %u %u \"", doa_ent, doa_type, doa_loc);
+            for (uint8_t i = 0; i < mlen; i++) {
+                uint8_t c = pkt[abs_offset + 10 + i];
+                sink_printf(sink, "%c", (c >= 0x20 && c < 0x7F) ? c : '?');
+            }
+            sink_printf(sink, "\"");
+            // DOA-DATA: base64 (データがある場合)
+            size_t doa_data_off = abs_offset + 10 + mlen;
+            size_t doa_data_len = (abs_offset + rdlen) - doa_data_off;
+            if (doa_data_len > 0) {
+                int b64_n = 0;
+                char *b64 = base64_encode_alloc(&pkt[doa_data_off], doa_data_len, &b64_n);
+                if (b64) {
+                    sink_printf(sink, " ");
+                    int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
+                    sink_split_b64(sink, b64, b64_n, sw);
+                    free(b64);
+                }
+            }
+            return;
+        }
         default:
             break;
     }

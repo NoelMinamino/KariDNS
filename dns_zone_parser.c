@@ -1159,6 +1159,12 @@ PROCESS_RECORD:
           case 26: // PX
               if (j == 1 || j == 2) is_domain_name = true;
               break;
+          case 30: // NXT (RFC 2535): rdata[0] = Next Domain Name
+              if (j == 0) is_domain_name = true;
+              break;
+          case 38: // A6 (RFC 2874): rdata[2] = prefix name domain (prefix_len > 0 のときのみ)
+              if (j == 2) is_domain_name = true;
+              break;
           default:
               break;
       }
@@ -1204,9 +1210,17 @@ PROCESS_RECORD:
     if (rec->type_code == 5 || rec->type_code == 12 || rec->type_code == 2 ||
         rec->type_code == 39 || rec->type_code == 23 || 
         (rec->type_code >= 3 && rec->type_code <= 4) || 
-        (rec->type_code >= 7 && rec->type_code <= 9)) {
+        (rec->type_code >= 7 && rec->type_code <= 9) ||
+        rec->type_code == 30 /* NXT: rdata[0] = Next Domain Name */) {
       if (rec->rdata_count > 0)
         rec->rdata[0] = expand_domain_name(rec->rdata[0], *origin_io, arena);
+    } else if (rec->type_code == 38) { // A6 (RFC 2874): prefix name は rdata[2]
+      // prefix_len (rdata[0]) > 0 のときのみ rdata[2] にプレフィックス名が存在する
+      if (rec->rdata_count >= 3) {
+        uint8_t a6_plen = (uint8_t)atoi(rec->rdata[0]);
+        if (a6_plen > 0)
+          rec->rdata[2] = expand_domain_name(rec->rdata[2], *origin_io, arena);
+      }
     } else if (rec->type_code == 6) {
       if (rec->rdata_count > 0)
         rec->rdata[0] = expand_domain_name(rec->rdata[0], *origin_io, arena);
@@ -1294,6 +1308,12 @@ PROCESS_RECORD:
           break;
         case 45: case 260:
           if (j == 3) is_domain_field = true;
+          break;
+        case 30: // NXT (RFC 2535): rdata[0] = Next Domain Name
+          if (j == 0) is_domain_field = true;
+          break;
+        case 38: // A6 (RFC 2874): rdata[2] = prefix name (prefix_len > 0)
+          if (j == 2) is_domain_field = true;
           break;
         default:
           if ((rec->type_code == 64 || rec->type_code == 65) && j == 1 && strcmp(rec->rdata[1], ".") != 0) {

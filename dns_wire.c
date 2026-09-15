@@ -2728,6 +2728,126 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             case 128: { // NXNAME (RFC 9824 Compact Denial of Existence): 0-length RDATA
                 break;
             }
+            case 30: { // NXT (RFC 2535 §5.1): 非圧縮ドメイン名 + シンプルタイプビットマップ
+                // rdata[0] = Next Domain Name (非圧縮、RFC 2535 §5.1 — 圧縮禁止)
+                if (rec->rdata_count < 1) return -1;
+                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                if (w < 0) return -1;
+                offset += (size_t)w;
+                // Type Bit Map: ビット n がタイプ n に対応 (RFC 2535 §5.2)
+                // NXT は type 1-127 のみ対応 (16バイト固定ではなく末尾ゼロをトリムした最小長)
+                uint8_t nxt_bitmap[16] = {0};
+                size_t nxt_max_byte = 0;
+                for (int j = 1; j < rec->rdata_count; j++) {
+                    uint16_t tc = get_type_code(rec->rdata[j]);
+                    if (tc == 0 || tc > 127) continue;
+                    size_t byte_pos = (size_t)(tc / 8);
+                    int bit_pos    = 7 - (tc % 8);
+                    nxt_bitmap[byte_pos] |= (uint8_t)(1u << bit_pos);
+                    if (byte_pos >= nxt_max_byte) nxt_max_byte = byte_pos + 1;
+                }
+                if (nxt_max_byte > 0) {
+                    if ((size_t)offset + nxt_max_byte > max_res_len) return -1;
+                    memcpy(&res[offset], nxt_bitmap, nxt_max_byte);
+                    offset += nxt_max_byte;
+                }
+                break;
+            }
+            case 34: { // ATMA (RFC 2163 §2): format byte + address
+                // rdata[0] = format: "0" = E.164 (ASCII digits), "1" = AESA (20 bytes hex)
+                // rdata[1] = address string
+                if (rec->rdata_count < 2) return -1;
+                uint8_t atma_fmt;
+                if (!parse_u8(rec->rdata[0], &atma_fmt) || atma_fmt > 1) return -1;
+                if ((size_t)offset + 1 > max_res_len) return -1;
+                res[offset++] = atma_fmt;
+                if (atma_fmt == 0) {
+                    // E.164: フォーマットバイト(0x00) + ASCII 十進数字列
+                    const char *digits = rec->rdata[1];
+                    size_t dlen = strlen(digits);
+                    if (dlen == 0) return -1;
+                    if ((size_t)offset + dlen > max_res_len) return -1;
+                    memcpy(&res[offset], digits, dlen);
+                    offset += dlen;
+                } else {
+                    // AESA: フォーマットバイト(0x01) + 20バイト生データ (16進デコード)
+                    uint8_t aesa[20];
+                    size_t aesa_len = hex_decode(rec->rdata[1], aesa, sizeof(aesa));
+                    if (aesa_len == (size_t)-1 || aesa_len != 20) return -1;
+                    if ((size_t)offset + 20 > max_res_len) return -1;
+                    memcpy(&res[offset], aesa, 20);
+                    offset += 20;
+                }
+                break;
+            }
+            case 38: { // A6 (RFC 2874 §3, deprecated by RFC 6563)
+                // rdata[0] = prefix-length (0-128)
+                // rdata[1] = IPv6 address suffix (prefix_len==0 なら完全アドレス)
+                // rdata[2] = prefix name (domain name, prefix_len>0 のときのみ)
+                if (rec->rdata_count < 1) return -1;
+                uint8_t prefix_len;
+                if (!parse_u8(rec->rdata[0], &prefix_len) || prefix_len > 128) return -1;
+                if ((size_t)offset + 1 > max_res_len) return -1;
+                res[offset++] = prefix_len;
+                // サフィックスバイト数: ceil((128 - prefix_len) / 8)
+                size_t suffix_bytes = (size_t)((128 - prefix_len + 7) / 8);
+                if (suffix_bytes > 0) {
+                    if (rec->rdata_count < 2) return -1;
+                    struct in6_addr addr6;
+                    if (inet_pton(AF_INET6, rec->rdata[1], &addr6) != 1) return -1;
+                    // サフィックスは完全IPv6アドレスの下位 suffix_bytes バイト
+                    size_t addr_off = 16 - suffix_bytes;
+                    if ((size_t)offset + suffix_bytes > max_res_len) return -1;
+                    memcpy(&res[offset], &addr6.s6_addr[addr_off], suffix_bytes);
+                    offset += suffix_bytes;
+                }
+                // プレフィックス名 (prefix_len > 0 のとき必須, 非圧縮)
+                if (prefix_len > 0) {
+                    const char *pfx_name = (rec->rdata_count >= 3) ? rec->rdata[2] : ".";
+                    long w = write_uncompressed_name(res, offset, max_res_len, pfx_name);
+                    if (w < 0) return -1;
+                    offset += (size_t)w;
+                }
+                break;
+            }
+            case 259: { // DOA (RFC 7169 §4.4.2): Digital Object Architecture
+                // rdata[0] = DOA-ENTERPRISE (uint32, decimal)
+                // rdata[1] = DOA-TYPE      (uint32, decimal)
+                // rdata[2] = DOA-LOCATION  (uint8,  decimal)
+                // rdata[3] = DOA-MEDIA-TYPE (quoted string, e.g. "" or "text/plain")
+                // rdata[4..] = DOA-DATA (base64)
+                if (rec->rdata_count < 4) return -1;
+                uint32_t doa_ent  = (uint32_t)strtoul(rec->rdata[0], NULL, 10);
+                uint32_t doa_type = (uint32_t)strtoul(rec->rdata[1], NULL, 10);
+                uint8_t  doa_loc;
+                if (!parse_u8(rec->rdata[2], &doa_loc)) return -1;
+                const char *media   = rec->rdata[3];
+                size_t      mlen    = strlen(media);
+                if (mlen > 255) return -1;
+                if ((size_t)offset + 10 + mlen > max_res_len) return -1;
+                res[offset++] = (doa_ent  >> 24) & 0xFF;
+                res[offset++] = (doa_ent  >> 16) & 0xFF;
+                res[offset++] = (doa_ent  >>  8) & 0xFF;
+                res[offset++] =  doa_ent         & 0xFF;
+                res[offset++] = (doa_type >> 24) & 0xFF;
+                res[offset++] = (doa_type >> 16) & 0xFF;
+                res[offset++] = (doa_type >>  8) & 0xFF;
+                res[offset++] =  doa_type        & 0xFF;
+                res[offset++] = doa_loc;
+                res[offset++] = (uint8_t)mlen;
+                if (mlen > 0) {
+                    memcpy(&res[offset], media, mlen);
+                    offset += mlen;
+                }
+                // DOA-DATA: base64 (省略可)
+                if (rec->rdata_count >= 5) {
+                    size_t off = offset;
+                    if (decode_concat_b64_rdata(&rec->rdata[4], rec->rdata_count - 4,
+                                                res, max_res_len, &off) != 0) return -1;
+                    offset = (uint16_t)off;
+                }
+                break;
+            }
             default: {
                 // [安全装置] 汎用フォーマット(generic_data)を持たず、ネイティブのシリアライズ方法も未定義のレコード
                 // 低レイヤー関数であるためログ出力は行わず、上位層にエラー状態のみを伝播させる
