@@ -129,6 +129,170 @@ static void build_edns_mqtype_query(uint8_t *buf, size_t *out_len, uint16_t txid
     *out_len = off;
 }
 
+static void build_edns_ecs_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype,
+                                uint16_t family, uint8_t src_prefix, const uint8_t *addr, size_t addr_len) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    uint16_t opt_len = 4 + (uint16_t)addr_len;
+    uint16_t rdlen = 4 + opt_len;
+    buf[off++] = (uint8_t)(rdlen >> 8); buf[off++] = (uint8_t)(rdlen & 0xFF);
+    buf[off++] = 0x00; buf[off++] = 8; // Option Code: 8 (ECS)
+    buf[off++] = (uint8_t)(opt_len >> 8); buf[off++] = (uint8_t)(opt_len & 0xFF);
+    buf[off++] = (uint8_t)(family >> 8); buf[off++] = (uint8_t)(family & 0xFF);
+    buf[off++] = src_prefix;
+    buf[off++] = 0; // scope prefix
+    memcpy(&buf[off], addr, addr_len);
+    off += addr_len;
+    *out_len = off;
+}
+
+static void build_edns_malformed_cookie_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    buf[off++] = 0x00; buf[off++] = 8; // RDLEN = 8
+    buf[off++] = 0x00; buf[off++] = 10; // Option Code: 10 (COOKIE)
+    buf[off++] = 0x00; buf[off++] = 4; // Option len: 4 (malformed: not 8 and not 16-40)
+    buf[off++] = 0x11; buf[off++] = 0x22; buf[off++] = 0x33; buf[off++] = 0x44;
+    *out_len = off;
+}
+
+static void build_edns_nsid_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    buf[off++] = 0x00; buf[off++] = 4; // RDLEN = 4
+    buf[off++] = 0x00; buf[off++] = 3; // Option Code: 3 (NSID)
+    buf[off++] = 0x00; buf[off++] = 0; // Option len: 0
+    *out_len = off;
+}
+
+static void build_edns_keepalive_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    buf[off++] = 0x00; buf[off++] = 4; // RDLEN = 4
+    buf[off++] = 0x00; buf[off++] = 11; // Option Code: 11 (Keepalive)
+    buf[off++] = 0x00; buf[off++] = 0; // Option len: 0
+    *out_len = off;
+}
+
+static void build_edns_karidns_ext_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    buf[off++] = 0x00; buf[off++] = 9; // RDLEN = 9
+    buf[off++] = (uint8_t)(EDNS_OPTION_KARIDNS_EXT >> 8); buf[off++] = (uint8_t)(EDNS_OPTION_KARIDNS_EXT & 0xFF); // 65153
+    buf[off++] = 0x00; buf[off++] = 5; // Option len: 5
+    buf[off++] = 1; // version
+    buf[off++] = 0x12; buf[off++] = 0x34; buf[off++] = 0x56; buf[off++] = 0x78; // hash
+    *out_len = off;
+}
+
+static void build_edns_ede_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, uint16_t ede_code, const char *text) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    uint16_t text_len = text ? (uint16_t)strlen(text) : 0;
+    uint16_t opt_len = 2 + text_len;
+    uint16_t rdlen = 4 + opt_len;
+    buf[off++] = (uint8_t)(rdlen >> 8); buf[off++] = (uint8_t)(rdlen & 0xFF);
+    buf[off++] = 0x00; buf[off++] = 15; // Option Code: 15 (EDE)
+    buf[off++] = (uint8_t)(opt_len >> 8); buf[off++] = (uint8_t)(opt_len & 0xFF);
+    buf[off++] = (uint8_t)(ede_code >> 8); buf[off++] = (uint8_t)(ede_code & 0xFF);
+    if (text_len > 0) {
+        memcpy(&buf[off], text, text_len);
+        off += text_len;
+    }
+    *out_len = off;
+}
+
+static void build_edns_cookie_ecs_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype,
+                                       const uint8_t *client_cookie, uint16_t family, uint8_t src_prefix, const uint8_t *addr, size_t addr_len) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    uint16_t ecs_opt_len = 4 + (uint16_t)addr_len;
+    uint16_t cookie_opt_len = 8;
+    uint16_t rdlen = (4 + cookie_opt_len) + (4 + ecs_opt_len);
+    buf[off++] = (uint8_t)(rdlen >> 8); buf[off++] = (uint8_t)(rdlen & 0xFF);
+    // Cookie option
+    buf[off++] = 0x00; buf[off++] = 10;
+    buf[off++] = (uint8_t)(cookie_opt_len >> 8); buf[off++] = (uint8_t)(cookie_opt_len & 0xFF);
+    memcpy(&buf[off], client_cookie, 8);
+    off += 8;
+    // ECS option
+    buf[off++] = 0x00; buf[off++] = 8;
+    buf[off++] = (uint8_t)(ecs_opt_len >> 8); buf[off++] = (uint8_t)(ecs_opt_len & 0xFF);
+    buf[off++] = (uint8_t)(family >> 8); buf[off++] = (uint8_t)(family & 0xFF);
+    buf[off++] = src_prefix;
+    buf[off++] = 0; // scope
+    memcpy(&buf[off], addr, addr_len);
+    off += addr_len;
+    *out_len = off;
+}
+
+static void build_edns_mqtype_do_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, uint16_t mqtype) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x80; buf[off++] = 0x00; // DO bit = 1
+    buf[off++] = 0x00; buf[off++] = 6;  // RDLEN = 6 (option header 4 + 2 bytes mqtype)
+    buf[off++] = 0x00; buf[off++] = 20; // Option code: 20 (MQTYPE)
+    buf[off++] = 0x00; buf[off++] = 2;  // Option len: 2
+    buf[off++] = (uint8_t)(mqtype >> 8);
+    buf[off++] = (uint8_t)(mqtype & 0xFF);
+    *out_len = off;
+}
+
 static void test_wire_cache_consistency(void) {
     printf("[TEST] Running wire cache byte-for-byte consistency test...\n");
 
@@ -154,6 +318,7 @@ static void test_wire_cache_consistency(void) {
         "ns1.example.com. 3600 IN A 192.0.2.1\n"
         "ns2.example.com. 3600 IN AAAA 2001:db8::2\n"
         "mail.example.com. 3600 IN A 192.0.2.10\n"
+        "mail.example.com. 3600 IN RRSIG A 13 3 3600 20300101000000 20260101000000 12345 example.com. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
         "mail.example.com. 3600 IN AAAA 2001:db8::10\n"
         "_sip._tcp.example.com. 3600 IN SRV 10 60 5060 bigbox.example.com.\n"
         "bigbox.example.com. 3600 IN A 192.0.2.20\n"
@@ -381,8 +546,9 @@ static void test_wire_cache_consistency(void) {
         }
     }
 
-    // 5. Test Fallbacks
+    // 5. Test Fallbacks (All exclusion criteria)
     // A. EDNS DO=1 (DNSSEC OK) fallback
+    // Zone has RRSIG for mail.example.com. A. DO=0 returns ANCOUNT=1 (cached), DO=1 returns ANCOUNT=2 (A + RRSIG, dynamic)
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
@@ -395,9 +561,11 @@ static void test_wire_cache_consistency(void) {
                                         "mail.example.com.", 1,
                                         "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
         assert(len > 0);
+        uint16_t ancount = ((uint16_t)res[6] << 8) | res[7];
         uint16_t arcount = ((uint16_t)res[10] << 8) | res[11];
-        assert(arcount >= 1); // OPT record present in additional section
-        printf("  [PASS] EDNS DO=1 query bypassed cache and dynamically processed\n");
+        assert(ancount == 2); // A + RRSIG returned dynamically!
+        assert(arcount >= 1); // OPT record present
+        printf("  [PASS] EDNS DO=1 query bypassed cache and dynamically returned RRSIG (ANCOUNT=%d)\n", ancount);
     }
 
     // B. EDNS Multi-QTYPE fallback (RFC 10029)
@@ -424,7 +592,199 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] EDNS Multi-QTYPE (+mqtype=AAAA) bypassed cache and returned multiple answers (ANCOUNT=%d)\n", ancount);
     }
 
-    // C. Wildcard query fallback
+    // C. EDNS Client Subnet (ECS, RFC 7871) fallback
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        uint8_t ecs_ip[4] = { 192, 0, 2, 0 };
+        build_edns_ecs_query(req, &req_len, 0x999B, "mail.example.com.", 1, 1 /* IPv4 */, 24, ecs_ip, 4);
+
+        cfg.ecs_enable = true;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        cfg.ecs_enable = false;
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        assert(rcode == 0);
+        uint16_t arcount = ((uint16_t)res[10] << 8) | res[11];
+        assert(arcount >= 1);
+        // Verify that OPT record contains ECS option (code 8)
+        bool has_ecs_option = false;
+        for (int p = req_len; p < len - 4; p++) {
+            if (res[p] == 0x00 && res[p+1] == 0x08) {
+                has_ecs_option = true;
+                break;
+            }
+        }
+        assert(has_ecs_option);
+        printf("  [PASS] EDNS ECS query bypassed cache and responded with ECS option\n");
+    }
+
+    // D. Malformed Cookie fallback
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_malformed_cookie_query(req, &req_len, 0x999C, "mail.example.com.", 1);
+
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        assert(rcode == 1); // FORMERR on malformed cookie
+        printf("  [PASS] Malformed Cookie query bypassed cache and returned FORMERR (RCODE=1)\n");
+    }
+
+    // E. EDNS NSID (RFC 5001) fallback
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_nsid_query(req, &req_len, 0x999D, "mail.example.com.", 1);
+
+        cfg.nsid_string = (char *)"kari-test-node";
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        cfg.nsid_string = NULL;
+        assert(len > 0);
+        // Verify that OPT record contains NSID option (code 3)
+        bool has_nsid_option = false;
+        for (int p = req_len; p < len - 4; p++) {
+            if (res[p] == 0x00 && res[p+1] == 0x03) {
+                has_nsid_option = true;
+                break;
+            }
+        }
+        assert(has_nsid_option);
+        printf("  [PASS] EDNS NSID query bypassed cache and responded with NSID option\n");
+    }
+
+    // F. EDNS TCP Keepalive (RFC 7828) fallback
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_keepalive_query(req, &req_len, 0x999E, "mail.example.com.", 1);
+
+        cfg.tcp_connection_reuse = true;
+        cfg.tcp_idle_timeout = 10000;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, true /* is_tcp */, NULL, &snap, &cfg, &matched);
+        cfg.tcp_connection_reuse = false;
+        assert(len > 0);
+        // Verify that OPT record contains Keepalive option (code 11)
+        bool has_keepalive_option = false;
+        for (int p = req_len; p < len - 4; p++) {
+            if (res[p] == 0x00 && res[p+1] == 0x0B) {
+                has_keepalive_option = true;
+                break;
+            }
+        }
+        assert(has_keepalive_option);
+        printf("  [PASS] EDNS TCP Keepalive query bypassed cache and responded with Keepalive option\n");
+    }
+
+    // G. KariDNS Extended AXFR (Option 65153) fallback
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_karidns_ext_query(req, &req_len, 0x999F, "mail.example.com.", 1);
+
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        assert(rcode == 0);
+        printf("  [PASS] KariDNS Extended AXFR option query bypassed cache and dynamically processed\n");
+    }
+
+    // H. Extended DNS Error (EDE, RFC 8914) fallback
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_ede_query(req, &req_len, 0x99A0, "mail.example.com.", 1, 15 /* Blocked */, "Filtered");
+
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        assert(rcode == 0);
+        printf("  [PASS] Extended DNS Error (EDE) query bypassed cache and dynamically processed\n");
+    }
+
+    // I. Combined condition fallback: Cookie + ECS
+    {
+        uint8_t client_cookie[8] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+        uint8_t ecs_ip[4] = { 192, 0, 2, 0 };
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_cookie_ecs_query(req, &req_len, 0x99A1, "mail.example.com.", 1, client_cookie, 1, 24, ecs_ip, 4);
+
+        cfg.ecs_enable = true;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        cfg.ecs_enable = false;
+        assert(len > 0);
+        // Verify both Cookie (code 10) and ECS (code 8) options are present
+        bool has_cookie = false, has_ecs = false;
+        for (int p = req_len; p < len - 4; p++) {
+            if (res[p] == 0x00 && res[p+1] == 0x0A) has_cookie = true;
+            if (res[p] == 0x00 && res[p+1] == 0x08) has_ecs = true;
+        }
+        assert(has_cookie && has_ecs);
+        printf("  [PASS] Combined Cookie + ECS query bypassed cache and generated both options in OPT\n");
+    }
+
+    // J. Combined condition fallback: Multi-QTYPE + DO=1
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_mqtype_do_query(req, &req_len, 0x99A2, "mail.example.com.", 1 /* A */, 28 /* AAAA */);
+
+        cfg.rfc10029_mqtype_enable = true;
+        cfg.max_mqtypes = 4;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        cfg.rfc10029_mqtype_enable = false;
+        cfg.max_mqtypes = 0;
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        uint16_t ancount = ((uint16_t)res[6] << 8) | res[7];
+        assert(rcode == 0);
+        assert(ancount == 3); // A (192.0.2.10) + AAAA (2001:db8::10) + RRSIG for A = 3 answers!
+        printf("  [PASS] Combined Multi-QTYPE + DO=1 query bypassed cache and returned all answers + RRSIG (ANCOUNT=%d)\n", ancount);
+    }
+
+    // K. Wildcard query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
@@ -444,7 +804,7 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] Wildcard query synthesized answer via dynamic fallback\n");
     }
 
-    // D. NXDOMAIN query fallback
+    // L. NXDOMAIN query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
@@ -462,7 +822,7 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] NXDOMAIN query returned RCODE 3 via dynamic fallback\n");
     }
 
-    // E. NODATA query fallback
+    // M. NODATA query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
