@@ -3225,7 +3225,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   // Pre-rendered wire-format response cache (Fast Path)
-  if (!edns.present && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
+  // [EDNS対応] !edns.present の条件を撤廃。ボディはEDNSの有無と無関係に同一のため、
+  // キャッシュヒット後にOPTレコードだけ動的に追記する。
+  if (!is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
       current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {
     uint32_t qname_hash = calc_fnv1a_str(current_qname);
     size_t hash_idx = (qname_hash ^ (uint32_t)qtype) & (current_zone->response_cache.bucket_count - 1);
@@ -3233,11 +3235,16 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       if (e->qtype == qtype && e->qclass == qclass && e->name_hash == qname_hash &&
           strcasecmp(e->name, current_qname) == 0) {
         if ((size_t)q_offset + e->body_len <= max_res_len) {
+          memcpy(res + q_offset, e->body, e->body_len);
+          uint16_t body_offset = (uint16_t)(q_offset + e->body_len);
+          uint16_t arcount = e->arcount;
+          if (edns.present) {
+            assemble_edns_opt(res, max_res_len, &body_offset, &arcount, &edns, 0, is_tcp, cfg);
+          }
           *res_ancount = htons(e->ancount);
           *res_nscount = htons(e->nscount);
-          *res_arcount = htons(e->arcount);
-          memcpy(res + q_offset, e->body, e->body_len);
-          return q_offset + e->body_len;
+          *res_arcount = htons(arcount);
+          return body_offset;
         }
         break;
       }
