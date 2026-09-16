@@ -347,6 +347,30 @@ sink-node   IN SINK \# 4 01020304
 ; enterprise=0 type=0 location=0 media-type="" data=base64("hello")
 doa-node    IN DOA 0 0 0 "" aGVsbG8=
 
+; SIG (RFC 2535, Type 24) — 旧式DNSSEC署名、RRSIG と同一ワイヤ形式
+; 実際の署名データはRRSIGと同フォーマット (タイプカバード + アルゴリズム + ...)
+sig-node    IN SIG A 13 4 86400 20300101000000 20260101000000 12345 example.com. (
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAA== )
+
+; NINFO (Experimental, Type 56) — TXT と同一ワイヤ形式
+ninfo-node  IN NINFO "status=operational" "location=datacenter-1"
+
+; RKEY (Experimental, Type 57, draft-reid-dnsext-rkey-00) — flags MUST be 0, protocol MUST be 1
+rkey-node   IN RKEY 0 1 13 (
+    Gt5VRfB9PU4fsMAgkp+4Lux7ikef1M2e/ZtbggoiyDxZ
+    hKunv9246kZG2JSyg3VHgWpLeQLV+eIQ8NlePcXJUg== )
+
+; TALINK (Trust Anchor LINK, Type 58)
+; format: previous-ta-name next-ta-name (両方ドメイン名)
+talink-node IN TALINK . ta-root.example.com.
+
+; HHIT (Host Identity Tag, RFC 9886, Type 67) — opaque base64
+hhit-node   IN HHIT ( AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA )
+
+; BRID (Bound RVS Identifier, RFC 9886, Type 68) — opaque base64
+brid-node   IN BRID ( AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA )
+
 ; RFC 3597 Generic Unknown Record (TYPE65280)
 generic-rr  IN TYPE65280 \# 4 c0000201
 

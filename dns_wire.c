@@ -1908,6 +1908,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 break;
             }
+            case 56: // NINFO — wire format identical to TXT
             case 16: case 99: case 258: { // TXT, SPF, AVC
                 if (rec->is_cached && rec->cache.txt.wire_data) {
                     if ((size_t)offset + rec->cache.txt.wire_len > max_res_len) return -1;
@@ -2063,6 +2064,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset = off;
                 break;
             }
+            case 24: // SIG (RFC 2535) — wire format identical to RRSIG (RFC 4034)
             case 46: { // RRSIG
                 if (rec->rdata_count < 9) return -1;
                 uint16_t type_covered;
@@ -2721,6 +2723,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset = off;
                 break;
             }
+            case 57: // RKEY — wire format identical to DNSKEY/KEY
             case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
                 if (rec->rdata_count < 4) return -1;
                 uint16_t flags;
@@ -2736,6 +2739,24 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 size_t off = offset;
                 if (decode_concat_b64_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
                 offset = off;
+                break;
+            }
+            case 58: { // TALINK (Trust Anchor LINK)
+                if (rec->rdata_count < 2) return -1;
+                long w0 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                if (w0 < 0) return -1;
+                offset += (size_t)w0;
+                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                if (w1 < 0) return -1;
+                offset += (size_t)w1;
+                break;
+            }
+            case 67: case 68: { // HHIT, BRID (RFC 9886) — opaque base64 blob
+                if (rec->rdata_count < 1) return -1;
+                size_t off = offset;
+                if (decode_concat_b64_rdata(rec->rdata, rec->rdata_count,
+                                            res, max_res_len, &off) != 0) return -1;
+                offset = (uint16_t)off;
                 break;
             }
             case 128: { // NXNAME (RFC 9824 Compact Denial of Existence): 0-length RDATA
@@ -3464,6 +3485,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             }
             break;
         }
+        case 56: // NINFO — cache identical to TXT
         case 16: case 99: case 258: { // TXT, SPF, AVC
             if (rec->rdata_count > 0 && arena) {
                 size_t required = 0;
@@ -3575,6 +3597,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                 }
             }
             break;
+        case 24: // SIG — cache identical to RRSIG
         case 46: // RRSIG
             if (rec->rdata_count >= 9) {
                 if (parse_u8(rec->rdata[1], &rec->cache.rrsig.algorithm) &&

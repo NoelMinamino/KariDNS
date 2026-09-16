@@ -1180,6 +1180,9 @@ PROCESS_RECORD:
           case 38: // A6 (RFC 2874): rdata[2] = prefix name domain (prefix_len > 0 のときのみ)
               if (j == 2) is_domain_name = true;
               break;
+          case 58: // TALINK: rdata[0]=prev, rdata[1]=next (両方ドメイン名)
+              if (j == 0 || j == 1) is_domain_name = true;
+              break;
           default:
               break;
       }
@@ -1297,6 +1300,11 @@ PROCESS_RECORD:
           rec->rdata[1] = expand_domain_name(rec->rdata[1], *origin_io, arena);
         }
       }
+    } else if (rec->type_code == 58) { // TALINK: prev + next
+      if (rec->rdata_count > 0)
+        rec->rdata[0] = expand_domain_name(rec->rdata[0], *origin_io, arena);
+      if (rec->rdata_count > 1)
+        rec->rdata[1] = expand_domain_name(rec->rdata[1], *origin_io, arena);
     }
 
     // Validate domain name length in RDATA
@@ -1329,6 +1337,9 @@ PROCESS_RECORD:
           break;
         case 38: // A6 (RFC 2874): rdata[2] = prefix name (prefix_len > 0)
           if (j == 2) is_domain_field = true;
+          break;
+        case 58: // TALINK
+          if (j == 0 || j == 1) is_domain_field = true;
           break;
         default:
           if ((rec->type_code == 64 || rec->type_code == 65) && j == 1 && strcmp(rec->rdata[1], ".") != 0) {

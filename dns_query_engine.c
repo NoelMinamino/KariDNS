@@ -2484,6 +2484,13 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   size_t tsig_mac_len = 0;
   char current_qname[256];
   strlcpy(current_qname, qname, sizeof(current_qname));
+  char current_qname_lc[256];
+  size_t current_qname_lc_len = 0;
+  for (; current_qname[current_qname_lc_len] != '\0' && current_qname_lc_len < sizeof(current_qname_lc) - 1; current_qname_lc_len++) {
+    char c = current_qname[current_qname_lc_len];
+    current_qname_lc[current_qname_lc_len] = (c >= 'A' && c <= 'Z') ? (c | 0x20) : c;
+  }
+  current_qname_lc[current_qname_lc_len] = '\0';
   zone_arena_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
   view_snapshot_t *view = NULL;
@@ -3225,19 +3232,38 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   // Pre-rendered wire-format response cache (Fast Path)
-  if (!edns.present && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
+  // [策A] プレーンな標準EDNSクエリ（DO=0, MQTYPEなし, ECSなし等）のみ安全にキャッシュを適用し、
+  // DNSSEC(DO=1)やMQTYPE、ECS等の動的機能は通常パスへフォールバックさせる。
+  bool edns_safe_for_cache = (!edns.present) ||
+      (edns.version == 0 &&
+       !edns.dnssec_ok &&
+       !edns.compact_answers_ok &&
+       !edns.has_mqtype_query &&
+       !edns.has_ecs &&
+       !edns.has_nsid_query &&
+       !edns.has_keepalive_query &&
+       !edns.has_karidns_ext &&
+       edns.ede_count == 0 &&
+       !edns.has_malformed_cookie);
+
+  if (edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
       current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {
-    uint32_t qname_hash = calc_fnv1a_str(current_qname);
+    uint32_t qname_hash = calc_fnv1a_str(current_qname_lc);
     size_t hash_idx = (qname_hash ^ (uint32_t)qtype) & (current_zone->response_cache.bucket_count - 1);
     for (response_cache_entry_t *e = current_zone->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
       if (e->qtype == qtype && e->qclass == qclass && e->name_hash == qname_hash &&
-          strcasecmp(e->name, current_qname) == 0) {
+          strcmp(e->name, current_qname_lc) == 0) {
         if ((size_t)q_offset + e->body_len <= max_res_len) {
+          memcpy(res + q_offset, e->body, e->body_len);
+          uint16_t body_offset = (uint16_t)(q_offset + e->body_len);
+          uint16_t arcount = e->arcount;
+          if (edns.present) {
+            assemble_edns_opt(res, max_res_len, &body_offset, &arcount, &edns, 0, is_tcp, cfg);
+          }
           *res_ancount = htons(e->ancount);
           *res_nscount = htons(e->nscount);
-          *res_arcount = htons(e->arcount);
-          memcpy(res + q_offset, e->body, e->body_len);
-          return q_offset + e->body_len;
+          *res_arcount = htons(arcount);
+          return body_offset;
         }
         break;
       }
@@ -3260,7 +3286,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       *res_arcount = htons(arcount);
       return offset;
     }
-    int limit = cfg_for_ede ? cfg_for_ede->max_mqtypes : 4;
+    int limit = (cfg_for_ede && cfg_for_ede->max_mqtypes > 0) ? cfg_for_ede->max_mqtypes : 4;
     for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
        uint16_t mq = edns.mqtypes[i];
        if (is_non_data_rrtype(mq)) {

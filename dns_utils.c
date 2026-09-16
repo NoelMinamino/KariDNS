@@ -88,6 +88,10 @@ uint16_t get_type_code(const char *type_str) {
     if (strcmp(type_str, "AXFR") == 0)
       return 252;
     break;
+  case 'B':
+    if (strcmp(type_str, "BRID") == 0)
+      return 68;
+    break;
   case 'C':
     if (strcmp(type_str, "CNAME") == 0)
       return 5;
@@ -137,6 +141,8 @@ uint16_t get_type_code(const char *type_str) {
       return 65;
     if (strcmp(type_str, "HIP") == 0)
       return 55;
+    if (strcmp(type_str, "HHIT") == 0)
+      return 67;
     break;
   case 'I':
     if (strcmp(type_str, "ISDN") == 0)
@@ -205,6 +211,8 @@ uint16_t get_type_code(const char *type_str) {
       return 50;
     if (strcmp(type_str, "NSEC3PARAM") == 0)
       return 51;
+    if (strcmp(type_str, "NINFO") == 0)
+      return 56;
     if (strcmp(type_str, "NID") == 0)
       return 104;
     break;
@@ -225,6 +233,8 @@ uint16_t get_type_code(const char *type_str) {
       return 17;
     if (strcmp(type_str, "RT") == 0)
       return 21;
+    if (strcmp(type_str, "RKEY") == 0)
+      return 57;
     if (strcmp(type_str, "RRSIG") == 0)
       return 46;
     break;
@@ -251,6 +261,8 @@ uint16_t get_type_code(const char *type_str) {
       return 16;
     if (strcmp(type_str, "TLSA") == 0)
       return 52;
+    if (strcmp(type_str, "TALINK") == 0)
+      return 58;
     if (strcmp(type_str, "TKEY") == 0)
       return 249;
     if (strcmp(type_str, "TSIG") == 0)
@@ -354,6 +366,9 @@ static const type_name_entry_t TYPE_NAMES[] = {
     {52, "TLSA"},
     {53, "SMIMEA"},
     {55, "HIP"},
+    {56, "NINFO"},
+    {57, "RKEY"},
+    {58, "TALINK"},
     {59, "CDS"},
     {60, "CDNSKEY"},
     {61, "OPENPGPKEY"},
@@ -362,6 +377,8 @@ static const type_name_entry_t TYPE_NAMES[] = {
     {64, "SVCB"},
     {65, "HTTPS"},
     {66, "DSYNC"},
+    {67, "HHIT"},
+    {68, "BRID"},
     {99, "SPF"},
     {104, "NID"},
     {105, "L32"},

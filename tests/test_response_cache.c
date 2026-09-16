@@ -93,6 +93,42 @@ static void build_edns_query(uint8_t *buf, size_t *out_len, uint16_t txid, const
     *out_len = off;
 }
 
+static void build_edns_cookie_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, const uint8_t *client_cookie) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    buf[off++] = 0x00; buf[off++] = 12; // RDLEN = 12
+    buf[off++] = 0x00; buf[off++] = 10; // Option code: 10 (COOKIE)
+    buf[off++] = 0x00; buf[off++] = 8;  // Option len: 8
+    memcpy(&buf[off], client_cookie, 8);
+    off += 8;
+    *out_len = off;
+}
+
+static void build_edns_mqtype_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, uint16_t mqtype) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    buf[off++] = 0x00; buf[off++] = 6;  // RDLEN = 6 (option header 4 + 2 bytes mqtype)
+    buf[off++] = 0x00; buf[off++] = 20; // Option code: 20 (MQTYPE)
+    buf[off++] = 0x00; buf[off++] = 2;  // Option len: 2
+    buf[off++] = (uint8_t)(mqtype >> 8);
+    buf[off++] = (uint8_t)(mqtype & 0xFF);
+    *out_len = off;
+}
+
 static void test_wire_cache_consistency(void) {
     printf("[TEST] Running wire cache byte-for-byte consistency test...\n");
 
@@ -178,6 +214,7 @@ static void test_wire_cache_consistency(void) {
         { "1.2.0.192.in-addr.arpa.", 12, "PTR" },
     };
 
+    // 1. Standard (non-EDNS) query byte-for-byte consistency
     for (size_t i = 0; i < sizeof(test_cases) / sizeof(test_cases[0]); i++) {
         uint8_t req[512], res_cached[4096], res_uncached[4096];
         size_t req_len = 0;
@@ -186,14 +223,12 @@ static void test_wire_cache_consistency(void) {
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
 
-        // 1. Cached run
         zone_db_entry_t *matched1 = NULL;
         int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
                                                test_cases[i].qname, test_cases[i].qtype,
                                                "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
         assert(len_cached > 0);
 
-        // 2. Uncached run (temporarily clear buckets pointer)
         response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
         arena.response_cache.buckets = NULL;
 
@@ -203,11 +238,8 @@ static void test_wire_cache_consistency(void) {
                                                  test_cases[i].qname, test_cases[i].qtype,
                                                  "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched2);
         assert(len_uncached > 0);
-
-        // Restore buckets pointer
         arena.response_cache.buckets = saved_buckets;
 
-        // Byte-for-byte comparison
         assert(len_cached == len_uncached);
         assert(memcmp(res_cached, res_uncached, len_cached) == 0);
 
@@ -216,44 +248,145 @@ static void test_wire_cache_consistency(void) {
             assert(ans_ptr == 0xC00C);
         }
 
-        printf("  [PASS] %s (%s) matches uncached response byte-for-byte (length=%d bytes)\n",
+        printf("  [PASS] %s (%s) non-EDNS matches uncached response byte-for-byte (length=%d bytes)\n",
                test_cases[i].qname, test_cases[i].desc, len_cached);
     }
 
-    // Test 0x20 casing preservation
-    {
+    // 2. Plain EDNS query (DO=0) byte-for-byte consistency (all test cases)
+    for (size_t i = 0; i < sizeof(test_cases) / sizeof(test_cases[0]); i++) {
         uint8_t req[512], res_cached[4096], res_uncached[4096];
         size_t req_len = 0;
-        const char *mixed_qname = "MaIl.ExAmPlE.cOm.";
-        build_simple_query(req, &req_len, 0x5678, mixed_qname, 1);
+        build_edns_query(req, &req_len, (uint16_t)(0x3456 + i), test_cases[i].qname, test_cases[i].qtype, false);
 
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
-        zone_db_entry_t *matched = NULL;
+
+        zone_db_entry_t *matched1 = NULL;
         int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
-                                               mixed_qname, 1,
-                                               "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+                                               test_cases[i].qname, test_cases[i].qtype,
+                                               "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
         assert(len_cached > 0);
+        uint16_t arcount_cached = ((uint16_t)res_cached[10] << 8) | res_cached[11];
+        assert(arcount_cached >= 1); // OPT record present
 
         response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
         arena.response_cache.buckets = NULL;
+
         compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched2 = NULL;
         int len_uncached = process_dns_query_impl(req, req_len, res_uncached, sizeof(res_uncached),
-                                                 mixed_qname, 1,
-                                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+                                                 test_cases[i].qname, test_cases[i].qtype,
+                                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched2);
+        assert(len_uncached > 0);
         arena.response_cache.buckets = saved_buckets;
 
         assert(len_cached == len_uncached);
         assert(memcmp(res_cached, res_uncached, len_cached) == 0);
-        printf("  [PASS] 0x20 mixed casing '%s' preserved and byte-identical\n", mixed_qname);
+
+        printf("  [PASS] %s (%s) plain EDNS (DO=0) matches uncached response byte-for-byte (length=%d bytes)\n",
+               test_cases[i].qname, test_cases[i].desc, len_cached);
     }
 
-    // Test Fallbacks
-    // A. EDNS query fallback
+    // 3. DNS Cookie query consistency & multi-client isolation test
+    {
+        uint8_t client_cookie1[8] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+        uint8_t client_cookie2[8] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
+
+        uint8_t req1[512], res1_cached[4096], res1_uncached[4096];
+        uint8_t req2[512], res2_cached[4096];
+        size_t req_len1 = 0, req_len2 = 0;
+
+        build_edns_cookie_query(req1, &req_len1, 0x7701, "mail.example.com.", 1, client_cookie1);
+        build_edns_cookie_query(req2, &req_len2, 0x7702, "mail.example.com.", 1, client_cookie2);
+
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+
+        // Client 1 query (cached)
+        zone_db_entry_t *matched1 = NULL;
+        int len1_cached = process_dns_query_impl(req1, req_len1, res1_cached, sizeof(res1_cached),
+                                                "mail.example.com.", 1,
+                                                "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
+        assert(len1_cached > 0);
+
+        // Client 1 query (uncached)
+        response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
+        arena.response_cache.buckets = NULL;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched2 = NULL;
+        int len1_uncached = process_dns_query_impl(req1, req_len1, res1_uncached, sizeof(res1_uncached),
+                                                  "mail.example.com.", 1,
+                                                  "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched2);
+        assert(len1_uncached > 0);
+        arena.response_cache.buckets = saved_buckets;
+
+        assert(len1_cached == len1_uncached);
+        assert(memcmp(res1_cached, res1_uncached, len1_cached) == 0);
+        printf("  [PASS] Client 1 DNS Cookie query matches uncached response byte-for-byte\n");
+
+        // Client 2 query from different IP (cached)
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched3 = NULL;
+        int len2_cached = process_dns_query_impl(req2, req_len2, res2_cached, sizeof(res2_cached),
+                                                "mail.example.com.", 1,
+                                                "192.0.2.2", &comp_ctx, false, NULL, &snap, &cfg, &matched3);
+        assert(len2_cached > 0);
+
+        // Verify body portion (ANSWER section) is identical between Client 1 and Client 2
+        // while the OPT / Cookie portion is independently generated
+        assert(len1_cached == len2_cached);
+        // Header TXID differs (0x7701 vs 0x7702)
+        assert(res1_cached[0] != res2_cached[0] || res1_cached[1] != res2_cached[1]);
+        // Answer section length and payload are identical
+        assert(memcmp(&res1_cached[req_len1], &res2_cached[req_len2], 16) == 0); // 16 bytes A RR
+        // Cookie in OPT record differs due to different client cookie & IP
+        assert(memcmp(&res1_cached[len1_cached - 24], &res2_cached[len2_cached - 24], 24) != 0);
+
+        printf("  [PASS] Multiple clients with different IPs/Cookies receive shared cached body with isolated Cookie generation\n");
+    }
+
+    // 4. Test 0x20 casing preservation & case-folding cache hit
+    {
+        const char *mixed_qnames[] = {
+            "MaIl.ExAmPlE.cOm.",
+            "WWW.example.com.",
+            "WwW.ExAmPlE.CoM.",
+            "NS1.EXAMPLE.COM."
+        };
+        for (size_t i = 0; i < sizeof(mixed_qnames) / sizeof(mixed_qnames[0]); i++) {
+            const char *mixed_qname = mixed_qnames[i];
+            uint8_t req[512], res_cached[4096], res_uncached[4096];
+            size_t req_len = 0;
+            build_simple_query(req, &req_len, (uint16_t)(0x5678 + i), mixed_qname, 1);
+
+            compress_ctx_t comp_ctx;
+            compress_ctx_init_packet(&comp_ctx);
+            zone_db_entry_t *matched = NULL;
+            int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
+                                                   mixed_qname, 1,
+                                                   "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+            assert(len_cached > 0);
+
+            response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
+            arena.response_cache.buckets = NULL;
+            compress_ctx_init_packet(&comp_ctx);
+            int len_uncached = process_dns_query_impl(req, req_len, res_uncached, sizeof(res_uncached),
+                                                     mixed_qname, 1,
+                                                     "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+            arena.response_cache.buckets = saved_buckets;
+
+            assert(len_cached == len_uncached);
+            assert(memcmp(res_cached, res_uncached, len_cached) == 0);
+            printf("  [PASS] 0x20 mixed casing '%s' preserved and byte-identical\n", mixed_qname);
+        }
+    }
+
+    // 5. Test Fallbacks
+    // A. EDNS DO=1 (DNSSEC OK) fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
-        build_edns_query(req, &req_len, 0x9999, "mail.example.com.", 1, false);
+        build_edns_query(req, &req_len, 0x9999, "mail.example.com.", 1, true /* dnssec_ok = true */);
 
         compress_ctx_t comp_ctx;
         compress_ctx_init_packet(&comp_ctx);
@@ -264,10 +397,34 @@ static void test_wire_cache_consistency(void) {
         assert(len > 0);
         uint16_t arcount = ((uint16_t)res[10] << 8) | res[11];
         assert(arcount >= 1); // OPT record present in additional section
-        printf("  [PASS] EDNS query bypassed cache and assembled OPT record\n");
+        printf("  [PASS] EDNS DO=1 query bypassed cache and dynamically processed\n");
     }
 
-    // B. Wildcard query fallback
+    // B. EDNS Multi-QTYPE fallback (RFC 10029)
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_mqtype_query(req, &req_len, 0x999A, "mail.example.com.", 1 /* A */, 28 /* AAAA */);
+
+        cfg.rfc10029_mqtype_enable = true;
+        cfg.max_mqtypes = 4;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        cfg.rfc10029_mqtype_enable = false;
+        cfg.max_mqtypes = 0;
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        uint16_t ancount = ((uint16_t)res[6] << 8) | res[7];
+        assert(rcode == 0);
+        assert(ancount == 2); // Both A (192.0.2.10) and AAAA (2001:db8::10) answered!
+        printf("  [PASS] EDNS Multi-QTYPE (+mqtype=AAAA) bypassed cache and returned multiple answers (ANCOUNT=%d)\n", ancount);
+    }
+
+    // C. Wildcard query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
@@ -287,7 +444,7 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] Wildcard query synthesized answer via dynamic fallback\n");
     }
 
-    // C. NXDOMAIN query fallback
+    // D. NXDOMAIN query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
@@ -305,7 +462,7 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] NXDOMAIN query returned RCODE 3 via dynamic fallback\n");
     }
 
-    // D. NODATA query fallback
+    // E. NODATA query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
