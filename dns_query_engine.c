@@ -2484,6 +2484,13 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   size_t tsig_mac_len = 0;
   char current_qname[256];
   strlcpy(current_qname, qname, sizeof(current_qname));
+  char current_qname_lc[256];
+  size_t current_qname_lc_len = 0;
+  for (; current_qname[current_qname_lc_len] != '\0' && current_qname_lc_len < sizeof(current_qname_lc) - 1; current_qname_lc_len++) {
+    char c = current_qname[current_qname_lc_len];
+    current_qname_lc[current_qname_lc_len] = (c >= 'A' && c <= 'Z') ? (c | 0x20) : c;
+  }
+  current_qname_lc[current_qname_lc_len] = '\0';
   zone_arena_t *current_zone = NULL;
   zone_db_entry_t *db_entry = NULL;
   view_snapshot_t *view = NULL;
@@ -3229,11 +3236,11 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   // キャッシュヒット後にOPTレコードだけ動的に追記する。
   if (!is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
       current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {
-    uint32_t qname_hash = calc_fnv1a_str(current_qname);
+    uint32_t qname_hash = calc_fnv1a_str(current_qname_lc);
     size_t hash_idx = (qname_hash ^ (uint32_t)qtype) & (current_zone->response_cache.bucket_count - 1);
     for (response_cache_entry_t *e = current_zone->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
       if (e->qtype == qtype && e->qclass == qclass && e->name_hash == qname_hash &&
-          strcasecmp(e->name, current_qname) == 0) {
+          strcmp(e->name, current_qname_lc) == 0) {
         if ((size_t)q_offset + e->body_len <= max_res_len) {
           memcpy(res + q_offset, e->body, e->body_len);
           uint16_t body_offset = (uint16_t)(q_offset + e->body_len);

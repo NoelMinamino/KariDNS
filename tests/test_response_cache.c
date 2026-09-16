@@ -327,32 +327,40 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] Multiple clients with different IPs/Cookies receive shared cached body with isolated Cookie generation\n");
     }
 
-    // 4. Test 0x20 casing preservation
+    // 4. Test 0x20 casing preservation & case-folding cache hit
     {
-        uint8_t req[512], res_cached[4096], res_uncached[4096];
-        size_t req_len = 0;
-        const char *mixed_qname = "MaIl.ExAmPlE.cOm.";
-        build_simple_query(req, &req_len, 0x5678, mixed_qname, 1);
+        const char *mixed_qnames[] = {
+            "MaIl.ExAmPlE.cOm.",
+            "WWW.example.com.",
+            "WwW.ExAmPlE.CoM.",
+            "NS1.EXAMPLE.COM."
+        };
+        for (size_t i = 0; i < sizeof(mixed_qnames) / sizeof(mixed_qnames[0]); i++) {
+            const char *mixed_qname = mixed_qnames[i];
+            uint8_t req[512], res_cached[4096], res_uncached[4096];
+            size_t req_len = 0;
+            build_simple_query(req, &req_len, (uint16_t)(0x5678 + i), mixed_qname, 1);
 
-        compress_ctx_t comp_ctx;
-        compress_ctx_init_packet(&comp_ctx);
-        zone_db_entry_t *matched = NULL;
-        int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
-                                               mixed_qname, 1,
-                                               "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
-        assert(len_cached > 0);
+            compress_ctx_t comp_ctx;
+            compress_ctx_init_packet(&comp_ctx);
+            zone_db_entry_t *matched = NULL;
+            int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
+                                                   mixed_qname, 1,
+                                                   "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+            assert(len_cached > 0);
 
-        response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
-        arena.response_cache.buckets = NULL;
-        compress_ctx_init_packet(&comp_ctx);
-        int len_uncached = process_dns_query_impl(req, req_len, res_uncached, sizeof(res_uncached),
-                                                 mixed_qname, 1,
-                                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
-        arena.response_cache.buckets = saved_buckets;
+            response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
+            arena.response_cache.buckets = NULL;
+            compress_ctx_init_packet(&comp_ctx);
+            int len_uncached = process_dns_query_impl(req, req_len, res_uncached, sizeof(res_uncached),
+                                                     mixed_qname, 1,
+                                                     "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+            arena.response_cache.buckets = saved_buckets;
 
-        assert(len_cached == len_uncached);
-        assert(memcmp(res_cached, res_uncached, len_cached) == 0);
-        printf("  [PASS] 0x20 mixed casing '%s' preserved and byte-identical\n", mixed_qname);
+            assert(len_cached == len_uncached);
+            assert(memcmp(res_cached, res_uncached, len_cached) == 0);
+            printf("  [PASS] 0x20 mixed casing '%s' preserved and byte-identical\n", mixed_qname);
+        }
     }
 
     // 5. Test Fallbacks
