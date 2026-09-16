@@ -823,6 +823,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             }
             return;
         }
+        case 56: // NINFO — display identical to TXT
         case 16: case 99: case 258: { // TXT, SPF, AVC
             size_t p = abs_offset, end = abs_offset + rdlen;
             bool first = true;
@@ -1362,6 +1363,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             }
             break;
         }
+        case 57: // RKEY — display identical to DNSKEY/KEY
         case 25: case 48: case 60: { // KEY, DNSKEY, CDNSKEY
             sink_dnskey_like(sink, &pkt[abs_offset], rdlen, dopt);
             return;
@@ -1660,6 +1662,32 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                     sink_split_b64(sink, b64, b64_n, sw);
                     free(b64);
                 }
+            }
+            return;
+        }
+        case 58: { // TALINK: prev-name next-name
+            if (rdlen < 2) { sink_printf(sink, "(malformed TALINK)"); return; }
+            char *prev = NULL, *next = NULL;
+            size_t n1, n2;
+            if (expand_wire_name(pkt, pkt_len, abs_offset, &n1, &g_dag_arena, &prev) != 0 ||
+                n1 > abs_offset + rdlen) {
+                sink_printf(sink, "(malformed TALINK prev)"); return;
+            }
+            if (expand_wire_name(pkt, pkt_len, n1, &n2, &g_dag_arena, &next) != 0 ||
+                n2 > abs_offset + rdlen) {
+                sink_printf(sink, "(malformed TALINK next)"); return;
+            }
+            sink_printf(sink, "%s %s", prev ? prev : ".", next ? next : ".");
+            return;
+        }
+        case 67: case 68: { // HHIT, BRID (RFC 9886) — opaque base64
+            if (rdlen == 0) { sink_printf(sink, "(empty)"); return; }
+            int b64_n = 0;
+            char *b64 = base64_encode_alloc(&pkt[abs_offset], rdlen, &b64_n);
+            if (b64) {
+                int sw = (dopt && dopt->split_width > 0) ? dopt->split_width : 0;
+                sink_split_b64(sink, b64, b64_n, sw);
+                free(b64);
             }
             return;
         }
