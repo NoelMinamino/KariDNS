@@ -3232,9 +3232,21 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   // Pre-rendered wire-format response cache (Fast Path)
-  // [EDNS対応] !edns.present の条件を撤廃。ボディはEDNSの有無と無関係に同一のため、
-  // キャッシュヒット後にOPTレコードだけ動的に追記する。
-  if (!is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
+  // [策A] プレーンな標準EDNSクエリ（DO=0, MQTYPEなし, ECSなし等）のみ安全にキャッシュを適用し、
+  // DNSSEC(DO=1)やMQTYPE、ECS等の動的機能は通常パスへフォールバックさせる。
+  bool edns_safe_for_cache = (!edns.present) ||
+      (edns.version == 0 &&
+       !edns.dnssec_ok &&
+       !edns.compact_answers_ok &&
+       !edns.has_mqtype_query &&
+       !edns.has_ecs &&
+       !edns.has_nsid_query &&
+       !edns.has_keepalive_query &&
+       !edns.has_karidns_ext &&
+       edns.ede_count == 0 &&
+       !edns.has_malformed_cookie);
+
+  if (edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
       current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {
     uint32_t qname_hash = calc_fnv1a_str(current_qname_lc);
     size_t hash_idx = (qname_hash ^ (uint32_t)qtype) & (current_zone->response_cache.bucket_count - 1);
@@ -3274,7 +3286,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       *res_arcount = htons(arcount);
       return offset;
     }
-    int limit = cfg_for_ede ? cfg_for_ede->max_mqtypes : 4;
+    int limit = (cfg_for_ede && cfg_for_ede->max_mqtypes > 0) ? cfg_for_ede->max_mqtypes : 4;
     for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
        uint16_t mq = edns.mqtypes[i];
        if (is_non_data_rrtype(mq)) {

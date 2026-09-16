@@ -111,6 +111,24 @@ static void build_edns_cookie_query(uint8_t *buf, size_t *out_len, uint16_t txid
     *out_len = off;
 }
 
+static void build_edns_mqtype_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, uint16_t mqtype) {
+    build_simple_query(buf, out_len, txid, qname, qtype);
+    size_t off = *out_len;
+    buf[10] = 0x00; buf[11] = 0x01; // ARCOUNT=1
+    buf[off++] = 0x00; // Root name
+    buf[off++] = 0x00; buf[off++] = 41; // OPT (41)
+    buf[off++] = 0x10; buf[off++] = 0x00; // UDP payload 4096
+    buf[off++] = 0x00; // ext rcode
+    buf[off++] = 0x00; // edns version 0
+    buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    buf[off++] = 0x00; buf[off++] = 6;  // RDLEN = 6 (option header 4 + 2 bytes mqtype)
+    buf[off++] = 0x00; buf[off++] = 20; // Option code: 20 (MQTYPE)
+    buf[off++] = 0x00; buf[off++] = 2;  // Option len: 2
+    buf[off++] = (uint8_t)(mqtype >> 8);
+    buf[off++] = (uint8_t)(mqtype & 0xFF);
+    *out_len = off;
+}
+
 static void test_wire_cache_consistency(void) {
     printf("[TEST] Running wire cache byte-for-byte consistency test...\n");
 
@@ -234,7 +252,7 @@ static void test_wire_cache_consistency(void) {
                test_cases[i].qname, test_cases[i].desc, len_cached);
     }
 
-    // 2. EDNS query byte-for-byte consistency (all test cases)
+    // 2. Plain EDNS query (DO=0) byte-for-byte consistency (all test cases)
     for (size_t i = 0; i < sizeof(test_cases) / sizeof(test_cases[0]); i++) {
         uint8_t req[512], res_cached[4096], res_uncached[4096];
         size_t req_len = 0;
@@ -265,7 +283,7 @@ static void test_wire_cache_consistency(void) {
         assert(len_cached == len_uncached);
         assert(memcmp(res_cached, res_uncached, len_cached) == 0);
 
-        printf("  [PASS] %s (%s) EDNS matches uncached response byte-for-byte (length=%d bytes)\n",
+        printf("  [PASS] %s (%s) plain EDNS (DO=0) matches uncached response byte-for-byte (length=%d bytes)\n",
                test_cases[i].qname, test_cases[i].desc, len_cached);
     }
 
@@ -364,7 +382,49 @@ static void test_wire_cache_consistency(void) {
     }
 
     // 5. Test Fallbacks
-    // A. Wildcard query fallback
+    // A. EDNS DO=1 (DNSSEC OK) fallback
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_query(req, &req_len, 0x9999, "mail.example.com.", 1, true /* dnssec_ok = true */);
+
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        assert(len > 0);
+        uint16_t arcount = ((uint16_t)res[10] << 8) | res[11];
+        assert(arcount >= 1); // OPT record present in additional section
+        printf("  [PASS] EDNS DO=1 query bypassed cache and dynamically processed\n");
+    }
+
+    // B. EDNS Multi-QTYPE fallback (RFC 10029)
+    {
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_edns_mqtype_query(req, &req_len, 0x999A, "mail.example.com.", 1 /* A */, 28 /* AAAA */);
+
+        cfg.rfc10029_mqtype_enable = true;
+        cfg.max_mqtypes = 4;
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "mail.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        cfg.rfc10029_mqtype_enable = false;
+        cfg.max_mqtypes = 0;
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        uint16_t ancount = ((uint16_t)res[6] << 8) | res[7];
+        assert(rcode == 0);
+        assert(ancount == 2); // Both A (192.0.2.10) and AAAA (2001:db8::10) answered!
+        printf("  [PASS] EDNS Multi-QTYPE (+mqtype=AAAA) bypassed cache and returned multiple answers (ANCOUNT=%d)\n", ancount);
+    }
+
+    // C. Wildcard query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
@@ -384,7 +444,7 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] Wildcard query synthesized answer via dynamic fallback\n");
     }
 
-    // B. NXDOMAIN query fallback
+    // D. NXDOMAIN query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
@@ -402,7 +462,7 @@ static void test_wire_cache_consistency(void) {
         printf("  [PASS] NXDOMAIN query returned RCODE 3 via dynamic fallback\n");
     }
 
-    // C. NODATA query fallback
+    // E. NODATA query fallback
     {
         uint8_t req[512], res[4096];
         size_t req_len = 0;
