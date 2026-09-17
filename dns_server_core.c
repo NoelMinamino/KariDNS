@@ -2407,7 +2407,6 @@ static const char *find_configured_domain(const char *arg, char *out_buf, size_t
   server_config_t *active = acquire_config_snapshot();
   if (!active) return out_buf;
   zone_config_t *zcfg = active->zones;
-  size_t arg_len = strlen(arg);
   while (zcfg) {
     if (domain_names_match_ci(zcfg->domain, arg)) {
       snprintf(out_buf, out_size, "%s", zcfg->domain);

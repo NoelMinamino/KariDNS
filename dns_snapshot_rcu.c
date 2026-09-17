@@ -204,10 +204,18 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
   if (!z) return NULL;
   atomic_init(&z->active_axfr, 0);
   atomic_init(&z->snapshot_refs, 1);
-  strncpy(z->domain, domain, sizeof(z->domain) - 1);
-  z->domain[sizeof(z->domain) - 1] = 0;
-  strncpy(z->view_name, view_name, sizeof(z->view_name) - 1);
-  z->view_name[sizeof(z->view_name) - 1] = 0;
+
+  size_t dlen = domain ? strlen(domain) : 0;
+  if (dlen > 0 && domain[dlen - 1] != '.' && dlen + 1 < sizeof(z->domain)) {
+    memcpy(z->domain, domain, dlen);
+    z->domain[dlen] = '.';
+    z->domain[dlen + 1] = '\0';
+  } else {
+    strncpy(z->domain, domain ? domain : "", sizeof(z->domain) - 1);
+    z->domain[sizeof(z->domain) - 1] = '\0';
+  }
+  strncpy(z->view_name, view_name ? view_name : "", sizeof(z->view_name) - 1);
+  z->view_name[sizeof(z->view_name) - 1] = '\0';
   pthread_mutex_init(&z->writer_lock, NULL);
   pthread_mutex_init(&z->ixfr_history.lock, NULL);
   z->ixfr_history.count = 0;
