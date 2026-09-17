@@ -1825,6 +1825,7 @@ static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
   size_t copy_len = q_end > max_res_len ? max_res_len : q_end;
   memcpy(res, req, copy_len);
   res[2] |= 0x80;              // QR=1
+  res[2] &= ~0x06;             // AA=0, TC=0 をクリア
   res[3] = (res[3] & 0xF0) | 2; // RCODE=2 (SERVFAIL), RA/Z/AD/CDは維持
   /* [M-4] 質問セクションが切り詰められた場合 QDCOUNT と実内容が乖離しないよう
    * copy_len < q_end (切り詰めが発生した) なら QDCOUNT=0 に設定する。

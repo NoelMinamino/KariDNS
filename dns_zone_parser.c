@@ -1756,7 +1756,7 @@ int validate_zone_dname(zone_arena_t *arena, parse_error_t *err) {
     dns_record_t *rec = &arena->records[i];
     if (!rec->name) continue;
     const char *parent = rec->name;
-    while ((parent = strchr(parent, '.')) != NULL) {
+    while ((parent = strchr_unescaped(parent, '.')) != NULL) {
       parent++;
       if (*parent == '\0') break;
       uint32_t p_hash = calc_fnv1a_str(parent);

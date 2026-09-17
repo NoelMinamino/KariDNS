@@ -3014,17 +3014,30 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                 }
                             }
                         } else if (opt_code == 8) { // EDNS Client Subnet (RFC 7871)
-                            if (opt_len >= 4) {
-                                edns->has_ecs = true;
-                                edns->ecs_family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
-                                edns->ecs_source_prefix = req[rdata_offset + 2];
-                                edns->ecs_scope_prefix = req[rdata_offset + 3];
-                                memset(edns->ecs_addr, 0, sizeof(edns->ecs_addr));
-                                size_t addr_len = opt_len - 4;
-                                if (addr_len > sizeof(edns->ecs_addr)) {
-                                    addr_len = sizeof(edns->ecs_addr);
-                                }
-                                memcpy(edns->ecs_addr, req + rdata_offset + 4, addr_len);
+                            if (opt_len < 4) return -1;
+                            uint16_t family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
+                            if (family != 1 && family != 2) return -1;
+                            uint8_t source_prefix = req[rdata_offset + 2];
+                            if (family == 1 && source_prefix > 32) return -1;
+                            if (family == 2 && source_prefix > 128) return -1;
+                            uint8_t scope_prefix = req[rdata_offset + 3];
+                            if (scope_prefix != 0) return -1;
+                            size_t expected_addr_len = (source_prefix + 7) / 8;
+                            size_t actual_addr_len = opt_len - 4;
+                            if (actual_addr_len != expected_addr_len) return -1;
+                            if (source_prefix % 8 != 0) {
+                                uint8_t pad_mask = (uint8_t)((1u << (8 - (source_prefix % 8))) - 1);
+                                uint8_t last_byte = req[rdata_offset + 4 + expected_addr_len - 1];
+                                if ((last_byte & pad_mask) != 0) return -1;
+                            }
+                            edns->has_ecs = true;
+                            edns->ecs_family = family;
+                            edns->ecs_source_prefix = source_prefix;
+                            edns->ecs_scope_prefix = scope_prefix;
+                            memset(edns->ecs_addr, 0, sizeof(edns->ecs_addr));
+                            size_t copy_len = actual_addr_len > sizeof(edns->ecs_addr) ? sizeof(edns->ecs_addr) : actual_addr_len;
+                            if (copy_len > 0) {
+                                memcpy(edns->ecs_addr, req + rdata_offset + 4, copy_len);
                             }
                         } else if (opt_code == EDNS_OPTION_KARIDNS_EXT) { // 65153
                             if (opt_len == 5) {
