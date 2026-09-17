@@ -225,8 +225,8 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
                  &ancount, &nscount, &arcount,
                  false, false, 0, false, NULL, NULL, NULL,
                  NULL, false, NULL, 0, 0, NULL);
-    if ((res[3] & 0x0F) != 2) {
-        // Must be exactly SERVFAIL (2) on CNAME loop exhaustion
+    if ((res[3] & 0x0F) != 0 || ancount != 1) {
+        // Must preserve resolved CNAME in Answer section and return NOERROR (0) per RFC 1034 §5.2.2
         zone_arena_destroy(&loop_arena);
         abort();
     }

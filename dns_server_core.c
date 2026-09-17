@@ -489,11 +489,19 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
     uint64_t t = atomic_load_explicit(&g_resp_log_tail, memory_order_relaxed);
     uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
     
-    // ロックフリー CAS ループ (バッファフル時はDDoS状態とみなし、潔くログをドロップする)
-    do {
+    // ロックフリー CAS ループ (バッファフルまたはConsumer未処理時は安全にドロップ)
+    while (1) {
         if (t - h >= RESP_LOG_RING_SIZE) return; 
-    } while (!atomic_compare_exchange_weak_explicit(&g_resp_log_tail, &t, t + 1, 
-                                                    memory_order_acq_rel, memory_order_relaxed));
+        uint32_t idx = t & (RESP_LOG_RING_SIZE - 1);
+        if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
+            return;
+        }
+        if (atomic_compare_exchange_weak_explicit(&g_resp_log_tail, &t, t + 1, 
+                                                  memory_order_acq_rel, memory_order_relaxed)) {
+            break;
+        }
+        h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
+    }
     
     uint32_t idx = t & (RESP_LOG_RING_SIZE - 1);
     resp_log_entry_t *entry = &g_resp_log_ring[idx];
@@ -631,6 +639,7 @@ void *response_logger_thread_func(void *arg) {
         
         if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
             resp_log_entry_t *entry = &g_resp_log_ring[idx];
+            rcu_reader_enter(&g_resp_logger_rcu_ctx);
             server_config_t *cfg = acquire_config_snapshot();
             
             if (cfg && cfg->logging.responses_channel) {
@@ -686,6 +695,7 @@ void *response_logger_thread_func(void *arg) {
                 }
             }
             release_config_snapshot(cfg);
+            rcu_reader_exit(&g_resp_logger_rcu_ctx);
             
             // Consumerのポインタを進める
             atomic_store_explicit(&entry->ready, false, memory_order_release);
@@ -791,6 +801,7 @@ void *query_logger_thread_func(void *arg) {
     uint64_t last_reported_dropped = 0;
 
     while (1) {
+        rcu_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
         log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
 
@@ -923,6 +934,7 @@ void *query_logger_thread_func(void *arg) {
         }
 
         if (cfg) release_config_snapshot(cfg);
+        rcu_reader_exit(&g_query_logger_rcu_ctx);
 
         // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
         usleep(any_work ? 1000 : 10000);
@@ -996,7 +1008,7 @@ typedef struct {
   int active_fd; // For UDP, IPC socket to frontend
   int client_fd; // For TCP, client socket
   udp_ipc_t ipc_hdr;
-  uint8_t req_buf[UDP_DEFAULT_MAX_RES_LEN];
+  uint8_t req_buf[BUFFER_SIZE];
   size_t req_len;
   char client_ip[INET6_ADDRSTRLEN];
   int client_port;
@@ -1012,7 +1024,6 @@ typedef struct {
   bool dnssec_ok;
   size_t question_end;
   zone_db_snapshot_t *snap;
-  worker_ctx_t *owner_ctx;
 } async_io_task_t;
 
 typedef struct {
@@ -1064,7 +1075,8 @@ static void *async_io_worker_func(void *arg) {
       uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
       rate_limit_config_t *rrl_cfg = NULL;
-      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+      size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
+      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, max_res,
                                       task.qname, task.qtype, task.client_ip,
                                       &thread_compress_ctx, false, &rrl_cfg, task.snap);
       release_zone_snapshot(task.snap);
@@ -1107,9 +1119,6 @@ static void *async_io_worker_func(void *arg) {
         submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                             0, 0, 0, false, false);
       }
-      if (task.owner_ctx) {
-        rcu_reader_exit(task.owner_ctx);
-      }
     } else {
       // TCP async resolution
       uint8_t *tcp_res = malloc(65535);
@@ -1137,9 +1146,6 @@ static void *async_io_worker_func(void *arg) {
       }
       close(task.client_fd);
       dec_tcp_clients();
-      if (task.owner_ctx) {
-        rcu_reader_exit(task.owner_ctx);
-      }
     }
   }
   return NULL;
@@ -1246,6 +1252,7 @@ void *worker_thread_func(void *arg) {
       if (tcp_fd >= 0) {
         int flags = fcntl(tcp_fd, F_GETFL, 0);
         fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
+        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT_LB
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt));
 #else
@@ -1255,7 +1262,7 @@ void *worker_thread_func(void *arg) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
           struct kevent ev;
-          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)2);
+          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
         } else
           close(tcp_fd);
@@ -1266,6 +1273,7 @@ void *worker_thread_func(void *arg) {
       if (tcp_fd >= 0) {
         int flags = fcntl(tcp_fd, F_GETFL, 0);
         fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
+        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setsockopt(tcp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT_LB
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt));
@@ -1276,7 +1284,7 @@ void *worker_thread_func(void *arg) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
           struct kevent ev;
-          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)2);
+          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
         } else
           close(tcp_fd);
@@ -1508,11 +1516,10 @@ worker_startup_success:;
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
-              task.owner_ctx = ctx;
               task.is_tcp = false;
               task.active_fd = active_fd;
               task.ipc_hdr = *ipc_msg;
-              task.req_len = payload_received > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : payload_received;
+              task.req_len = (size_t)payload_received > sizeof(task.req_buf) ? sizeof(task.req_buf) : (size_t)payload_received;
               memcpy(task.req_buf, req_buf, task.req_len);
               strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
@@ -1529,9 +1536,9 @@ worker_startup_success:;
               task.dnssec_ok = dnssec_ok;
               task.question_end = question_end;
               task.snap = acquire_zone_snapshot();
+              rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
-                rcu_reader_exit(ctx);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
@@ -1673,6 +1680,7 @@ worker_startup_success:;
             dec_tcp_clients();
             continue;
           }
+          clock_gettime(CLOCK_MONOTONIC, &ctx_tcp->connect_time);
           struct kevent ev_timeout;
           EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
                  10000, ctx_tcp);
@@ -1721,6 +1729,28 @@ process_tcp_client: ;
           }
           continue;
         }
+
+        // [Slowloris対策] TCP接続全体の最大生存時間チェック (60秒)
+        struct timespec now_mono;
+        clock_gettime(CLOCK_MONOTONIC, &now_mono);
+        int64_t elapsed_sec = (int64_t)(now_mono.tv_sec - ctx_tcp->connect_time.tv_sec);
+        if (elapsed_sec >= 60) {
+          struct kevent ev_del[2];
+          EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+          EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+          kevent(kq, ev_del, 2, NULL, 0, NULL);
+          close(client_fd);
+          dec_tcp_clients();
+          free(ctx_tcp);
+          for (int j = i + 1; j < n_events; j++) {
+            if (ev_list[j].ident == (uintptr_t)client_fd) {
+              ev_list[j].udata = NULL;
+              ev_list[j].filter = 0;
+            }
+          }
+          continue;
+        }
+
         int processed_queries = 0;
         bool client_closed = false;
 
@@ -1746,6 +1776,44 @@ process_tcp_client: ;
             break;
           }
           if (ret == 0) {
+            break;
+          }
+
+          if (msg_len < DNS_HEADER_SIZE) {
+            struct kevent ev_del[2];
+            EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+            EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            kevent(kq, ev_del, 2, NULL, 0, NULL);
+            close(client_fd);
+            dec_tcp_clients();
+            free(ctx_tcp);
+            client_closed = true;
+            for (int j = i + 1; j < n_events; j++) {
+              if (ev_list[j].ident == (uintptr_t)client_fd) {
+                ev_list[j].udata = NULL;
+                ev_list[j].filter = 0;
+              }
+            }
+            break;
+          }
+
+          // [RFC 1035 §4.1.1 / RFC 5452] QR=1 (レスポンスパケット) の破棄
+          if (msg_len >= DNS_HEADER_SIZE && (msg[2] & 0x80) != 0) {
+            submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, 0, "<response-on-query-port>", 0, 0, 0, false, false);
+            struct kevent ev_del[2];
+            EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+            EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            kevent(kq, ev_del, 2, NULL, 0, NULL);
+            close(client_fd);
+            dec_tcp_clients();
+            free(ctx_tcp);
+            client_closed = true;
+            for (int j = i + 1; j < n_events; j++) {
+              if (ev_list[j].ident == (uintptr_t)client_fd) {
+                ev_list[j].udata = NULL;
+                ev_list[j].filter = 0;
+              }
+            }
             break;
           }
 
@@ -1937,17 +2005,9 @@ process_tcp_client: ;
                   allowed = tsig_ok;
               }
             }
-            release_config_snapshot(cfg);
-            zone_db_entry_t *entry = NULL;
-            if (xfr_view) {
-              for (size_t i = 0; i < xfr_view->zone_count; i++) {
-                if (strcasecmp(xfr_view->entries[i]->domain, qname) == 0) {
-                  entry = xfr_view->entries[i];
-                  break;
-                }
-              }
-            }
+            zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
             if (allowed && entry) {
+              release_config_snapshot(cfg);
               if (atomic_fetch_add(&entry->active_axfr, 1) >= MAX_ZONE_AXFR) {
                 atomic_fetch_sub(&entry->active_axfr, 1);
                 allowed = false;
@@ -1969,9 +2029,22 @@ process_tcp_client: ;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
-                  args->req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
+                  args->req_len = msg_len > sizeof(args->req) ? sizeof(args->req) : msg_len;
                   memcpy(args->req, msg, args->req_len);
-                  args->tsig_key = matched_key;
+                  if (matched_key) {
+                    args->has_tsig = true;
+                    strncpy(args->tsig_name, matched_key->name ? matched_key->name : "", sizeof(args->tsig_name) - 1);
+                    args->tsig_name[sizeof(args->tsig_name) - 1] = '\0';
+                    strncpy(args->tsig_algorithm, matched_key->algorithm ? matched_key->algorithm : "", sizeof(args->tsig_algorithm) - 1);
+                    args->tsig_algorithm[sizeof(args->tsig_algorithm) - 1] = '\0';
+                    args->tsig_secret_decoded_len = matched_key->secret_decoded_len;
+                    if (args->tsig_secret_decoded_len > sizeof(args->tsig_secret_decoded))
+                      args->tsig_secret_decoded_len = sizeof(args->tsig_secret_decoded);
+                    memcpy(args->tsig_secret_decoded, matched_key->secret_decoded, args->tsig_secret_decoded_len);
+                  } else {
+                    args->has_tsig = false;
+                    args->tsig_secret_decoded_len = 0;
+                  }
                   args->tsig_mac_len = tsig_mac_len;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
@@ -1992,7 +2065,6 @@ process_tcp_client: ;
                     allowed = false;
                   } else {
                     pthread_detach(t);
-                    release_zone_snapshot(snap);
                     free(ctx_tcp);
                     client_closed = true;
                     for (int j = i + 1; j < n_events; j++) {
@@ -2031,20 +2103,31 @@ process_tcp_client: ;
                 res_buf[11] = arcount & 0xFF;
                 copy_len = offset;
 
+                int sign_rc = 0;
                 if (matched_key)
-                  tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
-                                   matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
+                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
+                                             matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
                 else {
                   tsig_key_t dummy = {0};
                   dummy.name = (zcfg && zcfg->tsig_keys_count > 0) ? zcfg->tsig_keys[0] : (zcfg ? zcfg->tsig_key : "unknown");
                   dummy.algorithm = "hmac-sha256";
-                  tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
-                                   17, tsig_mac, &tsig_mac_len, NULL, 0, false);
+                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
+                                             17, tsig_mac, &tsig_mac_len, NULL, 0, false);
+                }
+                if (sign_rc != 0) {
+                  release_config_snapshot(cfg);
+                  release_zone_snapshot(snap);
+                  close(client_fd);
+                  dec_tcp_clients();
+                  free(ctx_tcp);
+                  client_closed = true;
+                  rcu_reader_exit(ctx);
+                  break;
                 }
               } else {
                 res_buf[2] |= 0x84;
                 res_buf[3] |= 0x05;
-                add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
+                add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
                 
                 uint16_t qd = (msg[4] << 8) | msg[5];
                 uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
@@ -2058,6 +2141,7 @@ process_tcp_client: ;
                 res_buf[11] = arcount & 0xFF;
                 copy_len = offset;
               }
+              release_config_snapshot(cfg);
               release_zone_snapshot(snap);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
@@ -2089,10 +2173,9 @@ process_tcp_client: ;
               kevent(kq, ev_del_syn, 2, NULL, 0, NULL);
 
               async_io_task_t task = {0};
-              task.owner_ctx = ctx;
               task.is_tcp = true;
               task.client_fd = client_fd;
-              task.req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
+              task.req_len = msg_len > sizeof(task.req_buf) ? sizeof(task.req_buf) : msg_len;
               memcpy(task.req_buf, msg, task.req_len);
               strncpy(task.client_ip, ctx_tcp->client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
@@ -2109,9 +2192,9 @@ process_tcp_client: ;
               task.snap = snap;
               free(ctx_tcp);
 
+              rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(snap);
-                rcu_reader_exit(ctx);
                 close(client_fd);
                 dec_tcp_clients();
               }
@@ -2173,6 +2256,11 @@ process_tcp_client: ;
           uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
           release_config_snapshot(cfg);
 
+          // [Slowloris対策] 未完了データ受信中の場合は3秒タイムアウト
+          if (ctx_tcp->state == TCP_STATE_READ_BODY || ctx_tcp->accumulated > 0) {
+            idle_timeout = 3000;
+          }
+
           struct kevent evs[2];
           uint32_t to_ms = (processed_queries >= 16) ? 1 : idle_timeout;
           ctx_tcp->quota_yield = (processed_queries >= 16);
@@ -2204,6 +2292,8 @@ typedef enum {
 typedef struct ctrl_client {
   int fd;
   ctrl_state_t state;
+  time_t connect_time;
+  time_t last_active;
   char challenge[65];
   char buf[1024];
   size_t buf_len;
@@ -2319,18 +2409,8 @@ static const char *find_configured_domain(const char *arg, char *out_buf, size_t
   server_config_t *active = acquire_config_snapshot();
   if (!active) return out_buf;
   zone_config_t *zcfg = active->zones;
-  size_t arg_len = strlen(arg);
   while (zcfg) {
-    size_t z_len = strlen(zcfg->domain);
-    if (strcasecmp(zcfg->domain, arg) == 0) {
-      snprintf(out_buf, out_size, "%s", zcfg->domain);
-      break;
-    }
-    if (arg_len + 1 == z_len && zcfg->domain[z_len - 1] == '.' && strncasecmp(zcfg->domain, arg, arg_len) == 0) {
-      snprintf(out_buf, out_size, "%s", zcfg->domain);
-      break;
-    }
-    if (z_len + 1 == arg_len && arg[arg_len - 1] == '.' && strncasecmp(zcfg->domain, arg, z_len) == 0) {
+    if (domain_names_match_ci(zcfg->domain, arg)) {
       snprintf(out_buf, out_size, "%s", zcfg->domain);
       break;
     }
@@ -2417,6 +2497,8 @@ void *control_thread_func(void *arg) {
           }
           c->fd = cfd;
           c->state = CTRL_STATE_NEW;
+          c->connect_time = time(NULL);
+          c->last_active = c->connect_time;
           c->next = g_ctrl_clients;
           g_ctrl_clients = c;
           
@@ -2454,6 +2536,7 @@ void *control_thread_func(void *arg) {
           free_ctrl_client(cfd);
           continue;
         }
+        c->last_active = time(NULL);
         c->buf_len += r;
         c->buf[c->buf_len] = '\0';
         
@@ -2552,6 +2635,9 @@ void *control_thread_func(void *arg) {
                             break;
                         case RELOAD_ERR_MISSING_SOA:
                             send(cfd, "ERROR missing SOA\n", 18, 0);
+                            break;
+                        case RELOAD_ERR_BUSY:
+                            send(cfd, "ERROR busy (AXFR in progress)\n", 30, 0);
                             break;
                     }
                   } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {
@@ -2755,6 +2841,27 @@ void *control_thread_func(void *arg) {
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
+        // Check control clients timeout: 5s unauthenticated or 15s inactive
+        ctrl_client_t *curr_c = g_ctrl_clients;
+        while (curr_c) {
+          ctrl_client_t *next_c = curr_c->next;
+          bool timed_out = false;
+          if (curr_c->state != CTRL_STATE_CMD_WAIT) {
+            if (now - curr_c->connect_time >= 5) {
+              timed_out = true;
+            }
+          } else {
+            if (now - curr_c->last_active >= 15) {
+              timed_out = true;
+            }
+          }
+          if (timed_out) {
+            syslog(LOG_WARNING, "[Control] Disconnecting idle/unauthenticated control client fd %d", curr_c->fd);
+            free_ctrl_client(curr_c->fd);
+          }
+          curr_c = next_c;
+        }
+
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_zone_snapshot();
         if (snap) {
@@ -3425,6 +3532,12 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             break; // EAGAIN
 
           udp_ipc_t *msg = (udp_ipc_t *)buffer;
+          ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
+          if (msg->payload_len > max_valid_payload) {
+            syslog(LOG_WARNING, "[Frontend %d] Dropping NOTIFY message with inconsistent payload_len (%u > %zd)",
+                   router_id, msg->payload_len, max_valid_payload);
+            continue;
+          }
           if (msg->sock_fd_idx == -2) {
             syslog(LOG_NOTICE, "[Frontend %d] Received stop command from backend. Shutting down cleanly.", router_id);
             exit(0);
@@ -3707,10 +3820,14 @@ static pid_t g_supervisor_pid = 0;
 static char g_pid_file_path[1024] = "";
 static int g_pid_fd = -1;
 static volatile sig_atomic_t g_supervisor_should_exit = 0;
+static volatile sig_atomic_t g_supervisor_got_sighup = 0;
 
 static void supervisor_sig_handler(int sig) {
-  (void)sig;
-  g_supervisor_should_exit = 1;
+  if (sig == SIGHUP) {
+    g_supervisor_got_sighup = 1;
+  } else {
+    g_supervisor_should_exit = 1;
+  }
 }
 
 static void cleanup_pid_file(void) {
@@ -4073,13 +4190,22 @@ int main(int argc, char **argv) {
     strncpy(dir_buf, sock_path, sizeof(dir_buf) - 1);
     dir_buf[sizeof(dir_buf) - 1] = '\0';
     char *slash = strrchr(dir_buf, '/');
+    const char *leaf_name = sock_path;
+    int dir_fd = -1;
     if (slash && slash != dir_buf) {
       *slash = '\0';
+      leaf_name = strrchr(sock_path, '/') + 1;
       if (!ensure_priv_dir_safe(dir_buf)) {
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
         return 1;
       }
+      dir_fd = open(dir_buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } else if (slash == dir_buf) {
+      leaf_name = sock_path + 1;
+      dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } else {
+      dir_fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     }
     strncpy(un.sun_path, sock_path, sizeof(un.sun_path) - 1);
     unlink(un.sun_path);
@@ -4099,14 +4225,18 @@ int main(int argc, char **argv) {
               struct group *grp = getgrnam(cfg->group);
               if (grp) target_gid = grp->gr_gid;
             }
-            /* [SEC] chown(path) は TOCTOU/シンボリックリンク攻撃に脆弱
-             * (bind()でノード作成後、chown()実行までの間に攻撃者が
-             * un.sun_path を任意ファイルへのシンボリックリンクに差し替える
-             * 競合が可能)。既に確立済みの g_control_sock の fd に対して
-             * fchown() を行うことで、パス再解決を一切行わずに所有者変更
-             * でき、この種のレースを構造的に排除できる。 */
-            fchown(g_control_sock, target_uid, target_gid);
+            /* [SEC] ソケットFDに対する fchown() は FreeBSD で EINVAL となるため、
+             * 事前に O_DIRECTORY で開いた安全なディレクトリFD (dir_fd) と
+             * AT_SYMLINK_NOFOLLOW を用いて fchownat() を実行し、
+             * TOCTOU/シンボリックリンク攻撃を防ぎつつ所有者を変更する。 */
+            if (dir_fd >= 0) {
+              fchownat(dir_fd, leaf_name, target_uid, target_gid, AT_SYMLINK_NOFOLLOW);
+            }
           }
+        }
+        if (dir_fd >= 0) {
+          close(dir_fd);
+          dir_fd = -1;
         }
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         cap_rights_t ctrl_rights;
@@ -4116,8 +4246,17 @@ int main(int argc, char **argv) {
         syslog(LOG_ERR, "Failed to bind control socket: %m");
         close(g_control_sock);
         g_control_sock = -1;
+        if (dir_fd >= 0) {
+          close(dir_fd);
+          dir_fd = -1;
+        }
       }
       umask(old_mask);
+    } else {
+      if (dir_fd >= 0) {
+        close(dir_fd);
+        dir_fd = -1;
+      }
     }
   }
 
@@ -4131,6 +4270,11 @@ int main(int argc, char **argv) {
 
   if (backend_pid > 0) {
     // === Parent Process (Process Manager / Supervisor) ===
+    sigset_t unblock_set;
+    sigemptyset(&unblock_set);
+    sigaddset(&unblock_set, SIGHUP);
+    sigprocmask(SIG_UNBLOCK, &unblock_set, NULL);
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = supervisor_sig_handler;
@@ -4138,6 +4282,7 @@ int main(int argc, char **argv) {
     sa.sa_flags = 0;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
     pid_t router_pids[MAX_FRONTEND_ROUTERS];
     for (int r = 0; r < g_num_frontend_routers; r++) {
@@ -4189,6 +4334,11 @@ int main(int argc, char **argv) {
     pid_t dead = 0;
     int child_exit_code = 0;
     while (!g_supervisor_should_exit) {
+      if (g_supervisor_got_sighup) {
+        g_supervisor_got_sighup = 0;
+        syslog(LOG_INFO, "[Manager] Received SIGHUP. Forwarding to backend process %d", backend_pid);
+        kill(backend_pid, SIGHUP);
+      }
       int status;
       dead = wait(&status);
       if (dead > 0) {

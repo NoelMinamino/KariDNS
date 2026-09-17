@@ -1,5 +1,6 @@
 #include "dns_zone_parser.h"
 #include "dns_utils.h"
+#include <ctype.h>
 
 static void unescape_string_in_place(char *str) {
     if (!str) return;
@@ -8,13 +9,12 @@ static void unescape_string_in_place(char *str) {
     while (*read) {
         if (*read == '\\' && *(read + 1)) {
             read++;
-            // 【修正箇所】 8進数 (0-7) 3桁の検証と計算
-            if (*read >= '0' && *read <= '7' && 
-                *(read+1) >= '0' && *(read+1) <= '7' && 
-                *(read+2) >= '0' && *(read+2) <= '7') {
+            // RFC 1035 §5.1: \DDD は 000 から 255 までの 10 進数 3 桁
+            if (isdigit((unsigned char)*read) && 
+                isdigit((unsigned char)*(read+1)) && 
+                isdigit((unsigned char)*(read+2))) {
                 
-                // 8進数の各桁を重み付け (64, 8, 1) して加算
-                int val = (*read - '0') * 64 + (*(read+1) - '0') * 8 + (*(read+2) - '0');
+                int val = (*read - '0') * 100 + (*(read+1) - '0') * 10 + (*(read+2) - '0');
                 if (val <= 255) {
                     *write++ = (char)val;
                     read += 3;
@@ -175,7 +175,7 @@ static char *expand_domain_name(char *name, const char *origin,
     fqdn[o_len + 1] = '\0';
     return fqdn;
   }
-  if (!origin) {
+  if (!origin || strcmp(origin, ".") == 0 || origin[0] == '\0') {
     char *fqdn = (char *)arena_alloc(arena, n_len + 2);
     if (!fqdn)
       return name;
@@ -1756,7 +1756,7 @@ int validate_zone_dname(zone_arena_t *arena, parse_error_t *err) {
     dns_record_t *rec = &arena->records[i];
     if (!rec->name) continue;
     const char *parent = rec->name;
-    while ((parent = strchr(parent, '.')) != NULL) {
+    while ((parent = strchr_unescaped(parent, '.')) != NULL) {
       parent++;
       if (*parent == '\0') break;
       uint32_t p_hash = calc_fnv1a_str(parent);

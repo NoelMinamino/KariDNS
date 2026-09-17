@@ -42,13 +42,17 @@ void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_are
   if (!old_arena->hash_table || !new_arena->hash_table) return;
   uint32_t old_serial = 0, new_serial = 0;
   for (size_t i = 0; i < old_arena->count; i++) {
-    if (old_arena->records[i].type_code == 6 && old_arena->records[i].rdata_count >= 3 && old_arena->records[i].rdata[2]) {
+    if (old_arena->records[i].type_code == 6 &&
+        domain_names_match_ci(old_arena->records[i].name, entry->domain) &&
+        old_arena->records[i].rdata_count >= 3 && old_arena->records[i].rdata[2]) {
       old_serial = strtoul(old_arena->records[i].rdata[2], NULL, 10);
       break;
     }
   }
   for (size_t i = 0; i < new_arena->count; i++) {
-    if (new_arena->records[i].type_code == 6 && new_arena->records[i].rdata_count >= 3 && new_arena->records[i].rdata[2]) {
+    if (new_arena->records[i].type_code == 6 &&
+        domain_names_match_ci(new_arena->records[i].name, entry->domain) &&
+        new_arena->records[i].rdata_count >= 3 && new_arena->records[i].rdata[2]) {
       new_serial = strtoul(new_arena->records[i].rdata[2], NULL, 10);
       break;
     }
@@ -368,11 +372,20 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       rec->ecs_subnet_tag = arena_strdup(standby, session->current_ecs_tag);
     }
     size_t name_len = strlen(rec->name);
-    if (name_len < domain_len ||
-        strcasecmp(rec->name + name_len - domain_len, domain) != 0)
+    size_t dlen = domain_len;
+    if (dlen > 0 && domain[dlen - 1] == '.') dlen--;
+    size_t nlen = name_len;
+    if (nlen > 0 && rec->name[nlen - 1] == '.') nlen--;
+    if (nlen < dlen)
       return -1;
-    if (name_len > domain_len && rec->name[name_len - domain_len - 1] != '.')
-      return -1;
+    if (nlen == dlen) {
+      if (strncasecmp(rec->name, domain, dlen) != 0)
+        return -1;
+    } else {
+      if (rec->name[nlen - dlen - 1] != '.' ||
+          strncasecmp(rec->name + nlen - dlen, domain, dlen) != 0)
+        return -1;
+    }
     if (type == 6) {
       session->soa_count++;
       uint32_t current_serial = strtoul(rec->rdata[2], NULL, 10);
@@ -408,7 +421,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         session->is_deleting = false;
         for (size_t k = 0; k < standby->count - 1; k++) {
           if (standby->records[k].type_code == 6 &&
-              strcasecmp(standby->records[k].name, domain) == 0) {
+              domain_names_match_ci(standby->records[k].name, domain)) {
             standby->records[k] = standby->records[standby->count - 1];
             standby->count--;
             break;
@@ -423,7 +436,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           standby->count--;
         }
       } else {
-        if (strcasecmp(session->initial_soa_name, rec->name) == 0 &&
+        if (domain_names_match_ci(session->initial_soa_name, rec->name) &&
             session->initial_soa_serial == current_serial) {
           session->is_finished = true;
           standby->count--;
@@ -541,6 +554,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         bool has_soa = false;
         for (size_t k = 0; k < tmp_arena.count; k++) {
           if (tmp_arena.records[k].type_code == 6 &&
+              domain_names_match_ci(tmp_arena.records[k].name, entry->domain) &&
               tmp_arena.records[k].rdata_count >= 7) {
             serial = strtoul(tmp_arena.records[k].rdata[2], NULL, 10);
             refresh = parse_ttl_value(tmp_arena.records[k].rdata[3]);
@@ -778,8 +792,17 @@ void *axfr_bg_thread_func(void *arg) {
     size_t req_mac_len = 0;
     if (tsig_key_ptr) {
       size_t p_len = req_len - 2;
-      tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
-                       tsig_key_ptr, 0, req_mac, &req_mac_len, NULL, 0, false);
+      if (tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
+                           tsig_key_ptr, 0, req_mac, &req_mac_len, NULL, 0, false) != 0) {
+        syslog(LOG_ERR, "[AXFR] Failed to TSIG-sign request for zone %s", ctx->domain);
+        free(stream_ctx);
+        close(tcp_fd);
+        if (ctx->entry)
+          atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
+        free(ctx);
+        atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
+        pthread_exit(NULL);
+      }
       req_len = p_len + 2;
     }
     uint16_t msg_len = req_len - 2;
@@ -939,7 +962,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   int soa_idx = -1;
   for (size_t i = 0; i < current_zone->count; i++) {
     if (current_zone->records[i].type_code == 6 &&
-        strcasecmp(current_zone->records[i].name, entry->domain) == 0) {
+        domain_names_match_ci(current_zone->records[i].name, entry->domain)) {
       soa_idx = i;
       break;
     }
@@ -1016,7 +1039,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     } \
     if (tsig_key) { \
       size_t sign_len = prev_offset; \
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, NULL, 0, is_subsequent); \
+      if (tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, NULL, 0, is_subsequent) != 0) goto axfr_error; \
       is_subsequent = true; \
       prev_offset = sign_len; \
     } \
@@ -1036,14 +1059,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     \
     memset(&comp_ctx, 0, sizeof(comp_ctx)); \
     compress_ctx_init_packet(&comp_ctx); \
-    /* q_offset までスキップした状態で、自身(質問セクション)の名前を圧縮テーブルに登録 */ \
-    size_t dummy_off = DNS_HEADER_SIZE; \
-    char *dummy_name = NULL; \
-    /* 【修正】第5引数を active から current_zone に変更 */ \
-    if (expand_wire_name(res, q_offset, dummy_off, &dummy_off, current_zone, &dummy_name) == 0 && dummy_name) { \
-        uint16_t reg_off = DNS_HEADER_SIZE; \
-        write_dns_name_str(res, &reg_off, dummy_name, &comp_ctx, 65535); \
-    } \
+    /* パケットバッファを破壊せず質問セクションの名前を圧縮テーブルに登録 */ \
+    register_wire_name_for_compression(res, DNS_HEADER_SIZE, &comp_ctx); \
     \
     if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
       syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer", \
@@ -1273,8 +1290,10 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
     if (tsig_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
-                       &tsig_mac_len, NULL, 0, is_subsequent);
+      if (tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
+                           &tsig_mac_len, NULL, 0, is_subsequent) != 0) {
+        goto axfr_error;
+      }
       offset = sign_len;
     }
     uint8_t len_prefix[2] = {offset >> 8, offset & 0xFF};
@@ -1309,8 +1328,18 @@ void *axfr_worker_thread(void *arg) {
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
+  tsig_key_t key_val;
+  tsig_key_t *pkey = NULL;
+  if (args->has_tsig) {
+    memset(&key_val, 0, sizeof(key_val));
+    key_val.name = args->tsig_name;
+    key_val.algorithm = args->tsig_algorithm;
+    key_val.secret_decoded_len = args->tsig_secret_decoded_len;
+    memcpy(key_val.secret_decoded, args->tsig_secret_decoded, args->tsig_secret_decoded_len);
+    pkey = &key_val;
+  }
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
-                     args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len,
+                     pkey, entry, args->tsig_mac, args->tsig_mac_len,
                      &args->client_addr, args->client_len,
                      args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
   

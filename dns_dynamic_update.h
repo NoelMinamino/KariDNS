@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include "dns_server_internal.h"
 
-uint32_t bump_soa_serial_in_arena(zone_arena_t *arena);
+uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name);
 int handle_dynamic_update(const uint8_t *req, size_t req_len,
                           zone_db_entry_t *entry,
                           const char *client_ip,

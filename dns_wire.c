@@ -490,16 +490,13 @@ static int parse_label(const char *name, uint8_t *label_out, const char **next_p
         if (*p == '\\') {
             p++;
             if (!*p) return -1; // dangling backslash
-            // 【修正】'0' から '7' までの3桁の「8進数」としてパースする
-            if (*p >= '0' && *p <= '7') {
-                int val = 0;
-                for (int i = 0; i < 3 && *p >= '0' && *p <= '7'; i++) {
-                    val = (val << 3) + (*p - '0'); // 8進数なので << 3 (つまり * 8)
-                    p++;
-                }
+            // RFC 1035 §5.1: 000-255 の 3 桁 10 進数
+            if (isdigit((unsigned char)*p) && isdigit((unsigned char)*(p + 1)) && isdigit((unsigned char)*(p + 2))) {
+                int val = (*p - '0') * 100 + (*(p + 1) - '0') * 10 + (*(p + 2) - '0');
                 if (val > 255) return -1;
                 if (len >= 63) return -1;
                 label_out[len++] = (uint8_t)val;
+                p += 3;
             } else {
                 if (len >= 63) return -1;
                 label_out[len++] = (uint8_t)*p++;
@@ -869,6 +866,10 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
 
         if (offset + 10 > packet_len) return -1;
+        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
+        if (i < ancount + nscount + arcount - 1 && type == 250) {
+            return -1; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
+        }
         uint16_t rdlen = (packet[offset+8] << 8) | packet[offset+9];
         offset += 10 + rdlen;
     }
@@ -896,12 +897,14 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
     uint64_t upper = (UINT64_MAX - fudge < time_signed) ? UINT64_MAX : time_signed + fudge;
     uint64_t lower = (time_signed < fudge) ? 0 : time_signed - fudge;
-    if (now > upper || now < lower) return 18; // BADTIME
     tsig_p += 8;
     uint16_t mac_size = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     if (tsig_p + mac_size + 6 > packet_len) return -1;
     const uint8_t *mac = &packet[tsig_p]; tsig_p += mac_size;
     uint16_t orig_id = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
+    if (!is_subsequent && orig_id != (((uint16_t)packet[0] << 8) | packet[1])) {
+        return 16; // BADSIG per RFC 8945 §5.3.1
+    }
     uint16_t err = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     uint16_t other_len = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     if (tsig_p + other_len > packet_len) return -1;
@@ -972,6 +975,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     }
     /* [T8] 元の if/else 両分岐の重複 const_time_memcmp を統合 */
     if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+    if (now > upper || now < lower) return 18; // BADTIME (RFC 8945 §5.3.1)
     if (mac_out && mac_len_out) {
         *mac_len_out = mac_size;
         memcpy(mac_out, mac, mac_size);
@@ -997,6 +1001,10 @@ bool packet_has_tsig(const uint8_t *packet, size_t packet_len) {
         if (offset >= packet_len) return false;
         if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
         if (offset + 10 > packet_len) return false;
+        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
+        if (i < ancount + nscount + arcount - 1 && type == 250) {
+            return false; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
+        }
         uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
         offset += 10 + rdlen;
     }
@@ -2966,6 +2974,11 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         if (rdata_offset + opt_len > rdata_end) break;
                         
                         if (opt_code == 10) { // DNS Cookie
+                            if (edns->has_cookie || edns->has_malformed_cookie) {
+                                // RFC 7873 §5.2: 最初の COOKIE のみを採用し、以降は無視
+                                rdata_offset += opt_len;
+                                continue;
+                            }
                             if (opt_len == 8 || (opt_len >= 16 && opt_len <= 40)) {
                                 edns->has_cookie = true;
                                 memcpy(edns->client_cookie, req + rdata_offset, 8);
@@ -2997,6 +3010,10 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         } else if (opt_code == 3) { // NSID
                             edns->has_nsid_query = true;
                         } else if (opt_code == 11) { // edns-tcp-keepalive
+                            if (edns->has_keepalive_query) {
+                                rdata_offset += opt_len;
+                                continue;
+                            }
                             edns->has_keepalive_query = true;
                         } else if (opt_code == 21) {
                             edns->saw_invalid_mqtype_response_in_query = true;
@@ -3014,17 +3031,34 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                 }
                             }
                         } else if (opt_code == 8) { // EDNS Client Subnet (RFC 7871)
-                            if (opt_len >= 4) {
-                                edns->has_ecs = true;
-                                edns->ecs_family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
-                                edns->ecs_source_prefix = req[rdata_offset + 2];
-                                edns->ecs_scope_prefix = req[rdata_offset + 3];
-                                memset(edns->ecs_addr, 0, sizeof(edns->ecs_addr));
-                                size_t addr_len = opt_len - 4;
-                                if (addr_len > sizeof(edns->ecs_addr)) {
-                                    addr_len = sizeof(edns->ecs_addr);
-                                }
-                                memcpy(edns->ecs_addr, req + rdata_offset + 4, addr_len);
+                            if (edns->has_ecs) {
+                                rdata_offset += opt_len;
+                                continue;
+                            }
+                            if (opt_len < 4) return -1;
+                            uint16_t family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
+                            if (family != 1 && family != 2) return -1;
+                            uint8_t source_prefix = req[rdata_offset + 2];
+                            if (family == 1 && source_prefix > 32) return -1;
+                            if (family == 2 && source_prefix > 128) return -1;
+                            uint8_t scope_prefix = req[rdata_offset + 3];
+                            if (scope_prefix != 0) return -1;
+                            size_t expected_addr_len = (source_prefix + 7) / 8;
+                            size_t actual_addr_len = opt_len - 4;
+                            if (actual_addr_len != expected_addr_len) return -1;
+                            if (source_prefix % 8 != 0) {
+                                uint8_t pad_mask = (uint8_t)((1u << (8 - (source_prefix % 8))) - 1);
+                                uint8_t last_byte = req[rdata_offset + 4 + expected_addr_len - 1];
+                                if ((last_byte & pad_mask) != 0) return -1;
+                            }
+                            edns->has_ecs = true;
+                            edns->ecs_family = family;
+                            edns->ecs_source_prefix = source_prefix;
+                            edns->ecs_scope_prefix = scope_prefix;
+                            memset(edns->ecs_addr, 0, sizeof(edns->ecs_addr));
+                            size_t copy_len = actual_addr_len > sizeof(edns->ecs_addr) ? sizeof(edns->ecs_addr) : actual_addr_len;
+                            if (copy_len > 0) {
+                                memcpy(edns->ecs_addr, req + rdata_offset + 4, copy_len);
                             }
                         } else if (opt_code == EDNS_OPTION_KARIDNS_EXT) { // 65153
                             if (opt_len == 5) {
@@ -3191,6 +3225,7 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
 
 static bool name_is_in_zone(const char *name, const char *zone_name) {
     if (!name || !zone_name) return false;
+    if (strcmp(zone_name, ".") == 0) return true;
     size_t n_len = strlen(name);
     size_t z_len = strlen(zone_name);
     if (n_len < z_len) return false;
@@ -3234,7 +3269,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     offset += 4;
 
     if (ztype != 6) return 1; // SOA
-    if (strcasecmp(zname, zone_name) != 0) return 9; // NOTAUTH
+    if (!domain_names_match_ci(zname, zone_name)) return 9; // NOTAUTH
 
     // Prerequisite Section (3.2)
     if (build_zone_index(standby, true) != 0) return 2; // SERVFAIL on OOM
@@ -3244,6 +3279,8 @@ int process_update_sections(const uint8_t *req, size_t req_len,
         char *name;
         if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
         if (offset + 10 > req_len) return 1;
+        /* [RFC 2136 §3.2.5] PrerequisiteセクションのNAMEがゾーン外の場合はNOTZONE(10)を返却 */
+        if (!name_is_in_zone(name, zone_name)) return 10; // NOTZONE
         uint16_t type = (req[offset] << 8) | req[offset + 1];
         uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
         uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];
@@ -3317,7 +3354,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
         if (class_val == 255) { // ANY (Delete RRset/Domain)
             if (rdlen != 0) return 1;
             if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
-            if (type == 2 && strcasecmp(name, zone_name) == 0) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
+            if (type == 2 && domain_names_match_ci(name, zone_name)) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
             /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 (ADD分岐と同一のチェックを削除系にも追加) */
             if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
 
@@ -3328,7 +3365,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 if (strcasecmp(standby->records[k].name, name) == 0) {
                     if (type == 255 || standby->records[k].type_code == type) {
                         if (standby->records[k].type_code == 6) { continue; } // protect SOA
-                        if (standby->records[k].type_code == 2 && strcasecmp(name, zone_name) == 0) { continue; } // protect apex NS
+                        if (standby->records[k].type_code == 2 && domain_names_match_ci(name, zone_name)) { continue; } // protect apex NS
                         standby->records[k].name = NULL; // Tombstone delete
                     }
                 }

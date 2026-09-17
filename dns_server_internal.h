@@ -146,6 +146,7 @@ typedef struct {
   socklen_t server_len;
   bool has_server_addr;
   bool quota_yield;
+  struct timespec connect_time;
 } tcp_stream_ctx_t;
 
 typedef struct {

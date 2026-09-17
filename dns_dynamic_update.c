@@ -20,10 +20,11 @@
 #include <time.h>
 #include <unistd.h>
 
-uint32_t bump_soa_serial_in_arena(zone_arena_t *arena) {
+uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
+  if (!arena || !zone_name) return 0;
   uint32_t new_serial = 0;
   for (size_t i = 0; i < arena->count; i++) {
-    if (arena->records[i].type_code == 6 && arena->records[i].rdata_count >= 3) {
+    if (arena->records[i].type_code == 6 && domain_names_match_ci(arena->records[i].name, zone_name) && arena->records[i].rdata_count >= 3) {
       if (arena->records[i].rdata[2]) {
         uint32_t serial = strtoul(arena->records[i].rdata[2], NULL, 10);
         serial++;
@@ -67,7 +68,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
     return rcode;
   }
 
-  uint32_t new_serial = bump_soa_serial_in_arena(z_standby);
+  uint32_t new_serial = bump_soa_serial_in_arena(z_standby, entry->domain);
   if (new_serial != 0) {
     atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
   }

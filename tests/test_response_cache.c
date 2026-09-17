@@ -140,6 +140,8 @@ static void build_edns_ecs_query(uint8_t *buf, size_t *out_len, uint16_t txid, c
     buf[off++] = 0x00; // ext rcode
     buf[off++] = 0x00; // edns version 0
     buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    size_t expected_addr_len = (src_prefix + 7) / 8;
+    if (addr_len > expected_addr_len) addr_len = expected_addr_len;
     uint16_t opt_len = 4 + (uint16_t)addr_len;
     uint16_t rdlen = 4 + opt_len;
     buf[off++] = (uint8_t)(rdlen >> 8); buf[off++] = (uint8_t)(rdlen & 0xFF);
@@ -255,6 +257,8 @@ static void build_edns_cookie_ecs_query(uint8_t *buf, size_t *out_len, uint16_t 
     buf[off++] = 0x00; // ext rcode
     buf[off++] = 0x00; // edns version 0
     buf[off++] = 0x00; buf[off++] = 0x00; // flags
+    size_t expected_addr_len = (src_prefix + 7) / 8;
+    if (addr_len > expected_addr_len) addr_len = expected_addr_len;
     uint16_t ecs_opt_len = 4 + (uint16_t)addr_len;
     uint16_t cookie_opt_len = 8;
     uint16_t rdlen = (4 + cookie_opt_len) + (4 + ecs_opt_len);
