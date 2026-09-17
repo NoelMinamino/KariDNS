@@ -61,7 +61,7 @@ static bool zone_uses_nsec3(zone_arena_t *zone, const char *apex_name) {
        i = zone->records[i].next_record) {
     dns_record_t *rec = &zone->records[i];
     if (rec->type_code == 51 /* NSEC3PARAM */ &&
-        strcasecmp(rec->name, apex_name) == 0)
+        domain_names_match_ci(rec->name, apex_name))
       return true;
   }
   return false;
@@ -659,7 +659,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
     return false;
   time_t tinydns_now = (current_zone && current_zone->is_tinydns_format) ? time(NULL) : 0;
   const char *name = qname;
-  while (name && *name && strcasecmp(name, zone_apex) != 0) {
+  while (name && *name && !domain_names_match_ci(name, zone_apex)) {
     // RFC 4035 §3.1.4.1: 委任点そのもの(name == qname)へのDSクエリは、
     // 参照応答(referral)にせず、権威応答としてフェーズ2の通常検索へ継続させる。
     if (is_ds_query && name == qname) {
@@ -675,7 +675,7 @@ static bool find_delegation(zone_arena_t *current_zone, const char *qname,
          i = current_zone->records[i].next_record) {
       dns_record_t *rec = &current_zone->records[i];
       if (rec->type_code == 2 &&
-          strcasecmp(rec->name, name) == 0) {
+          domain_names_match_ci(rec->name, name)) {
         uint32_t eff_ttl;
         if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
         delegated = true;
@@ -1355,15 +1355,29 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       else
         res[3] &= 0xF0;
       if (!apex_hash_computed) {
-        apex_hash = calc_fnv1a_str(db_entry->domain);
+        const char *apex_lookup = db_entry->domain;
+        char dot_buf[256];
+        size_t dlen = strlen(apex_lookup);
+        if (dlen > 0 && apex_lookup[dlen - 1] != '.' && dlen + 2 <= sizeof(dot_buf)) {
+          memcpy(dot_buf, apex_lookup, dlen);
+          dot_buf[dlen] = '.';
+          dot_buf[dlen + 1] = '\0';
+          uint32_t dh = calc_fnv1a_str(dot_buf);
+          size_t di = dh & (current_zone->hash_size - 1);
+          if (current_zone->hash_table[di] != -1) {
+            apex_lookup = dot_buf;
+          }
+        }
+        apex_hash = calc_fnv1a_str(apex_lookup);
         apex_idx = apex_hash & (current_zone->hash_size - 1);
         apex_hash_computed = true;
       }
+      bool soa_found = false;
       for (int i = current_zone->hash_table[apex_idx]; i != -1;
            i = current_zone->records[i].next_record) {
         dns_record_t *rec = &current_zone->records[i];
         if (rec->type_code == 6 &&
-            strcasecmp(rec->name, db_entry->domain) == 0) {
+            domain_names_match_ci(rec->name, db_entry->domain)) {
           uint32_t eff_ttl;
           if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
           uint32_t minimum_ttl = 3600;
@@ -1385,7 +1399,37 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
               return;
             }
           }
+          soa_found = true;
           break;
+        }
+      }
+      if (!soa_found) {
+        for (size_t i = 0; i < current_zone->count; i++) {
+          dns_record_t *rec = &current_zone->records[i];
+          if (rec->type_code == 6 &&
+              domain_names_match_ci(rec->name, db_entry->domain)) {
+            uint32_t eff_ttl;
+            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+            uint32_t minimum_ttl = 3600;
+            if (rec->rdata_count >= 7)
+              minimum_ttl = parse_ttl_value(rec->rdata[6]);
+            dns_record_t rec_copy = *rec;
+            rec_copy.ttl_value = eff_ttl;
+            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
+                                     NULL, minimum_ttl) < 0) {
+              res[2] |= 0x02;
+              return;
+            } else
+              (*nscount)++;
+            if (dnssec_ok) {
+              if (!attach_covering_rrsig_ext(current_zone, apex_idx, db_entry->domain, NULL, 6,
+                                             res, max_res_len, offset, comp_ctx, nscount, minimum_ttl)) {
+                res[2] |= 0x02;
+                return;
+              }
+            }
+            break;
+          }
         }
       }
     }
@@ -1705,7 +1749,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
            i = current_zone->records[i].next_record) {
         dns_record_t *rec = &current_zone->records[i];
         if (rec->type_code == 2 &&
-            strcasecmp(rec->name, db_entry->domain) == 0) {
+            domain_names_match_ci(rec->name, db_entry->domain)) {
           uint32_t eff_ttl;
           if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
           dns_record_t rec_copy = *rec;
@@ -2317,12 +2361,17 @@ void spawn_program_zone_plugins(server_config_t *cfg) {
 }
 
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
+  if (!snap) return NULL;
   for (size_t i = 0; i < snap->view_count; i++) {
     if (snap->views[i].match_clients_parsed && snap->views[i].match_clients_count > 0) {
       if (check_acl_bin(client_ip, snap->views[i].match_clients_parsed, snap->views[i].match_clients_count)) {
         return &snap->views[i];
       }
-    } else if (check_acl(client_ip, snap->views[i].match_clients, snap->views[i].match_clients_count)) {
+    } else if (snap->views[i].match_clients && snap->views[i].match_clients_count > 0) {
+      if (check_acl(client_ip, snap->views[i].match_clients, snap->views[i].match_clients_count)) {
+        return &snap->views[i];
+      }
+    } else {
       return &snap->views[i];
     }
   }
@@ -2518,8 +2567,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (out_rrl_cfg) {
-    *out_rrl_cfg = &cfg->rrl;
-    if (db_entry && view) {
+    *out_rrl_cfg = cfg ? &cfg->rrl : NULL;
+    if (db_entry && view && cfg) {
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->rrl.configured) {
         *out_rrl_cfg = &zcfg->rrl;
@@ -2565,6 +2614,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   server_config_t *cfg_for_ede = cfg;
+  bool send_ede = (cfg_for_ede != NULL && cfg_for_ede->send_extended_errors);
   
   if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
     edns.has_mqtype_query = false;
@@ -2614,7 +2664,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
     res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
-    add_ede(&edns, cfg_for_ede->send_extended_errors, 21, "This opcode is not supported by this server");
+    add_ede(&edns, send_ede, 21, "This opcode is not supported by this server");
     
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     res[6] = 0; res[7] = 0; // ANCOUNT = 0
@@ -2636,7 +2686,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
     res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
-    add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
+    add_ede(&edns, send_ede, 0, NULL);
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
     res[6] = 0; res[7] = 0; // ANCOUNT = 0
     res[8] = 0; res[9] = 0; // NSCOUNT = 0
@@ -2779,10 +2829,10 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     } else {
       if (attempted_key || has_tsig) {
           res[3] = (res[3] & 0xF0) | 9; // NOTAUTH
-          add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Invalid TSIG");
+          add_ede(&edns, send_ede, 18, "Invalid TSIG");
       } else {
           res[3] = (res[3] & 0xF0) | 5; // REFUSED
-          add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
+          add_ede(&edns, send_ede, 18, "Query refused due to access control");
       }
     }
     uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
@@ -2902,13 +2952,13 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key ? matched_key->name : "<none>");
     } else if (auth && !zone_is_master) {
       rcode = 9; // NOTAUTH (RFC 2136 §3.8: Server is not the primary for the zone)
-      add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not the primary for the zone");
+      add_ede(&edns, send_ede, 20, "This server is not the primary for the zone");
     } else {
       if (attempted_key || has_tsig) {
         rcode = 9; // NOTAUTH
-        add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Invalid TSIG");
+        add_ede(&edns, send_ede, 18, "Invalid TSIG");
       } else {
-        add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control");
+        add_ede(&edns, send_ede, 18, "Query refused due to access control");
       }
     }
     
@@ -2983,8 +3033,10 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
               }
           }
           if (!valid) {
-              is_badcookie = true;
-              ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
+              if (!is_tcp) {
+                  is_badcookie = true;
+                  ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
+              }
               if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
                   edns.server_cookie_len = 0;
                   edns.has_cookie = false;
@@ -3004,7 +3056,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     memcpy(res, req, copy_len);
     res[2] |= 0x80;
     res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
-    add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
+    add_ede(&edns, send_ede, 0, NULL);
     uint16_t offset = copy_len;
     uint16_t arcount = 0;
     res[6] = 0; res[7] = 0; // ANCOUNT = 0
@@ -3019,12 +3071,13 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (db_entry && db_entry->expire > 0) {
         time_t last_ok = atomic_load_explicit(&db_entry->last_successful_transfer, memory_order_acquire);
         if (last_ok > 0 && (time(NULL) - last_ok) > (time_t)db_entry->expire) {
-            if (!cfg_for_ede->serve_stale) {
+            bool serve_stale = (cfg_for_ede != NULL && cfg_for_ede->serve_stale);
+            if (!serve_stale) {
                 size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
                 memcpy(res, req, copy_len);
                 res[2] |= 0x80;
                 res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
-                add_ede(&edns, cfg_for_ede->send_extended_errors, 3, "Zone expired (SOA EXPIRE exceeded)");
+                add_ede(&edns, send_ede, 3, "Zone expired (SOA EXPIRE exceeded)");
                 uint16_t offset = copy_len;
                 uint16_t arcount = 0;
                 res[6] = 0; res[7] = 0; // ANCOUNT = 0
@@ -3036,7 +3089,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                 res[11] = arcount & 0xFF;
                 return offset;
             } else {
-                add_ede(&edns, cfg_for_ede->send_extended_errors, 3, "Stale Answer (Zone EXPIRED)");
+                add_ede(&edns, send_ede, 3, "Stale Answer (Zone EXPIRED)");
             }
         }
     }
@@ -3067,7 +3120,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       memcpy(res, req, copy_len);
       res[2] |= 0x80;
       res[3] = (res[3] & 0xF0) | 0x05; // REFUSED
-      add_ede(&edns, cfg_for_ede->send_extended_errors, 0, NULL);
+      add_ede(&edns, send_ede, 0, NULL);
       uint16_t offset = copy_len;
       uint16_t arcount = 0;
       res[6] = 0; res[7] = 0; // ANCOUNT = 0
@@ -3123,9 +3176,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   if (!current_zone) {
     res[3] = (res[3] & 0xF0) | 5;
     if (!view) {
-      add_ede(&edns, cfg_for_ede->send_extended_errors, 18, "Query refused due to access control (no view matched)");
+      add_ede(&edns, send_ede, 18, "Query refused due to access control (no view matched)");
     } else {
-      add_ede(&edns, cfg_for_ede->send_extended_errors, 20, "This server is not authoritative for the queried zone");
+      add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
     }
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
@@ -3138,7 +3191,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (current_zone->count == 0) {
     res[3] = (res[3] & 0xF0) | 2; // SERVFAIL
-    add_ede(&edns, cfg_for_ede->send_extended_errors, 14, "Zone not ready (empty)");
+    add_ede(&edns, send_ede, 14, "Zone not ready (empty)");
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
     if (edns.present) {
@@ -3156,6 +3209,20 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
     }
+    *res_arcount = htons(arcount);
+    return offset;
+  }
+
+  if (is_badcookie) {
+    res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
+    res[3] = (res[3] & 0xF0) | 0x07; // BADCOOKIE (Base RCODE 7)
+    uint16_t offset = q_offset;
+    uint16_t arcount = 0;
+    if (edns.present) {
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+    }
+    *res_ancount = 0;
+    *res_nscount = 0;
     *res_arcount = htons(arcount);
     return offset;
   }
@@ -3214,7 +3281,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     for (int i = current_zone->hash_table[apex_idx]; i != -1;
          i = current_zone->records[i].next_record) {
       if (current_zone->records[i].type_code == 6 &&
-          strcasecmp(current_zone->records[i].name, db_entry->domain) == 0) {
+          domain_names_match_ci(current_zone->records[i].name, db_entry->domain)) {
         soa_rec = &current_zone->records[i];
         break;
       }
@@ -3222,7 +3289,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (!soa_rec) {
       for (size_t i = 0; i < current_zone->count; i++) {
         if (current_zone->records[i].type_code == 6 &&
-            strcasecmp(current_zone->records[i].name, db_entry->domain) == 0) {
+            domain_names_match_ci(current_zone->records[i].name, db_entry->domain)) {
           soa_rec = &current_zone->records[i];
           break;
         }

@@ -3248,7 +3248,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     offset += 4;
 
     if (ztype != 6) return 1; // SOA
-    if (strcasecmp(zname, zone_name) != 0) return 9; // NOTAUTH
+    if (!domain_names_match_ci(zname, zone_name)) return 9; // NOTAUTH
 
     // Prerequisite Section (3.2)
     if (build_zone_index(standby, true) != 0) return 2; // SERVFAIL on OOM
@@ -3333,7 +3333,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
         if (class_val == 255) { // ANY (Delete RRset/Domain)
             if (rdlen != 0) return 1;
             if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
-            if (type == 2 && strcasecmp(name, zone_name) == 0) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
+            if (type == 2 && domain_names_match_ci(name, zone_name)) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
             /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 (ADD分岐と同一のチェックを削除系にも追加) */
             if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
 
@@ -3344,7 +3344,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
                 if (strcasecmp(standby->records[k].name, name) == 0) {
                     if (type == 255 || standby->records[k].type_code == type) {
                         if (standby->records[k].type_code == 6) { continue; } // protect SOA
-                        if (standby->records[k].type_code == 2 && strcasecmp(name, zone_name) == 0) { continue; } // protect apex NS
+                        if (standby->records[k].type_code == 2 && domain_names_match_ci(name, zone_name)) { continue; } // protect apex NS
                         standby->records[k].name = NULL; // Tombstone delete
                     }
                 }

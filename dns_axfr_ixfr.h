@@ -40,7 +40,7 @@ typedef struct {
   uint16_t qtype;
   bool has_edns;
   bool dnssec_ok;
-  uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
+  uint8_t req[BUFFER_SIZE];
   uint16_t req_len;
   bool has_tsig;
   char tsig_name[256];

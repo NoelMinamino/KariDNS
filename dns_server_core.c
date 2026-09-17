@@ -2003,17 +2003,9 @@ process_tcp_client: ;
                   allowed = tsig_ok;
               }
             }
-            release_config_snapshot(cfg);
-            zone_db_entry_t *entry = NULL;
-            if (xfr_view) {
-              for (size_t i = 0; i < xfr_view->zone_count; i++) {
-                if (strcasecmp(xfr_view->entries[i]->domain, qname) == 0) {
-                  entry = xfr_view->entries[i];
-                  break;
-                }
-              }
-            }
+            zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
             if (allowed && entry) {
+              release_config_snapshot(cfg);
               if (atomic_fetch_add(&entry->active_axfr, 1) >= MAX_ZONE_AXFR) {
                 atomic_fetch_sub(&entry->active_axfr, 1);
                 allowed = false;
@@ -2035,7 +2027,7 @@ process_tcp_client: ;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
                   args->dnssec_ok = dnssec_ok;
-                  args->req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
+                  args->req_len = msg_len > sizeof(args->req) ? sizeof(args->req) : msg_len;
                   memcpy(args->req, msg, args->req_len);
                   if (matched_key) {
                     args->has_tsig = true;
@@ -2121,6 +2113,7 @@ process_tcp_client: ;
                                              17, tsig_mac, &tsig_mac_len, NULL, 0, false);
                 }
                 if (sign_rc != 0) {
+                  release_config_snapshot(cfg);
                   release_zone_snapshot(snap);
                   close(client_fd);
                   dec_tcp_clients();
@@ -2132,7 +2125,7 @@ process_tcp_client: ;
               } else {
                 res_buf[2] |= 0x84;
                 res_buf[3] |= 0x05;
-                add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
+                add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
                 
                 uint16_t qd = (msg[4] << 8) | msg[5];
                 uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
@@ -2146,6 +2139,7 @@ process_tcp_client: ;
                 res_buf[11] = arcount & 0xFF;
                 copy_len = offset;
               }
+              release_config_snapshot(cfg);
               release_zone_snapshot(snap);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
@@ -2415,16 +2409,7 @@ static const char *find_configured_domain(const char *arg, char *out_buf, size_t
   zone_config_t *zcfg = active->zones;
   size_t arg_len = strlen(arg);
   while (zcfg) {
-    size_t z_len = strlen(zcfg->domain);
-    if (strcasecmp(zcfg->domain, arg) == 0) {
-      snprintf(out_buf, out_size, "%s", zcfg->domain);
-      break;
-    }
-    if (arg_len + 1 == z_len && zcfg->domain[z_len - 1] == '.' && strncasecmp(zcfg->domain, arg, arg_len) == 0) {
-      snprintf(out_buf, out_size, "%s", zcfg->domain);
-      break;
-    }
-    if (z_len + 1 == arg_len && arg[arg_len - 1] == '.' && strncasecmp(zcfg->domain, arg, z_len) == 0) {
+    if (domain_names_match_ci(zcfg->domain, arg)) {
       snprintf(out_buf, out_size, "%s", zcfg->domain);
       break;
     }

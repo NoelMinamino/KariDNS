@@ -42,13 +42,17 @@ void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_are
   if (!old_arena->hash_table || !new_arena->hash_table) return;
   uint32_t old_serial = 0, new_serial = 0;
   for (size_t i = 0; i < old_arena->count; i++) {
-    if (old_arena->records[i].type_code == 6 && old_arena->records[i].rdata_count >= 3 && old_arena->records[i].rdata[2]) {
+    if (old_arena->records[i].type_code == 6 &&
+        domain_names_match_ci(old_arena->records[i].name, entry->domain) &&
+        old_arena->records[i].rdata_count >= 3 && old_arena->records[i].rdata[2]) {
       old_serial = strtoul(old_arena->records[i].rdata[2], NULL, 10);
       break;
     }
   }
   for (size_t i = 0; i < new_arena->count; i++) {
-    if (new_arena->records[i].type_code == 6 && new_arena->records[i].rdata_count >= 3 && new_arena->records[i].rdata[2]) {
+    if (new_arena->records[i].type_code == 6 &&
+        domain_names_match_ci(new_arena->records[i].name, entry->domain) &&
+        new_arena->records[i].rdata_count >= 3 && new_arena->records[i].rdata[2]) {
       new_serial = strtoul(new_arena->records[i].rdata[2], NULL, 10);
       break;
     }
@@ -368,11 +372,20 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       rec->ecs_subnet_tag = arena_strdup(standby, session->current_ecs_tag);
     }
     size_t name_len = strlen(rec->name);
-    if (name_len < domain_len ||
-        strcasecmp(rec->name + name_len - domain_len, domain) != 0)
+    size_t dlen = domain_len;
+    if (dlen > 0 && domain[dlen - 1] == '.') dlen--;
+    size_t nlen = name_len;
+    if (nlen > 0 && rec->name[nlen - 1] == '.') nlen--;
+    if (nlen < dlen)
       return -1;
-    if (name_len > domain_len && rec->name[name_len - domain_len - 1] != '.')
-      return -1;
+    if (nlen == dlen) {
+      if (strncasecmp(rec->name, domain, dlen) != 0)
+        return -1;
+    } else {
+      if (rec->name[nlen - dlen - 1] != '.' ||
+          strncasecmp(rec->name + nlen - dlen, domain, dlen) != 0)
+        return -1;
+    }
     if (type == 6) {
       session->soa_count++;
       uint32_t current_serial = strtoul(rec->rdata[2], NULL, 10);
@@ -408,7 +421,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         session->is_deleting = false;
         for (size_t k = 0; k < standby->count - 1; k++) {
           if (standby->records[k].type_code == 6 &&
-              strcasecmp(standby->records[k].name, domain) == 0) {
+              domain_names_match_ci(standby->records[k].name, domain)) {
             standby->records[k] = standby->records[standby->count - 1];
             standby->count--;
             break;
@@ -423,7 +436,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           standby->count--;
         }
       } else {
-        if (strcasecmp(session->initial_soa_name, rec->name) == 0 &&
+        if (domain_names_match_ci(session->initial_soa_name, rec->name) &&
             session->initial_soa_serial == current_serial) {
           session->is_finished = true;
           standby->count--;
@@ -541,6 +554,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         bool has_soa = false;
         for (size_t k = 0; k < tmp_arena.count; k++) {
           if (tmp_arena.records[k].type_code == 6 &&
+              domain_names_match_ci(tmp_arena.records[k].name, entry->domain) &&
               tmp_arena.records[k].rdata_count >= 7) {
             serial = strtoul(tmp_arena.records[k].rdata[2], NULL, 10);
             refresh = parse_ttl_value(tmp_arena.records[k].rdata[3]);
@@ -948,7 +962,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   int soa_idx = -1;
   for (size_t i = 0; i < current_zone->count; i++) {
     if (current_zone->records[i].type_code == 6 &&
-        strcasecmp(current_zone->records[i].name, entry->domain) == 0) {
+        domain_names_match_ci(current_zone->records[i].name, entry->domain)) {
       soa_idx = i;
       break;
     }

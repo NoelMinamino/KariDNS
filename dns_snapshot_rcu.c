@@ -71,7 +71,7 @@ int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
     if (view_name && strcasecmp(v->name, view_name) != 0) continue;
     zone_config_t *zcfg = NULL;
     for (zone_config_t *z = v->zones; z; z = z->next) {
-      if (strcasecmp(z->domain, domain) == 0) { zcfg = z; break; }
+      if (domain_names_match_ci(z->domain, domain)) { zcfg = z; break; }
     }
     if (!zcfg) continue;
 
@@ -83,7 +83,7 @@ int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
           uint32_t hash = calc_fnv1a_str(domain);
           size_t idx = hash & (snap->views[sv].hash_size - 1);
           for (int i = snap->views[sv].hash_table[idx]; i != -1; i = snap->views[sv].chain_next[i]) {
-            if (strcasecmp(snap->views[sv].entries[i]->domain, domain) == 0) {
+            if (domain_names_match_ci(snap->views[sv].entries[i]->domain, domain)) {
               entry = snap->views[sv].entries[i];
               break;
             }
@@ -109,7 +109,7 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
       uint32_t hash = calc_fnv1a_str(domain);
       size_t idx = hash & (snap->views[v].hash_size - 1);
       for (int i = snap->views[v].hash_table[idx]; i != -1; i = snap->views[v].chain_next[i]) {
-        if (strcasecmp(snap->views[v].entries[i]->domain, domain) == 0) {
+        if (domain_names_match_ci(snap->views[v].entries[i]->domain, domain)) {
           return snap->views[v].entries[i];
         }
       }
@@ -729,7 +729,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   uint32_t hash = calc_fnv1a_str(entry->domain);
   size_t idx = hash & (z_standby->hash_size - 1);
   for (int i = z_standby->hash_table[idx]; i != -1; i = z_standby->records[i].next_record) {
-      if (z_standby->records[i].type_code == 6 && strcasecmp(z_standby->records[i].name, entry->domain) == 0) {
+      if (z_standby->records[i].type_code == 6 && domain_names_match_ci(z_standby->records[i].name, entry->domain)) {
           has_soa = true;
           if (z_standby->records[i].rdata_count >= 7) {
               entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
@@ -738,6 +738,43 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
               entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
           }
           break;
+      }
+  }
+  if (!has_soa) {
+      size_t elen = strlen(entry->domain);
+      if (elen > 0 && entry->domain[elen - 1] != '.' && elen + 2 < 256) {
+          char dot_domain[256];
+          memcpy(dot_domain, entry->domain, elen);
+          dot_domain[elen] = '.';
+          dot_domain[elen + 1] = '\0';
+          uint32_t dot_hash = calc_fnv1a_str(dot_domain);
+          size_t dot_idx = dot_hash & (z_standby->hash_size - 1);
+          for (int i = z_standby->hash_table[dot_idx]; i != -1; i = z_standby->records[i].next_record) {
+              if (z_standby->records[i].type_code == 6 && domain_names_match_ci(z_standby->records[i].name, entry->domain)) {
+                  has_soa = true;
+                  if (z_standby->records[i].rdata_count >= 7) {
+                      entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
+                      entry->refresh = parse_ttl_value(z_standby->records[i].rdata[3]);
+                      entry->retry = parse_ttl_value(z_standby->records[i].rdata[4]);
+                      entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
+                  }
+                  break;
+              }
+          }
+      }
+  }
+  if (!has_soa) {
+      for (size_t i = 0; i < z_standby->count; i++) {
+          if (z_standby->records[i].type_code == 6 && domain_names_match_ci(z_standby->records[i].name, entry->domain)) {
+              has_soa = true;
+              if (z_standby->records[i].rdata_count >= 7) {
+                  entry->serial = strtoul(z_standby->records[i].rdata[2], NULL, 10);
+                  entry->refresh = parse_ttl_value(z_standby->records[i].rdata[3]);
+                  entry->retry = parse_ttl_value(z_standby->records[i].rdata[4]);
+                  entry->expire = parse_ttl_value(z_standby->records[i].rdata[5]);
+              }
+              break;
+          }
       }
   }
   if (!has_soa) {
