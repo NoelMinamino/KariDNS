@@ -1045,14 +1045,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     \
     memset(&comp_ctx, 0, sizeof(comp_ctx)); \
     compress_ctx_init_packet(&comp_ctx); \
-    /* q_offset までスキップした状態で、自身(質問セクション)の名前を圧縮テーブルに登録 */ \
-    size_t dummy_off = DNS_HEADER_SIZE; \
-    char *dummy_name = NULL; \
-    /* 【修正】第5引数を active から current_zone に変更 */ \
-    if (expand_wire_name(res, q_offset, dummy_off, &dummy_off, current_zone, &dummy_name) == 0 && dummy_name) { \
-        uint16_t reg_off = DNS_HEADER_SIZE; \
-        write_dns_name_str(res, &reg_off, dummy_name, &comp_ctx, 65535); \
-    } \
+    /* パケットバッファを破壊せず質問セクションの名前を圧縮テーブルに登録 */ \
+    register_wire_name_for_compression(res, DNS_HEADER_SIZE, &comp_ctx); \
     \
     if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
       syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer", \

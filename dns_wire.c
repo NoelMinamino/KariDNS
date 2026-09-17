@@ -490,16 +490,13 @@ static int parse_label(const char *name, uint8_t *label_out, const char **next_p
         if (*p == '\\') {
             p++;
             if (!*p) return -1; // dangling backslash
-            // 【修正】'0' から '7' までの3桁の「8進数」としてパースする
-            if (*p >= '0' && *p <= '7') {
-                int val = 0;
-                for (int i = 0; i < 3 && *p >= '0' && *p <= '7'; i++) {
-                    val = (val << 3) + (*p - '0'); // 8進数なので << 3 (つまり * 8)
-                    p++;
-                }
+            // RFC 1035 §5.1: 000-255 の 3 桁 10 進数
+            if (isdigit((unsigned char)*p) && isdigit((unsigned char)*(p + 1)) && isdigit((unsigned char)*(p + 2))) {
+                int val = (*p - '0') * 100 + (*(p + 1) - '0') * 10 + (*(p + 2) - '0');
                 if (val > 255) return -1;
                 if (len >= 63) return -1;
                 label_out[len++] = (uint8_t)val;
+                p += 3;
             } else {
                 if (len >= 63) return -1;
                 label_out[len++] = (uint8_t)*p++;

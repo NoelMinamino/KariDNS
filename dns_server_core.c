@@ -1777,6 +1777,24 @@ process_tcp_client: ;
             break;
           }
 
+          if (msg_len < DNS_HEADER_SIZE) {
+            struct kevent ev_del[2];
+            EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+            EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            kevent(kq, ev_del, 2, NULL, 0, NULL);
+            close(client_fd);
+            dec_tcp_clients();
+            free(ctx_tcp);
+            client_closed = true;
+            for (int j = i + 1; j < n_events; j++) {
+              if (ev_list[j].ident == (uintptr_t)client_fd) {
+                ev_list[j].udata = NULL;
+                ev_list[j].filter = 0;
+              }
+            }
+            break;
+          }
+
           // [RFC 1035 §4.1.1 / RFC 5452] QR=1 (レスポンスパケット) の破棄
           if (msg_len >= DNS_HEADER_SIZE && (msg[2] & 0x80) != 0) {
             submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, 0, "<response-on-query-port>", 0, 0, 0, false, false);
