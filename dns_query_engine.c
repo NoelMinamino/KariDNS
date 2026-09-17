@@ -866,6 +866,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
   strlcpy(current_qname, qname, sizeof(current_qname));
   size_t current_qname_len = strlen(current_qname);
   uint32_t current_qname_hash = calc_fnv1a_str(current_qname);
+  char visited_qnames[16][256];
+  int visited_count = 0;
+  strlcpy(visited_qnames[visited_count++], current_qname, sizeof(visited_qnames[0]));
   const char *glue_targets[16];
   int glue_target_count = 0;
   memset(glue_targets, 0, sizeof(glue_targets));
@@ -1002,7 +1005,23 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
           }
           if (rec->rdata_count > 0) {
-            strlcpy(current_qname, rec->rdata[0], sizeof(current_qname));
+            const char *target = rec->rdata[0];
+            bool loop_detected = false;
+            for (int v = 0; v < visited_count; v++) {
+              if (domain_names_match_ci(target, visited_qnames[v])) {
+                loop_detected = true;
+                break;
+              }
+            }
+            if (loop_detected) {
+              res[3] &= 0xF0;
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+              return;
+            }
+            if (visited_count < 16) {
+              strlcpy(visited_qnames[visited_count++], target, sizeof(visited_qnames[0]));
+            }
+            strlcpy(current_qname, target, sizeof(current_qname));
             current_qname_len = strlen(current_qname);
             current_qname_hash = calc_fnv1a_str(current_qname);
             cname_followed = true;
@@ -1125,6 +1144,22 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
               return;
             }
             (*ancount)++;
+            const char *target = synth_name;
+            bool loop_detected = false;
+            for (int v = 0; v < visited_count; v++) {
+              if (domain_names_match_ci(target, visited_qnames[v])) {
+                loop_detected = true;
+                break;
+              }
+            }
+            if (loop_detected) {
+              res[3] &= 0xF0;
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+              return;
+            }
+            if (visited_count < 16) {
+              strlcpy(visited_qnames[visited_count++], target, sizeof(visited_qnames[0]));
+            }
             strlcpy(current_qname, synth_name, sizeof(current_qname));
             current_qname_len = prefix_len + (size_t)written;
             current_qname_hash = calc_fnv1a_str(current_qname);
@@ -1196,7 +1231,23 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                     }
                   }
                   if (rec->rdata_count > 0) {
-                    strlcpy(current_qname, rec->rdata[0], sizeof(current_qname));
+                    const char *target = rec->rdata[0];
+                    bool loop_detected = false;
+                    for (int v = 0; v < visited_count; v++) {
+                      if (domain_names_match_ci(target, visited_qnames[v])) {
+                        loop_detected = true;
+                        break;
+                      }
+                    }
+                    if (loop_detected) {
+                      res[3] &= 0xF0;
+                      if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+                      return;
+                    }
+                    if (visited_count < 16) {
+                      strlcpy(visited_qnames[visited_count++], target, sizeof(visited_qnames[0]));
+                    }
+                    strlcpy(current_qname, target, sizeof(current_qname));
                     current_qname_len = strlen(current_qname);
                     current_qname_hash = calc_fnv1a_str(current_qname);
                     cname_followed = true;
