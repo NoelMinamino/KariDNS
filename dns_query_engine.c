@@ -1071,10 +1071,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             uint32_t eff_ttl;
             if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             dname_found = true;
-            size_t prefix_len = dname_parent - current_qname;
             if (rec->rdata_count == 0) break;
-            size_t target_len = strlen(rec->rdata[0]);
-            if (prefix_len + target_len > 255) { res[3] = (res[3] & 0xF0) | 6; return; }
+
+            // 先に DNAME レコード自身を Answer セクションに追加
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
             if (rec->ecs_subnet_tag != NULL) ecs_used = true;
@@ -1085,15 +1084,33 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
             (*ancount)++;
             if (dnssec_ok) {
-              if (!attach_covering_rrsig(current_zone, p_idx, dname_parent, NULL, 39, res, max_res_len, offset, comp_ctx, ancount)) { res[2] |= 0x02; return; }
+              if (!attach_covering_rrsig(current_zone, p_idx, dname_parent, NULL, 39, res, max_res_len, offset, comp_ctx, ancount)) {
+                res[2] |= 0x02;
+                if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+                return;
+              }
             }
+
+            // [RFC 6672 §4.1] 合成名長の検証
+            size_t prefix_len = dname_parent - current_qname;
+            size_t target_len = strlen(rec->rdata[0]);
+            if (prefix_len + target_len > 255) {
+              // 合成 CNAME は含めず、DNAME のみを載せて YXDOMAIN を返す
+              res[3] = (res[3] & 0xF0) | 6; // YXDOMAIN
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+              return;
+            }
+
             char synth_name[256];
             memcpy(synth_name, current_qname, prefix_len);
             int written = snprintf(synth_name + prefix_len, sizeof(synth_name) - prefix_len, "%s", rec->rdata[0]);
-            if (written < 0 || (size_t)written >= sizeof(synth_name) - prefix_len) {
-                res[3] = (res[3] & 0xF0) | 6; // YXDomain/error for truncation
-                return;
+            if (written < 0 || (size_t)written >= sizeof(synth_name) - prefix_len || (prefix_len + (size_t)written > 255)) {
+              res[3] = (res[3] & 0xF0) | 6; // YXDOMAIN
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+              return;
             }
+
+            // 255 バイト以内の場合は通常通り合成 CNAME を追加して追跡継続
             dns_record_t synth_cname;
             memset(&synth_cname, 0, sizeof(synth_cname));
             synth_cname.name = (char *)current_qname;
@@ -1102,7 +1119,11 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             synth_cname.ttl_value = eff_ttl;
             synth_cname.rdata_count = 1;
             synth_cname.rdata[0] = synth_name;
-            if (serialize_dns_record(res, max_res_len, offset, &synth_cname, comp_ctx, NULL, 0xFFFFFFFF) < 0) { res[2] |= 0x02; return; }
+            if (serialize_dns_record(res, max_res_len, offset, &synth_cname, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+              res[2] |= 0x02;
+              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
+              return;
+            }
             (*ancount)++;
             strlcpy(current_qname, synth_name, sizeof(current_qname));
             current_qname_len = prefix_len + (size_t)written;
@@ -1783,11 +1804,17 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     break;
   }
   if (chain_exhausted) {
-    res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
-    *offset = initial_offset;
-    *ancount = initial_ancount;
-    *nscount = initial_nscount;
-    *arcount = initial_arcount;
+    // 既に 1 つ以上の CNAME が Answer に格納されている場合は SERVFAIL にロールバックしない
+    if (*ancount > initial_ancount) {
+      // 解決できた CNAME 群を保持して正常終了 (NOERROR)
+      res[3] &= 0xF0;
+    } else {
+      res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
+      *offset = initial_offset;
+      *ancount = initial_ancount;
+      *nscount = initial_nscount;
+      *arcount = initial_arcount;
+    }
     if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
   } else {
     if (ecs_used && out_ecs_scope_prefix) {
