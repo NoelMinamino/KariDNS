@@ -153,6 +153,37 @@ static void start_connect_broker(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
     return;
+
+  /* [SEC] このブローカー子プロセスが行うのは socket()+connect() の代行
+   * だけであり、いずれもroot権限を必要としない。しかし従来はfork時点の
+   * 実効ユーザー(多くの構成ではroot)のまま無期限に稼働し続けていた。
+   * ブローカーはCapsicumサンドボックス突入後のワーカーからも
+   * (family, type, addr) を渡すだけで任意の相手へconnect()させられる
+   * ため、万一呼び出し側(サンドボックス内のワーカー)が何らかのバグで
+   * 攻撃者に汚染された場合、本来Capsicumが塞ぐはずの「新規ソケット
+   * 作成」をroot権限のまま代行してしまう"特権エスカレーション用の
+   * オラクル"になり得る。connect()自体に特権は不要なため、fork直後・
+   * 要求ループ開始前に、サーバ本体と同じ実行ユーザーへ降格する。
+   * 降格に失敗した場合は稼働を継続させず終了する(fail-closed)。 */
+  bool need_drop = (geteuid() == 0);
+  uid_t drop_uid = (uid_t)-1;
+  gid_t drop_gid = (gid_t)-1;
+  if (need_drop) {
+    const char *user = g_config_db.config_a.user;
+    if (user) {
+      struct passwd *pwd = getpwnam(user);
+      if (pwd) {
+        drop_uid = pwd->pw_uid;
+        drop_gid = pwd->pw_gid;
+        const char *group = g_config_db.config_a.group;
+        if (group) {
+          struct group *grp = getgrnam(group);
+          if (grp) drop_gid = grp->gr_gid;
+        }
+      }
+    }
+  }
+
   pid_t pid = fork();
   if (pid < 0) {
     close(sv[0]);
@@ -161,6 +192,18 @@ static void start_connect_broker(void) {
   }
   if (pid == 0) {
     close(sv[0]);
+    if (need_drop) {
+      if (drop_uid == (uid_t)-1 ||
+          setgroups(0, NULL) != 0 ||
+          setgid(drop_gid) != 0 ||
+          setuid(drop_uid) != 0 ||
+          getuid() != drop_uid || geteuid() != drop_uid ||
+          getgid() != drop_gid || getegid() != drop_gid) {
+        syslog(LOG_ERR, "[Broker] Failed to drop privileges; refusing to run as root");
+        close(sv[1]);
+        _exit(1);
+      }
+    }
     struct {
       int family;
       int type;
@@ -370,15 +413,42 @@ static void init_logging_channels(server_config_t *cfg) {
         char dirbuf[PATH_MAX], basebuf[PATH_MAX];
         if (split_path_for_openat(ch->file_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
           if (dirbuf[0] != '\0' && strcmp(dirbuf, ".") != 0) {
-            struct stat d_st;
-            if (stat(dirbuf, &d_st) != 0) {
-              mkdir(dirbuf, 0755);
+            /* [SEC] 以前は stat(dirbuf) -> mkdir(dirbuf) -> chown(dirbuf) と
+             * パス文字列を都度再解決していたため、各呼び出しの間に
+             * dirbuf を(攻撃者が書き込み可能な親ディレクトリ経由で)
+             * シンボリックリンクへ差し替えられると、root権限で任意の
+             * パス(例: /etc 配下)の所有者をサービス実行ユーザーへ
+             * 変更されてしまうTOCTOUレースが存在した(CWE-367)。
+             * ここでは親ディレクトリのfdを取得した上でmkdirat/openatを
+             * 用い、最終的にO_NOFOLLOWで開いたディレクトリfdに対して
+             * のみfchown()する。シンボリックリンクが置かれていた場合は
+             * openatがELOOPで失敗し、所有者変更は行われない
+             * (fail-closed)。 */
+            char parent_buf[PATH_MAX], leaf_buf[PATH_MAX];
+            int pfd = -1;
+            const char *leaf = NULL;
+            if (strcmp(dirbuf, "/") == 0) {
+              pfd = -1; /* ルートは対象外 */
+            } else if (split_path_for_openat(dirbuf, parent_buf, sizeof(parent_buf), leaf_buf, sizeof(leaf_buf))) {
+              const char *popen_path = parent_buf[0] ? parent_buf : "/";
+              pfd = open(popen_path, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+              leaf = leaf_buf;
             }
-            if (target_uid != (uid_t)-1 &&
-                strcmp(dirbuf, "/") != 0 && strcmp(dirbuf, "/var") != 0 &&
-                strcmp(dirbuf, "/var/log") != 0 && strcmp(dirbuf, "/tmp") != 0 &&
-                strcmp(dirbuf, "/etc") != 0) {
-              chown(dirbuf, target_uid, target_gid);
+            if (pfd >= 0 && leaf) {
+              if (mkdirat(pfd, leaf, 0755) != 0 && errno != EEXIST) {
+                /* 作成失敗時もopenatへフォールスルーし、既存の可能性を試す */
+              }
+              int ddfd = openat(pfd, leaf, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
+              if (ddfd >= 0) {
+                if (target_uid != (uid_t)-1 &&
+                    strcmp(dirbuf, "/var") != 0 &&
+                    strcmp(dirbuf, "/var/log") != 0 && strcmp(dirbuf, "/tmp") != 0 &&
+                    strcmp(dirbuf, "/etc") != 0) {
+                  fchown(ddfd, target_uid, target_gid);
+                }
+                close(ddfd);
+              }
+              close(pfd);
             }
           }
         }
@@ -3734,6 +3804,51 @@ static void setup_ipc_tables(int num_workers) {
   cap_rights_limit(g_notify_ipc[1], &n_rights_1);
 }
 
+/* [SEC] pidfile / control-socket 用ディレクトリの安全性検証。
+ *
+ * mkdir(dir_buf, 0755) 自体はシンボリックリンクを追跡しないため作成時の
+ * 攻撃は受けないが、そのディレクトリが「既に存在していた」場合(mkdirが
+ * EEXISTで返る場合)には何も検証していなかった。root権限で起動する前に、
+ * 非rootユーザーがコンテナの共有ボリューム等を通じてそのパスへ罠の
+ * ディレクトリ(自ユーザー所有・group/other書き込み可)を事前に用意して
+ * いても、そのまま使ってしまう。
+ *
+ * ここではO_NOFOLLOW付きでディレクトリ自体をオープンし、そのfdに対して
+ * fstat()することでシンボリックリンク追跡やTOCTOUなしに実体を検査する。
+ * root所有でなく、group/otherに書き込み可能な場合は「事前に仕込まれた
+ * ディレクトリ」の可能性があるため、起動をfail-closedで拒否する。
+ * geteuid()!=0(非root実行)の場合は特権境界を跨がないため検証しない。 */
+static bool ensure_priv_dir_safe(const char *dir_buf) {
+  if (!dir_buf || dir_buf[0] == '\0')
+    return true;
+  if (geteuid() != 0)
+    return true; /* 非root実行では特権昇格の懸念がないため検証不要 */
+
+  if (mkdir(dir_buf, 0755) != 0 && errno != EEXIST) {
+    /* 作成失敗時は後続のopen()/bind()が本来のエラーを報告するので
+     * ここではブロックしない。 */
+    return true;
+  }
+
+  int dfd = open(dir_buf, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
+  if (dfd < 0) {
+    syslog(LOG_ERR, "[Startup] Failed to verify directory '%s': %s", dir_buf, strerror(errno));
+    fprintf(stderr, "[ERROR] Failed to verify directory '%s': %s\n", dir_buf, strerror(errno));
+    return false;
+  }
+  struct stat st;
+  bool ok = (fstat(dfd, &st) == 0) && S_ISDIR(st.st_mode) &&
+            st.st_uid == 0 && !(st.st_mode & (S_IWGRP | S_IWOTH));
+  close(dfd);
+  if (!ok) {
+    syslog(LOG_ERR, "[Startup] Refusing to use directory '%s': not root-owned and non-writable by "
+                     "group/other (possible pre-planted directory attack)", dir_buf);
+    fprintf(stderr, "[ERROR] Refusing to use directory '%s': not root-owned and non-writable by "
+                     "group/other (possible pre-planted directory attack)\n", dir_buf);
+  }
+  return ok;
+}
+
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   init_server_cookie_secret();
@@ -3860,10 +3975,26 @@ int main(int argc, char **argv) {
     char *slash = strrchr(dir_buf, '/');
     if (slash && slash != dir_buf) {
       *slash = '\0';
-      mkdir(dir_buf, 0755);
+      if (!ensure_priv_dir_safe(dir_buf)) {
+        cleanup_pid_file();
+        free_server_config_fields(&g_config_db.config_a);
+        return 1;
+      }
     }
-    g_pid_fd = open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    /* [SEC] O_NOFOLLOW必須: pidfileはroot権限(特権降格前)でO_CREAT|O_RDWR
+     * オープンされ、直後にftruncate(0)してPIDを書き込む。もしこのパスの
+     * 最終コンポーネントが(攻撃者が書き込み可能な親ディレクトリ経由で
+     * 事前に設置された)シンボリックリンクであった場合、O_NOFOLLOWが
+     * 無いとリンク先を追跡してオープン・0バイトへtruncate・上書きして
+     * しまい、root権限による任意ファイル破壊/上書きプリミティブとなる。
+     * O_NOFOLLOWを付与し、シンボリックリンクなら即座にELOOPで失敗させる
+     * (fail-closed)。 */
+    g_pid_fd = open(effective_pid_file, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (g_pid_fd < 0) {
+      if (errno == ELOOP) {
+        syslog(LOG_ERR, "Refusing to open pidfile %s: path is a symlink (possible attack)", effective_pid_file);
+        fprintf(stderr, "Refusing to open pidfile %s: path is a symlink (possible attack)\n", effective_pid_file);
+      }
       syslog(LOG_ERR, "Failed to open pidfile %s: %s", effective_pid_file, strerror(errno));
       fprintf(stderr, "Failed to open pidfile %s: %s\n", effective_pid_file, strerror(errno));
       cleanup_pid_file();
@@ -3944,7 +4075,11 @@ int main(int argc, char **argv) {
     char *slash = strrchr(dir_buf, '/');
     if (slash && slash != dir_buf) {
       *slash = '\0';
-      mkdir(dir_buf, 0755);
+      if (!ensure_priv_dir_safe(dir_buf)) {
+        cleanup_pid_file();
+        free_server_config_fields(&g_config_db.config_a);
+        return 1;
+      }
     }
     strncpy(un.sun_path, sock_path, sizeof(un.sun_path) - 1);
     unlink(un.sun_path);
@@ -3964,7 +4099,13 @@ int main(int argc, char **argv) {
               struct group *grp = getgrnam(cfg->group);
               if (grp) target_gid = grp->gr_gid;
             }
-            chown(un.sun_path, target_uid, target_gid);
+            /* [SEC] chown(path) は TOCTOU/シンボリックリンク攻撃に脆弱
+             * (bind()でノード作成後、chown()実行までの間に攻撃者が
+             * un.sun_path を任意ファイルへのシンボリックリンクに差し替える
+             * 競合が可能)。既に確立済みの g_control_sock の fd に対して
+             * fchown() を行うことで、パス再解決を一切行わずに所有者変更
+             * でき、この種のレースを構造的に排除できる。 */
+            fchown(g_control_sock, target_uid, target_gid);
           }
         }
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
