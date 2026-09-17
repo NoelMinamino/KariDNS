@@ -2771,14 +2771,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                               strcasecmp(zc->type, "forward") == 0)) {
         size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
         memcpy(res, req, copy_len);
-        res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
+        res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
         res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
         return copy_len;
       }
     }
     if (edns.has_mqtype_query) {
       memcpy(res, req, DNS_HEADER_SIZE);
-      res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
+      res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 1;
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
     }
@@ -2844,6 +2844,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x84; // QR=1, AA=1
+    res[2] &= ~0x01; // RD=0 per RFC 1996 §3.7
     
     if (auth) {
       res[3] &= 0xF0;
@@ -2894,14 +2895,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                               strcasecmp(zc->type, "forward") == 0)) {
         size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
         memcpy(res, req, copy_len);
-        res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
+        res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
         res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
         return copy_len;
       }
     }
     if (edns.has_mqtype_query) {
       memcpy(res, req, DNS_HEADER_SIZE);
-      res[2] |= 0x80; res[3] = (res[3] & 0xF0) | 1;
+      res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 1;
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
     }
@@ -2973,6 +2974,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
     memcpy(res, req, copy_len);
     res[2] |= 0x80; // QR=1
+    res[2] &= ~0x01; // RD=0 per RFC 2136 §2.2 / §3.8
     
     int rcode = 5; // REFUSED
     if (auth && zone_is_master) {

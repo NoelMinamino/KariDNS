@@ -866,6 +866,10 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
 
         if (offset + 10 > packet_len) return -1;
+        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
+        if (i < ancount + nscount + arcount - 1 && type == 250) {
+            return -1; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
+        }
         uint16_t rdlen = (packet[offset+8] << 8) | packet[offset+9];
         offset += 10 + rdlen;
     }
@@ -997,6 +1001,10 @@ bool packet_has_tsig(const uint8_t *packet, size_t packet_len) {
         if (offset >= packet_len) return false;
         if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
         if (offset + 10 > packet_len) return false;
+        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
+        if (i < ancount + nscount + arcount - 1 && type == 250) {
+            return false; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
+        }
         uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
         offset += 10 + rdlen;
     }

@@ -3530,6 +3530,12 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             break; // EAGAIN
 
           udp_ipc_t *msg = (udp_ipc_t *)buffer;
+          ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
+          if (msg->payload_len > max_valid_payload) {
+            syslog(LOG_WARNING, "[Frontend %d] Dropping NOTIFY message with inconsistent payload_len (%u > %zd)",
+                   router_id, msg->payload_len, max_valid_payload);
+            continue;
+          }
           if (msg->sock_fd_idx == -2) {
             syslog(LOG_NOTICE, "[Frontend %d] Received stop command from backend. Shutting down cleanly.", router_id);
             exit(0);
