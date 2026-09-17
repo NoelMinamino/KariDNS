@@ -130,6 +130,21 @@ if grep -q "2.3.4.5" res.txt; then
 fi
 check_asan_log
 
+echo "[*] 4.5. Prerequisite Failure (RFC 2136 NOTZONE - Out of Zone Prerequisite)..."
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "out-of-zone.example.com" --update-add 'new-invalid.dynupdate.com 300 A 2.3.4.6' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+if ! grep -q "NOTZONE" out.txt; then
+    echo "[FAIL] Expected NOTZONE for out-of-zone prerequisite, output:"
+    cat out.txt
+    exit 1
+fi
+$DAG new-invalid.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
+if grep -q "2.3.4.6" res.txt; then
+    echo "[FAIL] Out-of-zone prerequisite UPDATE added record!"
+    exit 1
+fi
+echo "[+] RFC 2136 §3.2.5 Out-of-zone prerequisite correctly rejected with NOTZONE."
+check_asan_log
+
 echo "[*] 5. Authorized UPDATE (Delete Record)..."
 $DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "new-host.dynupdate.com" --update-del 'new.dynupdate.com A' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 $DAG new.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
