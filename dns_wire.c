@@ -2974,6 +2974,11 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         if (rdata_offset + opt_len > rdata_end) break;
                         
                         if (opt_code == 10) { // DNS Cookie
+                            if (edns->has_cookie || edns->has_malformed_cookie) {
+                                // RFC 7873 §5.2: 最初の COOKIE のみを採用し、以降は無視
+                                rdata_offset += opt_len;
+                                continue;
+                            }
                             if (opt_len == 8 || (opt_len >= 16 && opt_len <= 40)) {
                                 edns->has_cookie = true;
                                 memcpy(edns->client_cookie, req + rdata_offset, 8);
@@ -3005,6 +3010,10 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                         } else if (opt_code == 3) { // NSID
                             edns->has_nsid_query = true;
                         } else if (opt_code == 11) { // edns-tcp-keepalive
+                            if (edns->has_keepalive_query) {
+                                rdata_offset += opt_len;
+                                continue;
+                            }
                             edns->has_keepalive_query = true;
                         } else if (opt_code == 21) {
                             edns->saw_invalid_mqtype_response_in_query = true;
@@ -3022,6 +3031,10 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                 }
                             }
                         } else if (opt_code == 8) { // EDNS Client Subnet (RFC 7871)
+                            if (edns->has_ecs) {
+                                rdata_offset += opt_len;
+                                continue;
+                            }
                             if (opt_len < 4) return -1;
                             uint16_t family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
                             if (family != 1 && family != 2) return -1;

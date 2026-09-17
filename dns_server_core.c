@@ -1252,6 +1252,7 @@ void *worker_thread_func(void *arg) {
       if (tcp_fd >= 0) {
         int flags = fcntl(tcp_fd, F_GETFL, 0);
         fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
+        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT_LB
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt));
 #else
@@ -1261,7 +1262,7 @@ void *worker_thread_func(void *arg) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
           struct kevent ev;
-          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)2);
+          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
         } else
           close(tcp_fd);
@@ -1272,6 +1273,7 @@ void *worker_thread_func(void *arg) {
       if (tcp_fd >= 0) {
         int flags = fcntl(tcp_fd, F_GETFL, 0);
         fcntl(tcp_fd, F_SETFL, flags | O_NONBLOCK);
+        setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setsockopt(tcp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT_LB
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt));
@@ -1282,7 +1284,7 @@ void *worker_thread_func(void *arg) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
           struct kevent ev;
-          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)2);
+          EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
         } else
           close(tcp_fd);
