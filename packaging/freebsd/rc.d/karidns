@@ -45,7 +45,8 @@ karidns_prestart()
     _group="${_owner}"
 
     # Ensure run / log directory exists
-    install -d -o "${_owner}" -g "${_group}" -m 0755 /var/run/karidns
+    # /var/run/karidns must be root:wheel (0755) to satisfy ensure_priv_dir_safe()
+    install -d -o root -g wheel -m 0755 /var/run/karidns
     install -d -o "${_owner}" -g "${_group}" -m 0755 /var/log/named
 }
 
