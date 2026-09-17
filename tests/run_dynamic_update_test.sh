@@ -96,7 +96,7 @@ if grep -q "1.2.3.5" res.txt; then
 fi
 
 echo "[*] 3. Authorized UPDATE (Add Record with prereq)..."
-$DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "new-host.example.com" --update-add 'new.dynupdate.com 300 A 1.2.3.7' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "new-host.dynupdate.com" --update-add 'new.dynupdate.com 300 A 1.2.3.7' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 $DAG new.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
 if ! grep -q "1.2.3.7" res.txt; then
     echo "[FAIL] Authorized UPDATE failed to add record."
@@ -131,7 +131,7 @@ fi
 check_asan_log
 
 echo "[*] 5. Authorized UPDATE (Delete Record)..."
-$DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "new-host.example.com" --update-del 'new.dynupdate.com A' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --prereq-nxdomain "new-host.dynupdate.com" --update-del 'new.dynupdate.com A' +nohexdump-response -y hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
 $DAG new.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
 if grep -q "1.2.3.7" res.txt; then
     echo "[FAIL] Authorized UPDATE failed to delete record."
