@@ -17,8 +17,12 @@
 #include "dns_tsig_acl.h"
 
 static void *safe_realloc_or_die(void *ptr, size_t size) {
+  if (size == 0) {
+    free(ptr);
+    return NULL;
+  }
   void *p = realloc(ptr, size);
-  if (!p && size > 0) {
+  if (!p) {
     syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", size);
     exit(1);
   }
@@ -26,12 +30,23 @@ static void *safe_realloc_or_die(void *ptr, size_t size) {
 }
 
 static void *safe_calloc_or_die(size_t nmemb, size_t size) {
+  if (nmemb == 0 || size == 0) {
+    return NULL;
+  }
   void *p = calloc(nmemb, size);
-  if (!p && nmemb > 0 && size > 0) {
+  if (!p) {
     syslog(LOG_CRIT, "[Config] Out of memory during config parse (requested %zu bytes)", nmemb * size);
     exit(1);
   }
   return p;
+}
+
+void *safe_realloc_or_die_test_wrapper(void *ptr, size_t size) {
+  return safe_realloc_or_die(ptr, size);
+}
+
+void *safe_calloc_or_die_test_wrapper(size_t nmemb, size_t size) {
+  return safe_calloc_or_die(nmemb, size);
 }
 
 #define APPEND_STR(arr, cnt, val) \

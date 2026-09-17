@@ -238,5 +238,7 @@ void free_rate_limit_config(rate_limit_config_t *rrl);
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino);
 bool match_cidr(const char *client_ip_str, const char *cidr_str);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
+void *safe_realloc_or_die_test_wrapper(void *ptr, size_t size);
+void *safe_calloc_or_die_test_wrapper(size_t nmemb, size_t size);
 
 #endif
