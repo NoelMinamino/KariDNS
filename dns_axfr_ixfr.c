@@ -1320,8 +1320,18 @@ void *axfr_worker_thread(void *arg) {
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
+  tsig_key_t key_val;
+  tsig_key_t *pkey = NULL;
+  if (args->has_tsig) {
+    memset(&key_val, 0, sizeof(key_val));
+    key_val.name = args->tsig_name;
+    key_val.algorithm = args->tsig_algorithm;
+    key_val.secret_decoded_len = args->tsig_secret_decoded_len;
+    memcpy(key_val.secret_decoded, args->tsig_secret_decoded, args->tsig_secret_decoded_len);
+    pkey = &key_val;
+  }
   send_axfr_response(args->client_fd, args->qname, args->req, args->req_len,
-                     args->tsig_key, entry, args->tsig_mac, args->tsig_mac_len,
+                     pkey, entry, args->tsig_mac, args->tsig_mac_len,
                      &args->client_addr, args->client_len,
                      args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
   

@@ -639,6 +639,7 @@ void *response_logger_thread_func(void *arg) {
         
         if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
             resp_log_entry_t *entry = &g_resp_log_ring[idx];
+            rcu_reader_enter(&g_resp_logger_rcu_ctx);
             server_config_t *cfg = acquire_config_snapshot();
             
             if (cfg && cfg->logging.responses_channel) {
@@ -694,6 +695,7 @@ void *response_logger_thread_func(void *arg) {
                 }
             }
             release_config_snapshot(cfg);
+            rcu_reader_exit(&g_resp_logger_rcu_ctx);
             
             // Consumerのポインタを進める
             atomic_store_explicit(&entry->ready, false, memory_order_release);
@@ -799,6 +801,7 @@ void *query_logger_thread_func(void *arg) {
     uint64_t last_reported_dropped = 0;
 
     while (1) {
+        rcu_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
         log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
 
@@ -931,6 +934,7 @@ void *query_logger_thread_func(void *arg) {
         }
 
         if (cfg) release_config_snapshot(cfg);
+        rcu_reader_exit(&g_query_logger_rcu_ctx);
 
         // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
         usleep(any_work ? 1000 : 10000);
@@ -1004,7 +1008,7 @@ typedef struct {
   int active_fd; // For UDP, IPC socket to frontend
   int client_fd; // For TCP, client socket
   udp_ipc_t ipc_hdr;
-  uint8_t req_buf[UDP_DEFAULT_MAX_RES_LEN];
+  uint8_t req_buf[BUFFER_SIZE];
   size_t req_len;
   char client_ip[INET6_ADDRSTRLEN];
   int client_port;
@@ -1071,7 +1075,8 @@ static void *async_io_worker_func(void *arg) {
       uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
       rate_limit_config_t *rrl_cfg = NULL;
-      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+      size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
+      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, max_res,
                                       task.qname, task.qtype, task.client_ip,
                                       &thread_compress_ctx, false, &rrl_cfg, task.snap);
       release_zone_snapshot(task.snap);
@@ -1512,7 +1517,7 @@ worker_startup_success:;
               task.is_tcp = false;
               task.active_fd = active_fd;
               task.ipc_hdr = *ipc_msg;
-              task.req_len = payload_received > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : payload_received;
+              task.req_len = (size_t)payload_received > sizeof(task.req_buf) ? sizeof(task.req_buf) : (size_t)payload_received;
               memcpy(task.req_buf, req_buf, task.req_len);
               strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
@@ -2014,7 +2019,20 @@ process_tcp_client: ;
                   args->dnssec_ok = dnssec_ok;
                   args->req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
                   memcpy(args->req, msg, args->req_len);
-                  args->tsig_key = matched_key;
+                  if (matched_key) {
+                    args->has_tsig = true;
+                    strncpy(args->tsig_name, matched_key->name ? matched_key->name : "", sizeof(args->tsig_name) - 1);
+                    args->tsig_name[sizeof(args->tsig_name) - 1] = '\0';
+                    strncpy(args->tsig_algorithm, matched_key->algorithm ? matched_key->algorithm : "", sizeof(args->tsig_algorithm) - 1);
+                    args->tsig_algorithm[sizeof(args->tsig_algorithm) - 1] = '\0';
+                    args->tsig_secret_decoded_len = matched_key->secret_decoded_len;
+                    if (args->tsig_secret_decoded_len > sizeof(args->tsig_secret_decoded))
+                      args->tsig_secret_decoded_len = sizeof(args->tsig_secret_decoded);
+                    memcpy(args->tsig_secret_decoded, matched_key->secret_decoded, args->tsig_secret_decoded_len);
+                  } else {
+                    args->has_tsig = false;
+                    args->tsig_secret_decoded_len = 0;
+                  }
                   args->tsig_mac_len = tsig_mac_len;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
@@ -2143,7 +2161,7 @@ process_tcp_client: ;
               async_io_task_t task = {0};
               task.is_tcp = true;
               task.client_fd = client_fd;
-              task.req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
+              task.req_len = msg_len > sizeof(task.req_buf) ? sizeof(task.req_buf) : msg_len;
               memcpy(task.req_buf, msg, task.req_len);
               strncpy(task.client_ip, ctx_tcp->client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
@@ -2260,6 +2278,8 @@ typedef enum {
 typedef struct ctrl_client {
   int fd;
   ctrl_state_t state;
+  time_t connect_time;
+  time_t last_active;
   char challenge[65];
   char buf[1024];
   size_t buf_len;
@@ -2473,6 +2493,8 @@ void *control_thread_func(void *arg) {
           }
           c->fd = cfd;
           c->state = CTRL_STATE_NEW;
+          c->connect_time = time(NULL);
+          c->last_active = c->connect_time;
           c->next = g_ctrl_clients;
           g_ctrl_clients = c;
           
@@ -2510,6 +2532,7 @@ void *control_thread_func(void *arg) {
           free_ctrl_client(cfd);
           continue;
         }
+        c->last_active = time(NULL);
         c->buf_len += r;
         c->buf[c->buf_len] = '\0';
         
@@ -2814,6 +2837,27 @@ void *control_thread_func(void *arg) {
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
+        // Check control clients timeout: 5s unauthenticated or 15s inactive
+        ctrl_client_t *curr_c = g_ctrl_clients;
+        while (curr_c) {
+          ctrl_client_t *next_c = curr_c->next;
+          bool timed_out = false;
+          if (curr_c->state != CTRL_STATE_CMD_WAIT) {
+            if (now - curr_c->connect_time >= 5) {
+              timed_out = true;
+            }
+          } else {
+            if (now - curr_c->last_active >= 15) {
+              timed_out = true;
+            }
+          }
+          if (timed_out) {
+            syslog(LOG_WARNING, "[Control] Disconnecting idle/unauthenticated control client fd %d", curr_c->fd);
+            free_ctrl_client(curr_c->fd);
+          }
+          curr_c = next_c;
+        }
+
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_zone_snapshot();
         if (snap) {
@@ -4136,13 +4180,22 @@ int main(int argc, char **argv) {
     strncpy(dir_buf, sock_path, sizeof(dir_buf) - 1);
     dir_buf[sizeof(dir_buf) - 1] = '\0';
     char *slash = strrchr(dir_buf, '/');
+    const char *leaf_name = sock_path;
+    int dir_fd = -1;
     if (slash && slash != dir_buf) {
       *slash = '\0';
+      leaf_name = strrchr(sock_path, '/') + 1;
       if (!ensure_priv_dir_safe(dir_buf)) {
         cleanup_pid_file();
         free_server_config_fields(&g_config_db.config_a);
         return 1;
       }
+      dir_fd = open(dir_buf, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } else if (slash == dir_buf) {
+      leaf_name = sock_path + 1;
+      dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    } else {
+      dir_fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     }
     strncpy(un.sun_path, sock_path, sizeof(un.sun_path) - 1);
     unlink(un.sun_path);
@@ -4162,14 +4215,18 @@ int main(int argc, char **argv) {
               struct group *grp = getgrnam(cfg->group);
               if (grp) target_gid = grp->gr_gid;
             }
-            /* [SEC] chown(path) は TOCTOU/シンボリックリンク攻撃に脆弱
-             * (bind()でノード作成後、chown()実行までの間に攻撃者が
-             * un.sun_path を任意ファイルへのシンボリックリンクに差し替える
-             * 競合が可能)。既に確立済みの g_control_sock の fd に対して
-             * fchown() を行うことで、パス再解決を一切行わずに所有者変更
-             * でき、この種のレースを構造的に排除できる。 */
-            fchown(g_control_sock, target_uid, target_gid);
+            /* [SEC] ソケットFDに対する fchown() は FreeBSD で EINVAL となるため、
+             * 事前に O_DIRECTORY で開いた安全なディレクトリFD (dir_fd) と
+             * AT_SYMLINK_NOFOLLOW を用いて fchownat() を実行し、
+             * TOCTOU/シンボリックリンク攻撃を防ぎつつ所有者を変更する。 */
+            if (dir_fd >= 0) {
+              fchownat(dir_fd, leaf_name, target_uid, target_gid, AT_SYMLINK_NOFOLLOW);
+            }
           }
+        }
+        if (dir_fd >= 0) {
+          close(dir_fd);
+          dir_fd = -1;
         }
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         cap_rights_t ctrl_rights;
@@ -4179,8 +4236,17 @@ int main(int argc, char **argv) {
         syslog(LOG_ERR, "Failed to bind control socket: %m");
         close(g_control_sock);
         g_control_sock = -1;
+        if (dir_fd >= 0) {
+          close(dir_fd);
+          dir_fd = -1;
+        }
       }
       umask(old_mask);
+    } else {
+      if (dir_fd >= 0) {
+        close(dir_fd);
+        dir_fd = -1;
+      }
     }
   }
 

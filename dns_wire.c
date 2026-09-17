@@ -896,12 +896,14 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
     uint64_t upper = (UINT64_MAX - fudge < time_signed) ? UINT64_MAX : time_signed + fudge;
     uint64_t lower = (time_signed < fudge) ? 0 : time_signed - fudge;
-    if (now > upper || now < lower) return 18; // BADTIME
     tsig_p += 8;
     uint16_t mac_size = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     if (tsig_p + mac_size + 6 > packet_len) return -1;
     const uint8_t *mac = &packet[tsig_p]; tsig_p += mac_size;
     uint16_t orig_id = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
+    if (!is_subsequent && orig_id != (((uint16_t)packet[0] << 8) | packet[1])) {
+        return 16; // BADSIG per RFC 8945 §5.3.1
+    }
     uint16_t err = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     uint16_t other_len = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
     if (tsig_p + other_len > packet_len) return -1;
@@ -972,6 +974,7 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
     }
     /* [T8] 元の if/else 両分岐の重複 const_time_memcmp を統合 */
     if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
+    if (now > upper || now < lower) return 18; // BADTIME (RFC 8945 §5.3.1)
     if (mac_out && mac_len_out) {
         *mac_len_out = mac_size;
         memcpy(mac_out, mac, mac_size);
@@ -3191,6 +3194,7 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
 
 static bool name_is_in_zone(const char *name, const char *zone_name) {
     if (!name || !zone_name) return false;
+    if (strcmp(zone_name, ".") == 0) return true;
     size_t n_len = strlen(name);
     size_t z_len = strlen(zone_name);
     if (n_len < z_len) return false;

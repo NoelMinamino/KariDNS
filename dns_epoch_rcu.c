@@ -7,6 +7,8 @@
 #include <inttypes.h>
 
 _Atomic uint64_t g_global_epoch = ATOMIC_VAR_INIT(0);
+worker_ctx_t g_resp_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
+worker_ctx_t g_query_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
 
 void rcu_exponential_backoff(int *retries, useconds_t *sleep_time) {
   if (*retries < 100) {
@@ -40,6 +42,19 @@ void rcu_writer_wait_until_safe(uint64_t retire_epoch, int timeout_ms) {
           all_safe = false;
           break;
         }
+      }
+    }
+
+    if (all_safe) {
+      uint64_t obs_resp = atomic_load_explicit(&g_resp_logger_rcu_ctx.rcu_observed_epoch, memory_order_acquire);
+      if (obs_resp != RCU_EPOCH_IDLE && obs_resp <= retire_epoch) {
+        all_safe = false;
+      }
+    }
+    if (all_safe) {
+      uint64_t obs_query = atomic_load_explicit(&g_query_logger_rcu_ctx.rcu_observed_epoch, memory_order_acquire);
+      if (obs_query != RCU_EPOCH_IDLE && obs_query <= retire_epoch) {
+        all_safe = false;
       }
     }
 

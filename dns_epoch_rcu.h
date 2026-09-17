@@ -11,6 +11,8 @@
 #include "dns_server_internal.h"
 
 extern _Atomic uint64_t g_global_epoch;
+extern worker_ctx_t g_resp_logger_rcu_ctx;
+extern worker_ctx_t g_query_logger_rcu_ctx;
 
 // グローバル世代カウンタを1進めて新しい世代番号を返す(writer専用、低頻度呼び出し)
 uint64_t rcu_writer_advance_epoch(void);

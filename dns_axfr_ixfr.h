@@ -42,7 +42,11 @@ typedef struct {
   bool dnssec_ok;
   uint8_t req[UDP_DEFAULT_MAX_RES_LEN];
   uint16_t req_len;
-  tsig_key_t *tsig_key;
+  bool has_tsig;
+  char tsig_name[256];
+  char tsig_algorithm[64];
+  uint8_t tsig_secret_decoded[256];
+  size_t tsig_secret_decoded_len;
   uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   size_t tsig_mac_len;
   zone_db_entry_t *entry;
