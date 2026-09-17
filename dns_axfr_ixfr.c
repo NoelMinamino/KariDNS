@@ -778,8 +778,17 @@ void *axfr_bg_thread_func(void *arg) {
     size_t req_mac_len = 0;
     if (tsig_key_ptr) {
       size_t p_len = req_len - 2;
-      tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
-                       tsig_key_ptr, 0, req_mac, &req_mac_len, NULL, 0, false);
+      if (tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
+                           tsig_key_ptr, 0, req_mac, &req_mac_len, NULL, 0, false) != 0) {
+        syslog(LOG_ERR, "[AXFR] Failed to TSIG-sign request for zone %s", ctx->domain);
+        free(stream_ctx);
+        close(tcp_fd);
+        if (ctx->entry)
+          atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
+        free(ctx);
+        atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
+        pthread_exit(NULL);
+      }
       req_len = p_len + 2;
     }
     uint16_t msg_len = req_len - 2;
@@ -1016,7 +1025,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     } \
     if (tsig_key) { \
       size_t sign_len = prev_offset; \
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, NULL, 0, is_subsequent); \
+      if (tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, NULL, 0, is_subsequent) != 0) goto axfr_error; \
       is_subsequent = true; \
       prev_offset = sign_len; \
     } \
@@ -1273,8 +1282,10 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
     if (tsig_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
-                       &tsig_mac_len, NULL, 0, is_subsequent);
+      if (tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
+                           &tsig_mac_len, NULL, 0, is_subsequent) != 0) {
+        goto axfr_error;
+      }
       offset = sign_len;
     }
     uint8_t len_prefix[2] = {offset >> 8, offset & 0xFF};

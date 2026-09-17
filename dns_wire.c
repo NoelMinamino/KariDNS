@@ -3244,6 +3244,8 @@ int process_update_sections(const uint8_t *req, size_t req_len,
         char *name;
         if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
         if (offset + 10 > req_len) return 1;
+        /* [RFC 2136 §3.2.5] PrerequisiteセクションのNAMEがゾーン外の場合はNOTZONE(10)を返却 */
+        if (!name_is_in_zone(name, zone_name)) return 10; // NOTZONE
         uint16_t type = (req[offset] << 8) | req[offset + 1];
         uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
         uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];

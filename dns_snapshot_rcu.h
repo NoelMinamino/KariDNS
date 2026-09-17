@@ -14,6 +14,7 @@ typedef enum {
     RELOAD_ERR_FILE_READ = -1,
     RELOAD_ERR_PARSE = -2,
     RELOAD_ERR_MISSING_SOA = -3,
+    RELOAD_ERR_BUSY = -4,
 } reload_result_t;
 
 zone_db_snapshot_t *acquire_zone_snapshot(void);

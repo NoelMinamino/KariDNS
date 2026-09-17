@@ -489,11 +489,19 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
     uint64_t t = atomic_load_explicit(&g_resp_log_tail, memory_order_relaxed);
     uint64_t h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
     
-    // ロックフリー CAS ループ (バッファフル時はDDoS状態とみなし、潔くログをドロップする)
-    do {
+    // ロックフリー CAS ループ (バッファフルまたはConsumer未処理時は安全にドロップ)
+    while (1) {
         if (t - h >= RESP_LOG_RING_SIZE) return; 
-    } while (!atomic_compare_exchange_weak_explicit(&g_resp_log_tail, &t, t + 1, 
-                                                    memory_order_acq_rel, memory_order_relaxed));
+        uint32_t idx = t & (RESP_LOG_RING_SIZE - 1);
+        if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
+            return;
+        }
+        if (atomic_compare_exchange_weak_explicit(&g_resp_log_tail, &t, t + 1, 
+                                                  memory_order_acq_rel, memory_order_relaxed)) {
+            break;
+        }
+        h = atomic_load_explicit(&g_resp_log_head, memory_order_acquire);
+    }
     
     uint32_t idx = t & (RESP_LOG_RING_SIZE - 1);
     resp_log_entry_t *entry = &g_resp_log_ring[idx];
@@ -1012,7 +1020,6 @@ typedef struct {
   bool dnssec_ok;
   size_t question_end;
   zone_db_snapshot_t *snap;
-  worker_ctx_t *owner_ctx;
 } async_io_task_t;
 
 typedef struct {
@@ -1107,9 +1114,6 @@ static void *async_io_worker_func(void *arg) {
         submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                             0, 0, 0, false, false);
       }
-      if (task.owner_ctx) {
-        rcu_reader_exit(task.owner_ctx);
-      }
     } else {
       // TCP async resolution
       uint8_t *tcp_res = malloc(65535);
@@ -1137,9 +1141,6 @@ static void *async_io_worker_func(void *arg) {
       }
       close(task.client_fd);
       dec_tcp_clients();
-      if (task.owner_ctx) {
-        rcu_reader_exit(task.owner_ctx);
-      }
     }
   }
   return NULL;
@@ -1508,7 +1509,6 @@ worker_startup_success:;
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               async_io_task_t task = {0};
-              task.owner_ctx = ctx;
               task.is_tcp = false;
               task.active_fd = active_fd;
               task.ipc_hdr = *ipc_msg;
@@ -1529,9 +1529,9 @@ worker_startup_success:;
               task.dnssec_ok = dnssec_ok;
               task.question_end = question_end;
               task.snap = acquire_zone_snapshot();
+              rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
-                rcu_reader_exit(ctx);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
@@ -1673,6 +1673,7 @@ worker_startup_success:;
             dec_tcp_clients();
             continue;
           }
+          clock_gettime(CLOCK_MONOTONIC, &ctx_tcp->connect_time);
           struct kevent ev_timeout;
           EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
                  10000, ctx_tcp);
@@ -1721,6 +1722,28 @@ process_tcp_client: ;
           }
           continue;
         }
+
+        // [Slowloris対策] TCP接続全体の最大生存時間チェック (60秒)
+        struct timespec now_mono;
+        clock_gettime(CLOCK_MONOTONIC, &now_mono);
+        int64_t elapsed_sec = (int64_t)(now_mono.tv_sec - ctx_tcp->connect_time.tv_sec);
+        if (elapsed_sec >= 60) {
+          struct kevent ev_del[2];
+          EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+          EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+          kevent(kq, ev_del, 2, NULL, 0, NULL);
+          close(client_fd);
+          dec_tcp_clients();
+          free(ctx_tcp);
+          for (int j = i + 1; j < n_events; j++) {
+            if (ev_list[j].ident == (uintptr_t)client_fd) {
+              ev_list[j].udata = NULL;
+              ev_list[j].filter = 0;
+            }
+          }
+          continue;
+        }
+
         int processed_queries = 0;
         bool client_closed = false;
 
@@ -1746,6 +1769,26 @@ process_tcp_client: ;
             break;
           }
           if (ret == 0) {
+            break;
+          }
+
+          // [RFC 1035 §4.1.1 / RFC 5452] QR=1 (レスポンスパケット) の破棄
+          if (msg_len >= DNS_HEADER_SIZE && (msg[2] & 0x80) != 0) {
+            submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, 0, "<response-on-query-port>", 0, 0, 0, false, false);
+            struct kevent ev_del[2];
+            EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+            EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            kevent(kq, ev_del, 2, NULL, 0, NULL);
+            close(client_fd);
+            dec_tcp_clients();
+            free(ctx_tcp);
+            client_closed = true;
+            for (int j = i + 1; j < n_events; j++) {
+              if (ev_list[j].ident == (uintptr_t)client_fd) {
+                ev_list[j].udata = NULL;
+                ev_list[j].filter = 0;
+              }
+            }
             break;
           }
 
@@ -1992,7 +2035,6 @@ process_tcp_client: ;
                     allowed = false;
                   } else {
                     pthread_detach(t);
-                    release_zone_snapshot(snap);
                     free(ctx_tcp);
                     client_closed = true;
                     for (int j = i + 1; j < n_events; j++) {
@@ -2031,15 +2073,25 @@ process_tcp_client: ;
                 res_buf[11] = arcount & 0xFF;
                 copy_len = offset;
 
+                int sign_rc = 0;
                 if (matched_key)
-                  tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
-                                   matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
+                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
+                                             matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
                 else {
                   tsig_key_t dummy = {0};
                   dummy.name = (zcfg && zcfg->tsig_keys_count > 0) ? zcfg->tsig_keys[0] : (zcfg ? zcfg->tsig_key : "unknown");
                   dummy.algorithm = "hmac-sha256";
-                  tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
-                                   17, tsig_mac, &tsig_mac_len, NULL, 0, false);
+                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
+                                             17, tsig_mac, &tsig_mac_len, NULL, 0, false);
+                }
+                if (sign_rc != 0) {
+                  release_zone_snapshot(snap);
+                  close(client_fd);
+                  dec_tcp_clients();
+                  free(ctx_tcp);
+                  client_closed = true;
+                  rcu_reader_exit(ctx);
+                  break;
                 }
               } else {
                 res_buf[2] |= 0x84;
@@ -2089,7 +2141,6 @@ process_tcp_client: ;
               kevent(kq, ev_del_syn, 2, NULL, 0, NULL);
 
               async_io_task_t task = {0};
-              task.owner_ctx = ctx;
               task.is_tcp = true;
               task.client_fd = client_fd;
               task.req_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
@@ -2109,9 +2160,9 @@ process_tcp_client: ;
               task.snap = snap;
               free(ctx_tcp);
 
+              rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(snap);
-                rcu_reader_exit(ctx);
                 close(client_fd);
                 dec_tcp_clients();
               }
@@ -2172,6 +2223,11 @@ process_tcp_client: ;
           server_config_t *cfg = acquire_config_snapshot();
           uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
           release_config_snapshot(cfg);
+
+          // [Slowloris対策] 未完了データ受信中の場合は3秒タイムアウト
+          if (ctx_tcp->state == TCP_STATE_READ_BODY || ctx_tcp->accumulated > 0) {
+            idle_timeout = 3000;
+          }
 
           struct kevent evs[2];
           uint32_t to_ms = (processed_queries >= 16) ? 1 : idle_timeout;
@@ -2552,6 +2608,9 @@ void *control_thread_func(void *arg) {
                             break;
                         case RELOAD_ERR_MISSING_SOA:
                             send(cfd, "ERROR missing SOA\n", 18, 0);
+                            break;
+                        case RELOAD_ERR_BUSY:
+                            send(cfd, "ERROR busy (AXFR in progress)\n", 30, 0);
                             break;
                     }
                   } else if (lr.zcfg->type && (strcasecmp(lr.zcfg->type, "slave") == 0 || strcasecmp(lr.zcfg->type, "secondary") == 0)) {
@@ -3707,10 +3766,14 @@ static pid_t g_supervisor_pid = 0;
 static char g_pid_file_path[1024] = "";
 static int g_pid_fd = -1;
 static volatile sig_atomic_t g_supervisor_should_exit = 0;
+static volatile sig_atomic_t g_supervisor_got_sighup = 0;
 
 static void supervisor_sig_handler(int sig) {
-  (void)sig;
-  g_supervisor_should_exit = 1;
+  if (sig == SIGHUP) {
+    g_supervisor_got_sighup = 1;
+  } else {
+    g_supervisor_should_exit = 1;
+  }
 }
 
 static void cleanup_pid_file(void) {
@@ -4131,6 +4194,11 @@ int main(int argc, char **argv) {
 
   if (backend_pid > 0) {
     // === Parent Process (Process Manager / Supervisor) ===
+    sigset_t unblock_set;
+    sigemptyset(&unblock_set);
+    sigaddset(&unblock_set, SIGHUP);
+    sigprocmask(SIG_UNBLOCK, &unblock_set, NULL);
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = supervisor_sig_handler;
@@ -4138,6 +4206,7 @@ int main(int argc, char **argv) {
     sa.sa_flags = 0;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
     pid_t router_pids[MAX_FRONTEND_ROUTERS];
     for (int r = 0; r < g_num_frontend_routers; r++) {
@@ -4189,6 +4258,11 @@ int main(int argc, char **argv) {
     pid_t dead = 0;
     int child_exit_code = 0;
     while (!g_supervisor_should_exit) {
+      if (g_supervisor_got_sighup) {
+        g_supervisor_got_sighup = 0;
+        syslog(LOG_INFO, "[Manager] Received SIGHUP. Forwarding to backend process %d", backend_pid);
+        kill(backend_pid, SIGHUP);
+      }
       int status;
       dead = wait(&status);
       if (dead > 0) {

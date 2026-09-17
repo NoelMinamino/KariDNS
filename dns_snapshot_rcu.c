@@ -578,6 +578,19 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
     return RELOAD_ERR_FILE_READ;
   }
   pthread_mutex_lock(&entry->writer_lock);
+  int axfr_wait_ms = 0;
+  int backoff = 1;
+  while (atomic_load_explicit(&entry->active_axfr, memory_order_acquire) > 0) {
+    if (axfr_wait_ms >= 5000) {
+      syslog(LOG_WARNING, "[Zone] Reload of zone '%s' postponed: active AXFR in progress (timeout 5s).", entry->domain);
+      free(buf);
+      pthread_mutex_unlock(&entry->writer_lock);
+      return RELOAD_ERR_BUSY;
+    }
+    usleep(backoff * 1000);
+    axfr_wait_ms += backoff;
+    if (backoff < 50) backoff *= 2;
+  }
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
   rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);

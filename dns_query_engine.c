@@ -928,6 +928,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     uint16_t signed_types[64];
     int signed_types_count = 0;
     bool has_any = (qtypes[0] == 255);
+    bool skip_synthesis = false;
     if (has_any && minimal_any) {
       bool name_exists = false, has_cname = false, has_rrsig = false;
       for (int i = current_zone->hash_table[idx]; i != -1;
@@ -941,7 +942,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
           if (rec->type_code == 46) has_rrsig = true;  // RRSIG
         }
       }
-      bool skip_synthesis = dnssec_ok && has_rrsig;
+      skip_synthesis = dnssec_ok && has_rrsig;
       if (name_exists && !has_cname && !skip_synthesis) {
         dns_record_t hinfo_rec;
         memset(&hinfo_rec, 0, sizeof(hinfo_rec));
@@ -965,6 +966,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       }
     }
 
+    uint16_t minimal_any_chosen_type = 0;
     for (int i = current_zone->hash_table[idx]; i != -1;
          i = current_zone->records[i].next_record) {
       dns_record_t *rec = &current_zone->records[i];
@@ -1007,6 +1009,18 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
           }
           break;
         } else {
+          /* [RFC 8482 §4.2] DNSSECゾーンでのANYクエリ: 最初に見つかった1つのRRsetのみを返し、他は展開しない */
+          if (has_any && minimal_any && skip_synthesis) {
+            if (rec_type != 46) {
+              if (minimal_any_chosen_type == 0) {
+                minimal_any_chosen_type = rec_type;
+              } else if (minimal_any_chosen_type != rec_type) {
+                continue;
+              }
+            } else {
+              continue;
+            }
+          }
           if (qtypes[0] == 255 || qtypes[0] == rec_type) {
             type_matched = true;
             if (rec->ecs_subnet_tag != NULL) ecs_used = true;
@@ -2783,8 +2797,13 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *sign_key = auth ? matched_key : attempted_key;
     if (sign_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false);
-      offset = sign_len;
+      if (tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false) == 0) {
+        offset = sign_len;
+      } else {
+        res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
+        res[10] = 0; res[11] = 0; // ARCOUNT = 0
+        offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+      }
     }
     return offset;
   }
@@ -2908,8 +2927,13 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     tsig_key_t *sign_key = auth ? matched_key : attempted_key;
     if (sign_key) {
       size_t sign_len = offset;
-      tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false);
-      offset = sign_len;
+      if (tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false) == 0) {
+        offset = sign_len;
+      } else {
+        res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
+        res[10] = 0; res[11] = 0; // ARCOUNT = 0
+        offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+      }
     }
     return offset;
   }
