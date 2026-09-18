@@ -309,10 +309,10 @@ coverage-report:
 	@ls $(COV_DIR)/*.profraw >/dev/null 2>&1 || { echo "Error: No profile data found in $(COV_DIR). Run 'make coverage-run' first."; exit 1; }
 	$(LLVM_PROFDATA) merge -sparse $(COV_DIR)/*.profraw -o $(COV_DATA)
 	@mkdir -p $(COV_HTML_DIR)
-	$(LLVM_COV) show $(TARGET) -instr-profile=$(COV_DATA) -format=html -output-dir=$(COV_HTML_DIR) -ignore-filename-regex="tests/|tools/|scratch/|old_patches/|third_party/" -show-line-counts-or-regions -show-branches=count
+	$(LLVM_COV) show $(TARGET) -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck -instr-profile=$(COV_DATA) -format=html -output-dir=$(COV_HTML_DIR) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/" -show-line-counts-or-regions -show-branches=count
 	@echo ""
-	@echo "=== KariDNS Core Engine Coverage Summary ==="
-	$(LLVM_COV) report $(TARGET) -instr-profile=$(COV_DATA) -ignore-filename-regex="tests/|tools/|scratch/|old_patches/|third_party/"
+	@echo "=== KariDNS & dag Integrated Engine Coverage Summary ==="
+	$(LLVM_COV) report $(TARGET) -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck -instr-profile=$(COV_DATA) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/"
 	@echo ""
 	@echo "Full HTML coverage report available at: $(COV_HTML_DIR)/index.html"
 

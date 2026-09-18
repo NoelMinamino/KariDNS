@@ -61,6 +61,17 @@ STOP_ON_FAILURE=0
 VERBOSE=0
 QUICK_MODE=0
 LIST_ONLY=0
+SKIP_DAG=0
+
+# Ensure LLVM_PROFILE_FILE is an absolute path so sub-scripts that change directory still write profdata
+if [ -n "${LLVM_PROFILE_FILE:-}" ]; then
+    case "${LLVM_PROFILE_FILE}" in
+        /*) ;; # already absolute
+        *)  LLVM_PROFILE_FILE="${ROOT_DIR}/${LLVM_PROFILE_FILE}"
+            export LLVM_PROFILE_FILE
+            ;;
+    esac
+fi
 
 # Parse arguments
 while [ $# -gt 0 ]; do
@@ -102,6 +113,9 @@ while [ $# -gt 0 ]; do
         -l|--list)
             LIST_ONLY=1
             ;;
+        --no-dag|--skip-dag)
+            SKIP_DAG=1
+            ;;
         -h|--help)
             echo "KariDNS Test Suite Runner"
             echo "Usage: $0 [options]"
@@ -109,7 +123,8 @@ while [ $# -gt 0 ]; do
             echo "Options:"
             echo "  -c, --category <name>   Filter by category (comma-separated or multiple):"
             echo "                          unit, xfr, dnssec, update, edns, rrl, catalog,"
-            echo "                          tinydns, core, dag, regression, all"
+            echo "                          dnstap, tinydns, core, regression, dag, all"
+            echo "  --no-dag, --skip-dag    Skip dag diagnostic client test suite"
             echo "  -f, --filter <pattern>  Filter tests matching name substring"
             echo "  -q, --quick             Run quick unit and core tests only"
             echo "  -x, --stop-on-failure   Stop on first test failure"
@@ -161,7 +176,7 @@ register_test() {
 }
 
 # ==============================================================================
-# Test Registry (105 Tests across 10 Categories)
+# Test Registry (All Server & Core Tests + Optional dag Suite)
 # ==============================================================================
 
 # 1. Unit Tests (C Binaries)
@@ -204,11 +219,14 @@ register_test "rrl" "sh" "tests/run_glue_truncation_test.sh" "Additional section
 register_test "catalog" "sh" "tests/run_catalog_zone_test.sh" "RFC 9432 Catalog Zone member provisioning"
 register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 Change of Ownership (CoO) migration"
 
-# 8. tinydns Format & Location
+# 8. DNSTAP Telemetry Logging
+register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
+
+# 9. tinydns Format & Location
 register_test "tinydns" "sh" "tests/run_tinydns_location_test.sh" "tinydns %location split-horizon resolution"
 register_test "tinydns" "sh" "tests/run_tinydns_timestamp_test.sh" "tinydns TTL countdown & TTD expiration"
 
-# 9. Server Core & Resolution
+# 10. Server Core & Resolution
 register_test "core" "sh" "tests/run_paren_check_test.sh" "Zone file multi-line parentheses tokenizer"
 register_test "core" "sh" "tests/run_ttl_suffix_test.sh" "TTL time unit suffixes (s, m, h, d, w)"
 register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire serialization roundtrip"
@@ -219,7 +237,8 @@ register_test "core" "sh" "tests/run_phase2_audit_part2_test.sh" "Phase 2 Securi
 register_test "core" "sh" "tests/run_response_section_order_test.sh" "RFC 1035 Response section ordering"
 register_test "core" "sh" "tests/run_sibling_additional_test.sh" "Sibling zone glue synthesis in Additional section"
 register_test "core" "sh" "tests/run_multi_instance_test.sh" "Multi-instance isolation & SO_REUSEPORT"
-register_test "core" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
+register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zone upstream resolution & failover"
+register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
 register_test "core" "sh" "tests/run_config_duplicate_rejection_test.sh" "Duplicate view/zone rejection in config parser"
@@ -233,15 +252,15 @@ register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmo
 register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "RFC 2181 31-bit signed TTL clamp"
 register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback"
 
-# 10. dag Diagnostic Client
-register_test "dag" "sh" "tests/run_dag_ci_test.sh" "dag comprehensive CI test suite (Part 1-19 + Part 20-21 parallel sub-suites)"
-register_test "dag" "sh" "tests/run_dag_batch_advanced_opts_test.sh" "dag Batch mode (-f) with advanced options"
-
-# 11. Regression, Sanitizer & Fuzz Smoke
+# 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
 register_test "regression" "sh" "tests/run_stress_test.sh" "TSan & ASan concurrency stress test (dnsperf + IXFR)"
-register_test "regression" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer smoke execution"
 register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-resistance smoke verification"
+
+# 12. dag Diagnostic Client Suite (Run with -c dag or --include-dag)
+register_test "dag" "sh" "tests/run_dag_ci_test.sh" "dag comprehensive CI test suite (Part 1-19 + Part 20-21 parallel sub-suites)"
+register_test "dag" "sh" "tests/run_dag_batch_advanced_opts_test.sh" "dag Batch mode (-f) with advanced options"
+register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer smoke execution"
 
 # If -l or --list, print tests and exit
 if [ "${LIST_ONLY}" -eq 1 ]; then
@@ -266,6 +285,9 @@ fi
 # Function to check if a category is selected
 is_category_selected() {
     _target_cat="$1"
+    if [ "${SKIP_DAG}" -eq 1 ] && [ "${_target_cat}" = "dag" ]; then
+        return 1
+    fi
     if [ -z "${SELECTED_CATEGORIES}" ] || [ "${SELECTED_CATEGORIES}" = "all" ]; then
         return 0
     fi
