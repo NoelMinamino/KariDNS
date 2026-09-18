@@ -1512,8 +1512,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         // --- Dry-run serialize_dns_record ---
         uint8_t scratch[65535];
         uint16_t scratch_offset = 0;
-        compress_ctx_t comp_ctx;
-        memset(&comp_ctx, 0, sizeof(comp_ctx));
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         int wire_result = serialize_dns_record(
             scratch, sizeof(scratch), &scratch_offset,

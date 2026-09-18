@@ -91,7 +91,7 @@ static void test_mqtype_truncation(void) {
     req[off++] = 0x00; req[off++] = 0x02; // OptLen 2
     req[off++] = 0x00; req[off++] = 0x10; // QTYPE TXT (16)
 
-    compress_ctx_t comp_ctx;
+    compress_ctx_t comp_ctx = {0};
     compress_ctx_init_packet(&comp_ctx);
 
     // Test with buffer large enough for A record (~70 bytes) but not for large TXT records (~250 bytes)
@@ -147,7 +147,7 @@ static void test_mqtype_qdcount0_formerr(void) {
     req[off++] = 0x00; req[off++] = 0x10; // QTYPE TXT (16)
 
     uint8_t res[512] = {0};
-    compress_ctx_t comp_ctx;
+    compress_ctx_t comp_ctx = {0};
     compress_ctx_init_packet(&comp_ctx);
     rate_limit_config_t *rrl = NULL;
 
@@ -175,7 +175,7 @@ static void test_resolve_name_servfail_rcode_clearing(void) {
     uint8_t res[512] = {0};
     res[3] = 0x83; // Pre-set RCODE=3 (NXDOMAIN)
     uint16_t offset = 12, ancount = 0, nscount = 0, arcount = 0;
-    compress_ctx_t comp_ctx;
+    compress_ctx_t comp_ctx = {0};
     compress_ctx_init_packet(&comp_ctx);
 
     uint16_t qtype = 1;
@@ -273,7 +273,7 @@ static void test_response_section_order(void) {
     memset(res, 0, sizeof(res));
     uint16_t offset = 12;
     uint16_t ancount = 0, nscount = 0, arcount = 0;
-    compress_ctx_t comp_ctx;
+    compress_ctx_t comp_ctx = {0};
     compress_ctx_init_packet(&comp_ctx);
 
     uint16_t qtype = 2; // NS

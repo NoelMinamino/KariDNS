@@ -292,6 +292,7 @@ typedef struct {
 // ============================================================================
 
 // 名前圧縮
+void compress_ctx_init(compress_ctx_t *ctx);
 void compress_ctx_init_packet(compress_ctx_t *ctx);
 int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx, size_t max_len);
 void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t start_offset, compress_ctx_t *ctx);

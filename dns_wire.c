@@ -44,9 +44,19 @@
 // ============================================================================
 // 5. 名前圧縮アルゴリズム (FNV-1a, Branchless, 無限ループ防御)
 // ============================================================================
+void compress_ctx_init(compress_ctx_t *ctx) {
+    if (!ctx) return;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->current_generation = 1;
+}
+
 void compress_ctx_init_packet(compress_ctx_t *ctx) {
+    if (!ctx) return;
     ctx->current_generation++;
-    if (ctx->current_generation == 0) { memset(ctx->table, 0, sizeof(ctx->table)); ctx->current_generation = 1; }
+    if (ctx->current_generation == 0) {
+        memset(ctx->table, 0, sizeof(ctx->table));
+        ctx->current_generation = 1;
+    }
 }
 
 
@@ -1544,6 +1554,7 @@ static uint8_t loc_encode_precsize(double meters) {
 
 static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
+    if (!fields || !res || !offset || *offset > max_res_len) return -1;
     char b64[2048] = "";
     size_t b64_len = 0;
     for (int i = 0; i < count; i++) {
@@ -1572,6 +1583,7 @@ static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
 
 static int decode_concat_hex_rdata(char **fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
+    if (!fields || !res || !offset || *offset > max_res_len) return -1;
     char hex[2048] = "";
     size_t hex_len = 0;
     for (int i = 0; i < count; i++) {

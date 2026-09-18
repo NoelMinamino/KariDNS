@@ -117,8 +117,8 @@ static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
 static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
 static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
-worker_ctx_t *g_worker_ctxs = NULL;
-int g_worker_count = 0;
+_Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
+_Atomic int g_worker_count = ATOMIC_VAR_INIT(0);
 
 static inline uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
     if (!cfg) return 0;
@@ -727,8 +727,9 @@ static inline void write_query_log(worker_ctx_t *ctx,
         ctx->log_current_sec = now_sec;
         ctx->log_emitted_this_sec = 0;
     }
-    uint32_t quota = (limit >= (uint32_t)g_worker_count && g_worker_count > 0)
-                     ? (limit / g_worker_count) : 1;
+    int nw = atomic_load_explicit(&g_worker_count, memory_order_relaxed);
+    uint32_t quota = (nw > 0 && limit >= (uint32_t)nw)
+                     ? (limit / (uint32_t)nw) : 1;
     if (ctx->log_emitted_this_sec >= quota) {
         // 閾値超過: リングバッファ操作やメモリコピーを一切行わず即座にリターン
         return;
@@ -805,8 +806,8 @@ void *query_logger_thread_func(void *arg) {
         server_config_t *cfg = acquire_config_snapshot();
         log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
 
-        int num_workers = g_worker_count;
-        worker_ctx_t *workers = g_worker_ctxs;
+        int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+        worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         bool any_work = false;
 
         if (ch && num_workers > 0 && workers) {
@@ -1421,7 +1422,6 @@ worker_startup_success:;
             break;
           }
 
-          zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int n_tx = 0;
           for (int p = 0; p < n_recv; p++) {
             ssize_t received = (ssize_t)batch->rx_msgs[p].msg_len;
@@ -1444,6 +1444,7 @@ worker_startup_success:;
 
             char client_ip[INET6_ADDRSTRLEN] = "";
             rcu_reader_enter(ctx);
+            zone_db_snapshot_t *snap = acquire_zone_snapshot();
             if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
               fast_ipv4_to_str(client_addr->sin.sin_addr.s_addr, client_ip);
             } else if (client_addr->ss_family == AF_INET6) {
@@ -1676,9 +1677,6 @@ worker_startup_success:;
             }
           }
           atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
-          if (snap) {
-            release_zone_snapshot(snap);
-          }
           if (n_tx > 0) {
             sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
             n_tx = 0;
@@ -2156,7 +2154,6 @@ process_tcp_client: ;
                 }
                 if (sign_rc != 0) {
                   release_config_snapshot(cfg);
-                  release_zone_snapshot(snap);
                   close(client_fd);
                   dec_tcp_clients();
                   free(ctx_tcp);
@@ -2182,7 +2179,6 @@ process_tcp_client: ;
                 copy_len = offset;
               }
               release_config_snapshot(cfg);
-              release_zone_snapshot(snap);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
                                  &ctx_tcp->client_addr, ctx_tcp->client_len,
@@ -2202,14 +2198,11 @@ process_tcp_client: ;
               client_closed = true;
               rcu_reader_exit(ctx);
               break;
-            } else {
-              release_zone_snapshot(snap);
             }
           } else {
             if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
               uint8_t *heap_req = malloc(msg_len);
               if (!heap_req) {
-                release_zone_snapshot(snap);
                 free(ctx_tcp);
                 close(client_fd);
                 dec_tcp_clients();
@@ -2248,7 +2241,7 @@ process_tcp_client: ;
 
               rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
-                release_zone_snapshot(snap);
+                release_zone_snapshot(task.snap);
                 free(task.req_buf);
                 close(client_fd);
                 dec_tcp_clients();
@@ -2261,7 +2254,6 @@ process_tcp_client: ;
               int res_len = process_dns_query(msg, msg_len, tcp_res, 65535,
                                               qname, qtype, ctx_tcp->client_ip,
                                               &thread_compress_ctx, true, NULL, snap);
-              release_zone_snapshot(snap);
               if (res_len > 0) {
                 submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                     tcp_res[3] & 0x0F, has_edns, dnssec_ok);
@@ -2283,8 +2275,6 @@ process_tcp_client: ;
                                     0, 0, 0, false, false);
               }
               free(tcp_res);
-            } else {
-              release_zone_snapshot(snap);
             }
             
             server_config_t *cfg = acquire_config_snapshot();
@@ -2665,6 +2655,7 @@ void *control_thread_func(void *arg) {
                 char canon_buf[256];
                 const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
                 zone_db_snapshot_t *snap = acquire_zone_snapshot();
+                if (snap) retain_zone_snapshot(snap);
                 server_config_t *active = acquire_config_snapshot();
                 zone_lookup_result_t lr = {0};
                 int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
@@ -2739,6 +2730,7 @@ void *control_thread_func(void *arg) {
               
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
               if (snap) {
+                retain_zone_snapshot(snap);
                 for (size_t v = 0; v < snap->view_count; v++) {
                   st.num_zones += snap->views[v].zone_count;
                 }
@@ -2783,6 +2775,7 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2802,6 +2795,7 @@ void *control_thread_func(void *arg) {
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "observatory") == 0) {
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               char canon_buf[256];
               const char *canon_arg = (arg && strlen(arg) > 0) ? find_configured_domain(arg, canon_buf, sizeof(canon_buf)) : NULL;
@@ -2843,6 +2837,7 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2864,6 +2859,7 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2924,6 +2920,7 @@ void *control_thread_func(void *arg) {
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_zone_snapshot();
         if (snap) {
+            retain_zone_snapshot(snap);
             for (size_t v = 0; v < snap->view_count; v++) {
                 for (size_t i = 0; i < snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = snap->views[v].entries[i];
@@ -3423,6 +3420,9 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     kevent(kq, &ev, 1, NULL, 0, NULL);
   }
   signal(SIGCHLD, SIG_DFL);
+  signal(SIGTERM, SIG_DFL);
+  signal(SIGINT, SIG_DFL);
+  signal(SIGHUP, SIG_IGN);
   if (router_id == 0) {
     struct kevent ev_notify;
     EV_SET(&ev_notify, g_notify_ipc[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
@@ -3508,8 +3508,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             }
           }
         }
-        syslog(LOG_CRIT, "[Frontend %d] Backend process (pid=%d) exited unexpectedly. Shutting down.", router_id, backend_pid);
-        exit(1);
+        syslog(LOG_NOTICE, "[Frontend %d] Backend process (pid=%d) terminated. Shutting down.", router_id, backend_pid);
+        exit(0);
       }
       if (ud == 1001) {
         syslog(LOG_NOTICE, "[Frontend %d] Parent supervisor process exited. Shutting down.", router_id);
@@ -4455,9 +4455,6 @@ int main(int argc, char **argv) {
       if (w < 0 && errno == EINTR) continue;
       break;
     }
-    if (!g_supervisor_should_exit && child_exit_code == 0) {
-      child_exit_code = 1;
-    }
     cleanup_pid_file();
     exit(child_exit_code);
   }
@@ -4479,10 +4476,6 @@ int main(int argc, char **argv) {
   init_async_io_pool();
   rrl_init();
 
-  pthread_t control_thread;
-  if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
-    exit(1);
-
   server_config_t *cfg = &g_config_db.config_a;
   uint32_t qlog_buf_size = cfg->query_log_buffer_size;
   if (qlog_buf_size < 1024 || (qlog_buf_size & (qlog_buf_size - 1)) != 0) {
@@ -4493,8 +4486,6 @@ int main(int argc, char **argv) {
   worker_ctx_t *ctxs = calloc(num_workers, sizeof(worker_ctx_t));
   if (!threads || !ctxs)
     exit(1);
-  g_worker_ctxs = ctxs;
-  g_worker_count = num_workers;
   for (int i = 0; i < num_workers; i++) {
     ctxs[i].thread_id = i;
     ctxs[i].core_id = (g_num_frontend_routers + i) % total_cores;
@@ -4522,6 +4513,16 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
     if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
       exit(EXIT_FAILURE);
+  }
+
+  atomic_store_explicit(&g_worker_ctxs, ctxs, memory_order_release);
+  atomic_store_explicit(&g_worker_count, num_workers, memory_order_release);
+
+  pthread_t control_thread;
+  if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
+    exit(1);
+
+  for (int i = 0; i < num_workers; i++) {
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
       exit(EXIT_FAILURE);
   }

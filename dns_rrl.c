@@ -108,7 +108,7 @@ bool rrl_check(const void *client_addr_ptr, rrl_response_class_t cls, const rate
   uint32_t rate = 0;
   switch (cls) {
     case RRL_RESP_NOERROR: rate = cfg->responses_per_second; break;
-    case RRL_RESP_NODATA:  rate = cfg->responses_per_second; break;
+    case RRL_RESP_NODATA:  rate = cfg->nodata_per_second; break;
     case RRL_RESP_NXDOMAIN: rate = cfg->nxdomains_per_second; break;
     case RRL_RESP_ERROR:   rate = cfg->errors_per_second; break;
   }

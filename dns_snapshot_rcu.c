@@ -44,7 +44,13 @@ void retain_zone_snapshot(zone_db_snapshot_t *snap) {
 
 void release_zone_snapshot(zone_db_snapshot_t *snap) {
   if (snap) {
-    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+    int old = atomic_load_explicit(&snap->reader_count, memory_order_relaxed);
+    while (old > 0) {
+      if (atomic_compare_exchange_weak_explicit(&snap->reader_count, &old, old - 1,
+                                                memory_order_release, memory_order_relaxed)) {
+        break;
+      }
+    }
   }
 }
 
@@ -799,6 +805,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   }
 
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
+  if (cur_snap) retain_zone_snapshot(cur_snap);
   server_config_t *active_cfg_prelink = acquire_config_snapshot();
   additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                       ? zcfg->additional_from_auth
@@ -1609,6 +1616,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
             zone_db_snapshot_t *snap = acquire_zone_snapshot();
             if (snap) {
+                retain_zone_snapshot(snap);
                 zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
                 if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
                     struct stat st;
@@ -1628,6 +1636,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
             if (z->is_catalog && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
                 zone_db_snapshot_t *snap = acquire_zone_snapshot();
                 if (snap) {
+                    retain_zone_snapshot(snap);
                     zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
                     if (entry) {
                         catalog_process_membership(entry, z, v->name);
@@ -1641,6 +1650,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
     // Pass 2: Pre-link additional glue across authoritative zones in each view
     zone_db_snapshot_t *relink_snap = acquire_zone_snapshot();
     if (relink_snap) {
+        retain_zone_snapshot(relink_snap);
         for (size_t v = 0; v < relink_snap->view_count; v++) {
             view_snapshot_t *view = &relink_snap->views[v];
             for (size_t i = 0; i < view->zone_count; i++) {

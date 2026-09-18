@@ -324,8 +324,8 @@ void *dnstap_sender_thread_func(void *arg) {
     static uint8_t g_dnstap_scratch_buf[65535 + 128]; // 送信スレッドは1本のみなので競合しない
     while (1) {
         bool any_work = false;
-        int num_workers = g_worker_count;
-        worker_ctx_t *workers = g_worker_ctxs;
+        int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+        worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
             if (num_workers > 0 && workers) {
                 for (int w = 0; w < num_workers; w++) {

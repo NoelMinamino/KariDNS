@@ -628,6 +628,7 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
 
         zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
+        if (cur_snap) retain_zone_snapshot(cur_snap);
         server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
         zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
         additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)

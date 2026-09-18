@@ -213,8 +213,8 @@ struct worker_ctx {
 
 #include "dns_epoch_rcu.h"
 
-extern worker_ctx_t *g_worker_ctxs;
-extern int g_worker_count;
+extern _Atomic(worker_ctx_t *) g_worker_ctxs;
+extern _Atomic int g_worker_count;
 
 typedef struct {
   uint32_t old_serial;
