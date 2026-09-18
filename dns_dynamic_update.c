@@ -138,6 +138,14 @@ static void send_single_notify(const uint8_t *req, size_t req_len,
   }
 
   uint8_t buf[2048];
+  /* Defense in depth: all current callers build a small, internally-generated
+   * NOTIFY packet (well under this limit), but nothing here enforced that.
+   * Without this check, any future caller (or refactor) passing a larger
+   * req_len would silently overflow this stack buffer. */
+  if (sizeof(msg) + req_len > sizeof(buf)) {
+    syslog(LOG_ERR, "[Notify] NOTIFY payload too large (%zu bytes), dropping", req_len);
+    return;
+  }
   memcpy(buf, &msg, sizeof(msg));
   memcpy(buf + sizeof(msg), req, req_len);
   /* [H-1] send 戻り値を検査してエラーをログに記録する */
