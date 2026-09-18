@@ -424,11 +424,92 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         char *ip_buf = arena_alloc(arena, 16); if (!ip_buf) return -1;
         snprintf(ip_buf, 16, "%d.%d.%d.%d", packet[*offset], packet[*offset+1], packet[*offset+2], packet[*offset+3]);
         rec->rdata[0] = ip_buf; rec->rdata_count = 1;
-    } else if (type == 2 || type == 5 || type == 12) {
+    } else if (type == 2 || type == 3 || type == 4 || type == 5 || type == 7 ||
+               type == 8 || type == 9 || type == 12 || type == 23 || type == 39) {
+        // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
         size_t rdata_p = *offset; char *target;
         if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: NAME expand failed"); return -1; }
         if (rdata_p > *offset + rdlen) { syslog(LOG_ERR, "[AXFR] parse_resource_record: NAME exceeds rdlen"); return -1; }
         rec->rdata[0] = target; rec->rdata_count = 1;
+    } else if (type == 14 || type == 17) {
+        // MINFO, RP: 2 domain names
+        size_t rdata_p = *offset; char *name1, *name2;
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &name1) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &name2) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
+        rec->rdata[0] = name1; rec->rdata[1] = name2; rec->rdata_count = 2;
+    } else if (type == 18 || type == 21 || type == 36 || type == 107) {
+        // AFSDB, RT, KX, LP: uint16 pref + domain name
+        if (rdlen < 3) return -1;
+        size_t rdata_p = *offset; char *target;
+        uint16_t pref = (packet[rdata_p] << 8) | packet[rdata_p+1];
+        rdata_p += 2;
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
+        char *pref_buf = arena_alloc(arena, 16); if (!pref_buf) return -1;
+        snprintf(pref_buf, 16, "%u", pref);
+        rec->rdata[0] = pref_buf; rec->rdata[1] = target; rec->rdata_count = 2;
+    } else if (type == 26) {
+        // PX: uint16 pref + 2 domain names
+        if (rdlen < 4) return -1;
+        size_t rdata_p = *offset; char *map822, *mapx400;
+        uint16_t pref = (packet[rdata_p] << 8) | packet[rdata_p+1];
+        rdata_p += 2;
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &map822) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &mapx400) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
+        char *pref_buf = arena_alloc(arena, 16); if (!pref_buf) return -1;
+        snprintf(pref_buf, 16, "%u", pref);
+        rec->rdata[0] = pref_buf; rec->rdata[1] = map822; rec->rdata[2] = mapx400; rec->rdata_count = 3;
+    } else if (type == 33) {
+        // SRV: uint16 prio, uint16 weight, uint16 port + domain name
+        if (rdlen < 7) return -1;
+        size_t rdata_p = *offset; char *target;
+        uint16_t prio = (packet[rdata_p] << 8) | packet[rdata_p+1];
+        uint16_t weight = (packet[rdata_p+2] << 8) | packet[rdata_p+3];
+        uint16_t port = (packet[rdata_p+4] << 8) | packet[rdata_p+5];
+        rdata_p += 6;
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &target) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
+        char *prio_buf = arena_alloc(arena, 16);
+        char *weight_buf = arena_alloc(arena, 16);
+        char *port_buf = arena_alloc(arena, 16);
+        if (!prio_buf || !weight_buf || !port_buf) return -1;
+        snprintf(prio_buf, 16, "%u", prio);
+        snprintf(weight_buf, 16, "%u", weight);
+        snprintf(port_buf, 16, "%u", port);
+        rec->rdata[0] = prio_buf; rec->rdata[1] = weight_buf; rec->rdata[2] = port_buf; rec->rdata[3] = target; rec->rdata_count = 4;
+    } else if (type == 35) {
+        // NAPTR: order, pref, flags, services, regexp, replacement (domain name)
+        if (rdlen < 7) return -1;
+        size_t rdata_p = *offset;
+        uint16_t order = (packet[rdata_p] << 8) | packet[rdata_p+1];
+        uint16_t pref = (packet[rdata_p+2] << 8) | packet[rdata_p+3];
+        rdata_p += 4;
+        char *cstrs[3];
+        for (int k = 0; k < 3; k++) {
+            if (rdata_p >= *offset + rdlen) return -1;
+            uint8_t slen = packet[rdata_p++];
+            if (rdata_p + slen > *offset + rdlen) return -1;
+            char *s = arena_alloc(arena, slen + 1); if (!s) return -1;
+            memcpy(s, &packet[rdata_p], slen); s[slen] = '\0';
+            cstrs[k] = s;
+            rdata_p += slen;
+        }
+        char *replacement;
+        if (expand_wire_name(packet, packet_len, rdata_p, &rdata_p, arena, &replacement) != 0) return -1;
+        if (rdata_p > *offset + rdlen) return -1;
+        char *order_buf = arena_alloc(arena, 16);
+        char *pref_buf = arena_alloc(arena, 16);
+        if (!order_buf || !pref_buf) return -1;
+        snprintf(order_buf, 16, "%u", order);
+        snprintf(pref_buf, 16, "%u", pref);
+        rec->rdata[0] = order_buf; rec->rdata[1] = pref_buf;
+        rec->rdata[2] = cstrs[0]; rec->rdata[3] = cstrs[1]; rec->rdata[4] = cstrs[2];
+        rec->rdata[5] = replacement;
+        rec->rdata_count = 6;
     } else if (type == 15) {
         if (rdlen < 3) return -1;
         size_t rdata_p = *offset; char *target;
@@ -1636,7 +1717,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += 16;
                 break;
             }
-            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR
+            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: { // NS, MD, MF, CNAME, MB, MG, MR, PTR
                 if (rec->is_cached && rec->cache.name.wire_name) {
                     if (!comp_ctx) {
                         if ((size_t)offset + rec->cache.name.wire_name_len > max_res_len) return -1;
@@ -1651,7 +1732,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (write_dns_name_str(res, &offset, rec->rdata[0], comp_ctx, max_res_len) != 0 || (size_t)offset > max_res_len) return -1;
                 break;
             }
-            case 39: { // DNAME (RFC 6672: 圧縮禁止)
+            case 23: case 39: { // NSAP-PTR (RFC 3597), DNAME (RFC 6672) - 圧縮禁止
                 if (rec->is_cached && rec->cache.name.wire_name) {
                     if ((size_t)offset + rec->cache.name.wire_name_len > max_res_len) return -1;
                     memcpy(&res[offset], rec->cache.name.wire_name, rec->cache.name.wire_name_len);

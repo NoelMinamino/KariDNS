@@ -1159,7 +1159,7 @@ PROCESS_RECORD:
   for (int j = 0; j < rec->rdata_count; j++) {
       bool is_domain_name = false;
       switch (rec->type_code) {
-          case 2: case 5: case 12: case 39: // NS, CNAME, PTR, DNAME
+          case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
               if (j == 0) is_domain_name = true;
               break;
           case 15: // MX
@@ -1807,7 +1807,7 @@ int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err) {
     for (int j = 0; j < rec->rdata_count; j++) {
         bool is_domain_name = false;
         switch (rec->type_code) {
-            case 2: case 5: case 12: case 39: // NS, CNAME, PTR, DNAME
+            case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
                 if (j == 0) is_domain_name = true;
                 break;
             case 15: // MX
@@ -1830,6 +1830,15 @@ int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err) {
                 break;
             case 26: // PX
                 if (j == 1 || j == 2) is_domain_name = true;
+                break;
+            case 30: // NXT (RFC 2535): rdata[0] = Next Domain Name
+                if (j == 0) is_domain_name = true;
+                break;
+            case 38: // A6 (RFC 2874): rdata[2] = prefix name
+                if (j == 2) is_domain_name = true;
+                break;
+            case 58: // TALINK: rdata[0]=prev, rdata[1]=next
+                if (j == 0 || j == 1) is_domain_name = true;
                 break;
             default:
                 break;
