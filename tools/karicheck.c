@@ -1177,6 +1177,25 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         if (tcode == 55) { // HIP
             if (rcount < 3) {
                 fprintf(stderr, "[WARNING] HIP record requires at least 3 fields: HIT algorithm, HIT (hex), and public key (base64) for name '%s'\n", arena.records[i].name);
+            } else {
+                /* Reconstruct the concatenated public-key base64 token the same way
+                 * the server's serializer does, and reject lengths that are not a
+                 * non-zero multiple of 4: such input makes EVP_DecodeBlock's
+                 * returned length smaller than the base64 padding count, which
+                 * underflows the RR's public-key length field at response time. */
+                size_t pk_b64_len = 0;
+                bool pk_finished = false;
+                for (int r_idx = 2; r_idx < rcount && !pk_finished; r_idx++) {
+                    if (strchr(rdata[r_idx], '.') != NULL) break;
+                    size_t tlen = strlen(rdata[r_idx]);
+                    pk_b64_len += tlen;
+                    if (tlen > 0 && rdata[r_idx][tlen - 1] == '=') pk_finished = true;
+                }
+                if (pk_b64_len == 0 || (pk_b64_len % 4) != 0) {
+                    fprintf(stderr, "[ERROR] HIP record public key for name '%s' is not valid base64 (length %zu is not a non-zero multiple of 4) in zone '%s'\n",
+                            arena.records[i].name, pk_b64_len, domain);
+                    error_found = true;
+                }
             }
         }
         if (tcode == 11) { // WKS

@@ -1553,11 +1553,19 @@ static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
         b64_len += flen;
         b64[b64_len] = '\0';
     }
+    /* b64_len must be a non-zero multiple of 4 (a well-formed base64 quantum
+     * count). Otherwise EVP_DecodeBlock's returned length can legitimately be
+     * smaller than the trailing '=' padding count below (e.g. b64_len==2 with
+     * a trailing '=' yields declen==0, padding==1), which would underflow
+     * (declen - padding) to a negative int that then wraps to a huge size_t
+     * when added to *offset, corrupting all bound checks that follow. */
+    if (b64_len == 0 || (b64_len % 4) != 0) return -1;
     size_t decoded_upper_bound = ((b64_len + 3) / 4) * 3;
     if (*offset + decoded_upper_bound > max_res_len) return -1;
     int declen = EVP_DecodeBlock(&res[*offset], (const unsigned char *)b64, b64_len);
     if (declen < 0) return -1;
     int padding = (b64_len > 0 && b64[b64_len-1]=='=') + (b64_len > 1 && b64[b64_len-2]=='=');
+    if (declen < padding) return -1; // guard against underflow
     *offset += (size_t)(declen - padding);
     return 0;
 }
@@ -2345,6 +2353,11 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     r_idx++;
                 }
 
+                // pk_b64 must be a well-formed base64 quantum (non-empty, multiple of 4)
+                // or EVP_DecodeBlock's returned length can be smaller than the padding
+                // count below, underflowing pk_len (uint16_t) into a huge value.
+                if (pk_b64_len == 0 || (pk_b64_len % 4) != 0) return -1;
+
                 size_t decoded_upper_bound = ((pk_b64_len + 3) / 4) * 3;
                 if ((size_t)offset + 4 + hit_len + decoded_upper_bound > max_res_len) return -1;
                 
@@ -2364,7 +2377,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (pk_b64_len > 0 && pk_b64[pk_b64_len - 1] == '=') padding++;
                 if (pk_b64_len > 1 && pk_b64[pk_b64_len - 2] == '=') padding++;
                 
-                uint16_t pk_len = pk_declen - padding;
+                if (pk_declen < padding) return -1; // guard against uint16_t underflow below
+                uint16_t pk_len = (uint16_t)(pk_declen - padding);
                 res[pk_len_offset] = pk_len >> 8;
                 res[pk_len_offset + 1] = pk_len & 0xFF;
                 offset += pk_len;
@@ -2558,15 +2572,16 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                             }
                         } else if (key == 5) { // ech
                             size_t blen = strlen(val_str);
+                            if (blen == 0 || (blen % 4) != 0) return -1;
                             size_t decoded_upper_bound = ((blen + 3) / 4) * 3;
                             if ((size_t)(val_len + decoded_upper_bound) > sizeof(val_wire)) return -1;
                             int declen = EVP_DecodeBlock(&val_wire[val_len], (const unsigned char *)val_str, blen);
-                            if (declen > 0) {
-                                int pad = 0;
-                                if (blen > 0 && val_str[blen-1] == '=') pad++;
-                                if (blen > 1 && val_str[blen-2] == '=') pad++;
-                                val_len += (declen - pad);
-                            }
+                            if (declen < 0) return -1;
+                            int pad = 0;
+                            if (blen > 0 && val_str[blen-1] == '=') pad++;
+                            if (blen > 1 && val_str[blen-2] == '=') pad++;
+                            if (declen < pad) return -1;
+                            val_len += (size_t)(declen - pad);
                         } else {
                             // 汎用 keyNNN (RFC 9460 §2.1, Appendix D.2 Figure 5/6):
                             const char *p = val_str;
