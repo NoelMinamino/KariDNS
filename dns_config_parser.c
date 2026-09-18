@@ -1513,6 +1513,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
+  config->wire_cache_max_records = 0;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->query_log_max_qps = 5000;
   config->query_log_buffer_size = 32768;
@@ -1917,6 +1918,28 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key); free_token(&tok); return -1;
           }
           config->minimal_any_ttl = (uint32_t)v;
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "wire-cache-max-records") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          char *endptr;
+          unsigned long v = strtoul(tok.value, &endptr, 10);
+          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
+            syslog(LOG_ERR, "[Config] Invalid wire-cache-max-records value '%s' (must be a non-negative integer)", tok.value);
+            fprintf(stderr, "[ERROR] Invalid wire-cache-max-records value '%s' (must be a non-negative integer)\n", tok.value);
+            free(key); free_token(&tok); return -1;
+          }
+          config->wire_cache_max_records = (uint32_t)v;
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {

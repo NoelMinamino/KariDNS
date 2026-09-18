@@ -174,6 +174,7 @@ typedef struct server_config_s {
   bool minimal_responses;
   bool minimal_any;
   uint32_t minimal_any_ttl;
+  uint32_t wire_cache_max_records;
   additional_from_auth_t additional_from_auth;
   uint32_t query_log_max_qps;
   uint32_t query_log_buffer_size;

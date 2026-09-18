@@ -850,7 +850,150 @@ static void test_wire_cache_consistency(void) {
     printf("[SUCCESS] All wire cache tests passed!\n");
 }
 
+static void test_wire_cache_max_records_limit(void) {
+    printf("[TEST] Running wire-cache-max-records configuration and threshold tests...\n");
+
+    // 1. Config parser tests
+    {
+        char conf_ok[] = "options { wire-cache-max-records 500000; };";
+        server_config_t cfg_ok;
+        memset(&cfg_ok, 0, sizeof(cfg_ok));
+        int res = parse_named_conf(conf_ok, &cfg_ok);
+        assert(res == 0);
+        assert(cfg_ok.wire_cache_max_records == 500000);
+        free_server_config_fields(&cfg_ok);
+
+        char conf_zero[] = "options { wire-cache-max-records 0; };";
+        server_config_t cfg_zero;
+        memset(&cfg_zero, 0, sizeof(cfg_zero));
+        res = parse_named_conf(conf_zero, &cfg_zero);
+        assert(res == 0);
+        assert(cfg_zero.wire_cache_max_records == 0);
+        free_server_config_fields(&cfg_zero);
+
+        char conf_neg[] = "options { wire-cache-max-records -10; };";
+        server_config_t cfg_neg;
+        memset(&cfg_neg, 0, sizeof(cfg_neg));
+        res = parse_named_conf(conf_neg, &cfg_neg);
+        assert(res != 0);
+
+        char conf_invalid[] = "options { wire-cache-max-records abc; };";
+        server_config_t cfg_inv;
+        memset(&cfg_inv, 0, sizeof(cfg_inv));
+        res = parse_named_conf(conf_invalid, &cfg_inv);
+        assert(res != 0);
+
+        printf("  [PASS] Config parser handles wire-cache-max-records properly\n");
+    }
+
+    // 2. Threshold check & boundary tests
+    {
+        zone_arena_t arena;
+        memset(&arena, 0, sizeof(arena));
+        zone_arena_init(&arena);
+
+        parse_error_t err = {0};
+        parse_context_t ctx = {
+            .base_dir = ".",
+            .default_origin = "example.com.",
+            .is_standalone_mode = true,
+            .err_out = &err,
+        };
+
+        const char zone_text[] =
+            "example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. 2026091401 7200 3600 1209600 3600\n"
+            "example.com. 3600 IN NS ns1.example.com.\n"
+            "ns1.example.com. 3600 IN A 192.0.2.1\n"
+            "mail.example.com. 3600 IN A 192.0.2.10\n"
+            "www.example.com. 3600 IN A 192.0.2.20\n";
+
+        int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
+        assert(parsed >= 0);
+        assert(build_zone_index(&arena, true) == 0);
+        size_t total_records = arena.count;
+        assert(total_records == 5);
+
+        server_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+
+        // Case A: wire_cache_max_records = 0 (unlimited) -> Cache enabled
+        cfg.wire_cache_max_records = 0;
+        build_zone_response_cache(&arena, &cfg, "example.com.");
+        assert(arena.response_cache.buckets != NULL);
+        assert(arena.response_cache.entry_count > 0);
+        printf("  [PASS] wire_cache_max_records=0 enables cache (entries=%zu)\n", arena.response_cache.entry_count);
+
+        // Case B: wire_cache_max_records = total_records + 1 (above) -> Cache enabled
+        free_zone_response_cache(&arena);
+        cfg.wire_cache_max_records = (uint32_t)(total_records + 1);
+        build_zone_response_cache(&arena, &cfg, "example.com.");
+        assert(arena.response_cache.buckets != NULL);
+        assert(arena.response_cache.entry_count > 0);
+        printf("  [PASS] wire_cache_max_records=%zu (total+1) enables cache\n", total_records + 1);
+
+        // Case C: wire_cache_max_records = total_records (exact boundary) -> Cache enabled (since arena->count > max is false)
+        free_zone_response_cache(&arena);
+        cfg.wire_cache_max_records = (uint32_t)total_records;
+        build_zone_response_cache(&arena, &cfg, "example.com.");
+        assert(arena.response_cache.buckets != NULL);
+        assert(arena.response_cache.entry_count > 0);
+        printf("  [PASS] wire_cache_max_records=%zu (exact total) enables cache\n", total_records);
+
+        // Case D: wire_cache_max_records = total_records - 1 (below) -> Cache disabled
+        free_zone_response_cache(&arena);
+        cfg.wire_cache_max_records = (uint32_t)(total_records - 1);
+        build_zone_response_cache(&arena, &cfg, "example.com.");
+        assert(arena.response_cache.buckets == NULL);
+        assert(arena.response_cache.entry_count == 0);
+        printf("  [PASS] wire_cache_max_records=%zu (total-1) disables cache\n", total_records - 1);
+
+        // Case E: Query resolution still works when cache is disabled (fallback to full path)
+        zone_db_entry_t db_entry;
+        memset(&db_entry, 0, sizeof(db_entry));
+        strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+        atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+        zone_db_entry_t *entries[1] = { &db_entry };
+        char *any_acl[1] = { (char *)"any" };
+
+        view_snapshot_t view;
+        memset(&view, 0, sizeof(view));
+        view.name = "default";
+        view.entries = entries;
+        view.zone_count = 1;
+        view.match_clients = any_acl;
+        view.match_clients_count = 1;
+
+        zone_db_snapshot_t snap;
+        memset(&snap, 0, sizeof(snap));
+        snap.views = &view;
+        snap.view_count = 1;
+
+        uint8_t req[512], res[4096];
+        size_t req_len = 0;
+        build_simple_query(req, &req_len, 0x1234, "www.example.com.", 1 /* A */);
+
+        compress_ctx_t comp_ctx;
+        compress_ctx_init_packet(&comp_ctx);
+        zone_db_entry_t *matched = NULL;
+        int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                        "www.example.com.", 1,
+                                        "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+        assert(len > 0);
+        uint8_t rcode = res[3] & 0x0F;
+        uint16_t ancount = ((uint16_t)res[6] << 8) | res[7];
+        assert(rcode == 0);
+        assert(ancount == 1);
+        printf("  [PASS] Query www.example.com A resolved correctly via full path when cache disabled\n");
+
+        zone_arena_destroy(&arena);
+    }
+
+    printf("[SUCCESS] All wire-cache-max-records tests passed!\n");
+}
+
 int main(void) {
     test_wire_cache_consistency();
+    test_wire_cache_max_records_limit();
     return 0;
 }

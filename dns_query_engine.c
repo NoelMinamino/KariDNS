@@ -2465,6 +2465,13 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
   if (arena->bind_location_tags != NULL && arena->bind_location_tag_count > 0) return;
   if (arena->bind_ecs_tags != NULL && arena->bind_ecs_tag_count > 0) return;
 
+  if (cfg && cfg->wire_cache_max_records > 0 && arena->count > cfg->wire_cache_max_records) {
+    syslog(LOG_NOTICE,
+           "[WireCache] zone '%s' has %zu records, exceeding wire-cache-max-records=%u; caching disabled for this zone",
+           domain ? domain : "(unknown)", arena->count, cfg->wire_cache_max_records);
+    return;
+  }
+
   zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, NULL, domain) : NULL;
   if (zcfg) {
     if (zcfg->location_tags != NULL && zcfg->location_tag_count > 0) return;
@@ -2493,6 +2500,9 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
   bool minimal_responses = cfg ? cfg->minimal_responses : false;
   bool minimal_any = cfg ? cfg->minimal_any : false;
   uint32_t minimal_any_ttl = cfg ? cfg->minimal_any_ttl : 86400;
+
+  size_t cached_entries = 0;
+  size_t cached_bytes = 0;
 
   for (size_t i = 0; i < arena->count; i++) {
     dns_record_t *rec = &arena->records[i];
@@ -2606,7 +2616,16 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
       entry->next = arena->response_cache.buckets[hash_idx];
       arena->response_cache.buckets[hash_idx] = entry;
       arena->response_cache.entry_count++;
+
+      cached_entries++;
+      cached_bytes += body_len + strlen(cached_name) + 1 + sizeof(response_cache_entry_t);
     }
+  }
+
+  if (cached_entries > 0) {
+    syslog(LOG_NOTICE,
+           "[WireCache] zone '%s': cached %zu entries (~%zu bytes) out of %zu total records",
+           domain ? domain : "(unknown)", cached_entries, cached_bytes, arena->count);
   }
 }
 
