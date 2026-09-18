@@ -18,6 +18,7 @@ typedef struct {
   int master_port;
   char domain[256];
   zone_db_entry_t *entry;
+  zone_db_snapshot_t *snap;
   /* tsig_key_t の内容を値コピーして保持 (ポインタ参照排除) */
   bool has_tsig;
   char tsig_name[256];

@@ -2987,6 +2987,8 @@ void *control_thread_func(void *arg) {
                                     bg_ctx->master_port = master_port;
                                     strncpy(bg_ctx->domain, entry->domain, sizeof(bg_ctx->domain) - 1);
                                     bg_ctx->entry = entry;
+                                    bg_ctx->snap = snap;
+                                    retain_zone_snapshot(snap);
                                     
                                     /* [H-4] config ポインタをそのまま渡すと UAF になるため、
                                      * TSIG キーのデータをスレッド起動前に bg_ctx へ値コピーする。*/
@@ -3018,6 +3020,7 @@ void *control_thread_func(void *arg) {
                                     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
                                     pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
                                     if (pthread_create(&bg_thread, &attr, axfr_bg_thread_func, bg_ctx) != 0) {
+                                        release_zone_snapshot(snap);
                                         free(bg_ctx);
                                         atomic_store_explicit(&entry->is_transferring, false, memory_order_release);
                                     }
