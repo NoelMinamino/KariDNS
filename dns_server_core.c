@@ -1069,7 +1069,10 @@ static bool enqueue_async_io_task(const async_io_task_t *task) {
 }
 
 static void *async_io_worker_func(void *arg) {
-  (void)arg;
+  int thread_idx = (int)(uintptr_t)arg;
+  if (thread_idx < 0 || thread_idx >= MAX_ASYNC_IO_RCU_WORKERS) {
+    thread_idx = 0;
+  }
   compress_ctx_t thread_compress_ctx = {0};
   while (1) {
     pthread_mutex_lock(&g_async_io_pool.lock);
@@ -1085,6 +1088,7 @@ static void *async_io_worker_func(void *arg) {
     g_async_io_pool.count--;
     pthread_mutex_unlock(&g_async_io_pool.lock);
 
+    rcu_reader_enter(&g_async_io_rcu_ctxs[thread_idx]);
     if (!task.is_tcp) {
       // UDP async resolution
       uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
@@ -1094,6 +1098,7 @@ static void *async_io_worker_func(void *arg) {
       int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, max_res,
                                       task.qname, task.qtype, task.client_ip,
                                       &thread_compress_ctx, false, &rrl_cfg, task.snap);
+      rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
       release_zone_snapshot(task.snap);
       free(task.req_buf);
 
@@ -1142,6 +1147,7 @@ static void *async_io_worker_func(void *arg) {
         int res_len = process_dns_query(task.req_buf, task.req_len, tcp_res, 65535,
                                         task.qname, task.qtype, task.client_ip,
                                         &thread_compress_ctx, true, NULL, task.snap);
+        rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
         release_zone_snapshot(task.snap);
         free(task.req_buf);
         if (res_len > 0) {
@@ -1159,6 +1165,7 @@ static void *async_io_worker_func(void *arg) {
         }
         free(tcp_res);
       } else {
+        rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
         release_zone_snapshot(task.snap);
         free(task.req_buf);
       }
@@ -1175,7 +1182,7 @@ static void init_async_io_pool(void) {
   pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
   g_async_io_pool.running = true;
   for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
-    pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, NULL);
+    pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, (void *)(uintptr_t)i);
   }
 }
 
@@ -1565,6 +1572,7 @@ worker_startup_success:;
               task.dnssec_ok = dnssec_ok;
               task.question_end = question_end;
               task.snap = acquire_zone_snapshot();
+              retain_zone_snapshot(task.snap);
               rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
@@ -2079,6 +2087,7 @@ process_tcp_client: ;
                   if (tsig_mac_len > 0) memcpy(args->tsig_mac, tsig_mac, tsig_mac_len);
                   args->entry = entry;
                   args->snap = snap;
+                  retain_zone_snapshot(args->snap);
                   int cflags = fcntl(client_fd, F_GETFL, 0);
                   fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
 
@@ -2090,6 +2099,7 @@ process_tcp_client: ;
 
                   pthread_t t;
                   if (pthread_create(&t, NULL, axfr_worker_thread, args) != 0) {
+                    release_zone_snapshot(args->snap);
                     free(args);
                     atomic_fetch_sub(&entry->active_axfr, 1);
                     allowed = false;
@@ -2233,6 +2243,7 @@ process_tcp_client: ;
               task.dnssec_ok = dnssec_ok;
               task.question_end = 0;
               task.snap = snap;
+              retain_zone_snapshot(task.snap);
               free(ctx_tcp);
 
               rcu_reader_exit(ctx);
@@ -2391,7 +2402,11 @@ static void perform_config_reload_ext(bool skip_unchanged) {
                                  : &g_config_db.config_a;
   
   /* [H-2] 既存のリーダーが参照を終えるのを待機。*/
-  rcu_writer_wait_until_safe(g_config_db.retire_epoch, 5000);
+  if (!rcu_writer_wait_until_safe(g_config_db.retire_epoch, 10000)) {
+    syslog(LOG_WARNING, "[Config] Reload postponed: existing readers still active on previous configuration (timeout 10s).");
+    free(config_str);
+    return;
+  }
   
   free_server_config_fields(standby);
   if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {

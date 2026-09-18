@@ -1280,6 +1280,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                         if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
                                                   res, max_res_len, offset, comp_ctx, ancount)) {
                           res[2] |= 0x02;
+                          if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                           return;
                         }
                       }

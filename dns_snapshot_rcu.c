@@ -36,8 +36,16 @@ zone_db_snapshot_t *acquire_zone_snapshot(void) {
   return atomic_load_explicit(&g_zone_db_active, memory_order_acquire);
 }
 
+void retain_zone_snapshot(zone_db_snapshot_t *snap) {
+  if (snap) {
+    atomic_fetch_add_explicit(&snap->reader_count, 1, memory_order_acquire);
+  }
+}
+
 void release_zone_snapshot(zone_db_snapshot_t *snap) {
-  (void)snap;
+  if (snap) {
+    atomic_fetch_sub_explicit(&snap->reader_count, 1, memory_order_release);
+  }
 }
 
 zone_config_t *find_zone_config_in_view(server_config_t *cfg,
@@ -238,11 +246,7 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
     }
     free(entry->groups);
   }
-  int axfr_retries = 0;
-  useconds_t axfr_sleep = 1;
-  while (atomic_load(&entry->active_axfr) > 0) {
-    rcu_exponential_backoff(&axfr_retries, &axfr_sleep);
-  }
+  wait_for_active_axfr(entry, 0);
   pthread_mutex_destroy(&entry->writer_lock);
   pthread_mutex_destroy(&entry->ixfr_history.lock);
   for (int idx = 0; idx < MAX_IXFR_HISTORY; idx++) {
@@ -260,6 +264,11 @@ void *gc_snapshot_thread(void *arg) {
   zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
   if (!snap) return NULL;
   rcu_writer_wait_until_safe(snap->retire_epoch, 60000);
+  int retries = 0;
+  useconds_t sleep_time = 1;
+  while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
+    rcu_exponential_backoff(&retries, &sleep_time);
+  }
   if (snap->views) {
     for (size_t v = 0; v < snap->view_count; v++) {
       if (snap->views[v].entries) {
@@ -586,22 +595,20 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
     return RELOAD_ERR_FILE_READ;
   }
   pthread_mutex_lock(&entry->writer_lock);
-  int axfr_wait_ms = 0;
-  int backoff = 1;
-  while (atomic_load_explicit(&entry->active_axfr, memory_order_acquire) > 0) {
-    if (axfr_wait_ms >= 5000) {
-      syslog(LOG_WARNING, "[Zone] Reload of zone '%s' postponed: active AXFR in progress (timeout 5s).", entry->domain);
-      free(buf);
-      pthread_mutex_unlock(&entry->writer_lock);
-      return RELOAD_ERR_BUSY;
-    }
-    usleep(backoff * 1000);
-    axfr_wait_ms += backoff;
-    if (backoff < 50) backoff *= 2;
+  if (!wait_for_active_axfr(entry, 5000)) {
+    syslog(LOG_WARNING, "[Zone] Reload of zone '%s' postponed: active AXFR in progress (timeout 5s).", entry->domain);
+    free(buf);
+    pthread_mutex_unlock(&entry->writer_lock);
+    return RELOAD_ERR_BUSY;
   }
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
+  if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
+    syslog(LOG_WARNING, "[Zone] Reload of zone '%s' postponed: RCU grace period wait timed out (60s).", entry->domain);
+    free(buf);
+    pthread_mutex_unlock(&entry->writer_lock);
+    return RELOAD_ERR_BUSY;
+  }
 
   zone_arena_free_include_buffers(z_standby);
   free(z_standby->locations);
@@ -1640,20 +1647,27 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                 zone_db_entry_t *entry = view->entries[i];
                 if (!entry) continue;
                 pthread_mutex_lock(&entry->writer_lock);
+                if (!wait_for_active_axfr(entry, 5000)) {
+                    pthread_mutex_unlock(&entry->writer_lock);
+                    continue;
+                }
                 zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
                 if (z_active && z_active->count > 0) {
                     zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-                    rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
-                    clone_zone_arena(z_active, z_standby);
-                    build_zone_index(z_standby, true);
-                    zone_config_t *zcfg = find_zone_config_in_view(config, view->name, entry->domain);
-                    additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
-                                                        ? zcfg->additional_from_auth
-                                                        : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
-                    prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, policy);
-                    build_zone_response_cache(z_standby, config, entry->domain);
-                    entry->rcu.retire_epoch = rcu_writer_advance_epoch();
-                    atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+                    if (rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
+                        clone_zone_arena(z_active, z_standby);
+                        build_zone_index(z_standby, true);
+                        zone_config_t *zcfg = find_zone_config_in_view(config, view->name, entry->domain);
+                        additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
+                                                            ? zcfg->additional_from_auth
+                                                            : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
+                        prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, policy);
+                        build_zone_response_cache(z_standby, config, entry->domain);
+                        entry->rcu.retire_epoch = rcu_writer_advance_epoch();
+                        atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+                    } else {
+                        syslog(LOG_WARNING, "[Zone] Pass 2 glue prelink for '%s' skipped: RCU wait timeout", entry->domain);
+                    }
                 }
                 pthread_mutex_unlock(&entry->writer_lock);
             }

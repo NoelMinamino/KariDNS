@@ -10,16 +10,23 @@
 
 #include "dns_server_internal.h"
 
+#define MAX_ASYNC_IO_RCU_WORKERS 16
+#define MAX_AXFR_RCU_WORKERS 32
+
 extern _Atomic uint64_t g_global_epoch;
 extern worker_ctx_t g_resp_logger_rcu_ctx;
 extern worker_ctx_t g_query_logger_rcu_ctx;
+extern worker_ctx_t g_async_io_rcu_ctxs[MAX_ASYNC_IO_RCU_WORKERS];
+extern int g_async_io_rcu_worker_count;
+extern worker_ctx_t g_axfr_rcu_ctxs[MAX_AXFR_RCU_WORKERS];
+extern int g_axfr_rcu_worker_count;
 
 // グローバル世代カウンタを1進めて新しい世代番号を返す(writer専用、低頻度呼び出し)
 uint64_t rcu_writer_advance_epoch(void);
 
 // 指定epoch以前を参照しているワーカーがいなくなるまで待つ(writer専用、低頻度呼び出し)
-// timeout_ms <= 0 の場合は無制限に待つ(既存の wait_for_readers と同様、stall検知ログも出す)
-void rcu_writer_wait_until_safe(uint64_t retire_epoch, int timeout_ms);
+// timeout_ms <= 0 の場合は無制限に待つ。全リーダーの退出を確認できたら true、タイムアウト時は false を返す。
+bool rcu_writer_wait_until_safe(uint64_t retire_epoch, int timeout_ms);
 
 // 指数バックオフ関数 (共通利用可能)
 void rcu_exponential_backoff(int *retries, useconds_t *sleep_time);

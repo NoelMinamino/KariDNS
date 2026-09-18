@@ -3,6 +3,8 @@
 #include "dns_server_internal.h"
 #include "dns_wire.h"
 #include "dns_utils.h"
+#include "dns_axfr_ixfr.h"
+#include "dns_snapshot_rcu.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -53,10 +55,19 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
                           const char *client_ip,
                           const char *matched_key_name) {
   pthread_mutex_lock(&entry->writer_lock);
+  if (!wait_for_active_axfr(entry, 5000)) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_WARNING, "[Update] Dynamic update on zone '%s' rejected: active AXFR in progress.", entry->domain);
+    return 2; // SERVFAIL
+  }
 
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
+  if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Update] Dynamic update on zone '%s' aborted: RCU grace period wait timed out", entry->domain);
+    return 2; // SERVFAIL
+  }
 
   clone_zone_arena(z_active, z_standby);
 

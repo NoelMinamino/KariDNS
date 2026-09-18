@@ -375,10 +375,10 @@ typedef struct {
 
 extern _Atomic int g_xfers_running;
 
-// Shared internal function prototypes
 server_config_t *acquire_config_snapshot(void);
 void release_config_snapshot(server_config_t *snap);
 zone_db_snapshot_t *acquire_zone_snapshot(void);
+void retain_zone_snapshot(zone_db_snapshot_t *snap);
 void release_zone_snapshot(zone_db_snapshot_t *snap);
 zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_name, const char *domain);
 zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,

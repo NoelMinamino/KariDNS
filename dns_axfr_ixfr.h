@@ -72,4 +72,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
 void *axfr_worker_thread(void *arg);
 
+bool wait_for_active_axfr(zone_db_entry_t *entry, int timeout_ms);
+
 #endif /* DNS_AXFR_IXFR_H */

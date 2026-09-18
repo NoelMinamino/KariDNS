@@ -38,6 +38,29 @@ void free_ixfr_txn(ixfr_txn_t *txn) {
   free(txn);
 }
 
+bool wait_for_active_axfr(zone_db_entry_t *entry, int timeout_ms) {
+  if (!entry) return true;
+  int retries = 0;
+  useconds_t sleep_time = 1;
+  struct timespec start, now;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  while (atomic_load_explicit(&entry->active_axfr, memory_order_acquire) > 0) {
+    if (timeout_ms > 0) {
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000 +
+                           (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000;
+      if (elapsed_ms >= timeout_ms) {
+        syslog(LOG_WARNING, "[AXFR] wait_for_active_axfr timed out after %d ms for zone '%s'",
+               timeout_ms, entry->domain);
+        return false;
+      }
+    }
+    rcu_exponential_backoff(&retries, &sleep_time);
+  }
+  return true;
+}
+
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena) {
   if (!old_arena->hash_table || !new_arena->hash_table) return;
   uint32_t old_serial = 0, new_serial = 0;
@@ -566,10 +589,23 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
 
         pthread_mutex_lock(&entry->writer_lock);
+        if (!wait_for_active_axfr(entry, 5000)) {
+          pthread_mutex_unlock(&entry->writer_lock);
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_WARNING, "[XFR] Inbound transfer swap for zone '%s' postponed: active AXFR in progress.", entry->domain);
+          return -1;
+        }
         zone_arena_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
         zone_arena_t *standby = (cur_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b
                                                                     : &entry->rcu.arena_a;
-        rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000);
+        if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
+          pthread_mutex_unlock(&entry->writer_lock);
+          if (unsigned_msgs) free(unsigned_msgs);
+          zone_arena_destroy(&tmp_arena);
+          syslog(LOG_ERR, "[XFR] Inbound transfer swap for zone '%s' aborted: RCU grace period wait timed out", entry->domain);
+          return -1;
+        }
 
         if (has_soa) {
           entry->serial = serial;
@@ -1333,6 +1369,10 @@ void *axfr_worker_thread(void *arg) {
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
+  static _Atomic int axfr_slot_counter = ATOMIC_VAR_INIT(0);
+  int slot = (int)(atomic_fetch_add(&axfr_slot_counter, 1) % MAX_AXFR_RCU_WORKERS);
+  rcu_reader_enter(&g_axfr_rcu_ctxs[slot]);
+
   tsig_key_t key_val;
   tsig_key_t *pkey = NULL;
   if (args->has_tsig) {
@@ -1357,6 +1397,7 @@ void *axfr_worker_thread(void *arg) {
   free(args);
   if (entry)
     atomic_fetch_sub(&entry->active_axfr, 1);
+  rcu_reader_exit(&g_axfr_rcu_ctxs[slot]);
   release_zone_snapshot(worker_snap);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);
