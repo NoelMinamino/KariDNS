@@ -94,6 +94,7 @@ FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tc
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
 	unit-tests test test-all cidr_test tinydns_test asan_test include_test hash_test vulnerability_test \
+	dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test \
 	coverage coverage-build coverage-run coverage-report coverage-clean
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
@@ -215,6 +216,12 @@ TEST_TINYDNS_SRCS = tests/test_tinydns_parser.c dns_config_parser.c dns_zone_par
 TEST_ASAN_SRCS = tests/test_asan_overflow.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
 TEST_CONF_SRCS = tests/test_conf_include.c dns_config_parser.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c
 TEST_HASH_SRCS = tests/test_hash_table.c
+TEST_DNSTAP_SRCS = tests/test_dnstap_engine.c dns_dnstap.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c
+TEST_EDNS_ECS_SRCS = tests/test_edns_ecs_engine.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c
+TEST_DYN_UPDATE_SRCS = tests/test_dynamic_update_engine.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c
+TEST_AXFR_IXFR_SRCS = tests/test_axfr_ixfr_engine.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c
+TEST_RRL_SRCS = tests/test_rrl_engine.c dns_rrl.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
+TEST_QUERY_EXP_SRCS = tests/test_query_engine_expanded.c dns_query_engine.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 RESPONSE_CACHE_TEST_SRCS = tests/test_response_cache.c dns_query_engine.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 VULN_TEST_SRCS = tests/test_vulnerability_fixes.c dns_query_engine.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 
@@ -260,6 +267,42 @@ test_hash_table: $(TEST_HASH_SRCS)
 hash_test: test_hash_table
 	./test_hash_table
 
+test_dnstap_engine: $(TEST_DNSTAP_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_DNSTAP_SRCS) -o test_dnstap_engine $(LDFLAGS) -lcrypto -lpthread -lm
+
+dnstap_test: test_dnstap_engine
+	./test_dnstap_engine
+
+test_edns_ecs_engine: $(TEST_EDNS_ECS_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_EDNS_ECS_SRCS) -o test_edns_ecs_engine $(LDFLAGS) -lcrypto -lpthread -lm
+
+edns_ecs_test: test_edns_ecs_engine
+	./test_edns_ecs_engine
+
+test_dynamic_update_engine: $(TEST_DYN_UPDATE_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_DYN_UPDATE_SRCS) -o test_dynamic_update_engine $(LDFLAGS) -lcrypto -lpthread -lm
+
+dynamic_update_test: test_dynamic_update_engine
+	./test_dynamic_update_engine
+
+test_axfr_ixfr_engine: $(TEST_AXFR_IXFR_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_AXFR_IXFR_SRCS) -o test_axfr_ixfr_engine $(LDFLAGS) -lcrypto -lpthread -lm
+
+axfr_ixfr_test: test_axfr_ixfr_engine
+	./test_axfr_ixfr_engine
+
+test_rrl_engine: $(TEST_RRL_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_RRL_SRCS) -o test_rrl_engine $(LDFLAGS) -lcrypto -lpthread -lm
+
+rrl_test: test_rrl_engine
+	./test_rrl_engine
+
+test_query_engine_expanded: $(TEST_QUERY_EXP_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_QUERY_EXP_SRCS) -o test_query_engine_expanded $(LDFLAGS) -lcrypto -lpthread -lm
+
+query_expanded_test: test_query_engine_expanded
+	./test_query_engine_expanded
+
 test_response_cache: $(RESPONSE_CACHE_TEST_SRCS)
 	$(CC) $(CFLAGS) -I. $(RESPONSE_CACHE_TEST_SRCS) -o test_response_cache $(LDFLAGS) -lcrypto -lpthread -lm
 
@@ -272,7 +315,7 @@ test_vulnerability_fixes: $(VULN_TEST_SRCS)
 vulnerability_test: test_vulnerability_fixes
 	./test_vulnerability_fixes
 
-unit-tests: cidr_test tinydns_test asan_test include_test hash_test response_cache_test vulnerability_test
+unit-tests: cidr_test tinydns_test asan_test include_test hash_test dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test
 
 test: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 	@sh tests/run_all_suite.sh
@@ -296,7 +339,7 @@ coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
 	$(MAKE) clean
 	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
-	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_hash_table test_response_cache test_vulnerability_fixes
+	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes
 
 coverage-run:
 	@echo "=== Executing Test Suite with Instrumentation ==="
@@ -326,7 +369,7 @@ bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_zone_parser.o dns
 
 clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
-	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes
+	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes
 
 run: $(TARGET)
 	./$(TARGET)

@@ -181,7 +181,13 @@ register_test() {
 
 # 1. Unit Tests (C Binaries)
 register_test "unit" "bin" "test_vulnerability_fixes" "Vulnerability & Epoch RCU robustness test"
+register_test "unit" "bin" "test_query_engine_expanded" "All-RR types, wildcards, DNAME & 0x20 bit preservation"
 register_test "unit" "bin" "test_response_cache" "Response cache lock-free lookup & invalidation"
+register_test "unit" "bin" "test_dnstap_engine" "DNSTAP Protobuf encoder, frame sender & ring buffers"
+register_test "unit" "bin" "test_edns_ecs_engine" "EDNS Cookies, EDE error codes & ECS subnet LPM resolution"
+register_test "unit" "bin" "test_dynamic_update_engine" "RFC 2136 SOA serial bump & NOTIFY deduplication"
+register_test "unit" "bin" "test_axfr_ixfr_engine" "RFC 1995 IXFR differential computation & Option 65153"
+register_test "unit" "bin" "test_rrl_engine" "SipHash token bucket rate limiter & SLIP responses"
 register_test "unit" "bin" "test_asan_overflow" "ASan boundary checks, CLASS validation & parsers"
 register_test "unit" "bin" "test_tinydns_parser" "tinydns data file syntax & record decoder"
 register_test "unit" "bin" "test_cidr" "CIDR prefix matching & binary ACL evaluator"
