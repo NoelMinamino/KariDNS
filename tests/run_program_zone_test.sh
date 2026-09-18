@@ -135,6 +135,56 @@ run_check "Oversized query via TCP returns full response" \
     "$DAG @127.0.0.1 -p $PORT oversized.brokentest.example TXT +tcp +timeout=2 +tries=1" \
     "ANSWER: 10"
 
+# Test large TCP request (>5000 bytes, exceeding 4096 BUFFER_SIZE) to synthetic program zone
+LARGE_TCP_TEST="perl -e '
+use strict;
+use warnings;
+use Socket;
+
+my \$port = \$ARGV[0];
+my \$ip = \"127.0.0.1\";
+
+socket(my \$sock, PF_INET, SOCK_STREAM, getprotobyname(\"tcp\")) or die \"socket: \$!\";
+my \$dest = sockaddr_in(\$port, inet_aton(\$ip));
+connect(\$sock, \$dest) or die \"connect: \$!\";
+
+my \$pad_len = 5000;
+my \$txid = pack(\"n\", 0x1234);
+my \$flags = pack(\"n\", 0x0100);
+my \$counts = pack(\"nnnn\", 1, 0, 0, 1);
+my \$qname = \"\\x06normal\\x0Abrokentest\\x07example\\x00\";
+my \$qtype_qclass = pack(\"nn\", 1, 1);
+my \$opt_rr = \"\\x00\" . pack(\"nnNn\", 41, 4096, 0, \$pad_len + 4) . pack(\"nn\", 12, \$pad_len) . (\"\\x00\" x \$pad_len);
+my \$dns_msg = \$txid . \$flags . \$counts . \$qname . \$qtype_qclass . \$opt_rr;
+my \$msg_len = length(\$dns_msg);
+
+send(\$sock, pack(\"n\", \$msg_len) . \$dns_msg, 0);
+
+my \$len_buf;
+read(\$sock, \$len_buf, 2) or die \"read length failed\";
+my \$res_len = unpack(\"n\", \$len_buf);
+
+my \$res_body = \"\";
+while (length(\$res_body) < \$res_len) {
+    my \$chunk;
+    my \$r = read(\$sock, \$chunk, \$res_len - length(\$res_body));
+    last unless \$r;
+    \$res_body .= \$chunk;
+}
+
+my (\$res_id, \$res_flags, \$qdcount, \$ancount) = unpack(\"nnnn\", substr(\$res_body, 0, 8));
+my \$rcode = \$res_flags & 0x0F;
+if (\$rcode == 0 && \$ancount >= 1 && \$res_body =~ /\\xC0\\x00\\x02\\x01/) {
+    print \"SUCCESS: Large TCP query (\$msg_len bytes) processed without truncation\\n\";
+} else {
+    print \"FAIL: rcode=\$rcode ancount=\$ancount\\n\";
+}
+' $PORT"
+
+run_check "Large TCP query (>5000 bytes) to async program zone is not truncated" \
+    "$LARGE_TCP_TEST" \
+    "SUCCESS: Large TCP query"
+
 if [ "$FAILED" -gt 0 ] && [ -f "$TMP_DIR/karidns.log" ]; then
     echo "=== Server Log ==="
     cat "$TMP_DIR/karidns.log"

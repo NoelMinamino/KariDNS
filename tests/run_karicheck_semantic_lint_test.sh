@@ -140,6 +140,49 @@ else
     FAILED=1
 fi
 
+# Test 7: rdata Count Overflow (> MAX_RDATA = 48) (ERROR)
+echo "[+] Test 7: rdata field count overflow check (>48 fields)..."
+RDATA_OVERFLOW_ZONE="tests/zones/test_lint_rdata_overflow.tmp.zone"
+RDATA_OK_ZONE="tests/zones/test_lint_rdata_ok.tmp.zone"
+
+# Build 49-field TXT zone
+printf '\$ORIGIN example.com.\n\$TTL 3600\n@ IN SOA ns1.example.com. hostmaster.example.com. 2026091801 7200 3600 1209600 3600\n@ IN NS ns1.example.com.\nns1 IN A 192.0.2.1\ntxtoverflow IN TXT' > "$RDATA_OVERFLOW_ZONE"
+for i in $(seq 1 49); do
+    printf ' "txt%d"' "$i" >> "$RDATA_OVERFLOW_ZONE"
+done
+printf '\n' >> "$RDATA_OVERFLOW_ZONE"
+
+# Build 48-field TXT zone (exact MAX_RDATA limit)
+printf '\$ORIGIN example.com.\n\$TTL 3600\n@ IN SOA ns1.example.com. hostmaster.example.com. 2026091801 7200 3600 1209600 3600\n@ IN NS ns1.example.com.\nns1 IN A 192.0.2.1\ntxtok IN TXT' > "$RDATA_OK_ZONE"
+for i in $(seq 1 48); do
+    printf ' "txt%d"' "$i" >> "$RDATA_OK_ZONE"
+done
+printf '\n' >> "$RDATA_OK_ZONE"
+
+set +e
+OUT7_BAD=$(./karicheck zone example.com. "$RDATA_OVERFLOW_ZONE" 2>&1)
+EXIT7_BAD=$?
+OUT7_OK=$(./karicheck zone example.com. "$RDATA_OK_ZONE" 2>&1)
+EXIT7_OK=$?
+set -e
+rm -f "$RDATA_OVERFLOW_ZONE" "$RDATA_OK_ZONE"
+
+if [ $EXIT7_BAD -ne 0 ] && echo "$OUT7_BAD" | grep -qi "Too many rdata fields on record"; then
+    echo "  PASS: 49 rdata fields correctly rejected with MAX_RDATA error (exit=$EXIT7_BAD)."
+else
+    echo "  FAIL: Expected MAX_RDATA overflow rejection not detected (exit=$EXIT7_BAD):"
+    echo "$OUT7_BAD"
+    FAILED=1
+fi
+
+if [ $EXIT7_OK -eq 0 ] && echo "$OUT7_OK" | grep -q "\[RESULT\] Zone 'example.com.': 0 error(s)"; then
+    echo "  PASS: 48 rdata fields correctly accepted at exact MAX_RDATA boundary."
+else
+    echo "  FAIL: Expected 48 rdata fields to pass, but failed (exit=$EXIT7_OK):"
+    echo "$OUT7_OK"
+    FAILED=1
+fi
+
 if [ $FAILED -ne 0 ]; then
     echo "=== Some Semantic Lint Tests FAILED ==="
     exit 1

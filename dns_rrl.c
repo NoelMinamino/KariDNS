@@ -205,22 +205,25 @@ bool rrl_check(const void *client_addr_ptr, rrl_response_class_t cls, const rate
       b->last_refill_ms[i] = now_ms;
     }
     uint64_t cap0 = (uint64_t)cfg->responses_per_second * window_sec;
+    uint64_t cap1 = (uint64_t)cfg->nodata_per_second * window_sec;
     uint64_t cap2 = (uint64_t)cfg->nxdomains_per_second * window_sec;
     uint64_t cap3 = (uint64_t)cfg->errors_per_second * window_sec;
     if (cap0 > 0x7FFFFFFF) cap0 = 0x7FFFFFFF;
+    if (cap1 > 0x7FFFFFFF) cap1 = 0x7FFFFFFF;
     if (cap2 > 0x7FFFFFFF) cap2 = 0x7FFFFFFF;
     if (cap3 > 0x7FFFFFFF) cap3 = 0x7FFFFFFF;
     b->tokens[0] = (int32_t)cap0;
-    b->tokens[1] = (int32_t)cap0;
+    b->tokens[1] = (int32_t)cap1;
     b->tokens[2] = (int32_t)cap2;
     b->tokens[3] = (int32_t)cap3;
     b->slip_counter = 0;
   } else {
+    // nodata_per_second が未設定の場合は設定ロード時に responses_per_second へフォールバックされているため、既存設定ファイルの挙動は変わらない
     uint32_t rates[4] = {
-      cfg->responses_per_second,
-      cfg->responses_per_second,
-      cfg->nxdomains_per_second,
-      cfg->errors_per_second
+      cfg->responses_per_second, // index0: NOERROR
+      cfg->nodata_per_second,    // index1: NODATA（専用レート。未設定時は responses_per_second と同値）
+      cfg->nxdomains_per_second, // index2: NXDOMAIN
+      cfg->errors_per_second     // index3: ERROR
     };
     for (int i = 0; i < 4; i++) {
       if (rates[i] == 0) continue;

@@ -1103,6 +1103,15 @@ PROCESS_RECORD:
   }
   while (i < field_idx && rec->rdata_count < MAX_RDATA)
     rec->rdata[rec->rdata_count++] = fields[i++];
+
+  if (i < field_idx) {
+    if (ctx && ctx->err_out) {
+      ctx->err_out->error_message = "Too many rdata fields on record (exceeds MAX_RDATA limit)";
+      ctx->err_out->error_offset = (size_t)(fields[i] - buf);
+      ctx->err_out->token_length = strlen(fields[i]);
+    }
+    return -1;
+  }
     
   if (!rec->type) {
     if (ctx && ctx->err_out) {

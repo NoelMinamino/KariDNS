@@ -1008,7 +1008,8 @@ typedef struct {
   int active_fd; // For UDP, IPC socket to frontend
   int client_fd; // For TCP, client socket
   udp_ipc_t ipc_hdr;
-  uint8_t req_buf[BUFFER_SIZE];
+  uint8_t *req_buf;   // ヒープ確保（可変長）。UDP経路は最大 BUFFER_SIZE、TCP経路は最大 65535 バイトまで許容
+  size_t req_buf_cap; // malloc したバイト数（free 時の追跡・デバッグ用）
   size_t req_len;
   char client_ip[INET6_ADDRSTRLEN];
   int client_port;
@@ -1080,6 +1081,7 @@ static void *async_io_worker_func(void *arg) {
                                       task.qname, task.qtype, task.client_ip,
                                       &thread_compress_ctx, false, &rrl_cfg, task.snap);
       release_zone_snapshot(task.snap);
+      free(task.req_buf);
 
       if (res_len > 0) {
         bool slip_triggered = false;
@@ -1127,6 +1129,7 @@ static void *async_io_worker_func(void *arg) {
                                         task.qname, task.qtype, task.client_ip,
                                         &thread_compress_ctx, true, NULL, task.snap);
         release_zone_snapshot(task.snap);
+        free(task.req_buf);
         if (res_len > 0) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
@@ -1143,6 +1146,7 @@ static void *async_io_worker_func(void *arg) {
         free(tcp_res);
       } else {
         release_zone_snapshot(task.snap);
+        free(task.req_buf);
       }
       close(task.client_fd);
       dec_tcp_clients();
@@ -1515,12 +1519,23 @@ worker_startup_success:;
                                ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
+              uint8_t *heap_req = malloc((size_t)payload_received);
+              if (!heap_req) {
+                rcu_reader_exit(ctx);
+                if (rlog_enabled) {
+                  submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+                }
+                continue;
+              }
+              memcpy(heap_req, req_buf, (size_t)payload_received);
+
               async_io_task_t task = {0};
               task.is_tcp = false;
               task.active_fd = active_fd;
               task.ipc_hdr = *ipc_msg;
-              task.req_len = (size_t)payload_received > sizeof(task.req_buf) ? sizeof(task.req_buf) : (size_t)payload_received;
-              memcpy(task.req_buf, req_buf, task.req_len);
+              task.req_buf = heap_req;
+              task.req_buf_cap = (size_t)payload_received;
+              task.req_len = (size_t)payload_received;
               strncpy(task.client_ip, client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
               memcpy(&task.client_addr, client_addr, ipc_msg->addr_len <= sizeof(task.client_addr) ? ipc_msg->addr_len : sizeof(task.client_addr));
@@ -1539,6 +1554,7 @@ worker_startup_success:;
               rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
+                free(task.req_buf);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
@@ -2167,6 +2183,18 @@ process_tcp_client: ;
             }
           } else {
             if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
+              uint8_t *heap_req = malloc(msg_len);
+              if (!heap_req) {
+                release_zone_snapshot(snap);
+                free(ctx_tcp);
+                close(client_fd);
+                dec_tcp_clients();
+                client_closed = true;
+                rcu_reader_exit(ctx);
+                break;
+              }
+              memcpy(heap_req, msg, msg_len);
+
               struct kevent ev_del_syn[2];
               EV_SET(&ev_del_syn[0], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
               EV_SET(&ev_del_syn[1], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
@@ -2175,8 +2203,9 @@ process_tcp_client: ;
               async_io_task_t task = {0};
               task.is_tcp = true;
               task.client_fd = client_fd;
-              task.req_len = msg_len > sizeof(task.req_buf) ? sizeof(task.req_buf) : msg_len;
-              memcpy(task.req_buf, msg, task.req_len);
+              task.req_buf = heap_req;
+              task.req_buf_cap = msg_len;
+              task.req_len = msg_len;
               strncpy(task.client_ip, ctx_tcp->client_ip, sizeof(task.client_ip) - 1);
               task.client_port = client_port;
               task.client_addr = ctx_tcp->client_addr;
@@ -2195,6 +2224,7 @@ process_tcp_client: ;
               rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(snap);
+                free(task.req_buf);
                 close(client_fd);
                 dec_tcp_clients();
               }

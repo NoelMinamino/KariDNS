@@ -906,6 +906,8 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   rrl->configured = true;
   rrl->log_only = false;
   rrl->responses_per_second = 0;
+  rrl->nodata_per_second = 0;
+  rrl->nodata_per_second_set = false;
   rrl->nxdomains_per_second = 0;
   rrl->errors_per_second = 0;
   rrl->window_seconds = 15;
@@ -959,6 +961,13 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     if (strcmp(key, "responses-per-second") == 0) {
       if (valid) rrl->responses_per_second = (int)num_val;
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+    } else if (strcmp(key, "nodata-per-second") == 0) {
+      if (valid) {
+        rrl->nodata_per_second = (int)num_val;
+        rrl->nodata_per_second_set = true;
+      } else {
+        syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      }
     } else if (strcmp(key, "nxdomains-per-second") == 0) {
       if (valid) rrl->nxdomains_per_second = (int)num_val;
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
@@ -980,6 +989,12 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     }
     free(key);
     free(val);
+  }
+
+  if (!rrl->nodata_per_second_set) {
+    // nodata-per-second が明示指定されていない場合は responses-per-second を流用する
+    // （既存設定ファイルの後方互換のためのデフォルト）
+    rrl->nodata_per_second = rrl->responses_per_second;
   }
   
   tok = get_next_token(ctx);

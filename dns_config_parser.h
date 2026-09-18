@@ -23,6 +23,8 @@ typedef struct {
   bool early_drop;
   bool log_only;
   uint32_t responses_per_second;
+  uint32_t nodata_per_second;
+  bool nodata_per_second_set;
   uint32_t nxdomains_per_second;
   uint32_t errors_per_second;
   uint32_t window_seconds;
