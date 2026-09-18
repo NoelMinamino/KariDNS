@@ -70,6 +70,7 @@ typedef struct {
   response_cache_entry_t **buckets;
   size_t bucket_count;
   size_t entry_count;
+  size_t total_bytes;
 } response_cache_table_t;
 
 typedef struct zone_arena_s {

@@ -388,6 +388,11 @@ typedef struct {
     uint64_t notify_ack;
     uint64_t axfr_success;
     uint64_t ixfr_success;
+    uint64_t wirecache_hits;
+    uint64_t wirecache_misses;
+    bool wirecache_enabled;
+    uint64_t wirecache_entries;
+    uint64_t wirecache_bytes;
 } zone_observatory_snapshot_t;
 
 #endif // DNS_WIRE_H

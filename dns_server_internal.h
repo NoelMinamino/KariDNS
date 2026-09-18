@@ -259,6 +259,8 @@ typedef struct {
   _Atomic uint64_t notify_ack;
   _Atomic uint64_t axfr_success;
   _Atomic uint64_t ixfr_success;
+  _Atomic uint64_t wirecache_hits;
+  _Atomic uint64_t wirecache_misses;
   _Atomic time_t   last_transfer_time;
   _Atomic time_t   last_notify_time;
 } zone_observatory_t;

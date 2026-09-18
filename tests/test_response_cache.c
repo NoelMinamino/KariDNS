@@ -992,8 +992,104 @@ static void test_wire_cache_max_records_limit(void) {
     printf("[SUCCESS] All wire-cache-max-records tests passed!\n");
 }
 
+static void test_wire_cache_observatory_counters(void) {
+    printf("[TEST] Running wire cache observatory statistics & counters test...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+
+    const char zone_text[] =
+        "example.com. 3600 IN SOA ns1.example.com. hostmaster.example.com. 2026091801 7200 3600 1209600 3600\n"
+        "example.com. 3600 IN NS ns1.example.com.\n"
+        "ns1.example.com. 3600 IN A 192.0.2.1\n"
+        "www.example.com. 3600 IN A 192.0.2.2\n";
+
+    int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
+    assert(parsed >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    build_zone_response_cache(&arena, &cfg, "example.com.");
+    assert(arena.response_cache.buckets != NULL);
+    assert(arena.response_cache.entry_count > 0);
+    assert(arena.response_cache.total_bytes > 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    char *any_acl[1] = { (char *)"any" };
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    // 1. Cache hit query: www.example.com A
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+    build_simple_query(req, &req_len, 0x1001, "www.example.com.", 1);
+
+    compress_ctx_t comp_ctx;
+    compress_ctx_init_packet(&comp_ctx);
+    zone_db_entry_t *matched = NULL;
+    int len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                    "www.example.com.", 1,
+                                    "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len > 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 0);
+
+    // 2. Cache miss query (NXDOMAIN): nonexistent.example.com A
+    build_simple_query(req, &req_len, 0x1002, "nonexistent.example.com.", 1);
+    compress_ctx_init_packet(&comp_ctx);
+    matched = NULL;
+    len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                 "nonexistent.example.com.", 1,
+                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len > 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
+
+    // 3. Cache-ineligible query (DO=1): should not increment hits or misses
+    build_edns_query(req, &req_len, 0x1003, "www.example.com.", 1, true /* DO=1 */);
+    compress_ctx_init_packet(&comp_ctx);
+    matched = NULL;
+    len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                 "www.example.com.", 1,
+                                 "127.0.0.1", &comp_ctx, false, NULL, &snap, &cfg, &matched);
+    assert(len > 0);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_hits, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&db_entry.observatory.wirecache_misses, memory_order_relaxed) == 1);
+
+    zone_arena_destroy(&arena);
+    printf("[SUCCESS] All wire cache observatory counters tests passed!\n");
+}
+
 int main(void) {
     test_wire_cache_consistency();
     test_wire_cache_max_records_limit();
+    test_wire_cache_observatory_counters();
     return 0;
 }

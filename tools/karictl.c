@@ -437,6 +437,27 @@ int main(int argc, char **argv) {
                     printf("  NOTIFY (Out):          Sent=%lu Configured-Slaves=%u (Last: %s)\n",
                            (unsigned long)snap.notify_sent, snap.slaves_configured, notify_time_str);
                 }
+                if (snap.wirecache_enabled) {
+                    unsigned long wc_total = (unsigned long)snap.wirecache_hits + (unsigned long)snap.wirecache_misses;
+                    double hit_rate_overall = wc_total > 0 ? (100.0 * snap.wirecache_hits / wc_total) : 0.0;
+                    double hit_rate_noerror = snap.responses_noerror > 0 ? (100.0 * snap.wirecache_hits / snap.responses_noerror) : 0.0;
+                    double attempt_rate = snap.queries_total > 0 ? (100.0 * wc_total / snap.queries_total) : 0.0;
+
+                    long long other_noerror_misses = (long long)snap.wirecache_misses
+                                                      - (long long)snap.responses_nxdomain
+                                                      - (long long)snap.responses_nodata;
+                    if (other_noerror_misses < 0) other_noerror_misses = 0; // 概算のズレで負値になった場合の保険
+
+                    printf("  WireCache:             Hits=%lu Misses=%lu [Entries: %lu, ~%lu bytes]\n",
+                           (unsigned long)snap.wirecache_hits, (unsigned long)snap.wirecache_misses,
+                           (unsigned long)snap.wirecache_entries, (unsigned long)snap.wirecache_bytes);
+                    printf("                         HitRate: overall=%.1f%% / of-NOERROR=%.1f%% / cache-attempt-rate=%.1f%%\n",
+                           hit_rate_overall, hit_rate_noerror, attempt_rate);
+                    printf("                         Miss breakdown (approx): NXDOMAIN=%lu NODATA=%lu other-NOERROR=%lld\n",
+                           (unsigned long)snap.responses_nxdomain, (unsigned long)snap.responses_nodata, other_noerror_misses);
+                } else {
+                    printf("  WireCache:             disabled for this zone\n");
+                }
                 if (i + 1 < count) printf("\n");
             }
         }

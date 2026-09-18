@@ -2623,6 +2623,7 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
   }
 
   if (cached_entries > 0) {
+    arena->response_cache.total_bytes = cached_bytes;
     syslog(LOG_NOTICE,
            "[WireCache] zone '%s': cached %zu entries (~%zu bytes) out of %zu total records",
            domain ? domain : "(unknown)", cached_entries, cached_bytes, arena->count);
@@ -3441,6 +3442,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       current_zone && current_zone->response_cache.buckets && max_res_len >= 512) {
     uint32_t qname_hash = calc_fnv1a_str(current_qname_lc);
     size_t hash_idx = (qname_hash ^ (uint32_t)qtype) & (current_zone->response_cache.bucket_count - 1);
+    bool wc_hit = false;
     for (response_cache_entry_t *e = current_zone->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
       if (e->qtype == qtype && e->qclass == qclass && e->name_hash == qname_hash &&
           strcmp(e->name, current_qname_lc) == 0) {
@@ -3454,10 +3456,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           *res_ancount = htons(e->ancount);
           *res_nscount = htons(e->nscount);
           *res_arcount = htons(arcount);
+          if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_hits, 1, memory_order_relaxed);
           return body_offset;
         }
         break;
       }
+    }
+    if (!wc_hit && db_entry) {
+      atomic_fetch_add_explicit(&db_entry->observatory.wirecache_misses, 1, memory_order_relaxed);
     }
   }
 

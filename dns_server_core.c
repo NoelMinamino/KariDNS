@@ -974,6 +974,20 @@ static void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t 
     out->notify_ack = atomic_load_explicit(&e->observatory.notify_ack, memory_order_relaxed);
     out->axfr_success = atomic_load_explicit(&e->observatory.axfr_success, memory_order_relaxed);
     out->ixfr_success = atomic_load_explicit(&e->observatory.ixfr_success, memory_order_relaxed);
+
+    out->wirecache_hits = atomic_load_explicit(&e->observatory.wirecache_hits, memory_order_relaxed);
+    out->wirecache_misses = atomic_load_explicit(&e->observatory.wirecache_misses, memory_order_relaxed);
+
+    zone_arena_t *active_arena = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    if (active_arena && active_arena->response_cache.buckets) {
+        out->wirecache_enabled = true;
+        out->wirecache_entries = active_arena->response_cache.entry_count;
+        out->wirecache_bytes = active_arena->response_cache.total_bytes;
+    } else {
+        out->wirecache_enabled = false;
+        out->wirecache_entries = 0;
+        out->wirecache_bytes = 0;
+    }
 }
 
 // ============================================================================
