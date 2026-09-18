@@ -680,9 +680,6 @@ void *axfr_bg_thread_func(void *arg) {
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_bg_ctx_t *ctx = (axfr_bg_ctx_t *)arg;
   zone_db_snapshot_t *bg_snap = ctx->snap;
-  static _Atomic int axfr_bg_slot_counter = ATOMIC_VAR_INIT(0);
-  int slot = (int)(atomic_fetch_add(&axfr_bg_slot_counter, 1) % MAX_AXFR_RCU_WORKERS);
-  rcu_reader_enter(&g_axfr_rcu_ctxs[slot]);
 
   /* [H-4] ctx->has_tsig が真の場合は、ctx 内に値コピーされた TSIG 情報から
    * スタック上の tsig_key_t を組み立てて使用する (config ポインタを参照しない)。*/
@@ -719,7 +716,6 @@ void *axfr_bg_thread_func(void *arg) {
     if (ctx->entry)
       atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
     free(ctx);
-    rcu_reader_exit(&g_axfr_rcu_ctxs[slot]);
     if (bg_snap)
       release_zone_snapshot(bg_snap);
     atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
@@ -744,7 +740,6 @@ void *axfr_bg_thread_func(void *arg) {
       if (ctx->entry)
         atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
       free(ctx);
-      rcu_reader_exit(&g_axfr_rcu_ctxs[slot]);
       if (bg_snap)
         release_zone_snapshot(bg_snap);
       atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
@@ -847,7 +842,6 @@ void *axfr_bg_thread_func(void *arg) {
         if (ctx->entry)
           atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
         free(ctx);
-        rcu_reader_exit(&g_axfr_rcu_ctxs[slot]);
         if (bg_snap)
           release_zone_snapshot(bg_snap);
         atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
@@ -880,7 +874,6 @@ void *axfr_bg_thread_func(void *arg) {
     atomic_store_explicit(&ctx->entry->is_transferring, false,
                           memory_order_release);
   free(ctx);
-  rcu_reader_exit(&g_axfr_rcu_ctxs[slot]);
   if (bg_snap)
     release_zone_snapshot(bg_snap);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
