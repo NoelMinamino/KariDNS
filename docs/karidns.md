@@ -76,6 +76,7 @@ options {
 
     rate-limit {
         responses-per-second 50;
+        nodata-per-second 50;
         nxdomains-per-second 20;
         errors-per-second 10;
         window 15;

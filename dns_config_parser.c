@@ -906,6 +906,8 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   rrl->configured = true;
   rrl->log_only = false;
   rrl->responses_per_second = 0;
+  rrl->nodata_per_second = 0;
+  rrl->nodata_per_second_set = false;
   rrl->nxdomains_per_second = 0;
   rrl->errors_per_second = 0;
   rrl->window_seconds = 15;
@@ -959,6 +961,13 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     if (strcmp(key, "responses-per-second") == 0) {
       if (valid) rrl->responses_per_second = (int)num_val;
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+    } else if (strcmp(key, "nodata-per-second") == 0) {
+      if (valid) {
+        rrl->nodata_per_second = (int)num_val;
+        rrl->nodata_per_second_set = true;
+      } else {
+        syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      }
     } else if (strcmp(key, "nxdomains-per-second") == 0) {
       if (valid) rrl->nxdomains_per_second = (int)num_val;
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
@@ -980,6 +989,12 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     }
     free(key);
     free(val);
+  }
+
+  if (!rrl->nodata_per_second_set) {
+    // nodata-per-second が明示指定されていない場合は responses-per-second を流用する
+    // （既存設定ファイルの後方互換のためのデフォルト）
+    rrl->nodata_per_second = rrl->responses_per_second;
   }
   
   tok = get_next_token(ctx);
@@ -1513,6 +1528,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
+  config->wire_cache_max_records = 0;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->query_log_max_qps = 5000;
   config->query_log_buffer_size = 32768;
@@ -1917,6 +1933,28 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key); free_token(&tok); return -1;
           }
           config->minimal_any_ttl = (uint32_t)v;
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(key);
+            return -1;
+          }
+          free_token(&tok);
+        } else if (strcmp(key, "wire-cache-max-records") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) {
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          char *endptr;
+          unsigned long v = strtoul(tok.value, &endptr, 10);
+          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
+            syslog(LOG_ERR, "[Config] Invalid wire-cache-max-records value '%s' (must be a non-negative integer)", tok.value);
+            fprintf(stderr, "[ERROR] Invalid wire-cache-max-records value '%s' (must be a non-negative integer)\n", tok.value);
+            free(key); free_token(&tok); return -1;
+          }
+          config->wire_cache_max_records = (uint32_t)v;
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) {

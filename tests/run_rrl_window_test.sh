@@ -65,6 +65,7 @@ send_instant_burst() {
     use Socket;
 
     my $count = $ARGV[0] || 25;
+    my $qtype = $ARGV[1] || 1; # 1 = A (NOERROR), 28 = AAAA (NODATA)
     my $port = 10053;
     my $ip = "127.0.0.1";
 
@@ -73,7 +74,7 @@ send_instant_burst() {
     connect($sock, $dest) or die "connect: $!";
 
     my $qname = "\x03www\x03rrl\x04test\x00";
-    my $pkt_base = $qname . pack("nn", 1, 1);
+    my $pkt_base = $qname . pack("nn", $qtype, 1);
 
     # Pre-generate all packets so send loop is purely connected UDP writes (< 1ms total)
     my @pkts = map { pack("nnnnnn", $_, 0x0100, 1, 0, 0, 0) . $pkt_base } (1..$count);
@@ -94,12 +95,12 @@ send_instant_burst() {
         }
     }
     print "$received\n";
-    ' "$1"
+    ' "$1" "${2:-1}"
 }
 
 # 1. Initial burst of 25 queries (capacity is 15 -> exactly 15 accepted, 10 dropped)
-echo "[*] Step 1: Sending initial instant burst of 25 queries..."
-BURST1_RES=$(send_instant_burst 25)
+echo "[*] Step 1: Sending initial instant burst of 25 queries (NOERROR)..."
+BURST1_RES=$(send_instant_burst 25 1)
 echo "[*] Step 1 responses received: $BURST1_RES / 25 (expected 15)"
 
 if [ "$BURST1_RES" -ne 15 ]; then
@@ -112,7 +113,7 @@ echo "[*] Step 2: Waiting 3.5s for full window refill..."
 sleep 3.5
 
 echo "[*] Step 2: Sending second instant burst of 25 queries after full refill..."
-BURST2_RES=$(send_instant_burst 25)
+BURST2_RES=$(send_instant_burst 25 1)
 echo "[*] Step 2 responses received: $BURST2_RES / 25 (expected 15)"
 
 if [ "$BURST2_RES" -ne 15 ]; then
@@ -125,7 +126,7 @@ echo "[*] Step 3: Waiting 1.0s for partial refill (5 tokens)..."
 sleep 1.0
 
 echo "[*] Step 3: Sending instant burst of 10 queries after 1.0s partial refill..."
-BURST3_RES=$(send_instant_burst 10)
+BURST3_RES=$(send_instant_burst 10 1)
 echo "[*] Step 3 responses received: $BURST3_RES / 10 (expected 5)"
 
 if [ "$BURST3_RES" -ne 5 ]; then
@@ -133,5 +134,53 @@ if [ "$BURST3_RES" -ne 5 ]; then
     exit 1
 fi
 
-echo "[PASS] RRL window burst capacity (15), rate throttling (drops), and time-based token refills verified successfully!"
+# 4. Step 4: Dedicated nodata-per-second verification
+echo "[*] Step 4: Restarting server with dedicated nodata-per-second configuration..."
+kill -9 "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+
+cat << EOF > "$CONF"
+options {
+    port 10053;
+    bind-address { 127.0.0.1; };
+    user "nobody";
+    group "nobody";
+    rate-limit {
+        responses-per-second 10;
+        nodata-per-second 3;
+        window 2;
+        slip 0;
+    };
+};
+zone "rrl.test" {
+    type master;
+    file "$ZONE";
+};
+EOF
+
+$BIN -f -c "$CONF" > "$DIR/server_rrl.log" 2>&1 &
+SERVER_PID=$!
+sleep 2
+
+# 4a. NODATA burst test (qtype 28 AAAA on www.rrl.test -> NODATA: cap = 3 rps * 2s = 6 tokens)
+echo "[*] Step 4a: Sending burst of 20 NODATA queries (qtype=28 AAAA)..."
+NODATA_RES=$(send_instant_burst 20 28)
+echo "[*] Step 4a NODATA responses received: $NODATA_RES / 20 (expected 6)"
+
+if [ "$NODATA_RES" -ne 6 ]; then
+    echo "[FAIL] Expected 6 responses for NODATA burst (nodata_rps=3, window=2), but received $NODATA_RES!"
+    exit 1
+fi
+
+# 4b. NOERROR burst test (qtype 1 A on www.rrl.test -> NOERROR: cap = 10 rps * 2s = 20 tokens)
+echo "[*] Step 4b: Sending burst of 30 NOERROR queries (qtype=1 A)..."
+NOERROR_RES=$(send_instant_burst 30 1)
+echo "[*] Step 4b NOERROR responses received: $NOERROR_RES / 30 (expected 20)"
+
+if [ "$NOERROR_RES" -ne 20 ]; then
+    echo "[FAIL] Expected 20 responses for NOERROR burst (responses_rps=10, window=2), but received $NOERROR_RES!"
+    exit 1
+fi
+
+echo "[PASS] RRL window burst capacity, rate throttling, refills, and dedicated nodata-per-second verified successfully!"
 exit 0

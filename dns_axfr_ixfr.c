@@ -931,6 +931,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   compress_ctx_t comp_ctx;
   memset(&comp_ctx, 0, sizeof(comp_ctx));
   compress_ctx_init_packet(&comp_ctx);
+  // 質問セクションの名前（オフセット DNS_HEADER_SIZE）を圧縮テーブルに登録する。
+  // これにより最初のレコード（通常はゾーン apex の SOA）の所有者名が
+  // 質問セクションへの2バイトポインタとして圧縮され、BIND と同等の
+  // メッセージサイズになる（分割後の再初期化コードと同じ処理）。
+  register_wire_name_for_compression(res, DNS_HEADER_SIZE, &comp_ctx);
   uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
   size_t tsig_mac_len = req_mac_len;

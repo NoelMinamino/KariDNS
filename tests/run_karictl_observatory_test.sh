@@ -168,6 +168,20 @@ else
     exit 1
 fi
 
+if echo "$OBS_OUT" | grep -E -q "WireCache:[[:space:]]+Hits=[1-9]"; then
+    echo "  PASS: WireCache statistics tracked."
+else
+    echo "  FAIL: WireCache statistics not displayed."
+    exit 1
+fi
+
+if echo "$OBS_OUT" | grep -q "HitRate: overall=" && echo "$OBS_OUT" | grep -q "Miss breakdown (approx):"; then
+    echo "  PASS: WireCache detailed hit rate & miss breakdown displayed."
+else
+    echo "  FAIL: WireCache detailed metrics missing."
+    exit 1
+fi
+
 # 8. Test specific zone query
 echo "[+] Testing specific zone query: karictl observatory obs.example.com..."
 OBS_SPECIFIC=$("$KARICTL" -s "$CTRL_SOCK" -f "$TMP_DIR/karictl.conf" observatory obs.example.com)
