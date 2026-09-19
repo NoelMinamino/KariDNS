@@ -575,13 +575,13 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
                              const char *default_ttl, const char *cur_buf,
                              const char *ecs_tag, const char *loc_tag) {
     if (field_idx < 5) {
-        if (ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
+        if (ctx && ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
         return -1;
     }
     parse_error_t local_err = {0};
     generate_range_t range;
     if (parse_generate_range(fields[1], &range, &local_err) != 0) {
-        if (ctx->err_out) {
+        if (ctx && ctx->err_out) {
             ctx->err_out->error_message = local_err.error_message;
             ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
             ctx->err_out->token_length = strlen(fields[1]);
@@ -613,7 +613,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     }
 
     if (!type_str || !rhs_tmpl) {
-        if (ctx->err_out) {
+        if (ctx && ctx->err_out) {
             ctx->err_out->error_message = "$GENERATE requires range lhs [ttl] [class] type rhs";
             ctx->err_out->error_offset = (size_t)(fields[0] - cur_buf);
             ctx->err_out->token_length = strlen(fields[0]);
@@ -625,7 +625,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     if (type_code != 1 && type_code != 28 && type_code != 2 &&
         type_code != 5 && type_code != 12 && type_code != 39 &&
         type_code != 16) {
-        if (ctx->err_out) {
+        if (ctx && ctx->err_out) {
             ctx->err_out->error_message = "$GENERATE does not support this record type";
             ctx->err_out->error_offset = (size_t)(fields[3] - cur_buf);
             ctx->err_out->token_length = strlen(fields[3]);
@@ -637,7 +637,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     for (uint64_t v = range.start; v <= range.stop; v += range.step) {
         size_t name_len = expand_generate_template(lhs_tmpl, v, name_buf, sizeof(name_buf), &local_err);
         if (name_len == (size_t)-1) {
-            if (ctx->err_out) {
+            if (ctx && ctx->err_out) {
                 ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE lhs expansion failed";
                 ctx->err_out->error_offset = (size_t)(fields[2] - cur_buf);
                 ctx->err_out->token_length = strlen(fields[2]);
@@ -646,7 +646,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         }
         size_t rdata_len = expand_generate_template(rhs_tmpl, v, rdata_buf, sizeof(rdata_buf), &local_err);
         if (rdata_len == (size_t)-1) {
-            if (ctx->err_out) {
+            if (ctx && ctx->err_out) {
                 ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE rhs expansion failed";
                 ctx->err_out->error_offset = (size_t)(fields[4] - cur_buf);
                 ctx->err_out->token_length = strlen(fields[4]);
@@ -660,11 +660,11 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         rec->bind_location_tag = (char *)loc_tag;
 
         char *name_copy = arena_alloc(arena, name_len + 1);
-        if (!name_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
+        if (!name_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
         memcpy(name_copy, name_buf, name_len + 1);
 
         char *rdata_copy = arena_alloc(arena, rdata_len + 1);
-        if (!rdata_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
+        if (!rdata_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
         memcpy(rdata_copy, rdata_buf, rdata_len + 1);
 
         rec->name = expand_domain_name(name_copy, origin, arena);

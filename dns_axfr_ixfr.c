@@ -523,20 +523,24 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           zone_arena_destroy(&tmp_arena);
           return -1;
         }
-        if (unsigned_msgs_len + msg_len > unsigned_msgs_cap) {
-          size_t new_cap = unsigned_msgs_cap == 0 ? 65536 : unsigned_msgs_cap * 2;
-          while (new_cap < unsigned_msgs_len + msg_len) new_cap *= 2;
-          uint8_t *new_buf = realloc(unsigned_msgs, new_cap);
-          if (!new_buf) {
-            if (unsigned_msgs) free(unsigned_msgs);
-            zone_arena_destroy(&tmp_arena);
-            return -1;
+        if (msg_len > 0) {
+          if (unsigned_msgs_len + msg_len > unsigned_msgs_cap) {
+            size_t new_cap = unsigned_msgs_cap == 0 ? 65536 : unsigned_msgs_cap * 2;
+            while (new_cap < unsigned_msgs_len + msg_len) new_cap *= 2;
+            uint8_t *new_buf = realloc(unsigned_msgs, new_cap);
+            if (!new_buf) {
+              if (unsigned_msgs) free(unsigned_msgs);
+              zone_arena_destroy(&tmp_arena);
+              return -1;
+            }
+            unsigned_msgs = new_buf;
+            unsigned_msgs_cap = new_cap;
           }
-          unsigned_msgs = new_buf;
-          unsigned_msgs_cap = new_cap;
+          if (unsigned_msgs && msg) {
+            memcpy(unsigned_msgs + unsigned_msgs_len, msg, msg_len);
+            unsigned_msgs_len += msg_len;
+          }
         }
-        memcpy(unsigned_msgs + unsigned_msgs_len, msg, msg_len);
-        unsigned_msgs_len += msg_len;
       } else {
         uint8_t current_mac[64];
         size_t current_mac_len = 0;

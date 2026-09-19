@@ -18,6 +18,7 @@
 #include "dns_zone_parser.h"
 #include "dns_snapshot_rcu.h"
 #include "dns_dynamic_update.h"
+#include "dns_query_engine.h"
 #include "dns_axfr_ixfr.h"
 #include "dns_utils.h"
 
@@ -461,11 +462,237 @@ static void test_send_notify_to_all_comprehensive(void) {
     printf("  -> send_notify_to_all comprehensive passed.\n");
 }
 
+static void test_process_update_sections_apex_ns_protection(void) {
+    printf("[TEST] Dynamic Update: RFC 2136 §3.4.2.4 apex NS deletion protection via Class NONE...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    arena.hash_size = 256;
+    arena.hash_table = malloc(sizeof(int) * arena.hash_size);
+    for (size_t i = 0; i < arena.hash_size; i++) arena.hash_table[i] = -1;
+
+    arena.records = malloc(sizeof(dns_record_t) * 16);
+    arena.records_cap = 16;
+
+    // SOA record
+    dns_record_t soa;
+    memset(&soa, 0, sizeof(soa));
+    soa.name = arena_strdup(&arena, "example.com.");
+    soa.type = arena_strdup(&arena, "SOA");
+    soa.type_code = 6;
+    soa.class_str = arena_strdup(&arena, "IN");
+    soa.class_val = 1;
+    soa.ttl = arena_strdup(&arena, "3600");
+    soa.ttl_value = 3600;
+    soa.rdata_count = 7;
+    soa.rdata[0] = arena_strdup(&arena, "ns1.example.com.");
+    soa.rdata[1] = arena_strdup(&arena, "hostmaster.example.com.");
+    soa.rdata[2] = arena_strdup(&arena, "100");
+    soa.rdata[3] = arena_strdup(&arena, "7200");
+    soa.rdata[4] = arena_strdup(&arena, "3600");
+    soa.rdata[5] = arena_strdup(&arena, "1209600");
+    soa.rdata[6] = arena_strdup(&arena, "300");
+    arena.records[arena.count++] = soa;
+
+    // Only 1 apex NS record
+    dns_record_t ns1;
+    memset(&ns1, 0, sizeof(ns1));
+    ns1.name = arena_strdup(&arena, "example.com.");
+    ns1.type = arena_strdup(&arena, "NS");
+    ns1.type_code = 2;
+    ns1.class_str = arena_strdup(&arena, "IN");
+    ns1.class_val = 1;
+    ns1.ttl = arena_strdup(&arena, "3600");
+    ns1.ttl_value = 3600;
+    ns1.rdata_count = 1;
+    ns1.rdata[0] = arena_strdup(&arena, "ns1.example.com.");
+    arena.records[arena.count++] = ns1;
+
+    build_zone_index(&arena, true);
+
+    // Build UPDATE packet to delete ns1 via CLASS NONE (254)
+    uint8_t pkt[512] = {0};
+    pkt[0] = 0xAA; pkt[1] = 0x55;
+    pkt[2] = 0x28; // Opcode=5 (UPDATE)
+    pkt[4] = 0x00; pkt[5] = 0x01; // ZOCOUNT=1
+    pkt[8] = 0x00; pkt[9] = 0x01; // UPCOUNT=1
+
+    size_t off = 12;
+    // Zone: example.com. IN SOA
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 6; // SOA
+    pkt[off++] = 0; pkt[off++] = 1; // IN
+
+    // Delete exact RR: example.com. 0 NONE NS ns1.example.com.
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 2;   // TYPE=NS
+    pkt[off++] = 0; pkt[off++] = 254; // CLASS=NONE
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; // TTL=0
+    size_t rdlen_pos = off;
+    off += 2;
+    size_t rdata_start = off;
+    pkt[off++] = 3; memcpy(&pkt[off], "ns1", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    uint16_t rdlen = (uint16_t)(off - rdata_start);
+    pkt[rdlen_pos] = (uint8_t)(rdlen >> 8);
+    pkt[rdlen_pos + 1] = (uint8_t)(rdlen & 0xFF);
+
+    int prcount = 0, upcount = 0;
+    int rcode = process_update_sections(pkt, off, "example.com.", &arena, &prcount, &upcount);
+    assert(rcode == 5); // Must return REFUSED (5) because it is the last apex NS record!
+    assert(arena.records[1].name != NULL); // NS record was NOT tombstoned
+
+    // Now add a second apex NS record: ns2.example.com.
+    dns_record_t ns2;
+    memset(&ns2, 0, sizeof(ns2));
+    ns2.name = arena_strdup(&arena, "example.com.");
+    ns2.type = arena_strdup(&arena, "NS");
+    ns2.type_code = 2;
+    ns2.class_str = arena_strdup(&arena, "IN");
+    ns2.class_val = 1;
+    ns2.ttl = arena_strdup(&arena, "3600");
+    ns2.ttl_value = 3600;
+    ns2.rdata_count = 1;
+    ns2.rdata[0] = arena_strdup(&arena, "ns2.example.com.");
+    arena.records[arena.count++] = ns2;
+    build_zone_index(&arena, true);
+
+    // Now repeating the delete of ns1 must succeed (2 apex NS existed -> 1 remains)
+    rcode = process_update_sections(pkt, off, "example.com.", &arena, &prcount, &upcount);
+    assert(rcode == 0); // NOERROR
+    assert(arena.count == 2); // Compacted: SOA + ns2
+    assert(arena.records[0].name != NULL && arena.records[0].type_code == 6); // SOA exists
+    assert(arena.records[1].name != NULL && arena.records[1].type_code == 2); // ns2 remains
+    assert(strcmp(arena.records[1].rdata[0], "ns2.example.com.") == 0);
+
+    zone_arena_destroy(&arena);
+    printf("  -> Apex NS deletion protection passed.\n");
+}
+
+static void test_update_multi_tsig_keys(void) {
+    printf("[TEST] Dynamic Update: Multiple TSIG keys in allow-update authorization...\n");
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    tsig_key_t key1;
+    memset(&key1, 0, sizeof(key1));
+    key1.name = "key1.example.com.";
+    key1.algorithm = "hmac-sha256";
+    key1.secret_decoded_len = 32;
+    memset(key1.secret_decoded, 0x11, 32);
+
+    tsig_key_t key2;
+    memset(&key2, 0, sizeof(key2));
+    key2.name = "key2.example.com.";
+    key2.algorithm = "hmac-sha256";
+    key2.secret_decoded_len = 32;
+    memset(key2.secret_decoded, 0x22, 32);
+
+    key1.next = &key2;
+    cfg.keys = &key1;
+
+    char *allow_keys[2] = { "key1.example.com.", "key2.example.com." };
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zcfg.domain = "example.com.";
+    zcfg.type = "master";
+    zcfg.allow_update = allow_keys;
+    zcfg.allow_update_count = 2;
+    cfg.zones = &zcfg;
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    init_sample_zone_arena(&entry.rcu.arena_a, "example.com.", "100");
+    init_sample_zone_arena(&entry.rcu.arena_b, "example.com.", "100");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.serial, 100, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &entry };
+    char *any_acl[1] = { "any" };
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    // Construct UPDATE packet: ZOCOUNT=1 (example.com), UPCOUNT=1 (Add host.example.com A 192.0.2.77)
+    uint8_t pkt[1024] = {0};
+    pkt[0] = 0x55; pkt[1] = 0xAA;
+    pkt[2] = 0x28; // UPDATE
+    pkt[4] = 0x00; pkt[5] = 0x01; // ZOCOUNT=1
+    pkt[8] = 0x00; pkt[9] = 0x01; // UPCOUNT=1
+
+    size_t off = 12;
+    // Zone: example.com. IN SOA
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 6; // SOA
+    pkt[off++] = 0; pkt[off++] = 1; // IN
+
+    // Update 1: Add host.example.com. 300 IN A 192.0.2.77
+    pkt[off++] = 4; memcpy(&pkt[off], "host", 4); off += 4;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 1; // A
+    pkt[off++] = 0; pkt[off++] = 1; // IN
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C; // TTL=300
+    pkt[off++] = 0; pkt[off++] = 4; // RDLEN=4
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 77;
+
+    // Sign the update packet using key2 (the 2nd key in allow_update list!)
+    uint8_t mac[64];
+    size_t mac_len = 0;
+    size_t signed_len = off;
+    int sign_res = tsig_sign_packet(pkt, &signed_len, sizeof(pkt), &key2, 0, mac, &mac_len, NULL, 0, false);
+    assert(sign_res == 0);
+
+    // Now process via query engine
+    uint8_t res[4096] = {0};
+    compress_ctx_t comp_ctx = {0};
+    zone_db_entry_t *matched_entry = NULL;
+    int res_len = process_dns_query_impl(pkt, signed_len, res, sizeof(res), "example.com.", 6,
+                                         "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched_entry);
+    assert(res_len > 0);
+    uint8_t rcode = res[3] & 0x0F;
+    assert(rcode == 0); // MUST NOT be 9 (NOTAUTH)! Must succeed with NOERROR (0)
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    zone_arena_destroy(&entry.rcu.arena_b);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+
+    printf("  -> Multiple TSIG keys in allow-update passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Dynamic Update Engine Unit Tests ===\n");
     test_bump_soa_serial();
     test_process_update_sections_records();
+    test_process_update_sections_apex_ns_protection();
     test_handle_dynamic_update_pipeline();
+    test_update_multi_tsig_keys();
     test_send_notify_to_all_comprehensive();
     printf("=== All Dynamic Update Engine Unit Tests PASSED ===\n");
     return 0;

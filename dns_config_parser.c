@@ -692,6 +692,7 @@ bool match_cidr(const char *client_ip_str, const char *cidr_str) {
 }
 
 static int parse_string_list_inner(token_ctx_t *ctx, char ***list, int *count) {
+  if (!list || !count) return -1;
   while (1) {
     conf_token_t tok = get_next_token(ctx);
     if (tok.type == TOKEN_RBRACE) {
@@ -734,6 +735,7 @@ typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD } acl_key_mode_t;
 
 static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                            acl_key_mode_t key_mode, char ***tsig_keys_out, int *tsig_keys_count_out) {
+    if (!list || !count) return -1;
     conf_token_t tok = get_next_token(ctx);
     if (tok.type != TOKEN_LBRACE) { free_token(&tok); return -1; }
     free_token(&tok);

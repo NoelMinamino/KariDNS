@@ -1060,9 +1060,13 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
     } else {
         // MODE: Catalog Delta Update
+        if (!catalog_entry_to_update) {
+            abort_rebuild_snapshot(new_snap, "null catalog_entry_to_update");
+            return NULL;
+        }
         
         // Step A: Update Pending CoO Intentions (acting as $OLDCATZ)
-        if (catalog_entry_to_update) {
+        {
             int p = 0;
             while (p < g_pending_coo_count) {
                 if (strcasecmp(g_pending_coo[p].old_catalog, catalog_entry_to_update->domain) == 0) {
@@ -1088,9 +1092,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         g_pending_coo_capacity = new_cap;
                         memset(&g_pending_coo[old_cap], 0, (new_cap - old_cap) * sizeof(pending_coo_t));
                     }
-                    snprintf(g_pending_coo[g_pending_coo_count].domain, sizeof(g_pending_coo[0].domain), "%s", new_desired_members[i].domain);
-                    snprintf(g_pending_coo[g_pending_coo_count].old_catalog, sizeof(g_pending_coo[0].old_catalog), "%s", catalog_entry_to_update->domain);
-                    snprintf(g_pending_coo[g_pending_coo_count].new_catalog, sizeof(g_pending_coo[0].new_catalog), "%s", new_desired_members[i].coo_target);
+                    strncpy(g_pending_coo[g_pending_coo_count].domain, new_desired_members[i].domain, sizeof(g_pending_coo[0].domain) - 1);
+                    g_pending_coo[g_pending_coo_count].domain[sizeof(g_pending_coo[0].domain) - 1] = '\0';
+                    strncpy(g_pending_coo[g_pending_coo_count].old_catalog, catalog_entry_to_update->domain, sizeof(g_pending_coo[0].old_catalog) - 1);
+                    g_pending_coo[g_pending_coo_count].old_catalog[sizeof(g_pending_coo[0].old_catalog) - 1] = '\0';
+                    strncpy(g_pending_coo[g_pending_coo_count].new_catalog, new_desired_members[i].coo_target, sizeof(g_pending_coo[0].new_catalog) - 1);
+                    g_pending_coo[g_pending_coo_count].new_catalog[sizeof(g_pending_coo[0].new_catalog) - 1] = '\0';
                     g_pending_coo_count++;
                 }
             }
@@ -1352,10 +1359,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 continue;
             }
             strncpy(entry->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(entry->owning_catalog_domain) - 1);
+            entry->owning_catalog_domain[sizeof(entry->owning_catalog_domain) - 1] = '\0';
             syslog(LOG_INFO, "[Catalog] Added new member '%s' (unique-id: %s) owned by %s", added_members[i].domain, added_members[i].unique_id, catalog_entry_to_update->domain);
             entry->is_catalog_member = true;
             entry->is_secondary = true;
             strncpy(entry->catalog_member_unique_id, added_members[i].unique_id, sizeof(entry->catalog_member_unique_id) - 1);
+            entry->catalog_member_unique_id[sizeof(entry->catalog_member_unique_id) - 1] = '\0';
             if (added_members[i].group_count > 0) {
                 entry->groups = calloc(added_members[i].group_count, sizeof(char*));
                 entry->group_count = added_members[i].group_count;
@@ -1365,6 +1374,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             }
             if (catalog_cfg->masters_count > 0 && catalog_cfg->masters[0].ip != NULL) {
                 strncpy(entry->cached_master_ip, catalog_cfg->masters[0].ip, sizeof(entry->cached_master_ip) - 1);
+                entry->cached_master_ip[sizeof(entry->cached_master_ip) - 1] = '\0';
                 entry->cached_master_port = catalog_cfg->masters[0].port;
             }
             if (catalog_cfg->tsig_key) {

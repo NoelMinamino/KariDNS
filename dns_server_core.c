@@ -3213,7 +3213,7 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
 
         bool already_bound = false;
         for (int k = 0; k < num_fds; k++) {
-          struct sockaddr_storage ss;
+          struct sockaddr_storage ss = {0};
           socklen_t slen = sizeof(ss);
           if (getsockname(out_fds[k], (struct sockaddr *)&ss, &slen) == 0) {
             if (is_v4 && ss.ss_family == AF_INET) {
@@ -3392,7 +3392,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
   int notify_v4_sock = -1;
   int notify_v6_sock = -1;
   for (int i = 0; i < local_num_udp_fds; i++) {
-    struct sockaddr_storage ss;
+    struct sockaddr_storage ss = {0};
     socklen_t slen = sizeof(ss);
     if (getsockname(local_udp_fds[i], (struct sockaddr *)&ss, &slen) == 0) {
       if (ss.ss_family == AF_INET) {

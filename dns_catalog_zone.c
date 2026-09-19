@@ -159,6 +159,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                         strncpy(new_desired[new_desired_count].unique_id, arena->records[i].name, prefix_len);
                         new_desired[new_desired_count].unique_id[prefix_len] = '\0';
                         strncpy(new_desired[new_desired_count].domain, norm_target, sizeof(new_desired[new_desired_count].domain) - 1);
+                        new_desired[new_desired_count].domain[sizeof(new_desired[new_desired_count].domain) - 1] = '\0';
                         new_desired_count++;
                     }
                 }

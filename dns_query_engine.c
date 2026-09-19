@@ -2871,7 +2871,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           }
         }
         if (zcfg->tsig_key && zcfg->tsig_key[0] != '\0') {
-          tsig_key_t *k = cfg->keys;
+          tsig_key_t *k = cfg ? cfg->keys : NULL;
           while (k) {
             if (strcmp(k->name, zcfg->tsig_key) == 0) {
               matched_key = k;
@@ -2897,7 +2897,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (has_tsig && (!matched_key || tsig_error_code != 0)) {
       auth = false;
       if (!attempted_key) {
-        tsig_key_t *k = cfg->keys;
+        tsig_key_t *k = cfg ? cfg->keys : NULL;
         while (k) {
           int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
           if (err == 0) {
@@ -2999,7 +2999,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
         } else if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
           auth = true;
         }
-        tsig_key_t *k = cfg->keys;
+        tsig_key_t *k = cfg ? cfg->keys : NULL;
         while (k) {
           bool key_allowed = false;
           for (int i = 0; i < zcfg->allow_update_count; i++) {
@@ -3013,6 +3013,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
             int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
             if (err == 0) {
               matched_key = k;
+              attempted_key = k;
+              tsig_error_code = 0;
               auth = true;
               break;
             } else {
@@ -3022,7 +3024,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           k = k->next;
         }
         if (has_tsig && !attempted_key) {
-          k = cfg->keys;
+          k = cfg ? cfg->keys : NULL;
           while (k) {
             int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
             if (err == 0) {
@@ -3306,19 +3308,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (is_badcookie) {
     res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
-    res[3] = (res[3] & 0xF0) | 0x07;
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
-    }
-    *res_arcount = htons(arcount);
-    return offset;
-  }
-
-  if (is_badcookie) {
-    res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
     res[3] = (res[3] & 0xF0) | 0x07; // BADCOOKIE (Base RCODE 7)
-    uint16_t offset = q_offset;
-    uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
     }

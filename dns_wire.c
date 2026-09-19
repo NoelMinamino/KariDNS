@@ -3489,6 +3489,21 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             uint16_t dummy_type;
             if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
             
+            if (parsed_rec.type_code == 2 && domain_names_match_ci(parsed_rec.name, zone_name)) {
+                // RFC 2136 §3.4.2.4: At least one NS RR must remain at the zone apex
+                int active_apex_ns = 0;
+                for (size_t r = 0; r < standby->count; r++) {
+                    if (standby->records[r].name &&
+                        standby->records[r].type_code == 2 &&
+                        domain_names_match_ci(standby->records[r].name, zone_name)) {
+                        active_apex_ns++;
+                    }
+                }
+                if (active_apex_ns <= 1) {
+                    return 5; // REFUSED (cannot delete last NS at apex)
+                }
+            }
+
             uint32_t ph = calc_fnv1a_str(parsed_rec.name);
             size_t phidx = ph & (standby->hash_size - 1);
             for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
