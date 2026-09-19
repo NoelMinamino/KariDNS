@@ -27,6 +27,19 @@
 #include "dns_config_parser.h"
 #include "dns_utils.h"
 
+// Internal server core prototypes for testing
+void perform_config_reload(void);
+void perform_config_reload_ext(bool skip_unchanged);
+void reload_all_zones(void);
+void run_frontend_router(pid_t backend_pid, int router_id);
+void backend_sig_handler(int sig);
+void daemonize(void);
+void supervisor_sig_handler(int sig);
+void cleanup_pid_file(void);
+void setup_ipc_tables(int num_workers);
+void *worker_thread_func(void *arg);
+void *async_io_worker_func(void *arg);
+
 // ----------------------------------------------------------------------------
 // 1. fast_ipv4_to_str Test
 // ----------------------------------------------------------------------------
@@ -1292,6 +1305,8 @@ static void test_meta_types_and_utils_helpers(void) {
     // 7. perform_config_reload & reload_all_zones with NULL/invalid path
     g_config_path = "/nonexistent/karidns_test_invalid_config.conf";
     perform_config_reload();
+    perform_config_reload_ext(true);
+    perform_config_reload_ext(false);
     reload_all_zones();
 
     printf("  -> Meta RR types, string & compression helpers passed.\n");

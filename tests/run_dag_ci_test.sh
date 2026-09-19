@@ -248,6 +248,7 @@ run_check "Flags override (+adflag +cdflag +aaflag +tcflag +raflag +zflag)" "$DA
 run_check "Recursion flag override (+norec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +norec +qr" ";; flags:"
 run_check "Recursion flag enable (+rec)" "$DAG @127.0.0.1 -p $PORT www.example.com A +rec +qr" "flags:.*rd"
 run_check "Ignore truncation flag (+ignore)" "$DAG @127.0.0.1 -p $PORT www.example.com A +ignore" "192\.0\.2\.10"
+run_check "HTTPS record with ipv4hint and ipv6hint" "$DAG @127.0.0.1 -p $PORT example.com HTTPS" "(ipv4hint|ipv6hint|alpn)"
 run_check "Timeout flag (+timeout=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +timeout=2" "192\.0\.2\.10"
 run_check "Timeout alias (+time=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +time=2" "192\.0\.2\.10"
 run_check "Tries and Retry flags (+tries=2 +retry=2)" "$DAG @127.0.0.1 -p $PORT www.example.com A +tries=2 +retry=2" "192\.0\.2\.10"

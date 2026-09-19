@@ -18,6 +18,9 @@
 #include "dns_axfr_ixfr.h"
 #include "dns_utils.h"
 
+// Internal catalog zone prototypes for testing
+void free_catalog_desired_list(catalog_member_id_t *list, int count);
+
 // Mock globals
 int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
@@ -364,6 +367,14 @@ static void test_find_catalog_parent_and_valid_properties(void) {
         cat_parent.catalog_members = NULL;
         cat_parent.catalog_member_count = 0;
     }
+
+    // 4. Test free_catalog_desired_list
+    catalog_member_id_t *dlist = calloc(2, sizeof(catalog_member_id_t));
+    dlist[0].group_count = 1;
+    dlist[0].groups = malloc(sizeof(char *));
+    dlist[0].groups[0] = strdup("grp1");
+    free_catalog_desired_list(dlist, 2);
+    free_catalog_desired_list(NULL, 0);
 
     printf("  -> find_catalog_parent_and_valid_properties passed.\n");
 }

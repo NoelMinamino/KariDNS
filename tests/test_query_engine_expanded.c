@@ -19,6 +19,24 @@
 #include "dns_dynamic_update.h"
 
 // Prototypes for internal query engine functions under test
+void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
+                        uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
+bool nsec_covers_name(const dns_record_t *rec, const char *name);
+dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
+size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
+int64_t monotonic_ms(void);
+uint32_t remaining_ms(int64_t deadline);
+int build_synthetic_servfail(const uint8_t *req, size_t req_len,
+                             uint8_t *res, size_t max_res_len);
+ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms);
+ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
+int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
+                             uint8_t *res, size_t max_res_len,
+                             const char *client_ip, bool is_tcp);
+bool question_section_matches(const uint8_t *resp, size_t resp_len,
+                              const uint8_t *req, size_t req_len);
+int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+                          uint8_t *res, size_t max_res_len);
 size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire);
 bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
@@ -1630,6 +1648,80 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     uint8_t qpkt[12] = {0};
     uint8_t rpkt[512];
     assert(forward_via_tcp(&fwd_ss, sizeof(struct sockaddr_in), qpkt, sizeof(qpkt), rpkt, sizeof(rpkt), 100) == -1);
+
+    // 16. restore_checkpoint
+    resolve_checkpoint_t cp_extra = { 100, 1, 2, 3 };
+    uint16_t roff = 0, ranc = 0, rnsc = 0, rarc = 0;
+    restore_checkpoint(&cp_extra, &roff, &ranc, &rnsc, &rarc);
+    assert(roff == 100 && ranc == 1 && rnsc == 2 && rarc == 3);
+
+    // 17. nsec_covers_name & find_covering_nsec
+    dns_record_t nsec_rec;
+    memset(&nsec_rec, 0, sizeof(nsec_rec));
+    nsec_rec.type_code = 47;
+    nsec_rec.name = "a.example.com.";
+    nsec_rec.rdata[0] = "c.example.com.";
+    nsec_rec.rdata_count = 1;
+    assert(nsec_covers_name(&nsec_rec, "b.example.com.") == true);
+    assert(nsec_covers_name(&nsec_rec, "d.example.com.") == false);
+    assert(nsec_covers_name(NULL, "b.example.com.") == false);
+
+    zone_arena_t cov_arena;
+    zone_arena_init(&cov_arena);
+    assert(find_covering_nsec(&cov_arena, "b.example.com.") == NULL);
+    zone_arena_destroy(&cov_arena);
+
+    // 18. hex_to_bytes
+    uint8_t hex_out[16];
+    assert(hex_to_bytes("DEADBEEF", hex_out, sizeof(hex_out)) == 4);
+    assert(hex_out[0] == 0xDE && hex_out[1] == 0xAD);
+    assert(hex_to_bytes("-", hex_out, sizeof(hex_out)) == 0);
+    assert(hex_to_bytes(NULL, hex_out, sizeof(hex_out)) == 0);
+
+    // 19. monotonic_ms & remaining_ms
+    int64_t now_m = monotonic_ms();
+    assert(now_m > 0);
+    assert(remaining_ms(now_m + 500) > 0);
+    assert(remaining_ms(now_m - 500) == 0);
+
+    // 20. build_synthetic_servfail
+    uint8_t sf_res[512];
+    int sf_len = build_synthetic_servfail(qpkt, sizeof(qpkt), sf_res, sizeof(sf_res));
+    assert(sf_len >= 12);
+    assert(build_synthetic_servfail(qpkt, sizeof(qpkt), sf_res, 6) == 0);
+    assert(build_synthetic_servfail(qpkt, 6, sf_res, sizeof(sf_res)) == 0);
+
+    // 21. write_all_timeout & read_all_timeout
+    int sv_rw[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv_rw) == 0) {
+        uint8_t send_b[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        uint8_t recv_b[8] = {0};
+        assert(write_all_timeout(sv_rw[0], send_b, sizeof(send_b), 500) == (ssize_t)sizeof(send_b));
+        assert(read_all_timeout(sv_rw[1], recv_b, sizeof(recv_b), 500) == (ssize_t)sizeof(recv_b));
+        assert(memcmp(send_b, recv_b, sizeof(send_b)) == 0);
+        close(sv_rw[0]);
+        close(sv_rw[1]);
+    }
+    assert(write_all_timeout(-1, qpkt, sizeof(qpkt), 10) == -1);
+    assert(read_all_timeout(-1, qpkt, sizeof(qpkt), 10) == -1);
+
+    // 22. dispatch_to_program_zone & question_section_matches
+    uint8_t valid_qpkt[256];
+    size_t valid_qlen = 0;
+    build_dns_query(valid_qpkt, &valid_qlen, 0x1234, "example.com.", 1, false);
+    assert(question_section_matches(valid_qpkt, valid_qlen, valid_qpkt, valid_qlen) == true);
+    assert(question_section_matches(qpkt, sizeof(qpkt), qpkt, sizeof(qpkt)) == false);
+    assert(question_section_matches(NULL, 0, valid_qpkt, valid_qlen) == false);
+    int pgm_res = dispatch_to_program_zone("invalid.zone.", valid_qpkt, valid_qlen, rpkt, sizeof(rpkt), "127.0.0.1", false);
+    assert(pgm_res >= 12);
+    assert((rpkt[3] & 0x0F) == 2); // SERVFAIL
+
+    // 23. dispatch_forward_zone
+    zone_config_t dummy_fwd;
+    memset(&dummy_fwd, 0, sizeof(dummy_fwd));
+    int fwd_res = dispatch_forward_zone(&dummy_fwd, valid_qpkt, valid_qlen, rpkt, sizeof(rpkt));
+    assert(fwd_res >= 12);
+    assert((rpkt[3] & 0x0F) == 2); // SERVFAIL
 
     printf("  -> Query engine helpers & edge cases passed.\n");
 }

@@ -493,7 +493,7 @@ static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t 
     out[out_len] = '\0';
 }
 
-static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
+STATIC_TEST size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
     if (!hex || strcmp(hex, "-") == 0 || strcmp(hex, "") == 0) return 0;
     size_t hlen = strlen(hex);
     size_t count = 0;
@@ -1946,7 +1946,7 @@ void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t 
  *  大きく異なるため、ログの記述に合わせて実装側もSERVFAILを返す。) */
 STATIC_TEST int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                                        uint8_t *res, size_t max_res_len) {
-  if (req_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
+  if (req_len < DNS_HEADER_SIZE || max_res_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
   uint16_t qdcount = (req[4] << 8) | req[5];
   size_t q_end = (size_t)get_question_end_offset(req, req_len, qdcount);
   size_t copy_len = q_end > max_res_len ? max_res_len : q_end;
