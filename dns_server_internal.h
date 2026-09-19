@@ -427,9 +427,12 @@ void *control_thread_func(void *arg);
 void *response_logger_thread_func(void *arg);
 void *query_logger_thread_func(void *arg);
 void init_async_io_pool(void);
+int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
+void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 
 extern config_rcu_t g_config_db;
 extern int g_control_sock;
+extern int g_control_kq;
 extern time_t g_boot_time;
 extern time_t g_last_configured_time;
 extern _Atomic int g_tcp_clients;

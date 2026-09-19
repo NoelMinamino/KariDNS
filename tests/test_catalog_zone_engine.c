@@ -219,10 +219,106 @@ static void test_catalog_process_membership_rfc9432(void) {
     printf("  -> catalog_process_membership validations passed.\n");
 }
 
+static void test_find_catalog_parent_and_valid_properties(void) {
+    printf("[TEST] Catalog Zone: find_catalog_parent_in_snapshot & valid member properties...\n");
+
+    zone_db_entry_t cat_parent;
+    memset(&cat_parent, 0, sizeof(cat_parent));
+    strlcpy(cat_parent.domain, "catalog.example.", sizeof(cat_parent.domain));
+
+    zone_db_entry_t other_z;
+    memset(&other_z, 0, sizeof(other_z));
+    strlcpy(other_z.domain, "other.example.", sizeof(other_z.domain));
+
+    zone_db_entry_t *entries[2] = {&cat_parent, &other_z};
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 2;
+
+    // 1. Without hash table (linear scan fallback)
+    zone_db_entry_t *found = find_catalog_parent_in_snapshot(&view, "CATALOG.EXAMPLE.");
+    assert(found == &cat_parent);
+    found = find_catalog_parent_in_snapshot(&view, "nonexistent.catalog.");
+    assert(found == NULL);
+    assert(find_catalog_parent_in_snapshot(NULL, "catalog.example.") == NULL);
+    assert(find_catalog_parent_in_snapshot(&view, NULL) == NULL);
+
+    // 2. With hash table
+    int hash_tbl[4] = {-1, -1, -1, -1};
+    int chain_nxt[2] = {-1, -1};
+    uint32_t h = calc_fnv1a_str("catalog.example.") & 3;
+    hash_tbl[h] = 0;
+    view.hash_table = hash_tbl;
+    view.hash_size = 4;
+    view.chain_next = chain_nxt;
+
+    found = find_catalog_parent_in_snapshot(&view, "catalog.example.");
+    assert(found == &cat_parent);
+
+    // 3. Valid member processing with group property
+    zone_config_t cat_cfg;
+    memset(&cat_cfg, 0, sizeof(cat_cfg));
+    cat_cfg.domain = "catalog.example.";
+    cat_cfg.is_catalog = true;
+
+    zone_arena_t a_valid;
+    zone_arena_init(&a_valid);
+    a_valid.records = calloc(8, sizeof(dns_record_t));
+    a_valid.records_cap = 8;
+
+    dns_record_t r_ver;
+    memset(&r_ver, 0, sizeof(r_ver));
+    r_ver.name = arena_strdup(&a_valid, "version.catalog.example.");
+    r_ver.type_code = 16;
+    r_ver.rdata_count = 1;
+    r_ver.rdata[0] = arena_strdup(&a_valid, "2");
+    a_valid.records[a_valid.count++] = r_ver;
+
+    dns_record_t r_ptr;
+    memset(&r_ptr, 0, sizeof(r_ptr));
+    r_ptr.name = arena_strdup(&a_valid, "unique1.zones.catalog.example.");
+    r_ptr.type_code = 12;
+    r_ptr.rdata_count = 1;
+    r_ptr.rdata[0] = arena_strdup(&a_valid, "member1.example.");
+    a_valid.records[a_valid.count++] = r_ptr;
+
+    dns_record_t r_grp;
+    memset(&r_grp, 0, sizeof(r_grp));
+    r_grp.name = arena_strdup(&a_valid, "group.unique1.zones.catalog.example.");
+    r_grp.type_code = 16;
+    r_grp.rdata_count = 1;
+    r_grp.rdata[0] = arena_strdup(&a_valid, "edge-nodes");
+    a_valid.records[a_valid.count++] = r_grp;
+
+    dns_record_t r_coo;
+    memset(&r_coo, 0, sizeof(r_coo));
+    r_coo.name = arena_strdup(&a_valid, "coo.unique1.zones.catalog.example.");
+    r_coo.type_code = 12;
+    r_coo.rdata_count = 1;
+    r_coo.rdata[0] = arena_strdup(&a_valid, "newcatalog.example.");
+    a_valid.records[a_valid.count++] = r_coo;
+
+    atomic_store_explicit(&cat_parent.rcu.active, &a_valid, memory_order_release);
+    catalog_process_membership(&cat_parent, &cat_cfg, "default");
+
+    // Clean up
+    zone_arena_destroy(&a_valid);
+    if (cat_parent.catalog_members) {
+        free_catalog_member_ids(cat_parent.catalog_members, cat_parent.catalog_member_count);
+        cat_parent.catalog_members = NULL;
+        cat_parent.catalog_member_count = 0;
+    }
+
+    printf("  -> find_catalog_parent_and_valid_properties passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Catalog Zone Engine Unit Tests ===\n");
     test_catalog_hashing_and_bookkeeping();
     test_catalog_process_membership_rfc9432();
+    test_find_catalog_parent_and_valid_properties();
     printf("=== All Catalog Zone Engine Unit Tests PASSED ===\n");
     return 0;
 }

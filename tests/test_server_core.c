@@ -15,6 +15,10 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <sys/event.h>
+#include <signal.h>
 
 #include "dns_server_internal.h"
 #include "dns_snapshot_rcu.h"
@@ -631,9 +635,439 @@ static void test_ensure_priv_dir_safe(void) {
 }
 
 // ----------------------------------------------------------------------------
+// 12. Response Logger Background Thread Test
+// ----------------------------------------------------------------------------
+static void test_response_logger_thread_func(void) {
+    printf("[TEST] Server Core: response_logger_thread_func asynchronous consumer...\n");
+
+    char log_path[256];
+    snprintf(log_path, sizeof(log_path), "/tmp/karidns_test_resp_thread_%ld.log", (long)time(NULL));
+    unlink(log_path);
+
+    log_channel_t resp_ch;
+    memset(&resp_ch, 0, sizeof(resp_ch));
+    resp_ch.file_path = log_path;
+    resp_ch.print_time = true;
+    resp_ch.print_category = true;
+    resp_ch.print_severity = true;
+    resp_ch.fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert(resp_ch.fd >= 0);
+    pthread_mutex_init(&resp_ch.lock, NULL);
+
+    server_config_t mock_cfg;
+    memset(&mock_cfg, 0, sizeof(mock_cfg));
+    mock_cfg.logging.responses_channel = &resp_ch;
+
+    atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
+    atomic_store_explicit(&g_resp_log_tail, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_resp_log_head, 0, memory_order_relaxed);
+    for (int i = 0; i < RESP_LOG_RING_SIZE; i++) {
+        atomic_store_explicit(&g_resp_log_ring[i].ready, false, memory_order_relaxed);
+    }
+
+    pthread_t th;
+    int rc = pthread_create(&th, NULL, response_logger_thread_func, NULL);
+    assert(rc == 0);
+
+    // Enqueue various actions, classes, types, and RCODEs
+    submit_response_log(LOG_ACT_SENT, "192.0.2.1", 5353, "example.com.", 1, 1, 0, true, true);
+    submit_response_log(LOG_ACT_SENT, "2001:db8::1", 5353, "any.example.com.", 255, 28, 0, true, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 1053, "version.bind.", 3, 16, 0, false, false);
+    submit_response_log(LOG_ACT_SENT, "10.0.0.1", 2053, "custom.class.", 99, 65534, 0, false, false);
+    submit_response_log(LOG_ACT_DROP_RRL, "198.51.100.1", 4000, "rrl.example.com.", 1, 1, 2, false, false);
+    submit_response_log(LOG_ACT_DROP_MALFORMED, "198.51.100.2", 4001, "malformed.example.", 1, 1, 1, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "nx.example.", 1, 1, 3, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "notimp.example.", 1, 1, 4, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "refused.example.", 1, 1, 5, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "yxdomain.example.", 1, 1, 6, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "yxrrset.example.", 1, 1, 7, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "nxrrset.example.", 1, 1, 8, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "notauth.example.", 1, 1, 9, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "notzone.example.", 1, 1, 10, false, false);
+    submit_response_log(LOG_ACT_SENT, "127.0.0.1", 53, "unknown.example.", 1, 1, 15, false, false);
+
+    // Allow background thread to process the ring buffer
+    for (int wait_i = 0; wait_i < 50; wait_i++) {
+        if (atomic_load_explicit(&g_resp_log_head, memory_order_relaxed) >= 15) break;
+        usleep(2000);
+    }
+
+    pthread_cancel(th);
+    pthread_join(th, NULL);
+
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    if (resp_ch.fd >= 0) close(resp_ch.fd);
+    pthread_mutex_destroy(&resp_ch.lock);
+
+    struct stat st;
+    assert(stat(log_path, &st) == 0);
+    assert(st.st_size > 0);
+    unlink(log_path);
+
+    printf("  -> response_logger_thread_func passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// 13. Query Logger Background Thread Test
+// ----------------------------------------------------------------------------
+static void test_query_logger_thread_func(void) {
+    printf("[TEST] Server Core: query_logger_thread_func asynchronous consumer & batching...\n");
+
+    char log_path[256];
+    snprintf(log_path, sizeof(log_path), "/tmp/karidns_test_query_thread_%ld.log", (long)time(NULL));
+    unlink(log_path);
+
+    log_channel_t q_ch;
+    memset(&q_ch, 0, sizeof(q_ch));
+    q_ch.file_path = log_path;
+    q_ch.print_time = true;
+    q_ch.print_category = true;
+    q_ch.print_severity = true;
+    q_ch.fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert(q_ch.fd >= 0);
+    pthread_mutex_init(&q_ch.lock, NULL);
+
+    server_config_t mock_cfg;
+    memset(&mock_cfg, 0, sizeof(mock_cfg));
+    mock_cfg.logging.queries_channel = &q_ch;
+
+    worker_ctx_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.thread_id = 0;
+    worker.qlog_ring.size = 64;
+    worker.qlog_ring.mask = 63;
+    worker.qlog_ring.events = calloc(64, sizeof(qlog_event_t));
+    atomic_init(&worker.qlog_ring.head, 0);
+    atomic_init(&worker.qlog_ring.tail, 0);
+    atomic_init(&worker.qlog_ring.dropped_count, 0);
+
+    atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
+    atomic_store_explicit(&g_worker_ctxs, &worker, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_qlog_circuit_broken, false, memory_order_relaxed);
+
+    pthread_t th;
+    int rc = pthread_create(&th, NULL, query_logger_thread_func, NULL);
+    assert(rc == 0);
+
+    struct sockaddr_in sin4;
+    memset(&sin4, 0, sizeof(sin4));
+    sin4.sin_family = AF_INET;
+    sin4.sin_port = htons(5300);
+    inet_pton(AF_INET, "192.0.2.55", &sin4.sin_addr);
+
+    struct sockaddr_in6 sin6;
+    memset(&sin6, 0, sizeof(sin6));
+    sin6.sin6_family = AF_INET6;
+    sin6.sin6_port = htons(5301);
+    inet_pton(AF_INET6, "2001:db8::99", &sin6.sin6_addr);
+
+    // Enqueue queries: IPv4 and IPv6, various classes and types
+    write_query_log(&worker, &sin4, sizeof(sin4), "q1.example.com.", 1, 1, true, true, IPPROTO_UDP, 50000);
+    write_query_log(&worker, &sin6, sizeof(sin6), "q2.example.com.", 255, 28, true, false, IPPROTO_TCP, 50000);
+    write_query_log(&worker, &sin4, sizeof(sin4), "q3.example.com.", 3, 16, false, false, IPPROTO_UDP, 50000);
+    write_query_log(&worker, &sin6, sizeof(sin6), "q4.example.com.", 99, 65000, false, false, IPPROTO_UDP, 50000);
+
+    // Test circuit breaker auto-recovery
+    atomic_store_explicit(&g_qlog_circuit_broken, true, memory_order_relaxed);
+
+    for (int wait_i = 0; wait_i < 50; wait_i++) {
+        uint32_t t = atomic_load_explicit(&worker.qlog_ring.tail, memory_order_relaxed);
+        uint32_t h = atomic_load_explicit(&worker.qlog_ring.head, memory_order_relaxed);
+        if (t == h && !atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed)) break;
+        usleep(2000);
+    }
+
+    assert(atomic_load_explicit(&g_qlog_circuit_broken, memory_order_relaxed) == false);
+
+    pthread_cancel(th);
+    pthread_join(th, NULL);
+
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 0, memory_order_relaxed);
+
+    if (q_ch.fd >= 0) close(q_ch.fd);
+    pthread_mutex_destroy(&q_ch.lock);
+    free(worker.qlog_ring.events);
+
+    struct stat st;
+    assert(stat(log_path, &st) == 0);
+    assert(st.st_size > 0);
+    unlink(log_path);
+
+    printf("  -> query_logger_thread_func passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// 14. Control Socket HMAC Auth & Commands Test
+// ----------------------------------------------------------------------------
+static int run_ctrl_cmd(const struct sockaddr_un *sun, const char *secret, const char *cmd, char *out_buf, size_t out_buf_sz) {
+    int cfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (cfd < 0) return -1;
+    if (connect(cfd, (struct sockaddr *)sun, sizeof(*sun)) != 0) {
+        close(cfd);
+        return -1;
+    }
+    char rbuf[1024];
+    ssize_t n = recv(cfd, rbuf, sizeof(rbuf) - 1, 0);
+    if (n <= 10 || strncmp(rbuf, "CHALLENGE ", 10) != 0) {
+        close(cfd);
+        return -1;
+    }
+    char challenge[65];
+    strncpy(challenge, rbuf + 10, 64);
+    challenge[64] = '\0';
+
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int md_len = 0;
+    HMAC(EVP_sha256(), secret, strlen(secret), (unsigned char *)challenge, 64, md, &md_len);
+    char hmac_hex[65];
+    for (unsigned int k = 0; k < md_len; k++) snprintf(&hmac_hex[k * 2], 3, "%02x", md[k]);
+
+    char auth_cmd[128];
+    snprintf(auth_cmd, sizeof(auth_cmd), "AUTH %s\n", hmac_hex);
+    send(cfd, auth_cmd, strlen(auth_cmd), 0);
+
+    n = recv(cfd, rbuf, sizeof(rbuf) - 1, 0);
+    if (n <= 0 || strncmp(rbuf, "OK\n", 3) != 0) {
+        close(cfd);
+        return -1;
+    }
+
+    send(cfd, cmd, strlen(cmd), 0);
+    ssize_t total = 0;
+    while (total < (ssize_t)out_buf_sz - 1) {
+        ssize_t r = recv(cfd, out_buf + total, out_buf_sz - 1 - total, 0);
+        if (r <= 0) break;
+        total += r;
+    }
+    out_buf[total] = '\0';
+    close(cfd);
+    return (int)total;
+}
+
+static void test_control_socket_thread_and_commands(void) {
+    printf("[TEST] Server Core: control_thread_func HMAC auth & commands...\n");
+
+    char sock_path[256];
+    snprintf(sock_path, sizeof(sock_path), "/tmp/karidns_test_ctrl_%ld.sock", (long)time(NULL));
+    unlink(sock_path);
+
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(lfd >= 0);
+
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, sock_path, sizeof(sun.sun_path) - 1);
+
+    int res = bind(lfd, (struct sockaddr *)&sun, sizeof(sun));
+    assert(res == 0);
+    res = listen(lfd, 8);
+    assert(res == 0);
+
+    g_control_sock = lfd;
+
+    server_config_t mock_cfg;
+    memset(&mock_cfg, 0, sizeof(mock_cfg));
+    mock_cfg.control.enabled = true;
+    const char *secret_key = "kari_secret_key_123";
+    memcpy(mock_cfg.control.secret_decoded, secret_key, strlen(secret_key));
+    mock_cfg.control.secret_decoded_len = strlen(secret_key);
+
+    zone_db_entry_t z_master;
+    memset(&z_master, 0, sizeof(z_master));
+    strlcpy(z_master.domain, "example.com.", sizeof(z_master.domain));
+    strlcpy(z_master.view_name, "default", sizeof(z_master.view_name));
+    atomic_init(&z_master.serial, 2026091901);
+    atomic_init(&z_master.refresh, 3600);
+
+    zone_db_entry_t z_slave;
+    memset(&z_slave, 0, sizeof(z_slave));
+    strlcpy(z_slave.domain, "slave.example.", sizeof(z_slave.domain));
+    strlcpy(z_slave.view_name, "default", sizeof(z_slave.view_name));
+    z_slave.is_secondary = true;
+    atomic_init(&z_slave.serial, 100);
+    atomic_init(&z_slave.refresh, 1800);
+
+    zone_db_entry_t *entries[2] = {&z_master, &z_slave};
+    int hash_tbl[4] = {-1, -1, -1, -1};
+    int chain_nxt[2] = {-1, -1};
+
+    uint32_t h0 = calc_fnv1a_str("example.com.") & 3;
+    hash_tbl[h0] = 0;
+    uint32_t h1 = calc_fnv1a_str("slave.example.") & 3;
+    if (hash_tbl[h1] == -1) {
+        hash_tbl[h1] = 1;
+    } else {
+        chain_nxt[0] = 1;
+    }
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 2;
+    view.hash_table = hash_tbl;
+    view.hash_size = 4;
+    view.chain_next = chain_nxt;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    atomic_init(&snap.reader_count, 1);
+
+    zone_config_t zc_master;
+    memset(&zc_master, 0, sizeof(zc_master));
+    zc_master.domain = "example.com.";
+    zc_master.type = "master";
+
+    zone_config_t zc_slave;
+    memset(&zc_slave, 0, sizeof(zc_slave));
+    zc_slave.domain = "slave.example.";
+    zc_slave.type = "slave";
+
+    zc_master.next = &zc_slave;
+
+    view_config_t vc;
+    memset(&vc, 0, sizeof(vc));
+    vc.name = "default";
+    vc.zones = &zc_master;
+    mock_cfg.views = &vc;
+
+    atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
+    atomic_store_explicit(&g_zone_db_active, &snap, memory_order_release);
+
+    pthread_t th;
+    res = pthread_create(&th, NULL, control_thread_func, NULL);
+    assert(res == 0);
+    usleep(10000);
+
+    // 1. Connect and test Bad Auth
+    int cfd1 = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(cfd1 >= 0);
+    res = connect(cfd1, (struct sockaddr *)&sun, sizeof(sun));
+    assert(res == 0);
+
+    char rbuf[1024];
+    ssize_t n = recv(cfd1, rbuf, sizeof(rbuf) - 1, 0);
+    assert(n > 0);
+    rbuf[n] = '\0';
+    assert(strncmp(rbuf, "CHALLENGE ", 10) == 0);
+
+    const char *bad_auth = "AUTH 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+    send(cfd1, bad_auth, strlen(bad_auth), 0);
+    n = recv(cfd1, rbuf, sizeof(rbuf) - 1, 0);
+    assert(n > 0);
+    rbuf[n] = '\0';
+    assert(strcmp(rbuf, "AUTH_FAILED\n") == 0);
+    close(cfd1);
+
+    // 2. Authenticated single commands via helper
+    char out[2048];
+
+    int len = run_ctrl_cmd(&sun, secret_key, "status\n", out, sizeof(out));
+    assert(len >= (int)(3 + sizeof(karidns_status_t)));
+    assert(strncmp(out, "OK ", 3) == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "zonestatus example.com.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strncmp(out, "OK serial=", 10) == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "zonestatus unknown.example.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "ERROR zone not found\n") == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "observatory\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strncmp(out, "OK 2\n", 5) == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "notify example.com.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "OK\n") == 0);
+    assert(atomic_load_explicit(&z_master.notify_now, memory_order_relaxed) == true);
+
+    len = run_ctrl_cmd(&sun, secret_key, "retransfer slave.example.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "OK\n") == 0);
+    assert(atomic_load_explicit(&z_slave.refresh_now, memory_order_relaxed) == true);
+
+    len = run_ctrl_cmd(&sun, secret_key, "reload slave.example.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "OK reloaded (slave)\n") == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "invalid_command_foo\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "ERROR unknown command\n") == 0);
+
+    // 3. Test Command Buffer Overflow
+    int cfd2 = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(cfd2 >= 0);
+    res = connect(cfd2, (struct sockaddr *)&sun, sizeof(sun));
+    assert(res == 0);
+    n = recv(cfd2, rbuf, sizeof(rbuf) - 1, 0);
+    assert(n > 0);
+    char overflow_payload[1024];
+    memset(overflow_payload, 'A', sizeof(overflow_payload));
+    send(cfd2, overflow_payload, sizeof(overflow_payload), 0);
+    n = recv(cfd2, rbuf, sizeof(rbuf) - 1, 0);
+    if (n > 0) {
+        rbuf[n] = '\0';
+        assert(strstr(rbuf, "ERROR") != NULL);
+    }
+    close(cfd2);
+
+    pthread_cancel(th);
+    pthread_join(th, NULL);
+
+    close(lfd);
+    unlink(sock_path);
+    g_control_sock = -1;
+
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    atomic_store_explicit(&g_zone_db_active, NULL, memory_order_release);
+
+    printf("  -> control_thread_func passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// 15. open_router_udp_sockets & setup_udp_socket_buffers Test
+// ----------------------------------------------------------------------------
+static void test_open_router_udp_sockets_and_buffers(void) {
+    printf("[TEST] Server Core: open_router_udp_sockets & setup_udp_socket_buffers...\n");
+
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(s >= 0);
+    setup_udp_socket_buffers(s, 1048576, 1048576);
+    close(s);
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.port = 35353;
+    const char *binds[1] = {"127.0.0.1"};
+    cfg.bind_addresses = (char **)binds;
+    cfg.bind_address_count = 1;
+    cfg.udp_recvbuf_size = 524288;
+    cfg.udp_sndbuf_size = 524288;
+
+    int out_fds[MAX_BIND_ADDRS];
+    bool out_is_wc[MAX_BIND_ADDRS];
+    int num = open_router_udp_sockets(&cfg, out_fds, out_is_wc);
+    assert(num == 1);
+    assert(out_fds[0] >= 0);
+    assert(out_is_wc[0] == false);
+
+    close(out_fds[0]);
+    printf("  -> open_router_udp_sockets & setup_udp_socket_buffers passed.\n");
+}
+
+// ----------------------------------------------------------------------------
 // Main Test Runner
 // ----------------------------------------------------------------------------
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     printf("=== Starting KariDNS Server Core Unit Tests ===\n");
 
     test_fast_ipv4_to_str();
@@ -647,7 +1081,12 @@ int main(void) {
     test_fill_observatory_snapshot();
     test_synthetic_zone_and_find_domain();
     test_ensure_priv_dir_safe();
+    test_response_logger_thread_func();
+    test_query_logger_thread_func();
+    test_control_socket_thread_and_commands();
+    test_open_router_udp_sockets_and_buffers();
 
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
     return 0;
 }
+

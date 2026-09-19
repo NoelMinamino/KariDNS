@@ -30,7 +30,7 @@ pending_coo_t *g_pending_coo = NULL;
 int g_pending_coo_count = 0;
 int g_pending_coo_capacity = 0;
 
-static _Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
+_Atomic(zone_db_snapshot_t *) g_zone_db_active = ATOMIC_VAR_INIT(NULL);
 
 zone_db_snapshot_t *acquire_zone_snapshot(void) {
   return atomic_load_explicit(&g_zone_db_active, memory_order_acquire);

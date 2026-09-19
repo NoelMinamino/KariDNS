@@ -17,6 +17,7 @@ typedef enum {
     RELOAD_ERR_BUSY = -4,
 } reload_result_t;
 
+extern _Atomic(zone_db_snapshot_t *) g_zone_db_active;
 zone_db_snapshot_t *acquire_zone_snapshot(void);
 void retain_zone_snapshot(zone_db_snapshot_t *snap);
 void release_zone_snapshot(zone_db_snapshot_t *snap);

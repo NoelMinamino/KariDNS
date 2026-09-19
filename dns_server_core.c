@@ -2963,7 +2963,7 @@ void *control_thread_func(void *arg) {
 // 13. Frontend Router Process (マルチプロセス UDP送受信ルーティング)
 // ============================================================================
 
-static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
+void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
   if (desired_rcv > 0) {
     if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
       syslog(LOG_WARNING, "[Network] Failed to set SO_RCVBUF to %d: %m", desired_rcv);
@@ -2998,7 +2998,7 @@ static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
   }
 }
 
-static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
+int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
   int num_fds = 0;
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int bind_count = cfg->bind_address_count;

@@ -444,9 +444,115 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
     printf("  -> send_axfr_response passed.\n");
 }
 
+static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff with generic RDATA, subnet tags & wrap-around...\n");
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "example.org.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    // 1. Same serial test -> no diff produced
+    zone_arena_t arena_v1, arena_v2;
+    zone_arena_init(&arena_v1);
+    zone_arena_init(&arena_v2);
+    arena_v1.records = calloc(4, sizeof(dns_record_t));
+    arena_v1.records_cap = 4;
+    arena_v2.records = calloc(4, sizeof(dns_record_t));
+    arena_v2.records_cap = 4;
+
+    dns_record_t soa1;
+    memset(&soa1, 0, sizeof(soa1));
+    soa1.name = arena_strdup(&arena_v1, "example.org.");
+    soa1.type = arena_strdup(&arena_v1, "SOA");
+    soa1.type_code = 6;
+    soa1.ttl = arena_strdup(&arena_v1, "3600");
+    soa1.ttl_value = 3600;
+    soa1.class_str = arena_strdup(&arena_v1, "IN");
+    soa1.class_val = 1;
+    soa1.rdata_count = 3;
+    soa1.rdata[0] = arena_strdup(&arena_v1, "ns1.example.org.");
+    soa1.rdata[1] = arena_strdup(&arena_v1, "hostmaster.example.org.");
+    soa1.rdata[2] = arena_strdup(&arena_v1, "500");
+    arena_v1.records[0] = soa1;
+    arena_v1.count = 1;
+    build_zone_index(&arena_v1, true);
+
+    dns_record_t soa2 = soa1;
+    soa2.name = arena_strdup(&arena_v2, "example.org.");
+    soa2.type = arena_strdup(&arena_v2, "SOA");
+    soa2.ttl = arena_strdup(&arena_v2, "3600");
+    soa2.class_str = arena_strdup(&arena_v2, "IN");
+    soa2.rdata[0] = arena_strdup(&arena_v2, "ns1.example.org.");
+    soa2.rdata[1] = arena_strdup(&arena_v2, "hostmaster.example.org.");
+    soa2.rdata[2] = arena_strdup(&arena_v2, "500"); // Same serial 500
+    arena_v2.records[0] = soa2;
+    arena_v2.count = 1;
+    build_zone_index(&arena_v2, true);
+
+    compute_ixfr_diff(&entry, &arena_v1, &arena_v2);
+    assert(entry.ixfr_history.count == 0); // No diff added for same serial
+
+    // 2. Generic RDATA & ECS/Location tagged record diff
+    zone_arena_t arena_v3;
+    zone_arena_init(&arena_v3);
+    arena_v3.records = calloc(8, sizeof(dns_record_t));
+    arena_v3.records_cap = 8;
+
+    dns_record_t soa3 = soa1;
+    soa3.name = arena_strdup(&arena_v3, "example.org.");
+    soa3.type = arena_strdup(&arena_v3, "SOA");
+    soa3.ttl = arena_strdup(&arena_v3, "3600");
+    soa3.class_str = arena_strdup(&arena_v3, "IN");
+    soa3.rdata[0] = arena_strdup(&arena_v3, "ns1.example.org.");
+    soa3.rdata[1] = arena_strdup(&arena_v3, "hostmaster.example.org.");
+    soa3.rdata[2] = arena_strdup(&arena_v3, "501"); // Serial increased to 501
+    arena_v3.records[0] = soa3;
+
+    // Generic unknown RR
+    dns_record_t gen_rec;
+    memset(&gen_rec, 0, sizeof(gen_rec));
+    gen_rec.name = arena_strdup(&arena_v3, "opaque.example.org.");
+    gen_rec.type = arena_strdup(&arena_v3, "TYPE65500");
+    gen_rec.type_code = 65500;
+    gen_rec.ttl = arena_strdup(&arena_v3, "300");
+    gen_rec.ttl_value = 300;
+    gen_rec.class_str = arena_strdup(&arena_v3, "IN");
+    gen_rec.class_val = 1;
+    uint8_t raw_payload[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    gen_rec.generic_data = arena_alloc(&arena_v3, 8);
+    memcpy(gen_rec.generic_data, raw_payload, 8);
+    gen_rec.generic_len = 8;
+    gen_rec.ecs_subnet_tag = arena_strdup(&arena_v3, "192.0.2.0/24");
+    gen_rec.bind_location_tag = arena_strdup(&arena_v3, "tokyo");
+    arena_v3.records[1] = gen_rec;
+    arena_v3.count = 2;
+    build_zone_index(&arena_v3, true);
+
+    compute_ixfr_diff(&entry, &arena_v1, &arena_v3);
+    assert(entry.ixfr_history.count == 1);
+    ixfr_txn_t *t = entry.ixfr_history.entries[0];
+    assert(t != NULL);
+    assert(t->old_serial == 500);
+    assert(t->new_serial == 501);
+    assert(t->added_count >= 1);
+
+    // Clean up
+    for (int i = 0; i < entry.ixfr_history.count; i++) {
+        free_ixfr_txn(entry.ixfr_history.entries[i]);
+    }
+    zone_arena_destroy(&arena_v1);
+    zone_arena_destroy(&arena_v2);
+    zone_arena_destroy(&arena_v3);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+
+    printf("  -> compute_ixfr_diff_generic_and_edge_cases passed.\n");
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_compute_ixfr_diff();
+    test_compute_ixfr_diff_generic_and_edge_cases();
     test_parse_xfr_packet();
     test_send_axfr_response_ixfr_and_extended();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");

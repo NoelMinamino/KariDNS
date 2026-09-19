@@ -824,6 +824,215 @@ static void test_parse_query_question_fast_cases(void) {
     printf("  -> parse_query_question_fast() tests passed.\n");
 }
 
+static void test_cname_loop_and_max_depth(void) {
+    printf("[TEST] Query Engine: CNAME loop & recursion limit (depth >= 16)...\n");
+
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    arena.records = calloc(8, sizeof(dns_record_t));
+    arena.records_cap = 8;
+
+    // CNAME a.loop. -> b.loop.
+    dns_record_t c1;
+    memset(&c1, 0, sizeof(c1));
+    c1.name = arena_strdup(&arena, "a.loop.example.");
+    c1.type = arena_strdup(&arena, "CNAME");
+    c1.type_code = 5;
+    c1.ttl = arena_strdup(&arena, "300");
+    c1.ttl_value = 300;
+    c1.class_str = arena_strdup(&arena, "IN");
+    c1.class_val = 1;
+    c1.rdata_count = 1;
+    c1.rdata[0] = arena_strdup(&arena, "b.loop.example.");
+    arena.records[0] = c1;
+
+    // CNAME b.loop. -> a.loop. (Circular loop)
+    dns_record_t c2;
+    memset(&c2, 0, sizeof(c2));
+    c2.name = arena_strdup(&arena, "b.loop.example.");
+    c2.type = arena_strdup(&arena, "CNAME");
+    c2.type_code = 5;
+    c2.ttl = arena_strdup(&arena, "300");
+    c2.ttl_value = 300;
+    c2.class_str = arena_strdup(&arena, "IN");
+    c2.class_val = 1;
+    c2.rdata_count = 1;
+    c2.rdata[0] = arena_strdup(&arena, "a.loop.example.");
+    arena.records[1] = c2;
+
+    arena.count = 2;
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "loop.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.hash_table = hash_tbl;
+    view.hash_size = 2;
+    view.chain_next = chain_nxt;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    uint8_t qbuf[512];
+    size_t qlen = 0;
+    build_dns_query(qbuf, &qlen, 0x1122, "a.loop.example.", 1, false);
+
+    uint8_t rbuf[4096];
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+
+    rate_limit_config_t *rrl_out = NULL;
+    zone_db_entry_t *matched_entry = NULL;
+
+    int res_len = process_dns_query_impl(qbuf, qlen, rbuf, sizeof(rbuf),
+                                         "a.loop.example.", 1,
+                                         "127.0.0.1", &comp_ctx,
+                                         false, &rrl_out, &snap, &cfg, &matched_entry);
+    assert(res_len >= 12);
+    uint8_t rcode = rbuf[3] & 0x0F;
+    assert(rcode == 2 || rcode == 0); // SERVFAIL or terminated CNAME chain
+
+    zone_arena_destroy(&arena);
+    printf("  -> CNAME loop & recursion limit passed.\n");
+}
+
+static void test_prelink_zone_additional_glue_policies(void) {
+    printf("[TEST] Snapshot RCU: prelink_zone_additional_glue policies...\n");
+
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    arena.records = calloc(8, sizeof(dns_record_t));
+    arena.records_cap = 8;
+
+    // SOA
+    dns_record_t soa;
+    memset(&soa, 0, sizeof(soa));
+    soa.name = arena_strdup(&arena, "glue.example.");
+    soa.type = arena_strdup(&arena, "SOA");
+    soa.type_code = 6;
+    soa.ttl = arena_strdup(&arena, "3600");
+    soa.ttl_value = 3600;
+    soa.class_str = arena_strdup(&arena, "IN");
+    soa.class_val = 1;
+    soa.rdata_count = 3;
+    soa.rdata[0] = arena_strdup(&arena, "ns1.glue.example.");
+    soa.rdata[1] = arena_strdup(&arena, "hostmaster.glue.example.");
+    soa.rdata[2] = arena_strdup(&arena, "1");
+    arena.records[0] = soa;
+
+    // NS record pointing to in-bailiwick ns1.glue.example.
+    dns_record_t ns;
+    memset(&ns, 0, sizeof(ns));
+    ns.name = arena_strdup(&arena, "glue.example.");
+    ns.type = arena_strdup(&arena, "NS");
+    ns.type_code = 2;
+    ns.ttl = arena_strdup(&arena, "3600");
+    ns.ttl_value = 3600;
+    ns.class_str = arena_strdup(&arena, "IN");
+    ns.class_val = 1;
+    ns.rdata_count = 1;
+    ns.rdata[0] = arena_strdup(&arena, "ns1.glue.example.");
+    arena.records[1] = ns;
+
+    // MX record pointing to mail.glue.example.
+    dns_record_t mx;
+    memset(&mx, 0, sizeof(mx));
+    mx.name = arena_strdup(&arena, "glue.example.");
+    mx.type = arena_strdup(&arena, "MX");
+    mx.type_code = 15;
+    mx.ttl = arena_strdup(&arena, "3600");
+    mx.ttl_value = 3600;
+    mx.class_str = arena_strdup(&arena, "IN");
+    mx.class_val = 1;
+    mx.rdata_count = 2;
+    mx.rdata[0] = arena_strdup(&arena, "10");
+    mx.rdata[1] = arena_strdup(&arena, "mail.glue.example.");
+    arena.records[2] = mx;
+
+    // A records for ns1 and mail
+    dns_record_t a1;
+    memset(&a1, 0, sizeof(a1));
+    a1.name = arena_strdup(&arena, "ns1.glue.example.");
+    a1.type = arena_strdup(&arena, "A");
+    a1.type_code = 1;
+    a1.ttl = arena_strdup(&arena, "3600");
+    a1.ttl_value = 3600;
+    a1.class_str = arena_strdup(&arena, "IN");
+    a1.class_val = 1;
+    a1.rdata_count = 1;
+    a1.rdata[0] = arena_strdup(&arena, "192.0.2.53");
+    arena.records[3] = a1;
+
+    dns_record_t a2;
+    memset(&a2, 0, sizeof(a2));
+    a2.name = arena_strdup(&arena, "mail.glue.example.");
+    a2.type = arena_strdup(&arena, "A");
+    a2.type_code = 1;
+    a2.ttl = arena_strdup(&arena, "3600");
+    a2.ttl_value = 3600;
+    a2.class_str = arena_strdup(&arena, "IN");
+    a2.class_val = 1;
+    a2.rdata_count = 1;
+    a2.rdata[0] = arena_strdup(&arena, "192.0.2.25");
+    arena.records[4] = a2;
+
+    arena.count = 5;
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "glue.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.hash_table = hash_tbl;
+    view.hash_size = 2;
+    view.chain_next = chain_nxt;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    // 1. Policy NO
+    prelink_zone_additional_glue(&arena, "glue.example.", &snap, &view, ADDITIONAL_AUTH_NO);
+    assert(arena.prelinked_glue == NULL);
+
+    // 2. Policy YES
+    prelink_zone_additional_glue(&arena, "glue.example.", &snap, &view, ADDITIONAL_AUTH_YES);
+    assert(arena.prelinked_glue != NULL);
+    assert(arena.prelinked_glue_count >= 1);
+
+    zone_arena_destroy(&arena);
+    printf("  -> prelink_zone_additional_glue policies passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -834,6 +1043,8 @@ int main(void) {
     test_resolve_name_servfail_rcode_clearing();
     test_response_section_order();
     test_parse_query_question_fast_cases();
+    test_cname_loop_and_max_depth();
+    test_prelink_zone_additional_glue_policies();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
