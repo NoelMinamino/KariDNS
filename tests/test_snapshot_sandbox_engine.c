@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
@@ -19,6 +20,8 @@
 #include "dns_priv_sandbox.h"
 #include "dns_query_engine.h"
 #include "dns_axfr_ixfr.h"
+#include "dns_cidr.h"
+#include "dns_tsig_acl.h"
 #include "dns_utils.h"
 
 // Mock globals
@@ -107,10 +110,23 @@ static void test_priv_sandbox_directory_caching(void) {
     int sock_udp = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_udp >= 0) {
         limit_server_socket_rights(sock_udp, false);
+        limit_client_socket_rights(sock_udp);
         close(sock_udp);
     }
 
-    // 4. Capability mode rejection on uncached path
+    // 4. renameat via dir cache
+    char tmp_file2[] = "/tmp/karidns_sandbox_test2_XXXXXX";
+    int fd2 = mkstemp(tmp_file2);
+    if (fd2 >= 0) {
+        close(fd2);
+        char tmp_file3[PATH_MAX];
+        snprintf(tmp_file3, sizeof(tmp_file3), "%s_renamed", tmp_file2);
+        int r_ren = renameat_via_dir_cache(tmp_file2, tmp_file3);
+        assert(r_ren == 0);
+        unlink(tmp_file3);
+    }
+
+    // 5. Capability mode rejection on uncached path
     atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);
     int r_encap = open_via_dir_cache("/nonexistent_dir_uncached/test.zone", O_RDONLY, 0, false);
     assert(r_encap < 0);
@@ -118,6 +134,18 @@ static void test_priv_sandbox_directory_caching(void) {
     atomic_store_explicit(&g_capsicum_enabled, false, memory_order_release);
 
     unlink(tmp_file);
+
+    // 6. enter_capsicum_sandbox in child process (since Capsicum capability mode is irreversible)
+    pid_t cap_pid = fork();
+    if (cap_pid == 0) {
+        enter_capsicum_sandbox();
+        assert(atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire) == true);
+        _exit(0);
+    } else if (cap_pid > 0) {
+        int st = 0;
+        waitpid(cap_pid, &st, 0);
+        assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
     printf("  -> Priv Sandbox directory caching passed.\n");
 }
 
@@ -150,10 +178,51 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     r1.rdata[0] = arena_strdup(&src, "192.0.2.55");
     src.records[src.count++] = r1;
 
+    // Add locations, tags, and trusted resolvers
+    tinydns_location_entry_t loc1;
+    memset(&loc1, 0, sizeof(loc1));
+    loc1.code[0] = 'u'; loc1.code[1] = 's';
+    loc1.prefix[0] = 192; loc1.prefix[1] = 0; loc1.prefix[2] = 2; loc1.prefix[3] = 0;
+    loc1.prefix_len = 24;
+    src.locations = malloc(sizeof(tinydns_location_entry_t));
+    memcpy(src.locations, &loc1, sizeof(loc1));
+    src.location_count = 1;
+
+    ecs_tag_def_t b_loc;
+    memset(&b_loc, 0, sizeof(b_loc));
+    b_loc.tag = strdup("tokyo");
+    b_loc.cidr_count = 1;
+    b_loc.cidrs = calloc(1, sizeof(ecs_cidr_entry_t));
+    b_loc.cidrs[0].cidr = strdup("192.0.2.0/24");
+    src.bind_location_tags = malloc(sizeof(ecs_tag_def_t));
+    memcpy(src.bind_location_tags, &b_loc, sizeof(b_loc));
+    src.bind_location_tag_count = 1;
+
+    ecs_tag_def_t b_ecs;
+    memset(&b_ecs, 0, sizeof(b_ecs));
+    b_ecs.tag = strdup("cloud");
+    b_ecs.cidr_count = 1;
+    b_ecs.cidrs = calloc(1, sizeof(ecs_cidr_entry_t));
+    b_ecs.cidrs[0].cidr = strdup("198.51.100.0/24");
+    src.bind_ecs_tags = malloc(sizeof(ecs_tag_def_t));
+    memcpy(src.bind_ecs_tags, &b_ecs, sizeof(b_ecs));
+    src.bind_ecs_tag_count = 1;
+
+    src.bind_ecs_trusted_resolvers = malloc(sizeof(char *));
+    src.bind_ecs_trusted_resolvers[0] = strdup("127.0.0.1/32");
+    src.bind_ecs_trusted_resolver_count = 1;
+
     clone_zone_arena(&src, &dst);
     assert(dst.count == 1);
     assert(strcmp(dst.records[0].name, "host.example.com.") == 0);
     assert(strcmp(dst.records[0].rdata[0], "192.0.2.55") == 0);
+    assert(dst.location_count == 1);
+    assert(dst.bind_location_tag_count == 1);
+    assert(dst.bind_ecs_tag_count == 1);
+    assert(dst.bind_ecs_trusted_resolver_count == 1);
+
+    // Test wait_for_readers on dst (reader_count = 0)
+    wait_for_readers(&dst);
 
     zone_arena_clear_data_pools(&dst);
     zone_arena_destroy(&src);
@@ -179,6 +248,11 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
 
     zone_db_entry_t *not_found = find_zone_in_view(&view, "otherdomain.org.");
     assert(not_found == NULL);
+
+    // 4. abort_rebuild_snapshot
+    zone_db_snapshot_t *mock_new_snap = calloc(1, sizeof(zone_db_snapshot_t));
+    abort_rebuild_snapshot(mock_new_snap, "test_allocation_abort");
+    abort_rebuild_snapshot(NULL, "test_null_abort");
 
     free_zone_db_entry(entry);
     printf("  -> Snapshot RCU lifecycle & suffix lookup passed.\n");

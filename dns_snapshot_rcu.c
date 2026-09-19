@@ -1,4 +1,9 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
+#ifdef KARIDNS_UNIT_TEST
+#define STATIC_TEST
+#else
+#define STATIC_TEST static
+#endif
 #include "dns_snapshot_rcu.h"
 #include "dns_server_internal.h"
 #include "dns_catalog_zone.h"
@@ -818,7 +823,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   return RELOAD_OK;
 }
 
-static void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason) {
+STATIC_TEST void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason) {
     syslog(LOG_ERR, "[Core] Memory allocation failed during snapshot rebuild (%s), aborting", reason);
     if (new_snap) {
         gc_snapshot_thread(new_snap);

@@ -430,6 +430,56 @@ void init_async_io_pool(void);
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 
+#define ASYNC_IO_POOL_SIZE 16
+#define ASYNC_IO_QUEUE_CAPACITY 4096
+
+typedef struct {
+  bool is_tcp;
+  int active_fd; // For UDP, IPC socket to frontend
+  int client_fd; // For TCP, client socket
+  udp_ipc_t ipc_hdr;
+  uint8_t *req_buf;
+  size_t req_buf_cap;
+  size_t req_len;
+  char client_ip[INET6_ADDRSTRLEN];
+  int client_port;
+  struct sockaddr_storage client_addr;
+  socklen_t client_len;
+  struct sockaddr_storage server_addr;
+  socklen_t server_len;
+  bool has_server_addr;
+  char qname[256];
+  uint16_t qtype;
+  uint16_t qclass;
+  bool has_edns;
+  bool dnssec_ok;
+  size_t question_end;
+  zone_db_snapshot_t *snap;
+} async_io_task_t;
+
+typedef struct {
+  async_io_task_t queue[ASYNC_IO_QUEUE_CAPACITY];
+  size_t head;
+  size_t tail;
+  size_t count;
+  pthread_mutex_t lock;
+  pthread_cond_t cond_not_empty;
+  pthread_t threads[ASYNC_IO_POOL_SIZE];
+  bool running;
+} async_io_pool_t;
+
+extern async_io_pool_t g_async_io_pool;
+
+#ifdef KARIDNS_UNIT_TEST
+extern const char *g_config_path;
+extern int g_broker_sock;
+bool enqueue_async_io_task(const async_io_task_t *task);
+void *async_io_worker_func(void *arg);
+void reload_all_zones(void);
+void perform_config_reload(void);
+void perform_config_reload_ext(bool skip_unchanged);
+#endif
+
 extern config_rcu_t g_config_db;
 extern int g_control_sock;
 extern int g_control_kq;

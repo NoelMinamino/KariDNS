@@ -14,6 +14,12 @@
 #include <sys/event.h>
 #endif
 
+#ifdef KARIDNS_UNIT_TEST
+#define STATIC_TEST
+#else
+#define STATIC_TEST static
+#endif
+
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;
 
@@ -502,7 +508,7 @@ static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
     return count;
 }
 
-static size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire) {
+STATIC_TEST size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire) {
     if (!name || max_wire < 1) return 0;
     size_t pos = 0;
     const char *p = name;
@@ -525,7 +531,7 @@ static size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max
     return pos;
 }
 
-static bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
+STATIC_TEST bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                                const uint8_t *salt, size_t salt_len,
                                char *out_b32, size_t out_b32_sz) {
     if (algo != 1) return false;
@@ -550,7 +556,7 @@ static bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iteratio
     return true;
 }
 
-static bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash) {
+STATIC_TEST bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash) {
     if (!owner_hash || !next_hash || !target_hash) return false;
     int cmp_owner_next = strcasecmp(owner_hash, next_hash);
     int cmp_owner_tgt = strcasecmp(owner_hash, target_hash);
@@ -565,7 +571,7 @@ static bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, con
     }
 }
 
-static dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex) {
+STATIC_TEST dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex) {
     char owner_name[300];
     snprintf(owner_name, sizeof(owner_name), "%s.%s", hash_b32, apex);
     uint32_t h = calc_fnv1a_str(owner_name);
@@ -579,7 +585,7 @@ static dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b3
     return NULL;
 }
 
-static dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash) {
+STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash) {
     for (size_t i = 0; i < zone->count; i++) {
         dns_record_t *rec = &zone->records[i];
         if (rec->type_code == 50 && rec->name && rec->rdata_count >= 5 && rec->rdata[4]) {
@@ -598,7 +604,7 @@ static dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_
     return NULL;
 }
 
-static bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz) {
+STATIC_TEST bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz) {
     if (!qname || !encloser || !out || out_sz == 0) return false;
     size_t qlen = strlen(qname);
     size_t elen = strlen(encloser);
@@ -622,7 +628,7 @@ static bool find_next_closer_name(const char *qname, const char *encloser, char 
     return true;
 }
 
-static bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+STATIC_TEST bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                                 uint8_t *res, size_t max_res_len, uint16_t *offset,
                                 compress_ctx_t *comp_ctx, uint16_t *nscount,
                                 dns_record_t **attached, int *attached_count) {
@@ -642,7 +648,7 @@ static bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                                  res, max_res_len, offset, comp_ctx, nscount);
 }
 
-static bool find_delegation(zone_arena_t *current_zone, const char *qname,
+STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             uint32_t qname_hash,
                             const char *zone_apex, uint8_t *res,
                             size_t max_res_len, uint16_t *offset,
@@ -1899,7 +1905,7 @@ size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount)
     return (offset <= len) ? offset : len;
 }
 
-static program_plugin_t *find_program_plugin(const char *domain) {
+STATIC_TEST program_plugin_t *find_program_plugin(const char *domain) {
   if (!domain) return NULL;
   for (int i = 0; i < g_program_plugins_count; i++) {
     if (strcasecmp(g_program_plugins[i].domain, domain) == 0)
@@ -1908,7 +1914,7 @@ static program_plugin_t *find_program_plugin(const char *domain) {
   return NULL;
 }
 
-static int64_t monotonic_ms(void) {
+STATIC_TEST int64_t monotonic_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -1917,7 +1923,7 @@ static int64_t monotonic_ms(void) {
 /* deadline(monotonic_ms()基準の絶対時刻)までの残り時間をmsで返す。
  * 既に締切を過ぎていれば0を返す(呼び出し先のwrite_all_timeout/read_all_timeoutは
  * timeout_ms=0で即座にタイムアウト扱いになる)。 */
-static uint32_t remaining_ms(int64_t deadline) {
+STATIC_TEST uint32_t remaining_ms(int64_t deadline) {
   int64_t rem = deadline - monotonic_ms();
   if (rem <= 0) return 0;
   if (rem > UINT32_MAX) return UINT32_MAX; /* 実際には発生しないが念のため */
@@ -1940,7 +1946,7 @@ void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t 
  * (以前は単に0を返しており、これは「応答なし(サイレントドロップ)」を
  *  意味していた。クライアント視点ではタイムアウトとSERVFAILは挙動が
  *  大きく異なるため、ログの記述に合わせて実装側もSERVFAILを返す。) */
-static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
+STATIC_TEST int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                                        uint8_t *res, size_t max_res_len) {
   if (req_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
   uint16_t qdcount = (req[4] << 8) | req[5];
@@ -1962,7 +1968,7 @@ static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
   return (int)copy_len;
 }
 
-static ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms) {
+STATIC_TEST ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms) {
   size_t written = 0;
   struct timespec start_ts, now_ts;
   clock_gettime(CLOCK_MONOTONIC, &start_ts);
@@ -1990,7 +1996,7 @@ static ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_
   return (ssize_t)written;
 }
 
-static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms) {
+STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms) {
   size_t nread = 0;
   struct timespec start_ts, now_ts;
   clock_gettime(CLOCK_MONOTONIC, &start_ts);
@@ -2020,7 +2026,7 @@ static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeo
   return (ssize_t)nread;
 }
 
-static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
+STATIC_TEST int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
                                     uint8_t *res, size_t max_res_len,
                                     const char *client_ip, bool is_tcp) {
   program_plugin_t *plugin = find_program_plugin(domain);
@@ -2129,7 +2135,7 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
  * 含む部分)が、respの中に(先頭12バイトの直後に)存在するかを確認する。
  * QNAMEのドメイン名ラベル文字はRFCに準拠して大文字小文字を区別せず(case-insensitive)
  * 比較し、末尾のQTYPE/QCLASSは完全一致を検証する。 */
-static bool question_section_matches(const uint8_t *resp, size_t resp_len,
+STATIC_TEST bool question_section_matches(const uint8_t *resp, size_t resp_len,
                                      const uint8_t *req, size_t req_len) {
   if (req_len <= DNS_HEADER_SIZE || resp_len <= DNS_HEADER_SIZE) return false;
   size_t roff = DNS_HEADER_SIZE;
@@ -2162,7 +2168,7 @@ static bool question_section_matches(const uint8_t *resp, size_t resp_len,
   return memcmp(req + roff, resp + soff, 4) == 0;
 }
 
-static ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
+STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                                const uint8_t *query, size_t query_len,
                                uint8_t *resp_out, size_t resp_out_cap,
                                uint32_t timeout_ms) {
@@ -2189,7 +2195,7 @@ static ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
 _Thread_local static uint8_t s_forward_req_buf[65535];
 _Thread_local static uint8_t s_forward_res_buf[65535];
 
-static int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                                  uint8_t *res, size_t max_res_len) {
   if (req_len < DNS_HEADER_SIZE || zcfg->forwarders_count == 0) {
     return build_synthetic_servfail(req, req_len, res, max_res_len);

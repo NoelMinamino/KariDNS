@@ -227,11 +227,11 @@ VULN_TEST_SRCS = tests/test_vulnerability_fixes.c dns_query_engine.c dns_snapsho
 
 TEST_CATALOG_SRCS = tests/test_catalog_zone_engine.c dns_catalog_zone.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 TEST_SANDBOX_SRCS = tests/test_snapshot_sandbox_engine.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
-TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c dns_zone_parser.c dns_config_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c
+TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c dns_zone_parser.c dns_config_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c
 TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 
 test_cidr: $(TEST_CIDR_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_CIDR_SRCS) -o test_cidr $(LDFLAGS) -lcrypto
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_CIDR_SRCS) -o test_cidr $(LDFLAGS) -lcrypto
 
 cidr_test: test_cidr
 	./test_cidr
@@ -267,73 +267,73 @@ include_test: test_conf_include
 	./test_conf_include
 
 test_hash_table: $(TEST_HASH_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_HASH_SRCS) -o test_hash_table $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_HASH_SRCS) -o test_hash_table $(LDFLAGS) -lcrypto -lpthread -lm
 
 hash_test: test_hash_table
 	./test_hash_table
 
 test_dnstap_engine: $(TEST_DNSTAP_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_DNSTAP_SRCS) -o test_dnstap_engine $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DNSTAP_SRCS) -o test_dnstap_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
 dnstap_test: test_dnstap_engine
 	./test_dnstap_engine
 
 test_edns_ecs_engine: $(TEST_EDNS_ECS_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_EDNS_ECS_SRCS) -o test_edns_ecs_engine $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_EDNS_ECS_SRCS) -o test_edns_ecs_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
 edns_ecs_test: test_edns_ecs_engine
 	./test_edns_ecs_engine
 
 test_dynamic_update_engine: $(TEST_DYN_UPDATE_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_DYN_UPDATE_SRCS) -o test_dynamic_update_engine $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DYN_UPDATE_SRCS) -o test_dynamic_update_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
 dynamic_update_test: test_dynamic_update_engine
 	./test_dynamic_update_engine
 
 test_axfr_ixfr_engine: $(TEST_AXFR_IXFR_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_AXFR_IXFR_SRCS) -o test_axfr_ixfr_engine $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_AXFR_IXFR_SRCS) -o test_axfr_ixfr_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
 axfr_ixfr_test: test_axfr_ixfr_engine
 	./test_axfr_ixfr_engine
 
 test_rrl_engine: $(TEST_RRL_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_RRL_SRCS) -o test_rrl_engine $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_RRL_SRCS) -o test_rrl_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
 rrl_test: test_rrl_engine
 	./test_rrl_engine
 
 test_query_engine_expanded: $(TEST_QUERY_EXP_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_QUERY_EXP_SRCS) -o test_query_engine_expanded $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_QUERY_EXP_SRCS) -o test_query_engine_expanded $(LDFLAGS) -lcrypto -lpthread -lm
 
 query_expanded_test: test_query_engine_expanded
 	./test_query_engine_expanded
 
 test_response_cache: $(RESPONSE_CACHE_TEST_SRCS)
-	$(CC) $(CFLAGS) -I. $(RESPONSE_CACHE_TEST_SRCS) -o test_response_cache $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(RESPONSE_CACHE_TEST_SRCS) -o test_response_cache $(LDFLAGS) -lcrypto -lpthread -lm
 
 response_cache_test: test_response_cache
 	./test_response_cache
 
 test_vulnerability_fixes: $(VULN_TEST_SRCS)
-	$(CC) $(CFLAGS) -I. $(VULN_TEST_SRCS) -o test_vulnerability_fixes $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(VULN_TEST_SRCS) -o test_vulnerability_fixes $(LDFLAGS) -lcrypto -lpthread -lm
 
 vulnerability_test: test_vulnerability_fixes
 	./test_vulnerability_fixes
 
 test_catalog_zone_engine: $(TEST_CATALOG_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_CATALOG_SRCS) -o test_catalog_zone_engine $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_CATALOG_SRCS) -o test_catalog_zone_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
 catalog_zone_test: test_catalog_zone_engine
 	./test_catalog_zone_engine
 
 test_snapshot_sandbox_engine: $(TEST_SANDBOX_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_SANDBOX_SRCS) -o test_snapshot_sandbox_engine $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_SANDBOX_SRCS) -o test_snapshot_sandbox_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
 snapshot_sandbox_test: test_snapshot_sandbox_engine
 	./test_snapshot_sandbox_engine
 
 test_dag_tools: $(TEST_DAG_TOOLS_SRCS)
-	$(CC) $(CFLAGS) -I. $(TEST_DAG_TOOLS_SRCS) -o test_dag_tools $(LDFLAGS) -lcrypto -lpthread -lm
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DAG_TOOLS_SRCS) -o test_dag_tools $(LDFLAGS) -lcrypto -lpthread -lm -lz $(IDN_LDFLAGS)
 
 dag_tools_test: test_dag_tools
 	./test_dag_tools

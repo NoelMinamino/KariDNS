@@ -50,7 +50,10 @@ int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len)
 }
 
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
-    (void)fd;
+    if (fd > 2) {
+        ssize_t w = write(fd, buf, len);
+        (void)w;
+    }
     if (g_tcp_out_len + len <= sizeof(g_tcp_out)) {
         memcpy(g_tcp_out + g_tcp_out_len, buf, len);
         g_tcp_out_len += len;
@@ -410,7 +413,7 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
 
     g_tcp_out_len = 0;
     g_tcp_send_count = 0;
-    send_axfr_response(1, "example.com.", req_ext, e_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    send_axfr_response(-1, "example.com.", req_ext, e_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
     assert(g_tcp_send_count >= 2);
     assert(g_tcp_out_len > 100);
 
@@ -425,7 +428,7 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
 
     g_tcp_out_len = 0;
     g_tcp_send_count = 0;
-    send_axfr_response(1, "example.com.", req_std, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    send_axfr_response(-1, "example.com.", req_std, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
     assert(g_tcp_send_count >= 2);
     // Standard AXFR should only emit SOA (initial + closing) and skip tagged record
     uint16_t an_std = (g_tcp_out[2 + 6] << 8) | g_tcp_out[2 + 7];
@@ -433,7 +436,7 @@ static void test_send_axfr_response_ixfr_and_extended(void) {
 
     // 4. Null entry error response
     g_tcp_out_len = 0;
-    send_axfr_response(1, "example.com.", req_std, s_off, NULL, NULL, NULL, 0, NULL, 0, NULL, false);
+    send_axfr_response(-1, "example.com.", req_std, s_off, NULL, NULL, NULL, 0, NULL, 0, NULL, false);
     assert(g_tcp_out_len > 0);
     assert((g_tcp_out[2 + 3] & 0x0F) == 5); // REFUSED / NOTAUTH rcode
 
@@ -549,12 +552,91 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
     printf("  -> compute_ixfr_diff_generic_and_edge_cases passed.\n");
 }
 
+// ----------------------------------------------------------------------------
+// 5. handle_axfr_event & axfr_worker_thread Test
+// ----------------------------------------------------------------------------
+static void test_handle_axfr_event_and_worker_thread(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event & axfr_worker_thread...\n");
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "worker.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    init_axfr_zone(&entry.rcu.arena_a, "worker.example.", "300");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.serial, 300, memory_order_release);
+
+    // 1. handle_axfr_event with closed socket -> returns -1
+    int sp[2];
+    int res = socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+    assert(res == 0);
+    close(sp[1]); // Remote closed
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    int r_event = handle_axfr_event(sp[0], &entry, &stream_ctx, &session, NULL, NULL, 0);
+    assert(r_event == -1);
+    close(sp[0]);
+
+    // 2. axfr_worker_thread execution
+    int sp_worker[2];
+    res = socketpair(AF_UNIX, SOCK_STREAM, 0, sp_worker);
+    assert(res == 0);
+
+    uint8_t req[64];
+    memset(req, 0, sizeof(req));
+    req[0] = 0x12; req[1] = 0x34;
+    req[4] = 0; req[5] = 1; // QDCOUNT=1
+    size_t qoff = 12;
+    qoff += write_uncompressed_name(req, qoff, sizeof(req), "worker.example.");
+    req[qoff++] = 0; req[qoff++] = 252; // AXFR
+    req[qoff++] = 0; req[qoff++] = 1;   // IN
+
+    axfr_worker_args_t *args = calloc(1, sizeof(axfr_worker_args_t));
+    assert(args != NULL);
+    args->client_fd = sp_worker[0];
+    strlcpy(args->client_ip, "127.0.0.1", sizeof(args->client_ip));
+    args->client_port = 54321;
+    strlcpy(args->qname, "worker.example.", sizeof(args->qname));
+    args->qclass = 1;
+    args->qtype = 252;
+    memcpy(args->req, req, qoff);
+    args->req_len = qoff;
+    args->entry = &entry;
+
+    pthread_t th;
+    res = pthread_create(&th, NULL, axfr_worker_thread, args);
+    assert(res == 0);
+
+    // Read responses from sp_worker[1]
+    uint8_t rx_buf[1024];
+    ssize_t n = recv(sp_worker[1], rx_buf, sizeof(rx_buf), 0);
+    assert(n > 2); // 2-byte prefix + DNS AXFR response
+    close(sp_worker[1]);
+
+    pthread_join(th, NULL);
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+
+    printf("  -> handle_axfr_event & axfr_worker_thread passed.\n");
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_compute_ixfr_diff();
     test_compute_ixfr_diff_generic_and_edge_cases();
     test_parse_xfr_packet();
     test_send_axfr_response_ixfr_and_extended();
+    test_handle_axfr_event_and_worker_thread();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }
+

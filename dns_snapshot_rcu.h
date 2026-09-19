@@ -49,4 +49,8 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
 void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
 
+#ifdef KARIDNS_UNIT_TEST
+void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason);
+#endif
+
 #endif /* DNS_SNAPSHOT_RCU_H */

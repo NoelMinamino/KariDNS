@@ -1,4 +1,9 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
+#ifdef KARIDNS_UNIT_TEST
+#define STATIC_TEST
+#else
+#define STATIC_TEST static
+#endif
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"
@@ -85,7 +90,7 @@ void release_config_snapshot(server_config_t *snap) {
 }
 int g_control_kq = -1;
 int g_cwd_fd = -1;
-static const char *g_config_path = NULL;
+STATIC_TEST const char *g_config_path = NULL;
 static int g_cli_port_override = 0;
 _Atomic int g_bound_workers = 0;
 static _Atomic bool g_privilege_drop_complete = false;
@@ -147,7 +152,7 @@ void dec_tcp_clients(void) {
 
 
 // Broker
-static int g_broker_sock = -1;
+STATIC_TEST int g_broker_sock = -1;
 static pid_t g_broker_pid = -1;
 __attribute__((unused)) static void start_connect_broker(void) {
   int sv[2];
@@ -1015,47 +1020,9 @@ ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
   return sent;
 }
 
-#define ASYNC_IO_POOL_SIZE 16
-#define ASYNC_IO_QUEUE_CAPACITY 4096
+async_io_pool_t g_async_io_pool;
 
-typedef struct {
-  bool is_tcp;
-  int active_fd; // For UDP, IPC socket to frontend
-  int client_fd; // For TCP, client socket
-  udp_ipc_t ipc_hdr;
-  uint8_t *req_buf;   // ヒープ確保（可変長）。UDP経路は最大 BUFFER_SIZE、TCP経路は最大 65535 バイトまで許容
-  size_t req_buf_cap; // malloc したバイト数（free 時の追跡・デバッグ用）
-  size_t req_len;
-  char client_ip[INET6_ADDRSTRLEN];
-  int client_port;
-  struct sockaddr_storage client_addr;
-  socklen_t client_len;
-  struct sockaddr_storage server_addr;
-  socklen_t server_len;
-  bool has_server_addr;
-  char qname[256];
-  uint16_t qtype;
-  uint16_t qclass;
-  bool has_edns;
-  bool dnssec_ok;
-  size_t question_end;
-  zone_db_snapshot_t *snap;
-} async_io_task_t;
-
-typedef struct {
-  async_io_task_t queue[ASYNC_IO_QUEUE_CAPACITY];
-  size_t head;
-  size_t tail;
-  size_t count;
-  pthread_mutex_t lock;
-  pthread_cond_t cond_not_empty;
-  pthread_t threads[ASYNC_IO_POOL_SIZE];
-  bool running;
-} async_io_pool_t;
-
-static async_io_pool_t g_async_io_pool;
-
-static bool enqueue_async_io_task(const async_io_task_t *task) {
+STATIC_TEST bool enqueue_async_io_task(const async_io_task_t *task) {
   pthread_mutex_lock(&g_async_io_pool.lock);
   if (!g_async_io_pool.running || g_async_io_pool.count >= ASYNC_IO_QUEUE_CAPACITY) {
     pthread_mutex_unlock(&g_async_io_pool.lock);
@@ -1069,7 +1036,7 @@ static bool enqueue_async_io_task(const async_io_task_t *task) {
   return true;
 }
 
-static void *async_io_worker_func(void *arg) {
+STATIC_TEST void *async_io_worker_func(void *arg) {
   int thread_idx = (int)(uintptr_t)arg;
   if (thread_idx < 0 || thread_idx >= MAX_ASYNC_IO_RCU_WORKERS) {
     thread_idx = 0;
@@ -2289,17 +2256,17 @@ static ctrl_client_t *get_ctrl_client(int fd) {
   return NULL;
 }
 
-static void perform_config_reload_ext(bool skip_unchanged);
+STATIC_TEST void perform_config_reload_ext(bool skip_unchanged);
 
-static void reload_all_zones(void) {
+STATIC_TEST void reload_all_zones(void) {
   perform_config_reload_ext(false);
 }
 
-static void perform_config_reload(void) {
+STATIC_TEST void perform_config_reload(void) {
   perform_config_reload_ext(true);
 }
 
-static void perform_config_reload_ext(bool skip_unchanged) {
+STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
   g_last_configured_time = time(NULL);
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)

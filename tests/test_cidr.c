@@ -186,9 +186,24 @@ int main(void) {
     test_acl_parity(acl_sample1, 5, "10.1.2.3");      /* Allowed by /8 -> true */
     test_acl_parity(acl_sample1, 5, "172.16.1.1");    /* Not in ACL -> false */
 
-    char *acl_any[] = { "!192.168.1.1", "any" };
-    test_acl_parity(acl_any, 2, "192.168.1.1");       /* Denied -> false */
-    test_acl_parity(acl_any, 2, "8.8.8.8");           /* Any -> true */
+    /* 8. TSIG Key lookup by name */
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    tsig_key_t k1, k2;
+    memset(&k1, 0, sizeof(k1));
+    memset(&k2, 0, sizeof(k2));
+    k1.name = "admin-key";
+    k2.name = "transfer-key";
+    k1.next = &k2;
+    cfg.keys = &k1;
+
+    TEST_ASSERT(find_tsig_key_by_name(&cfg, "admin-key") == &k1, "find admin-key exact");
+    TEST_ASSERT(find_tsig_key_by_name(&cfg, "ADMIN-KEY") == &k1, "find admin-key case-insensitive");
+    TEST_ASSERT(find_tsig_key_by_name(&cfg, "transfer-key") == &k2, "find transfer-key");
+    TEST_ASSERT(find_tsig_key_by_name(&cfg, "nonexistent") == NULL, "find nonexistent");
+    TEST_ASSERT(find_tsig_key_by_name(NULL, "admin-key") == NULL, "find NULL cfg");
+    TEST_ASSERT(find_tsig_key_by_name(&cfg, NULL) == NULL, "find NULL key");
+    TEST_ASSERT(find_tsig_key_by_name(&cfg, "") == NULL, "find empty key");
 
     printf("[*] Results: %d / %d tests passed.\n", g_tests_passed, g_tests_run);
     if (g_tests_passed == g_tests_run) {

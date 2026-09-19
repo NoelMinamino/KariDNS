@@ -67,7 +67,7 @@ size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_sto
 }
 
 static void build_dns_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, bool dnssec_ok) {
-    memset(buf, 0, 512);
+    memset(buf, 0, 12);
     buf[0] = (uint8_t)(txid >> 8);
     buf[1] = (uint8_t)(txid & 0xFF);
     buf[2] = 0x01; // RD=1
@@ -77,9 +77,9 @@ static void build_dns_query(uint8_t *buf, size_t *out_len, uint16_t txid, const 
     buf[8] = 0; buf[9] = 0;
     buf[10] = 0; buf[11] = dnssec_ok ? 0x01 : 0x00; // ARCOUNT
 
-    long wlen = write_uncompressed_name(buf, 12, 512, qname);
+    long wlen = write_uncompressed_name(buf, 12, 256, qname);
     assert(wlen > 0);
-    size_t off = 12 + wlen;
+    size_t off = 12 + (size_t)wlen;
     buf[off++] = (uint8_t)(qtype >> 8);
     buf[off++] = (uint8_t)(qtype & 0xFF);
     buf[off++] = 0x00;
@@ -1033,6 +1033,327 @@ static void test_prelink_zone_additional_glue_policies(void) {
     printf("  -> prelink_zone_additional_glue policies passed.\n");
 }
 
+// ----------------------------------------------------------------------------
+// 11. NSEC3 Hashing, Interval Coverage & Tree Search Tests
+// ----------------------------------------------------------------------------
+static void test_nsec3_hashing_and_intervals(void) {
+    printf("[TEST] Query Engine: NSEC3 canonical wire, SHA1 hashing & interval coverage...\n");
+
+    // 1. name_to_canonical_wire
+    uint8_t wire[256];
+    size_t wlen = name_to_canonical_wire("WwW.ExAmPlE.CoM.", wire, sizeof(wire));
+    assert(wlen == 17); // 1+3 + 1+7 + 1+3 + 1
+    assert(wire[0] == 3 && memcmp(wire + 1, "www", 3) == 0);
+    assert(wire[4] == 7 && memcmp(wire + 5, "example", 7) == 0);
+    assert(wire[12] == 3 && memcmp(wire + 13, "com", 3) == 0);
+    assert(wire[16] == 0); // Root label
+
+    // Error conditions
+    assert(name_to_canonical_wire(NULL, wire, sizeof(wire)) == 0);
+    assert(name_to_canonical_wire("example.com.", wire, 2) == 0); // Buffer too small
+
+    // 2. compute_nsec3_hash
+    char b32_out[128];
+    uint8_t salt[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    bool ok = compute_nsec3_hash("example.com.", 1 /* SHA-1 */, 10 /* iterations */,
+                                salt, sizeof(salt), b32_out, sizeof(b32_out));
+    assert(ok == true);
+    assert(strlen(b32_out) > 0);
+
+    // Unsupported algorithm
+    assert(compute_nsec3_hash("example.com.", 2, 1, salt, sizeof(salt), b32_out, sizeof(b32_out)) == false);
+
+    // 3. nsec3_covers_hash
+    // Standard interval: owner="1000", next="3000"
+    assert(nsec3_covers_hash("1000", "3000", "2000") == true);
+    assert(nsec3_covers_hash("1000", "3000", "0500") == false);
+    assert(nsec3_covers_hash("1000", "3000", "4000") == false);
+
+    // Wrap-around interval: owner="8000", next="2000"
+    assert(nsec3_covers_hash("8000", "2000", "9000") == true);
+    assert(nsec3_covers_hash("8000", "2000", "1000") == true);
+    assert(nsec3_covers_hash("8000", "2000", "5000") == false);
+
+    // Single record (owner == next): covers all except owner
+    assert(nsec3_covers_hash("5000", "5000", "1000") == true);
+    assert(nsec3_covers_hash("5000", "5000", "5000") == false);
+
+    // NULL edge cases
+    assert(nsec3_covers_hash(NULL, "2000", "1000") == false);
+
+    // 4. find_next_closer_name
+    char closer[256];
+    assert(find_next_closer_name("sub.host.example.com.", "example.com.", closer, sizeof(closer)) == true);
+    assert(strcmp(closer, "host.example.com") == 0);
+
+    assert(find_next_closer_name("host.example.com.", "example.com.", closer, sizeof(closer)) == true);
+    assert(strcmp(closer, "host.example.com") == 0);
+
+    // Negative find_next_closer_name
+    assert(find_next_closer_name("example.com.", "example.com.", closer, sizeof(closer)) == false);
+    assert(find_next_closer_name("other.org.", "example.com.", closer, sizeof(closer)) == false);
+
+    // 5. NSEC3 matching & covering in zone arena
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    arena.records = calloc(8, sizeof(dns_record_t));
+    arena.records_cap = 8;
+
+    dns_record_t nsec3_rec;
+    memset(&nsec3_rec, 0, sizeof(nsec3_rec));
+    nsec3_rec.name = arena_strdup(&arena, "00000000000000000000000000000000.example.com.");
+    nsec3_rec.type = arena_strdup(&arena, "NSEC3");
+    nsec3_rec.type_code = 50;
+    nsec3_rec.ttl = arena_strdup(&arena, "3600");
+    nsec3_rec.ttl_value = 3600;
+    nsec3_rec.class_str = arena_strdup(&arena, "IN");
+    nsec3_rec.class_val = 1;
+    nsec3_rec.rdata_count = 6;
+    nsec3_rec.rdata[0] = arena_strdup(&arena, "1"); // Hash algo SHA-1
+    nsec3_rec.rdata[1] = arena_strdup(&arena, "0"); // Flags
+    nsec3_rec.rdata[2] = arena_strdup(&arena, "1"); // Iterations
+    nsec3_rec.rdata[3] = arena_strdup(&arena, "-"); // Salt
+    nsec3_rec.rdata[4] = arena_strdup(&arena, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"); // Next hash
+    nsec3_rec.rdata[5] = arena_strdup(&arena, "A"); // Type bitmap
+    arena.records[0] = nsec3_rec;
+    arena.count = 1;
+    build_zone_index(&arena, true);
+
+    dns_record_t *matched = find_matching_nsec3(&arena, "00000000000000000000000000000000", "example.com.");
+    assert(matched != NULL);
+    assert(matched->type_code == 50);
+
+    dns_record_t *covering = find_covering_nsec3(&arena, "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM");
+    assert(covering != NULL);
+
+    // 6. attach_nsec3_record
+    uint8_t res_buf[512];
+    uint16_t offset = 12;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init_packet(&comp_ctx);
+    uint16_t nscount = 0;
+    dns_record_t *attached[8] = {0};
+    int attached_count = 0;
+
+    bool attached_ok = attach_nsec3_record(&arena, matched, res_buf, sizeof(res_buf),
+                                           &offset, &comp_ctx, &nscount,
+                                           attached, &attached_count);
+    assert(attached_ok == true);
+    assert(nscount == 1);
+    assert(attached_count == 1);
+
+    zone_arena_destroy(&arena);
+    printf("  -> NSEC3 hashing, interval coverage & tree search passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// 12. Delegation Referral & RFC 4035 DS Query Exception Tests
+// ----------------------------------------------------------------------------
+static void test_delegation_referral_and_ds_handling(void) {
+    printf("[TEST] Query Engine: Delegation NS referral & DS query handling...\n");
+
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    arena.records = calloc(8, sizeof(dns_record_t));
+    arena.records_cap = 8;
+
+    // Apex SOA
+    dns_record_t soa;
+    memset(&soa, 0, sizeof(soa));
+    soa.name = arena_strdup(&arena, "example.com.");
+    soa.type = arena_strdup(&arena, "SOA");
+    soa.type_code = 6;
+    soa.ttl = arena_strdup(&arena, "3600");
+    soa.ttl_value = 3600;
+    soa.class_str = arena_strdup(&arena, "IN");
+    soa.class_val = 1;
+    soa.rdata_count = 3;
+    soa.rdata[0] = arena_strdup(&arena, "ns1.example.com.");
+    soa.rdata[1] = arena_strdup(&arena, "hostmaster.example.com.");
+    soa.rdata[2] = arena_strdup(&arena, "1");
+    arena.records[0] = soa;
+
+    // Subdelegation NS: child.example.com. NS ns1.child.example.com.
+    dns_record_t ns_del;
+    memset(&ns_del, 0, sizeof(ns_del));
+    ns_del.name = arena_strdup(&arena, "child.example.com.");
+    ns_del.type = arena_strdup(&arena, "NS");
+    ns_del.type_code = 2;
+    ns_del.ttl = arena_strdup(&arena, "3600");
+    ns_del.ttl_value = 3600;
+    ns_del.class_str = arena_strdup(&arena, "IN");
+    ns_del.class_val = 1;
+    ns_del.rdata_count = 1;
+    ns_del.rdata[0] = arena_strdup(&arena, "ns1.child.example.com.");
+    arena.records[1] = ns_del;
+
+    // Glue A: ns1.child.example.com. A 192.0.2.123
+    dns_record_t glue;
+    memset(&glue, 0, sizeof(glue));
+    glue.name = arena_strdup(&arena, "ns1.child.example.com.");
+    glue.type = arena_strdup(&arena, "A");
+    glue.type_code = 1;
+    glue.ttl = arena_strdup(&arena, "3600");
+    glue.ttl_value = 3600;
+    glue.class_str = arena_strdup(&arena, "IN");
+    glue.class_val = 1;
+    glue.rdata_count = 1;
+    glue.rdata[0] = arena_strdup(&arena, "192.0.2.123");
+    arena.records[2] = glue;
+
+    arena.count = 3;
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.hash_table = hash_tbl;
+    view.hash_size = 2;
+    view.chain_next = chain_nxt;
+
+    // 1. Regular query under delegated zone: www.child.example.com. -> Returns referral (delegation)
+    uint8_t res[512] = {0};
+    uint16_t offset = 12;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init_packet(&comp_ctx);
+    uint16_t nscount = 0;
+    uint16_t arcount = 0;
+
+    bool del_res = find_delegation(&arena, "www.child.example.com.", calc_fnv1a_str("www.child.example.com."),
+                                   "example.com.", res, sizeof(res), &offset,
+                                   &comp_ctx, &nscount, &arcount, false /* not DS */,
+                                   NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &view, false);
+    assert(del_res == true);
+    assert(nscount >= 1); // NS in authority section
+    assert(arcount >= 1); // Glue A in additional section
+
+    // 2. DS query directly at delegation point: child.example.com. DS -> Returns false (continues to auth lookup)
+    offset = 12;
+    compress_ctx_init_packet(&comp_ctx);
+    nscount = 0;
+    arcount = 0;
+    del_res = find_delegation(&arena, "child.example.com.", calc_fnv1a_str("child.example.com."),
+                              "example.com.", res, sizeof(res), &offset,
+                              &comp_ctx, &nscount, &arcount, true /* is DS query */,
+                              NULL, NULL, NULL, ADDITIONAL_AUTH_YES, &view, false);
+    assert(del_res == false); // Must return false so DS is handled as authoritative answer/NODATA
+
+    zone_arena_destroy(&arena);
+    printf("  -> Delegation referral & DS query handling passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// 13. Program Plugins & Forward Zone Helper Tests
+// ----------------------------------------------------------------------------
+static void test_program_plugins_and_forward_zone_helpers(void) {
+    printf("[TEST] Query Engine: Program plugin & forward zone helpers...\n");
+
+    // 1. compute_program_zone_fingerprint
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zcfg.domain = "dynamic.prog.";
+    zcfg.type = "program";
+    zcfg.program_path = "/usr/local/bin/test_plugin";
+    zcfg.program_user = "bind";
+    zcfg.program_timeout_ms = 1500;
+    zcfg.program_max_failures = 3;
+    const char *args[2] = {"--zone=dynamic.prog", "--debug"};
+    zcfg.program_args = (char **)args;
+    zcfg.program_args_count = 2;
+
+    char fp[256];
+    compute_program_zone_fingerprint(&zcfg, fp, sizeof(fp));
+    assert(strstr(fp, "path=/usr/local/bin/test_plugin") != NULL);
+    assert(strstr(fp, "user=bind") != NULL);
+    assert(strstr(fp, "timeout=1500") != NULL);
+    assert(strstr(fp, "--zone=dynamic.prog;") != NULL);
+
+    // 2. build_synthetic_servfail
+    uint8_t qpkt[512];
+    size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0xABCD, "broken.prog.", 1, false);
+
+    uint8_t servfail_res[512];
+    int sf_len = build_synthetic_servfail(qpkt, qlen, servfail_res, sizeof(servfail_res));
+    assert(sf_len >= (int)DNS_HEADER_SIZE);
+    assert(servfail_res[0] == 0xAB && servfail_res[1] == 0xCD); // Matching txid
+    assert((servfail_res[2] & 0x80) != 0); // QR=1
+    assert((servfail_res[3] & 0x0F) == 2);  // RCODE=2 (SERVFAIL)
+
+    // 3. question_section_matches
+    uint8_t resp_pkt[512];
+    size_t rlen = 0;
+    build_dns_query(resp_pkt, &rlen, 0xABCD, "BrOkEn.PrOg.", 1, false);
+    assert(question_section_matches(resp_pkt, rlen, qpkt, qlen) == true); // Case-insensitive match
+
+    // Mismatched QTYPE
+    uint8_t resp_mismatch[512];
+    size_t rlen2 = 0;
+    build_dns_query(resp_mismatch, &rlen2, 0xABCD, "broken.prog.", 28 /* AAAA */, false);
+    assert(question_section_matches(resp_mismatch, rlen2, qpkt, qlen) == false);
+
+    // 4. write_all_timeout & read_all_timeout via pipe
+    int pfd[2];
+    int r_pipe = pipe(pfd);
+    assert(r_pipe == 0);
+
+    const char *test_msg = "KARIDNS_PIPE_TEST_MSG";
+    ssize_t nw = write_all_timeout(pfd[1], (const uint8_t *)test_msg, strlen(test_msg), 1000);
+    assert(nw == (ssize_t)strlen(test_msg));
+
+    char rbuf[64] = {0};
+    ssize_t nr = read_all_timeout(pfd[0], (uint8_t *)rbuf, strlen(test_msg), 1000);
+    assert(nr == (ssize_t)strlen(test_msg));
+    assert(strcmp(rbuf, test_msg) == 0);
+
+    close(pfd[0]);
+    close(pfd[1]);
+
+    // 5. monotonic_ms & remaining_ms
+    int64_t t1 = monotonic_ms();
+    assert(t1 > 0);
+    int64_t future_deadline = t1 + 500;
+    assert(remaining_ms(future_deadline) > 0);
+    int64_t past_deadline = t1 - 100;
+    assert(remaining_ms(past_deadline) == 0);
+
+    // 6. dispatch_to_program_zone with no plugin registered -> returns synthetic SERVFAIL
+    uint8_t prog_res[512];
+    int pr_len = dispatch_to_program_zone("unregistered.prog.", qpkt, qlen, prog_res, sizeof(prog_res), "127.0.0.1", false);
+    assert(pr_len > 0);
+    assert((prog_res[3] & 0x0F) == 2); // SERVFAIL
+
+    // 7. dispatch_forward_zone with 0 forwarders -> returns synthetic SERVFAIL
+    zone_config_t fwd_cfg;
+    memset(&fwd_cfg, 0, sizeof(fwd_cfg));
+    fwd_cfg.domain = "forward.example.";
+    fwd_cfg.type = "forward";
+    fwd_cfg.forwarders_count = 0;
+
+    int fwd_len = dispatch_forward_zone(&fwd_cfg, qpkt, qlen, prog_res, sizeof(prog_res));
+    assert(fwd_len > 0);
+    assert((prog_res[3] & 0x0F) == 2); // SERVFAIL
+
+    // 8. spawn_program_zone_plugins with no program zones
+    server_config_t no_prog_cfg;
+    memset(&no_prog_cfg, 0, sizeof(no_prog_cfg));
+    spawn_program_zone_plugins(&no_prog_cfg);
+
+    printf("  -> Program plugin & forward zone helpers passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -1045,6 +1366,10 @@ int main(void) {
     test_parse_query_question_fast_cases();
     test_cname_loop_and_max_depth();
     test_prelink_zone_additional_glue_policies();
+    test_nsec3_hashing_and_intervals();
+    test_delegation_referral_and_ds_handling();
+    test_program_plugins_and_forward_zone_helpers();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
+

@@ -150,11 +150,48 @@ static void test_rrl_rate_limiting_and_slip(void) {
     printf("  -> rate limiting & slip passed.\n");
 }
 
+static void test_rrl_client_exhaustion_and_shutdown(void) {
+    printf("[TEST] RRL: rrl_is_client_exhausted & rrl_shutdown...\n");
+
+    rate_limit_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.configured = true;
+    cfg.responses_per_second = 2;
+    cfg.window_seconds = 1;
+
+    struct sockaddr_in cli;
+    memset(&cli, 0, sizeof(cli));
+    cli.sin_family = AF_INET;
+    cli.sin_port = htons(12345);
+    inet_pton(AF_INET, "198.51.100.22", &cli.sin_addr);
+
+    // Initial state: not exhausted
+    assert(rrl_is_client_exhausted(&cli, &cfg) == false);
+
+    bool slip = false;
+    rrl_check(&cli, RRL_RESP_NOERROR, &cfg, &slip);
+    rrl_check(&cli, RRL_RESP_NOERROR, &cfg, &slip);
+    rrl_check(&cli, RRL_RESP_NOERROR, &cfg, &slip); // Now dropped
+
+    assert(rrl_is_client_exhausted(&cli, &cfg) == true);
+    assert(rrl_is_client_exhausted(NULL, &cfg) == false);
+
+    rate_limit_config_t uncfg;
+    memset(&uncfg, 0, sizeof(uncfg));
+    assert(rrl_is_client_exhausted(&cli, &uncfg) == false);
+
+    // Test shutdown
+    rrl_shutdown();
+
+    printf("  -> rrl_is_client_exhausted & rrl_shutdown passed.\n");
+}
+
 int main(void) {
     printf("=== Starting RRL Engine Unit Tests ===\n");
     test_siphash_and_init();
     test_get_rrl_class();
     test_rrl_rate_limiting_and_slip();
+    test_rrl_client_exhaustion_and_shutdown();
     printf("=== All RRL Engine Unit Tests PASSED ===\n");
     return 0;
 }

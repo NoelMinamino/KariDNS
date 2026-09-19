@@ -1063,6 +1063,240 @@ static void test_open_router_udp_sockets_and_buffers(void) {
     printf("  -> open_router_udp_sockets & setup_udp_socket_buffers passed.\n");
 }
 
+static void build_dns_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, bool dnssec_ok) {
+    memset(buf, 0, 12);
+    buf[0] = (uint8_t)(txid >> 8);
+    buf[1] = (uint8_t)(txid & 0xFF);
+    buf[2] = 0x01; // RD=1
+    buf[4] = 0x00; buf[5] = 0x01; // QDCOUNT=1
+    buf[10] = 0; buf[11] = dnssec_ok ? 0x01 : 0x00;
+
+    long wlen = write_uncompressed_name(buf, 12, 256, qname);
+    assert(wlen > 0);
+    size_t off = 12 + (size_t)wlen;
+    buf[off++] = (uint8_t)(qtype >> 8);
+    buf[off++] = (uint8_t)(qtype & 0xFF);
+    buf[off++] = 0x00;
+    buf[off++] = 0x01;
+    *out_len = off;
+}
+
+// ----------------------------------------------------------------------------
+// 16. async_io_pool & enqueue_async_io_task Test
+// ----------------------------------------------------------------------------
+static void test_async_io_pool_and_tasks(void) {
+    printf("[TEST] Server Core: async_io_pool & enqueue_async_io_task...\n");
+
+    init_async_io_pool();
+    assert(g_async_io_pool.running == true);
+
+    // Setup active zone snapshot for async query resolution
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    arena.records = calloc(4, sizeof(dns_record_t));
+    arena.records_cap = 4;
+
+    dns_record_t a_rec;
+    memset(&a_rec, 0, sizeof(a_rec));
+    a_rec.name = arena_strdup(&arena, "async.example.com.");
+    a_rec.type = arena_strdup(&arena, "A");
+    a_rec.type_code = 1;
+    a_rec.ttl = arena_strdup(&arena, "300");
+    a_rec.ttl_value = 300;
+    a_rec.class_str = arena_strdup(&arena, "IN");
+    a_rec.class_val = 1;
+    a_rec.rdata_count = 1;
+    a_rec.rdata[0] = arena_strdup(&arena, "192.0.2.77");
+    arena.records[0] = a_rec;
+    arena.count = 1;
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "async.example.com.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.hash_table = hash_tbl;
+    view.hash_size = 2;
+    view.chain_next = chain_nxt;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    atomic_init(&snap.reader_count, 10);
+
+    // 1. UDP Async Task
+    int sp_udp[2];
+    int res = socketpair(AF_UNIX, SOCK_DGRAM, 0, sp_udp);
+    assert(res == 0);
+
+    uint8_t qbuf[512];
+    size_t qlen = 0;
+    build_dns_query(qbuf, &qlen, 0x55AA, "async.example.com.", 1, false);
+
+    uint8_t *heap_req = malloc(qlen);
+    assert(heap_req != NULL);
+    memcpy(heap_req, qbuf, qlen);
+
+    async_io_task_t udp_task;
+    memset(&udp_task, 0, sizeof(udp_task));
+    udp_task.is_tcp = false;
+    udp_task.active_fd = sp_udp[0];
+    udp_task.req_buf = heap_req;
+    udp_task.req_buf_cap = qlen;
+    udp_task.req_len = qlen;
+    strlcpy(udp_task.client_ip, "127.0.0.1", sizeof(udp_task.client_ip));
+    udp_task.client_port = 53535;
+    strlcpy(udp_task.qname, "async.example.com.", sizeof(udp_task.qname));
+    udp_task.qtype = 1;
+    udp_task.qclass = 1;
+    udp_task.snap = &snap;
+
+    bool enq_ok = enqueue_async_io_task(&udp_task);
+    assert(enq_ok == true);
+
+    // Wait and read response from sp_udp[1]
+    uint8_t rx_resp[512 + sizeof(udp_ipc_t)];
+    struct pollfd pfd = { .fd = sp_udp[1], .events = POLLIN };
+    if (poll(&pfd, 1, 500) > 0) {
+        ssize_t got = recv(sp_udp[1], rx_resp, sizeof(rx_resp), 0);
+        assert(got > (ssize_t)sizeof(udp_ipc_t));
+    }
+    close(sp_udp[0]);
+    close(sp_udp[1]);
+
+    // 2. TCP Async Task
+    int sp_tcp[2];
+    res = socketpair(AF_UNIX, SOCK_STREAM, 0, sp_tcp);
+    assert(res == 0);
+
+    heap_req = malloc(qlen);
+    assert(heap_req != NULL);
+    memcpy(heap_req, qbuf, qlen);
+
+    async_io_task_t tcp_task;
+    memset(&tcp_task, 0, sizeof(tcp_task));
+    tcp_task.is_tcp = true;
+    tcp_task.client_fd = sp_tcp[0];
+    tcp_task.req_buf = heap_req;
+    tcp_task.req_buf_cap = qlen;
+    tcp_task.req_len = qlen;
+    strlcpy(tcp_task.client_ip, "127.0.0.1", sizeof(tcp_task.client_ip));
+    tcp_task.client_port = 53535;
+    strlcpy(tcp_task.qname, "async.example.com.", sizeof(tcp_task.qname));
+    tcp_task.qtype = 1;
+    tcp_task.qclass = 1;
+    tcp_task.snap = &snap;
+
+    enq_ok = enqueue_async_io_task(&tcp_task);
+    assert(enq_ok == true);
+
+    struct pollfd pfd_tcp = { .fd = sp_tcp[1], .events = POLLIN };
+    if (poll(&pfd_tcp, 1, 500) > 0) {
+        uint8_t tcp_rx[512];
+        ssize_t got = recv(sp_tcp[1], tcp_rx, sizeof(tcp_rx), 0);
+        assert(got > 2); // 2-byte prefix + DNS message
+    }
+    close(sp_tcp[1]);
+
+    // Stop pool
+    pthread_mutex_lock(&g_async_io_pool.lock);
+    g_async_io_pool.running = false;
+    pthread_cond_broadcast(&g_async_io_pool.cond_not_empty);
+    pthread_mutex_unlock(&g_async_io_pool.lock);
+
+    for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
+        pthread_join(g_async_io_pool.threads[i], NULL);
+    }
+    zone_arena_destroy(&arena);
+
+    printf("  -> async_io_pool passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// 17. Meta Types, String & Compression Helpers Test
+// ----------------------------------------------------------------------------
+static void test_meta_types_and_utils_helpers(void) {
+    printf("[TEST] Server Core / Utils: Meta RR types, string & compression helpers...\n");
+
+    // 1. is_meta_rrtype
+    assert(is_meta_rrtype(255) == true); // ANY
+    assert(is_meta_rrtype(252) == true); // AXFR
+    assert(is_meta_rrtype(251) == true); // IXFR
+    assert(is_meta_rrtype(41) == true);  // OPT
+    assert(is_meta_rrtype(250) == true); // TSIG
+    assert(is_meta_rrtype(249) == true); // TKEY
+    assert(is_meta_rrtype(1) == false);  // A
+    assert(is_meta_rrtype(28) == false); // AAAA
+    assert(is_meta_rrtype(6) == false);  // SOA
+
+    // 2. get_type_code & dns_type_to_string
+    assert(get_type_code("ANY") == 255);
+    assert(get_type_code("AXFR") == 252);
+    assert(get_type_code("IXFR") == 251);
+    assert(get_type_code("TYPE65530") == 65530);
+
+    assert(strcmp(dns_type_to_string(1), "A") == 0);
+    assert(strcmp(dns_type_to_string(28), "AAAA") == 0);
+    assert(strcmp(dns_type_to_string(6), "SOA") == 0);
+    assert(strcmp(dns_type_to_string(255), "ANY") == 0);
+
+    // 3. strchr_unescaped
+    const char *s = "foo\\.bar;baz";
+    const char *p = strchr_unescaped(s, ';');
+    assert(p != NULL && strcmp(p, ";baz") == 0);
+
+    const char *s_dot = strchr_unescaped("escaped\\.name.com", '.');
+    assert(s_dot != NULL && strcmp(s_dot, ".com") == 0);
+
+    // 4. compress_ctx_init & compress_ctx_init_packet
+    compress_ctx_t ctx1, ctx2;
+    compress_ctx_init(&ctx1);
+    assert(ctx1.current_generation == 1);
+    memset(&ctx2, 0, sizeof(ctx2));
+    compress_ctx_init_packet(&ctx2);
+    assert(ctx2.current_generation == 1);
+
+    // 5. acquire_config_snapshot & release_config_snapshot
+    server_config_t *acq = acquire_config_snapshot();
+    release_config_snapshot(acq);
+
+    // 6. broker_connect tests
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(53);
+    sin.sin_addr.s_addr = htonl(0x7F000001);
+    assert(broker_connect(AF_INET, SOCK_DGRAM, (struct sockaddr *)&sin, sizeof(sin)) == -1);
+
+    int sp_broker[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp_broker) == 0) {
+        g_broker_sock = sp_broker[0];
+        close(sp_broker[1]);
+        assert(broker_connect(AF_INET, SOCK_DGRAM, (struct sockaddr *)&sin, sizeof(sin)) == -1);
+        close(sp_broker[0]);
+        g_broker_sock = -1;
+    }
+
+    // 7. perform_config_reload & reload_all_zones with NULL/invalid path
+    g_config_path = "/nonexistent/karidns_test_invalid_config.conf";
+    perform_config_reload();
+    reload_all_zones();
+
+    printf("  -> Meta RR types, string & compression helpers passed.\n");
+}
+
 // ----------------------------------------------------------------------------
 // Main Test Runner
 // ----------------------------------------------------------------------------
@@ -1085,8 +1319,11 @@ int main(void) {
     test_query_logger_thread_func();
     test_control_socket_thread_and_commands();
     test_open_router_udp_sockets_and_buffers();
+    test_async_io_pool_and_tasks();
+    test_meta_types_and_utils_helpers();
 
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
     return 0;
 }
+
 
