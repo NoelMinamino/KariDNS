@@ -3868,3 +3868,95 @@ size_t pb_encode_fixed32_field(uint8_t *out, size_t out_cap, uint32_t field_no, 
     out[tag_len + 3] = (uint8_t)((value >> 24) & 0xFF);
     return tag_len + 4;
 }
+
+// ============================================================================
+// 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
+// ============================================================================
+bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size_t qname_size,
+                               uint16_t *qtype, uint16_t *qclass, size_t *question_end) {
+    if (!buf || len <= DNS_HEADER_SIZE || !qname || qname_size == 0) {
+        if (qname && qname_size > 0) qname[0] = '\0';
+        if (qtype) *qtype = 0;
+        if (qclass) *qclass = 1;
+        if (question_end) *question_end = DNS_HEADER_SIZE;
+        return false;
+    }
+
+    size_t offset = DNS_HEADER_SIZE;
+    size_t written = 0;
+    bool qname_completed = false;
+
+    while (offset < len) {
+        uint8_t label_len = buf[offset];
+        if (label_len == 0) {
+            offset++;
+            qname_completed = true;
+            break;
+        }
+        if ((label_len & 0xC0) == 0xC0) {
+            if (offset + 2 > len) {
+                break;
+            }
+            offset += 2;
+            qname_completed = true;
+            break;
+        }
+        // RFC 1035 s2.3.4: max label length is 63 octets
+        if (label_len > 63 || offset + 1 + label_len > len) {
+            break;
+        }
+        offset++;
+        if (written > 0 && qname[written - 1] != '.') {
+            if (written + 1 < qname_size) {
+                qname[written++] = '.';
+            }
+        }
+        for (size_t b = 0; b < label_len; b++) {
+            uint8_t c = buf[offset + b];
+            if (c == '.' || c == '\\') {
+                if (written + 2 < qname_size) {
+                    qname[written++] = '\\';
+                    qname[written++] = (char)c;
+                }
+            } else {
+                if (written + 1 < qname_size) {
+                    qname[written++] = (char)c;
+                }
+            }
+        }
+        offset += label_len;
+    }
+
+    if (!qname_completed) {
+        if (qname && qname_size > 0) qname[0] = '\0';
+        if (qtype) *qtype = 0;
+        if (qclass) *qclass = 1;
+        if (question_end) *question_end = offset;
+        return false;
+    }
+
+    if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
+        if (written + 1 < qname_size) {
+            qname[written++] = '.';
+        }
+    }
+    if (written < qname_size) {
+        qname[written] = '\0';
+    } else {
+        qname[qname_size - 1] = '\0';
+    }
+
+    if (offset + 4 <= len) {
+        if (qtype) *qtype = (uint16_t)((buf[offset] << 8) | buf[offset + 1]);
+        if (qclass) *qclass = (uint16_t)((buf[offset + 2] << 8) | buf[offset + 3]);
+        offset += 4;
+        if (question_end) *question_end = offset;
+        return true;
+    }
+
+    if (qtype) *qtype = 0;
+    if (qclass) *qclass = 1;
+    if (question_end) *question_end = offset;
+    return false;
+}
+

@@ -316,7 +316,7 @@ static void *mock_framestream_server(void *arg) {
     uint32_t ready_hdr[5];
     ssize_t r = recv(cli_fd, ready_hdr, sizeof(ready_hdr), MSG_WAITALL);
     if (r == sizeof(ready_hdr)) {
-        char ct[32] = {0};
+        char ct[64] = {0};
         uint32_t ct_len = ntohl(ready_hdr[4]);
         if (ct_len < sizeof(ct)) {
             recv(cli_fd, ct, ct_len, MSG_WAITALL);
@@ -339,8 +339,14 @@ static void *mock_framestream_server(void *arg) {
 
     // 3. Receive START frame from client
     uint32_t start_hdr[5];
-    recv(cli_fd, start_hdr, sizeof(start_hdr), MSG_WAITALL);
-    recv(cli_fd, ready_hdr, ct_len, MSG_WAITALL);
+    r = recv(cli_fd, start_hdr, sizeof(start_hdr), MSG_WAITALL);
+    if (r == sizeof(start_hdr)) {
+        char ct_start[64] = {0};
+        uint32_t start_ct_len = ntohl(start_hdr[4]);
+        if (start_ct_len < sizeof(ct_start)) {
+            recv(cli_fd, ct_start, start_ct_len, MSG_WAITALL);
+        }
+    }
 
     close(cli_fd);
     return NULL;

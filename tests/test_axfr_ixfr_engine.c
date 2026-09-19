@@ -294,7 +294,8 @@ static void init_axfr_zone(zone_arena_t *arena, const char *domain, const char *
     char *zone_buf = arena_strdup(arena, stack_buf);
     int parsed = parse_zone_fast(zone_buf, strlen(zone_buf), arena, &ctx);
     assert(parsed >= 0);
-    assert(build_zone_index(arena, true) == 0);
+    int b_rc = build_zone_index(arena, true);
+    assert(b_rc == 0);
 }
 
 static void test_send_axfr_response_ixfr_and_extended(void) {

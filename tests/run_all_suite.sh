@@ -144,7 +144,14 @@ done
 
 # Environment cleanup helper
 cleanup_stale_processes() {
-    # 1. Kill stale background servers / mocks
+    # 1. Kill stale background servers / mocks gracefully with TERM, then KILL
+    pkill -TERM -f "karidns" 2>/dev/null || true
+    pkill -TERM -f "mock_server.pl" 2>/dev/null || true
+    pkill -TERM -f "mock_anomalous_dns_server.pl" 2>/dev/null || true
+    pkill -TERM -f "mock_dnstap_receiver.pl" 2>/dev/null || true
+    pkill -TERM -f "mock_dns_server.pl" 2>/dev/null || true
+    pkill -TERM -f "rr_differential_test.pl" 2>/dev/null || true
+    sleep 0.1 2>/dev/null || true
     pkill -9 -f "karidns" 2>/dev/null || true
     pkill -9 -f "mock_server.pl" 2>/dev/null || true
     pkill -9 -f "mock_anomalous_dns_server.pl" 2>/dev/null || true

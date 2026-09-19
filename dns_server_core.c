@@ -1349,7 +1349,7 @@ worker_startup_success:;
   while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
     sched_yield();
   if (getppid() != parent_pid)
-    _exit(0);
+    exit(0);
   compress_ctx_t thread_compress_ctx = {0};
   struct kevent ev_list[MAX_EVENTS];
 
@@ -1382,7 +1382,7 @@ worker_startup_success:;
 
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].udata == (void *)(uintptr_t)1001) {
-        _exit(0);
+        exit(0);
       } else if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
@@ -1462,44 +1462,10 @@ worker_startup_success:;
             bool dnssec_ok = false;
 
             if (payload_received > DNS_HEADER_SIZE) {
-              size_t offset = DNS_HEADER_SIZE;
+              parse_query_question_fast(req_buf, (size_t)payload_received, qname, sizeof(qname),
+                                        &qtype, &qclass, &question_end);
+              size_t offset = question_end;
               size_t recv_len = (size_t)payload_received;
-              size_t written = 0;
-
-              // 1回のループで qname と question_end を同時に確定
-              while (offset < recv_len) {
-                uint8_t len = req_buf[offset];
-                if (len == 0 || (len & 0xC0) == 0xC0) {
-                  offset += (len == 0) ? 1 : 2;
-                  break;
-                }
-                if (offset + len + 1 > recv_len) break;
-                offset++;
-                if (written > 0 && qname[written - 1] != '.') {
-                  if (written < 255) qname[written++] = '.';
-                }
-                if (offset + len <= recv_len) {
-                  for (size_t b = 0; b < len; b++) {
-                    uint8_t c = req_buf[offset + b];
-                    if (written < 254) {
-                      if (c == '.' || c == '\\') qname[written++] = '\\';
-                      qname[written++] = (char)c;
-                    }
-                  }
-                }
-                offset += len;
-              }
-              if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-                if (written < 255) qname[written++] = '.';
-              }
-              qname[written] = '\0';
-
-              if (offset + 4 <= recv_len) {
-                qtype = (req_buf[offset] << 8) | req_buf[offset + 1];
-                qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
-                offset += 4;
-                question_end = offset;
-              }
 
               // EDNSの走査 (Questionの直後から無駄なくスキャン)
               uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
@@ -1860,44 +1826,11 @@ process_tcp_client: ;
 
           char qname[256] = "";
           uint16_t qtype = 0;
+          uint16_t qclass = 1;
+          size_t question_end = DNS_HEADER_SIZE;
           if (msg_len > DNS_HEADER_SIZE) {
-            size_t offset = DNS_HEADER_SIZE;
-            size_t written = 0;
-            while (offset < msg_len) {
-              uint8_t len = msg[offset];
-              if (len == 0 || (len & 0xC0) == 0xC0) {
-                offset++;
-                break;
-              }
-              offset++;
-              if (written > 0 && qname[written - 1] != '.') {
-                if (written < 255)
-                  qname[written++] = '.';
-              }
-              if (offset + len <= msg_len) {
-                for (size_t b = 0; b < len; b++) {
-                  uint8_t c = msg[offset + b];
-                  if (c == '.' || c == '\\') {
-                    if (written + 2 < 255) {
-                      qname[written++] = '\\';
-                      qname[written++] = (char)c;
-                    }
-                  } else {
-                    if (written < 255) {
-                      qname[written++] = (char)c;
-                    }
-                  }
-                }
-              }
-              offset += len;
-            }
-            if (offset + 1 < msg_len)
-              qtype = (msg[offset] << 8) | msg[offset + 1];
-            if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-              if (written < 255)
-                qname[written++] = '.';
-            }
-            qname[written] = '\0';
+            parse_query_question_fast(msg, msg_len, qname, sizeof(qname),
+                                      &qtype, &qclass, &question_end);
           }
           struct sockaddr_storage client_addr;
           socklen_t c_len = sizeof(client_addr);
@@ -1908,24 +1841,10 @@ process_tcp_client: ;
           else if (client_addr.ss_family == AF_INET6)
             client_port =
                 ntohs(((struct sockaddr_in6 *)&client_addr)->sin6_port);
-          uint16_t qclass = 1;
           edns_info_t edns;
           memset(&edns, 0, sizeof(edns));
           edns.present = false;
           if (msg_len >= DNS_HEADER_SIZE) {
-            size_t offset = DNS_HEADER_SIZE;
-            while (offset < msg_len) {
-              uint8_t len = msg[offset];
-              if (len == 0 || (len & 0xC0) == 0xC0) {
-                offset += (len == 0) ? 1 : 2;
-                break;
-              }
-              if (offset + len + 1 > msg_len) break;
-              offset += len + 1;
-            }
-            if (offset + 3 < msg_len)
-              qclass = (msg[offset + 2] << 8) | msg[offset + 3];
-
             uint16_t qd = (msg[4] << 8) | msg[5];
             uint16_t an = (msg[6] << 8) | msg[7];
             uint16_t ns = (msg[8] << 8) | msg[9];
@@ -3884,6 +3803,24 @@ static int g_pid_fd = -1;
 static volatile sig_atomic_t g_supervisor_should_exit = 0;
 static volatile sig_atomic_t g_supervisor_got_sighup = 0;
 
+#if defined(__FreeBSD__) || defined(__linux__) || defined(__APPLE__)
+#ifdef __clang__
+__attribute__((weak)) int __llvm_profile_write_file(void);
+#endif
+#endif
+
+static volatile sig_atomic_t g_backend_should_exit = 0;
+static void backend_sig_handler(int sig) {
+  (void)sig;
+  g_backend_should_exit = 1;
+#ifdef __clang__
+  if (__llvm_profile_write_file) {
+    __llvm_profile_write_file();
+  }
+#endif
+  exit(0);
+}
+
 static void supervisor_sig_handler(int sig) {
   if (sig == SIGHUP) {
     g_supervisor_got_sighup = 1;
@@ -4460,6 +4397,14 @@ int main(int argc, char **argv) {
   }
 
   // === Backend Process (backend_pid == 0) ===
+  struct sigaction b_sa;
+  memset(&b_sa, 0, sizeof(b_sa));
+  b_sa.sa_handler = backend_sig_handler;
+  sigemptyset(&b_sa.sa_mask);
+  b_sa.sa_flags = 0;
+  sigaction(SIGTERM, &b_sa, NULL);
+  sigaction(SIGINT, &b_sa, NULL);
+
   g_pid_file_path[0] = '\0';
   if (g_pid_fd >= 0) {
     close(g_pid_fd);
@@ -4694,5 +4639,10 @@ int main(int argc, char **argv) {
     free_server_config_fields(active);
   }
   rrl_shutdown();
+#ifdef __clang__
+  if (__llvm_profile_write_file) {
+    __llvm_profile_write_file();
+  }
+#endif
   return 0;
 }

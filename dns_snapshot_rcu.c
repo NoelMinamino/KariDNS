@@ -132,18 +132,6 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
   return NULL;
 }
 
-static inline uint32_t calc_fnv1a_strn(const char *str, size_t len) {
-  uint32_t hash = 2166136261u;
-  for (size_t i = 0; i < len; i++) {
-    uint8_t c = (uint8_t)str[i];
-    if (c >= 'A' && c <= 'Z')
-      c |= 0x20;
-    hash ^= c;
-    hash *= 16777619u;
-  }
-  return hash;
-}
-
 static zone_db_entry_t *view_suffix_hash_lookup(view_snapshot_t *view, const char *key, size_t key_len) {
   if (!view || !view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
     return NULL;

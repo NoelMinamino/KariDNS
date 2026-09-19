@@ -1563,6 +1563,17 @@ uint32_t calc_fnv1a_str(const char *str) {
   }
   return hash;
 }
+uint32_t calc_fnv1a_strn(const char *str, size_t len) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    uint8_t c = (uint8_t)str[i];
+    if (c >= 'A' && c <= 'Z')
+      c |= 0x20;
+    hash ^= c;
+    hash *= 16777619u;
+  }
+  return hash;
+}
 static size_t next_pow2(size_t n) {
   size_t p = 256;
   while (p < n)

@@ -332,7 +332,8 @@ static void test_wire_cache_consistency(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    int b_rc = build_zone_index(&arena, true);
+    assert(b_rc == 0);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -909,7 +910,8 @@ static void test_wire_cache_max_records_limit(void) {
 
         int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
         assert(parsed >= 0);
-        assert(build_zone_index(&arena, true) == 0);
+        int b_rc = build_zone_index(&arena, true);
+        assert(b_rc == 0);
         size_t total_records = arena.count;
         assert(total_records == 5);
 
@@ -1015,7 +1017,8 @@ static void test_wire_cache_observatory_counters(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    int b_rc = build_zone_index(&arena, true);
+    assert(b_rc == 0);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));

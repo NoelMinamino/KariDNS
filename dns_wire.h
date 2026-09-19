@@ -396,4 +396,10 @@ typedef struct {
     uint64_t wirecache_bytes;
 } zone_observatory_snapshot_t;
 
+// ============================================================================
+// 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
+// ============================================================================
+bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size_t qname_size,
+                               uint16_t *qtype, uint16_t *qclass, size_t *question_end);
+
 #endif // DNS_WIRE_H

@@ -145,7 +145,8 @@ static void test_all_rr_types_and_resolution(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    int b_res = build_zone_index(&arena, true);
+    assert(b_res == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
@@ -282,7 +283,8 @@ static void test_dnssec_negative_and_delegation_proofs(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    int b_res = build_zone_index(&arena, true);
+    assert(b_res == 0);
 
     zone_db_entry_t db_entry;
     memset(&db_entry, 0, sizeof(db_entry));
@@ -484,11 +486,354 @@ static void test_tinydns_timestamp_countdown(void) {
     printf("  -> tinydns timestamp countdown passed.\n");
 }
 
+static void test_mqtype_truncation(void) {
+    printf("[TEST] Query Engine: MQTYPE EDNS option truncation handling...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char zone_text[] = "example.com. 3600 IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400\n"
+                       "example.com. 3600 IN NS ns1.example.com.\n"
+                       "example.com. 3600 IN A 192.0.2.1\n"
+                       "example.com. 3600 IN TXT \"this is a very long txt record to trigger buffer overflow during mqtype response assembly 1234567890 1234567890\"\n"
+                       "example.com. 3600 IN TXT \"another very long txt record for overflow testing 1234567890 1234567890 1234567890 1234567890\"\n";
+    int p_res = parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx);
+    assert(p_res >= 0);
+    int b_res = build_zone_index(&arena, true);
+    assert(b_res == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    char *any_acl[1] = { (char *)"any" };
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.rfc10029_mqtype_enable = true;
+    cfg.max_mqtypes = 4;
+
+    // Build Query: example.com. IN A + EDNS MQTYPE (TXT)
+    uint8_t req[512] = {0};
+    req[0] = 0xAB; req[1] = 0xCD; // ID
+    req[2] = 0x01; req[3] = 0x00; // RD=1
+    req[4] = 0x00; req[5] = 0x01; // QDCOUNT=1
+    req[10] = 0x00; req[11] = 0x01; // ARCOUNT=1 (OPT)
+
+    size_t off = 12;
+    const char *qname = "\x07" "example" "\x03" "com" "\x00";
+    memcpy(&req[off], qname, 13);
+    off += 13;
+    req[off++] = 0x00; req[off++] = 0x01; // TYPE A
+    req[off++] = 0x00; req[off++] = 0x01; // CLASS IN
+
+    // OPT RR with MQTYPE-Query (TXT = 16)
+    req[off++] = 0x00; // Root name
+    req[off++] = 0x00; req[off++] = 0x29; // TYPE OPT (41)
+    req[off++] = 0x10; req[off++] = 0x00; // UDP payload 4096
+    req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; // Extended RCODE / Flags
+    req[off++] = 0x00; req[off++] = 0x06; // RDLEN = 6
+    req[off++] = 0x00; req[off++] = 0x14; // OptCode 20 (MQTYPE-Query)
+    req[off++] = 0x00; req[off++] = 0x02; // OptLen 2
+    req[off++] = 0x00; req[off++] = 0x10; // QTYPE TXT (16)
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+
+    uint8_t res[512] = {0};
+    size_t small_res_len = 100;
+    rate_limit_config_t *rrl = NULL;
+    zone_db_entry_t *matched_entry = NULL;
+    int res_len = process_dns_query_impl(req, off, res, small_res_len, "example.com.", 1,
+                                         "127.0.0.1", &comp_ctx, false, &rrl, &snap, &cfg, &matched_entry);
+
+    if (res_len > 0) {
+        uint8_t rcode = res[3] & 0x0F;
+        bool tc_set = (res[2] & 0x02) != 0;
+        uint16_t ancount = (res[6] << 8) | res[7];
+
+        assert(rcode != 5 /* REFUSED */);
+        assert(!tc_set); // RFC 10029 §3.4: MQTYPE failure MUST NOT trigger TC bit
+        assert(ancount >= 1);
+    }
+
+    zone_arena_destroy(&arena);
+    printf("  -> MQTYPE truncation handling passed.\n");
+}
+
+static void test_mqtype_qdcount0_formerr(void) {
+    printf("[TEST] Query Engine: MQTYPE QDCOUNT=0 FORMERR handling...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.rfc10029_mqtype_enable = true;
+
+    uint8_t req[512] = {0};
+    req[0] = 0x12; req[1] = 0x34; // ID
+    req[2] = 0x00; req[3] = 0x00; // Opcode=0, QDCOUNT=0
+    req[4] = 0x00; req[5] = 0x00; // QDCOUNT=0
+    req[10] = 0x00; req[11] = 0x01; // ARCOUNT=1 (OPT)
+
+    size_t off = 12;
+    req[off++] = 0x00; // Root name
+    req[off++] = 0x00; req[off++] = 0x29; // TYPE OPT (41)
+    req[off++] = 0x10; req[off++] = 0x00; // UDP payload 4096
+    req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00; req[off++] = 0x00;
+    req[off++] = 0x00; req[off++] = 0x06; // RDLEN = 6
+    req[off++] = 0x00; req[off++] = 0x14; // OptCode 20 (MQTYPE-Query)
+    req[off++] = 0x00; req[off++] = 0x02; // OptLen 2
+    req[off++] = 0x00; req[off++] = 0x10; // QTYPE TXT (16)
+
+    uint8_t res[512] = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_entry_t *matched = NULL;
+
+    int res_len = process_dns_query_impl(req, off, res, sizeof(res), "", 0,
+                                         "127.0.0.1", &comp_ctx, false, &rrl, NULL, &cfg, &matched);
+    assert(res_len >= 12);
+    uint8_t rcode = res[3] & 0x0F;
+    assert(rcode == 1); // FORMERR (1) per RFC 10029 §3.3
+    printf("  -> MQTYPE QDCOUNT=0 FORMERR passed.\n");
+}
+
+static void test_resolve_name_servfail_rcode_clearing(void) {
+    printf("[TEST] Query Engine: resolve_name() SERVFAIL and CNAME resolution...\n");
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
+
+    zone_arena_t *empty_zone = NULL;
+    zone_db_entry_t *db_entry_ptr = &db_entry;
+    zone_arena_t **zone_ptr = &empty_zone;
+
+    uint8_t res[512] = {0};
+    res[3] = 0x83; // Pre-set RCODE=3 (NXDOMAIN)
+    uint16_t offset = 12, ancount = 0, nscount = 0, arcount = 0;
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+
+    uint16_t qtype = 1;
+    resolve_name("example.com.", 1, &qtype, 1,
+                 &db_entry_ptr, zone_ptr, res,
+                 sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount,
+                 false, false, 0, false, NULL, NULL,
+                 "127.0.0.1", NULL, false, NULL, 0, 0, NULL);
+    assert((res[3] & 0x0F) == 2); // Exactly SERVFAIL (2)
+
+    // CNAME loop / chain test
+    zone_arena_t loop_arena;
+    memset(&loop_arena, 0, sizeof(loop_arena));
+    zone_arena_init(&loop_arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char loop_zone[] = "example.com. 3600 IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400\n"
+                       "example.com. 3600 IN NS ns1.example.com.\n"
+                       "loop.example.com. 3600 IN CNAME loop.example.com.\n";
+    int p_res = parse_zone_fast(loop_zone, strlen(loop_zone), &loop_arena, &ctx);
+    assert(p_res >= 0);
+    int b_res = build_zone_index(&loop_arena, true);
+    assert(b_res == 0);
+
+    zone_arena_t *current_zone = &loop_arena;
+    zone_ptr = &current_zone;
+
+    memset(res, 0, sizeof(res));
+    res[3] = 0x83; // Pre-set RCODE=3
+    offset = 12; ancount = 0; nscount = 0; arcount = 0;
+    compress_ctx_init_packet(&comp_ctx);
+
+    resolve_name("loop.example.com.", 1, &qtype, 1,
+                 &db_entry_ptr, zone_ptr, res,
+                 sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount,
+                 false, false, 0, false, NULL, NULL,
+                 "127.0.0.1", NULL, false, NULL, 0, 0, NULL);
+    assert((res[3] & 0x0F) == 0 && ancount == 1);
+
+    zone_arena_destroy(&loop_arena);
+    printf("  -> resolve_name() SERVFAIL and CNAME resolution passed.\n");
+}
+
+static void test_response_section_order(void) {
+    printf("[TEST] Query Engine: Response section ordering (Answer before Additional)...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char zone_text[] = "example.com. 1800 IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 1800\n"
+                       "example.com. 1800 IN NS ns1.example.com.\n"
+                       "example.com. 1800 IN NS ns2.v6.example.com.\n"
+                       "example.com. 1800 IN NS ns3.v6.example.com.\n"
+                       "ns1.example.com. 1800 IN A 192.0.2.1\n"
+                       "ns2.v6.example.com. 1800 IN AAAA 2001:db8:1::1\n"
+                       "ns2.v6.example.com. 1800 IN A 192.0.2.2\n"
+                       "ns3.v6.example.com. 1800 IN AAAA 2001:db8:2::1\n"
+                       "ns3.v6.example.com. 1800 IN A 192.0.2.3\n";
+    int p_res = parse_zone_fast(zone_text, strlen(zone_text), &arena, &ctx);
+    assert(p_res >= 0);
+    int b_res = build_zone_index(&arena, true);
+    assert(b_res == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "example.com.", sizeof(db_entry.domain) - 1);
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *db_entry_ptr = &db_entry;
+    zone_arena_t *cur_zone = &arena;
+    zone_arena_t **zone_ptr = &cur_zone;
+
+    uint8_t res[1024];
+    memset(res, 0, sizeof(res));
+    uint16_t offset = 12;
+    uint16_t ancount = 0, nscount = 0, arcount = 0;
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+
+    uint16_t qtype = 2; // NS
+    resolve_name("example.com.", 1, &qtype, 1,
+                 &db_entry_ptr, zone_ptr, res,
+                 sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount,
+                 false, false, 0, false, NULL, NULL,
+                 "127.0.0.1", NULL, false, NULL, 0, 0, NULL);
+
+    assert(ancount == 3 && nscount == 0 && arcount == 5);
+
+    size_t parse_off = 12;
+    for (int i = 0; i < ancount; i++) {
+        dns_record_t rec;
+        uint16_t rtype = 0;
+        int pr_rc = parse_resource_record(res, offset, &parse_off, &arena, &rec, &rtype);
+        assert(pr_rc >= 0);
+        assert(rtype == 2); // Must be NS
+    }
+
+    for (int i = 0; i < arcount; i++) {
+        dns_record_t rec;
+        uint16_t rtype = 0;
+        int pr_rc = parse_resource_record(res, offset, &parse_off, &arena, &rec, &rtype);
+        assert(pr_rc >= 0);
+        assert(rtype == 1 || rtype == 28); // Must be A or AAAA
+    }
+
+    zone_arena_destroy(&arena);
+    printf("  -> Response section ordering passed.\n");
+}
+
+static void test_parse_query_question_fast_cases(void) {
+    printf("[TEST] Wire: parse_query_question_fast() comprehensive tests...\n");
+
+    char qname[256];
+    uint16_t qtype = 0, qclass = 0;
+    size_t qend = 0;
+
+    // 1. Normal standard domain "www.example.com."
+    uint8_t pkt1[64] = {
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Header
+        3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, // QNAME
+        0x00, 0x01, // QTYPE=A
+        0x00, 0x01  // QCLASS=IN
+    };
+    bool ok = parse_query_question_fast(pkt1, 12 + 17 + 4, qname, sizeof(qname), &qtype, &qclass, &qend);
+    assert(ok == true);
+    assert(strcmp(qname, "www.example.com.") == 0);
+    assert(qtype == 1);
+    assert(qclass == 1);
+    assert(qend == 12 + 17 + 4);
+
+    // 2. Root domain "."
+    uint8_t pkt2[64] = {
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0, // Root QNAME
+        0x00, 0x02, // QTYPE=NS
+        0x00, 0x01  // QCLASS=IN
+    };
+    ok = parse_query_question_fast(pkt2, 12 + 1 + 4, qname, sizeof(qname), &qtype, &qclass, &qend);
+    assert(ok == true);
+    assert(strcmp(qname, ".") == 0);
+    assert(qtype == 2);
+    assert(qclass == 1);
+    assert(qend == 12 + 1 + 4);
+
+    // 3. Domain with escaped dot and backslash
+    uint8_t pkt3[64] = {
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        4, 'a', '.', 'b', '\\', 3, 'c', 'o', 'm', 0,
+        0x00, 0x10, // TXT
+        0x00, 0x01
+    };
+    ok = parse_query_question_fast(pkt3, 12 + 10 + 4, qname, sizeof(qname), &qtype, &qclass, &qend);
+    assert(ok == true);
+    assert(strcmp(qname, "a\\.b\\\\.com.") == 0);
+    assert(qtype == 16);
+
+    // 4. Truncated / malformed packet (length < 12)
+    ok = parse_query_question_fast(pkt1, 10, qname, sizeof(qname), &qtype, &qclass, &qend);
+    assert(ok == false);
+
+    // 5. Malformed label length exceeding packet bounds
+    uint8_t pkt_bad[64] = {
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        50, 'a', 'b', 'c' // claims 50 bytes, only 3 present
+    };
+    ok = parse_query_question_fast(pkt_bad, 16, qname, sizeof(qname), &qtype, &qclass, &qend);
+    assert(ok == false);
+
+    printf("  -> parse_query_question_fast() tests passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();
     test_tinydns_timestamp_countdown();
+    test_mqtype_truncation();
+    test_mqtype_qdcount0_formerr();
+    test_resolve_name_servfail_rcode_clearing();
+    test_response_section_order();
+    test_parse_query_question_fast_cases();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
