@@ -411,4 +411,34 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len);
 size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_storage *out);
 
+void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
+void fast_ipv4_to_str(uint32_t ip_be, char *dst);
+uint32_t get_effective_query_log_max_qps(const server_config_t *cfg);
+void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info);
+void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool ensure_priv_dir_safe(const char *dir_buf);
+void init_logging_channels(server_config_t *cfg);
+const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
+void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
+                     const char *qname, uint16_t qclass, uint16_t qtype,
+                     bool has_edns, bool dnssec_ok, uint8_t protocol, uint32_t max_qps);
+void *control_thread_func(void *arg);
+void *response_logger_thread_func(void *arg);
+void *query_logger_thread_func(void *arg);
+void init_async_io_pool(void);
+
+extern config_rcu_t g_config_db;
+extern int g_control_sock;
+extern time_t g_boot_time;
+extern time_t g_last_configured_time;
+extern _Atomic int g_tcp_clients;
+extern _Atomic int g_tcp_high_water;
+extern _Atomic int g_bound_workers;
+extern _Atomic bool g_frontend_alive;
+extern _Atomic bool g_qlog_circuit_broken;
+extern resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
+extern _Atomic uint64_t g_resp_log_tail;
+extern _Atomic uint64_t g_resp_log_head;
+
 #endif /* DNS_SERVER_INTERNAL_H */

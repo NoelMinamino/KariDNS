@@ -100,6 +100,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 14 | [`test_cidr`](file:///c:/git/my_dns/tests/test_cidr.c) | `dns_cidr.c`, `dns_tsig_acl.c` | RFC 4632, RFC 4291 | **Positive / Boundary** | Evaluates IPv4 and IPv6 bitmask calculations, prefix containment logic, and binary ACL matching rules. |
 | 15 | [`test_conf_include`](file:///c:/git/my_dns/tests/test_conf_include.c) | `dns_config_parser.c` | BIND 9 config format | **Positive / Negative** | Nested `$INCLUDE` configuration parsing, detection of circular file dependencies, and token syntax error isolation. |
 | 16 | [`test_hash_table`](file:///c:/git/my_dns/tests/test_hash_table.c) | `dns_snapshot_rcu.c`, `dns_utils.c`, `dns_wire.c` | FNV-1a Hash, RCU Snapshot | **Positive / Boundary** | Production snapshot RCU exact and suffix hash table lookup, case-insensitivity, longest-match fallback, missing teeth tolerance, and zero-zone views. |
+| 17 | [`test_server_core`](file:///c:/git/my_dns/tests/test_server_core.c) | `dns_server_core.c`, `dns_snapshot_rcu.c`, `dns_wire.c`, `dns_dnstap.c` | RFC 1034, RFC 1035, RFC 7766, BIND Logging | **Positive / Boundary / Concurrency** | Dedicated unit testing of `dns_server_core.c` internal machinery: fast IPv4 serialization, RFC 1035/BIND qname log escaping, log file size and date rotation, TCP message stream framing & chunking, query log ring buffer rate limiting & 80% circuit breaker, response logging ring, zone observatory snapshots, synthetic zone detection, and safe directory creation. |
 
 ---
 

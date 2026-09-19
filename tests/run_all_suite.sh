@@ -203,6 +203,7 @@ register_test "unit" "bin" "test_tinydns_parser" "tinydns data file syntax & rec
 register_test "unit" "bin" "test_cidr" "CIDR prefix matching & binary ACL evaluator"
 register_test "unit" "bin" "test_conf_include" "Config file tokenizer & \$INCLUDE nesting"
 register_test "unit" "bin" "test_hash_table" "Fixed-size FNV1a hash table collisions"
+register_test "unit" "bin" "test_server_core" "Server Core internals: fast IPv4, log esc/rot, ring buffers, TCP & observatory"
 
 # 2. Zone Transfer / Redundancy (AXFR / IXFR)
 register_test "xfr" "sh" "tests/run_capsicum_axfr_test.sh" "Capsicum sandbox capability mode AXFR"

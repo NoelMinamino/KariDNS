@@ -87,7 +87,7 @@ int g_control_kq = -1;
 int g_cwd_fd = -1;
 static const char *g_config_path = NULL;
 static int g_cli_port_override = 0;
-static _Atomic int g_bound_workers = 0;
+_Atomic int g_bound_workers = 0;
 static _Atomic bool g_privilege_drop_complete = false;
 #define MAX_ZONE_AXFR 4
 
@@ -101,8 +101,8 @@ static int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
 static int g_num_workers = 0;
 char g_startup_cwd[PATH_MAX] = "";
 int g_notify_ipc[2];
-static int g_control_sock = -1;
-static _Atomic(bool) g_frontend_alive = true;
+int g_control_sock = -1;
+_Atomic(bool) g_frontend_alive = true;
 
 time_t g_boot_time = 0;
 time_t g_last_configured_time = 0;
@@ -112,15 +112,15 @@ _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
 #define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_channel != NULL)
 
-static resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
-static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
+resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
+_Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
+_Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
-static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
+_Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
 _Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
 _Atomic int g_worker_count = ATOMIC_VAR_INIT(0);
 
-static inline uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
+uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
     if (!cfg) return 0;
     // チャンネル側に 0 より大きい値が明示されている場合のみそれを採用
     if (cfg->logging.queries_channel && 
@@ -149,7 +149,7 @@ void dec_tcp_clients(void) {
 // Broker
 static int g_broker_sock = -1;
 static pid_t g_broker_pid = -1;
-static void start_connect_broker(void) {
+__attribute__((unused)) static void start_connect_broker(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
     return;
@@ -391,7 +391,7 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
 // 10. Logging
 // ============================================================================
 
-static void init_logging_channels(server_config_t *cfg) {
+void init_logging_channels(server_config_t *cfg) {
   uid_t target_uid = (uid_t)-1;
   gid_t target_gid = (gid_t)-1;
   if (geteuid() == 0 && cfg->user) {
@@ -522,7 +522,7 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
     // データ書き込み完了をConsumerに通知
     atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
-static void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
+void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
   if (!dst || dst_size == 0) return;
   if (!src) {
     dst[0] = '\0';
@@ -555,7 +555,7 @@ static void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
   dst[di < dst_size ? di : dst_size - 1] = '\0';
 }
 
-static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
+void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
     int today = (tm_info->tm_year + 1900) * 10000 + (tm_info->tm_mon + 1) * 100 + tm_info->tm_mday;
     pthread_mutex_lock(&ch->lock);
     bool rotate = false;
@@ -707,7 +707,7 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
-static inline void write_query_log(worker_ctx_t *ctx,
+void write_query_log(worker_ctx_t *ctx,
                                    const void *client_addr,
                                    socklen_t addr_len,
                                    const char *qname, uint16_t qclass, uint16_t qtype,
@@ -943,7 +943,7 @@ void *query_logger_thread_func(void *arg) {
     return NULL;
 }
 
-static void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out) {
+void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out) {
     if (!e || !out) return;
     strlcpy(out->domain, e->domain, sizeof(out->domain));
     strlcpy(out->view_name, e->view_name, sizeof(out->view_name));
@@ -1177,7 +1177,7 @@ static void *async_io_worker_func(void *arg) {
   return NULL;
 }
 
-static void init_async_io_pool(void) {
+void init_async_io_pool(void) {
   memset(&g_async_io_pool, 0, sizeof(g_async_io_pool));
   pthread_mutex_init(&g_async_io_pool.lock, NULL);
   pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
@@ -1187,7 +1187,7 @@ static void init_async_io_pool(void) {
   }
 }
 
-static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
   if (!snap || !qname) return false;
   view_snapshot_t *view = select_view(snap, client_ip);
   if (!view) return false;
@@ -1206,7 +1206,7 @@ static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_
   return is_synth;
 }
 
-static inline void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
+void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
   uint8_t *p = (uint8_t *)&ip_be;
   for (int i = 0; i < 4; i++) {
     uint8_t v = p[i];
@@ -2371,7 +2371,7 @@ static void perform_config_reload_ext(bool skip_unchanged) {
   free(config_str);
 }
 
-static const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
+const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
   if (!out_buf || out_size == 0) return arg;
   snprintf(out_buf, out_size, "%s", arg);
   server_config_t *active = acquire_config_snapshot();
@@ -3214,7 +3214,7 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
   return num_fds;
 }
 
-static void run_frontend_router(pid_t backend_pid, int router_id) {
+__attribute__((unused)) static void run_frontend_router(pid_t backend_pid, int router_id) {
   cpuset_t cpuset;
   CPU_ZERO(&cpuset);
   CPU_SET(router_id, &cpuset);
@@ -3810,7 +3810,7 @@ __attribute__((weak)) int __llvm_profile_write_file(void);
 #endif
 
 static volatile sig_atomic_t g_backend_should_exit = 0;
-static void backend_sig_handler(int sig) {
+__attribute__((unused)) static void backend_sig_handler(int sig) {
   (void)sig;
   g_backend_should_exit = 1;
 #ifdef __clang__
@@ -3821,7 +3821,7 @@ static void backend_sig_handler(int sig) {
   exit(0);
 }
 
-static void supervisor_sig_handler(int sig) {
+__attribute__((unused)) static void supervisor_sig_handler(int sig) {
   if (sig == SIGHUP) {
     g_supervisor_got_sighup = 1;
   } else {
@@ -3829,7 +3829,7 @@ static void supervisor_sig_handler(int sig) {
   }
 }
 
-static void cleanup_pid_file(void) {
+__attribute__((unused)) static void cleanup_pid_file(void) {
   if (g_supervisor_pid != 0 && getpid() == g_supervisor_pid) {
     if (g_pid_fd >= 0) {
       close(g_pid_fd);
@@ -3842,7 +3842,7 @@ static void cleanup_pid_file(void) {
   }
 }
 
-static void daemonize(void) {
+__attribute__((unused)) static void daemonize(void) {
   pid_t pid = fork();
   if (pid < 0)
     exit(EXIT_FAILURE);
@@ -3877,7 +3877,7 @@ static void daemonize(void) {
     cap_rights_limit(stdio_fd, &io_rights);
 }
 
-static void setup_ipc_tables(int num_workers) {
+__attribute__((unused)) static void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
   server_config_t *cfg = &g_config_db.config_a;
   int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
@@ -3934,7 +3934,7 @@ static void setup_ipc_tables(int num_workers) {
  * root所有でなく、group/otherに書き込み可能な場合は「事前に仕込まれた
  * ディレクトリ」の可能性があるため、起動をfail-closedで拒否する。
  * geteuid()!=0(非root実行)の場合は特権境界を跨がないため検証しない。 */
-static bool ensure_priv_dir_safe(const char *dir_buf) {
+bool ensure_priv_dir_safe(const char *dir_buf) {
   if (!dir_buf || dir_buf[0] == '\0')
     return true;
   if (geteuid() != 0)
@@ -3965,6 +3965,7 @@ static bool ensure_priv_dir_safe(const char *dir_buf) {
   return ok;
 }
 
+#ifndef KARIDNS_UNIT_TEST
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   init_server_cookie_secret();
@@ -4646,3 +4647,4 @@ int main(int argc, char **argv) {
 #endif
   return 0;
 }
+#endif /* !KARIDNS_UNIT_TEST */
