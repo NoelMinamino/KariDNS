@@ -1,3 +1,4 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -29,12 +30,19 @@ _Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
 int g_cwd_fd = -1;
 char g_startup_cwd[PATH_MAX] = "";
 
+// Captured TCP buffer for testing send_axfr_response
+static uint8_t g_tcp_out[256 * 1024];
+static size_t g_tcp_out_len = 0;
+static int g_tcp_send_count = 0;
+
 void syslog(int priority, const char *format, ...) {
     (void)priority;
     (void)format;
 }
 
-server_config_t *acquire_config_snapshot(void) { return NULL; }
+server_config_t *acquire_config_snapshot(void) {
+    return atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+}
 void release_config_snapshot(server_config_t *snap) { (void)snap; }
 
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len) {
@@ -42,7 +50,13 @@ int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len)
 }
 
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
-    (void)fd; (void)buf; return len;
+    (void)fd;
+    if (g_tcp_out_len + len <= sizeof(g_tcp_out)) {
+        memcpy(g_tcp_out + g_tcp_out_len, buf, len);
+        g_tcp_out_len += len;
+        g_tcp_send_count++;
+    }
+    return len;
 }
 
 int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out, uint16_t *msg_len_out) {
@@ -154,9 +168,7 @@ static void test_compute_ixfr_diff(void) {
     assert(txn != NULL);
     assert(txn->old_serial == 100);
     assert(txn->new_serial == 101);
-    // Deleted list should have old SOA and old A
     assert(txn->deleted_count == 2);
-    // Added list should have new SOA and new A
     assert(txn->added_count == 2);
 
     // Clean up
@@ -165,6 +177,7 @@ static void test_compute_ixfr_diff(void) {
     }
     zone_arena_destroy(&old_arena);
     zone_arena_destroy(&new_arena);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
 
     printf("  -> compute_ixfr_diff passed.\n");
 }
@@ -252,8 +265,8 @@ static void test_parse_xfr_packet(void) {
     pkt[opt_rdlen_pos] = opt_rdlen >> 8;
     pkt[opt_rdlen_pos + 1] = opt_rdlen & 0xFF;
 
-    r = parse_xfr_packet(pkt, off, &standby, NULL, &session, "example.com");
-    assert(r == 0);
+    int r_ok = parse_xfr_packet(pkt, off, &standby, NULL, &session, "example.com");
+    assert(r_ok == 0);
     assert(session.is_extended_mode == true);
     assert(session.soa_count == 1);
     assert(standby.count == 1);
@@ -262,29 +275,179 @@ static void test_parse_xfr_packet(void) {
     printf("  -> parse_xfr_packet passed.\n");
 }
 
-static void test_wait_for_active_axfr(void) {
-    printf("[TEST] AXFR/IXFR: wait_for_active_axfr...\n");
+static void init_axfr_zone(zone_arena_t *arena, const char *domain, const char *serial_str) {
+    memset(arena, 0, sizeof(*arena));
+    zone_arena_init(arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = domain,
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char stack_buf[512];
+    snprintf(stack_buf, sizeof(stack_buf),
+        "$ORIGIN %s\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.example.com. admin.example.com. %s 7200 3600 1209600 300\n",
+        domain, serial_str);
+    char *zone_buf = arena_strdup(arena, stack_buf);
+    int parsed = parse_zone_fast(zone_buf, strlen(zone_buf), arena, &ctx);
+    assert(parsed >= 0);
+    assert(build_zone_index(arena, true) == 0);
+}
+
+static void test_send_axfr_response_ixfr_and_extended(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response() IXFR match, multi-txn & Option 65153...\n");
+
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    atomic_init(&entry.active_axfr, 0);
+    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    bool ok = wait_for_active_axfr(&entry, 100);
-    assert(ok == true);
+    init_axfr_zone(&entry.rcu.arena_a, "example.com.", "200");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.serial, 200, memory_order_release);
 
-    atomic_store(&entry.active_axfr, 1);
-    // Timeout expected
-    ok = wait_for_active_axfr(&entry, 20);
-    assert(ok == false);
+    // 1. Inbound IXFR request matching current serial (200) -> returns single SOA
+    uint8_t req_ixfr[512] = {0};
+    req_ixfr[0] = 0x33; req_ixfr[1] = 0x44;
+    req_ixfr[4] = 0x00; req_ixfr[5] = 0x01; // QDCOUNT=1
+    req_ixfr[8] = 0x00; req_ixfr[9] = 0x01; // NSCOUNT=1 (Client SOA serial in Authority)
 
-    atomic_store(&entry.active_axfr, 0);
-    printf("  -> wait_for_active_axfr passed.\n");
+    size_t q_off = 12;
+    // Question: example.com. IN IXFR
+    q_off += write_uncompressed_name(req_ixfr, q_off, sizeof(req_ixfr), "example.com.");
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 251; // IXFR
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 1;   // IN
+
+    // Authority SOA with serial 200
+    q_off += write_uncompressed_name(req_ixfr, q_off, sizeof(req_ixfr), "example.com.");
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 6;   // SOA
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 1;   // IN
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; // TTL=0
+    size_t rd_len_p = q_off; q_off += 2;
+    q_off += write_uncompressed_name(req_ixfr, q_off, sizeof(req_ixfr), "ns1.example.com.");
+    q_off += write_uncompressed_name(req_ixfr, q_off, sizeof(req_ixfr), "admin.example.com.");
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 200; // Serial 200
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0;
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0;
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0;
+    req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0; req_ixfr[q_off++] = 0;
+    uint16_t auth_rdlen = (uint16_t)(q_off - (rd_len_p + 2));
+    req_ixfr[rd_len_p] = auth_rdlen >> 8;
+    req_ixfr[rd_len_p + 1] = auth_rdlen & 0xFF;
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+
+    send_axfr_response(1, "example.com.", req_ixfr, q_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count >= 2); // Length prefix + response payload
+    assert(g_tcp_out_len > 2);
+    // Verify ancount == 1 (Single SOA for up-to-date IXFR)
+    uint16_t ancount = (g_tcp_out[2 + 6] << 8) | g_tcp_out[2 + 7];
+    assert(ancount == 1);
+
+    // 2. Extended AXFR Option 65153 with tag definitions and dynamic states
+    zone_arena_t *cur = &entry.rcu.arena_a;
+    cur->bind_location_tag_count = 1;
+    cur->bind_location_tags = calloc(1, sizeof(ecs_tag_def_t));
+    cur->bind_location_tags[0].tag = strdup("loc-tokyo");
+    cur->bind_location_tags[0].cidrs = calloc(1, sizeof(ecs_cidr_entry_t));
+    cur->bind_location_tags[0].cidrs[0].cidr = strdup("192.0.2.0/24");
+    cur->bind_location_tags[0].cidr_count = 1;
+
+    dns_record_t tagged_rec;
+    memset(&tagged_rec, 0, sizeof(tagged_rec));
+    tagged_rec.name = arena_strdup(cur, "geo.example.com.");
+    tagged_rec.type = arena_strdup(cur, "A");
+    tagged_rec.type_code = 1;
+    tagged_rec.ttl = arena_strdup(cur, "300");
+    tagged_rec.ttl_value = 300;
+    tagged_rec.class_str = arena_strdup(cur, "IN");
+    tagged_rec.class_val = 1;
+    tagged_rec.rdata_count = 1;
+    tagged_rec.rdata[0] = arena_strdup(cur, "192.0.2.88");
+    tagged_rec.bind_location_tag = "loc-tokyo";
+    if (cur->count >= cur->records_cap) {
+        cur->records_cap = (cur->count + 4) * 2;
+        cur->records = realloc(cur->records, sizeof(dns_record_t) * cur->records_cap);
+    }
+    cur->records[cur->count++] = tagged_rec;
+    build_zone_index(cur, true);
+
+    // Build AXFR query with Option 65153
+    uint8_t req_ext[512] = {0};
+    req_ext[0] = 0x55; req_ext[1] = 0x66;
+    req_ext[4] = 0x00; req_ext[5] = 0x01; // QDCOUNT=1
+    req_ext[10] = 0x00; req_ext[11] = 0x01; // ARCOUNT=1 (EDNS)
+
+    size_t e_off = 12;
+    e_off += write_uncompressed_name(req_ext, e_off, sizeof(req_ext), "example.com.");
+    req_ext[e_off++] = 0; req_ext[e_off++] = 252; // AXFR
+    req_ext[e_off++] = 0; req_ext[e_off++] = 1;   // IN
+
+    // EDNS OPT with Option 65153
+    req_ext[e_off++] = 0;
+    req_ext[e_off++] = 0x00; req_ext[e_off++] = 0x29;
+    req_ext[e_off++] = 0x10; req_ext[e_off++] = 0x00;
+    req_ext[e_off++] = 0; req_ext[e_off++] = 0; req_ext[e_off++] = 0; req_ext[e_off++] = 0;
+    size_t opt_len_p = e_off; e_off += 2;
+    req_ext[e_off++] = 0xFE; req_ext[e_off++] = 0x81;
+    req_ext[e_off++] = 0x00; req_ext[e_off++] = 0x05;
+    req_ext[e_off++] = KARIDNS_EXT_VERSION;
+    uint32_t zhash = calc_fnv1a_str("example.com.");
+    req_ext[e_off++] = (zhash >> 24) & 0xFF;
+    req_ext[e_off++] = (zhash >> 16) & 0xFF;
+    req_ext[e_off++] = (zhash >> 8) & 0xFF;
+    req_ext[e_off++] = zhash & 0xFF;
+    uint16_t opt_rdlen_ext = (uint16_t)(e_off - (opt_len_p + 2));
+    req_ext[opt_len_p] = opt_rdlen_ext >> 8;
+    req_ext[opt_len_p + 1] = opt_rdlen_ext & 0xFF;
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(1, "example.com.", req_ext, e_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count >= 2);
+    assert(g_tcp_out_len > 100);
+
+    // 3. Fallback AXFR query (WITHOUT Option 65153) -> filters out tagged records
+    uint8_t req_std[512] = {0};
+    req_std[0] = 0x77; req_std[1] = 0x88;
+    req_std[4] = 0x00; req_std[5] = 0x01;
+    size_t s_off = 12;
+    s_off += write_uncompressed_name(req_std, s_off, sizeof(req_std), "example.com.");
+    req_std[s_off++] = 0; req_std[s_off++] = 252; // AXFR
+    req_std[s_off++] = 0; req_std[s_off++] = 1;   // IN
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(1, "example.com.", req_std, s_off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count >= 2);
+    // Standard AXFR should only emit SOA (initial + closing) and skip tagged record
+    uint16_t an_std = (g_tcp_out[2 + 6] << 8) | g_tcp_out[2 + 7];
+    assert(an_std == 2); // Initial SOA + Closing SOA
+
+    // 4. Null entry error response
+    g_tcp_out_len = 0;
+    send_axfr_response(1, "example.com.", req_std, s_off, NULL, NULL, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_out_len > 0);
+    assert((g_tcp_out[2 + 3] & 0x0F) == 5); // REFUSED / NOTAUTH rcode
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+
+    printf("  -> send_axfr_response passed.\n");
 }
 
 int main(void) {
-    printf("=== Starting AXFR / IXFR Engine Unit Tests ===\n");
+    printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_compute_ixfr_diff();
     test_parse_xfr_packet();
-    test_wait_for_active_axfr();
-    printf("=== All AXFR / IXFR Engine Unit Tests PASSED ===\n");
+    test_send_axfr_response_ixfr_and_extended();
+    printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }

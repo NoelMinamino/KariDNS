@@ -14,7 +14,7 @@ To avoid duplicate test execution (二重起動), the comprehensive diagnostic c
 
 ### 1.1 Test Category Distribution in `run_all_sui| Category Code | Category Name | Target Domain | Top-Level Count | Primary Execution Method |
 |:---|:---|:---|:---:|:---|
-| `unit` | **Unit Tests** | C unit tests compiled with ASan/UBSan | 13 | Native binary execution |
+| `unit` | **Unit Tests** | C unit tests compiled with ASan/UBSan | 16 | Native binary execution |
 | `xfr` | **Zone Transfer** | RFC 5936 AXFR, RFC 1995 IXFR, Extended AXFR, Capsicum | 6 | Shell script + multi-instance KariDNS |
 | `dnssec` | **DNSSEC & Digest** | RFC 4034/4035 DNSSEC serving, RFC 8976 ZONEMD | 3 | Shell script + `karicheck` |
 | `update` | **Dynamic Update** | RFC 2136 DNS UPDATE prerequisites & updates | 3 | Shell script + `dag` UPDATE |
@@ -26,7 +26,7 @@ To avoid duplicate test execution (二重起動), the comprehensive diagnostic c
 | `core` | **Server Core Engine** | RFC 1034/1035 resolution, section order, forward, program, glue, RCU reload | 24 | Shell script + `karidns` / `karictl` / `karicheck` |
 | `regression` | **Regression & Fuzz** | ASan/UBSan smoke, concurrency stress, libFuzzer harnesses | 3 | Shell script + libFuzzer / ASan binaries |
 | `dag` | **Diagnostic Tool** | `run_dag_ci_test.sh` (Part 1-19 + 55 parallel sub-tests) + batch opts + dag fuzzer | 3 | Master runner + parallel workers (Included by default; skip with `--no-dag`) |
-| **Total Runner Entries** | | | **65** | *(62 server engine tests + 3 dag diagnostic client entries = 65 integrated targets)* |
+| **Total Runner Entries** | | | **68** | *(65 server engine tests + 3 dag diagnostic client entries = 68 integrated targets)* |
 
 ---
 
@@ -92,11 +92,14 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 6 | [`test_dynamic_update_engine`](file:///c:/git/my_dns/tests/test_dynamic_update_engine.c) | `dns_dynamic_update.c`, `dns_wire.c`, `dns_snapshot_rcu.c` | RFC 2136, RFC 1982, RFC 1996 | **Positive / Negative** | Validates SOA serial number arithmetic bumping, wrap-around handling, RFC 1996 NOTIFY message wire construction, destination deduplication, and update section Add/Delete processing. |
 | 7 | [`test_axfr_ixfr_engine`](file:///c:/git/my_dns/tests/test_axfr_ixfr_engine.c) | `dns_axfr_ixfr.c`, `dns_wire.c`, `dns_snapshot_rcu.c` | RFC 1995, RFC 5936, Option 65153 | **Positive / Negative** | Validates IXFR difference computation between zone arena snapshots, transaction history ring rotation and memory lifecycle, XFR wire packet parsing, and EDNS Option 65153 (Extended AXFR) hash negotiation. |
 | 8 | [`test_rrl_engine`](file:///c:/git/my_dns/tests/test_rrl_engine.c) | `dns_rrl.c`, `dns_config_parser.c` | Response Rate Limiting (RRL) | **Positive / Negative / Anti-DoS** | Validates SipHash-2-4 hash calculation, response classification (NOERROR, NODATA, NXDOMAIN, ERROR), token bucket leak rates, IPv4 /24 and IPv6 /56 subnet aggregation, and SLIP (TC=1) truncation. |
-| 9 | [`test_asan_overflow`](file:///c:/git/my_dns/tests/test_asan_overflow.c) | `dns_wire.c`, `dns_zone_parser.c`, `dns_tinydns_parser.c`, `dns_cidr.c`, `dns_tsig_acl.c` | RFC 1035, RFC 3597 | **Negative / Memory (ASan)** | Boundary overflow defense on corrupt DNS packets, invalid CLASS tokens, non-numeric TTL overflows, and RFC 3597 unknown RDATA syntax under AddressSanitizer. |
-| 10 | [`test_tinydns_parser`](file:///c:/git/my_dns/tests/test_tinydns_parser.c) | `dns_tinydns_parser.c`, `dns_zone_parser.c`, `dns_wire.c` | tinydns data format | **Positive / Negative** | Parsing djbdns data format record leading characters (`+`, `@`, `.`, `&`, `=`, `^`, `'`, `:`, `%`), TTL overrides, and syntax error recovery. |
-| 11 | [`test_cidr`](file:///c:/git/my_dns/tests/test_cidr.c) | `dns_cidr.c`, `dns_tsig_acl.c` | RFC 4632, RFC 4291 | **Positive / Boundary** | Evaluates IPv4 and IPv6 bitmask calculations, prefix containment logic, and binary ACL matching rules. |
-| 12 | [`test_conf_include`](file:///c:/git/my_dns/tests/test_conf_include.c) | `dns_config_parser.c` | BIND 9 config format | **Positive / Negative** | Nested `$INCLUDE` configuration parsing, detection of circular file dependencies, and token syntax error isolation. |
-| 13 | [`test_hash_table`](file:///c:/git/my_dns/tests/test_hash_table.c) | Core hash routines | FNV-1a Hash | **Positive / Boundary** | Fixed-size hash table distribution, collision bucket resolution, and key deletion. |letion. |
+| 9 | [`test_catalog_zone_engine`](file:///c:/git/my_dns/tests/test_catalog_zone_engine.c) | `dns_catalog_zone.c`, `dns_config_parser.c` | RFC 9432 | **Positive / Negative** | Validates RFC 9432 catalog zone membership processing, member hash computation, broken catalog rejection (duplicate PTRs, multiple unique-Ns to same domain), static config collisions, and bookkeeping cleanup. |
+| 10 | [`test_snapshot_sandbox_engine`](file:///c:/git/my_dns/tests/test_snapshot_sandbox_engine.c) | `dns_priv_sandbox.c`, `dns_snapshot_rcu.c` | Capsicum, RCU | **Positive / Negative / Security** | Validates directory file descriptor caching, Capsicum capability mode rights limitation, ENOTCAPABLE rejection on uncached paths, snapshot retain/release, arena deep cloning, and suffix hash lookup. |
+| 11 | [`test_dag_tools`](file:///c:/git/my_dns/tests/test_dag_tools.c) | `tools/dag_tcp_reassembly.c`, `tools/dag_tsig_client.c` | RFC 7766, RFC 8945 | **Positive / Negative** | Validates in-order and out-of-order TCP segment reassembly, missing gap draining, stream LRU eviction, BIND TSIG keyfile parsing, and algorithm inference. |
+| 12 | [`test_asan_overflow`](file:///c:/git/my_dns/tests/test_asan_overflow.c) | `dns_wire.c`, `dns_zone_parser.c`, `dns_tinydns_parser.c`, `dns_cidr.c`, `dns_tsig_acl.c` | RFC 1035, RFC 3597 | **Negative / Memory (ASan)** | Boundary overflow defense on corrupt DNS packets, invalid CLASS tokens, non-numeric TTL overflows, and RFC 3597 unknown RDATA syntax under AddressSanitizer. |
+| 13 | [`test_tinydns_parser`](file:///c:/git/my_dns/tests/test_tinydns_parser.c) | `dns_tinydns_parser.c`, `dns_zone_parser.c`, `dns_wire.c` | tinydns data format | **Positive / Negative** | Parsing djbdns data format record leading characters (`+`, `@`, `.`, `&`, `=`, `^`, `'`, `:`, `%`), TTL overrides, and syntax error recovery. |
+| 14 | [`test_cidr`](file:///c:/git/my_dns/tests/test_cidr.c) | `dns_cidr.c`, `dns_tsig_acl.c` | RFC 4632, RFC 4291 | **Positive / Boundary** | Evaluates IPv4 and IPv6 bitmask calculations, prefix containment logic, and binary ACL matching rules. |
+| 15 | [`test_conf_include`](file:///c:/git/my_dns/tests/test_conf_include.c) | `dns_config_parser.c` | BIND 9 config format | **Positive / Negative** | Nested `$INCLUDE` configuration parsing, detection of circular file dependencies, and token syntax error isolation. |
+| 16 | [`test_hash_table`](file:///c:/git/my_dns/tests/test_hash_table.c) | Core hash routines | FNV-1a Hash | **Positive / Boundary** | Fixed-size hash table distribution, collision bucket resolution, and key deletion. |letion. |
 
 ---
 

@@ -24,6 +24,14 @@ static uint32_t bench_parse_dnssec_time(const char *str) {
     return (uint32_t)total_seconds;
 }
 #include "../dns_zone_parser.h" // For parse_dnssec_time
+#include <fcntl.h>
+#include <unistd.h>
+
+int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
+    (void)mode;
+    (void)writable;
+    return open(path, flags);
+}
 
 #include <openssl/evp.h>
 

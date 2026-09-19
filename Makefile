@@ -225,6 +225,10 @@ TEST_QUERY_EXP_SRCS = tests/test_query_engine_expanded.c dns_query_engine.c dns_
 RESPONSE_CACHE_TEST_SRCS = tests/test_response_cache.c dns_query_engine.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 VULN_TEST_SRCS = tests/test_vulnerability_fixes.c dns_query_engine.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 
+TEST_CATALOG_SRCS = tests/test_catalog_zone_engine.c dns_catalog_zone.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
+TEST_SANDBOX_SRCS = tests/test_snapshot_sandbox_engine.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
+TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c dns_zone_parser.c dns_config_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c
+
 test_cidr: $(TEST_CIDR_SRCS)
 	$(CC) $(CFLAGS) -I. $(TEST_CIDR_SRCS) -o test_cidr $(LDFLAGS) -lcrypto
 
@@ -315,7 +319,25 @@ test_vulnerability_fixes: $(VULN_TEST_SRCS)
 vulnerability_test: test_vulnerability_fixes
 	./test_vulnerability_fixes
 
-unit-tests: cidr_test tinydns_test asan_test include_test hash_test dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test
+test_catalog_zone_engine: $(TEST_CATALOG_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_CATALOG_SRCS) -o test_catalog_zone_engine $(LDFLAGS) -lcrypto -lpthread -lm
+
+catalog_zone_test: test_catalog_zone_engine
+	./test_catalog_zone_engine
+
+test_snapshot_sandbox_engine: $(TEST_SANDBOX_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_SANDBOX_SRCS) -o test_snapshot_sandbox_engine $(LDFLAGS) -lcrypto -lpthread -lm
+
+snapshot_sandbox_test: test_snapshot_sandbox_engine
+	./test_snapshot_sandbox_engine
+
+test_dag_tools: $(TEST_DAG_TOOLS_SRCS)
+	$(CC) $(CFLAGS) -I. $(TEST_DAG_TOOLS_SRCS) -o test_dag_tools $(LDFLAGS) -lcrypto -lpthread -lm
+
+dag_tools_test: test_dag_tools
+	./test_dag_tools
+
+unit-tests: cidr_test tinydns_test asan_test include_test hash_test dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test
 
 test: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 	@sh tests/run_all_suite.sh
@@ -332,6 +354,12 @@ COV_DIR     = coverage_raw
 COV_HTML_DIR = coverage_html
 COV_DATA    = coverage.profdata
 
+COV_BIN_OBJS = -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck \
+  -object=test_cidr -object=test_tinydns_parser -object=test_asan_overflow -object=test_conf_include \
+  -object=test_hash_table -object=test_dnstap_engine -object=test_edns_ecs_engine -object=test_dynamic_update_engine \
+  -object=test_axfr_ixfr_engine -object=test_rrl_engine -object=test_query_engine_expanded -object=test_response_cache \
+  -object=test_vulnerability_fixes -object=test_catalog_zone_engine -object=test_snapshot_sandbox_engine -object=test_dag_tools
+
 coverage-clean:
 	rm -rf $(COV_DIR) $(COV_HTML_DIR) $(COV_DATA) default.profraw *.profraw
 
@@ -339,7 +367,7 @@ coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
 	$(MAKE) clean
 	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
-	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes
+	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools
 
 coverage-run:
 	@echo "=== Executing Test Suite with Instrumentation ==="
@@ -352,10 +380,10 @@ coverage-report:
 	@ls $(COV_DIR)/*.profraw >/dev/null 2>&1 || { echo "Error: No profile data found in $(COV_DIR). Run 'make coverage-run' first."; exit 1; }
 	$(LLVM_PROFDATA) merge -sparse $(COV_DIR)/*.profraw -o $(COV_DATA)
 	@mkdir -p $(COV_HTML_DIR)
-	$(LLVM_COV) show $(TARGET) -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck -instr-profile=$(COV_DATA) -format=html -output-dir=$(COV_HTML_DIR) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/" -show-line-counts-or-regions -show-branches=count
+	$(LLVM_COV) show $(TARGET) $(COV_BIN_OBJS) -instr-profile=$(COV_DATA) -format=html -output-dir=$(COV_HTML_DIR) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/" -show-line-counts-or-regions -show-branches=count
 	@echo ""
 	@echo "=== KariDNS & dag Integrated Engine Coverage Summary ==="
-	$(LLVM_COV) report $(TARGET) -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck -instr-profile=$(COV_DATA) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/"
+	$(LLVM_COV) report $(TARGET) $(COV_BIN_OBJS) -instr-profile=$(COV_DATA) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/"
 	@echo ""
 	@echo "Full HTML coverage report available at: $(COV_HTML_DIR)/index.html"
 
@@ -369,7 +397,7 @@ bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_zone_parser.o dns
 
 clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
-	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes
+	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools
 
 run: $(TARGET)
 	./$(TARGET)

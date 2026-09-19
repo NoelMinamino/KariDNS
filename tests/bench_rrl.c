@@ -6,9 +6,16 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "../dns_config_parser.h"
 #include "../dns_rrl.h"
+
+int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
+    (void)mode;
+    (void)writable;
+    return open(path, flags);
+}
 
 #define NUM_QUERIES 10000000
 

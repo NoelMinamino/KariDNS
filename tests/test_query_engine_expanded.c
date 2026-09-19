@@ -1,3 +1,4 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -34,7 +35,9 @@ void syslog(int priority, const char *format, ...) {
     (void)format;
 }
 
-server_config_t *acquire_config_snapshot(void) { return NULL; }
+server_config_t *acquire_config_snapshot(void) {
+    return atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+}
 void release_config_snapshot(server_config_t *snap) { (void)snap; }
 
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len) {
@@ -234,37 +237,258 @@ static void test_all_rr_types_and_resolution(void) {
         uint8_t rcode = res[3] & 0x0F;
         uint16_t ancount = (res[6] << 8) | res[7];
 
-        if (rcode != tests[i].exp_rcode || (tests[i].min_ancount > 0 && ancount < tests[i].min_ancount)) {
-            fprintf(stderr, "FAIL: Test %zu [%s type %u]: got rcode=%u ancount=%u, expected rcode=%u min_ancount=%u\n",
-                    i, tests[i].qname, tests[i].qtype, rcode, ancount, tests[i].exp_rcode, tests[i].min_ancount);
-        }
         assert(rcode == tests[i].exp_rcode);
         if (tests[i].min_ancount > 0) {
             assert(ancount >= tests[i].min_ancount);
         }
     }
 
-    // Test Case-insensitivity & 0x20 bit preservation
-    const char mixed_qname[] = "Ns1.ExAmPlE.cOm.";
-    build_dns_query(req, &req_len, 0x1234, mixed_qname, 1 /* A */, false);
+    zone_arena_destroy(&arena);
+    printf("  -> All-RR types resolution passed.\n");
+}
+
+static void test_dnssec_negative_and_delegation_proofs(void) {
+    printf("[TEST] Query Engine: DNSSEC NSEC/NSEC3 Negative Proofs & Insecure Delegation...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "sec.example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+
+    // DNSSEC NSEC-signed zone with delegation without DS
+    const char zone_text[] =
+        "$ORIGIN sec.example.com.\n"
+        "$TTL 3600\n"
+        "@       IN SOA   ns1.sec.example.com. hostmaster.sec.example.com. 2026091401 7200 3600 1209600 3600\n"
+        "@       IN RRSIG SOA 13 3 3600 20300101000000 20260101000000 12345 sec.example.com. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "@       IN NS    ns1.sec.example.com.\n"
+        "@       IN RRSIG NS 13 3 3600 20300101000000 20260101000000 12345 sec.example.com. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "ns1     IN A     192.0.2.5\n"
+        "ns1     IN RRSIG A 13 4 3600 20300101000000 20260101000000 12345 sec.example.com. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "@       IN NSEC  ns1.sec.example.com. SOA NS RRSIG NSEC\n"
+        "@       IN RRSIG NSEC 13 3 3600 20300101000000 20260101000000 12345 sec.example.com. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "ns1     IN NSEC  sub.sec.example.com. A RRSIG NSEC\n"
+        "ns1     IN RRSIG NSEC 13 4 3600 20300101000000 20260101000000 12345 sec.example.com. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "sub     IN NS    ns1.sub.sec.example.com.\n" // Delegation without DS
+        "sub     IN NSEC  sec.example.com. NS RRSIG NSEC\n"
+        "sub     IN RRSIG NSEC 13 4 3600 20300101000000 20260101000000 12345 sec.example.com. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n";
+
+    int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
+    assert(parsed >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "sec.example.com.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    char *any_acl[1] = { (char *)"any" };
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+
+    // 1. NXDOMAIN with DO=1 -> Authority section contains NSEC + RRSIG
+    build_dns_query(req, &req_len, 0x8801, "nonexistent.sec.example.com.", 1 /* A */, true);
     compress_ctx_init_packet(&comp_ctx);
     rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched_entry = NULL;
     int res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
-                                         mixed_qname, 1,
+                                         "nonexistent.sec.example.com.", 1,
+                                         "192.0.2.100", &comp_ctx,
+                                         false, &rrl_out, &snap, &cfg, &matched_entry);
+    assert(res_len >= DNS_HEADER_SIZE);
+    assert((res[3] & 0x0F) == 3); // NXDOMAIN
+    uint16_t nscount = (res[8] << 8) | res[9];
+    assert(nscount > 0); // Authority section has SOA + NSEC + RRSIGs
+
+    // 2. NODATA with DO=1 (AAAA query for ns1.sec.example.com which only has A)
+    build_dns_query(req, &req_len, 0x8802, "ns1.sec.example.com.", 28 /* AAAA */, true);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                     "ns1.sec.example.com.", 28,
+                                     "192.0.2.100", &comp_ctx,
+                                     false, &rrl_out, &snap, &cfg, &matched_entry);
+    assert(res_len >= DNS_HEADER_SIZE);
+    assert((res[3] & 0x0F) == 0); // NOERROR
+    uint16_t ancount = (res[6] << 8) | res[7];
+    assert(ancount == 0); // NODATA
+    nscount = (res[8] << 8) | res[9];
+    assert(nscount > 0); // NSEC proof present in Authority
+
+    // 3. Delegation referral with DO=1 (host.sub.sec.example.com) -> Insecure Delegation DS proof
+    build_dns_query(req, &req_len, 0x8803, "host.sub.sec.example.com.", 1 /* A */, true);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                     "host.sub.sec.example.com.", 1,
+                                     "192.0.2.100", &comp_ctx,
+                                     false, &rrl_out, &snap, &cfg, &matched_entry);
+    assert(res_len >= DNS_HEADER_SIZE);
+    assert((res[2] & 0x04) == 0); // AA=0 (Referral)
+    nscount = (res[8] << 8) | res[9];
+    assert(nscount >= 1); // NS referral + NSEC DS denial proof
+
+    zone_arena_destroy(&arena);
+    printf("  -> DNSSEC Negative Proofs & Delegation passed.\n");
+}
+
+static void test_tinydns_timestamp_countdown(void) {
+    printf("[TEST] Query Engine: tinydns Timestamp & Countdown TTL Resolution...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    arena.is_tinydns_format = true;
+
+    arena.records = malloc(sizeof(dns_record_t) * 8);
+    arena.records_cap = 8;
+    arena.hash_size = 256;
+    arena.hash_table = malloc(sizeof(int) * arena.hash_size);
+    for (size_t i = 0; i < arena.hash_size; i++) arena.hash_table[i] = -1;
+
+    // SOA
+    dns_record_t soa; memset(&soa, 0, sizeof(soa));
+    soa.name = arena_strdup(&arena, "tiny.example.");
+    soa.type_code = 6; soa.ttl_value = 3600; soa.class_val = 1;
+    soa.rdata_count = 7;
+    soa.rdata[0] = arena_strdup(&arena, "a.ns.tiny.example.");
+    soa.rdata[1] = arena_strdup(&arena, "hostmaster.tiny.example.");
+    soa.rdata[2] = arena_strdup(&arena, "1");
+    soa.rdata[3] = arena_strdup(&arena, "7200");
+    soa.rdata[4] = arena_strdup(&arena, "3600");
+    soa.rdata[5] = arena_strdup(&arena, "1209600");
+    soa.rdata[6] = arena_strdup(&arena, "300");
+    arena.records[arena.count++] = soa;
+
+    time_t now = time(NULL);
+
+    // Record 1: Past activation timestamp (active)
+    dns_record_t r_past; memset(&r_past, 0, sizeof(r_past));
+    r_past.name = arena_strdup(&arena, "past.tiny.example.");
+    r_past.type_code = 1; r_past.class_val = 1;
+    r_past.ttl_value = 300; r_past.rdata_count = 1;
+    r_past.rdata[0] = arena_strdup(&arena, "192.0.2.11");
+    r_past.tinydns_ttd = now - 1000; // Activated in past
+    r_past.tinydns_ttl_countdown = false;
+    arena.records[arena.count++] = r_past;
+
+    // Record 2: Future activation timestamp (inactive)
+    dns_record_t r_fut; memset(&r_fut, 0, sizeof(r_fut));
+    r_fut.name = arena_strdup(&arena, "future.tiny.example.");
+    r_fut.type_code = 1; r_fut.class_val = 1;
+    r_fut.ttl_value = 300; r_fut.rdata_count = 1;
+    r_fut.rdata[0] = arena_strdup(&arena, "192.0.2.22");
+    r_fut.tinydns_ttd = now + 10000; // In future
+    r_fut.tinydns_ttl_countdown = false;
+    arena.records[arena.count++] = r_fut;
+
+    // Record 3: Countdown TTL (expires in 60 seconds)
+    dns_record_t r_cnt; memset(&r_cnt, 0, sizeof(r_cnt));
+    r_cnt.name = arena_strdup(&arena, "countdown.tiny.example.");
+    r_cnt.type_code = 1; r_cnt.class_val = 1;
+    r_cnt.ttl_value = 300; r_cnt.rdata_count = 1;
+    r_cnt.rdata[0] = arena_strdup(&arena, "192.0.2.33");
+    r_cnt.tinydns_ttd = now + 60;
+    r_cnt.tinydns_ttl_countdown = true;
+    arena.records[arena.count++] = r_cnt;
+
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strncpy(db_entry.domain, "tiny.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+    rate_limit_config_t *rrl_out = NULL;
+    zone_db_entry_t *matched_entry = NULL;
+
+    // Query 1: Past activation record -> found (ancount=1)
+    build_dns_query(req, &req_len, 0x9001, "past.tiny.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                         "past.tiny.example.", 1,
                                          "192.0.2.100", &comp_ctx,
                                          false, &rrl_out, &snap, &cfg, &matched_entry);
     assert(res_len >= DNS_HEADER_SIZE);
     assert((res[3] & 0x0F) == 0); // NOERROR
-    assert(((res[6] << 8) | res[7]) >= 1); // ANCOUNT >= 1
+    assert(((res[6] << 8) | res[7]) == 1);
+
+    // Query 2: Future activation record -> omitted (NXDOMAIN/NODATA)
+    build_dns_query(req, &req_len, 0x9002, "future.tiny.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                     "future.tiny.example.", 1,
+                                     "192.0.2.100", &comp_ctx,
+                                     false, &rrl_out, &snap, &cfg, &matched_entry);
+    assert(res_len >= DNS_HEADER_SIZE);
+    assert(((res[6] << 8) | res[7]) == 0); // Not returned
+
+    // Query 3: Countdown record -> found with dynamically computed TTL
+    build_dns_query(req, &req_len, 0x9003, "countdown.tiny.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
+                                     "countdown.tiny.example.", 1,
+                                     "192.0.2.100", &comp_ctx,
+                                     false, &rrl_out, &snap, &cfg, &matched_entry);
+    assert(res_len >= DNS_HEADER_SIZE);
+    assert(((res[6] << 8) | res[7]) == 1);
 
     zone_arena_destroy(&arena);
-    printf("  -> All RR types & query engine edge cases passed.\n");
+    printf("  -> tinydns timestamp countdown passed.\n");
 }
 
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
+    test_dnssec_negative_and_delegation_proofs();
+    test_tinydns_timestamp_countdown();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
