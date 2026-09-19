@@ -140,7 +140,9 @@ run_check "Reverse PTR Query (-x)" "$DAG @127.0.0.1 -p $PORT -x 192.0.2.10" "10\
 run_check "Reverse IPv6 PTR Query (-x)" "$DAG @127.0.0.1 -p $PORT -x 2001:db8::1 +timeout=1" "(ip6\.arpa|timed out|no usable response|no servers could be reached)"
 run_check "Search list resolution (+search)" "$DAG @127.0.0.1 -p $PORT +search +timeout=1 example.com" "(SOA|NS|192\.0\.2|status: NOERROR)"
 run_check "HTTPS record with +multiline" "$DAG @127.0.0.1 -p $PORT example.com HTTPS +multiline" "(ipv4hint|ipv6hint|alpn|HTTPS)"
+run_check "HTTPS hints record" "$DAG @127.0.0.1 -p $PORT hints.example.com HTTPS" "(ipv4hint|192\.0\.2\.1)"
 run_check "SVCB record (port & alpn)" "$DAG @127.0.0.1 -p $PORT _8443._tcp.svc.example.com SVCB" 'alpn="h2"[[:space:]]+port=8443'
+run_check "SVCB hints record" "$DAG @127.0.0.1 -p $PORT svchints.example.com SVCB" "(ipv6hint|2001:db8::40)"
 run_check "DNAME resolution" "$DAG @127.0.0.1 -p $PORT sub.legacy.example.com A" "(archive\.example\.com|192\.0\.2)"
 run_check "URI query" "$DAG @127.0.0.1 -p $PORT _https._tcp.example.com URI" "https://www\.example\.com"
 run_check "SPF query" "$DAG @127.0.0.1 -p $PORT example.com SPF" "v=spf1"

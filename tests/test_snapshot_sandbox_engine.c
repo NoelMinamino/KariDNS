@@ -266,9 +266,11 @@ static void test_capsicum_sandbox_execution(void) {
         if (pid == 0) {
             close(sv[0]);
             g_dnstap_sock = sv[1];
+            g_bypass_cap_enter = false;
             enter_capsicum_sandbox();
             bool enabled = atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire);
-            exit(enabled ? 0 : 1);
+            close(sv[1]);
+            _exit(enabled ? 0 : 1);
         }
         close(sv[0]);
         close(sv[1]);
@@ -276,7 +278,8 @@ static void test_capsicum_sandbox_execution(void) {
         waitpid(pid, &status, 0);
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
-    // Also test in main test process
+    // Also test in main test process (with bypass so exit can flush coverage profraw)
+    g_bypass_cap_enter = true;
     enter_capsicum_sandbox();
     assert(atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire) == true);
     printf("  -> enter_capsicum_sandbox passed.\n");

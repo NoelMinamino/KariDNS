@@ -32,6 +32,7 @@ typedef struct dir_fd_entry {
 
 static dir_fd_entry_t *g_dir_fd_table = NULL;
 static pthread_mutex_t g_dir_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+bool g_bypass_cap_enter = false;
 // g_capsicum_enabled is defined in dns_utils.c and declared in dns_utils.h
 
 static int get_or_open_dir_fd(const char *dirpath, bool writable) {
@@ -164,18 +165,20 @@ void limit_client_socket_rights(int fd) {
 }
 
 void enter_capsicum_sandbox(void) {
-#if !defined(SANITIZER_BUILD) && !defined(KARIDNS_UNIT_TEST)
+#ifndef SANITIZER_BUILD
   if (g_dnstap_sock >= 0) {
     cap_rights_t rights;
     cap_rights_init(&rights, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
     cap_rights_limit(g_dnstap_sock, &rights);
   }
-  int trapmode = PROC_TRAPCAP_CTL_ENABLE;
-  procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);
-  if (cap_enter() != 0) {
-    if (errno == ENOSYS)
-      return;
-    exit(EXIT_FAILURE);
+  if (!g_bypass_cap_enter) {
+    int trapmode = PROC_TRAPCAP_CTL_ENABLE;
+    procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);
+    if (cap_enter() != 0) {
+      if (errno == ENOSYS)
+        return;
+      exit(EXIT_FAILURE);
+    }
   }
 #endif
   atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);

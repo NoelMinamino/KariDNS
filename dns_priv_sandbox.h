@@ -5,6 +5,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+extern bool g_bypass_cap_enter;
+
 void enter_capsicum_sandbox(void);
 void limit_server_socket_rights(int fd, bool is_listening_tcp);
 void limit_client_socket_rights(int fd);
