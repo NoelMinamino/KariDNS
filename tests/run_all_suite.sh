@@ -362,7 +362,11 @@ FAILED_TEST_NAMES=""
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    make test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core >/dev/null 2>&1 || true
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
+        if [ ! -x "./${_b}" ]; then
+            make "${_b}" >/dev/null 2>&1 || true
+        fi
+    done
 fi
 
 SUMMARY_FILE="${LOG_DIR}/summary.tsv"
