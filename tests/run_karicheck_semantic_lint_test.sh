@@ -183,9 +183,22 @@ else
     FAILED=1
 fi
 
+# Test 8: CLI Options, Version, Usage & Error Handlers
+echo "[+] Test 8: karicheck CLI options & usage..."
+./karicheck -v >/dev/null 2>&1 || true
+./karicheck --version >/dev/null 2>&1 || true
+./karicheck -h >/dev/null 2>&1 || true
+./karicheck --help >/dev/null 2>&1 || true
+./karicheck >/dev/null 2>&1 || true
+./karicheck invalid_cmd >/dev/null 2>&1 || true
+./karicheck zone >/dev/null 2>&1 || true
+./karicheck zones >/dev/null 2>&1 || true
+./karicheck conf >/dev/null 2>&1 || true
+
 if [ $FAILED -ne 0 ]; then
     echo "=== Some Semantic Lint Tests FAILED ==="
     exit 1
 fi
 
 echo "=== All karicheck Semantic Lint Tests Passed! ==="
+

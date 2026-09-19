@@ -1397,6 +1397,169 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     printf("  -> Program plugin & forward zone helpers passed.\n");
 }
 
+static void test_query_engine_helpers_and_edge_cases(void) {
+    printf("[TEST] Query Engine: helper functions, checkpoints, glue & observatory...\n");
+
+    // 1. restore_checkpoint
+    resolve_checkpoint_t cp = { 123, 1, 2, 3 };
+    uint16_t off = 999, an = 9, ns = 8, ar = 7;
+    restore_checkpoint(&cp, &off, &an, &ns, &ar);
+    assert(off == 123 && an == 1 && ns == 2 && ar == 3);
+
+    // 2. tinydns_record_currently_valid
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.ttl_value = 300;
+    uint32_t eff_ttl = 0;
+    time_t now = 1700000000;
+
+    // Location mismatch / match
+    rec.tinydns_loc[0] = 'u'; rec.tinydns_loc[1] = 's';
+    assert(tinydns_record_currently_valid(&rec, now, "jp", NULL, NULL, &eff_ttl) == false);
+    assert(tinydns_record_currently_valid(&rec, now, "us", NULL, NULL, &eff_ttl) == true);
+    rec.tinydns_loc[0] = 0; rec.tinydns_loc[1] = 0;
+
+    // ECS tag mismatch / match
+    rec.ecs_subnet_tag = "tagA";
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", "tagB", NULL, &eff_ttl) == false);
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", "tagA", NULL, &eff_ttl) == true);
+    rec.ecs_subnet_tag = NULL;
+
+    // BIND location tag mismatch / match
+    rec.bind_location_tag = "locX";
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, "locY", &eff_ttl) == false);
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, "locX", &eff_ttl) == true);
+    rec.bind_location_tag = NULL;
+
+    // Timestamp countdown: future activation (ttd >= now)
+    rec.tinydns_ttd = now + 100;
+    rec.tinydns_ttl_countdown = false;
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+
+    // Timestamp countdown: past activation (ttd < now)
+    rec.tinydns_ttd = now - 100;
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
+    assert(eff_ttl == 300);
+
+    // Countdown TTL: expired
+    rec.tinydns_ttl_countdown = true;
+    rec.tinydns_ttd = now - 10;
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == false);
+
+    // Countdown TTL: remaining < 2s clamped to 2s
+    rec.tinydns_ttd = now + 1;
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
+    assert(eff_ttl == 2);
+
+    // Countdown TTL: remaining > 3600s clamped to 3600s
+    rec.tinydns_ttd = now + 5000;
+    assert(tinydns_record_currently_valid(&rec, now, "\0\0", NULL, NULL, &eff_ttl) == true);
+    assert(eff_ttl == 3600);
+
+    // 3. collect_additional_rr_glue
+    const char *glue_targets[16] = {0};
+    int glue_count = 0;
+
+    // Minimal responses flag disables collection
+    collect_additional_rr_glue(&rec, glue_targets, &glue_count, true);
+    assert(glue_count == 0);
+
+    // MX record
+    dns_record_t mx_rec;
+    memset(&mx_rec, 0, sizeof(mx_rec));
+    mx_rec.type_code = 15;
+    mx_rec.rdata[0] = "10";
+    mx_rec.rdata[1] = "mail.example.com.";
+    mx_rec.rdata_count = 2;
+    collect_additional_rr_glue(&mx_rec, glue_targets, &glue_count, false);
+    assert(glue_count == 1);
+    assert(strcmp(glue_targets[0], "mail.example.com.") == 0);
+
+    // Duplicate MX target ignored
+    collect_additional_rr_glue(&mx_rec, glue_targets, &glue_count, false);
+    assert(glue_count == 1);
+
+    // SRV record
+    dns_record_t srv_rec;
+    memset(&srv_rec, 0, sizeof(srv_rec));
+    srv_rec.type_code = 33;
+    srv_rec.rdata[0] = "0";
+    srv_rec.rdata[1] = "5";
+    srv_rec.rdata[2] = "5060";
+    srv_rec.rdata[3] = "sip.example.com.";
+    srv_rec.rdata_count = 4;
+    collect_additional_rr_glue(&srv_rec, glue_targets, &glue_count, false);
+    assert(glue_count == 2);
+    assert(strcmp(glue_targets[1], "sip.example.com.") == 0);
+
+    // NS record
+    dns_record_t ns_rec;
+    memset(&ns_rec, 0, sizeof(ns_rec));
+    ns_rec.type_code = 2;
+    ns_rec.rdata[0] = "ns1.example.com.";
+    ns_rec.rdata_count = 1;
+    collect_additional_rr_glue(&ns_rec, glue_targets, &glue_count, false);
+    assert(glue_count == 3);
+
+    // 4. append_glue_records NO-OP paths
+    uint8_t dummy_res[512];
+    uint16_t dummy_off = 0, dummy_ar = 0;
+    compress_ctx_t comp;
+    compress_ctx_init(&comp);
+    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL) == true);
+
+    // 5. record_observatory_response
+    zone_db_entry_t obs_entry;
+    memset(&obs_entry, 0, sizeof(obs_entry));
+    record_observatory_response(NULL, 0, 1);
+    record_observatory_response(&obs_entry, 0, 1); // noerror
+    assert(atomic_load_explicit(&obs_entry.observatory.responses_noerror, memory_order_relaxed) == 1);
+    record_observatory_response(&obs_entry, 0, 0); // nodata
+    assert(atomic_load_explicit(&obs_entry.observatory.responses_nodata, memory_order_relaxed) == 1);
+    record_observatory_response(&obs_entry, 3, 0); // nxdomain
+    assert(atomic_load_explicit(&obs_entry.observatory.responses_nxdomain, memory_order_relaxed) == 1);
+    record_observatory_response(&obs_entry, 2, 0); // servfail
+    assert(atomic_load_explicit(&obs_entry.observatory.responses_servfail, memory_order_relaxed) == 1);
+    record_observatory_response(&obs_entry, 5, 0); // refused
+    assert(atomic_load_explicit(&obs_entry.observatory.responses_refused, memory_order_relaxed) == 1);
+
+    // 6. select_view
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.view_count = 2;
+    view_snapshot_t views[2];
+    memset(views, 0, sizeof(views));
+    views[0].name = "internal";
+    char *internal_cidr[1] = { "192.168.1.0/24" };
+    views[0].match_clients = internal_cidr;
+    views[0].match_clients_count = 1;
+
+    views[1].name = "default";
+    views[1].match_clients = NULL;
+    views[1].match_clients_count = 0;
+    snap.views = views;
+
+    view_snapshot_t *sel1 = select_view(&snap, "192.168.1.50");
+    assert(sel1 == &views[0]);
+
+    view_snapshot_t *sel2 = select_view(&snap, "203.0.113.1");
+    assert(sel2 == &views[1]);
+
+
+    // 7. build_zone_response_cache
+    zone_arena_t test_arena;
+    zone_arena_init(&test_arena);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.wire_cache_max_records = 100;
+    build_zone_response_cache(&test_arena, &cfg, "example.com.");
+    zone_arena_destroy(&test_arena);
+
+    printf("  -> Query engine helpers & edge cases passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -1412,7 +1575,9 @@ int main(void) {
     test_nsec3_hashing_and_intervals();
     test_delegation_referral_and_ds_handling();
     test_program_plugins_and_forward_zone_helpers();
+    test_query_engine_helpers_and_edge_cases();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
+
 

@@ -45,9 +45,44 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                   uint8_t ecs_source_prefix,
                   uint8_t *out_ecs_scope_prefix);
 
+typedef struct resolve_checkpoint {
+    uint16_t offset;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+} resolve_checkpoint_t;
+
 void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *domain);
 
 #ifdef KARIDNS_UNIT_TEST
+void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
+
+                        uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
+bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
+                                    const char client_loc[2],
+                                    const char *client_ecs_tag,
+                                    const char *client_loc_tag,
+                                    uint32_t *effective_ttl_out);
+bool append_glue_records(zone_arena_t *current_zone, const char *target,
+                         const char *zone_apex, uint8_t *res,
+                         size_t max_res_len, uint16_t *offset,
+                         compress_ctx_t *comp_ctx, uint16_t *arcount,
+                         const char client_loc[2],
+                         const char *client_ecs_tag,
+                         const char *client_loc_tag,
+                         additional_from_auth_t policy,
+                         view_snapshot_t *view);
+void collect_additional_rr_glue(dns_record_t *rec,
+                                const char *glue_targets[16],
+                                int *glue_target_count,
+                                bool minimal_responses);
+bool name_exists_in_zone(zone_arena_t *zone, const char *name,
+                         const char client_loc[2], const char *client_ecs_tag,
+                         const char *client_loc_tag);
+const char *find_closest_encloser(zone_arena_t *zone, const char *qname,
+                                  const char *zone_apex, const char client_loc[2],
+                                  const char *client_ecs_tag,
+                                  const char *client_loc_tag);
 size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire);
 bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
@@ -93,6 +128,8 @@ int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_le
 bool nsec_covers_name(const dns_record_t *rec, const char *name);
 dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
 bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out);
+void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount);
 #endif
 
 #endif /* DNS_QUERY_ENGINE_H */
+

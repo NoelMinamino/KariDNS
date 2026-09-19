@@ -258,10 +258,33 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     printf("  -> Snapshot RCU lifecycle & suffix lookup passed.\n");
 }
 
+static void test_capsicum_sandbox_execution(void) {
+    printf("[TEST] Priv Sandbox: enter_capsicum_sandbox in child process...\n");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(sv[0]);
+            g_dnstap_sock = sv[1];
+            enter_capsicum_sandbox();
+            bool enabled = atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire);
+            _exit(enabled ? 0 : 1);
+        }
+        close(sv[0]);
+        close(sv[1]);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    printf("  -> enter_capsicum_sandbox passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Sandbox & Snapshot RCU Engine Unit Tests ===\n");
     test_priv_sandbox_directory_caching();
     test_snapshot_rcu_lifecycle_and_suffix_lookup();
+    test_capsicum_sandbox_execution();
     printf("=== All Sandbox & Snapshot RCU Engine Unit Tests PASSED ===\n");
     return 0;
 }
+

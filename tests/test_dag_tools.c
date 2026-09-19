@@ -406,6 +406,20 @@ static void test_dag_transport_helpers(void) {
         "Content-Length: 0\r\n\r\n";
     assert(decode_http_response_body((const uint8_t *)http_404, strlen(http_404), resp_dec, sizeof(resp_dec)) == -1);
 
+    // 5. send_proxyv2_if_enabled
+    query_opts_t no_proxy_qo;
+    memset(&no_proxy_qo, 0, sizeof(no_proxy_qo));
+    no_proxy_qo.use_proxy = false;
+    send_proxyv2_if_enabled(-1, &no_proxy_qo, true);
+
+    // 6. set_socket_timeouts
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0) {
+        set_socket_timeouts(fds[0], 2);
+        close(fds[0]);
+        close(fds[1]);
+    }
+
     printf("  -> DAG transport helpers passed.\n");
 }
 
@@ -422,4 +436,5 @@ int main(void) {
     printf("=== All DAG Tools Unit Tests PASSED ===\n");
     return 0;
 }
+
 

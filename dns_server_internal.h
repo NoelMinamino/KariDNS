@@ -478,7 +478,18 @@ void *async_io_worker_func(void *arg);
 void reload_all_zones(void);
 void perform_config_reload(void);
 void perform_config_reload_ext(bool skip_unchanged);
+void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
+void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
+                     const char *qname, uint16_t qclass, uint16_t qtype,
+                     bool has_edns, bool dnssec_ok, uint8_t protocol,
+                     uint32_t max_qps);
+void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg,
+                               zone_observatory_snapshot_t *out);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
+void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 #endif
+
 
 extern config_rcu_t g_config_db;
 extern int g_control_sock;

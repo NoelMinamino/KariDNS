@@ -82,20 +82,14 @@ static bool is_non_data_rrtype(uint16_t t) {
     }
 }
 
-typedef struct {
-    uint16_t offset;
-    uint16_t ancount;
-    uint16_t nscount;
-    uint16_t arcount;
-} resolve_checkpoint_t;
-
 static resolve_checkpoint_t save_checkpoint(uint16_t *offset, uint16_t *ancount,
+
                                              uint16_t *nscount, uint16_t *arcount) {
     resolve_checkpoint_t cp = { *offset, *ancount, *nscount, *arcount };
     return cp;
 }
 
-static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
+STATIC_TEST void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                                 uint16_t *ancount, uint16_t *nscount, uint16_t *arcount) {
     *offset = cp->offset;
     *ancount = cp->ancount;
@@ -110,11 +104,11 @@ static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
  *
  * rec->tinydns_ttd == 0 かつ location未指定・ECSタグ未指定・LOCATIONタグ未指定の場合(制限のないレコード)
  * は即座にtrueを返す。 */
-static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
-                                                   const char client_loc[2],
-                                                   const char *client_ecs_tag,
-                                                   const char *client_loc_tag,
-                                                   uint32_t *effective_ttl_out) {
+STATIC_TEST bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
+                                                const char client_loc[2],
+                                                const char *client_ecs_tag,
+                                                const char *client_loc_tag,
+                                                uint32_t *effective_ttl_out) {
     if (rec->tinydns_loc[0] != 0 || rec->tinydns_loc[1] != 0) {
         if (rec->tinydns_loc[0] != client_loc[0] || rec->tinydns_loc[1] != client_loc[1]) {
             return false;
@@ -151,15 +145,16 @@ static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_
     return true;
 }
 
-static bool append_glue_records(zone_arena_t *current_zone, const char *target,
-                                const char *zone_apex, uint8_t *res,
-                                size_t max_res_len, uint16_t *offset,
-                                compress_ctx_t *comp_ctx, uint16_t *arcount,
-                                const char client_loc[2],
-                                const char *client_ecs_tag,
-                                const char *client_loc_tag,
-                                additional_from_auth_t policy,
-                                view_snapshot_t *view) {
+STATIC_TEST bool append_glue_records(zone_arena_t *current_zone, const char *target,
+                                     const char *zone_apex, uint8_t *res,
+                                     size_t max_res_len, uint16_t *offset,
+                                     compress_ctx_t *comp_ctx, uint16_t *arcount,
+                                     const char client_loc[2],
+                                     const char *client_ecs_tag,
+                                     const char *client_loc_tag,
+                                     additional_from_auth_t policy,
+                                     view_snapshot_t *view) {
+
   if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
 
   // 1. Fast path: check prelinked glue
@@ -325,7 +320,7 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
   return true;
 }
 
-static void collect_additional_rr_glue(dns_record_t *rec,
+STATIC_TEST void collect_additional_rr_glue(dns_record_t *rec,
                                        const char *glue_targets[16],
                                        int *glue_target_count,
                                        bool minimal_responses) {
@@ -406,7 +401,7 @@ STATIC_TEST dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *nam
   return NULL;
 }
 
-static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
+STATIC_TEST bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
   size_t name_len = strlen(name);
   time_t tinydns_now = (zone && zone->is_tinydns_format) ? time(NULL) : 0;
@@ -449,7 +444,7 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char
   return false;
 }
 
-static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
+STATIC_TEST const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
     return zone_apex;
   const char *parent = qname;
@@ -475,6 +470,7 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
   }
   return zone_apex;
 }
+
 
 static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
@@ -3549,7 +3545,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   return offset;
 }
 
-static inline void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount) {
+STATIC_TEST void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount) {
     if (!entry) return;
     if (rcode == 0) {
         if (ancount == 0) {
