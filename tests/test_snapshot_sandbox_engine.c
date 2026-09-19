@@ -268,7 +268,7 @@ static void test_capsicum_sandbox_execution(void) {
             g_dnstap_sock = sv[1];
             enter_capsicum_sandbox();
             bool enabled = atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire);
-            _exit(enabled ? 0 : 1);
+            exit(enabled ? 0 : 1);
         }
         close(sv[0]);
         close(sv[1]);
@@ -276,6 +276,9 @@ static void test_capsicum_sandbox_execution(void) {
         waitpid(pid, &status, 0);
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
+    // Also test in main test process
+    enter_capsicum_sandbox();
+    assert(atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire) == true);
     printf("  -> enter_capsicum_sandbox passed.\n");
 }
 
