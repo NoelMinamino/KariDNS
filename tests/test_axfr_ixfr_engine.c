@@ -629,6 +629,63 @@ static void test_handle_axfr_event_and_worker_thread(void) {
     printf("  -> handle_axfr_event & axfr_worker_thread passed.\n");
 }
 
+static void test_axfr_bg_thread_and_free_ixfr_txn(void) {
+    printf("[TEST] AXFR/IXFR: axfr_bg_thread_func & free_ixfr_txn...\n");
+
+    // 1. free_ixfr_txn with populated additions and deletions
+    ixfr_txn_t *txn = calloc(1, sizeof(ixfr_txn_t));
+    zone_arena_init(&txn->arena);
+    txn->old_serial = 100;
+    txn->new_serial = 200;
+    txn->added_count = 2;
+    txn->added = calloc(2, sizeof(dns_record_t));
+    txn->added[0].name = arena_strdup(&txn->arena, "add1.example.");
+    txn->added[1].name = arena_strdup(&txn->arena, "add2.example.");
+    txn->deleted_count = 1;
+    txn->deleted = calloc(1, sizeof(dns_record_t));
+    txn->deleted[0].name = arena_strdup(&txn->arena, "del1.example.");
+
+    free_ixfr_txn(txn);
+    free_ixfr_txn(NULL);
+
+    // 2. axfr_bg_thread_func with invalid master IP -> exits immediately
+    axfr_bg_ctx_t *ctx_bad_ip = calloc(1, sizeof(axfr_bg_ctx_t));
+    strlcpy(ctx_bad_ip->master_ip, "999.999.999.999", sizeof(ctx_bad_ip->master_ip));
+    ctx_bad_ip->master_port = 53;
+    strlcpy(ctx_bad_ip->domain, "test.example.", sizeof(ctx_bad_ip->domain));
+
+    pthread_t th1;
+    assert(pthread_create(&th1, NULL, axfr_bg_thread_func, ctx_bad_ip) == 0);
+    pthread_join(th1, NULL);
+
+    // 3. axfr_bg_thread_func with valid IPv4, TSIG enabled, but broker_connect fails
+    axfr_bg_ctx_t *ctx_tsig = calloc(1, sizeof(axfr_bg_ctx_t));
+    strlcpy(ctx_tsig->master_ip, "127.0.0.1", sizeof(ctx_tsig->master_ip));
+    ctx_tsig->master_port = 5353;
+    strlcpy(ctx_tsig->domain, "tsig.example.", sizeof(ctx_tsig->domain));
+    ctx_tsig->has_tsig = true;
+    strlcpy(ctx_tsig->tsig_name, "test-key", sizeof(ctx_tsig->tsig_name));
+    strlcpy(ctx_tsig->tsig_algorithm, "hmac-sha256", sizeof(ctx_tsig->tsig_algorithm));
+    memcpy(ctx_tsig->tsig_secret_decoded, "secret1234567890", 16);
+    ctx_tsig->tsig_secret_decoded_len = 16;
+
+    pthread_t th2;
+    assert(pthread_create(&th2, NULL, axfr_bg_thread_func, ctx_tsig) == 0);
+    pthread_join(th2, NULL);
+
+    // 4. axfr_bg_thread_func with IPv6
+    axfr_bg_ctx_t *ctx_v6 = calloc(1, sizeof(axfr_bg_ctx_t));
+    strlcpy(ctx_v6->master_ip, "::1", sizeof(ctx_v6->master_ip));
+    ctx_v6->master_port = 5353;
+    strlcpy(ctx_v6->domain, "ipv6.example.", sizeof(ctx_v6->domain));
+
+    pthread_t th3;
+    assert(pthread_create(&th3, NULL, axfr_bg_thread_func, ctx_v6) == 0);
+    pthread_join(th3, NULL);
+
+    printf("  -> axfr_bg_thread_func & free_ixfr_txn passed.\n");
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_compute_ixfr_diff();
@@ -636,6 +693,7 @@ int main(void) {
     test_parse_xfr_packet();
     test_send_axfr_response_ixfr_and_extended();
     test_handle_axfr_event_and_worker_thread();
+    test_axfr_bg_thread_and_free_ixfr_txn();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }

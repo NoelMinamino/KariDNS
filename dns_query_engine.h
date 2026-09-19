@@ -90,6 +90,9 @@ ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         uint32_t timeout_ms);
 int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                           uint8_t *res, size_t max_res_len);
+bool nsec_covers_name(const dns_record_t *rec, const char *name);
+dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
+bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out);
 #endif
 
 #endif /* DNS_QUERY_ENGINE_H */

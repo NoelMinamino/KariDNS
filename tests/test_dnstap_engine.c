@@ -383,6 +383,77 @@ static void test_dnstap_handshake(void) {
     printf("  -> dnstap handshake passed.\n");
 }
 
+static void test_dnstap_sender_thread(void) {
+    printf("[TEST] DNSTAP: dnstap_sender_thread_func event draining & write failure...\n");
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    g_dnstap_sock = sv[0];
+    atomic_store_explicit(&g_dnstap_connected, true, memory_order_release);
+
+    worker_ctx_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.dnstap_ring.size = 16;
+    worker.dnstap_ring.mask = 15;
+    worker.dnstap_ring.events = calloc(16, sizeof(dnstap_event_t));
+    atomic_init(&worker.dnstap_ring.head, 0);
+    atomic_init(&worker.dnstap_ring.tail, 0);
+    atomic_init(&worker.dnstap_ring.dropped, 0);
+
+    atomic_store_explicit(&g_worker_ctxs, &worker, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 1, memory_order_release);
+
+    memset(&g_aux_dnstap_ring, 0, sizeof(g_aux_dnstap_ring));
+    g_aux_dnstap_ring.size = 16;
+    g_aux_dnstap_ring.mask = 15;
+    g_aux_dnstap_ring.events = calloc(16, sizeof(dnstap_aux_event_t));
+    atomic_init(&g_aux_dnstap_ring.head, 0);
+    atomic_init(&g_aux_dnstap_ring.tail, 0);
+    atomic_init(&g_aux_dnstap_ring.dropped, 0);
+
+    // Push an event to worker ring
+    uint8_t wire[12] = {0x12, 0x34, 0x01, 0x00, 0x00, 0x01};
+    struct sockaddr_in caddr;
+    memset(&caddr, 0, sizeof(caddr));
+    caddr.sin_family = AF_INET;
+    caddr.sin_port = htons(12345);
+    inet_pton(AF_INET, "127.0.0.1", &caddr.sin_addr);
+
+    write_dnstap_event(&worker, 1, wire, sizeof(wire),
+                       (struct sockaddr_storage *)&caddr, sizeof(caddr),
+                       NULL, false, IPPROTO_UDP);
+
+    // Push an event to aux ring
+    write_dnstap_event(NULL, 2, wire, sizeof(wire),
+                       (struct sockaddr_storage *)&caddr, sizeof(caddr),
+                       NULL, false, IPPROTO_TCP);
+
+    pthread_t th;
+    assert(pthread_create(&th, NULL, dnstap_sender_thread_func, NULL) == 0);
+
+    // Read the frames written to sv[1]
+    uint8_t frame_buf[4096];
+    ssize_t n = recv(sv[1], frame_buf, sizeof(frame_buf), 0);
+    assert(n > 4); // Frame streams control/data frame
+
+    // Test write failure handling by closing receiver side
+    close(sv[1]);
+    usleep(30000); // allow sender thread loop to encounter write error and mark disconnected
+
+    pthread_cancel(th);
+    pthread_join(th, NULL);
+
+    free(worker.dnstap_ring.events);
+    free(g_aux_dnstap_ring.events);
+    memset(&g_aux_dnstap_ring, 0, sizeof(g_aux_dnstap_ring));
+    atomic_store_explicit(&g_worker_ctxs, NULL, memory_order_release);
+    atomic_store_explicit(&g_worker_count, 0, memory_order_release);
+
+    // Error path tests for handshake
+    assert(dnstap_connect_and_handshake("/nonexistent/dnstap_invalid_path.sock", "id", "1.0") == -1);
+
+    printf("  -> dnstap sender thread passed.\n");
+}
+
 int main(void) {
     printf("=== Starting DNSTAP Engine Unit Tests ===\n");
     test_protobuf_encoders();
@@ -391,6 +462,7 @@ int main(void) {
     test_dnstap_send_frame_socketpair();
     test_dnstap_rings_and_queuing();
     test_dnstap_handshake();
+    test_dnstap_sender_thread();
     printf("=== All DNSTAP Engine Unit Tests PASSED ===\n");
     return 0;
 }

@@ -1,3 +1,9 @@
+#define OPENSSL_SUPPRESS_DEPRECATED 1
+#ifdef KARIDNS_UNIT_TEST
+#define STATIC_TEST
+#else
+#define STATIC_TEST static
+#endif
 #include "dns_catalog_zone.h"
 
 uint32_t calc_catalog_member_hash(const char *domain, const char *unique_id) {
@@ -82,7 +88,7 @@ static void normalize_domain_fqdn_local(const char *in, char *out, size_t out_ca
     }
 }
 
-static void free_catalog_desired_list(catalog_member_id_t *list, int count) {
+STATIC_TEST void free_catalog_desired_list(catalog_member_id_t *list, int count) {
     if (!list) return;
     for (int i = 0; i < count; i++) {
         if (list[i].groups) {

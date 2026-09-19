@@ -15,11 +15,20 @@
 #include "tools/dag_tcp_reassembly.h"
 #include "tools/dag_tsig_client.h"
 #include "tools/dag_replay.h"
+#include "tools/dag_transport.h"
 
 zone_arena_t g_dag_arena;
 bool g_dag_suppress_stdout = false;
+char g_last_server_ip[INET6_ADDRSTRLEN + 1] = {0};
 static int g_reasm_msg_count = 0;
 static size_t g_last_reasm_len = 0;
+
+bool has_break(break_kind_t kind, long *param_out, bool *has_param_out) {
+    (void)kind;
+    if (param_out) *param_out = 0;
+    if (has_param_out) *has_param_out = false;
+    return false;
+}
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
     (void)mode;
@@ -303,6 +312,103 @@ static void test_dag_internal_helpers(void) {
     printf("  -> dag_strcasestr passed.\n");
 }
 
+static void test_dag_transport_helpers(void) {
+    printf("[TEST] DAG Tools: proxyv2 & transport address resolution...\n");
+
+    // 1. parse_proxy_arg
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    assert(parse_proxy_arg(NULL, &qo) == true);
+    assert(qo.proxy_use_local_cmd == true);
+
+    memset(&qo, 0, sizeof(qo));
+    assert(parse_proxy_arg("192.0.2.1#12345-198.51.100.1#53", &qo) == true);
+    assert(qo.proxy_family == AF_INET);
+    assert(qo.proxy_src_port == 12345);
+    assert(qo.proxy_dst_port == 53);
+    assert(strcmp(qo.proxy_src_addr, "192.0.2.1") == 0);
+    assert(strcmp(qo.proxy_dst_addr, "198.51.100.1") == 0);
+
+    memset(&qo, 0, sizeof(qo));
+    assert(parse_proxy_arg("2001:db8::1#54321-2001:db8::2#53", &qo) == true);
+    assert(qo.proxy_family == AF_INET6);
+    assert(qo.proxy_src_port == 54321);
+    assert(qo.proxy_dst_port == 53);
+
+    memset(&qo, 0, sizeof(qo));
+    assert(parse_proxy_arg("invalid_format_no_dash", &qo) == false);
+    assert(parse_proxy_arg("not_an_ip-192.0.2.1", &qo) == false);
+
+    // 2. build_proxyv2_header
+    uint8_t pbuf[128];
+    qo.use_proxy = false;
+    assert(build_proxyv2_header(pbuf, sizeof(pbuf), &qo, true) == 0);
+
+    qo.use_proxy = true;
+    qo.proxy_use_local_cmd = true;
+    size_t plen_loc = build_proxyv2_header(pbuf, sizeof(pbuf), &qo, true);
+    assert(plen_loc == 16);
+
+    qo.proxy_use_local_cmd = false;
+    qo.proxy_family = AF_INET;
+    size_t plen_v4_tcp = build_proxyv2_header(pbuf, sizeof(pbuf), &qo, true);
+    assert(plen_v4_tcp == 28);
+    size_t plen_v4_udp = build_proxyv2_header(pbuf, sizeof(pbuf), &qo, false);
+    assert(plen_v4_udp == 28);
+
+    qo.proxy_family = AF_INET6;
+    size_t plen_v6 = build_proxyv2_header(pbuf, sizeof(pbuf), &qo, true);
+    assert(plen_v6 == 52);
+
+    assert(build_proxyv2_header(pbuf, 10, &qo, true) == 0); // buffer cap < 52
+
+    // 3. resolve_server_addr & get_server_addr_count
+    struct sockaddr_storage dest;
+    socklen_t dlen = 0;
+    int fam = 0;
+    assert(resolve_server_addr("127.0.0.1", 53, AF_INET, &dest, &dlen, &fam, true) == true);
+    assert(fam == AF_INET);
+    assert(dlen == sizeof(struct sockaddr_in));
+
+    assert(resolve_server_addr("::1", 53, AF_INET6, &dest, &dlen, &fam, true) == true);
+    assert(fam == AF_INET6);
+    assert(dlen == sizeof(struct sockaddr_in6));
+
+    assert(get_server_addr_count("127.0.0.1", 53, AF_INET) == 1);
+    assert(get_server_addr_count("::1", 53, AF_INET6) == 1);
+
+    // 4. decode_http_response_body (Content-Length)
+    const char *hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: 12\r\n\r\n";
+    size_t hdr_len = strlen(hdr);
+    uint8_t http_200_cl[256];
+    memcpy(http_200_cl, hdr, hdr_len);
+    uint8_t dns_body[12] = {0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+    memcpy(http_200_cl + hdr_len, dns_body, 12);
+    size_t total_http_len = hdr_len + 12;
+
+    uint8_t resp_dec[512];
+    ssize_t dec_len = decode_http_response_body(http_200_cl, total_http_len, resp_dec, sizeof(resp_dec));
+    assert(dec_len == 12);
+    assert(resp_dec[0] == 0x12 && resp_dec[1] == 0x34);
+
+    // Chunked transfer decoding
+    const char *chunk_hdr = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n123456\r\n6\r\nabcdef\r\n0\r\n\r\n";
+    ssize_t chunk_dec_len = decode_http_response_body((const uint8_t *)chunk_hdr, strlen(chunk_hdr), resp_dec, sizeof(resp_dec));
+    assert(chunk_dec_len == 12);
+    assert(memcmp(resp_dec, "123456abcdef", 12) == 0);
+
+    // Incomplete HTTP header
+    assert(decode_http_response_body((const uint8_t *)"HTTP/1.1 200 OK\r\n", 17, resp_dec, sizeof(resp_dec)) == -1);
+
+    // Non-200 HTTP response
+    const char *http_404 =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: 0\r\n\r\n";
+    assert(decode_http_response_body((const uint8_t *)http_404, strlen(http_404), resp_dec, sizeof(resp_dec)) == -1);
+
+    printf("  -> DAG transport helpers passed.\n");
+}
+
 int main(void) {
     printf("=== Starting DAG Tools Unit Tests ===\n");
     zone_arena_init(&g_dag_arena);
@@ -310,6 +416,7 @@ int main(void) {
     test_dag_sig0_client_keys();
     test_dag_tsig_client_parser();
     test_dag_replay_and_pcap_parsing();
+    test_dag_transport_helpers();
     test_dag_internal_helpers();
     zone_arena_destroy(&g_dag_arena);
     printf("=== All DAG Tools Unit Tests PASSED ===\n");

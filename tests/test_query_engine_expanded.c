@@ -1351,6 +1351,49 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     memset(&no_prog_cfg, 0, sizeof(no_prog_cfg));
     spawn_program_zone_plugins(&no_prog_cfg);
 
+    // 9. spawn_one_program_plugin with NULL path -> false
+    zone_config_t null_prog_cfg;
+    memset(&null_prog_cfg, 0, sizeof(null_prog_cfg));
+    null_prog_cfg.domain = "null.prog.";
+    program_plugin_t null_out;
+    assert(spawn_one_program_plugin(&null_prog_cfg, &null_out) == false);
+
+    // 10. nsec_covers_name & find_covering_nsec
+    zone_arena_t nsec_arena;
+    zone_arena_init(&nsec_arena);
+    dns_record_t nsec1; memset(&nsec1, 0, sizeof(nsec1));
+    nsec1.name = arena_strdup(&nsec_arena, "a.example.");
+    nsec1.type_code = 47;
+    nsec1.rdata_count = 1;
+    nsec1.rdata[0] = arena_strdup(&nsec_arena, "m.example.");
+
+    dns_record_t nsec2; memset(&nsec2, 0, sizeof(nsec2));
+    nsec2.name = arena_strdup(&nsec_arena, "m.example.");
+    nsec2.type_code = 47;
+    nsec2.rdata_count = 1;
+    nsec2.rdata[0] = arena_strdup(&nsec_arena, "a.example."); // wrap-around
+
+    assert(nsec_covers_name(&nsec1, "b.example.") == true);
+    assert(nsec_covers_name(&nsec1, "z.example.") == false);
+    assert(nsec_covers_name(&nsec2, "z.example.") == true); // wrap-around covers z
+    assert(nsec_covers_name(NULL, "b.example.") == false);
+
+    nsec_arena.records = calloc(2, sizeof(dns_record_t));
+    nsec_arena.records[0] = nsec1;
+    nsec_arena.records[1] = nsec2;
+    nsec_arena.count = 2;
+
+    dns_record_t *cov = find_covering_nsec(&nsec_arena, "b.example.");
+    assert(cov != NULL && strcmp(cov->name, "a.example.") == 0);
+
+    dns_record_t *cov_wrap = find_covering_nsec(&nsec_arena, "z.example.");
+    assert(cov_wrap != NULL && strcmp(cov_wrap->name, "m.example.") == 0);
+
+    assert(find_covering_nsec(NULL, "b.example.") == NULL);
+    assert(find_covering_nsec(&nsec_arena, NULL) == NULL);
+
+    zone_arena_destroy(&nsec_arena);
+
     printf("  -> Program plugin & forward zone helpers passed.\n");
 }
 

@@ -353,7 +353,7 @@ static void collect_additional_rr_glue(dns_record_t *rec,
   }
 }
 
-static bool nsec_covers_name(const dns_record_t *rec, const char *name) {
+STATIC_TEST bool nsec_covers_name(const dns_record_t *rec, const char *name) {
   if (!rec || rec->type_code != 47 || rec->rdata_count < 1 || !rec->rdata[0] ||
       !rec->name || !name)
     return false;
@@ -369,7 +369,7 @@ static bool nsec_covers_name(const dns_record_t *rec, const char *name) {
   }
 }
 
-static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
+STATIC_TEST dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
   if (!zone || !name) return NULL;
   if (zone->nsec_records && zone->nsec_count > 0) {
     int low = 0, high = (int)zone->nsec_count - 1;

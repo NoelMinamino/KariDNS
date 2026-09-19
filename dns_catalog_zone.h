@@ -9,4 +9,8 @@ zone_db_entry_t *find_catalog_parent_in_snapshot(view_snapshot_t *view, const ch
 void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, const char *unique_id, const char *domain);
 void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name);
 
+#ifdef KARIDNS_UNIT_TEST
+void free_catalog_desired_list(catalog_member_id_t *list, int count);
+#endif
+
 #endif /* DNS_CATALOG_ZONE_H */

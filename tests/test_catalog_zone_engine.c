@@ -210,11 +210,57 @@ static void test_catalog_process_membership_rfc9432(void) {
     catalog_process_membership(&cat_entry, &cat_cfg, "default");
     assert(cat_entry.catalog_member_count == 0); // Colliding member skipped!
 
+    // 5. Broken catalog: multiple COO PTR records for single member
+    zone_arena_t a_mult_coo;
+    memset(&a_mult_coo, 0, sizeof(a_mult_coo));
+    zone_arena_init(&a_mult_coo);
+    a_mult_coo.records = malloc(sizeof(dns_record_t) * 8);
+    a_mult_coo.records_cap = 8;
+    a_mult_coo.records[a_mult_coo.count++] = r_ver;
+
+    dns_record_t r_m1; memset(&r_m1, 0, sizeof(r_m1));
+    r_m1.name = arena_strdup(&a_mult_coo, "node1.zones.catalog.example.");
+    r_m1.type_code = 12; r_m1.rdata_count = 1;
+    r_m1.rdata[0] = arena_strdup(&a_mult_coo, "member1.example.");
+    a_mult_coo.records[a_mult_coo.count++] = r_m1;
+
+    dns_record_t r_coo1; memset(&r_coo1, 0, sizeof(r_coo1));
+    r_coo1.name = arena_strdup(&a_mult_coo, "coo.node1.zones.catalog.example.");
+    r_coo1.type_code = 12; r_coo1.rdata_count = 1;
+    r_coo1.rdata[0] = arena_strdup(&a_mult_coo, "target1.catalog.");
+    a_mult_coo.records[a_mult_coo.count++] = r_coo1;
+
+    dns_record_t r_coo2; memset(&r_coo2, 0, sizeof(r_coo2));
+    r_coo2.name = arena_strdup(&a_mult_coo, "coo.node1.zones.catalog.example.");
+    r_coo2.type_code = 12; r_coo2.rdata_count = 1;
+    r_coo2.rdata[0] = arena_strdup(&a_mult_coo, "target2.catalog.");
+    a_mult_coo.records[a_mult_coo.count++] = r_coo2;
+
+    atomic_store_explicit(&cat_entry.rcu.active, &a_mult_coo, memory_order_release);
+    catalog_process_membership(&cat_entry, &cat_cfg, "default");
+    assert(cat_entry.catalog_member_count == 0); // Multiple coo records rejected!
+
+    // 6. NULL catalog parameters
+    catalog_process_membership(NULL, &cat_cfg, "default");
+    catalog_process_membership(&cat_entry, NULL, "default");
+    atomic_store_explicit(&cat_entry.rcu.active, NULL, memory_order_release);
+    catalog_process_membership(&cat_entry, &cat_cfg, "default");
+
+    // 7. Direct free_catalog_desired_list testing
+    free_catalog_desired_list(NULL, 0);
+    catalog_member_id_t *test_des = calloc(2, sizeof(catalog_member_id_t));
+    test_des[0].group_count = 2;
+    test_des[0].groups = calloc(2, sizeof(char *));
+    test_des[0].groups[0] = strdup("grpA");
+    test_des[0].groups[1] = strdup("grpB");
+    free_catalog_desired_list(test_des, 2);
+
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
     zone_arena_destroy(&a_no_ver);
     zone_arena_destroy(&a_dup_ptr);
     zone_arena_destroy(&a_dup_target);
     zone_arena_destroy(&a_static_col);
+    zone_arena_destroy(&a_mult_coo);
 
     printf("  -> catalog_process_membership validations passed.\n");
 }
