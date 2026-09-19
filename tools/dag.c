@@ -519,14 +519,9 @@ static void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rd
 
     if (dopt && !dopt->yaml && dopt->multiline) {
         sink_printf(sink, "%u %u %u (\n", flags, protocol, algorithm);
-        int split_w = (dopt->split_width > 0) ? dopt->split_width : 44;
-        for (int i = 0; i < n; i += split_w) {
-            sink_printf(sink, "\t\t\t\t\t%.*s\n", (n - i) < split_w ? (n - i) : split_w, b64 + i);
-        }
-        if (dopt->rrcomments || dopt->multiline) {
-            sink_printf(sink, "\t\t\t\t\t) ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
-        } else {
-            sink_printf(sink, "\t\t\t\t\t)");
+        sink_multiline_b64(sink, b64, n, dopt->split_width);
+        if (dopt->rrcomments) {
+            sink_printf(sink, " ; %s; alg = %s ; key id = %u", is_ksk ? "KSK" : "ZSK", alg_name, keytag);
         }
     } else {
         sink_printf(sink, "%u %u %u ", flags, protocol, algorithm);

@@ -193,7 +193,39 @@ static void test_dag_sig0_client_keys(void) {
     if (key_ec.signer_name) free((void *)key_ec.signer_name);
     unlink(tmp_ec);
 
-    // 3. Invalid file paths
+    // 3. Synthetic BIND RSA .private key (alg 8)
+    char tmp_rsa[] = "/tmp/Kexample.com.+008+12345.private";
+    fd = open(tmp_rsa, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        strcpy(tmp_rsa, "Kexample.com.+008+12345.private");
+        fd = open(tmp_rsa, O_CREAT | O_RDWR, 0600);
+    }
+    assert(fd >= 0);
+    const char rsa_content[] =
+        "Private-key-format: v1.3\n"
+        "Algorithm: 8 (RSASHA256)\n"
+        "Modulus: o3gQjF4y3mS31M4q0y5Q5mS31M4q0y5Q5mS31M4q0y4=\n"
+        "PublicExponent: AQAB\n"
+        "PrivateExponent: o3gQjF4y3mS31M4q0y5Q5mS31M4q0y5Q5mS31M4q0y4=\n"
+        "Prime1: o3gQjF4y3mS31M4q0y5Q5w==\n"
+        "Prime2: o3gQjF4y3mS31M4q0y5Q5w==\n"
+        "Exponent1: o3gQjF4y3mS31M4q0y5Q5w==\n"
+        "Exponent2: o3gQjF4y3mS31M4q0y5Q5w==\n"
+        "Coefficient: o3gQjF4y3mS31M4q0y5Q5w==\n";
+    write(fd, rsa_content, strlen(rsa_content));
+    close(fd);
+
+    sig0_key_t key_rsa;
+    memset(&key_rsa, 0, sizeof(key_rsa));
+    bool ok_rsa = load_bind_sig0_private_key(tmp_rsa, &key_rsa);
+    assert(ok_rsa == true);
+    assert(key_rsa.algorithm == 8);
+    assert(key_rsa.pkey != NULL);
+    if (key_rsa.pkey) EVP_PKEY_free(key_rsa.pkey);
+    if (key_rsa.signer_name) free((void *)key_rsa.signer_name);
+    unlink(tmp_rsa);
+
+    // 4. Invalid file paths
     sig0_key_t key_bad;
     memset(&key_bad, 0, sizeof(key_bad));
     assert(load_bind_sig0_private_key("/nonexistent/file.private", &key_bad) == false);
@@ -294,6 +326,9 @@ static void test_dag_replay_and_pcap_parsing(void) {
     diff_dns_responses(resp1, sizeof(resp1), resp2, sizeof(resp2), true, &diff_res);
     assert(diff_res.match == true);
     assert(diff_res.diff_flags == 0);
+
+    // 3. parse_dnstap_data_frame
+    assert(parse_dnstap_data_frame(NULL, 0, out_dns, &out_dns_len) == false);
 
     printf("  -> PCAP packet parsing & diff passed.\n");
 }
@@ -419,6 +454,10 @@ static void test_dag_transport_helpers(void) {
         close(fds[0]);
         close(fds[1]);
     }
+
+    // 7. do_tls_recv_response with NULL ssl
+    uint8_t t_resp[512];
+    assert(do_tls_recv_response(NULL, t_resp, sizeof(t_resp)) == -1);
 
     printf("  -> DAG transport helpers passed.\n");
 }

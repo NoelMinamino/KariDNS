@@ -16,8 +16,28 @@
 #include "dns_snapshot_rcu.h"
 #include "dns_query_engine.h"
 #include "dns_server_internal.h"
-#include "dns_axfr_ixfr.h"
 #include "dns_dynamic_update.h"
+
+// Prototypes for internal query engine functions under test
+size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire);
+bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
+                        const uint8_t *salt, size_t salt_len,
+                        char *out_b32, size_t out_b32_sz);
+bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
+dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex);
+dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash);
+bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
+bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+                         uint8_t *res, size_t max_res_len, uint16_t *offset,
+                         compress_ctx_t *comp_ctx, uint16_t *nscount,
+                         dns_record_t **attached, int *attached_count);
+bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
+const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
+program_plugin_t *find_program_plugin(const char *domain);
+ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
+                        const uint8_t *query, size_t query_len,
+                        uint8_t *resp_out, size_t resp_out_cap,
+                        uint32_t timeout_ms);
 
 // Mock globals
 int g_control_kq = -1;
@@ -1556,6 +1576,60 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     cfg.wire_cache_max_records = 100;
     build_zone_response_cache(&test_arena, &cfg, "example.com.");
     zone_arena_destroy(&test_arena);
+
+    // 8. name_to_canonical_wire
+    uint8_t cwire[256];
+    size_t cwire_len = name_to_canonical_wire("WWW.Example.COM.", cwire, sizeof(cwire));
+    assert(cwire_len > 0);
+    assert(cwire[0] == 3 && cwire[1] == 'w');
+    assert(name_to_canonical_wire(NULL, cwire, sizeof(cwire)) == 0);
+
+    // 9. compute_nsec3_hash
+    char b32_hash[64];
+    uint8_t salt[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
+    assert(compute_nsec3_hash("example.com.", 1, 1, salt, sizeof(salt), b32_hash, sizeof(b32_hash)) == true);
+    assert(strlen(b32_hash) > 0);
+    assert(compute_nsec3_hash("example.com.", 2 /* invalid algo */, 1, salt, sizeof(salt), b32_hash, sizeof(b32_hash)) == false);
+
+    // 10. nsec3_covers_hash
+    assert(nsec3_covers_hash("AAAA", "CCCC", "BBBB") == true);
+    assert(nsec3_covers_hash("AAAA", "CCCC", "DDDD") == false);
+    assert(nsec3_covers_hash("ZZZZ", "AAAA", "0000") == true); // Wrap-around inside
+    assert(nsec3_covers_hash("ZZZZ", "AAAA", "YYYY") == false); // Wrap-around outside
+    assert(nsec3_covers_hash(NULL, "CCCC", "BBBB") == false);
+
+    // 11. find_next_closer_name
+    char next_closer[256];
+    assert(find_next_closer_name("sub.deep.example.com.", "example.com.", next_closer, sizeof(next_closer)) == true);
+    assert(strcmp(next_closer, "deep.example.com") == 0);
+    assert(find_next_closer_name("example.com.", "example.com.", next_closer, sizeof(next_closer)) == false);
+    assert(find_next_closer_name(NULL, "example.com.", next_closer, sizeof(next_closer)) == false);
+
+    // 12. name_exists_in_zone & find_closest_encloser
+    assert(name_exists_in_zone(NULL, "example.com.", "\0\0", NULL, NULL) == false);
+    assert(strcmp(find_closest_encloser(NULL, "sub.example.com.", "example.com.", "\0\0", NULL, NULL), "example.com.") == 0);
+
+    // 13. find_matching_nsec3 & find_covering_nsec3 on empty arena
+    zone_arena_t nsec3_arena;
+    zone_arena_init(&nsec3_arena);
+    assert(find_matching_nsec3(&nsec3_arena, "AAAA", "example.com.") == NULL);
+    assert(find_covering_nsec3(&nsec3_arena, "AAAA") == NULL);
+    dns_record_t *att[8];
+    int att_count = 0;
+    assert(attach_nsec3_record(&nsec3_arena, NULL, dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, att, &att_count) == true);
+    zone_arena_destroy(&nsec3_arena);
+
+    // 14. find_program_plugin
+    assert(find_program_plugin(NULL) == NULL);
+    assert(find_program_plugin("unknown.domain.invalid.") == NULL);
+
+    // 15. forward_via_tcp
+    struct sockaddr_storage fwd_ss;
+    memset(&fwd_ss, 0, sizeof(fwd_ss));
+    fwd_ss.ss_family = AF_INET;
+    uint8_t qpkt[12] = {0};
+    uint8_t rpkt[512];
+    assert(forward_via_tcp(&fwd_ss, sizeof(struct sockaddr_in), qpkt, sizeof(qpkt), rpkt, sizeof(rpkt), 100) == -1);
 
     printf("  -> Query engine helpers & edge cases passed.\n");
 }

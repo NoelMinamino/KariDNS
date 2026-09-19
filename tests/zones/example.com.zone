@@ -92,7 +92,7 @@ _https._tcp     IN URI 10 1 "https://www.example.com/"
 ; ----------------------------------------------------------------------------
 ; HTTPS / SVCB (RFC 9460)
 ; ----------------------------------------------------------------------------
-@       IN HTTPS 1 . alpn=h2,h3
+@       IN HTTPS 1 . alpn=h2,h3 ipv4hint=192.0.2.1 ipv6hint=2001:db8::1
 www     IN HTTPS 1 . alpn=h2
 
 svc             IN A 192.0.2.40

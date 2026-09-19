@@ -568,6 +568,7 @@ STATIC_TEST bool nsec3_covers_hash(const char *owner_hash, const char *next_hash
 }
 
 STATIC_TEST dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex) {
+    if (!zone || !hash_b32 || !apex || !zone->hash_table || zone->hash_size == 0) return NULL;
     char owner_name[300];
     snprintf(owner_name, sizeof(owner_name), "%s.%s", hash_b32, apex);
     uint32_t h = calc_fnv1a_str(owner_name);
@@ -582,6 +583,7 @@ STATIC_TEST dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *ha
 }
 
 STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash) {
+    if (!zone || !target_hash || !zone->records || zone->count == 0) return NULL;
     for (size_t i = 0; i < zone->count; i++) {
         dns_record_t *rec = &zone->records[i];
         if (rec->type_code == 50 && rec->name && rec->rdata_count >= 5 && rec->rdata[4]) {
@@ -2168,6 +2170,7 @@ STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss
                                const uint8_t *query, size_t query_len,
                                uint8_t *resp_out, size_t resp_out_cap,
                                uint32_t timeout_ms) {
+  if (!ss || !query || !resp_out) return -1;
   int fd = broker_connect(ss->ss_family, SOCK_STREAM, (struct sockaddr *)ss, ss_len);
   if (fd < 0) return -1;
 

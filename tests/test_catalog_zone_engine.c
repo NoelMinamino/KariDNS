@@ -103,6 +103,14 @@ static void test_catalog_hashing_and_bookkeeping(void) {
     assert(cat_entry.catalog_member_count == 1);
     assert(strcmp(cat_entry.catalog_members[0].unique_id, "u3") == 0);
 
+    // Test free_catalog_desired_list
+    free_catalog_desired_list(NULL, 0);
+    catalog_member_id_t *des_list = calloc(2, sizeof(catalog_member_id_t));
+    des_list[0].group_count = 1;
+    des_list[0].groups = malloc(sizeof(char *));
+    des_list[0].groups[0] = strdup("grpA");
+    free_catalog_desired_list(des_list, 2);
+
     free(cat_entry.catalog_members);
     printf("  -> Bookkeeping removal passed.\n");
 }

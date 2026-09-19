@@ -473,6 +473,16 @@ extern async_io_pool_t g_async_io_pool;
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
 extern int g_broker_sock;
+extern int g_num_workers;
+extern int g_num_frontend_routers;
+extern int g_ipc_fds[4][128][2];
+extern pid_t g_supervisor_pid;
+extern int g_pid_fd;
+extern char g_pid_file_path[1024];
+extern volatile sig_atomic_t g_supervisor_should_exit;
+extern volatile sig_atomic_t g_supervisor_got_sighup;
+extern volatile sig_atomic_t g_backend_should_exit;
+
 bool enqueue_async_io_task(const async_io_task_t *task);
 void *async_io_worker_func(void *arg);
 void reload_all_zones(void);
@@ -488,6 +498,13 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg,
 bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
+void backend_sig_handler(int sig);
+void supervisor_sig_handler(int sig);
+void cleanup_pid_file(void);
+void daemonize(void);
+void setup_ipc_tables(int num_workers);
+void run_frontend_router(pid_t backend_pid, int router_id);
+void *worker_thread_func(void *arg);
 #endif
 
 

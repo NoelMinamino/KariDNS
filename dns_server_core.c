@@ -101,9 +101,9 @@ static _Atomic bool g_privilege_drop_complete = false;
 #define MAX_WORKERS 128
 
 // Frontend/Backend IPC用グローバル変数
-static int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
-static int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
-static int g_num_workers = 0;
+STATIC_TEST int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
+STATIC_TEST int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
+STATIC_TEST int g_num_workers = 0;
 char g_startup_cwd[PATH_MAX] = "";
 int g_notify_ipc[2];
 int g_control_sock = -1;
@@ -1195,9 +1195,14 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
 
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
+#ifndef CPU_SETSIZE
+#define CPU_SETSIZE 256
+#endif
   cpuset_t cpuset;
   CPU_ZERO(&cpuset);
-  CPU_SET(ctx->core_id, &cpuset);
+  if (ctx->core_id >= 0 && ctx->core_id < (int)CPU_SETSIZE) {
+    CPU_SET(ctx->core_id, &cpuset);
+  }
   if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(cpuset_t),
                          &cpuset) != 0)
     goto worker_startup_failed;
@@ -3181,10 +3186,13 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
   return num_fds;
 }
 
-__attribute__((unused)) static void run_frontend_router(pid_t backend_pid, int router_id) {
+STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
+  (void)backend_pid;
   cpuset_t cpuset;
   CPU_ZERO(&cpuset);
-  CPU_SET(router_id, &cpuset);
+  if (router_id >= 0 && router_id < (int)CPU_SETSIZE) {
+    CPU_SET(router_id, &cpuset);
+  }
   if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cpuset), &cpuset) < 0) {
     syslog(LOG_WARNING, "[Frontend %d] Failed to set CPU affinity: %m", router_id);
   }
@@ -3764,11 +3772,11 @@ __attribute__((unused)) static void run_frontend_router(pid_t backend_pid, int r
 // 14. メインエントリーポイント & UDP/IPC 初期化
 // ============================================================================
 
-static pid_t g_supervisor_pid = 0;
-static char g_pid_file_path[1024] = "";
-static int g_pid_fd = -1;
-static volatile sig_atomic_t g_supervisor_should_exit = 0;
-static volatile sig_atomic_t g_supervisor_got_sighup = 0;
+STATIC_TEST pid_t g_supervisor_pid = 0;
+STATIC_TEST char g_pid_file_path[1024] = "";
+STATIC_TEST int g_pid_fd = -1;
+STATIC_TEST volatile sig_atomic_t g_supervisor_should_exit = 0;
+STATIC_TEST volatile sig_atomic_t g_supervisor_got_sighup = 0;
 
 #if defined(__FreeBSD__) || defined(__linux__) || defined(__APPLE__)
 #ifdef __clang__
@@ -3776,8 +3784,8 @@ __attribute__((weak)) int __llvm_profile_write_file(void);
 #endif
 #endif
 
-static volatile sig_atomic_t g_backend_should_exit = 0;
-__attribute__((unused)) static void backend_sig_handler(int sig) {
+STATIC_TEST volatile sig_atomic_t g_backend_should_exit = 0;
+STATIC_TEST void backend_sig_handler(int sig) {
   (void)sig;
   g_backend_should_exit = 1;
 #ifdef __clang__
@@ -3785,10 +3793,10 @@ __attribute__((unused)) static void backend_sig_handler(int sig) {
     __llvm_profile_write_file();
   }
 #endif
-  exit(0);
+  _exit(0);
 }
 
-__attribute__((unused)) static void supervisor_sig_handler(int sig) {
+STATIC_TEST void supervisor_sig_handler(int sig) {
   if (sig == SIGHUP) {
     g_supervisor_got_sighup = 1;
   } else {
@@ -3796,7 +3804,7 @@ __attribute__((unused)) static void supervisor_sig_handler(int sig) {
   }
 }
 
-__attribute__((unused)) static void cleanup_pid_file(void) {
+STATIC_TEST void cleanup_pid_file(void) {
   if (g_supervisor_pid != 0 && getpid() == g_supervisor_pid) {
     if (g_pid_fd >= 0) {
       close(g_pid_fd);
@@ -3809,7 +3817,7 @@ __attribute__((unused)) static void cleanup_pid_file(void) {
   }
 }
 
-__attribute__((unused)) static void daemonize(void) {
+STATIC_TEST void daemonize(void) {
   pid_t pid = fork();
   if (pid < 0)
     exit(EXIT_FAILURE);
@@ -3844,7 +3852,7 @@ __attribute__((unused)) static void daemonize(void) {
     cap_rights_limit(stdio_fd, &io_rights);
 }
 
-__attribute__((unused)) static void setup_ipc_tables(int num_workers) {
+STATIC_TEST void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
   server_config_t *cfg = &g_config_db.config_a;
   int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;

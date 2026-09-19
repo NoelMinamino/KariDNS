@@ -1297,6 +1297,96 @@ static void test_meta_types_and_utils_helpers(void) {
     printf("  -> Meta RR types, string & compression helpers passed.\n");
 }
 
+static void test_server_core_process_lifecycle_and_signals(void) {
+    printf("[TEST] Server Core: supervisor/backend signals, daemonize, PID file, router & worker...\n");
+
+    // 1. supervisor_sig_handler
+    g_supervisor_got_sighup = 0;
+    g_supervisor_should_exit = 0;
+    supervisor_sig_handler(SIGHUP);
+    assert(g_supervisor_got_sighup == 1);
+    assert(g_supervisor_should_exit == 0);
+
+    supervisor_sig_handler(SIGTERM);
+    assert(g_supervisor_should_exit == 1);
+
+    // 2. cleanup_pid_file
+    g_supervisor_pid = getpid();
+    snprintf(g_pid_file_path, sizeof(g_pid_file_path), "/tmp/karidns_test_pid_%ld.pid", (long)getpid());
+    g_pid_fd = open(g_pid_file_path, O_CREAT | O_RDWR, 0644);
+    assert(g_pid_fd >= 0);
+    cleanup_pid_file();
+    assert(g_pid_fd == -1);
+    assert(g_pid_file_path[0] == '\0');
+
+    // 3. setup_ipc_tables
+    g_num_frontend_routers = 1;
+    setup_ipc_tables(1);
+    assert(g_ipc_fds[0][0][0] >= 0);
+    assert(g_ipc_fds[0][0][1] >= 0);
+    close(g_ipc_fds[0][0][0]);
+    close(g_ipc_fds[0][0][1]);
+    close(g_notify_ipc[0]);
+    close(g_notify_ipc[1]);
+
+    // 4. backend_sig_handler in child process
+    pid_t cpid1 = fork();
+    assert(cpid1 >= 0);
+    if (cpid1 == 0) {
+        backend_sig_handler(SIGTERM);
+        _exit(1);
+    }
+    int status1 = 0;
+    waitpid(cpid1, &status1, 0);
+    assert(WIFEXITED(status1) && WEXITSTATUS(status1) == 0);
+
+    // 5. daemonize in child process
+    pid_t cpid2 = fork();
+    assert(cpid2 >= 0);
+    if (cpid2 == 0) {
+        daemonize();
+        _exit(0);
+    }
+    int status2 = 0;
+    waitpid(cpid2, &status2, 0);
+    assert(WIFEXITED(status2) && WEXITSTATUS(status2) == 0);
+
+    // 6. worker_thread_func with invalid core affinity in pthread
+    pthread_t w_th;
+    worker_ctx_t dummy_worker;
+    memset(&dummy_worker, 0, sizeof(dummy_worker));
+    dummy_worker.core_id = 999999;
+    int pct = pthread_create(&w_th, NULL, worker_thread_func, &dummy_worker);
+    assert(pct == 0);
+    void *wres = NULL;
+    pthread_join(w_th, &wres);
+    assert(wres == NULL);
+
+    // 7. run_frontend_router in child process
+    pid_t cpid3 = fork();
+    assert(cpid3 >= 0);
+    if (cpid3 == 0) {
+        server_config_t test_cfg;
+        memset(&test_cfg, 0, sizeof(test_cfg));
+        test_cfg.user = "nonexistent_user_12345";
+        test_cfg.port = 53556;
+        atomic_store_explicit(&g_config_db.active, &test_cfg, memory_order_release);
+        g_num_frontend_routers = 1;
+        g_num_workers = 1;
+        g_ipc_fds[0][0][0] = -1;
+        g_ipc_fds[0][0][1] = -1;
+        g_notify_ipc[0] = -1;
+        g_notify_ipc[1] = -1;
+        run_frontend_router(getppid(), 0);
+        _exit(0);
+    }
+    int status3 = 0;
+    waitpid(cpid3, &status3, 0);
+    assert(WIFEXITED(status3));
+
+    printf("  -> Process lifecycle, signals, router & worker passed.\n");
+}
+
 // ----------------------------------------------------------------------------
 // Main Test Runner
 // ----------------------------------------------------------------------------
@@ -1321,6 +1411,7 @@ int main(void) {
     test_open_router_udp_sockets_and_buffers();
     test_async_io_pool_and_tasks();
     test_meta_types_and_utils_helpers();
+    test_server_core_process_lifecycle_and_signals();
 
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
     return 0;
