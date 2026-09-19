@@ -1,9 +1,5 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
-#ifdef KARIDNS_UNIT_TEST
 #define STATIC_TEST
-#else
-#define STATIC_TEST static
-#endif
 #include "dns_catalog_zone.h"
 
 uint32_t calc_catalog_member_hash(const char *domain, const char *unique_id) {

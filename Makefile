@@ -355,7 +355,7 @@ test-all: test
 LLVM_PROFDATA ?= llvm-profdata
 LLVM_COV      ?= llvm-cov
 
-COV_CFLAGS  = -fprofile-instr-generate -fcoverage-mapping -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE -DKARIDNS_UNIT_TEST=1 $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+COV_CFLAGS  = -fprofile-instr-generate -fcoverage-mapping -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_LDFLAGS = -fprofile-instr-generate -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 COV_DIR     = coverage_raw
 COV_HTML_DIR = coverage_html

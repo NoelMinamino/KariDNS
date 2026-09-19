@@ -14,11 +14,7 @@
 #include <sys/event.h>
 #endif
 
-#ifdef KARIDNS_UNIT_TEST
 #define STATIC_TEST
-#else
-#define STATIC_TEST static
-#endif
 
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;

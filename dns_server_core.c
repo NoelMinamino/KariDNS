@@ -1,9 +1,5 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
-#ifdef KARIDNS_UNIT_TEST
 #define STATIC_TEST
-#else
-#define STATIC_TEST static
-#endif
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"

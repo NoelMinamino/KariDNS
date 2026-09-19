@@ -164,7 +164,7 @@ void limit_client_socket_rights(int fd) {
 }
 
 void enter_capsicum_sandbox(void) {
-#ifndef SANITIZER_BUILD
+#if !defined(SANITIZER_BUILD) && !defined(KARIDNS_UNIT_TEST)
   if (g_dnstap_sock >= 0) {
     cap_rights_t rights;
     cap_rights_init(&rights, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
