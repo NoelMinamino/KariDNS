@@ -66,11 +66,14 @@ SKIP_DAG=0
 # Ensure LLVM_PROFILE_FILE is an absolute path so sub-scripts that change directory still write profdata
 if [ -n "${LLVM_PROFILE_FILE:-}" ]; then
     case "${LLVM_PROFILE_FILE}" in
-        /*) ;; # already absolute
+        /*) export LLVM_PROFILE_FILE ;; # already absolute
         *)  LLVM_PROFILE_FILE="${ROOT_DIR}/${LLVM_PROFILE_FILE}"
             export LLVM_PROFILE_FILE
             ;;
     esac
+else
+    LLVM_PROFILE_FILE="${ROOT_DIR}/coverage_raw/karidns_%p_%m.profraw"
+    export LLVM_PROFILE_FILE
 fi
 
 # Parse arguments

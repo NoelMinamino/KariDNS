@@ -380,7 +380,7 @@ coverage-build:
 coverage-run:
 	@echo "=== Executing Test Suite with Instrumentation ==="
 	@mkdir -p $(COV_DIR)
-	@LLVM_PROFILE_FILE="$(CURDIR)/$(COV_DIR)/karidns_%p_%m.profraw" sh tests/run_all_suite.sh || true
+	@LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/karidns_%p_%m.profraw" sh tests/run_all_suite.sh || true
 
 coverage-report:
 	@echo "=== Merging Profile Data & Generating Coverage Report ==="
