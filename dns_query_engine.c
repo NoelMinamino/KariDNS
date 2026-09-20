@@ -2822,7 +2822,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (edns.present) {
       if (edns.has_cookie) {
         // Refresh server cookie for cookie-only probes (RFC 7873 §5.4)
-        if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
+        if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie, (uint32_t)time(NULL))) {
             edns.server_cookie_len = 0;
             edns.has_cookie = false;
         } else {
@@ -3113,40 +3113,31 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   bool is_badcookie = false;
   
   if (edns.has_cookie) {
+      bool need_new_cookie = false;
       if (edns.server_cookie_len == 0) {
-          if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
-              edns.server_cookie_len = 0;
-              edns.has_cookie = false;
-          } else {
-              edns.server_cookie_len = 16;
-          }
+          need_new_cookie = true;               // client-only cookie: hand out a Server Cookie
       } else {
-          bool valid = false;
-          if (edns.server_cookie_len == 16 && edns.server_cookie[0] == 1) {
-              uint32_t ts = ((uint32_t)edns.server_cookie[4] << 24) |
-                            ((uint32_t)edns.server_cookie[5] << 16) |
-                            ((uint32_t)edns.server_cookie[6] << 8) |
-                            edns.server_cookie[7];
-              uint32_t now = time(NULL);
-              if ((now >= ts && now - ts <= 3600) || (now < ts && ts - now <= 300)) {
-                  uint8_t expected_server_cookie[16];
-                  if (generate_server_cookie(client_ip, edns.client_cookie, expected_server_cookie, ts) &&
-                      const_time_memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
-                      valid = true;
-                  }
-              }
-          }
-          if (!valid) {
+          // RFC 9018 §4.2-4.4: SipHash-2-4, Reserved hashed as received, RFC 1982 timestamp window
+          server_cookie_status_t cst = verify_server_cookie(cfg, client_ip, edns.client_cookie,
+                                                            edns.server_cookie, edns.server_cookie_len,
+                                                            (uint32_t)time(NULL));
+          if (cst == SERVER_COOKIE_INVALID) {
               if (!is_tcp) {
                   is_badcookie = true;
                   ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
               }
-              if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
-                  edns.server_cookie_len = 0;
-                  edns.has_cookie = false;
-              } else {
-                  edns.server_cookie_len = 16;
-              }
+              need_new_cookie = true;
+          } else if (cst == SERVER_COOKIE_VALID_REFRESH) {
+              need_new_cookie = true;           // RFC 9018 §4.3: renew cookies older than 30 minutes
+          }
+      }
+      if (need_new_cookie) {
+          if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie,
+                                      (uint32_t)time(NULL))) {
+              edns.server_cookie_len = 0;
+              edns.has_cookie = false;
+          } else {
+              edns.server_cookie_len = SERVER_COOKIE_LEN;
           }
       }
   }

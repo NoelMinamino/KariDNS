@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -18,7 +19,12 @@
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <sys/event.h>
+#include <sys/wait.h>
 #include <signal.h>
+#ifdef __FreeBSD__
+#include <sys/capsicum.h>
+#include <sys/procctl.h>
+#endif
 
 #include "dns_server_internal.h"
 #include "dns_snapshot_rcu.h"
@@ -633,16 +639,76 @@ static void test_ensure_priv_dir_safe(void) {
     assert(ensure_priv_dir_safe(NULL) == true);
     assert(ensure_priv_dir_safe("") == true);
 
-    if (geteuid() == 0) {
-        // When running as root, world-writable /tmp must be rejected as insecure
-        assert(ensure_priv_dir_safe("/tmp") == false);
-        // Root-owned restricted directories (/var/run or /etc) must pass
-        assert(ensure_priv_dir_safe("/var/run") == true);
-    } else {
-        // Non-root execution bypasses privilege directory checks
+    if (geteuid() != 0) {
+        // Non-root execution bypasses privilege directory checks by design
         assert(ensure_priv_dir_safe("/tmp") == true);
-        assert(ensure_priv_dir_safe("/var/run") == true);
+        printf("  -> ensure_priv_dir_safe passed (non-root: bypass only; "
+               "attack-scenario checks SKIPPED, re-run as root for full coverage).\n");
+        return;
     }
+
+    // --- root-only: every case runs against a private mkdtemp() tree, never a
+    // system path whose layout differs per OS (/var/run is a symlink on Linux). ---
+    char base[] = "/tmp/karidns_privdir_XXXXXX";
+    assert(mkdtemp(base) != NULL);
+    char path[256];
+
+    // World-writable sticky /tmp itself must be rejected
+    assert(ensure_priv_dir_safe("/tmp") == false);
+
+    // Root-owned 0755 directory -> accepted
+    snprintf(path, sizeof(path), "%s/ok", base);
+    assert(mkdir(path, 0755) == 0);
+    assert(chmod(path, 0755) == 0);
+    assert(ensure_priv_dir_safe(path) == true);
+
+    // Non-existent directory is created 0755 root-owned -> accepted
+    snprintf(path, sizeof(path), "%s/created/", base);
+    assert(ensure_priv_dir_safe(path) == true);
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/created", base);
+    assert(stat(path, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == 0 &&
+           (st.st_mode & (S_IWGRP | S_IWOTH)) == 0);
+
+    // Group-writable, other-writable and sticky world-writable -> rejected
+    snprintf(path, sizeof(path), "%s/ok", base);
+    assert(chmod(path, 0775) == 0); assert(ensure_priv_dir_safe(path) == false);
+    assert(chmod(path, 0757) == 0); assert(ensure_priv_dir_safe(path) == false);
+    assert(chmod(path, 01777) == 0); assert(ensure_priv_dir_safe(path) == false);
+    assert(chmod(path, 0755) == 0); assert(ensure_priv_dir_safe(path) == true);
+
+    // Directory owned by an unprivileged uid (pre-planted directory attack) -> rejected
+    assert(chown(path, 65534, (gid_t)-1) == 0);
+    assert(ensure_priv_dir_safe(path) == false);
+    assert(chown(path, 0, (gid_t)-1) == 0);
+    assert(ensure_priv_dir_safe(path) == true);
+
+    // Symlink to a perfectly safe directory -> rejected (O_NOFOLLOW, fail-closed)
+    char link[256];
+    snprintf(link, sizeof(link), "%s/link", base);
+    assert(symlink(path, link) == 0);
+    assert(ensure_priv_dir_safe(link) == false);
+
+    // Regular file where a directory is expected -> rejected
+    char file[256];
+    snprintf(file, sizeof(file), "%s/file", base);
+    int ffd = open(file, O_CREAT | O_WRONLY, 0644);
+    assert(ffd >= 0); close(ffd);
+    assert(ensure_priv_dir_safe(file) == false);
+
+    // Real system directory: the verdict must agree with the on-disk layout
+    // (real root-owned dir -> true on FreeBSD; symlink -> false on Linux).
+    if (lstat("/var/run", &st) == 0) {
+        bool expect_ok = S_ISDIR(st.st_mode) && st.st_uid == 0 &&
+                         (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+        assert(ensure_priv_dir_safe("/var/run") == expect_ok);
+    }
+
+    // cleanup
+    unlink(file); unlink(link);
+    snprintf(path, sizeof(path), "%s/created", base); rmdir(path);
+    snprintf(path, sizeof(path), "%s/ok", base); rmdir(path);
+    rmdir(base);
 
     printf("  -> ensure_priv_dir_safe passed.\n");
 }
@@ -860,6 +926,14 @@ static int run_ctrl_cmd(const struct sockaddr_un *sun, const char *secret, const
     return (int)total;
 }
 
+// Blocking recv() in a unit test turns any server-side regression into a hung CI job.
+// Give every test client socket a receive timeout so failures are fast assertion failures.
+static void test_set_io_timeout(int fd, int seconds) {
+    struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 static void test_control_socket_thread_and_commands(void) {
     printf("[TEST] Server Core: control_thread_func HMAC auth & commands...\n");
 
@@ -961,6 +1035,7 @@ static void test_control_socket_thread_and_commands(void) {
     // 1. Connect and test Bad Auth
     int cfd1 = socket(AF_UNIX, SOCK_STREAM, 0);
     assert(cfd1 >= 0);
+    test_set_io_timeout(cfd1, 5);
     res = connect(cfd1, (struct sockaddr *)&sun, sizeof(sun));
     assert(res == 0);
 
@@ -1018,6 +1093,7 @@ static void test_control_socket_thread_and_commands(void) {
     // 3. Test Command Buffer Overflow
     int cfd2 = socket(AF_UNIX, SOCK_STREAM, 0);
     assert(cfd2 >= 0);
+    test_set_io_timeout(cfd2, 5);
     res = connect(cfd2, (struct sockaddr *)&sun, sizeof(sun));
     assert(res == 0);
     n = recv(cfd2, rbuf, sizeof(rbuf) - 1, 0);
@@ -1405,10 +1481,76 @@ static void test_server_core_process_lifecycle_and_signals(void) {
 // ----------------------------------------------------------------------------
 // Main Test Runner
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// 0. tsig_prewarm_crypto() must keep HMAC usable inside Capsicum capability mode
+// ----------------------------------------------------------------------------
+// Regression guard. OpenSSL initialises lazily on the first HMAC() (opening openssl.cnf). Inside
+// capability mode that open() fails with ECAPMODE and, with PROC_TRAPCAP_CTL_ENABLE (as
+// enter_capsicum_sandbox() sets), the process dies with SIGTRAP. RFC 9018 cookies no longer use
+// OpenSSL, so nothing but tsig_prewarm_crypto() initialises it before cap_enter() any more.
+//
+// This MUST run before any other test that touches OpenSSL (see main()): the child inherits the
+// parent's OpenSSL state, and an already-initialised parent would hide a broken pre-warm.
+static void test_crypto_prewarm_survives_capability_mode(void) {
+    printf("[TEST] Server Core: tsig_prewarm_crypto() keeps HMAC usable in capability mode...\n");
+    fflush(stdout);
+#ifdef __FreeBSD__
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        // Child: same order as main() in dns_server_core.c: pre-warm, then cap_enter().
+        if (!tsig_prewarm_crypto()) _exit(90);
+        int trapmode = PROC_TRAPCAP_CTL_ENABLE;
+        procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);   // violation => SIGTRAP, like production
+        if (cap_enter() != 0) _exit(91);
+
+        // Everything the sandboxed backend does with OpenSSL: every TSIG algorithm plus the
+        // karictl control-channel HMAC-SHA256.
+        static const struct { const EVP_MD *(*fn)(void); unsigned int len; } algs[] = {
+            { EVP_md5, 16 }, { EVP_sha1, 20 }, { EVP_sha224, 28 },
+            { EVP_sha256, 32 }, { EVP_sha384, 48 }, { EVP_sha512, 64 },
+        };
+        unsigned char md[EVP_MAX_MD_SIZE];
+        for (size_t i = 0; i < sizeof(algs) / sizeof(algs[0]); i++) {
+            unsigned int l = 0;
+            if (!HMAC(algs[i].fn(), "k", 1, (const unsigned char *)"data", 4, md, &l) || l != algs[i].len)
+                _exit(92);
+        }
+        // RFC 4231 test case 2 (HMAC-SHA-256): key "Jefe", data "what do ya want for nothing?"
+        static const unsigned char tc2[32] = {
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
+            0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43
+        };
+        unsigned int l = 0;
+        if (!HMAC(EVP_sha256(), "Jefe", 4, (const unsigned char *)"what do ya want for nothing?", 28, md, &l) ||
+            l != 32 || memcmp(md, tc2, 32) != 0)
+            _exit(93);
+        _exit(0);
+    }
+    int status = 0;
+    pid_t w;
+    do { w = waitpid(pid, &status, 0); } while (w < 0 && errno == EINTR);
+    assert(w == pid);
+    if (WIFSIGNALED(status)) {
+        fprintf(stderr, "  child killed by signal %d (SIGTRAP=5: OpenSSL initialised lazily inside capability mode)\n",
+                WTERMSIG(status));
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "  child exited with %d (90=prewarm failed, 91=cap_enter, 92=HMAC, 93=RFC 4231 mismatch)\n",
+                WEXITSTATUS(status));
+    }
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("  -> HMAC works inside capability mode after pre-warm.\n");
+#else
+    printf("  -> skipped (Capsicum is FreeBSD-only).\n");
+#endif
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("=== Starting KariDNS Server Core Unit Tests ===\n");
 
+    // Must stay first: it needs a process in which OpenSSL has not been initialised yet.
+    test_crypto_prewarm_survives_capability_mode();
     test_fast_ipv4_to_str();
     test_escape_qname_for_log();
     test_resolve_ip_port_to_sockaddr();

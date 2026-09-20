@@ -42,7 +42,7 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) 
 }
 
 static void test_cookie_generation(void) {
-    printf("[TEST] EDNS/ECS: Cookie secret init & HMAC generation...\n");
+    printf("[TEST] EDNS/ECS: Cookie secret init & SipHash-2-4 generation...\n");
     init_server_cookie_secret();
 
     uint8_t client_cookie[8] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
@@ -51,32 +51,32 @@ static void test_cookie_generation(void) {
     uint32_t ts = 1700000000;
 
     // IPv4 Cookie
-    bool ok = generate_server_cookie("192.0.2.1", client_cookie, server_cookie1, ts);
+    bool ok = generate_server_cookie(NULL, "192.0.2.1", client_cookie, server_cookie1, ts);
     assert(ok == true);
     assert(server_cookie1[0] == 1); // version
     assert(server_cookie1[4] == ((ts >> 24) & 0xFF));
     assert(server_cookie1[7] == (ts & 0xFF));
 
     // Deterministic with same parameters
-    ok = generate_server_cookie("192.0.2.1", client_cookie, server_cookie2, ts);
+    ok = generate_server_cookie(NULL, "192.0.2.1", client_cookie, server_cookie2, ts);
     assert(ok == true);
     assert(memcmp(server_cookie1, server_cookie2, 16) == 0);
 
     // Different IP produces different cookie
     uint8_t server_cookie_diff[16] = {0};
-    ok = generate_server_cookie("192.0.2.2", client_cookie, server_cookie_diff, ts);
+    ok = generate_server_cookie(NULL, "192.0.2.2", client_cookie, server_cookie_diff, ts);
     assert(ok == true);
     assert(memcmp(server_cookie1 + 8, server_cookie_diff + 8, 8) != 0);
 
     // IPv6 Cookie
     uint8_t server_cookie_v6[16] = {0};
-    ok = generate_server_cookie("2001:db8::1", client_cookie, server_cookie_v6, ts);
+    ok = generate_server_cookie(NULL, "2001:db8::1", client_cookie, server_cookie_v6, ts);
     assert(ok == true);
     assert(server_cookie_v6[0] == 1);
 
     // Invalid IP
     uint8_t dummy_srv[16] = {0};
-    ok = generate_server_cookie("not-an-ip", client_cookie, dummy_srv, ts);
+    ok = generate_server_cookie(NULL, "not-an-ip", client_cookie, dummy_srv, ts);
     assert(ok == false);
 
     printf("  -> Cookie generation passed.\n");

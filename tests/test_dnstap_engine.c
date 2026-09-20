@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <time.h>
+#include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -212,6 +213,46 @@ static void test_fill_dnstap_event(void) {
     assert(out_wire_len == 10);
     assert(meta.client_addr_len == 0);
     assert(meta.has_server_addr == false);
+
+    /* Regression: the UDP path passes a compact ipc_sockaddr_t (<= 28 bytes),
+     * not a sockaddr_storage. fill_dnstap_event() must copy only what the
+     * address family guarantees; it used to memcpy sizeof(sockaddr_storage)
+     * (128 bytes) and over-read the caller's object (ASan: stack-buffer-overflow).
+     * The 0xCD canary makes the bug visible even without a sanitizer. */
+    {
+        struct { struct sockaddr_in sin; uint8_t canary[112]; } pack4;
+        memset(&pack4, 0xCD, sizeof(pack4));
+        memset(&pack4.sin, 0, sizeof(pack4.sin));
+        pack4.sin.sin_family = AF_INET;
+        pack4.sin.sin_port = htons(53);
+        pack4.sin.sin_addr.s_addr = htonl(0xC0000201);
+        memset(&meta, 0xEE, sizeof(meta));
+        fill_dnstap_event(&meta, wire_dst, sizeof(wire_dst), &out_wire_len,
+                          1, wire_src, 4, &cli, sizeof(cli), &pack4.sin, true, IPPROTO_UDP);
+        assert(meta.has_server_addr == true);
+        assert(meta.server_addr_len == sizeof(struct sockaddr_in));
+        assert(memcmp(&meta.server_addr, &pack4.sin, sizeof(struct sockaddr_in)) == 0);
+        const uint8_t *tail = (const uint8_t *)&meta.server_addr + sizeof(struct sockaddr_in);
+        for (size_t i = 0; i < sizeof(meta.server_addr) - sizeof(struct sockaddr_in); i++)
+            assert(tail[i] == 0);   /* no canary bytes leaked from beyond the sockaddr_in */
+
+        struct { struct sockaddr_in6 sin6; uint8_t canary[100]; } pack6;
+        memset(&pack6, 0xCD, sizeof(pack6));
+        memset(&pack6.sin6, 0, sizeof(pack6.sin6));
+        pack6.sin6.sin6_family = AF_INET6;
+        pack6.sin6.sin6_port = htons(53);
+        pack6.sin6.sin6_addr.s6_addr[0] = 0x20; pack6.sin6.sin6_addr.s6_addr[1] = 0x01;
+        pack6.sin6.sin6_addr.s6_addr[2] = 0x0d; pack6.sin6.sin6_addr.s6_addr[3] = 0xb8;
+        pack6.sin6.sin6_addr.s6_addr[15] = 0x35;
+        memset(&meta, 0xEE, sizeof(meta));
+        fill_dnstap_event(&meta, wire_dst, sizeof(wire_dst), &out_wire_len,
+                          2, wire_src, 4, &cli, sizeof(cli), &pack6.sin6, true, IPPROTO_UDP);
+        assert(meta.server_addr_len == sizeof(struct sockaddr_in6));
+        assert(memcmp(&meta.server_addr, &pack6.sin6, sizeof(struct sockaddr_in6)) == 0);
+        tail = (const uint8_t *)&meta.server_addr + sizeof(struct sockaddr_in6);
+        for (size_t i = 0; i < sizeof(meta.server_addr) - sizeof(struct sockaddr_in6); i++)
+            assert(tail[i] == 0);
+    }
 
     printf("  -> fill_dnstap_event passed.\n");
 }
@@ -455,6 +496,10 @@ static void test_dnstap_sender_thread(void) {
 }
 
 int main(void) {
+    /* The server installs SIG_IGN for SIGPIPE at startup (dns_server_core.c). Do the same here:
+     * the write-failure tests below write to a closed socketpair peer and would otherwise
+     * kill the test binary with SIGPIPE (exit 141, no output) on Linux/macOS. */
+    signal(SIGPIPE, SIG_IGN);
     printf("=== Starting DNSTAP Engine Unit Tests ===\n");
     test_protobuf_encoders();
     test_dnstap_build_message();

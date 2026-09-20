@@ -45,13 +45,19 @@ jobs:
             make -j"$NCPU" all asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
-            ./test_asan_overflow
-            ./test_tinydns_parser
-            ./test_hash_table
-            ./test_conf_include
-            ./test_response_cache
-            ./test_vulnerability_fixes
+            echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests)"
+            # Previously only 6 of the C unit tests ran in CI (asan, tinydns, hash, include,
+            # response_cache, vulnerability). `unit-tests` builds and runs every binary, sequentially.
+            make unit-tests
+            echo "::endgroup::"
+
+            echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan"
+            # The plain test_* binaries use production CFLAGS, so they are NOT sanitizer-checked
+            # (test_asan_overflow included). This rebuilds every unit test with
+            # -fsanitize=address,undefined (UBSan findings are fatal); leak checks are off by default
+            # (UT_ASAN_LEAKS=1 enables them once the tests' teardown is complete).
+            # Burn-in: first FreeBSD run is reported as a warning; remove the fallback to make it blocking.
+            make unit-tests-asan || echo "::warning title=unit-tests-asan::ASan/UBSan unit tests failed on FreeBSD ${{ matrix.release }} - see log above (non-blocking during burn-in)"
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
@@ -123,6 +129,52 @@ jobs:
 
             echo ""
             echo "🎉 All FreeBSD builds and smoke tests passed!"
+
+  unit-tests-portable:
+    name: Portable unit tests (+ASan/UBSan) on ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc >= 2.36 is required for arc4random_buf(); ubuntu-24.04 ships 2.39.
+          - os: ubuntu-24.04
+            name: Linux (Ubuntu 24.04)
+            experimental: false
+          # macOS is verified only by CI itself (not locally): non-blocking until the first green run.
+          - os: macos-14
+            name: macOS 14 (ARM64)
+            experimental: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev zlib1g-dev libidn2-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3 zlib libidn2
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          LIBIDN2_PREFIX=$(brew --prefix libidn2 2>/dev/null || echo "")
+          echo "PKG_CONFIG_PATH=${OPENSSL_PREFIX}/lib/pkgconfig:${LIBIDN2_PREFIX}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+      # The server core needs FreeBSD (kqueue/Capsicum) and is covered by the FreeBSD job. These are
+      # the unit tests that do not touch FreeBSD-only APIs: cidr, tinydns parser, ASan-boundary,
+      # config include, dnstap, EDNS/cookies, RRL, RFC published vectors, dag tools.
+      - name: Portable unit tests
+        run: |
+          make clean
+          make unit-tests-portable
+
+      - name: Portable unit tests under ASan + UBSan
+        run: |
+          make unit-tests-portable-asan
 
   build-dag-unix:
     name: Build & Smoke Test dag on ${{ matrix.name }}

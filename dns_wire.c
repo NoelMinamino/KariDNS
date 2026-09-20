@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #endif
 #include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/md5.h>
@@ -774,25 +775,53 @@ int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t
     return 0;
 }
 
+/* TSIGアルゴリズム名 -> EVP_MD の対応表。tsig_algorithm_from_name() と
+ * tsig_prewarm_crypto() の両方がこの表を参照するため、アルゴリズムを追加/削除
+ * しても「プリウォーム対象」が自動的に追従する(表の更新漏れによる
+ * Capsicum内でのOpenSSL遅延初期化の再発を防ぐ)。 */
+static const struct { const char *name; const EVP_MD *(*fn)(void); } g_tsig_alg_table[] = {
+    { "hmac-md5.sig-alg.reg.int", EVP_md5 },
+    { "hmac-md5",    EVP_md5    },
+    { "hmac-sha1",   EVP_sha1   },
+    { "hmac-sha224", EVP_sha224 },
+    { "hmac-sha256", EVP_sha256 },
+    { "hmac-sha384", EVP_sha384 },
+    { "hmac-sha512", EVP_sha512 },
+};
+#define TSIG_ALG_TABLE_LEN (sizeof(g_tsig_alg_table) / sizeof(g_tsig_alg_table[0]))
+
 static const EVP_MD *tsig_algorithm_from_name(const char *alg) {
     if (!alg) return NULL;
     size_t len = strlen(alg);
     if (len > 0 && alg[len - 1] == '.') len--;
-    struct { const char *name; const EVP_MD *(*fn)(void); } table[] = {
-        { "hmac-md5.sig-alg.reg.int", EVP_md5 },
-        { "hmac-md5",    EVP_md5    },
-        { "hmac-sha1",   EVP_sha1   },
-        { "hmac-sha224", EVP_sha224 },
-        { "hmac-sha256", EVP_sha256 },
-        { "hmac-sha384", EVP_sha384 },
-        { "hmac-sha512", EVP_sha512 },
-    };
-    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
-        if (strncasecmp(alg, table[i].name, len) == 0 && strlen(table[i].name) == len) {
-            return table[i].fn();
+    for (size_t i = 0; i < TSIG_ALG_TABLE_LEN; i++) {
+        if (strncasecmp(alg, g_tsig_alg_table[i].name, len) == 0 && strlen(g_tsig_alg_table[i].name) == len) {
+            return g_tsig_alg_table[i].fn();
         }
     }
     return NULL;
+}
+
+bool tsig_prewarm_crypto(void) {
+    /* OpenSSL 3.x は最初の暗号API呼び出しで遅延初期化を行い、その際に
+     * openssl.cnf をopen()する(1.1.x でも同様の遅延初期化がある)。Capsicum の
+     * capability mode (cap_enter後) では open() が ECAPMODE で失敗し、
+     * PROC_TRAPCAP_CTL_ENABLE 下では SIGTRAP でプロセスが即死する。
+     * そのため cap_enter() より前に、サンドボックス内で使う全HMACアルゴリズム
+     * (TSIG各種 + karictl制御チャネルのHMAC-SHA256)を一度実行して初期化と
+     * アルゴリズムのfetchを済ませておく。 */
+    bool all_ok = true;
+    unsigned char md[EVP_MAX_MD_SIZE];
+    static const unsigned char key[] = "prewarm-key";
+    static const unsigned char msg[] = "prewarm-msg";
+    for (size_t i = 0; i < TSIG_ALG_TABLE_LEN; i++) {
+        const EVP_MD *evp_md = g_tsig_alg_table[i].fn();
+        unsigned int md_len = 0;
+        if (!evp_md || !HMAC(evp_md, key, (int)(sizeof(key) - 1), msg, sizeof(msg) - 1, md, &md_len) || md_len == 0)
+            all_ok = false;
+    }
+    OPENSSL_cleanse(md, sizeof(md));
+    return all_ok;
 }
 
 bool tsig_algorithm_is_supported(const char *alg) {

@@ -33,7 +33,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
 - **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, DS, CDS, CDNSKEY, CSYNC, etc.). Includes RFC 8976 (ZONEMD) digest validation.
 - **Security & Rate Limiting:**
   - **Response Rate Limiting (RRL):** BIND9-compatible token-bucket rate limiting with response classification, CIDR aggregation, and `slip` truncation.
-  - **DNS Cookies (RFC 7873 / RFC 9018):** Generates and validates client and server cookies.
+  - **DNS Cookies (RFC 7873 / RFC 9018):** Interoperable SipHash-2-4 Server Cookies with configurable, rotatable `cookie-secret`; BADCOOKIE and 30-minute refresh handling.
   - **TSIG (RFC 8945):** Transaction authentication supporting HMAC-MD5, SHA1, SHA224, SHA256, SHA384, and SHA512.
   - **Extended DNS Errors (EDE, RFC 8914):** Returns diagnostic error codes when queries cannot be fulfilled normally.
 - **Protocol Extensions:**
@@ -338,6 +338,13 @@ options {
     tcp-idle-timeout 10;
     minimal-any yes;
     nsid "karidns-node-01";
+
+    # RFC 9018 DNS Server Cookies (SipHash-2-4). Use the SAME secret on every server of an anycast set.
+    # 128-bit = 32 hex digits, e.g. from: openssl rand -hex 16
+    # Up to 4 entries: the first generates cookies, all of them verify (secret rollover, RFC 9018 s.5).
+    # Without it a random per-process secret is used (valid, but not interoperable across servers).
+    # cookie-secret "<32 hex digits>";
+    # cookie-algorithm siphash24;   # the only supported (and RFC 9018-mandatory) algorithm
 
     rate-limit {
         responses-per-second 50;

@@ -248,10 +248,16 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
     }
     meta->has_server_addr = has_server_addr;
     if (has_server_addr && server_addr) {
-        socklen_t srv_len = sizeof(meta->server_addr);
-        size_t copy_len = srv_len < sizeof(meta->server_addr) ? srv_len : sizeof(meta->server_addr);
+        /* server_addr carries no length. TCP callers pass a full sockaddr_storage
+         * but the UDP path passes the compact ipc_sockaddr_t (max 28 bytes), so
+         * copying sizeof(sockaddr_storage) over-reads the caller's object.
+         * Copy only what the address family guarantees to be present. */
+        const struct sockaddr *sa = (const struct sockaddr *)server_addr;
+        size_t copy_len = (sa->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6)
+                                                       : sizeof(struct sockaddr_in);
+        memset(&meta->server_addr, 0, sizeof(meta->server_addr));
         memcpy(&meta->server_addr, server_addr, copy_len);
-        meta->server_addr_len = sizeof(meta->server_addr);
+        meta->server_addr_len = (socklen_t)copy_len;
     } else {
         memset(&meta->server_addr, 0, sizeof(meta->server_addr));
         meta->server_addr_len = 0;

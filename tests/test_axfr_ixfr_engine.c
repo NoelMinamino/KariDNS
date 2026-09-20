@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
@@ -553,6 +555,70 @@ static void test_compute_ixfr_diff_generic_and_edge_cases(void) {
 }
 
 // ----------------------------------------------------------------------------
+// Framed-read helpers for TCP DNS streams.
+// A bare recv() on SOCK_STREAM may return only the 2-byte length prefix because the
+// server sends prefix and body with separate send() calls; tests must never assume
+// one recv() == one DNS message.
+// ----------------------------------------------------------------------------
+static bool test_recv_exact(int fd, uint8_t *buf, size_t want) {
+    size_t got = 0;
+    while (got < want) {
+        ssize_t r = recv(fd, buf + got, want - got, 0);
+        if (r <= 0) return false;   // EOF, error, or SO_RCVTIMEO expiry
+        got += (size_t)r;
+    }
+    return true;
+}
+
+// Skips one (possibly compressed) domain name; returns new offset or 0 on malformed input.
+static size_t test_skip_wire_name(const uint8_t *m, size_t len, size_t off) {
+    while (off < len) {
+        uint8_t l = m[off];
+        if (l == 0) return off + 1;
+        if ((l & 0xC0) == 0xC0) return (off + 2 <= len) ? off + 2 : 0;
+        if ((l & 0xC0) != 0) return 0;
+        off += 1u + l;
+    }
+    return 0;
+}
+
+// Reads one length-prefixed DNS message; returns its length (0 on failure).
+static size_t test_recv_tcp_dns_msg(int fd, uint8_t *msg, size_t cap) {
+    uint8_t pfx[2];
+    if (!test_recv_exact(fd, pfx, 2)) return 0;
+    size_t mlen = ((size_t)pfx[0] << 8) | pfx[1];
+    if (mlen < 12 || mlen > cap) return 0;
+    return test_recv_exact(fd, msg, mlen) ? mlen : 0;
+}
+
+// Counts answer RRs by type in one message; returns false if the message is malformed.
+static bool test_count_answer_types(const uint8_t *m, size_t len, size_t *n_answers,
+                                    size_t *n_soa, uint16_t *first_type, uint16_t *last_type) {
+    uint16_t qd = (uint16_t)((m[4] << 8) | m[5]);
+    uint16_t an = (uint16_t)((m[6] << 8) | m[7]);
+    size_t off = 12;
+    for (uint16_t i = 0; i < qd; i++) {
+        off = test_skip_wire_name(m, len, off);
+        if (off == 0 || off + 4 > len) return false;
+        off += 4;
+    }
+    for (uint16_t i = 0; i < an; i++) {
+        off = test_skip_wire_name(m, len, off);
+        if (off == 0 || off + 10 > len) return false;
+        uint16_t type = (uint16_t)((m[off] << 8) | m[off + 1]);
+        uint16_t rdlen = (uint16_t)((m[off + 8] << 8) | m[off + 9]);
+        off += 10;
+        if (off + rdlen > len) return false;
+        off += rdlen;
+        if (*n_answers == 0) *first_type = type;
+        *last_type = type;
+        (*n_answers)++;
+        if (type == 6) (*n_soa)++;
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
 // 5. handle_axfr_event & axfr_worker_thread Test
 // ----------------------------------------------------------------------------
 static void test_handle_axfr_event_and_worker_thread(void) {
@@ -614,10 +680,27 @@ static void test_handle_axfr_event_and_worker_thread(void) {
     res = pthread_create(&th, NULL, axfr_worker_thread, args);
     assert(res == 0);
 
-    // Read responses from sp_worker[1]
-    uint8_t rx_buf[1024];
-    ssize_t n = recv(sp_worker[1], rx_buf, sizeof(rx_buf), 0);
-    assert(n > 2); // 2-byte prefix + DNS AXFR response
+    // Read framed responses from sp_worker[1] (never trust a single recv()).
+    // RFC 5936 §2.2: an AXFR response stream begins and ends with the zone's SOA RR.
+    struct timeval rcv_to = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sp_worker[1], SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+
+    uint8_t msg[65535];
+    size_t n_answers = 0, n_soa = 0, n_msgs = 0;
+    uint16_t first_type = 0, last_type = 0;
+    while (n_soa < 2 && n_msgs < 64) {
+        size_t mlen = test_recv_tcp_dns_msg(sp_worker[1], msg, sizeof(msg));
+        assert(mlen >= 12);                                   // got a complete framed message
+        assert(msg[0] == 0x12 && msg[1] == 0x34);             // ID echoes the request
+        assert((msg[2] & 0x80) != 0);                         // QR=1 (response)
+        assert((msg[3] & 0x0F) == 0);                         // RCODE=NOERROR
+        assert(test_count_answer_types(msg, mlen, &n_answers, &n_soa, &first_type, &last_type));
+        n_msgs++;
+    }
+    assert(n_answers >= 2);
+    assert(first_type == 6);                                  // stream starts with SOA
+    assert(last_type == 6);                                   // ...and ends with SOA
+    assert(n_soa == 2);                                       // exactly two SOAs for a SOA-only zone
     close(sp_worker[1]);
 
     pthread_join(th, NULL);

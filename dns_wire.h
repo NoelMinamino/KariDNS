@@ -307,6 +307,12 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);
+
+/* Capsicum(cap_enter)突入前に呼ぶこと。TSIGで使う全HMACアルゴリズムを一度実行し、
+ * OpenSSLの遅延初期化(openssl.cnfのopen等)をcapability mode突入前に完了させる。
+ * cap_enter後に初回のHMAC()が走ると ECAPMODE -> SIGTRAP でプロセスが落ちる。
+ * 全アルゴリズムのHMAC計算に成功した場合のみ true (FIPS環境でMD5が使えない場合等は false)。 */
+bool tsig_prewarm_crypto(void);
 int const_time_memcmp(const void *a, const void *b, size_t len);
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
                      uint8_t *prior_mac, size_t *prior_mac_len,

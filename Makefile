@@ -93,7 +93,7 @@ FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tc
 	fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
-	unit-tests test test-all cidr_test tinydns_test asan_test include_test hash_test vulnerability_test \
+	unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan test test-all rfc_vectors_test cidr_test tinydns_test asan_test include_test hash_test vulnerability_test \
 	dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test \
 	coverage coverage-build coverage-run coverage-report coverage-clean
 
@@ -218,6 +218,7 @@ TEST_CONF_SRCS = tests/test_conf_include.c dns_config_parser.c dns_wire.c dns_zo
 TEST_HASH_SRCS = tests/test_hash_table.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 TEST_DNSTAP_SRCS = tests/test_dnstap_engine.c dns_dnstap.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c
 TEST_EDNS_ECS_SRCS = tests/test_edns_ecs_engine.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c
+TEST_RFC_VECTORS_SRCS = tests/test_rfc_vectors.c dns_edns_ecs.c dns_rrl.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c
 TEST_DYN_UPDATE_SRCS = tests/test_dynamic_update_engine.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c
 TEST_AXFR_IXFR_SRCS = tests/test_axfr_ixfr_engine.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c
 TEST_RRL_SRCS = tests/test_rrl_engine.c dns_rrl.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
@@ -284,6 +285,12 @@ test_edns_ecs_engine: $(TEST_EDNS_ECS_SRCS)
 edns_ecs_test: test_edns_ecs_engine
 	./test_edns_ecs_engine
 
+test_rfc_vectors: $(TEST_RFC_VECTORS_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_RFC_VECTORS_SRCS) -o test_rfc_vectors $(LDFLAGS) -lcrypto -lpthread -lm
+
+rfc_vectors_test: test_rfc_vectors
+	./test_rfc_vectors
+
 test_dynamic_update_engine: $(TEST_DYN_UPDATE_SRCS)
 	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DYN_UPDATE_SRCS) -o test_dynamic_update_engine $(LDFLAGS) -lcrypto -lpthread -lm
 
@@ -344,7 +351,95 @@ test_server_core: $(TEST_SERVER_CORE_SRCS)
 server_core_test: test_server_core
 	./test_server_core
 
-unit-tests: cidr_test tinydns_test asan_test include_test hash_test dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test
+unit-tests: cidr_test tinydns_test asan_test include_test hash_test dnstap_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test
+
+# --- Unit tests under ASan + UBSan --------------------------------------------
+# The plain test_* targets above are built with the production CFLAGS (-O3 -flto),
+# so tests such as test_asan_overflow are NOT actually sanitizer-checked by
+# "make asan_test". These targets rebuild the same test binaries with
+# -fsanitize=address,undefined (UBSan findings are fatal) and run them.
+#   make unit-tests-asan                 # leak detection off (default)
+#   make unit-tests-asan UT_ASAN_LEAKS=1 # also enable LeakSanitizer
+UT_ASAN_LEAKS ?= 0
+UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+UT_ASAN_LDFLAGS = -fsanitize=address,undefined -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS)
+
+test_cidr-asan: $(TEST_CIDR_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_CIDR_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_tinydns_parser-asan: $(TEST_TINYDNS_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_TINYDNS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_asan_overflow-asan: $(TEST_ASAN_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_ASAN_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_conf_include-asan: $(TEST_CONF_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_CONF_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_hash_table-asan: $(TEST_HASH_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_HASH_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_dnstap_engine-asan: $(TEST_DNSTAP_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DNSTAP_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_edns_ecs_engine-asan: $(TEST_EDNS_ECS_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_EDNS_ECS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_rfc_vectors-asan: $(TEST_RFC_VECTORS_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_RFC_VECTORS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_dynamic_update_engine-asan: $(TEST_DYN_UPDATE_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DYN_UPDATE_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_axfr_ixfr_engine-asan: $(TEST_AXFR_IXFR_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_AXFR_IXFR_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_rrl_engine-asan: $(TEST_RRL_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_RRL_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_query_engine_expanded-asan: $(TEST_QUERY_EXP_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_QUERY_EXP_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_response_cache-asan: $(RESPONSE_CACHE_TEST_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(RESPONSE_CACHE_TEST_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_vulnerability_fixes-asan: $(VULN_TEST_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(VULN_TEST_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_catalog_zone_engine-asan: $(TEST_CATALOG_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_CATALOG_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_snapshot_sandbox_engine-asan: $(TEST_SANDBOX_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_SANDBOX_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_dag_tools-asan: $(TEST_DAG_TOOLS_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DAG_TOOLS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
+
+test_server_core-asan: $(TEST_SERVER_CORE_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_SERVER_CORE_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+UT_ASAN_BINS = test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_hash_table-asan test_dnstap_engine-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_server_core-asan
+
+unit-tests-asan: $(UT_ASAN_BINS)
+	@rc=0; for t in $(UT_ASAN_BINS); do \
+	  echo "=== $$t"; \
+	  ASAN_OPTIONS="detect_leaks=$(UT_ASAN_LEAKS):abort_on_error=0:print_summary=1" \
+	  UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" ./$$t || { echo "*** FAILED: $$t"; rc=1; }; \
+	done; exit $$rc
+
+# --- Portable subset: unit tests that build and run on Linux/macOS without FreeBSD-only APIs
+# (no kqueue / Capsicum). Used by the cross-OS CI jobs; the server-core tests need FreeBSD.
+UT_PORTABLE_TESTS = cidr_test tinydns_test asan_test include_test dnstap_test edns_ecs_test rrl_test rfc_vectors_test dag_tools_test
+UT_PORTABLE_ASAN_BINS = test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_dnstap_engine-asan test_edns_ecs_engine-asan test_rrl_engine-asan test_rfc_vectors-asan test_dag_tools-asan
+
+unit-tests-portable: $(UT_PORTABLE_TESTS)
+
+unit-tests-portable-asan: $(UT_PORTABLE_ASAN_BINS)
+	@rc=0; for t in $(UT_PORTABLE_ASAN_BINS); do \
+	  echo "=== $$t"; \
+	  ASAN_OPTIONS="detect_leaks=$(UT_ASAN_LEAKS):abort_on_error=0:print_summary=1" \
+	  UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" ./$$t || { echo "*** FAILED: $$t"; rc=1; }; \
+	done; exit $$rc
 
 test: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 	@sh tests/run_all_suite.sh
@@ -363,7 +458,7 @@ COV_DATA    = coverage.profdata
 
 COV_BIN_OBJS = -object=$(TARGET) -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck \
   -object=test_cidr -object=test_tinydns_parser -object=test_asan_overflow -object=test_conf_include \
-  -object=test_hash_table -object=test_dnstap_engine -object=test_edns_ecs_engine -object=test_dynamic_update_engine \
+  -object=test_hash_table -object=test_dnstap_engine -object=test_edns_ecs_engine -object=test_rfc_vectors -object=test_dynamic_update_engine \
   -object=test_axfr_ixfr_engine -object=test_rrl_engine -object=test_query_engine_expanded -object=test_response_cache \
   -object=test_vulnerability_fixes -object=test_catalog_zone_engine -object=test_snapshot_sandbox_engine -object=test_dag_tools \
   -object=test_server_core
@@ -375,7 +470,7 @@ coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
 	$(MAKE) clean
 	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
-	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core
+	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core
 
 coverage-run:
 	@echo "=== Executing Test Suite with Instrumentation ==="
@@ -405,7 +500,8 @@ bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_zone_parser.o dns
 
 clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
-	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core
+	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core
+	rm -f $(UT_ASAN_BINS)
 
 run: $(TARGET)
 	./$(TARGET)

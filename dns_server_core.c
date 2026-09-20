@@ -3958,9 +3958,14 @@ int main(int argc, char **argv) {
   g_boot_time = time(NULL);
   g_last_configured_time = g_boot_time;
   
-  // Force OpenSSL lazy initialization before entering Capsicum sandbox
-  uint8_t dummy_cookie[16];
-  generate_server_cookie("127.0.0.1", (const uint8_t *)"12345678", dummy_cookie, time(NULL));
+  // Force OpenSSL lazy initialization before entering Capsicum sandbox.
+  // NOTE: RFC 9018 Server Cookie は SipHash-2-4 (OpenSSL非依存) になったため、従来のように
+  // generate_server_cookie() を呼んでもOpenSSLは初期化されない。かつてはその内部の
+  // HMAC(EVP_sha256) が副作用として初期化を済ませていたが、それに依存してはならない。
+  // 初期化を怠ると、cap_enter() 後の最初のHMAC (TSIG検証/署名, karictl制御チャネルのAUTH) が
+  // openssl.cnf を open() しようとして ECAPMODE -> SIGTRAP となりbackendが死ぬ。
+  // 明示的に全TSIGアルゴリズムのHMACを事前実行する。
+  const bool crypto_prewarm_ok = tsig_prewarm_crypto();  // 警告はopenlog()後に出す
   {
     SHA_CTX dummy_sha;
     uint8_t dummy_digest[20];
@@ -4018,6 +4023,9 @@ int main(int argc, char **argv) {
 
   openlog("KariDNS", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
   syslog(LOG_INFO, "Starting KariDNS %s...", KARIDNS_VERSION);
+  if (!crypto_prewarm_ok) {
+    syslog(LOG_WARNING, "[Startup] OpenSSL HMAC pre-warm incomplete: some TSIG algorithms are unavailable in this OpenSSL build (e.g. FIPS mode)");
+  }
 
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)

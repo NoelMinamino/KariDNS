@@ -195,6 +195,7 @@ register_test "unit" "bin" "test_query_engine_expanded" "All-RR types, wildcards
 register_test "unit" "bin" "test_response_cache" "Response cache lock-free lookup & invalidation"
 register_test "unit" "bin" "test_dnstap_engine" "DNSTAP Protobuf encoder, frame sender & ring buffers"
 register_test "unit" "bin" "test_edns_ecs_engine" "EDNS Cookies, EDE error codes & ECS subnet LPM resolution"
+register_test "unit" "bin" "test_rfc_vectors" "RFC 9018 Server Cookie vectors, SipHash-2-4, RFC 4034 key tag & cookie-secret config"
 register_test "unit" "bin" "test_dynamic_update_engine" "RFC 2136 SOA serial bump & NOTIFY deduplication"
 register_test "unit" "bin" "test_axfr_ixfr_engine" "RFC 1995 IXFR differential computation & Option 65153"
 register_test "unit" "bin" "test_rrl_engine" "SipHash token bucket rate limiter & SLIP responses"
@@ -365,7 +366,7 @@ FAILED_TEST_NAMES=""
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
         if [ ! -x "./${_b}" ]; then
             make "${_b}" >/dev/null 2>&1 || true
         fi

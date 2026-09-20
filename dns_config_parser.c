@@ -1,4 +1,5 @@
 #include "dns_config_parser.h"
+#include <openssl/crypto.h>
 #include "dns_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,13 @@
 #include <limits.h>
 #include "dns_wire.h"
 #include "dns_tsig_acl.h"
+
+static int hex_nibble_value(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
 
 static void *safe_realloc_or_die(void *ptr, size_t size) {
   if (size == 0) {
@@ -460,6 +468,8 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
   if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
+  OPENSSL_cleanse(cfg->cookie_secrets, sizeof(cfg->cookie_secrets));
+  cfg->cookie_secret_count = 0;
 
   if (cfg->zones_are_flat) {
     zone_config_t *curr_flat = cfg->zones;
@@ -1526,6 +1536,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->send_extended_errors = true;
   config->tcp_connection_reuse = false;
   config->nsid_string = NULL;
+  memset(config->cookie_secrets, 0, sizeof(config->cookie_secrets));
+  config->cookie_secret_count = 0;
   config->tcp_idle_timeout = 10000;
   config->minimal_responses = false;
   config->minimal_any = false;
@@ -1758,6 +1770,51 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key); free_token(&tok); return -1;
           }
           config->tcp_idle_timeout = (int)v;
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
+          free_token(&tok);
+        } else if (strcmp(key, "cookie-secret") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
+          uint8_t secret[16];
+          bool hex_ok = (strlen(tok.value) == 32);
+          for (int hi = 0; hex_ok && hi < 16; hi++) {
+            int hv = hex_nibble_value(tok.value[hi * 2]);
+            int lv = hex_nibble_value(tok.value[hi * 2 + 1]);
+            if (hv < 0 || lv < 0) { hex_ok = false; break; }
+            secret[hi] = (uint8_t)((hv << 4) | lv);
+          }
+          if (!hex_ok) {
+            syslog(LOG_ERR, "[Config] Invalid cookie-secret (must be exactly 32 hex digits = 128-bit SipHash-2-4 key, RFC 9018)");
+            fprintf(stderr, "[ERROR] Invalid cookie-secret (must be exactly 32 hex digits = 128-bit SipHash-2-4 key, RFC 9018)\n");
+            OPENSSL_cleanse(tok.value, strlen(tok.value));
+            free(key); free_token(&tok); return -1;
+          }
+          if (config->cookie_secret_count >= 4) {
+            syslog(LOG_ERR, "[Config] Too many cookie-secret entries (max 4)");
+            fprintf(stderr, "[ERROR] Too many cookie-secret entries (max 4)\n");
+            OPENSSL_cleanse(secret, sizeof(secret));
+            OPENSSL_cleanse(tok.value, strlen(tok.value));
+            free(key); free_token(&tok); return -1;
+          }
+          memcpy(config->cookie_secrets[config->cookie_secret_count++], secret, sizeof(secret));
+          OPENSSL_cleanse(secret, sizeof(secret));
+          OPENSSL_cleanse(tok.value, strlen(tok.value));
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
+          free_token(&tok);
+        } else if (strcmp(key, "cookie-algorithm") == 0) {
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
+          if (strcasecmp(tok.value, "siphash24") != 0) {
+            /* RFC 9018 §6: SipHash-2-4 is the mandatory algorithm; the BIND aes/sha1/sha256
+             * variants are not interoperable and are deliberately not implemented. */
+            syslog(LOG_ERR, "[Config] cookie-algorithm '%s' is not supported (only siphash24, RFC 9018)", tok.value);
+            fprintf(stderr, "[ERROR] cookie-algorithm '%s' is not supported (only siphash24, RFC 9018)\n", tok.value);
+            free(key); free_token(&tok); return -1;
+          }
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }

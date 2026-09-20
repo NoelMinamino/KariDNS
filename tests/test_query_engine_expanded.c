@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <time.h>
@@ -1093,10 +1094,63 @@ static void test_nsec3_hashing_and_intervals(void) {
     // 2. compute_nsec3_hash
     char b32_out[128];
     uint8_t salt[4] = {0xAA, 0xBB, 0xCC, 0xDD};
-    bool ok = compute_nsec3_hash("example.com.", 1 /* SHA-1 */, 10 /* iterations */,
-                                salt, sizeof(salt), b32_out, sizeof(b32_out));
-    assert(ok == true);
-    assert(strlen(b32_out) > 0);
+    // The previous assertion here was only strlen(b32_out) > 0, which a wrong hash passes.
+    // Check against the published RFC 5155 Appendix A vectors (SHA-1, 12 iterations, salt aabbccdd).
+    static const struct { const char *name; const char *hash; } rfc5155_a[] = {
+        { "example.",       "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom" },
+        { "a.example.",     "35mthgpgcu1qg68fab165klnsnk3dpvl" },
+        { "ai.example.",    "gjeqe526plbf1g8mklp59enfd789njgi" },
+        { "ns1.example.",   "2t7b4g4vsa5smi47k61mv5bv1a22bojr" },
+        { "ns2.example.",   "q04jkcevqvmu85r014c7dkba38o0ji5r" },
+        { "w.example.",     "k8udemvp1j2f7eg6jebps17vp3n8i58h" },
+        { "*.w.example.",   "r53bq7cc2uvmubfu5ocmm6pers9tk9en" },
+        { "x.w.example.",   "b4um86eghhds6nea196smvmlo4ors995" },
+        { "y.w.example.",   "ji6neoaepv8b5o6k4ev33abha8ht9fgc" },
+        { "x.y.w.example.", "2vptu5timamqttgl4luu9kg21e0aor3s" },
+        { "xx.example.",    "t644ebqk9bibcna874givr6joj62mlhv" },
+        // RFC 5155 Appendix B.1 (name error): next-closer and wildcard hashes
+        { "c.x.w.example.",   "0va5bpr2ou0vk0lbqeeljri88laipsfh" },
+        { "*.x.w.example.",   "92pqneegtaue7pjatc3l3qnk738c6v5m" },
+    };
+    for (size_t i = 0; i < sizeof(rfc5155_a) / sizeof(rfc5155_a[0]); i++) {
+        memset(b32_out, 0, sizeof(b32_out));
+        assert(compute_nsec3_hash(rfc5155_a[i].name, 1, 12, salt, sizeof(salt),
+                                  b32_out, sizeof(b32_out)) == true);
+        assert(strcasecmp(b32_out, rfc5155_a[i].hash) == 0);
+    }
+    // Owner-name case must not matter (RFC 5155 §5: canonical lower-case form is hashed)
+    assert(compute_nsec3_hash("X.Y.W.EXAMPLE.", 1, 12, salt, sizeof(salt), b32_out, sizeof(b32_out)));
+    assert(strcasecmp(b32_out, "2vptu5timamqttgl4luu9kg21e0aor3s") == 0);
+    // Independently computed (SHA-1, no salt): iterations = 0, iterations = 1, and the root name
+    assert(compute_nsec3_hash("example.com.", 1, 0, NULL, 0, b32_out, sizeof(b32_out)));
+    assert(strcasecmp(b32_out, "onib9mgub9h0rml3cdf5bgrj59dkjhvk") == 0);
+    assert(compute_nsec3_hash("EXAMPLE.COM.", 1, 1, NULL, 0, b32_out, sizeof(b32_out)));
+    assert(strcasecmp(b32_out, "9vq38lj9qs6s1aruer131mbtsfnvek2p") == 0);
+    assert(compute_nsec3_hash(".", 1, 0, NULL, 0, b32_out, sizeof(b32_out)));
+    assert(strcasecmp(b32_out, "bekjp7dgpvsjukll47bk43i3urmq4u2f") == 0);
+    // Characterization: an undersized output buffer never overflows and stays NUL-terminated.
+    // (compute_nsec3_hash() currently still returns true with a *truncated* hash; callers must
+    //  pass >= 33 bytes. Returning false here would be safer - see report.)
+    {
+        char guarded[8 + 16];
+        memset(guarded, 0x5A, sizeof(guarded));
+        assert(compute_nsec3_hash("example.", 1, 12, salt, sizeof(salt), guarded, 8));
+        assert(strlen(guarded) == 7);
+        assert(strncasecmp(guarded, "0p9mhav", 7) == 0);   // engine emits upper-case base32hex; RFC 4648 §7 is case-insensitive
+        for (size_t i = 8; i < sizeof(guarded); i++) assert((unsigned char)guarded[i] == 0x5A);
+    }
+
+    // RFC 5155 Appendix B.1 proof structure, expressed with the real hashes:
+    //   closest encloser x.w.example.  -> matched by owner b4um86eg...
+    //   next closer c.x.w.example.     -> covered by 0p9mhave... -> 2t7b4g4v...
+    //   wildcard *.x.w.example.        -> covered by 35mthgpg... -> b4um86eg...
+    assert(nsec3_covers_hash("0p9mhaveqvm6t7vbl5lop2u3t2rp3tom", "2t7b4g4vsa5smi47k61mv5bv1a22bojr",
+                             "0va5bpr2ou0vk0lbqeeljri88laipsfh") == true);
+    assert(nsec3_covers_hash("35mthgpgcu1qg68fab165klnsnk3dpvl", "b4um86eghhds6nea196smvmlo4ors995",
+                             "92pqneegtaue7pjatc3l3qnk738c6v5m") == true);
+    // ...and the closest encloser's own hash is an owner, not "covered" by its predecessor's interval
+    assert(nsec3_covers_hash("35mthgpgcu1qg68fab165klnsnk3dpvl", "b4um86eghhds6nea196smvmlo4ors995",
+                             "b4um86eghhds6nea196smvmlo4ors995") == false);
 
     // Unsupported algorithm
     assert(compute_nsec3_hash("example.com.", 2, 1, salt, sizeof(salt), b32_out, sizeof(b32_out)) == false);
@@ -1182,6 +1236,456 @@ static void test_nsec3_hashing_and_intervals(void) {
 
     zone_arena_destroy(&arena);
     printf("  -> NSEC3 hashing, interval coverage & tree search passed.\n");
+}
+
+
+// ----------------------------------------------------------------------------
+// RFC 4592 §2.2.1 / §3.3.2 wildcard "golden" test.
+// Unlike test_all_rr_types_and_resolution() (which only checks RCODE and
+// ANCOUNT >= N), this parses the response and checks owner names, RDATA, the
+// AA flag and section placement against the outcomes RFC 4592 prescribes.
+// ----------------------------------------------------------------------------
+typedef struct {
+    char name[256];
+    uint16_t type;
+    uint32_t ttl;        // for OPT: extended RCODE | version | flags
+    size_t rdoff, rdlen;
+    int sect;            // 1 = ANSWER, 2 = AUTHORITY, 3 = ADDITIONAL
+} gr_rr_t;
+
+typedef struct {
+    const uint8_t *msg;
+    size_t len;
+    uint8_t rcode;
+    bool aa;
+    uint16_t counts[3];
+    gr_rr_t rr[64];
+    int nrr;
+} gr_resp_t;
+
+// Decodes a (possibly compressed) name at `off`; returns offset after it in the
+// original position, or 0 on malformed input. Output has a trailing dot, e.g. "host3.example."
+static size_t gr_read_name(const uint8_t *m, size_t len, size_t off, char *out, size_t cap) {
+    size_t o = 0, next = 0;
+    int jumps = 0;
+    bool jumped = false;
+    while (1) {
+        if (off >= len) return 0;
+        uint8_t l = m[off];
+        if ((l & 0xC0) == 0xC0) {
+            if (off + 1 >= len || ++jumps > 16) return 0;
+            if (!jumped) next = off + 2;
+            jumped = true;
+            off = (size_t)(((l & 0x3F) << 8) | m[off + 1]);
+            continue;
+        }
+        if (l == 0) { if (!jumped) next = off + 1; break; }
+        if ((l & 0xC0) != 0 || off + 1 + l > len || o + l + 2 > cap) return 0;
+        memcpy(out + o, m + off + 1, l); o += l; out[o++] = '.';
+        off += 1u + l;
+    }
+    if (o == 0) { out[o++] = '.'; }
+    out[o] = '\0';
+    return next;
+}
+
+static bool gr_parse(const uint8_t *m, size_t len, gr_resp_t *r) {
+    memset(r, 0, sizeof(*r));
+    if (len < 12) return false;
+    r->msg = m; r->len = len;
+    r->rcode = m[3] & 0x0F;
+    r->aa = (m[2] & 0x04) != 0;
+    uint16_t qd = (uint16_t)((m[4] << 8) | m[5]);
+    r->counts[0] = (uint16_t)((m[6] << 8) | m[7]);
+    r->counts[1] = (uint16_t)((m[8] << 8) | m[9]);
+    r->counts[2] = (uint16_t)((m[10] << 8) | m[11]);
+    size_t off = 12;
+    char tmp[256];
+    for (uint16_t i = 0; i < qd; i++) {
+        off = gr_read_name(m, len, off, tmp, sizeof(tmp));
+        if (!off || off + 4 > len) return false;
+        off += 4;
+    }
+    for (int sect = 0; sect < 3; sect++) {
+        for (uint16_t i = 0; i < r->counts[sect]; i++) {
+            if (r->nrr >= 64) return false;
+            gr_rr_t *rr = &r->rr[r->nrr++];
+            off = gr_read_name(m, len, off, rr->name, sizeof(rr->name));
+            if (!off || off + 10 > len) return false;
+            rr->type = (uint16_t)((m[off] << 8) | m[off + 1]);
+            rr->ttl = ((uint32_t)m[off + 4] << 24) | ((uint32_t)m[off + 5] << 16) |
+                      ((uint32_t)m[off + 6] << 8) | m[off + 7];
+            rr->rdlen = (size_t)((m[off + 8] << 8) | m[off + 9]);
+            off += 10;
+            if (off + rr->rdlen > len) return false;
+            rr->rdoff = off;
+            rr->sect = sect + 1;
+            off += rr->rdlen;
+        }
+    }
+    return true;
+}
+
+static int gr_count(const gr_resp_t *r, int sect, int type /* -1 = any */) {
+    int n = 0;
+    for (int i = 0; i < r->nrr; i++)
+        if (r->rr[i].sect == sect && (type < 0 || r->rr[i].type == type)) n++;
+    return n;
+}
+
+static const gr_rr_t *gr_first(const gr_resp_t *r, int sect, int type) {
+    for (int i = 0; i < r->nrr; i++)
+        if (r->rr[i].sect == sect && r->rr[i].type == type) return &r->rr[i];
+    return NULL;
+}
+
+static struct {
+    zone_arena_t arena;
+    zone_db_entry_t entry;
+    zone_db_entry_t *entries[1];
+    char *acl[1];
+    view_snapshot_t view;
+    zone_db_snapshot_t snap;
+    server_config_t cfg;
+    uint8_t res[4096];
+} g_gr;
+
+static void gr_setup(const char *origin, const char *zone_text) {
+    memset(&g_gr, 0, sizeof(g_gr));
+    zone_arena_init(&g_gr.arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = origin,
+                            .is_standalone_mode = true, .err_out = &err };
+    // parse_zone_fast() keeps pointers into its input (zero-copy), so the text must
+    // live as long as the arena: give it arena lifetime instead of free()ing it.
+    char *buf = arena_strdup(&g_gr.arena, zone_text);
+    assert(buf != NULL);
+    assert(parse_zone_fast(buf, strlen(buf), &g_gr.arena, &ctx) >= 0);
+    assert(build_zone_index(&g_gr.arena, true) == 0);
+    strncpy(g_gr.entry.domain, origin, sizeof(g_gr.entry.domain) - 1);
+    atomic_store_explicit(&g_gr.entry.rcu.active, &g_gr.arena, memory_order_release);
+    g_gr.entries[0] = &g_gr.entry;
+    g_gr.acl[0] = (char *)"any";
+    g_gr.view.name = "default";
+    g_gr.view.entries = g_gr.entries;
+    g_gr.view.zone_count = 1;
+    g_gr.view.match_clients = g_gr.acl;
+    g_gr.view.match_clients_count = 1;
+    g_gr.snap.views = &g_gr.view;
+    g_gr.snap.view_count = 1;
+}
+
+static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, uint16_t qtype,
+                         const char *client_ip, bool is_tcp, gr_resp_t *out);
+
+static void gr_query(const char *qname, uint16_t qtype, bool dnssec_ok, gr_resp_t *out) {
+    uint8_t req[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x4592, qname, qtype, dnssec_ok);
+    gr_query_raw(req, req_len, qname, qtype, "192.0.2.100", false, out);
+}
+
+static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, uint16_t qtype,
+                         const char *client_ip, bool is_tcp, gr_resp_t *out) {
+    compress_ctx_t comp;
+    memset(&comp, 0, sizeof(comp));
+    compress_ctx_init_packet(&comp);
+    rate_limit_config_t *rrl_out = NULL;
+    zone_db_entry_t *matched = NULL;
+    int n = process_dns_query_impl(req, req_len, g_gr.res, sizeof(g_gr.res), qname, qtype,
+                                   client_ip, &comp, is_tcp, &rrl_out,
+                                   &g_gr.snap, &g_gr.cfg, &matched);
+    assert(n >= DNS_HEADER_SIZE);
+    assert(gr_parse(g_gr.res, (size_t)n, out));
+    assert(g_gr.res[0] == 0x45 && g_gr.res[1] == 0x92);   // ID echoed
+}
+
+static void gr_expect_txt(const gr_resp_t *r, const gr_rr_t *rr, const char *text) {
+    assert(rr->rdlen == 1u + strlen(text));
+    assert(r->msg[rr->rdoff] == strlen(text));
+    assert(memcmp(r->msg + rr->rdoff + 1, text, strlen(text)) == 0);
+}
+
+static void test_rfc4592_wildcard_golden(void) {
+    printf("[TEST] Query Engine: RFC 4592 §2.2.1 wildcard golden responses...\n");
+
+    // Example zone from RFC 4592 §2.2.1 (SOA RDATA is left open by the RFC).
+    gr_setup("example.",
+        "$ORIGIN example.\n"
+        "$TTL 3600\n"
+        "@                   IN SOA  ns.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600\n"
+        "@                   IN NS   ns.example.com.\n"
+        "@                   IN NS   ns.example.net.\n"
+        "*                   IN TXT  \"this is a wildcard\"\n"
+        "*                   IN MX   10 host1.example.\n"
+        "sub.*               IN TXT  \"this is not a wildcard\"\n"
+        "host1               IN A    192.0.2.1\n"
+        "_ssh._tcp.host1     IN SRV  0 0 80 host1.example.\n"
+        "_ssh._tcp.host2     IN SRV  0 0 80 host2.example.\n"
+        "subdel              IN NS   ns.example.com.\n"
+        "subdel              IN NS   ns.example.net.\n");
+
+    gr_resp_t r;
+    const gr_rr_t *rr;
+
+    // --- Synthesized from *.example. ---------------------------------------
+    // host3.example. MX -> "host3.example. IN MX ..." (owner is the QNAME, not the wildcard)
+    gr_query("host3.example.", 15, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(gr_count(&r, 1, -1) == 1);
+    rr = gr_first(&r, 1, 15);
+    assert(rr && strcasecmp(rr->name, "host3.example.") == 0);
+    assert(rr->rdlen >= 3 && r.msg[rr->rdoff] == 0 && r.msg[rr->rdoff + 1] == 10);   // preference 10
+    {
+        char target[256];
+        assert(gr_read_name(r.msg, r.len, rr->rdoff + 2, target, sizeof(target)) != 0);
+        assert(strcasecmp(target, "host1.example.") == 0);
+    }
+
+    // host3.example. A -> NOERROR/NODATA: no A RRset at *.example.
+    gr_query("host3.example.", 1, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(gr_count(&r, 1, -1) == 0);
+    assert(gr_count(&r, 2, 6) == 1);                        // SOA in AUTHORITY (RFC 2308)
+
+    // foo.bar.example. TXT -> synthesized although bar.example. does not exist
+    gr_query("foo.bar.example.", 16, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(gr_count(&r, 1, -1) == 1);
+    rr = gr_first(&r, 1, 16);
+    assert(rr && strcasecmp(rr->name, "foo.bar.example.") == 0);
+    gr_expect_txt(&r, rr, "this is a wildcard");
+
+    // _telnet._tcp.host3.example. SRV -> closest encloser example., wildcard exists but has no SRV -> NODATA
+    gr_query("_telnet._tcp.host3.example.", 33, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(gr_count(&r, 1, -1) == 0);
+    assert(gr_count(&r, 2, 6) == 1);
+
+    // --- Must NOT be synthesized from any wildcard -------------------------
+    // host1.example. MX -> host1.example. exists (A only): NODATA, not the wildcard MX
+    gr_query("host1.example.", 15, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(gr_count(&r, 1, -1) == 0);
+    assert(gr_count(&r, 2, 6) == 1);
+
+    // sub.*.example. MX -> the literal name exists (TXT only): NODATA
+    gr_query("sub.*.example.", 15, false, &r);
+    assert(r.rcode == 0 && r.aa);
+    assert(gr_count(&r, 1, -1) == 0);
+    // ...and its own TXT is returned literally, not the wildcard's TXT
+    gr_query("sub.*.example.", 16, false, &r);
+    assert(r.rcode == 0 && gr_count(&r, 1, -1) == 1);
+    rr = gr_first(&r, 1, 16);
+    assert(rr && strcasecmp(rr->name, "sub.*.example.") == 0);
+    gr_expect_txt(&r, rr, "this is not a wildcard");
+
+    // _telnet._tcp.host1.example. SRV -> _tcp.host1.example. exists (empty non-terminal): NXDOMAIN
+    gr_query("_telnet._tcp.host1.example.", 33, false, &r);
+    assert(r.rcode == 3 && r.aa);
+    assert(gr_count(&r, 1, -1) == 0);
+    assert(gr_count(&r, 2, 6) == 1);
+
+    // §3.3.2 chart: _telnet._tcp.host2.example. and _dns._udp.host2.example. have no source of synthesis
+    gr_query("_telnet._tcp.host2.example.", 33, false, &r);
+    assert(r.rcode == 3 && gr_count(&r, 1, -1) == 0);
+    gr_query("_dns._udp.host2.example.", 33, false, &r);
+    assert(r.rcode == 3 && gr_count(&r, 1, -1) == 0);
+
+    // ghost.*.example. MX / foobar.*.example. MX -> closest encloser is *.example. itself;
+    // its source of synthesis (*.*.example.) does not exist -> NXDOMAIN
+    gr_query("ghost.*.example.", 15, false, &r);
+    assert(r.rcode == 3 && gr_count(&r, 1, -1) == 0);
+    gr_query("foobar.*.example.", 15, false, &r);
+    assert(r.rcode == 3 && gr_count(&r, 1, -1) == 0);
+
+    // host.subdel.example. A -> below a zone cut: referral (NOERROR, AA=0, NS in AUTHORITY)
+    gr_query("host.subdel.example.", 1, false, &r);
+    assert(r.rcode == 0 && !r.aa);
+    assert(gr_count(&r, 1, -1) == 0);
+    assert(gr_count(&r, 2, 2) == 2);
+    rr = gr_first(&r, 2, 2);
+    assert(rr && strcasecmp(rr->name, "subdel.example.") == 0);
+
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> RFC 4592 wildcard golden responses passed.\n");
+}
+
+
+// ----------------------------------------------------------------------------
+// RFC 9018 / RFC 7873 DNS Cookie behaviour of the query engine, end to end
+// (EDNS COOKIE option in -> BADCOOKIE / refresh / echo decisions out).
+// ----------------------------------------------------------------------------
+static size_t gr_build_cookie_query(uint8_t *req, const char *qname, uint16_t qtype,
+                                    const uint8_t *cookie, size_t cookie_len) {
+    size_t o = 0;
+    req[o++] = 0x45; req[o++] = 0x92;          // ID
+    req[o++] = 0x01; req[o++] = 0x00;          // RD
+    req[o++] = 0; req[o++] = 1;                // QDCOUNT
+    req[o++] = 0; req[o++] = 0;                // ANCOUNT
+    req[o++] = 0; req[o++] = 0;                // NSCOUNT
+    req[o++] = 0; req[o++] = 1;                // ARCOUNT (OPT)
+    for (const char *p = qname; *p; ) {        // QNAME
+        const char *dot = strchr(p, '.');
+        size_t l = dot ? (size_t)(dot - p) : strlen(p);
+        if (l == 0) break;
+        req[o++] = (uint8_t)l; memcpy(req + o, p, l); o += l;
+        p += l + (dot ? 1 : 0);
+    }
+    req[o++] = 0;
+    req[o++] = (uint8_t)(qtype >> 8); req[o++] = (uint8_t)qtype;
+    req[o++] = 0; req[o++] = 1;                // QCLASS IN
+    req[o++] = 0;                              // OPT owner = root
+    req[o++] = 0; req[o++] = 41;               // TYPE OPT
+    req[o++] = 0x10; req[o++] = 0x00;          // UDP payload 4096
+    req[o++] = 0; req[o++] = 0; req[o++] = 0; req[o++] = 0;   // ext RCODE / version / flags
+    size_t rdlen = 4 + cookie_len;
+    req[o++] = (uint8_t)(rdlen >> 8); req[o++] = (uint8_t)rdlen;
+    req[o++] = 0; req[o++] = 10;               // option COOKIE
+    req[o++] = (uint8_t)(cookie_len >> 8); req[o++] = (uint8_t)cookie_len;
+    memcpy(req + o, cookie, cookie_len); o += cookie_len;
+    return o;
+}
+
+// Returns pointer to the COOKIE option payload in the response's OPT RR (NULL if absent).
+static const uint8_t *gr_find_cookie(const gr_resp_t *r, size_t *len_out, uint32_t *opt_ttl_out) {
+    for (int i = 0; i < r->nrr; i++) {
+        if (r->rr[i].sect != 3 || r->rr[i].type != 41) continue;
+        if (opt_ttl_out) *opt_ttl_out = r->rr[i].ttl;
+        size_t off = r->rr[i].rdoff, end = off + r->rr[i].rdlen;
+        while (off + 4 <= end) {
+            uint16_t code = (uint16_t)((r->msg[off] << 8) | r->msg[off + 1]);
+            uint16_t len = (uint16_t)((r->msg[off + 2] << 8) | r->msg[off + 3]);
+            if (off + 4 + len > end) return NULL;
+            if (code == 10) { *len_out = len; return r->msg + off + 4; }
+            off += 4 + (size_t)len;
+        }
+    }
+    return NULL;
+}
+
+static void test_dns_cookie_engine_rfc9018(void) {
+    printf("[TEST] Query Engine: RFC 9018 DNS Cookie handling (BADCOOKIE / refresh / echo)...\n");
+    gr_setup("example.",
+        "$ORIGIN example.\n$TTL 3600\n"
+        "@ IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns.example.com.\n"
+        "host1 IN A 192.0.2.1\n");
+    // RFC 9018 Appendix A.1 secret, configured exactly like `cookie-secret` in named.conf
+    static const uint8_t secret[16] = { 0xe5,0xe9,0x73,0xe5,0xa6,0xb2,0xa4,0x3f,
+                                        0x48,0xe7,0xdc,0x84,0x9e,0x37,0xbf,0xcf };
+    memcpy(g_gr.cfg.cookie_secrets[0], secret, 16);
+    g_gr.cfg.cookie_secret_count = 1;
+
+    const char *ip = "198.51.100.100";
+    const uint8_t cc[8] = { 0x24, 0x64, 0xc4, 0xab, 0xcf, 0x10, 0xc9, 0x57 };
+    const uint32_t now = (uint32_t)time(NULL);
+    uint8_t req[512], opt[24], sc[16];
+    gr_resp_t r;
+    size_t clen;
+    uint32_t opt_ttl;
+    const uint8_t *ck;
+
+    memcpy(opt, cc, 8);
+
+    // 1. Client-only cookie -> NOERROR plus a fresh, valid Server Cookie bound to (client cookie, IP)
+    size_t n = gr_build_cookie_query(req, "host1.example.", 1, opt, 8);
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert(r.rcode == 0 && gr_count(&r, 1, 1) == 1);
+    ck = gr_find_cookie(&r, &clen, &opt_ttl);
+    assert(ck && clen == 24 && memcmp(ck, cc, 8) == 0);
+    assert(verify_server_cookie(&g_gr.cfg, ip, cc, ck + 8, 16, (uint32_t)time(NULL)) == SERVER_COOKIE_VALID);
+    assert(((opt_ttl >> 24) & 0xFF) == 0);                  // no BADCOOKIE extended RCODE
+
+    // 2. Valid, fresh Server Cookie -> accepted and echoed unchanged (no needless rotation)
+    assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 10));
+    memcpy(opt + 8, sc, 16);
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert(r.rcode == 0 && gr_count(&r, 1, 1) == 1);
+    ck = gr_find_cookie(&r, &clen, &opt_ttl);
+    assert(ck && clen == 24 && memcmp(ck + 8, sc, 16) == 0);
+
+    // 3. Valid but older than 30 minutes -> accepted, and a NEW Server Cookie is returned (RFC 9018 4.3)
+    assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 2400));
+    memcpy(opt + 8, sc, 16);
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert(r.rcode == 0 && gr_count(&r, 1, 1) == 1);
+    ck = gr_find_cookie(&r, &clen, &opt_ttl);
+    assert(ck && clen == 24 && memcmp(ck + 8, sc, 16) != 0);
+    assert(verify_server_cookie(&g_gr.cfg, ip, cc, ck + 8, 16, (uint32_t)time(NULL)) == SERVER_COOKIE_VALID);
+
+    // 4. Reserved bytes set by another implementation but hash valid (RFC 9018 4.2) -> accepted
+    uint8_t rsv[16] = { 0x01, 0xab, 0xcd, 0xef };
+    rsv[4] = (uint8_t)((now - 10) >> 24); rsv[5] = (uint8_t)((now - 10) >> 16);
+    rsv[6] = (uint8_t)((now - 10) >> 8);  rsv[7] = (uint8_t)(now - 10);
+    assert(compute_server_cookie_hash(secret, ip, cc, rsv, rsv + 8));
+    memcpy(opt + 8, rsv, 16);
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert(r.rcode == 0);                                   // NOT BADCOOKIE
+    ck = gr_find_cookie(&r, &clen, &opt_ttl);
+    assert(ck && clen == 24 && ((opt_ttl >> 24) & 0xFF) == 0);
+
+    // 5. Wrong hash over UDP -> BADCOOKIE (RCODE 23 = ext 1 | base 7) with a fresh cookie so the client can retry
+    assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 10));
+    sc[15] ^= 0x01;
+    memcpy(opt + 8, sc, 16);
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert((r.msg[3] & 0x0F) == 7);
+    ck = gr_find_cookie(&r, &clen, &opt_ttl);
+    assert(ck && clen == 24 && ((opt_ttl >> 24) & 0xFF) == 1);
+    assert(verify_server_cookie(&g_gr.cfg, ip, cc, ck + 8, 16, (uint32_t)time(NULL)) == SERVER_COOKIE_VALID);
+    assert(gr_count(&r, 1, -1) == 0);                       // no answer data is leaked on BADCOOKIE
+
+    // 6. Same invalid cookie over TCP -> served normally (TCP already proves the source address)
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, ip, true, &r);
+    assert(r.rcode == 0 && gr_count(&r, 1, 1) == 1);
+
+    // 7. Too old (> 1 hour) and cookie replayed from another client address -> BADCOOKIE
+    assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 3700));
+    memcpy(opt + 8, sc, 16);
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert((r.msg[3] & 0x0F) == 7);
+    assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 10));
+    memcpy(opt + 8, sc, 16);
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, "198.51.100.101", false, &r);
+    assert((r.msg[3] & 0x0F) == 7);
+
+    // 8. Secret rollover: a cookie made with the previous (2nd) secret is still accepted...
+    static const uint8_t old_secret[16] = { 0xdd,0x3b,0xdf,0x93,0x44,0xb6,0x78,0xb1,
+                                            0x85,0xa6,0xf5,0xcb,0x60,0xfc,0xa7,0x15 };
+    server_config_t old_cfg;
+    memset(&old_cfg, 0, sizeof(old_cfg));
+    memcpy(old_cfg.cookie_secrets[0], old_secret, 16);
+    old_cfg.cookie_secret_count = 1;
+    assert(generate_server_cookie(&old_cfg, ip, cc, sc, now - 10));
+    memcpy(g_gr.cfg.cookie_secrets[1], old_secret, 16);
+    g_gr.cfg.cookie_secret_count = 2;
+    memcpy(opt + 8, sc, 16);
+    n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert(r.rcode == 0);
+    // ...and rejected once it is removed (stage 3)
+    g_gr.cfg.cookie_secret_count = 1;
+    gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
+    assert((r.msg[3] & 0x0F) == 7);
+
+    // 9. A query without a COOKIE option never gets one back
+    uint8_t plain[512];
+    size_t pn = 0;
+    build_dns_query(plain, &pn, 0x4592, "host1.example.", 1, false);
+    gr_query_raw(plain, pn, "host1.example.", 1, ip, false, &r);
+    assert(r.rcode == 0 && gr_find_cookie(&r, &clen, &opt_ttl) == NULL);
+
+    memset(&g_gr.cfg, 0, sizeof(g_gr.cfg));
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> RFC 9018 DNS Cookie engine handling passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -1739,6 +2243,8 @@ int main(void) {
     test_cname_loop_and_max_depth();
     test_prelink_zone_additional_glue_policies();
     test_nsec3_hashing_and_intervals();
+    test_rfc4592_wildcard_golden();
+    test_dns_cookie_engine_rfc9018();
     test_delegation_referral_and_ds_handling();
     test_program_plugins_and_forward_zone_helpers();
     test_query_engine_helpers_and_edge_cases();
