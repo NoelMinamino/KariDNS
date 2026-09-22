@@ -40,10 +40,19 @@ bool pcap_extract_l4(const uint8_t *data, size_t len, uint32_t linktype, pcap_l4
     size_t l4_offset = 0;
     uint8_t l4_proto = 0;
 
+    /* `end` is where the IP datagram really ends. Ethernet pads short frames (60-byte minimum) and some links
+     * append a trailer; the bytes after the IP total length are not TCP/UDP payload. */
+    size_t end = len;
+
     if (ip_version == 4) {
         if (ip_offset + 20 > len) return false;
         uint8_t ihl = (data[ip_offset] & 0x0F) * 4;
         if (ihl < 20 || ip_offset + ihl > len) return false;
+        uint16_t total_len = ((uint16_t)data[ip_offset + 2] << 8) | data[ip_offset + 3];
+        uint16_t frag_field = ((uint16_t)data[ip_offset + 6] << 8) | data[ip_offset + 7];
+        /* A non-first fragment carries no TCP/UDP header: its first bytes are payload of the original datagram. */
+        if ((frag_field & 0x1FFF) != 0) return false;
+        if (total_len >= ihl && ip_offset + total_len < len) end = ip_offset + total_len;
         l4_proto = data[ip_offset + 9];
         out->ip_version = 4;
         memcpy(out->src_addr, data + ip_offset + 12, 4);
@@ -51,6 +60,8 @@ bool pcap_extract_l4(const uint8_t *data, size_t len, uint32_t linktype, pcap_l4
         l4_offset = ip_offset + ihl;
     } else if (ip_version == 6) {
         if (ip_offset + 40 > len) return false;
+        uint16_t payload_len6 = ((uint16_t)data[ip_offset + 4] << 8) | data[ip_offset + 5];
+        if (payload_len6 > 0 && ip_offset + 40 + payload_len6 < len) end = ip_offset + 40 + payload_len6;
         l4_proto = data[ip_offset + 6];
         out->ip_version = 6;
         memcpy(out->src_addr, data + ip_offset + 8, 16);
@@ -63,20 +74,20 @@ bool pcap_extract_l4(const uint8_t *data, size_t len, uint32_t linktype, pcap_l4
     out->l4_proto = l4_proto;
 
     if (l4_proto == 17) { // UDP
-        if (l4_offset + 8 > len) return false;
+        if (l4_offset + 8 > end) return false;
         out->src_port = ((uint16_t)data[l4_offset] << 8) | data[l4_offset + 1];
         out->dst_port = ((uint16_t)data[l4_offset + 2] << 8) | data[l4_offset + 3];
         uint16_t udp_len = ((uint16_t)data[l4_offset + 4] << 8) | data[l4_offset + 5];
         size_t payload_len = 0;
-        if (udp_len < 8 || l4_offset + udp_len > len) {
-            payload_len = len - l4_offset - 8;
+        if (udp_len < 8 || l4_offset + udp_len > end) {
+            payload_len = end - l4_offset - 8;
         } else {
             payload_len = udp_len - 8;
         }
         out->l4_payload = data + l4_offset + 8;
         out->l4_payload_len = payload_len;
     } else if (l4_proto == 6) { // TCP
-        if (l4_offset + 20 > len) return false;
+        if (l4_offset + 20 > end) return false;
         out->src_port = ((uint16_t)data[l4_offset] << 8) | data[l4_offset + 1];
         out->dst_port = ((uint16_t)data[l4_offset + 2] << 8) | data[l4_offset + 3];
         out->tcp_seq = ((uint32_t)data[l4_offset + 4] << 24) |
@@ -88,10 +99,10 @@ bool pcap_extract_l4(const uint8_t *data, size_t len, uint32_t linktype, pcap_l4
                        ((uint32_t)data[l4_offset + 10] << 8) |
                         (uint32_t)data[l4_offset + 11];
         uint8_t tcp_hdr_len = ((data[l4_offset + 12] >> 4) & 0x0F) * 4;
-        if (tcp_hdr_len < 20 || l4_offset + tcp_hdr_len > len) return false;
+        if (tcp_hdr_len < 20 || l4_offset + tcp_hdr_len > end) return false;
         out->tcp_flags = data[l4_offset + 13];
         out->l4_payload = data + l4_offset + tcp_hdr_len;
-        out->l4_payload_len = len - (l4_offset + tcp_hdr_len);
+        out->l4_payload_len = end - (l4_offset + tcp_hdr_len);
     } else {
         return false;
     }

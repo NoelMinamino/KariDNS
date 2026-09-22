@@ -1170,7 +1170,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       }
       
       // ==== フェーズ4: ワイルドカード合成 ====
-      if (!dname_found) {
+      // RFC 4592 2.2.1 / RFC 4035 3.1.3.3 / RFC 5155 B.2.1: a name that exists only as an Empty Non-Terminal
+      // (it has descendants) still EXISTS, so a wildcard must not synthesize an answer for it (NODATA instead).
+      if (!dname_found && !name_exists_in_zone(current_zone, current_qname, client_loc, client_ecs_tag, client_loc_tag)) {
         const char *parent = current_qname;
         char wc_name[256];
         wc_name[0] = '*';
@@ -1421,6 +1423,16 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     }
     if (qtx_included_out) *qtx_included_out = included_mask;
 
+    // RFC 8020 / RFC 4592 2.2.1: an Empty Non-Terminal (no records of its own, but descendants exist) EXISTS.
+    // Asking for it is NODATA (NOERROR), never NXDOMAIN: NXDOMAIN would claim that nothing exists below it.
+    bool ent_nodata = false;
+    if (!found &&
+        name_exists_in_zone(current_zone, current_qname, client_loc, client_ecs_tag, client_loc_tag)) {
+      found = true;
+      ent_nodata = true;
+      all_matched = false;   // no RRset of the requested type(s): a NODATA proof is required
+    }
+
     // ==== フェーズ7: ネガティブ応答(SOA)付加 ====
     if (!found || !type_matched) {
       if (!found)
@@ -1575,6 +1587,24 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
               nsec_failed = true; break;
             }
             break;
+          }
+        }
+        if (ent_nodata && !nsec_failed && nsec_attached_cnt == 0) {
+          // An ENT owns no NSEC; the NSEC that covers it (its next name is a descendant) proves it exists.
+          dns_record_t *cover = find_covering_nsec(current_zone, current_qname);
+          if (cover) {
+            if (nsec_attached_cnt < 8) nsec_attached[nsec_attached_cnt++] = cover;
+            if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+              nsec_failed = true;
+            } else {
+              (*nscount)++;
+              uint32_t c_hash = calc_fnv1a_str(cover->name);
+              size_t c_idx = c_hash & (current_zone->hash_size - 1);
+              if (!attach_covering_rrsig(current_zone, c_idx, cover->name, NULL, 47,
+                                         res, max_res_len, offset, comp_ctx, nscount)) {
+                nsec_failed = true;
+              }
+            }
           }
         }
       } else if (!found) {

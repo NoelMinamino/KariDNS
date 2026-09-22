@@ -685,9 +685,12 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             unsigned long type_num = strtoul(f[1], NULL, 10);
-            // 禁止タイプ検証 (0, NS=2, CNAME=5, SOA=6, PTR=12, MX=15, AXFR=252)
+            // 禁止タイプ検証 (0, NS=2, CNAME=5, SOA=6, PTR=12, MX=15) and every meta-type (OPT, TKEY, TSIG, IXFR, AXFR,
+            // MAILB/MAILA, ANY, NXNAME): the same is_meta_rrtype() the master-file parser uses, so a meta-type can not be
+            // smuggled into zone data through a generic record.
             if (type_num == 0 || type_num == 2 || type_num == 5 || type_num == 6 ||
-                type_num == 12 || type_num == 15 || type_num == 252 || type_num > 65535) {
+                type_num == 12 || type_num == 15 || type_num > 65535 ||
+                is_meta_rrtype((uint16_t)type_num)) {
                 if (ctx && ctx->err_out) {
                     ctx->err_out->error_message = "Prohibited or invalid RR type in tinydns generic record";
                     ctx->err_out->error_offset = (size_t)(line_start - buf);

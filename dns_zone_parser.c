@@ -1203,13 +1203,59 @@ PROCESS_RECORD:
   rec->generic_len = 0;
   rec->generic_data = NULL;
   if (rec->rdata_count >= 2 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0)) {
-    long declared_len = atol(rec->rdata[1]);
+    /* RFC 3597 section 5: "\# <length> <hex rdata>". The declared length is a decimal number, the rdata is an
+     * even number of hex digits (possibly split into several tokens) and its size MUST equal <length>. Anything
+     * else used to be "repaired" silently (non-hex skipped, short data padded, long data cut off), which let a
+     * malformed record be served as if it were valid (e.g. a 3-byte A record). */
+    const char *len_tok = rec->rdata[1];
+    size_t len_tok_len = strlen(len_tok);
+    if (len_tok_len == 0 || len_tok_len > 5 || strspn(len_tok, "0123456789") != len_tok_len) {
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) is not a decimal number";
+      return -1;
+    }
+    long declared_len = atol(len_tok);
     if (declared_len < 0 || declared_len > 65535) {
       if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) out of range (0-65535)";
       return -1;
     }
+    size_t nibbles = 0;
+    for (int j = 2; j < rec->rdata_count; j++) {
+      for (const char *h = rec->rdata[j]; *h; h++) {
+        if (hex_char_to_val(*h) < 0) {
+          if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) contains a non-hexadecimal character";
+          return -1;
+        }
+        nibbles++;
+      }
+    }
+    if ((nibbles & 1) != 0) {
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) has an odd number of hex digits";
+      return -1;
+    }
+    if (nibbles / 2 != (size_t)declared_len) {
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) length does not match the declared length";
+      return -1;
+    }
+    /* Types whose RDATA has a fixed size must not be given in a different size, even in generic form. */
+    {
+      int fixed = -1;
+      switch (rec->type_code) {
+        case 1:   fixed = 4;  break;   /* A */
+        case 28:  fixed = 16; break;   /* AAAA */
+        case 108: fixed = 6;  break;   /* EUI48 */
+        case 109: fixed = 8;  break;   /* EUI64 */
+        case 105: fixed = 6;  break;   /* L32 */
+        case 104: fixed = 10; break;   /* NID */
+        case 106: fixed = 10; break;   /* L64 */
+        default: break;
+      }
+      if (fixed >= 0 && declared_len != fixed) {
+        if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) has the wrong length for this fixed-size record type";
+        return -1;
+      }
+    }
     rec->generic_len = (uint16_t)declared_len;
-    if (rec->generic_len > 0 && rec->rdata_count > 2) {
+    if (rec->generic_len > 0) {
       uint8_t *blob = (uint8_t *)arena_alloc(arena, rec->generic_len);
       if (blob) {
         size_t b_idx = 0;
@@ -1217,20 +1263,17 @@ PROCESS_RECORD:
         for (int j = 2; j < rec->rdata_count; j++) {
           for (char *h = rec->rdata[j]; *h; h++) {
             int val = hex_char_to_val(*h);
-            if (val < 0)
-              continue;
             if (high_nibble < 0)
               high_nibble = val;
             else {
-              if (b_idx < rec->generic_len)
-                blob[b_idx++] = (high_nibble << 4) | val;
+              blob[b_idx++] = (uint8_t)((high_nibble << 4) | val);
               high_nibble = -1;
             }
           }
         }
         rec->generic_data = blob;
       }
-    } else if (rec->generic_len == 0) {
+    } else {
       rec->generic_data = (uint8_t *)"";
     }
   } else if (rec->type) {

@@ -312,17 +312,6 @@ static int parse_opcode_value(const char *s) {
 // dag.c: get_type_str(dns_wire.c, arena依存)を使わず、dag内で完結させる。
 // format_type_name is now in dns_utils.h
 
-static const uint8_t *read_char_string(const uint8_t *p, const uint8_t *end, char *out, size_t out_cap) {
-    if (!out || out_cap == 0) return NULL;
-    if (p >= end) return NULL;
-    uint8_t len = *p++;
-    if (p + len > end) return NULL;
-    size_t copy_len = (len < out_cap - 1) ? len : out_cap - 1;
-    memcpy(out, p, copy_len);
-    out[copy_len] = '\0';
-    return p + len;
-}
-
 static double loc_decode_precsize(uint8_t b) {
     uint8_t mantissa = b >> 4;
     uint8_t exponent = b & 0x0F;
@@ -444,6 +433,31 @@ static void sink_printf(rdata_sink_t *sink, const char *fmt, ...) {
         }
     }
     va_end(args);
+}
+
+/* RFC 1035 section 5.1 presentation of a <character-string>: enclosed in double quotes, '"' and '\\' are
+ * backslash-escaped, printable ASCII is printed as is and every other octet as \DDD where DDD is the DECIMAL value
+ * (dig prints 0x7f as \127; the octal "\177" this code used to emit reads back as a different byte). One helper serves
+ * every type that prints text (TXT, SPF, AVC, NINFO, CAA, HINFO, X25, ISDN, GPOS, NAPTR). */
+static void sink_char_string(rdata_sink_t *sink, const uint8_t *s, size_t len) {
+    sink_printf(sink, "\"");
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = s[i];
+        if (c == '"' || c == '\\') sink_printf(sink, "\\%c", c);
+        else if (c >= 0x20 && c < 0x7f) sink_printf(sink, "%c", c);
+        else sink_printf(sink, "\\%03u", (unsigned)c);
+    }
+    sink_printf(sink, "\"");
+}
+
+/* Splits the next length-prefixed <character-string> off [p, end); NULL when it does not fit. */
+static const uint8_t *next_char_string(const uint8_t *p, const uint8_t *end, const uint8_t **str, size_t *len) {
+    if (p >= end) return NULL;
+    size_t l = *p++;
+    if ((size_t)(end - p) < l) return NULL;
+    *str = p;
+    *len = l;
+    return p + l;
 }
 
 static void sink_split_b64(rdata_sink_t *sink, const char *b64, int len, int split_width) {
@@ -631,7 +645,9 @@ static void sink_svcparam_alpn(rdata_sink_t *sink, const uint8_t *value, uint16_
 }
 
 static void sink_svcparam_ipvXhint(rdata_sink_t *sink, const uint8_t *value, uint16_t value_len, bool is_v6) {
-    sink_printf(sink, "%s=\"", is_v6 ? "ipv6hint" : "ipv4hint");
+    /* RFC 9460 section 7.1/7.3: ipv4hint/ipv6hint values are comma-separated IP addresses, printed unquoted
+     * (dig: "ipv4hint=192.0.2.1", not "ipv4hint=\"192.0.2.1\""). */
+    sink_printf(sink, "%s=", is_v6 ? "ipv6hint" : "ipv4hint");
     size_t addr_size = is_v6 ? 16 : 4;
     size_t pos = 0;
     bool first = true;
@@ -643,7 +659,6 @@ static void sink_svcparam_ipvXhint(rdata_sink_t *sink, const uint8_t *value, uin
         pos += addr_size;
         first = false;
     }
-    sink_printf(sink, "\"");
 }
 
 static void sink_svcparams(rdata_sink_t *sink, const uint8_t *rdata, size_t offset, size_t rdlen) {
@@ -827,14 +842,7 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                 if (p + slen > end) break;
                 if (!first) sink_printf(sink, " ");
                 first = false;
-                sink_printf(sink, "\"");
-                for (uint8_t i = 0; i < slen; i++) {
-                    unsigned char c = pkt[p + i];
-                    if (c == '"' || c == '\\') sink_printf(sink, "\\%c", c);
-                    else if (c >= 0x20 && c < 0x7f) sink_printf(sink, "%c", c);
-                    else sink_printf(sink, "\\%03o", c);
-                }
-                sink_printf(sink, "\"");
+                sink_char_string(sink, &pkt[p], slen);
                 p += slen;
             }
             return;
@@ -856,13 +864,16 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             break;
         }
         case 13: { // HINFO
-            char cpu[256], os[256];
+            const uint8_t *cpu, *os;
+            size_t cpu_len, os_len;
             const uint8_t *p = &pkt[abs_offset];
             const uint8_t *end = p + rdlen;
-            p = read_char_string(p, end, cpu, sizeof(cpu));
-            if (p) p = read_char_string(p, end, os, sizeof(os));
+            p = next_char_string(p, end, &cpu, &cpu_len);
+            if (p) p = next_char_string(p, end, &os, &os_len);
             if (p) {
-                sink_printf(sink, "\"%s\" \"%s\"", cpu, os);
+                sink_char_string(sink, cpu, cpu_len);
+                sink_printf(sink, " ");
+                sink_char_string(sink, os, os_len);
                 return;
             }
             break;
@@ -897,28 +908,30 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                     }
                 }
             } else if (type == 19) { // X25
-                char psdn[256];
+                const uint8_t *psdn; size_t psdn_len;
                 const uint8_t *p = &pkt[abs_offset];
                 const uint8_t *end = p + rdlen;
-                p = read_char_string(p, end, psdn, sizeof(psdn));
+                p = next_char_string(p, end, &psdn, &psdn_len);
                 if (p) {
-                    sink_printf(sink, "\"%s\"", psdn);
+                    sink_char_string(sink, psdn, psdn_len);
                     return;
                 }
             } else if (type == 20) { // ISDN
-                char isdn_addr[256], sub_addr[256];
+                const uint8_t *isdn_addr, *sub_addr; size_t isdn_len, sub_len;
                 const uint8_t *p = &pkt[abs_offset];
                 const uint8_t *end = p + rdlen;
-                p = read_char_string(p, end, isdn_addr, sizeof(isdn_addr));
+                p = next_char_string(p, end, &isdn_addr, &isdn_len);
                 if (p) {
                     if (p < end) {
-                        p = read_char_string(p, end, sub_addr, sizeof(sub_addr));
+                        p = next_char_string(p, end, &sub_addr, &sub_len);
                         if (p) {
-                            sink_printf(sink, "\"%s\" \"%s\"", isdn_addr, sub_addr);
+                            sink_char_string(sink, isdn_addr, isdn_len);
+                            sink_printf(sink, " ");
+                            sink_char_string(sink, sub_addr, sub_len);
                             return;
                         }
                     } else {
-                        sink_printf(sink, "\"%s\"", isdn_addr);
+                        sink_char_string(sink, isdn_addr, isdn_len);
                         return;
                     }
                 }
@@ -954,12 +967,14 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
         }
         case 27: { // GPOS
             const uint8_t *p = &pkt[abs_offset], *end = p + rdlen;
-            char lat[256], lon[256], alt[256];
-            p = read_char_string(p, end, lat, sizeof(lat));
-            if (p) p = read_char_string(p, end, lon, sizeof(lon));
-            if (p) p = read_char_string(p, end, alt, sizeof(alt));
+            const uint8_t *lat, *lon, *alt; size_t lat_len, lon_len, alt_len;
+            p = next_char_string(p, end, &lat, &lat_len);
+            if (p) p = next_char_string(p, end, &lon, &lon_len);
+            if (p) p = next_char_string(p, end, &alt, &alt_len);
             if (p) {
-                sink_printf(sink, "\"%s\" \"%s\" \"%s\"", lat, lon, alt);
+                sink_char_string(sink, lat, lat_len); sink_printf(sink, " ");
+                sink_char_string(sink, lon, lon_len); sink_printf(sink, " ");
+                sink_char_string(sink, alt, alt_len);
                 return;
             }
             break;
@@ -1001,17 +1016,21 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             if (rdlen >= 4) {
                 uint16_t order = (pkt[abs_offset] << 8) | pkt[abs_offset + 1];
                 uint16_t pref = (pkt[abs_offset + 2] << 8) | pkt[abs_offset + 3];
-                char flags[256], svcs[256], regexp[256];
+                const uint8_t *flags, *svcs, *regexp; size_t flags_len, svcs_len, regexp_len;
                 const uint8_t *p = &pkt[abs_offset + 4];
                 const uint8_t *end = &pkt[abs_offset + rdlen];
-                p = read_char_string(p, end, flags, sizeof(flags));
-                if (p) p = read_char_string(p, end, svcs, sizeof(svcs));
-                if (p) p = read_char_string(p, end, regexp, sizeof(regexp));
+                p = next_char_string(p, end, &flags, &flags_len);
+                if (p) p = next_char_string(p, end, &svcs, &svcs_len);
+                if (p) p = next_char_string(p, end, &regexp, &regexp_len);
                 if (p) {
                     char *repl = NULL; size_t next;
                     if (expand_wire_name(pkt, pkt_len, p - pkt, &next, &g_dag_arena, &repl) == 0 &&
                         next <= abs_offset + rdlen) {
-                        sink_printf(sink, "%u %u \"%s\" \"%s\" \"%s\" %s", order, pref, flags, svcs, regexp, repl);
+                        sink_printf(sink, "%u %u ", order, pref);
+                        sink_char_string(sink, flags, flags_len); sink_printf(sink, " ");
+                        sink_char_string(sink, svcs, svcs_len); sink_printf(sink, " ");
+                        sink_char_string(sink, regexp, regexp_len);   /* a "\\1" back-reference is shown as "\\\\1" (re-readable) */
+                        sink_printf(sink, " %s", repl);
                         return;
                     }
                 }
@@ -1461,16 +1480,8 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                 uint8_t flags = pkt[abs_offset];
                 uint8_t tag_len = pkt[abs_offset + 1];
                 if (2 + tag_len <= rdlen) {
-                    sink_printf(sink, "%u %.*s \"", flags, tag_len, &pkt[abs_offset + 2]);
-                    const uint8_t *val = &pkt[abs_offset + 2 + tag_len];
-                    size_t vlen = rdlen - 2 - tag_len;
-                    for (size_t vi = 0; vi < vlen; vi++) {
-                        unsigned char c = val[vi];
-                        if (c == '"' || c == '\\') sink_printf(sink, "\\%c", c);
-                        else if (c >= 0x20 && c < 0x7f) sink_printf(sink, "%c", c);
-                        else sink_printf(sink, "\\%03o", c);
-                    }
-                    sink_printf(sink, "\"");
+                    sink_printf(sink, "%u %.*s ", flags, tag_len, &pkt[abs_offset + 2]);
+                    sink_char_string(sink, &pkt[abs_offset + 2 + tag_len], rdlen - 2 - tag_len);
                     return;
                 }
             }
@@ -1498,9 +1509,13 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
         case 104: { // NID
             if (rdlen == 10) {
                 uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
-                sink_printf(sink, "%u %02x%02x:%02x%02x:%02x%02x:%02x%02x", pref,
-                            pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5],
-                            pkt[abs_offset+6], pkt[abs_offset+7], pkt[abs_offset+8], pkt[abs_offset+9]);
+                /* RFC 6742 2.3 / RFC 5952: the identifier is printed like an IPv6 address's low 64 bits -
+                 * four ':'-separated hex groups WITHOUT leading zeros (dig: 14:4f01:0:1, not 000e:4f01:0000:0001). */
+                sink_printf(sink, "%u %x:%x:%x:%x", pref,
+                            ((unsigned)pkt[abs_offset+2] << 8) | pkt[abs_offset+3],
+                            ((unsigned)pkt[abs_offset+4] << 8) | pkt[abs_offset+5],
+                            ((unsigned)pkt[abs_offset+6] << 8) | pkt[abs_offset+7],
+                            ((unsigned)pkt[abs_offset+8] << 8) | pkt[abs_offset+9]);
                 return;
             }
             break;
@@ -1517,23 +1532,26 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
         case 106: { // L64
             if (rdlen == 10) {
                 uint16_t pref = (pkt[abs_offset] << 8) | pkt[abs_offset+1];
-                sink_printf(sink, "%u %02x%02x:%02x%02x:%02x%02x:%02x%02x", pref,
-                            pkt[abs_offset+2], pkt[abs_offset+3], pkt[abs_offset+4], pkt[abs_offset+5],
-                            pkt[abs_offset+6], pkt[abs_offset+7], pkt[abs_offset+8], pkt[abs_offset+9]);
+                /* RFC 6742 2.4 / RFC 5952: same hextet-group-without-leading-zeros convention as NID above. */
+                sink_printf(sink, "%u %x:%x:%x:%x", pref,
+                            ((unsigned)pkt[abs_offset+2] << 8) | pkt[abs_offset+3],
+                            ((unsigned)pkt[abs_offset+4] << 8) | pkt[abs_offset+5],
+                            ((unsigned)pkt[abs_offset+6] << 8) | pkt[abs_offset+7],
+                            ((unsigned)pkt[abs_offset+8] << 8) | pkt[abs_offset+9]);
                 return;
             }
             break;
         }
         case 260: { // AMTRELAY
             if (rdlen >= 1) {
+                /* RFC 8777 section 4.1: octet 0 = Precedence (all 8 bits); octet 1 = D bit (MSB) | Relay Type (7 bits) */
                 uint8_t prec = pkt[abs_offset];
-                uint8_t d_opt = (prec & 0x80) != 0;
-                prec &= 0x7F;
                 if (rdlen < 2) {
-                    sink_printf(sink, "%u %u 0 .", prec, d_opt);
+                    sink_printf(sink, "%u 0 0 .", prec);
                     return;
                 }
-                uint8_t relay_type = pkt[abs_offset + 1];
+                uint8_t d_opt = (pkt[abs_offset + 1] & 0x80) != 0;
+                uint8_t relay_type = pkt[abs_offset + 1] & 0x7F;
                 const uint8_t *p = &pkt[abs_offset + 2];
                 const uint8_t *end = &pkt[abs_offset + rdlen];
                 sink_printf(sink, "%u %u %u ", prec, d_opt, relay_type);

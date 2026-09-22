@@ -5,6 +5,13 @@
 
 #define TCP_REASM_MAX_OOO_SEGMENTS 8
 
+/* TCP sequence numbers are 32 bits wide and wrap around. Ordering comparisons must use modular ("serial number")
+ * arithmetic (RFC 9293 3.4 / RFC 1982): a is "after" b when the signed 32-bit difference is positive. A plain
+ * unsigned a > b misorders segments on either side of the wrap and silently stalls the stream. */
+#define SEQ_LT(a, b) ((int32_t)((uint32_t)(a) - (uint32_t)(b)) < 0)
+#define SEQ_GT(a, b) ((int32_t)((uint32_t)(a) - (uint32_t)(b)) > 0)
+#define SEQ_GE(a, b) ((int32_t)((uint32_t)(a) - (uint32_t)(b)) >= 0)
+
 typedef struct {
     uint32_t seq;
     uint16_t len;
@@ -148,11 +155,11 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
                 seg->in_use = false;
                 progress = true;
                 break;
-            } else if (seg->seq > d->next_seq) {
+            } else if (SEQ_GT(seg->seq, d->next_seq)) {
                 continue;
-            } else if (seg->seq >= base_seq) {
+            } else if (SEQ_GE(seg->seq, base_seq)) {
                 // Starts within currently buffered data
-                if (end_seq > d->next_seq) {
+                if (SEQ_GT(end_seq, d->next_seq)) {
                     size_t overlap = (size_t)(d->next_seq - seg->seq);
                     size_t new_bytes = seg->len - overlap;
                     if (!append_to_dir_buf(d, max_buf, seg->data + overlap, new_bytes)) {
@@ -170,13 +177,13 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
             } else {
                 // seg->seq < base_seq
                 if (!d->has_drained) {
-                    if (end_seq >= base_seq) {
+                    if (SEQ_GE(end_seq, base_seq)) {
                         size_t new_prefix = (size_t)(base_seq - seg->seq);
                         if (!prepend_to_dir_buf(d, max_buf, seg->data, new_prefix)) {
                             evict_stream(st);
                             return;
                         }
-                        if (end_seq > d->next_seq) {
+                        if (SEQ_GT(end_seq, d->next_seq)) {
                             size_t overlap = (size_t)(d->next_seq - seg->seq);
                             size_t new_suffix = seg->len - overlap;
                             d->next_seq += (uint32_t)new_suffix;
@@ -192,7 +199,7 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
                     // end_seq < base_seq: wait for earlier segments before prepending
                 } else {
                     // has_drained == true: data before base_seq was already consumed
-                    if (end_seq > d->next_seq) {
+                    if (SEQ_GT(end_seq, d->next_seq)) {
                         size_t overlap = (size_t)(d->next_seq - seg->seq);
                         size_t new_bytes = seg->len - overlap;
                         d->next_seq += (uint32_t)new_bytes;
@@ -311,7 +318,7 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
                 return;
             }
             process_ooo(target_stream, direction, t->max_buffer_per_direction);
-        } else if (seq > d->next_seq) {
+        } else if (SEQ_GT(seq, d->next_seq)) {
             // Forward out-of-order segment
             if (len <= sizeof(d->ooo[0].data)) {
                 int slot = -1;
@@ -337,17 +344,17 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
                     memcpy(d->ooo[0].data, payload, len);
                 }
             }
-        } else if (seq < base_seq) {
+        } else if (SEQ_LT(seq, base_seq)) {
             // Segment starts before currently buffered window
             if (!d->has_drained) {
                 // Initial stream startup before any message was drained: allow prepending
-                if (end_seq >= base_seq) {
+                if (SEQ_GE(end_seq, base_seq)) {
                     size_t new_prefix = (size_t)(base_seq - seq);
                     if (!prepend_to_dir_buf(d, t->max_buffer_per_direction, payload, new_prefix)) {
                         evict_stream(target_stream);
                         return;
                     }
-                    if (end_seq > d->next_seq) {
+                    if (SEQ_GT(end_seq, d->next_seq)) {
                         size_t overlap = (size_t)(d->next_seq - seq);
                         size_t new_suffix = len - overlap;
                         d->next_seq += (uint32_t)new_suffix;
@@ -375,7 +382,7 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
             } else {
                 // has_drained == true: Data before base_seq was already consumed.
                 // Ignore retransmissions and only append novel suffix if end_seq > next_seq.
-                if (end_seq > d->next_seq) {
+                if (SEQ_GT(end_seq, d->next_seq)) {
                     size_t overlap = (size_t)(d->next_seq - seq);
                     size_t new_bytes = len - overlap;
                     d->next_seq += (uint32_t)new_bytes;
@@ -388,7 +395,7 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
             }
         } else {
             // seq >= base_seq && seq <= d->next_seq
-            if (end_seq > d->next_seq) {
+            if (SEQ_GT(end_seq, d->next_seq)) {
                 size_t overlap = (size_t)(d->next_seq - seq);
                 size_t new_bytes = len - overlap;
                 d->next_seq += (uint32_t)new_bytes;

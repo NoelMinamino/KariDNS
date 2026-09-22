@@ -323,6 +323,78 @@ static void test_ecs_resolution(void) {
     printf("  -> ECS & location resolution passed.\n");
 }
 
+static void test_ecs_trusted_resolver_precedence(void) {
+    printf("[TEST] EDNS/ECS: is_ecs_trusted_resolver source precedence (zone data > zone config > server config)...\n");
+
+    char *srv_list[] = { (char *)"192.0.2.0/24" };
+    char *zcfg_list[] = { (char *)"198.51.100.0/24" };
+    char *zone_list[] = { (char *)"203.0.113.0/24" };
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zone_arena_t zone;
+    memset(&zone, 0, sizeof(zone));
+
+    // No source configured anywhere, or no client address: never trusted (fail closed).
+    assert(!is_ecs_trusted_resolver(NULL, NULL, NULL, "192.0.2.7"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, NULL));
+
+    // Server-level list, pre-parsed binary ACL.
+    cfg.ecs_trusted_resolvers = srv_list;
+    cfg.ecs_trusted_resolvers_count = 1;
+    cfg.ecs_trusted_resolvers_parsed = acl_list_parse(srv_list, 1);
+    assert(cfg.ecs_trusted_resolvers_parsed != NULL);
+    assert(is_ecs_trusted_resolver(&zone, &cfg, NULL, "192.0.2.7"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, NULL, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, NULL, "203.0.113.9"));
+
+    // A zone-level list replaces (does not extend) the server-level list.
+    zcfg.ecs_trusted_resolvers = zcfg_list;
+    zcfg.ecs_trusted_resolvers_count = 1;
+    zcfg.ecs_trusted_resolvers_parsed = acl_list_parse(zcfg_list, 1);
+    assert(zcfg.ecs_trusted_resolvers_parsed != NULL);
+    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
+
+    // The list received via extended AXFR (stored in the zone data) wins over both.
+    zone.bind_ecs_trusted_resolvers = zone_list;
+    zone.bind_ecs_trusted_resolver_count = 1;
+    zone.bind_ecs_trusted_resolvers_parsed = acl_list_parse(zone_list, 1);
+    assert(zone.bind_ecs_trusted_resolvers_parsed != NULL);
+    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "203.0.113.9"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
+
+    // Without the pre-parsed form the textual lists are used, with the same precedence.
+    free(zone.bind_ecs_trusted_resolvers_parsed); zone.bind_ecs_trusted_resolvers_parsed = NULL;
+    free(zcfg.ecs_trusted_resolvers_parsed);      zcfg.ecs_trusted_resolvers_parsed = NULL;
+    free(cfg.ecs_trusted_resolvers_parsed);       cfg.ecs_trusted_resolvers_parsed = NULL;
+    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "203.0.113.9"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
+    zone.bind_ecs_trusted_resolvers = NULL; zone.bind_ecs_trusted_resolver_count = 0;
+    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
+    zcfg.ecs_trusted_resolvers = NULL; zcfg.ecs_trusted_resolvers_count = 0;
+    assert(is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "192.0.2.7"));
+    assert(!is_ecs_trusted_resolver(&zone, &cfg, &zcfg, "198.51.100.1"));
+
+    // ACL semantics: first match wins, `!` negates (BIND 9 address_match_list), IPv6 prefixes.
+    char *neg[] = { (char *)"!192.0.2.7", (char *)"192.0.2.0/24", (char *)"2001:db8::/32" };
+    cfg.ecs_trusted_resolvers = neg;
+    cfg.ecs_trusted_resolvers_count = 3;
+    cfg.ecs_trusted_resolvers_parsed = acl_list_parse(neg, 3);
+    assert(cfg.ecs_trusted_resolvers_parsed != NULL);
+    assert(!is_ecs_trusted_resolver(NULL, &cfg, NULL, "192.0.2.7"));    // negated entry matches first
+    assert(is_ecs_trusted_resolver(NULL, &cfg, NULL, "192.0.2.8"));
+    assert(is_ecs_trusted_resolver(NULL, &cfg, NULL, "2001:db8::1"));
+    assert(!is_ecs_trusted_resolver(NULL, &cfg, NULL, "2001:db9::1"));
+    free(cfg.ecs_trusted_resolvers_parsed);
+    printf("  -> is_ecs_trusted_resolver precedence & ACL semantics passed.\n");
+}
+
 int main(void) {
     printf("=== Starting EDNS / ECS Engine Unit Tests ===\n");
     test_cookie_generation();
@@ -331,6 +403,7 @@ int main(void) {
     test_trusted_resolvers_unpack();
     test_tinydns_loc_and_wrap();
     test_ecs_resolution();
+    test_ecs_trusted_resolver_precedence();
     printf("=== All EDNS / ECS Engine Unit Tests PASSED ===\n");
     return 0;
 }

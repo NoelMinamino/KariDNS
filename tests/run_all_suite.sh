@@ -206,6 +206,16 @@ register_test "unit" "bin" "test_asan_overflow" "ASan boundary checks, CLASS val
 register_test "unit" "bin" "test_tinydns_parser" "tinydns data file syntax & record decoder"
 register_test "unit" "bin" "test_cidr" "CIDR prefix matching & binary ACL evaluator"
 register_test "unit" "bin" "test_conf_include" "Config file tokenizer & \$INCLUDE nesting"
+register_test "unit" "bin" "test_config_directives" "named.conf directives: options/zone/key/logging/dnstap/ecs-tags, ACL negation & validation"
+register_test "unit" "bin" "test_wire_helpers" "Wire helpers: question parser, TSIG position, name pointers/compression, path split"
+register_test "unit" "bin" "test_zone_parser_paths" "Zone parser: 91 RR forms, 44 RFC golden RDATA vectors, rejection tables, \$INCLUDE/\$GENERATE/tags"
+register_test "unit" "bin" "test_tinydns_paths" "tinydns parser: 23 valid line forms, over-long FQDN rejection in every position, generic/unknown records, mutations"
+register_test "unit" "bin" "test_sig0_sign" "RFC 2931 SIG(0) signing verified independently with OpenSSL (RSA/ECDSA/Ed25519)"
+register_test "unit" "bin" "test_snapshot_rebuild" "Zone snapshot rebuild across views, zone lookup & reload_master_zone verdicts"
+register_test "unit" "bin" "test_dag_reassembly" "dag pcap L4 extraction (all link types, padding, fragments) & randomized TCP reassembly (reorder, retransmit, seq wraparound)"
+register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type"
+register_test "unit" "bin" "test_query_engine_protocol" "Query engine protocol: BADVERS, FORMERR/NOTIMP, foreign classes, IXFR/UDP, SOA EXPIRE, NOTIFY+TSIG authorization"
+register_test "unit" "bin" "test_dnssec_proofs" "DNSSEC negative proofs: RFC 5155 App A/B (NSEC3) & RFC 4035 App A/B (NSEC) example zones"
 register_test "unit" "bin" "test_hash_table" "Fixed-size FNV1a hash table collisions"
 register_test "unit" "bin" "test_server_core" "Server Core internals: fast IPv4, log esc/rot, ring buffers, TCP & observatory"
 
@@ -253,6 +263,7 @@ register_test "core" "sh" "tests/run_ttl_suffix_test.sh" "TTL time unit suffixes
 register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire serialization roundtrip"
 register_test "core" "sh" "tests/run_karicheck_glue_test.sh" "karicheck in-bailiwick glue record verification"
 register_test "core" "sh" "tests/run_karicheck_semantic_lint_test.sh" "karicheck RFC semantic linter checks"
+register_test "core" "sh" "tests/run_karicheck_matrix_test.sh" "karicheck diagnostic matrix: RDATA/DNSSEC/structure/tinydns/catalog/config lint, exit status contract"
 register_test "core" "sh" "tests/run_phase2_core_audit_test.sh" "Phase 2 Core architecture audit test"
 register_test "core" "sh" "tests/run_phase2_audit_part2_test.sh" "Phase 2 Security & boundary validation"
 register_test "core" "sh" "tests/run_response_section_order_test.sh" "RFC 1035 Response section ordering"
@@ -272,6 +283,7 @@ register_test "core" "sh" "tests/run_response_cache_test.sh" "Response cache hit
 register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load"
 register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "RFC 2181 31-bit signed TTL clamp"
 register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback"
+register_test "core" "sh" "tests/run_coverage_merge_test.sh" "Coverage report tolerates corrupt raw profiles (SIGKILL during profile write)"
 
 # 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
@@ -366,7 +378,7 @@ FAILED_TEST_NAMES=""
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
         if [ ! -x "./${_b}" ]; then
             make "${_b}" >/dev/null 2>&1 || true
         fi

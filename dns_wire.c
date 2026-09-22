@@ -1272,7 +1272,7 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
     }
     p += (size_t)name_len;
 
-    // 3. 署名対象データ = 現在のメッセージ全体(ARCOUNT加算済) || sig_rdata_prefix
+    // 3. 署名対象データ = sig_rdata_prefix || 元のメッセージ全体(ARCOUNTは加算前の値) (RFC 2931 3.1)
     // 4096バイト以下ならスタックバッファでゼロアロケーション
     size_t to_sign_len = *packet_len + p;
     uint8_t stack_to_sign[4096];
@@ -1282,8 +1282,13 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
         packet[11] = (uint8_t)(orig_arcount & 0xFF);
         return -1;
     }
-    memcpy(to_sign, packet, *packet_len);
-    memcpy(to_sign + *packet_len, sig_rdata_prefix, p);
+    /* RFC 2931 section 3.1: data = RDATA(sig fields, signature omitted) | (request - SIG(0)), where the request is
+     * taken BEFORE its RR counts are adjusted for the SIG(0). The order used to be "message(ARCOUNT+1) | RDATA",
+     * which no RFC-conformant verifier (BIND, ...) accepts. */
+    memcpy(to_sign, sig_rdata_prefix, p);
+    memcpy(to_sign + p, packet, *packet_len);
+    to_sign[p + 10] = (uint8_t)(orig_arcount >> 8);
+    to_sign[p + 11] = (uint8_t)(orig_arcount & 0xFF);
 
     // 4. EVP_DigestSign で署名
     const EVP_MD *md = NULL;
@@ -1669,6 +1674,32 @@ uint32_t parse_ttl_value(const char *ttl_str) {
     // RFC 2181 §8: TTLは符号なし32bit、最上位ビットは立てない(実質最大2147483647)
     if (total > 2147483647ULL) total = 2147483647ULL;
     return (uint32_t)total;
+}
+
+/* RFC 6742 2.3/2.4: the NID/L64 identifier is written like the low 64 bits of an IPv6 address - four
+ * ':'-separated groups of 1-4 hex digits, no leading zeros required (both "14:4f01:0:1" and "0014:4f01:0000:0001"
+ * denote the same 8 bytes). Returns true and fills node_id[8] on success. */
+static bool parse_nid_identifier(const char *s, uint8_t node_id[8]) {
+    unsigned groups[4];
+    for (int g = 0; g < 4; g++) {
+        const char *start = s;
+        int ndig = 0;
+        unsigned val = 0;
+        while (isxdigit((unsigned char)*s)) {
+            val = (val << 4) | (unsigned)hex_char_to_val(*s);
+            s++; ndig++;
+            if (ndig > 4) return false;
+        }
+        if (ndig == 0 || s == start) return false;
+        groups[g] = val;
+        if (g < 3) {
+            if (*s != ':') return false;
+            s++;
+        }
+    }
+    if (*s != '\0') return false;
+    for (int g = 0; g < 4; g++) { node_id[g * 2] = (uint8_t)(groups[g] >> 8); node_id[g * 2 + 1] = (uint8_t)groups[g]; }
+    return true;
 }
 
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
@@ -2163,7 +2194,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
                 uint8_t nodeid[8];
-                if (hex_decode(rec->rdata[1], nodeid, 8) != 8) return -1;
+                if (!parse_nid_identifier(rec->rdata[1], nodeid)) return -1;
                 memcpy(&res[offset], nodeid, 8); offset += 8;
                 break;
             }
@@ -2185,7 +2216,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
                 uint8_t loc64[8];
-                if (hex_decode(rec->rdata[1], loc64, 8) != 8) return -1;
+                if (!parse_nid_identifier(rec->rdata[1], loc64)) return -1;
                 memcpy(&res[offset], loc64, 8); offset += 8;
                 break;
             }
@@ -2269,7 +2300,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 50: { // NSEC3
-                if (rec->rdata_count < 6) return -1;
+                /* RFC 5155 3.2.1: the Type Bit Maps field may be empty (that is exactly what an NSEC3 for an
+                 * Empty Non-Terminal looks like), so only the five fixed fields are mandatory. */
+                if (rec->rdata_count < 5) return -1;
                 uint8_t halg, flags;
                 uint16_t iterations;
                 if (!parse_u8(rec->rdata[0], &halg) ||
@@ -2470,6 +2503,18 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     } else {
                         strncpy(key_str, param, sizeof(key_str) - 1);
                         key_str[sizeof(key_str) - 1] = '\0';
+                    }
+                    /* RFC 9460 section 2.1: a SvcParamValue may be written contiguous or as a quoted string
+                     * (alpn="h2,h3"). dag and dig print the quoted form for some values, so it must read back. */
+                    char unquoted_val[4096];
+                    if (val_str) {
+                        size_t vl = strlen(val_str);
+                        if (vl >= 2 && val_str[0] == '"' && val_str[vl - 1] == '"') {
+                            if (vl - 2 >= sizeof(unquoted_val)) return -1;
+                            memcpy(unquoted_val, val_str + 1, vl - 2);
+                            unquoted_val[vl - 2] = '\0';
+                            val_str = unquoted_val;
+                        }
                     }
                     
                     uint16_t key = 0;

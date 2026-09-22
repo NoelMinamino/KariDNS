@@ -1021,7 +1021,7 @@ void diff_dns_responses(const uint8_t *resp1, size_t len1, const uint8_t *resp2,
         APPEND_DIFF_FLAG(DIFF_CNAME_CHAIN, "CNAME_CHAIN");
         #undef APPEND_DIFF_FLAG
 
-        snprintf(out_diff->diff_desc, sizeof(out_diff->diff_desc), "Diff: %s", buf);
+        snprintf(out_diff->diff_desc, sizeof(out_diff->diff_desc), "Diff: %.*s", (int)(sizeof(out_diff->diff_desc) - 7), buf);
     }
 
     out_diff->rcode_match = !(out_diff->diff_flags & DIFF_RCODE);
