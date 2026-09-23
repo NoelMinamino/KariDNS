@@ -317,7 +317,7 @@ static void test_dag_replay_and_pcap_parsing(void) {
     assert(parse_pcap_packet(eth_ip_udp_dns, sizeof(eth_ip_udp_dns), 1, out_dns, &out_dns_len) == true);
     assert(out_dns_len == 12);
 
-    // 2. diff_dns_responses
+    // 2. diff_dns_responses - exact match
     uint8_t resp1[12] = {0xAB, 0xCD, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
     uint8_t resp2[12] = {0xAB, 0xCD, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
     diff_result_t diff_res;
@@ -327,8 +327,95 @@ static void test_dag_replay_and_pcap_parsing(void) {
     assert(diff_res.match == true);
     assert(diff_res.diff_flags == 0);
 
-    // 3. parse_dnstap_data_frame
+    // Differing RCODE (NOERROR vs NXDOMAIN)
+    uint8_t resp_nx[12] = {0xAB, 0xCD, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    memset(&diff_res, 0, sizeof(diff_res));
+    diff_dns_responses(resp1, sizeof(resp1), resp_nx, sizeof(resp_nx), true, &diff_res);
+    assert(diff_res.match == false);
+    assert((diff_res.diff_flags & DIFF_RCODE) != 0);
+
+    // Differing Flags (AA bit set)
+    uint8_t resp_aa[12] = {0xAB, 0xCD, 0x85, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+    memset(&diff_res, 0, sizeof(diff_res));
+    diff_dns_responses(resp1, sizeof(resp1), resp_aa, sizeof(resp_aa), true, &diff_res);
+    assert((diff_res.diff_flags & DIFF_FLAGS) != 0);
+
+    // Differing ANCOUNT / NSCOUNT / ARCOUNT
+    uint8_t resp_counts[12] = {0xAB, 0xCD, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x01};
+    memset(&diff_res, 0, sizeof(diff_res));
+    diff_dns_responses(resp1, sizeof(resp1), resp_counts, sizeof(resp_counts), true, &diff_res);
+    assert((diff_res.diff_flags & DIFF_ANCOUNT) != 0);
+    assert((diff_res.diff_flags & DIFF_NSCOUNT) != 0);
+    assert((diff_res.diff_flags & DIFF_ARCOUNT) != 0);
+
+    // Malformed response diff (< 12 bytes)
+    memset(&diff_res, 0, sizeof(diff_res));
+    diff_dns_responses(resp1, 4, resp2, sizeof(resp2), true, &diff_res);
+    assert(diff_res.match == false);
+
+    // 3. IPv6 UDP PCAP Frame
+    uint8_t eth_ip6_udp_dns[14 + 40 + 8 + 12] = {
+        // Ethernet (14B)
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0x86, 0xDD, // IPv6 ether type
+        // IPv6 (40B, NextHeader = 17 UDP)
+        0x60, 0x00, 0x00, 0x00, 0x00, 20, 17, 64,
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        // UDP (8B, src=10000, dst=53)
+        0x27, 0x10, 0x00, 0x35, 0x00, 20, 0x00, 0x00,
+        // DNS (12B, ID=0x5566)
+        0x55, 0x66, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    out_dns_len = 0;
+    assert(parse_pcap_packet_ex(eth_ip6_udp_dns, sizeof(eth_ip6_udp_dns), 1, out_dns, &out_dns_len, out_transport, sizeof(out_transport)) == true);
+    assert(out_dns_len == 12);
+    assert(out_dns[0] == 0x55 && out_dns[1] == 0x66);
+    assert(strcmp(out_transport, "udp") == 0);
+
+    // 4. Linux SLL (Cooked Capture, linktype = 113)
+    uint8_t sll_ip_udp_dns[16 + 20 + 8 + 12] = {
+        // SLL (16B, proto = 0x0800 IPv4)
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x00,
+        // IPv4 (20B)
+        0x45, 0x00, 0x00, 40, 0, 0, 0, 0, 64, 17, 0, 0,
+        192, 0, 2, 1, 192, 0, 2, 2,
+        // UDP (8B)
+        0x27, 0x10, 0x00, 0x35, 0x00, 20, 0x00, 0x00,
+        // DNS (12B, ID=0x7788)
+        0x77, 0x88, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    out_dns_len = 0;
+    assert(parse_pcap_packet_ex(sll_ip_udp_dns, sizeof(sll_ip_udp_dns), 113 /* LINKTYPE_LINUX_SLL */, out_dns, &out_dns_len, out_transport, sizeof(out_transport)) == true);
+    assert(out_dns_len == 12);
+    assert(out_dns[0] == 0x77 && out_dns[1] == 0x88);
+
+    // 5. Raw IPv4 packet (linktype = 101 or 12)
+    uint8_t raw_ip_udp_dns[20 + 8 + 12];
+    memcpy(raw_ip_udp_dns, &sll_ip_udp_dns[16], 20 + 8 + 12);
+    out_dns_len = 0;
+    assert(parse_pcap_packet_ex(raw_ip_udp_dns, sizeof(raw_ip_udp_dns), 101 /* LINKTYPE_RAW */, out_dns, &out_dns_len, out_transport, sizeof(out_transport)) == true);
+    assert(out_dns_len == 12);
+    assert(out_dns[0] == 0x77 && out_dns[1] == 0x88);
+
+    // 6. Non-UDP/TCP protocol (e.g. ICMP = 1) -> false
+    uint8_t icmp_pcap[14 + 20 + 8 + 12];
+    memcpy(icmp_pcap, eth_ip_udp_dns, sizeof(icmp_pcap));
+    icmp_pcap[14 + 9] = 1; // Protocol ICMP (1)
+    assert(parse_pcap_packet_ex(icmp_pcap, sizeof(icmp_pcap), 1, out_dns, &out_dns_len, out_transport, sizeof(out_transport)) == false);
+
+    // Truncated DNS payload (QDCOUNT = 0) -> false
+    uint8_t no_qd_pcap[14 + 20 + 8 + 12];
+    memcpy(no_qd_pcap, eth_ip_udp_dns, sizeof(no_qd_pcap));
+    no_qd_pcap[14 + 20 + 8 + 4] = 0; no_qd_pcap[14 + 20 + 8 + 5] = 0; // QDCOUNT = 0
+    assert(parse_pcap_packet_ex(no_qd_pcap, sizeof(no_qd_pcap), 1, out_dns, &out_dns_len, out_transport, sizeof(out_transport)) == false);
+
+    // 7. parse_dnstap_data_frame
     assert(parse_dnstap_data_frame(NULL, 0, out_dns, &out_dns_len) == false);
+    assert(parse_dnstap_data_frame_ex(NULL, 0, out_dns, &out_dns_len, out_transport, sizeof(out_transport)) == false);
+
+    dnstap_frame_info_t df_info;
+    memset(&df_info, 0, sizeof(df_info));
+    assert(parse_dnstap_data_frame_full(NULL, 0, &df_info) == false);
 
     printf("  -> PCAP packet parsing & diff passed.\n");
 }
