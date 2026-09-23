@@ -888,7 +888,16 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
             }
             break;
         }
-        case 17: case 18: case 19: case 20: case 22: case 26: case 40: { // RP, AFSDB, X25, ISDN, NSAP, PX, SINK
+        case 40: { // SINK (draft-ietf-dnsind-kitchen-sink): meaning, coding, subcoding (1 octet each) + base64 data
+            if (rdlen < 3) { sink_printf(sink, "(malformed SINK)"); return; }
+            uint8_t meaning = pkt[abs_offset], coding = pkt[abs_offset + 1], subcoding = pkt[abs_offset + 2];
+            int n = 0;
+            char *b64 = base64_encode_alloc(&pkt[abs_offset + 3], rdlen - 3, &n);
+            sink_printf(sink, "%u %u %u %s", meaning, coding, subcoding, (b64 && n > 0) ? b64 : "");
+            free(b64);
+            return;
+        }
+        case 17: case 18: case 19: case 20: case 22: case 26: { // RP, AFSDB, X25, ISDN, NSAP, PX
             if (type == 17) { // RP
                 char *mbox = NULL, *txt = NULL; size_t next;
                 if (expand_wire_name(pkt, pkt_len, abs_offset, &next, &g_dag_arena, &mbox) == 0 &&
@@ -1605,6 +1614,10 @@ static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t typ
                     }
                 }
             }
+            return;
+        }
+        case 31: case 32: { // EID, NIMLOC (undocumented; presented as a bare hex string, no "\# len" prefix)
+            sink_split_hex(sink, &pkt[abs_offset], rdlen, 0);
             return;
         }
         case 34: { // ATMA (RFC 2163 §2): format byte + address

@@ -360,6 +360,20 @@ static void test_dig_compat_formatting(void) {
     static const uint8_t nid_zero[] = { 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
     show(104, nid_zero, sizeof(nid_zero), out, sizeof(out), false);
     assert(strcmp(out, "1 0:0:0:0") == 0);
+    /* SINK (draft-ietf-dnsind-kitchen-sink): meaning/coding/subcoding (decimal) + base64 data */
+    static const uint8_t sink[] = { 1, 2, 3, 4 };
+    show(40, sink, sizeof(sink), out, sizeof(out), false);
+    assert(strcmp(out, "1 2 3 BA==") == 0);
+    static const uint8_t sink_empty[] = { 5, 6, 7 };
+    show(40, sink_empty, sizeof(sink_empty), out, sizeof(out), false);
+    assert(strcmp(out, "5 6 7 ") == 0 || strcmp(out, "5 6 7") == 0);
+
+    /* EID / NIMLOC: bare hex, no "\# len" prefix */
+    static const uint8_t raw4[] = { 0x01, 0x02, 0x03, 0x04 };
+    show(31, raw4, sizeof(raw4), out, sizeof(out), false);
+    assert(strcmp(out, "01020304") == 0);
+    show(32, raw4, sizeof(raw4), out, sizeof(out), false);
+    assert(strcmp(out, "01020304") == 0);
     printf("  -> dig-compatible formatting passed.\n");
 }
 

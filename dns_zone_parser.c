@@ -1202,6 +1202,24 @@ PROCESS_RECORD:
 
   rec->generic_len = 0;
   rec->generic_data = NULL;
+  /* EID (31) / NIMLOC (32) have no dedicated wire encoder; the server always serves them via the RFC 3597
+   * generic form. dig's presentation for these undocumented types is a single bare hex token with no "\# len"
+   * prefix, so accept that shape too by rewriting it into an equivalent "\# <len> <hex>" generic record. */
+  if ((rec->type_code == 31 || rec->type_code == 32) && rec->rdata_count == 1 &&
+      strcmp(rec->rdata[0], "\\#") != 0 && strcmp(rec->rdata[0], "#") != 0) {
+    char hex_copy[512];
+    strlcpy(hex_copy, rec->rdata[0], sizeof(hex_copy));
+    size_t hexlen = strlen(hex_copy);
+    if (hexlen > 0 && (hexlen % 2) == 0 && hexlen < sizeof(hex_copy) &&
+        strspn(hex_copy, "0123456789abcdefABCDEF") == hexlen && MAX_RDATA >= 3) {
+      char lenbuf[16];
+      snprintf(lenbuf, sizeof(lenbuf), "%zu", hexlen / 2);
+      rec->rdata[0] = arena_strdup(arena, "\\#");
+      rec->rdata[1] = arena_strdup(arena, lenbuf);
+      rec->rdata[2] = arena_strdup(arena, hex_copy);
+      rec->rdata_count = 3;
+    }
+  }
   if (rec->rdata_count >= 2 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0)) {
     /* RFC 3597 section 5: "\# <length> <hex rdata>". The declared length is a decimal number, the rdata is an
      * even number of hex digits (possibly split into several tokens) and its size MUST equal <length>. Anything
