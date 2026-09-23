@@ -1120,18 +1120,343 @@ static void test_axfr_bg_thread_and_free_ixfr_txn(void) {
     printf("  -> axfr_bg_thread_func & free_ixfr_txn passed.\n");
 }
 
+static void test_parse_xfr_packet_error_and_out_of_zone_rejections(void) {
+    printf("[TEST] AXFR/IXFR: parse_xfr_packet error handling & out-of-zone rejection...\n");
+    zone_arena_t standby, active;
+    zone_arena_init(&standby);
+    zone_arena_init(&active);
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    // 1. Short packet (< 12 bytes)
+    uint8_t short_pkt[8] = {0};
+    assert(parse_xfr_packet(short_pkt, sizeof(short_pkt), &standby, &active, &session, "example.com.") == -1);
+
+    // 2. Malformed QDCOUNT question section
+    uint8_t bad_qd_pkt[16] = {0};
+    bad_qd_pkt[4] = 0; bad_qd_pkt[5] = 1; // QDCOUNT = 1
+    assert(parse_xfr_packet(bad_qd_pkt, sizeof(bad_qd_pkt), &standby, &active, &session, "example.com.") == -1);
+
+    // 3. Out-of-zone record in answer section
+    uint8_t out_pkt[256] = {0};
+    out_pkt[0] = 0x12; out_pkt[1] = 0x34;
+    out_pkt[6] = 0; out_pkt[7] = 1; // ANCOUNT = 1
+    size_t off = 12;
+    off += write_uncompressed_name(out_pkt, off, sizeof(out_pkt), "outofzone.org.");
+    out_pkt[off++] = 0; out_pkt[off++] = 1; // A
+    out_pkt[off++] = 0; out_pkt[off++] = 1; // IN
+    out_pkt[off++] = 0; out_pkt[off++] = 0; out_pkt[off++] = 1; out_pkt[off++] = 0x2C;
+    out_pkt[off++] = 0; out_pkt[off++] = 4;
+    out_pkt[off++] = 192; out_pkt[off++] = 0; out_pkt[off++] = 2; out_pkt[off++] = 1;
+    assert(parse_xfr_packet(out_pkt, off, &standby, &active, &session, "example.com.") == -1);
+
+    // 4. Same length but mismatch domain name
+    uint8_t diff_pkt[256] = {0};
+    diff_pkt[6] = 0; diff_pkt[7] = 1;
+    off = 12;
+    off += write_uncompressed_name(diff_pkt, off, sizeof(diff_pkt), "otherdomain.");
+    diff_pkt[off++] = 0; diff_pkt[off++] = 1; diff_pkt[off++] = 0; diff_pkt[off++] = 1;
+    diff_pkt[off++] = 0; diff_pkt[off++] = 0; diff_pkt[off++] = 1; diff_pkt[off++] = 0x2C;
+    diff_pkt[off++] = 0; diff_pkt[off++] = 4;
+    diff_pkt[off++] = 192; diff_pkt[off++] = 0; diff_pkt[off++] = 2; diff_pkt[off++] = 1;
+    assert(parse_xfr_packet(diff_pkt, off, &standby, &active, &session, "example.com.") == -1);
+
+    // 5. Serial rollback / not newer check
+    uint8_t rollback_pkt[256] = {0};
+    rollback_pkt[6] = 0; rollback_pkt[7] = 1; // ANCOUNT = 1
+    off = 12;
+    off += write_uncompressed_name(rollback_pkt, off, sizeof(rollback_pkt), "example.com.");
+    rollback_pkt[off++] = 0; rollback_pkt[off++] = 6; rollback_pkt[off++] = 0; rollback_pkt[off++] = 1;
+    rollback_pkt[off++] = 0; rollback_pkt[off++] = 0; rollback_pkt[off++] = 1; rollback_pkt[off++] = 0x2C;
+    size_t rdp = off; off += 2;
+    off += write_uncompressed_name(rollback_pkt, off, sizeof(rollback_pkt), "ns1.example.com.");
+    off += write_uncompressed_name(rollback_pkt, off, sizeof(rollback_pkt), "admin.example.com.");
+    rollback_pkt[off++] = 0; rollback_pkt[off++] = 0; rollback_pkt[off++] = 0; rollback_pkt[off++] = 100; // serial 100
+    for (int k = 0; k < 4; k++) { rollback_pkt[off++] = 0; rollback_pkt[off++] = 0; rollback_pkt[off++] = 0; rollback_pkt[off++] = 10; }
+    uint16_t rdl = (uint16_t)(off - (rdp + 2));
+    rollback_pkt[rdp] = rdl >> 8; rollback_pkt[rdp+1] = rdl & 0xFF;
+
+    memset(&session, 0, sizeof(session));
+    session.client_serial = 200; // Current serial is 200
+    assert(parse_xfr_packet(rollback_pkt, off, &standby, &active, &session, "example.com.") == -1);
+
+    // 6. Up-to-date check: serial == client_serial -> returns 0 and is_finished = true
+    memset(&session, 0, sizeof(session));
+    session.client_serial = 100;
+    assert(parse_xfr_packet(rollback_pkt, off, &standby, &active, &session, "example.com.") == 0);
+    assert(session.is_finished == true);
+
+    zone_arena_destroy(&standby);
+    zone_arena_destroy(&active);
+    printf("  -> parse_xfr_packet error and out-of-zone rejections passed.\n");
+}
+
+static void test_send_axfr_response_error_and_edge_branches(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response error paths & edge branches...\n");
+
+    uint8_t req[64] = {0};
+    req[0] = 0x12; req[1] = 0x34;
+    req[4] = 0; req[5] = 1; // QDCOUNT = 1
+    size_t qoff = 12;
+    qoff += write_uncompressed_name(req, qoff, sizeof(req), "edge.example.");
+    req[qoff++] = 0; req[qoff++] = 252; // AXFR
+    req[qoff++] = 0; req[qoff++] = 1;   // IN
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+
+    // 1. entry == NULL -> sends REFUSED response (5)
+    send_axfr_response(-1, "edge.example.", req, qoff, NULL, NULL, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count == 2); // len prefix + packet
+    assert(g_tcp_out_len >= 14);
+
+    // 2. empty arena (count == 0) -> returns early
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "edge.example.", sizeof(entry.domain));
+    zone_arena_t empty_arena;
+    zone_arena_init(&empty_arena);
+    atomic_store_explicit(&entry.rcu.active, &empty_arena, memory_order_release);
+    send_axfr_response(-1, "edge.example.", req, qoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+
+    // 3. malformed question section (skip_wire_name fails)
+    init_axfr_zone(&entry.rcu.arena_a, "edge.example.", "100");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    uint8_t bad_req[14] = { 0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF }; // Invalid pointer
+    send_axfr_response(-1, "edge.example.", bad_req, sizeof(bad_req), NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+
+    // 4. Zone without SOA record
+    zone_arena_t nosoa_arena;
+    zone_arena_init(&nosoa_arena);
+    dns_record_t a_rec;
+    memset(&a_rec, 0, sizeof(a_rec));
+    a_rec.name = arena_strdup(&nosoa_arena, "edge.example.");
+    a_rec.type = arena_strdup(&nosoa_arena, "A");
+    a_rec.type_code = 1;
+    a_rec.class_str = arena_strdup(&nosoa_arena, "IN");
+    a_rec.class_val = 1;
+    a_rec.ttl = arena_strdup(&nosoa_arena, "300");
+    a_rec.ttl_value = 300;
+    a_rec.rdata_count = 1;
+    a_rec.rdata[0] = arena_strdup(&nosoa_arena, "192.0.2.1");
+    nosoa_arena.records = malloc(sizeof(dns_record_t) * 4);
+    nosoa_arena.records_cap = 4;
+    nosoa_arena.records[0] = a_rec;
+    nosoa_arena.count = 1;
+    atomic_store_explicit(&entry.rcu.active, &nosoa_arena, memory_order_release);
+    send_axfr_response(-1, "edge.example.", req, qoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+
+    zone_arena_destroy(&empty_arena);
+    zone_arena_destroy(&nosoa_arena);
+    zone_arena_destroy(&entry.rcu.arena_a);
+
+    printf("  -> send_axfr_response error paths passed.\n");
+}
+
+static void test_compute_ixfr_diff_exhaustive(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff exhaustive edge cases...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "diff.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    zone_arena_t old_a, new_a;
+    zone_arena_init(&old_a);
+    zone_arena_init(&new_a);
+
+    // 1. Missing hash_table -> returns immediately
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+
+    // 2. Add SOA records
+    init_axfr_zone(&old_a, "diff.example.", "100");
+    init_axfr_zone(&new_a, "diff.example.", "200");
+
+    // 3. Add custom generic_data records, ecs_subnet_tag, bind_location_tag
+    dns_record_t rec_old;
+    memset(&rec_old, 0, sizeof(rec_old));
+    rec_old.name = arena_strdup(&old_a, "loc.diff.example.");
+    rec_old.type = arena_strdup(&old_a, "TXT");
+    rec_old.type_code = 16;
+    rec_old.class_str = arena_strdup(&old_a, "IN");
+    rec_old.class_val = 1;
+    rec_old.ttl = arena_strdup(&old_a, "300");
+    rec_old.ttl_value = 300;
+    rec_old.bind_location_tag = arena_strdup(&old_a, "tokyo");
+    rec_old.ecs_subnet_tag = arena_strdup(&old_a, "192.0.2.0/24");
+    rec_old.generic_len = 5;
+    rec_old.generic_data = (uint8_t *)"hello";
+    rec_old.rdata_count = 1;
+    rec_old.rdata[0] = arena_strdup(&old_a, "\"hello\"");
+    old_a.records[old_a.count++] = rec_old;
+
+    dns_record_t rec_new;
+    memset(&rec_new, 0, sizeof(rec_new));
+    rec_new.name = arena_strdup(&new_a, "loc.diff.example.");
+    rec_new.type = arena_strdup(&new_a, "TXT");
+    rec_new.type_code = 16;
+    rec_new.class_str = arena_strdup(&new_a, "IN");
+    rec_new.class_val = 1;
+    rec_new.ttl = arena_strdup(&new_a, "300");
+    rec_new.ttl_value = 300;
+    rec_new.bind_location_tag = arena_strdup(&new_a, "osaka");
+    rec_new.ecs_subnet_tag = arena_strdup(&new_a, "198.51.100.0/24");
+    rec_new.generic_len = 5;
+    rec_new.generic_data = (uint8_t *)"world";
+    rec_new.rdata_count = 1;
+    rec_new.rdata[0] = arena_strdup(&new_a, "\"world\"");
+    new_a.records[new_a.count++] = rec_new;
+
+    build_zone_index(&old_a, true);
+    build_zone_index(&new_a, true);
+
+    // Compute diff: should populate entry.ixfr_history
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+    assert(entry.ixfr_history.count == 1);
+    assert(entry.ixfr_history.entries[0] != NULL);
+    assert(entry.ixfr_history.entries[0]->old_serial == 100);
+    assert(entry.ixfr_history.entries[0]->new_serial == 200);
+
+    // Ring buffer fill to MAX_IXFR_HISTORY
+    for (int k = 0; k < MAX_IXFR_HISTORY + 2; k++) {
+        compute_ixfr_diff(&entry, &old_a, &new_a);
+    }
+    assert(entry.ixfr_history.count == MAX_IXFR_HISTORY);
+
+    // Free history
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) {
+            free_ixfr_txn(entry.ixfr_history.entries[i]);
+            entry.ixfr_history.entries[i] = NULL;
+        }
+    }
+    zone_arena_destroy(&old_a);
+    zone_arena_destroy(&new_a);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> compute_ixfr_diff_exhaustive passed.\n");
+}
+
+static void test_extended_axfr_and_intermediate_tsig_cases(void) {
+    printf("[TEST] AXFR/IXFR: extended AXFR tags and intermediate TSIG buffering...\n");
+
+    zone_arena_t standby, active;
+    zone_arena_init(&standby);
+    zone_arena_init(&active);
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    // Construct packet with Extended AXFR tags (LOC_STATE, ECS_STATE, LOC_TAGDEF, ECS_TAGDEF, ECS_TRUSTED, TINYDNS_LOCDEF, TINYDNS_WRAP)
+    uint8_t pkt[2048] = {0};
+    pkt[0] = 0xAA; pkt[1] = 0xBB; pkt[2] = 0x84;
+    pkt[6] = 0; pkt[7] = 8; // ANCOUNT = 8
+    size_t off = 12;
+
+    // 1. Initial SOA (serial 100)
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ext.example.");
+    pkt[off++] = 0; pkt[off++] = 6; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    size_t rdp = off; off += 2;
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ns1.ext.example.");
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "admin.ext.example.");
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 100;
+    for (int k = 0; k < 4; k++) { pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 10; }
+    uint16_t rdl = (uint16_t)(off - (rdp + 2));
+    pkt[rdp] = rdl >> 8; pkt[rdp+1] = rdl & 0xFF;
+
+    // 2. LOC_STATE tag ("tokyo-dc")
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ext.example.");
+    pkt[off++] = (DNS_TYPE_KARIDNS_LOC_STATE >> 8); pkt[off++] = (DNS_TYPE_KARIDNS_LOC_STATE & 0xFF);
+    pkt[off++] = (DNS_CLASS_KARIDNS_EXT >> 8); pkt[off++] = (DNS_CLASS_KARIDNS_EXT & 0xFF);
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 8;
+    memcpy(pkt + off, "tokyo-dc", 8); off += 8;
+
+    // 3. ECS_STATE tag ("192.0.2.0/24")
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ext.example.");
+    pkt[off++] = (DNS_TYPE_KARIDNS_ECS_STATE >> 8); pkt[off++] = (DNS_TYPE_KARIDNS_ECS_STATE & 0xFF);
+    pkt[off++] = (DNS_CLASS_KARIDNS_EXT >> 8); pkt[off++] = (DNS_CLASS_KARIDNS_EXT & 0xFF);
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 12;
+    memcpy(pkt + off, "192.0.2.0/24", 12); off += 12;
+
+    // 4. LOC_TAGDEF
+    ecs_tag_def_t tdef;
+    memset(&tdef, 0, sizeof(tdef));
+    tdef.tag = "tokyo-dc";
+    tdef.cidr_count = 1;
+    tdef.cidrs = calloc(1, sizeof(ecs_cidr_entry_t));
+    tdef.cidrs[0].cidr = "10.0.0.0/8";
+    uint8_t tbuf[512];
+    size_t tlen = pack_tag_def_rdata(tbuf, sizeof(tbuf), &tdef);
+    free(tdef.cidrs);
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ext.example.");
+    pkt[off++] = (DNS_TYPE_KARIDNS_LOC_TAGDEF >> 8); pkt[off++] = (DNS_TYPE_KARIDNS_LOC_TAGDEF & 0xFF);
+    pkt[off++] = (DNS_CLASS_KARIDNS_EXT >> 8); pkt[off++] = (DNS_CLASS_KARIDNS_EXT & 0xFF);
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = (tlen >> 8); pkt[off++] = (tlen & 0xFF);
+    memcpy(pkt + off, tbuf, tlen); off += tlen;
+
+    // 5. ECS_TRUSTED
+    uint8_t tr_buf[64] = { 1, 12, '1', '9', '2', '.', '0', '.', '2', '.', '0', '/', '2', '4' };
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ext.example.");
+    pkt[off++] = (DNS_TYPE_KARIDNS_ECS_TRUSTED >> 8); pkt[off++] = (DNS_TYPE_KARIDNS_ECS_TRUSTED & 0xFF);
+    pkt[off++] = (DNS_CLASS_KARIDNS_EXT >> 8); pkt[off++] = (DNS_CLASS_KARIDNS_EXT & 0xFF);
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 14;
+    memcpy(pkt + off, tr_buf, 14); off += 14;
+
+    // 6. TINYDNS_LOCDEF
+    uint8_t tloc[7] = { 'j', 'p', 32, 192, 0, 2, 1 };
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ext.example.");
+    pkt[off++] = (DNS_TYPE_KARIDNS_TINYDNS_LOCDEF >> 8); pkt[off++] = (DNS_TYPE_KARIDNS_TINYDNS_LOCDEF & 0xFF);
+    pkt[off++] = (DNS_CLASS_KARIDNS_EXT >> 8); pkt[off++] = (DNS_CLASS_KARIDNS_EXT & 0xFF);
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 7;
+    memcpy(pkt + off, tloc, 7); off += 7;
+
+    // 7. Regular A record
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "www.ext.example.");
+    pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 4;
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 99;
+
+    // 8. Closing SOA (serial 100)
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ext.example.");
+    pkt[off++] = 0; pkt[off++] = 6; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    rdp = off; off += 2;
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "ns1.ext.example.");
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "admin.ext.example.");
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 100;
+    for (int k = 0; k < 4; k++) { pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 10; }
+    rdl = (uint16_t)(off - (rdp + 2));
+    pkt[rdp] = rdl >> 8; pkt[rdp+1] = rdl & 0xFF;
+
+    assert(parse_xfr_packet(pkt, off, &standby, &active, &session, "ext.example.") == 0);
+    assert(session.is_finished == true);
+
+    zone_arena_destroy(&standby);
+    zone_arena_destroy(&active);
+    printf("  -> extended AXFR tags passed.\n");
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_wait_for_active_axfr_branches();
     test_compute_ixfr_diff();
     test_compute_ixfr_diff_generic_and_edge_cases();
+    test_compute_ixfr_diff_exhaustive();
     test_parse_xfr_packet();
     test_parse_xfr_packet_ixfr_sequence_and_tinydns();
+    test_parse_xfr_packet_error_and_out_of_zone_rejections();
+    test_extended_axfr_and_intermediate_tsig_cases();
     test_send_axfr_response_ixfr_and_extended();
     test_send_axfr_response_large_multi_chunk_tsig();
+    test_send_axfr_response_error_and_edge_branches();
     test_handle_axfr_event_multi_message_and_tsig();
     test_handle_axfr_event_and_worker_thread();
     test_axfr_bg_thread_and_free_ixfr_txn();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }
+

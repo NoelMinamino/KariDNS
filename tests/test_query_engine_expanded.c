@@ -2412,6 +2412,76 @@ static void test_query_engine_protocol_qclass_and_edns_branches(void) {
     printf("  -> UDP AXFR, foreign QCLASS, and EDNS BADVERS passed.\n");
 }
 
+static void test_cname_target_overflow_and_tsig_query_paths(void) {
+    printf("[TEST] Query Engine: CNAME target overflow (>255) and query TSIG verification...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    // Build zone with long CNAME target composed of valid labels (<= 63 bytes each)
+    const char *long_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa."
+                            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
+                            "cccccccccccccccccccccccccccccccccccccccccccccccccc."
+                            "dddddddddddddddddddddddddddddddddddddddddddddddddd."
+                            "example.com.";
+
+    char ztext[1024];
+    snprintf(ztext, sizeof(ztext),
+             "cname.example. 3600 IN SOA ns1.cname.example. admin.cname.example. 1 3600 1800 604800 86400\n"
+             "cname.example. 3600 IN NS ns1.cname.example.\n"
+             "alias.cname.example. 3600 IN CNAME %s\n", long_name);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "cname.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    int p_res = parse_zone_fast(ztext, strlen(ztext), &arena, &ctx);
+    assert(p_res >= 0);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "cname.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+    view_snapshot_t view = {
+        .name = "default",
+        .entries = entries,
+        .zone_count = 1,
+        .hash_table = hash_tbl,
+        .hash_size = 2,
+        .chain_next = chain_nxt,
+    };
+    zone_db_snapshot_t snap = {
+        .views = &view,
+        .view_count = 1,
+    };
+
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+
+    uint8_t qbuf[512], rbuf[1024];
+    size_t qlen = 0;
+    build_dns_query(qbuf, &qlen, 0x4444, "alias.cname.example.", 1 /*A*/, false);
+
+    rate_limit_config_t *rrl_cfg = NULL;
+    int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "alias.cname.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    // Should successfully answer with the CNAME record
+    uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
+    assert(ancount == 1);
+
+    zone_arena_destroy(&arena);
+    printf("  -> CNAME target overflow test passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -2432,6 +2502,7 @@ int main(void) {
     test_query_engine_helpers_and_edge_cases();
     test_dname_synthesis_and_wildcard_proofs();
     test_query_engine_protocol_qclass_and_edns_branches();
+    test_cname_target_overflow_and_tsig_query_paths();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }

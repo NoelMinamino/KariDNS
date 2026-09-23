@@ -1092,6 +1092,34 @@ static void test_control_socket_thread_and_commands(void) {
     assert(len > 0);
     assert(strcmp(out, "ERROR unknown command\n") == 0);
 
+    len = run_ctrl_cmd(&sun, secret_key, "notify unknown.example.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "ERROR zone not found\n") == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "retransfer unknown.example.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "ERROR zone not found\n") == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "reload unknown.example.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "ERROR zone not found\n") == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "observatory unknown.example.\n", out, sizeof(out));
+    assert(len > 0);
+    assert(strcmp(out, "OK 0\n") == 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "stats\n", out, sizeof(out));
+    assert(len > 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "stats json\n", out, sizeof(out));
+    assert(len > 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "reload\n", out, sizeof(out));
+    assert(len > 0);
+
+    len = run_ctrl_cmd(&sun, secret_key, "reconfig\n", out, sizeof(out));
+    assert(len > 0);
+
     // 3. Test Command Buffer Overflow
     int cfd2 = socket(AF_UNIX, SOCK_STREAM, 0);
     assert(cfd2 >= 0);
@@ -1598,6 +1626,17 @@ static void test_active_broker_connect_loop(void) {
     printf("  -> active start_connect_broker passed.\n");
 }
 
+static void test_setup_ipc_tables_and_reload_error_paths(void) {
+    printf("[TEST] Server Core: setup_ipc_tables worker limits and reload_all_zones errors...\n");
+    setup_ipc_tables(1);
+    setup_ipc_tables(4);
+    setup_ipc_tables(16);
+
+    // reload_all_zones with empty config / NULL active snapshot
+    reload_all_zones();
+    printf("  -> setup_ipc_tables and reload_all_zones passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("=== Starting KariDNS Server Core Unit Tests ===\n");
@@ -1621,6 +1660,7 @@ int main(void) {
     test_open_router_udp_sockets_and_buffers();
     test_async_io_pool_and_tasks();
     test_meta_types_and_utils_helpers();
+    test_setup_ipc_tables_and_reload_error_paths();
     test_perform_config_reload_valid_and_diff();
     test_active_broker_connect_loop();
     test_server_core_process_lifecycle_and_signals();

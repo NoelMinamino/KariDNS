@@ -597,6 +597,56 @@ static void test_dag_transport_helpers(void) {
     printf("  -> DAG transport helpers passed.\n");
 }
 
+static void test_dag_replay_mode_cli_and_protobuf_varint(void) {
+    printf("[TEST] DAG Tools: replay mode CLI parsing & protobuf varint decoding...\n");
+
+    // 1. Missing args (should return 1)
+    char *argv_empty[] = { "dag", "--replay" };
+    assert(run_replay_mode(2, argv_empty) == 1);
+
+    // 2. Conflicting args --compare-recorded and --server2
+    char *argv_conflict[] = { "dag", "--replay", "some.pcap", "--server1", "127.0.0.1:5353", "--server2", "127.0.0.1:5354", "--compare-recorded" };
+    assert(run_replay_mode(8, argv_conflict) == 1);
+
+    // 3. Non-existent file
+    char *argv_no_file[] = { "dag", "--replay", "/tmp/non_existent_file_xyz_123.pcap", "--server1", "127.0.0.1:5353" };
+    assert(run_replay_mode(5, argv_no_file) == 1);
+
+    // 4. Protobuf varint decoding for DNSTAP frame
+    // Outer frame: dnstap.Dnstap (tag 14: message, len 28)
+    // Inner message: dnstap.Message
+    //   Message Type: tag 1, wire type 0 -> 0x08, 0x01 (AUTH_QUERY)
+    //   Socket Family: tag 2, wire type 0 -> 0x10, 0x01 (INET)
+    //   Socket Protocol: tag 3, wire type 0 -> 0x18, 0x11 (UDP = 17)
+    //   Query Address: tag 4, wire type 2 -> 0x22, 0x04, 192, 0, 2, 1
+    //   Query Port: tag 6, wire type 0 -> 0x30, 0x35 (53)
+    //   Query Message: tag 14, wire type 2 -> 0x72, 0x0C, 12-byte DNS wire
+    uint8_t proto_buf[64] = {
+        0x72, 28, // Outer: tag 14 (message), len 28
+        0x08, 0x01,
+        0x10, 0x01,
+        0x18, 0x11,
+        0x22, 0x04, 192, 0, 2, 1,
+        0x30, 0x35,
+        0x72, 0x0C, 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    dnstap_frame_info_t df_info;
+    memset(&df_info, 0, sizeof(df_info));
+    assert(parse_dnstap_data_frame_full(proto_buf, 30, &df_info) == true);
+    assert(df_info.message_type == 1);
+    assert(df_info.protocol == 17);
+    assert(df_info.has_wire == true);
+    assert(df_info.wire_len == 12);
+    assert(df_info.wire[0] == 0x12 && df_info.wire[1] == 0x34);
+
+    // Malformed truncated protobuf tag
+    uint8_t bad_varint[2] = { 0x80, 0x80 }; // Incomplete multi-byte varint
+    memset(&df_info, 0, sizeof(df_info));
+    assert(parse_dnstap_data_frame_full(bad_varint, sizeof(bad_varint), &df_info) == false);
+
+    printf("  -> replay mode CLI parsing & protobuf varint decoding passed.\n");
+}
+
 int main(void) {
     printf("=== Starting DAG Tools Unit Tests ===\n");
     zone_arena_init(&g_dag_arena);
@@ -604,6 +654,7 @@ int main(void) {
     test_dag_sig0_client_keys();
     test_dag_tsig_client_parser();
     test_dag_replay_and_pcap_parsing();
+    test_dag_replay_mode_cli_and_protobuf_varint();
     test_dag_transport_helpers();
     test_dag_internal_helpers();
     zone_arena_destroy(&g_dag_arena);
