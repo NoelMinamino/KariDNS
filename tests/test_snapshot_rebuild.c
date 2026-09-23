@@ -197,12 +197,107 @@ static void test_rebuild_two_views(void) {
     printf("  -> rebuild/lookup/reload verdicts passed.\n");
 }
 
+static void test_snapshot_retain_release_and_gc(void) {
+    printf("[TEST] Snapshot retain, release, GC, and abort rebuild...\n");
+    // Retain / release NULL safety
+    retain_zone_snapshot(NULL);
+    release_zone_snapshot(NULL);
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.reader_count = ATOMIC_VAR_INIT(0);
+
+    retain_zone_snapshot(&snap);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    retain_zone_snapshot(&snap);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 2);
+    release_zone_snapshot(&snap);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    release_zone_snapshot(&snap);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+    // Release when already 0 (no underflow)
+    release_zone_snapshot(&snap);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+
+    // Entry create and free
+    zone_db_entry_t *entry = create_new_zone_entry("test.example.", "default");
+    assert(entry != NULL);
+    assert(strcmp(entry->domain, "test.example.") == 0);
+    assert(strcmp(entry->view_name, "default") == 0);
+    free_zone_db_entry(entry);
+
+    // wait_for_readers NULL and empty
+    wait_for_readers(NULL);
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    arena.reader_count = ATOMIC_VAR_INIT(0);
+    wait_for_readers(&arena);
+
+    // abort_rebuild_snapshot NULL and valid
+    abort_rebuild_snapshot(NULL, "unit_test_null");
+    zone_db_snapshot_t *dummy_snap = calloc(1, sizeof(zone_db_snapshot_t));
+    abort_rebuild_snapshot(dummy_snap, "unit_test_dummy");
+
+    printf("  -> Snapshot retain/release/GC passed.\n");
+}
+
+static void test_lookup_across_views_multi(void) {
+    printf("[TEST] lookup_zone_across_views multi-match and edge cases...\n");
+    wfile("shared.zone", ZONE_A);
+
+    server_config_t *cfg = load_conf(
+        "view \"view1\" {\n  match-clients { 10.0.0.0/8; };\n"
+        "  zone \"shared.example\" { type master; file \"%s/shared.zone\"; };\n"
+        "  zone \"unique1.example\" { type master; file \"%s/shared.zone\"; };\n};\n"
+        "view \"view2\" {\n  match-clients { any; };\n"
+        "  zone \"shared.example\" { type master; file \"%s/shared.zone\"; };\n"
+        "  zone \"unique2.example\" { type master; file \"%s/shared.zone\"; };\n};\n",
+        g_dir, g_dir, g_dir, g_dir);
+
+    zone_db_snapshot_t *snap = build(cfg, false);
+    assert(snap != NULL);
+
+    zone_lookup_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    // Lookup with view_name specified
+    int m1 = lookup_zone_across_views(snap, cfg, "shared.example.", "view1", &res);
+    assert(m1 == 1);
+    assert(res.entry != NULL && strcmp(res.view_name, "view1") == 0);
+
+    // Lookup across all views (NULL view_name) -> should find 2 matches
+    memset(&res, 0, sizeof(res));
+    int m2 = lookup_zone_across_views(snap, cfg, "shared.example.", NULL, &res);
+    assert(m2 == 2);
+
+    // Lookup non-existent zone -> 0 matches
+    memset(&res, 0, sizeof(res));
+    int m3 = lookup_zone_across_views(snap, cfg, "nonexistent.example.", NULL, &res);
+    assert(m3 == 0);
+
+    // Suffix lookup edge cases
+    view_snapshot_t *v1 = &snap->views[0];
+    assert(find_zone_in_view(NULL, "shared.example.") == NULL);
+    assert(find_zone_in_view(v1, NULL) == NULL);
+    assert(find_zone_in_view(v1, "sub.deep.shared.example.") != NULL);
+
+    // snapshot_get_zone NULL safety
+    assert(snapshot_get_zone(NULL, "shared.example.") == NULL);
+    assert(snapshot_get_zone(snap, "nonexistent.example.") == NULL);
+
+    release_zone_snapshot(snap);
+    printf("  -> lookup_zone_across_views multi-match passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Snapshot Rebuild Tests ===\n");
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_snap_XXXXXX");
     assert(mkdtemp(g_dir));
     test_rebuild_two_views();
+    test_snapshot_retain_release_and_gc();
+    test_lookup_across_views_multi();
     char cmd[200]; snprintf(cmd, sizeof(cmd), "rm -rf %s", g_dir); assert(system(cmd) == 0);
     printf("=== All Snapshot Rebuild Tests PASSED ===\n");
     return 0;
 }
+

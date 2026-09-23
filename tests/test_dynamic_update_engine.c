@@ -686,14 +686,239 @@ static void test_update_multi_tsig_keys(void) {
     printf("  -> Multiple TSIG keys in allow-update passed.\n");
 }
 
+static void test_dynamic_update_prerequisites_and_error_paths(void) {
+    printf("[TEST] Dynamic Update: RFC 2136 Prerequisite and Error branches...\n");
+    zone_arena_t arena;
+    init_sample_zone_arena(&arena, "example.com.", "100");
+
+    // Add an A record for www.example.com.
+    dns_record_t a_rec;
+    memset(&a_rec, 0, sizeof(a_rec));
+    a_rec.name = arena_strdup(&arena, "www.example.com.");
+    a_rec.type = arena_strdup(&arena, "A");
+    a_rec.type_code = 1;
+    a_rec.class_str = arena_strdup(&arena, "IN");
+    a_rec.class_val = 1;
+    a_rec.ttl = arena_strdup(&arena, "300");
+    a_rec.ttl_value = 300;
+    a_rec.rdata_count = 1;
+    a_rec.rdata[0] = arena_strdup(&arena, "192.0.2.1");
+    arena.records[arena.count++] = a_rec;
+    build_zone_index(&arena, true);
+
+    // 1. Short packet (< 12 bytes)
+    uint8_t short_pkt[8] = {0};
+    int prc = 0, upc = 0;
+    assert(process_update_sections(short_pkt, sizeof(short_pkt), "example.com.", &arena, &prc, &upc) == 1);
+
+    // 2. ZOCOUNT != 1
+    uint8_t pkt_zocnt[64] = {0};
+    pkt_zocnt[2] = 0x28; // UPDATE
+    pkt_zocnt[5] = 0;    // ZOCOUNT = 0
+    assert(process_update_sections(pkt_zocnt, 12, "example.com.", &arena, &prc, &upc) == 1);
+
+    // 3. Excessive count (> 1000)
+    pkt_zocnt[5] = 1; // ZOCOUNT = 1
+    pkt_zocnt[6] = 0x03; pkt_zocnt[7] = 0xF0; // PRCOUNT = 1008
+    assert(process_update_sections(pkt_zocnt, 12, "example.com.", &arena, &prc, &upc) == 5); // REFUSED
+
+    // Helper to build base header + zone section for example.com.
+    #define BUILD_HEADER(buf, len_var, pr_cnt, up_cnt) do { \
+        memset(buf, 0, sizeof(buf)); \
+        buf[2] = 0x28; \
+        buf[4] = 0; buf[5] = 1; /* ZOCOUNT = 1 */ \
+        buf[6] = (uint8_t)((pr_cnt) >> 8); buf[7] = (uint8_t)((pr_cnt) & 0xFF); \
+        buf[8] = (uint8_t)((up_cnt) >> 8); buf[9] = (uint8_t)((up_cnt) & 0xFF); \
+        len_var = 12; \
+        buf[len_var++] = 7; memcpy(&buf[len_var], "example", 7); len_var += 7; \
+        buf[len_var++] = 3; memcpy(&buf[len_var], "com", 3); len_var += 3; \
+        buf[len_var++] = 0; \
+        buf[len_var++] = 0; buf[len_var++] = 6; /* SOA */ \
+        buf[len_var++] = 0; buf[len_var++] = 1; /* IN */ \
+    } while (0)
+
+    uint8_t pkt[1024];
+    size_t off = 0;
+
+    // 4. Zone name mismatch -> NOTAUTH (9)
+    BUILD_HEADER(pkt, off, 0, 0);
+    assert(process_update_sections(pkt, off, "other.com.", &arena, &prc, &upc) == 9);
+
+    // 5. Prereq: name out of zone -> NOTZONE (10)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 3; memcpy(&pkt[off], "out", 3); off += 3;
+    pkt[off++] = 3; memcpy(&pkt[off], "org", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 255; // ANY
+    pkt[off++] = 0; pkt[off++] = 255; // ANY
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; // TTL=0
+    pkt[off++] = 0; pkt[off++] = 0; // RDLEN=0
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 10);
+
+    // 6. Prereq: CLASS=ANY (255), RDLEN != 0 -> FORMERR (1)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 255; // ANY
+    pkt[off++] = 0; pkt[off++] = 255; // ANY
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 4; // RDLEN=4 (invalid for ANY)
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 1;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 1);
+
+    // 7. Prereq: CLASS=ANY, TYPE=ANY, name not in zone DB -> NXDOMAIN (3)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 4; memcpy(&pkt[off], "none", 4); off += 4;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 255; // TYPE=ANY
+    pkt[off++] = 0; pkt[off++] = 255; // CLASS=ANY
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 0;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 3); // NXDOMAIN
+
+    // 8. Prereq: CLASS=ANY, TYPE=TXT (not present on www.example.com.) -> NXRRSET (8)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 16;  // TYPE=TXT
+    pkt[off++] = 0; pkt[off++] = 255; // CLASS=ANY
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 0;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 8); // NXRRSET
+
+    // 9. Prereq: CLASS=NONE (254), TYPE=ANY, name exists (www) -> YXDOMAIN (6)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 255; // TYPE=ANY
+    pkt[off++] = 0; pkt[off++] = 254; // CLASS=NONE
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 0;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 6); // YXDOMAIN
+
+    // 10. Prereq: CLASS=NONE (254), TYPE=A, RRset exists (www A) -> YXRRSET (7)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 1;   // TYPE=A
+    pkt[off++] = 0; pkt[off++] = 254; // CLASS=NONE
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 0;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 7); // YXRRSET
+
+    // 11. Prereq: CLASS=IN, value-dependent exact match mismatch -> NXRRSET (8)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 1; // TYPE=A
+    pkt[off++] = 0; pkt[off++] = 1; // CLASS=IN
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 4;
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 99; // 192.0.2.99 != 192.0.2.1
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 8); // NXRRSET
+
+    // 12. Prereq: CLASS=IN, value-dependent exact match success -> NOERROR (0)
+    BUILD_HEADER(pkt, off, 1, 0);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 1; // TYPE=A
+    pkt[off++] = 0; pkt[off++] = 1; // CLASS=IN
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 4;
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 1; // 192.0.2.1
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 0);
+
+    // 13. Update: Delete SOA via CLASS=ANY -> REFUSED (5)
+    BUILD_HEADER(pkt, off, 0, 1);
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 6;   // SOA
+    pkt[off++] = 0; pkt[off++] = 255; // ANY
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 0;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 5);
+
+    // 14. Update: Add meta type (OPT=41) via ADD -> FORMERR (1)
+    BUILD_HEADER(pkt, off, 0, 1);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 41; // OPT
+    pkt[off++] = 0; pkt[off++] = 1;  // IN
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 0;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 1);
+
+    // 15. Update: Add RR with wrong class (CH=3) -> FORMERR (1)
+    BUILD_HEADER(pkt, off, 0, 1);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 1; // A
+    pkt[off++] = 0; pkt[off++] = 3; // CH (wrong class)
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 4;
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 5;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 1);
+
+    // 16. Update: Add RR with owner out of zone -> REFUSED (5)
+    BUILD_HEADER(pkt, off, 0, 1);
+    pkt[off++] = 3; memcpy(&pkt[off], "out", 3); off += 3;
+    pkt[off++] = 3; memcpy(&pkt[off], "org", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 1; // A
+    pkt[off++] = 0; pkt[off++] = 1; // IN
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 4;
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 5;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 5);
+
+    // 17. Update: Add CNAME where A already exists (www) -> REFUSED (5)
+    BUILD_HEADER(pkt, off, 0, 1);
+    pkt[off++] = 3; memcpy(&pkt[off], "www", 3); off += 3;
+    pkt[off++] = 7; memcpy(&pkt[off], "example", 7); off += 7;
+    pkt[off++] = 3; memcpy(&pkt[off], "com", 3); off += 3;
+    pkt[off++] = 0;
+    pkt[off++] = 0; pkt[off++] = 5; // CNAME
+    pkt[off++] = 0; pkt[off++] = 1; // IN
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 8;
+    pkt[off++] = 6; memcpy(&pkt[off], "target", 6); off += 6;
+    pkt[off++] = 0;
+    assert(process_update_sections(pkt, off, "example.com.", &arena, &prc, &upc) == 5);
+
+    zone_arena_destroy(&arena);
+    #undef BUILD_HEADER
+    printf("  -> Dynamic Update prerequisite & error branches passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Dynamic Update Engine Unit Tests ===\n");
     test_bump_soa_serial();
     test_process_update_sections_records();
     test_process_update_sections_apex_ns_protection();
+    test_dynamic_update_prerequisites_and_error_paths();
     test_handle_dynamic_update_pipeline();
     test_update_multi_tsig_keys();
     test_send_notify_to_all_comprehensive();
     printf("=== All Dynamic Update Engine Unit Tests PASSED ===\n");
     return 0;
 }
+
