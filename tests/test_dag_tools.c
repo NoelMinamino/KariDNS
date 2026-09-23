@@ -528,13 +528,61 @@ static void test_dag_transport_helpers(void) {
         "Content-Length: 0\r\n\r\n";
     assert(decode_http_response_body((const uint8_t *)http_404, strlen(http_404), resp_dec, sizeof(resp_dec)) == -1);
 
-    // 5. send_proxyv2_if_enabled
+    // 5. send_proxyv2_if_enabled and PROXY v2 parsing/building
     query_opts_t no_proxy_qo;
     memset(&no_proxy_qo, 0, sizeof(no_proxy_qo));
     no_proxy_qo.use_proxy = false;
     send_proxyv2_if_enabled(-1, &no_proxy_qo, true);
 
-    // 6. set_socket_timeouts
+    query_opts_t proxy_qo;
+    memset(&proxy_qo, 0, sizeof(proxy_qo));
+    // NULL / empty -> LOCAL command
+    assert(parse_proxy_arg(NULL, &proxy_qo) == true);
+    assert(proxy_qo.proxy_use_local_cmd == true);
+
+    // IPv4 PROXY arg
+    memset(&proxy_qo, 0, sizeof(proxy_qo));
+    proxy_qo.use_proxy = true;
+    assert(parse_proxy_arg("192.0.2.1#12345-192.0.2.2#53", &proxy_qo) == true);
+    assert(proxy_qo.proxy_family == AF_INET);
+    assert(proxy_qo.proxy_src_port == 12345 && proxy_qo.proxy_dst_port == 53);
+
+    uint8_t proxy_hdr[128];
+    size_t ph_len = build_proxyv2_header(proxy_hdr, sizeof(proxy_hdr), &proxy_qo, true);
+    assert(ph_len == 28); // 16 + 12
+    assert(proxy_hdr[12] == 0x21 && proxy_hdr[13] == 0x11); // v2 PROXY, AF_INET STREAM
+
+    // UDP IPv4
+    ph_len = build_proxyv2_header(proxy_hdr, sizeof(proxy_hdr), &proxy_qo, false);
+    assert(ph_len == 28);
+    assert(proxy_hdr[13] == 0x12); // AF_INET DGRAM
+
+    // IPv6 PROXY arg
+    memset(&proxy_qo, 0, sizeof(proxy_qo));
+    proxy_qo.use_proxy = true;
+    assert(parse_proxy_arg("2001:db8::1#54321-2001:db8::2#53", &proxy_qo) == true);
+    assert(proxy_qo.proxy_family == AF_INET6);
+    ph_len = build_proxyv2_header(proxy_hdr, sizeof(proxy_hdr), &proxy_qo, true);
+    assert(ph_len == 52); // 16 + 36
+    assert(proxy_hdr[13] == 0x21); // AF_INET6 STREAM
+
+    // Invalid proxy arg
+    assert(parse_proxy_arg("invalid_without_dash", &proxy_qo) == false);
+
+    // Capacity too small for build_proxyv2_header
+    assert(build_proxyv2_header(proxy_hdr, 10, &proxy_qo, true) == 0);
+
+    // 6. dag_strcasestr tests
+    assert(dag_strcasestr(NULL, "needle") == NULL);
+    assert(dag_strcasestr("haystack", NULL) == NULL);
+    assert(strcmp(dag_strcasestr("Hello World", ""), "Hello World") == 0);
+    assert(strcmp(dag_strcasestr("Hello WORLD", "world"), "WORLD") == 0);
+    assert(dag_strcasestr("Hello World", "xyz") == NULL);
+
+    // 7. close_cached_tcp
+    close_cached_tcp();
+
+    // 8. set_socket_timeouts
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0) {
         set_socket_timeouts(fds[0], 2);
@@ -542,7 +590,7 @@ static void test_dag_transport_helpers(void) {
         close(fds[1]);
     }
 
-    // 7. do_tls_recv_response with NULL ssl
+    // 9. do_tls_recv_response with NULL ssl
     uint8_t t_resp[512];
     assert(do_tls_recv_response(NULL, t_resp, sizeof(t_resp)) == -1);
 

@@ -2324,6 +2324,94 @@ static void test_dname_synthesis_and_wildcard_proofs(void) {
     printf("  -> DNAME synthesis & wildcard resolution passed.\n");
 }
 
+static void test_query_engine_protocol_qclass_and_edns_branches(void) {
+    printf("[TEST] Query Engine: UDP AXFR rejection, foreign QCLASS, and EDNS BADVERS...\n");
+
+    zone_arena_t arena;
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    zone_arena_init(&arena);
+    const char *zstr =
+        "$ORIGIN qproto.example.\n$TTL 300\n"
+        "@ IN SOA ns1.qproto.example. admin.qproto.example. 1 7200 3600 1209600 300\n"
+        "@ IN NS ns1.qproto.example.\n"
+        "ns1 IN A 192.0.2.1\n";
+    char *zbuf = arena_strdup(&arena, zstr);
+    assert(parse_zone_fast(zbuf, strlen(zbuf), &arena, &ctx) >= 0);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "qproto.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.hash_table = hash_tbl;
+    view.hash_size = 2;
+    view.chain_next = chain_nxt;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    atomic_init(&snap.reader_count, 10);
+
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    // 1. UDP AXFR (QTYPE=252 on UDP -> FORMERR)
+    uint8_t qbuf[512];
+    size_t qlen = 0;
+    build_dns_query(qbuf, &qlen, 0x1111, "qproto.example.", 252 /*AXFR*/, false);
+    uint8_t rbuf[4096];
+    int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "qproto.example.", 252, "127.0.0.1", &comp_ctx, false /*is_tcp=false*/, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    assert((rbuf[3] & 0x0F) == 1); // FORMERR
+
+    // 2. Foreign QCLASS (e.g. QCLASS=4 HS -> REFUSED)
+    compress_ctx_init(&comp_ctx);
+    build_dns_query(qbuf, &qlen, 0x2222, "qproto.example.", 1 /*A*/, false);
+    // Overwrite QCLASS in question section to HS (4)
+    size_t q_end = qlen;
+    qbuf[q_end - 2] = 0; qbuf[q_end - 1] = 4; // QCLASS = 4 (Hesiod)
+    rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "qproto.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    assert((rbuf[3] & 0x0F) == 5); // REFUSED
+
+    // 3. EDNS BADVERS (EDNS version = 1 -> BADVERS 16)
+    compress_ctx_init(&comp_ctx);
+    build_dns_query(qbuf, &qlen, 0x3333, "qproto.example.", 1, false);
+    // Append OPT RR with version = 1
+    qbuf[11] = 1; // ARCOUNT = 1
+    qbuf[qlen++] = 0; // root name
+    qbuf[qlen++] = 0; qbuf[qlen++] = 41; // TYPE = OPT
+    qbuf[qlen++] = 0x10; qbuf[qlen++] = 0x00; // CLASS = UDP payload size 4096
+    qbuf[qlen++] = 0; // Extended RCODE = 0
+    qbuf[qlen++] = 1; // EDNS Version = 1 (unsupported!)
+    qbuf[qlen++] = 0; qbuf[qlen++] = 0; // DO=0, Z=0
+    qbuf[qlen++] = 0; qbuf[qlen++] = 0; // RDLEN = 0
+
+    rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "qproto.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    // In BADVERS, base RCODE in header is 0, but OPT record has extended RCODE 1 (16 = BADVERS)
+    assert((rbuf[3] & 0x0F) == 0);
+    uint16_t arcount = (rbuf[10] << 8) | rbuf[11];
+    assert(arcount == 1);
+
+    zone_arena_destroy(&arena);
+    printf("  -> UDP AXFR, foreign QCLASS, and EDNS BADVERS passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -2343,8 +2431,10 @@ int main(void) {
     test_program_plugins_and_forward_zone_helpers();
     test_query_engine_helpers_and_edge_cases();
     test_dname_synthesis_and_wildcard_proofs();
+    test_query_engine_protocol_qclass_and_edns_branches();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
+
 
 

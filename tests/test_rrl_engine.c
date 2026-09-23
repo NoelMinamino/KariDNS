@@ -11,6 +11,7 @@
 
 #include "dns_wire.h"
 #include "dns_rrl.h"
+#include "dns_cidr.h"
 #include "dns_config_parser.h"
 
 #include <fcntl.h>
@@ -147,6 +148,39 @@ static void test_rrl_rate_limiting_and_slip(void) {
     allow = rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
     assert(allow == true); // Exempt!
 
+    // Test exempt_clients_parsed
+    cidr_entry_t parsed_exempt;
+    memset(&parsed_exempt, 0, sizeof(parsed_exempt));
+    assert(cidr_entry_parse(&parsed_exempt, "192.0.2.0/24"));
+    cfg.exempt_clients_parsed = &parsed_exempt;
+    cfg.exempt_clients = NULL;
+    allow = rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
+    assert(allow == true);
+
+    // Test log_only mode
+    cfg.exempt_clients_parsed = NULL;
+    cfg.exempt_clients_count = 0;
+    cfg.log_only = true;
+    cfg.responses_per_second = 1;
+    rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
+    // In log_only mode, rate exceeded should still return true!
+    allow = rrl_check(&cli1, RRL_RESP_NOERROR, &cfg, &slip);
+    assert(allow == true);
+
+    // Test NODATA and ERROR rate classes
+    cfg.log_only = false;
+    cfg.nodata_per_second = 1;
+    cfg.errors_per_second = 1;
+    cfg.window_seconds = 5000; // Trigger > 3600 clamp
+    allow = rrl_check(&cli1, RRL_RESP_NODATA, &cfg, &slip);
+    assert(allow == true);
+    allow = rrl_check(&cli1, RRL_RESP_ERROR, &cfg, &slip);
+    assert(allow == true);
+
+    // NULL and unconfigured checks
+    assert(rrl_check(NULL, RRL_RESP_NOERROR, &cfg, &slip) == true);
+    assert(rrl_check(&cli1, RRL_RESP_NOERROR, NULL, &slip) == true);
+
     printf("  -> rate limiting & slip passed.\n");
 }
 
@@ -176,6 +210,21 @@ static void test_rrl_client_exhaustion_and_shutdown(void) {
     assert(rrl_is_client_exhausted(&cli, &cfg) == true);
     assert(rrl_is_client_exhausted(NULL, &cfg) == false);
 
+    // Test exempt client in rrl_is_client_exhausted
+    ip_port_t exempt;
+    exempt.ip = "198.51.100.0/24";
+    exempt.port = 0;
+    cfg.exempt_clients = &exempt;
+    cfg.exempt_clients_count = 1;
+    assert(rrl_is_client_exhausted(&cli, &cfg) == false);
+
+    cidr_entry_t parsed_exempt;
+    memset(&parsed_exempt, 0, sizeof(parsed_exempt));
+    assert(cidr_entry_parse(&parsed_exempt, "198.51.100.0/24"));
+    cfg.exempt_clients_parsed = &parsed_exempt;
+    cfg.exempt_clients = NULL;
+    assert(rrl_is_client_exhausted(&cli, &cfg) == false);
+
     rate_limit_config_t uncfg;
     memset(&uncfg, 0, sizeof(uncfg));
     assert(rrl_is_client_exhausted(&cli, &uncfg) == false);
@@ -195,3 +244,4 @@ int main(void) {
     printf("=== All RRL Engine Unit Tests PASSED ===\n");
     return 0;
 }
+
