@@ -473,6 +473,8 @@ extern async_io_pool_t g_async_io_pool;
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
 extern int g_broker_sock;
+extern pid_t g_broker_pid;
+void start_connect_broker(void);
 extern int g_num_workers;
 extern int g_num_frontend_routers;
 extern int g_ipc_fds[4][128][2];

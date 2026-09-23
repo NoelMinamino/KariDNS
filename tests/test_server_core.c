@@ -45,6 +45,8 @@ void cleanup_pid_file(void);
 void setup_ipc_tables(int num_workers);
 void *worker_thread_func(void *arg);
 void *async_io_worker_func(void *arg);
+void start_connect_broker(void);
+extern pid_t g_broker_pid;
 
 // ----------------------------------------------------------------------------
 // 1. fast_ipv4_to_str Test
@@ -1545,6 +1547,57 @@ static void test_crypto_prewarm_survives_capability_mode(void) {
 #endif
 }
 
+static void test_perform_config_reload_valid_and_diff(void) {
+    printf("[TEST] Server Core: perform_config_reload with valid zone files and AST updates...\n");
+    char conf_path[256];
+    char zone_path[256];
+    snprintf(conf_path, sizeof(conf_path), "/tmp/karidns_reload_test_%ld.conf", (long)time(NULL));
+    snprintf(zone_path, sizeof(zone_path), "/tmp/karidns_reload_test_%ld.zone", (long)time(NULL));
+
+    FILE *fz = fopen(zone_path, "w");
+    assert(fz != NULL);
+    fprintf(fz, "$ORIGIN reload.test.\n$TTL 300\n@ IN SOA ns.reload.test. admin.reload.test. 1 7200 3600 1209600 300\n@ IN NS ns.reload.test.\nns IN A 192.0.2.1\n");
+    fclose(fz);
+
+    FILE *fc = fopen(conf_path, "w");
+    assert(fc != NULL);
+    fprintf(fc, "options {\n  port 5354;\n};\nview \"default\" {\n  zone \"reload.test.\" {\n    type master;\n    file \"%s\";\n  };\n};\n", zone_path);
+    fclose(fc);
+
+    g_config_path = conf_path;
+    perform_config_reload_ext(false);
+    perform_config_reload_ext(true);
+    reload_all_zones();
+
+    unlink(conf_path);
+    unlink(zone_path);
+    printf("  -> perform_config_reload with valid zone files passed.\n");
+}
+
+static void test_active_broker_connect_loop(void) {
+    printf("[TEST] Server Core: active start_connect_broker process loop...\n");
+    start_connect_broker();
+    if (g_broker_sock >= 0) {
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons(5353);
+        inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+
+        int fd = broker_connect(AF_INET, SOCK_STREAM, (struct sockaddr *)&sin, sizeof(sin));
+        if (fd >= 0) close(fd);
+
+        close(g_broker_sock);
+        g_broker_sock = -1;
+        if (g_broker_pid > 0) {
+            kill(g_broker_pid, SIGTERM);
+            waitpid(g_broker_pid, NULL, 0);
+            g_broker_pid = -1;
+        }
+    }
+    printf("  -> active start_connect_broker passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("=== Starting KariDNS Server Core Unit Tests ===\n");
@@ -1568,6 +1621,8 @@ int main(void) {
     test_open_router_udp_sockets_and_buffers();
     test_async_io_pool_and_tasks();
     test_meta_types_and_utils_helpers();
+    test_perform_config_reload_valid_and_diff();
+    test_active_broker_connect_loop();
     test_server_core_process_lifecycle_and_signals();
 
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");

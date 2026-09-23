@@ -149,8 +149,8 @@ void dec_tcp_clients(void) {
 
 // Broker
 STATIC_TEST int g_broker_sock = -1;
-static pid_t g_broker_pid = -1;
-__attribute__((unused)) static void start_connect_broker(void) {
+STATIC_TEST pid_t g_broker_pid = -1;
+__attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
     return;
