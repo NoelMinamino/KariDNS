@@ -2230,6 +2230,100 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     printf("  -> Query engine helpers & edge cases passed.\n");
 }
 
+static void test_dname_synthesis_and_wildcard_proofs(void) {
+    printf("[TEST] Query Engine: DNAME synthesis & wildcard resolution edge cases...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "dname.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char *zstr =
+        "$ORIGIN dname.example.\n"
+        "$TTL 300\n"
+        "@ IN SOA ns1.dname.example. hostmaster.dname.example. 1 7200 3600 1209600 300\n"
+        "@ IN NS ns1.dname.example.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "sub IN DNAME target.example.net.\n"
+        "*.wild IN A 192.0.2.99\n"
+        "*.wild IN TXT \"wildcard text\"\n";
+
+    char *zbuf = arena_strdup(&arena, zstr);
+    int parsed = parse_zone_fast(zbuf, strlen(zbuf), &arena, &ctx);
+    assert(parsed >= 0);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "dname.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.hash_table = hash_tbl;
+    view.hash_size = 2;
+    view.chain_next = chain_nxt;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    atomic_init(&snap.reader_count, 10);
+
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    // 1. Query for host.sub.dname.example. -> synthesizes DNAME + CNAME target.example.net.
+    uint8_t qbuf[512];
+    size_t qlen = 0;
+    build_dns_query(qbuf, &qlen, 0x1122, "host.sub.dname.example.", 1, false);
+
+    uint8_t rbuf[4096];
+    int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "host.sub.dname.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    assert((rbuf[3] & 0x0F) == 0); // NOERROR
+    uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
+    assert(ancount >= 1); // Contains DNAME and synthesized CNAME
+
+    // 2. Query for a.b.wild.dname.example. -> Wildcard expansion
+    compress_ctx_init(&comp_ctx);
+    build_dns_query(qbuf, &qlen, 0x3344, "a.b.wild.dname.example.", 1, false);
+    rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "a.b.wild.dname.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    assert((rbuf[3] & 0x0F) == 0); // NOERROR
+    ancount = (rbuf[6] << 8) | rbuf[7];
+    assert(ancount == 1); // 1 A record synthesized from wildcard
+
+    // 3. Query for a.b.wild.dname.example. QTYPE=AAAA -> Wildcard No-Data
+    compress_ctx_init(&comp_ctx);
+    build_dns_query(qbuf, &qlen, 0x5566, "a.b.wild.dname.example.", 28, false);
+    rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "a.b.wild.dname.example.", 28, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    assert((rbuf[3] & 0x0F) == 0); // NOERROR
+    ancount = (rbuf[6] << 8) | rbuf[7];
+    assert(ancount == 0); // 0 answers (NODATA)
+    uint16_t nscount = (rbuf[8] << 8) | rbuf[9];
+    assert(nscount >= 1); // SOA in authority section
+
+    zone_arena_destroy(&arena);
+    printf("  -> DNAME synthesis & wildcard resolution passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -2248,6 +2342,7 @@ int main(void) {
     test_delegation_referral_and_ds_handling();
     test_program_plugins_and_forward_zone_helpers();
     test_query_engine_helpers_and_edge_cases();
+    test_dname_synthesis_and_wildcard_proofs();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
