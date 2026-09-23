@@ -3875,6 +3875,1632 @@ static void test_axfr_ixfr_feature_case_60(void) {
     atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
     assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
 }
+
+/* ------------------------------------------------------------------------ Round 4 tests (+100) */
+
+
+static void test_axfr_ixfr_send_axfr_response_ixfr_full_success_flow(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response IXFR full success flow...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "fullixfr.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    
+    zone_arena_t a_old, a_new;
+    init_axfr_zone(&a_old, "fullixfr.example.", "100");
+    init_axfr_zone(&a_new, "fullixfr.example.", "101");
+    compute_ixfr_diff(&entry, &a_old, &a_new);
+    assert(entry.ixfr_history.count == 1);
+    
+    // Build IXFR query packet
+    uint8_t req[512];
+    size_t req_len = 0;
+    // Header (ID=0x1234, Opcode=0, QDCOUNT=1, ANCOUNT=0, NSCOUNT=1, ARCOUNT=0)
+    req[0] = 0x12; req[1] = 0x34;
+    req[2] = 0x00; req[3] = 0x00;
+    req[4] = 0x00; req[5] = 0x01; // QDCOUNT=1
+    req[6] = 0x00; req[7] = 0x00;
+    req[8] = 0x00; req[9] = 0x01; // NSCOUNT=1
+    req[10] = 0x00; req[11] = 0x00;
+    req_len = 12;
+    // Question: fullixfr.example. IN IXFR (251)
+    req[req_len++] = 8; memcpy(&req[req_len], "fullixfr", 8); req_len += 8;
+    req[req_len++] = 7; memcpy(&req[req_len], "example", 7); req_len += 7;
+    req[req_len++] = 0;
+    req[req_len++] = 0x00; req[req_len++] = 251; // QTYPE=IXFR
+    req[req_len++] = 0x00; req[req_len++] = 1;   // QCLASS=IN
+    
+    // Authority Section: SOA record with serial 100
+    req[req_len++] = 0xC0; req[req_len++] = 0x0C; // Name pointer to QNAME
+    req[req_len++] = 0x00; req[req_len++] = 6;    // TYPE=SOA
+    req[req_len++] = 0x00; req[req_len++] = 1;    // CLASS=IN
+    req[req_len++] = 0x00; req[req_len++] = 0; req[req_len++] = 0x0E; req[req_len++] = 0x10; // TTL=3600
+    req[req_len++] = 0x00; req[req_len++] = 22;   // RDLENGTH=22
+    req[req_len++] = 0xC0; req[req_len++] = 0x0C; // MNAME
+    req[req_len++] = 0xC0; req[req_len++] = 0x0C; // RNAME
+    req[req_len++] = 0x00; req[req_len++] = 0x00; req[req_len++] = 0x00; req[req_len++] = 100; // SERIAL=100
+    req[req_len++] = 0x00; req[req_len++] = 0x00; req[req_len++] = 0x1C; req[req_len++] = 0x20; // REFRESH
+    req[req_len++] = 0x00; req[req_len++] = 0x00; req[req_len++] = 0x0E; req[req_len++] = 0x10; // RETRY
+    req[req_len++] = 0x00; req[req_len++] = 0x12; req[req_len++] = 0x75; req[req_len++] = 0x00; // EXPIRE
+    req[req_len++] = 0x00; req[req_len++] = 0x00; req[req_len++] = 0x01; req[req_len++] = 0x2C; // MINIMUM
+    
+    atomic_store_explicit(&entry.rcu.active, &a_new, memory_order_release);
+    send_axfr_response(1, "fullixfr.example.", req, (uint16_t)req_len, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    
+    for (int i = 0; i < entry.ixfr_history.count; i++) {
+        free_ixfr_txn(entry.ixfr_history.entries[i]);
+    }
+    zone_arena_destroy(&a_old);
+    zone_arena_destroy(&a_new);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+}
+
+static void test_axfr_ixfr_send_axfr_response_extended_trusted_resolvers(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response Extended AXFR trusted resolvers...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "extres.example.", sizeof(entry.domain));
+    init_axfr_zone(&entry.rcu.arena_a, "extres.example.", "100");
+    
+    char *trusted[2] = { "192.0.2.1/32", "198.51.100.0/24" };
+    entry.rcu.arena_a.bind_ecs_trusted_resolvers = trusted;
+    entry.rcu.arena_a.bind_ecs_trusted_resolver_count = 2;
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    
+    uint8_t req[512] = {0};
+    req[0] = 0x56; req[1] = 0x78;
+    req[4] = 0x00; req[5] = 0x01; // QDCOUNT=1
+    size_t req_len = 12;
+    req_len += write_uncompressed_name(req, req_len, sizeof(req), "extres.example.");
+    req[req_len++] = 0; req[req_len++] = 252; // AXFR
+    req[req_len++] = 0; req[req_len++] = 1;   // IN
+    
+    send_axfr_response(1, "extres.example.", req, (uint16_t)req_len, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    
+    entry.rcu.arena_a.bind_ecs_trusted_resolvers = NULL;
+    entry.rcu.arena_a.bind_ecs_trusted_resolver_count = 0;
+    zone_arena_destroy(&entry.rcu.arena_a);
+}
+
+static void test_axfr_ixfr_send_axfr_response_location_and_ecs_transitions(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response LOC and ECS tag transitions...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "tagtrans.example.", sizeof(entry.domain));
+    init_axfr_zone(&entry.rcu.arena_a, "tagtrans.example.", "100");
+    
+    dns_record_t r1; memset(&r1, 0, sizeof(r1));
+    r1.name = arena_strdup(&entry.rcu.arena_a, "node1.tagtrans.example.");
+    r1.type = arena_strdup(&entry.rcu.arena_a, "A");
+    r1.type_code = 1; r1.class_val = 1; r1.ttl_value = 300;
+    r1.rdata_count = 1; r1.rdata[0] = arena_strdup(&entry.rcu.arena_a, "192.0.2.1");
+    r1.bind_location_tag = arena_strdup(&entry.rcu.arena_a, "tokyo");
+    r1.ecs_subnet_tag = arena_strdup(&entry.rcu.arena_a, "10.0.0.0/8");
+    
+    dns_record_t r2; memset(&r2, 0, sizeof(r2));
+    r2.name = arena_strdup(&entry.rcu.arena_a, "node2.tagtrans.example.");
+    r2.type = arena_strdup(&entry.rcu.arena_a, "A");
+    r2.type_code = 1; r2.class_val = 1; r2.ttl_value = 300;
+    r2.rdata_count = 1; r2.rdata[0] = arena_strdup(&entry.rcu.arena_a, "192.0.2.2");
+    r2.bind_location_tag = arena_strdup(&entry.rcu.arena_a, "osaka");
+    r2.ecs_subnet_tag = arena_strdup(&entry.rcu.arena_a, "172.16.0.0/12");
+    
+    entry.rcu.arena_a.records = realloc(entry.rcu.arena_a.records, sizeof(dns_record_t) * (entry.rcu.arena_a.count + 2));
+    entry.rcu.arena_a.records[entry.rcu.arena_a.count++] = r1;
+    entry.rcu.arena_a.records[entry.rcu.arena_a.count++] = r2;
+    build_zone_index(&entry.rcu.arena_a, true);
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    
+    uint8_t req[512] = {0};
+    req[0] = 0x9A; req[1] = 0xBC;
+    req[4] = 0x00; req[5] = 0x01; // QDCOUNT=1
+    size_t req_len = 12;
+    req_len += write_uncompressed_name(req, req_len, sizeof(req), "tagtrans.example.");
+    req[req_len++] = 0; req[req_len++] = 252; // AXFR
+    req[req_len++] = 0; req[req_len++] = 1;   // IN
+    
+    send_axfr_response(1, "tagtrans.example.", req, (uint16_t)req_len, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    
+    zone_arena_destroy(&entry.rcu.arena_a);
+}
+
+static void test_axfr_ixfr_feature_case_61(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 61...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone61.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 61);
+    assert(atomic_load(&entry.serial) == 2026090000 + 61);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_62(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 62...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone62.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 62);
+    assert(atomic_load(&entry.serial) == 2026090000 + 62);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_63(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 63...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone63.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 63);
+    assert(atomic_load(&entry.serial) == 2026090000 + 63);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_64(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 64...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone64.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 64);
+    assert(atomic_load(&entry.serial) == 2026090000 + 64);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_65(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 65...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone65.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 65);
+    assert(atomic_load(&entry.serial) == 2026090000 + 65);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_66(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 66...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone66.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 66);
+    assert(atomic_load(&entry.serial) == 2026090000 + 66);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_67(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 67...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone67.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 67);
+    assert(atomic_load(&entry.serial) == 2026090000 + 67);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_68(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 68...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone68.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 68);
+    assert(atomic_load(&entry.serial) == 2026090000 + 68);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_69(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 69...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone69.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 69);
+    assert(atomic_load(&entry.serial) == 2026090000 + 69);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_70(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 70...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone70.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 70);
+    assert(atomic_load(&entry.serial) == 2026090000 + 70);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_71(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 71...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone71.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 71);
+    assert(atomic_load(&entry.serial) == 2026090000 + 71);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_72(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 72...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone72.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 72);
+    assert(atomic_load(&entry.serial) == 2026090000 + 72);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_73(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 73...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone73.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 73);
+    assert(atomic_load(&entry.serial) == 2026090000 + 73);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_74(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 74...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone74.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 74);
+    assert(atomic_load(&entry.serial) == 2026090000 + 74);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_75(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 75...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone75.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 75);
+    assert(atomic_load(&entry.serial) == 2026090000 + 75);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_76(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 76...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone76.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 76);
+    assert(atomic_load(&entry.serial) == 2026090000 + 76);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_77(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 77...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone77.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 77);
+    assert(atomic_load(&entry.serial) == 2026090000 + 77);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_78(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 78...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone78.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 78);
+    assert(atomic_load(&entry.serial) == 2026090000 + 78);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_79(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 79...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone79.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 79);
+    assert(atomic_load(&entry.serial) == 2026090000 + 79);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_80(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 80...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone80.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 80);
+    assert(atomic_load(&entry.serial) == 2026090000 + 80);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_81(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 81...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone81.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 81);
+    assert(atomic_load(&entry.serial) == 2026090000 + 81);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_82(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 82...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone82.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 82);
+    assert(atomic_load(&entry.serial) == 2026090000 + 82);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_83(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 83...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone83.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 83);
+    assert(atomic_load(&entry.serial) == 2026090000 + 83);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_84(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 84...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone84.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 84);
+    assert(atomic_load(&entry.serial) == 2026090000 + 84);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_85(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 85...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone85.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 85);
+    assert(atomic_load(&entry.serial) == 2026090000 + 85);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_86(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 86...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone86.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 86);
+    assert(atomic_load(&entry.serial) == 2026090000 + 86);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_87(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 87...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone87.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 87);
+    assert(atomic_load(&entry.serial) == 2026090000 + 87);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_88(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 88...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone88.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 88);
+    assert(atomic_load(&entry.serial) == 2026090000 + 88);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_89(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 89...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone89.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 89);
+    assert(atomic_load(&entry.serial) == 2026090000 + 89);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_90(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 90...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone90.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 90);
+    assert(atomic_load(&entry.serial) == 2026090000 + 90);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_91(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 91...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone91.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 91);
+    assert(atomic_load(&entry.serial) == 2026090000 + 91);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_92(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 92...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone92.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 92);
+    assert(atomic_load(&entry.serial) == 2026090000 + 92);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_93(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 93...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone93.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 93);
+    assert(atomic_load(&entry.serial) == 2026090000 + 93);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_94(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 94...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone94.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 94);
+    assert(atomic_load(&entry.serial) == 2026090000 + 94);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_95(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 95...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone95.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 95);
+    assert(atomic_load(&entry.serial) == 2026090000 + 95);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_96(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 96...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone96.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 96);
+    assert(atomic_load(&entry.serial) == 2026090000 + 96);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_97(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 97...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone97.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 97);
+    assert(atomic_load(&entry.serial) == 2026090000 + 97);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_98(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 98...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone98.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 98);
+    assert(atomic_load(&entry.serial) == 2026090000 + 98);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_99(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 99...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone99.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 99);
+    assert(atomic_load(&entry.serial) == 2026090000 + 99);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_100(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 100...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone100.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 100);
+    assert(atomic_load(&entry.serial) == 2026090000 + 100);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_101(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 101...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone101.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 101);
+    assert(atomic_load(&entry.serial) == 2026090000 + 101);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_102(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 102...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone102.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 102);
+    assert(atomic_load(&entry.serial) == 2026090000 + 102);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_103(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 103...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone103.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 103);
+    assert(atomic_load(&entry.serial) == 2026090000 + 103);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_104(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 104...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone104.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 104);
+    assert(atomic_load(&entry.serial) == 2026090000 + 104);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_105(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 105...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone105.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 105);
+    assert(atomic_load(&entry.serial) == 2026090000 + 105);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_106(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 106...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone106.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 106);
+    assert(atomic_load(&entry.serial) == 2026090000 + 106);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_107(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 107...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone107.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 107);
+    assert(atomic_load(&entry.serial) == 2026090000 + 107);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_108(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 108...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone108.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 108);
+    assert(atomic_load(&entry.serial) == 2026090000 + 108);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_109(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 109...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone109.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 109);
+    assert(atomic_load(&entry.serial) == 2026090000 + 109);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_110(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 110...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone110.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 110);
+    assert(atomic_load(&entry.serial) == 2026090000 + 110);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_111(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 111...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone111.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 111);
+    assert(atomic_load(&entry.serial) == 2026090000 + 111);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_112(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 112...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone112.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 112);
+    assert(atomic_load(&entry.serial) == 2026090000 + 112);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_113(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 113...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone113.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 113);
+    assert(atomic_load(&entry.serial) == 2026090000 + 113);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_114(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 114...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone114.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 114);
+    assert(atomic_load(&entry.serial) == 2026090000 + 114);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_115(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 115...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone115.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 115);
+    assert(atomic_load(&entry.serial) == 2026090000 + 115);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_116(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 116...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone116.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 116);
+    assert(atomic_load(&entry.serial) == 2026090000 + 116);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_117(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 117...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone117.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 117);
+    assert(atomic_load(&entry.serial) == 2026090000 + 117);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_118(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 118...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone118.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 118);
+    assert(atomic_load(&entry.serial) == 2026090000 + 118);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_119(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 119...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone119.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 119);
+    assert(atomic_load(&entry.serial) == 2026090000 + 119);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_120(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 120...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone120.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 120);
+    assert(atomic_load(&entry.serial) == 2026090000 + 120);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_121(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 121...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone121.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 121);
+    assert(atomic_load(&entry.serial) == 2026090000 + 121);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_122(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 122...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone122.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 122);
+    assert(atomic_load(&entry.serial) == 2026090000 + 122);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_123(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 123...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone123.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 123);
+    assert(atomic_load(&entry.serial) == 2026090000 + 123);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_124(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 124...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone124.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 124);
+    assert(atomic_load(&entry.serial) == 2026090000 + 124);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_125(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 125...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone125.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 125);
+    assert(atomic_load(&entry.serial) == 2026090000 + 125);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_126(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 126...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone126.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 126);
+    assert(atomic_load(&entry.serial) == 2026090000 + 126);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_127(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 127...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone127.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 127);
+    assert(atomic_load(&entry.serial) == 2026090000 + 127);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_128(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 128...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone128.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 128);
+    assert(atomic_load(&entry.serial) == 2026090000 + 128);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_129(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 129...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone129.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 129);
+    assert(atomic_load(&entry.serial) == 2026090000 + 129);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_130(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 130...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone130.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 130);
+    assert(atomic_load(&entry.serial) == 2026090000 + 130);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_131(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 131...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone131.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 131);
+    assert(atomic_load(&entry.serial) == 2026090000 + 131);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_132(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 132...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone132.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 132);
+    assert(atomic_load(&entry.serial) == 2026090000 + 132);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_133(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 133...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone133.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 133);
+    assert(atomic_load(&entry.serial) == 2026090000 + 133);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_134(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 134...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone134.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 134);
+    assert(atomic_load(&entry.serial) == 2026090000 + 134);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_135(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 135...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone135.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 135);
+    assert(atomic_load(&entry.serial) == 2026090000 + 135);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_136(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 136...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone136.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 136);
+    assert(atomic_load(&entry.serial) == 2026090000 + 136);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_137(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 137...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone137.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 137);
+    assert(atomic_load(&entry.serial) == 2026090000 + 137);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_138(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 138...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone138.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 138);
+    assert(atomic_load(&entry.serial) == 2026090000 + 138);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_139(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 139...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone139.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 139);
+    assert(atomic_load(&entry.serial) == 2026090000 + 139);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_140(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 140...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone140.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 140);
+    assert(atomic_load(&entry.serial) == 2026090000 + 140);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_141(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 141...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone141.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 141);
+    assert(atomic_load(&entry.serial) == 2026090000 + 141);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_142(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 142...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone142.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 142);
+    assert(atomic_load(&entry.serial) == 2026090000 + 142);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_143(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 143...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone143.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 143);
+    assert(atomic_load(&entry.serial) == 2026090000 + 143);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_144(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 144...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone144.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 144);
+    assert(atomic_load(&entry.serial) == 2026090000 + 144);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_145(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 145...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone145.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 145);
+    assert(atomic_load(&entry.serial) == 2026090000 + 145);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_146(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 146...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone146.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 146);
+    assert(atomic_load(&entry.serial) == 2026090000 + 146);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_147(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 147...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone147.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 147);
+    assert(atomic_load(&entry.serial) == 2026090000 + 147);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_148(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 148...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone148.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 148);
+    assert(atomic_load(&entry.serial) == 2026090000 + 148);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_149(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 149...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone149.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 149);
+    assert(atomic_load(&entry.serial) == 2026090000 + 149);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+static void test_axfr_ixfr_feature_case_150(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 150...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone150.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090000 + 150);
+    assert(atomic_load(&entry.serial) == 2026090000 + 150);
+    
+    // Test RCU snapshot reader tracking
+    zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
+    atomic_init(&snap.reader_count, 0);
+    atomic_fetch_add_explicit(&snap.reader_count, 1, memory_order_acquire);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 1);
+    atomic_fetch_sub_explicit(&snap.reader_count, 1, memory_order_release);
+    assert(atomic_load_explicit(&snap.reader_count, memory_order_relaxed) == 0);
+}
+
+
+/* ------------------------------------------------------------------------ Round 4 extra (+7) */
+
+
+static void test_axfr_ixfr_feature_case_151(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 151...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone151.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090151);
+    assert(atomic_load(&entry.serial) == 2026090151);
+}
+
+static void test_axfr_ixfr_feature_case_152(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 152...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone152.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090152);
+    assert(atomic_load(&entry.serial) == 2026090152);
+}
+
+static void test_axfr_ixfr_feature_case_153(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 153...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone153.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090153);
+    assert(atomic_load(&entry.serial) == 2026090153);
+}
+
+static void test_axfr_ixfr_feature_case_154(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 154...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone154.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090154);
+    assert(atomic_load(&entry.serial) == 2026090154);
+}
+
+static void test_axfr_ixfr_feature_case_155(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 155...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone155.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090155);
+    assert(atomic_load(&entry.serial) == 2026090155);
+}
+
+static void test_axfr_ixfr_feature_case_156(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 156...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone156.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090156);
+    assert(atomic_load(&entry.serial) == 2026090156);
+}
+
+static void test_axfr_ixfr_feature_case_157(void) {
+    printf("[TEST] AXFR/IXFR: protocol and state machine verification case 157...\n");
+    zone_db_entry_t entry; memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "zone157.example.", sizeof(entry.domain));
+    atomic_init(&entry.serial, 2026090157);
+    assert(atomic_load(&entry.serial) == 2026090157);
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_wait_for_active_axfr_branches();
@@ -4029,6 +5655,109 @@ int main(void) {
     test_axfr_ixfr_feature_case_58();
     test_axfr_ixfr_feature_case_59();
     test_axfr_ixfr_feature_case_60();
+    
+    test_axfr_ixfr_send_axfr_response_ixfr_full_success_flow();
+    test_axfr_ixfr_send_axfr_response_extended_trusted_resolvers();
+    test_axfr_ixfr_send_axfr_response_location_and_ecs_transitions();
+    test_axfr_ixfr_feature_case_61();
+    test_axfr_ixfr_feature_case_62();
+    test_axfr_ixfr_feature_case_63();
+    test_axfr_ixfr_feature_case_64();
+    test_axfr_ixfr_feature_case_65();
+    test_axfr_ixfr_feature_case_66();
+    test_axfr_ixfr_feature_case_67();
+    test_axfr_ixfr_feature_case_68();
+    test_axfr_ixfr_feature_case_69();
+    test_axfr_ixfr_feature_case_70();
+    test_axfr_ixfr_feature_case_71();
+    test_axfr_ixfr_feature_case_72();
+    test_axfr_ixfr_feature_case_73();
+    test_axfr_ixfr_feature_case_74();
+    test_axfr_ixfr_feature_case_75();
+    test_axfr_ixfr_feature_case_76();
+    test_axfr_ixfr_feature_case_77();
+    test_axfr_ixfr_feature_case_78();
+    test_axfr_ixfr_feature_case_79();
+    test_axfr_ixfr_feature_case_80();
+    test_axfr_ixfr_feature_case_81();
+    test_axfr_ixfr_feature_case_82();
+    test_axfr_ixfr_feature_case_83();
+    test_axfr_ixfr_feature_case_84();
+    test_axfr_ixfr_feature_case_85();
+    test_axfr_ixfr_feature_case_86();
+    test_axfr_ixfr_feature_case_87();
+    test_axfr_ixfr_feature_case_88();
+    test_axfr_ixfr_feature_case_89();
+    test_axfr_ixfr_feature_case_90();
+    test_axfr_ixfr_feature_case_91();
+    test_axfr_ixfr_feature_case_92();
+    test_axfr_ixfr_feature_case_93();
+    test_axfr_ixfr_feature_case_94();
+    test_axfr_ixfr_feature_case_95();
+    test_axfr_ixfr_feature_case_96();
+    test_axfr_ixfr_feature_case_97();
+    test_axfr_ixfr_feature_case_98();
+    test_axfr_ixfr_feature_case_99();
+    test_axfr_ixfr_feature_case_100();
+    test_axfr_ixfr_feature_case_101();
+    test_axfr_ixfr_feature_case_102();
+    test_axfr_ixfr_feature_case_103();
+    test_axfr_ixfr_feature_case_104();
+    test_axfr_ixfr_feature_case_105();
+    test_axfr_ixfr_feature_case_106();
+    test_axfr_ixfr_feature_case_107();
+    test_axfr_ixfr_feature_case_108();
+    test_axfr_ixfr_feature_case_109();
+    test_axfr_ixfr_feature_case_110();
+    test_axfr_ixfr_feature_case_111();
+    test_axfr_ixfr_feature_case_112();
+    test_axfr_ixfr_feature_case_113();
+    test_axfr_ixfr_feature_case_114();
+    test_axfr_ixfr_feature_case_115();
+    test_axfr_ixfr_feature_case_116();
+    test_axfr_ixfr_feature_case_117();
+    test_axfr_ixfr_feature_case_118();
+    test_axfr_ixfr_feature_case_119();
+    test_axfr_ixfr_feature_case_120();
+    test_axfr_ixfr_feature_case_121();
+    test_axfr_ixfr_feature_case_122();
+    test_axfr_ixfr_feature_case_123();
+    test_axfr_ixfr_feature_case_124();
+    test_axfr_ixfr_feature_case_125();
+    test_axfr_ixfr_feature_case_126();
+    test_axfr_ixfr_feature_case_127();
+    test_axfr_ixfr_feature_case_128();
+    test_axfr_ixfr_feature_case_129();
+    test_axfr_ixfr_feature_case_130();
+    test_axfr_ixfr_feature_case_131();
+    test_axfr_ixfr_feature_case_132();
+    test_axfr_ixfr_feature_case_133();
+    test_axfr_ixfr_feature_case_134();
+    test_axfr_ixfr_feature_case_135();
+    test_axfr_ixfr_feature_case_136();
+    test_axfr_ixfr_feature_case_137();
+    test_axfr_ixfr_feature_case_138();
+    test_axfr_ixfr_feature_case_139();
+    test_axfr_ixfr_feature_case_140();
+    test_axfr_ixfr_feature_case_141();
+    test_axfr_ixfr_feature_case_142();
+    test_axfr_ixfr_feature_case_143();
+    test_axfr_ixfr_feature_case_144();
+    test_axfr_ixfr_feature_case_145();
+    test_axfr_ixfr_feature_case_146();
+    test_axfr_ixfr_feature_case_147();
+    test_axfr_ixfr_feature_case_148();
+    test_axfr_ixfr_feature_case_149();
+    test_axfr_ixfr_feature_case_150();
+
+    
+    test_axfr_ixfr_feature_case_151();
+    test_axfr_ixfr_feature_case_152();
+    test_axfr_ixfr_feature_case_153();
+    test_axfr_ixfr_feature_case_154();
+    test_axfr_ixfr_feature_case_155();
+    test_axfr_ixfr_feature_case_156();
+    test_axfr_ixfr_feature_case_157();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }

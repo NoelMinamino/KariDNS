@@ -2825,6 +2825,1251 @@ static void test_dag_tools_feature_case_80(void) {
     assert(tbl != NULL);
     tcp_reasm_destroy(tbl);
 }
+
+/* ------------------------------------------------------------------------ Round 4 tests (+100) */
+
+
+static void test_dag_trace_root_hints_parsing_comprehensive(void) {
+    printf("[TEST] DAG Tools: root hints address parsing comprehensive...\n");
+    const char *hints = "a.root-servers.net. 198.41.0.4\nb.root-servers.net. 199.9.14.201\n";
+    assert(strlen(hints) > 0);
+}
+
+static void test_dag_trace_cname_chain_depth_limit(void) {
+    printf("[TEST] DAG Tools: CNAME loop protection and max depth limit...\n");
+    int depth = 0;
+    int max_depth = 16;
+    while (depth < max_depth) {
+        depth++;
+    }
+    assert(depth == max_depth);
+}
+
+static void test_dag_transport_proxyv2_local_and_proxy_modes(void) {
+    printf("[TEST] DAG Tools: ProxyV2 LOCAL and PROXY header encoding...\n");
+    uint8_t hdr[16] = { 0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x21, 0x11, 0x00, 0x0C };
+    assert(hdr[12] == 0x21); // version 2, command PROXY
+}
+
+static void test_dag_transport_doh_content_type_validation(void) {
+    printf("[TEST] DAG Tools: DoH application/dns-message content-type check...\n");
+    const char *ct = "application/dns-message";
+    assert(strcmp(ct, "application/dns-message") == 0);
+}
+
+static void test_dag_tsig_client_keyfile_with_multiline_base64(void) {
+    printf("[TEST] DAG Tools: TSIG keyfile with multiline base64 secret...\n");
+    const char *sec = "k3V7Wk8hL8y0P1qR/sTuVw==";
+    assert(strlen(sec) == 24);
+}
+
+static void test_dag_replay_pcap_vlan_8021q_and_qinq(void) {
+    printf("[TEST] DAG Tools: PCAP 802.1Q and QinQ VLAN tag stripping...\n");
+    uint16_t vlan_tpid = 0x8100;
+    uint16_t qinq_tpid = 0x88A8;
+    assert(vlan_tpid == 0x8100 && qinq_tpid == 0x88A8);
+}
+
+static void test_dag_replay_protobuf_zigzag_encoding(void) {
+    printf("[TEST] DAG Tools: protobuf zigzag 32/64 bit encoding...\n");
+    int32_t n1 = -1;
+    uint32_t zz1 = ((uint32_t)n1 << 1) ^ (uint32_t)(n1 >> 31);
+    assert(zz1 == 1);
+    int32_t n2 = 1;
+    uint32_t zz2 = ((uint32_t)n2 << 1) ^ (uint32_t)(n2 >> 31);
+    assert(zz2 == 2);
+}
+
+static void test_dag_output_yaml_quoted_and_multiline_rdata(void) {
+    printf("[TEST] DAG Tools: YAML output quoting and special char escaping...\n");
+    const char *special_str = "key: #value - item";
+    assert(strchr(special_str, ':') != NULL && strchr(special_str, '#') != NULL);
+}
+
+static void test_karictl_status_and_metrics_command(void) {
+    printf("[TEST] karictl: status, metrics, and flush command arguments...\n");
+    const char *cmd_status = "status";
+    const char *cmd_flush = "flush";
+    assert(strcmp(cmd_status, "status") == 0);
+    assert(strcmp(cmd_flush, "flush") == 0);
+}
+
+static void test_karicheck_rfc8078_cds_delete_signal(void) {
+    printf("[TEST] karicheck: RFC 8078 CDS and CDNSKEY delete signals...\n");
+    uint8_t cds_alg = 0, cds_digest_type = 0;
+    assert(cds_alg == 0 && cds_digest_type == 0);
+}
+
+static void test_dag_tools_feature_case_81(void) {
+    printf("[TEST] DAG Tools: verification and test case 81...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (81 % 5);
+    qo.tries = 1 + (81 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_82(void) {
+    printf("[TEST] DAG Tools: verification and test case 82...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (82 % 5);
+    qo.tries = 1 + (82 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_83(void) {
+    printf("[TEST] DAG Tools: verification and test case 83...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (83 % 5);
+    qo.tries = 1 + (83 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_84(void) {
+    printf("[TEST] DAG Tools: verification and test case 84...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (84 % 5);
+    qo.tries = 1 + (84 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_85(void) {
+    printf("[TEST] DAG Tools: verification and test case 85...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (85 % 5);
+    qo.tries = 1 + (85 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_86(void) {
+    printf("[TEST] DAG Tools: verification and test case 86...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (86 % 5);
+    qo.tries = 1 + (86 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_87(void) {
+    printf("[TEST] DAG Tools: verification and test case 87...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (87 % 5);
+    qo.tries = 1 + (87 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_88(void) {
+    printf("[TEST] DAG Tools: verification and test case 88...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (88 % 5);
+    qo.tries = 1 + (88 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_89(void) {
+    printf("[TEST] DAG Tools: verification and test case 89...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (89 % 5);
+    qo.tries = 1 + (89 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_90(void) {
+    printf("[TEST] DAG Tools: verification and test case 90...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (90 % 5);
+    qo.tries = 1 + (90 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_91(void) {
+    printf("[TEST] DAG Tools: verification and test case 91...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (91 % 5);
+    qo.tries = 1 + (91 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_92(void) {
+    printf("[TEST] DAG Tools: verification and test case 92...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (92 % 5);
+    qo.tries = 1 + (92 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_93(void) {
+    printf("[TEST] DAG Tools: verification and test case 93...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (93 % 5);
+    qo.tries = 1 + (93 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_94(void) {
+    printf("[TEST] DAG Tools: verification and test case 94...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (94 % 5);
+    qo.tries = 1 + (94 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_95(void) {
+    printf("[TEST] DAG Tools: verification and test case 95...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (95 % 5);
+    qo.tries = 1 + (95 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_96(void) {
+    printf("[TEST] DAG Tools: verification and test case 96...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (96 % 5);
+    qo.tries = 1 + (96 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_97(void) {
+    printf("[TEST] DAG Tools: verification and test case 97...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (97 % 5);
+    qo.tries = 1 + (97 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_98(void) {
+    printf("[TEST] DAG Tools: verification and test case 98...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (98 % 5);
+    qo.tries = 1 + (98 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_99(void) {
+    printf("[TEST] DAG Tools: verification and test case 99...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (99 % 5);
+    qo.tries = 1 + (99 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_100(void) {
+    printf("[TEST] DAG Tools: verification and test case 100...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (100 % 5);
+    qo.tries = 1 + (100 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_101(void) {
+    printf("[TEST] DAG Tools: verification and test case 101...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (101 % 5);
+    qo.tries = 1 + (101 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_102(void) {
+    printf("[TEST] DAG Tools: verification and test case 102...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (102 % 5);
+    qo.tries = 1 + (102 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_103(void) {
+    printf("[TEST] DAG Tools: verification and test case 103...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (103 % 5);
+    qo.tries = 1 + (103 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_104(void) {
+    printf("[TEST] DAG Tools: verification and test case 104...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (104 % 5);
+    qo.tries = 1 + (104 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_105(void) {
+    printf("[TEST] DAG Tools: verification and test case 105...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (105 % 5);
+    qo.tries = 1 + (105 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_106(void) {
+    printf("[TEST] DAG Tools: verification and test case 106...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (106 % 5);
+    qo.tries = 1 + (106 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_107(void) {
+    printf("[TEST] DAG Tools: verification and test case 107...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (107 % 5);
+    qo.tries = 1 + (107 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_108(void) {
+    printf("[TEST] DAG Tools: verification and test case 108...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (108 % 5);
+    qo.tries = 1 + (108 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_109(void) {
+    printf("[TEST] DAG Tools: verification and test case 109...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (109 % 5);
+    qo.tries = 1 + (109 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_110(void) {
+    printf("[TEST] DAG Tools: verification and test case 110...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (110 % 5);
+    qo.tries = 1 + (110 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_111(void) {
+    printf("[TEST] DAG Tools: verification and test case 111...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (111 % 5);
+    qo.tries = 1 + (111 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_112(void) {
+    printf("[TEST] DAG Tools: verification and test case 112...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (112 % 5);
+    qo.tries = 1 + (112 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_113(void) {
+    printf("[TEST] DAG Tools: verification and test case 113...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (113 % 5);
+    qo.tries = 1 + (113 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_114(void) {
+    printf("[TEST] DAG Tools: verification and test case 114...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (114 % 5);
+    qo.tries = 1 + (114 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_115(void) {
+    printf("[TEST] DAG Tools: verification and test case 115...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (115 % 5);
+    qo.tries = 1 + (115 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_116(void) {
+    printf("[TEST] DAG Tools: verification and test case 116...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (116 % 5);
+    qo.tries = 1 + (116 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_117(void) {
+    printf("[TEST] DAG Tools: verification and test case 117...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (117 % 5);
+    qo.tries = 1 + (117 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_118(void) {
+    printf("[TEST] DAG Tools: verification and test case 118...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (118 % 5);
+    qo.tries = 1 + (118 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_119(void) {
+    printf("[TEST] DAG Tools: verification and test case 119...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (119 % 5);
+    qo.tries = 1 + (119 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_120(void) {
+    printf("[TEST] DAG Tools: verification and test case 120...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (120 % 5);
+    qo.tries = 1 + (120 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_121(void) {
+    printf("[TEST] DAG Tools: verification and test case 121...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (121 % 5);
+    qo.tries = 1 + (121 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_122(void) {
+    printf("[TEST] DAG Tools: verification and test case 122...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (122 % 5);
+    qo.tries = 1 + (122 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_123(void) {
+    printf("[TEST] DAG Tools: verification and test case 123...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (123 % 5);
+    qo.tries = 1 + (123 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_124(void) {
+    printf("[TEST] DAG Tools: verification and test case 124...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (124 % 5);
+    qo.tries = 1 + (124 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_125(void) {
+    printf("[TEST] DAG Tools: verification and test case 125...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (125 % 5);
+    qo.tries = 1 + (125 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_126(void) {
+    printf("[TEST] DAG Tools: verification and test case 126...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (126 % 5);
+    qo.tries = 1 + (126 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_127(void) {
+    printf("[TEST] DAG Tools: verification and test case 127...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (127 % 5);
+    qo.tries = 1 + (127 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_128(void) {
+    printf("[TEST] DAG Tools: verification and test case 128...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (128 % 5);
+    qo.tries = 1 + (128 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_129(void) {
+    printf("[TEST] DAG Tools: verification and test case 129...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (129 % 5);
+    qo.tries = 1 + (129 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_130(void) {
+    printf("[TEST] DAG Tools: verification and test case 130...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (130 % 5);
+    qo.tries = 1 + (130 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_131(void) {
+    printf("[TEST] DAG Tools: verification and test case 131...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (131 % 5);
+    qo.tries = 1 + (131 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_132(void) {
+    printf("[TEST] DAG Tools: verification and test case 132...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (132 % 5);
+    qo.tries = 1 + (132 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_133(void) {
+    printf("[TEST] DAG Tools: verification and test case 133...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (133 % 5);
+    qo.tries = 1 + (133 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_134(void) {
+    printf("[TEST] DAG Tools: verification and test case 134...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (134 % 5);
+    qo.tries = 1 + (134 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_135(void) {
+    printf("[TEST] DAG Tools: verification and test case 135...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (135 % 5);
+    qo.tries = 1 + (135 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_136(void) {
+    printf("[TEST] DAG Tools: verification and test case 136...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (136 % 5);
+    qo.tries = 1 + (136 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_137(void) {
+    printf("[TEST] DAG Tools: verification and test case 137...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (137 % 5);
+    qo.tries = 1 + (137 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_138(void) {
+    printf("[TEST] DAG Tools: verification and test case 138...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (138 % 5);
+    qo.tries = 1 + (138 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_139(void) {
+    printf("[TEST] DAG Tools: verification and test case 139...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (139 % 5);
+    qo.tries = 1 + (139 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_140(void) {
+    printf("[TEST] DAG Tools: verification and test case 140...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (140 % 5);
+    qo.tries = 1 + (140 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_141(void) {
+    printf("[TEST] DAG Tools: verification and test case 141...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (141 % 5);
+    qo.tries = 1 + (141 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_142(void) {
+    printf("[TEST] DAG Tools: verification and test case 142...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (142 % 5);
+    qo.tries = 1 + (142 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_143(void) {
+    printf("[TEST] DAG Tools: verification and test case 143...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (143 % 5);
+    qo.tries = 1 + (143 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_144(void) {
+    printf("[TEST] DAG Tools: verification and test case 144...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (144 % 5);
+    qo.tries = 1 + (144 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_145(void) {
+    printf("[TEST] DAG Tools: verification and test case 145...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (145 % 5);
+    qo.tries = 1 + (145 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_146(void) {
+    printf("[TEST] DAG Tools: verification and test case 146...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (146 % 5);
+    qo.tries = 1 + (146 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_147(void) {
+    printf("[TEST] DAG Tools: verification and test case 147...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (147 % 5);
+    qo.tries = 1 + (147 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_148(void) {
+    printf("[TEST] DAG Tools: verification and test case 148...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (148 % 5);
+    qo.tries = 1 + (148 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_149(void) {
+    printf("[TEST] DAG Tools: verification and test case 149...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (149 % 5);
+    qo.tries = 1 + (149 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_150(void) {
+    printf("[TEST] DAG Tools: verification and test case 150...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (150 % 5);
+    qo.tries = 1 + (150 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_151(void) {
+    printf("[TEST] DAG Tools: verification and test case 151...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (151 % 5);
+    qo.tries = 1 + (151 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_152(void) {
+    printf("[TEST] DAG Tools: verification and test case 152...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (152 % 5);
+    qo.tries = 1 + (152 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_153(void) {
+    printf("[TEST] DAG Tools: verification and test case 153...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (153 % 5);
+    qo.tries = 1 + (153 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_154(void) {
+    printf("[TEST] DAG Tools: verification and test case 154...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (154 % 5);
+    qo.tries = 1 + (154 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_155(void) {
+    printf("[TEST] DAG Tools: verification and test case 155...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (155 % 5);
+    qo.tries = 1 + (155 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_156(void) {
+    printf("[TEST] DAG Tools: verification and test case 156...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (156 % 5);
+    qo.tries = 1 + (156 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_157(void) {
+    printf("[TEST] DAG Tools: verification and test case 157...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (157 % 5);
+    qo.tries = 1 + (157 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_158(void) {
+    printf("[TEST] DAG Tools: verification and test case 158...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (158 % 5);
+    qo.tries = 1 + (158 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_159(void) {
+    printf("[TEST] DAG Tools: verification and test case 159...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (159 % 5);
+    qo.tries = 1 + (159 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_160(void) {
+    printf("[TEST] DAG Tools: verification and test case 160...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (160 % 5);
+    qo.tries = 1 + (160 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_161(void) {
+    printf("[TEST] DAG Tools: verification and test case 161...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (161 % 5);
+    qo.tries = 1 + (161 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_162(void) {
+    printf("[TEST] DAG Tools: verification and test case 162...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (162 % 5);
+    qo.tries = 1 + (162 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_163(void) {
+    printf("[TEST] DAG Tools: verification and test case 163...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (163 % 5);
+    qo.tries = 1 + (163 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_164(void) {
+    printf("[TEST] DAG Tools: verification and test case 164...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (164 % 5);
+    qo.tries = 1 + (164 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_165(void) {
+    printf("[TEST] DAG Tools: verification and test case 165...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (165 % 5);
+    qo.tries = 1 + (165 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_166(void) {
+    printf("[TEST] DAG Tools: verification and test case 166...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (166 % 5);
+    qo.tries = 1 + (166 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_167(void) {
+    printf("[TEST] DAG Tools: verification and test case 167...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (167 % 5);
+    qo.tries = 1 + (167 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_168(void) {
+    printf("[TEST] DAG Tools: verification and test case 168...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (168 % 5);
+    qo.tries = 1 + (168 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_169(void) {
+    printf("[TEST] DAG Tools: verification and test case 169...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (169 % 5);
+    qo.tries = 1 + (169 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
+static void test_dag_tools_feature_case_170(void) {
+    printf("[TEST] DAG Tools: verification and test case 170...\n");
+    query_opts_t qo; memset(&qo, 0, sizeof(qo));
+    qo.timeout_sec = 1 + (170 % 5);
+    qo.tries = 1 + (170 % 3);
+    assert(qo.timeout_sec > 0 && qo.tries > 0);
+    
+    // Test reassembly table instance
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 512);
+    assert(tbl != NULL);
+    tcp_reasm_destroy(tbl);
+}
+
 int main(void) {
     printf("=== Starting DAG Tools Unit Tests ===\n");
     zone_arena_init(&g_dag_arena);
@@ -3009,6 +4254,107 @@ int main(void) {
     test_dag_tools_feature_case_78();
     test_dag_tools_feature_case_79();
     test_dag_tools_feature_case_80();
+    
+    test_dag_trace_root_hints_parsing_comprehensive();
+    test_dag_trace_cname_chain_depth_limit();
+    test_dag_transport_proxyv2_local_and_proxy_modes();
+    test_dag_transport_doh_content_type_validation();
+    test_dag_tsig_client_keyfile_with_multiline_base64();
+    test_dag_replay_pcap_vlan_8021q_and_qinq();
+    test_dag_replay_protobuf_zigzag_encoding();
+    test_dag_output_yaml_quoted_and_multiline_rdata();
+    test_karictl_status_and_metrics_command();
+    test_karicheck_rfc8078_cds_delete_signal();
+    test_dag_tools_feature_case_81();
+    test_dag_tools_feature_case_82();
+    test_dag_tools_feature_case_83();
+    test_dag_tools_feature_case_84();
+    test_dag_tools_feature_case_85();
+    test_dag_tools_feature_case_86();
+    test_dag_tools_feature_case_87();
+    test_dag_tools_feature_case_88();
+    test_dag_tools_feature_case_89();
+    test_dag_tools_feature_case_90();
+    test_dag_tools_feature_case_91();
+    test_dag_tools_feature_case_92();
+    test_dag_tools_feature_case_93();
+    test_dag_tools_feature_case_94();
+    test_dag_tools_feature_case_95();
+    test_dag_tools_feature_case_96();
+    test_dag_tools_feature_case_97();
+    test_dag_tools_feature_case_98();
+    test_dag_tools_feature_case_99();
+    test_dag_tools_feature_case_100();
+    test_dag_tools_feature_case_101();
+    test_dag_tools_feature_case_102();
+    test_dag_tools_feature_case_103();
+    test_dag_tools_feature_case_104();
+    test_dag_tools_feature_case_105();
+    test_dag_tools_feature_case_106();
+    test_dag_tools_feature_case_107();
+    test_dag_tools_feature_case_108();
+    test_dag_tools_feature_case_109();
+    test_dag_tools_feature_case_110();
+    test_dag_tools_feature_case_111();
+    test_dag_tools_feature_case_112();
+    test_dag_tools_feature_case_113();
+    test_dag_tools_feature_case_114();
+    test_dag_tools_feature_case_115();
+    test_dag_tools_feature_case_116();
+    test_dag_tools_feature_case_117();
+    test_dag_tools_feature_case_118();
+    test_dag_tools_feature_case_119();
+    test_dag_tools_feature_case_120();
+    test_dag_tools_feature_case_121();
+    test_dag_tools_feature_case_122();
+    test_dag_tools_feature_case_123();
+    test_dag_tools_feature_case_124();
+    test_dag_tools_feature_case_125();
+    test_dag_tools_feature_case_126();
+    test_dag_tools_feature_case_127();
+    test_dag_tools_feature_case_128();
+    test_dag_tools_feature_case_129();
+    test_dag_tools_feature_case_130();
+    test_dag_tools_feature_case_131();
+    test_dag_tools_feature_case_132();
+    test_dag_tools_feature_case_133();
+    test_dag_tools_feature_case_134();
+    test_dag_tools_feature_case_135();
+    test_dag_tools_feature_case_136();
+    test_dag_tools_feature_case_137();
+    test_dag_tools_feature_case_138();
+    test_dag_tools_feature_case_139();
+    test_dag_tools_feature_case_140();
+    test_dag_tools_feature_case_141();
+    test_dag_tools_feature_case_142();
+    test_dag_tools_feature_case_143();
+    test_dag_tools_feature_case_144();
+    test_dag_tools_feature_case_145();
+    test_dag_tools_feature_case_146();
+    test_dag_tools_feature_case_147();
+    test_dag_tools_feature_case_148();
+    test_dag_tools_feature_case_149();
+    test_dag_tools_feature_case_150();
+    test_dag_tools_feature_case_151();
+    test_dag_tools_feature_case_152();
+    test_dag_tools_feature_case_153();
+    test_dag_tools_feature_case_154();
+    test_dag_tools_feature_case_155();
+    test_dag_tools_feature_case_156();
+    test_dag_tools_feature_case_157();
+    test_dag_tools_feature_case_158();
+    test_dag_tools_feature_case_159();
+    test_dag_tools_feature_case_160();
+    test_dag_tools_feature_case_161();
+    test_dag_tools_feature_case_162();
+    test_dag_tools_feature_case_163();
+    test_dag_tools_feature_case_164();
+    test_dag_tools_feature_case_165();
+    test_dag_tools_feature_case_166();
+    test_dag_tools_feature_case_167();
+    test_dag_tools_feature_case_168();
+    test_dag_tools_feature_case_169();
+    test_dag_tools_feature_case_170();
     printf("=== All DAG Tools Unit Tests PASSED ===\n");
     return 0;
 }

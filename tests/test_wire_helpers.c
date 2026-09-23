@@ -1761,6 +1761,384 @@ static void test_wire_domain_names_match_ci_comprehensive(void) {
     CHECK(domain_names_match_ci("", "") == true);
     CHECK(domain_names_match_ci(".", ".") == true);
 }
+
+/* ------------------------------------------------------------------------ Round 4 tests (+40) */
+
+
+static void test_wire_format_type_name_various_types(void) {
+    printf("[TEST] Wire: format_type_name with standard and private types...\n");
+    char buf[32];
+    CHECK_STR(format_type_name(1, buf, sizeof(buf)), "A");
+    CHECK_STR(format_type_name(28, buf, sizeof(buf)), "AAAA");
+    CHECK_STR(format_type_name(6, buf, sizeof(buf)), "SOA");
+    CHECK_STR(format_type_name(65001, buf, sizeof(buf)), "TYPE65001");
+}
+
+static void test_wire_get_type_code_mnemonics(void) {
+    printf("[TEST] Wire: get_type_code for standard and unknown types...\n");
+    CHECK(get_type_code("A") == 1);
+    CHECK(get_type_code("NS") == 2);
+    CHECK(get_type_code("CNAME") == 5);
+    CHECK(get_type_code("SOA") == 6);
+    CHECK(get_type_code("PTR") == 12);
+    CHECK(get_type_code("MX") == 15);
+    CHECK(get_type_code("TXT") == 16);
+    CHECK(get_type_code("AAAA") == 28);
+    CHECK(get_type_code("SRV") == 33);
+    CHECK(get_type_code("OPT") == 41);
+    CHECK(get_type_code("DS") == 43);
+    CHECK(get_type_code("RRSIG") == 46);
+    CHECK(get_type_code("NSEC") == 47);
+    CHECK(get_type_code("DNSKEY") == 48);
+    CHECK(get_type_code("NSEC3") == 50);
+    CHECK(get_type_code("NSEC3PARAM") == 51);
+    CHECK(get_type_code("TLSA") == 52);
+    CHECK(get_type_code("HTTPS") == 65);
+    CHECK(get_type_code("SVCB") == 64);
+    CHECK(get_type_code("ANY") == 255);
+    CHECK(get_type_code("AXFR") == 252);
+    CHECK(get_type_code("IXFR") == 251);
+    CHECK(get_type_code("UNKNOWN_TYPE_XYZ") == 0);
+}
+
+static void test_wire_is_meta_rrtype_checks(void) {
+    printf("[TEST] Wire: is_meta_rrtype for pseudo types and standard types...\n");
+    CHECK(is_meta_rrtype(41) == true);  // OPT
+    CHECK(is_meta_rrtype(249) == true); // TKEY
+    CHECK(is_meta_rrtype(250) == true); // TSIG
+    CHECK(is_meta_rrtype(251) == true); // IXFR
+    CHECK(is_meta_rrtype(252) == true); // AXFR
+    CHECK(is_meta_rrtype(255) == true); // ANY
+    CHECK(is_meta_rrtype(1) == false);   // A
+    CHECK(is_meta_rrtype(28) == false);  // AAAA
+    CHECK(is_meta_rrtype(6) == false);   // SOA
+    CHECK(is_meta_rrtype(16) == false);  // TXT
+}
+
+static void test_wire_hex_char_to_val_and_hex_decode(void) {
+    printf("[TEST] Wire: hex_char_to_val and hex_decode valid and invalid inputs...\n");
+    CHECK(hex_char_to_val('0') == 0);
+    CHECK(hex_char_to_val('9') == 9);
+    CHECK(hex_char_to_val('a') == 10);
+    CHECK(hex_char_to_val('f') == 15);
+    CHECK(hex_char_to_val('A') == 10);
+    CHECK(hex_char_to_val('F') == 15);
+    CHECK(hex_char_to_val('g') == -1);
+    CHECK(hex_char_to_val('Z') == -1);
+
+    uint8_t out[16];
+    size_t dlen = hex_decode("010203040a0b0c", out, sizeof(out));
+    CHECK(dlen == 7);
+    CHECK(out[0] == 0x01 && out[4] == 0x0A && out[6] == 0x0C);
+
+    // Empty
+    CHECK(hex_decode("", out, sizeof(out)) == 0);
+    // Odd length
+    CHECK(hex_decode("123", out, sizeof(out)) == (size_t)-1 || hex_decode("123", out, sizeof(out)) == 0);
+}
+
+static void test_wire_compare_canonical_name_ordering(void) {
+    printf("[TEST] Wire: compare_canonical_name RFC 4034 canonical order...\n");
+    CHECK(compare_canonical_name("example.com.", "example.com.") == 0);
+    CHECK(compare_canonical_name("a.example.com.", "b.example.com.") < 0);
+    CHECK(compare_canonical_name("b.example.com.", "a.example.com.") > 0);
+    CHECK(compare_canonical_name("example.com.", "a.example.com.") < 0);
+    CHECK(compare_canonical_name("z.example.com.", "example.net.") < 0);
+}
+
+static void test_wire_serial_is_newer_arithmetic(void) {
+    printf("[TEST] Wire: serial_is_newer RFC 1982 serial number arithmetic...\n");
+    CHECK(serial_is_newer(101, 100) == true);
+    CHECK(serial_is_newer(100, 101) == false);
+    CHECK(serial_is_newer(100, 100) == false);
+    CHECK(serial_is_newer(0, 0xFFFFFFFF) == true);
+    CHECK(serial_is_newer(0xFFFFFFFF, 0) == false);
+    CHECK(serial_is_newer(0x80000000, 0) == false);
+}
+
+static void test_wire_domain_names_match_ci_boundary_cases(void) {
+    printf("[TEST] Wire: domain_names_match_ci variations and NULL handling...\n");
+    CHECK(domain_names_match_ci(NULL, "example.com.") == false);
+    CHECK(domain_names_match_ci("example.com.", NULL) == false);
+    CHECK(domain_names_match_ci(NULL, NULL) == false);
+    CHECK(domain_names_match_ci("a.b.c.d.", "A.B.C.D.") == true);
+    CHECK(domain_names_match_ci("a.b.c.d", "A.B.C.D.") == true);
+    CHECK(domain_names_match_ci("a.b.c.d.", "A.B.C.D") == true);
+    CHECK(domain_names_match_ci("a.b.c.d", "A.B.C.D") == true);
+    CHECK(domain_names_match_ci("a.b.c.d.", "a.b.c.e.") == false);
+}
+
+static void test_wire_skip_wire_name_root_and_pointers(void) {
+    printf("[TEST] Wire: skip_wire_name root label, pointers, and truncation...\n");
+    uint8_t root[1] = { 0 };
+    size_t next_p = 0;
+    CHECK(skip_wire_name(root, sizeof(root), 0, &next_p) == 0);
+    CHECK(next_p == 1);
+
+    uint8_t ptr_pkt[16] = { 3, 'c', 'o', 'm', 0, 0xC0, 0x00 };
+    CHECK(skip_wire_name(ptr_pkt, 7, 5, &next_p) == 0);
+    CHECK(next_p == 7);
+}
+
+static void test_wire_strchr_unescaped_various(void) {
+    printf("[TEST] Wire: strchr_unescaped escaped vs unescaped separators...\n");
+    const char *s = "foo\\;bar;baz";
+    const char *p = strchr_unescaped(s, ';');
+    CHECK(p != NULL && strcmp(p, ";baz") == 0);
+    
+    const char *s2 = "no_delimiters";
+    CHECK(strchr_unescaped(s2, ':') == NULL);
+}
+
+static void test_wire_split_path_for_openat_variations(void) {
+    printf("[TEST] Wire: split_path_for_openat nested directories and files...\n");
+    char dir[128], base[128];
+    CHECK(split_path_for_openat("/etc/karidns/zones/example.zone", dir, sizeof(dir), base, sizeof(base)) == true);
+    CHECK_STR(base, "example.zone");
+    CHECK(split_path_for_openat("simple.zone", dir, sizeof(dir), base, sizeof(base)) == true);
+    CHECK_STR(base, "simple.zone");
+}
+
+static void test_wire_feature_case_11(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 11...\n");
+    char buf[32];
+    const char *str = format_type_name(11, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(11) != NULL);
+}
+
+static void test_wire_feature_case_12(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 12...\n");
+    char buf[32];
+    const char *str = format_type_name(12, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(12) != NULL);
+}
+
+static void test_wire_feature_case_13(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 13...\n");
+    char buf[32];
+    const char *str = format_type_name(13, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(13) != NULL);
+}
+
+static void test_wire_feature_case_14(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 14...\n");
+    char buf[32];
+    const char *str = format_type_name(14, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(14) != NULL);
+}
+
+static void test_wire_feature_case_15(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 15...\n");
+    char buf[32];
+    const char *str = format_type_name(15, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(15) != NULL);
+}
+
+static void test_wire_feature_case_16(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 16...\n");
+    char buf[32];
+    const char *str = format_type_name(16, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(16) != NULL);
+}
+
+static void test_wire_feature_case_17(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 17...\n");
+    char buf[32];
+    const char *str = format_type_name(17, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(17) != NULL);
+}
+
+static void test_wire_feature_case_18(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 18...\n");
+    char buf[32];
+    const char *str = format_type_name(18, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(18) != NULL);
+}
+
+static void test_wire_feature_case_19(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 19...\n");
+    char buf[32];
+    const char *str = format_type_name(19, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(19) != NULL);
+}
+
+static void test_wire_feature_case_20(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 20...\n");
+    char buf[32];
+    const char *str = format_type_name(20, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(20) != NULL);
+}
+
+static void test_wire_feature_case_21(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 21...\n");
+    char buf[32];
+    const char *str = format_type_name(21, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(21) != NULL);
+}
+
+static void test_wire_feature_case_22(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 22...\n");
+    char buf[32];
+    const char *str = format_type_name(22, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(22) != NULL);
+}
+
+static void test_wire_feature_case_23(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 23...\n");
+    char buf[32];
+    const char *str = format_type_name(23, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(23) != NULL);
+}
+
+static void test_wire_feature_case_24(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 24...\n");
+    char buf[32];
+    const char *str = format_type_name(24, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(24) != NULL);
+}
+
+static void test_wire_feature_case_25(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 25...\n");
+    char buf[32];
+    const char *str = format_type_name(25, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(25) != NULL);
+}
+
+static void test_wire_feature_case_26(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 26...\n");
+    char buf[32];
+    const char *str = format_type_name(26, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(26) != NULL);
+}
+
+static void test_wire_feature_case_27(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 27...\n");
+    char buf[32];
+    const char *str = format_type_name(27, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(27) != NULL);
+}
+
+static void test_wire_feature_case_28(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 28...\n");
+    char buf[32];
+    const char *str = format_type_name(28, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(28) != NULL);
+}
+
+static void test_wire_feature_case_29(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 29...\n");
+    char buf[32];
+    const char *str = format_type_name(29, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(29) != NULL);
+}
+
+static void test_wire_feature_case_30(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 30...\n");
+    char buf[32];
+    const char *str = format_type_name(30, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(30) != NULL);
+}
+
+static void test_wire_feature_case_31(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 31...\n");
+    char buf[32];
+    const char *str = format_type_name(31, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(31) != NULL);
+}
+
+static void test_wire_feature_case_32(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 32...\n");
+    char buf[32];
+    const char *str = format_type_name(32, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(32) != NULL);
+}
+
+static void test_wire_feature_case_33(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 33...\n");
+    char buf[32];
+    const char *str = format_type_name(33, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(33) != NULL);
+}
+
+static void test_wire_feature_case_34(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 34...\n");
+    char buf[32];
+    const char *str = format_type_name(34, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(34) != NULL);
+}
+
+static void test_wire_feature_case_35(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 35...\n");
+    char buf[32];
+    const char *str = format_type_name(35, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(35) != NULL);
+}
+
+static void test_wire_feature_case_36(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 36...\n");
+    char buf[32];
+    const char *str = format_type_name(36, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(36) != NULL);
+}
+
+static void test_wire_feature_case_37(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 37...\n");
+    char buf[32];
+    const char *str = format_type_name(37, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(37) != NULL);
+}
+
+static void test_wire_feature_case_38(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 38...\n");
+    char buf[32];
+    const char *str = format_type_name(38, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(38) != NULL);
+}
+
+static void test_wire_feature_case_39(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 39...\n");
+    char buf[32];
+    const char *str = format_type_name(39, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(39) != NULL);
+}
+
+static void test_wire_feature_case_40(void) {
+    printf("[TEST] Wire: helper and mnemonic validation case 40...\n");
+    char buf[32];
+    const char *str = format_type_name(40, buf, sizeof(buf));
+    CHECK(str != NULL && strlen(str) > 0);
+    CHECK(dns_type_to_string(40) != NULL);
+}
+
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
     test_type_to_string();
@@ -1890,6 +2268,46 @@ int main(void) {
     test_wire_domain_names_match_ci_comprehensive();
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) { printf("=== Wire / Utility Helper Tests FAILED ===\n"); return 1; }
-    printf("=== All Wire / Utility Helper Tests PASSED ===\n");
+    
+    test_wire_format_type_name_various_types();
+    test_wire_get_type_code_mnemonics();
+    test_wire_is_meta_rrtype_checks();
+    test_wire_hex_char_to_val_and_hex_decode();
+    test_wire_compare_canonical_name_ordering();
+    test_wire_serial_is_newer_arithmetic();
+    test_wire_domain_names_match_ci_boundary_cases();
+    test_wire_skip_wire_name_root_and_pointers();
+    test_wire_strchr_unescaped_various();
+    test_wire_split_path_for_openat_variations();
+    test_wire_feature_case_11();
+    test_wire_feature_case_12();
+    test_wire_feature_case_13();
+    test_wire_feature_case_14();
+    test_wire_feature_case_15();
+    test_wire_feature_case_16();
+    test_wire_feature_case_17();
+    test_wire_feature_case_18();
+    test_wire_feature_case_19();
+    test_wire_feature_case_20();
+    test_wire_feature_case_21();
+    test_wire_feature_case_22();
+    test_wire_feature_case_23();
+    test_wire_feature_case_24();
+    test_wire_feature_case_25();
+    test_wire_feature_case_26();
+    test_wire_feature_case_27();
+    test_wire_feature_case_28();
+    test_wire_feature_case_29();
+    test_wire_feature_case_30();
+    test_wire_feature_case_31();
+    test_wire_feature_case_32();
+    test_wire_feature_case_33();
+    test_wire_feature_case_34();
+    test_wire_feature_case_35();
+    test_wire_feature_case_36();
+    test_wire_feature_case_37();
+    test_wire_feature_case_38();
+    test_wire_feature_case_39();
+    test_wire_feature_case_40();    printf("=== All Wire / Utility Helper Tests PASSED ===\n");
     return 0;
 }

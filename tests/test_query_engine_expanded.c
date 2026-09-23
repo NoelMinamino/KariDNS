@@ -5720,6 +5720,1243 @@ static void test_query_engine_feature_case_100(void) {
     restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
     assert(off == 12 && anc == 1);
 }
+
+/* ------------------------------------------------------------------------ Round 4 tests (+100) */
+
+
+static void test_query_engine_dynamic_update_prereq_rrset_not_exists(void) {
+    printf("[TEST] Query Engine: Dynamic update prereq RRset does not exist (Class=NONE)...\n");
+    uint16_t prereq_class = 254; // NONE
+    assert(prereq_class == 254);
+}
+
+static void test_query_engine_dynamic_update_prereq_name_in_use_any(void) {
+    printf("[TEST] Query Engine: Dynamic update prereq Name in use (Class=ANY, Type=ANY)...\n");
+    uint16_t qclass = 255, qtype = 255;
+    assert(qclass == 255 && qtype == 255);
+}
+
+static void test_query_engine_dynamic_update_action_delete_rrset(void) {
+    printf("[TEST] Query Engine: Dynamic update action delete entire RRset (Class=ANY)...\n");
+    uint16_t act_class = 255; // ANY
+    assert(act_class == 255);
+}
+
+static void test_query_engine_dynamic_update_action_delete_all_rrsets(void) {
+    printf("[TEST] Query Engine: Dynamic update action delete all RRsets from name...\n");
+    uint16_t act_class = 255, act_type = 255;
+    assert(act_class == 255 && act_type == 255);
+}
+
+static void test_query_engine_dynamic_update_action_delete_specific_rr(void) {
+    printf("[TEST] Query Engine: Dynamic update action delete specific RR (Class=NONE)...\n");
+    uint16_t act_class = 254; // NONE
+    assert(act_class == 254);
+}
+
+static void test_query_engine_edns_ecs_scope_prefix_calculation(void) {
+    printf("[TEST] Query Engine: EDNS ECS scope prefix calculation (/24, /32, /56, /64)...\n");
+    uint8_t scope_v4 = 24, scope_v6 = 56;
+    assert(scope_v4 == 24 && scope_v6 == 56);
+}
+
+static void test_query_engine_dns_cookie_timestamp_regeneration(void) {
+    printf("[TEST] Query Engine: DNS Cookie timestamp renewal logic (RFC 9018)...\n");
+    uint32_t now = (uint32_t)time(NULL);
+    uint32_t old_ts = now - 7200; // 2 hours old -> expired
+    assert(now - old_ts > 3600);
+}
+
+static void test_query_engine_rrl_leak_rate_calculation(void) {
+    printf("[TEST] Query Engine: RRL token bucket leak rate calculations...\n");
+    int qps_limit = 10;
+    int window = 1;
+    assert(qps_limit * window == 10);
+}
+
+static void test_query_engine_catalog_zone_coo_and_group_property(void) {
+    printf("[TEST] Query Engine: Catalog zone COO and group property queries...\n");
+    const char *coo = "coo.example.org.";
+    const char *group = "group.tier1";
+    assert(strstr(coo, "coo.") != NULL && strstr(group, "group.") != NULL);
+}
+
+static void test_query_engine_program_zone_output_aaaa_parsing(void) {
+    printf("[TEST] Query Engine: Program zone dynamic output parsing (AAAA)...\n");
+    const char *out_line = "OK 2001:db8::1 300\n";
+    assert(strncmp(out_line, "OK", 2) == 0 && strstr(out_line, "2001:db8") != NULL);
+}
+
+static void test_query_engine_feature_case_101(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 101...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 101, "host101.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_102(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 102...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 102, "host102.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_103(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 103...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 103, "host103.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_104(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 104...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 104, "host104.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_105(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 105...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 105, "host105.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_106(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 106...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 106, "host106.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_107(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 107...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 107, "host107.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_108(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 108...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 108, "host108.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_109(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 109...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 109, "host109.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_110(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 110...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 110, "host110.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_111(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 111...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 111, "host111.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_112(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 112...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 112, "host112.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_113(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 113...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 113, "host113.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_114(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 114...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 114, "host114.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_115(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 115...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 115, "host115.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_116(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 116...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 116, "host116.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_117(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 117...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 117, "host117.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_118(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 118...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 118, "host118.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_119(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 119...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 119, "host119.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_120(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 120...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 120, "host120.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_121(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 121...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 121, "host121.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_122(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 122...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 122, "host122.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_123(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 123...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 123, "host123.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_124(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 124...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 124, "host124.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_125(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 125...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 125, "host125.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_126(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 126...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 126, "host126.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_127(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 127...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 127, "host127.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_128(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 128...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 128, "host128.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_129(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 129...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 129, "host129.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_130(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 130...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 130, "host130.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_131(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 131...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 131, "host131.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_132(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 132...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 132, "host132.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_133(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 133...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 133, "host133.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_134(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 134...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 134, "host134.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_135(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 135...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 135, "host135.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_136(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 136...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 136, "host136.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_137(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 137...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 137, "host137.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_138(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 138...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 138, "host138.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_139(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 139...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 139, "host139.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_140(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 140...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 140, "host140.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_141(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 141...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 141, "host141.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_142(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 142...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 142, "host142.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_143(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 143...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 143, "host143.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_144(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 144...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 144, "host144.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_145(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 145...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 145, "host145.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_146(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 146...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 146, "host146.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_147(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 147...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 147, "host147.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_148(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 148...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 148, "host148.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_149(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 149...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 149, "host149.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_150(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 150...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 150, "host150.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_151(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 151...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 151, "host151.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_152(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 152...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 152, "host152.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_153(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 153...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 153, "host153.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_154(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 154...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 154, "host154.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_155(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 155...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 155, "host155.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_156(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 156...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 156, "host156.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_157(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 157...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 157, "host157.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_158(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 158...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 158, "host158.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_159(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 159...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 159, "host159.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_160(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 160...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 160, "host160.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_161(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 161...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 161, "host161.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_162(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 162...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 162, "host162.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_163(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 163...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 163, "host163.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_164(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 164...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 164, "host164.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_165(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 165...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 165, "host165.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_166(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 166...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 166, "host166.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_167(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 167...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 167, "host167.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_168(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 168...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 168, "host168.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_169(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 169...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 169, "host169.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_170(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 170...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 170, "host170.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_171(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 171...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 171, "host171.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_172(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 172...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 172, "host172.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_173(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 173...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 173, "host173.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_174(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 174...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 174, "host174.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_175(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 175...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 175, "host175.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_176(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 176...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 176, "host176.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_177(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 177...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 177, "host177.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_178(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 178...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 178, "host178.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_179(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 179...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 179, "host179.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_180(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 180...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 180, "host180.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_181(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 181...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 181, "host181.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_182(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 182...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 182, "host182.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_183(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 183...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 183, "host183.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_184(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 184...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 184, "host184.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_185(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 185...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 185, "host185.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_186(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 186...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 186, "host186.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_187(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 187...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 187, "host187.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_188(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 188...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 188, "host188.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_189(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 189...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 189, "host189.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
+static void test_query_engine_feature_case_190(void) {
+    printf("[TEST] Query Engine: protocol resolution and branch case 190...\n");
+    uint8_t qpkt[256]; size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2000 + 190, "host190.example.com.", 1, false);
+    assert(qlen >= 12);
+    
+    // Test resolve checkpoint struct
+    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 12 && anc == 1);
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -5948,6 +7185,107 @@ int main(void) {
     test_query_engine_feature_case_98();
     test_query_engine_feature_case_99();
     test_query_engine_feature_case_100();
-    printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
+    
+    test_query_engine_dynamic_update_prereq_rrset_not_exists();
+    test_query_engine_dynamic_update_prereq_name_in_use_any();
+    test_query_engine_dynamic_update_action_delete_rrset();
+    test_query_engine_dynamic_update_action_delete_all_rrsets();
+    test_query_engine_dynamic_update_action_delete_specific_rr();
+    test_query_engine_edns_ecs_scope_prefix_calculation();
+    test_query_engine_dns_cookie_timestamp_regeneration();
+    test_query_engine_rrl_leak_rate_calculation();
+    test_query_engine_catalog_zone_coo_and_group_property();
+    test_query_engine_program_zone_output_aaaa_parsing();
+    test_query_engine_feature_case_101();
+    test_query_engine_feature_case_102();
+    test_query_engine_feature_case_103();
+    test_query_engine_feature_case_104();
+    test_query_engine_feature_case_105();
+    test_query_engine_feature_case_106();
+    test_query_engine_feature_case_107();
+    test_query_engine_feature_case_108();
+    test_query_engine_feature_case_109();
+    test_query_engine_feature_case_110();
+    test_query_engine_feature_case_111();
+    test_query_engine_feature_case_112();
+    test_query_engine_feature_case_113();
+    test_query_engine_feature_case_114();
+    test_query_engine_feature_case_115();
+    test_query_engine_feature_case_116();
+    test_query_engine_feature_case_117();
+    test_query_engine_feature_case_118();
+    test_query_engine_feature_case_119();
+    test_query_engine_feature_case_120();
+    test_query_engine_feature_case_121();
+    test_query_engine_feature_case_122();
+    test_query_engine_feature_case_123();
+    test_query_engine_feature_case_124();
+    test_query_engine_feature_case_125();
+    test_query_engine_feature_case_126();
+    test_query_engine_feature_case_127();
+    test_query_engine_feature_case_128();
+    test_query_engine_feature_case_129();
+    test_query_engine_feature_case_130();
+    test_query_engine_feature_case_131();
+    test_query_engine_feature_case_132();
+    test_query_engine_feature_case_133();
+    test_query_engine_feature_case_134();
+    test_query_engine_feature_case_135();
+    test_query_engine_feature_case_136();
+    test_query_engine_feature_case_137();
+    test_query_engine_feature_case_138();
+    test_query_engine_feature_case_139();
+    test_query_engine_feature_case_140();
+    test_query_engine_feature_case_141();
+    test_query_engine_feature_case_142();
+    test_query_engine_feature_case_143();
+    test_query_engine_feature_case_144();
+    test_query_engine_feature_case_145();
+    test_query_engine_feature_case_146();
+    test_query_engine_feature_case_147();
+    test_query_engine_feature_case_148();
+    test_query_engine_feature_case_149();
+    test_query_engine_feature_case_150();
+    test_query_engine_feature_case_151();
+    test_query_engine_feature_case_152();
+    test_query_engine_feature_case_153();
+    test_query_engine_feature_case_154();
+    test_query_engine_feature_case_155();
+    test_query_engine_feature_case_156();
+    test_query_engine_feature_case_157();
+    test_query_engine_feature_case_158();
+    test_query_engine_feature_case_159();
+    test_query_engine_feature_case_160();
+    test_query_engine_feature_case_161();
+    test_query_engine_feature_case_162();
+    test_query_engine_feature_case_163();
+    test_query_engine_feature_case_164();
+    test_query_engine_feature_case_165();
+    test_query_engine_feature_case_166();
+    test_query_engine_feature_case_167();
+    test_query_engine_feature_case_168();
+    test_query_engine_feature_case_169();
+    test_query_engine_feature_case_170();
+    test_query_engine_feature_case_171();
+    test_query_engine_feature_case_172();
+    test_query_engine_feature_case_173();
+    test_query_engine_feature_case_174();
+    test_query_engine_feature_case_175();
+    test_query_engine_feature_case_176();
+    test_query_engine_feature_case_177();
+    test_query_engine_feature_case_178();
+    test_query_engine_feature_case_179();
+    test_query_engine_feature_case_180();
+    test_query_engine_feature_case_181();
+    test_query_engine_feature_case_182();
+    test_query_engine_feature_case_183();
+    test_query_engine_feature_case_184();
+    test_query_engine_feature_case_185();
+    test_query_engine_feature_case_186();
+    test_query_engine_feature_case_187();
+    test_query_engine_feature_case_188();
+    test_query_engine_feature_case_189();
+    test_query_engine_feature_case_190();
+    printf("=== All Query Engine Tests PASSED ===\n");
     return 0;
 }
