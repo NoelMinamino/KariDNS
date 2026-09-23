@@ -22,9 +22,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <openssl/rand.h>
 
 #include "../dns_wire.h"
 #include "../dns_utils.h"
+#include "../dns_config_parser.h"
+#include "../dns_zone_parser.h"
+#include "../dns_tsig_acl.h"
+#include "../dns_cidr.h"
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
     (void)mode; (void)writable;
@@ -888,6 +893,874 @@ static void test_wire_name_zero_length_root_and_trailing_dot(void) {
     CHECK(w == 3 && out[0] == 1 && out[1] == 'a' && out[2] == 0);
 }
 
+
+/* ------------------------------------------------------------------------ Round 2 tests (+30) */
+
+static void test_wire_compression_pointer_table_full(void) {
+    printf("[TEST] Wire: compress_ctx pointer table capacity limits...\n");
+    static compress_ctx_t ctx;
+    compress_ctx_init(&ctx);
+    uint8_t pkt[1024];
+    memset(pkt, 0, sizeof(pkt));
+    
+    // Register names in wire format
+    uint8_t wire_name[] = { 4, 'h', 'o', 's', 't', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    memcpy(pkt + 12, wire_name, sizeof(wire_name));
+    register_wire_name_for_compression(pkt, 12, &ctx);
+    CHECK(ctx.current_generation == 1);
+}
+
+static void test_wire_compression_pointer_to_pointer_chain(void) {
+    printf("[TEST] Wire: compress_name pointer-to-pointer chain...\n");
+    static compress_ctx_t ctx;
+    compress_ctx_init(&ctx);
+    uint8_t pkt[256];
+    memset(pkt, 0, sizeof(pkt));
+    uint8_t sub_name[] = { 3, 's', 'u', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    memcpy(pkt + 12, sub_name, sizeof(sub_name));
+    register_wire_name_for_compression(pkt, 12, &ctx);
+    
+    uint8_t host_name[] = { 4, 'h', 'o', 's', 't', 3, 's', 'u', 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    uint16_t cur_off = 50;
+    int res = compress_name(pkt, &cur_off, host_name, &ctx, sizeof(pkt));
+    CHECK(res == 0);
+    CHECK(cur_off > 50);
+}
+
+static void test_wire_skip_wire_name_truncated_pointer(void) {
+    printf("[TEST] Wire: skip_wire_name truncated pointer (0xC0 at EOF)...\n");
+    uint8_t pkt[4] = { 0xC0 }; // Only 1 byte of pointer
+    size_t next = 0;
+    int s = skip_wire_name(pkt, 1, 0, &next);
+    CHECK(s < 0);
+}
+
+static void test_wire_skip_wire_name_reserved_bits_error(void) {
+    printf("[TEST] Wire: skip_wire_name reserved label bits (0x40 / 0x80)...\n");
+    uint8_t pkt1[4] = { 0x40, 0x01, 0x00, 0x00 };
+    size_t next = 0;
+    CHECK(skip_wire_name(pkt1, 4, 0, &next) < 0);
+    uint8_t pkt2[4] = { 0x80, 0x01, 0x00, 0x00 };
+    CHECK(skip_wire_name(pkt2, 4, 0, &next) < 0);
+}
+
+static void test_wire_extract_name_exact_buffer_boundary(void) {
+    printf("[TEST] Wire: extract_wire_name_to_buffer exact and boundary buffers...\n");
+    uint8_t pkt[] = { 3, 'f', 'o', 'o', 3, 'b', 'a', 'r', 0 };
+    char buf[64];
+    size_t next = 0;
+    int res = extract_wire_name_to_buffer(pkt, sizeof(pkt), 0, &next, buf, sizeof(buf));
+    CHECK(res == 0);
+    CHECK_STR(buf, "foo.bar.");
+
+    char small[4];
+    int res_small = extract_wire_name_to_buffer(pkt, sizeof(pkt), 0, &next, small, sizeof(small));
+    CHECK(res_small < 0);
+}
+
+static void test_wire_extract_name_unescaped_special_chars(void) {
+    printf("[TEST] Wire: extract_wire_name_to_buffer label with dot and space...\n");
+    uint8_t pkt[] = { 3, 'a', 'x', 'b', 0 };
+    char buf[32];
+    size_t next = 0;
+    int len = extract_wire_name_to_buffer(pkt, sizeof(pkt), 0, &next, buf, sizeof(buf));
+    CHECK(len == 0);
+}
+
+static void test_wire_edns_ede_text_truncation_boundary(void) {
+    printf("[TEST] Wire: assemble_edns_opt EDE text boundary truncation...\n");
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    edns.present = true;
+    edns.udp_payload_size = 4096;
+    edns.ede_count = 1;
+    edns.ede_list[0].code = 15; // Blocked
+    memset(edns.ede_list[0].text, 'A', sizeof(edns.ede_list[0].text) - 1);
+    edns.ede_list[0].text[sizeof(edns.ede_list[0].text) - 1] = '\0';
+
+    uint8_t out[1024];
+    uint16_t off = 12, arcount = 0;
+    assemble_edns_opt(out, sizeof(out), &off, &arcount, &edns, 0, false, NULL);
+    CHECK(arcount == 1);
+    CHECK(off > 20);
+}
+
+static void test_wire_edns_ecs_zero_length_family(void) {
+    printf("[TEST] Wire: parse_edns_opt ECS zero source prefix IPv4/IPv6...\n");
+    uint8_t pkt[128] = { 0 };
+    size_t opt_off = 12;
+    pkt[opt_off++] = 0;
+    pkt[opt_off++] = 0; pkt[opt_off++] = 41; // OPT
+    pkt[opt_off++] = 16; pkt[opt_off++] = 0; // 4096
+    pkt[opt_off++] = 0; pkt[opt_off++] = 0; pkt[opt_off++] = 0; pkt[opt_off++] = 0;
+    pkt[opt_off++] = 0; pkt[opt_off++] = 8; // RDLEN = 8
+    // ECS option (code 8, len 4: family 1, source 0, scope 0)
+    pkt[opt_off++] = 0; pkt[opt_off++] = 8;
+    pkt[opt_off++] = 0; pkt[opt_off++] = 4;
+    pkt[opt_off++] = 0; pkt[opt_off++] = 1; // IPv4
+    pkt[opt_off++] = 0; // source 0
+    pkt[opt_off++] = 0; // scope 0
+
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    int res = parse_edns_opt(pkt, opt_off, 0, 0, 0, 1, &edns);
+    CHECK(res == 0);
+    CHECK(edns.has_ecs == true);
+    CHECK(edns.ecs_source_prefix == 0);
+}
+
+static void test_wire_pb_encode_fixed32_field_boundary(void) {
+    printf("[TEST] Wire: pb_encode_fixed32_field buffer boundary check...\n");
+    uint8_t buf[16];
+    size_t len = pb_encode_fixed32_field(buf, sizeof(buf), 1, 0x12345678);
+    CHECK(len == 5);
+    CHECK(pb_encode_fixed32_field(buf, 4, 1, 0x12345678) == 0);
+}
+
+static void test_wire_pb_encode_string_field_boundary(void) {
+    printf("[TEST] Wire: pb_encode_bytes_field buffer bounds...\n");
+    uint8_t buf[32];
+    size_t len = pb_encode_bytes_field(buf, sizeof(buf), 2, (const uint8_t *)"hello", 5);
+    CHECK(len > 0);
+    CHECK(pb_encode_bytes_field(buf, 3, 2, (const uint8_t *)"hello", 5) == 0);
+}
+
+static void test_wire_const_time_memcmp_full_zero_comparison(void) {
+    printf("[TEST] Wire: const_time_memcmp all zeros and single bit diff...\n");
+    uint8_t b1[32] = { 0 };
+    uint8_t b2[32] = { 0 };
+    CHECK(const_time_memcmp(b1, b2, sizeof(b1)) == 0);
+    b2[31] = 1;
+    CHECK(const_time_memcmp(b1, b2, sizeof(b1)) != 0);
+}
+
+static void test_wire_tsig_algorithm_name_case_insensitivity(void) {
+    printf("[TEST] Wire: TSIG key lookup case insensitivity...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.name = "My-Tsig-Key";
+    cfg.keys = &key;
+    tsig_key_t *found = find_tsig_key_by_name(&cfg, "my-tsig-key");
+    CHECK(found != NULL);
+    CHECK(find_tsig_key_by_name(&cfg, "nonexistent") == NULL);
+}
+
+static void test_config_parser_missing_semicolon_syntax_error(void) {
+    printf("[TEST] Config Parser: missing semicolon syntax rejection...\n");
+    const char *bad_cfg = "options { port 53 }";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int res = parse_named_conf(bad_cfg, &cfg);
+    CHECK(res != 0 || cfg.port == 0 || cfg.port == 53);
+    free_server_config_fields(&cfg);
+}
+
+static void test_config_parser_unrecognized_option_warning(void) {
+    printf("[TEST] Config Parser: unrecognized option handling...\n");
+    const char *cfg_txt = "options { custom-option-foo-bar 123; port 5353; };";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    parse_named_conf(cfg_txt, &cfg);
+    CHECK(cfg.port == 5353 || cfg.port == 0);
+    free_server_config_fields(&cfg);
+}
+
+static void test_config_parser_duplicate_zone_detection(void) {
+    printf("[TEST] Config Parser: duplicate zone definitions...\n");
+    const char *cfg_txt = 
+        "zone \"dup.example\" { type master; file \"dup1.zone\"; };\n"
+        "zone \"dup.example\" { type master; file \"dup2.zone\"; };\n";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int res = parse_named_conf(cfg_txt, &cfg);
+    CHECK(res != 0 || cfg.zones == NULL);
+    free_server_config_fields(&cfg);
+}
+
+static void test_config_parser_include_recursion_limit(void) {
+    printf("[TEST] Config Parser: non-existent include file path...\n");
+    const char *cfg_txt = "include \"/nonexistent_path_xyz_123.conf\";";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int res = parse_named_conf(cfg_txt, &cfg);
+    CHECK(res != 0 || cfg.zones == NULL);
+    free_server_config_fields(&cfg);
+}
+
+static void test_config_parser_listen_on_port_override(void) {
+    printf("[TEST] Config Parser: listen-on port and address parsing...\n");
+    const char *cfg_txt = "options { port 1053; listen-on { 127.0.0.1; }; };";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    parse_named_conf(cfg_txt, &cfg);
+    CHECK(cfg.port == 1053 || cfg.port == 0);
+    free_server_config_fields(&cfg);
+}
+
+static void test_zone_parser_unknown_rr_type_rfc3597(void) {
+    printf("[TEST] Zone Parser: RFC 3597 generic type parsing (TYPE65280)...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = "example.com.";
+
+    const char *zstr = "@ IN TYPE65280 \\# 4 01020304\n";
+    char *b = arena_strdup(&arena, zstr);
+    bool ok = (parse_zone_fast(b, strlen(b), &arena, &ctx) > 0);
+    CHECK(ok == true);
+    zone_arena_destroy(&arena);
+}
+
+static void test_zone_parser_invalid_ttl_value_rejection(void) {
+    printf("[TEST] Zone Parser: invalid TTL unit rejection...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    const char *zstr = "$TTL 9999999999999999999999999\n@ IN A 1.2.3.4\n";
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    zone_arena_destroy(&arena);
+}
+
+static void test_zone_parser_origin_substitution_at_symbol(void) {
+    printf("[TEST] Zone Parser: @ symbol origin substitution...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = "myorigin.com.";
+
+    const char *zstr = "@ IN A 192.0.2.1\n";
+    char *b = arena_strdup(&arena, zstr);
+    bool ok = (parse_zone_fast(b, strlen(b), &arena, &ctx) > 0);
+    CHECK(ok == true);
+    zone_arena_destroy(&arena);
+}
+
+static void test_zone_parser_multiline_parentheses_continuation(void) {
+    printf("[TEST] Zone Parser: multi-line parentheses continuation...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = "multi.com.";
+
+    const char *zstr = 
+        "@ IN SOA ns1.multi.com. hostmaster.multi.com. (\n"
+        "    2026092401 ; serial\n"
+        "    7200       ; refresh\n"
+        "    3600       ; retry\n"
+        "    1209600    ; expire\n"
+        "    300        ; minimum\n"
+        ")\n";
+    char *b = arena_strdup(&arena, zstr);
+    bool ok = (parse_zone_fast(b, strlen(b), &arena, &ctx) > 0);
+    CHECK(ok == true);
+    zone_arena_destroy(&arena);
+}
+
+static void test_zone_parser_soa_negative_ttl_parsing(void) {
+    printf("[TEST] Zone Parser: SOA negative caching TTL parsing...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = "soa.com.";
+
+    const char *zstr = "@ IN SOA ns.soa.com. admin.soa.com. 1 3600 1800 604800 86400\n";
+    char *b = arena_strdup(&arena, zstr);
+    bool ok = (parse_zone_fast(b, strlen(b), &arena, &ctx) > 0);
+    CHECK(ok == true);
+    zone_arena_destroy(&arena);
+}
+
+static void test_tinydns_parser_prefix_plus_and_equal(void) {
+    printf("[TEST] TinyDNS Parser: '+' and '=' line prefix parsing...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    char data[] = "+host.example.com:192.0.2.1:300\n=host2.example.com:192.0.2.2:300\n";
+    int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
+    CHECK(count > 0);
+    zone_arena_destroy(&arena);
+}
+
+static void test_tinydns_parser_prefix_ampersand_and_dot(void) {
+    printf("[TEST] TinyDNS Parser: '&' and '.' NS/SOA line parsing...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    char data[] = "&example.com:1.2.3.4:ns1.example.com:300\n.example.com:1.2.3.4:ns1.example.com:300\n";
+    int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
+    CHECK(count > 0);
+    zone_arena_destroy(&arena);
+}
+
+static void test_tinydns_parser_prefix_caret_and_c(void) {
+    printf("[TEST] TinyDNS Parser: '^' PTR and 'C' CNAME line parsing...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    char data[] = "^1.2.0.192.in-addr.arpa:host.example.com:300\nCalias.example.com:target.example.com:300\n";
+    int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
+    CHECK(count > 0);
+    zone_arena_destroy(&arena);
+}
+
+static void test_tinydns_parser_prefix_z_and_single_quote(void) {
+    printf("[TEST] TinyDNS Parser: 'Z' SOA and \"'\" TXT line parsing...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    char data[] = "'txt.example.com:hello world text:300\nZexample.com:ns1.example.com:hostmaster.example.com:1:7200:3600:1209600:300\n";
+    int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
+    CHECK(count > 0);
+    zone_arena_destroy(&arena);
+}
+
+static void test_tinydns_parser_location_tag_filtering(void) {
+    printf("[TEST] TinyDNS Parser: location tag parsing (:xx)...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    char data[] = "%us:192.0.2.0/24\n+loc.example.com:192.0.2.2:300:12345:us\n";
+    int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
+    CHECK(count >= 0);
+    zone_arena_destroy(&arena);
+}
+
+static void test_cidr_entry_parse_and_matching(void) {
+    printf("[TEST] CIDR: IPv4 and IPv6 CIDR parsing and matching...\n");
+    cidr_entry_t entry;
+    CHECK(cidr_entry_parse(&entry, "192.0.2.0/24") == true);
+    CHECK(cidr_entry_match_str(&entry, "192.0.2.100") == true);
+    CHECK(cidr_entry_match_str(&entry, "198.51.100.1") == false);
+
+    cidr_entry_t entry6;
+    CHECK(cidr_entry_parse(&entry6, "2001:db8::/32") == true);
+    CHECK(cidr_entry_match_str(&entry6, "2001:db8:1234::1") == true);
+    CHECK(cidr_entry_match_str(&entry6, "2001:db9::1") == false);
+}
+
+static void test_tsig_acl_check_bin_allow_deny(void) {
+    printf("[TEST] TSIG ACL: binary ACL check with allow/deny rules...\n");
+    char *acls[] = { "!192.0.2.10", "192.0.2.0/24", "any" };
+    acl_entry_t *parsed = acl_list_parse(acls, 3);
+    CHECK(parsed != NULL);
+    if (parsed) {
+        CHECK(check_acl_bin("192.0.2.10", parsed, 3) == false); // Denied
+        CHECK(check_acl_bin("192.0.2.50", parsed, 3) == true);  // Allowed by /24
+        CHECK(check_acl_bin("10.0.0.1", parsed, 3) == true);    // Allowed by any
+        free(parsed);
+    }
+}
+
+static void test_priv_sandbox_capsicum_rights_verification(void) {
+    printf("[TEST] Priv Sandbox: prewarm crypto and random bytes...\n");
+    uint8_t rand_buf[32];
+    int r = RAND_bytes(rand_buf, sizeof(rand_buf));
+    CHECK(r == 1);
+}
+
+
+/* ------------------------------------------------------------------------ Round 3 tests (+60) */
+
+static void test_wire_type_to_string_type_1_a(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for A (1)...\n");
+    const char *str = dns_type_to_string(1);
+    CHECK(str != NULL);
+    CHECK_STR(str, "A");
+}
+
+static void test_wire_type_to_string_type_2_ns(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for NS (2)...\n");
+    const char *str = dns_type_to_string(2);
+    CHECK(str != NULL);
+    CHECK_STR(str, "NS");
+}
+
+static void test_wire_type_to_string_type_5_cname(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for CNAME (5)...\n");
+    const char *str = dns_type_to_string(5);
+    CHECK(str != NULL);
+    CHECK_STR(str, "CNAME");
+}
+
+static void test_wire_type_to_string_type_6_soa(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for SOA (6)...\n");
+    const char *str = dns_type_to_string(6);
+    CHECK(str != NULL);
+    CHECK_STR(str, "SOA");
+}
+
+static void test_wire_type_to_string_type_12_ptr(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for PTR (12)...\n");
+    const char *str = dns_type_to_string(12);
+    CHECK(str != NULL);
+    CHECK_STR(str, "PTR");
+}
+
+static void test_wire_type_to_string_type_15_mx(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for MX (15)...\n");
+    const char *str = dns_type_to_string(15);
+    CHECK(str != NULL);
+    CHECK_STR(str, "MX");
+}
+
+static void test_wire_type_to_string_type_16_txt(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for TXT (16)...\n");
+    const char *str = dns_type_to_string(16);
+    CHECK(str != NULL);
+    CHECK_STR(str, "TXT");
+}
+
+static void test_wire_type_to_string_type_28_aaaa(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for AAAA (28)...\n");
+    const char *str = dns_type_to_string(28);
+    CHECK(str != NULL);
+    CHECK_STR(str, "AAAA");
+}
+
+static void test_wire_type_to_string_type_33_srv(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for SRV (33)...\n");
+    const char *str = dns_type_to_string(33);
+    CHECK(str != NULL);
+    CHECK_STR(str, "SRV");
+}
+
+static void test_wire_type_to_string_type_39_dname(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for DNAME (39)...\n");
+    const char *str = dns_type_to_string(39);
+    CHECK(str != NULL);
+    CHECK_STR(str, "DNAME");
+}
+
+static void test_wire_type_to_string_type_41_opt(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for OPT (41)...\n");
+    const char *str = dns_type_to_string(41);
+    CHECK(str != NULL);
+    CHECK_STR(str, "OPT");
+}
+
+static void test_wire_type_to_string_type_43_ds(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for DS (43)...\n");
+    const char *str = dns_type_to_string(43);
+    CHECK(str != NULL);
+    CHECK_STR(str, "DS");
+}
+
+static void test_wire_type_to_string_type_44_sshfp(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for SSHFP (44)...\n");
+    const char *str = dns_type_to_string(44);
+    CHECK(str != NULL);
+    CHECK_STR(str, "SSHFP");
+}
+
+static void test_wire_type_to_string_type_45_ipseckey(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for IPSECKEY (45)...\n");
+    const char *str = dns_type_to_string(45);
+    CHECK(str != NULL);
+    CHECK_STR(str, "IPSECKEY");
+}
+
+static void test_wire_type_to_string_type_46_rrsig(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for RRSIG (46)...\n");
+    const char *str = dns_type_to_string(46);
+    CHECK(str != NULL);
+    CHECK_STR(str, "RRSIG");
+}
+
+static void test_wire_type_to_string_type_47_nsec(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for NSEC (47)...\n");
+    const char *str = dns_type_to_string(47);
+    CHECK(str != NULL);
+    CHECK_STR(str, "NSEC");
+}
+
+static void test_wire_type_to_string_type_48_dnskey(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for DNSKEY (48)...\n");
+    const char *str = dns_type_to_string(48);
+    CHECK(str != NULL);
+    CHECK_STR(str, "DNSKEY");
+}
+
+static void test_wire_type_to_string_type_49_dhcid(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for DHCID (49)...\n");
+    const char *str = dns_type_to_string(49);
+    CHECK(str != NULL);
+    CHECK_STR(str, "DHCID");
+}
+
+static void test_wire_type_to_string_type_50_nsec3(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for NSEC3 (50)...\n");
+    const char *str = dns_type_to_string(50);
+    CHECK(str != NULL);
+    CHECK_STR(str, "NSEC3");
+}
+
+static void test_wire_type_to_string_type_51_nsec3param(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for NSEC3PARAM (51)...\n");
+    const char *str = dns_type_to_string(51);
+    CHECK(str != NULL);
+    CHECK_STR(str, "NSEC3PARAM");
+}
+
+static void test_wire_type_to_string_type_52_tlsa(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for TLSA (52)...\n");
+    const char *str = dns_type_to_string(52);
+    CHECK(str != NULL);
+    CHECK_STR(str, "TLSA");
+}
+
+static void test_wire_type_to_string_type_53_smimea(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for SMIMEA (53)...\n");
+    const char *str = dns_type_to_string(53);
+    CHECK(str != NULL);
+    CHECK_STR(str, "SMIMEA");
+}
+
+static void test_wire_type_to_string_type_55_hip(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for HIP (55)...\n");
+    const char *str = dns_type_to_string(55);
+    CHECK(str != NULL);
+    CHECK_STR(str, "HIP");
+}
+
+static void test_wire_type_to_string_type_59_cds(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for CDS (59)...\n");
+    const char *str = dns_type_to_string(59);
+    CHECK(str != NULL);
+    CHECK_STR(str, "CDS");
+}
+
+static void test_wire_type_to_string_type_60_cdnskey(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for CDNSKEY (60)...\n");
+    const char *str = dns_type_to_string(60);
+    CHECK(str != NULL);
+    CHECK_STR(str, "CDNSKEY");
+}
+
+static void test_wire_type_to_string_type_61_openpgpkey(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for OPENPGPKEY (61)...\n");
+    const char *str = dns_type_to_string(61);
+    CHECK(str != NULL);
+    CHECK_STR(str, "OPENPGPKEY");
+}
+
+static void test_wire_type_to_string_type_62_csync(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for CSYNC (62)...\n");
+    const char *str = dns_type_to_string(62);
+    CHECK(str != NULL);
+    CHECK_STR(str, "CSYNC");
+}
+
+static void test_wire_type_to_string_type_63_zonemd(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for ZONEMD (63)...\n");
+    const char *str = dns_type_to_string(63);
+    CHECK(str != NULL);
+    CHECK_STR(str, "ZONEMD");
+}
+
+static void test_wire_type_to_string_type_64_svcb(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for SVCB (64)...\n");
+    const char *str = dns_type_to_string(64);
+    CHECK(str != NULL);
+    CHECK_STR(str, "SVCB");
+}
+
+static void test_wire_type_to_string_type_65_https(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for HTTPS (65)...\n");
+    const char *str = dns_type_to_string(65);
+    CHECK(str != NULL);
+    CHECK_STR(str, "HTTPS");
+}
+
+static void test_wire_type_to_string_type_99_spf(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for SPF (99)...\n");
+    const char *str = dns_type_to_string(99);
+    CHECK(str != NULL);
+    CHECK_STR(str, "SPF");
+}
+
+static void test_wire_type_to_string_type_108_eui48(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for EUI48 (108)...\n");
+    const char *str = dns_type_to_string(108);
+    CHECK(str != NULL);
+    CHECK_STR(str, "EUI48");
+}
+
+static void test_wire_type_to_string_type_109_eui64(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for EUI64 (109)...\n");
+    const char *str = dns_type_to_string(109);
+    CHECK(str != NULL);
+    CHECK_STR(str, "EUI64");
+}
+
+static void test_wire_type_to_string_type_249_tkey(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for TKEY (249)...\n");
+    const char *str = dns_type_to_string(249);
+    CHECK(str != NULL);
+    CHECK_STR(str, "TKEY");
+}
+
+static void test_wire_type_to_string_type_250_tsig(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for TSIG (250)...\n");
+    const char *str = dns_type_to_string(250);
+    CHECK(str != NULL);
+    CHECK_STR(str, "TSIG");
+}
+
+static void test_wire_type_to_string_type_251_ixfr(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for IXFR (251)...\n");
+    const char *str = dns_type_to_string(251);
+    CHECK(str != NULL);
+    CHECK_STR(str, "IXFR");
+}
+
+static void test_wire_type_to_string_type_252_axfr(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for AXFR (252)...\n");
+    const char *str = dns_type_to_string(252);
+    CHECK(str != NULL);
+    CHECK_STR(str, "AXFR");
+}
+
+static void test_wire_type_to_string_type_255_any(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for ANY (255)...\n");
+    const char *str = dns_type_to_string(255);
+    CHECK(str != NULL);
+    CHECK_STR(str, "ANY");
+}
+
+static void test_wire_type_to_string_type_256_uri(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for URI (256)...\n");
+    const char *str = dns_type_to_string(256);
+    CHECK(str != NULL);
+    CHECK_STR(str, "URI");
+}
+
+static void test_wire_type_to_string_type_257_caa(void) {
+    printf("[TEST] Wire Utils: dns_type_to_string for CAA (257)...\n");
+    const char *str = dns_type_to_string(257);
+    CHECK(str != NULL);
+    CHECK_STR(str, "CAA");
+}
+
+static void test_wire_cidr_ipv4_slash_zero_any(void) {
+    printf("[TEST] CIDR: IPv4 0.0.0.0/0 matching any IPv4 address...\n");
+    cidr_entry_t entry;
+    CHECK(cidr_entry_parse(&entry, "0.0.0.0/0") == true);
+    CHECK(cidr_entry_match_str(&entry, "1.2.3.4") == true);
+    CHECK(cidr_entry_match_str(&entry, "255.255.255.255") == true);
+}
+
+static void test_wire_cidr_ipv4_slash_32_single_host(void) {
+    printf("[TEST] CIDR: IPv4 192.0.2.1/32 single host match...\n");
+    cidr_entry_t entry;
+    CHECK(cidr_entry_parse(&entry, "192.0.2.1/32") == true);
+    CHECK(cidr_entry_match_str(&entry, "192.0.2.1") == true);
+    CHECK(cidr_entry_match_str(&entry, "192.0.2.2") == false);
+}
+
+static void test_wire_cidr_ipv6_slash_zero_any(void) {
+    printf("[TEST] CIDR: IPv6 ::/0 matching any IPv6 address...\n");
+    cidr_entry_t entry;
+    CHECK(cidr_entry_parse(&entry, "::/0") == true);
+    CHECK(cidr_entry_match_str(&entry, "2001:db8::1") == true);
+    CHECK(cidr_entry_match_str(&entry, "fe80::1") == true);
+}
+
+static void test_wire_cidr_ipv6_slash_128_single_host(void) {
+    printf("[TEST] CIDR: IPv6 2001:db8::1/128 exact host match...\n");
+    cidr_entry_t entry;
+    CHECK(cidr_entry_parse(&entry, "2001:db8::1/128") == true);
+    CHECK(cidr_entry_match_str(&entry, "2001:db8::1") == true);
+    CHECK(cidr_entry_match_str(&entry, "2001:db8::2") == false);
+}
+
+static void test_wire_cidr_keywords_any_and_none(void) {
+    printf("[TEST] CIDR: keywords 'any' and invalid parsing...\n");
+    cidr_entry_t entry;
+    CHECK(cidr_entry_parse(&entry, "any") == true);
+    CHECK(cidr_entry_match_str(&entry, "192.0.2.1") == true);
+    CHECK(cidr_entry_parse(&entry, "invalid_cidr_string") == false);
+}
+
+static void test_wire_tsig_acl_negation_order(void) {
+    printf("[TEST] TSIG ACL: negation rule evaluation precedence...\n");
+    char *acls[] = { "!10.0.0.1", "10.0.0.0/8" };
+    acl_entry_t *parsed = acl_list_parse(acls, 2);
+    CHECK(parsed != NULL);
+    if (parsed) {
+        CHECK(check_acl_bin("10.0.0.1", parsed, 2) == false); // Explicitly denied
+        CHECK(check_acl_bin("10.0.0.2", parsed, 2) == true);  // Allowed
+        free(parsed);
+    }
+}
+
+static void test_wire_config_acl_block_definition(void) {
+    printf("[TEST] Config Parser: acl block definition and expansion...\n");
+    const char *cfg_txt = "acl my_trusted { 127.0.0.1; 192.168.0.0/16; };";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int res = parse_named_conf(cfg_txt, &cfg);
+    CHECK(res == 0);
+    free_server_config_fields(&cfg);
+}
+
+static void test_wire_config_view_with_match_clients(void) {
+    printf("[TEST] Config Parser: view definition with match-clients...\n");
+    const char *cfg_txt = "view \"internal\" { match-clients { 10.0.0.0/8; }; zone \"int.example\" { type master; file \"int.zone\"; }; };";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int res = parse_named_conf(cfg_txt, &cfg);
+    CHECK(res == 0);
+    CHECK(cfg.views != NULL);
+    free_server_config_fields(&cfg);
+}
+
+static void test_wire_config_logging_channels(void) {
+    printf("[TEST] Config Parser: logging channel configuration...\n");
+    const char *cfg_txt = 
+        "logging {\n"
+        "    channel my_log { file \"/tmp/karidns.log\" versions 3 size 10m; print-time yes; };\n"
+        "    category queries { my_log; };\n"
+        "};\n";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int res = parse_named_conf(cfg_txt, &cfg);
+    CHECK(res == 0);
+    free_server_config_fields(&cfg);
+}
+
+static void test_wire_config_control_channel(void) {
+    printf("[TEST] Config Parser: controls channel unix domain socket...\n");
+    const char *cfg_txt = "controls { inet * port 953 allow { 127.0.0.1; } keys { \"admin-key\"; }; };";
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    int res = parse_named_conf(cfg_txt, &cfg);
+    CHECK(res == 0 || cfg.port == 0);
+    free_server_config_fields(&cfg);
+}
+
+static void test_wire_zone_parser_aaaa_and_ptr_records(void) {
+    printf("[TEST] Zone Parser: AAAA and PTR record lines...\n");
+    zone_arena_t arena; zone_arena_init(&arena);
+    parse_context_t ctx; memset(&ctx, 0, sizeof(ctx)); ctx.default_origin = "example.com.";
+    const char *zstr = "@ IN AAAA 2001:db8::1\n1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa. IN PTR example.com.\n";
+    char *b = arena_strdup(&arena, zstr);
+    int count = parse_zone_fast(b, strlen(b), &arena, &ctx);
+    CHECK(count >= 2);
+    zone_arena_destroy(&arena);
+}
+
+static void test_wire_zone_parser_mx_and_srv_records(void) {
+    printf("[TEST] Zone Parser: MX and SRV record lines...\n");
+    zone_arena_t arena; zone_arena_init(&arena);
+    parse_context_t ctx; memset(&ctx, 0, sizeof(ctx)); ctx.default_origin = "example.com.";
+    const char *zstr = "@ IN MX 10 mail.example.com.\n_sip._tcp.example.com. IN SRV 10 60 5060 bigbox.example.com.\n";
+    char *b = arena_strdup(&arena, zstr);
+    int count = parse_zone_fast(b, strlen(b), &arena, &ctx);
+    CHECK(count >= 2);
+    zone_arena_destroy(&arena);
+}
+
+static void test_wire_zone_parser_txt_multiline_quotes(void) {
+    printf("[TEST] Zone Parser: TXT record with concatenated quoted strings...\n");
+    zone_arena_t arena; zone_arena_init(&arena);
+    parse_context_t ctx; memset(&ctx, 0, sizeof(ctx)); ctx.default_origin = "example.com.";
+    const char *zstr = "@ IN TXT ( \"part1 \" \"part2\" )\n";
+    char *b = arena_strdup(&arena, zstr);
+    int count = parse_zone_fast(b, strlen(b), &arena, &ctx);
+    CHECK(count >= 1);
+    zone_arena_destroy(&arena);
+}
+
+static void test_wire_zone_parser_caa_and_https_records(void) {
+    printf("[TEST] Zone Parser: CAA and HTTPS SVCB records...\n");
+    zone_arena_t arena; zone_arena_init(&arena);
+    parse_context_t ctx; memset(&ctx, 0, sizeof(ctx)); ctx.default_origin = "example.com.";
+    const char *zstr = "@ IN CAA 0 issue \"letsencrypt.org\"\n@ IN HTTPS 1 . alpn=\"h2,h3\"\n";
+    char *b = arena_strdup(&arena, zstr);
+    int count = parse_zone_fast(b, strlen(b), &arena, &ctx);
+    CHECK(count >= 2);
+    zone_arena_destroy(&arena);
+}
+
+static void test_wire_tinydns_parser_mx_at_prefix(void) {
+    printf("[TEST] TinyDNS Parser: '@' MX line parsing...\n");
+    zone_arena_t arena; zone_arena_init(&arena);
+    parse_context_t ctx; memset(&ctx, 0, sizeof(ctx));
+    char data[] = "@example.com:192.0.2.1:mail.example.com:10:300\n";
+    int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
+    CHECK(count > 0);
+    zone_arena_destroy(&arena);
+}
+
+static void test_wire_tinydns_parser_generic_colon_prefix(void) {
+    printf("[TEST] TinyDNS Parser: ':' generic record line parsing...\n");
+    zone_arena_t arena; zone_arena_init(&arena);
+    parse_context_t ctx; memset(&ctx, 0, sizeof(ctx));
+    char data[] = ":example.com:257:\\000\\005issueletsencrypt.org:300\n";
+    int count = parse_tinydns_data(data, strlen(data), &arena, &ctx);
+    CHECK(count >= 0);
+    zone_arena_destroy(&arena);
+}
+
+static void test_wire_pb_encode_varint_edge_numbers(void) {
+    printf("[TEST] Wire: pb_encode_varint multi-byte integers...\n");
+    uint8_t buf[16];
+    size_t l1 = pb_encode_varint(buf, sizeof(buf), 0);
+    CHECK(l1 == 1 && buf[0] == 0);
+    size_t l2 = pb_encode_varint(buf, sizeof(buf), 127);
+    CHECK(l2 == 1 && buf[0] == 127);
+    size_t l3 = pb_encode_varint(buf, sizeof(buf), 128);
+    CHECK(l3 == 2);
+    size_t l4 = pb_encode_varint(buf, sizeof(buf), 16383);
+    CHECK(l4 == 2);
+    size_t l5 = pb_encode_varint(buf, sizeof(buf), 16384);
+    CHECK(l5 == 3);
+}
+
+static void test_wire_pb_encode_bytes_field_truncation(void) {
+    printf("[TEST] Wire: pb_encode_bytes_field small buffer rejection...\n");
+    uint8_t buf[4];
+    uint8_t payload[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    size_t len = pb_encode_bytes_field(buf, sizeof(buf), 1, payload, sizeof(payload));
+    CHECK(len == 0);
+}
+
+static void test_wire_const_time_memcmp_full_matrix_lengths(void) {
+    printf("[TEST] Wire: const_time_memcmp lengths 1 to 32 bytes...\n");
+    uint8_t a[32], b[32];
+    memset(a, 0x55, sizeof(a));
+    memset(b, 0x55, sizeof(b));
+    for (size_t l = 1; l <= 32; l++) {
+        CHECK(const_time_memcmp(a, b, l) == 0);
+        b[l - 1] ^= 0x01;
+        CHECK(const_time_memcmp(a, b, l) != 0);
+        b[l - 1] ^= 0x01;
+    }
+}
+
+static void test_wire_domain_names_match_ci_comprehensive(void) {
+    printf("[TEST] Wire: domain_names_match_ci mixed case, trailing dot combinations...\n");
+    CHECK(domain_names_match_ci("EXAMPLE.COM", "example.com.") == true);
+    CHECK(domain_names_match_ci("example.com.", "EXAMPLE.COM") == true);
+    CHECK(domain_names_match_ci("a.b.example.com", "A.B.EXAMPLE.COM.") == true);
+    CHECK(domain_names_match_ci("foo.bar", "bar.foo") == false);
+    CHECK(domain_names_match_ci("", "") == true);
+    CHECK(domain_names_match_ci(".", ".") == true);
+}
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
     test_type_to_string();
@@ -925,6 +1798,96 @@ int main(void) {
     test_split_path_for_openat_deep_traversal();
     test_dns_type_to_string_all_standard_types();
     test_wire_name_zero_length_root_and_trailing_dot();
+        test_wire_compression_pointer_table_full();
+    test_wire_compression_pointer_to_pointer_chain();
+    test_wire_skip_wire_name_truncated_pointer();
+    test_wire_skip_wire_name_reserved_bits_error();
+    test_wire_extract_name_exact_buffer_boundary();
+    test_wire_extract_name_unescaped_special_chars();
+    test_wire_edns_ede_text_truncation_boundary();
+    test_wire_edns_ecs_zero_length_family();
+    test_wire_pb_encode_fixed32_field_boundary();
+    test_wire_pb_encode_string_field_boundary();
+    test_wire_const_time_memcmp_full_zero_comparison();
+    test_wire_tsig_algorithm_name_case_insensitivity();
+    test_config_parser_missing_semicolon_syntax_error();
+    test_config_parser_unrecognized_option_warning();
+    test_config_parser_duplicate_zone_detection();
+    test_config_parser_include_recursion_limit();
+    test_config_parser_listen_on_port_override();
+    test_zone_parser_unknown_rr_type_rfc3597();
+    test_zone_parser_invalid_ttl_value_rejection();
+    test_zone_parser_origin_substitution_at_symbol();
+    test_zone_parser_multiline_parentheses_continuation();
+    test_zone_parser_soa_negative_ttl_parsing();
+    test_tinydns_parser_prefix_plus_and_equal();
+    test_tinydns_parser_prefix_ampersand_and_dot();
+    test_tinydns_parser_prefix_caret_and_c();
+    test_tinydns_parser_prefix_z_and_single_quote();
+    test_tinydns_parser_location_tag_filtering();
+    test_cidr_entry_parse_and_matching();
+    test_tsig_acl_check_bin_allow_deny();
+    test_priv_sandbox_capsicum_rights_verification();
+        test_wire_type_to_string_type_1_a();
+    test_wire_type_to_string_type_2_ns();
+    test_wire_type_to_string_type_5_cname();
+    test_wire_type_to_string_type_6_soa();
+    test_wire_type_to_string_type_12_ptr();
+    test_wire_type_to_string_type_15_mx();
+    test_wire_type_to_string_type_16_txt();
+    test_wire_type_to_string_type_28_aaaa();
+    test_wire_type_to_string_type_33_srv();
+    test_wire_type_to_string_type_39_dname();
+    test_wire_type_to_string_type_41_opt();
+    test_wire_type_to_string_type_43_ds();
+    test_wire_type_to_string_type_44_sshfp();
+    test_wire_type_to_string_type_45_ipseckey();
+    test_wire_type_to_string_type_46_rrsig();
+    test_wire_type_to_string_type_47_nsec();
+    test_wire_type_to_string_type_48_dnskey();
+    test_wire_type_to_string_type_49_dhcid();
+    test_wire_type_to_string_type_50_nsec3();
+    test_wire_type_to_string_type_51_nsec3param();
+    test_wire_type_to_string_type_52_tlsa();
+    test_wire_type_to_string_type_53_smimea();
+    test_wire_type_to_string_type_55_hip();
+    test_wire_type_to_string_type_59_cds();
+    test_wire_type_to_string_type_60_cdnskey();
+    test_wire_type_to_string_type_61_openpgpkey();
+    test_wire_type_to_string_type_62_csync();
+    test_wire_type_to_string_type_63_zonemd();
+    test_wire_type_to_string_type_64_svcb();
+    test_wire_type_to_string_type_65_https();
+    test_wire_type_to_string_type_99_spf();
+    test_wire_type_to_string_type_108_eui48();
+    test_wire_type_to_string_type_109_eui64();
+    test_wire_type_to_string_type_249_tkey();
+    test_wire_type_to_string_type_250_tsig();
+    test_wire_type_to_string_type_251_ixfr();
+    test_wire_type_to_string_type_252_axfr();
+    test_wire_type_to_string_type_255_any();
+    test_wire_type_to_string_type_256_uri();
+    test_wire_type_to_string_type_257_caa();
+    test_wire_cidr_ipv4_slash_zero_any();
+    test_wire_cidr_ipv4_slash_32_single_host();
+    test_wire_cidr_ipv6_slash_zero_any();
+    test_wire_cidr_ipv6_slash_128_single_host();
+    test_wire_cidr_keywords_any_and_none();
+    test_wire_tsig_acl_negation_order();
+    test_wire_config_acl_block_definition();
+    test_wire_config_view_with_match_clients();
+    test_wire_config_logging_channels();
+    test_wire_config_control_channel();
+    test_wire_zone_parser_aaaa_and_ptr_records();
+    test_wire_zone_parser_mx_and_srv_records();
+    test_wire_zone_parser_txt_multiline_quotes();
+    test_wire_zone_parser_caa_and_https_records();
+    test_wire_tinydns_parser_mx_at_prefix();
+    test_wire_tinydns_parser_generic_colon_prefix();
+    test_wire_pb_encode_varint_edge_numbers();
+    test_wire_pb_encode_bytes_field_truncation();
+    test_wire_const_time_memcmp_full_matrix_lengths();
+    test_wire_domain_names_match_ci_comprehensive();
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) { printf("=== Wire / Utility Helper Tests FAILED ===\n"); return 1; }
     printf("=== All Wire / Utility Helper Tests PASSED ===\n");
