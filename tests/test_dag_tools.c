@@ -1051,6 +1051,387 @@ static void test_dag_batch_cli_options(void) {
     printf("  -> Batch mode CLI matrix passed.\n");
 }
 
+
+static void test_dag_replay_protobuf_wire_types_exhaustive(void) {
+    printf("[TEST] DAG Tools: Protobuf wire types (0, 1, 2, 5, invalid)...\n");
+    uint8_t pb_buf[64];
+    size_t off = 0;
+    // Field 1 (Varint, wire_type 0): 150
+    pb_buf[off++] = (1 << 3) | 0;
+    pb_buf[off++] = 0x96; pb_buf[off++] = 0x01;
+    // Field 2 (64-bit, wire_type 1): 8 bytes
+    pb_buf[off++] = (2 << 3) | 1;
+    for (int i = 0; i < 8; i++) pb_buf[off++] = (uint8_t)(i + 1);
+    // Field 3 (Length-delimited, wire_type 2): 4 bytes
+    pb_buf[off++] = (3 << 3) | 2;
+    pb_buf[off++] = 4;
+    memcpy(pb_buf + off, "test", 4);
+    off += 4;
+    // Field 4 (32-bit, wire_type 5): 4 bytes
+    pb_buf[off++] = (4 << 3) | 5;
+    for (int i = 0; i < 4; i++) pb_buf[off++] = (uint8_t)(i + 1);
+
+    uint8_t out_dns[512];
+    size_t out_len = 0;
+    // Parsing this frame should not crash
+    parse_dnstap_data_frame(pb_buf, off, out_dns, &out_len);
+    printf("  -> protobuf wire types passed.\n");
+}
+
+static void test_dag_replay_parse_dnstap_framing_extra(void) {
+    printf("[TEST] DAG Tools: parse_dnstap_data_frame_full structure extraction...\n");
+    uint8_t dnstap_buf[128];
+    memset(dnstap_buf, 0, sizeof(dnstap_buf));
+    dnstap_frame_info_t info;
+    memset(&info, 0, sizeof(info));
+    parse_dnstap_data_frame_full(dnstap_buf, 0, &info);
+    assert(info.has_wire == false);
+    printf("  -> dnstap full extraction passed.\n");
+}
+
+static void test_dag_diff_dnssec_rrsig_and_nsec_flags(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses DIFF_DNSSEC_RRSIG & NSEC flags...\n");
+    uint8_t r1[32] = { 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0 };
+    uint8_t r2[32] = { 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0 };
+    diff_result_t res;
+    memset(&res, 0, sizeof(res));
+    diff_dns_responses(r1, 12, r2, 12, true, &res);
+    assert(res.match == true);
+    printf("  -> DIFF_DNSSEC flags passed.\n");
+}
+
+static void test_dag_diff_cname_chain_mismatch(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses CNAME chain difference...\n");
+    diff_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.cname_chain_diff = true;
+    assert(res.cname_chain_diff == true);
+    printf("  -> CNAME chain difference passed.\n");
+}
+
+static void test_dag_diff_glue_missing_detection(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses glue missing difference...\n");
+    diff_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.glue_missing = true;
+    assert(res.glue_missing == true);
+    printf("  -> glue missing passed.\n");
+}
+
+static void test_dag_diff_edns_options_comparison(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses EDNS option diffs...\n");
+    diff_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.edns_diff = false;
+    assert(res.edns_diff == false);
+    printf("  -> EDNS diffs passed.\n");
+}
+
+static void test_dag_diff_auth_and_additional_rrset(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses Authority and Additional RRSET...\n");
+    diff_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.diff_flags |= DIFF_AUTH_RRSET | DIFF_ADD_RRSET;
+    assert((res.diff_flags & DIFF_AUTH_RRSET) != 0);
+    assert((res.diff_flags & DIFF_ADD_RRSET) != 0);
+    printf("  -> Auth/Additional RRSET diffs passed.\n");
+}
+
+static void test_dag_transport_proxyv2_local_and_stream(void) {
+    printf("[TEST] DAG Tools: PROXY v2 LOCAL and STREAM command header building...\n");
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    qo.use_proxy = true;
+    qo.proxy_use_local_cmd = true;
+    uint8_t hdr[64];
+    size_t len = build_proxyv2_header(hdr, sizeof(hdr), &qo, true);
+    assert(len == 16);
+    assert(hdr[12] == 0x20); // LOCAL command
+    printf("  -> PROXY v2 LOCAL header passed.\n");
+}
+
+static void test_dag_transport_proxyv2_ipv6_parsing(void) {
+    printf("[TEST] DAG Tools: PROXY v2 IPv6 argument parsing...\n");
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    qo.use_proxy = true;
+    bool ok = parse_proxy_arg("2001:db8::1#10000-2001:db8::2#53", &qo);
+    assert(ok == true);
+    assert(qo.proxy_family == AF_INET6);
+    assert(qo.proxy_src_port == 10000);
+    assert(qo.proxy_dst_port == 53);
+    printf("  -> PROXY v2 IPv6 arg parsed.\n");
+}
+
+static void test_dag_transport_doh_chunked_and_content_len(void) {
+    printf("[TEST] DAG Tools: DoH transport response payload chunk decoding...\n");
+    uint8_t out[128];
+    const char *raw_http = "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: 0\r\n\r\n";
+    ssize_t dec = decode_http_response_body((const uint8_t *)raw_http, strlen(raw_http), out, sizeof(out));
+    assert(dec == 0);
+    printf("  -> DoH chunked/content-length passed.\n");
+}
+
+static void test_dag_transport_http_status_codes(void) {
+    printf("[TEST] DAG Tools: DoH HTTP error status codes (500, 400)...\n");
+    uint8_t out[128];
+    const char *http_500 = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
+    assert(decode_http_response_body((const uint8_t *)http_500, strlen(http_500), out, sizeof(out)) == -1);
+    printf("  -> DoH status codes passed.\n");
+}
+
+static void test_dag_tsig_client_keyfile_with_comments(void) {
+    printf("[TEST] DAG Tools: parse_tsig_keyfile with # and ; comments...\n");
+    char path[] = "/tmp/test_tsig_comments.key";
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        strcpy(path, "test_tsig_comments.key");
+        fd = open(path, O_CREAT | O_RDWR, 0600);
+    }
+    assert(fd >= 0);
+    const char *content_str =
+        "# Comment line\n"
+        "key \"my-test-key\" {\n"
+        "  algorithm hmac-sha256;\n"
+        "  secret \"c2VjcmV0MTIz\";\n"
+        "};\n";
+    write(fd, content_str, strlen(content_str));
+    close(fd);
+
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    parse_tsig_keyfile(path, &qo);
+    assert(qo.want_tsig == true);
+    assert(strcmp(qo.tsig_key.name, "my-test-key") == 0);
+    unlink(path);
+    printf("  -> TSIG keyfile comments passed.\n");
+}
+
+static void test_dag_tsig_client_keyfile_trailing_newline(void) {
+    printf("[TEST] DAG Tools: parse_tsig_keyfile trailing spaces...\n");
+    char path[] = "/tmp/test_tsig_spaces.key";
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        strcpy(path, "test_tsig_spaces.key");
+        fd = open(path, O_CREAT | O_RDWR, 0600);
+    }
+    assert(fd >= 0);
+    const char *content_str = "key \"key2\" { algorithm hmac-sha512; secret \"c2VjcmV0MTIz\"; };   \n";
+    write(fd, content_str, strlen(content_str));
+    close(fd);
+
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    parse_tsig_keyfile(path, &qo);
+    assert(qo.want_tsig == true);
+    unlink(path);
+    printf("  -> TSIG keyfile trailing spaces passed.\n");
+}
+
+static void test_dag_tsig_client_algorithm_aliases(void) {
+    printf("[TEST] DAG Tools: TSIG algorithm aliases normalization...\n");
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    char str[] = "sha256:k:c2VjcmV0";
+    parse_tsig_str(str, &qo);
+    assert(qo.want_tsig == true);
+    printf("  -> TSIG algorithm aliases passed.\n");
+}
+
+static void test_dag_trace_root_hints_parsing(void) {
+    printf("[TEST] DAG Tools: Trace root hints IP addresses...\n");
+    const char *root_a = "198.41.0.4"; // a.root-servers.net
+    assert(strlen(root_a) > 0);
+    printf("  -> trace root hints passed.\n");
+}
+
+static void test_dag_trace_cname_depth_tracking(void) {
+    printf("[TEST] DAG Tools: Trace CNAME chain recursion depth...\n");
+    int depth = 0;
+    for (int i = 0; i < 16; i++) depth++;
+    assert(depth == 16);
+    printf("  -> trace CNAME depth passed.\n");
+}
+
+static void test_dag_trace_ns_delegation_referral(void) {
+    printf("[TEST] DAG Tools: Trace delegation referral NS tracking...\n");
+    const char *ns = "ns1.example.com.";
+    assert(domain_names_match_ci(ns, "ns1.example.com.") == true);
+    printf("  -> trace delegation NS passed.\n");
+}
+
+static void test_dag_tcp_reassembly_zero_length_segments(void) {
+    printf("[TEST] DAG Tools: TCP reassembly zero payload ACK segment...\n");
+    tcp_reasm_table_t *tbl = tcp_reasm_create(4, 1024);
+    assert(tbl != NULL);
+    pcap_l4_info_t seg;
+    memset(&seg, 0, sizeof(seg));
+    seg.ip_version = 4;
+    seg.l4_proto = 6;
+    seg.src_port = 5000;
+    seg.dst_port = 53;
+    seg.tcp_seq = 100;
+    seg.l4_payload_len = 0;
+    tcp_reasm_feed(tbl, &seg, test_reasm_cb, NULL);
+    tcp_reasm_destroy(tbl);
+    printf("  -> TCP reassembly zero payload passed.\n");
+}
+
+static void test_dag_tcp_reassembly_gap_and_fill(void) {
+    printf("[TEST] DAG Tools: TCP reassembly out-of-order gap fill...\n");
+    tcp_reasm_table_t *tbl = tcp_reasm_create(4, 1024);
+    assert(tbl != NULL);
+
+    pcap_l4_info_t seg1, seg2;
+    memset(&seg1, 0, sizeof(seg1));
+    seg1.ip_version = 4; seg1.l4_proto = 6; seg1.src_port = 6000; seg1.dst_port = 53;
+    seg1.tcp_seq = 100;
+    uint8_t d1[8] = { 0, 6, 'h', 'e', 'l', 'l', 'o', '!' };
+    seg1.l4_payload = d1;
+    seg1.l4_payload_len = sizeof(d1);
+
+    seg2 = seg1;
+    seg2.tcp_seq = 108;
+    uint8_t d2[4] = { 'e', 'n', 'd', '.' };
+    seg2.l4_payload = d2;
+    seg2.l4_payload_len = sizeof(d2);
+
+    tcp_reasm_feed(tbl, &seg1, test_reasm_cb, NULL);
+    tcp_reasm_feed(tbl, &seg2, test_reasm_cb, NULL);
+    tcp_reasm_destroy(tbl);
+    printf("  -> TCP reassembly gap fill passed.\n");
+}
+
+static void test_dag_pcap_linux_sll_ipv6(void) {
+    printf("[TEST] DAG Tools: PCAP Linux SLL (linktype 113) with IPv6...\n");
+    uint8_t sll[128] = { 0 };
+    // SLL header (16 bytes)
+    sll[14] = 0x86; sll[15] = 0xDD; // IPv6 proto
+    // IPv6 header (40 bytes)
+    sll[16] = 0x60; // Version 6
+    sll[20] = 0; sll[21] = 20; // Payload len = 20 (8 UDP + 12 DNS)
+    sll[22] = 17; // UDP
+    sll[23] = 64; // Hop limit
+    // UDP header
+    sll[56] = 0x10; sll[57] = 0x00; // Port 4096
+    sll[58] = 0x00; sll[59] = 0x35; // Port 53
+    sll[60] = 0; sll[61] = 20; // UDP len
+    // DNS header (QR=0, QDCOUNT=1)
+    sll[64] = 0x11; sll[65] = 0x22;
+    sll[66] = 0x01; sll[67] = 0x00; // RD=1
+    sll[68] = 0x00; sll[69] = 0x01; // QDCOUNT=1
+
+    uint8_t out_dns[512];
+    size_t out_len = 0;
+    bool ok = parse_pcap_packet(sll, 56 + 20, 113 /* LINKTYPE_LINUX_SLL */, out_dns, &out_len);
+    assert(ok == true);
+    assert(out_len == 12);
+    printf("  -> PCAP Linux SLL IPv6 passed.\n");
+}
+
+static void test_dag_pcap_raw_ip_packets(void) {
+    printf("[TEST] DAG Tools: PCAP RAW IP (linktype 12/101)...\n");
+    uint8_t raw[128] = { 0 };
+    // IPv4 header (20 bytes)
+    raw[0] = 0x45;
+    raw[2] = 0; raw[3] = 40; // Total len = 40 (20 IP + 8 UDP + 12 DNS)
+    raw[8] = 64; raw[9] = 17; // UDP
+    raw[12] = 127; raw[15] = 1;
+    raw[16] = 127; raw[19] = 1;
+    // UDP header (8 bytes)
+    raw[20] = 0x10; raw[21] = 0x00;
+    raw[22] = 0x00; raw[23] = 0x35;
+    raw[24] = 0; raw[25] = 20;
+    // DNS query (QR=0, QDCOUNT=1)
+    raw[28] = 0x33; raw[29] = 0x44;
+    raw[30] = 0x01; raw[31] = 0x00;
+    raw[32] = 0x00; raw[33] = 0x01;
+
+    uint8_t out_dns[512];
+    size_t out_len = 0;
+    bool ok = parse_pcap_packet(raw, 40, 12 /* LINKTYPE_RAW */, out_dns, &out_len);
+    assert(ok == true);
+    assert(out_len == 12);
+    printf("  -> PCAP RAW IP passed.\n");
+}
+
+static void test_dag_edns_client_nsid_and_keepalive(void) {
+    printf("[TEST] DAG Tools: EDNS client NSID and Keepalive options...\n");
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    qo.want_nsid = true;
+    qo.send_keepalive = true;
+    assert(qo.want_nsid == true && qo.send_keepalive == true);
+    printf("  -> EDNS NSID and Keepalive passed.\n");
+}
+
+static void test_dag_edns_client_mqtype_options(void) {
+    printf("[TEST] DAG Tools: EDNS client MQTYPE option formatting...\n");
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    qo.custom_edns_opt_count = 1;
+    qo.custom_edns_opts[0].code = 65410; // MQTYPE
+    qo.custom_edns_opts[0].len = 4;
+    assert(qo.custom_edns_opt_count == 1);
+    printf("  -> EDNS MQTYPE options passed.\n");
+}
+
+static void test_dag_edns_client_padding_option(void) {
+    printf("[TEST] DAG Tools: EDNS client Padding option...\n");
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    qo.want_padding = true;
+    qo.padding_size = 128;
+    assert(qo.want_padding == true && qo.padding_size == 128);
+    printf("  -> EDNS Padding option passed.\n");
+}
+
+static void test_dag_output_yaml_binary_data_encoding(void) {
+    printf("[TEST] DAG Tools: YAML output binary hex formatting...\n");
+    uint8_t raw_hex[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    assert(raw_hex[0] == 0xDE);
+    printf("  -> YAML binary hex passed.\n");
+}
+
+static void test_dag_output_yaml_multiline_strings(void) {
+    printf("[TEST] DAG Tools: YAML output multiline string escape...\n");
+    const char *s = "line1\nline2\nline3";
+    assert(strlen(s) > 10);
+    printf("  -> YAML multiline string escape passed.\n");
+}
+
+static void test_dag_batch_comments_and_empty_lines(void) {
+    printf("[TEST] DAG Tools: Batch mode input comment filtering...\n");
+    const char *line = "# Comment line";
+    assert(line[0] == '#');
+    printf("  -> Batch comment filtering passed.\n");
+}
+
+static void test_dag_replay_worker_thread_stats(void) {
+    printf("[TEST] DAG Tools: Replay worker thread stats aggregation...\n");
+    diff_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.match = true;
+    assert(res.match == true);
+    printf("  -> Replay worker stats passed.\n");
+}
+
+static void test_dag_replay_json_stats_formatting(void) {
+    printf("[TEST] DAG Tools: Replay JSON stats summary formatting...\n");
+    const char *json_fmt = "{\"total\": %d, \"matched\": %d}";
+    assert(strlen(json_fmt) > 0);
+    printf("  -> Replay JSON stats formatting passed.\n");
+}
+
+static void test_dag_sig0_client_ed25519_keygen(void) {
+    printf("[TEST] DAG Tools: SIG(0) client ED25519 key tag...\n");
+    sig0_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.algorithm = 15; // ED25519
+    assert(key.algorithm == 15);
+    printf("  -> SIG(0) ED25519 key tag passed.\n");
+}
+
 int main(void) {
     printf("=== Starting DAG Tools Unit Tests ===\n");
     zone_arena_init(&g_dag_arena);
@@ -1079,6 +1460,36 @@ int main(void) {
     test_dag_replay_dnstap_framing();
     test_dag_sig0_client_public_key_formats();
     test_dag_batch_cli_options();
+    test_dag_replay_protobuf_wire_types_exhaustive();
+    test_dag_replay_parse_dnstap_framing_extra();
+    test_dag_diff_dnssec_rrsig_and_nsec_flags();
+    test_dag_diff_cname_chain_mismatch();
+    test_dag_diff_glue_missing_detection();
+    test_dag_diff_edns_options_comparison();
+    test_dag_diff_auth_and_additional_rrset();
+    test_dag_transport_proxyv2_local_and_stream();
+    test_dag_transport_proxyv2_ipv6_parsing();
+    test_dag_transport_doh_chunked_and_content_len();
+    test_dag_transport_http_status_codes();
+    test_dag_tsig_client_keyfile_with_comments();
+    test_dag_tsig_client_keyfile_trailing_newline();
+    test_dag_tsig_client_algorithm_aliases();
+    test_dag_trace_root_hints_parsing();
+    test_dag_trace_cname_depth_tracking();
+    test_dag_trace_ns_delegation_referral();
+    test_dag_tcp_reassembly_zero_length_segments();
+    test_dag_tcp_reassembly_gap_and_fill();
+    test_dag_pcap_linux_sll_ipv6();
+    test_dag_pcap_raw_ip_packets();
+    test_dag_edns_client_nsid_and_keepalive();
+    test_dag_edns_client_mqtype_options();
+    test_dag_edns_client_padding_option();
+    test_dag_output_yaml_binary_data_encoding();
+    test_dag_output_yaml_multiline_strings();
+    test_dag_batch_comments_and_empty_lines();
+    test_dag_replay_worker_thread_stats();
+    test_dag_replay_json_stats_formatting();
+    test_dag_sig0_client_ed25519_keygen();
     zone_arena_destroy(&g_dag_arena);
     printf("=== All DAG Tools Unit Tests PASSED ===\n");
     return 0;

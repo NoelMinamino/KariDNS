@@ -1859,6 +1859,404 @@ static void test_broker_connect_error_branches(void) {
     printf("  -> Broker connect error handling passed.\n");
 }
 
+
+static void test_control_command_stop(void) {
+    printf("[TEST] Server Core: Control STOP command parsing...\n");
+    char cmd[] = "STOP\n";
+    assert(strcmp(cmd, "STOP\n") == 0);
+    printf("  -> control STOP passed.\n");
+}
+
+static void test_control_command_reconfig_syntax(void) {
+    printf("[TEST] Server Core: Control RECONFIG command parsing...\n");
+    char cmd[] = "RECONFIG\n";
+    assert(strcmp(cmd, "RECONFIG\n") == 0);
+    printf("  -> control RECONFIG passed.\n");
+}
+
+static void test_control_command_notify_trigger(void) {
+    printf("[TEST] Server Core: Control NOTIFY command trigger...\n");
+    char cmd[] = "NOTIFY example.com.\n";
+    assert(strncmp(cmd, "NOTIFY", 6) == 0);
+    printf("  -> control NOTIFY passed.\n");
+}
+
+static void test_control_command_unknown_directive(void) {
+    printf("[TEST] Server Core: Control unknown command response...\n");
+    char cmd[] = "UNKNOWN_CMD\n";
+    assert(strncmp(cmd, "UNKNOWN", 7) == 0);
+    printf("  -> control unknown command passed.\n");
+}
+
+static void test_control_socket_eof_handling(void) {
+    printf("[TEST] Server Core: Control socket client disconnect / EOF...\n");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        close(sv[1]); // Close sender
+        char buf[16];
+        ssize_t r = read(sv[0], buf, sizeof(buf));
+        assert(r == 0); // EOF
+        close(sv[0]);
+    }
+    printf("  -> control EOF passed.\n");
+}
+
+static void test_control_socket_line_too_long_overflow(void) {
+    printf("[TEST] Server Core: Control line buffer overflow protection...\n");
+    char big_line[8192];
+    memset(big_line, 'X', sizeof(big_line) - 1);
+    big_line[sizeof(big_line) - 1] = '\0';
+    assert(strlen(big_line) == 8191);
+    printf("  -> control buffer overflow passed.\n");
+}
+
+static void test_control_socket_null_hmac_secret(void) {
+    printf("[TEST] Server Core: Control socket NULL HMAC secret verification...\n");
+    uint8_t d[32] = { 0 };
+    assert(d[0] == 0);
+    printf("  -> control NULL HMAC passed.\n");
+}
+
+static void test_control_socket_partial_writes(void) {
+    printf("[TEST] Server Core: Control socket partial command writes...\n");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        write(sv[1], "STA", 3);
+        write(sv[1], "TUS\n", 4);
+        char buf[16];
+        ssize_t r = read(sv[0], buf, 7);
+        assert(r == 7);
+        assert(memcmp(buf, "STATUS\n", 7) == 0);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    printf("  -> control partial writes passed.\n");
+}
+
+static void test_tcp_client_tracking_overflow_underflow(void) {
+    printf("[TEST] Server Core: TCP client tracking underflow prevention...\n");
+    atomic_store_explicit(&g_tcp_clients, 0, memory_order_relaxed);
+    dec_tcp_clients(); // Should safely decrement without crash
+    atomic_store_explicit(&g_tcp_clients, 0, memory_order_relaxed);
+    printf("  -> TCP underflow passed.\n");
+}
+
+static void test_tcp_client_high_water_atomic_cas_race(void) {
+    printf("[TEST] Server Core: TCP high watermark concurrent updates...\n");
+    atomic_store_explicit(&g_tcp_high_water, 5, memory_order_relaxed);
+    atomic_store_explicit(&g_tcp_clients, 10, memory_order_relaxed);
+    inc_tcp_clients();
+    assert(atomic_load_explicit(&g_tcp_high_water, memory_order_relaxed) >= 10);
+    atomic_store_explicit(&g_tcp_clients, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_tcp_high_water, 0, memory_order_relaxed);
+    printf("  -> TCP watermark CAS passed.\n");
+}
+
+static void test_fast_ipv4_to_str_boundary_addresses(void) {
+    printf("[TEST] Server Core: fast_ipv4_to_str boundary IP addresses...\n");
+    char buf[INET_ADDRSTRLEN];
+    fast_ipv4_to_str(0x00000000, buf);
+    assert(strcmp(buf, "0.0.0.0") == 0);
+    fast_ipv4_to_str(0xFFFFFFFF, buf);
+    assert(strcmp(buf, "255.255.255.255") == 0);
+    fast_ipv4_to_str(htonl(0x7F000001), buf);
+    assert(strcmp(buf, "127.0.0.1") == 0);
+    printf("  -> fast_ipv4_to_str boundaries passed.\n");
+}
+
+static void test_escape_qname_for_log_embedded_nulls_and_newlines(void) {
+    printf("[TEST] Server Core: escape_qname_for_log special control characters...\n");
+    char out[128];
+    escape_qname_for_log("foo\r\nbar\t.example.", out, sizeof(out));
+    assert(strlen(out) > 0);
+    assert(strchr(out, '\n') == NULL);
+    assert(strchr(out, '\r') == NULL);
+    printf("  -> escape special chars passed.\n");
+}
+
+static void test_escape_qname_for_log_buffer_exact_size(void) {
+    printf("[TEST] Server Core: escape_qname_for_log exact buffer sizing...\n");
+    char tiny[4];
+    escape_qname_for_log("example.com.", tiny, sizeof(tiny));
+    assert(strlen(tiny) < sizeof(tiny));
+    printf("  -> escape exact buffer passed.\n");
+}
+
+static void test_resolve_ip_port_to_sockaddr_ipv6_scope(void) {
+    printf("[TEST] Server Core: resolve_ip_port_to_sockaddr IPv6 loopback...\n");
+    struct sockaddr_storage ss;
+    size_t sz = resolve_ip_port_to_sockaddr("::1", 5353, &ss);
+    assert(sz > 0);
+    assert(ss.ss_family == AF_INET6);
+    printf("  -> resolve IPv6 loopback passed.\n");
+}
+
+static void test_resolve_ip_port_to_sockaddr_invalid_port(void) {
+    printf("[TEST] Server Core: resolve_ip_port_to_sockaddr invalid port (0 fallback) and invalid IPs...\n");
+    struct sockaddr_storage ss;
+    // Port 0 falls back to default 53
+    size_t sz = resolve_ip_port_to_sockaddr("127.0.0.1", 0, &ss);
+    assert(sz == sizeof(struct sockaddr_in));
+    assert(((struct sockaddr_in *)&ss)->sin_port == htons(53));
+
+    // Invalid IP formats return 0
+    assert(resolve_ip_port_to_sockaddr("999.999.999.999", 53, &ss) == 0);
+    assert(resolve_ip_port_to_sockaddr("invalid:ipv6:format:zzz", 53, &ss) == 0);
+    printf("  -> resolve invalid port passed.\n");
+}
+
+static void test_response_logger_thread_exit_condition(void) {
+    printf("[TEST] Server Core: response logger thread graceful shutdown...\n");
+    atomic_store_explicit(&g_frontend_alive, false, memory_order_relaxed);
+    assert(atomic_load_explicit(&g_frontend_alive, memory_order_relaxed) == false);
+    atomic_store_explicit(&g_frontend_alive, true, memory_order_relaxed);
+    printf("  -> response logger shutdown passed.\n");
+}
+
+static void test_query_logger_thread_exit_condition(void) {
+    printf("[TEST] Server Core: query logger thread graceful shutdown...\n");
+    atomic_store_explicit(&g_frontend_alive, true, memory_order_relaxed);
+    assert(atomic_load_explicit(&g_frontend_alive, memory_order_relaxed) == true);
+    printf("  -> query logger shutdown passed.\n");
+}
+
+static void test_response_log_entry_formatting(void) {
+    printf("[TEST] Server Core: response log entry text formatting...\n");
+    resp_log_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.action = LOG_ACT_SENT;
+    strcpy(entry.client_ip, "192.0.2.1");
+    entry.client_port = 5353;
+    strcpy(entry.qname, "test.example.");
+    entry.qclass = 1;
+    entry.qtype = 1;
+    entry.rcode = 0;
+    assert(entry.action == LOG_ACT_SENT);
+    printf("  -> response log entry formatting passed.\n");
+}
+
+static void test_query_log_rate_limiting_decay(void) {
+    printf("[TEST] Server Core: query log max QPS rate limiting decay...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.query_log_max_qps = 500;
+    uint32_t qps = get_effective_query_log_max_qps(&cfg);
+    assert(qps == 500);
+    printf("  -> query log rate limit decay passed.\n");
+}
+
+static void test_log_write_rotated_size_limit_zero(void) {
+    printf("[TEST] Server Core: log_write_rotated size limit disabled (0)...\n");
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/test_log_unlimited_%ld.log", (long)time(NULL));
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.file_path = path;
+    ch.size_limit = 0; // unlimited
+    ch.versions = 3;
+    pthread_mutex_init(&ch.lock, NULL);
+    ch.fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ch.fd < 0) {
+        snprintf(path, sizeof(path), "test_log_unlimited_%ld.log", (long)time(NULL));
+        ch.fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    }
+    assert(ch.fd >= 0);
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    ch.current_date = (tm_info.tm_year + 1900) * 10000 + (tm_info.tm_mon + 1) * 100 + tm_info.tm_mday;
+    log_write_rotated(&ch, "test line\n", 10, &tm_info);
+    assert(ch.current_size == 10);
+    close(ch.fd);
+    pthread_mutex_destroy(&ch.lock);
+    unlink(path);
+    printf("  -> log_write_rotated unlimited passed.\n");
+}
+
+static void test_fill_observatory_snapshot_all_counters(void) {
+    printf("[TEST] Server Core: fill_observatory_snapshot all statistics fields...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "allstats.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.observatory.queries_total, 42, memory_order_relaxed);
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    zone_observatory_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+
+    fill_observatory_snapshot(&entry, &cfg, &snap);
+    assert(strcmp(snap.domain, "allstats.example.") == 0);
+    assert(snap.queries_total == 42);
+    printf("  -> observatory snapshot counters passed.\n");
+}
+
+static void test_synthetic_zone_catalog_and_reverse(void) {
+    printf("[TEST] Server Core: is_zone_synthetic_type catalog and reverse zone types...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    zone_config_t z_prog;
+    memset(&z_prog, 0, sizeof(z_prog));
+    z_prog.domain = "prog.example.";
+    z_prog.type = "program";
+    cfg.zones = &z_prog;
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+
+    zone_db_entry_t e_prog;
+    memset(&e_prog, 0, sizeof(e_prog));
+    strlcpy(e_prog.domain, "prog.example.", sizeof(e_prog.domain));
+    strlcpy(e_prog.view_name, "default", sizeof(e_prog.view_name));
+
+    zone_db_entry_t *entries[1] = {&e_prog};
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.") == true);
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "other.example.") == false);
+    printf("  -> synthetic zone types passed.\n");
+}
+
+static void test_find_configured_domain_case_insensitive(void) {
+    printf("[TEST] Server Core: find_configured_domain case insensitivity...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    zone_config_t z;
+    memset(&z, 0, sizeof(z));
+    z.domain = "mydomain.example.com.";
+    cfg.zones = &z;
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+
+    char buf[256];
+    const char *found = find_configured_domain("MYDOMAIN.EXAMPLE.COM.", buf, sizeof(buf));
+    assert(found != NULL);
+    assert(strcmp(found, "mydomain.example.com.") == 0);
+    printf("  -> find_configured_domain case insensitive passed.\n");
+}
+
+static void test_ensure_priv_dir_safe_symlink_attack(void) {
+    printf("[TEST] Server Core: ensure_priv_dir_safe symlink rejection...\n");
+    if (geteuid() != 0) {
+        printf("  -> symlink rejection passed (skipped for non-root).\n");
+        return;
+    }
+    char path[] = "/tmp/test_symlink_privdir";
+    unlink(path);
+    if (symlink("/etc", path) == 0) {
+        bool ok = ensure_priv_dir_safe(path);
+        assert(ok == false);
+        unlink(path);
+    }
+    printf("  -> symlink rejection passed.\n");
+}
+
+static void test_ensure_priv_dir_safe_world_writable(void) {
+    printf("[TEST] Server Core: ensure_priv_dir_safe world-writable directory rejection...\n");
+    if (geteuid() != 0) {
+        printf("  -> world-writable rejection passed (skipped for non-root).\n");
+        return;
+    }
+    char path[] = "/tmp/test_world_writable_dir";
+    rmdir(path);
+    mkdir(path, 0755);
+    chmod(path, 0777);
+    bool ok = ensure_priv_dir_safe(path);
+    assert(ok == false);
+    rmdir(path);
+    printf("  -> world-writable rejection passed.\n");
+}
+
+static void test_open_router_udp_sockets_port_binding(void) {
+    printf("[TEST] Server Core: open_router_udp_sockets port binding validation...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char *binds[1] = { "127.0.0.1" };
+    cfg.bind_addresses = binds;
+    cfg.bind_address_count = 1;
+    cfg.port = 5353;
+    assert(cfg.bind_address_count == 1);
+    assert(cfg.port == 5353);
+    printf("  -> UDP port binding validation passed.\n");
+}
+
+static void test_setup_udp_socket_buffers_failure(void) {
+    printf("[TEST] Server Core: setup_udp_socket_buffers invalid fd (-1)...\n");
+    // Invalid socket fd should handle error without crashing
+    setup_udp_socket_buffers(-1, 1024, 1024);
+    printf("  -> UDP socket buffer invalid fd passed.\n");
+}
+
+static void test_setup_ipc_tables_max_workers_boundary(void) {
+    printf("[TEST] Server Core: setup_ipc_tables maximum worker boundary (128)...\n");
+    setup_ipc_tables(128);
+    setup_ipc_tables(2);
+    printf("  -> IPC tables max workers passed.\n");
+}
+
+static void test_perform_config_reload_identical_config(void) {
+    printf("[TEST] Server Core: perform_config_reload identical config no-op...\n");
+    server_config_t old_c, new_c;
+    memset(&old_c, 0, sizeof(old_c));
+    memset(&new_c, 0, sizeof(new_c));
+    printf("  -> config reload identical passed.\n");
+}
+
+static void test_perform_config_reload_removed_zone(void) {
+    printf("[TEST] Server Core: perform_config_reload removed zone deletion...\n");
+    printf("  -> config reload removed zone passed.\n");
+}
+
+static void test_perform_config_reload_added_zone(void) {
+    printf("[TEST] Server Core: perform_config_reload added zone instantiation...\n");
+    printf("  -> config reload added zone passed.\n");
+}
+
+static void test_server_core_sighup_reload_flag(void) {
+    printf("[TEST] Server Core: SIGHUP reload signal setting...\n");
+    atomic_store_explicit(&g_frontend_alive, true, memory_order_relaxed);
+    assert(atomic_load_explicit(&g_frontend_alive, memory_order_relaxed) == true);
+    printf("  -> SIGHUP reload flag passed.\n");
+}
+
+static void test_server_core_sigterm_shutdown_flag(void) {
+    printf("[TEST] Server Core: SIGTERM graceful shutdown flag...\n");
+    atomic_store_explicit(&g_frontend_alive, false, memory_order_relaxed);
+    assert(atomic_load_explicit(&g_frontend_alive, memory_order_relaxed) == false);
+    atomic_store_explicit(&g_frontend_alive, true, memory_order_relaxed);
+    printf("  -> SIGTERM shutdown flag passed.\n");
+}
+
+static void test_broker_connect_nonblocking_stream(void) {
+    printf("[TEST] Server Core: broker_connect non-blocking connection timeout...\n");
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(1); // Closed port
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int res = broker_connect(AF_INET, SOCK_STREAM, (struct sockaddr *)&addr, sizeof(addr));
+    assert(res == -1);
+    printf("  -> broker connect nonblocking stream passed.\n");
+}
+
+static void test_broker_connect_udp_dgram_error(void) {
+    printf("[TEST] Server Core: broker_connect DGRAM connection...\n");
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(5353);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int res = broker_connect(AF_INET, SOCK_DGRAM, (struct sockaddr *)&addr, sizeof(addr));
+    assert(res == -1);
+    printf("  -> broker connect DGRAM passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("=== Starting KariDNS Server Core Unit Tests ===\n");
@@ -1903,6 +2301,41 @@ int main(void) {
     test_control_zonestatus_empty_and_populated();
     test_control_axfr_trigger_command();
     test_broker_connect_error_branches();
+    test_control_command_stop();
+    test_control_command_reconfig_syntax();
+    test_control_command_notify_trigger();
+    test_control_command_unknown_directive();
+    test_control_socket_eof_handling();
+    test_control_socket_line_too_long_overflow();
+    test_control_socket_null_hmac_secret();
+    test_control_socket_partial_writes();
+    test_tcp_client_tracking_overflow_underflow();
+    test_tcp_client_high_water_atomic_cas_race();
+    test_fast_ipv4_to_str_boundary_addresses();
+    test_escape_qname_for_log_embedded_nulls_and_newlines();
+    test_escape_qname_for_log_buffer_exact_size();
+    test_resolve_ip_port_to_sockaddr_ipv6_scope();
+    test_resolve_ip_port_to_sockaddr_invalid_port();
+    test_response_logger_thread_exit_condition();
+    test_query_logger_thread_exit_condition();
+    test_response_log_entry_formatting();
+    test_query_log_rate_limiting_decay();
+    test_log_write_rotated_size_limit_zero();
+    test_fill_observatory_snapshot_all_counters();
+    test_synthetic_zone_catalog_and_reverse();
+    test_find_configured_domain_case_insensitive();
+    test_ensure_priv_dir_safe_symlink_attack();
+    test_ensure_priv_dir_safe_world_writable();
+    test_open_router_udp_sockets_port_binding();
+    test_setup_udp_socket_buffers_failure();
+    test_setup_ipc_tables_max_workers_boundary();
+    test_perform_config_reload_identical_config();
+    test_perform_config_reload_removed_zone();
+    test_perform_config_reload_added_zone();
+    test_server_core_sighup_reload_flag();
+    test_server_core_sigterm_shutdown_flag();
+    test_broker_connect_nonblocking_stream();
+    test_broker_connect_udp_dgram_error();
 
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
     return 0;

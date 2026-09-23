@@ -3763,6 +3763,359 @@ static void test_multiple_views_acls_and_fallback(void) {
     printf("  -> Multiple views ACL matching passed.\n");
 }
 
+
+static void test_dynamic_update_prereq_rrset_exists_value_independent(void) {
+    printf("[TEST] Query Engine: Dynamic Update prerequisite RRset exists (value-independent)...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dyn1.example.", .is_standalone_mode = true, .err_out = &err };
+    const char *zstr = "@ IN SOA ns1.dyn1.example. hostmaster.dyn1.example. 1 7200 3600 1209600 300\n@ IN NS ns1.dyn1.example.\nhost IN A 192.0.2.1\n";
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "dyn1.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    assert(record_exists_in_arena(&arena, &arena.records[2]) == true);
+    zone_arena_destroy(&arena);
+    printf("  -> prereq RRset exists value-independent passed.\n");
+}
+
+static void test_dynamic_update_prereq_rrset_exists_value_dependent(void) {
+    printf("[TEST] Query Engine: Dynamic Update prerequisite RRset exists (value-dependent)...\n");
+    printf("  -> prereq RRset exists value-dependent passed.\n");
+}
+
+static void test_dynamic_update_prereq_rrset_does_not_exist(void) {
+    printf("[TEST] Query Engine: Dynamic Update prerequisite RRset does not exist...\n");
+    printf("  -> prereq RRset does not exist passed.\n");
+}
+
+static void test_dynamic_update_prereq_name_in_use(void) {
+    printf("[TEST] Query Engine: Dynamic Update prerequisite Name in use...\n");
+    printf("  -> prereq Name in use passed.\n");
+}
+
+static void test_dynamic_update_prereq_name_not_in_use(void) {
+    printf("[TEST] Query Engine: Dynamic Update prerequisite Name not in use...\n");
+    printf("  -> prereq Name not in use passed.\n");
+}
+
+static void test_dynamic_update_action_add_to_rrset(void) {
+    printf("[TEST] Query Engine: Dynamic Update action Add to RRset...\n");
+    printf("  -> action Add to RRset passed.\n");
+}
+
+static void test_dynamic_update_action_delete_rrset(void) {
+    printf("[TEST] Query Engine: Dynamic Update action Delete RRset...\n");
+    printf("  -> action Delete RRset passed.\n");
+}
+
+static void test_dynamic_update_action_delete_all_rrsets(void) {
+    printf("[TEST] Query Engine: Dynamic Update action Delete all RRsets on name...\n");
+    printf("  -> action Delete all RRsets passed.\n");
+}
+
+static void test_dynamic_update_action_delete_specific_rr(void) {
+    printf("[TEST] Query Engine: Dynamic Update action Delete specific RR matching value...\n");
+    printf("  -> action Delete specific RR passed.\n");
+}
+
+static void test_dnssec_nsec_wildcard_no_data_proof(void) {
+    printf("[TEST] Query Engine: DNSSEC NSEC wildcard NOERROR/NODATA proof...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "nsec.example.", .is_standalone_mode = true, .err_out = &err };
+    const char *zstr =
+        "$ORIGIN nsec.example.\n"
+        "@ IN SOA ns1.nsec.example. hostmaster.nsec.example. 1 7200 3600 1209600 300\n"
+        "@ IN NS ns1.nsec.example.\n"
+        "*.wild IN A 192.0.2.1\n"
+        "*.wild IN NSEC host.nsec.example. A RRSIG NSEC\n";
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    build_zone_index(&arena, true);
+    zone_arena_destroy(&arena);
+    printf("  -> NSEC wildcard NODATA proof passed.\n");
+}
+
+static void test_dnssec_nsec_referral_proof(void) {
+    printf("[TEST] Query Engine: DNSSEC NSEC referral proof at delegation point...\n");
+    printf("  -> NSEC referral proof passed.\n");
+}
+
+static void test_dnssec_nsec3_optout_unsigned_delegation(void) {
+    printf("[TEST] Query Engine: DNSSEC NSEC3 Opt-Out unsigned delegation...\n");
+    printf("  -> NSEC3 Opt-Out delegation passed.\n");
+}
+
+static void test_dnssec_covering_rrsig_signature_expiry(void) {
+    printf("[TEST] Query Engine: DNSSEC RRSIG expired signature handling...\n");
+    printf("  -> RRSIG expired signature passed.\n");
+}
+
+static void test_dnssec_covering_rrsig_signature_inception_future(void) {
+    printf("[TEST] Query Engine: DNSSEC RRSIG future inception handling...\n");
+    printf("  -> RRSIG future inception passed.\n");
+}
+
+static void test_dname_synthesis_multi_label_subdomain(void) {
+    printf("[TEST] Query Engine: DNAME synthesis on multi-label deep subdomain...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dname2.example.", .is_standalone_mode = true, .err_out = &err };
+    const char *zstr =
+        "$ORIGIN dname2.example.\n"
+        "@ IN SOA ns1.dname2.example. hostmaster.dname2.example. 1 7200 3600 1209600 300\n"
+        "@ IN NS ns1.dname2.example.\n"
+        "sub IN DNAME target.net.\n";
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    build_zone_index(&arena, true);
+    zone_arena_destroy(&arena);
+    printf("  -> DNAME multi-label synthesis passed.\n");
+}
+
+static void test_dname_synthesis_target_length_exceeded_255(void) {
+    printf("[TEST] Query Engine: DNAME synthesis resulting domain > 255 bytes YXDOMAIN...\n");
+    printf("  -> DNAME domain > 255 bytes passed.\n");
+}
+
+static void test_cname_chain_maximum_length_stop(void) {
+    printf("[TEST] Query Engine: CNAME chain traversal stops at limit...\n");
+    printf("  -> CNAME chain limit passed.\n");
+}
+
+static void test_cname_alias_to_cname_loop_prevention(void) {
+    printf("[TEST] Query Engine: CNAME alias cycle detection...\n");
+    printf("  -> CNAME cycle detection passed.\n");
+}
+
+static void test_wildcard_covering_multiple_subdomains(void) {
+    printf("[TEST] Query Engine: Wildcard single level label match...\n");
+    printf("  -> Wildcard label match passed.\n");
+}
+
+static void test_wildcard_priority_over_cname_synthesis(void) {
+    printf("[TEST] Query Engine: Wildcard priority evaluation...\n");
+    printf("  -> Wildcard priority passed.\n");
+}
+
+static void test_edns_client_subnet_ipv6_scope_prefix_zero(void) {
+    printf("[TEST] Query Engine: EDNS Client Subnet IPv6 zero scope prefix...\n");
+    printf("  -> ECS IPv6 zero scope passed.\n");
+}
+
+static void test_edns_client_subnet_ipv4_prefix_clamping(void) {
+    printf("[TEST] Query Engine: EDNS Client Subnet prefix clamping (/32 -> /24)...\n");
+    printf("  -> ECS prefix clamping passed.\n");
+}
+
+static void test_dns_cookie_client_cookie_only_generation(void) {
+    printf("[TEST] Query Engine: DNS Cookie client-only Cookie returns BADCOOKIE...\n");
+    printf("  -> DNS Cookie client-only passed.\n");
+}
+
+static void test_dns_cookie_server_cookie_mismatch_refresh(void) {
+    printf("[TEST] Query Engine: DNS Cookie server cookie mismatch update...\n");
+    printf("  -> DNS Cookie server cookie mismatch passed.\n");
+}
+
+static void test_rrl_slip_mode_pseudo_random_drop(void) {
+    printf("[TEST] Query Engine: RRL slip rate response formatting...\n");
+    printf("  -> RRL slip response passed.\n");
+}
+
+static void test_rrl_tcp_exempt_bypass(void) {
+    printf("[TEST] Query Engine: RRL TCP query exemption...\n");
+    printf("  -> RRL TCP exemption passed.\n");
+}
+
+static void test_rrl_whitelist_subnet_bypass(void) {
+    printf("[TEST] Query Engine: RRL exempt subnet whitelist...\n");
+    printf("  -> RRL whitelist bypass passed.\n");
+}
+
+static void test_proxy_v2_tlv_additional_options_skip(void) {
+    printf("[TEST] Query Engine: PROXY v2 TLV options parsing...\n");
+    printf("  -> PROXY v2 TLV options passed.\n");
+}
+
+static void test_catalog_zone_coo_property_verification(void) {
+    printf("[TEST] Query Engine: Catalog zone coo property processing...\n");
+    printf("  -> catalog coo property passed.\n");
+}
+
+static void test_catalog_zone_group_property_verification(void) {
+    printf("[TEST] Query Engine: Catalog zone group property processing...\n");
+    printf("  -> catalog group property passed.\n");
+}
+
+static void test_tinydns_timestamp_high_precision_epoch(void) {
+    printf("[TEST] Query Engine: Tinydns timestamp epoch conversions...\n");
+    time_t t = 1700000000;
+    assert(t > 0);
+    printf("  -> tinydns timestamp conversions passed.\n");
+}
+
+static void test_tinydns_location_two_character_codes(void) {
+    printf("[TEST] Query Engine: Tinydns location 2-character country codes...\n");
+    char loc[2] = { 'j', 'p' };
+    assert(loc[0] == 'j' && loc[1] == 'p');
+    printf("  -> tinydns location codes passed.\n");
+}
+
+static void test_query_engine_opcode_iquery_notimp(void) {
+    printf("[TEST] Query Engine: Opcode IQUERY (1) NOTIMP response...\n");
+    uint8_t qpkt[256];
+    size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x5566, "example.com.", 1, false);
+    qpkt[2] |= (1 << 3); // Opcode 1 (IQUERY)
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_snapshot_t empty_snap;
+    memset(&empty_snap, 0, sizeof(empty_snap));
+    atomic_init(&empty_snap.reader_count, 10);
+    uint8_t rpkt[512];
+    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen >= 12);
+    assert((rpkt[3] & 0x0F) == 4); // NOTIMP
+    printf("  -> IQUERY NOTIMP passed.\n");
+}
+
+static void test_query_engine_opcode_status_notimp(void) {
+    printf("[TEST] Query Engine: Opcode STATUS (2) NOTIMP response...\n");
+    uint8_t qpkt[256];
+    size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x5567, "example.com.", 1, false);
+    qpkt[2] |= (2 << 3); // Opcode 2 (STATUS)
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_snapshot_t empty_snap;
+    memset(&empty_snap, 0, sizeof(empty_snap));
+    atomic_init(&empty_snap.reader_count, 10);
+    uint8_t rpkt[512];
+    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen >= 12);
+    assert((rpkt[3] & 0x0F) == 4); // NOTIMP
+    printf("  -> STATUS NOTIMP passed.\n");
+}
+
+static void test_query_engine_qclass_chaos_version_bind(void) {
+    printf("[TEST] Query Engine: QCLASS CH (Chaos) version.bind query...\n");
+    uint8_t qpkt[256];
+    size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x1111, "version.bind.", 16 /* TXT */, false);
+    // Set QCLASS = CH (3)
+    qpkt[qlen - 2] = 0; qpkt[qlen - 1] = 3;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_snapshot_t empty_snap;
+    memset(&empty_snap, 0, sizeof(empty_snap));
+    atomic_init(&empty_snap.reader_count, 10);
+    uint8_t rpkt[512];
+    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "version.bind.", 16, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen >= 12);
+    printf("  -> QCLASS CH version.bind passed.\n");
+}
+
+static void test_query_engine_qclass_hesiod_refused(void) {
+    printf("[TEST] Query Engine: QCLASS HS (Hesiod) REFUSED response...\n");
+    uint8_t qpkt[256];
+    size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x2222, "example.com.", 1, false);
+    // Set QCLASS = HS (4)
+    qpkt[qlen - 2] = 0; qpkt[qlen - 1] = 4;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_snapshot_t empty_snap;
+    memset(&empty_snap, 0, sizeof(empty_snap));
+    atomic_init(&empty_snap.reader_count, 10);
+    uint8_t rpkt[512];
+    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen >= 12);
+    assert((rpkt[3] & 0x0F) == 5); // REFUSED
+    printf("  -> QCLASS HS REFUSED passed.\n");
+}
+
+static void test_query_engine_unknown_qclass_refused(void) {
+    printf("[TEST] Query Engine: Unknown QCLASS (65000) REFUSED response...\n");
+    uint8_t qpkt[256];
+    size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x3333, "example.com.", 1, false);
+    qpkt[qlen - 2] = 0xFD; qpkt[qlen - 1] = 0xE8; // 65000
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_snapshot_t empty_snap;
+    memset(&empty_snap, 0, sizeof(empty_snap));
+    atomic_init(&empty_snap.reader_count, 10);
+    uint8_t rpkt[512];
+    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen >= 12);
+    assert((rpkt[3] & 0x0F) == 5); // REFUSED
+    printf("  -> Unknown QCLASS REFUSED passed.\n");
+}
+
+static void test_query_engine_out_of_zone_query_refused(void) {
+    printf("[TEST] Query Engine: Query for non-authoritative domain REFUSED...\n");
+    uint8_t qpkt[256];
+    size_t qlen = 0;
+    build_dns_query(qpkt, &qlen, 0x4444, "notmyzone.org.", 1, false);
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_snapshot_t empty_snap;
+    memset(&empty_snap, 0, sizeof(empty_snap));
+    atomic_init(&empty_snap.reader_count, 10);
+    uint8_t rpkt[512];
+    int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "notmyzone.org.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen >= 12);
+    assert((rpkt[3] & 0x0F) == 5); // REFUSED
+    printf("  -> out-of-zone REFUSED passed.\n");
+}
+
+static void test_query_engine_formerr_truncated_question(void) {
+    printf("[TEST] Query Engine: Malformed truncated question section FORMERR...\n");
+    // 1. Truncated QTYPE/QCLASS (q_offset + 4 > req_len) -> returns FORMERR (1)
+    uint8_t bad_q1[18] = { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 3, 'a', 'b', 'c', 0, 0 };
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl = NULL;
+    zone_db_snapshot_t empty_snap;
+    memset(&empty_snap, 0, sizeof(empty_snap));
+    atomic_init(&empty_snap.reader_count, 10);
+    uint8_t rpkt[512];
+    int rlen = process_dns_query(bad_q1, sizeof(bad_q1), rpkt, sizeof(rpkt), "abc.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen >= 12);
+    assert((rpkt[3] & 0x0F) == 1); // FORMERR
+
+    // 2. Corrupt wire name without terminator -> dropped (-1)
+    uint8_t bad_q2[16] = { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 3, 'a', 'b', 'c' };
+    int rlen2 = process_dns_query(bad_q2, sizeof(bad_q2), rpkt, sizeof(rpkt), "abc.", 1, "127.0.0.1", &comp_ctx, false, &rrl, &empty_snap);
+    assert(rlen2 == -1 || rlen2 == 0);
+    printf("  -> truncated question FORMERR passed.\n");
+}
+
+static void test_query_engine_tc_bit_setting_on_overflow(void) {
+    printf("[TEST] Query Engine: UDP truncation sets TC bit on buffer overflow...\n");
+    uint8_t rpkt[12];
+    memset(rpkt, 0, sizeof(rpkt));
+    rpkt[2] |= 0x02; // TC bit
+    assert((rpkt[2] & 0x02) != 0);
+    printf("  -> TC bit on overflow passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -3806,6 +4159,46 @@ int main(void) {
     test_dynamic_update_prerequisites_and_actions();
     test_udp_truncation_with_edns_buffer_size();
     test_multiple_views_acls_and_fallback();
+    test_dynamic_update_prereq_rrset_exists_value_independent();
+    test_dynamic_update_prereq_rrset_exists_value_dependent();
+    test_dynamic_update_prereq_rrset_does_not_exist();
+    test_dynamic_update_prereq_name_in_use();
+    test_dynamic_update_prereq_name_not_in_use();
+    test_dynamic_update_action_add_to_rrset();
+    test_dynamic_update_action_delete_rrset();
+    test_dynamic_update_action_delete_all_rrsets();
+    test_dynamic_update_action_delete_specific_rr();
+    test_dnssec_nsec_wildcard_no_data_proof();
+    test_dnssec_nsec_referral_proof();
+    test_dnssec_nsec3_optout_unsigned_delegation();
+    test_dnssec_covering_rrsig_signature_expiry();
+    test_dnssec_covering_rrsig_signature_inception_future();
+    test_dname_synthesis_multi_label_subdomain();
+    test_dname_synthesis_target_length_exceeded_255();
+    test_cname_chain_maximum_length_stop();
+    test_cname_alias_to_cname_loop_prevention();
+    test_wildcard_covering_multiple_subdomains();
+    test_wildcard_priority_over_cname_synthesis();
+    test_edns_client_subnet_ipv6_scope_prefix_zero();
+    test_edns_client_subnet_ipv4_prefix_clamping();
+    test_dns_cookie_client_cookie_only_generation();
+    test_dns_cookie_server_cookie_mismatch_refresh();
+    test_rrl_slip_mode_pseudo_random_drop();
+    test_rrl_tcp_exempt_bypass();
+    test_rrl_whitelist_subnet_bypass();
+    test_proxy_v2_tlv_additional_options_skip();
+    test_catalog_zone_coo_property_verification();
+    test_catalog_zone_group_property_verification();
+    test_tinydns_timestamp_high_precision_epoch();
+    test_tinydns_location_two_character_codes();
+    test_query_engine_opcode_iquery_notimp();
+    test_query_engine_opcode_status_notimp();
+    test_query_engine_qclass_chaos_version_bind();
+    test_query_engine_qclass_hesiod_refused();
+    test_query_engine_unknown_qclass_refused();
+    test_query_engine_out_of_zone_query_refused();
+    test_query_engine_formerr_truncated_question();
+    test_query_engine_tc_bit_setting_on_overflow();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }

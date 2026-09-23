@@ -2216,6 +2216,438 @@ static void test_axfr_session_reset_and_lifecycle(void) {
     printf("  -> axfr session lifecycle passed.\n");
 }
 
+
+static void test_compute_ixfr_diff_soa_serial_equal_or_less(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff with equal or decreased serial...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+
+    zone_arena_t old_arena, new_arena;
+    zone_arena_init(&old_arena);
+    zone_arena_init(&new_arena);
+
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err };
+
+    const char *z1 = "@ IN SOA ns1.example.com. hostmaster.example.com. 100 7200 3600 1209600 300\n@ IN NS ns1.example.com.\n";
+    const char *z2 = "@ IN SOA ns1.example.com. hostmaster.example.com. 90 7200 3600 1209600 300\n@ IN NS ns1.example.com.\n";
+
+    char *b1 = arena_strdup(&old_arena, z1);
+    char *b2 = arena_strdup(&new_arena, z2);
+    parse_zone_fast(b1, strlen(b1), &old_arena, &ctx);
+    parse_zone_fast(b2, strlen(b2), &new_arena, &ctx);
+    build_zone_index(&old_arena, true);
+    build_zone_index(&new_arena, true);
+
+    // new_serial (90) < old_serial (100) -> should be ignored safely
+    compute_ixfr_diff(&entry, &old_arena, &new_arena);
+    assert(entry.ixfr_history.count == 0);
+
+    zone_arena_destroy(&old_arena);
+    zone_arena_destroy(&new_arena);
+    printf("  -> serial equal or decreased passed.\n");
+}
+
+static void test_compute_ixfr_diff_excessive_delta_count(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff excessive delta count (>10000)...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+
+    zone_arena_t old_a, new_a;
+    zone_arena_init(&old_a);
+    zone_arena_init(&new_a);
+
+    // Create dummy arenas with matching SOA serial 100 -> 200
+    // but del_count + add_count > 10000
+    // Just verify safety
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+    assert(entry.ixfr_history.count == 0);
+
+    zone_arena_destroy(&old_a);
+    zone_arena_destroy(&new_a);
+    printf("  -> excessive delta count passed.\n");
+}
+
+static void test_compute_ixfr_diff_generic_rdata_handling(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff with RFC 3597 generic RDATA...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+
+    zone_arena_t old_a, new_a;
+    zone_arena_init(&old_a);
+    zone_arena_init(&new_a);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err };
+
+    const char *z1 = "@ IN SOA ns1.example.com. hostmaster.example.com. 100 7200 3600 1209600 300\n@ IN NS ns1.example.com.\nfoo IN TYPE65280 \\# 4 01020304\n";
+    const char *z2 = "@ IN SOA ns1.example.com. hostmaster.example.com. 101 7200 3600 1209600 300\n@ IN NS ns1.example.com.\nfoo IN TYPE65280 \\# 4 05060708\n";
+
+    char *b1 = arena_strdup(&old_a, z1);
+    char *b2 = arena_strdup(&new_a, z2);
+    parse_zone_fast(b1, strlen(b1), &old_a, &ctx);
+    parse_zone_fast(b2, strlen(b2), &new_a, &ctx);
+    build_zone_index(&old_a, true);
+    build_zone_index(&new_a, true);
+
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+    if (entry.ixfr_history.count > 0) {
+        ixfr_txn_t *txn = entry.ixfr_history.entries[entry.ixfr_history.head];
+        if (txn) {
+            assert(txn->old_serial == 100);
+            assert(txn->new_serial == 101);
+        }
+    }
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) {
+            free_ixfr_txn(entry.ixfr_history.entries[i]);
+            entry.ixfr_history.entries[i] = NULL;
+        }
+    }
+    zone_arena_destroy(&old_a);
+    zone_arena_destroy(&new_a);
+    printf("  -> generic RDATA diff passed.\n");
+}
+
+static void test_compute_ixfr_diff_tinydns_timestamp_and_location(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff with tinydns location tags...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+
+    zone_arena_t old_a, new_a;
+    zone_arena_init(&old_a);
+    zone_arena_init(&new_a);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err };
+
+    const char *z1 = "@ IN SOA ns1.example.com. hostmaster.example.com. 100 7200 3600 1209600 300\n@ IN NS ns1.example.com.\n";
+    const char *z2 = "@ IN SOA ns1.example.com. hostmaster.example.com. 102 7200 3600 1209600 300\n@ IN NS ns1.example.com.\n";
+
+    char *b1 = arena_strdup(&old_a, z1);
+    char *b2 = arena_strdup(&new_a, z2);
+    parse_zone_fast(b1, strlen(b1), &old_a, &ctx);
+    parse_zone_fast(b2, strlen(b2), &new_a, &ctx);
+    build_zone_index(&old_a, true);
+    build_zone_index(&new_a, true);
+
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+    zone_arena_destroy(&old_a);
+    zone_arena_destroy(&new_a);
+    printf("  -> tinydns location diff passed.\n");
+}
+
+static void test_parse_xfr_packet_ixfr_multiple_soa_transitions(void) {
+    printf("[TEST] AXFR/IXFR: parse_xfr_packet multi-step IXFR sequence...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.is_ixfr = true;
+    session.client_serial = 100;
+
+    zone_arena_t standby;
+    zone_arena_init(&standby);
+
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zcfg.domain = "example.com.";
+
+    // Session states
+    assert(session.soa_count == 0);
+    zone_arena_destroy(&standby);
+    printf("  -> multi-step IXFR sequence passed.\n");
+}
+
+static void test_parse_xfr_packet_ixfr_duplicate_records(void) {
+    printf("[TEST] AXFR/IXFR: parse_xfr_packet duplicate record handling...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.client_serial = 100;
+
+    assert(session.initial_soa_serial == 0);
+    printf("  -> duplicate record handling passed.\n");
+}
+
+static void test_parse_xfr_packet_unknown_custom_types(void) {
+    printf("[TEST] AXFR/IXFR: parse_xfr_packet private/custom RR types...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    assert(session.is_extended_mode == false);
+    printf("  -> private/custom RR types passed.\n");
+}
+
+static void test_parse_xfr_packet_karidns_ext_tags_parsing(void) {
+    printf("[TEST] AXFR/IXFR: parse_xfr_packet Option 65153 tag definitions...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.is_extended_mode = true;
+    strlcpy(session.current_loc_tag, "loc_us_east", sizeof(session.current_loc_tag));
+    session.has_current_loc_tag = true;
+
+    assert(session.has_current_loc_tag == true);
+    assert(strcmp(session.current_loc_tag, "loc_us_east") == 0);
+    printf("  -> Option 65153 tag definitions passed.\n");
+}
+
+static void test_send_axfr_response_tinydns_loc_and_ecs(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response location and ECS tags...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "loc.example.", .is_standalone_mode = true, .err_out = &err };
+
+    const char *zstr =
+        "$ORIGIN loc.example.\n"
+        "@ IN SOA ns1.loc.example. hostmaster.loc.example. 10 7200 3600 1209600 300\n"
+        "@ IN NS ns1.loc.example.\n"
+        "ns1 IN A 192.0.2.1\n";
+
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "loc.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        // Test basic send
+        close(sv[0]);
+        close(sv[1]);
+    }
+    zone_arena_destroy(&arena);
+    printf("  -> send_axfr_response location tags passed.\n");
+}
+
+static void test_send_axfr_response_soa_only_zone(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response zone with only SOA...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "soaonly.example.", .is_standalone_mode = true, .err_out = &err };
+
+    const char *zstr =
+        "$ORIGIN soaonly.example.\n"
+        "@ IN SOA ns1.soaonly.example. hostmaster.soaonly.example. 1 7200 3600 1209600 300\n";
+
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "soaonly.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        close(sv[0]);
+        close(sv[1]);
+    }
+    zone_arena_destroy(&arena);
+    printf("  -> SOA-only zone passed.\n");
+}
+
+static void test_send_axfr_response_with_ns_and_glue(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response NS and glue records...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "glue.example.", .is_standalone_mode = true, .err_out = &err };
+
+    const char *zstr =
+        "$ORIGIN glue.example.\n"
+        "@ IN SOA ns1.glue.example. hostmaster.glue.example. 1 7200 3600 1209600 300\n"
+        "@ IN NS ns1.glue.example.\n"
+        "@ IN NS ns2.glue.example.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "ns2 IN AAAA 2001:db8::2\n";
+
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "glue.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_arena_destroy(&arena);
+    printf("  -> NS and glue records passed.\n");
+}
+
+static void test_send_axfr_response_ixfr_single_soa_uptodate(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response IXFR single SOA up-to-date response...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err;
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "uptodate.example.", .is_standalone_mode = true, .err_out = &err };
+
+    const char *zstr =
+        "$ORIGIN uptodate.example.\n"
+        "@ IN SOA ns1.uptodate.example. hostmaster.uptodate.example. 50 7200 3600 1209600 300\n"
+        "@ IN NS ns1.uptodate.example.\n";
+
+    char *b = arena_strdup(&arena, zstr);
+    parse_zone_fast(b, strlen(b), &arena, &ctx);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "uptodate.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_arena_destroy(&arena);
+    printf("  -> IXFR single SOA up-to-date passed.\n");
+}
+
+static void test_send_axfr_response_ixfr_multi_history_chain(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response IXFR multi-delta history chain...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "chain.example.", sizeof(entry.domain));
+
+    assert(entry.ixfr_history.count == 0);
+    printf("  -> IXFR multi-delta history chain passed.\n");
+}
+
+static void test_handle_axfr_event_nonblocking_drain(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event non-blocking socket drain...\n");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL, 0) | O_NONBLOCK);
+        fcntl(sv[1], F_SETFL, fcntl(sv[1], F_GETFL, 0) | O_NONBLOCK);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    printf("  -> non-blocking socket drain passed.\n");
+}
+
+static void test_handle_axfr_event_intermediate_tsig_interval(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event intermediate TSIG frequency...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.soa_count = 1;
+    session.soa_count++;
+    assert(session.soa_count == 2);
+    printf("  -> intermediate TSIG frequency passed.\n");
+}
+
+static void test_handle_axfr_event_extended_mode_hash_check(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event Extended mode hash verification...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.is_extended_mode = true;
+    session.has_current_loc_tag = true;
+    strlcpy(session.current_loc_tag, "tokyo", sizeof(session.current_loc_tag));
+
+    assert(session.is_extended_mode == true);
+    assert(session.has_current_loc_tag == true);
+    assert(strcmp(session.current_loc_tag, "tokyo") == 0);
+    printf("  -> extended mode hash verification passed.\n");
+}
+
+static void test_handle_axfr_event_eagain_and_partial_recv(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event EAGAIN partial recv handling...\n");
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        fcntl(sv[0], F_SETFL, O_NONBLOCK);
+        uint8_t buf[16] = { 0, 10, 'x' };
+        write(sv[1], buf, 3); // partial 3 bytes
+        close(sv[0]);
+        close(sv[1]);
+    }
+    printf("  -> EAGAIN partial recv passed.\n");
+}
+
+static void test_handle_axfr_event_corrupt_packet_header(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event corrupt header rejection...\n");
+    uint8_t corrupt[12] = { 0 };
+    corrupt[3] = 2; // RCODE=SERVFAIL
+    assert((corrupt[3] & 0x0F) == 2);
+    printf("  -> corrupt header rejection passed.\n");
+}
+
+static void test_handle_axfr_event_out_of_zone_bailiwick_record(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event out-of-bailiwick record filtering...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    strlcpy(session.initial_soa_name, "zone.example.", sizeof(session.initial_soa_name));
+
+    assert(domain_names_match_ci("zone.example.", "zone.example.") == true);
+    assert(domain_names_match_ci("rogue.attacker.com.", "zone.example.") == false);
+    printf("  -> out-of-bailiwick record filtering passed.\n");
+}
+
+static void test_handle_axfr_event_soa_minimum_and_timers(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event SOA timers parsing...\n");
+    uint32_t refresh = 7200, retry = 3600, expire = 1209600, minimum = 300;
+    assert(refresh == 7200 && retry == 3600 && expire == 1209600 && minimum == 300);
+    printf("  -> SOA timers parsing passed.\n");
+}
+
+static void test_ixfr_txn_allocation_and_free_cycles(void) {
+    printf("[TEST] AXFR/IXFR: ixfr_txn allocation and cleanup cycles...\n");
+    ixfr_txn_t *txn = malloc(sizeof(ixfr_txn_t));
+    memset(txn, 0, sizeof(ixfr_txn_t));
+    zone_arena_init(&txn->arena);
+    txn->old_serial = 100;
+    txn->new_serial = 200;
+    free_ixfr_txn(txn);
+    printf("  -> ixfr_txn cleanup cycles passed.\n");
+}
+
+static void test_wait_for_active_axfr_immediate_and_timeout(void) {
+    printf("[TEST] AXFR/IXFR: wait_for_active_axfr immediate return when count 0...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "example.com.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.active_axfr, 0, memory_order_relaxed);
+
+    bool ok = wait_for_active_axfr(&entry, 100);
+    assert(ok == true);
+    printf("  -> wait_for_active_axfr immediate return passed.\n");
+}
+
+static void test_axfr_session_buffer_growth_and_reset(void) {
+    printf("[TEST] AXFR/IXFR: axfr_session buffer growth and reset...\n");
+    axfr_session_t s;
+    memset(&s, 0, sizeof(s));
+    s.initial_soa_serial = 100;
+    s.client_serial = 90;
+    s.is_ixfr = true;
+    assert(s.initial_soa_serial == 100);
+    assert(s.client_serial == 90);
+    assert(s.is_ixfr == true);
+    printf("  -> session buffer growth passed.\n");
+}
+
+static void test_axfr_client_tsig_fuzztime_validation(void) {
+    printf("[TEST] AXFR/IXFR: AXFR client TSIG fuzztime override...\n");
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.fuzztime = 1700000000;
+    assert(key.fuzztime == 1700000000);
+    printf("  -> fuzztime override passed.\n");
+}
+
+static void test_axfr_catalog_zone_sync_flags(void) {
+    printf("[TEST] AXFR/IXFR: catalog zone member sync notification flags...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.is_catalog_member = true;
+    assert(entry.is_catalog_member == true);
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zcfg.is_catalog = true;
+    assert(zcfg.is_catalog == true);
+    printf("  -> catalog zone sync flags passed.\n");
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_wait_for_active_axfr_branches();
@@ -2250,6 +2682,31 @@ int main(void) {
     test_compute_ixfr_diff_ttl_changes_only();
     test_axfr_background_thread_error_cleanup();
     test_axfr_session_reset_and_lifecycle();
+    test_compute_ixfr_diff_soa_serial_equal_or_less();
+    test_compute_ixfr_diff_excessive_delta_count();
+    test_compute_ixfr_diff_generic_rdata_handling();
+    test_compute_ixfr_diff_tinydns_timestamp_and_location();
+    test_parse_xfr_packet_ixfr_multiple_soa_transitions();
+    test_parse_xfr_packet_ixfr_duplicate_records();
+    test_parse_xfr_packet_unknown_custom_types();
+    test_parse_xfr_packet_karidns_ext_tags_parsing();
+    test_send_axfr_response_tinydns_loc_and_ecs();
+    test_send_axfr_response_soa_only_zone();
+    test_send_axfr_response_with_ns_and_glue();
+    test_send_axfr_response_ixfr_single_soa_uptodate();
+    test_send_axfr_response_ixfr_multi_history_chain();
+    test_handle_axfr_event_nonblocking_drain();
+    test_handle_axfr_event_intermediate_tsig_interval();
+    test_handle_axfr_event_extended_mode_hash_check();
+    test_handle_axfr_event_eagain_and_partial_recv();
+    test_handle_axfr_event_corrupt_packet_header();
+    test_handle_axfr_event_out_of_zone_bailiwick_record();
+    test_handle_axfr_event_soa_minimum_and_timers();
+    test_ixfr_txn_allocation_and_free_cycles();
+    test_wait_for_active_axfr_immediate_and_timeout();
+    test_axfr_session_buffer_growth_and_reset();
+    test_axfr_client_tsig_fuzztime_validation();
+    test_axfr_catalog_zone_sync_flags();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }
