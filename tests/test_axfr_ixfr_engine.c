@@ -1690,6 +1690,532 @@ static void test_handle_axfr_event_intermediate_unsigned_flow(void) {
     printf("  -> handle_axfr_event multi-message TSIG flow passed.\n");
 }
 
+
+static void test_ixfr_delta_empty_records(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff with identical records (serial increment only)...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "deltaempty.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    zone_arena_t old_a, new_a;
+    zone_arena_init(&old_a);
+    zone_arena_init(&new_a);
+
+    init_axfr_zone(&old_a, "deltaempty.example.", "100");
+    init_axfr_zone(&new_a, "deltaempty.example.", "101");
+    build_zone_index(&old_a, true);
+    build_zone_index(&new_a, true);
+
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+    assert(entry.ixfr_history.count == 1);
+    assert(entry.ixfr_history.entries[0] != NULL);
+    assert(entry.ixfr_history.entries[0]->old_serial == 100);
+    assert(entry.ixfr_history.entries[0]->new_serial == 101);
+
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) {
+            free_ixfr_txn(entry.ixfr_history.entries[i]);
+            entry.ixfr_history.entries[i] = NULL;
+        }
+    }
+    zone_arena_destroy(&old_a);
+    zone_arena_destroy(&new_a);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> ixfr delta empty records passed.\n");
+}
+
+static void test_ixfr_history_ring_buffer_wrap(void) {
+    printf("[TEST] AXFR/IXFR: history ring buffer heavy wrap-around...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "ringwrap.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    for (int k = 0; k < MAX_IXFR_HISTORY * 3; k++) {
+        zone_arena_t old_a, new_a;
+        zone_arena_init(&old_a);
+        zone_arena_init(&new_a);
+        char s1[16], s2[16];
+        snprintf(s1, sizeof(s1), "%d", 100 + k);
+        snprintf(s2, sizeof(s2), "%d", 101 + k);
+        init_axfr_zone(&old_a, "ringwrap.example.", s1);
+        init_axfr_zone(&new_a, "ringwrap.example.", s2);
+        build_zone_index(&old_a, true);
+        build_zone_index(&new_a, true);
+        compute_ixfr_diff(&entry, &old_a, &new_a);
+        zone_arena_destroy(&old_a);
+        zone_arena_destroy(&new_a);
+    }
+    assert(entry.ixfr_history.count == MAX_IXFR_HISTORY);
+
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) {
+            free_ixfr_txn(entry.ixfr_history.entries[i]);
+            entry.ixfr_history.entries[i] = NULL;
+        }
+    }
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> ring buffer heavy wrap passed.\n");
+}
+
+static void test_axfr_extended_option_version_mismatch(void) {
+    printf("[TEST] AXFR/IXFR: Option 65153 version mismatch fallback...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "optver.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    init_axfr_zone(&entry.rcu.arena_a, "optver.example.", "100");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+
+    uint8_t req[512] = {0};
+    req[0] = 0x77; req[1] = 0x88;
+    req[4] = 0; req[5] = 1; // QDCOUNT = 1
+    req[10] = 0; req[11] = 1; // ARCOUNT = 1
+    size_t off = 12;
+    off += write_uncompressed_name(req, off, sizeof(req), "optver.example.");
+    req[off++] = 0; req[off++] = 252; // AXFR
+    req[off++] = 0; req[off++] = 1;
+    // OPT with version 99 (unsupported)
+    req[off++] = 0; req[off++] = 0; req[off++] = 41;
+    req[off++] = 0x10; req[off++] = 0x00;
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0;
+    req[off++] = 0; req[off++] = 9;
+    req[off++] = 0xFE; req[off++] = 0x81;
+    req[off++] = 0; req[off++] = 5;
+    req[off++] = 99; // Bad version
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0;
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(-1, "optver.example.", req, off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count >= 2);
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    pthread_mutex_destroy(&entry.writer_lock);
+    printf("  -> Option 65153 version mismatch passed.\n");
+}
+
+static void test_axfr_extended_option_hash_mismatch(void) {
+    printf("[TEST] AXFR/IXFR: Option 65153 hash mismatch fallback...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "opthash.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    init_axfr_zone(&entry.rcu.arena_a, "opthash.example.", "100");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+
+    uint8_t req[512] = {0};
+    req[0] = 0x77; req[1] = 0x88;
+    req[4] = 0; req[5] = 1;
+    req[10] = 0; req[11] = 1;
+    size_t off = 12;
+    off += write_uncompressed_name(req, off, sizeof(req), "opthash.example.");
+    req[off++] = 0; req[off++] = 252;
+    req[off++] = 0; req[off++] = 1;
+    req[off++] = 0; req[off++] = 0; req[off++] = 41;
+    req[off++] = 0x10; req[off++] = 0x00;
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0;
+    req[off++] = 0; req[off++] = 9;
+    req[off++] = 0xFE; req[off++] = 0x81;
+    req[off++] = 0; req[off++] = 5;
+    req[off++] = KARIDNS_EXT_VERSION;
+    req[off++] = 0xDE; req[off++] = 0xAD; req[off++] = 0xBE; req[off++] = 0xEF; // Mismatched hash
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(-1, "opthash.example.", req, off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count >= 2);
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    pthread_mutex_destroy(&entry.writer_lock);
+    printf("  -> Option 65153 hash mismatch passed.\n");
+}
+
+static void test_send_axfr_response_zero_records_nosoa(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response empty active zone...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "emptyzone.example.", sizeof(entry.domain));
+    zone_arena_t empty_a;
+    zone_arena_init(&empty_a);
+    atomic_store_explicit(&entry.rcu.active, &empty_a, memory_order_release);
+
+    uint8_t req[64] = { 0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    size_t off = 12;
+    off += write_uncompressed_name(req, off, sizeof(req), "emptyzone.example.");
+    req[off++] = 0; req[off++] = 252;
+    req[off++] = 0; req[off++] = 1;
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(-1, "emptyzone.example.", req, off, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    zone_arena_destroy(&empty_a);
+    printf("  -> send_axfr_response empty zone passed.\n");
+}
+
+static void test_send_axfr_response_tsig_signing_error(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response invalid TSIG key algorithm...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "badtsig.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    init_axfr_zone(&entry.rcu.arena_a, "badtsig.example.", "100");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+
+    uint8_t req[64] = { 0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    size_t off = 12;
+    off += write_uncompressed_name(req, off, sizeof(req), "badtsig.example.");
+    req[off++] = 0; req[off++] = 252;
+    req[off++] = 0; req[off++] = 1;
+
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.name = "bad-alg-key";
+    key.algorithm = "unsupported-cipher";
+
+    send_axfr_response(-1, "badtsig.example.", req, off, &key, &entry, NULL, 0, NULL, 0, NULL, false);
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    pthread_mutex_destroy(&entry.writer_lock);
+    printf("  -> send_axfr_response invalid TSIG key passed.\n");
+}
+
+static void test_handle_axfr_event_socket_closed(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event socket closed unexpected EOF...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "eof.example.", sizeof(entry.domain));
+
+    reset_mock_tcp_stream(); // 0 messages pushed -> read_dns_tcp_message returns -1
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    int res = handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0);
+    assert(res == -1);
+
+    printf("  -> handle_axfr_event EOF passed.\n");
+}
+
+static void test_handle_axfr_event_non_soa_first_packet(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event reject stream with non-SOA first packet...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "nosoa1.example.", sizeof(entry.domain));
+
+    reset_mock_tcp_stream();
+    uint8_t p1[256] = {0};
+    p1[0] = 0x11; p1[1] = 0x22; p1[2] = 0x84;
+    p1[6] = 0; p1[7] = 1; // ANCOUNT = 1 (A record, not SOA)
+    size_t off = 12;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "nosoa1.example.");
+    p1[off++] = 0; p1[off++] = 1; // A
+    p1[off++] = 0; p1[off++] = 1;
+    p1[off++] = 0; p1[off++] = 0; p1[off++] = 1; p1[off++] = 0x2C;
+    p1[off++] = 0; p1[off++] = 4;
+    p1[off++] = 192; p1[off++] = 0; p1[off++] = 2; p1[off++] = 1;
+    push_mock_tcp_msg(p1, (uint16_t)off);
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    int res = handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0);
+    assert(res == -1);
+
+    printf("  -> handle_axfr_event non-SOA first packet rejected.\n");
+}
+
+static void test_handle_axfr_event_serial_not_newer(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event reject serial rollback...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "rollback.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.serial, 300, memory_order_release);
+
+    reset_mock_tcp_stream();
+    uint8_t p1[256] = {0};
+    p1[0] = 0x11; p1[1] = 0x22; p1[2] = 0x84;
+    p1[6] = 0; p1[7] = 1; // ANCOUNT = 1
+    size_t off = 12;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "rollback.example.");
+    p1[off++] = 0; p1[off++] = 6; p1[off++] = 0; p1[off++] = 1;
+    p1[off++] = 0; p1[off++] = 0; p1[off++] = 1; p1[off++] = 0x2C;
+    size_t rdp = off; off += 2;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "ns1.rollback.example.");
+    off += write_uncompressed_name(p1, off, sizeof(p1), "admin.rollback.example.");
+    p1[off++] = 0; p1[off++] = 0; p1[off++] = 0; p1[off++] = 200; // Serial 200 < 300
+    for (int k = 0; k < 4; k++) { p1[off++] = 0; p1[off++] = 0; p1[off++] = 0; p1[off++] = 10; }
+    uint16_t rdl = (uint16_t)(off - (rdp + 2));
+    p1[rdp] = rdl >> 8; p1[rdp+1] = rdl & 0xFF;
+    push_mock_tcp_msg(p1, (uint16_t)off);
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.client_serial = 300;
+
+    int res = handle_axfr_event(-1, &entry, &stream_ctx, &session, NULL, NULL, 0);
+    assert(res == -1);
+
+    printf("  -> handle_axfr_event serial rollback rejected.\n");
+}
+
+static void test_handle_axfr_event_tsig_badsig_abort(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event TSIG BADSIG abort...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "tsigabort.example.", sizeof(entry.domain));
+
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.name = "abort-key";
+    key.algorithm = "hmac-sha256";
+    memcpy(key.secret_decoded, "secret1234567890secret1234567890", 32);
+    key.secret_decoded_len = 32;
+
+    reset_mock_tcp_stream();
+    uint8_t p1[512] = {0};
+    p1[0] = 0x11; p1[1] = 0x22; p1[2] = 0x84;
+    p1[6] = 0; p1[7] = 1;
+    size_t off = 12;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "tsigabort.example.");
+    p1[off++] = 0; p1[off++] = 6; p1[off++] = 0; p1[off++] = 1;
+    p1[off++] = 0; p1[off++] = 0; p1[off++] = 1; p1[off++] = 0x2C;
+    size_t rdp = off; off += 2;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "ns1.tsigabort.example.");
+    off += write_uncompressed_name(p1, off, sizeof(p1), "admin.tsigabort.example.");
+    p1[off++] = 0; p1[off++] = 0; p1[off++] = 0; p1[off++] = 200;
+    for (int k = 0; k < 4; k++) { p1[off++] = 0; p1[off++] = 0; p1[off++] = 0; p1[off++] = 10; }
+    uint16_t rdl = (uint16_t)(off - (rdp + 2));
+    p1[rdp] = rdl >> 8; p1[rdp+1] = rdl & 0xFF;
+
+    uint8_t cur_mac[64];
+    size_t cur_mac_len = 0;
+    size_t p1_len = off;
+    tsig_sign_packet(p1, &p1_len, sizeof(p1), &key, 0, cur_mac, &cur_mac_len, NULL, 0, false);
+    p1[p1_len - 10] ^= 0xFF; // Corrupt MAC
+    push_mock_tcp_msg(p1, (uint16_t)p1_len);
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    int res = handle_axfr_event(-1, &entry, &stream_ctx, &session, &key, NULL, 0);
+    assert(res == -1);
+
+    printf("  -> handle_axfr_event TSIG BADSIG abort passed.\n");
+}
+
+static void test_parse_xfr_packet_malformed_soa_rdata(void) {
+    printf("[TEST] AXFR/IXFR: parse_xfr_packet malformed SOA RDATA truncation...\n");
+    zone_arena_t standby, active;
+    zone_arena_init(&standby);
+    zone_arena_init(&active);
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    uint8_t pkt[256] = {0};
+    pkt[0] = 0x11; pkt[1] = 0x22;
+    pkt[6] = 0; pkt[7] = 1;
+    size_t off = 12;
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "badsoa.example.");
+    pkt[off++] = 0; pkt[off++] = 6; pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+    pkt[off++] = 0; pkt[off++] = 4; // RDLENGTH = 4 (Truncated SOA)
+    pkt[off++] = 1; pkt[off++] = 2; pkt[off++] = 3; pkt[off++] = 4;
+
+    assert(parse_xfr_packet(pkt, off, &standby, &active, &session, "badsoa.example.") == -1);
+
+    zone_arena_destroy(&standby);
+    zone_arena_destroy(&active);
+    printf("  -> parse_xfr_packet malformed SOA RDATA rejected.\n");
+}
+
+static void test_parse_xfr_packet_uncompressed_name_error(void) {
+    printf("[TEST] AXFR/IXFR: parse_xfr_packet invalid wire name pointer...\n");
+    zone_arena_t standby, active;
+    zone_arena_init(&standby);
+    zone_arena_init(&active);
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    uint8_t bad_ptr_pkt[32] = { 0x11, 0x22, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0xC0, 0xFF, 0, 1, 0, 1 };
+    assert(parse_xfr_packet(bad_ptr_pkt, sizeof(bad_ptr_pkt), &standby, &active, &session, "ptrerr.example.") == -1);
+
+    zone_arena_destroy(&standby);
+    zone_arena_destroy(&active);
+    printf("  -> parse_xfr_packet invalid wire pointer rejected.\n");
+}
+
+static void test_compute_ixfr_diff_rdata_order_insensitive(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff RDATA order insensitivity...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "order.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    zone_arena_t old_a, new_a;
+    zone_arena_init(&old_a);
+    zone_arena_init(&new_a);
+
+    init_axfr_zone(&old_a, "order.example.", "100");
+    init_axfr_zone(&new_a, "order.example.", "200");
+
+    // Add TXT records in reverse order
+    dns_record_t r1, r2;
+    memset(&r1, 0, sizeof(r1));
+    r1.name = arena_strdup(&old_a, "txt.order.example.");
+    r1.type = arena_strdup(&old_a, "TXT");
+    r1.type_code = 16;
+    r1.class_str = arena_strdup(&old_a, "IN");
+    r1.class_val = 1;
+    r1.ttl = arena_strdup(&old_a, "300");
+    r1.ttl_value = 300;
+    r1.rdata_count = 1;
+    r1.rdata[0] = arena_strdup(&old_a, "\"record1\"");
+    old_a.records[old_a.count++] = r1;
+
+    memset(&r2, 0, sizeof(r2));
+    r2.name = arena_strdup(&new_a, "txt.order.example.");
+    r2.type = arena_strdup(&new_a, "TXT");
+    r2.type_code = 16;
+    r2.class_str = arena_strdup(&new_a, "IN");
+    r2.class_val = 1;
+    r2.ttl = arena_strdup(&new_a, "300");
+    r2.ttl_value = 300;
+    r2.rdata_count = 1;
+    r2.rdata[0] = arena_strdup(&new_a, "\"record1\"");
+    new_a.records[new_a.count++] = r2;
+
+    build_zone_index(&old_a, true);
+    build_zone_index(&new_a, true);
+
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+    assert(entry.ixfr_history.count == 1);
+
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) {
+            free_ixfr_txn(entry.ixfr_history.entries[i]);
+            entry.ixfr_history.entries[i] = NULL;
+        }
+    }
+    zone_arena_destroy(&old_a);
+    zone_arena_destroy(&new_a);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> compute_ixfr_diff order insensitivity passed.\n");
+}
+
+static void test_compute_ixfr_diff_ttl_changes_only(void) {
+    printf("[TEST] AXFR/IXFR: compute_ixfr_diff TTL change only detection...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "ttlchange.example.", sizeof(entry.domain));
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    zone_arena_t old_a, new_a;
+    zone_arena_init(&old_a);
+    zone_arena_init(&new_a);
+
+    init_axfr_zone(&old_a, "ttlchange.example.", "100");
+    init_axfr_zone(&new_a, "ttlchange.example.", "200");
+
+    dns_record_t r_old, r_new;
+    memset(&r_old, 0, sizeof(r_old));
+    r_old.name = arena_strdup(&old_a, "host.ttlchange.example.");
+    r_old.type = arena_strdup(&old_a, "A");
+    r_old.type_code = 1;
+    r_old.class_str = arena_strdup(&old_a, "IN");
+    r_old.class_val = 1;
+    r_old.ttl = arena_strdup(&old_a, "300");
+    r_old.ttl_value = 300;
+    r_old.rdata_count = 1;
+    r_old.rdata[0] = arena_strdup(&old_a, "192.0.2.1");
+    old_a.records[old_a.count++] = r_old;
+
+    memset(&r_new, 0, sizeof(r_new));
+    r_new.name = arena_strdup(&new_a, "host.ttlchange.example.");
+    r_new.type = arena_strdup(&new_a, "A");
+    r_new.type_code = 1;
+    r_new.class_str = arena_strdup(&new_a, "IN");
+    r_new.class_val = 1;
+    r_new.ttl = arena_strdup(&new_a, "600"); // Changed TTL
+    r_new.ttl_value = 600;
+    r_new.rdata_count = 1;
+    r_new.rdata[0] = arena_strdup(&new_a, "192.0.2.1");
+    new_a.records[new_a.count++] = r_new;
+
+    build_zone_index(&old_a, true);
+    build_zone_index(&new_a, true);
+
+    compute_ixfr_diff(&entry, &old_a, &new_a);
+    assert(entry.ixfr_history.count == 1);
+    assert(entry.ixfr_history.entries[0]->added_count >= 1);
+    assert(entry.ixfr_history.entries[0]->deleted_count >= 1);
+
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) {
+            free_ixfr_txn(entry.ixfr_history.entries[i]);
+            entry.ixfr_history.entries[i] = NULL;
+        }
+    }
+    zone_arena_destroy(&old_a);
+    zone_arena_destroy(&new_a);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> compute_ixfr_diff TTL change passed.\n");
+}
+
+static void test_axfr_background_thread_error_cleanup(void) {
+    printf("[TEST] AXFR/IXFR: axfr_bg_thread_func error exit and cleanup...\n");
+    axfr_bg_ctx_t *ctx = calloc(1, sizeof(axfr_bg_ctx_t));
+    strlcpy(ctx->master_ip, "192.0.2.254", sizeof(ctx->master_ip));
+    ctx->master_port = 5353;
+    strlcpy(ctx->domain, "bgerr.example.", sizeof(ctx->domain));
+
+    pthread_t th;
+    assert(pthread_create(&th, NULL, axfr_bg_thread_func, ctx) == 0);
+    pthread_join(th, NULL);
+    printf("  -> axfr bg thread error cleanup passed.\n");
+}
+
+static void test_axfr_session_reset_and_lifecycle(void) {
+    printf("[TEST] AXFR/IXFR: axfr_session_t lifecycle and fields...\n");
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.client_serial = 100;
+    session.initial_soa_serial = 200;
+    session.is_ixfr = true;
+    session.is_finished = false;
+    session.soa_count = 2;
+    session.is_extended_mode = true;
+    strlcpy(session.initial_soa_name, "example.com.", sizeof(session.initial_soa_name));
+    strlcpy(session.current_loc_tag, "loc1", sizeof(session.current_loc_tag));
+    session.has_current_loc_tag = true;
+    strlcpy(session.current_ecs_tag, "ecs1", sizeof(session.current_ecs_tag));
+    session.has_current_ecs_tag = true;
+
+    assert(session.is_ixfr == true);
+    assert(session.initial_soa_serial == 200);
+    assert(session.soa_count == 2);
+    assert(session.is_extended_mode == true);
+    assert(strcmp(session.initial_soa_name, "example.com.") == 0);
+    assert(session.has_current_loc_tag == true);
+    assert(session.has_current_ecs_tag == true);
+
+    memset(&session, 0, sizeof(session));
+    assert(session.client_serial == 0);
+    assert(session.initial_soa_serial == 0);
+    assert(session.is_ixfr == false);
+    assert(session.soa_count == 0);
+    printf("  -> axfr session lifecycle passed.\n");
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_wait_for_active_axfr_branches();
@@ -1708,7 +2234,22 @@ int main(void) {
     test_handle_axfr_event_intermediate_unsigned_flow();
     test_handle_axfr_event_and_worker_thread();
     test_axfr_bg_thread_and_free_ixfr_txn();
+    test_ixfr_delta_empty_records();
+    test_ixfr_history_ring_buffer_wrap();
+    test_axfr_extended_option_version_mismatch();
+    test_axfr_extended_option_hash_mismatch();
+    test_send_axfr_response_zero_records_nosoa();
+    test_send_axfr_response_tsig_signing_error();
+    test_handle_axfr_event_socket_closed();
+    test_handle_axfr_event_non_soa_first_packet();
+    test_handle_axfr_event_serial_not_newer();
+    test_handle_axfr_event_tsig_badsig_abort();
+    test_parse_xfr_packet_malformed_soa_rdata();
+    test_parse_xfr_packet_uncompressed_name_error();
+    test_compute_ixfr_diff_rdata_order_insensitive();
+    test_compute_ixfr_diff_ttl_changes_only();
+    test_axfr_background_thread_error_cleanup();
+    test_axfr_session_reset_and_lifecycle();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");
     return 0;
 }
-

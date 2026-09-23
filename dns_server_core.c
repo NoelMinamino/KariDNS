@@ -89,7 +89,7 @@ int g_cwd_fd = -1;
 STATIC_TEST const char *g_config_path = NULL;
 static int g_cli_port_override = 0;
 _Atomic int g_bound_workers = 0;
-static _Atomic bool g_privilege_drop_complete = false;
+STATIC_TEST _Atomic bool g_privilege_drop_complete = false;
 #define MAX_ZONE_AXFR 4
 
 #define NUM_FRONTEND_ROUTERS 2

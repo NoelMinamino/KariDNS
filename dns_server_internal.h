@@ -519,6 +519,7 @@ extern _Atomic int g_tcp_clients;
 extern _Atomic int g_tcp_high_water;
 extern _Atomic int g_bound_workers;
 extern _Atomic bool g_frontend_alive;
+extern _Atomic bool g_privilege_drop_complete;
 extern _Atomic bool g_qlog_circuit_broken;
 extern resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 extern _Atomic uint64_t g_resp_log_tail;

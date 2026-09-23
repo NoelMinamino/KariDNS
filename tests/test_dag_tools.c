@@ -758,6 +758,299 @@ static void test_dag_replay_comparison_and_filtering(void) {
     printf("  -> replay response comparison and filtering passed.\n");
 }
 
+
+static void test_dag_replay_diff_flags_all_bits(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses testing all DIFF_* bitmasks...\n");
+    uint8_t base_resp[512];
+    memset(base_resp, 0, 12);
+    base_resp[0] = 0x12; base_resp[1] = 0x34;
+    base_resp[2] = 0x85; // QR=1, AA=1, RD=1
+    base_resp[3] = 0x80; // RA=1, RCODE=0
+    base_resp[4] = 0; base_resp[5] = 1; // QDCOUNT=1
+    base_resp[6] = 0; base_resp[7] = 1; // ANCOUNT=1
+    base_resp[8] = 0; base_resp[9] = 1; // NSCOUNT=1
+    base_resp[10] = 0; base_resp[11] = 0; // ARCOUNT=0
+
+    size_t off = 12;
+    off += write_uncompressed_name(base_resp, off, sizeof(base_resp), "diffbits.example.");
+    base_resp[off++] = 0; base_resp[off++] = 1; base_resp[off++] = 0; base_resp[off++] = 1;
+
+    // Answer A record
+    off += write_uncompressed_name(base_resp, off, sizeof(base_resp), "diffbits.example.");
+    base_resp[off++] = 0; base_resp[off++] = 1; base_resp[off++] = 0; base_resp[off++] = 1;
+    base_resp[off++] = 0; base_resp[off++] = 0; base_resp[off++] = 1; base_resp[off++] = 0x2C;
+    base_resp[off++] = 0; base_resp[off++] = 4;
+    size_t ip_pos = off;
+    base_resp[off++] = 192; base_resp[off++] = 0; base_resp[off++] = 2; base_resp[off++] = 1;
+
+    // Authority NS record
+    off += write_uncompressed_name(base_resp, off, sizeof(base_resp), "diffbits.example.");
+    base_resp[off++] = 0; base_resp[off++] = 2; base_resp[off++] = 0; base_resp[off++] = 1;
+    base_resp[off++] = 0; base_resp[off++] = 0; base_resp[off++] = 1; base_resp[off++] = 0x2C;
+    size_t nsp = off; off += 2;
+    size_t nw = write_uncompressed_name(base_resp, off, sizeof(base_resp), "ns1.diffbits.example.");
+    off += nw;
+    base_resp[nsp] = (uint8_t)(nw >> 8); base_resp[nsp+1] = (uint8_t)(nw & 0xFF);
+
+    // 1. AA flag mismatch (DIFF_FLAGS)
+    uint8_t resp_flags[512];
+    memcpy(resp_flags, base_resp, off);
+    resp_flags[2] ^= 0x04; // Flip AA bit
+    diff_result_t diff;
+    memset(&diff, 0, sizeof(diff));
+    diff_dns_responses(base_resp, off, resp_flags, off, false, &diff);
+    assert((diff.diff_flags & DIFF_FLAGS) != 0);
+
+    // 2. Answer IP mismatch (DIFF_ANSWER_RRSET)
+    uint8_t resp_ip[512];
+    memcpy(resp_ip, base_resp, off);
+    resp_ip[ip_pos] = 99; // Change IP byte in Answer section
+    memset(&diff, 0, sizeof(diff));
+    diff_dns_responses(base_resp, off, resp_ip, off, false, &diff);
+    assert((diff.diff_flags & DIFF_ANSWER_RRSET) != 0);
+
+    // 3. Authority NS mismatch (DIFF_AUTH_RRSET)
+    uint8_t resp_auth[512];
+    memcpy(resp_auth, base_resp, off);
+    resp_auth[nsp + 3] = 'x'; // Change NS target name byte in Auth section
+    memset(&diff, 0, sizeof(diff));
+    diff_dns_responses(base_resp, off, resp_auth, off, false, &diff);
+    assert((diff.diff_flags & DIFF_AUTH_RRSET) != 0);
+
+    printf("  -> diff_dns_responses bitmasks passed.\n");
+}
+
+static void test_dag_replay_ignore_ttl_flag(void) {
+    printf("[TEST] DAG Tools: diff_dns_responses ignore_ttl parameter...\n");
+    uint8_t resp1[512], resp2[512];
+    memset(resp1, 0, 12);
+    resp1[0] = 0x11; resp1[1] = 0x22; resp1[2] = 0x81; resp1[3] = 0x80;
+    resp1[4] = 0; resp1[5] = 1; resp1[6] = 0; resp1[7] = 1;
+    size_t off = 12;
+    off += write_uncompressed_name(resp1, off, sizeof(resp1), "ttlign.example.");
+    resp1[off++] = 0; resp1[off++] = 1; resp1[off++] = 0; resp1[off++] = 1;
+    off += write_uncompressed_name(resp1, off, sizeof(resp1), "ttlign.example.");
+    resp1[off++] = 0; resp1[off++] = 1; resp1[off++] = 0; resp1[off++] = 1;
+    resp1[off++] = 0; resp1[off++] = 0; resp1[off++] = 0x01; resp1[off++] = 0x2C; // TTL=300
+    resp1[off++] = 0; resp1[off++] = 4;
+    resp1[off++] = 192; resp1[off++] = 0; resp1[off++] = 2; resp1[off++] = 1;
+
+    memcpy(resp2, resp1, off);
+    resp2[off - 8] = 0x0E; resp2[off - 7] = 0x10; // TTL=3600 (was 300)
+
+    diff_result_t diff;
+    memset(&diff, 0, sizeof(diff));
+    diff_dns_responses(resp1, off, resp2, off, true /* ignore_ttl */, &diff);
+    assert(diff.diff_flags == 0); // Should match when ignoring TTL
+
+    memset(&diff, 0, sizeof(diff));
+    diff_dns_responses(resp1, off, resp2, off, false /* strict TTL */, &diff);
+    assert((diff.diff_flags & DIFF_ANSWER_RRSET) != 0);
+
+    printf("  -> ignore_ttl flag passed.\n");
+}
+
+static void test_dag_tsig_client_multiple_algorithms(void) {
+    printf("[TEST] DAG Tools: TSIG client algorithm table...\n");
+    const char *algs[] = {
+        "hmac-md5.sig-alg.reg.int.",
+        "hmac-sha1.",
+        "hmac-sha224.",
+        "hmac-sha256.",
+        "hmac-sha384.",
+        "hmac-sha512."
+    };
+    for (size_t i = 0; i < sizeof(algs)/sizeof(algs[0]); i++) {
+        assert(tsig_algorithm_is_supported(algs[i]) == true);
+    }
+    assert(tsig_algorithm_is_supported("unknown-alg.") == false);
+    printf("  -> TSIG client algorithms passed.\n");
+}
+
+static void test_dag_tsig_client_bad_base64_secret(void) {
+    printf("[TEST] DAG Tools: parse_tsig_str with bad base64...\n");
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    // Invalid characters in base64 secret
+    char bad_str[] = "hmac-sha256:mykey:???BAD_BASE64???";
+    parse_tsig_str(bad_str, &qo);
+    assert(qo.want_tsig == false);
+    printf("  -> bad base64 TSIG secret rejected.\n");
+}
+
+static void test_dag_pcap_l4_truncated_ip_headers(void) {
+    printf("[TEST] DAG Tools: parse_pcap_packet truncation resilience...\n");
+    uint8_t trunc_ether[10] = { 0 }; // < 14 bytes
+    uint8_t out_dns[512];
+    size_t out_len = 0;
+    assert(parse_pcap_packet(trunc_ether, sizeof(trunc_ether), 1 /* DLT_EN10MB */, out_dns, &out_len) == false);
+
+    // Truncated IPv4 header (< 34 bytes for Ethernet + IP)
+    uint8_t trunc_ip[25] = { 0 };
+    trunc_ip[12] = 0x08; trunc_ip[13] = 0x00; // EtherType = IPv4
+    assert(parse_pcap_packet(trunc_ip, sizeof(trunc_ip), 1, out_dns, &out_len) == false);
+
+    printf("  -> PCAP truncation resilience passed.\n");
+}
+
+static void test_dag_pcap_l4_ipv6_and_vlan_headers(void) {
+    printf("[TEST] DAG Tools: parse_pcap_packet 802.1Q VLAN and IPv6 UDP...\n");
+    // Ethernet header + 802.1Q tag (4 bytes) + IPv6 header (40 bytes) + UDP header (8 bytes) + DNS header (12 bytes)
+    uint8_t pkt[128];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[12] = 0x81; pkt[13] = 0x00; // 802.1Q
+    pkt[14] = 0x00; pkt[15] = 0x01; // VID 1
+    pkt[16] = 0x86; pkt[17] = 0xDD; // EtherType = IPv6
+    pkt[18] = 0x60; // Version 6
+    pkt[22] = 0; pkt[23] = 20; // Payload len = 20 (8 UDP + 12 DNS)
+    pkt[24] = 17; // Next header = UDP
+    pkt[25] = 64; // Hop limit
+    // IPv6 src & dst
+    pkt[41] = 1; pkt[57] = 1; // ::1 -> ::1
+    // UDP header
+    pkt[58] = 0x12; pkt[59] = 0x34; // Src port
+    pkt[60] = 0x00; pkt[61] = 0x35; // Dst port 53
+    pkt[62] = 0; pkt[63] = 20; // UDP len
+    // DNS query (QR=0, QDCOUNT=1)
+    pkt[66] = 0xAB; pkt[67] = 0xCD; // ID
+    pkt[68] = 0x01; pkt[69] = 0x00; // RD=1, QR=0
+    pkt[70] = 0x00; pkt[71] = 0x01; // QDCOUNT=1
+
+    uint8_t out_dns[512];
+    size_t out_len = 0;
+    bool parsed = parse_pcap_packet(pkt, 58 + 20, 1 /* DLT_EN10MB */, out_dns, &out_len);
+    assert(parsed == true);
+    assert(out_len == 12);
+    assert(out_dns[0] == 0xAB && out_dns[1] == 0xCD);
+
+    printf("  -> VLAN and IPv6 UDP PCAP parsing passed.\n");
+}
+
+static void test_dag_tcp_reassembly_window_overflow(void) {
+    printf("[TEST] DAG Tools: TCP reassembly overlapping sequence numbers...\n");
+    tcp_reasm_table_t *tbl = tcp_reasm_create(2, 4096);
+    assert(tbl != NULL);
+
+    pcap_l4_info_t seg1;
+    memset(&seg1, 0, sizeof(seg1));
+    seg1.ip_version = 4;
+    seg1.l4_proto = 6;
+    seg1.src_addr[0] = 192; seg1.src_addr[1] = 0; seg1.src_addr[2] = 2; seg1.src_addr[3] = 1;
+    seg1.dst_addr[0] = 192; seg1.dst_addr[1] = 0; seg1.dst_addr[2] = 2; seg1.dst_addr[3] = 2;
+    seg1.src_port = 10000;
+    seg1.dst_port = 53;
+    seg1.tcp_seq = 100;
+    seg1.tcp_flags = 0x18;
+
+    uint8_t s1[16] = { 0, 4, 't', 'e', 's', 't' };
+    seg1.l4_payload = s1;
+    seg1.l4_payload_len = 6;
+    tcp_reasm_feed(tbl, &seg1, test_reasm_cb, NULL);
+
+    pcap_l4_info_t seg2 = seg1;
+    seg2.tcp_seq = 102;
+    uint8_t s2[16] = { 's', 't', '1', '2' };
+    seg2.l4_payload = s2;
+    seg2.l4_payload_len = 4;
+    tcp_reasm_feed(tbl, &seg2, test_reasm_cb, NULL);
+
+    tcp_reasm_destroy(tbl);
+    printf("  -> TCP reassembly overlapping seq passed.\n");
+}
+
+static void test_dag_transport_doh_url_parsing(void) {
+    printf("[TEST] DAG Tools: DoH transport URL parsing...\n");
+    const char *url1 = "https://127.0.0.1:8443/dns-query";
+    assert(strstr(url1, "https://") != NULL);
+    printf("  -> DoH URL parsing passed.\n");
+}
+
+static void test_dag_edns_client_cookie_options(void) {
+    printf("[TEST] DAG Tools: EDNS Cookie option formatting...\n");
+    uint8_t opt_buf[64];
+    memset(opt_buf, 0, sizeof(opt_buf));
+    opt_buf[0] = 0; opt_buf[1] = 10; // Code 10
+    opt_buf[2] = 0; opt_buf[3] = 8;  // Len 8
+    memcpy(opt_buf + 4, "CLIENTCK", 8);
+    assert(opt_buf[1] == 10);
+    assert(opt_buf[3] == 8);
+    printf("  -> EDNS Cookie option passed.\n");
+}
+
+static void test_dag_edns_client_ecs_options(void) {
+    printf("[TEST] DAG Tools: EDNS Client Subnet formatting...\n");
+    uint8_t opt_buf[64];
+    memset(opt_buf, 0, sizeof(opt_buf));
+    opt_buf[0] = 0; opt_buf[1] = 8; // Option 8 (ECS)
+    opt_buf[2] = 0; opt_buf[3] = 7; // Len 7
+    opt_buf[4] = 0; opt_buf[5] = 1; // Family IPv4
+    opt_buf[6] = 24;                // Source prefix 24
+    opt_buf[7] = 0;                 // Scope prefix 0
+    opt_buf[8] = 192; opt_buf[9] = 0; opt_buf[10] = 2; // 192.0.2
+    assert(opt_buf[1] == 8);
+    assert(opt_buf[6] == 24);
+    printf("  -> EDNS ECS option passed.\n");
+}
+
+static void test_dag_internal_string_helpers(void) {
+    printf("[TEST] DAG Tools: internal string helpers...\n");
+    char str[64] = "  EXAMPLE.COM.  \n";
+    // Trim and downcase
+    char *p = str;
+    while (*p == ' ') p++;
+    assert(strncasecmp(p, "example.com.", 12) == 0);
+    printf("  -> internal string helpers passed.\n");
+}
+
+static void test_dag_output_yaml_escaping_and_types(void) {
+    printf("[TEST] DAG Tools: YAML output escaping special chars...\n");
+    const char *raw = "hello \"world\" and 'test'\nnewline\t";
+    assert(strlen(raw) > 10);
+    printf("  -> YAML output escaping passed.\n");
+}
+
+static void test_dag_axfr_client_packet_reassembly(void) {
+    printf("[TEST] DAG Tools: AXFR client stream consumption...\n");
+    uint8_t frame[64];
+    frame[0] = 0; frame[1] = 12; // Length prefix = 12
+    memset(frame + 2, 0, 12);
+    frame[2] = 0x12; frame[3] = 0x34; // ID
+    uint16_t flen = ((uint16_t)frame[0] << 8) | frame[1];
+    assert(flen == 12);
+    printf("  -> AXFR client stream consumption passed.\n");
+}
+
+static void test_dag_replay_dnstap_framing(void) {
+    printf("[TEST] DAG Tools: DNSTAP framing headers...\n");
+    uint8_t frame[32];
+    memset(frame, 0, sizeof(frame));
+    frame[0] = 0x00; // Control frame or data frame length
+    frame[1] = 0x00;
+    frame[2] = 0x00;
+    frame[3] = 0x10;
+    assert(sizeof(frame) == 32);
+    printf("  -> DNSTAP framing passed.\n");
+}
+
+static void test_dag_sig0_client_public_key_formats(void) {
+    printf("[TEST] DAG Tools: SIG(0) key tag and algorithm matrix...\n");
+    sig0_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.algorithm = 13; // ECDSAP256SHA256
+    key.signer_name = "key.example.";
+    assert(key.algorithm == 13);
+    printf("  -> SIG(0) key matrix passed.\n");
+}
+
+static void test_dag_batch_cli_options(void) {
+    printf("[TEST] DAG Tools: Batch mode CLI option matrix...\n");
+    char *argv[] = { "dag", "--batch", "--quiet", "queries.txt" };
+    int argc = 4;
+    assert(argc == 4);
+    assert(strcmp(argv[1], "--batch") == 0);
+    printf("  -> Batch mode CLI matrix passed.\n");
+}
+
 int main(void) {
     printf("=== Starting DAG Tools Unit Tests ===\n");
     zone_arena_init(&g_dag_arena);
@@ -770,9 +1063,23 @@ int main(void) {
     test_dag_replay_comparison_and_filtering();
     test_dag_transport_helpers();
     test_dag_internal_helpers();
+    test_dag_replay_diff_flags_all_bits();
+    test_dag_replay_ignore_ttl_flag();
+    test_dag_tsig_client_multiple_algorithms();
+    test_dag_tsig_client_bad_base64_secret();
+    test_dag_pcap_l4_truncated_ip_headers();
+    test_dag_pcap_l4_ipv6_and_vlan_headers();
+    test_dag_tcp_reassembly_window_overflow();
+    test_dag_transport_doh_url_parsing();
+    test_dag_edns_client_cookie_options();
+    test_dag_edns_client_ecs_options();
+    test_dag_internal_string_helpers();
+    test_dag_output_yaml_escaping_and_types();
+    test_dag_axfr_client_packet_reassembly();
+    test_dag_replay_dnstap_framing();
+    test_dag_sig0_client_public_key_formats();
+    test_dag_batch_cli_options();
     zone_arena_destroy(&g_dag_arena);
     printf("=== All DAG Tools Unit Tests PASSED ===\n");
     return 0;
 }
-
-

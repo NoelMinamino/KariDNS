@@ -405,6 +405,114 @@ static void test_cookie_and_edns_wire_parsing(void) {
     CHECK(res != 0);
 }
 
+
+static void test_pb_encode_varint_and_fields(void) {
+    printf("[TEST] Wire: Protocol Buffers varint and field encoders...\n");
+    uint8_t buf[64];
+    size_t len = pb_encode_varint(buf, sizeof(buf), 300);
+    CHECK(len == 2);
+    CHECK(buf[0] == 0xAC && buf[1] == 0x02);
+
+    // Varint 0
+    len = pb_encode_varint(buf, sizeof(buf), 0);
+    CHECK(len == 1 && buf[0] == 0);
+
+    // Fixed32
+    len = pb_encode_fixed32_field(buf, sizeof(buf), 1, 0x12345678);
+    CHECK(len > 4);
+
+    // Bytes field
+    len = pb_encode_bytes_field(buf, sizeof(buf), 2, (const uint8_t *)"test", 4);
+    CHECK(len > 4);
+
+    // Buffer overflow guard
+    CHECK(pb_encode_varint(buf, 0, 100) == 0);
+    CHECK(pb_encode_fixed32_field(buf, 2, 1, 100) == 0);
+    CHECK(pb_encode_bytes_field(buf, 2, 1, (const uint8_t *)"test", 4) == 0);
+}
+
+static void test_wire_name_length_and_write_uncompressed(void) {
+    printf("[TEST] Wire: write_uncompressed_name and buffer validation...\n");
+    uint8_t out[64];
+    long w = write_uncompressed_name(out, 0, sizeof(out), ".");
+    CHECK(w == 1 && out[0] == 0);
+
+    w = write_uncompressed_name(out, 0, sizeof(out), "example.com.");
+    CHECK(w == 13);
+
+    w = write_uncompressed_name(out, 0, sizeof(out), "API.Example.Com.");
+    CHECK(w == 17);
+    CHECK(out[0] == 3 && out[1] == 'a' && out[2] == 'p' && out[3] == 'i'); // Lowercased canonical
+    CHECK(out[4] == 7 && out[12] == 3 && out[16] == 0);
+
+    // Buffer too small
+    CHECK(write_uncompressed_name(out, 0, 5, "api.example.com.") < 0);
+}
+
+static void test_compress_name_pointer_chains(void) {
+    printf("[TEST] Wire: compress_name multi-level pointer chains...\n");
+    uint8_t pkt[512] = {0};
+    compress_ctx_t ctx;
+    compress_ctx_init(&ctx);
+
+    uint16_t off = 12;
+    static const uint8_t fqdn1[] = { 3, 'f', 'o', 'o', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    CHECK(compress_name(pkt, &off, fqdn1, &ctx, sizeof(pkt)) == 0);
+    CHECK(off == 12 + sizeof(fqdn1));
+
+    static const uint8_t fqdn2[] = { 3, 'b', 'a', 'r', 3, 'f', 'o', 'o', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    CHECK(compress_name(pkt, &off, fqdn2, &ctx, sizeof(pkt)) == 0);
+    // Should point to foo.example.com which is at offset 12
+    CHECK(pkt[off - 2] == 0xC0 && pkt[off - 1] == 12);
+}
+
+static void test_skip_name_inplace_pointers_and_loops(void) {
+    printf("[TEST] Wire: skip_wire_name pointer loops and boundaries...\n");
+    // Valid name at offset 0
+    uint8_t valid_pkt[] = { 3, 'a', 'b', 'c', 0 };
+    size_t next_off = 0;
+    CHECK(skip_wire_name(valid_pkt, sizeof(valid_pkt), 0, &next_off) == 0);
+    CHECK(next_off == 5);
+
+    // Pointer loop (0xC0, 0x00 -> points to itself)
+    uint8_t loop_pkt[] = { 0xC0, 0x00 };
+    CHECK(skip_wire_name(loop_pkt, sizeof(loop_pkt), 0, &next_off) != 0);
+
+    // Forward pointer out of bounds
+    uint8_t oob_pkt[] = { 0xC0, 0xFF };
+    CHECK(skip_wire_name(oob_pkt, sizeof(oob_pkt), 0, &next_off) != 0);
+}
+
+static void test_sig0_dnskey_keytag_calculation(void) {
+    printf("[TEST] Wire: compute_dnskey_tag calculation...\n");
+    uint8_t rdata[8] = { 0x01, 0x00, 0x03, 0x08, 0x12, 0x34, 0x56, 0x78 }; // Flags=256, Proto=3, Alg=8
+    uint16_t tag = compute_dnskey_tag(rdata, sizeof(rdata));
+    CHECK(tag != 0);
+    CHECK(compute_dnskey_tag(NULL, 0) == 0);
+    CHECK(compute_dnskey_tag(rdata, 2) == 0);
+}
+
+static void test_edns_option_karidns_ext_wire_format(void) {
+    printf("[TEST] Wire: assemble_edns_opt Option 65153 and cookie...\n");
+    uint8_t res[512];
+    uint16_t off = 12;
+    uint16_t arcount = 0;
+
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    edns.has_cookie = true;
+    memcpy(edns.client_cookie, "12345678", 8);
+    edns.server_cookie_len = 8;
+    memcpy(edns.server_cookie, "87654321", 8);
+    edns.has_karidns_ext = true;
+    edns.karidns_ext_version = 1;
+    edns.karidns_ext_hash = 0xAABBCCDD;
+
+    assemble_edns_opt(res, sizeof(res), &off, &arcount, &edns, 0, false, NULL);
+    CHECK(arcount == 1);
+    CHECK(off > 12);
+}
+
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
     test_type_to_string();
@@ -416,6 +524,12 @@ int main(void) {
     test_skip_wire_name();
     test_name_compression();
     test_cookie_and_edns_wire_parsing();
+    test_pb_encode_varint_and_fields();
+    test_wire_name_length_and_write_uncompressed();
+    test_compress_name_pointer_chains();
+    test_skip_name_inplace_pointers_and_loops();
+    test_sig0_dnskey_keytag_calculation();
+    test_edns_option_karidns_ext_wire_format();
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) { printf("=== Wire / Utility Helper Tests FAILED ===\n"); return 1; }
     printf("=== All Wire / Utility Helper Tests PASSED ===\n");
