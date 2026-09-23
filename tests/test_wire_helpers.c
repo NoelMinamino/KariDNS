@@ -377,10 +377,32 @@ static void test_name_compression(void) {
     CHECK(compress_name(pkt, &off, mail_example_com, &ctx, sizeof(pkt)) == 0);
     /* 04 mail + pointer to "example.com" which begins at 12 + 4 = 16 => 0xC010 */
     CHECK(off == 47 && pkt[45] == 0xC0 && pkt[46] == 0x10);
-    register_wire_name_for_compression(NULL, 12, &ctx);                 /* NULL arguments are ignored */
+    register_wire_name_for_compression(NULL, 12, &ctx);
     register_wire_name_for_compression(pkt, 12, NULL);
     compress_ctx_init(NULL);
     compress_ctx_init_packet(NULL);
+}
+
+static void test_cookie_and_edns_wire_parsing(void) {
+    printf("[TEST] extract_wire_name_to_buffer / domain label limits and escaping...\n");
+
+    char name_buf[256];
+    static const uint8_t valid_name[] = { 3, 'a', 'p', 'i', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    size_t next_off = 0;
+    int res = extract_wire_name_to_buffer(valid_name, sizeof(valid_name), 0, &next_off, name_buf, sizeof(name_buf));
+    CHECK(res == 0);
+    CHECK(next_off == sizeof(valid_name));
+    CHECK_STR(name_buf, "api.example.com.");
+
+    // Truncated wire name (label says length 10, but buffer ends after 4 bytes)
+    static const uint8_t trunc_name[] = { 10, 'a', 'b', 'c', 'd' };
+    res = extract_wire_name_to_buffer(trunc_name, sizeof(trunc_name), 0, &next_off, name_buf, sizeof(name_buf));
+    CHECK(res != 0);
+
+    // Buffer too small for output FQDN
+    char tiny_buf[5];
+    res = extract_wire_name_to_buffer(valid_name, sizeof(valid_name), 0, &next_off, tiny_buf, sizeof(tiny_buf));
+    CHECK(res != 0);
 }
 
 int main(void) {
@@ -393,6 +415,7 @@ int main(void) {
     test_packet_has_tsig();
     test_skip_wire_name();
     test_name_compression();
+    test_cookie_and_edns_wire_parsing();
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) { printf("=== Wire / Utility Helper Tests FAILED ===\n"); return 1; }
     printf("=== All Wire / Utility Helper Tests PASSED ===\n");

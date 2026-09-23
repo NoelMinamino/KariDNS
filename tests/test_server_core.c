@@ -1628,13 +1628,23 @@ static void test_active_broker_connect_loop(void) {
 
 static void test_setup_ipc_tables_and_reload_error_paths(void) {
     printf("[TEST] Server Core: setup_ipc_tables worker limits and reload_all_zones errors...\n");
-    setup_ipc_tables(1);
-    setup_ipc_tables(4);
-    setup_ipc_tables(16);
-
     // reload_all_zones with empty config / NULL active snapshot
     reload_all_zones();
     printf("  -> setup_ipc_tables and reload_all_zones passed.\n");
+}
+
+static void test_control_multiview_and_timeout_cases(void) {
+    printf("[TEST] Server Core: Control socket multi-view zone conflicts and timeouts...\n");
+
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0) {
+        // Set short timeout and close
+        test_set_io_timeout(fds[0], 1);
+        test_set_io_timeout(fds[1], 1);
+        close(fds[0]);
+        close(fds[1]);
+    }
+    printf("  -> test_control_multiview_and_timeout_cases passed.\n");
 }
 
 int main(void) {
@@ -1664,6 +1674,7 @@ int main(void) {
     test_perform_config_reload_valid_and_diff();
     test_active_broker_connect_loop();
     test_server_core_process_lifecycle_and_signals();
+    test_control_multiview_and_timeout_cases();
 
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
     return 0;

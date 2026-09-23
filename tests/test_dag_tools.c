@@ -647,14 +647,127 @@ static void test_dag_replay_mode_cli_and_protobuf_varint(void) {
     printf("  -> replay mode CLI parsing & protobuf varint decoding passed.\n");
 }
 
+static void test_dag_tsig_client_signing_and_verify(void) {
+    printf("[TEST] DAG Tools: TSIG client signing and response verification...\n");
+
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.name = "dag-test-key.";
+    key.algorithm = "hmac-sha256";
+    memcpy(key.secret_decoded, "01234567890123456789012345678901", 32);
+    key.secret_decoded_len = 32;
+
+    uint8_t pkt[1024];
+    memset(pkt, 0, 12);
+    pkt[0] = 0xAB; pkt[1] = 0xCD;
+    pkt[2] = 0x01; // RD=1
+    pkt[4] = 0; pkt[5] = 1; // QDCOUNT=1
+    size_t off = 12;
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "query.example.");
+    pkt[off++] = 0; pkt[off++] = 1; // A
+    pkt[off++] = 0; pkt[off++] = 1; // IN
+
+    uint8_t mac[64];
+    size_t mac_len = 0;
+    size_t pkt_len = off;
+
+    // 1. Sign request packet (no prior MAC)
+    int s_res = tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &key, 0, mac, &mac_len, NULL, 0, false);
+    assert(s_res == 0);
+    assert(mac_len == 32);
+    assert(pkt_len > off);
+
+    // 2. Verify request packet (prior_mac is NULL / 0 for request)
+    uint8_t q_mac[64];
+    size_t q_mac_len = 0;
+    int v_res = tsig_verify_packet(pkt, pkt_len, &key, NULL, 0, NULL, 0, false, q_mac, &q_mac_len);
+    assert(v_res == 0);
+    assert(q_mac_len == 32);
+    assert(memcmp(q_mac, mac, 32) == 0);
+
+    // 3. Corrupt MAC in TSIG record
+    uint8_t bad_pkt[1024];
+    memcpy(bad_pkt, pkt, pkt_len);
+    bad_pkt[pkt_len - 10] ^= 0xFF; // Flip bit in MAC
+
+    v_res = tsig_verify_packet(bad_pkt, pkt_len, &key, NULL, 0, NULL, 0, false, q_mac, &q_mac_len);
+    assert(v_res != 0);
+
+    // 4. Test response signing and verification with request MAC as prior_mac
+    uint8_t resp_pkt[1024];
+    memset(resp_pkt, 0, 12);
+    resp_pkt[0] = 0xAB; resp_pkt[1] = 0xCD;
+    resp_pkt[2] = 0x81; resp_pkt[3] = 0x80;
+    resp_pkt[4] = 0; resp_pkt[5] = 1;
+    resp_pkt[6] = 0; resp_pkt[7] = 1;
+    size_t roff = 12;
+    roff += write_uncompressed_name(resp_pkt, roff, sizeof(resp_pkt), "query.example.");
+    resp_pkt[roff++] = 0; resp_pkt[roff++] = 1; resp_pkt[roff++] = 0; resp_pkt[roff++] = 1;
+    roff += write_uncompressed_name(resp_pkt, roff, sizeof(resp_pkt), "query.example.");
+    resp_pkt[roff++] = 0; resp_pkt[roff++] = 1; resp_pkt[roff++] = 0; resp_pkt[roff++] = 1;
+    resp_pkt[roff++] = 0; resp_pkt[roff++] = 0; resp_pkt[roff++] = 0x0E; resp_pkt[roff++] = 0x10;
+    resp_pkt[roff++] = 0; resp_pkt[roff++] = 4;
+    resp_pkt[roff++] = 192; resp_pkt[roff++] = 0; resp_pkt[roff++] = 2; resp_pkt[roff++] = 1;
+
+    uint8_t resp_signed_mac[64];
+    size_t resp_signed_mac_len = mac_len;
+    memcpy(resp_signed_mac, mac, mac_len);
+    size_t resp_pkt_len = roff;
+    int resp_s_res = tsig_sign_packet(resp_pkt, &resp_pkt_len, sizeof(resp_pkt), &key, 0, resp_signed_mac, &resp_signed_mac_len, NULL, 0, false);
+    assert(resp_s_res == 0);
+
+    uint8_t resp_verify_mac[64];
+    size_t resp_verify_mac_len = 0;
+    int resp_v_res = tsig_verify_packet(resp_pkt, resp_pkt_len, &key, mac, mac_len, NULL, 0, false, resp_verify_mac, &resp_verify_mac_len);
+    assert(resp_v_res == 0);
+
+    printf("  -> TSIG client signing and response verification passed.\n");
+}
+
+static void test_dag_replay_comparison_and_filtering(void) {
+    printf("[TEST] DAG Tools: replay response comparison and filtering logic...\n");
+
+    // Build two matching responses
+    uint8_t resp1[512], resp2[512];
+    memset(resp1, 0, 12);
+    resp1[0] = 0x11; resp1[1] = 0x22; resp1[2] = 0x81; resp1[3] = 0x80;
+    resp1[4] = 0; resp1[5] = 1; resp1[6] = 0; resp1[7] = 1;
+    size_t o1 = 12;
+    o1 += write_uncompressed_name(resp1, o1, sizeof(resp1), "cmp.example.");
+    resp1[o1++] = 0; resp1[o1++] = 1; resp1[o1++] = 0; resp1[o1++] = 1;
+    o1 += write_uncompressed_name(resp1, o1, sizeof(resp1), "cmp.example.");
+    resp1[o1++] = 0; resp1[o1++] = 1; resp1[o1++] = 0; resp1[o1++] = 1;
+    resp1[o1++] = 0; resp1[o1++] = 0; resp1[o1++] = 0x0E; resp1[o1++] = 0x10; // TTL=3600
+    resp1[o1++] = 0; resp1[o1++] = 4; // RDLEN=4
+    resp1[o1++] = 192; resp1[o1++] = 0; resp1[o1++] = 2; resp1[o1++] = 1;
+
+    memcpy(resp2, resp1, o1);
+
+    // Identical responses match
+    diff_result_t diff;
+    memset(&diff, 0, sizeof(diff));
+    diff_dns_responses(resp1, o1, resp2, o1, false, &diff);
+    assert(diff.diff_flags == 0);
+
+    // Difference in RCODE
+    resp2[3] = 0x83; // NXDOMAIN
+    memset(&diff, 0, sizeof(diff));
+    diff_dns_responses(resp1, o1, resp2, o1, false, &diff);
+    assert((diff.diff_flags & DIFF_RCODE) != 0);
+
+    printf("  -> replay response comparison and filtering passed.\n");
+}
+
 int main(void) {
     printf("=== Starting DAG Tools Unit Tests ===\n");
     zone_arena_init(&g_dag_arena);
     test_tcp_reassembly_engine();
     test_dag_sig0_client_keys();
     test_dag_tsig_client_parser();
+    test_dag_tsig_client_signing_and_verify();
     test_dag_replay_and_pcap_parsing();
     test_dag_replay_mode_cli_and_protobuf_varint();
+    test_dag_replay_comparison_and_filtering();
     test_dag_transport_helpers();
     test_dag_internal_helpers();
     zone_arena_destroy(&g_dag_arena);

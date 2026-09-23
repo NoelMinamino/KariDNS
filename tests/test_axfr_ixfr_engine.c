@@ -841,43 +841,53 @@ static void test_send_axfr_response_large_multi_chunk_tsig(void) {
 
     zone_db_entry_t entry;
     memset(&entry, 0, sizeof(entry));
-    strncpy(entry.domain, "large.example.", sizeof(entry.domain) - 1);
-    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    strlcpy(entry.domain, "large.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
     pthread_mutex_init(&entry.writer_lock, NULL);
     pthread_mutex_init(&entry.ixfr_history.lock, NULL);
 
-    init_axfr_zone(&entry.rcu.arena_a, "large.example.", "1000");
-    zone_arena_t *cur = &entry.rcu.arena_a;
+    zone_arena_init(&entry.rcu.arena_a);
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "large.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
 
-    // Add 400 TXT records of ~200 bytes each to exceed 65000 bytes message boundary
-    cur->records_cap = 500;
-    cur->records = realloc(cur->records, sizeof(dns_record_t) * cur->records_cap);
+    // Dynamically build a zone string of ~75KB
+    size_t zbuf_cap = 128 * 1024;
+    char *zbuf = malloc(zbuf_cap);
+    assert(zbuf != NULL);
+    int w = snprintf(zbuf, zbuf_cap,
+                     "$ORIGIN large.example.\n"
+                     "$TTL 300\n"
+                     "@ IN SOA ns1.large.example. admin.large.example. 1000 7200 3600 1209600 300\n"
+                     "@ IN NS ns1.large.example.\n");
+    size_t zlen = (size_t)w;
+    char txt_payload[181];
+    memset(txt_payload, 'X', 180);
+    txt_payload[180] = '\0';
+
     for (int i = 0; i < 350; i++) {
-        char namebuf[64], txtbuf[256];
-        snprintf(namebuf, sizeof(namebuf), "item%d.large.example.", i);
-        memset(txtbuf, 'X', 180);
-        txtbuf[180] = '\0';
-        dns_record_t rec;
-        memset(&rec, 0, sizeof(rec));
-        rec.name = arena_strdup(cur, namebuf);
-        rec.type = arena_strdup(cur, "TXT");
-        rec.type_code = 16;
-        rec.ttl = arena_strdup(cur, "300");
-        rec.ttl_value = 300;
-        rec.class_str = arena_strdup(cur, "IN");
-        rec.class_val = 1;
-        rec.rdata_count = 1;
-        rec.rdata[0] = arena_strdup(cur, txtbuf);
-        cur->records[cur->count++] = rec;
+        int n = snprintf(zbuf + zlen, zbuf_cap - zlen,
+                         "item%d IN TXT \"%s\"\n", i, txt_payload);
+        if (n > 0) zlen += (size_t)n;
     }
-    build_zone_index(cur, true);
 
-    atomic_store_explicit(&entry.rcu.active, cur, memory_order_release);
+    char *zone_buf = arena_strdup(&entry.rcu.arena_a, zbuf);
+    free(zbuf);
+    assert(zone_buf != NULL);
+    int pres = parse_zone_fast(zone_buf, zlen, &entry.rcu.arena_a, &ctx);
+    assert(pres >= 0);
+    build_zone_index(&entry.rcu.arena_a, true);
+
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
     atomic_store_explicit(&entry.serial, 1000, memory_order_release);
 
     tsig_key_t key;
     memset(&key, 0, sizeof(key));
-    key.name = "axfr-key";
+    key.name = "axfr-key.";
     key.algorithm = "hmac-sha256";
     memcpy(key.secret_decoded, "secret1234567890secret1234567890", 32);
     key.secret_decoded_len = 32;
@@ -1440,6 +1450,246 @@ static void test_extended_axfr_and_intermediate_tsig_cases(void) {
     printf("  -> extended AXFR tags passed.\n");
 }
 
+static void test_send_axfr_response_full_matrix(void) {
+    printf("[TEST] AXFR/IXFR: send_axfr_response() full extended & IXFR delta sending...\n");
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "matrix.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    init_axfr_zone(&entry.rcu.arena_a, "matrix.example.", "300");
+    zone_arena_t *cur = &entry.rcu.arena_a;
+
+    // 1. Setup zone tags: location tags, ecs tags, trusted resolvers, tinydns locations
+    cur->bind_location_tag_count = 1;
+    cur->bind_location_tags = calloc(1, sizeof(ecs_tag_def_t));
+    cur->bind_location_tags[0].tag = strdup("tokyo");
+    cur->bind_location_tags[0].cidr_count = 1;
+    cur->bind_location_tags[0].cidrs = calloc(1, sizeof(ecs_cidr_entry_t));
+    cur->bind_location_tags[0].cidrs[0].cidr = strdup("10.0.0.0/8");
+
+    cur->bind_ecs_tag_count = 1;
+    cur->bind_ecs_tags = calloc(1, sizeof(ecs_tag_def_t));
+    cur->bind_ecs_tags[0].tag = strdup("subnet-a");
+    cur->bind_ecs_tags[0].cidr_count = 1;
+    cur->bind_ecs_tags[0].cidrs = calloc(1, sizeof(ecs_cidr_entry_t));
+    cur->bind_ecs_tags[0].cidrs[0].cidr = strdup("192.0.2.0/24");
+
+    cur->bind_ecs_trusted_resolver_count = 1;
+    cur->bind_ecs_trusted_resolvers = calloc(1, sizeof(char *));
+    cur->bind_ecs_trusted_resolvers[0] = strdup("192.0.2.53");
+
+    cur->location_count = 1;
+    cur->locations = calloc(1, sizeof(tinydns_location_entry_t));
+    cur->locations[0].code[0] = 'j'; cur->locations[0].code[1] = 'p';
+    cur->locations[0].prefix_len = 3;
+    memcpy(cur->locations[0].prefix, "\xC0\x00\x02", 3);
+
+    // Records with tags & tinydns
+    dns_record_t r_loc;
+    memset(&r_loc, 0, sizeof(r_loc));
+    r_loc.name = arena_strdup(cur, "geo.matrix.example.");
+    r_loc.type = arena_strdup(cur, "A");
+    r_loc.type_code = 1;
+    r_loc.class_str = arena_strdup(cur, "IN");
+    r_loc.class_val = 1;
+    r_loc.ttl = arena_strdup(cur, "300");
+    r_loc.ttl_value = 300;
+    r_loc.rdata_count = 1;
+    r_loc.rdata[0] = arena_strdup(cur, "192.0.2.1");
+    r_loc.bind_location_tag = "tokyo";
+    r_loc.ecs_subnet_tag = "subnet-a";
+    r_loc.tinydns_loc[0] = 'j'; r_loc.tinydns_loc[1] = 'p';
+    r_loc.tinydns_ttd = 12345678;
+
+    cur->records_cap = 16;
+    cur->records = realloc(cur->records, sizeof(dns_record_t) * cur->records_cap);
+    cur->records[cur->count++] = r_loc;
+    build_zone_index(cur, true);
+
+    atomic_store_explicit(&entry.rcu.active, cur, memory_order_release);
+    atomic_store_explicit(&entry.serial, 300, memory_order_release);
+
+    // 2. Add IXFR transactions into entry.ixfr_history
+    zone_arena_t old_v, new_v;
+    zone_arena_init(&old_v);
+    zone_arena_init(&new_v);
+    init_axfr_zone(&old_v, "matrix.example.", "200");
+    init_axfr_zone(&new_v, "matrix.example.", "300");
+    build_zone_index(&old_v, true);
+    build_zone_index(&new_v, true);
+    compute_ixfr_diff(&entry, &old_v, &new_v);
+    zone_arena_destroy(&old_v);
+    zone_arena_destroy(&new_v);
+
+    // 3. Build IXFR query for serial 200
+    uint8_t req_ixfr[512] = {0};
+    req_ixfr[0] = 0x33; req_ixfr[1] = 0x44;
+    req_ixfr[4] = 0; req_ixfr[5] = 1; // QDCOUNT = 1
+    req_ixfr[8] = 0; req_ixfr[9] = 1; // NSCOUNT = 1 (Authority SOA serial 200)
+    size_t qoff = 12;
+    qoff += write_uncompressed_name(req_ixfr, qoff, sizeof(req_ixfr), "matrix.example.");
+    req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 251; // IXFR
+    req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 1;   // IN
+
+    // Authority SOA record with serial 200
+    qoff += write_uncompressed_name(req_ixfr, qoff, sizeof(req_ixfr), "matrix.example.");
+    req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 6; req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 1;
+    req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 1; req_ixfr[qoff++] = 0x2C;
+    size_t rdp = qoff; qoff += 2;
+    qoff += write_uncompressed_name(req_ixfr, qoff, sizeof(req_ixfr), "ns1.matrix.example.");
+    qoff += write_uncompressed_name(req_ixfr, qoff, sizeof(req_ixfr), "admin.matrix.example.");
+    req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 200; // serial 200
+    for (int k = 0; k < 4; k++) { req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 0; req_ixfr[qoff++] = 10; }
+    uint16_t rdl = (uint16_t)(qoff - (rdp + 2));
+    req_ixfr[rdp] = rdl >> 8; req_ixfr[rdp+1] = rdl & 0xFF;
+
+    // Send IXFR response
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(-1, "matrix.example.", req_ixfr, qoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count >= 2);
+    assert(g_tcp_out_len > 50);
+
+    // 4. Extended AXFR sending (Option 65153 with tags)
+    uint8_t req_ext[512] = {0};
+    req_ext[0] = 0x55; req_ext[1] = 0x66;
+    req_ext[4] = 0; req_ext[5] = 1;
+    req_ext[10] = 0; req_ext[11] = 1; // ARCOUNT = 1 (EDNS Option 65153)
+    size_t eoff = 12;
+    eoff += write_uncompressed_name(req_ext, eoff, sizeof(req_ext), "matrix.example.");
+    req_ext[eoff++] = 0; req_ext[eoff++] = 252; // AXFR
+    req_ext[eoff++] = 0; req_ext[eoff++] = 1;
+    req_ext[eoff++] = 0; req_ext[eoff++] = 0; req_ext[eoff++] = 41; // OPT
+    req_ext[eoff++] = 0x10; req_ext[eoff++] = 0x00;
+    req_ext[eoff++] = 0; req_ext[eoff++] = 0; req_ext[eoff++] = 0; req_ext[eoff++] = 0;
+    size_t opt_p = eoff; eoff += 2;
+    req_ext[eoff++] = 0xFE; req_ext[eoff++] = 0x81;
+    req_ext[eoff++] = 0x00; req_ext[eoff++] = 0x05;
+    req_ext[eoff++] = KARIDNS_EXT_VERSION;
+    uint32_t zhash = calc_fnv1a_str("matrix.example.");
+    req_ext[eoff++] = (zhash >> 24) & 0xFF; req_ext[eoff++] = (zhash >> 16) & 0xFF;
+    req_ext[eoff++] = (zhash >> 8) & 0xFF; req_ext[eoff++] = zhash & 0xFF;
+    uint16_t opt_len = (uint16_t)(eoff - (opt_p + 2));
+    req_ext[opt_p] = opt_len >> 8; req_ext[opt_p+1] = opt_len & 0xFF;
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(-1, "matrix.example.", req_ext, eoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_send_count >= 2);
+    assert(g_tcp_out_len > 100);
+
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) {
+            free_ixfr_txn(entry.ixfr_history.entries[i]);
+            entry.ixfr_history.entries[i] = NULL;
+        }
+    }
+    zone_arena_destroy(&entry.rcu.arena_a);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> send_axfr_response full matrix passed.\n");
+}
+
+static void test_handle_axfr_event_intermediate_unsigned_flow(void) {
+    printf("[TEST] AXFR/IXFR: handle_axfr_event() multi-message TSIG with intermediate unsigned packets...\n");
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "tsigflow.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    init_axfr_zone(&entry.rcu.arena_a, "tsigflow.example.", "100");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.serial, 100, memory_order_release);
+
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.name = "tsigflow-key";
+    key.algorithm = "hmac-sha256";
+    memcpy(key.secret_decoded, "secret1234567890secret1234567890", 32);
+    key.secret_decoded_len = 32;
+
+    reset_mock_tcp_stream();
+
+    // Packet 1: Initial SOA serial 200 (TSIG signed)
+    uint8_t p1[1024] = {0};
+    p1[0] = 0x11; p1[1] = 0x22; p1[2] = 0x84;
+    p1[4] = 0; p1[5] = 1; // QDCOUNT = 1
+    p1[6] = 0; p1[7] = 1; // ANCOUNT = 1
+    size_t off = 12;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "tsigflow.example.");
+    p1[off++] = 0; p1[off++] = 252; p1[off++] = 0; p1[off++] = 1;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "tsigflow.example.");
+    p1[off++] = 0; p1[off++] = 6; p1[off++] = 0; p1[off++] = 1;
+    p1[off++] = 0; p1[off++] = 0; p1[off++] = 1; p1[off++] = 0x2C;
+    size_t rdp = off; off += 2;
+    off += write_uncompressed_name(p1, off, sizeof(p1), "ns1.tsigflow.example.");
+    off += write_uncompressed_name(p1, off, sizeof(p1), "admin.tsigflow.example.");
+    p1[off++] = 0; p1[off++] = 0; p1[off++] = 0; p1[off++] = 200;
+    for (int k = 0; k < 4; k++) { p1[off++] = 0; p1[off++] = 0; p1[off++] = 0; p1[off++] = 10; }
+    uint16_t rdl = (uint16_t)(off - (rdp + 2));
+    p1[rdp] = rdl >> 8; p1[rdp+1] = rdl & 0xFF;
+
+    uint8_t cur_mac[64];
+    size_t cur_mac_len = 0;
+    size_t p1_len = off;
+    tsig_sign_packet(p1, &p1_len, sizeof(p1), &key, 0, cur_mac, &cur_mac_len, NULL, 0, false);
+    push_mock_tcp_msg(p1, (uint16_t)p1_len);
+
+    // Packet 2: Intermediate record (UNSIGNED)
+    uint8_t p2[512] = {0};
+    p2[0] = 0x11; p2[1] = 0x22; p2[2] = 0x84;
+    p2[6] = 0; p2[7] = 1; // ANCOUNT = 1
+    off = 12;
+    off += write_uncompressed_name(p2, off, sizeof(p2), "www.tsigflow.example.");
+    p2[off++] = 0; p2[off++] = 1; p2[off++] = 0; p2[off++] = 1;
+    p2[off++] = 0; p2[off++] = 0; p2[off++] = 1; p2[off++] = 0x2C;
+    p2[off++] = 0; p2[off++] = 4;
+    p2[off++] = 192; p2[off++] = 0; p2[off++] = 2; p2[off++] = 1;
+    size_t p2_len = off;
+    push_mock_tcp_msg(p2, (uint16_t)p2_len);
+
+    // Packet 3: Closing SOA (TSIG SIGNED)
+    uint8_t p3[1024] = {0};
+    p3[0] = 0x11; p3[1] = 0x22; p3[2] = 0x84;
+    p3[6] = 0; p3[7] = 1; // ANCOUNT = 1
+    off = 12;
+    off += write_uncompressed_name(p3, off, sizeof(p3), "tsigflow.example.");
+    p3[off++] = 0; p3[off++] = 6; p3[off++] = 0; p3[off++] = 1;
+    p3[off++] = 0; p3[off++] = 0; p3[off++] = 1; p3[off++] = 0x2C;
+    rdp = off; off += 2;
+    off += write_uncompressed_name(p3, off, sizeof(p3), "ns1.tsigflow.example.");
+    off += write_uncompressed_name(p3, off, sizeof(p3), "admin.tsigflow.example.");
+    p3[off++] = 0; p3[off++] = 0; p3[off++] = 0; p3[off++] = 200;
+    for (int k = 0; k < 4; k++) { p3[off++] = 0; p3[off++] = 0; p3[off++] = 0; p3[off++] = 10; }
+    rdl = (uint16_t)(off - (rdp + 2));
+    p3[rdp] = rdl >> 8; p3[rdp+1] = rdl & 0xFF;
+
+    size_t p3_len = off;
+    tsig_sign_packet(p3, &p3_len, sizeof(p3), &key, 0, cur_mac, &cur_mac_len, p2, p2_len, true);
+    push_mock_tcp_msg(p3, (uint16_t)p3_len);
+
+    tcp_stream_ctx_t stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    int res = handle_axfr_event(-1, &entry, &stream_ctx, &session, &key, NULL, 0);
+    assert(res == 1);
+    assert(entry.serial == 200);
+
+    zone_arena_destroy(&entry.rcu.arena_a);
+    zone_arena_destroy(&entry.rcu.arena_b);
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    printf("  -> handle_axfr_event multi-message TSIG flow passed.\n");
+}
+
 int main(void) {
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_wait_for_active_axfr_branches();
@@ -1451,9 +1701,11 @@ int main(void) {
     test_parse_xfr_packet_error_and_out_of_zone_rejections();
     test_extended_axfr_and_intermediate_tsig_cases();
     test_send_axfr_response_ixfr_and_extended();
+    test_send_axfr_response_full_matrix();
     test_send_axfr_response_large_multi_chunk_tsig();
     test_send_axfr_response_error_and_edge_branches();
     test_handle_axfr_event_multi_message_and_tsig();
+    test_handle_axfr_event_intermediate_unsigned_flow();
     test_handle_axfr_event_and_worker_thread();
     test_axfr_bg_thread_and_free_ixfr_txn();
     printf("=== All AXFR/IXFR Engine Unit Tests PASSED ===\n");

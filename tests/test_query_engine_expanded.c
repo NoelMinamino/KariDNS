@@ -2482,6 +2482,156 @@ static void test_cname_target_overflow_and_tsig_query_paths(void) {
     printf("  -> CNAME target overflow test passed.\n");
 }
 
+static void test_non_data_rrtypes_and_special_qtypes(void) {
+    printf("[TEST] Query Engine: Non-data RR types and special QTYPEs (41, 249..255)...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    char ztext[] =
+        "special.example. 3600 IN SOA ns1.special.example. admin.special.example. 1 3600 1800 604800 86400\n"
+        "special.example. 3600 IN NS ns1.special.example.\n"
+        "special.example. 3600 IN A 192.0.2.1\n"
+        "special.example. 3600 IN TXT \"hello special\"\n"
+        "ns1.special.example. 3600 IN A 192.0.2.2\n";
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "special.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    int p_res = parse_zone_fast(ztext, strlen(ztext), &arena, &ctx);
+    assert(p_res >= 0);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "special.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+    view_snapshot_t view = {
+        .name = "default",
+        .entries = entries,
+        .zone_count = 1,
+        .hash_table = hash_tbl,
+        .hash_size = 2,
+        .chain_next = chain_nxt,
+    };
+    zone_db_snapshot_t snap = {
+        .views = &view,
+        .view_count = 1,
+    };
+
+    compress_ctx_t comp_ctx;
+    uint8_t qbuf[512], rbuf[1024];
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    // Test each non-data type: 41, 249, 250, 251, 252, 253, 254, 255
+    uint16_t non_data_types[] = {41, 249, 250, 251, 252, 253, 254, 255};
+    for (size_t i = 0; i < sizeof(non_data_types)/sizeof(non_data_types[0]); i++) {
+        uint16_t qt = non_data_types[i];
+        size_t qlen = 0;
+        build_dns_query(qbuf, &qlen, 0x1000 + qt, "special.example.", qt, false);
+        compress_ctx_init(&comp_ctx);
+        int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "special.example.", qt, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+        assert(rlen >= 12);
+        if (qt == 255 /* ANY */) {
+            // ANY query on apex should return all records (SOA, NS, A, TXT)
+            uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
+            assert(ancount >= 3);
+        }
+    }
+
+    zone_arena_destroy(&arena);
+    printf("  -> Non-data RR types and ANY query handling passed.\n");
+}
+
+static void test_covering_rrsig_and_buffer_exhaustion_branches(void) {
+    printf("[TEST] Query Engine: Covering RRSIG buffer exhaustion & malformed rdata_count...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    // Build zone with SOA, NS, A, and malformed/valid RRSIGs
+    char ztext[] =
+        "rrsig.example. 3600 IN SOA ns1.rrsig.example. admin.rrsig.example. 1 3600 1800 604800 86400\n"
+        "rrsig.example. 3600 IN NS ns1.rrsig.example.\n"
+        "host.rrsig.example. 3600 IN A 192.0.2.1\n"
+        "host.rrsig.example. 3600 IN RRSIG A 8 3 3600 20300101000000 20200101000000 12345 rrsig.example. AAAA\n"
+        "host.rrsig.example. 3600 IN RRSIG A 8 3 3600 20300101000000 20200101000000 54321 rrsig.example. BBBB\n";
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "rrsig.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    int p_res = parse_zone_fast(ztext, strlen(ztext), &arena, &ctx);
+    assert(p_res >= 0);
+
+    // Corrupt one record to have rdata_count < 9 to exercise the line 35-36 check
+    for (size_t i = 0; i < arena.count; i++) {
+        if (arena.records[i].type_code == 46 /* RRSIG */) {
+            arena.records[i].rdata_count = 5; // malformed!
+            break;
+        }
+    }
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "rrsig.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = {&entry};
+    int hash_tbl[2] = {0, -1};
+    int chain_nxt[1] = {-1};
+    view_snapshot_t view = {
+        .name = "default",
+        .entries = entries,
+        .zone_count = 1,
+        .hash_table = hash_tbl,
+        .hash_size = 2,
+        .chain_next = chain_nxt,
+    };
+    zone_db_snapshot_t snap = {
+        .views = &view,
+        .view_count = 1,
+    };
+
+    compress_ctx_t comp_ctx;
+    uint8_t qbuf[512], rbuf[1024];
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    // Query with DO=1
+    size_t qlen = 0;
+    build_dns_query(qbuf, &qlen, 0x2222, "host.rrsig.example.", 1 /* A */, true);
+    compress_ctx_init(&comp_ctx);
+    int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "host.rrsig.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(rlen >= 12);
+    // Should answer with A and the uncorrupted RRSIG
+    uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
+    assert(ancount >= 2);
+
+    // Now test response buffer truncation / exhaustion
+    uint8_t small_rbuf[40];
+    compress_ctx_init(&comp_ctx);
+    rlen = process_dns_query(qbuf, qlen, small_rbuf, sizeof(small_rbuf), "host.rrsig.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    // TC bit should be set or safe truncated packet returned
+    assert(rlen >= 12);
+
+    zone_arena_destroy(&arena);
+    printf("  -> Covering RRSIG and buffer exhaustion branches passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_all_rr_types_and_resolution();
@@ -2503,6 +2653,8 @@ int main(void) {
     test_dname_synthesis_and_wildcard_proofs();
     test_query_engine_protocol_qclass_and_edns_branches();
     test_cname_target_overflow_and_tsig_query_paths();
+    test_non_data_rrtypes_and_special_qtypes();
+    test_covering_rrsig_and_buffer_exhaustion_branches();
     printf("=== All Expanded Query Engine Unit Tests PASSED ===\n");
     return 0;
 }
