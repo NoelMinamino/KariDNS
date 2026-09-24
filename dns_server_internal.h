@@ -90,18 +90,19 @@ typedef struct {
 } udp_ipc_t;
 
 #define UDP_BATCH_SIZE 16
-#define UDP_IPC_BUFFER_SIZE (sizeof(udp_ipc_t) + 65535)
+#define UDP_IPC_PAYLOAD_MAX 65535
+#define UDP_IPC_BUFFER_SIZE ((sizeof(udp_ipc_t) + UDP_IPC_PAYLOAD_MAX + 7) & ~7)
 
 // ワーカーローカル用 UDPバッチコンテキスト (ヒープ保持)
 typedef struct {
   struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
   struct iovec   rx_iov[UDP_BATCH_SIZE];
-  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
   struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
 
   struct mmsghdr tx_msgs[UDP_BATCH_SIZE];
   struct iovec   tx_iov[UDP_BATCH_SIZE];
-  uint8_t        tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
 } udp_batch_ctx_t;
 
 // Frontend ルーター用 UDP制御メッセージバッファ共用体
@@ -115,7 +116,7 @@ typedef union {
 typedef struct {
   struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
   struct iovec   rx_iov[UDP_BATCH_SIZE];
-  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
   struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
   router_cmsg_buf_t rx_cbuf[UDP_BATCH_SIZE];
 
@@ -124,7 +125,7 @@ typedef struct {
 
   struct mmsghdr ipc_rx_msgs[UDP_BATCH_SIZE];
   struct iovec   ipc_rx_iov[UDP_BATCH_SIZE];
-  uint8_t        ipc_rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t ipc_rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
 
   struct mmsghdr cli_tx_msgs[UDP_BATCH_SIZE];
   struct iovec   cli_tx_iov[UDP_BATCH_SIZE];

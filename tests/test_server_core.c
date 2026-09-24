@@ -1288,7 +1288,7 @@ static void test_async_io_pool_and_tasks(void) {
     assert(enq_ok == true);
 
     // Wait and read response from sp_udp[1]
-    uint8_t rx_resp[512 + sizeof(udp_ipc_t)];
+    alignas(udp_ipc_t) uint8_t rx_resp[512 + sizeof(udp_ipc_t)];
     struct pollfd pfd = { .fd = sp_udp[1], .events = POLLIN };
     if (poll(&pfd, 1, 500) > 0) {
         ssize_t got = recv(sp_udp[1], rx_resp, sizeof(rx_resp), 0);

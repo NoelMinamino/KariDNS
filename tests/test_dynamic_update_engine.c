@@ -439,7 +439,7 @@ static void test_send_notify_to_all_comprehensive(void) {
     // Count received NOTIFY packets from IPC
     int pkt_count = 0;
     while (1) {
-        uint8_t buf[2048];
+        alignas(udp_ipc_t) uint8_t buf[2048];
         ssize_t n = recv(g_notify_ipc[0], buf, sizeof(buf), MSG_DONTWAIT);
         if (n <= 0) break;
         pkt_count++;

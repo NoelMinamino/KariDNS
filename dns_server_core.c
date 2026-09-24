@@ -1055,7 +1055,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
     rcu_reader_enter(&g_async_io_rcu_ctxs[thread_idx]);
     if (!task.is_tcp) {
       // UDP async resolution
-      uint8_t res_buf_full[UDP_IPC_BUFFER_SIZE];
+      alignas(udp_ipc_t) uint8_t res_buf_full[UDP_IPC_BUFFER_SIZE];
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
       rate_limit_config_t *rrl_cfg = NULL;
       size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
@@ -3369,7 +3369,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
     fctx->cli_tx_msgs[k].msg_hdr.msg_controllen = 0;
   }
 
-  uint8_t buffer[65536];
+  alignas(udp_ipc_t) uint8_t buffer[UDP_IPC_BUFFER_SIZE];
   int rr = 0; // ラウンドロビン分配用
   struct kevent ev_list[128];
   syslog(LOG_NOTICE, "[Frontend %d] UDP Router process started.", router_id);
