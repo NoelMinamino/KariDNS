@@ -7157,8 +7157,156 @@ static void test_query_engine_opcode_header_validations(void) {
     printf("  -> Opcode NOTIFY / UPDATE packet header validations passed.\n");
 }
 
+static void test_query_engine_dname_cname_wildcard_truncation(void) {
+    printf("[TEST] Query Engine: DNAME (>255 YXDOMAIN, direct query), CNAME loops/NXDOMAIN, Wildcard vs exact node, TC=1 truncation...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "matrix.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+
+    const char zone_text[] =
+        "$ORIGIN matrix.example.\n"
+        "$TTL 3600\n"
+        "@       IN SOA   ns1.matrix.example. hostmaster.matrix.example. 2026092401 7200 3600 1209600 3600\n"
+        "@       IN NS    ns1.matrix.example.\n"
+        "@       IN NS    ns2.matrix.example.\n"
+        "ns1     IN A     192.0.2.1\n"
+        "ns2     IN AAAA  2001:db8::2\n"
+        "dname-node IN DNAME dname-target.org.\n"
+        "long-dname-node IN DNAME sub1.sub2.sub3.sub4.sub5.sub6.sub7.sub8.sub9.sub10.sub11.sub12.sub13.sub14.sub15.sub16.sub17.sub18.sub19.sub20.sub21.sub22.sub23.sub24.target.org.\n"
+        "cname-nx IN CNAME non-existent.matrix.example.\n"
+        "cname-self IN CNAME cname-self.matrix.example.\n"
+        "cname-loop1 IN CNAME cname-loop2.matrix.example.\n"
+        "cname-loop2 IN CNAME cname-loop1.matrix.example.\n"
+        "*.wild-coexist IN A 192.0.2.77\n"
+        "sub.wild-coexist IN TXT \"only txt here\"\n"
+        "exact.wild-coexist IN AAAA 2001:db8::99\n"
+        "direct-a IN A 192.0.2.10\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "matrix.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+
+    /* 1. Direct DNAME query (qtype=39) */
+    build_dns_query(req, &req_len, 101, "dname-node.matrix.example.", 39, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "dname-node.matrix.example.", 39, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    /* 2. DNAME synthesis normal case */
+    build_dns_query(req, &req_len, 102, "sub.dname-node.matrix.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), "sub.dname-node.matrix.example.", 1, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 2);
+
+    /* 3. DNAME synthesis > 255 bytes returns YXDOMAIN (RCODE=6) */
+    char deep_qname[300];
+    snprintf(deep_qname, sizeof(deep_qname),
+             "p1.p2.p3.p4.p5.p6.p7.p8.p9.p10.p11.p12.p13.p14.p15.p16.p17.p18.p19.p20.p21.p22.p23.p24.p25.p26.p27.p28.p29.p30.long-dname-node.matrix.example.");
+    build_dns_query(req, &req_len, 103, deep_qname, 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), deep_qname, 1, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 6);
+
+    /* 4. CNAME to non-existent node */
+    build_dns_query(req, &req_len, 104, "cname-nx.matrix.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), "cname-nx.matrix.example.", 1, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    /* 5. CNAME self loop detection */
+    build_dns_query(req, &req_len, 105, "cname-self.matrix.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), "cname-self.matrix.example.", 1, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+
+    /* 6. CNAME 2-node circular loop detection */
+    build_dns_query(req, &req_len, 106, "cname-loop1.matrix.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), "cname-loop1.matrix.example.", 1, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+
+    /* 7. Wildcard vs exact node: sub.wild-coexist A -> NODATA */
+    build_dns_query(req, &req_len, 107, "sub.wild-coexist.matrix.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), "sub.wild-coexist.matrix.example.", 1, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) == 0);
+    assert(((res[8] << 8) | res[9]) >= 1);
+
+    /* 8. Wildcard non-existing sibling -> synthesizes */
+    build_dns_query(req, &req_len, 108, "other.wild-coexist.matrix.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), "other.wild-coexist.matrix.example.", 1, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    /* 9. Truncation TC=1 on small buffer */
+    build_dns_query(req, &req_len, 109, "matrix.example.", 2, false);
+    compress_ctx_init_packet(&comp_ctx);
+    uint8_t tiny_res[40];
+    res_len = process_dns_query(req, req_len, tiny_res, sizeof(tiny_res), "matrix.example.", 2, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((tiny_res[2] & 0x02) != 0);
+
+    /* 10. Additional Section Glue for NS query */
+    build_dns_query(req, &req_len, 110, "matrix.example.", 2, false);
+    compress_ctx_init_packet(&comp_ctx);
+    res_len = process_dns_query(req, req_len, res, sizeof(res), "matrix.example.", 2, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 2);
+    assert(((res[10] << 8) | res[11]) >= 2);
+
+    zone_arena_destroy(&arena);
+    printf("  -> DNAME / CNAME loops / Wildcard coexistence / TC truncation / Glue tests passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
+    test_query_engine_dname_cname_wildcard_truncation();
     test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
     test_query_engine_opcode_header_validations();
     test_all_rr_types_and_resolution();

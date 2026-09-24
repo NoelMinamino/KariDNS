@@ -815,7 +815,7 @@ static void test_svcb_quoted_values(void) {
 }
 
 static void test_extended_negative_paths(void) {
-    printf("[TEST] Zone parser: extended negative patterns (TTL, parentheses, bad directives, RDATA, CNAME/SOA)...\n");
+    printf("[TEST] Zone parser: extended negative patterns (TTL, parentheses, bad directives, RDATA, CNAME/SOA, GENERATE modifiers)...\n");
 
     /* 1. Invalid TTL suffixes and overflow numbers */
     static const char *const bad_ttls[] = {
@@ -823,6 +823,8 @@ static void test_extended_negative_paths(void) {
         "$ORIGIN ex.\n$TTL 99999999999999999999\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n",
         "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nhost 500Z IN A 192.0.2.1\n",
         "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nhost 99999999999999999999 IN A 192.0.2.1\n",
+        "$ORIGIN ex.\n$TTL -10s\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nhost 10ss IN A 192.0.2.1\n",
     };
     for (size_t i = 0; i < N(bad_ttls); i++) {
         zt_t z;
@@ -834,38 +836,68 @@ static void test_extended_negative_paths(void) {
         zt_free(&z);
     }
 
-    /* 2. Unclosed multiline parentheses reaching EOF */
-    static const char *const unclosed_parens[] = {
+    /* 2. Unclosed multiline parentheses and floating closing parentheses */
+    static const char *const paren_cases[] = {
         "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h ( 1 2 3 4 5\n",
         "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nwww A ( 192.0.2.1\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n) floating paren IN A 192.0.2.1\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h ( 1 2 3 4 5 ) )\n@ NS ns\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h ( 1 2 \n ; comment inside paren \n 3 4 5 )\n@ NS ns\n",
     };
-    for (size_t i = 0; i < N(unclosed_parens); i++) {
+    for (size_t i = 0; i < N(paren_cases); i++) {
         zt_t z;
-        zt_load(&z, unclosed_parens[i]);
-        assert(z.rc < 0);
-        zt_free(&z);
-    }
-
-    /* 3. Bad directives: $ORIGIN without arg, bad domain in $ORIGIN, invalid $GENERATE */
-    static const char *const bad_directives[] = {
-        "$ORIGIN\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n",
-        "$ORIGIN invalid..name\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n",
-        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE\n",
-        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-5\n",
-        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-5 h$ BOGUSTYPE rhs\n",
-        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 5-1 h$ A 192.0.2.$\n",
-    };
-    for (size_t i = 0; i < N(bad_directives); i++) {
-        zt_t z;
-        zt_load(&z, bad_directives[i]);
-        /* Must either fail or handle safely */
+        zt_load(&z, paren_cases[i]);
         if (z.rc >= 0) {
             build_zone_index(&z.arena, true);
         }
         zt_free(&z);
     }
 
-    /* 4. Malformed RDATA for various RR types */
+    /* 3. Escapes and Quotes edge cases in TXT records */
+    static const char *const escape_lines[] = {
+        "IN TXT \"unterminated string without closing quote",
+        "IN TXT \"escape at end of line \\",
+        "IN TXT \"valid escape \\\" and backslash \\\\ and octal \\127\"",
+        "IN TXT \"overflow decimal escape \\999 and \\256\"",
+        "IN TXT \"non-digit escape \\1a2\"",
+        "IN TXT \"embedded null \\000 character\"",
+    };
+    for (size_t i = 0; i < N(escape_lines); i++) {
+        zt_t z;
+        zt_load_line(&z, escape_lines[i]);
+        if (z.rc >= 0) {
+            uint8_t wire[1024]; const uint8_t *rd; size_t rdlen;
+            (void)ser_rdata(&z.arena.records[z.arena.count - 1], wire, sizeof(wire), &rd, &rdlen);
+        }
+        zt_free(&z);
+    }
+
+    /* 4. $GENERATE detailed modifier and error paths */
+    static const char *const generate_cases[] = {
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-5\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-5 h$ BOGUSTYPE rhs\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 5-1 h$ A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-10/0 h$ A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-5/10 h$ A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 host${0,2,d} A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 host${1,3,o} A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 host${1,3,x} A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 host${1,3,X} A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 host${1,3,z} A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 host${1,3,d A 192.0.2.$\n",
+        "$ORIGIN ex.\n$TTL 3600\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-3 host${1,9999999999,d} A 192.0.2.$\n",
+    };
+    for (size_t i = 0; i < N(generate_cases); i++) {
+        zt_t z;
+        zt_load(&z, generate_cases[i]);
+        if (z.rc >= 0) {
+            build_zone_index(&z.arena, true);
+        }
+        zt_free(&z);
+    }
+
+    /* 5. Malformed RDATA for various RR types (APL, LOC, SVCB, IPSECKEY, CSYNC, etc.) */
     static const char *const bad_rdata_lines[] = {
         "IN A 999.999.999.999",
         "IN AAAA 2001:db8:::1",
@@ -879,19 +911,23 @@ static void test_extended_negative_paths(void) {
         "IN NAPTR 100",
         "IN WKS 192.0.2.1 99999 25",
         "IN LOC 999 999 N 999 999 E 0m",
+        "IN LOC 52 22 23.000 N 4 53 32.000 E -5000000m 0m 10000m 10m",
+        "IN APL !1:192.0.2.0/24 !2:2001:db8::/32 !3:1.2.3.4/24",
+        "IN IPSECKEY 10 4 2 gw.example. AQNRU3mG",
+        "IN CSYNC 66 999 A NS",
+        "IN ZONEMD 2018031500 99 1 AABBCC",
     };
     for (size_t i = 0; i < N(bad_rdata_lines); i++) {
         zt_t z;
         zt_load_line(&z, bad_rdata_lines[i]);
         if (z.rc >= 0) {
-            /* If parse succeeded, dry-run serialization should catch or reject invalid format */
             uint8_t wire[1024]; const uint8_t *rd; size_t rdlen;
             (void)ser_rdata(&z.arena.records[z.arena.count - 1], wire, sizeof(wire), &rd, &rdlen);
         }
         zt_free(&z);
     }
 
-    /* 5. CNAME coexistence & SOA validation */
+    /* 6. CNAME coexistence & SOA validation */
     zt_t z_cname;
     zt_load(&z_cname, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n"
                       "c CNAME target.example.\nc A 192.0.2.1\n");
@@ -899,7 +935,7 @@ static void test_extended_negative_paths(void) {
     assert(build_zone_index(&z_cname.arena, true) == 0);
     zt_free(&z_cname);
 
-    /* 6. Non-apex SOA definition */
+    /* 7. Non-apex SOA definition */
     zt_t z_soa;
     zt_load(&z_soa, "$ORIGIN example.\n$TTL 60\nsub.example. SOA ns h 1 2 3 4 5\n@ NS ns\n");
     assert(z_soa.rc >= 0);

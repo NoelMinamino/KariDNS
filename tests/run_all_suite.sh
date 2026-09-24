@@ -296,6 +296,8 @@ register_test "core" "sh" "tests/run_server_lifecycle_test.sh" "Server lifecycle
 register_test "core" "sh" "tests/run_tcp_adversary_test.sh" "TCP state machine adversary: slowloris, framing errors, trickle, flood"
 register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel IPC adversary: invalid HMAC, buffer limits, timeouts"
 register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rule checks: SSHFP, RFC 8624, options linting"
+register_test "core" "sh" "tests/run_karicheck_deep_rules_test.sh" "karicheck static lint rules: delegation, glue, CNAME & ZONEMD"
+register_test "core" "sh" "tests/run_zone_parser_error_paths_test.sh" "Zone parser error paths, escape sequences & malformed directives"
 register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command line argument validation and socket error resilience"
 
 # 11. Regression, Sanitizer & Concurrency Stress
@@ -307,6 +309,7 @@ register_test "regression" "sh" "tests/run_break_duplicate_kind_override_test.sh
 # 12. dag Diagnostic Client & Scenario Matrix Suite (Run with -c dag or --include-dag)
 register_test "dag" "sh" "tests/run_dag_scenario_matrix_test.sh" "dag & karictl Multi-Protocol Scenario Matrix (Trace, Transport, Replay, IPC)"
 register_test "dag" "sh" "tests/run_dag_ci_test.sh" "dag comprehensive CI test suite (Part 1-19 + Part 20-21 parallel sub-suites)"
+register_test "dag" "sh" "tests/run_dag_cli_anomalous_options_test.sh" "dag CLI anomalous options, YAML escaping & transport errors"
 register_test "dag" "sh" "tests/run_dag_batch_advanced_opts_test.sh" "dag Batch mode (-f) with advanced options"
 register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer smoke execution"
 register_test "dag" "sh" "tests/run_dag_apl_afdlength_overflow_test.sh" "dag APL afdlength buffer overflow regression test"

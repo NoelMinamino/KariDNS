@@ -2237,50 +2237,191 @@ static void test_wire_compression_and_rdata_boundaries(void) {
     CHECK(skip_wire_name(cycle2_pkt, sizeof(cycle2_pkt), 12, &next_off) != 0);
     CHECK(expand_wire_name(cycle2_pkt, sizeof(cycle2_pkt), 12, &next_off, &arena, &expanded_name) != 0);
 
-    /* 4. RDATA boundary checks for parse_resource_record */
-    /* Construct base packet with owner "ex." at offset 0: \x02ex\x00 (3 bytes) */
-    uint8_t rr_pkt[128];
-    memset(rr_pkt, 0, sizeof(rr_pkt));
-    rr_pkt[0] = 2; rr_pkt[1] = 'e'; rr_pkt[2] = 'x'; rr_pkt[3] = 0;
-    /* offset 4: TYPE=1 (A), CLASS=1 (IN), TTL=300, RDLEN=3 (1 byte missing) */
-    rr_pkt[4] = 0; rr_pkt[5] = 1; /* A */
-    rr_pkt[6] = 0; rr_pkt[7] = 1; /* IN */
-    rr_pkt[8] = 0; rr_pkt[9] = 0; rr_pkt[10] = 1; rr_pkt[11] = 0x2C; /* TTL=300 */
-    rr_pkt[12] = 0; rr_pkt[13] = 3; /* RDLEN=3 (invalid for A record, needs 4) */
-    rr_pkt[14] = 192; rr_pkt[15] = 0; rr_pkt[16] = 2;
-
-    dns_record_t rec;
-    memset(&rec, 0, sizeof(rec));
-    uint16_t type_out = 0;
-    size_t parse_off = 0;
-    CHECK(parse_resource_record(rr_pkt, 17, &parse_off, &arena, &rec, &type_out) != 0);
-
-    /* A record with RDLEN=5 (1 byte extra) */
-    rr_pkt[13] = 5;
-    rr_pkt[17] = 1;
-    parse_off = 0;
-    CHECK(parse_resource_record(rr_pkt, 18, &parse_off, &arena, &rec, &type_out) != 0);
-
-    /* AAAA record with RDLEN=15 (1 byte missing) */
-    rr_pkt[5] = 28; /* AAAA */
-    rr_pkt[13] = 15;
-    parse_off = 0;
-    CHECK(parse_resource_record(rr_pkt, 30, &parse_off, &arena, &rec, &type_out) != 0);
-
-    /* SRV record with RDLEN=5 (< 7) */
-    rr_pkt[5] = 33; /* SRV */
-    rr_pkt[13] = 5;
-    parse_off = 0;
-    CHECK(parse_resource_record(rr_pkt, 20, &parse_off, &arena, &rec, &type_out) != 0);
-
-    /* NAPTR record with RDLEN=5 (< 7) */
-    rr_pkt[5] = 35; /* NAPTR */
-    rr_pkt[13] = 5;
-    parse_off = 0;
-    CHECK(parse_resource_record(rr_pkt, 20, &parse_off, &arena, &rec, &type_out) != 0);
+    /* 4. Reserved label length indicators (0x40 - 0xBF) */
+    uint8_t bad_label_pkt[32];
+    memset(bad_label_pkt, 0, sizeof(bad_label_pkt));
+    bad_label_pkt[12] = 0x45; /* 0b01000101 (extended/reserved label type) */
+    CHECK(skip_wire_name(bad_label_pkt, sizeof(bad_label_pkt), 12, &next_off) != 0);
+    CHECK(expand_wire_name(bad_label_pkt, sizeof(bad_label_pkt), 12, &next_off, &arena, &expanded_name) != 0);
+    bad_label_pkt[12] = 0x80; /* 0b10000000 (reserved) */
+    CHECK(skip_wire_name(bad_label_pkt, sizeof(bad_label_pkt), 12, &next_off) != 0);
+    CHECK(expand_wire_name(bad_label_pkt, sizeof(bad_label_pkt), 12, &next_off, &arena, &expanded_name) != 0);
 
     zone_arena_destroy(&arena);
     printf("  -> compression pointer anomalies and RDATA boundary validations passed.\n");
+}
+
+static void test_wire_edns0_opt_parsing_boundaries(void) {
+    printf("[TEST] Wire: EDNS0 (OPT RR) option boundaries and malformed payloads...\n");
+
+    /* Construct base packet with OPT RR at offset 12 */
+    /* Header: ID=1, QDCOUNT=0, AN=0, NS=0, ARCOUNT=1 */
+    uint8_t opt_pkt[512];
+    memset(opt_pkt, 0, sizeof(opt_pkt));
+    opt_pkt[0] = 0x12; opt_pkt[1] = 0x34;
+    opt_pkt[11] = 1; /* ARCOUNT=1 */
+    /* Root name: 0x00 */
+    opt_pkt[12] = 0x00;
+    /* TYPE=41 (OPT), CLASS=4096 (UDP buf size), EXT-RCODE=0, VERSION=0, FLAGS=0 */
+    opt_pkt[13] = 0x00; opt_pkt[14] = 41;
+    opt_pkt[15] = 0x10; opt_pkt[16] = 0x00; /* 4096 */
+    opt_pkt[17] = 0x00; opt_pkt[18] = 0x00; opt_pkt[19] = 0x00; opt_pkt[20] = 0x00;
+
+    /* 1. RDLEN exceeds remaining packet */
+    opt_pkt[21] = 0x00; opt_pkt[22] = 50; /* RDLEN=50, but packet length is 25 */
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    CHECK(parse_edns_opt(opt_pkt, 25, 0, 0, 0, 1, &edns) != 0);
+
+    /* 2. OPT_COOKIE boundary cases */
+    /* Code=10 (COOKIE), Len=4 (< 8 underflow) */
+    opt_pkt[21] = 0x00; opt_pkt[22] = 8;
+    opt_pkt[23] = 0x00; opt_pkt[24] = 10;
+    opt_pkt[25] = 0x00; opt_pkt[26] = 4;
+    memset(opt_pkt + 27, 0xAA, 4);
+    memset(&edns, 0, sizeof(edns));
+    parse_edns_opt(opt_pkt, 31, 0, 0, 0, 1, &edns);
+    CHECK(edns.has_malformed_cookie == true || edns.has_cookie == false);
+
+    /* Code=10 (COOKIE), Len=12 (between 8 and 16 is invalid) */
+    opt_pkt[22] = 16;
+    opt_pkt[26] = 12;
+    memset(opt_pkt + 27, 0xAA, 12);
+    memset(&edns, 0, sizeof(edns));
+    parse_edns_opt(opt_pkt, 39, 0, 0, 0, 1, &edns);
+    CHECK(edns.has_malformed_cookie == true || edns.has_cookie == false);
+
+    /* Code=10 (COOKIE), Len=8 (valid client cookie) */
+    opt_pkt[22] = 12;
+    opt_pkt[26] = 8;
+    memset(opt_pkt + 27, 0xAA, 8);
+    memset(&edns, 0, sizeof(edns));
+    CHECK(parse_edns_opt(opt_pkt, 35, 0, 0, 0, 1, &edns) == 0);
+    CHECK(edns.has_cookie == true);
+
+    /* Code=10 (COOKIE), Len=24 (valid client + server cookie) */
+    opt_pkt[22] = 28;
+    opt_pkt[26] = 24;
+    memset(opt_pkt + 27, 0xBB, 24);
+    memset(&edns, 0, sizeof(edns));
+    CHECK(parse_edns_opt(opt_pkt, 51, 0, 0, 0, 1, &edns) == 0);
+    CHECK(edns.has_cookie == true);
+    CHECK(edns.server_cookie_len == 16);
+
+    /* 3. OPT_ECS (Code=8) boundary cases */
+    /* Underflow: len < 4 */
+    opt_pkt[22] = 6;
+    opt_pkt[23] = 0x00; opt_pkt[24] = 8;
+    opt_pkt[25] = 0x00; opt_pkt[26] = 2;
+    opt_pkt[27] = 0x00; opt_pkt[28] = 0x01;
+    memset(&edns, 0, sizeof(edns));
+    parse_edns_opt(opt_pkt, 29, 0, 0, 0, 1, &edns);
+
+    /* Invalid family (3) */
+    opt_pkt[22] = 8;
+    opt_pkt[26] = 4;
+    opt_pkt[27] = 0x00; opt_pkt[28] = 0x03; /* Family=3 */
+    opt_pkt[29] = 24; opt_pkt[30] = 0;
+    memset(&edns, 0, sizeof(edns));
+    parse_edns_opt(opt_pkt, 31, 0, 0, 0, 1, &edns);
+
+    /* Valid IPv4 ECS /24 */
+    opt_pkt[22] = 11;
+    opt_pkt[26] = 7;
+    opt_pkt[28] = 0x01; opt_pkt[29] = 24; opt_pkt[30] = 0;
+    opt_pkt[31] = 192; opt_pkt[32] = 0; opt_pkt[33] = 2;
+    memset(&edns, 0, sizeof(edns));
+    CHECK(parse_edns_opt(opt_pkt, 34, 0, 0, 0, 1, &edns) == 0);
+    CHECK(edns.has_ecs == true);
+    CHECK(edns.ecs_source_prefix == 24);
+
+    /* 4. OPT_EDE (Code=15) boundary cases */
+    /* Valid EDE info-code 18 (Prohibited) */
+    opt_pkt[22] = 6;
+    opt_pkt[23] = 0x00; opt_pkt[24] = 15;
+    opt_pkt[25] = 0x00; opt_pkt[26] = 2;
+    opt_pkt[27] = 0x00; opt_pkt[28] = 18;
+    memset(&edns, 0, sizeof(edns));
+    CHECK(parse_edns_opt(opt_pkt, 29, 0, 0, 0, 1, &edns) == 0);
+    CHECK(edns.ede_count >= 1);
+    CHECK(edns.ede_list[0].code == 18);
+
+    /* 5. OPT_NSID (Code=3) */
+    opt_pkt[22] = 4;
+    opt_pkt[23] = 0x00; opt_pkt[24] = 3;
+    opt_pkt[25] = 0x00; opt_pkt[26] = 0; /* empty NSID request */
+    memset(&edns, 0, sizeof(edns));
+    CHECK(parse_edns_opt(opt_pkt, 27, 0, 0, 0, 1, &edns) == 0);
+    CHECK(edns.has_nsid_query == true);
+
+    printf("  -> EDNS0 OPT RR boundaries and malformed payloads passed.\n");
+}
+
+static void test_wire_unpack_rr_all_types_underflow_matrix(void) {
+    printf("[TEST] Wire: parse_resource_record underflow & boundary matrix across all RR types...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    /* Base packet: owner "t." (3 bytes: \x01t\x00) */
+    uint8_t pkt[256];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 1; pkt[1] = 't'; pkt[2] = 0;
+    pkt[5] = 1; /* TYPE=1 (A) */
+    pkt[7] = 1; /* CLASS=1 (IN) */
+    pkt[11] = 60; /* TTL=60 */
+
+    dns_record_t rec;
+    uint16_t type_out;
+    size_t off;
+
+    static const struct { uint16_t type; size_t bad_rdlen; } underflows[] = {
+        { 1,   0 }, { 1,   3 },  /* A (needs 4) */
+        { 28,  0 }, { 28,  15 }, /* AAAA (needs 16) */
+        { 15,  0 }, { 15,  1 },  /* MX (needs >= 3) */
+        { 33,  0 }, { 33,  5 },  /* SRV (needs >= 7) */
+        { 35,  0 }, { 35,  6 },  /* NAPTR (needs >= 7) */
+        { 42,  0 }, { 42,  3 },  /* APL (needs >= 4) */
+        { 257, 0 }, { 257, 1 },  /* CAA (needs >= 2) */
+        { 44,  0 }, { 44,  2 },  /* SSHFP (needs >= 3) */
+        { 43,  0 }, { 43,  3 },  /* DS (needs >= 4) */
+        { 59,  0 }, { 59,  3 },  /* CDS (needs >= 4) */
+        { 48,  0 }, { 48,  3 },  /* DNSKEY (needs >= 4) */
+        { 60,  0 }, { 60,  3 },  /* CDNSKEY (needs >= 4) */
+        { 46,  0 }, { 46,  17 }, /* RRSIG (needs >= 18) */
+        { 47,  0 }, { 47,  1 },  /* NSEC (needs >= 2) */
+        { 50,  0 }, { 50,  4 },  /* NSEC3 (needs >= 5) */
+        { 51,  0 }, { 51,  4 },  /* NSEC3PARAM (needs >= 5) */
+        { 52,  0 }, { 52,  2 },  /* TLSA (needs >= 3) */
+        { 53,  0 }, { 53,  2 },  /* SMIMEA (needs >= 3) */
+        { 64,  0 }, { 64,  1 },  /* SVCB (needs >= 2) */
+        { 65,  0 }, { 65,  1 },  /* HTTPS (needs >= 2) */
+        { 55,  0 }, { 55,  3 },  /* HIP (needs >= 4) */
+        { 45,  0 }, { 45,  2 },  /* IPSECKEY (needs >= 3) */
+        { 108, 0 }, { 108, 5 },  /* EUI48 (needs 6) */
+        { 109, 0 }, { 109, 7 },  /* EUI64 (needs 8) */
+        { 256, 0 }, { 256, 3 },  /* URI (needs >= 4) */
+        { 63,  0 }, { 63,  5 },  /* ZONEMD (needs >= 6) */
+        { 11,  0 }, { 11,  4 },  /* WKS (needs >= 5) */
+        { 29,  0 }, { 29,  15 }, /* LOC (needs 16) */
+        { 13,  0 }, { 13,  1 },  /* HINFO (needs >= 2) */
+        { 62,  0 }, { 62,  5 },  /* CSYNC (needs >= 6) */
+    };
+
+    for (size_t i = 0; i < sizeof(underflows)/sizeof(underflows[0]); i++) {
+        pkt[4] = (uint8_t)(underflows[i].type >> 8);
+        pkt[5] = (uint8_t)(underflows[i].type & 0xFF);
+        pkt[12] = (uint8_t)(underflows[i].bad_rdlen >> 8);
+        pkt[13] = (uint8_t)(underflows[i].bad_rdlen & 0xFF);
+        off = 0;
+        size_t total_len = 14 + underflows[i].bad_rdlen;
+        CHECK(parse_resource_record(pkt, total_len, &off, &arena, &rec, &type_out) != 0);
+    }
+
+    zone_arena_destroy(&arena);
+    printf("  -> RR underflow matrix (%zu boundary checks) passed.\n",
+           sizeof(underflows)/sizeof(underflows[0]));
 }
 
 int main(void) {
@@ -2412,8 +2553,6 @@ int main(void) {
     test_wire_pb_encode_bytes_field_truncation();
     test_wire_const_time_memcmp_full_matrix_lengths();
     test_wire_domain_names_match_ci_comprehensive();
-    printf("[*] %d checks, %d failed\n", g_checks, g_failed);
-    if (g_failed) { printf("=== Wire / Utility Helper Tests FAILED ===\n"); return 1; }
     
     test_wire_format_type_name_various_types();
     test_wire_get_type_code_mnemonics();
@@ -2455,6 +2594,8 @@ int main(void) {
     test_wire_feature_case_38();
     test_wire_feature_case_39();
     test_wire_feature_case_40();
+    test_wire_edns0_opt_parsing_boundaries();
+    test_wire_unpack_rr_all_types_underflow_matrix();
     printf("[*] Final checks: %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
         printf("=== Wire / Utility Helper Tests FAILED ===\n");
