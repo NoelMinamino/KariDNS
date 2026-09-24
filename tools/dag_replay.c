@@ -1004,26 +1004,18 @@ void diff_dns_responses(const uint8_t *resp1, size_t len1, const uint8_t *resp2,
         out_diff->match = false;
         char buf[512] = "";
         size_t bpos = 0;
-        #define APPEND_DIFF_FLAG(flg, name) do { \
-            if (out_diff->diff_flags & (flg)) { \
-                bpos += snprintf(buf + bpos, sizeof(buf) - bpos, "[%s] ", name); \
-            } \
-        } while (0)
-
-        APPEND_DIFF_FLAG(DIFF_RCODE, "RCODE");
-        APPEND_DIFF_FLAG(DIFF_FLAGS, "FLAGS");
-        APPEND_DIFF_FLAG(DIFF_ANCOUNT, "ANCOUNT");
-        APPEND_DIFF_FLAG(DIFF_NSCOUNT, "NSCOUNT");
-        APPEND_DIFF_FLAG(DIFF_ARCOUNT, "ARCOUNT");
-        APPEND_DIFF_FLAG(DIFF_ANSWER_RRSET, "ANSWER");
-        APPEND_DIFF_FLAG(DIFF_AUTH_RRSET, "AUTH");
-        APPEND_DIFF_FLAG(DIFF_ADD_RRSET, "ADDITIONAL");
-        APPEND_DIFF_FLAG(DIFF_GLUE_MISSING, "GLUE_MISSING");
-        APPEND_DIFF_FLAG(DIFF_EDNS, "EDNS");
-        APPEND_DIFF_FLAG(DIFF_DNSSEC_RRSIG, "DNSSEC_RRSIG");
-        APPEND_DIFF_FLAG(DIFF_DNSSEC_NSEC, "DNSSEC_NSEC");
-        APPEND_DIFF_FLAG(DIFF_CNAME_CHAIN, "CNAME_CHAIN");
-        #undef APPEND_DIFF_FLAG
+        static const struct { uint32_t flag; const char *name; } k_diff_flags[] = {
+            {DIFF_RCODE, "RCODE"}, {DIFF_FLAGS, "FLAGS"}, {DIFF_ANCOUNT, "ANCOUNT"},
+            {DIFF_NSCOUNT, "NSCOUNT"}, {DIFF_ARCOUNT, "ARCOUNT"}, {DIFF_ANSWER_RRSET, "ANSWER"},
+            {DIFF_AUTH_RRSET, "AUTH"}, {DIFF_ADD_RRSET, "ADDITIONAL"}, {DIFF_GLUE_MISSING, "GLUE_MISSING"},
+            {DIFF_EDNS, "EDNS"}, {DIFF_DNSSEC_RRSIG, "DNSSEC_RRSIG"}, {DIFF_DNSSEC_NSEC, "DNSSEC_NSEC"},
+            {DIFF_CNAME_CHAIN, "CNAME_CHAIN"},
+        };
+        for (size_t df_i = 0; df_i < sizeof(k_diff_flags)/sizeof(k_diff_flags[0]); df_i++) {
+            if (out_diff->diff_flags & k_diff_flags[df_i].flag) {
+                bpos += snprintf(buf + bpos, sizeof(buf) - bpos, "[%s] ", k_diff_flags[df_i].name);
+            }
+        }
 
         snprintf(out_diff->diff_desc, sizeof(out_diff->diff_desc), "Diff: %.*s", (int)(sizeof(out_diff->diff_desc) - 7), buf);
     }

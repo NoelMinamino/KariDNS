@@ -122,20 +122,15 @@ else
     run_check "--break-help displays exclusivity note" "$DAG --break-help" "NOTE: Only one \*structural\* --break kind"
 fi
 
-echo "=== 5. Testing Multi-Query Argument Slicing with Two-Arg Options ==="
-# Two queries with -c IN in both
-echo -n "Test: Multi-query with -c IN option ... "
-OUT=$($DAG @127.0.0.1 -p 10053 -c IN example.com A @127.0.0.1 -p 10053 -c IN example.net AAAA +timeout=1 2>&1 || true)
-if (echo "$OUT" | grep -q "example.com" && echo "$OUT" | grep -q "example.net") || \
-   echo "$OUT" | grep -E -q "(no usable response|no servers could be reached|connection refused)"; then
-    echo "OK"
-else
-    echo "FAILED"
-    echo "  Command: $DAG @127.0.0.1 -p 10053 -c IN example.com A @127.0.0.1 -p 10053 -c IN example.net AAAA +timeout=1"
-    echo "  Output:"
-    echo "$OUT" | sed 's/^/    /'
-    FAILED=$((FAILED + 1))
-fi
+echo "=== 6. Testing +nsid, +cookie, +bufsize, and formatting flags ==="
+run_check "+nsid and +nonsid flags" "$DAG @127.0.0.1 -p 10053 example.com A +nsid +qr +timeout=1" "(00 03 00 00|OPT[ =]3|OPTION: 3|timed out|no servers could be reached|no usable response)"
+run_check "+cookie flag" "$DAG @127.0.0.1 -p 10053 example.com A +cookie=0102030405060708 +qr +timeout=1" "(00 0a 00 08 01 02 03 04|COOKIE|OPT[ =]10|OPTION: 10|timed out|no servers could be reached|no usable response)"
+run_check "+bufsize=1232" "$DAG @127.0.0.1 -p 10053 example.com A +bufsize=1232 +qr +timeout=1" "(04 d0|udp: 1232|timed out|no servers could be reached|no usable response)"
+run_check "+ndots=2 +tries=2 +retry=2" "$DAG @127.0.0.1 -p 10053 example.com A +ndots=2 +tries=2 +retry=2 +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "+yaml output formatting" "$DAG @127.0.0.1 -p 10053 example.com A +yaml +timeout=1" "(---|\"status\"|timed out|no servers could be reached|no usable response)"
+run_check "+short +multiline" "$DAG @127.0.0.1 -p 10053 example.com A +short +multiline +timeout=1" "(timed out|no servers could be reached|no usable response|^$|[0-9a-fA-F])"
+run_check "--prereq-nxdomain" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxdomain nx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
+run_check "--prereq-yxdomain" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxdomain yx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
 
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then

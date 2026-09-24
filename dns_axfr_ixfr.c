@@ -885,6 +885,135 @@ void *axfr_bg_thread_func(void *arg) {
   pthread_exit(NULL);
 }
 
+#ifndef KARIDNS_AXFR_MSG_LIMIT
+#define KARIDNS_AXFR_MSG_LIMIT 65000
+#endif
+
+typedef struct {
+  uint8_t *res;
+  uint16_t offset;
+  uint16_t q_offset;
+  uint16_t answers;
+  compress_ctx_t comp_ctx;
+  const uint8_t *req;
+  int client_fd;
+  bool is_extended_axfr;
+  bool opt_sent;
+  bool is_subsequent;
+  tsig_key_t *tsig_key;
+  uint8_t tsig_mac[64];
+  size_t tsig_mac_len;
+  edns_info_t resp_edns;
+  const struct sockaddr_storage *client_addr;
+  socklen_t client_len;
+  const struct sockaddr_storage *server_addr;
+  bool has_server_addr;
+  const char *domain;
+} axfr_emit_ctx_t;
+
+static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
+  uint16_t prev_offset = ec->offset;
+  if (serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+    uint16_t *res_ancount = (uint16_t *)&ec->res[6];
+    *res_ancount = htons(ec->answers);
+    if (ec->is_extended_axfr && !ec->opt_sent) {
+      uint16_t arcount = 0;
+      assemble_edns_opt(ec->res, 65535, &prev_offset, &arcount, &ec->resp_edns, 0, true, NULL);
+      ec->res[10] = (arcount >> 8) & 0xFF;
+      ec->res[11] = arcount & 0xFF;
+      ec->opt_sent = true;
+    }
+    if (ec->tsig_key) {
+      size_t sign_len = prev_offset;
+      if (tsig_sign_packet(ec->res, &sign_len, 65535, ec->tsig_key, 0, ec->tsig_mac,
+                           &ec->tsig_mac_len, NULL, 0, ec->is_subsequent) != 0) {
+        return -1;
+      }
+      ec->is_subsequent = true;
+      prev_offset = (uint16_t)sign_len;
+    }
+    uint8_t len_prefix[2] = {(uint8_t)(prev_offset >> 8), (uint8_t)(prev_offset & 0xFF)};
+    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, ec->res, prev_offset,
+                       (const struct sockaddr *)ec->client_addr, ec->client_len,
+                       ec->has_server_addr ? (const struct sockaddr *)ec->server_addr : NULL,
+                       ec->has_server_addr, IPPROTO_TCP);
+    if (send_tcp_robust(ec->client_fd, len_prefix, 2) < 0) return -1;
+    if (send_tcp_robust(ec->client_fd, ec->res, prev_offset) < 0) return -1;
+
+    /* 次のパケットの準備（QDCOUNT=1 と質問セクションを必ず引き継ぐ） */
+    ec->offset = ec->q_offset;
+    ec->answers = 0;
+    memset(ec->res, 0, 65535);
+    memcpy(ec->res, ec->req, ec->q_offset); /* クエリのヘッダと質問セクションをそのままコピー */
+    ec->res[2] |= 0x84; ec->res[3] &= 0xF0;
+    ec->res[8] = 0; ec->res[9] = 0; ec->res[10] = 0; ec->res[11] = 0;
+
+    memset(&ec->comp_ctx, 0, sizeof(ec->comp_ctx));
+    compress_ctx_init_packet(&ec->comp_ctx);
+    /* パケットバッファを破壊せず質問セクションの名前を圧縮テーブルに登録 */
+    register_wire_name_for_compression(ec->res, DNS_HEADER_SIZE, &ec->comp_ctx);
+
+    if (serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+      syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer",
+             rec->name ? rec->name : "(null)", rec->type_code);
+      return -1;
+    }
+  }
+  ec->answers++;
+  return 0;
+}
+
+static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_item,
+                                 const char **cur_loc_io, const char **cur_ecs_io) {
+  if (!ec->is_extended_axfr) {
+    if (rec_item->bind_location_tag != NULL ||
+        rec_item->ecs_subnet_tag != NULL ||
+        rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 ||
+        rec_item->tinydns_ttd != 0) {
+      /* Skip tagged records in fallback mode */
+      return 0;
+    }
+    return axfr_emit_record(ec, rec_item);
+  }
+
+  const char *r_loc = rec_item->bind_location_tag ? rec_item->bind_location_tag : "";
+  if (strcasecmp(r_loc, *(cur_loc_io) ? *(cur_loc_io) : "") != 0) {
+    dns_record_t set_rec;
+    memset(&set_rec, 0, sizeof(set_rec));
+    set_rec.name = (char *)ec->domain;
+    set_rec.type_code = DNS_TYPE_KARIDNS_LOC_STATE;
+    set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+    set_rec.class_str = "KARIDNS";
+    set_rec.generic_data = (uint8_t *)r_loc;
+    set_rec.generic_len = strlen(r_loc);
+    if (axfr_emit_record(ec, &set_rec) < 0) return -1;
+    *(cur_loc_io) = rec_item->bind_location_tag;
+  }
+  const char *r_ecs = rec_item->ecs_subnet_tag ? rec_item->ecs_subnet_tag : "";
+  if (strcasecmp(r_ecs, *(cur_ecs_io) ? *(cur_ecs_io) : "") != 0) {
+    dns_record_t set_rec;
+    memset(&set_rec, 0, sizeof(set_rec));
+    set_rec.name = (char *)ec->domain;
+    set_rec.type_code = DNS_TYPE_KARIDNS_ECS_STATE;
+    set_rec.class_val = DNS_CLASS_KARIDNS_EXT;
+    set_rec.class_str = "KARIDNS";
+    set_rec.generic_data = (uint8_t *)r_ecs;
+    set_rec.generic_len = strlen(r_ecs);
+    if (axfr_emit_record(ec, &set_rec) < 0) return -1;
+    *(cur_ecs_io) = rec_item->ecs_subnet_tag;
+  }
+  if (rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 || rec_item->tinydns_ttd != 0) {
+    dns_record_t wrap_rec;
+    uint8_t wrap_buf[4096];
+    if (wrap_tinydns_record(rec_item, &wrap_rec, wrap_buf, sizeof(wrap_buf))) {
+      return axfr_emit_record(ec, &wrap_rec);
+    } else {
+      return axfr_emit_record(ec, rec_item);
+    }
+  }
+  return axfr_emit_record(ec, rec_item);
+}
+
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
                         uint8_t *req_mac, size_t req_mac_len,
@@ -896,9 +1025,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     memcpy(res_buf, req, copy_len);
     res_buf[2] |= 0x84;
     res_buf[3] |= 0x05;
-    uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
+    uint8_t len_prefix[2] = {(uint8_t)(copy_len >> 8), (uint8_t)(copy_len & 0xFF)};
     write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
-                       client_addr, client_len, server_addr, has_server_addr, IPPROTO_TCP);
+                       (const struct sockaddr *)client_addr, client_len,
+                       has_server_addr ? (const struct sockaddr *)server_addr : NULL,
+                       has_server_addr, IPPROTO_TCP);
     send_tcp_robust(client_fd, len_prefix, 2);
     send_tcp_robust(client_fd, res_buf, copy_len);
     return;
@@ -968,30 +1099,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
     }
   }
-  uint16_t offset = q_offset;
-  uint16_t answers = 0;
-  uint16_t *res_ancount = (uint16_t *)&res[6];
-  memset(res, 0, 65535);
-  memcpy(res, req, q_offset); // ここで q_offset までコピーしていることを確認
-  res[2] |= 0x84;
-  res[3] &= 0xF0;
-  res[8] = 0;
-  res[9] = 0;
-  res[10] = 0;
-  res[11] = 0;
-  compress_ctx_t comp_ctx;
-  memset(&comp_ctx, 0, sizeof(comp_ctx));
-  compress_ctx_init_packet(&comp_ctx);
-  // 質問セクションの名前（オフセット DNS_HEADER_SIZE）を圧縮テーブルに登録する。
-  // これにより最初のレコード（通常はゾーン apex の SOA）の所有者名が
-  // 質問セクションへの2バイトポインタとして圧縮され、BIND と同等の
-  // メッセージサイズになる（分割後の再初期化コードと同じ処理）。
-  register_wire_name_for_compression(res, DNS_HEADER_SIZE, &comp_ctx);
-  uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
-  static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
-  size_t tsig_mac_len = req_mac_len;
-  if (req_mac_len > 0) memcpy(tsig_mac, req_mac, req_mac_len);
-  bool is_subsequent = false;
   uint16_t req_qd = (req[4] << 8) | req[5];
   uint16_t req_an = (req[6] << 8) | req[7];
   uint16_t req_ns = (req[8] << 8) | req[9];
@@ -1006,7 +1113,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
     }
   }
-  bool opt_sent = false;
   edns_info_t resp_edns = {0};
   if (is_extended_axfr) {
     resp_edns.present = true;
@@ -1082,105 +1188,42 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     pthread_mutex_unlock(&entry->ixfr_history.lock);
   }
 
-#define SERIALIZE_ADD_RECORD(rec_ptr) do { \
-  uint16_t prev_offset = offset; \
-  if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
-    *res_ancount = htons(answers); \
-    if (is_extended_axfr && !opt_sent) { \
-      uint16_t arcount = 0; \
-      assemble_edns_opt(res, 65535, &prev_offset, &arcount, &resp_edns, 0, true, NULL); \
-      res[10] = (arcount >> 8) & 0xFF; \
-      res[11] = arcount & 0xFF; \
-      opt_sent = true; \
-    } \
-    if (tsig_key) { \
-      size_t sign_len = prev_offset; \
-      if (tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac, &tsig_mac_len, NULL, 0, is_subsequent) != 0) goto axfr_error; \
-      is_subsequent = true; \
-      prev_offset = sign_len; \
-    } \
-    uint8_t len_prefix[2] = {prev_offset >> 8, prev_offset & 0xFF}; \
-    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res, prev_offset, \
-                       client_addr, client_len, server_addr, has_server_addr, IPPROTO_TCP); \
-    if (send_tcp_robust(client_fd, len_prefix, 2) < 0) goto axfr_error; \
-    if (send_tcp_robust(client_fd, res, prev_offset) < 0) goto axfr_error; \
-    \
-    /* 次のパケットの準備（QDCOUNT=1 と質問セクションを必ず引き継ぐ） */ \
-    offset = q_offset; \
-    answers = 0; \
-    memset(res, 0, 65535); \
-    memcpy(res, req, q_offset); /* クエリのヘッダと質問セクションをそのままコピー */ \
-    res[2] |= 0x84; res[3] &= 0xF0; \
-    res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0; \
-    \
-    memset(&comp_ctx, 0, sizeof(comp_ctx)); \
-    compress_ctx_init_packet(&comp_ctx); \
-    /* パケットバッファを破壊せず質問セクションの名前を圧縮テーブルに登録 */ \
-    register_wire_name_for_compression(res, DNS_HEADER_SIZE, &comp_ctx); \
-    \
-    if (serialize_dns_record(res, 65000, &offset, (rec_ptr), &comp_ctx, NULL, 0xFFFFFFFF) < 0) { \
-      syslog(LOG_ERR, "[AXFR] Record too large to fit in any TCP message (name=%s type=%u), aborting transfer", \
-             (rec_ptr)->name ? (rec_ptr)->name : "(null)", (rec_ptr)->type_code); \
-      goto axfr_error; \
-    } \
-  } \
-  answers++; \
-} while (0)
+  axfr_emit_ctx_t ec;
+  memset(&ec, 0, sizeof(ec));
+  ec.res = res;
+  ec.offset = (uint16_t)q_offset;
+  ec.q_offset = (uint16_t)q_offset;
+  ec.answers = 0;
+  ec.req = req;
+  ec.client_fd = client_fd;
+  ec.is_extended_axfr = is_extended_axfr;
+  ec.opt_sent = false;
+  ec.is_subsequent = false;
+  ec.tsig_key = tsig_key;
+  if (req_mac_len > 0) {
+    memcpy(ec.tsig_mac, req_mac, req_mac_len);
+    ec.tsig_mac_len = req_mac_len;
+  }
+  ec.resp_edns = resp_edns;
+  ec.client_addr = client_addr;
+  ec.client_len = client_len;
+  ec.server_addr = server_addr;
+  ec.has_server_addr = has_server_addr;
+  ec.domain = entry->domain;
 
-#define EMIT_ZONE_RECORD(r_ptr, cur_loc_io, cur_ecs_io) do { \
-  dns_record_t *rec_item = (r_ptr); \
-  if (!is_extended_axfr) { \
-    if (rec_item->bind_location_tag != NULL || \
-        rec_item->ecs_subnet_tag != NULL || \
-        rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 || \
-        rec_item->tinydns_ttd != 0) { \
-      /* Skip tagged records in fallback mode */ \
-    } else { \
-      SERIALIZE_ADD_RECORD(rec_item); \
-    } \
-  } else { \
-    const char *r_loc = rec_item->bind_location_tag ? rec_item->bind_location_tag : ""; \
-    if (strcasecmp(r_loc, *(cur_loc_io) ? *(cur_loc_io) : "") != 0) { \
-      dns_record_t set_rec; \
-      memset(&set_rec, 0, sizeof(set_rec)); \
-      set_rec.name = entry->domain; \
-      set_rec.type_code = DNS_TYPE_KARIDNS_LOC_STATE; \
-      set_rec.class_val = DNS_CLASS_KARIDNS_EXT; \
-      set_rec.class_str = "KARIDNS"; \
-      set_rec.generic_data = (uint8_t *)r_loc; \
-      set_rec.generic_len = strlen(r_loc); \
-      SERIALIZE_ADD_RECORD(&set_rec); \
-      *(cur_loc_io) = rec_item->bind_location_tag; \
-    } \
-    const char *r_ecs = rec_item->ecs_subnet_tag ? rec_item->ecs_subnet_tag : ""; \
-    if (strcasecmp(r_ecs, *(cur_ecs_io) ? *(cur_ecs_io) : "") != 0) { \
-      dns_record_t set_rec; \
-      memset(&set_rec, 0, sizeof(set_rec)); \
-      set_rec.name = entry->domain; \
-      set_rec.type_code = DNS_TYPE_KARIDNS_ECS_STATE; \
-      set_rec.class_val = DNS_CLASS_KARIDNS_EXT; \
-      set_rec.class_str = "KARIDNS"; \
-      set_rec.generic_data = (uint8_t *)r_ecs; \
-      set_rec.generic_len = strlen(r_ecs); \
-      SERIALIZE_ADD_RECORD(&set_rec); \
-      *(cur_ecs_io) = rec_item->ecs_subnet_tag; \
-    } \
-    if (rec_item->tinydns_loc[0] != 0 || rec_item->tinydns_loc[1] != 0 || rec_item->tinydns_ttd != 0) { \
-      dns_record_t wrap_rec; \
-      uint8_t wrap_buf[4096]; \
-      if (wrap_tinydns_record(rec_item, &wrap_rec, wrap_buf, sizeof(wrap_buf))) { \
-        SERIALIZE_ADD_RECORD(&wrap_rec); \
-      } else { \
-        SERIALIZE_ADD_RECORD(rec_item); \
-      } \
-    } else { \
-      SERIALIZE_ADD_RECORD(rec_item); \
-    } \
-  } \
-} while (0)
+  memset(res, 0, 65535);
+  memcpy(res, req, q_offset);
+  res[2] |= 0x84;
+  res[3] &= 0xF0;
+  res[8] = 0;
+  res[9] = 0;
+  res[10] = 0;
+  res[11] = 0;
+  compress_ctx_init_packet(&ec.comp_ctx);
+  register_wire_name_for_compression(res, DNS_HEADER_SIZE, &ec.comp_ctx);
 
   if (send_ixfr) {
-    SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+    if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
     const char *ixfr_loc = NULL;
     const char *ixfr_ecs = NULL;
     for (int t = 0; t < txn_count; t++) {
@@ -1189,27 +1232,31 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       for (int i = 0; i < txn->deleted_count; i++) {
         if (txn->deleted[i].type_code == 6) { soa_del_idx = i; break; }
       }
-      if (soa_del_idx >= 0) SERIALIZE_ADD_RECORD(&txn->deleted[soa_del_idx]);
+      if (soa_del_idx >= 0) {
+        if (axfr_emit_record(&ec, &txn->deleted[soa_del_idx]) < 0) goto axfr_error;
+      }
       for (int i = 0; i < txn->deleted_count; i++) {
         if (i == soa_del_idx) continue;
-        EMIT_ZONE_RECORD(&txn->deleted[i], &ixfr_loc, &ixfr_ecs);
+        if (axfr_emit_zone_record(&ec, &txn->deleted[i], &ixfr_loc, &ixfr_ecs) < 0) goto axfr_error;
       }
       int soa_add_idx = -1;
       for (int i = 0; i < txn->added_count; i++) {
         if (txn->added[i].type_code == 6) { soa_add_idx = i; break; }
       }
-      if (soa_add_idx >= 0) SERIALIZE_ADD_RECORD(&txn->added[soa_add_idx]);
+      if (soa_add_idx >= 0) {
+        if (axfr_emit_record(&ec, &txn->added[soa_add_idx]) < 0) goto axfr_error;
+      }
       for (int i = 0; i < txn->added_count; i++) {
         if (i == soa_add_idx) continue;
-        EMIT_ZONE_RECORD(&txn->added[i], &ixfr_loc, &ixfr_ecs);
+        if (axfr_emit_zone_record(&ec, &txn->added[i], &ixfr_loc, &ixfr_ecs) < 0) goto axfr_error;
       }
     }
     if (txn_count > 0) {
-      SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+      if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
     }
   } else {
     // 1. Initial SOA
-    SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+    if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
 
     // Definitions emitted after first SOA in extended mode
     if (is_extended_axfr) {
@@ -1225,7 +1272,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
           tag_rec.class_str = "KARIDNS";
           tag_rec.generic_data = tag_buf;
           tag_rec.generic_len = dlen;
-          SERIALIZE_ADD_RECORD(&tag_rec);
+          if (axfr_emit_record(&ec, &tag_rec) < 0) goto axfr_error;
         }
       }
       for (int i = 0; i < current_zone->bind_ecs_tag_count; i++) {
@@ -1240,7 +1287,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
           tag_rec.class_str = "KARIDNS";
           tag_rec.generic_data = tag_buf;
           tag_rec.generic_len = dlen;
-          SERIALIZE_ADD_RECORD(&tag_rec);
+          if (axfr_emit_record(&ec, &tag_rec) < 0) goto axfr_error;
         }
       }
       server_config_t *axfr_cfg = acquire_config_snapshot();
@@ -1275,7 +1322,10 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         trusted_rec.class_str = "KARIDNS";
         trusted_rec.generic_data = trusted_buf;
         trusted_rec.generic_len = toffset;
-        SERIALIZE_ADD_RECORD(&trusted_rec);
+        if (axfr_emit_record(&ec, &trusted_rec) < 0) {
+          if (axfr_cfg) release_config_snapshot(axfr_cfg);
+          goto axfr_error;
+        }
       }
       if (axfr_cfg) release_config_snapshot(axfr_cfg);
       for (int i = 0; i < current_zone->location_count; i++) {
@@ -1295,7 +1345,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         loc_rec.class_str = "KARIDNS";
         loc_rec.generic_data = loc_buf;
         loc_rec.generic_len = 3 + loc->prefix_len;
-        SERIALIZE_ADD_RECORD(&loc_rec);
+        if (axfr_emit_record(&ec, &loc_rec) < 0) goto axfr_error;
       }
     }
 
@@ -1304,7 +1354,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     for (size_t i = 0; i < current_zone->count; i++) {
       if ((int)i == soa_idx)
         continue;
-      EMIT_ZONE_RECORD(&current_zone->records[i], &current_stream_loc, &current_stream_ecs);
+      if (axfr_emit_zone_record(&ec, &current_zone->records[i], &current_stream_loc, &current_stream_ecs) < 0) goto axfr_error;
     }
 
     if (is_extended_axfr) {
@@ -1317,7 +1367,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         set_rec.class_str = "KARIDNS";
         set_rec.generic_data = (uint8_t *)"";
         set_rec.generic_len = 0;
-        SERIALIZE_ADD_RECORD(&set_rec);
+        if (axfr_emit_record(&ec, &set_rec) < 0) goto axfr_error;
       }
       if (current_stream_ecs && *current_stream_ecs) {
         dns_record_t set_rec;
@@ -1328,36 +1378,39 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         set_rec.class_str = "KARIDNS";
         set_rec.generic_data = (uint8_t *)"";
         set_rec.generic_len = 0;
-        SERIALIZE_ADD_RECORD(&set_rec);
+        if (axfr_emit_record(&ec, &set_rec) < 0) goto axfr_error;
       }
     }
 
     // 3. Trailing SOA
-    SERIALIZE_ADD_RECORD(&current_zone->records[soa_idx]);
+    if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
   }
-  if (answers > 0) {
-    *res_ancount = htons(answers);
-    if (is_extended_axfr && !opt_sent) {
+  if (ec.answers > 0) {
+    uint16_t *res_ancount = (uint16_t *)&ec.res[6];
+    *res_ancount = htons(ec.answers);
+    if (ec.is_extended_axfr && !ec.opt_sent) {
       uint16_t arcount = 0;
-      assemble_edns_opt(res, 65535, &offset, &arcount, &resp_edns, 0, true, NULL);
-      res[10] = (arcount >> 8) & 0xFF;
-      res[11] = arcount & 0xFF;
-      opt_sent = true;
+      assemble_edns_opt(ec.res, 65535, &ec.offset, &arcount, &ec.resp_edns, 0, true, NULL);
+      ec.res[10] = (arcount >> 8) & 0xFF;
+      ec.res[11] = arcount & 0xFF;
+      ec.opt_sent = true;
     }
-    if (tsig_key) {
-      size_t sign_len = offset;
-      if (tsig_sign_packet(res, &sign_len, 65535, tsig_key, 0, tsig_mac,
-                           &tsig_mac_len, NULL, 0, is_subsequent) != 0) {
+    if (ec.tsig_key) {
+      size_t sign_len = ec.offset;
+      if (tsig_sign_packet(ec.res, &sign_len, 65535, ec.tsig_key, 0, ec.tsig_mac,
+                           &ec.tsig_mac_len, NULL, 0, ec.is_subsequent) != 0) {
         goto axfr_error;
       }
-      offset = sign_len;
+      ec.offset = (uint16_t)sign_len;
     }
-    uint8_t len_prefix[2] = {offset >> 8, offset & 0xFF};
-    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res, offset,
-                       client_addr, client_len, server_addr, has_server_addr, IPPROTO_TCP);
+    uint8_t len_prefix[2] = {(uint8_t)(ec.offset >> 8), (uint8_t)(ec.offset & 0xFF)};
+    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, ec.res, ec.offset,
+                       (const struct sockaddr *)client_addr, client_len,
+                       has_server_addr ? (const struct sockaddr *)server_addr : NULL,
+                       has_server_addr, IPPROTO_TCP);
     if (send_tcp_robust(client_fd, len_prefix, 2) < 0)
       goto axfr_error;
-    if (send_tcp_robust(client_fd, res, offset) < 0)
+    if (send_tcp_robust(client_fd, ec.res, ec.offset) < 0)
       goto axfr_error;
   }
 

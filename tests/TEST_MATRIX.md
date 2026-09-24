@@ -235,6 +235,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 65 | [`run_ttl_rfc2181_clamp_test.sh`](file:///c:/git/my_dns/tests/run_ttl_rfc2181_clamp_test.sh) | `dns_wire.c` | RFC 2181 §8 | **Boundary** | Clamping TTL values with the high bit set (≥ 2^31) to 0 during wire serialization. |
 | 66 | [`run_zone_oom_partial_load_test.sh`](file:///c:/git/my_dns/tests/run_zone_oom_partial_load_test.sh) | `dns_zone_parser.c`, `dns_snapshot_rcu.c` | Robustness | **Negative / Fault Injection** | Fail-closed atomic rollback to previous zone version upon encountering simulated OOM. |
 | 67 | [`run_break_duplicate_kind_override_test.sh`](file:///c:/git/my_dns/tests/run_break_duplicate_kind_override_test.sh) | `dns_config_parser.c` | Config Grammar | **Negative** | Validation of config directive precedence and rejection of conflicting keyword overrides. |
+| 68 | [`run_matrix_queries_test.sh`](file:///c:/git/my_dns/tests/run_matrix_queries_test.sh) | `dns_query_engine.c`, `dns_wire.c` | RFC 1034, RFC 1035, RFC 6672, RFC 4035 | **Table-Driven Matrix** | Matrix validation of query/response across all supported RR types, negative caching, and wildcard/DNAME delegations. |
 
 ---
 

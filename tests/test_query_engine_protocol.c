@@ -556,11 +556,167 @@ static void test_notify_authorization(void) {
     printf("  -> NOTIFY authorization matrix passed.\n");
 }
 
+static void test_rfc8482_minimal_any_synthesis(void) {
+    printf("[TEST] Query Engine: RFC 8482 minimal-any ANY->HINFO synthesis...\n");
+    static const char *zone_any =
+        "$ORIGIN any.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.any.example. admin.any.example. 100 7200 3600 1209600 300\n"
+        "@ IN NS ns1.any.example.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "host IN A 192.0.2.53\n"
+        "host IN TXT \"hello world\"\n"
+        "alias IN CNAME host.any.example.\n";
+
+    gr_setup("any.example.", zone_any);
+    g_gr.cfg.minimal_any = true;
+    g_gr.cfg.minimal_any_ttl = 300;
+
+    req_t q;
+    gr_resp_t r;
+
+    // 1. DO=0 ANY query on "host.any.example." -> synthesizes HINFO "RFC8482"
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0);
+    put_question(&q, "host.any.example.", 255, 1); // ANY
+    ask(&q, "host.any.example.", 255, "192.0.2.10", false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && r.counts[0] == 1);
+    const gr_rr_t *hinfo = gr_first(&r, 1, 13); // HINFO in ANSWER
+    assert(hinfo != NULL);
+    assert(hinfo->ttl == 300);
+
+    // 2. ANY query on CNAME record "alias.any.example." -> CNAME followed, no HINFO synthesis
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0);
+    put_question(&q, "alias.any.example.", 255, 1);
+    ask(&q, "alias.any.example.", 255, "192.0.2.10", false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa);
+    const gr_rr_t *cname = gr_first(&r, 1, 5); // CNAME in ANSWER
+    assert(cname != NULL);
+
+    // 3. ANY query on apex "any.example."
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0);
+    put_question(&q, "any.example.", 255, 1);
+    ask(&q, "any.example.", 255, "192.0.2.10", false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa);
+
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> RFC 8482 minimal-any synthesis passed.\n");
+}
+
+static void test_sibling_zone_additional_glue_and_limits(void) {
+    printf("[TEST] Query Engine: Sibling zone additional search & alternate hash...\n");
+    zone_arena_t arena_prim, arena_sib;
+    zone_arena_init(&arena_prim);
+    zone_arena_init(&arena_sib);
+
+    parse_error_t err = {0};
+    parse_context_t ctx1 = { .base_dir = ".", .default_origin = "prim.example.", .is_standalone_mode = true, .err_out = &err };
+    const char *prim_text =
+        "$ORIGIN prim.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.sib.example. admin.prim.example. 100 7200 3600 1209600 300\n"
+        "@ IN NS ns1.sib.example.\n"
+        "sub IN NS ns1.sib.example.\n";
+    char *p_buf = arena_strdup(&arena_prim, prim_text);
+    parse_zone_fast(p_buf, strlen(p_buf), &arena_prim, &ctx1);
+    build_zone_index(&arena_prim, true);
+
+    parse_context_t ctx2 = { .base_dir = ".", .default_origin = "sib.example.", .is_standalone_mode = true, .err_out = &err };
+    const char *sib_text =
+        "$ORIGIN sib.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.sib.example. admin.sib.example. 100 7200 3600 1209600 300\n"
+        "@ IN NS ns1.sib.example.\n"
+        "ns1 IN A 198.51.100.1\n"
+        "ns1 IN AAAA 2001:db8::1\n";
+    char *s_buf = arena_strdup(&arena_sib, sib_text);
+    parse_zone_fast(s_buf, strlen(s_buf), &arena_sib, &ctx2);
+    build_zone_index(&arena_sib, true);
+
+    zone_db_entry_t entry_prim, entry_sib;
+    memset(&entry_prim, 0, sizeof(entry_prim));
+    memset(&entry_sib, 0, sizeof(entry_sib));
+    strlcpy(entry_prim.domain, "prim.example.", sizeof(entry_prim.domain));
+    strlcpy(entry_sib.domain, "sib.example.", sizeof(entry_sib.domain));
+    atomic_store_explicit(&entry_prim.rcu.active, &arena_prim, memory_order_release);
+    atomic_store_explicit(&entry_sib.rcu.active, &arena_sib, memory_order_release);
+
+    zone_db_entry_t *entries[2] = { &entry_prim, &entry_sib };
+    char *acl_any[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 2;
+    view.match_clients = acl_any;
+    view.match_clients_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.additional_from_auth = ADDITIONAL_AUTH_YES;
+
+    uint8_t res[4096];
+    compress_ctx_t comp;
+    memset(&comp, 0, sizeof(comp));
+    compress_ctx_init_packet(&comp);
+    rate_limit_config_t *rrl_out = NULL;
+    zone_db_entry_t *matched = NULL;
+
+    req_t q;
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0);
+    put_question(&q, "sub.prim.example.", 1, 1);
+
+    int n = process_dns_query_impl(q.b, q.n, res, sizeof(res), "sub.prim.example.", 1,
+                                   "192.0.2.10", &comp, false, &rrl_out,
+                                   &snap, &cfg, &matched);
+    assert(n >= DNS_HEADER_SIZE);
+    gr_resp_t r;
+    assert(gr_parse(res, (size_t)n, &r));
+    CHECK(&r, r.counts[2] >= 1);
+
+    zone_arena_destroy(&arena_prim);
+    zone_arena_destroy(&arena_sib);
+    printf("  -> Sibling zone additional glue passed.\n");
+}
+
+static void test_eff_ttl_resolution_and_clamp(void) {
+    printf("[TEST] Query Engine: Effective TTL resolution & tinydns clamp...\n");
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.ttl_value = 86400;
+    rec.tinydns_ttd = 0;
+
+    uint32_t eff_ttl = 0;
+    bool valid = tinydns_record_currently_valid(&rec, 0, NULL, NULL, NULL, &eff_ttl);
+    assert(valid == true);
+    assert(eff_ttl == 86400);
+
+    // Countdown TTL
+    rec.tinydns_ttd = 1000000;
+    rec.tinydns_ttl_countdown = true;
+    valid = tinydns_record_currently_valid(&rec, 999900, NULL, NULL, NULL, &eff_ttl);
+    assert(valid == true);
+    assert(eff_ttl == 100);
+
+    // Expired TTL
+    valid = tinydns_record_currently_valid(&rec, 1000001, NULL, NULL, NULL, &eff_ttl);
+    assert(valid == false);
+
+    printf("  -> Effective TTL resolution & tinydns clamp passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Query Engine Protocol Tests ===\n");
     test_protocol_anomalies();
     test_expired_secondary_zone();
     test_notify_authorization();
+    test_rfc8482_minimal_any_synthesis();
+    test_sibling_zone_additional_glue_and_limits();
+    test_eff_ttl_resolution_and_clamp();
     printf("=== All Query Engine Protocol Tests PASSED ===\n");
     return 0;
 }

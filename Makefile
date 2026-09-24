@@ -251,9 +251,13 @@ TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/da
 TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 
 FI_WRAP_LDFLAGS  = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=strdup -Wl,--wrap=strndup -Wl,--wrap=posix_memalign
-FI_WRAP_LDFLAGS += -Wl,--wrap=open -Wl,--wrap=openat -Wl,--wrap=fopen -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=socket -Wl,--wrap=bind -Wl,--wrap=listen
-FI_WRAP_LDFLAGS += -Wl,--wrap=accept -Wl,--wrap=connect -Wl,--wrap=rename -Wl,--wrap=mkdir -Wl,--wrap=getaddrinfo -Wl,--wrap=pthread_create
+FI_WRAP_LDFLAGS += -Wl,--wrap=open -Wl,--wrap=openat -Wl,--wrap=fopen -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=send -Wl,--wrap=sendto -Wl,--wrap=recv -Wl,--wrap=recvfrom
+FI_WRAP_LDFLAGS += -Wl,--wrap=close -Wl,--wrap=pipe -Wl,--wrap=fork -Wl,--wrap=execv -Wl,--wrap=execvp -Wl,--wrap=execve
+FI_WRAP_LDFLAGS += -Wl,--wrap=socket -Wl,--wrap=bind -Wl,--wrap=listen -Wl,--wrap=accept -Wl,--wrap=connect -Wl,--wrap=getsockname
+FI_WRAP_LDFLAGS += -Wl,--wrap=fcntl -Wl,--wrap=setsockopt -Wl,--wrap=kevent -Wl,--wrap=poll -Wl,--wrap=select
+FI_WRAP_LDFLAGS += -Wl,--wrap=rename -Wl,--wrap=mkdir -Wl,--wrap=getaddrinfo -Wl,--wrap=pthread_create
 FI_WRAP_LDFLAGS += -Wl,--wrap=time -Wl,--wrap=clock_gettime -Wl,--wrap=gettimeofday
+FI_WRAP_SSL_LDFLAGS = -Wl,--wrap=SSL_CTX_new -Wl,--wrap=SSL_connect -Wl,--wrap=SSL_read -Wl,--wrap=SSL_write
 
 FI_COMMON_SRCS = tests/fi/kari_fi.c
 
@@ -475,7 +479,7 @@ fi_misc_test: test_fi_misc
 	./test_fi_misc
 
 test_fi_dag: $(TEST_FI_DAG_SRCS)
-	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_FI_DAG_SRCS) -o test_fi_dag $(LDFLAGS) $(FI_WRAP_LDFLAGS) -lssl -lcrypto -lpthread -lm -lz $(IDN_LDFLAGS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_FI_DAG_SRCS) -o test_fi_dag $(LDFLAGS) $(FI_WRAP_LDFLAGS) $(FI_WRAP_SSL_LDFLAGS) -lssl -lcrypto -lpthread -lm -lz $(IDN_LDFLAGS)
 
 fi_dag_test: test_fi_dag
 	./test_fi_dag

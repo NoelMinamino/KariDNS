@@ -1438,7 +1438,7 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
 
 
 // Type Bitmap (NSEC/NSEC3/CSYNC用) を構築するヘルパー
-static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset, char **types, int type_count) {
+static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset, char *const *types, int type_count) {
     if (type_count == 0) return 0;
     
     uint16_t *codes = malloc(sizeof(uint16_t) * type_count);
@@ -1552,7 +1552,7 @@ static double parse_double_c(const char *s, char **endptr) {
     return val;
 }
 
-static int loc_parse_coord(char **rdata, int rdata_count, int *idx, double *out_seconds, char *dir_out) {
+static int loc_parse_coord(char *const *rdata, int rdata_count, int *idx, double *out_seconds, char *dir_out) {
     double parts[3] = {0, 0, 0};
     int n = 0;
     while (n < 3 && *idx < rdata_count) {
@@ -1589,7 +1589,7 @@ static uint8_t loc_encode_precsize(double meters) {
 }
 
 
-static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
+static int decode_concat_b64_rdata(char *const *fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
     if (!fields || !res || !offset || *offset > max_res_len) return -1;
     char b64[2048] = "";
@@ -1618,7 +1618,7 @@ static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
     return 0;
 }
 
-static int decode_concat_hex_rdata(char **fields, int count, uint8_t *res,
+static int decode_concat_hex_rdata(char *const *fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
     if (!fields || !res || !offset || *offset > max_res_len) return -1;
     char hex[2048] = "";
@@ -1705,7 +1705,7 @@ static bool parse_nid_identifier(const char *s, uint8_t node_id[8]) {
     return true;
 }
 
-int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
+int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
 

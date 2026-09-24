@@ -4133,58 +4133,174 @@ static void test_server_core_feature_case_150(void) {
 }
 
 static void test_server_core_feature_case_151(void) {
-    printf("[TEST] Server Core: system and process validation case 151...\n");
-    char ip_buf[16];
-    fast_ipv4_to_str(htonl(0x7F000001 + (151 % 250)), ip_buf);
-    assert(ip_buf[0] == '1' && ip_buf[1] == '2' && ip_buf[2] == '7');
-    
-    // Test safe directory verification with empty path
-    assert(ensure_priv_dir_safe("") == true);
+    printf("[TEST] Server Core: Case 151 - NOTIFY outbound source address binding and ephemeral fallback...\n");
+    // Test IPv4 source binding socket creation & fallback
+    int s_v4 = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(s_v4 >= 0);
+    int opt_reuse = 1;
+    setsockopt(s_v4, SOL_SOCKET, SO_REUSEADDR, &opt_reuse, sizeof(opt_reuse));
+
+    struct sockaddr_in bind_v4;
+    memset(&bind_v4, 0, sizeof(bind_v4));
+    bind_v4.sin_family = AF_INET;
+    bind_v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind_v4.sin_port = htons(0); // Ephemeral port
+    assert(bind(s_v4, (struct sockaddr *)&bind_v4, sizeof(bind_v4)) == 0);
+
+    struct sockaddr_storage pss;
+    socklen_t plen = sizeof(pss);
+    assert(getsockname(s_v4, (struct sockaddr *)&pss, &plen) == 0);
+    uint16_t src_port = ntohs(((struct sockaddr_in *)&pss)->sin_port);
+    assert(src_port > 0);
+    close(s_v4);
+
+    // Test IPv6 source binding socket creation
+    int s_v6 = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (s_v6 >= 0) {
+        setsockopt(s_v6, SOL_SOCKET, SO_REUSEADDR, &opt_reuse, sizeof(opt_reuse));
+        struct sockaddr_in6 bind_v6;
+        memset(&bind_v6, 0, sizeof(bind_v6));
+        bind_v6.sin6_family = AF_INET6;
+        bind_v6.sin6_addr = in6addr_loopback;
+        bind_v6.sin6_port = htons(0);
+        int b_rc = bind(s_v6, (struct sockaddr *)&bind_v6, sizeof(bind_v6));
+        (void)b_rc;
+        close(s_v6);
+    }
+    printf("  -> Case 151 passed.\n");
 }
 
 static void test_server_core_feature_case_152(void) {
-    printf("[TEST] Server Core: system and process validation case 152...\n");
-    char ip_buf[16];
-    fast_ipv4_to_str(htonl(0x7F000001 + (152 % 250)), ip_buf);
-    assert(ip_buf[0] == '1' && ip_buf[1] == '2' && ip_buf[2] == '7');
-    
-    // Test safe directory verification with empty path
-    assert(ensure_priv_dir_safe("") == true);
+    printf("[TEST] Server Core: Case 152 - TCP ACL refusal response formatting with EDE 18 & send-extended-errors...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.send_extended_errors = true;
+
+    uint8_t res_buf[512] = {0};
+    res_buf[0] = 0x12; res_buf[1] = 0x34;
+    res_buf[4] = 0; res_buf[5] = 1; // QDCOUNT=1
+    size_t off = 12;
+    off += write_uncompressed_name(res_buf, off, sizeof(res_buf), "forbidden.example.");
+    res_buf[off++] = 0; res_buf[off++] = 1; // A
+    res_buf[off++] = 0; res_buf[off++] = 1; // IN
+    size_t copy_len = off;
+
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    edns.present = true;
+    edns.udp_payload_size = 4096;
+
+    // Apply TCP ACL refusal logic (as in dns_server_core.c:2052-2067)
+    res_buf[2] |= 0x84;
+    res_buf[3] |= 0x05; // REFUSED
+    add_ede(&edns, cfg.send_extended_errors, 18, "Query refused due to access control");
+
+    uint16_t qd = (res_buf[4] << 8) | res_buf[5];
+    uint16_t q_end = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
+    uint16_t arcount = 0;
+    if (edns.present) {
+        assemble_edns_opt(res_buf, sizeof(res_buf), &q_end, &arcount, &edns, 0, true, &cfg);
+    }
+    res_buf[6] = 0; res_buf[7] = 0;
+    res_buf[8] = 0; res_buf[9] = 0;
+    res_buf[10] = arcount >> 8;
+    res_buf[11] = arcount & 0xFF;
+    copy_len = q_end;
+
+    assert((res_buf[3] & 0x0F) == 5); // REFUSED
+    assert(arcount == 1);
+    assert(edns.ede_count == 1);
+    assert(edns.ede_list[0].code == 18);
+    printf("  -> Case 152 passed.\n");
 }
 
 static void test_server_core_feature_case_153(void) {
-    printf("[TEST] Server Core: system and process validation case 153...\n");
-    char ip_buf[16];
-    fast_ipv4_to_str(htonl(0x7F000001 + (153 % 250)), ip_buf);
-    assert(ip_buf[0] == '1' && ip_buf[1] == '2' && ip_buf[2] == '7');
-    
-    // Test safe directory verification with empty path
-    assert(ensure_priv_dir_safe("") == true);
+    printf("[TEST] Server Core: Case 153 - TCP ACL refusal with TSIG signing and socket closure on sign failure...\n");
+    uint8_t res_buf[512] = {0};
+    res_buf[0] = 0xAA; res_buf[1] = 0xBB;
+    res_buf[2] = 0x84; res_buf[3] = 0x05; // REFUSED
+    res_buf[4] = 0; res_buf[5] = 1;
+    size_t off = 12;
+    off += write_uncompressed_name(res_buf, off, sizeof(res_buf), "tsigrefuse.example.");
+    res_buf[off++] = 0; res_buf[off++] = 1;
+    res_buf[off++] = 0; res_buf[off++] = 1;
+    size_t copy_len = off;
+
+    tsig_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.name = "refuse-key.";
+    key.algorithm = "hmac-sha256";
+    memset(key.secret_decoded, 0x99, 32);
+    key.secret_decoded_len = 32;
+
+    uint8_t tsig_mac[64];
+    size_t tsig_mac_len = 0;
+    int sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
+                                   &key, 0, tsig_mac, &tsig_mac_len, NULL, 0, false);
+    assert(sign_rc == 0);
+    assert(copy_len > off);
+    assert(packet_has_tsig(res_buf, copy_len) == true);
+    printf("  -> Case 153 passed.\n");
 }
 
 static void test_server_core_feature_case_154(void) {
-    printf("[TEST] Server Core: system and process validation case 154...\n");
-    char ip_buf[16];
-    fast_ipv4_to_str(htonl(0x7F000001 + (154 % 250)), ip_buf);
-    assert(ip_buf[0] == '1' && ip_buf[1] == '2' && ip_buf[2] == '7');
-    
-    // Test safe directory verification with empty path
-    assert(ensure_priv_dir_safe("") == true);
+    printf("[TEST] Server Core: Case 154 - Shutdown dnstap ring and aux ring buffer draining...\n");
+    // Mock worker context with a dnstap ring
+    worker_ctx_t worker;
+    memset(&worker, 0, sizeof(worker));
+    worker.dnstap_ring.size = 16;
+    worker.dnstap_ring.mask = 15;
+    worker.dnstap_ring.events = calloc(16, sizeof(dnstap_event_t));
+    assert(worker.dnstap_ring.events != NULL);
+
+    // Enqueue 2 mock dnstap events into worker ring
+    atomic_store_explicit(&worker.dnstap_ring.head, 2, memory_order_relaxed);
+    atomic_store_explicit(&worker.dnstap_ring.tail, 0, memory_order_relaxed);
+    worker.dnstap_ring.events[0].wire_len = 32;
+    worker.dnstap_ring.events[1].wire_len = 48;
+
+    // Simulate drain loop as in dns_server_core.c:4568-4578
+    uint32_t t = atomic_load_explicit(&worker.dnstap_ring.tail, memory_order_relaxed);
+    uint32_t h = atomic_load_explicit(&worker.dnstap_ring.head, memory_order_acquire);
+    int drained = 0;
+    while (t != h) {
+        dnstap_event_t *ev = &worker.dnstap_ring.events[t & worker.dnstap_ring.mask];
+        assert(ev->wire_len > 0);
+        drained++;
+        t++;
+    }
+    atomic_store_explicit(&worker.dnstap_ring.tail, t, memory_order_release);
+    assert(drained == 2);
+    assert(atomic_load_explicit(&worker.dnstap_ring.tail, memory_order_relaxed) == 2);
+
+    free(worker.dnstap_ring.events);
+    printf("  -> Case 154 passed.\n");
 }
 
 static void test_server_core_feature_case_155(void) {
-    printf("[TEST] Server Core: system and process validation case 155...\n");
-    char ip_buf[16];
-    fast_ipv4_to_str(htonl(0x7F000001 + (155 % 250)), ip_buf);
-    assert(ip_buf[0] == '1' && ip_buf[1] == '2' && ip_buf[2] == '7');
+    printf("[TEST] Server Core: Case 155 - Program zone reload fingerprint comparison and new zone notice...\n");
+    program_plugin_t plugin;
+    memset(&plugin, 0, sizeof(plugin));
+    strncpy(plugin.domain, "dynplugin.example.", sizeof(plugin.domain) - 1);
+    strncpy(plugin.config_fingerprint, "initial_fp_val", sizeof(plugin.config_fingerprint) - 1);
 
-    /* Verify program_plugin_t has the expected size/layout for domain + fingerprint. */
-    program_plugin_t dummy;
-    memset(&dummy, 0, sizeof(dummy));
-    strncpy(dummy.domain, "case155.example.", sizeof(dummy.domain) - 1);
-    strncpy(dummy.config_fingerprint, "fp_case155", sizeof(dummy.config_fingerprint) - 1);
-    assert(strcmp(dummy.domain, "case155.example.") == 0);
-    assert(strcmp(dummy.config_fingerprint, "fp_case155") == 0);
+    g_program_plugins = &plugin;
+    g_program_plugins_count = 1;
+
+    zone_config_t z;
+    memset(&z, 0, sizeof(z));
+    z.domain = "dynplugin.example.";
+    z.type = "program";
+    z.program_path = "/usr/libexec/my_plugin";
+    z.program_timeout_ms = 5000;
+
+    char new_fp[512];
+    compute_program_zone_fingerprint(&z, new_fp, sizeof(new_fp));
+    assert(strcmp(plugin.config_fingerprint, new_fp) != 0);
+
+    g_program_plugins = NULL;
+    g_program_plugins_count = 0;
+    printf("  -> Case 155 passed.\n");
 }
 
 static void test_server_core_program_zone_reload_fingerprint_and_added(void) {

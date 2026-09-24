@@ -1,0 +1,41 @@
+$ORIGIN alltypes.test.
+$TTL 3600
+
+@   IN  SOA ns1.alltypes.test. admin.alltypes.test. (
+        2026090101 ; serial
+        7200       ; refresh
+        3600       ; retry
+        1209600    ; expire
+        300        ; minimum
+        )
+
+@       IN  NS      ns1.alltypes.test.
+ns1     IN  A       192.0.2.1
+ns1     IN  AAAA    2001:db8::1
+
+host-a      IN  A       192.0.2.10
+host-aaaa   IN  AAAA    2001:db8::10
+host-txt    IN  TXT     "v=spf1 -all"
+host-mx     IN  MX      10 mail.alltypes.test.
+mail        IN  A       192.0.2.25
+host-cname  IN  CNAME   host-a.alltypes.test.
+host-ptr    IN  PTR     target.alltypes.test.
+host-srv    IN  SRV     0 5 5060 sip.alltypes.test.
+sip         IN  A       192.0.2.50
+host-caa    IN  CAA     0 issue "letsencrypt.org"
+host-naptr  IN  NAPTR   100 10 "U" "E2U+sip" "!^.*$!sip:info@alltypes.test!" .
+host-sshfp  IN  SSHFP   1 1 123456789abcdef67890123456789abcdef67890
+host-tlsa   IN  TLSA    3 1 1 d2ab16567042b3b0f3def420a2f47c00572b89657b42074ec6f66b622fbc7878
+host-svcb   IN  SVCB    1 svc.alltypes.test. port=8080
+host-https  IN  HTTPS   1 https.alltypes.test. alpn=h2,h3
+host-hinfo  IN  HINFO   "PC-Intel" "FreeBSD"
+host-rp     IN  RP      admin.alltypes.test. txt-rp.alltypes.test.
+txt-rp      IN  TXT     "Administrator contact"
+host-afsdb  IN  AFSDB   1 afs.alltypes.test.
+afs         IN  A       192.0.2.80
+host-loc    IN  LOC     52 22 23.000 N 4 53 32.000 E -2.00m 100.00m 10000m 10m
+host-spf    IN  SPF     "v=spf1 a -all"
+host-uri    IN  URI     10 1 "https://alltypes.test/service"
+host-cert   IN  CERT    1 0 0 dGVzdGNlcnRkYXRh
+host-kx     IN  KX      10 mail.alltypes.test.
+host-dname  IN  DNAME   target-dname.alltypes.test.

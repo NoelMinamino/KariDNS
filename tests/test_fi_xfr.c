@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <signal.h>
 #include "fi/kari_fi.h"
 #include "../dns_wire.h"
 #include "../dns_zone_parser.h"
@@ -106,10 +107,53 @@ static void test_fi_soa_serial_bump(void) {
     zone_arena_destroy(&arena);
 }
 
+static void test_fi_axfr_send_and_recv(void) {
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "fixfr.example.", .is_standalone_mode = true, .err_out = &err };
+    char zone_text[] = "fixfr.example. 3600 IN SOA ns1.fixfr.example. admin.fixfr.example. 100 3600 1800 604800 86400\n"
+                       "fixfr.example. 3600 IN NS ns1.fixfr.example.\n"
+                       "ns1.fixfr.example. 300 IN A 192.0.2.1\n";
+    parse_zone_fast(zone_text, sizeof(zone_text) - 1, &arena, &ctx);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "fixfr.example.", sizeof(entry.domain));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+
+    uint8_t req[256] = {0};
+    req[0] = 0x12; req[1] = 0x34;
+    req[4] = 0; req[5] = 1;
+    size_t qoff = 12;
+    qoff += write_uncompressed_name(req, qoff, sizeof(req), "fixfr.example.");
+    req[qoff++] = 0; req[qoff++] = 252; // AXFR
+    req[qoff++] = 0; req[qoff++] = 1;
+
+    FI_SWEEP_KIND(FI_SEND, {
+        send_axfr_response(1, "fixfr.example.", req, qoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    });
+
+    FI_SWEEP_KIND(FI_WRITE, {
+        send_axfr_response(1, "fixfr.example.", req, qoff, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    });
+
+    pthread_mutex_destroy(&entry.writer_lock);
+    pthread_mutex_destroy(&entry.ixfr_history.lock);
+    zone_arena_destroy(&arena);
+}
+
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     printf("[*] Running test_fi_xfr...\n");
     test_fi_xfr_parsing();
     test_fi_soa_serial_bump();
+    test_fi_axfr_send_and_recv();
     printf("[+] test_fi_xfr passed successfully.\n");
     return 0;
 }

@@ -69,6 +69,11 @@ zone "chain.test" {
     type master;
     file "${ROOT_DIR}/tests/matrix/zones/cname_chain.zone";
 };
+
+zone "alltypes.test" {
+    type master;
+    file "${ROOT_DIR}/tests/matrix/zones/all_types.zone";
+};
 EOF
 
 # Start server

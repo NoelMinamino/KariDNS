@@ -15,16 +15,24 @@ extern "C" {
 typedef enum {
     FI_ALLOC = 0,      // malloc, calloc, realloc, strdup, strndup, posix_memalign
     FI_OPEN,           // open, openat, fopen
-    FI_READ,           // read, recv
-    FI_WRITE,          // write, send, sendto
+    FI_READ,           // read
+    FI_WRITE,          // write
+    FI_SEND,           // send, sendto
+    FI_RECV,           // recv, recvfrom
+    FI_CLOSE,          // close
+    FI_PIPE,           // pipe
+    FI_FORK,           // fork
+    FI_EXECV,          // execv, execvp, execve
     FI_SOCKET,         // socket
     FI_BIND,           // bind
     FI_LISTEN,         // listen
     FI_ACCEPT,         // accept
     FI_CONNECT,        // connect
+    FI_GETSOCKNAME,    // getsockname
     FI_FCNTL,          // fcntl
     FI_SETSOCKOPT,     // setsockopt
     FI_KEVENT,         // kevent
+    FI_POLL,           // poll, select
     FI_RENAME,         // rename
     FI_MKDIR,          // mkdir
     FI_GETADDRINFO,    // getaddrinfo
@@ -39,6 +47,7 @@ typedef enum {
 void     fi_reset(void);
 void     fi_arm_nth(fi_kind_t k, unsigned n);
 void     fi_arm_nth_errno(fi_kind_t k, unsigned n, int err_code);
+void     fi_arm_short(fi_kind_t k, unsigned n, size_t max_bytes);
 unsigned fi_count(fi_kind_t k);
 int      fi_fired(void);
 int      fi_fired_kind(fi_kind_t k);
@@ -60,6 +69,18 @@ void     fi_reset_time(void);
     } } while (0)
 
 #define FI_SWEEP(...) FI_SWEEP_KIND(FI_ALLOC, __VA_ARGS__)
+
+#define FI_SWEEP_ERRNO(kind, errno_list, ...) do {                     \
+    static const int elist_[] = errno_list;                            \
+    size_t elen_ = sizeof(elist_) / sizeof(elist_[0]);                 \
+    for (size_t ei_ = 0; ei_ < elen_; ei_++) {                         \
+        fi_reset(); do { __VA_ARGS__ } while (0);                      \
+        unsigned total_ = fi_count(kind);                              \
+        for (unsigned n_ = 1; n_ <= total_; n_++) {                    \
+            fi_reset(); fi_arm_nth_errno(kind, n_, elist_[ei_]);       \
+            do { __VA_ARGS__ } while (0);                              \
+        }                                                              \
+    } } while (0)
 
 #ifdef __cplusplus
 }
