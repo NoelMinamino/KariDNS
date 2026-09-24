@@ -71,7 +71,6 @@ typedef struct {
 // 定数 (dns_server_core.c から移動)
 // ============================================================================
 #define MAX_RDATA 48
-#define MAX_JUMPS 16
 #define COMPRESS_HASH_SIZE 4096
 #define COMPRESS_HASH_MASK (COMPRESS_HASH_SIZE - 1)
 #define MAX_PROBE_DEPTH 8

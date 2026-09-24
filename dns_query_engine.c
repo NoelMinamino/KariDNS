@@ -1956,10 +1956,11 @@ STATIC_TEST uint32_t remaining_ms(int64_t deadline) {
 
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap) {
   size_t pos = 0;
-  pos += (size_t)snprintf(out + pos, out_cap - pos, "path=%s|user=%s|timeout=%u|maxfail=%u|args=",
+  pos += (size_t)snprintf(out + pos, out_cap - pos, "path=%s|user=%s|timeout=%u|maxfail=%u|disable_tc=%d|args=",
                           z->program_path ? z->program_path : "",
                           z->program_user ? z->program_user : "",
-                          z->program_timeout_ms, z->program_max_failures);
+                          z->program_timeout_ms, z->program_max_failures,
+                          z->disable_auto_tc_flag ? 1 : 0);
   for (int i = 0; i < z->program_args_count && pos < out_cap; i++) {
     pos += (size_t)snprintf(out + pos, out_cap - pos, "%s;", z->program_args[i]);
   }
@@ -2079,19 +2080,32 @@ STATIC_TEST int dispatch_to_program_zone(const char *domain, const uint8_t *req,
   if (ok) {
     uint8_t resp_len_prefix[2];
     if (read_all_timeout(plugin->stdout_fd, resp_len_prefix, 2, remaining_ms(deadline)) == 2) {
-      uint16_t resp_len = (resp_len_prefix[0] << 8) | resp_len_prefix[1];
+      uint32_t resp_len = ((uint32_t)resp_len_prefix[0] << 8) | resp_len_prefix[1];
       if (resp_len == 0) {
         result_len = 0; // 意図的な無応答
         ok = true;
-      } else if (resp_len <= max_res_len) {
-        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == resp_len) {
+      } else if (resp_len > 65535) {
+        syslog(LOG_ERR, "[Plugin] zone '%s' returned response > 65535 bytes (%u); rejecting with SERVFAIL",
+               domain, (unsigned int)resp_len);
+        ok = false;
+      } else if (plugin->disable_auto_tc_flag) {
+        // disable-auto-tc-flag yes (default): do not truncate or force TC=1; send full response as-is (up to 65535)
+        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
           result_len = (int)resp_len;
+          ok = true;
+        } else {
+          ok = false;
+        }
+      } else if (resp_len <= max_res_len) {
+        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
+          result_len = (int)resp_len;
+          ok = true;
         } else {
           ok = false;
         }
       } else {
         syslog(LOG_INFO, "[Plugin] zone '%s' returned oversized response (%u > %zu); truncating with TC=1",
-               domain, resp_len, max_res_len);
+               domain, (unsigned int)resp_len, max_res_len);
         /* 最初の max_res_len 分を res に読み込み、残りを読み捨ててパイプの同期を保つ。
          * 共有締切の残り時間を使うため、宣言長がどれだけ大きくても合計の待ち時間は plugin->timeout_ms を超えない。 */
         size_t first_chunk = max_res_len;
@@ -2424,6 +2438,7 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
   pthread_mutex_init(&out->lock, NULL);
   out->timeout_ms = zcfg->program_timeout_ms > 0 ? zcfg->program_timeout_ms : 2000;
   out->max_failures = zcfg->program_max_failures > 0 ? zcfg->program_max_failures : 5;
+  out->disable_auto_tc_flag = zcfg->disable_auto_tc_flag;
   compute_program_zone_fingerprint(zcfg, out->config_fingerprint, sizeof(out->config_fingerprint));
   atomic_init(&out->consecutive_failures, 0);
   atomic_init(&out->dead, false);

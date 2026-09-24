@@ -203,8 +203,42 @@ run_suite_for_tool() {
         "compression-bad-bits.anomaly.test" "A" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Deep 60-hop pointer compression chain" \
         "compression-deep-chain.anomaly.test" "A" "" "(192\.0\.2\.1|malformed|bad packet|error)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 16 hops" \
+        "ptr-chain-16.anomaly.test" "NULL" "" "(Pointer chain|ANSWER)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 17 hops" \
+        "ptr-chain-17.anomaly.test" "NULL" "" "(Pointer chain|ANSWER)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 1024 hops" \
+        "ptr-chain-1024.anomaly.test" "NULL" "" "(Pointer chain|ANSWER)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain 8192 hops" \
+        "ptr-chain-8192.anomaly.test" "NULL" "" "(Pointer chain|ANSWER)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Pointer chain exceeding 255-octet name limit" \
+        "ptr-chain-name-overflow.anomaly.test" "NULL" "" "(malformed|bad packet|error)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Misaligned pointer target into middle of compression tag" \
+        "compression-misaligned.anomaly.test" "NULL" "" "(malformed|bad packet|error)"
     run_single_test "$TOOL_NAME" "$TOOL_PATH" "Unclosed/unterminated label" \
         "unclosed-label.anomaly.test" "A" "" "(malformed|bad packet|error)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Label length overflow (> 63 octets)" \
+        "label-overflow.anomaly.test" "A" "" "(malformed|bad packet|error)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Label length exactly 64 octets (RFC 1035 violation)" \
+        "label-64.anomaly.test" "A" "" "(malformed|bad packet|error)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Null byte in label content" \
+        "null-byte-in-label.anomaly.test" "A" "" "(null|malformed|bad packet|192\.0\.2\.1)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Case 0x20 bit mismatch in QNAME echo" \
+        "case-0x20-mismatch.anomaly.test" "A" "" "(192\.0\.2\.1|mismatch|bad packet)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Class mismatch in answer section (CH instead of IN)" \
+        "class-mismatch.anomaly.test" "A" "" "(CH|IN|192\.0\.2\.1|malformed|bad packet)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Meta-type (ANY) returned in answer section" \
+        "meta-type-in-answer.anomaly.test" "ANY" "" "(ANY|malformed|bad packet)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Mutual DNAME redirection loop" \
+        "dname-loop.anomaly.test" "A" "" "(DNAME|loop|malformed|bad packet|error)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "DNAME synthesized name exceeding 255 bytes" \
+        "dname-overflow.anomaly.test" "A" "" "(DNAME|malformed|bad packet|error)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "EDNS bufsize exceeded without TC flag" \
+        "edns-bufsize-exceeded.anomaly.test" "TXT" "" "(192\.0\.2\.1|Large response|ANSWER|flags:.*tc|Truncated)"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "what-is-my-ip test query" \
+        "what-is-my-ip.anomaly.test" "TXT" "" "127\.0\.0\.1"
+    run_single_test "$TOOL_NAME" "$TOOL_PATH" "Large TCP response 8192 bytes" \
+        "tcp-size-8192.anomaly.test" "NULL" "+tcp" "(ANSWER|192\.0\.2\.1|8192)"
 
     # Section 4: Section Count & Record Semantics
     printf "${BOLD}[4. Section Count & Record Semantics]${NC}\n"

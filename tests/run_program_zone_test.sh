@@ -107,6 +107,25 @@ zone "brokentest.example." {
     $PROG_USER_OPT
     program-timeout 2000;
     program-max-failures 5;
+    # default disable-auto-tc-flag no (auto-TC active)
+};
+
+zone "notc.example." {
+    type program;
+    program "$PLUGIN_SCRIPT";
+    $PROG_USER_OPT
+    program-timeout 2000;
+    program-max-failures 5;
+    disable-auto-tc-flag yes;
+};
+
+zone "autotc.example." {
+    type program;
+    program "$PLUGIN_SCRIPT";
+    $PROG_USER_OPT
+    program-timeout 2000;
+    program-max-failures 5;
+    disable-auto-tc-flag no;
 };
 EOF
 
@@ -125,9 +144,19 @@ run_check "Query with truncated RDATA is handled without server crash" \
     "$DAG @127.0.0.1 -p $PORT trunc-rdata.brokentest.example A +timeout=2 +tries=1" \
     "ANSWER: 1"
 
-# Test oversized response (>1232 bytes) with UDP (should return TC bit and truncate safely)
-run_check "Oversized query via UDP returns TC bit" \
+# Test oversized response (>1232 bytes) with UDP when disable-auto-tc-flag is default (no) - should return TC bit
+run_check "Oversized query via UDP with default disable-auto-tc-flag (no) returns TC bit" \
     "$DAG @127.0.0.1 -p $PORT oversized.brokentest.example TXT +ignore +timeout=2 +tries=1" \
+    "flags:.*tc"
+
+# Test oversized response (>1232 bytes) with UDP when disable-auto-tc-flag is yes - should NOT have TC bit and return full answer
+run_check "Oversized query via UDP with disable-auto-tc-flag yes returns full response without TC" \
+    "$DAG @127.0.0.1 -p $PORT oversized.notc.example TXT +timeout=2 +tries=1" \
+    "ANSWER: 10"
+
+# Test oversized response (>1232 bytes) with UDP when disable-auto-tc-flag is no - should return TC bit
+run_check "Oversized query via UDP with disable-auto-tc-flag no returns TC bit" \
+    "$DAG @127.0.0.1 -p $PORT oversized.autotc.example TXT +ignore +timeout=2 +tries=1" \
     "flags:.*tc"
 
 # Test oversized response via TCP (should return full 10 TXT records)

@@ -64,14 +64,12 @@ void compress_ctx_init_packet(compress_ctx_t *ctx) {
 static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, const uint8_t *name) {
     const uint8_t *p = packet_buf + offset;
     const uint8_t *n = name;
-    int jump_count = 0;
 
     while (*n != 0) {
         // パケット側が圧縮ポインタの場合はジャンプ
         if ((*p & 0xC0) == 0xC0) {
-            if (++jump_count > MAX_JUMPS) return false;
             uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
-            // 無限ループや未来へのジャンプを防止
+            // 無限ループや未来へのジャンプを防止 (オフセットが真に減少すること)
             if (next_offset >= offset) return false;
             offset = next_offset;
             p = packet_buf + offset;
@@ -95,9 +93,7 @@ static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, con
     }
 
     // name 側が終端(0)に達した場合、パケット側も最終的に 0 に到達しなければならない
-    jump_count = 0;
     while ((*p & 0xC0) == 0xC0) {
-        if (++jump_count > MAX_JUMPS) return false;
         uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
         if (next_offset >= offset) return false;
         offset = next_offset;
@@ -271,8 +267,13 @@ int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) 
 }
 
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset) {
-    size_t p = current_offset; int jump_count = 0; bool jumped = false; size_t jumped_offset = 0;
-    uint16_t visited[MAX_JUMPS];
+    if (!packet || current_offset >= packet_len) return -1;
+    size_t p = current_offset; bool jumped = false; size_t jumped_offset = 0;
+    uint64_t visited[(65536 + 63) / 64];
+    size_t words_to_clear = (packet_len + 63) / 64;
+    if (words_to_clear > (65536 + 63) / 64) words_to_clear = (65536 + 63) / 64;
+    memset(visited, 0, words_to_clear * sizeof(uint64_t));
+
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t raw = packet[p];
@@ -280,12 +281,10 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
         if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
             uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
+            if (ptr >= packet_len) return -1;
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
-            if (jump_count >= MAX_JUMPS) return -1;
-            for (int i = 0; i < jump_count; i++) {
-                if (visited[i] == ptr) return -1;
-            }
-            visited[jump_count++] = ptr;
+            if (visited[ptr / 64] & (1ULL << (ptr % 64))) return -1;
+            visited[ptr / 64] |= (1ULL << (ptr % 64));
             p = ptr; continue;
         } else if (label_type == 0x00) {
             uint8_t len = raw;
@@ -300,8 +299,13 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
 }
 
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
-    size_t p = current_offset, jumped_offset = 0; bool jumped = false; int jump_count = 0;
-    uint16_t visited[MAX_JUMPS];
+    if (!packet || current_offset >= packet_len) return -1;
+    size_t p = current_offset, jumped_offset = 0; bool jumped = false;
+    uint64_t visited[(65536 + 63) / 64];
+    size_t words_to_clear = (packet_len + 63) / 64;
+    if (words_to_clear > (65536 + 63) / 64) words_to_clear = (65536 + 63) / 64;
+    memset(visited, 0, words_to_clear * sizeof(uint64_t));
+
     char buf[1025]; size_t written = 0;
     size_t total_wire_len = 0;
     while (1) {
@@ -312,12 +316,10 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
         if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
             uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
+            if (ptr >= packet_len) return -1;
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
-            if (jump_count >= MAX_JUMPS) return -1;
-            for (int i = 0; i < jump_count; i++) {
-                if (visited[i] == ptr) return -1;
-            }
-            visited[jump_count++] = ptr;
+            if (visited[ptr / 64] & (1ULL << (ptr % 64))) return -1;
+            visited[ptr / 64] |= (1ULL << (ptr % 64));
             p = ptr; continue;
         } else if (label_type == 0x00) {
             len = raw;
@@ -378,7 +380,8 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
     char *dst = arena_alloc(arena, written);
     if (!dst) return -1;
     memcpy(dst, buf, written);
-    *name_out = dst; return 0;
+    if (name_out) *name_out = dst;
+    return 0;
 }
 
 const char *get_type_str(uint16_t type, zone_arena_t *arena) {

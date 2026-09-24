@@ -97,6 +97,9 @@ typedef struct zone_config {
   additional_from_auth_t additional_from_auth;
   bool additional_from_auth_specified;
 
+  /* --- disable-auto-tc-flag (ゾーン単位の上書き: 既定 no) --- */
+  bool disable_auto_tc_flag;
+
   struct zone_config *next;
 } zone_config_t;
 

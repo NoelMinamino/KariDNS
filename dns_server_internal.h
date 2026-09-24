@@ -90,7 +90,7 @@ typedef struct {
 } udp_ipc_t;
 
 #define UDP_BATCH_SIZE 16
-#define UDP_IPC_BUFFER_SIZE (sizeof(udp_ipc_t) + BUFFER_SIZE)
+#define UDP_IPC_BUFFER_SIZE (sizeof(udp_ipc_t) + 65535)
 
 // ワーカーローカル用 UDPバッチコンテキスト (ヒープ保持)
 typedef struct {
@@ -343,6 +343,7 @@ typedef struct program_plugin {
   pthread_mutex_t lock;    /* 1子プロセスを複数workerから同時に叩かないための直列化 */
   uint32_t timeout_ms;
   uint32_t max_failures;
+  bool disable_auto_tc_flag;
   _Atomic unsigned int consecutive_failures;
   _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
   char config_fingerprint[512]; /* M-4: reload時の設定変更検知用 */

@@ -2139,8 +2139,68 @@ static void test_wire_feature_case_40(void) {
     CHECK(dns_type_to_string(40) != NULL);
 }
 
+static void test_deep_pointer_chains_and_cycles(void) {
+    printf("[TEST] Wire: deep pointer chains (8192 hops) and cycle rejection...\n");
+    zone_arena_t arena = {0};
+    zone_arena_init(&arena);
+
+    // 1. 100 hops pointer chain to "deep.example.com."
+    uint8_t pkt100[1024];
+    memset(pkt100, 0, sizeof(pkt100));
+    static const uint8_t target_name[] = { 4, 'd', 'e', 'e', 'p', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+    memcpy(pkt100, target_name, sizeof(target_name));
+    size_t cur_off = sizeof(target_name);
+    for (int i = 0; i < 100; i++) {
+        uint16_t prev_off = (i == 0) ? 0 : (uint16_t)(cur_off - 2);
+        pkt100[cur_off] = 0xC0 | (uint8_t)(prev_off >> 8);
+        pkt100[cur_off + 1] = (uint8_t)(prev_off & 0xFF);
+        cur_off += 2;
+    }
+    size_t start_100 = cur_off - 2;
+    size_t next_off = 0;
+    CHECK(skip_wire_name(pkt100, cur_off, start_100, &next_off) == 0);
+    CHECK(next_off == start_100 + 2);
+
+    char *name_out = NULL;
+    CHECK(expand_wire_name(pkt100, cur_off, start_100, &next_off, &arena, &name_out) == 0);
+    CHECK(next_off == start_100 + 2);
+    CHECK_STR(name_out, "deep.example.com.");
+
+    // 2. 8192 hops pointer chain to root (.)
+    size_t num_hops = 8192;
+    size_t pkt_size = 2 + num_hops * 2;
+    uint8_t *pkt8192 = malloc(pkt_size);
+    CHECK(pkt8192 != NULL);
+    if (pkt8192) {
+        pkt8192[0] = 0;
+        pkt8192[1] = 0;
+        for (size_t i = 1; i <= num_hops; i++) {
+            uint16_t prev = (i == 1) ? 0 : (uint16_t)(2 * (i - 1));
+            pkt8192[2 * i] = 0xC0 | (uint8_t)(prev >> 8);
+            pkt8192[2 * i + 1] = (uint8_t)(prev & 0xFF);
+        }
+        size_t start_8192 = num_hops * 2;
+        CHECK(skip_wire_name(pkt8192, pkt_size, start_8192, &next_off) == 0);
+        CHECK(next_off == start_8192 + 2);
+
+        name_out = NULL;
+        CHECK(expand_wire_name(pkt8192, pkt_size, start_8192, &next_off, &arena, &name_out) == 0);
+        CHECK(next_off == start_8192 + 2);
+        CHECK_STR(name_out, ".");
+
+        // 3. Cycle in 8192 chain (make offset 0 point to offset 100)
+        pkt8192[0] = 0xC0;
+        pkt8192[1] = 100;
+        CHECK(skip_wire_name(pkt8192, pkt_size, start_8192, &next_off) == -1);
+        CHECK(expand_wire_name(pkt8192, pkt_size, start_8192, &next_off, &arena, &name_out) == -1);
+
+        free(pkt8192);
+    }
+}
+
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
+    test_deep_pointer_chains_and_cycles();
     test_type_to_string();
     test_strchr_unescaped();
     test_split_path();

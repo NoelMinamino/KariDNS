@@ -1201,6 +1201,7 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     if (ctx) ctx->error_occurred = true;
     return -1;
   }
+  zone->disable_auto_tc_flag = false; // default no
   zone->domain = tok.value;
   tok.value = NULL;
   free_token(&tok);
@@ -1460,6 +1461,35 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       else {
         syslog(LOG_WARNING, "[Config] zone '%s': Unknown additional-from-auth value '%s', defaulting to yes", zone->domain, tok.value);
         zone->additional_from_auth = ADDITIONAL_AUTH_YES;
+      }
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_SEMICOLON) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      free_token(&tok);
+    } else if (strcmp(key, "disable-auto-tc-flag") == 0) {
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) {
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
+      }
+      if (strcasecmp(tok.value, "yes") == 0 || strcasecmp(tok.value, "true") == 0) {
+        zone->disable_auto_tc_flag = true;
+      } else if (strcasecmp(tok.value, "no") == 0 || strcasecmp(tok.value, "false") == 0) {
+        zone->disable_auto_tc_flag = false;
+      } else {
+        syslog(LOG_ERR, "[Config] zone '%s': invalid disable-auto-tc-flag value '%s' (expected yes or no)", zone->domain, tok.value);
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        if (ctx) ctx->error_occurred = true;
+        return -1;
       }
       free_token(&tok);
       tok = get_next_token(ctx);

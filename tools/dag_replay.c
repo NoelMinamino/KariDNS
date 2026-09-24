@@ -514,11 +514,14 @@ static size_t expand_wire_name_buf(const uint8_t *pkt, size_t pkt_len, size_t of
     size_t cur = offset;
     size_t name_pos = 0;
     bool jumped = false;
-    int jumps = 0;
+    uint64_t visited[(65536 + 63) / 64];
+    size_t words_to_clear = (pkt_len + 63) / 64;
+    if (words_to_clear > (65536 + 63) / 64) words_to_clear = (65536 + 63) / 64;
+    memset(visited, 0, words_to_clear * sizeof(uint64_t));
 
     if (out_name && out_cap > 0) out_name[0] = '\0';
 
-    while (cur < pkt_len && jumps <= 32) {
+    while (cur < pkt_len) {
         uint8_t len = pkt[cur];
         if (len == 0) {
             if (!jumped && next_offset) {
@@ -545,8 +548,9 @@ static size_t expand_wire_name_buf(const uint8_t *pkt, size_t pkt_len, size_t of
                 if (next_offset) *next_offset = cur + 2;
                 jumped = true;
             }
+            if (visited[ptr / 64] & (1ULL << (ptr % 64))) return 0;
+            visited[ptr / 64] |= (1ULL << (ptr % 64));
             cur = ptr;
-            jumps++;
             continue;
         }
 
