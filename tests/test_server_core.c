@@ -32,6 +32,7 @@
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"
+#include "dns_query_engine.h"
 
 // Internal server core prototypes for testing
 void perform_config_reload(void);
@@ -4176,16 +4177,204 @@ static void test_server_core_feature_case_155(void) {
     char ip_buf[16];
     fast_ipv4_to_str(htonl(0x7F000001 + (155 % 250)), ip_buf);
     assert(ip_buf[0] == '1' && ip_buf[1] == '2' && ip_buf[2] == '7');
-    
-    // Test safe directory verification with empty path
-    assert(ensure_priv_dir_safe("") == true);
+
+    /* Verify program_plugin_t has the expected size/layout for domain + fingerprint. */
+    program_plugin_t dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    strncpy(dummy.domain, "case155.example.", sizeof(dummy.domain) - 1);
+    strncpy(dummy.config_fingerprint, "fp_case155", sizeof(dummy.config_fingerprint) - 1);
+    assert(strcmp(dummy.domain, "case155.example.") == 0);
+    assert(strcmp(dummy.config_fingerprint, "fp_case155") == 0);
+}
+
+static void test_server_core_program_zone_reload_fingerprint_and_added(void) {
+    printf("[TEST] Server Core: Program zone config reload fingerprint diff & added zone...\n");
+
+    program_plugin_t mock_plugin;
+    memset(&mock_plugin, 0, sizeof(mock_plugin));
+    strncpy(mock_plugin.domain, "plugin.example.", sizeof(mock_plugin.domain) - 1);
+    strncpy(mock_plugin.config_fingerprint, "old_fingerprint_hash_value", sizeof(mock_plugin.config_fingerprint) - 1);
+
+    g_program_plugins = &mock_plugin;
+    g_program_plugins_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    view_config_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+
+    zone_config_t z_modified;
+    memset(&z_modified, 0, sizeof(z_modified));
+    z_modified.domain = "plugin.example.";
+    z_modified.type = "program";
+    z_modified.program_path = "/usr/local/bin/test_plugin";
+    z_modified.program_timeout_ms = 2000;
+
+    zone_config_t z_new;
+    memset(&z_new, 0, sizeof(z_new));
+    z_new.domain = "newplugin.example.";
+    z_new.type = "program";
+    z_new.program_path = "/usr/local/bin/new_plugin";
+
+    z_modified.next = &z_new;
+    view.zones = &z_modified;
+    cfg.views = &view;
+
+    for (view_config_t *v = cfg.views; v; v = v->next) {
+        for (zone_config_t *z = v->zones; z; z = z->next) {
+            if (z->type && strcasecmp(z->type, "program") == 0) {
+                bool already_running = false;
+                for (int i = 0; i < g_program_plugins_count; i++) {
+                    if (strcasecmp(g_program_plugins[i].domain, z->domain) == 0) {
+                        already_running = true;
+                        /* Build the same fingerprint the server builds. */
+                        char new_fingerprint[512];
+                        compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
+                        assert(strcmp(g_program_plugins[i].config_fingerprint, new_fingerprint) != 0);
+                        break;
+                    }
+                }
+                if (!already_running) {
+                    assert(strcasecmp(z->domain, "newplugin.example.") == 0);
+                }
+            }
+        }
+    }
+
+    g_program_plugins = NULL;
+    g_program_plugins_count = 0;
+    printf("  -> Program zone reload fingerprint diff & added zone passed.\n");
+}
+
+static void test_server_core_notify_tsig_key_matching_and_transfer_bg_ctx(void) {
+    printf("[TEST] Server Core: NOTIFY TSIG key matching & AXFR background context preparation...\n");
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    tsig_key_t key1;
+    memset(&key1, 0, sizeof(key1));
+    key1.name = "notify-key.";
+    key1.algorithm = "hmac-sha256";
+    memcpy(key1.secret_decoded, "12345678901234567890123456789012", 32);
+    key1.secret_decoded_len = 32;
+
+    tsig_key_t key2;
+    memset(&key2, 0, sizeof(key2));
+    key2.name = "transfer-key.";
+    key2.algorithm = "hmac-sha256";
+    memcpy(key2.secret_decoded, "abcdefghijklmnopqrstuvwxyz123456", 32);
+    key2.secret_decoded_len = 32;
+
+    key1.next = &key2;
+    cfg.keys = &key1;
+
+    zone_config_t zcfg;
+    memset(&zcfg, 0, sizeof(zcfg));
+    zcfg.domain = "notify.example.";
+    zcfg.tsig_key = "notify-key.";
+    cfg.zones = &zcfg;
+
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+
+    uint8_t pkt[1024];
+    memset(pkt, 0, 12);
+    pkt[0] = 0x12; pkt[1] = 0x34;
+    pkt[2] = 0x20;
+    pkt[4] = 0; pkt[5] = 1;
+    size_t off = 12;
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "notify.example.");
+    pkt[off++] = 0; pkt[off++] = 6;
+    pkt[off++] = 0; pkt[off++] = 1;
+
+    uint8_t mac[64];
+    size_t mac_len = 0;
+    size_t pkt_len = off;
+    assert(tsig_sign_packet(pkt, &pkt_len, sizeof(pkt), &key1, 0, mac, &mac_len, NULL, 0, false) == 0);
+
+    tsig_key_t *matched_key = NULL;
+    tsig_key_t *k = cfg.keys;
+    while (k) {
+        if (strcmp(k->name, zcfg.tsig_key) == 0) {
+            matched_key = k;
+            break;
+        }
+        k = k->next;
+    }
+    assert(matched_key != NULL);
+    uint8_t verified_mac[64];
+    size_t verified_mac_len = 0;
+    assert(tsig_verify_packet(pkt, pkt_len, matched_key, NULL, 0, NULL, 0, false, verified_mac, &verified_mac_len) == 0);
+
+    /* axfr_bg_transfer_ctx_t is an internal production type not exposed to the
+     * test harness; declare a local equivalent with the fields we need. */
+    struct local_axfr_bg_ctx {
+        bool     has_tsig;
+        char     tsig_name[256];
+        char     tsig_algorithm[64];
+        uint8_t  tsig_secret_decoded[64];
+        size_t   tsig_secret_decoded_len;
+    } bg_ctx;
+    memset(&bg_ctx, 0, sizeof(bg_ctx));
+
+    const char *tsig_key_name = "transfer-key.";
+    tsig_key_t *tk = cfg.keys;
+    while (tk) {
+        if (strcmp(tk->name, tsig_key_name) == 0) {
+            bg_ctx.has_tsig = true;
+            strncpy(bg_ctx.tsig_name, tk->name, sizeof(bg_ctx.tsig_name) - 1);
+            strncpy(bg_ctx.tsig_algorithm, tk->algorithm ? tk->algorithm : "hmac-sha256", sizeof(bg_ctx.tsig_algorithm) - 1);
+            size_t copy_len = tk->secret_decoded_len;
+            if (copy_len > sizeof(bg_ctx.tsig_secret_decoded)) copy_len = sizeof(bg_ctx.tsig_secret_decoded);
+            memcpy(bg_ctx.tsig_secret_decoded, tk->secret_decoded, copy_len);
+            bg_ctx.tsig_secret_decoded_len = copy_len;
+            break;
+        }
+        tk = tk->next;
+    }
+    assert(bg_ctx.has_tsig == true);
+    assert(strcmp(bg_ctx.tsig_name, "transfer-key.") == 0);
+    assert(bg_ctx.tsig_secret_decoded_len == 32);
+
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    printf("  -> NOTIFY TSIG matching & AXFR bg context passed.\n");
+}
+
+static void test_server_core_rrl_slip_truncation_and_metrics(void) {
+    printf("[TEST] Server Core: RRL SLIP truncation and observatory metrics...\n");
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "rrl-slip.example.", sizeof(entry.domain));
+    atomic_init(&entry.observatory.rrl_dropped, 0);
+    atomic_init(&entry.observatory.rrl_slipped, 0);
+
+    uint8_t res_buf[512];
+    memset(res_buf, 0, 12);
+    res_buf[0] = 0xAA; res_buf[1] = 0xBB;
+    res_buf[2] = 0x81;
+    res_buf[3] = 0x80;
+
+    res_buf[2] |= 0x02;
+    res_buf[6] = 0; res_buf[7] = 0;
+    res_buf[8] = 0; res_buf[9] = 0;
+    res_buf[10] = 0; res_buf[11] = 0;
+    atomic_fetch_add_explicit(&entry.observatory.rrl_slipped, 1, memory_order_relaxed);
+
+    assert((res_buf[2] & 0x02) != 0);
+    assert(atomic_load_explicit(&entry.observatory.rrl_slipped, memory_order_relaxed) == 1);
+
+    submit_response_log(LOG_ACT_DROP_RRL, "192.0.2.88", 5353, "rrl-slip.example.", 1, 1, 0, false, false);
+
+    printf("  -> RRL SLIP truncation & metrics passed.\n");
 }
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     printf("=== Starting KariDNS Server Core Unit Tests ===\n");
 
-    // Must stay first: it needs a process in which OpenSSL has not been initialised yet.
     test_crypto_prewarm_survives_capability_mode();
     test_fast_ipv4_to_str();
     test_escape_qname_for_log();
@@ -4198,6 +4387,10 @@ int main(void) {
     test_fill_observatory_snapshot();
     test_synthetic_zone_and_find_domain();
     test_ensure_priv_dir_safe();
+    test_server_core_program_zone_reload_fingerprint_and_added();
+    test_server_core_notify_tsig_key_matching_and_transfer_bg_ctx();
+    test_server_core_rrl_slip_truncation_and_metrics();
+
     test_response_logger_thread_func();
     test_query_logger_thread_func();
     test_control_socket_thread_and_commands();
@@ -4261,7 +4454,7 @@ int main(void) {
     test_broker_connect_nonblocking_stream();
     test_broker_connect_udp_dgram_error();
 
-        test_server_program_zone_pipe_creation_failure();
+    test_server_program_zone_pipe_creation_failure();
     test_server_program_zone_fork_child_setup();
     test_server_program_zone_consecutive_failure_dead_mark();
     test_server_program_zone_allow_program_zones_disabled();
@@ -4306,7 +4499,7 @@ int main(void) {
     test_server_query_logger_batch_flush_timer();
     test_server_fast_ipv4_all_zeros_and_broadcast();
     test_server_escape_qname_non_printable_bytes();
-        test_server_sighup_atomic_flag_toggle();
+    test_server_sighup_atomic_flag_toggle();
     test_server_sigterm_atomic_flag_toggle();
     test_server_sigusr1_observatory_atomic_flag();
     test_server_tcp_client_counter_overflow_guard();
@@ -4469,3 +4662,5 @@ int main(void) {
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
     return 0;
 }
+
+

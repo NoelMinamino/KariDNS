@@ -1,0 +1,1 @@
+-k tests/fixtures/tsig.key example.com AXFR +yaml

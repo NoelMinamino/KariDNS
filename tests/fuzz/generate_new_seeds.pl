@@ -184,4 +184,88 @@ make_path($dir_axfr);
     close $fh;
 }
 
+# ------------------------------------------------------------------------------
+# 4. corpus_fuzz_dag_replay_pcap_reader
+# ------------------------------------------------------------------------------
+my $dir_pcap = "$base/corpus_fuzz_dag_replay_pcap_reader";
+make_path($dir_pcap);
+
+{
+    # Ethernet + IPv4 + UDP + DNS Query
+    open my $fh, '>:raw', "$dir_pcap/seed_eth_udp_dns.raw" or die $!;
+    my $dns_msg = pack('n6', 0x1234, 0x0100, 1, 0, 0, 0) . wire_name("example.com") . pack('nn', 1, 1);
+    my $udp_hdr = pack('nnnn', 5353, 53, 8 + length($dns_msg), 0);
+    my $ip_len = 20 + length($udp_hdr) + length($dns_msg);
+    my $ip_hdr = pack('CCnnnCCnC4C4', 0x45, 0, $ip_len, 0x1234, 0x4000, 64, 17, 0, 192, 0, 2, 1, 192, 0, 2, 53);
+    my $eth_hdr = pack('C6C6n', (0x00, 0x11, 0x22, 0x33, 0x44, 0x55), (0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff), 0x0800);
+    print $fh $eth_hdr . $ip_hdr . $udp_hdr . $dns_msg;
+    close $fh;
+}
+
+{
+    # Raw IP + UDP + DNS Query
+    open my $fh, '>:raw', "$dir_pcap/seed_raw_udp_dns.raw" or die $!;
+    my $dns_msg = pack('n6', 0x9abc, 0x0100, 1, 0, 0, 0) . wire_name("test.net") . pack('nn', 15, 1);
+    my $udp_hdr = pack('nnnn', 5353, 53, 8 + length($dns_msg), 0);
+    my $ip_len = 20 + length($udp_hdr) + length($dns_msg);
+    my $ip_hdr = pack('CCnnnCCnC4C4', 0x45, 0, $ip_len, 0x9abc, 0x4000, 64, 17, 0, 192, 0, 2, 3, 192, 0, 2, 53);
+    print $fh $ip_hdr . $udp_hdr . $dns_msg;
+    close $fh;
+}
+
+# ------------------------------------------------------------------------------
+# 5. corpus_fuzz_dag_replay_diff
+# ------------------------------------------------------------------------------
+my $dir_diff = "$base/corpus_fuzz_dag_replay_diff";
+make_path($dir_diff);
+
+{
+    open my $fh, '>:raw', "$dir_diff/seed_diff_basic.raw" or die $!;
+    my $q = wire_name("example.com") . pack('nn', 1, 1);
+    my $ans1 = wire_name("example.com") . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+    my $ans2 = wire_name("example.com") . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 2);
+    my $msg1 = pack('n6', 0x1234, 0x8180, 1, 1, 0, 0) . $q . $ans1;
+    my $msg2 = pack('n6', 0x1234, 0x8180, 1, 1, 0, 0) . $q . $ans2;
+    print $fh pack('C', length($msg1)) . $msg1 . $msg2;
+    close $fh;
+}
+
+{
+    open my $fh, '>:raw', "$dir_diff/seed_diff_identical.raw" or die $!;
+    my $q = wire_name("example.com") . pack('nn', 28, 1);
+    my $ans = wire_name("example.com") . pack('nnNn', 28, 1, 3600, 16) . pack('H32', "20010db8000000000000000000000001");
+    my $msg = pack('n6', 0xabcd, 0x8180, 1, 1, 0, 0) . $q . $ans;
+    print $fh pack('C', length($msg)) . $msg . $msg;
+    close $fh;
+}
+
+# ------------------------------------------------------------------------------
+# 6. corpus_fuzz_dag_tcp_reassembly
+# ------------------------------------------------------------------------------
+my $dir_reasm = "$base/corpus_fuzz_dag_tcp_reassembly";
+make_path($dir_reasm);
+
+{
+    open my $fh, '>:raw', "$dir_reasm/seed_tcp_reasm_inorder.raw" or die $!;
+    my $dns_msg = pack('n6', 0x1234, 0x0100, 1, 0, 0, 0) . wire_name("example.com") . pack('nn', 1, 1);
+    my $tcp_payload = pack('n', length($dns_msg)) . $dns_msg;
+    my $seg = pack('CNn', 0, 1000, length($tcp_payload)) . $tcp_payload;
+    print $fh $seg;
+    close $fh;
+}
+
+{
+    open my $fh, '>:raw', "$dir_reasm/seed_tcp_reasm_multi_seg.raw" or die $!;
+    my $dns_msg = pack('n6', 0x5678, 0x8180, 1, 1, 0, 0) . wire_name("example.com") . pack('nn', 1, 1) .
+                  wire_name("example.com") . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+    my $tcp_payload = pack('n', length($dns_msg)) . $dns_msg;
+    my $half = int(length($tcp_payload) / 2);
+    my $p1 = substr($tcp_payload, 0, $half);
+    my $p2 = substr($tcp_payload, $half);
+    my $seg1 = pack('CNn', 1, 2000, length($p1)) . $p1;
+    my $seg2 = pack('CNn', 1, 2000 + $half, length($p2)) . $p2;
+    print $fh $seg1 . $seg2;
+    close $fh;
+}
+
 print "[+] Seed corpus generation complete.\n";

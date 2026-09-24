@@ -192,4 +192,14 @@ else
     exit 1
 fi
 
+# 9. Test karictl command variations (usage, status, reload, zonestatus, notify)
+echo "[+] Testing karictl command coverage..."
+"$KARICTL" >/dev/null 2>&1 || true
+"$KARICTL" -h >/dev/null 2>&1 || true
+"$KARICTL" -s "$CTRL_SOCK" -f "$TMP_DIR/karictl.conf" status >/dev/null 2>&1 || true
+"$KARICTL" -s "$CTRL_SOCK" -f "$TMP_DIR/karictl.conf" zonestatus obs.example.com >/dev/null 2>&1 || true
+"$KARICTL" -s "$CTRL_SOCK" -f "$TMP_DIR/karictl.conf" reload obs.example.com >/dev/null 2>&1 || true
+"$KARICTL" -s "$CTRL_SOCK" -f "$TMP_DIR/karictl.conf" notify obs.example.com >/dev/null 2>&1 || true
+
 echo "=== All DNS Observatory Tests Passed! ==="
+

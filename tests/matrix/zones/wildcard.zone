@@ -1,0 +1,13 @@
+$ORIGIN wildcard.test.
+$TTL 3600
+wildcard.test. IN SOA ns1.wildcard.test. hostmaster.wildcard.test. 1 7200 3600 1209600 3600
+wildcard.test. IN NS ns1.wildcard.test.
+ns1.wildcard.test. IN A 192.0.2.1
+*.wildcard.test. IN A 192.0.2.100
+*.wildcard.test. IN TXT "wildcard-root"
+*.sub.wildcard.test. IN A 192.0.2.101
+*.sub.wildcard.test. IN AAAA 2001:db8::101
+ent.sub.wildcard.test. IN TXT "explicit-ent-child"
+exact.wildcard.test. IN A 192.0.2.200
+cname-wild.wildcard.test. IN CNAME target.wildcard.test.
+target.wildcard.test. IN A 192.0.2.201

@@ -4844,17 +4844,6 @@ int execute_query_spec(query_spec_t *spec) {
     return exit_code;
 }
 
-#if defined(main) || defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
-#ifndef _WIN32
-__attribute__((weak))
-#endif
-int run_replay_mode(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-    return 1;
-}
-#endif
-
 int main(int argc, char **argv) {
 #ifndef _WIN32
     // サーバーからのTCP切断時におけるSIGPIPEによるプロセス強制終了を防止

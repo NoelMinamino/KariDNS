@@ -6854,111 +6854,313 @@ static void test_query_engine_feature_case_182(void) {
 }
 
 static void test_query_engine_feature_case_183(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 183...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 183, "host183.example.com.", 1, false);
-    assert(qlen >= 12);
+    printf("[TEST] Query Engine: build_synthetic_servfail test...\n");
+    uint8_t req[512], res[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x1234, "servfail.example.com.", 1, false);
     
-    // Test resolve checkpoint struct
-    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
-    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
-    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    int len = build_synthetic_servfail(req, req_len, res, sizeof(res));
+    assert(len == (int)req_len);
+    assert((res[2] & 0x80) != 0); // QR=1
+    assert((res[3] & 0x0F) == 2); // RCODE=SERVFAIL
+    assert(res[0] == 0x12 && res[1] == 0x34); // Same ID
+
+    // Degenerate/short input returns 0 (cannot respond)
+    assert(build_synthetic_servfail(req, 8, res, sizeof(res)) == 0);
+    assert(build_synthetic_servfail(req, req_len, res, 10) == 0);
 }
 
 static void test_query_engine_feature_case_184(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 184...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 184, "host184.example.com.", 1, false);
-    assert(qlen >= 12);
-    
-    // Test resolve checkpoint struct
-    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
-    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
-    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    printf("[TEST] Query Engine: question_section_matches verification...\n");
+    uint8_t q1[512], q2[512], q3[512];
+    size_t l1 = 0, l2 = 0, l3 = 0;
+    build_dns_query(q1, &l1, 0x1111, "test.example.com.", 1 /* A */, true);
+    build_dns_query(q2, &l2, 0x2222, "TEST.EXAMPLE.COM.", 1 /* A */, false);
+    build_dns_query(q3, &l3, 0x3333, "other.example.com.", 1 /* A */, true);
+
+    assert(question_section_matches(q1, l1, q2, l2) == true);
+    assert(question_section_matches(q1, l1, q3, l3) == false);
+    assert(question_section_matches(q1, 8, q2, l2) == false);
+    assert(question_section_matches(q1, l1, q2, 8) == false);
 }
 
 static void test_query_engine_feature_case_185(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 185...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 185, "host185.example.com.", 1, false);
-    assert(qlen >= 12);
+    printf("[TEST] Query Engine: name_exists_in_zone and closest encloser...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
     
-    // Test resolve checkpoint struct
-    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
-    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
-    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char ztext[] = 
+        "$ORIGIN example.com.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "sub.child IN A 192.0.2.10\n";
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    char loc[2] = {0};
+    assert(name_exists_in_zone(&arena, "example.com.", loc, NULL, NULL) == true);
+    assert(name_exists_in_zone(&arena, "ns1.example.com.", loc, NULL, NULL) == true);
+    assert(name_exists_in_zone(&arena, "sub.child.example.com.", loc, NULL, NULL) == true);
+    assert(name_exists_in_zone(&arena, "child.example.com.", loc, NULL, NULL) == true); // ENT
+    assert(name_exists_in_zone(&arena, "nonexistent.example.com.", loc, NULL, NULL) == false);
+
+    const char *enc = find_closest_encloser(&arena, "foo.sub.child.example.com.", "example.com.", loc, NULL, NULL);
+    assert(enc != NULL);
+    assert(strcasecmp(enc, "sub.child.example.com.") == 0);
+
+    char next_closer[256];
+    assert(find_next_closer_name("foo.sub.child.example.com.", "sub.child.example.com.", next_closer, sizeof(next_closer)));
+    assert(strcasecmp(next_closer, "foo.sub.child.example.com") == 0);
+
+    zone_arena_destroy(&arena);
 }
 
 static void test_query_engine_feature_case_186(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 186...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 186, "host186.example.com.", 1, false);
-    assert(qlen >= 12);
+    printf("[TEST] Query Engine: nsec_covers_name & find_covering_nsec...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
     
-    // Test resolve checkpoint struct
-    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
-    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
-    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "nsec.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char ztext[] = 
+        "$ORIGIN nsec.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "@ IN NSEC d.nsec.example. NS SOA RRSIG NSEC\n"
+        "d IN NSEC h.nsec.example. A RRSIG NSEC\n"
+        "h IN NSEC nsec.example. A RRSIG NSEC\n";
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    dns_record_t *rec_d = NULL;
+    for (size_t i = 0; i < arena.count; i++) {
+        if (arena.records[i].type_code == 47 && strcasecmp(arena.records[i].name, "nsec.example.") == 0) {
+            rec_d = &arena.records[i];
+            break;
+        }
+    }
+    assert(rec_d != NULL);
+    assert(nsec_covers_name(rec_d, "b.nsec.example.") == true);
+    assert(nsec_covers_name(rec_d, "f.nsec.example.") == false);
+
+    dns_record_t *cover = find_covering_nsec(&arena, "b.nsec.example.");
+    assert(cover != NULL);
+    assert(strcasecmp(cover->name, "nsec.example.") == 0);
+
+    dns_record_t *cover_z = find_covering_nsec(&arena, "z.nsec.example.");
+    assert(cover_z != NULL);
+    assert(strcasecmp(cover_z->name, "h.nsec.example.") == 0);
+
+    zone_arena_destroy(&arena);
 }
 
 static void test_query_engine_feature_case_187(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 187...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 187, "host187.example.com.", 1, false);
-    assert(qlen >= 12);
-    
-    // Test resolve checkpoint struct
-    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
-    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
-    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    printf("[TEST] Query Engine: compute_nsec3_hash & nsec3_covers_hash...\n");
+    uint8_t salt[] = { 0xAA, 0xBB, 0xCC, 0xDD };
+    char b32[64];
+    assert(compute_nsec3_hash("example.com.", 1 /* SHA-1 */, 10, salt, sizeof(salt), b32, sizeof(b32)));
+    assert(strlen(b32) > 0);
+
+    // Standard interval: owner < next (e.g. 1000 < 3000)
+    assert(nsec3_covers_hash("10000000000000000000000000000000", "30000000000000000000000000000000", "20000000000000000000000000000000") == true);
+    assert(nsec3_covers_hash("10000000000000000000000000000000", "30000000000000000000000000000000", "40000000000000000000000000000000") == false);
+
+    // Wrap-around interval: owner > next (e.g. 8000 -> 2000)
+    assert(nsec3_covers_hash("80000000000000000000000000000000", "20000000000000000000000000000000", "90000000000000000000000000000000") == true);
+    assert(nsec3_covers_hash("80000000000000000000000000000000", "20000000000000000000000000000000", "10000000000000000000000000000000") == true);
+    assert(nsec3_covers_hash("80000000000000000000000000000000", "20000000000000000000000000000000", "50000000000000000000000000000000") == false);
 }
 
 static void test_query_engine_feature_case_188(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 188...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 188, "host188.example.com.", 1, false);
-    assert(qlen >= 12);
+    printf("[TEST] Query Engine: find_matching_nsec3 & find_covering_nsec3...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
     
-    // Test resolve checkpoint struct
-    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
-    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
-    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "n3.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char ztext[] = 
+        "$ORIGIN n3.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "00000000000000000000000000000000 IN NSEC3 1 0 0 - AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA A RRSIG\n"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA IN NSEC3 1 0 0 - 00000000000000000000000000000000 A RRSIG\n";
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    dns_record_t *m = find_matching_nsec3(&arena, "00000000000000000000000000000000", "n3.example.");
+    assert(m != NULL);
+
+    dns_record_t *c = find_covering_nsec3(&arena, "55555555555555555555555555555555");
+    assert(c != NULL);
+
+    zone_arena_destroy(&arena);
 }
 
 static void test_query_engine_feature_case_189(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 189...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 189, "host189.example.com.", 1, false);
-    assert(qlen >= 12);
-    
-    // Test resolve checkpoint struct
-    resolve_checkpoint_t cp = { 12, 1, 0, 0 };
-    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
-    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    printf("[TEST] Query Engine: monotonic_ms & remaining_ms test...\n");
+    int64_t now = monotonic_ms();
+    assert(now > 0);
+    assert(remaining_ms(now + 500) > 0 && remaining_ms(now + 500) <= 500);
+    assert(remaining_ms(now - 100) == 0);
 }
 
 static void test_query_engine_feature_case_190(void) {
-    printf("[TEST] Query Engine: protocol resolution and branch case 190...\n");
-    uint8_t qpkt[256]; size_t qlen = 0;
-    build_dns_query(qpkt, &qlen, 0x2000 + 190, "host190.example.com.", 1, false);
-    assert(qlen >= 12);
-    
-    // Test resolve checkpoint struct
+    printf("[TEST] Query Engine: resolve checkpoint restore & offset consistency...\n");
     resolve_checkpoint_t cp = { 12, 1, 0, 0 };
     uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
     restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
-    assert(off == 12 && anc == 1);
+    assert(off == 12 && anc == 1 && nsc == 0 && arc == 0);
+}
+
+static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(void) {
+    printf("[TEST] Query Engine: Program zone plugin timeout & dead mark...\n");
+
+    int in_p[2], out_p[2];
+    assert(pipe(in_p) == 0);
+    assert(pipe(out_p) == 0);
+
+    program_plugin_t plugin;
+    memset(&plugin, 0, sizeof(plugin));
+    strncpy(plugin.domain, "plugtest.example.", sizeof(plugin.domain) - 1);
+    plugin.pid = -1;
+    plugin.stdin_fd = in_p[1];
+    plugin.stdout_fd = out_p[0];
+    pthread_mutex_init(&plugin.lock, NULL);
+    plugin.timeout_ms = 50; // Very short timeout
+    plugin.max_failures = 2;
+    atomic_init(&plugin.consecutive_failures, 0);
+    atomic_init(&plugin.dead, false);
+
+    g_program_plugins = &plugin;
+    g_program_plugins_count = 1;
+
+    // Send query to program zone -> will timeout since nothing writes to out_p[1]
+    uint8_t req[64], res[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x1234, "plugtest.example.", 1, false);
+
+    int rc1 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    assert(rc1 >= 12); // Returns synthetic SERVFAIL packet length
+    assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
+    assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == false);
+
+    // Second failure -> reaches max_failures (2) -> marks dead
+    int rc2 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    assert(rc2 >= 12);
+    assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
+    assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 2);
+    assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == true);
+
+    // Third call while dead -> immediately returns SERVFAIL without pipe I/O
+    int rc3 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    assert(rc3 >= 12);
+    assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
+
+    pthread_mutex_destroy(&plugin.lock);
+    close(in_p[0]); close(in_p[1]);
+    close(out_p[0]); close(out_p[1]);
+    g_program_plugins = NULL;
+    g_program_plugins_count = 0;
+
+    printf("  -> Program zone plugin timeout & dead mark passed.\n");
+}
+
+static void test_query_engine_opcode_header_validations(void) {
+    printf("[TEST] Query Engine: Opcode NOTIFY / UPDATE packet header validations...\n");
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "op.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char ztext[] = "$ORIGIN op.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n";
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "op.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    // 1. NOTIFY packet with QDCOUNT = 0 -> FORMERR (RCODE=1)
+    uint8_t notify_bad_qd[64], res[512];
+    memset(notify_bad_qd, 0, 12);
+    notify_bad_qd[0] = 0x55; notify_bad_qd[1] = 0x66;
+    notify_bad_qd[2] = 0x20; // Opcode NOTIFY (4 << 3)
+    notify_bad_qd[4] = 0; notify_bad_qd[5] = 0; // QDCOUNT = 0
+    compress_ctx_init_packet(&comp_ctx);
+    int len1 = process_dns_query(notify_bad_qd, 12, res, sizeof(res), "op.example.", 6, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len1 >= 12);
+    assert((res[3] & 0x0F) == 1); // FORMERR
+
+    // 2. UPDATE packet with QDCOUNT = 0 -> FORMERR (RCODE=1)
+    uint8_t update_bad_qd[64];
+    memset(update_bad_qd, 0, 12);
+    update_bad_qd[0] = 0x77; update_bad_qd[1] = 0x88;
+    update_bad_qd[2] = 0x28; // Opcode UPDATE (5 << 3)
+    update_bad_qd[4] = 0; update_bad_qd[5] = 0; // QDCOUNT = 0
+    compress_ctx_init_packet(&comp_ctx);
+    int len2 = process_dns_query(update_bad_qd, 12, res, sizeof(res), "op.example.", 6, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len2 >= 12);
+    assert((res[3] & 0x0F) == 1); // FORMERR
+
+    zone_arena_destroy(&arena);
+    printf("  -> Opcode NOTIFY / UPDATE packet header validations passed.\n");
 }
 
 int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
+    test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
+    test_query_engine_opcode_header_validations();
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();
     test_tinydns_timestamp_countdown();

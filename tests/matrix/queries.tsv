@@ -1,0 +1,21 @@
+# ==============================================================================
+# KariDNS Matrix Query Test Specification
+# Format:
+# ZONE	QNAME	QTYPE	FLAGS	EXPECT_RCODE	EXPECT_ANS	EXPECT_AUTH	RFC_REF
+# ==============================================================================
+wildcard.test	foo.wildcard.test	A	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	foo.sub.wildcard.test	A	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	foo.sub.wildcard.test	AAAA	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	ent.sub.wildcard.test	A	+nodnssec	NOERROR	0	SOA	RFC 1034 §4.3.3 (ENT NODATA)
+wildcard.test	exact.wildcard.test	A	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	cname-wild.wildcard.test	A	+nodnssec	NOERROR	2	-	RFC 1034 §3.6.2
+dname.test	foo.sub.dname.test	A	+nodnssec	NOERROR	3	-	RFC 6672 §2.2 (DNAME + Synthetic CNAME + Target A)
+dname.test	foo.sub.dname.test	AAAA	+nodnssec	NOERROR	3	-	RFC 6672 §2.2 (DNAME + Synthetic CNAME + Target AAAA)
+deleg.test	host.sub1.deleg.test	A	+nodnssec	NOERROR	0	NS	RFC 1034 §4.2.1 (In-bailiwick Referral)
+deleg.test	sub2.deleg.test	A	+nodnssec	NOERROR	0	NS	RFC 1034 §4.2.1 (Out-of-bailiwick Referral)
+nsec.test	host.nsec.test	A	+dnssec	NOERROR	2	-	RFC 4035 §3.1.1 (A + covering RRSIG)
+nsec.test	nonexistent.nsec.test	A	+dnssec	NXDOMAIN	0	NSEC	RFC 4035 §3.1.3.2 (NSEC NXDOMAIN Denial)
+nsec.test	host.nsec.test	TXT	+dnssec	NOERROR	0	NSEC	RFC 4035 §3.1.3.1 (NSEC NODATA Proof)
+nsec.test	bar.wild.nsec.test	A	+dnssec	NOERROR	2	NSEC	RFC 4035 §3.1.3.3 (Wildcard Expansion + RRSIG + NSEC)
+chain.test	c1.chain.test	A	+nodnssec	NOERROR	4	-	RFC 1034 §3.6.2 (CNAME Chain Resolution)
+chain.test	loop-a.chain.test	A	+nodnssec	NOERROR	-	-	RFC 1034 §3.6.2 (CNAME Loop Protection)

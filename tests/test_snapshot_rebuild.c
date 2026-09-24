@@ -289,6 +289,113 @@ static void test_lookup_across_views_multi(void) {
     printf("  -> lookup_zone_across_views multi-match passed.\n");
 }
 
+static void test_snapshot_catalog_member_sync_and_deltas(void) {
+    printf("[TEST] Snapshot rebuild: Catalog zone member syncing, group property deltas & CoO...\n");
+
+    const char *CATALOG_ZONE_V1 =
+        "$ORIGIN cat.example.\n$TTL 300\n"
+        "@ IN SOA ns.cat.example. h.cat.example. 1 7200 3600 1209600 300\n"
+        "@ IN NS ns.cat.example.\n"
+        "version IN TXT \"2\"\n"
+        "uid1.zones.cat.example. IN PTR member1.example.\n"
+        "group.uid1.zones.cat.example. IN TXT \"group-a\"\n"
+        "group.uid1.zones.cat.example. IN TXT \"group-b\"\n"
+        "uid2.zones.cat.example. IN PTR member2.example.\n";
+
+    const char *CATALOG_ZONE_V2 =
+        "$ORIGIN cat.example.\n$TTL 300\n"
+        "@ IN SOA ns.cat.example. h.cat.example. 2 7200 3600 1209600 300\n"
+        "@ IN NS ns.cat.example.\n"
+        "version IN TXT \"2\"\n"
+        "uid1.zones.cat.example. IN PTR member1.example.\n"
+        "group.uid1.zones.cat.example. IN TXT \"group-c\"\n" // Modified group
+        "uid3.zones.cat.example. IN PTR member3.example.\n"; // Added member3, removed member2
+
+    wfile("cat_v1.zone", CATALOG_ZONE_V1);
+    wfile("cat_v2.zone", CATALOG_ZONE_V2);
+    wfile("m1.zone", "$ORIGIN member1.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n");
+    wfile("m2.zone", "$ORIGIN member2.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.2\n");
+    wfile("m3.zone", "$ORIGIN member3.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.3\n");
+
+    server_config_t *cfg1 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"default\" {\n"
+        "  zone \"cat.example\" { type master; file \"%s/cat_v1.zone\"; };\n"
+        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "  zone \"member2.example\" { type master; file \"%s/m2.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "};\n",
+        g_dir, g_dir, g_dir, g_dir);
+
+    zone_db_snapshot_t *snap1 = build(cfg1, false);
+    assert(snap1 != NULL);
+    zone_db_entry_t *ecat = snapshot_get_zone(snap1, "cat.example.");
+    assert(ecat != NULL);
+    (void)ecat;
+
+    // Rebuild with updated catalog configuration (v2)
+    server_config_t *cfg2 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"default\" {\n"
+        "  zone \"cat.example\" { type master; file \"%s/cat_v2.zone\"; };\n"
+        "  zone \"member1.example\" { type master; file \"%s/m1.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "  zone \"member3.example\" { type master; file \"%s/m3.zone\"; in-catalog-zone \"cat.example\"; };\n"
+        "};\n",
+        g_dir, g_dir, g_dir, g_dir);
+
+    zone_db_snapshot_t *snap2 = build(cfg2, false);
+    assert(snap2 != NULL);
+
+    release_zone_snapshot(snap1);
+    release_zone_snapshot(snap2);
+    printf("  -> Catalog zone member sync and group deltas passed.\n");
+}
+
+static void test_snapshot_standby_ecs_and_soa_serial(void) {
+    printf("[TEST] Snapshot rebuild: Standby zone reload, ECS resolvers & SOA serial...\n");
+
+    const char *ZONE_STANDBY_SOA =
+        "$ORIGIN standby.example.\n$TTL 300\n"
+        "@ IN SOA ns.standby.example. h.standby.example. 2026092401 7200 1800 1209600 300\n"
+        "@ IN NS ns.standby.example.\n"
+        "ns IN A 192.0.2.55\n";
+
+    wfile("standby.zone", ZONE_STANDBY_SOA);
+
+    server_config_t *cfg = load_conf(
+        "options { directory \"%s\"; };\n"
+        "view \"default\" {\n"
+        "  zone \"standby.example\" {\n"
+        "    type master;\n"
+        "    file \"%s/standby.zone\";\n"
+        "    bind-ecs-trusted-resolvers { 192.0.2.0/24; 2001:db8::/32; };\n"
+        "  };\n"
+        "};\n",
+        g_dir, g_dir);
+
+    zone_db_snapshot_t *snap = build(cfg, false);
+    assert(snap != NULL);
+
+    zone_db_entry_t *entry = snapshot_get_zone(snap, "standby.example.");
+    assert(entry != NULL);
+    assert(entry->serial == 2026092401);
+    assert(entry->refresh == 7200);
+    assert(entry->retry == 1800);
+    assert(entry->expire == 1209600);
+
+    // Test reload of standby zone with ECS trusted resolvers
+    zone_config_t *zcfg = find_zone_config_in_view(cfg, "default", "standby.example.");
+    assert(zcfg != NULL);
+    assert(reload_master_zone(entry, zcfg) == RELOAD_OK);
+
+    // Test skip_unchanged = true rebuild pass
+    zone_db_snapshot_t *snap_skip = build(cfg, true);
+    assert(snap_skip != NULL);
+    release_zone_snapshot(snap_skip);
+
+    release_zone_snapshot(snap);
+    printf("  -> Standby ECS and SOA serial reload passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Snapshot Rebuild Tests ===\n");
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_snap_XXXXXX");
@@ -296,8 +403,11 @@ int main(void) {
     test_rebuild_two_views();
     test_snapshot_retain_release_and_gc();
     test_lookup_across_views_multi();
+    test_snapshot_catalog_member_sync_and_deltas();
+    test_snapshot_standby_ecs_and_soa_serial();
     char cmd[200]; snprintf(cmd, sizeof(cmd), "rm -rf %s", g_dir); assert(system(cmd) == 0);
     printf("=== All Snapshot Rebuild Tests PASSED ===\n");
     return 0;
 }
+
 

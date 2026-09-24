@@ -4057,6 +4057,148 @@ static void test_dag_tools_feature_case_169(void) {
     tcp_reasm_destroy(tbl);
 }
 
+static void test_dag_tsig_client_p384_and_curve_matching(void) {
+    printf("[TEST] DAG Tools: P-384 ECDSA SIG(0) keys & keyname trailing dot...\n");
+
+    /*
+     * Generate a real P-384 key with OpenSSL so the private scalar is
+     * guaranteed to be a valid point on the curve.  Export the raw 48-byte
+     * scalar, base64-encode it, then write a BIND-format file and round-trip
+     * through load_sig0_pkey.
+     *
+     * Use O_TRUNC so a stale file from a previous run cannot corrupt the read.
+     */
+    char tmp_ec384[] = "/tmp/Kexample.com.+014+65432.private";
+    int fd = open(tmp_ec384, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) {
+        strcpy(tmp_ec384, "Kexample.com.+014+65432.private");
+        fd = open(tmp_ec384, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    }
+    assert(fd >= 0);
+
+    /* Generate a real P-384 key. */
+    EVP_PKEY *gen_pkey = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-384");
+    assert(gen_pkey != NULL);
+
+    /* Extract the private scalar via OSSL_PKEY_PARAM_PRIV_KEY (BN form).
+     * EVP_PKEY_get_raw_private_key is for raw-key types (Ed25519 etc.) only. */
+    BIGNUM *priv_bn = NULL;
+    int rc_bn = EVP_PKEY_get_bn_param(gen_pkey, "priv", &priv_bn); /* OSSL_PKEY_PARAM_PRIV_KEY */
+    assert(rc_bn == 1 && priv_bn != NULL);
+    EVP_PKEY_free(gen_pkey);
+
+    uint8_t raw_priv[48];
+    /* BN_bn2binpad pads with leading zeros to exactly 48 bytes. */
+    int bn_ret = BN_bn2binpad(priv_bn, raw_priv, 48);
+    assert(bn_ret == 48);
+    BN_free(priv_bn);
+
+    /* Base64-encode without line breaks (our parser strips whitespace). */
+    char b64_buf[80] = {0};
+    static const char b64_alpha[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t bi = 0;
+    for (size_t i = 0; i < 48; i += 3) {
+        uint32_t v = ((uint32_t)raw_priv[i] << 16) |
+                     ((uint32_t)raw_priv[i+1] << 8) |
+                      (uint32_t)raw_priv[i+2];
+        b64_buf[bi++] = b64_alpha[(v >> 18) & 0x3f];
+        b64_buf[bi++] = b64_alpha[(v >> 12) & 0x3f];
+        b64_buf[bi++] = b64_alpha[(v >>  6) & 0x3f];
+        b64_buf[bi++] = b64_alpha[(v      ) & 0x3f];
+    }
+    b64_buf[bi] = '\0'; /* 64 chars, no padding needed for 48 bytes */
+
+    /* Write the BIND private-key file. */
+    dprintf(fd,
+        "Private-key-format: v1.3\n"
+        "Algorithm: 14 (ECDSAP384SHA384)\n"
+        "PrivateKey: %s\n",
+        b64_buf);
+    close(fd);
+
+    sig0_key_t key_ec384;
+    memset(&key_ec384, 0, sizeof(key_ec384));
+    bool ok_ec384 = load_sig0_pkey(tmp_ec384, &key_ec384);
+    assert(ok_ec384 == true);
+    assert(key_ec384.algorithm == 14);
+    assert(key_ec384.pkey != NULL);
+    if (key_ec384.pkey) EVP_PKEY_free(key_ec384.pkey);
+    if (key_ec384.signer_name) free((void *)key_ec384.signer_name);
+    unlink(tmp_ec384);
+
+    /* Unsupported private key algorithm (e.g. Alg 1 RSAMD5) */
+    char tmp_unsupp[] = "/tmp/Kexample.com.+001+11111.private";
+    fd = open(tmp_unsupp, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd >= 0) {
+        const char unsupp_content[] =
+            "Private-key-format: v1.3\n"
+            "Algorithm: 1 (RSAMD5)\n"
+            "Modulus: o3gQjF4y3mS31M4q0y5Q5mS31M4q0y5Q5mS31M4q0y4=\n"
+            "PublicExponent: AQAB\n"
+            "PrivateExponent: o3gQjF4y3mS31M4q0y5Q5mS31M4q0y5Q5mS31M4q0y4=\n";
+        write(fd, unsupp_content, strlen(unsupp_content));
+        close(fd);
+        sig0_key_t key_unsupp;
+        memset(&key_unsupp, 0, sizeof(key_unsupp));
+        assert(load_bind_sig0_private_key(tmp_unsupp, &key_unsupp) == false);
+        unlink(tmp_unsupp);
+    }
+
+    printf("  -> P-384 ECDSA SIG(0) keys & curve matching passed.\n");
+}
+
+static void test_dag_transport_proxyv2_exhaustive(void) {
+    printf("[TEST] DAG Tools: ProxyV2 building across all protocols & families...\n");
+
+    query_opts_t qo;
+    memset(&qo, 0, sizeof(qo));
+    qo.use_proxy = true;
+
+    // 1. IPv4 TCP (STREAM)
+    assert(parse_proxy_arg("192.0.2.10#10053-192.0.2.20#53", &qo) == true);
+    assert(qo.proxy_family == AF_INET);
+    assert(qo.proxy_src_port == 10053 && qo.proxy_dst_port == 53);
+
+    uint8_t hdr[128];
+    size_t sz = build_proxyv2_header(hdr, sizeof(hdr), &qo, true);
+    assert(sz == 28);
+    assert(hdr[12] == 0x21); // PROXY command v2
+    assert(hdr[13] == 0x11); // AF_INET + STREAM
+
+    // 2. IPv4 UDP (DGRAM)
+    sz = build_proxyv2_header(hdr, sizeof(hdr), &qo, false);
+    assert(sz == 28);
+    assert(hdr[13] == 0x12); // AF_INET + DGRAM
+
+    // 3. IPv6 TCP (STREAM)
+    memset(&qo, 0, sizeof(qo));
+    qo.use_proxy = true;
+    assert(parse_proxy_arg("2001:db8::1#50000-2001:db8::2#53", &qo) == true);
+    assert(qo.proxy_family == AF_INET6);
+    sz = build_proxyv2_header(hdr, sizeof(hdr), &qo, true);
+    assert(sz == 52);
+    assert(hdr[13] == 0x21); // AF_INET6 + STREAM
+
+    // 4. IPv6 UDP (DGRAM)
+    sz = build_proxyv2_header(hdr, sizeof(hdr), &qo, false);
+    assert(sz == 52);
+    assert(hdr[13] == 0x22); // AF_INET6 + DGRAM
+
+    // 5. LOCAL command (health check probe)
+    memset(&qo, 0, sizeof(qo));
+    qo.use_proxy = true;
+    qo.proxy_use_local_cmd = true;
+    sz = build_proxyv2_header(hdr, sizeof(hdr), &qo, true);
+    assert(sz == 16);
+    assert(hdr[12] == 0x20); // LOCAL command
+
+    // Small buffer safety
+    assert(build_proxyv2_header(hdr, 10, &qo, true) == 0);
+
+    printf("  -> ProxyV2 building passed.\n");
+}
+
 static void test_dag_tools_feature_case_170(void) {
     printf("[TEST] DAG Tools: verification and test case 170...\n");
     query_opts_t qo; memset(&qo, 0, sizeof(qo));
@@ -4075,6 +4217,8 @@ int main(void) {
     zone_arena_init(&g_dag_arena);
     test_tcp_reassembly_engine();
     test_dag_sig0_client_keys();
+    test_dag_tsig_client_p384_and_curve_matching();
+    test_dag_transport_proxyv2_exhaustive();
     test_dag_tsig_client_parser();
     test_dag_tsig_client_signing_and_verify();
     test_dag_replay_and_pcap_parsing();

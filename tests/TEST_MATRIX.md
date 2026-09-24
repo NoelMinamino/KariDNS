@@ -14,7 +14,7 @@ To avoid duplicate test execution (二重起動), the comprehensive diagnostic c
 
 ### 1.1 Test Category Distribution in `run_all_sui| Category Code | Category Name | Target Domain | Top-Level Count | Primary Execution Method |
 |:---|:---|:---|:---:|:---|
-| `unit` | **Unit Tests** | C unit tests compiled with ASan/UBSan | 16 | Native binary execution |
+| `unit` | **Unit Tests & Fault Injection** | C unit tests compiled with ASan/UBSan & fail-Nth FI sweeps | 22 | Native binary execution |
 | `xfr` | **Zone Transfer** | RFC 5936 AXFR, RFC 1995 IXFR, Extended AXFR, Capsicum | 6 | Shell script + multi-instance KariDNS |
 | `dnssec` | **DNSSEC & Digest** | RFC 4034/4035 DNSSEC serving, RFC 8976 ZONEMD | 3 | Shell script + `karicheck` |
 | `update` | **Dynamic Update** | RFC 2136 DNS UPDATE prerequisites & updates | 3 | Shell script + `dag` UPDATE |
@@ -23,10 +23,10 @@ To avoid duplicate test execution (二重起動), the comprehensive diagnostic c
 | `catalog` | **Catalog Zones** | RFC 9432 DNS Catalog Zones, Change of Ownership (CoO) | 2 | Shell script + multi-zone provisioning |
 | `dnstap` | **DNSTAP Logging** | Frame Streams / Protobuf logging | 1 | Shell script + mock receiver |
 | `tinydns` | **tinydns Format** | djbdns data format, %location split-horizon, Tai64n TTL | 2 | Shell script + `karidns` |
-| `core` | **Server Core Engine** | RFC 1034/1035 resolution, section order, forward, program, glue, RCU reload | 24 | Shell script + `karidns` / `karictl` / `karicheck` |
+| `core` | **Server Core Engine** | RFC 1034/1035 resolution, section order, forward, program, glue, RCU reload, lifecycle, rules & karictl | 31 | Shell script + `karidns` / `karictl` / `karicheck` |
 | `regression` | **Regression & Fuzz** | ASan/UBSan smoke, concurrency stress, libFuzzer harnesses | 3 | Shell script + libFuzzer / ASan binaries |
 | `dag` | **Diagnostic Tool** | `run_dag_ci_test.sh` (Part 1-19 + 55 parallel sub-tests) + batch opts + dag fuzzer | 3 | Master runner + parallel workers (Included by default; skip with `--no-dag`) |
-| **Total Runner Entries** | | | **68** | *(65 server engine tests + 3 dag diagnostic client entries = 68 integrated targets)* |
+| **Total Runner Entries** | | | **81** | *(78 server engine/FI tests + 3 dag diagnostic client entries = 81 integrated targets)* |
 
 ---
 
@@ -113,6 +113,12 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 27 | [`test_query_engine_protocol`](file:///c:/git/my_dns/tests/test_query_engine_protocol.c) | `dns_query_engine.c` (`process_dns_query_impl`) | RFC 6891 §6.1.3, RFC 9619, RFC 1035 §4.1.1, RFC 5936, RFC 1995 §2, RFC 7873, RFC 1035 §3.3.13, RFC 8767, RFC 1996, RFC 8945 §5.3-5.4 | **Positive / Negative / Mutation-verified** | BADVERS with OPT version 0; FORMERR for QDCOUNT>1, cut-off question, AXFR over UDP, NOTIFY/UPDATE without a question; NOTIMP for opcodes 1-3 and 6-15; REFUSED for CH/HS; IXFR over UDP (current client: single SOA, older client: TC); cookie not issued for an unparsable client address; SOA EXPIRE exceeded -> SERVFAIL / serve-stale; NOTIFY authorization matrix (master address x TSIG present/absent/wrong key/corrupted MAC, response TSIG verified against the request MAC, forward/program zones -> NOTIMP). |
 | 28 | [`test_dag_format`](file:///c:/git/my_dns/tests/test_dag_format.c) | `tools/dag.c` (`format_rdata_for_display`) | RFC 1035 §5.1, RFC 3597 §5, RFC 8777 §4.1, RFC 9460 §2.1 | **Golden / Round trip / Robustness** | Character-string escaping (`\"`, `\\`, decimal `\DDD`, all 256 octets) for TXT/SPF/AVC/NINFO/CAA/HINFO/X25/ISDN/GPOS/NAPTR; AMTRELAY D bit / relay type; display -> zone parser -> wire round trip for 85 RR forms must reproduce the original RDATA; RDATA truncated at every length displayed without out-of-bounds reads (ASan). Found and covers: octal escapes, unescaped quotes/backslashes in HINFO/X25/ISDN/GPOS/NAPTR, AMTRELAY D-bit misdecoding. |
 | 29 | [`test_dag_reassembly`](file:///c:/git/my_dns/tests/test_dag_reassembly.c) | `tools/dag_pcap_l4.c`, `tools/dag_tcp_reassembly.c` | RFC 791, RFC 8200, RFC 793 / RFC 9293 §3.4 (sequence arithmetic), RFC 7766 (DNS over TCP framing) | **Randomized model / Golden frames** | Frames built byte by byte for every link type (Ethernet, 802.1Q, Linux SLL, raw IP, auto-detect): padding and trailers, IP options, fragments, truncation at every length. Deterministic pseudo-random TCP model: random segmentation, duplicate and overlapping retransmissions, bounded reordering, both directions, interleaved streams, sequence-number wraparound; every DNS message must be delivered exactly once, byte-identical, in order. Buffer cap, LRU eviction, mid-stream capture. Found and covers: TCP padding counted as payload, non-first IPv4 fragments parsed as L4, unsigned sequence comparisons stalling streams across the 2^32 wrap. |
+| 30 | [`test_fi_parsers`](file:///c:/git/my_dns/tests/test_fi_parsers.c) | `dns_zone_parser.c`, `dns_config_parser.c`, `dns_tinydns_parser.c` | RFC 1035, BIND config, tinydns | **Fault Injection / Memory** | Exhaustive fail-Nth fault injection sweeps across memory allocations during zone, config, and tinydns parsing to verify clean error paths and zero leaks. |
+| 31 | [`test_fi_wire`](file:///c:/git/my_dns/tests/test_fi_wire.c) | `dns_wire.c`, `dns_tsig_acl.c` | RFC 1035, RFC 8945 | **Fault Injection / Wire** | Fail-Nth fault injection sweeps across wire format serialization, compression, and TSIG cryptographic signing/verification failure modes. |
+| 32 | [`test_fi_snapshot`](file:///c:/git/my_dns/tests/test_fi_snapshot.c) | `dns_snapshot_rcu.c`, `dns_priv_sandbox.c` | RCU, Capsicum | **Fault Injection / RCU** | Fail-Nth fault injection sweeps across RCU snapshot rebuilding, view structures, and Capsicum directory caching. |
+| 33 | [`test_fi_xfr`](file:///c:/git/my_dns/tests/test_fi_xfr.c) | `dns_axfr_ixfr.c`, `dns_dynamic_update.c` | RFC 5936, RFC 1995, RFC 1982 | **Fault Injection / XFR** | Fail-Nth fault injection sweeps across AXFR/IXFR inbound packet parsing and SOA serial incrementation. |
+| 34 | [`test_fi_misc`](file:///c:/git/my_dns/tests/test_fi_misc.c) | `dns_dynamic_update.c`, `dns_catalog_zone.c`, `dns_dnstap.c`, `dns_edns_ecs.c` | RFC 2136, RFC 9432, DNSTAP | **Fault Injection / Extensions** | Fail-Nth fault injection sweeps across dynamic updates, catalog zone bookkeeping, and DNSTAP Protobuf message construction. |
+| 35 | [`test_fi_dag`](file:///c:/git/my_dns/tests/test_fi_dag.c) | `tools/dag.c`, `tools/dag_output_yaml.c` | RFC 1035, YAML | **Fault Injection / Tools** | Fail-Nth fault injection sweeps across dag client query packet generation and YAML formatting helpers. |
 
 ---
 

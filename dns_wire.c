@@ -3698,10 +3698,10 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
     
     switch (rec->type_code) {
         case 1: // A
-            if (inet_pton(AF_INET, rec->rdata[0], &rec->cache.a.addr) == 1) rec->is_cached = true;
+            if (rec->rdata_count >= 1 && rec->rdata[0] && inet_pton(AF_INET, rec->rdata[0], &rec->cache.a.addr) == 1) rec->is_cached = true;
             break;
         case 28: // AAAA
-            if (inet_pton(AF_INET6, rec->rdata[0], &rec->cache.aaaa.addr) == 1) rec->is_cached = true;
+            if (rec->rdata_count >= 1 && rec->rdata[0] && inet_pton(AF_INET6, rec->rdata[0], &rec->cache.aaaa.addr) == 1) rec->is_cached = true;
             break;
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
             if (rec->rdata_count >= 1 && rec->rdata[0] && arena) {
@@ -3760,7 +3760,8 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             break;
         }
         case 6: // SOA
-            if (rec->rdata_count >= 7) {
+            if (rec->rdata_count >= 7 && rec->rdata[0] && rec->rdata[1] && rec->rdata[2] &&
+                rec->rdata[3] && rec->rdata[4] && rec->rdata[5] && rec->rdata[6]) {
                 rec->cache.soa.mname = rec->rdata[0];
                 rec->cache.soa.rname = rec->rdata[1];
                 rec->cache.soa.serial = strtoul(rec->rdata[2], NULL, 10);
@@ -3789,7 +3790,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                 rec->cache.soa.numbers_wire[16] = (min >> 24) & 0xFF; rec->cache.soa.numbers_wire[17] = (min >> 16) & 0xFF;
                 rec->cache.soa.numbers_wire[18] = (min >> 8) & 0xFF;  rec->cache.soa.numbers_wire[19] = min & 0xFF;
 
-                if (rec->rdata[0] && rec->rdata[1] && arena) {
+                if (arena) {
                     uint8_t m_wire[256], r_wire[256];
                     long mw = write_uncompressed_name_ext(m_wire, 0, sizeof(m_wire), rec->rdata[0], false);
                     long rw = write_uncompressed_name_ext(r_wire, 0, sizeof(r_wire), rec->rdata[1], false);
@@ -3810,12 +3811,12 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             }
             break;
         case 15: // MX
-            if (rec->rdata_count >= 2) {
+            if (rec->rdata_count >= 2 && rec->rdata[0] && rec->rdata[1]) {
                 if (parse_u16(rec->rdata[0], &rec->cache.mx.pref)) {
                     rec->cache.mx.target = rec->rdata[1];
                     rec->cache.mx.target_wire = NULL;
                     rec->cache.mx.target_wire_len = 0;
-                    if (rec->rdata[1] && arena) {
+                    if (arena) {
                         uint8_t tmp_wire[256];
                         long wlen = write_uncompressed_name_ext(tmp_wire, 0, sizeof(tmp_wire), rec->rdata[1], false);
                         if (wlen > 0) {
@@ -3833,7 +3834,9 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             break;
         case 24: // SIG — cache identical to RRSIG
         case 46: // RRSIG
-            if (rec->rdata_count >= 9) {
+            if (rec->rdata_count >= 9 && rec->rdata[0] && rec->rdata[1] && rec->rdata[2] &&
+                rec->rdata[3] && rec->rdata[4] && rec->rdata[5] && rec->rdata[6] &&
+                rec->rdata[7] && rec->rdata[8]) {
                 if (parse_u8(rec->rdata[1], &rec->cache.rrsig.algorithm) &&
                     parse_u8(rec->rdata[2], &rec->cache.rrsig.labels) &&
                     parse_u16(rec->rdata[6], &rec->cache.rrsig.key_tag)) {
@@ -3848,7 +3851,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                     if (arena) {
                         size_t b64_len = strlen(rec->rdata[8]);
                         for (int i = 9; i < rec->rdata_count; i++) {
-                            b64_len += strlen(rec->rdata[i]);
+                            if (rec->rdata[i]) b64_len += strlen(rec->rdata[i]);
                         }
                         size_t max_dec_len = b64_len * 3 / 4 + 4;
                         uint8_t *dec_buf = arena_alloc(arena, max_dec_len);
@@ -3865,14 +3868,14 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             }
             break;
         case 33: // SRV
-            if (rec->rdata_count >= 4) {
+            if (rec->rdata_count >= 4 && rec->rdata[0] && rec->rdata[1] && rec->rdata[2] && rec->rdata[3]) {
                 if (parse_u16(rec->rdata[0], &rec->cache.srv.priority) &&
                     parse_u16(rec->rdata[1], &rec->cache.srv.weight) &&
                     parse_u16(rec->rdata[2], &rec->cache.srv.port)) {
                     rec->cache.srv.target = rec->rdata[3];
                     rec->cache.srv.target_wire = NULL;
                     rec->cache.srv.target_wire_len = 0;
-                    if (rec->rdata[3] && arena) {
+                    if (arena) {
                         uint8_t tmp_wire[256];
                         long wlen = write_uncompressed_name_ext(tmp_wire, 0, sizeof(tmp_wire), rec->rdata[3], false);
                         if (wlen > 0) {

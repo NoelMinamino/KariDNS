@@ -2143,8 +2143,10 @@ STATIC_TEST int dispatch_to_program_zone(const char *domain, const uint8_t *req,
       atomic_store_explicit(&plugin->dead, true, memory_order_release);
       syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead "
              "(will return SERVFAIL until restart)", domain);
-      kill(plugin->pid, SIGKILL);
-      waitpid(plugin->pid, NULL, WNOHANG);
+      if (plugin->pid > 0) {
+        kill(plugin->pid, SIGKILL);
+        waitpid(plugin->pid, NULL, WNOHANG);
+      }
     }
     result_len = build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
   } else {

@@ -1015,6 +1015,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                                 fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SSHFP algorithm '%s' out of range (0-255)\n",
                                         domain, linenum, fld[1]);
                                 error_found = true;
+                            } else if (alg == 0 || alg > 4) {
+                                fprintf(stderr, "[WARNING] Zone '%s' (line %lu): SSHFP algorithm '%lu' is outside standard RFC assignments (1-4)\n",
+                                        domain, linenum, alg);
                             }
                         }
                         if (flen[2] > 0) {
@@ -1024,6 +1027,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                                 fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SSHFP fp_type '%s' out of range (0-255)\n",
                                         domain, linenum, fld[2]);
                                 error_found = true;
+                            } else if (fpt == 0 || fpt > 2) {
+                                fprintf(stderr, "[WARNING] Zone '%s' (line %lu): SSHFP fp_type '%lu' is outside standard RFC assignments (1-2)\n",
+                                        domain, linenum, fpt);
                             }
                         }
                         uint8_t fp_bin[64];
@@ -1353,12 +1359,18 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                     fprintf(stderr, "[ERROR] SSHFP algorithm '%s' out of range (0-255) for name '%s' in zone '%s'\n",
                             rdata[0], arena.records[i].name, domain);
                     error_found = true;
+                } else if (alg == 0 || alg > 4) {
+                    fprintf(stderr, "[WARNING] SSHFP record for '%s' uses algorithm '%lu' which is outside standard RFC assignments (1=RSA, 2=DSA, 3=ECDSA, 4=Ed25519)\n",
+                            arena.records[i].name, alg);
                 }
                 unsigned long fpt = strtoul(rdata[1], &endp, 10);
                 if (*endp != '\0' || fpt > 255) {
                     fprintf(stderr, "[ERROR] SSHFP fp_type '%s' out of range (0-255) for name '%s' in zone '%s'\n",
                             rdata[1], arena.records[i].name, domain);
                     error_found = true;
+                } else if (fpt == 0 || fpt > 2) {
+                    fprintf(stderr, "[WARNING] SSHFP record for '%s' uses fp_type '%lu' which is outside standard RFC assignments (1=SHA-1, 2=SHA-256)\n",
+                            arena.records[i].name, fpt);
                 }
                 uint8_t fp_bin[64];
                 size_t dec_len = hex_decode(rdata[2], fp_bin, sizeof(fp_bin));

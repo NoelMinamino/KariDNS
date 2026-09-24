@@ -1,0 +1,14 @@
+$TTL 86400
+$ORIGIN .
+@       IN SOA  a.root-servers.net. hostmaster.root. (
+                2026082401 ; Serial
+                3600       ; Refresh
+                1800       ; Retry
+                604800     ; Expire
+                86400      ; Minimum TTL
+        )
+        IN NS   a.root-servers.net.
+a.root-servers.net. IN A 127.0.0.1
+
+com.    IN NS   a.gtld-servers.net.
+a.gtld-servers.net. IN A 127.0.0.1

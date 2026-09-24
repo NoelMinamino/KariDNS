@@ -189,11 +189,9 @@ register_test() {
 # Test Registry (All Server & Core Tests + Optional dag Suite)
 # ==============================================================================
 
-# 1. Unit Tests (C Binaries)
+# 1. Unit Tests (C test binaries in ROOT_DIR)
 register_test "unit" "bin" "test_vulnerability_fixes" "Vulnerability & Epoch RCU robustness test"
 register_test "unit" "bin" "test_query_engine_expanded" "All-RR types, wildcards, DNAME & 0x20 bit preservation"
-
-# 1. Unit Tests (C test binaries in ROOT_DIR)
 register_test "unit" "bin" "test_dnstap_engine" "DNSTAP Protobuf encoder, frame sender & ring buffers"
 register_test "unit" "bin" "test_edns_ecs_engine" "EDNS Cookies, EDE error codes & ECS subnet LPM resolution"
 register_test "unit" "bin" "test_rfc_vectors" "RFC 9018 Server Cookie vectors, SipHash-2-4, RFC 4034 key tag & cookie-secret config"
@@ -216,12 +214,16 @@ register_test "unit" "bin" "test_snapshot_rebuild" "Zone snapshot rebuild across
 register_test "unit" "bin" "test_dag_reassembly" "dag pcap L4 extraction (all link types, padding, fragments) & randomized TCP reassembly (reorder, retransmit, seq wraparound)"
 register_test "unit" "bin" "test_dag_format" "dag RDATA display: RFC 1035 decimal escaping, RFC 8777 AMTRELAY, display->parse round trip of every RR type"
 register_test "unit" "bin" "test_query_engine_protocol" "Query engine protocol: BADVERS, FORMERR/NOTIMP, foreign classes, IXFR/UDP, SOA EXPIRE, NOTIFY+TSIG authorization"
-register_test "unit" "bin" "test_query_engine_expanded" "Expanded Query Engine: QTYPE 1-65535, wildcard synthesis, DNAME loop & syntheses"
 register_test "unit" "bin" "test_response_cache" "Response cache: hot-path LRU, TTL countdown, negative caching & invalidation"
-register_test "unit" "bin" "test_vulnerability_fixes" "Security fixes: bounds checks, label lengths, injection resistance"
 register_test "unit" "bin" "test_dnssec_proofs" "DNSSEC negative proofs: RFC 5155 App A/B (NSEC3) & RFC 4035 App A/B (NSEC) example zones"
 register_test "unit" "bin" "test_hash_table" "Fixed-size FNV1a hash table collisions"
 register_test "unit" "bin" "test_server_core" "Server Core internals: fast IPv4, log esc/rot, ring buffers, TCP & observatory"
+register_test "unit" "bin" "test_fi_parsers" "Fault Injection: Zone, Config, and tinydns parser error path sweeps"
+register_test "unit" "bin" "test_fi_wire" "Fault Injection: Wire serialize, TSIG sign/verify error sweeps"
+register_test "unit" "bin" "test_fi_snapshot" "Fault Injection: Snapshot RCU rebuild and view allocation error sweeps"
+register_test "unit" "bin" "test_fi_xfr" "Fault Injection: AXFR/IXFR stream parse and SOA serial bump sweeps"
+register_test "unit" "bin" "test_fi_misc" "Fault Injection: Dynamic update, catalog zone, and dnstap error sweeps"
+register_test "unit" "bin" "test_fi_dag" "Fault Injection: dag client query packet build and YAML formatting sweeps"
 
 # 2. Zone Transfer / Redundancy (AXFR / IXFR)
 register_test "xfr" "sh" "tests/run_capsicum_axfr_test.sh" "Capsicum sandbox capability mode AXFR"
@@ -289,6 +291,12 @@ register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "RFC 2181 31-bit
 register_test "core" "sh" "tests/run_zone_oom_partial_load_test.sh" "OOM fail-closed zone loading rollback"
 register_test "core" "sh" "tests/run_coverage_merge_test.sh" "Coverage report tolerates corrupt raw profiles (SIGKILL during profile write)"
 register_test "core" "sh" "tests/run_malformed_detection_default_test.sh" "Structural malformation detection in default mode (RFC 1035 §4.1.1)"
+register_test "core" "sh" "tests/run_matrix_queries_test.sh" "Table-driven Query Engine Matrix: Wildcard, DNAME, Delegation & NSEC proofs"
+register_test "core" "sh" "tests/run_server_lifecycle_test.sh" "Server lifecycle: port conflict, bad syntax, signals, and crash recovery"
+register_test "core" "sh" "tests/run_tcp_adversary_test.sh" "TCP state machine adversary: slowloris, framing errors, trickle, flood"
+register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel IPC adversary: invalid HMAC, buffer limits, timeouts"
+register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rule checks: SSHFP, RFC 8624, options linting"
+register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command line argument validation and socket error resilience"
 
 # 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
@@ -504,7 +512,7 @@ printf "%b" "${REGISTERED_TESTS}" | while IFS='|' read -r _cat _type _cmd _desc;
     T_END=$(date +%s 2>/dev/null || perl -e 'print time')
     T_ELAPSED=$((T_END - T_START))
     
-    echo "${_status}|${_cmd}|${_cat}|${T_ELAPSED}|${_exit_code}|${_desc}" >> "${SUMMARY_FILE}"
+    echo "${_status}|${_cmd}|${_cat}|${T_ELAPSED}|${_exit_code}|${_desc}|${_skip_reason}" >> "${SUMMARY_FILE}"
     
     if [ "${_status}" = "PASS" ]; then
         printf "  [ ${C_GREEN}PASS${C_RESET} ] %-42s (${T_ELAPSED}s) ${C_WHITE}%s${C_RESET}\n" "${_cmd}" "${_desc}"
@@ -538,7 +546,7 @@ PASSED_COUNT=0
 FAILED_COUNT=0
 SKIPPED_COUNT=0
 
-while IFS='|' read -r _s _c _cat _t _code _d; do
+while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
     [ -z "${_s}" ] && continue
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
     case "${_s}" in
@@ -568,10 +576,20 @@ fi
 printf "  Total Execution Time : %ds\n" "${TOTAL_DURATION}"
 echo "${C_BOLD}======================================================================${C_RESET}"
 
+if [ "${SKIPPED_COUNT}" -gt 0 ]; then
+    echo ""
+    echo "${C_YELLOW}Skipped Tests:${C_RESET}"
+    while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
+        if [ "${_s}" = "SKIP" ]; then
+            printf "  - ${C_YELLOW}%-45s${C_RESET} [Category: %s, Reason: %s]\n" "${_c}" "${_cat}" "${_skip_r:-unknown}"
+        fi
+    done < "${SUMMARY_FILE}"
+fi
+
 if [ "${FAILED_COUNT}" -gt 0 ]; then
     echo ""
     echo "${C_RED}Failed Tests:${C_RESET}"
-    while IFS='|' read -r _s _c _cat _t _code _d; do
+    while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
         if [ "${_s}" = "FAIL" ]; then
             printf "  - ${C_RED}%-45s${C_RESET} [Category: %s, Exit Code: %s]\n" "${_c}" "${_cat}" "${_code}"
         fi

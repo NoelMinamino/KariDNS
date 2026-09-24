@@ -1,0 +1,2 @@
+valid IN A 192.0.2.1
+invalid IN UNKNOWNTYPE 123

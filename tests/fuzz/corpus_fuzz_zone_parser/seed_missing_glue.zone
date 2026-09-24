@@ -1,0 +1,12 @@
+$ORIGIN missing-glue.example.
+$TTL 3600
+@ IN SOA ns1.missing-glue.example. hostmaster.missing-glue.example. (
+    2026082301 ; serial
+    7200       ; refresh
+    3600       ; retry
+    1209600    ; expire
+    3600       ; minimum
+)
+@ IN NS ns1.missing-glue.example.
+; Note: ns1.missing-glue.example. is in-bailiwick but has no glue A/AAAA record
+www IN A 192.0.2.1

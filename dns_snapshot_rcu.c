@@ -81,26 +81,29 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg,
 int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
                              const char *domain, const char *view_name,
                              zone_lookup_result_t *result) {
+  if (!cfg || !domain || !result) return 0;
   int matches = 0;
   for (view_config_t *v = cfg->views; v; v = v->next) {
-    if (view_name && strcasecmp(v->name, view_name) != 0) continue;
+    if (view_name && v->name && strcasecmp(v->name, view_name) != 0) continue;
     zone_config_t *zcfg = NULL;
     for (zone_config_t *z = v->zones; z; z = z->next) {
-      if (domain_names_match_ci(z->domain, domain)) { zcfg = z; break; }
+      if (z->domain && domain_names_match_ci(z->domain, domain)) { zcfg = z; break; }
     }
     if (!zcfg) continue;
 
     zone_db_entry_t *entry = NULL;
-    if (snap) {
+    if (snap && snap->views) {
       for (size_t sv = 0; sv < snap->view_count; sv++) {
-        if (strcasecmp(snap->views[sv].name, v->name) != 0) continue;
-        if (snap->views[sv].hash_size > 0 && snap->views[sv].hash_table) {
+        if (!snap->views[sv].name || !v->name || strcasecmp(snap->views[sv].name, v->name) != 0) continue;
+        if (snap->views[sv].hash_size > 0 && snap->views[sv].hash_table && snap->views[sv].chain_next && snap->views[sv].entries) {
           uint32_t hash = calc_fnv1a_str(domain);
           size_t idx = hash & (snap->views[sv].hash_size - 1);
           for (int i = snap->views[sv].hash_table[idx]; i != -1; i = snap->views[sv].chain_next[i]) {
-            if (domain_names_match_ci(snap->views[sv].entries[i]->domain, domain)) {
-              entry = snap->views[sv].entries[i];
-              break;
+            if (i >= 0 && (size_t)i < snap->views[sv].zone_count && snap->views[sv].entries[i]) {
+              if (domain_names_match_ci(snap->views[sv].entries[i]->domain, domain)) {
+                entry = snap->views[sv].entries[i];
+                break;
+              }
             }
           }
         }
@@ -118,14 +121,16 @@ int lookup_zone_across_views(zone_db_snapshot_t *snap, server_config_t *cfg,
 }
 
 zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain) {
-  if (!snap) return NULL;
+  if (!snap || !domain || !snap->views) return NULL;
   for (size_t v = 0; v < snap->view_count; v++) {
-    if (snap->views[v].hash_size > 0 && snap->views[v].hash_table) {
+    if (snap->views[v].hash_size > 0 && snap->views[v].hash_table && snap->views[v].chain_next && snap->views[v].entries) {
       uint32_t hash = calc_fnv1a_str(domain);
       size_t idx = hash & (snap->views[v].hash_size - 1);
       for (int i = snap->views[v].hash_table[idx]; i != -1; i = snap->views[v].chain_next[i]) {
-        if (domain_names_match_ci(snap->views[v].entries[i]->domain, domain)) {
-          return snap->views[v].entries[i];
+        if (i >= 0 && (size_t)i < snap->views[v].zone_count && snap->views[v].entries[i]) {
+          if (domain_names_match_ci(snap->views[v].entries[i]->domain, domain)) {
+            return snap->views[v].entries[i];
+          }
         }
       }
     }
@@ -255,15 +260,8 @@ void free_zone_db_entry(zone_db_entry_t *entry) {
   free(entry);
 }
 
-void *gc_snapshot_thread(void *arg) {
-  zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
-  if (!snap) return NULL;
-  rcu_writer_wait_until_safe(snap->retire_epoch, 60000);
-  int retries = 0;
-  useconds_t sleep_time = 1;
-  while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
-    rcu_exponential_backoff(&retries, &sleep_time);
-  }
+void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
+  if (!snap) return;
   if (snap->views) {
     for (size_t v = 0; v < snap->view_count; v++) {
       if (snap->views[v].entries) {
@@ -277,26 +275,56 @@ void *gc_snapshot_thread(void *arg) {
           }
         }
         free(snap->views[v].entries);
+        snap->views[v].entries = NULL;
       }
-      if (snap->views[v].name) free(snap->views[v].name);
+      if (snap->views[v].name) {
+        free(snap->views[v].name);
+        snap->views[v].name = NULL;
+      }
       if (snap->views[v].match_clients) {
         for (int i = 0; i < snap->views[v].match_clients_count; i++) {
           if (snap->views[v].match_clients[i]) free(snap->views[v].match_clients[i]);
         }
         free(snap->views[v].match_clients);
+        snap->views[v].match_clients = NULL;
       }
       if (snap->views[v].match_clients_parsed) {
         free(snap->views[v].match_clients_parsed);
         snap->views[v].match_clients_parsed = NULL;
       }
-      if (snap->views[v].hash_table) free(snap->views[v].hash_table);
-      if (snap->views[v].chain_next) free(snap->views[v].chain_next);
-      if (snap->views[v].suffix_hash_table) free(snap->views[v].suffix_hash_table);
-      if (snap->views[v].suffix_chain_next) free(snap->views[v].suffix_chain_next);
+      if (snap->views[v].hash_table) {
+        free(snap->views[v].hash_table);
+        snap->views[v].hash_table = NULL;
+      }
+      if (snap->views[v].chain_next) {
+        free(snap->views[v].chain_next);
+        snap->views[v].chain_next = NULL;
+      }
+      if (snap->views[v].suffix_hash_table) {
+        free(snap->views[v].suffix_hash_table);
+        snap->views[v].suffix_hash_table = NULL;
+      }
+      if (snap->views[v].suffix_chain_next) {
+        free(snap->views[v].suffix_chain_next);
+        snap->views[v].suffix_chain_next = NULL;
+      }
     }
     free(snap->views);
+    snap->views = NULL;
   }
   free(snap);
+}
+
+void *gc_snapshot_thread(void *arg) {
+  zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
+  if (!snap) return NULL;
+  rcu_writer_wait_until_safe(snap->retire_epoch, 60000);
+  int retries = 0;
+  useconds_t sleep_time = 1;
+  while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
+    rcu_exponential_backoff(&retries, &sleep_time);
+  }
+  free_zone_db_snapshot(snap);
   return NULL;
 }
 
@@ -822,7 +850,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
 STATIC_TEST void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char *reason) {
     syslog(LOG_ERR, "[Core] Memory allocation failed during snapshot rebuild (%s), aborting", reason);
     if (new_snap) {
-        gc_snapshot_thread(new_snap);
+        free_zone_db_snapshot(new_snap);
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
@@ -846,8 +874,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         // MODE: Full Config Reload
         
         int max_valid_members = 0;
-        if (old_snap) {
+        if (old_snap && old_snap->views) {
             for (size_t v = 0; v < old_snap->view_count; v++) {
+                if (!old_snap->views[v].entries) continue;
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
                     if (!entry) continue;
@@ -864,8 +893,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
         int valid_member_count = 0;
         
-        if (old_snap) {
+        if (old_snap && old_snap->views) {
             for (size_t v = 0; v < old_snap->view_count; v++) {
+                if (!old_snap->views[v].entries) continue;
                 for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = old_snap->views[v].entries[i];
                     if (!entry) continue;
@@ -914,7 +944,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         int vidx = 0;
         for (view_config_t *v = active_config->views; v; v = v->next, vidx++) {
             view_snapshot_t *vs = &new_snap->views[vidx];
-            vs->name = strdup(v->name);
+            vs->name = v->name ? strdup(v->name) : strdup("");
+            if (!vs->name) {
+                if (valid_members) free(valid_members);
+                abort_rebuild_snapshot(new_snap, "vs->name");
+                return NULL;
+            }
             vs->match_clients_count = v->match_clients_count;
             if (v->match_clients_count > 0) {
                 vs->match_clients = calloc(v->match_clients_count, sizeof(char *));
@@ -924,7 +959,14 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     return NULL;
                 }
                 for (int i = 0; i < v->match_clients_count; i++) {
-                    vs->match_clients[i] = strdup(v->match_clients[i]);
+                    if (v->match_clients[i]) {
+                        vs->match_clients[i] = strdup(v->match_clients[i]);
+                        if (!vs->match_clients[i]) {
+                            if (valid_members) free(valid_members);
+                            abort_rebuild_snapshot(new_snap, "vs->match_clients[i]");
+                            return NULL;
+                        }
+                    }
                 }
                 vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
             } else {
@@ -936,28 +978,30 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             for (zone_config_t *z = v->zones; z; z = z->next) static_count++;
             
             int dynamic_count = 0;
-            if (old_snap) {
+            if (old_snap && old_snap->views) {
                 for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                    if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                        for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                            zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
-                            if (!entry) continue;
-                            if (entry->is_catalog_member) {
-                                bool is_valid = false;
-                                for (int k = 0; k < valid_member_count; k++) {
-                                    if (strcasecmp(valid_members[k].domain, entry->domain) == 0 &&
-                                        strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
-                                        is_valid = true; break;
-                                    }
-                                }
-                                if (is_valid) {
-                                    bool overridden = false;
-                                    for (zone_config_t *z = v->zones; z; z = z->next) {
-                                        if (strcasecmp(z->domain, entry->domain) == 0) {
-                                             overridden = true; break;
+                    if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
+                        if (old_snap->views[ov].entries) {
+                            for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
+                                zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
+                                if (!entry) continue;
+                                if (entry->is_catalog_member) {
+                                    bool is_valid = false;
+                                    for (int k = 0; k < valid_member_count; k++) {
+                                        if (domain_names_match_ci(valid_members[k].domain, entry->domain) &&
+                                            strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
+                                            is_valid = true; break;
                                         }
                                     }
-                                    if (!overridden) dynamic_count++;
+                                    if (is_valid) {
+                                        bool overridden = false;
+                                        for (zone_config_t *z = v->zones; z; z = z->next) {
+                                            if (z->domain && domain_names_match_ci(z->domain, entry->domain)) {
+                                                 overridden = true; break;
+                                            }
+                                        }
+                                        if (!overridden) dynamic_count++;
+                                    }
                                 }
                             }
                         }
@@ -979,15 +1023,17 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             int zidx = 0;
             for (zone_config_t *z = v->zones; z; z = z->next) {
                 zone_db_entry_t *entry = NULL;
-                if (old_snap) {
+                if (old_snap && old_snap->views) {
                     for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                        if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                            for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                                if (!old_snap->views[ov].entries[oi]) continue;
-                                if (strcasecmp(old_snap->views[ov].entries[oi]->domain, z->domain) == 0) {
-                                    entry = old_snap->views[ov].entries[oi];
-                                    atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
-                                    break;
+                        if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
+                            if (old_snap->views[ov].entries) {
+                                for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
+                                    if (!old_snap->views[ov].entries[oi]) continue;
+                                    if (z->domain && domain_names_match_ci(old_snap->views[ov].entries[oi]->domain, z->domain)) {
+                                        entry = old_snap->views[ov].entries[oi];
+                                        atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+                                        break;
+                                    }
                                 }
                             }
                             break;
@@ -1005,36 +1051,38 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                 }
                 if (!entry) {
                     syslog(LOG_ERR, "[Core] Failed to allocate memory for zone '%s' in view '%s', skipping this zone this reload cycle",
-                           z->domain, v->name);
+                           z->domain ? z->domain : "unknown", v->name ? v->name : "unknown");
                     continue;
                 }
                 vs->entries[zidx++] = entry;
             }
 
-            if (old_snap) {
+            if (old_snap && old_snap->views) {
                 for (size_t ov = 0; ov < old_snap->view_count; ov++) {
-                    if (strcasecmp(old_snap->views[ov].name, v->name) == 0) {
-                        for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
-                            zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
-                            if (!entry) continue;
-                            if (entry->is_catalog_member) {
-                                bool is_valid = false;
-                                for (int k = 0; k < valid_member_count; k++) {
-                                    if (strcasecmp(valid_members[k].domain, entry->domain) == 0 &&
-                                        strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
-                                        is_valid = true; break;
-                                    }
-                                }
-                                if (is_valid) {
-                                    bool overridden = false;
-                                    for (zone_config_t *z = v->zones; z; z = z->next) {
-                                        if (strcasecmp(z->domain, entry->domain) == 0) {
-                                            overridden = true; break;
+                    if (old_snap->views[ov].name && v->name && strcasecmp(old_snap->views[ov].name, v->name) == 0) {
+                        if (old_snap->views[ov].entries) {
+                            for (size_t oi = 0; oi < old_snap->views[ov].zone_count; oi++) {
+                                zone_db_entry_t *entry = old_snap->views[ov].entries[oi];
+                                if (!entry) continue;
+                                if (entry->is_catalog_member) {
+                                    bool is_valid = false;
+                                    for (int k = 0; k < valid_member_count; k++) {
+                                        if (domain_names_match_ci(valid_members[k].domain, entry->domain) &&
+                                            strcmp(valid_members[k].unique_id, entry->catalog_member_unique_id) == 0) {
+                                            is_valid = true; break;
                                         }
                                     }
-                                    if (!overridden) {
-                                        atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
-                                        vs->entries[zidx++] = entry;
+                                    if (is_valid) {
+                                        bool overridden = false;
+                                        for (zone_config_t *z = v->zones; z; z = z->next) {
+                                            if (z->domain && domain_names_match_ci(z->domain, entry->domain)) {
+                                                overridden = true; break;
+                                            }
+                                        }
+                                        if (!overridden) {
+                                            atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+                                            vs->entries[zidx++] = entry;
+                                        }
                                     }
                                 }
                             }
@@ -1097,13 +1145,21 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         catalog_member_id_t *added_members = calloc(new_desired_count > 0 ? new_desired_count : 1, sizeof(catalog_member_id_t));
         catalog_member_id_t *removed_members = calloc(catalog_entry_to_update->catalog_member_count > 0 ? catalog_entry_to_update->catalog_member_count : 1, sizeof(catalog_member_id_t));
         catalog_member_id_t *coo_evicted_members = calloc(new_desired_count > 0 ? new_desired_count : 1, sizeof(catalog_member_id_t));
+        if (!added_members || !removed_members || !coo_evicted_members) {
+            if (added_members) free(added_members);
+            if (removed_members) free(removed_members);
+            if (coo_evicted_members) free(coo_evicted_members);
+            abort_rebuild_snapshot(new_snap, "catalog member allocations");
+            return NULL;
+        }
         int coo_evicted_count = 0;
 
         int filtered_count = 0;
         view_snapshot_t *target_view = NULL;
-        if (old_snap) {
+        if (old_snap && old_snap->views) {
             for (size_t v = 0; v < old_snap->view_count; v++) {
-                if (strcasecmp(old_snap->views[v].name, catalog_view_name) == 0) {
+                if (old_snap->views[v].name && catalog_view_name &&
+                    strcasecmp(old_snap->views[v].name, catalog_view_name) == 0) {
                     target_view = &old_snap->views[v];
                     break;
                 }
@@ -1215,8 +1271,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                     existing->group_count = new_desired_members[i].group_count;
                                     if (existing->group_count > 0) {
                                         existing->groups = calloc(existing->group_count, sizeof(char*));
-                                        for (int g = 0; g < existing->group_count; g++) {
-                                            existing->groups[g] = strdup(new_desired_members[i].groups[g]);
+                                        if (existing->groups) {
+                                            for (int g = 0; g < existing->group_count; g++) {
+                                                existing->groups[g] = strdup(new_desired_members[i].groups[g]);
+                                            }
+                                        } else {
+                                            existing->group_count = 0;
                                         }
                                     }
                                     needs_creation = false;
@@ -1356,17 +1416,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             entry->catalog_member_unique_id[sizeof(entry->catalog_member_unique_id) - 1] = '\0';
             if (added_members[i].group_count > 0) {
                 entry->groups = calloc(added_members[i].group_count, sizeof(char*));
-                entry->group_count = added_members[i].group_count;
-                for (int g = 0; g < added_members[i].group_count; g++) {
-                    entry->groups[g] = strdup(added_members[i].groups[g]);
+                if (entry->groups) {
+                    entry->group_count = added_members[i].group_count;
+                    for (int g = 0; g < added_members[i].group_count; g++) {
+                        entry->groups[g] = strdup(added_members[i].groups[g]);
+                    }
                 }
             }
-            if (catalog_cfg->masters_count > 0 && catalog_cfg->masters[0].ip != NULL) {
+            if (catalog_cfg && catalog_cfg->masters_count > 0 && catalog_cfg->masters[0].ip != NULL) {
                 strncpy(entry->cached_master_ip, catalog_cfg->masters[0].ip, sizeof(entry->cached_master_ip) - 1);
                 entry->cached_master_ip[sizeof(entry->cached_master_ip) - 1] = '\0';
                 entry->cached_master_port = catalog_cfg->masters[0].port;
             }
-            if (catalog_cfg->tsig_key) {
+            if (catalog_cfg && catalog_cfg->tsig_key) {
                 strncpy(entry->cached_tsig_key_name, catalog_cfg->tsig_key, sizeof(entry->cached_tsig_key_name) - 1);
             }
             atomic_store_explicit(&entry->refresh_now, true, memory_order_release);
@@ -1378,6 +1440,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         if (new_snap->view_count > 0) {
             new_snap->views = calloc(new_snap->view_count, sizeof(view_snapshot_t));
             if (!new_snap->views) {
+                for (int k = 0; k < actual_added_count; k++) {
+                    if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                }
                 free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                 abort_rebuild_snapshot(new_snap, "catalog new_snap->views");
                 return NULL;
@@ -1414,19 +1479,44 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
 
             for (size_t v = 0; v < old_snap->view_count; v++) {
                 view_snapshot_t *vs = &new_snap->views[v];
-                vs->name = strdup(old_snap->views[v].name);
+                vs->name = old_snap->views[v].name ? strdup(old_snap->views[v].name) : strdup("");
+                if (!vs->name) {
+                    if (del_hash_table) free(del_hash_table);
+                    if (del_chain_next) free(del_chain_next);
+                    for (int k = 0; k < actual_added_count; k++) {
+                        if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                    }
+                    free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                    abort_rebuild_snapshot(new_snap, "catalog vs->name");
+                    return NULL;
+                }
                 vs->match_clients_count = old_snap->views[v].match_clients_count;
                 if (vs->match_clients_count > 0) {
                     vs->match_clients = calloc(vs->match_clients_count, sizeof(char *));
                     if (!vs->match_clients) {
                         if (del_hash_table) free(del_hash_table);
                         if (del_chain_next) free(del_chain_next);
+                        for (int k = 0; k < actual_added_count; k++) {
+                            if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                        }
                         free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                         abort_rebuild_snapshot(new_snap, "catalog vs->match_clients");
                         return NULL;
                     }
                     for (int i = 0; i < vs->match_clients_count; i++) {
-                        vs->match_clients[i] = strdup(old_snap->views[v].match_clients[i]);
+                        if (old_snap->views[v].match_clients[i]) {
+                            vs->match_clients[i] = strdup(old_snap->views[v].match_clients[i]);
+                            if (!vs->match_clients[i]) {
+                                if (del_hash_table) free(del_hash_table);
+                                if (del_chain_next) free(del_chain_next);
+                                for (int k = 0; k < actual_added_count; k++) {
+                                    if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                                }
+                                free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
+                                abort_rebuild_snapshot(new_snap, "catalog vs->match_clients[i]");
+                                return NULL;
+                            }
+                        }
                     }
                     vs->match_clients_parsed = acl_list_parse(vs->match_clients, vs->match_clients_count);
                 } else {
@@ -1434,12 +1524,15 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     vs->match_clients_parsed = NULL;
                 }
 
-                if (strcasecmp(vs->name, catalog_view_name) == 0) {
+                if (catalog_view_name && strcasecmp(vs->name, catalog_view_name) == 0) {
                     size_t max_zones = old_snap->views[v].zone_count + added_count;
                     vs->entries = calloc(max_zones > 0 ? max_zones : 1, sizeof(zone_db_entry_t *));
                     if (!vs->entries) {
                         if (del_hash_table) free(del_hash_table);
                         if (del_chain_next) free(del_chain_next);
+                        for (int k = 0; k < actual_added_count; k++) {
+                            if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                        }
                         free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                         abort_rebuild_snapshot(new_snap, "catalog vs->entries");
                         return NULL;
@@ -1448,6 +1541,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     int zidx = 0;
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                         zone_db_entry_t *entry = old_snap->views[v].entries[i];
+                        if (!entry) continue;
                         bool is_removed = false;
                         if (entry->is_catalog_member && del_hash_table && del_chain_next) {
                             uint32_t h = calc_catalog_member_hash(entry->domain, entry->catalog_member_unique_id);
@@ -1493,14 +1587,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (!vs->entries) {
                         if (del_hash_table) free(del_hash_table);
                         if (del_chain_next) free(del_chain_next);
+                        for (int k = 0; k < actual_added_count; k++) {
+                            if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                        }
                         free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                         abort_rebuild_snapshot(new_snap, "catalog other vs->entries");
                         return NULL;
                     }
                     for (size_t i = 0; i < old_snap->views[v].zone_count; i++) {
                         zone_db_entry_t *entry = old_snap->views[v].entries[i];
-                        atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
-                        vs->entries[i] = entry;
+                        if (entry) {
+                            atomic_fetch_add_explicit(&entry->snapshot_refs, 1, memory_order_release);
+                            vs->entries[i] = entry;
+                        }
                     }
                 }
             }
@@ -1555,9 +1654,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         
         if ((vs->hash_size > 0 && !vs->hash_table) || (vs->zone_count > 0 && !vs->chain_next) ||
             (vs->suffix_hash_size > 0 && !vs->suffix_hash_table) || (vs->zone_count > 0 && !vs->suffix_chain_next)) {
-            syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name);
-            gc_snapshot_thread(new_snap); // Clean up the new snapshot cleanly
-            pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+            syslog(LOG_ERR, "[Core] Hash table allocation failed for view '%s', aborting snapshot rebuild", vs->name ? vs->name : "unknown");
+            abort_rebuild_snapshot(new_snap, "hash_tables");
             return NULL;
         }
 

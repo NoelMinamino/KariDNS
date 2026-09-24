@@ -1,0 +1,8 @@
+$ORIGIN catalog.example.com.
+$TTL 3600
+@ IN SOA ns1.example.com. admin.example.com. 2 3600 1800 604800 86400
+@ IN NS ns1.example.com.
+version IN TXT "2"
+zone2.zones IN PTR example.org.
+group.zone2.zones IN TXT "group1"
+group.zone3.zones IN TXT "group2"

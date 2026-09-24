@@ -1,0 +1,18 @@
+$ORIGIN nsec.test.
+$TTL 3600
+nsec.test. IN SOA ns1.nsec.test. hostmaster.nsec.test. 1 7200 3600 1209600 3600
+nsec.test. IN NS ns1.nsec.test.
+ns1.nsec.test. IN A 192.0.2.1
+host.nsec.test. IN A 192.0.2.10
+*.wild.nsec.test. IN A 192.0.2.20
+
+; NSEC chain
+nsec.test. IN NSEC host.nsec.test. A NS SOA RRSIG NSEC DNSKEY
+host.nsec.test. IN NSEC ns1.nsec.test. A RRSIG NSEC
+ns1.nsec.test. IN NSEC *.wild.nsec.test. A RRSIG NSEC
+*.wild.nsec.test. IN NSEC nsec.test. A RRSIG NSEC
+
+; Covering RRSIGs
+nsec.test. IN RRSIG SOA 13 2 3600 20350101000000 20250101000000 12345 nsec.test. AAAA
+host.nsec.test. IN RRSIG A 13 3 3600 20350101000000 20250101000000 12345 nsec.test. AAAA
+*.wild.nsec.test. IN RRSIG A 13 3 3600 20350101000000 20250101000000 12345 nsec.test. AAAA
