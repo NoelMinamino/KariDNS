@@ -3949,9 +3949,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 15; i++) tv_msg[i] = (uint8_t)i;
     uint64_t tv_result = siphash24(tv_msg, sizeof(tv_msg), tv_key);
     if (tv_result != 0xa129ca6149be45e5ULL) {
+      /* LCOV_EXCL_START */
       syslog(LOG_CRIT, "FATAL: SipHash-2-4 self-test failed (got %016llx, expected a129ca6149be45e5)",
              (unsigned long long)tv_result);
       abort();
+      /* LCOV_EXCL_STOP */
     }
   }
   tzset();

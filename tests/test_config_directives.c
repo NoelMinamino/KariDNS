@@ -90,7 +90,7 @@ static const zone_config_t *first_zone(const server_config_t *cfg) {
     return (cfg->views && cfg->views->zones) ? cfg->views->zones : NULL;
 }
 
-static const char *SECRET_OK = "k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U=";  /* decodes to 32 bytes */
+#define SECRET_OK "k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U="  /* decodes to 32 bytes */
 #define ZONE_MIN "zone \"example.com\" { type master; file \"example.com.zone\"; };"
 
 /* ------------------------------------------------------------------------ */
@@ -928,6 +928,151 @@ static void test_structure_and_validation(void) {
     expect_reject("view name missing", "view { };");
 }
 
+/* ------------------------------------------------------------------------ */
+static void test_config_cidr_matching(void) {
+    printf("[TEST] config parser: match_cidr helper coverage (IPv4/IPv6, boundary masks, invalid prefixes)...\n");
+
+    /* 1. NULL and keyword checks */
+    CHECK(match_cidr(NULL, "192.0.2.0/24") == false);
+    CHECK(match_cidr("192.0.2.1", NULL) == false);
+    CHECK(match_cidr("192.0.2.1", "any") == true);
+    CHECK(match_cidr("2001:db8::1", "any;") == true);
+
+    /* 2. IPv4 matching and prefix edge cases */
+    CHECK(match_cidr("192.0.2.1", "192.0.2.0/24") == true);
+    CHECK(match_cidr("192.0.3.1", "192.0.2.0/24") == false);
+    CHECK(match_cidr("192.0.2.1", "192.0.2.1/32") == true);
+    CHECK(match_cidr("192.0.2.2", "192.0.2.1/32") == false);
+    CHECK(match_cidr("10.0.0.1", "0.0.0.0/0") == true);
+    CHECK(match_cidr("192.0.2.1", "192.0.2.1") == true); /* implicit /32 */
+
+    /* 3. IPv4 invalid prefixes */
+    CHECK(match_cidr("192.0.2.1", "192.0.2.0/33") == false);
+    CHECK(match_cidr("192.0.2.1", "192.0.2.0/-1") == false);
+    CHECK(match_cidr("192.0.2.1", "192.0.2.0/abc") == false);
+    CHECK(match_cidr("192.0.2.1", "192.0.2.0/") == false);
+
+    /* 4. IPv6 matching and prefix edge cases */
+    CHECK(match_cidr("2001:db8::1", "2001:db8::/32") == true);
+    CHECK(match_cidr("2001:db9::1", "2001:db8::/32") == false);
+    CHECK(match_cidr("2001:db8::1", "2001:db8::1/128") == true);
+    CHECK(match_cidr("2001:db8::2", "2001:db8::1/128") == false);
+    CHECK(match_cidr("2001:db8::1", "::/0") == true);
+    CHECK(match_cidr("2001:db8::1", "2001:db8::1") == true); /* implicit /128 */
+    CHECK(match_cidr("2001:db8::1", "2001:db8::/121") == true);
+    CHECK(match_cidr("2001:db8::80", "2001:db8::/121") == false);
+    CHECK(match_cidr("2001:db8::80", "2001:db8::80/121") == true);
+    CHECK(match_cidr("2001:db8::81", "2001:db8::80/121") == true);
+
+    /* 5. IPv6 invalid prefixes */
+    CHECK(match_cidr("2001:db8::1", "2001:db8::/129") == false);
+    CHECK(match_cidr("2001:db8::1", "2001:db8::/-5") == false);
+    CHECK(match_cidr("2001:db8::1", "2001:db8::/xyz") == false);
+
+    /* 6. Address family mismatches */
+    CHECK(match_cidr("192.0.2.1", "2001:db8::/32") == false);
+    CHECK(match_cidr("2001:db8::1", "192.0.2.0/24") == false);
+    CHECK(match_cidr("invalid_ip", "192.0.2.0/24") == false);
+
+    printf("  -> match_cidr helper coverage verified.\n");
+}
+
+/* ------------------------------------------------------------------------ */
+static void test_config_negative_patterns(void) {
+    printf("[TEST] config parser: comprehensive error & warning branch coverage...\n");
+
+    /* 1. Unmatched braces and unexpected tokens */
+    expect_reject("unmatched open brace at EOF", "options { port 53; ");
+    expect_reject("unmatched closing brace (extra token)", "options { port 53; }; };");
+    expect_reject("zone with unmatched brace", "zone \"example.com\" { type master; file \"z\"; ");
+    expect_reject("options with unexpected nested brace", "options { { }; };");
+
+    /* 2. Missing required parameters and semicolons */
+    expect_reject("options missing value for port", "options { port; };");
+    expect_reject("options missing semicolon after port", "options { port 53 };");
+    expect_reject("view missing name", "view { zone \"a.com\" { type master; file \"z\"; }; };");
+
+    /* 3. Zone type, file-format, and auto-tc-flag errors */
+    expect_reject("unknown zone type", "zone \"example.com\" { type bogus_type; file \"z\"; };");
+    expect_reject("invalid file-format", "zone \"example.com\" { type master; file \"z\"; file-format yaml; };");
+    expect_reject("invalid disable-auto-tc-flag", "zone \"example.com\" { type master; file \"z\"; disable-auto-tc-flag bogus; };");
+
+    /* 4. Cookie secrets & algorithm validation */
+    expect_reject("cookie-secret not 32 hex digits (short)", "options { cookie-secret \"0123456789abcdef\"; };");
+    expect_reject("cookie-secret not hex digits (invalid chars)", "options { cookie-secret \"0123456789abcdef0123456789abcdeg\"; };");
+    expect_reject("too many cookie secrets (> 4)",
+                  "options { "
+                  "cookie-secret \"0123456789abcdef0123456789abcdef\"; "
+                  "cookie-secret \"0123456789abcdef0123456789abcde0\"; "
+                  "cookie-secret \"0123456789abcdef0123456789abcde1\"; "
+                  "cookie-secret \"0123456789abcdef0123456789abcde2\"; "
+                  "cookie-secret \"0123456789abcdef0123456789abcde3\"; };");
+    expect_reject("unsupported cookie algorithm", "options { cookie-algorithm sha256; };");
+
+    /* 5. Query log & cache buffer size validation */
+    expect_reject("query-log-buffer-size non power-of-2", "options { query-log-buffer-size 3000; };");
+    expect_reject("query-log-buffer-size too small (< 1024)", "options { query-log-buffer-size 512; };");
+    expect_reject("query-log-buffer-size too large (> 1048576)", "options { query-log-buffer-size 2097152; };");
+    expect_reject("query-log-buffer-size invalid string", "options { query-log-buffer-size abc; };");
+    expect_reject("query-log-max-qps invalid string", "options { query-log-max-qps abc; };");
+    expect_reject("wire-cache-max-records invalid string", "options { wire-cache-max-records non_numeric; };");
+
+    /* 6. Unsupported TSIG algorithms and invalid secrets */
+    expect_reject("key with unsupported TSIG algorithm",
+                  "key \"k1\" { algorithm bogus-algo; secret \"c2VjcmV0MTIz\"; };");
+    expect_reject("control-channel with unsupported algorithm",
+                  "control-channel { algorithm invalid-algo; secret \"c2VjcmV0MTIz\"; };");
+    expect_reject("key with empty secret",
+                  "key \"k1\" { algorithm hmac-sha256; secret \"\"; };");
+
+    /* 7. Undefined TSIG keys in zone references */
+    expect_reject("zone references undefined tsig-key",
+                  "zone \"example.com\" { type master; file \"z\"; tsig-key \"non_existent_key\"; };");
+    expect_reject("zone allow-transfer references undefined tsig-key",
+                  "zone \"example.com\" { type master; file \"z\"; allow-transfer { key non_existent_key; }; };");
+
+    /* 8. Duplicate definitions */
+    expect_reject("duplicate zone in flat config",
+                  "zone \"example.com\" { type master; file \"z1\"; }; "
+                  "zone \"example.com\" { type master; file \"z2\"; };");
+    expect_reject("duplicate zone in same view",
+                  "view \"v1\" { "
+                  "zone \"example.com\" { type master; file \"z1\"; }; "
+                  "zone \"example.com\" { type master; file \"z2\"; }; };");
+    expect_reject("duplicate view name",
+                  "view \"v1\" { zone \"a.com\" { type master; file \"z1\"; }; }; "
+                  "view \"v1\" { zone \"b.com\" { type master; file \"z2\"; }; };");
+    expect_reject("duplicate key name",
+                  "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; }; "
+                  "key \"k1\" { algorithm hmac-sha256; secret \"" SECRET_OK "\"; };");
+
+    /* 9. Undefined logging channel reference */
+    expect_reject("logging queries references undefined channel",
+                  "logging { category queries { non_existent_channel; }; };");
+    expect_reject("logging responses references undefined channel",
+                  "logging { category responses { non_existent_channel; }; };");
+
+    /* 10. Mixing flat zones and views */
+    expect_reject("mixing flat zone and view blocks",
+                  "zone \"flat.com\" { type master; file \"z\"; }; "
+                  "view \"v1\" { zone \"v.com\" { type master; file \"z\"; }; };");
+
+    /* 11. Valid warning path configurations (should parse successfully and hit warning branches) */
+    server_config_t cfg;
+    /* Deprecated MD5/SHA1 TSIG keys */
+    if (parse_ok("key \"k_md5\" { algorithm hmac-md5; secret \"c2VjcmV0MTIz\"; }; "
+                 "control-channel { algorithm hmac-sha1; secret \"c2VjcmV0MTIz\"; };", &cfg)) {
+        free_server_config_fields(&cfg);
+    }
+    /* Program & forward zone with superfluous file and masters */
+    if (parse_ok("zone \"p.com\" { type program; program-command \"/bin/echo\"; file \"z\"; masters { 1.2.3.4; }; }; "
+                 "zone \"f.com\" { type forward; forwarders { 1.2.3.4; }; file \"z\"; masters { 1.2.3.4; }; };", &cfg)) {
+        free_server_config_fields(&cfg);
+    }
+
+    printf("  -> config parser error & warning branches verified.\n");
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -948,6 +1093,8 @@ int main(void) {
     test_control_channel();
     test_logging_channels();
     test_structure_and_validation();
+    test_config_cidr_matching();
+    test_config_negative_patterns();
 
     printf("[*] %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {

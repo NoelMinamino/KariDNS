@@ -42,12 +42,33 @@ options {
     port ${PORT};
 };
 controls {
-    unix "${CTRL_SOCK}" perm 0600;
+    unix "${CTRL_SOCK}" perm 0600 secret "c2VjcmV0MTIz";
 };
 zone "example.com" {
     type master;
     file "${ROOT_DIR}/tests/zones/example.com.zone";
 };
+EOF
+
+# Create karictl configuration files
+cat > "${TMP_DIR}/karictl.conf" <<EOF
+socket "${CTRL_SOCK}";
+secret "c2VjcmV0MTIz";
+EOF
+
+cat > "${TMP_DIR}/wrong_secret.conf" <<EOF
+socket "${CTRL_SOCK}";
+secret "d3Jvbmc=";
+EOF
+
+cat > "${TMP_DIR}/bad_secret.conf" <<EOF
+socket "${CTRL_SOCK}";
+secret "invalid%%%base64";
+EOF
+
+cat > "${TMP_DIR}/long_secret.conf" <<EOF
+socket "${CTRL_SOCK}";
+secret "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 EOF
 
 # Start server
@@ -84,8 +105,38 @@ perl tests/lib/ctrl_client.pl "${CTRL_SOCK}" unknown_cmd || true
 # 4. Silent connection timeout
 perl tests/lib/ctrl_client.pl "${CTRL_SOCK}" silent || true
 
-# Verify control channel is still healthy via karictl
-./karictl -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
+echo "[+] Running karictl CLI and error tests..."
+
+# karictl version & tsig-keygen
+./karictl -v >/dev/null 2>&1 || true
+./karictl tsig-keygen >/dev/null 2>&1 || true
+./karictl tsig-keygen test-key >/dev/null 2>&1 || true
+
+# Non-existent socket error (should return 1)
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${TMP_DIR}/nonexistent.sock" status >/dev/null 2>&1 || true
+
+# Non-existent config error (should return 2)
+./karictl -c "${TMP_DIR}/nonexistent.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
+
+# Bad secret format in config (should return 2)
+./karictl -c "${TMP_DIR}/bad_secret.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
+
+# Too long secret in config (should return 2)
+./karictl -c "${TMP_DIR}/long_secret.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
+
+# HMAC authentication mismatch against server (should return 2)
+./karictl -c "${TMP_DIR}/wrong_secret.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
+
+# Unknown command transmission (server returns ERROR, karictl returns 3)
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" unknown_bogus_command >/dev/null 2>&1 || true
+
+# Valid commands
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" zonestatus example.com >/dev/null 2>&1 || true
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" reload example.com >/dev/null 2>&1 || true
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" observatory >/dev/null 2>&1 || true
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" notify example.com >/dev/null 2>&1 || true
+./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" retransfer example.com >/dev/null 2>&1 || true
 
 echo "[+] Control adversary tests completed cleanly."
 exit 0

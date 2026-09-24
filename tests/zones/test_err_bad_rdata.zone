@@ -1,0 +1,9 @@
+$ORIGIN bad-rdata.example.
+$TTL 3600
+@ IN SOA ns1.bad-rdata.example. hostmaster.bad-rdata.example. 2026092401 7200 3600 1209600 86400
+@ IN NS ns1.bad-rdata.example.
+ns1 IN A 999.999.999.999
+badaaaa IN AAAA 2001:db8:::1
+badhip IN HIP 2 200100107B1A74DF365639CC39F1D578 not-valid-b64! rvs.example.
+badcaa IN CAA 0 invalid_tag_characters! "issue.example"
+badmeta IN ANY 192.0.2.1

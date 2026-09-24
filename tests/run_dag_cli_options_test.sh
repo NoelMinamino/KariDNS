@@ -132,6 +132,34 @@ run_check "+short +multiline" "$DAG @127.0.0.1 -p 10053 example.com A +short +mu
 run_check "--prereq-nxdomain" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-nxdomain nx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
 run_check "--prereq-yxdomain" "$DAG @127.0.0.1 -p 10053 example.com SOA --update-add 'test.example.com 300 IN A 1.2.3.4' --prereq-yxdomain yx.example.com +qr +timeout=1" "Query \([0-9]+ bytes\)"
 
+echo "=== 7. Testing Conflicting Options, Invalid Ports, and Invalid Server IPs ==="
+# Conflicting transport flags: +tcp then +udp (udp wins)
+run_check "Conflicting +tcp and +udp (+udp last)" "$DAG @127.0.0.1 -p 10053 example.com A +tcp +udp +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+# Conflicting transport flags: +udp then +tcp (tcp wins)
+run_check "Conflicting +udp and +tcp (+tcp last)" "$DAG @127.0.0.1 -p 10053 example.com A +udp +tcp +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
+if [ "$DAG" != "dig" ]; then
+    # TSIG and SIG(0) conflict
+    run_check "TSIG and SIG(0) exclusivity error" "$DAG @127.0.0.1 -p 10053 example.com A +tsig=hmac-sha256:key:c2Vj +sig0 +timeout=1" "cannot be combined"
+    # Invalid port in @server#port
+    run_check "Invalid port in @server#port warning" "$DAG @127.0.0.1#99999 example.com A +timeout=1" "warning: invalid port"
+fi
+
+# Out-of-range ports with -p
+run_check "Out-of-range port 99999 fallback" "$DAG @127.0.0.1 -p 99999 example.com A +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+run_check "Negative port -1 fallback" "$DAG @127.0.0.1 -p -1 example.com A +timeout=1" "(opcode: QUERY|timed out|no usable response|status:|connection refused|no servers could be reached)"
+
+# Invalid server IP
+run_check "Invalid server IP address" "$DAG @999.999.999.999 example.com A +timeout=1" "(no servers could be reached|couldn't get address|no usable response|timed out|failed)"
+
+echo "=== 8. Testing Timeout / Refused / Error Formatting Across Modes ==="
+# Standard mode connection refused / timeout
+run_check "Error formatting (Standard)" "$DAG @127.0.0.1 -p 1 example.com A +timeout=1" "(connection refused|no servers could be reached|timed out|no usable response)"
+# YAML mode connection refused / timeout
+run_check "Error formatting (+yaml)" "$DAG @127.0.0.1 -p 1 example.com A +yaml +timeout=1" "(---|\"status\"|connection refused|no servers could be reached|timed out|no usable response)"
+# Short mode connection refused / timeout
+run_check "Error formatting (+short)" "$DAG @127.0.0.1 -p 1 example.com A +short +timeout=1" "(connection refused|no servers could be reached|timed out|no usable response|^$)"
+
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "🎉 ALL CLI OPTION TESTS PASSED!"

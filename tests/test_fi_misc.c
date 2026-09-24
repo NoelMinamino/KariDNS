@@ -126,10 +126,65 @@ static void test_fi_dnstap_encoding(void) {
     });
 }
 
+static void test_fi_socket_and_syscalls(void) {
+    /* 1. FI_SOCKET failure sweep on creating sockets */
+    FI_SWEEP_KIND(FI_SOCKET, {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) close(s);
+        int st = socket(AF_INET, SOCK_STREAM, 0);
+        if (st >= 0) close(st);
+    });
+
+    /* 2. FI_BIND and FI_LISTEN failure sweep */
+    FI_SWEEP_KIND(FI_BIND, {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s >= 0) {
+            struct sockaddr_in sin;
+            memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET;
+            sin.sin_port = 0;
+            sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            (void)bind(s, (struct sockaddr *)&sin, sizeof(sin));
+            close(s);
+        }
+    });
+
+    FI_SWEEP_KIND(FI_LISTEN, {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s >= 0) {
+            struct sockaddr_in sin;
+            memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET;
+            sin.sin_port = 0;
+            sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (bind(s, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
+                (void)listen(s, 128);
+            }
+            close(s);
+        }
+    });
+
+    /* 3. FI_SETSOCKOPT failure sweep */
+    FI_SWEEP_KIND(FI_SETSOCKOPT, {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            int opt = 1;
+            (void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+            close(s);
+        }
+    });
+
+    /* 4. FI_KEVENT failure sweep */
+    FI_SWEEP_KIND(FI_KEVENT, {
+        (void)fi_fired_kind(FI_KEVENT);
+    });
+}
+
 int main(void) {
     printf("[*] Running test_fi_misc...\n");
     test_fi_dynamic_update();
     test_fi_dnstap_encoding();
+    test_fi_socket_and_syscalls();
     printf("[+] test_fi_misc passed successfully.\n");
     return 0;
 }

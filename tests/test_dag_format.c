@@ -377,6 +377,192 @@ static void test_dig_compat_formatting(void) {
     printf("  -> dig-compatible formatting passed.\n");
 }
 
+static void test_dag_cli_parsing_helpers_and_error_paths(void) {
+    printf("[TEST] dag: CLI option parsing, helpers, and error branches...\n");
+
+    // 1. parse_opcode_value
+    assert(parse_opcode_value("QUERY") == 0);
+    assert(parse_opcode_value("IQUERY") == 1);
+    assert(parse_opcode_value("STATUS") == 2);
+    assert(parse_opcode_value("NOTIFY") == 4);
+    assert(parse_opcode_value("UPDATE") == 5);
+    assert(parse_opcode_value("15") == 15);
+    assert(parse_opcode_value("0") == 0);
+    assert(parse_opcode_value("16") == -1);
+    assert(parse_opcode_value("-1") == -1);
+    assert(parse_opcode_value("INVALID") == -1);
+    assert(parse_opcode_value("") == -1);
+    assert(parse_opcode_value(NULL) == -1);
+
+    // 2. get_ede_error_string
+    for (uint16_t code = 0; code <= 29; code++) {
+        const char *s = get_ede_error_string(code);
+        assert(s != NULL && strcmp(s, "Unassigned") != 0);
+    }
+    assert(strcmp(get_ede_error_string(999), "Unassigned") == 0);
+
+    // 3. rcode_name & opcode_name
+    assert(strcmp(rcode_name(0), "NOERROR") == 0);
+    assert(strcmp(rcode_name(3), "NXDOMAIN") == 0);
+    assert(strcmp(rcode_name(9), "NOTAUTH") == 0);
+    assert(strcmp(rcode_name(23), "BADCOOKIE") == 0);
+    assert(rcode_name(999) != NULL);
+
+    assert(strcmp(opcode_name(0), "QUERY") == 0);
+    assert(strcmp(opcode_name(1), "IQUERY") == 0);
+    assert(strcmp(opcode_name(2), "STATUS") == 0);
+    assert(strcmp(opcode_name(4), "NOTIFY") == 0);
+    assert(strcmp(opcode_name(5), "UPDATE") == 0);
+    assert(opcode_name(15) != NULL);
+
+    // 4. format_ttl_units
+    char ttl_buf[64];
+    assert(strcmp(format_ttl_units(0, ttl_buf, sizeof(ttl_buf)), "0s") == 0);
+    assert(strcmp(format_ttl_units(604800, ttl_buf, sizeof(ttl_buf)), "1w") == 0);
+    assert(strcmp(format_ttl_units(86400, ttl_buf, sizeof(ttl_buf)), "1d") == 0);
+    assert(strcmp(format_ttl_units(3600, ttl_buf, sizeof(ttl_buf)), "1h") == 0);
+    assert(strcmp(format_ttl_units(60, ttl_buf, sizeof(ttl_buf)), "1m") == 0);
+    assert(strcmp(format_ttl_units(45, ttl_buf, sizeof(ttl_buf)), "45s") == 0);
+    assert(strcmp(format_ttl_units(604800 + 86400 + 3600 + 60 + 5, ttl_buf, sizeof(ttl_buf)), "1w1d1h1m5s") == 0);
+
+    // 5. parse_qtype & resolve_qtype
+    assert(parse_qtype("A") == 1);
+    assert(parse_qtype("AAAA") == 28);
+    assert(parse_qtype("MX") == 15);
+    assert(parse_qtype("TYPE65280") == 65280);
+    assert(parse_qtype("IXFR=1234") == 251);
+    assert(parse_qtype("UNKNOWN_BAD_TYPE_XYZ") == -1);
+
+    // 6. loc coordinate formatting & prec helpers
+    char loc_buf[128];
+    loc_format_coord(0x80000000, true, loc_buf, sizeof(loc_buf));
+    assert(loc_buf[0] != '\0');
+    loc_format_coord(0x80000000 - 3600000, true, loc_buf, sizeof(loc_buf));
+    assert(strchr(loc_buf, 'S') != NULL);
+    loc_format_coord(0x80000000 + 3600000, false, loc_buf, sizeof(loc_buf));
+    assert(strchr(loc_buf, 'E') != NULL);
+
+    double prec1 = loc_decode_precsize(0x12);
+    assert(prec1 > 0);
+    format_loc_prec(10.0, loc_buf, sizeof(loc_buf));
+    assert(strcmp(loc_buf, "10m") == 0);
+    format_loc_prec(10.5, loc_buf, sizeof(loc_buf));
+    assert(strcmp(loc_buf, "10.50m") == 0);
+
+    format_time_comment(0, loc_buf, sizeof(loc_buf));
+    format_time_comment(604800, loc_buf, sizeof(loc_buf));
+    format_time_comment(86400, loc_buf, sizeof(loc_buf));
+    format_time_comment(3600, loc_buf, sizeof(loc_buf));
+    format_time_comment(60, loc_buf, sizeof(loc_buf));
+    format_time_comment(42, loc_buf, sizeof(loc_buf));
+
+    char cert_buf[32];
+    assert(strcmp(cert_type_name(1, cert_buf, sizeof(cert_buf)), "PKIX") == 0);
+    assert(strcmp(cert_type_name(253, cert_buf, sizeof(cert_buf)), "URI") == 0);
+    assert(strcmp(cert_type_name(999, cert_buf, sizeof(cert_buf)), "999") == 0);
+
+    // 7. alloc_result_row
+    server_result_t *row = alloc_result_row();
+    assert(row != NULL);
+    reset_dag_arena();
+
+    // 8. hexdump & print_ldnsz_payload
+    uint8_t dummy_wire[32];
+    memset(dummy_wire, 0xAB, sizeof(dummy_wire));
+    hexdump(dummy_wire, sizeof(dummy_wire));
+    print_ldnsz_payload(dummy_wire, sizeof(dummy_wire));
+
+    // 9. query_spec_t, deep_copy_query_opts, free_query_opts
+    query_spec_t spec1, spec2;
+    init_query_spec(&spec1);
+    spec1.qo.tls_ca_file = strdup("/path/to/ca.pem");
+    spec1.qo.doh_path = strdup("/dns-query");
+    spec1.qo.search_domain = strdup("example.com");
+    spec1.qo.tsig_key.algorithm = strdup("hmac-sha256");
+    spec1.qo.tsig_key.name = strdup("my-key.");
+    spec1.qo.update_op_count = 1;
+    spec1.qo.update_ops[0].kind = UPDATE_OP_ADD;
+    spec1.qo.update_ops[0].raw = strdup("test.example. 300 IN A 1.2.3.4");
+
+    init_query_spec(&spec2);
+    deep_copy_query_opts(&spec2.qo, &spec1.qo);
+    assert(spec2.qo.tls_ca_file != NULL);
+    assert(spec2.qo.update_op_count == 1);
+    free_query_opts(&spec1.qo);
+    free_query_opts(&spec2.qo);
+
+    // 10. parse_arg_slice and parse_query_arg_token comprehensive sweeping
+    query_spec_t spec;
+    init_query_spec(&spec);
+    char *args[] = {
+        "dag",
+        "+tcp", "+udp", "+notcp", "+novc", "+ignore", "+noignore", "+fail", "+nofail",
+        "+ldnsz", "+noldnsz", "+allcompare", "+noall", "+all", "+answer", "+noanswer",
+        "+authority", "+noauthority", "+additional", "+noadditional", "+question", "+noquestion",
+        "+comments", "+nocomments", "+stats", "+nostats", "+identify", "+noidentify",
+        "+multiline", "+nomultiline", "+expandaaaa", "+noexpandaaaa", "+yaml", "+noyaml",
+        "+trace", "+notrace", "+nssearch", "+nonssearch", "+glue", "+noglue",
+        "+search", "+nosearch", "+domain=example.com", "+ndots=2", "+class", "+noclass",
+        "+crypto", "+nocrypto", "+besteffort", "+nobesteffort", "+badcookie", "+nobadcookie",
+        "+showbadcookie", "+noshowbadcookie", "+ednsnegotiation", "+noednsnegotiation",
+        "+showbadvers", "+noshowbadvers", "+qr", "+noqr", "+rrcomments", "+norrcomments",
+        "+onesoa", "+noonesoa", "+split=40", "+nosplit", "+unknownformat", "+nounknownformat",
+        "+ttlunits", "+nottlunits", "+ttlid", "+nottlid", "+expire", "+noexpire",
+        "+showsearch", "+noshowsearch", "+idn", "+noidn", "+idnin", "+noidnin", "+idnout", "+noidnout",
+        "+rec", "+norec", "+raflag", "+noraflag", "+aaonly", "+noaaonly", "+coflag", "+nocoflag",
+        "+ednsflags=0x80", "+opcode=QUERY", "+qid=1234", "+header-only", "+noheader-only",
+        "+keepalive", "+nokeepalive", "+keepopen", "+nokeepopen", "+fuzztime=123456", "+nofuzztime",
+        "+dns64prefix", "+nodns64prefix", "+proxy-plain", "+noproxy-plain", "+tls", "+notls",
+        "+tls-ca", "+notls-ca", "+https", "+nohttps", "+http-plain", "+nohttp-plain",
+        "+nohexdump", "+hexdump", "+nohexdump-query", "+hexdump-query", "+nohexdump-response", "+hexdump-response",
+        "+edns=0", "+noedns", "+dnssec", "+nodnssec", "+nsid", "+nonsid", "+bufsize=4096",
+        "+adflag", "+noadflag", "+cdflag", "+nocdflag", "+tcflag", "+notcflag", "+zflag", "+nozflag",
+        "+tcp-mss=1400", "+tcp-window=65535", "+timeout=3", "+tries=2", "+retry=2",
+        "+padding=64", "+nopadding", "+mqtype=A,AAAA", "+nomqtype", "+noednsopt",
+        "+ednsopt=65001:0102", "+subnet=192.0.2.0/24", "+nosubnet", "+cookie=0102030405060708", "+nocookie",
+        "+tsig=hmac-sha256:testkey:c2VjcmV0MTIz", "+nosig0", "--test-all",
+        "-x", "192.0.2.1", "-c", "IN", "-t", "A", "-q", "example.com", "-u", "-m",
+        "-p", "5353", "-4", "-6", "-b", "127.0.0.1#12345",
+        "--update-add", "test.example. 300 IN A 1.2.3.4",
+        "--update-del", "test.example. A",
+        "--update-del-exact", "test.example. 300 IN A 1.2.3.4",
+        "--prereq=nxdomain:test.example.",
+        "--prereq-nxdomain", "nx.example.",
+        "--prereq-yxdomain", "yx.example.",
+        "--prereq-nxrrset", "test.example. A",
+        "--prereq-yxrrset", "test.example. A 1.2.3.4",
+        "@127.0.0.1", "example.com", "A"
+    };
+    int n_args = sizeof(args) / sizeof(args[0]);
+    int p_rc = parse_arg_slice(1, n_args, n_args, args, &spec);
+    assert(p_rc == 0);
+    free_query_opts(&spec.qo);
+
+    // Test invalid option handling
+    init_query_spec(&spec);
+    char *bad_opt_args[] = { "dag", "+invalid_unrecognized_flag_xyz" };
+    assert(parse_arg_slice(1, 2, 2, bad_opt_args, &spec) < 0);
+    free_query_opts(&spec.qo);
+
+    // Test TSIG and SIG0 exclusivity error
+    init_query_spec(&spec);
+    char *conflict_args[] = { "dag", "+tsig=hmac-sha256:key:c2Vj", "+sig0" };
+    assert(parse_arg_slice(1, 3, 3, conflict_args, &spec) < 0);
+    free_query_opts(&spec.qo);
+
+    // Test execute_query_spec error branches
+    init_query_spec(&spec);
+    spec.qo.want_sig0 = true;
+    spec.qo.sig0_key.pkey = NULL;
+    assert(execute_query_spec(&spec) == 1); // No private key
+
+    spec.qo.want_tsig = true;
+    assert(execute_query_spec(&spec) == 1); // TSIG + SIG0 conflict
+    free_query_opts(&spec.qo);
+
+    printf("  -> CLI option parsing, helpers, and error branches passed.\n");
+}
+
 int main(void) {
     printf("=== Starting dag RDATA Display Tests ===\n");
     test_character_string_escaping();
@@ -384,6 +570,8 @@ int main(void) {
     test_dig_compat_formatting();
     test_round_trip_all_types();
     test_truncation_robustness();
+    test_dag_cli_parsing_helpers_and_error_paths();
     printf("=== All dag RDATA Display Tests PASSED ===\n");
     return 0;
 }
+

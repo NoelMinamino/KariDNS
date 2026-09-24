@@ -1833,8 +1833,13 @@ static void test_wire_hex_char_to_val_and_hex_decode(void) {
 
     // Empty
     CHECK(hex_decode("", out, sizeof(out)) == 0);
-    // Odd length
-    CHECK(hex_decode("123", out, sizeof(out)) == (size_t)-1 || hex_decode("123", out, sizeof(out)) == 0);
+    // Odd length (decodes 1 full byte from 3 hex nibbles)
+    CHECK(hex_decode("123", out, sizeof(out)) == 1);
+    CHECK(out[0] == 0x12);
+    // Buffer capacity exceeded
+    CHECK(hex_decode("0102030405", out, 2) == (size_t)-1);
+    // Non-hex delimiters ignored
+    CHECK(hex_decode("01:02 03-04", out, sizeof(out)) == 4);
 }
 
 static void test_wire_compare_canonical_name_ordering(void) {
@@ -2198,8 +2203,89 @@ static void test_deep_pointer_chains_and_cycles(void) {
     }
 }
 
+static void test_wire_compression_and_rdata_boundaries(void) {
+    printf("[TEST] Wire: compression pointer anomalies and RDATA boundary validations...\n");
+
+    /* 1. Self-referencing compression pointer (cycle) */
+    uint8_t self_loop_pkt[32];
+    memset(self_loop_pkt, 0, sizeof(self_loop_pkt));
+    /* Pointer at offset 12 points to offset 12: 0xC0, 0x0C */
+    self_loop_pkt[12] = 0xC0;
+    self_loop_pkt[13] = 0x0C;
+    size_t next_off = 0;
+    CHECK(skip_wire_name(self_loop_pkt, sizeof(self_loop_pkt), 12, &next_off) != 0);
+
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    char *expanded_name = NULL;
+    CHECK(expand_wire_name(self_loop_pkt, sizeof(self_loop_pkt), 12, &next_off, &arena, &expanded_name) != 0);
+
+    /* 2. Pointer pointing outside packet boundary */
+    uint8_t oob_ptr_pkt[16];
+    memset(oob_ptr_pkt, 0, sizeof(oob_ptr_pkt));
+    oob_ptr_pkt[12] = 0xC0;
+    oob_ptr_pkt[13] = 0xFF; /* offset 255 in 16-byte packet */
+    CHECK(skip_wire_name(oob_ptr_pkt, sizeof(oob_ptr_pkt), 12, &next_off) != 0);
+    CHECK(expand_wire_name(oob_ptr_pkt, sizeof(oob_ptr_pkt), 12, &next_off, &arena, &expanded_name) != 0);
+
+    /* 3. Pointer cycle between two offsets: 12 -> 14 and 14 -> 12 */
+    uint8_t cycle2_pkt[32];
+    memset(cycle2_pkt, 0, sizeof(cycle2_pkt));
+    cycle2_pkt[12] = 0xC0; cycle2_pkt[13] = 14;
+    cycle2_pkt[14] = 0xC0; cycle2_pkt[15] = 12;
+    CHECK(skip_wire_name(cycle2_pkt, sizeof(cycle2_pkt), 12, &next_off) != 0);
+    CHECK(expand_wire_name(cycle2_pkt, sizeof(cycle2_pkt), 12, &next_off, &arena, &expanded_name) != 0);
+
+    /* 4. RDATA boundary checks for parse_resource_record */
+    /* Construct base packet with owner "ex." at offset 0: \x02ex\x00 (3 bytes) */
+    uint8_t rr_pkt[128];
+    memset(rr_pkt, 0, sizeof(rr_pkt));
+    rr_pkt[0] = 2; rr_pkt[1] = 'e'; rr_pkt[2] = 'x'; rr_pkt[3] = 0;
+    /* offset 4: TYPE=1 (A), CLASS=1 (IN), TTL=300, RDLEN=3 (1 byte missing) */
+    rr_pkt[4] = 0; rr_pkt[5] = 1; /* A */
+    rr_pkt[6] = 0; rr_pkt[7] = 1; /* IN */
+    rr_pkt[8] = 0; rr_pkt[9] = 0; rr_pkt[10] = 1; rr_pkt[11] = 0x2C; /* TTL=300 */
+    rr_pkt[12] = 0; rr_pkt[13] = 3; /* RDLEN=3 (invalid for A record, needs 4) */
+    rr_pkt[14] = 192; rr_pkt[15] = 0; rr_pkt[16] = 2;
+
+    dns_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    uint16_t type_out = 0;
+    size_t parse_off = 0;
+    CHECK(parse_resource_record(rr_pkt, 17, &parse_off, &arena, &rec, &type_out) != 0);
+
+    /* A record with RDLEN=5 (1 byte extra) */
+    rr_pkt[13] = 5;
+    rr_pkt[17] = 1;
+    parse_off = 0;
+    CHECK(parse_resource_record(rr_pkt, 18, &parse_off, &arena, &rec, &type_out) != 0);
+
+    /* AAAA record with RDLEN=15 (1 byte missing) */
+    rr_pkt[5] = 28; /* AAAA */
+    rr_pkt[13] = 15;
+    parse_off = 0;
+    CHECK(parse_resource_record(rr_pkt, 30, &parse_off, &arena, &rec, &type_out) != 0);
+
+    /* SRV record with RDLEN=5 (< 7) */
+    rr_pkt[5] = 33; /* SRV */
+    rr_pkt[13] = 5;
+    parse_off = 0;
+    CHECK(parse_resource_record(rr_pkt, 20, &parse_off, &arena, &rec, &type_out) != 0);
+
+    /* NAPTR record with RDLEN=5 (< 7) */
+    rr_pkt[5] = 35; /* NAPTR */
+    rr_pkt[13] = 5;
+    parse_off = 0;
+    CHECK(parse_resource_record(rr_pkt, 20, &parse_off, &arena, &rec, &type_out) != 0);
+
+    zone_arena_destroy(&arena);
+    printf("  -> compression pointer anomalies and RDATA boundary validations passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Wire / Utility Helper Tests ===\n");
+    test_wire_compression_and_rdata_boundaries();
     test_deep_pointer_chains_and_cycles();
     test_type_to_string();
     test_strchr_unescaped();
@@ -2368,6 +2454,12 @@ int main(void) {
     test_wire_feature_case_37();
     test_wire_feature_case_38();
     test_wire_feature_case_39();
-    test_wire_feature_case_40();    printf("=== All Wire / Utility Helper Tests PASSED ===\n");
+    test_wire_feature_case_40();
+    printf("[*] Final checks: %d checks, %d failed\n", g_checks, g_failed);
+    if (g_failed) {
+        printf("=== Wire / Utility Helper Tests FAILED ===\n");
+        return 1;
+    }
+    printf("=== All Wire / Utility Helper Tests PASSED ===\n");
     return 0;
 }

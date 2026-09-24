@@ -447,10 +447,12 @@ static void verify_type_names_sorted(void) {
     size_t n = sizeof(TYPE_NAMES) / sizeof(TYPE_NAMES[0]);
     for (size_t i = 1; i < n; i++) {
         if (TYPE_NAMES[i - 1].type >= TYPE_NAMES[i].type) {
+            /* LCOV_EXCL_START */
             fprintf(stderr,
                 "FATAL: TYPE_NAMES is not strictly sorted at index %zu (%u >= %u)\n",
                 i, TYPE_NAMES[i - 1].type, TYPE_NAMES[i].type);
             abort();
+            /* LCOV_EXCL_STOP */
         }
     }
 }
