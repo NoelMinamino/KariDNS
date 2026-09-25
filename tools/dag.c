@@ -21,6 +21,7 @@
 #include "dag_tsig_client.h"
 #include "dag_edns_client.h"
 #include "dag_transport.h"
+#include "karidns_tool_linkage.h"
 
 
 
@@ -155,11 +156,11 @@ bool resolve_qtype(const char *s, uint16_t *out_type) {
     return false;
 }
 
-static bool is_known_qtype(const char *s) {
+KARIDNS_TOOL_FN bool is_known_qtype(const char *s) {
     return resolve_qtype(s, NULL);
 }
 
-static bool is_qtype_syntax_or_known(const char *s) {
+KARIDNS_TOOL_FN bool is_qtype_syntax_or_known(const char *s) {
     if (!s) return false;
     if (is_known_qtype(s)) return true;
     if (strncasecmp(s, "TYPE", 4) == 0 && isdigit((unsigned char)s[4])) {
@@ -177,7 +178,7 @@ int parse_qtype(const char *s) {
     return -1;
 }
 
-static void print_ldnsz_payload(const uint8_t *buf, size_t len) {
+KARIDNS_TOOL_FN void print_ldnsz_payload(const uint8_t *buf, size_t len) {
     z_stream strm;
     memset(&strm, 0, sizeof(strm));
     if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
@@ -296,7 +297,7 @@ const char *opcode_name(uint8_t opcode) {
     }
 }
 
-static int parse_opcode_value(const char *s) {
+KARIDNS_TOOL_FN int parse_opcode_value(const char *s) {
     if (!s || !*s) return -1;
     if (strcasecmp(s, "QUERY") == 0) return 0;
     if (strcasecmp(s, "IQUERY") == 0) return 1;
@@ -312,14 +313,14 @@ static int parse_opcode_value(const char *s) {
 // dag.c: get_type_str(dns_wire.c, arena依存)を使わず、dag内で完結させる。
 // format_type_name is now in dns_utils.h
 
-static double loc_decode_precsize(uint8_t b) {
+KARIDNS_TOOL_FN double loc_decode_precsize(uint8_t b) {
     uint8_t mantissa = b >> 4;
     uint8_t exponent = b & 0x0F;
     double cm = mantissa * pow(10, exponent);
     return cm / 100.0;
 }
 
-static void format_loc_prec(double val, char *buf, size_t len) {
+KARIDNS_TOOL_FN void format_loc_prec(double val, char *buf, size_t len) {
     if (val == (long)val) {
         snprintf(buf, len, "%.0fm", val);
     } else {
@@ -327,7 +328,7 @@ static void format_loc_prec(double val, char *buf, size_t len) {
     }
 }
 
-static void format_time_comment(uint32_t sec, char *buf, size_t len) {
+KARIDNS_TOOL_FN void format_time_comment(uint32_t sec, char *buf, size_t len) {
     if (sec == 0) { snprintf(buf, len, " (0 seconds)"); return; }
     if (sec % 604800 == 0) {
         uint32_t w = sec / 604800;
@@ -346,7 +347,7 @@ static void format_time_comment(uint32_t sec, char *buf, size_t len) {
     }
 }
 
-static void loc_format_coord(uint32_t wire_val, bool is_lat, char *out, size_t out_cap) {
+KARIDNS_TOOL_FN void loc_format_coord(uint32_t wire_val, bool is_lat, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     int64_t signed_val = (int64_t)wire_val - 0x80000000LL;
     char dir = is_lat ? (signed_val < 0 ? 'S' : 'N') : (signed_val < 0 ? 'W' : 'E');
@@ -357,7 +358,7 @@ static void loc_format_coord(uint32_t wire_val, bool is_lat, char *out, size_t o
     snprintf(out, out_cap, "%d %d %.3f %c", deg, min, sec, dir);
 }
 
-static const char *cert_type_name(uint16_t type, char *buf, size_t buf_size) {
+KARIDNS_TOOL_FN const char *cert_type_name(uint16_t type, char *buf, size_t buf_size) {
     switch (type) {
         case 1: return "PKIX"; case 2: return "SPKI"; case 3: return "PGP";
         case 4: return "IPKIX"; case 5: return "ISPKI"; case 6: return "IPGP";
@@ -367,7 +368,7 @@ static const char *cert_type_name(uint16_t type, char *buf, size_t buf_size) {
     }
 }
 
-static void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len, char *out, size_t out_cap) {
+KARIDNS_TOOL_FN void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     size_t pos = 0, out_len = 0;
     out[0] = '\0';
@@ -395,7 +396,7 @@ static void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len, char *o
     }
 }
 
-static char *base64_encode_alloc(const uint8_t *data, size_t len, int *out_len) {
+KARIDNS_TOOL_FN char *base64_encode_alloc(const uint8_t *data, size_t len, int *out_len) {
     size_t cap = 4 * ((len + 2) / 3) + 1;
     char *buf = malloc(cap);
     if (!buf) {
@@ -413,7 +414,7 @@ typedef struct {
     size_t *pos;      /* Current write position (when buf != NULL) */
 } rdata_sink_t;
 
-static void sink_printf(rdata_sink_t *sink, const char *fmt, ...) {
+KARIDNS_TOOL_FN void sink_printf(rdata_sink_t *sink, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     if (sink->buf) {
@@ -439,7 +440,7 @@ static void sink_printf(rdata_sink_t *sink, const char *fmt, ...) {
  * backslash-escaped, printable ASCII is printed as is and every other octet as \DDD where DDD is the DECIMAL value
  * (dig prints 0x7f as \127; the octal "\177" this code used to emit reads back as a different byte). One helper serves
  * every type that prints text (TXT, SPF, AVC, NINFO, CAA, HINFO, X25, ISDN, GPOS, NAPTR). */
-static void sink_char_string(rdata_sink_t *sink, const uint8_t *s, size_t len) {
+KARIDNS_TOOL_FN void sink_char_string(rdata_sink_t *sink, const uint8_t *s, size_t len) {
     sink_printf(sink, "\"");
     for (size_t i = 0; i < len; i++) {
         unsigned char c = s[i];
@@ -451,7 +452,7 @@ static void sink_char_string(rdata_sink_t *sink, const uint8_t *s, size_t len) {
 }
 
 /* Splits the next length-prefixed <character-string> off [p, end); NULL when it does not fit. */
-static const uint8_t *next_char_string(const uint8_t *p, const uint8_t *end, const uint8_t **str, size_t *len) {
+KARIDNS_TOOL_FN const uint8_t *next_char_string(const uint8_t *p, const uint8_t *end, const uint8_t **str, size_t *len) {
     if (p >= end) return NULL;
     size_t l = *p++;
     if ((size_t)(end - p) < l) return NULL;
@@ -460,7 +461,7 @@ static const uint8_t *next_char_string(const uint8_t *p, const uint8_t *end, con
     return p + l;
 }
 
-static void sink_split_b64(rdata_sink_t *sink, const char *b64, int len, int split_width) {
+KARIDNS_TOOL_FN void sink_split_b64(rdata_sink_t *sink, const char *b64, int len, int split_width) {
     if (split_width > 0 && len > split_width) {
         for (int i = 0; i < len; i += split_width) {
             if (i > 0) sink_printf(sink, " ");
@@ -471,7 +472,7 @@ static void sink_split_b64(rdata_sink_t *sink, const char *b64, int len, int spl
     }
 }
 
-static void sink_split_hex(rdata_sink_t *sink, const uint8_t *data, size_t len, int split_width) {
+KARIDNS_TOOL_FN void sink_split_hex(rdata_sink_t *sink, const uint8_t *data, size_t len, int split_width) {
     int sw = (split_width > 0) ? (split_width / 2) : 0;
     for (size_t i = 0; i < len; i++) {
         if (sw > 0 && i > 0 && (i % sw) == 0) sink_printf(sink, " ");
@@ -479,7 +480,7 @@ static void sink_split_hex(rdata_sink_t *sink, const uint8_t *data, size_t len, 
     }
 }
 
-static void sink_multiline_hex(rdata_sink_t *sink, const uint8_t *data, size_t len, int split_width) {
+KARIDNS_TOOL_FN void sink_multiline_hex(rdata_sink_t *sink, const uint8_t *data, size_t len, int split_width) {
     if (len == 0) {
         sink_printf(sink, "\t\t\t\t\t )\n");
         return;
@@ -496,7 +497,7 @@ static void sink_multiline_hex(rdata_sink_t *sink, const uint8_t *data, size_t l
     }
 }
 
-static void sink_multiline_b64(rdata_sink_t *sink, const char *b64, int len, int split_width) {
+KARIDNS_TOOL_FN void sink_multiline_b64(rdata_sink_t *sink, const char *b64, int len, int split_width) {
     if (len == 0) {
         sink_printf(sink, "\t\t\t\t\t )\n");
         return;
@@ -513,7 +514,7 @@ static void sink_multiline_b64(rdata_sink_t *sink, const char *b64, int len, int
     }
 }
 
-static void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
+KARIDNS_TOOL_FN void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
     if (rdlen < 4) { sink_printf(sink, "(malformed)"); return; }
     uint16_t flags = (rdata[0]<<8)|rdata[1];
     uint8_t protocol = rdata[2];
@@ -547,7 +548,7 @@ static void sink_dnskey_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rd
     free(b64);
 }
 
-static void sink_ds_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
+KARIDNS_TOOL_FN void sink_ds_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, const display_opts_t *dopt) {
     if (rdlen < 4) { sink_printf(sink, "(malformed)"); return; }
     uint16_t keytag = (rdata[0]<<8)|rdata[1];
     uint8_t algorithm = rdata[2];
@@ -567,7 +568,7 @@ static void sink_ds_like(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen,
     }
 }
 
-static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
+KARIDNS_TOOL_FN void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
     size_t out_len = 0;
@@ -588,7 +589,7 @@ static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t 
     out[out_len] = '\0';
 }
 
-static void format_rrsig_time(uint32_t t, char *out, size_t out_cap) {
+KARIDNS_TOOL_FN void format_rrsig_time(uint32_t t, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     time_t tt = (time_t)t;
     struct tm tm_buf;
@@ -596,7 +597,7 @@ static void format_rrsig_time(uint32_t t, char *out, size_t out_cap) {
     strftime(out, out_cap, "%Y%m%d%H%M%S", &tm_buf);
 }
 
-static void sink_nsec3_params(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, bool with_hash, const display_opts_t *dopt) {
+KARIDNS_TOOL_FN void sink_nsec3_params(rdata_sink_t *sink, const uint8_t *rdata, size_t rdlen, bool with_hash, const display_opts_t *dopt) {
     if (rdlen < 5) { sink_printf(sink, "(malformed)"); return; }
     uint8_t hash_alg = rdata[0];
     uint8_t flags = rdata[1];
@@ -629,7 +630,7 @@ static void sink_nsec3_params(rdata_sink_t *sink, const uint8_t *rdata, size_t r
     }
 }
 
-static void sink_svcparam_alpn(rdata_sink_t *sink, const uint8_t *value, uint16_t value_len) {
+KARIDNS_TOOL_FN void sink_svcparam_alpn(rdata_sink_t *sink, const uint8_t *value, uint16_t value_len) {
     sink_printf(sink, "alpn=\"");
     size_t pos = 0;
     bool first = true;
@@ -644,7 +645,7 @@ static void sink_svcparam_alpn(rdata_sink_t *sink, const uint8_t *value, uint16_
     sink_printf(sink, "\"");
 }
 
-static void sink_svcparam_ipvXhint(rdata_sink_t *sink, const uint8_t *value, uint16_t value_len, bool is_v6) {
+KARIDNS_TOOL_FN void sink_svcparam_ipvXhint(rdata_sink_t *sink, const uint8_t *value, uint16_t value_len, bool is_v6) {
     /* RFC 9460 section 7.1/7.3: ipv4hint/ipv6hint values are comma-separated IP addresses, printed unquoted
      * (dig: "ipv4hint=192.0.2.1", not "ipv4hint=\"192.0.2.1\""). */
     sink_printf(sink, "%s=", is_v6 ? "ipv6hint" : "ipv4hint");
@@ -661,7 +662,7 @@ static void sink_svcparam_ipvXhint(rdata_sink_t *sink, const uint8_t *value, uin
     }
 }
 
-static void sink_svcparams(rdata_sink_t *sink, const uint8_t *rdata, size_t offset, size_t rdlen) {
+KARIDNS_TOOL_FN void sink_svcparams(rdata_sink_t *sink, const uint8_t *rdata, size_t offset, size_t rdlen) {
     while (offset + 4 <= rdlen) {
         uint16_t key = (rdata[offset]<<8)|rdata[offset+1];
         uint16_t vlen = (rdata[offset+2]<<8)|rdata[offset+3];
@@ -727,7 +728,7 @@ static void sink_svcparams(rdata_sink_t *sink, const uint8_t *rdata, size_t offs
     }
 }
 
-static void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t type,
+KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                                 size_t abs_offset, uint16_t rdlen,
                                 rdata_sink_t *sink, const display_opts_t *dopt) {
     if (abs_offset + rdlen > pkt_len) {
@@ -1740,14 +1741,14 @@ void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
     format_rdata_common(pkt, pkt_len, type, abs_offset, rdlen, &sink, dopt);
 }
 
-static void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
+KARIDNS_TOOL_FN void print_rdata(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                         size_t abs_offset, uint16_t rdlen, const display_opts_t *dopt) {
     rdata_sink_t sink = { .buf = NULL, .buf_cap = 0, .pos = NULL };
     format_rdata_common(pkt, pkt_len, type, abs_offset, rdlen, &sink, dopt);
 }
 
 
-static uint32_t calc_wire_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
+KARIDNS_TOOL_FN uint32_t calc_wire_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const uint8_t *rdata, uint16_t rdlen) {
     uint32_t h = 2166136261u;
     for (int i = 0; name && name[i]; i++) {
         h ^= tolower((unsigned char)name[i]);
@@ -1772,7 +1773,7 @@ static uint32_t calc_wire_rr_hash(const char *name, uint16_t type, uint16_t klas
     return h;
 }
 
-static uint32_t calc_record_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const char *rdata_text) {
+KARIDNS_TOOL_FN uint32_t calc_record_rr_hash(const char *name, uint16_t type, uint16_t klass, uint32_t ttl, const char *rdata_text) {
     uint32_t h = 2166136261u;
     for (int i = 0; name && name[i]; i++) {
         h ^= tolower((unsigned char)name[i]);
@@ -1856,7 +1857,7 @@ const char *format_class_name(uint16_t klass, char *buf, size_t buf_size) {
     }
 }
 
-static const char *idn_to_ascii(const char *name, bool *allocated) {
+KARIDNS_TOOL_FN const char *idn_to_ascii(const char *name, bool *allocated) {
     if (allocated) *allocated = false;
 #ifdef HAVE_LIBIDN2
     char *p = NULL;
@@ -1884,7 +1885,7 @@ static const char *idn_to_ascii(const char *name, bool *allocated) {
     return name;
 }
 
-static const char *idn_to_unicode(const char *name, char *buf, size_t buf_size) {
+KARIDNS_TOOL_FN const char *idn_to_unicode(const char *name, char *buf, size_t buf_size) {
 #ifdef HAVE_LIBIDN2
     char *p;
     if (idn2_to_unicode_8z8z(name, &p, 0) == IDN2_OK) {
@@ -1897,7 +1898,7 @@ static const char *idn_to_unicode(const char *name, char *buf, size_t buf_size) 
     return buf;
 }
 
-static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state, const display_opts_t *dopt) {
+KARIDNS_TOOL_FN bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axfr_state_t *axfr_state, const display_opts_t *dopt) {
     char *name = NULL; size_t next;
     if (expand_wire_name(pkt, pkt_len, *offset, &next, &g_dag_arena, &name) != 0) return false;
     size_t hdr = next;
@@ -1969,7 +1970,7 @@ static bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *offset, axf
 
 
 
-static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
+KARIDNS_TOOL_FN void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
                                      uint16_t qdcount, uint16_t ancount,
                                      uint16_t nscount, uint16_t arcount,
                                      const display_opts_t *dopt) {
@@ -2004,13 +2005,13 @@ static void print_opt_extra_options(const uint8_t *pkt, size_t pkt_len,
 }
 
 
-static void format_edns_flags(bool dnssec_ok, bool compact_answers_ok, char *buf, size_t buf_size) {
+KARIDNS_TOOL_FN void format_edns_flags(bool dnssec_ok, bool compact_answers_ok, char *buf, size_t buf_size) {
     buf[0] = '\0';
     if (dnssec_ok) strncat(buf, " do", buf_size - strlen(buf) - 1);
     if (compact_answers_ok) strncat(buf, " co", buf_size - strlen(buf) - 1);
 }
 
-static int count_non_opt_rrs(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount) {
+KARIDNS_TOOL_FN int count_non_opt_rrs(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount) {
     int count = 0;
     size_t cur = offset;
     for (uint16_t i = 0; i < arcount; i++) {
@@ -2028,7 +2029,7 @@ static int count_non_opt_rrs(const uint8_t *pkt, size_t pkt_len, size_t offset, 
     return count;
 }
 
-static void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opts_t *qo, const display_opts_t *dopt) {
+KARIDNS_TOOL_FN void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opts_t *qo, const display_opts_t *dopt) {
     if (pkt_len < 12) return;
     if (dopt->yaml) {
         printf(";; Sending query in YAML format\n");
@@ -2140,7 +2141,7 @@ static void print_sent_query(const uint8_t *pkt, size_t pkt_len, const query_opt
     printf(";; QUERY SIZE: %zu\n\n", pkt_len);
 }
 
-static bool check_packet_malformed(const uint8_t *pkt, size_t pkt_len, size_t *extra_bytes) {
+KARIDNS_TOOL_FN bool check_packet_malformed(const uint8_t *pkt, size_t pkt_len, size_t *extra_bytes) {
     if (pkt_len < 12) return true;
     uint16_t qdcount = (pkt[4] << 8) | pkt[5];
     uint16_t ancount = (pkt[6] << 8) | pkt[7];
@@ -2389,7 +2390,7 @@ size_t parse_hex_string(const char *hex, uint8_t *out, size_t out_cap) {
 
 // AAAAレコードのアドレスからRFC 6052 Well-Known PrefixまたはNSPを検出し、
 // 見つかった場合はプレフィックス文字列とプレフィックス長を返す。見つからなければ false。
-static bool detect_dns64_prefix_from_aaaa(const uint8_t *addr16, char *out_pstr, size_t out_cap, int *out_plen) {
+KARIDNS_TOOL_FN bool detect_dns64_prefix_from_aaaa(const uint8_t *addr16, char *out_pstr, size_t out_cap, int *out_plen) {
     const uint8_t *b = addr16;
     int plen = 0;
     if (b[12] == 0xC0 && b[13] == 0x00 && b[14] == 0x00 && (b[15] == 0xAA || b[15] == 0xAB)) plen = 96;
@@ -2411,7 +2412,7 @@ static bool detect_dns64_prefix_from_aaaa(const uint8_t *addr16, char *out_pstr,
 }
 
 
-static void run_dns64prefix_check(const char *server, int port, const query_opts_t *qo, bool use_tcp,
+KARIDNS_TOOL_FN void run_dns64prefix_check(const char *server, int port, const query_opts_t *qo, bool use_tcp,
                                    bool no_hexdump_query, bool no_hexdump_response,
                                    const display_opts_t *dopt) {
     (void)no_hexdump_query; (void)no_hexdump_response;
@@ -2474,7 +2475,7 @@ static void run_dns64prefix_check(const char *server, int port, const query_opts
     }
 }
 
-static int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
+KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const char *qtype_s, const char *server, int port,
                     bool use_tcp, bool norecurse,
                     bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
                     bool no_hexdump_query, bool no_hexdump_response,
@@ -2995,7 +2996,7 @@ static int run_test(const char *test_name, const char *qname, const char *qtype_
     return 0;
 }
 
-static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
+KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
     if (is_yaml || g_server_count == 0) return;
     
     if (g_server_count > 1) {
@@ -3106,7 +3107,7 @@ static void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
 }
 
 
-static void usage(const char *prog) {
+KARIDNS_TOOL_FN void usage(const char *prog) {
     (void)prog;
     printf(
         "Usage:  dag [@server] [-p port] [domain] [type] [options]\n"
@@ -3270,7 +3271,7 @@ static void usage(const char *prog) {
     );
 }
 
-static bool make_reverse_name(const char *ip_str, char *out_name, size_t out_len) {
+KARIDNS_TOOL_FN bool make_reverse_name(const char *ip_str, char *out_name, size_t out_len) {
     struct in_addr a4;
     struct in6_addr a6;
     if (inet_pton(AF_INET, ip_str, &a4) == 1) {
@@ -3352,7 +3353,7 @@ const char *get_system_resolver(void) {
 #endif
 }
 
-static int get_system_search_domains(char domains[][256], int max_domains) {
+KARIDNS_TOOL_FN int get_system_search_domains(char domains[][256], int max_domains) {
 #ifdef _WIN32
     (void)domains; (void)max_domains;
     return 0;
@@ -3381,14 +3382,14 @@ static int get_system_search_domains(char domains[][256], int max_domains) {
 #endif
 }
 
-static int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
+KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
                           bool use_tcp, bool force_udp, bool test_all, bool norecurse,
                           bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
                           bool no_hexdump_query, bool no_hexdump_response,
                           query_opts_t qo, const char *hex_payload, const display_opts_t *dopt);
 
 
-static inline void add_search_candidate(char candidates[8][512], int *count, const char *prefix, const char *suffix) {
+KARIDNS_TOOL_FN_INLINE void add_search_candidate(char candidates[8][512], int *count, const char *prefix, const char *suffix) {
     if (!count || *count >= 8) return;
     int written;
     if (suffix && *suffix) {
@@ -3403,7 +3404,7 @@ static inline void add_search_candidate(char candidates[8][512], int *count, con
     (*count)++;
 }
 
-static int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
+KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const char *server_arg, int port,
                           bool use_tcp, bool force_udp, bool test_all, bool norecurse,
                           bool adflag, bool cdflag, bool aaflag, bool tcflag, bool zflag,
                           bool no_hexdump_query, bool no_hexdump_response,
@@ -3744,7 +3745,7 @@ void init_query_spec(query_spec_t *spec) {
     spec->qo.use_glue = false;
 }
 
-static bool is_known_qclass_str(const char *s, uint16_t *out_class) {
+KARIDNS_TOOL_FN bool is_known_qclass_str(const char *s, uint16_t *out_class) {
     if (!s) return false;
     if (strcasecmp(s, "IN") == 0) {
         if (out_class) *out_class = 1;
@@ -3774,7 +3775,7 @@ static const char *TWO_ARG_OPTIONS[] = {
     NULL
 };
 
-static int get_arg_consume_count(int argc, char **argv, int i) {
+KARIDNS_TOOL_FN int get_arg_consume_count(int argc, char **argv, int i) {
     if (i >= argc) return 0;
     if (i + 1 >= argc) return 1;
     const char *arg = argv[i];
@@ -3832,7 +3833,7 @@ void prescan_always_global_options(int argc, char **argv, query_spec_t *global_s
     }
 }
 
-static int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spec) {
+KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_spec_t *spec) {
     const char *arg = argv[i];
 
     if (strcmp(arg, "+cmd") == 0) {
@@ -4844,6 +4845,14 @@ int execute_query_spec(query_spec_t *spec) {
     return exit_code;
 }
 
+#if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
+/* Coverage builds: the tests #include this file with "#define main dag_main",
+ * so the body below is named dag_main here as well; llvm-cov then merges the
+ * counters of every binary that runs it (see karidns_tool_linkage.h). */
+int dag_main(int argc, char **argv);
+int main(int argc, char **argv) { return dag_main(argc, argv); }
+#define main dag_main
+#endif
 int main(int argc, char **argv) {
 #ifndef _WIN32
     // サーバーからのTCP切断時におけるSIGPIPEによるプロセス強制終了を防止

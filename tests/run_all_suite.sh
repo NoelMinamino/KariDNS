@@ -262,6 +262,8 @@ register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 Change of Own
 
 # 8. DNSTAP Telemetry Logging
 register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
+register_test "core" "sh" "tests/run_server_core_matrix_test.sh" "Server runtime matrix: dual-stack wildcard, IPv6 NOTIFY, TCP misuse, RRL/TC, log rotation, control errors, daemon/CLI, primary+secondary"
+register_test "core" "sh" "tests/run_server_core_fi_test.sh" "Server fault injection: startup/runtime syscall failures via LD_PRELOAD shim (no crash allowed)"
 
 # 9. tinydns Format & Location
 register_test "tinydns" "sh" "tests/run_tinydns_location_test.sh" "tinydns %location split-horizon resolution"

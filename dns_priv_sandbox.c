@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <nl_types.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -171,6 +172,13 @@ void enter_capsicum_sandbox(void) {
     cap_rights_init(&rights, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
     cap_rights_limit(g_dnstap_sock, &rights);
   }
+  /* strerror() and syslog's %m look up libc's message catalog on first use
+   * (/usr/share/nls/<locale>/libc.cat). In capability mode that lookup is a
+   * Capsicum violation, which PROC_TRAPCAP turns into SIGTRAP: e.g. the dnstap
+   * sender logging "write failed: %s" after the collector went away killed
+   * the backend and, with it, the whole server. Open (and cache) the catalog
+   * now, as caph_cache_catpages() does. */
+  (void)catopen("libc", NL_CAT_LOCALE);
   if (!g_bypass_cap_enter) {
     int trapmode = PROC_TRAPCAP_CTL_ENABLE;
     procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);

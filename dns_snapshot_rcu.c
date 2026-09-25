@@ -1401,6 +1401,11 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             return NULL;
         }
         int actual_added_count = 0;
+        /* Once the new members are placed in the catalog's view, that view owns
+         * their initial reference and abort_rebuild_snapshot() frees them with
+         * the snapshot. Error paths may free them directly only before then;
+         * doing so afterwards was a use-after-free / double free. */
+        bool new_entries_published = false;
         for (int i = 0; i < added_count; i++) {
             zone_db_entry_t *entry = create_new_zone_entry(added_members[i].domain, catalog_view_name);
             if (!entry) {
@@ -1442,7 +1447,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             new_snap->views = calloc(new_snap->view_count, sizeof(view_snapshot_t));
             if (!new_snap->views) {
                 for (int k = 0; k < actual_added_count; k++) {
-                    if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                    if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
                 }
                 free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                 abort_rebuild_snapshot(new_snap, "catalog new_snap->views");
@@ -1485,7 +1490,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     if (del_hash_table) free(del_hash_table);
                     if (del_chain_next) free(del_chain_next);
                     for (int k = 0; k < actual_added_count; k++) {
-                        if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                        if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
                     }
                     free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                     abort_rebuild_snapshot(new_snap, "catalog vs->name");
@@ -1498,7 +1503,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         if (del_hash_table) free(del_hash_table);
                         if (del_chain_next) free(del_chain_next);
                         for (int k = 0; k < actual_added_count; k++) {
-                            if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                            if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
                         }
                         free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                         abort_rebuild_snapshot(new_snap, "catalog vs->match_clients");
@@ -1511,7 +1516,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                 if (del_hash_table) free(del_hash_table);
                                 if (del_chain_next) free(del_chain_next);
                                 for (int k = 0; k < actual_added_count; k++) {
-                                    if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                                    if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
                                 }
                                 free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                                 abort_rebuild_snapshot(new_snap, "catalog vs->match_clients[i]");
@@ -1532,7 +1537,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         if (del_hash_table) free(del_hash_table);
                         if (del_chain_next) free(del_chain_next);
                         for (int k = 0; k < actual_added_count; k++) {
-                            if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                            if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
                         }
                         free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                         abort_rebuild_snapshot(new_snap, "catalog vs->entries");
@@ -1581,6 +1586,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                     for (int i = 0; i < added_count; i++) {
                         vs->entries[zidx++] = new_entries[i];
                     }
+                    new_entries_published = true;
                     vs->zone_count = zidx;
                 } else {
                     vs->zone_count = old_snap->views[v].zone_count;
@@ -1589,7 +1595,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         if (del_hash_table) free(del_hash_table);
                         if (del_chain_next) free(del_chain_next);
                         for (int k = 0; k < actual_added_count; k++) {
-                            if (new_entries[k]) free_zone_db_entry(new_entries[k]);
+                            if (new_entries[k] && !new_entries_published) free_zone_db_entry(new_entries[k]);
                         }
                         free(added_members); free(removed_members); free(coo_evicted_members); free(new_entries);
                         abort_rebuild_snapshot(new_snap, "catalog other vs->entries");

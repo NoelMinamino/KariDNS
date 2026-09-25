@@ -31,7 +31,7 @@ static inline void karictl_explicit_bzero(void *p, size_t n) {
 #endif
 #endif
 
-char *read_entire_file(const char *path) {
+char *karictl_read_entire_file(const char *path) {
   FILE *f = fopen(path, "r");
   if (!f) return NULL;
   fseek(f, 0, SEEK_END);
@@ -56,7 +56,7 @@ char* extract_secret_from_config(const char* path) {
         }
     }
 
-    char *cfg = read_entire_file(path);
+    char *cfg = karictl_read_entire_file(path);
     if (!cfg) return NULL;
     
     char *secret = NULL;
@@ -86,7 +86,7 @@ char* extract_secret_from_config(const char* path) {
 }
 
 char* extract_socket_from_config(const char* path) {
-    char *cfg = read_entire_file(path);
+    char *cfg = karictl_read_entire_file(path);
     if (!cfg) return NULL;
     
     char *sock = NULL;
@@ -111,6 +111,14 @@ char* extract_socket_from_config(const char* path) {
     return sock;
 }
 
+#if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
+/* Coverage builds: the tests #include this file with "#define main karictl_main",
+ * so the body below is named karictl_main here as well; llvm-cov then merges the
+ * counters of every binary that runs it (see karidns_tool_linkage.h). */
+int karictl_main(int argc, char **argv);
+int main(int argc, char **argv) { return karictl_main(argc, argv); }
+#define main karictl_main
+#endif
 int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0)) {
         printf("karictl %s\n", KARIDNS_VERSION);
