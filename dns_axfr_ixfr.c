@@ -914,8 +914,8 @@ typedef struct {
 static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
   uint16_t prev_offset = ec->offset;
   if (serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF) < 0) {
-    uint16_t *res_ancount = (uint16_t *)&ec->res[6];
-    *res_ancount = htons(ec->answers);
+    ec->res[6] = (uint8_t)(ec->answers >> 8);
+    ec->res[7] = (uint8_t)(ec->answers & 0xFF);
     if (ec->is_extended_axfr && !ec->opt_sent) {
       uint16_t arcount = 0;
       assemble_edns_opt(ec->res, 65535, &prev_offset, &arcount, &ec->resp_edns, 0, true, NULL);
@@ -1386,8 +1386,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     if (axfr_emit_record(&ec, &current_zone->records[soa_idx]) < 0) goto axfr_error;
   }
   if (ec.answers > 0) {
-    uint16_t *res_ancount = (uint16_t *)&ec.res[6];
-    *res_ancount = htons(ec.answers);
+    ec.res[6] = (uint8_t)(ec.answers >> 8);
+    ec.res[7] = (uint8_t)(ec.answers & 0xFF);
     if (ec.is_extended_axfr && !ec.opt_sent) {
       uint16_t arcount = 0;
       assemble_edns_opt(ec.res, 65535, &ec.offset, &arcount, &ec.resp_edns, 0, true, NULL);

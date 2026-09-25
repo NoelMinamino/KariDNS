@@ -43,7 +43,7 @@ static void test_fi_serialize_records(void) {
         uint8_t out[512];
         uint16_t offset = 0;
         compress_ctx_t comp;
-        compress_ctx_init_packet(&comp);
+        compress_ctx_init(&comp);
         serialize_dns_record(out, sizeof(out), &offset, &rec_a, &comp, NULL, 0);
     });
 
@@ -51,7 +51,7 @@ static void test_fi_serialize_records(void) {
         uint8_t out[512];
         uint16_t offset = 0;
         compress_ctx_t comp;
-        compress_ctx_init_packet(&comp);
+        compress_ctx_init(&comp);
         serialize_dns_record(out, sizeof(out), &offset, &rec_txt, &comp, NULL, 0);
     });
 }

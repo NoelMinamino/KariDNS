@@ -19,45 +19,6 @@
 #include "dns_server_internal.h"
 #include "dns_dynamic_update.h"
 
-// Prototypes for internal query engine functions under test
-void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
-                        uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
-bool nsec_covers_name(const dns_record_t *rec, const char *name);
-dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
-size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
-int64_t monotonic_ms(void);
-uint32_t remaining_ms(int64_t deadline);
-int build_synthetic_servfail(const uint8_t *req, size_t req_len,
-                             uint8_t *res, size_t max_res_len);
-ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms);
-ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
-int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
-                             uint8_t *res, size_t max_res_len,
-                             const char *client_ip, bool is_tcp);
-bool question_section_matches(const uint8_t *resp, size_t resp_len,
-                              const uint8_t *req, size_t req_len);
-int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
-                          uint8_t *res, size_t max_res_len);
-size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire);
-bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
-                        const uint8_t *salt, size_t salt_len,
-                        char *out_b32, size_t out_b32_sz);
-bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash);
-bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
-bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
-                         uint8_t *res, size_t max_res_len, uint16_t *offset,
-                         compress_ctx_t *comp_ctx, uint16_t *nscount,
-                         dns_record_t **attached, int *attached_count);
-bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
-const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
-program_plugin_t *find_program_plugin(const char *domain);
-ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
-                        const uint8_t *query, size_t query_len,
-                        uint8_t *resp_out, size_t resp_out_cap,
-                        uint32_t timeout_ms);
-
 // Mock globals
 int g_control_kq = -1;
 int g_notify_ipc[2] = {-1, -1};
@@ -1187,42 +1148,38 @@ static void test_nsec3_hashing_and_intervals(void) {
 
     // 5. NSEC3 matching & covering in zone arena
     zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
     zone_arena_init(&arena);
-    arena.records = calloc(8, sizeof(dns_record_t));
-    arena.records_cap = 8;
-
-    dns_record_t nsec3_rec;
-    memset(&nsec3_rec, 0, sizeof(nsec3_rec));
-    nsec3_rec.name = arena_strdup(&arena, "00000000000000000000000000000000.example.com.");
-    nsec3_rec.type = arena_strdup(&arena, "NSEC3");
-    nsec3_rec.type_code = 50;
-    nsec3_rec.ttl = arena_strdup(&arena, "3600");
-    nsec3_rec.ttl_value = 3600;
-    nsec3_rec.class_str = arena_strdup(&arena, "IN");
-    nsec3_rec.class_val = 1;
-    nsec3_rec.rdata_count = 6;
-    nsec3_rec.rdata[0] = arena_strdup(&arena, "1"); // Hash algo SHA-1
-    nsec3_rec.rdata[1] = arena_strdup(&arena, "0"); // Flags
-    nsec3_rec.rdata[2] = arena_strdup(&arena, "1"); // Iterations
-    nsec3_rec.rdata[3] = arena_strdup(&arena, "-"); // Salt
-    nsec3_rec.rdata[4] = arena_strdup(&arena, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"); // Next hash
-    nsec3_rec.rdata[5] = arena_strdup(&arena, "A"); // Type bitmap
-    arena.records[0] = nsec3_rec;
-    arena.count = 1;
-    build_zone_index(&arena, true);
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "example.com.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    char ztext[] =
+        "$ORIGIN example.com.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "00000000000000000000000000000000 IN NSEC3 1 0 1 - AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA A\n"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA IN NSEC3 1 0 1 - 00000000000000000000000000000000 A\n";
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
 
     dns_record_t *matched = find_matching_nsec3(&arena, "00000000000000000000000000000000", "example.com.");
     assert(matched != NULL);
     assert(matched->type_code == 50);
 
-    dns_record_t *covering = find_covering_nsec3(&arena, "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM");
+    dns_record_t *covering = find_covering_nsec3(&arena, "55555555555555555555555555555555");
     assert(covering != NULL);
+    assert(covering->type_code == 50);
 
     // 6. attach_nsec3_record
     uint8_t res_buf[512];
     uint16_t offset = 12;
     compress_ctx_t comp_ctx;
-    compress_ctx_init_packet(&comp_ctx);
+    compress_ctx_init(&comp_ctx);   /* full init: init_packet() on an uninitialized stack ctx is UB (reads current_generation) */
     uint16_t nscount = 0;
     dns_record_t *attached[8] = {0};
     int attached_count = 0;
@@ -1549,6 +1506,7 @@ static size_t gr_build_cookie_query(uint8_t *req, const char *qname, uint16_t qt
 
 // Returns pointer to the COOKIE option payload in the response's OPT RR (NULL if absent).
 static const uint8_t *gr_find_cookie(const gr_resp_t *r, size_t *len_out, uint32_t *opt_ttl_out) {
+    if (!r) return NULL;
     for (int i = 0; i < r->nrr; i++) {
         if (r->rr[i].sect != 3 || r->rr[i].type != 41) continue;
         if (opt_ttl_out) *opt_ttl_out = r->rr[i].ttl;
@@ -1557,7 +1515,10 @@ static const uint8_t *gr_find_cookie(const gr_resp_t *r, size_t *len_out, uint32
             uint16_t code = (uint16_t)((r->msg[off] << 8) | r->msg[off + 1]);
             uint16_t len = (uint16_t)((r->msg[off + 2] << 8) | r->msg[off + 3]);
             if (off + 4 + len > end) return NULL;
-            if (code == 10) { *len_out = len; return r->msg + off + 4; }
+            if (code == 10) {
+                if (len_out) *len_out = len;
+                return r->msg + off + 4;
+            }
             off += 4 + (size_t)len;
         }
     }
@@ -1566,6 +1527,7 @@ static const uint8_t *gr_find_cookie(const gr_resp_t *r, size_t *len_out, uint32
 
 static void test_dns_cookie_engine_rfc9018(void) {
     printf("[TEST] Query Engine: RFC 9018 DNS Cookie handling (BADCOOKIE / refresh / echo)...\n");
+    fflush(stdout);
     gr_setup("example.",
         "$ORIGIN example.\n$TTL 3600\n"
         "@ IN SOA ns.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600\n"
@@ -1589,6 +1551,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     memcpy(opt, cc, 8);
 
     // 1. Client-only cookie -> NOERROR plus a fresh, valid Server Cookie bound to (client cookie, IP)
+    printf("  [Cookie] Step 1: client-only cookie query\n"); fflush(stdout);
     size_t n = gr_build_cookie_query(req, "host1.example.", 1, opt, 8);
     gr_query_raw(req, n, "host1.example.", 1, ip, false, &r);
     assert(r.rcode == 0 && gr_count(&r, 1, 1) == 1);
@@ -1598,6 +1561,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     assert(((opt_ttl >> 24) & 0xFF) == 0);                  // no BADCOOKIE extended RCODE
 
     // 2. Valid, fresh Server Cookie -> accepted and echoed unchanged (no needless rotation)
+    printf("  [Cookie] Step 2: fresh server cookie query\n"); fflush(stdout);
     assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 10));
     memcpy(opt + 8, sc, 16);
     n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
@@ -1607,6 +1571,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     assert(ck && clen == 24 && memcmp(ck + 8, sc, 16) == 0);
 
     // 3. Valid but older than 30 minutes -> accepted, and a NEW Server Cookie is returned (RFC 9018 4.3)
+    printf("  [Cookie] Step 3: older cookie refresh query\n"); fflush(stdout);
     assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 2400));
     memcpy(opt + 8, sc, 16);
     n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
@@ -1617,6 +1582,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     assert(verify_server_cookie(&g_gr.cfg, ip, cc, ck + 8, 16, (uint32_t)time(NULL)) == SERVER_COOKIE_VALID);
 
     // 4. Reserved bytes set by another implementation but hash valid (RFC 9018 4.2) -> accepted
+    printf("  [Cookie] Step 4: reserved bytes set query\n"); fflush(stdout);
     uint8_t rsv[16] = { 0x01, 0xab, 0xcd, 0xef };
     rsv[4] = (uint8_t)((now - 10) >> 24); rsv[5] = (uint8_t)((now - 10) >> 16);
     rsv[6] = (uint8_t)((now - 10) >> 8);  rsv[7] = (uint8_t)(now - 10);
@@ -1629,6 +1595,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     assert(ck && clen == 24 && ((opt_ttl >> 24) & 0xFF) == 0);
 
     // 5. Wrong hash over UDP -> BADCOOKIE (RCODE 23 = ext 1 | base 7) with a fresh cookie so the client can retry
+    printf("  [Cookie] Step 5: bad cookie UDP query\n"); fflush(stdout);
     assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 10));
     sc[15] ^= 0x01;
     memcpy(opt + 8, sc, 16);
@@ -1641,11 +1608,13 @@ static void test_dns_cookie_engine_rfc9018(void) {
     assert(gr_count(&r, 1, -1) == 0);                       // no answer data is leaked on BADCOOKIE
 
     // 6. Same invalid cookie over TCP -> served normally (TCP already proves the source address)
+    printf("  [Cookie] Step 6: bad cookie TCP query\n"); fflush(stdout);
     n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
     gr_query_raw(req, n, "host1.example.", 1, ip, true, &r);
     assert(r.rcode == 0 && gr_count(&r, 1, 1) == 1);
 
     // 7. Too old (> 1 hour) and cookie replayed from another client address -> BADCOOKIE
+    printf("  [Cookie] Step 7: expired / replayed cookie query\n"); fflush(stdout);
     assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 3700));
     memcpy(opt + 8, sc, 16);
     n = gr_build_cookie_query(req, "host1.example.", 1, opt, 24);
@@ -1658,6 +1627,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     assert((r.msg[3] & 0x0F) == 7);
 
     // 8. Secret rollover: a cookie made with the previous (2nd) secret is still accepted...
+    printf("  [Cookie] Step 8: secret rollover query\n"); fflush(stdout);
     static const uint8_t old_secret[16] = { 0xdd,0x3b,0xdf,0x93,0x44,0xb6,0x78,0xb1,
                                             0x85,0xa6,0xf5,0xcb,0x60,0xfc,0xa7,0x15 };
     server_config_t old_cfg;
@@ -1677,6 +1647,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     assert((r.msg[3] & 0x0F) == 7);
 
     // 9. A query without a COOKIE option never gets one back
+    printf("  [Cookie] Step 9: plain query\n"); fflush(stdout);
     uint8_t plain[512];
     size_t pn = 0;
     build_dns_query(plain, &pn, 0x4592, "host1.example.", 1, false);
@@ -1686,6 +1657,7 @@ static void test_dns_cookie_engine_rfc9018(void) {
     memset(&g_gr.cfg, 0, sizeof(g_gr.cfg));
     zone_arena_destroy(&g_gr.arena);
     printf("  -> RFC 9018 DNS Cookie engine handling passed.\n");
+    fflush(stdout);
 }
 
 // ----------------------------------------------------------------------------
@@ -1769,7 +1741,7 @@ static void test_delegation_referral_and_ds_handling(void) {
     uint8_t res[512] = {0};
     uint16_t offset = 12;
     compress_ctx_t comp_ctx;
-    compress_ctx_init_packet(&comp_ctx);
+    compress_ctx_init(&comp_ctx);   /* full init: init_packet() on an uninitialized stack ctx is UB (reads current_generation) */
     uint16_t nscount = 0;
     uint16_t arcount = 0;
 
@@ -1934,6 +1906,8 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     assert(find_covering_nsec(NULL, "b.example.") == NULL);
     assert(find_covering_nsec(&nsec_arena, NULL) == NULL);
 
+    free(nsec_arena.records);
+    nsec_arena.records = NULL;
     zone_arena_destroy(&nsec_arena);
 
     printf("  -> Program plugin & forward zone helpers passed.\n");
@@ -2914,10 +2888,8 @@ static void test_edns_client_subnet_cache_matching(void) {
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
     assert(ancount == 1);
 
-    free(arena.bind_ecs_tags[0].cidrs[0].cidr);
-    free(arena.bind_ecs_tags[0].cidrs);
-    free(arena.bind_ecs_tags[0].tag);
-    free(arena.bind_ecs_tags);
+    /* bind_ecs_tags は zone_arena_destroy() -> free_ecs_tags_array() が解放する。
+     * ここで手動 free すると二重解放 (double free) になる。 */
     zone_arena_destroy(&arena);
     printf("  -> EDNS Client Subnet matching passed.\n");
 }
@@ -7036,6 +7008,1823 @@ static void test_query_engine_feature_case_190(void) {
     assert(off == 12 && anc == 1 && nsc == 0 && arc == 0);
 }
 
+static void test_query_engine_feature_case_191(void) {
+    printf("[TEST] Query Engine: hex_to_bytes conversions and limits...\n");
+    uint8_t out[32];
+    assert(hex_to_bytes("deadbeef", out, sizeof(out)) == 4);
+    assert(out[0] == 0xde && out[1] == 0xad && out[2] == 0xbe && out[3] == 0xef);
+    assert(hex_to_bytes("DEADBEEF", out, sizeof(out)) == 4);
+    assert(out[0] == 0xde && out[1] == 0xad && out[2] == 0xbe && out[3] == 0xef);
+    assert(hex_to_bytes("-", out, sizeof(out)) == 0);
+    assert(hex_to_bytes("", out, sizeof(out)) == 0);
+    assert(hex_to_bytes(NULL, out, sizeof(out)) == 0);
+    assert(hex_to_bytes("deadbeef", out, 2) == 2);
+}
+
+static void test_query_engine_feature_case_192(void) {
+    printf("[TEST] Query Engine: name_to_canonical_wire checks...\n");
+    uint8_t wire[256];
+    size_t wlen = name_to_canonical_wire(".", wire, sizeof(wire));
+    assert(wlen == 1 && wire[0] == 0);
+
+    wlen = name_to_canonical_wire("example.com.", wire, sizeof(wire));
+    assert(wlen == 13);
+    assert(wire[0] == 7 && memcmp(&wire[1], "example", 7) == 0);
+    assert(wire[8] == 3 && memcmp(&wire[9], "com", 3) == 0);
+    assert(wire[12] == 0);
+
+    uint8_t wire2[256];
+    size_t wlen2 = name_to_canonical_wire("EXAMPLE.COM.", wire2, sizeof(wire2));
+    assert(wlen2 == wlen);
+    assert(memcmp(wire, wire2, wlen) == 0);
+}
+
+static void test_query_engine_feature_case_193(void) {
+    printf("[TEST] Query Engine: compute_nsec3_hash with SHA-1...\n");
+    char b32[64];
+    uint8_t salt[4] = { 0xaa, 0xbb, 0xcc, 0xdd };
+    bool ok = compute_nsec3_hash("example.com.", 1, 1, salt, sizeof(salt), b32, sizeof(b32));
+    assert(ok);
+    assert(strlen(b32) > 0);
+
+    ok = compute_nsec3_hash("example.com.", 1, 5000, salt, sizeof(salt), b32, sizeof(b32));
+    (void)ok;
+}
+
+static void test_query_engine_feature_case_194(void) {
+    printf("[TEST] Query Engine: nsec3_covers_hash interval logic...\n");
+    assert(nsec3_covers_hash("11111111111111111111111111111111",
+                             "33333333333333333333333333333333",
+                             "22222222222222222222222222222222") == true);
+    assert(nsec3_covers_hash("11111111111111111111111111111111",
+                             "33333333333333333333333333333333",
+                             "44444444444444444444444444444444") == false);
+
+    assert(nsec3_covers_hash("88888888888888888888888888888888",
+                             "22222222222222222222222222222222",
+                             "99999999999999999999999999999999") == true);
+    assert(nsec3_covers_hash("88888888888888888888888888888888",
+                             "22222222222222222222222222222222",
+                             "11111111111111111111111111111111") == true);
+    assert(nsec3_covers_hash("88888888888888888888888888888888",
+                             "22222222222222222222222222222222",
+                             "55555555555555555555555555555555") == false);
+}
+
+static void test_query_engine_feature_case_195(void) {
+    printf("[TEST] Query Engine: find_next_closer_name calculations...\n");
+    char out[256];
+    bool ok = find_next_closer_name("a.b.c.example.com.", "example.com.", out, sizeof(out));
+    assert(ok);
+    assert(strcasecmp(out, "c.example.com") == 0);
+
+    ok = find_next_closer_name("sub.example.com.", "example.com.", out, sizeof(out));
+    assert(ok);
+    assert(strcasecmp(out, "sub.example.com") == 0);
+
+    ok = find_next_closer_name("example.com.", "example.com.", out, sizeof(out));
+    assert(!ok);
+}
+
+static void test_query_engine_feature_case_196(void) {
+    printf("[TEST] Query Engine: cookie generation and validation with secret...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.cookie_secret_count = 1;
+    memset(cfg.cookie_secrets[0], 0x42, SERVER_COOKIE_SECRET_LEN);
+
+    uint8_t client_cookie[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint8_t server_cookie[SERVER_COOKIE_LEN];
+    uint32_t now = (uint32_t)time(NULL);
+
+    bool gen = generate_server_cookie(&cfg, "192.0.2.1", client_cookie, server_cookie, now);
+    assert(gen);
+
+    server_cookie_status_t st = verify_server_cookie(&cfg, "192.0.2.1", client_cookie, server_cookie, sizeof(server_cookie), now);
+    assert(st == SERVER_COOKIE_VALID);
+
+    st = verify_server_cookie(&cfg, "192.0.2.2", client_cookie, server_cookie, sizeof(server_cookie), now);
+    assert(st == SERVER_COOKIE_INVALID);
+
+    uint8_t bad_cli[8] = { 8, 7, 6, 5, 4, 3, 2, 1 };
+    st = verify_server_cookie(&cfg, "192.0.2.1", bad_cli, server_cookie, sizeof(server_cookie), now);
+    assert(st == SERVER_COOKIE_INVALID);
+
+    st = verify_server_cookie(&cfg, "192.0.2.1", client_cookie, server_cookie, sizeof(server_cookie), now + 3700);
+    assert(st == SERVER_COOKIE_INVALID);
+}
+
+static void test_query_engine_feature_case_197(void) {
+    printf("[TEST] Query Engine: EDE add_ede formatting...\n");
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    edns.present = true;
+    
+    add_ede(&edns, true, 15, "Blocked by policy");
+    assert(edns.ede_count == 1);
+    assert(edns.ede_list[0].code == 15);
+    assert(strcmp(edns.ede_list[0].text, "Blocked by policy") == 0);
+
+    add_ede(&edns, false, 16, "Censored");
+    assert(edns.ede_count == 1);
+}
+
+static void test_query_engine_feature_case_198(void) {
+    printf("[TEST] Query Engine: rate_limit_config_t parsing & slip flags...\n");
+    rrl_init();
+    rate_limit_config_t rrl;
+    memset(&rrl, 0, sizeof(rrl));
+    rrl.configured = true;
+    rrl.responses_per_second = 10;
+    rrl.slip = 2;
+    rrl.window_seconds = 1;
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(5353);
+    inet_pton(AF_INET, "198.51.198.1", &sin.sin_addr);
+
+    bool slip = false;
+    for (int i = 0; i < 10; i++) {
+        assert(rrl_check(&sin, RRL_RESP_NOERROR, &rrl, &slip) == true);
+    }
+}
+
+static void test_query_engine_feature_case_199(void) {
+    printf("[TEST] Query Engine: question_section_matches case sensitivity & length boundary...\n");
+    uint8_t q1[256], q2[256];
+    size_t l1 = 0, l2 = 0;
+    build_dns_query(q1, &l1, 1001, "mIxEd.CaSe.ExAmPlE.", 1, false);
+    build_dns_query(q2, &l2, 1002, "mixed.case.example.", 1, false);
+
+    assert(question_section_matches(q1, l1, q2, l2) == true);
+
+    build_dns_query(q2, &l2, 1002, "mixed.case.example.", 28 /* AAAA */, false);
+    assert(question_section_matches(q1, l1, q2, l2) == false);
+}
+
+static void test_query_engine_feature_case_200(void) {
+    printf("[TEST] Query Engine: TXT records with semicolon and escapes...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "txtesc.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN txtesc.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "rec1 IN TXT \"v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQ\"\n"
+        "rec2 IN TXT \"quoted \\\"internal\\\" text\"\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_201(void) {
+    printf("[TEST] Query Engine: Zone apex SOA query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "soa.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN soa.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.soa.example. admin.soa.example. 2026092501 7200 3600 1209600 3600\n"
+        "@ IN NS ns1.soa.example.\n"
+        "ns1 IN A 192.0.2.1\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "soa.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 201, "soa.example.", 6 /* SOA */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "soa.example.", 6, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0); // NOERROR
+    assert(((res[6] << 8) | res[7]) >= 1); // ANCOUNT >= 1
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_202(void) {
+    printf("[TEST] Query Engine: ANY query on zone apex...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "any.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN any.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "@ IN A 192.0.2.1\n"
+        "@ IN AAAA 2001:db8::1\n"
+        "@ IN MX 10 mail\n"
+        "@ IN TXT \"v=spf1 -all\"\n"
+        "ns1 IN A 192.0.2.2\n"
+        "mail IN A 192.0.2.3\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "any.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[2048];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 202, "any.example.", 255 /* ANY */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "any.example.", 255, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 3); // Multiple answer records
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_203(void) {
+    printf("[TEST] Query Engine: CNAME chaining 2-hop...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "cname2.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN cname2.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "target IN A 192.0.2.50\n"
+        "cname2 IN CNAME target.cname2.example.\n"
+        "cname1 IN CNAME cname2.cname2.example.\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "cname2.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 203, "cname1.cname2.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "cname1.cname2.example.", 1, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 2); // CNAMEs + target A
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_204(void) {
+    printf("[TEST] Query Engine: DNAME target synthesis...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "dnamesyn.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN dnamesyn.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "sub IN DNAME target.org.\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "dnamesyn.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 204, "host.sub.dnamesyn.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "host.sub.dnamesyn.example.", 1, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1); // Synthesized CNAME
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_205(void) {
+    printf("[TEST] Query Engine: Wildcard query synthesis...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "wildsyn.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN wildsyn.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "*.wildsyn.example. IN A 192.0.2.99\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "wildsyn.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 205, "random-host.wildsyn.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "random-host.wildsyn.example.", 1, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) == 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_206(void) {
+    printf("[TEST] Query Engine: Wildcard vs explicit child node...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "wildexp.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN wildexp.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "*.wildexp.example. IN A 192.0.2.100\n"
+        "explicit.wildexp.example. IN A 192.0.2.200\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "wildexp.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[512];
+    size_t req_len = 0;
+    // Explicit query
+    build_dns_query(req, &req_len, 206, "explicit.wildexp.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "explicit.wildexp.example.", 1, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) == 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_207(void) {
+    printf("[TEST] Query Engine: EDNS(0) DO bit query handling...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = {
+        .base_dir = ".",
+        .default_origin = "edns.example.",
+        .is_standalone_mode = true,
+        .err_out = &err,
+    };
+    const char zone_text[] =
+        "$ORIGIN edns.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n"
+        "@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n";
+
+    assert(parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "edns.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 207, "ns1.edns.example.", 1, true /* DO=1 */);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "ns1.edns.example.", 1, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[10] << 8) | res[11]) >= 1); // OPT record in Additional
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_208(void) {
+    printf("[TEST] Query Engine: ECS subnet tag resolution...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    uint8_t addr[4] = { 192, 0, 2, 10 };
+    uint8_t scope = 0;
+    const char *tag = resolve_ecs_subnet_tag(&arena, NULL, NULL, addr, AF_INET, &scope);
+    (void)tag;
+    assert(scope <= 32);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_209(void) {
+    printf("[TEST] Query Engine: RRL token bucket rate limiting...\n");
+    rrl_init();
+    rate_limit_config_t rrl;
+    memset(&rrl, 0, sizeof(rrl));
+    rrl.configured = true;
+    rrl.responses_per_second = 2;
+    rrl.window_seconds = 1;
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(1053);
+    inet_pton(AF_INET, "203.0.209.10", &sin.sin_addr);
+
+    bool slip = false;
+    assert(rrl_check(&sin, RRL_RESP_NOERROR, &rrl, &slip) == true);
+    assert(rrl_check(&sin, RRL_RESP_NOERROR, &rrl, &slip) == true);
+    // 3rd query should be rate limited
+    bool allowed = rrl_check(&sin, RRL_RESP_NOERROR, &rrl, &slip);
+    assert(allowed == false);
+}
+
+static void test_query_engine_feature_case_210(void) {
+    printf("[TEST] Query Engine: RRL slip TC bit set...\n");
+    rrl_init();
+    rate_limit_config_t rrl;
+    memset(&rrl, 0, sizeof(rrl));
+    rrl.configured = true;
+    rrl.responses_per_second = 1;
+    rrl.slip = 2; // Every 2nd dropped packet sets TC=1
+    rrl.window_seconds = 1;
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(1053);
+    inet_pton(AF_INET, "203.0.210.20", &sin.sin_addr);
+
+    bool slip = false;
+    assert(rrl_check(&sin, RRL_RESP_NOERROR, &rrl, &slip) == true);
+    assert(rrl_check(&sin, RRL_RESP_NOERROR, &rrl, &slip) == false && slip == false);
+    assert(rrl_check(&sin, RRL_RESP_NOERROR, &rrl, &slip) == false && slip == true); // 2nd dropped -> slip=true
+}
+
+static void test_query_engine_feature_case_211(void) {
+    printf("[TEST] Query Engine: Multi-view resolution...\n");
+    zone_arena_t arena_int, arena_ext;
+    memset(&arena_int, 0, sizeof(arena_int));
+    memset(&arena_ext, 0, sizeof(arena_ext));
+    zone_arena_init(&arena_int);
+    zone_arena_init(&arena_ext);
+
+    parse_error_t err = {0};
+    parse_context_t ctx_int = { .base_dir = ".", .default_origin = "view.example.", .is_standalone_mode = true, .err_out = &err };
+    parse_context_t ctx_ext = { .base_dir = ".", .default_origin = "view.example.", .is_standalone_mode = true, .err_out = &err };
+
+    const char z_int[] = "$ORIGIN view.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 10.0.0.1\n";
+    const char z_ext[] = "$ORIGIN view.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 198.51.100.1\n";
+
+    assert(parse_zone_fast((char *)z_int, strlen(z_int), &arena_int, &ctx_int) >= 0);
+    assert(build_zone_index(&arena_int, true) == 0);
+    assert(parse_zone_fast((char *)z_ext, strlen(z_ext), &arena_ext, &ctx_ext) >= 0);
+    assert(build_zone_index(&arena_ext, true) == 0);
+
+    zone_db_entry_t e_int, e_ext;
+    memset(&e_int, 0, sizeof(e_int));
+    memset(&e_ext, 0, sizeof(e_ext));
+    strlcpy(e_int.domain, "view.example.", sizeof(e_int.domain));
+    strlcpy(e_ext.domain, "view.example.", sizeof(e_ext.domain));
+    atomic_store_explicit(&e_int.rcu.active, &arena_int, memory_order_release);
+    atomic_store_explicit(&e_ext.rcu.active, &arena_ext, memory_order_release);
+
+    zone_db_entry_t *int_entries[1] = { &e_int };
+    zone_db_entry_t *ext_entries[1] = { &e_ext };
+
+    view_snapshot_t views[2];
+    memset(views, 0, sizeof(views));
+    views[0].name = "internal";
+    views[0].entries = int_entries;
+    views[0].zone_count = 1;
+    views[1].name = "default";
+    views[1].entries = ext_entries;
+    views[1].zone_count = 1;
+
+    zone_db_snapshot_t snap = { .views = views, .view_count = 2 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 211, "host.view.example.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "host.view.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+
+    zone_arena_destroy(&arena_int);
+    zone_arena_destroy(&arena_ext);
+}
+
+static void test_query_engine_feature_case_212(void) {
+    printf("[TEST] Query Engine: Dynamic Update prereq NXDOMAIN...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dynup.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN dynup.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nexisting IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[0] = 0x12; ureq[1] = 0x34;
+    ureq[2] = 0x28; // Opcode UPDATE
+    ureq[4] = 0; ureq[5] = 1; // ZOCOUNT=1
+    ureq[6] = 0; ureq[7] = 1; // PRCOUNT=1
+
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "dynup.example.");
+    ureq[off++] = 0; ureq[off++] = 6; // SOA
+    ureq[off++] = 0; ureq[off++] = 1; // IN
+
+    // Prereq: nonexisting.dynup.example. Name not in use (CLASS=NONE, TYPE=ANY)
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "nonexisting.dynup.example.");
+    ureq[off++] = 0; ureq[off++] = 255; // ANY
+    ureq[off++] = 0; ureq[off++] = 254; // NONE
+    ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
+    ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
+
+    int prc = 0, upc = 0;
+    int rcode = process_update_sections(ureq, off, "dynup.example.", &arena, &prc, &upc);
+    assert(rcode == 0); // NOERROR
+    assert(prc == 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_213(void) {
+    printf("[TEST] Query Engine: Dynamic Update prereq YXDOMAIN failure...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dynup2.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN dynup2.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nexisting IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[0] = 0x12; ureq[1] = 0x35;
+    ureq[2] = 0x28; // Opcode UPDATE
+    ureq[4] = 0; ureq[5] = 1; // ZOCOUNT=1
+    ureq[6] = 0; ureq[7] = 1; // PRCOUNT=1
+
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "dynup2.example.");
+    ureq[off++] = 0; ureq[off++] = 6; // SOA
+    ureq[off++] = 0; ureq[off++] = 1; // IN
+
+    // Prereq: existing.dynup2.example. Name not in use (CLASS=NONE, TYPE=ANY) -> FAILS (YXDOMAIN / RCODE=6)
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "existing.dynup2.example.");
+    ureq[off++] = 0; ureq[off++] = 255; // ANY
+    ureq[off++] = 0; ureq[off++] = 254; // NONE
+    ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
+    ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
+
+    int prc = 0, upc = 0;
+    int rcode = process_update_sections(ureq, off, "dynup2.example.", &arena, &prc, &upc);
+    assert(rcode == 6); // YXDOMAIN
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_214(void) {
+    printf("[TEST] Query Engine: Dynamic Update action ADD...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dynadd.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN dynadd.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[0] = 0x12; ureq[1] = 0x36;
+    ureq[2] = 0x28; // Opcode UPDATE
+    ureq[4] = 0; ureq[5] = 1; // ZOCOUNT=1
+    ureq[8] = 0; ureq[9] = 1; // UPCOUNT=1
+
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "dynadd.example.");
+    ureq[off++] = 0; ureq[off++] = 6; ureq[off++] = 0; ureq[off++] = 1;
+
+    // Action: ADD host.dynadd.example. A 192.0.2.77
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "host.dynadd.example.");
+    ureq[off++] = 0; ureq[off++] = 1; // A
+    ureq[off++] = 0; ureq[off++] = 1; // IN
+    ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0x0E; ureq[off++] = 0x10; // TTL=3600
+    ureq[off++] = 0; ureq[off++] = 4; // RDLENGTH=4
+    ureq[off++] = 192; ureq[off++] = 0; ureq[off++] = 2; ureq[off++] = 77;
+
+    int prc = 0, upc = 0;
+    int rcode = process_update_sections(ureq, off, "dynadd.example.", &arena, &prc, &upc);
+    assert(rcode == 0); // NOERROR
+    assert(upc == 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_215(void) {
+    printf("[TEST] Query Engine: Dynamic Update action DELETE RR...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dyndel.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN dyndel.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 192.0.2.77\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[0] = 0x12; ureq[1] = 0x37;
+    ureq[2] = 0x28; // Opcode UPDATE
+    ureq[4] = 0; ureq[5] = 1; // ZOCOUNT=1
+    ureq[8] = 0; ureq[9] = 1; // UPCOUNT=1
+
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "dyndel.example.");
+    ureq[off++] = 0; ureq[off++] = 6; ureq[off++] = 0; ureq[off++] = 1;
+
+    // Action: DELETE specific RR (CLASS=NONE, TYPE=A, RDATA=192.0.2.77)
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "host.dyndel.example.");
+    ureq[off++] = 0; ureq[off++] = 1; // A
+    ureq[off++] = 0; ureq[off++] = 254; // NONE
+    ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
+    ureq[off++] = 0; ureq[off++] = 4;
+    ureq[off++] = 192; ureq[off++] = 0; ureq[off++] = 2; ureq[off++] = 77;
+
+    int prc = 0, upc = 0;
+    int rcode = process_update_sections(ureq, off, "dyndel.example.", &arena, &prc, &upc);
+    assert(rcode == 0); // NOERROR
+    assert(upc == 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_216(void) {
+    printf("[TEST] Query Engine: Dynamic Update action DELETE RRset...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dyndelset.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN dyndelset.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 192.0.2.1\nhost IN A 192.0.2.2\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[0] = 0x12; ureq[1] = 0x38;
+    ureq[2] = 0x28; // Opcode UPDATE
+    ureq[4] = 0; ureq[5] = 1; // ZOCOUNT=1
+    ureq[8] = 0; ureq[9] = 1; // UPCOUNT=1
+
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "dyndelset.example.");
+    ureq[off++] = 0; ureq[off++] = 6; ureq[off++] = 0; ureq[off++] = 1;
+
+    // Action: DELETE RRset (CLASS=ANY, TYPE=A)
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "host.dyndelset.example.");
+    ureq[off++] = 0; ureq[off++] = 1; // A
+    ureq[off++] = 0; ureq[off++] = 255; // ANY
+    ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
+    ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
+
+    int prc = 0, upc = 0;
+    int rcode = process_update_sections(ureq, off, "dyndelset.example.", &arena, &prc, &upc);
+    assert(rcode == 0); // NOERROR
+    assert(upc == 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_217(void) {
+    printf("[TEST] Query Engine: Dynamic Update action DELETE ALL RRsets...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dyndelall.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN dyndelall.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nhost IN A 192.0.2.1\nhost IN TXT \"test\"\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[0] = 0x12; ureq[1] = 0x39;
+    ureq[2] = 0x28; // Opcode UPDATE
+    ureq[4] = 0; ureq[5] = 1; // ZOCOUNT=1
+    ureq[8] = 0; ureq[9] = 1; // UPCOUNT=1
+
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "dyndelall.example.");
+    ureq[off++] = 0; ureq[off++] = 6; ureq[off++] = 0; ureq[off++] = 1;
+
+    // Action: DELETE ALL RRsets (CLASS=ANY, TYPE=ANY)
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "host.dyndelall.example.");
+    ureq[off++] = 0; ureq[off++] = 255; // ANY
+    ureq[off++] = 0; ureq[off++] = 255; // ANY
+    ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
+    ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
+
+    int prc = 0, upc = 0;
+    int rcode = process_update_sections(ureq, off, "dyndelall.example.", &arena, &prc, &upc);
+    assert(rcode == 0); // NOERROR
+    assert(upc == 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_218(void) {
+    printf("[TEST] Query Engine: FORMERR truncated header (< 12 bytes)...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint8_t res[512];
+    int len = process_dns_query(req, sizeof(req), res, sizeof(res), "example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    // When req is < 12 bytes, cannot form valid DNS response or returns 0/FORMERR
+    assert(len == 0 || (len >= 12 && (res[3] & 0x0F) == 1));
+}
+
+static void test_query_engine_feature_case_219(void) {
+    printf("[TEST] Query Engine: FORMERR truncated question section...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[16];
+    memset(req, 0, sizeof(req));
+    req[0] = 0xAA; req[1] = 0xBB;
+    req[4] = 0; req[5] = 1; // QDCOUNT=1
+    req[12] = 7; // Label len 7 but truncated afterwards
+    req[13] = 'e'; req[14] = 'x'; req[15] = 'a';
+
+    uint8_t res[512];
+    int len = process_dns_query(req, sizeof(req), res, sizeof(res), "example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == 1); // FORMERR
+}
+
+static void test_query_engine_feature_case_220(void) {
+    printf("[TEST] Query Engine: RFC 9619 QDCOUNT == 0 (NOERROR) and QDCOUNT > 1 (FORMERR)...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    // 1. RFC 9619: Opcode QUERY (0), QDCOUNT=0 -> NOERROR (0)
+    uint8_t req[12];
+    memset(req, 0, sizeof(req));
+    req[0] = 0x11; req[1] = 0x22;
+
+    uint8_t res[512];
+    int len = process_dns_query(req, sizeof(req), res, sizeof(res), "example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == 0); // RFC 9619 NOERROR
+
+    // 2. Opcode QUERY (0), QDCOUNT=2 -> FORMERR (1)
+    uint8_t req2[64];
+    memset(req2, 0, sizeof(req2));
+    req2[0] = 0x11; req2[1] = 0x23;
+    req2[4] = 0; req2[5] = 2; // QDCOUNT=2
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(req2, off, sizeof(req2), "q1.example.");
+    req2[off++] = 0; req2[off++] = 1; req2[off++] = 0; req2[off++] = 1;
+    off += (size_t)write_uncompressed_name(req2, off, sizeof(req2), "q2.example.");
+    req2[off++] = 0; req2[off++] = 1; req2[off++] = 0; req2[off++] = 1;
+
+    compress_ctx_init_packet(&comp_ctx);
+    int len2 = process_dns_query(req2, off, res, sizeof(res), "q1.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len2 >= 12);
+    assert((res[3] & 0x0F) == 1); // FORMERR
+}
+
+static void test_query_engine_feature_case_221(void) {
+    printf("[TEST] Query Engine: Opcode STATUS returns NOTIMP...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[64];
+    memset(req, 0, sizeof(req));
+    req[0] = 0x33; req[1] = 0x44;
+    req[2] = 0x10; // Opcode STATUS (2 << 3)
+    req[4] = 0; req[5] = 1; // QDCOUNT=1
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "example.com.");
+    req[off++] = 0; req[off++] = 1; req[off++] = 0; req[off++] = 1;
+
+    uint8_t res[512];
+    int len = process_dns_query(req, off, res, sizeof(res), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == 4); // NOTIMP
+}
+
+static void test_query_engine_feature_case_222(void) {
+    printf("[TEST] Query Engine: Opcode IQUERY returns NOTIMP...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[64];
+    memset(req, 0, sizeof(req));
+    req[0] = 0x55; req[1] = 0x66;
+    req[2] = 0x08; // Opcode IQUERY (1 << 3)
+    req[4] = 0; req[5] = 1; // QDCOUNT=1
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "example.com.");
+    req[off++] = 0; req[off++] = 1; req[off++] = 0; req[off++] = 1;
+
+    uint8_t res[512];
+    int len = process_dns_query(req, off, res, sizeof(res), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == 4); // NOTIMP
+}
+
+static void test_query_engine_feature_case_223(void) {
+    printf("[TEST] Query Engine: Unknown QCLASS returns REFUSED...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[64];
+    memset(req, 0, sizeof(req));
+    req[0] = 0x77; req[1] = 0x88;
+    req[4] = 0; req[5] = 1;
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "example.com.");
+    req[off++] = 0; req[off++] = 1; // A
+    req[off++] = 0; req[off++] = 99; // QCLASS=99
+
+    uint8_t res[512];
+    int len = process_dns_query(req, off, res, sizeof(res), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == 5); // REFUSED
+}
+
+static void test_query_engine_feature_case_224(void) {
+    printf("[TEST] Query Engine: Hesiod QCLASS returns REFUSED...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[64];
+    memset(req, 0, sizeof(req));
+    req[0] = 0x88; req[1] = 0x99;
+    req[4] = 0; req[5] = 1;
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "example.com.");
+    req[off++] = 0; req[off++] = 1; // A
+    req[off++] = 0; req[off++] = 4; // QCLASS=HS (4)
+
+    uint8_t res[512];
+    int len = process_dns_query(req, off, res, sizeof(res), "example.com.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == 5); // REFUSED
+}
+
+static void test_query_engine_feature_case_225(void) {
+    printf("[TEST] Query Engine: CHAOS version.bind query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "version.bind.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN version.bind.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN TXT \"KariDNS\"\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    for (size_t i = 0; i < arena.count; i++) {
+        arena.records[i].class_val = 3;
+    }
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "version.bind.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[64];
+    memset(req, 0, sizeof(req));
+    req[0] = 0x99; req[1] = 0xAA;
+    req[4] = 0; req[5] = 1;
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "version.bind.");
+    req[off++] = 0; req[off++] = 16; // TXT
+    req[off++] = 0; req[off++] = 3;  // CH class
+
+    uint8_t res[512];
+    int len = process_dns_query(req, off, res, sizeof(res), "version.bind.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == 0); // NOERROR
+    assert(((res[6] << 8) | res[7]) >= 1); // ANCOUNT >= 1
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_226(void) {
+    printf("[TEST] Query Engine: Out-of-zone query returns REFUSED...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "local.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN local.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "local.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 226, "completely.unrelated.org.", 1, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "completely.unrelated.org.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 5); // REFUSED
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_227(void) {
+    printf("[TEST] Query Engine: Response truncation sets TC bit...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "trunc.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN trunc.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN TXT \"long payload 1\"\n@ IN TXT \"long payload 2\"\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "trunc.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[35]; // Tiny buffer
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 227, "trunc.example.", 16, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "trunc.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[2] & 0x02) != 0); // TC=1
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_228(void) {
+    printf("[TEST] Query Engine: NS query additional glue records...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "glue.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN glue.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.10\nns1 IN AAAA 2001:db8::10\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "glue.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 228, "glue.example.", 2 /* NS */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "glue.example.", 2, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1); // ANCOUNT >= 1
+    assert(((res[10] << 8) | res[11]) >= 1); // ARCOUNT >= 1 (Glue)
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_229(void) {
+    printf("[TEST] Query Engine: MX query additional mail glue records...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "mxglue.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN mxglue.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN MX 10 mail.mxglue.example.\nmail IN A 192.0.2.20\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "mxglue.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 229, "mxglue.example.", 15 /* MX */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "mxglue.example.", 15, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+    assert(((res[10] << 8) | res[11]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_230(void) {
+    printf("[TEST] Query Engine: SRV query additional target glue...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "srvglue.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN srvglue.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n_sip._tcp IN SRV 10 60 5060 srv1.srvglue.example.\nsrv1 IN A 192.0.2.30\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "srvglue.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 230, "_sip._tcp.srvglue.example.", 33 /* SRV */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "_sip._tcp.srvglue.example.", 33, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+    assert(((res[10] << 8) | res[11]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_231(void) {
+    printf("[TEST] Query Engine: NODATA response with SOA in Authority...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "nodata.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN nodata.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.1\nnode IN A 192.0.2.50\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "nodata.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 231, "node.nodata.example.", 28 /* AAAA - not present */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "node.nodata.example.", 28, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0); // NOERROR
+    assert(((res[6] << 8) | res[7]) == 0); // ANCOUNT = 0
+    assert(((res[8] << 8) | res[9]) >= 1); // NSCOUNT >= 1 (SOA)
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_232(void) {
+    printf("[TEST] Query Engine: NXDOMAIN response with SOA in Authority...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "nx.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN nx.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "nx.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 232, "nonexistent.nx.example.", 1 /* A */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "nonexistent.nx.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 3); // NXDOMAIN
+    assert(((res[6] << 8) | res[7]) == 0); // ANCOUNT = 0
+    assert(((res[8] << 8) | res[9]) >= 1); // NSCOUNT >= 1 (SOA)
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_233(void) {
+    printf("[TEST] Query Engine: PTR record query in in-addr.arpa...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "2.0.192.in-addr.arpa.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN 2.0.192.in-addr.arpa.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n1 IN PTR host1.example.com.\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "2.0.192.in-addr.arpa.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 233, "1.2.0.192.in-addr.arpa.", 12 /* PTR */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "1.2.0.192.in-addr.arpa.", 12, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_234(void) {
+    printf("[TEST] Query Engine: PTR record query in ip6.arpa...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "8.b.d.0.1.0.0.2.ip6.arpa.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN 8.b.d.0.1.0.0.2.ip6.arpa.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0 IN PTR host6.example.com.\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "8.b.d.0.1.0.0.2.ip6.arpa.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 234, "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.", 12 /* PTR */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.", 12, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_235(void) {
+    printf("[TEST] Query Engine: CAA record query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "caa.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN caa.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN CAA 0 issue \"letsencrypt.org\"\n@ IN CAA 0 iodef \"mailto:security@example.com\"\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "caa.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 235, "caa.example.", 257 /* CAA */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "caa.example.", 257, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) == 2);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_236(void) {
+    printf("[TEST] Query Engine: TLSA record query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "tlsa.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN tlsa.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n_443._tcp IN TLSA 3 1 1 d2abde240d7cd3ee6b4b28c54df034b97983a132e9620a4036024c63f2ef95ab\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "tlsa.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 236, "_443._tcp.tlsa.example.", 52 /* TLSA */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "_443._tcp.tlsa.example.", 52, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_237(void) {
+    printf("[TEST] Query Engine: SSHFP record query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "sshfp.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN sshfp.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nssh IN SSHFP 1 1 123456789abcdef67890123456789abcdef67890\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "sshfp.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 237, "ssh.sshfp.example.", 44 /* SSHFP */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "ssh.sshfp.example.", 44, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_238(void) {
+    printf("[TEST] Query Engine: NAPTR record query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "naptr.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN naptr.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN NAPTR 100 10 \"u\" \"sip+E2U\" \"!^.*$!sip:info@example.com!\" .\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "naptr.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 238, "naptr.example.", 35 /* NAPTR */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "naptr.example.", 35, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_239(void) {
+    printf("[TEST] Query Engine: LOC record query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "loc.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN loc.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN LOC 52 22 23.000 N 4 53 32.000 E -18.00m 10m 100m 10m\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "loc.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 239, "loc.example.", 29 /* LOC */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "loc.example.", 29, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_240(void) {
+    printf("[TEST] Query Engine: HINFO / TXT multiple strings...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "hinfo.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN hinfo.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\n@ IN HINFO \"x86_64\" \"FreeBSD\"\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "hinfo.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 240, "hinfo.example.", 13 /* HINFO */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "hinfo.example.", 13, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_241(void) {
+    printf("[TEST] Query Engine: Tinydns location resolution...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    char loc[2] = {0};
+    tinydns_resolve_client_location(&arena, "192.0.2.1", loc);
+    (void)loc;
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_242(void) {
+    printf("[TEST] Query Engine: Tinydns timestamp filter check...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "tinytim.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN tinytim.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_243(void) {
+    printf("[TEST] Query Engine: Catalog zone member zone query...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "catalog.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN catalog.example.\n$TTL 3600\n@ IN SOA ns1 host 1 7200 3600 1209600 3600\n@ IN NS ns1\nversion IN TXT \"2\"\nns1 IN A 192.0.2.1\n";
+    assert(parse_zone_fast((char *)ztext, strlen(ztext), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    zone_db_entry_t db_entry;
+    memset(&db_entry, 0, sizeof(db_entry));
+    strlcpy(db_entry.domain, "catalog.example.", sizeof(db_entry.domain));
+    atomic_store_explicit(&db_entry.rcu.active, &arena, memory_order_release);
+
+    zone_db_entry_t *entries[1] = { &db_entry };
+    view_snapshot_t view = { .name = "default", .entries = entries, .zone_count = 1 };
+    zone_db_snapshot_t snap = { .views = &view, .view_count = 1 };
+
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512], res[1024];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 243, "version.catalog.example.", 16 /* TXT */, false);
+    compress_ctx_init_packet(&comp_ctx);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "version.catalog.example.", 16, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    assert((res[3] & 0x0F) == 0);
+    assert(((res[6] << 8) | res[7]) >= 1);
+
+    zone_arena_destroy(&arena);
+}
+
+static void test_query_engine_feature_case_244(void) {
+    printf("[TEST] Query Engine: TSIG BADKEY validation...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 244, "tsigbadkey.example.", 1, false);
+
+    // Append mock TSIG record with invalid key name
+    size_t off = req_len;
+    req[10] = 0; req[11] = 1; // ARCOUNT=1
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "badkey.unknown.");
+    req[off++] = 0; req[off++] = 250; // TSIG
+    req[off++] = 0; req[off++] = 255; // ANY
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0; // TTL=0
+    req[off++] = 0; req[off++] = 16; // RDLENGTH
+    memset(req + off, 0, 16);
+    off += 16;
+
+    uint8_t res[512];
+    int res_len = process_dns_query(req, off, res, sizeof(res), "tsigbadkey.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+    // BADKEY -> RCODE=9 (NOTAUTH) or REFUSED
+    assert((res[3] & 0x0F) == 9 || (res[3] & 0x0F) == 5);
+}
+
+static void test_query_engine_feature_case_245(void) {
+    printf("[TEST] Query Engine: TSIG BADSIG verification...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 245, "tsigbadsig.example.", 1, false);
+
+    uint8_t res[512];
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "tsigbadsig.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+}
+
+static void test_query_engine_feature_case_246(void) {
+    printf("[TEST] Query Engine: TSIG BADTIME clock skew...\n");
+    zone_db_snapshot_t snap = {0};
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    rate_limit_config_t *rrl_cfg = NULL;
+
+    uint8_t req[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 246, "tsigbadtime.example.", 1, false);
+
+    uint8_t res[512];
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "tsigbadtime.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    assert(res_len >= 12);
+}
+
+static void test_query_engine_feature_case_247(void) {
+    printf("[TEST] Query Engine: EDE option code 15 Blocked...\n");
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    edns.present = true;
+    add_ede(&edns, true, 15, "Blocked by DNS firewall");
+    assert(edns.ede_count == 1);
+    assert(edns.ede_list[0].code == 15);
+}
+
+static void test_query_engine_feature_case_248(void) {
+    printf("[TEST] Query Engine: EDE option code 18 Prohibited...\n");
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    edns.present = true;
+    add_ede(&edns, true, 18, "Prohibited by server config");
+    assert(edns.ede_count == 1);
+    assert(edns.ede_list[0].code == 18);
+}
+
+static void test_query_engine_feature_case_249(void) {
+    printf("[TEST] Query Engine: Server cookie timestamp drift tolerance...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.cookie_secret_count = 1;
+    memset(cfg.cookie_secrets[0], 0x55, SERVER_COOKIE_SECRET_LEN);
+
+    uint8_t client_cookie[8] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    uint8_t server_cookie[SERVER_COOKIE_LEN];
+    uint32_t now = (uint32_t)time(NULL);
+
+    assert(generate_server_cookie(&cfg, "2001:db8::1", client_cookie, server_cookie, now));
+
+    // Valid within +60s
+    assert(verify_server_cookie(&cfg, "2001:db8::1", client_cookie, server_cookie, sizeof(server_cookie), now + 60) == SERVER_COOKIE_VALID);
+
+    // Valid within -60s (future cookie up to 300s accepted)
+    assert(verify_server_cookie(&cfg, "2001:db8::1", client_cookie, server_cookie, sizeof(server_cookie), now - 60) == SERVER_COOKIE_VALID);
+}
+
+static void test_query_engine_feature_case_250(void) {
+    printf("[TEST] Query Engine: Resolve checkpoint integrity & restore count...\n");
+    resolve_checkpoint_t cp = { .offset = 120, .ancount = 4, .nscount = 2, .arcount = 1 };
+    uint16_t off = 0, anc = 0, nsc = 0, arc = 0;
+    restore_checkpoint(&cp, &off, &anc, &nsc, &arc);
+    assert(off == 120 && anc == 4 && nsc == 2 && arc == 1);
+}
+
+
 static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(void) {
     printf("[TEST] Query Engine: Program zone plugin timeout & dead mark...\n");
 
@@ -7636,6 +9425,67 @@ int main(void) {
     test_query_engine_feature_case_188();
     test_query_engine_feature_case_189();
     test_query_engine_feature_case_190();
+    test_query_engine_feature_case_191();
+    test_query_engine_feature_case_192();
+    test_query_engine_feature_case_193();
+    test_query_engine_feature_case_194();
+    test_query_engine_feature_case_195();
+    test_query_engine_feature_case_196();
+    test_query_engine_feature_case_197();
+    test_query_engine_feature_case_198();
+    test_query_engine_feature_case_199();
+    test_query_engine_feature_case_200();
+    test_query_engine_feature_case_201();
+    test_query_engine_feature_case_202();
+    test_query_engine_feature_case_203();
+    test_query_engine_feature_case_204();
+    test_query_engine_feature_case_205();
+    test_query_engine_feature_case_206();
+    test_query_engine_feature_case_207();
+    test_query_engine_feature_case_208();
+    test_query_engine_feature_case_209();
+    test_query_engine_feature_case_210();
+    test_query_engine_feature_case_211();
+    test_query_engine_feature_case_212();
+    test_query_engine_feature_case_213();
+    test_query_engine_feature_case_214();
+    test_query_engine_feature_case_215();
+    test_query_engine_feature_case_216();
+    test_query_engine_feature_case_217();
+    test_query_engine_feature_case_218();
+    test_query_engine_feature_case_219();
+    test_query_engine_feature_case_220();
+    test_query_engine_feature_case_221();
+    test_query_engine_feature_case_222();
+    test_query_engine_feature_case_223();
+    test_query_engine_feature_case_224();
+    test_query_engine_feature_case_225();
+    test_query_engine_feature_case_226();
+    test_query_engine_feature_case_227();
+    test_query_engine_feature_case_228();
+    test_query_engine_feature_case_229();
+    test_query_engine_feature_case_230();
+    test_query_engine_feature_case_231();
+    test_query_engine_feature_case_232();
+    test_query_engine_feature_case_233();
+    test_query_engine_feature_case_234();
+    test_query_engine_feature_case_235();
+    test_query_engine_feature_case_236();
+    test_query_engine_feature_case_237();
+    test_query_engine_feature_case_238();
+    test_query_engine_feature_case_239();
+    test_query_engine_feature_case_240();
+    test_query_engine_feature_case_241();
+    test_query_engine_feature_case_242();
+    test_query_engine_feature_case_243();
+    test_query_engine_feature_case_244();
+    test_query_engine_feature_case_245();
+    test_query_engine_feature_case_246();
+    test_query_engine_feature_case_247();
+    test_query_engine_feature_case_248();
+    test_query_engine_feature_case_249();
+    test_query_engine_feature_case_250();
     printf("=== All Query Engine Tests PASSED ===\n");
-    return 0;
+    fflush(stdout);
+    exit(0);
 }

@@ -56,8 +56,8 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
 
 #ifdef KARIDNS_UNIT_TEST
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
-
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
+size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
                                     const char client_loc[2],
                                     const char *client_ecs_tag,

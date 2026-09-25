@@ -211,7 +211,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     uint8_t resp_buf[4096];
     compress_ctx_t comp_ctx;
-    compress_ctx_init_packet(&comp_ctx);
+    compress_ctx_init(&comp_ctx);
 
     bool is_tcp = (data[0] & 0x01) != 0;
     

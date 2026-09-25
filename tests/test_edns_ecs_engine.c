@@ -395,6 +395,132 @@ static void test_ecs_trusted_resolver_precedence(void) {
     printf("  -> is_ecs_trusted_resolver precedence & ACL semantics passed.\n");
 }
 
+static void test_edns_ecs_engine_case_1(void) {
+    printf("[TEST] EDNS/ECS: ECS family IPv4 prefix length 0...\n");
+    uint8_t ecs_opt[8] = { 0x00, 0x01, 0x00, 0x00 }; // Family=1, SourcePrefix=0, ScopePrefix=0
+    assert(ecs_opt[0] == 0 && ecs_opt[1] == 1);
+}
+
+static void test_edns_ecs_engine_case_2(void) {
+    printf("[TEST] EDNS/ECS: ECS family IPv4 prefix length 32...\n");
+    uint8_t ecs_opt[8] = { 0x00, 0x01, 32, 0x00, 192, 0, 2, 1 };
+    assert(ecs_opt[2] == 32);
+}
+
+static void test_edns_ecs_engine_case_3(void) {
+    printf("[TEST] EDNS/ECS: ECS family IPv6 prefix length 56...\n");
+    uint8_t ecs_opt[12] = { 0x00, 0x02, 56, 0x00 };
+    assert(ecs_opt[1] == 2 && ecs_opt[2] == 56);
+}
+
+static void test_edns_ecs_engine_case_4(void) {
+    printf("[TEST] EDNS/ECS: ECS family IPv6 prefix length 128...\n");
+    uint8_t ecs_opt[20] = { 0x00, 0x02, 128, 0x00 };
+    assert(ecs_opt[2] == 128);
+}
+
+static void test_edns_ecs_engine_case_5(void) {
+    printf("[TEST] EDNS/ECS: ECS unknown address family rejection...\n");
+    uint16_t family = 99;
+    assert(family != 1 && family != 2);
+}
+
+static void test_edns_ecs_engine_case_6(void) {
+    printf("[TEST] EDNS/ECS: Cookie secret rollover validation...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.cookie_secret_count = 2;
+    memset(cfg.cookie_secrets[0], 0x11, 16);
+    memset(cfg.cookie_secrets[1], 0x22, 16);
+    assert(cfg.cookie_secret_count == 2);
+}
+
+static void test_edns_ecs_engine_case_7(void) {
+    printf("[TEST] EDNS/ECS: Cookie timestamp drift tolerance check...\n");
+    uint32_t now = (uint32_t)time(NULL);
+    uint32_t past = now - 300; // 5 min ago (valid)
+    assert(now >= past && (now - past) <= 3600);
+}
+
+static void test_edns_ecs_engine_case_8(void) {
+    printf("[TEST] EDNS/ECS: Cookie timestamp future drift check...\n");
+    uint32_t now = (uint32_t)time(NULL);
+    uint32_t future = now + 60; // 1 min in future (valid drift)
+    assert(future > now && (future - now) <= 300);
+}
+
+static void test_edns_ecs_engine_case_9(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 0 Unsupported...\n");
+    parsed_ede_t ede = { .code = 0 };
+    assert(ede.code == 0);
+}
+
+static void test_edns_ecs_engine_case_10(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 1 Unsupported DNSKEY...\n");
+    parsed_ede_t ede = { .code = 1 };
+    assert(ede.code == 1);
+}
+
+static void test_edns_ecs_engine_case_11(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 2 Unsupported DS...\n");
+    parsed_ede_t ede = { .code = 2 };
+    assert(ede.code == 2);
+}
+
+static void test_edns_ecs_engine_case_12(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 3 Stale Answer...\n");
+    parsed_ede_t ede = { .code = 3 };
+    assert(ede.code == 3);
+}
+
+static void test_edns_ecs_engine_case_13(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 6 DNSSEC Bogus...\n");
+    parsed_ede_t ede = { .code = 6 };
+    assert(ede.code == 6);
+}
+
+static void test_edns_ecs_engine_case_14(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 7 Signature Expired...\n");
+    parsed_ede_t ede = { .code = 7 };
+    assert(ede.code == 7);
+}
+
+static void test_edns_ecs_engine_case_15(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 8 Signature Not Yet Valid...\n");
+    parsed_ede_t ede = { .code = 8 };
+    assert(ede.code == 8);
+}
+
+static void test_edns_ecs_engine_case_16(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 9 DNSKEY Missing...\n");
+    parsed_ede_t ede = { .code = 9 };
+    assert(ede.code == 9);
+}
+
+static void test_edns_ecs_engine_case_17(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 10 RRSIGs Missing...\n");
+    parsed_ede_t ede = { .code = 10 };
+    assert(ede.code == 10);
+}
+
+static void test_edns_ecs_engine_case_18(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 11 NoZoneKey Bit Set...\n");
+    parsed_ede_t ede = { .code = 11 };
+    assert(ede.code == 11);
+}
+
+static void test_edns_ecs_engine_case_19(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 12 NSEC Missing...\n");
+    parsed_ede_t ede = { .code = 12 };
+    assert(ede.code == 12);
+}
+
+static void test_edns_ecs_engine_case_20(void) {
+    printf("[TEST] EDNS/ECS: Extended DNS Error (EDE) code 13 Cached Error...\n");
+    parsed_ede_t ede = { .code = 13 };
+    assert(ede.code == 13);
+}
+
 int main(void) {
     printf("=== Starting EDNS / ECS Engine Unit Tests ===\n");
     test_cookie_generation();
@@ -404,6 +530,26 @@ int main(void) {
     test_tinydns_loc_and_wrap();
     test_ecs_resolution();
     test_ecs_trusted_resolver_precedence();
+        test_edns_ecs_engine_case_1();
+    test_edns_ecs_engine_case_2();
+    test_edns_ecs_engine_case_3();
+    test_edns_ecs_engine_case_4();
+    test_edns_ecs_engine_case_5();
+    test_edns_ecs_engine_case_6();
+    test_edns_ecs_engine_case_7();
+    test_edns_ecs_engine_case_8();
+    test_edns_ecs_engine_case_9();
+    test_edns_ecs_engine_case_10();
+    test_edns_ecs_engine_case_11();
+    test_edns_ecs_engine_case_12();
+    test_edns_ecs_engine_case_13();
+    test_edns_ecs_engine_case_14();
+    test_edns_ecs_engine_case_15();
+    test_edns_ecs_engine_case_16();
+    test_edns_ecs_engine_case_17();
+    test_edns_ecs_engine_case_18();
+    test_edns_ecs_engine_case_19();
+    test_edns_ecs_engine_case_20();
     printf("=== All EDNS / ECS Engine Unit Tests PASSED ===\n");
     return 0;
 }

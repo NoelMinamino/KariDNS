@@ -82,7 +82,8 @@ int dnstap_connect_and_handshake(const char *socket_path, const char *identity, 
         close(sock);
         return -1;
     }
-    uint32_t acc_type = ntohl(*(uint32_t *)acc_buf);
+    uint32_t acc_type = ((uint32_t)acc_buf[0] << 24) | ((uint32_t)acc_buf[1] << 16) |
+                        ((uint32_t)acc_buf[2] << 8) | (uint32_t)acc_buf[3];
     if (acc_type != FSTRM_CONTROL_ACCEPT) {
         close(sock);
         return -1;

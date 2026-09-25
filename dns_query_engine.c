@@ -583,9 +583,9 @@ STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *ta
     for (size_t i = 0; i < zone->count; i++) {
         dns_record_t *rec = &zone->records[i];
         if (rec->type_code == 50 && rec->name && rec->rdata_count >= 5 && rec->rdata[4]) {
-            char owner_hash[64];
+            char owner_hash[64] = {0};
             const char *dot = strchr(rec->name, '.');
-            if (!dot) continue;
+            if (!dot || dot <= rec->name) continue;
             size_t hlen = (size_t)(dot - rec->name);
             if (hlen >= sizeof(owner_hash)) continue;
             memcpy(owner_hash, rec->name, hlen);
@@ -3151,7 +3151,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (!is_tcp) {
       if (edns.udp_payload_size > 1232)
         edns.udp_payload_size = 1232;
-      if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
+      /* max_res_len は呼び出し側バッファの容量上限も兼ねる。呼び出し側が
+       * UDP 既定値 (512) 未満の小さなバッファを渡した場合に EDNS の
+       * payload size で拡大すると res[] の範囲外へ書き込む (スタック破壊)。
+       * 本番経路は常に >= 512 を渡すため挙動は変わらない。 */
+      if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN &&
+          max_res_len >= UDP_DEFAULT_MAX_RES_LEN)
         max_res_len = edns.udp_payload_size;
     }
   }
@@ -3279,9 +3284,6 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
   res[2] |= 0x84;
   res[3] &= 0xF0;
-  uint16_t *res_ancount = (uint16_t *)&res[6],
-           *res_nscount = (uint16_t *)&res[8],
-           *res_arcount = (uint16_t *)&res[10];
   if (db_entry && view) {
     server_config_t *cfg_lookup = cfg;
     zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
@@ -3311,9 +3313,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  *res_ancount = 0;
-  *res_nscount = 0;
-  *res_arcount = 0;
+  res[6] = 0; res[7] = 0;
+  res[8] = 0; res[9] = 0;
+  res[10] = 0; res[11] = 0;
 
   if (!current_zone) {
     res[3] = (res[3] & 0xF0) | 5;
@@ -3326,7 +3328,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
-      *res_arcount = htons(arcount);
+      res[10] = (uint8_t)(arcount >> 8);
+      res[11] = (uint8_t)(arcount & 0xFF);
     }
     return offset;
   }
@@ -3338,7 +3341,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
-      *res_arcount = htons(arcount);
+      res[10] = (uint8_t)(arcount >> 8);
+      res[11] = (uint8_t)(arcount & 0xFF);
     }
     return offset;
   }
@@ -3351,9 +3355,10 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
     }
-    *res_ancount = 0;
-    *res_nscount = 0;
-    *res_arcount = htons(arcount);
+    res[6] = 0; res[7] = 0;
+    res[8] = 0; res[9] = 0;
+    res[10] = (uint8_t)(arcount >> 8);
+    res[11] = (uint8_t)(arcount & 0xFF);
     return offset;
   }
 
@@ -3444,12 +3449,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
         ancount = 1;
       }
     }
-    *res_ancount = htons(ancount);
-    *res_nscount = 0;
+    res[6] = (uint8_t)(ancount >> 8);
+    res[7] = (uint8_t)(ancount & 0xFF);
+    res[8] = 0; res[9] = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
     }
-    *res_arcount = htons(arcount);
+    res[10] = (uint8_t)(arcount >> 8);
+    res[11] = (uint8_t)(arcount & 0xFF);
     return offset;
   }
 
@@ -3466,6 +3473,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
        !edns.has_keepalive_query &&
        !edns.has_karidns_ext &&
        edns.ede_count == 0 &&
+       !edns.has_cookie &&
        !edns.has_malformed_cookie);
 
   if (edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
@@ -3483,9 +3491,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           if (edns.present) {
             assemble_edns_opt(res, max_res_len, &body_offset, &arcount, &edns, 0, is_tcp, cfg);
           }
-          *res_ancount = htons(e->ancount);
-          *res_nscount = htons(e->nscount);
-          *res_arcount = htons(arcount);
+          res[6] = (uint8_t)(e->ancount >> 8);
+          res[7] = (uint8_t)(e->ancount & 0xFF);
+          res[8] = (uint8_t)(e->nscount >> 8);
+          res[9] = (uint8_t)(e->nscount & 0xFF);
+          res[10] = (uint8_t)(arcount >> 8);
+          res[11] = (uint8_t)(arcount & 0xFF);
           if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_hits, 1, memory_order_relaxed);
           return body_offset;
         }
@@ -3510,7 +3521,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       offset = q_offset;
       arcount = 0;
       if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-      *res_arcount = htons(arcount);
+      res[10] = (uint8_t)(arcount >> 8);
+      res[11] = (uint8_t)(arcount & 0xFF);
       return offset;
     }
     int limit = (cfg_for_ede && cfg_for_ede->max_mqtypes > 0) ? cfg_for_ede->max_mqtypes : 4;
@@ -3523,7 +3535,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           res[8] = 0; res[9] = 0;
           offset = q_offset; arcount = 0;
           if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-          *res_arcount = htons(arcount);
+          res[10] = (uint8_t)(arcount >> 8);
+          res[11] = (uint8_t)(arcount & 0xFF);
           return offset;
        }
        bool dup = false;
@@ -3535,7 +3548,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           res[8] = 0; res[9] = 0;
           offset = q_offset; arcount = 0;
           if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-          *res_arcount = htons(arcount);
+          res[10] = (uint8_t)(arcount >> 8);
+          res[11] = (uint8_t)(arcount & 0xFF);
           return offset;
        }
        qtypes[num_qtypes++] = mq;
@@ -3576,9 +3590,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
   }
 
-  *res_ancount = htons(ancount);
-  *res_nscount = htons(nscount);
-  *res_arcount = htons(arcount);
+  res[6] = (uint8_t)(ancount >> 8);
+  res[7] = (uint8_t)(ancount & 0xFF);
+  res[8] = (uint8_t)(nscount >> 8);
+  res[9] = (uint8_t)(nscount & 0xFF);
+  res[10] = (uint8_t)(arcount >> 8);
+  res[11] = (uint8_t)(arcount & 0xFF);
   return offset;
 }
 

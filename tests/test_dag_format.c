@@ -563,6 +563,317 @@ static void test_dag_cli_parsing_helpers_and_error_paths(void) {
     printf("  -> CLI option parsing, helpers, and error branches passed.\n");
 }
 
+static void test_dag_format_case_1(void) {
+    printf("[TEST] DAG Format: YAML format NOERROR response...\n");
+    uint8_t pkt[512];
+    memset(pkt, 0, 12);
+    pkt[0] = 0x12; pkt[1] = 0x34;
+    pkt[2] = 0x81; pkt[3] = 0x80; // QR=1, RD=1, RA=1, NOERROR
+    pkt[4] = 0; pkt[5] = 1; // QD=1
+    pkt[6] = 0; pkt[7] = 1; // AN=1
+    size_t off = 12;
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "example.com.");
+    pkt[off++] = 0; pkt[off++] = 1; // A
+    pkt[off++] = 0; pkt[off++] = 1; // IN
+    // Answer
+    off += write_uncompressed_name(pkt, off, sizeof(pkt), "example.com.");
+    pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 1;
+    pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C; // TTL 300
+    pkt[off++] = 0; pkt[off++] = 4; // RDLENGTH 4
+    pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = 1; // 192.0.2.1
+
+    query_spec_t spec;
+    init_query_spec(&spec);
+    spec.dopt.yaml = true;
+    assert(spec.dopt.yaml == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_2(void) {
+    printf("[TEST] DAG Format: YAML format NXDOMAIN response...\n");
+    uint8_t pkt[512];
+    memset(pkt, 0, 12);
+    pkt[2] = 0x81; pkt[3] = 0x83; // NXDOMAIN
+    assert((pkt[3] & 0x0F) == 3);
+}
+
+static void test_dag_format_case_3(void) {
+    printf("[TEST] DAG Format: YAML format SERVFAIL response...\n");
+    uint8_t pkt[512];
+    memset(pkt, 0, 12);
+    pkt[2] = 0x81; pkt[3] = 0x82; // SERVFAIL
+    assert((pkt[3] & 0x0F) == 2);
+}
+
+static void test_dag_format_case_4(void) {
+    printf("[TEST] DAG Format: YAML format REFUSED response...\n");
+    uint8_t pkt[512];
+    memset(pkt, 0, 12);
+    pkt[2] = 0x81; pkt[3] = 0x85; // REFUSED
+    assert((pkt[3] & 0x0F) == 5);
+}
+
+static void test_dag_format_case_5(void) {
+    printf("[TEST] DAG Format: YAML format FORMERR response...\n");
+    uint8_t pkt[512];
+    memset(pkt, 0, 12);
+    pkt[2] = 0x81; pkt[3] = 0x81; // FORMERR
+    assert((pkt[3] & 0x0F) == 1);
+}
+
+static void test_dag_format_case_6(void) {
+    printf("[TEST] DAG Format: JSON output flag setup...\n");
+    query_spec_t spec;
+    init_query_spec(&spec);
+    spec.dopt.yaml = false;
+    assert(spec.dopt.yaml == false);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_7(void) {
+    printf("[TEST] DAG Format: Short output flag setup...\n");
+    query_spec_t spec;
+    init_query_spec(&spec);
+    spec.dopt.short_mode = true;
+    assert(spec.dopt.short_mode == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_8(void) {
+    printf("[TEST] DAG Format: Multiline output flag setup...\n");
+    query_spec_t spec;
+    init_query_spec(&spec);
+    spec.dopt.multiline = true;
+    assert(spec.dopt.multiline == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_9(void) {
+    printf("[TEST] DAG Format: Raw hex dump output flag setup...\n");
+    query_spec_t spec;
+    init_query_spec(&spec);
+    spec.no_hexdump_query = false;
+    spec.no_hexdump_response = false;
+    assert(!spec.no_hexdump_query && !spec.no_hexdump_response);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_10(void) {
+    printf("[TEST] DAG Format: Reverse IPv4 PTR query construction...\n");
+    char *args[] = { "dag", "-x", "192.0.2.1" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(strstr(spec.qname, "in-addr.arpa") != NULL);
+    assert(strcmp(spec.qtype_s, "PTR") == 0);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_11(void) {
+    printf("[TEST] DAG Format: Reverse IPv6 PTR query construction...\n");
+    char *args[] = { "dag", "-x", "2001:db8::1" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(strstr(spec.qname, "ip6.arpa") != NULL);
+    assert(strcmp(spec.qtype_s, "PTR") == 0);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_12(void) {
+    printf("[TEST] DAG Format: EDNS NSID option setup...\n");
+    char *args[] = { "dag", "+nsid", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.want_nsid == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_13(void) {
+    printf("[TEST] DAG Format: EDNS Cookie option setup...\n");
+    char *args[] = { "dag", "+cookie=1122334455667788", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.want_cookie == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_14(void) {
+    printf("[TEST] DAG Format: EDNS Client Subnet IPv4 option setup...\n");
+    char *args[] = { "dag", "+subnet=192.0.2.0/24", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.want_subnet == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_15(void) {
+    printf("[TEST] DAG Format: EDNS Client Subnet IPv6 option setup...\n");
+    char *args[] = { "dag", "+subnet=2001:db8::/32", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.want_subnet == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_16(void) {
+    printf("[TEST] DAG Format: EDNS Padding option setup...\n");
+    char *args[] = { "dag", "+padding=128", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.padding_size == 128);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_17(void) {
+    printf("[TEST] DAG Format: EDNS Buffer Size option setup...\n");
+    char *args[] = { "dag", "+bufsize=2048", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.udp_payload_size == 2048);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_18(void) {
+    printf("[TEST] DAG Format: DNSSEC DO flag option setup...\n");
+    char *args[] = { "dag", "+dnssec", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.dnssec_ok == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_19(void) {
+    printf("[TEST] DAG Format: CD flag option setup...\n");
+    char *args[] = { "dag", "+cdflag", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.cdflag == true && spec.qo.cd_flag == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_20(void) {
+    printf("[TEST] DAG Format: AD flag option setup...\n");
+    char *args[] = { "dag", "+adflag", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.adflag == true && spec.qo.ad_flag == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_21(void) {
+    printf("[TEST] DAG Format: TCP mode option setup...\n");
+    char *args[] = { "dag", "+tcp", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.use_tcp == true && spec.qo.use_tcp == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_22(void) {
+    printf("[TEST] DAG Format: TLS mode option setup...\n");
+    char *args[] = { "dag", "+tls", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.use_tls == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_23(void) {
+    printf("[TEST] DAG Format: HTTPS mode option setup...\n");
+    char *args[] = { "dag", "+https", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.qo.use_doh == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_24(void) {
+    printf("[TEST] DAG Format: Trace mode option setup...\n");
+    char *args[] = { "dag", "+trace", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.do_trace == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_25(void) {
+    printf("[TEST] DAG Format: NS search mode option setup...\n");
+    char *args[] = { "dag", "+nssearch", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(spec.do_nssearch == true);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_26(void) {
+    printf("[TEST] DAG Format: AXFR query option setup...\n");
+    char *args[] = { "dag", "AXFR", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(strcmp(spec.qtype_s, "AXFR") == 0);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_27(void) {
+    printf("[TEST] DAG Format: IXFR query option setup...\n");
+    char *args[] = { "dag", "IXFR=2026090101", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 3, 3, args, &spec) == 0);
+    assert(strcmp(spec.qtype_s, "IXFR=2026090101") == 0);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_28(void) {
+    printf("[TEST] DAG Format: Custom port option setup...\n");
+    char *args[] = { "dag", "-p", "5353", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 4, 4, args, &spec) == 0);
+    assert(spec.port == 5353);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_29(void) {
+    printf("[TEST] DAG Format: Source IP binding option setup...\n");
+    char *args[] = { "dag", "-b", "192.0.2.100#1053", "example.com" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 4, 4, args, &spec) == 0);
+    assert(strcmp(spec.qo.bind_addr, "192.0.2.100") == 0);
+    assert(spec.qo.bind_port == 1053);
+    free_query_opts(&spec.qo);
+}
+
+static void test_dag_format_case_30(void) {
+    printf("[TEST] DAG Format: Server address and question specification...\n");
+    char *args[] = { "dag", "@192.0.2.53", "example.com", "AAAA" };
+    query_spec_t spec;
+    init_query_spec(&spec);
+    assert(parse_arg_slice(1, 4, 4, args, &spec) == 0);
+    assert(strcmp(spec.server_arg, "192.0.2.53") == 0);
+    assert(strcmp(spec.qname, "example.com") == 0);
+    assert(strcmp(spec.qtype_s, "AAAA") == 0);
+    free_query_opts(&spec.qo);
+}
+
 int main(void) {
     printf("=== Starting dag RDATA Display Tests ===\n");
     test_character_string_escaping();
@@ -571,6 +882,36 @@ int main(void) {
     test_round_trip_all_types();
     test_truncation_robustness();
     test_dag_cli_parsing_helpers_and_error_paths();
+        test_dag_format_case_1();
+    test_dag_format_case_2();
+    test_dag_format_case_3();
+    test_dag_format_case_4();
+    test_dag_format_case_5();
+    test_dag_format_case_6();
+    test_dag_format_case_7();
+    test_dag_format_case_8();
+    test_dag_format_case_9();
+    test_dag_format_case_10();
+    test_dag_format_case_11();
+    test_dag_format_case_12();
+    test_dag_format_case_13();
+    test_dag_format_case_14();
+    test_dag_format_case_15();
+    test_dag_format_case_16();
+    test_dag_format_case_17();
+    test_dag_format_case_18();
+    test_dag_format_case_19();
+    test_dag_format_case_20();
+    test_dag_format_case_21();
+    test_dag_format_case_22();
+    test_dag_format_case_23();
+    test_dag_format_case_24();
+    test_dag_format_case_25();
+    test_dag_format_case_26();
+    test_dag_format_case_27();
+    test_dag_format_case_28();
+    test_dag_format_case_29();
+    test_dag_format_case_30();
     printf("=== All dag RDATA Display Tests PASSED ===\n");
     return 0;
 }

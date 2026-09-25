@@ -294,6 +294,7 @@ static void ask(const req_t *q, const char *qname, uint16_t qtype, const char *i
 
 // Returns pointer to the COOKIE option payload in the response's OPT RR (NULL if absent).
 static const uint8_t *gr_find_cookie(const gr_resp_t *r, size_t *len_out, uint32_t *opt_ttl_out) {
+    if (!r) return NULL;
     for (int i = 0; i < r->nrr; i++) {
         if (r->rr[i].sect != 3 || r->rr[i].type != 41) continue;
         if (opt_ttl_out) *opt_ttl_out = r->rr[i].ttl;
@@ -302,7 +303,10 @@ static const uint8_t *gr_find_cookie(const gr_resp_t *r, size_t *len_out, uint32
             uint16_t code = (uint16_t)((r->msg[off] << 8) | r->msg[off + 1]);
             uint16_t len = (uint16_t)((r->msg[off + 2] << 8) | r->msg[off + 3]);
             if (off + 4 + len > end) return NULL;
-            if (code == 10) { *len_out = len; return r->msg + off + 4; }
+            if (code == 10) {
+                if (len_out) *len_out = len;
+                return r->msg + off + 4;
+            }
             off += 4 + (size_t)len;
         }
     }

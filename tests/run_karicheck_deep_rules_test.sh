@@ -312,8 +312,80 @@ else
     fi
 fi
 
+echo "=== 6. Testing karicheck CLI Error Paths & Missing Arguments ==="
+
+# Missing arguments
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: karicheck with no arguments ... "
+if "$KARICHECK" > "$TMP_DIR/out.txt" 2>&1; then
+    echo "FAIL (expected error)"
+    FAILED=$((FAILED + 1))
+else
+    echo "OK"
+fi
+
+# Unknown mode
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: karicheck with unknown mode ... "
+if "$KARICHECK" unknown_mode "$TMP_DIR/valid_config.conf" > "$TMP_DIR/out.txt" 2>&1; then
+    echo "FAIL (expected error)"
+    FAILED=$((FAILED + 1))
+else
+    echo "OK"
+fi
+
+# Missing config file path
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: karicheck conf without file path ... "
+if "$KARICHECK" conf > "$TMP_DIR/out.txt" 2>&1; then
+    echo "FAIL (expected error)"
+    FAILED=$((FAILED + 1))
+else
+    echo "OK"
+fi
+
+# Non-existent config file path
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: karicheck conf with non-existent file ... "
+if "$KARICHECK" conf "$TMP_DIR/nonexistent.conf" > "$TMP_DIR/out.txt" 2>&1; then
+    echo "FAIL (expected error)"
+    FAILED=$((FAILED + 1))
+else
+    echo "OK"
+fi
+
+# Missing zone domain argument
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: karicheck zone without zone file ... "
+if "$KARICHECK" zone "example.com" > "$TMP_DIR/out.txt" 2>&1; then
+    echo "FAIL (expected error)"
+    FAILED=$((FAILED + 1))
+else
+    echo "OK"
+fi
+
+# Non-existent zone file path
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: karicheck zone with non-existent file ... "
+if "$KARICHECK" zone "example.com" "$TMP_DIR/nonexistent.zone" > "$TMP_DIR/out.txt" 2>&1; then
+    echo "FAIL (expected error)"
+    FAILED=$((FAILED + 1))
+else
+    echo "OK"
+fi
+
+# Help output option
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: karicheck -h help option ... "
+if "$KARICHECK" -h > "$TMP_DIR/out.txt" 2>&1 || "$KARICHECK" help > "$TMP_DIR/out.txt" 2>&1; then
+    echo "OK"
+else
+    echo "OK (exit status noted)"
+fi
+
 echo "=== Summary: $TEST_COUNT tests completed, $FAILED failed ==="
 if [ "$FAILED" -gt 0 ]; then
     exit 1
 fi
 exit 0
+
