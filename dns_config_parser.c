@@ -1551,11 +1551,15 @@ static int parse_buffer_size_value(const char *str) {
   char *endptr = NULL;
   long long val = strtoll(str, &endptr, 10);
   if (val <= 0) return 0;
+  long long mult = 1;
   if (endptr && *endptr) {
-    if (*endptr == 'k' || *endptr == 'K') val *= 1024;
-    else if (*endptr == 'm' || *endptr == 'M') val *= 1024 * 1024;
-    else if (*endptr == 'g' || *endptr == 'G') val *= 1024 * 1024 * 1024;
+    if (*endptr == 'k' || *endptr == 'K') mult = 1024LL;
+    else if (*endptr == 'm' || *endptr == 'M') mult = 1024LL * 1024;
+    else if (*endptr == 'g' || *endptr == 'G') mult = 1024LL * 1024 * 1024;
   }
+  /* clamp before multiplying: "9999999999G" would overflow long long (UB) */
+  if (val > INT_MAX / mult) return INT_MAX;
+  val *= mult;
   if (val > INT_MAX) val = INT_MAX;
   return (int)val;
 }

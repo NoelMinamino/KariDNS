@@ -113,6 +113,16 @@ static char *read_file_or_die(const char *path, bool *out_failed) {
         fprintf(stderr, "[ERROR] Could not open file: %s (%s)\n", path, strerror(errno));
         return NULL;
     }
+    /* A directory (or FIFO/device) opens fine on some systems, but its ftell()
+     * result is meaningless (e.g. LONG_MAX for a directory on Linux), which
+     * would overflow the "len + 1" allocation below. Require a regular file. */
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
+        fclose(f);
+        if (out_failed) *out_failed = true;
+        fprintf(stderr, "[ERROR] Not a regular file: %s\n", path);
+        return NULL;
+    }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);

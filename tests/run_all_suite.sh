@@ -192,6 +192,10 @@ register_test() {
 # 1. Unit Tests (C test binaries in ROOT_DIR)
 register_test "unit" "bin" "test_vulnerability_fixes" "Vulnerability & Epoch RCU robustness test"
 register_test "unit" "bin" "test_query_engine_expanded" "All-RR types, wildcards, DNAME & 0x20 bit preservation"
+register_test "unit" "bin" "test_coverage_sweep" "Coverage sweeps: engine matrix/truncation/mutation, wire+TSIG+EDNS, zone/conf parsers, catalog, XFR, UPDATE, RRL/ECS/dnstap"
+register_test "unit" "bin" "test_coverage_sweep_dag" "dag coverage sweeps: every option token, print_response display matrix, dns64/SVCB corner cases"
+register_test "unit" "bin" "test_coverage_sweep_net" "dag network sweeps: UDP/TCP/DoT/DoH fake server, trace/nssearch, AXFR/IXFR, UPDATE, SIG(0) keys, --replay pcap/dnstap"
+register_test "unit" "bin" "test_coverage_sweep_tools" "karicheck lint-rule sweep and karictl control-socket protocol sweep"
 register_test "unit" "bin" "test_dnstap_engine" "DNSTAP Protobuf encoder, frame sender & ring buffers"
 register_test "unit" "bin" "test_edns_ecs_engine" "EDNS Cookies, EDE error codes & ECS subnet LPM resolution"
 register_test "unit" "bin" "test_rfc_vectors" "RFC 9018 Server Cookie vectors, SipHash-2-4, RFC 4034 key tag & cookie-secret config"
@@ -447,7 +451,7 @@ FAILED_TEST_NAMES=""
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
         if [ ! -x "./${_b}" ]; then
             make "${_b}" >/dev/null 2>&1 || true
         fi

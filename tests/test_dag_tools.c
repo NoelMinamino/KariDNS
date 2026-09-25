@@ -4422,7 +4422,7 @@ static void test_dag_tools_feature_case_202(void) {
 static void test_dag_tools_feature_case_203(void) {
     printf("[TEST] DAG Tools: Replay Protobuf zigzag 32-bit encoding...\n");
     int32_t n = -1;
-    uint32_t zz = (uint32_t)((n << 1) ^ (n >> 31));
+    uint32_t zz = ((uint32_t)n << 1) ^ (uint32_t)(n >> 31);   /* shift the unsigned value: n << 1 on a negative int is UB */
     assert(zz == 1);
 }
 

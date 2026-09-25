@@ -103,7 +103,7 @@ FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tc
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
 	karicheck_matrix_test unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan test test-all rfc_vectors_test cidr_test tinydns_test asan_test include_test config_directives_test wire_helpers_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_reassembly_test hash_test vulnerability_test \
-	dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test \
+	dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test \
 	coverage coverage-build coverage-run coverage-report coverage-clean
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
@@ -246,6 +246,10 @@ VULN_TEST_SRCS = tests/test_vulnerability_fixes.c dns_query_engine.c dns_snapsho
 TEST_CATALOG_SRCS = tests/test_catalog_zone_engine.c dns_catalog_zone.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 TEST_SANDBOX_SRCS = tests/test_snapshot_sandbox_engine.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
 TEST_DAGFORMAT_SRCS = tests/test_dag_format.c tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_tinydns_parser.c dns_tsig_acl.c
+TEST_COV_SWEEP_SRCS = tests/test_coverage_sweep.c dns_query_engine.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
+TEST_COV_SWEEP_NET_SRCS = tests/test_coverage_sweep_net.c tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_tinydns_parser.c dns_tsig_acl.c
+TEST_COV_SWEEP_TOOLS_SRCS = tests/test_coverage_sweep_tools.c tests/test_coverage_sweep_karictl_main.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
+TEST_COV_SWEEP_DAG_SRCS = tests/test_coverage_sweep_dag.c tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_replay.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_tinydns_parser.c dns_tsig_acl.c
 TEST_DAGREASM_SRCS = tests/test_dag_reassembly.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
 TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dag_transport.c dns_zone_parser.c dns_config_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c
 TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c
@@ -436,6 +440,30 @@ test_dag_format: $(TEST_DAGFORMAT_SRCS)
 dag_format_test: test_dag_format
 	./test_dag_format
 
+test_coverage_sweep: $(TEST_COV_SWEEP_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_SRCS) -o test_coverage_sweep $(LDFLAGS) -lcrypto -lpthread -lm
+
+coverage_sweep_test: test_coverage_sweep
+	./test_coverage_sweep
+
+test_coverage_sweep_dag: $(TEST_COV_SWEEP_DAG_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_DAG_SRCS) -o test_coverage_sweep_dag $(LDFLAGS) -lssl -lcrypto -lpthread -lm -lz $(IDN_LDFLAGS)
+
+coverage_sweep_dag_test: test_coverage_sweep_dag
+	./test_coverage_sweep_dag
+
+test_coverage_sweep_net: $(TEST_COV_SWEEP_NET_SRCS)
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_NET_SRCS) -o test_coverage_sweep_net $(LDFLAGS) -lssl -lcrypto -lpthread -lm -lz $(IDN_LDFLAGS)
+
+coverage_sweep_net_test: test_coverage_sweep_net
+	./test_coverage_sweep_net
+
+test_coverage_sweep_tools: $(TEST_COV_SWEEP_TOOLS_SRCS) tools/karicheck.c tools/karictl.c
+	$(CC) $(CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_TOOLS_SRCS) -o test_coverage_sweep_tools $(LDFLAGS) -lcrypto -lpthread -lm
+
+coverage_sweep_tools_test: test_coverage_sweep_tools
+	./test_coverage_sweep_tools
+
 test_dag_reassembly: $(TEST_DAGREASM_SRCS)
 	$(CC) $(CFLAGS) -I. $(TEST_DAGREASM_SRCS) -o test_dag_reassembly $(LDFLAGS)
 
@@ -484,7 +512,7 @@ test_fi_dag: $(TEST_FI_DAG_SRCS)
 fi_dag_test: test_fi_dag
 	./test_fi_dag
 
-unit-tests: cidr_test tinydns_test asan_test include_test config_directives_test wire_helpers_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_reassembly_test hash_test dnstap_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test
+unit-tests: cidr_test tinydns_test asan_test include_test config_directives_test wire_helpers_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_reassembly_test hash_test dnstap_test edns_ecs_test rfc_vectors_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test response_cache_test vulnerability_test catalog_zone_test snapshot_sandbox_test dag_tools_test server_core_test fi_parsers_test fi_wire_test fi_snapshot_test fi_xfr_test fi_misc_test fi_dag_test
 
 # --- Unit tests under ASan + UBSan --------------------------------------------
 # The plain test_* targets above are built with the production CFLAGS (-O3 -flto),
@@ -575,13 +603,25 @@ test_dag_tools-asan: $(TEST_DAG_TOOLS_SRCS)
 test_dag_format-asan: $(TEST_DAGFORMAT_SRCS)
 	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DAGFORMAT_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
 
+test_coverage_sweep-asan: $(TEST_COV_SWEEP_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
+test_coverage_sweep_dag-asan: $(TEST_COV_SWEEP_DAG_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_DAG_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
+
+test_coverage_sweep_net-asan: $(TEST_COV_SWEEP_NET_SRCS)
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_NET_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
+test_coverage_sweep_tools-asan: $(TEST_COV_SWEEP_TOOLS_SRCS) tools/karicheck.c tools/karictl.c
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_TOOLS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+
 test_dag_reassembly-asan: $(TEST_DAGREASM_SRCS)
 	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_DAGREASM_SRCS) -o $@ $(UT_ASAN_LDFLAGS)
 
 test_server_core-asan: $(TEST_SERVER_CORE_SRCS)
 	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_SERVER_CORE_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-UT_ASAN_BINS = test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_config_directives-asan test_wire_helpers-asan test_zone_parser_paths-asan test_tinydns_paths-asan test_sig0_sign-asan test_snapshot_rebuild-asan test_dnssec_proofs-asan test_query_engine_protocol-asan test_dag_format-asan test_dag_reassembly-asan test_hash_table-asan test_dnstap_engine-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_server_core-asan
+UT_ASAN_BINS = test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_config_directives-asan test_wire_helpers-asan test_zone_parser_paths-asan test_tinydns_paths-asan test_sig0_sign-asan test_snapshot_rebuild-asan test_dnssec_proofs-asan test_query_engine_protocol-asan test_dag_format-asan test_dag_reassembly-asan test_hash_table-asan test_dnstap_engine-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_server_core-asan test_coverage_sweep-asan test_coverage_sweep_dag-asan test_coverage_sweep_net-asan test_coverage_sweep_tools-asan
 
 unit-tests-asan: $(UT_ASAN_BINS)
 	@rc=0; for t in $(UT_ASAN_BINS); do \
@@ -751,6 +791,7 @@ COV_BIN_OBJS += -object=test_edns_ecs_engine -object=test_rfc_vectors -object=te
 COV_BIN_OBJS += -object=test_rrl_engine -object=test_query_engine_expanded -object=test_response_cache -object=test_vulnerability_fixes
 COV_BIN_OBJS += -object=test_catalog_zone_engine -object=test_snapshot_sandbox_engine -object=test_dag_tools -object=test_server_core
 COV_BIN_OBJS += -object=test_fi_parsers -object=test_fi_wire -object=test_fi_snapshot -object=test_fi_xfr -object=test_fi_misc -object=test_fi_dag
+COV_BIN_OBJS += -object=test_coverage_sweep -object=test_coverage_sweep_dag -object=test_coverage_sweep_net -object=test_coverage_sweep_tools
 COV_BIN_OBJS += $(COV_FUZZ_OBJS)
 
 coverage-clean:
@@ -760,7 +801,7 @@ coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
 	$(MAKE) clean
 	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
-	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag
+	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools
 	$(MAKE) coverage-fuzz-build
 
 coverage-run:
@@ -795,7 +836,7 @@ bench_rrl: tests/bench_rrl.c dns_rrl.o dns_config_parser.o dns_zone_parser.o dns
 
 clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
-	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag
+	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools
 	rm -f $(UT_ASAN_BINS)
 
 run: $(TARGET)

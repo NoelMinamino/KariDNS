@@ -1357,8 +1357,9 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
                         bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
                         if (groups_match) {
-                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
-                                if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
+                            /* i indexes the current members, j the desired ones (was swapped: OOB/UAF read) */
+                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
+                                if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
                                     groups_match = false; break;
                                 }
                             }
@@ -1374,7 +1375,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
                         bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
                         if (groups_match) {
-                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
+                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
                                 if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
                                     groups_match = false; break;
                                 }

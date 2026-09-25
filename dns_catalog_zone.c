@@ -97,6 +97,18 @@ STATIC_TEST void free_catalog_desired_list(catalog_member_id_t *list, int count)
     free(list);
 }
 
+/* RFC 9432 §4.1: a member node is exactly one label (<unique-N>) directly below
+ * "zones.<catalog>". PTR records deeper in the tree (e.g. the "coo" property at
+ * coo.<unique-N>.zones.<catalog>) are properties, not members. */
+static bool catalog_prefix_is_single_label(const char *name, size_t prefix_len) {
+    if (prefix_len == 0) return false;
+    for (size_t i = 0; i < prefix_len; i++) {
+        if (name[i] == '\\') { i++; continue; }  /* skip escaped character */
+        if (name[i] == '.') return false;
+    }
+    return true;
+}
+
 void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name) {
     if (!catalog_entry || !catalog_cfg) return;
 
@@ -142,7 +154,8 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     for (size_t i = 0; i < arena->count; i++) {
         if (arena->records[i].type_code == 12) { // PTR
             size_t name_len = strlen(arena->records[i].name);
-            if (name_len > suffix_len && strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) == 0) {
+            if (name_len > suffix_len && strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) == 0 &&
+                catalog_prefix_is_single_label(arena->records[i].name, name_len - suffix_len)) {
                 if (arena->records[i].rdata_count > 0) {
                     char *target = arena->records[i].rdata[0];
                     char norm_target[256];
@@ -177,7 +190,8 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
         if (arena->records[i].type_code != 12) continue;
         size_t name_len = strlen(arena->records[i].name);
         if (name_len <= suffix_len ||
-            strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) != 0)
+            strcasecmp(arena->records[i].name + name_len - suffix_len, suffix) != 0 ||
+            !catalog_prefix_is_single_label(arena->records[i].name, name_len - suffix_len))
             continue;
         int count_for_this_name = 0;
         for (size_t j = 0; j < arena->count; j++) {
