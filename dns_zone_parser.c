@@ -575,13 +575,13 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
                              const char *default_ttl, const char *cur_buf,
                              const char *ecs_tag, const char *loc_tag) {
     if (field_idx < 5) {
-        if (ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
+        if (ctx && ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
         return -1;
     }
     parse_error_t local_err = {0};
     generate_range_t range;
     if (parse_generate_range(fields[1], &range, &local_err) != 0) {
-        if (ctx->err_out) {
+        if (ctx && ctx->err_out) {
             ctx->err_out->error_message = local_err.error_message;
             ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
             ctx->err_out->token_length = strlen(fields[1]);
@@ -613,7 +613,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     }
 
     if (!type_str || !rhs_tmpl) {
-        if (ctx->err_out) {
+        if (ctx && ctx->err_out) {
             ctx->err_out->error_message = "$GENERATE requires range lhs [ttl] [class] type rhs";
             ctx->err_out->error_offset = (size_t)(fields[0] - cur_buf);
             ctx->err_out->token_length = strlen(fields[0]);
@@ -625,7 +625,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     if (type_code != 1 && type_code != 28 && type_code != 2 &&
         type_code != 5 && type_code != 12 && type_code != 39 &&
         type_code != 16) {
-        if (ctx->err_out) {
+        if (ctx && ctx->err_out) {
             ctx->err_out->error_message = "$GENERATE does not support this record type";
             ctx->err_out->error_offset = (size_t)(fields[3] - cur_buf);
             ctx->err_out->token_length = strlen(fields[3]);
@@ -637,7 +637,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     for (uint64_t v = range.start; v <= range.stop; v += range.step) {
         size_t name_len = expand_generate_template(lhs_tmpl, v, name_buf, sizeof(name_buf), &local_err);
         if (name_len == (size_t)-1) {
-            if (ctx->err_out) {
+            if (ctx && ctx->err_out) {
                 ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE lhs expansion failed";
                 ctx->err_out->error_offset = (size_t)(fields[2] - cur_buf);
                 ctx->err_out->token_length = strlen(fields[2]);
@@ -646,7 +646,7 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         }
         size_t rdata_len = expand_generate_template(rhs_tmpl, v, rdata_buf, sizeof(rdata_buf), &local_err);
         if (rdata_len == (size_t)-1) {
-            if (ctx->err_out) {
+            if (ctx && ctx->err_out) {
                 ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE rhs expansion failed";
                 ctx->err_out->error_offset = (size_t)(fields[4] - cur_buf);
                 ctx->err_out->token_length = strlen(fields[4]);
@@ -660,11 +660,11 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         rec->bind_location_tag = (char *)loc_tag;
 
         char *name_copy = arena_alloc(arena, name_len + 1);
-        if (!name_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
+        if (!name_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
         memcpy(name_copy, name_buf, name_len + 1);
 
         char *rdata_copy = arena_alloc(arena, rdata_len + 1);
-        if (!rdata_copy) { if (ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
+        if (!rdata_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
         memcpy(rdata_copy, rdata_buf, rdata_len + 1);
 
         rec->name = expand_domain_name(name_copy, origin, arena);
@@ -1202,14 +1202,79 @@ PROCESS_RECORD:
 
   rec->generic_len = 0;
   rec->generic_data = NULL;
+  /* EID (31) / NIMLOC (32) have no dedicated wire encoder; the server always serves them via the RFC 3597
+   * generic form. dig's presentation for these undocumented types is a single bare hex token with no "\# len"
+   * prefix, so accept that shape too by rewriting it into an equivalent "\# <len> <hex>" generic record. */
+  if ((rec->type_code == 31 || rec->type_code == 32) && rec->rdata_count == 1 &&
+      strcmp(rec->rdata[0], "\\#") != 0 && strcmp(rec->rdata[0], "#") != 0) {
+    char hex_copy[512];
+    /* snprintf rather than strlcpy: MinGW (Windows dag build) has no strlcpy */
+    snprintf(hex_copy, sizeof(hex_copy), "%s", rec->rdata[0]);
+    size_t hexlen = strlen(hex_copy);
+    if (hexlen > 0 && (hexlen % 2) == 0 && hexlen < sizeof(hex_copy) &&
+        strspn(hex_copy, "0123456789abcdefABCDEF") == hexlen && MAX_RDATA >= 3) {
+      char lenbuf[16];
+      snprintf(lenbuf, sizeof(lenbuf), "%zu", hexlen / 2);
+      rec->rdata[0] = arena_strdup(arena, "\\#");
+      rec->rdata[1] = arena_strdup(arena, lenbuf);
+      rec->rdata[2] = arena_strdup(arena, hex_copy);
+      rec->rdata_count = 3;
+    }
+  }
   if (rec->rdata_count >= 2 && (strcmp(rec->rdata[0], "\\#") == 0 || strcmp(rec->rdata[0], "#") == 0)) {
-    long declared_len = atol(rec->rdata[1]);
+    /* RFC 3597 section 5: "\# <length> <hex rdata>". The declared length is a decimal number, the rdata is an
+     * even number of hex digits (possibly split into several tokens) and its size MUST equal <length>. Anything
+     * else used to be "repaired" silently (non-hex skipped, short data padded, long data cut off), which let a
+     * malformed record be served as if it were valid (e.g. a 3-byte A record). */
+    const char *len_tok = rec->rdata[1];
+    size_t len_tok_len = strlen(len_tok);
+    if (len_tok_len == 0 || len_tok_len > 5 || strspn(len_tok, "0123456789") != len_tok_len) {
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) is not a decimal number";
+      return -1;
+    }
+    long declared_len = atol(len_tok);
     if (declared_len < 0 || declared_len > 65535) {
       if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA length (\\#) out of range (0-65535)";
       return -1;
     }
+    size_t nibbles = 0;
+    for (int j = 2; j < rec->rdata_count; j++) {
+      for (const char *h = rec->rdata[j]; *h; h++) {
+        if (hex_char_to_val(*h) < 0) {
+          if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) contains a non-hexadecimal character";
+          return -1;
+        }
+        nibbles++;
+      }
+    }
+    if ((nibbles & 1) != 0) {
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) has an odd number of hex digits";
+      return -1;
+    }
+    if (nibbles / 2 != (size_t)declared_len) {
+      if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) length does not match the declared length";
+      return -1;
+    }
+    /* Types whose RDATA has a fixed size must not be given in a different size, even in generic form. */
+    {
+      int fixed = -1;
+      switch (rec->type_code) {
+        case 1:   fixed = 4;  break;   /* A */
+        case 28:  fixed = 16; break;   /* AAAA */
+        case 108: fixed = 6;  break;   /* EUI48 */
+        case 109: fixed = 8;  break;   /* EUI64 */
+        case 105: fixed = 6;  break;   /* L32 */
+        case 104: fixed = 10; break;   /* NID */
+        case 106: fixed = 10; break;   /* L64 */
+        default: break;
+      }
+      if (fixed >= 0 && declared_len != fixed) {
+        if (ctx && ctx->err_out) ctx->err_out->error_message = "Generic RDATA (\\#) has the wrong length for this fixed-size record type";
+        return -1;
+      }
+    }
     rec->generic_len = (uint16_t)declared_len;
-    if (rec->generic_len > 0 && rec->rdata_count > 2) {
+    if (rec->generic_len > 0) {
       uint8_t *blob = (uint8_t *)arena_alloc(arena, rec->generic_len);
       if (blob) {
         size_t b_idx = 0;
@@ -1217,20 +1282,17 @@ PROCESS_RECORD:
         for (int j = 2; j < rec->rdata_count; j++) {
           for (char *h = rec->rdata[j]; *h; h++) {
             int val = hex_char_to_val(*h);
-            if (val < 0)
-              continue;
             if (high_nibble < 0)
               high_nibble = val;
             else {
-              if (b_idx < rec->generic_len)
-                blob[b_idx++] = (high_nibble << 4) | val;
+              blob[b_idx++] = (uint8_t)((high_nibble << 4) | val);
               high_nibble = -1;
             }
           }
         }
         rec->generic_data = blob;
       }
-    } else if (rec->generic_len == 0) {
+    } else {
       rec->generic_data = (uint8_t *)"";
     }
   } else if (rec->type) {
@@ -1556,6 +1618,17 @@ uint32_t calc_fnv1a_str(const char *str) {
   uint32_t hash = 2166136261u;
   for (const char *p = str; *p; p++) {
     uint8_t c = *p;
+    if (c >= 'A' && c <= 'Z')
+      c |= 0x20;
+    hash ^= c;
+    hash *= 16777619u;
+  }
+  return hash;
+}
+uint32_t calc_fnv1a_strn(const char *str, size_t len) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    uint8_t c = (uint8_t)str[i];
     if (c >= 'A' && c <= 'Z')
       c |= 0x20;
     hash ^= c;

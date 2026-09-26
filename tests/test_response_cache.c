@@ -18,8 +18,8 @@ int g_notify_ipc[2] = {-1, -1};
 int g_broker_sock = -1;
 config_rcu_t g_config_db;
 _Atomic int g_xfers_running = 0;
-int g_worker_count = 0;
-worker_ctx_t *g_worker_ctxs = NULL;
+_Atomic int g_worker_count = ATOMIC_VAR_INIT(0);
+_Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
 int g_cwd_fd = -1;
 char g_startup_cwd[PATH_MAX] = "";
 
@@ -332,7 +332,8 @@ static void test_wire_cache_consistency(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    int b_rc = build_zone_index(&arena, true);
+    assert(b_rc == 0);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -389,7 +390,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_simple_query(req, &req_len, (uint16_t)(0x1234 + i), test_cases[i].qname, test_cases[i].qtype);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
 
         zone_db_entry_t *matched1 = NULL;
@@ -427,7 +428,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_edns_query(req, &req_len, (uint16_t)(0x3456 + i), test_cases[i].qname, test_cases[i].qtype, false);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
 
         zone_db_entry_t *matched1 = NULL;
@@ -468,7 +469,7 @@ static void test_wire_cache_consistency(void) {
         build_edns_cookie_query(req1, &req_len1, 0x7701, "mail.example.com.", 1, client_cookie1);
         build_edns_cookie_query(req2, &req_len2, 0x7702, "mail.example.com.", 1, client_cookie2);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
 
         // Client 1 query (cached)
@@ -528,7 +529,7 @@ static void test_wire_cache_consistency(void) {
             size_t req_len = 0;
             build_simple_query(req, &req_len, (uint16_t)(0x5678 + i), mixed_qname, 1);
 
-            compress_ctx_t comp_ctx;
+            compress_ctx_t comp_ctx = {0};
             compress_ctx_init_packet(&comp_ctx);
             zone_db_entry_t *matched = NULL;
             int len_cached = process_dns_query_impl(req, req_len, res_cached, sizeof(res_cached),
@@ -558,7 +559,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_edns_query(req, &req_len, 0x9999, "mail.example.com.", 1, true /* dnssec_ok = true */);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -580,7 +581,7 @@ static void test_wire_cache_consistency(void) {
 
         cfg.rfc10029_mqtype_enable = true;
         cfg.max_mqtypes = 4;
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -604,7 +605,7 @@ static void test_wire_cache_consistency(void) {
         build_edns_ecs_query(req, &req_len, 0x999B, "mail.example.com.", 1, 1 /* IPv4 */, 24, ecs_ip, 4);
 
         cfg.ecs_enable = true;
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -634,7 +635,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_edns_malformed_cookie_query(req, &req_len, 0x999C, "mail.example.com.", 1);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -653,7 +654,7 @@ static void test_wire_cache_consistency(void) {
         build_edns_nsid_query(req, &req_len, 0x999D, "mail.example.com.", 1);
 
         cfg.nsid_string = (char *)"kari-test-node";
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -681,7 +682,7 @@ static void test_wire_cache_consistency(void) {
 
         cfg.tcp_connection_reuse = true;
         cfg.tcp_idle_timeout = 10000;
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -707,7 +708,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_edns_karidns_ext_query(req, &req_len, 0x999F, "mail.example.com.", 1);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -725,7 +726,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_edns_ede_query(req, &req_len, 0x99A0, "mail.example.com.", 1, 15 /* Blocked */, "Filtered");
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -746,7 +747,7 @@ static void test_wire_cache_consistency(void) {
         build_edns_cookie_ecs_query(req, &req_len, 0x99A1, "mail.example.com.", 1, client_cookie, 1, 24, ecs_ip, 4);
 
         cfg.ecs_enable = true;
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -772,7 +773,7 @@ static void test_wire_cache_consistency(void) {
 
         cfg.rfc10029_mqtype_enable = true;
         cfg.max_mqtypes = 4;
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -794,7 +795,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_simple_query(req, &req_len, 0x9998, "sub.wildcard.example.com.", 1);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -814,7 +815,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_simple_query(req, &req_len, 0x9997, "nonexistent.example.com.", 1);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -832,7 +833,7 @@ static void test_wire_cache_consistency(void) {
         size_t req_len = 0;
         build_simple_query(req, &req_len, 0x9996, "mail.example.com.", 16 /* TXT */);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -909,7 +910,8 @@ static void test_wire_cache_max_records_limit(void) {
 
         int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
         assert(parsed >= 0);
-        assert(build_zone_index(&arena, true) == 0);
+        int b_rc = build_zone_index(&arena, true);
+        assert(b_rc == 0);
         size_t total_records = arena.count;
         assert(total_records == 5);
 
@@ -973,7 +975,7 @@ static void test_wire_cache_max_records_limit(void) {
         size_t req_len = 0;
         build_simple_query(req, &req_len, 0x1234, "www.example.com.", 1 /* A */);
 
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         zone_db_entry_t *matched = NULL;
         int len = process_dns_query_impl(req, req_len, res, sizeof(res),
@@ -1015,7 +1017,8 @@ static void test_wire_cache_observatory_counters(void) {
 
     int parsed = parse_zone_fast((char *)zone_text, strlen(zone_text), &arena, &ctx);
     assert(parsed >= 0);
-    assert(build_zone_index(&arena, true) == 0);
+    int b_rc = build_zone_index(&arena, true);
+    assert(b_rc == 0);
 
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -1051,7 +1054,7 @@ static void test_wire_cache_observatory_counters(void) {
     size_t req_len = 0;
     build_simple_query(req, &req_len, 0x1001, "www.example.com.", 1);
 
-    compress_ctx_t comp_ctx;
+    compress_ctx_t comp_ctx = {0};
     compress_ctx_init_packet(&comp_ctx);
     zone_db_entry_t *matched = NULL;
     int len = process_dns_query_impl(req, req_len, res, sizeof(res),

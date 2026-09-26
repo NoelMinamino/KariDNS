@@ -1,0 +1,13 @@
+$TTL 3600
+$ORIGIN glue.test.
+
+@   IN SOA  ns1.glue.test. admin.glue.test. 1 3600 900 1209600 86400
+    IN NS   ns1.glue.test.
+
+ns1 IN A 127.0.0.1
+
+sub IN NS   ns1.sub.glue.test.
+sub IN NS   ns2.sub.glue.test.
+
+$GENERATE 1-20 ns1.sub IN AAAA 2001:db8::1:0:$
+$GENERATE 1-20 ns2.sub IN AAAA 2001:db8::2:0:$

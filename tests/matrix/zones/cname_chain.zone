@@ -1,0 +1,14 @@
+$ORIGIN chain.test.
+$TTL 3600
+chain.test. IN SOA ns1.chain.test. hostmaster.chain.test. 1 7200 3600 1209600 3600
+chain.test. IN NS ns1.chain.test.
+ns1.chain.test. IN A 192.0.2.1
+
+c1.chain.test. IN CNAME c2.chain.test.
+c2.chain.test. IN CNAME c3.chain.test.
+c3.chain.test. IN CNAME final.chain.test.
+final.chain.test. IN A 192.0.2.99
+final.chain.test. IN AAAA 2001:db8::99
+
+loop-a.chain.test. IN CNAME loop-b.chain.test.
+loop-b.chain.test. IN CNAME loop-a.chain.test.

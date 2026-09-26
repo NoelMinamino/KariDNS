@@ -2,6 +2,7 @@
 #include "dns_rrl.h"
 #include "dns_server_internal.h"
 #include "dns_utils.h"
+#include "dns_siphash.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -38,39 +39,8 @@ void rrl_init(void) {
 void rrl_shutdown(void) {
 }
 
-#define ROTL(x, b) (uint64_t)(((x) << (b)) | ((x) >> (64 - (b))))
-#define SIPROUND do { \
-    v0 += v1; v1 = ROTL(v1, 13); v1 ^= v0; v0 = ROTL(v0, 32); \
-    v2 += v3; v3 = ROTL(v3, 16); v3 ^= v2; \
-    v0 += v3; v3 = ROTL(v3, 21); v3 ^= v0; \
-    v2 += v1; v1 = ROTL(v1, 17); v1 ^= v2; v2 = ROTL(v2, 32); \
-} while (0)
-
 uint64_t siphash24(const uint8_t *in, size_t inlen, const uint64_t k[2]) {
-    uint64_t v0 = 0x736f6d6570736575ULL ^ k[0];
-    uint64_t v1 = 0x646f72616e646f6dULL ^ k[1];
-    uint64_t v2 = 0x6c7967656e657261ULL ^ k[0];
-    uint64_t v3 = 0x7465646279746573ULL ^ k[1];
-    uint64_t b = ((uint64_t)inlen) << 56;
-    const uint8_t *end = in + (inlen & ~7);
-    for (; in != end; in += 8) {
-        uint64_t m; memcpy(&m, in, 8);
-        v3 ^= m; SIPROUND; SIPROUND; v0 ^= m;
-    }
-    uint64_t t = 0;
-    switch (inlen & 7) {
-        case 7: t |= ((uint64_t)in[6]) << 48; // fallthrough
-        case 6: t |= ((uint64_t)in[5]) << 40; // fallthrough
-        case 5: t |= ((uint64_t)in[4]) << 32; // fallthrough
-        case 4: t |= ((uint64_t)in[3]) << 24; // fallthrough
-        case 3: t |= ((uint64_t)in[2]) << 16; // fallthrough
-        case 2: t |= ((uint64_t)in[1]) << 8;  // fallthrough
-        case 1: t |= ((uint64_t)in[0]);
-    }
-    b |= t;
-    v3 ^= b; SIPROUND; SIPROUND; v0 ^= b;
-    v2 ^= 0xff; SIPROUND; SIPROUND; SIPROUND; SIPROUND;
-    return v0 ^ v1 ^ v2 ^ v3;
+    return dns_siphash24(in, inlen, k);   /* shared header-only implementation */
 }
 
 static inline uint64_t rrl_hash_client_addr(const void *client_addr_ptr) {
@@ -108,7 +78,7 @@ bool rrl_check(const void *client_addr_ptr, rrl_response_class_t cls, const rate
   uint32_t rate = 0;
   switch (cls) {
     case RRL_RESP_NOERROR: rate = cfg->responses_per_second; break;
-    case RRL_RESP_NODATA:  rate = cfg->responses_per_second; break;
+    case RRL_RESP_NODATA:  rate = cfg->nodata_per_second; break;
     case RRL_RESP_NXDOMAIN: rate = cfg->nxdomains_per_second; break;
     case RRL_RESP_ERROR:   rate = cfg->errors_per_second; break;
   }

@@ -14,6 +14,8 @@
 #include <sys/event.h>
 #endif
 
+#define STATIC_TEST
+
 program_plugin_t *g_program_plugins = NULL;
 int g_program_plugins_count = 0;
 
@@ -76,20 +78,14 @@ static bool is_non_data_rrtype(uint16_t t) {
     }
 }
 
-typedef struct {
-    uint16_t offset;
-    uint16_t ancount;
-    uint16_t nscount;
-    uint16_t arcount;
-} resolve_checkpoint_t;
-
 static resolve_checkpoint_t save_checkpoint(uint16_t *offset, uint16_t *ancount,
+
                                              uint16_t *nscount, uint16_t *arcount) {
     resolve_checkpoint_t cp = { *offset, *ancount, *nscount, *arcount };
     return cp;
 }
 
-static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
+STATIC_TEST void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                                 uint16_t *ancount, uint16_t *nscount, uint16_t *arcount) {
     *offset = cp->offset;
     *ancount = cp->ancount;
@@ -104,11 +100,11 @@ static void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
  *
  * rec->tinydns_ttd == 0 かつ location未指定・ECSタグ未指定・LOCATIONタグ未指定の場合(制限のないレコード)
  * は即座にtrueを返す。 */
-static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
-                                                   const char client_loc[2],
-                                                   const char *client_ecs_tag,
-                                                   const char *client_loc_tag,
-                                                   uint32_t *effective_ttl_out) {
+STATIC_TEST bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
+                                                const char client_loc[2],
+                                                const char *client_ecs_tag,
+                                                const char *client_loc_tag,
+                                                uint32_t *effective_ttl_out) {
     if (rec->tinydns_loc[0] != 0 || rec->tinydns_loc[1] != 0) {
         if (rec->tinydns_loc[0] != client_loc[0] || rec->tinydns_loc[1] != client_loc[1]) {
             return false;
@@ -145,15 +141,16 @@ static inline bool tinydns_record_currently_valid(const dns_record_t *rec, time_
     return true;
 }
 
-static bool append_glue_records(zone_arena_t *current_zone, const char *target,
-                                const char *zone_apex, uint8_t *res,
-                                size_t max_res_len, uint16_t *offset,
-                                compress_ctx_t *comp_ctx, uint16_t *arcount,
-                                const char client_loc[2],
-                                const char *client_ecs_tag,
-                                const char *client_loc_tag,
-                                additional_from_auth_t policy,
-                                view_snapshot_t *view) {
+STATIC_TEST bool append_glue_records(zone_arena_t *current_zone, const char *target,
+                                     const char *zone_apex, uint8_t *res,
+                                     size_t max_res_len, uint16_t *offset,
+                                     compress_ctx_t *comp_ctx, uint16_t *arcount,
+                                     const char client_loc[2],
+                                     const char *client_ecs_tag,
+                                     const char *client_loc_tag,
+                                     additional_from_auth_t policy,
+                                     view_snapshot_t *view) {
+
   if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
 
   // 1. Fast path: check prelinked glue
@@ -319,7 +316,7 @@ static bool append_glue_records(zone_arena_t *current_zone, const char *target,
   return true;
 }
 
-static void collect_additional_rr_glue(dns_record_t *rec,
+STATIC_TEST void collect_additional_rr_glue(dns_record_t *rec,
                                        const char *glue_targets[16],
                                        int *glue_target_count,
                                        bool minimal_responses) {
@@ -347,7 +344,7 @@ static void collect_additional_rr_glue(dns_record_t *rec,
   }
 }
 
-static bool nsec_covers_name(const dns_record_t *rec, const char *name) {
+STATIC_TEST bool nsec_covers_name(const dns_record_t *rec, const char *name) {
   if (!rec || rec->type_code != 47 || rec->rdata_count < 1 || !rec->rdata[0] ||
       !rec->name || !name)
     return false;
@@ -363,7 +360,7 @@ static bool nsec_covers_name(const dns_record_t *rec, const char *name) {
   }
 }
 
-static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
+STATIC_TEST dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
   if (!zone || !name) return NULL;
   if (zone->nsec_records && zone->nsec_count > 0) {
     int low = 0, high = (int)zone->nsec_count - 1;
@@ -400,7 +397,7 @@ static dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
   return NULL;
 }
 
-static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
+STATIC_TEST bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
   size_t name_len = strlen(name);
   time_t tinydns_now = (zone && zone->is_tinydns_format) ? time(NULL) : 0;
@@ -443,7 +440,7 @@ static bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char
   return false;
 }
 
-static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
+STATIC_TEST const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
     return zone_apex;
   const char *parent = qname;
@@ -470,6 +467,7 @@ static const char *find_closest_encloser(zone_arena_t *zone, const char *qname, 
   return zone_apex;
 }
 
+
 static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
@@ -491,7 +489,7 @@ static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t 
     out[out_len] = '\0';
 }
 
-static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
+STATIC_TEST size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
     if (!hex || strcmp(hex, "-") == 0 || strcmp(hex, "") == 0) return 0;
     size_t hlen = strlen(hex);
     size_t count = 0;
@@ -502,7 +500,7 @@ static size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
     return count;
 }
 
-static size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire) {
+STATIC_TEST size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire) {
     if (!name || max_wire < 1) return 0;
     size_t pos = 0;
     const char *p = name;
@@ -525,7 +523,7 @@ static size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max
     return pos;
 }
 
-static bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
+STATIC_TEST bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                                const uint8_t *salt, size_t salt_len,
                                char *out_b32, size_t out_b32_sz) {
     if (algo != 1) return false;
@@ -550,7 +548,7 @@ static bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iteratio
     return true;
 }
 
-static bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash) {
+STATIC_TEST bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash) {
     if (!owner_hash || !next_hash || !target_hash) return false;
     int cmp_owner_next = strcasecmp(owner_hash, next_hash);
     int cmp_owner_tgt = strcasecmp(owner_hash, target_hash);
@@ -565,7 +563,8 @@ static bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, con
     }
 }
 
-static dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex) {
+STATIC_TEST dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex) {
+    if (!zone || !hash_b32 || !apex || !zone->hash_table || zone->hash_size == 0) return NULL;
     char owner_name[300];
     snprintf(owner_name, sizeof(owner_name), "%s.%s", hash_b32, apex);
     uint32_t h = calc_fnv1a_str(owner_name);
@@ -579,13 +578,14 @@ static dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b3
     return NULL;
 }
 
-static dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash) {
+STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash) {
+    if (!zone || !target_hash || !zone->records || zone->count == 0) return NULL;
     for (size_t i = 0; i < zone->count; i++) {
         dns_record_t *rec = &zone->records[i];
         if (rec->type_code == 50 && rec->name && rec->rdata_count >= 5 && rec->rdata[4]) {
-            char owner_hash[64];
+            char owner_hash[64] = {0};
             const char *dot = strchr(rec->name, '.');
-            if (!dot) continue;
+            if (!dot || dot <= rec->name) continue;
             size_t hlen = (size_t)(dot - rec->name);
             if (hlen >= sizeof(owner_hash)) continue;
             memcpy(owner_hash, rec->name, hlen);
@@ -598,7 +598,7 @@ static dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_
     return NULL;
 }
 
-static bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz) {
+STATIC_TEST bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz) {
     if (!qname || !encloser || !out || out_sz == 0) return false;
     size_t qlen = strlen(qname);
     size_t elen = strlen(encloser);
@@ -622,7 +622,7 @@ static bool find_next_closer_name(const char *qname, const char *encloser, char 
     return true;
 }
 
-static bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+STATIC_TEST bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                                 uint8_t *res, size_t max_res_len, uint16_t *offset,
                                 compress_ctx_t *comp_ctx, uint16_t *nscount,
                                 dns_record_t **attached, int *attached_count) {
@@ -642,7 +642,7 @@ static bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                                  res, max_res_len, offset, comp_ctx, nscount);
 }
 
-static bool find_delegation(zone_arena_t *current_zone, const char *qname,
+STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
                             uint32_t qname_hash,
                             const char *zone_apex, uint8_t *res,
                             size_t max_res_len, uint16_t *offset,
@@ -1170,7 +1170,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       }
       
       // ==== フェーズ4: ワイルドカード合成 ====
-      if (!dname_found) {
+      // RFC 4592 2.2.1 / RFC 4035 3.1.3.3 / RFC 5155 B.2.1: a name that exists only as an Empty Non-Terminal
+      // (it has descendants) still EXISTS, so a wildcard must not synthesize an answer for it (NODATA instead).
+      if (!dname_found && !name_exists_in_zone(current_zone, current_qname, client_loc, client_ecs_tag, client_loc_tag)) {
         const char *parent = current_qname;
         char wc_name[256];
         wc_name[0] = '*';
@@ -1421,6 +1423,16 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     }
     if (qtx_included_out) *qtx_included_out = included_mask;
 
+    // RFC 8020 / RFC 4592 2.2.1: an Empty Non-Terminal (no records of its own, but descendants exist) EXISTS.
+    // Asking for it is NODATA (NOERROR), never NXDOMAIN: NXDOMAIN would claim that nothing exists below it.
+    bool ent_nodata = false;
+    if (!found &&
+        name_exists_in_zone(current_zone, current_qname, client_loc, client_ecs_tag, client_loc_tag)) {
+      found = true;
+      ent_nodata = true;
+      all_matched = false;   // no RRset of the requested type(s): a NODATA proof is required
+    }
+
     // ==== フェーズ7: ネガティブ応答(SOA)付加 ====
     if (!found || !type_matched) {
       if (!found)
@@ -1575,6 +1587,24 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
               nsec_failed = true; break;
             }
             break;
+          }
+        }
+        if (ent_nodata && !nsec_failed && nsec_attached_cnt == 0) {
+          // An ENT owns no NSEC; the NSEC that covers it (its next name is a descendant) proves it exists.
+          dns_record_t *cover = find_covering_nsec(current_zone, current_qname);
+          if (cover) {
+            if (nsec_attached_cnt < 8) nsec_attached[nsec_attached_cnt++] = cover;
+            if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+              nsec_failed = true;
+            } else {
+              (*nscount)++;
+              uint32_t c_hash = calc_fnv1a_str(cover->name);
+              size_t c_idx = c_hash & (current_zone->hash_size - 1);
+              if (!attach_covering_rrsig(current_zone, c_idx, cover->name, NULL, 47,
+                                         res, max_res_len, offset, comp_ctx, nscount)) {
+                nsec_failed = true;
+              }
+            }
           }
         }
       } else if (!found) {
@@ -1899,7 +1929,7 @@ size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount)
     return (offset <= len) ? offset : len;
 }
 
-static program_plugin_t *find_program_plugin(const char *domain) {
+STATIC_TEST program_plugin_t *find_program_plugin(const char *domain) {
   if (!domain) return NULL;
   for (int i = 0; i < g_program_plugins_count; i++) {
     if (strcasecmp(g_program_plugins[i].domain, domain) == 0)
@@ -1908,7 +1938,7 @@ static program_plugin_t *find_program_plugin(const char *domain) {
   return NULL;
 }
 
-static int64_t monotonic_ms(void) {
+STATIC_TEST int64_t monotonic_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -1917,7 +1947,7 @@ static int64_t monotonic_ms(void) {
 /* deadline(monotonic_ms()基準の絶対時刻)までの残り時間をmsで返す。
  * 既に締切を過ぎていれば0を返す(呼び出し先のwrite_all_timeout/read_all_timeoutは
  * timeout_ms=0で即座にタイムアウト扱いになる)。 */
-static uint32_t remaining_ms(int64_t deadline) {
+STATIC_TEST uint32_t remaining_ms(int64_t deadline) {
   int64_t rem = deadline - monotonic_ms();
   if (rem <= 0) return 0;
   if (rem > UINT32_MAX) return UINT32_MAX; /* 実際には発生しないが念のため */
@@ -1926,10 +1956,11 @@ static uint32_t remaining_ms(int64_t deadline) {
 
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap) {
   size_t pos = 0;
-  pos += (size_t)snprintf(out + pos, out_cap - pos, "path=%s|user=%s|timeout=%u|maxfail=%u|args=",
+  pos += (size_t)snprintf(out + pos, out_cap - pos, "path=%s|user=%s|timeout=%u|maxfail=%u|disable_tc=%d|args=",
                           z->program_path ? z->program_path : "",
                           z->program_user ? z->program_user : "",
-                          z->program_timeout_ms, z->program_max_failures);
+                          z->program_timeout_ms, z->program_max_failures,
+                          z->disable_auto_tc_flag ? 1 : 0);
   for (int i = 0; i < z->program_args_count && pos < out_cap; i++) {
     pos += (size_t)snprintf(out + pos, out_cap - pos, "%s;", z->program_args[i]);
   }
@@ -1940,9 +1971,9 @@ void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t 
  * (以前は単に0を返しており、これは「応答なし(サイレントドロップ)」を
  *  意味していた。クライアント視点ではタイムアウトとSERVFAILは挙動が
  *  大きく異なるため、ログの記述に合わせて実装側もSERVFAILを返す。) */
-static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
+STATIC_TEST int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                                        uint8_t *res, size_t max_res_len) {
-  if (req_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
+  if (req_len < DNS_HEADER_SIZE || max_res_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
   uint16_t qdcount = (req[4] << 8) | req[5];
   size_t q_end = (size_t)get_question_end_offset(req, req_len, qdcount);
   size_t copy_len = q_end > max_res_len ? max_res_len : q_end;
@@ -1962,7 +1993,7 @@ static int build_synthetic_servfail(const uint8_t *req, size_t req_len,
   return (int)copy_len;
 }
 
-static ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms) {
+STATIC_TEST ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms) {
   size_t written = 0;
   struct timespec start_ts, now_ts;
   clock_gettime(CLOCK_MONOTONIC, &start_ts);
@@ -1990,7 +2021,7 @@ static ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_
   return (ssize_t)written;
 }
 
-static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms) {
+STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms) {
   size_t nread = 0;
   struct timespec start_ts, now_ts;
   clock_gettime(CLOCK_MONOTONIC, &start_ts);
@@ -2020,7 +2051,7 @@ static ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeo
   return (ssize_t)nread;
 }
 
-static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
+STATIC_TEST int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
                                     uint8_t *res, size_t max_res_len,
                                     const char *client_ip, bool is_tcp) {
   program_plugin_t *plugin = find_program_plugin(domain);
@@ -2049,19 +2080,32 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
   if (ok) {
     uint8_t resp_len_prefix[2];
     if (read_all_timeout(plugin->stdout_fd, resp_len_prefix, 2, remaining_ms(deadline)) == 2) {
-      uint16_t resp_len = (resp_len_prefix[0] << 8) | resp_len_prefix[1];
+      uint32_t resp_len = ((uint32_t)resp_len_prefix[0] << 8) | resp_len_prefix[1];
       if (resp_len == 0) {
         result_len = 0; // 意図的な無応答
         ok = true;
-      } else if (resp_len <= max_res_len) {
-        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == resp_len) {
+      } else if (resp_len > 65535) {
+        syslog(LOG_ERR, "[Plugin] zone '%s' returned response > 65535 bytes (%u); rejecting with SERVFAIL",
+               domain, (unsigned int)resp_len);
+        ok = false;
+      } else if (plugin->disable_auto_tc_flag) {
+        // disable-auto-tc-flag yes (default): do not truncate or force TC=1; send full response as-is (up to 65535)
+        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
           result_len = (int)resp_len;
+          ok = true;
+        } else {
+          ok = false;
+        }
+      } else if (resp_len <= max_res_len) {
+        if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
+          result_len = (int)resp_len;
+          ok = true;
         } else {
           ok = false;
         }
       } else {
         syslog(LOG_INFO, "[Plugin] zone '%s' returned oversized response (%u > %zu); truncating with TC=1",
-               domain, resp_len, max_res_len);
+               domain, (unsigned int)resp_len, max_res_len);
         /* 最初の max_res_len 分を res に読み込み、残りを読み捨ててパイプの同期を保つ。
          * 共有締切の残り時間を使うため、宣言長がどれだけ大きくても合計の待ち時間は plugin->timeout_ms を超えない。 */
         size_t first_chunk = max_res_len;
@@ -2113,8 +2157,10 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
       atomic_store_explicit(&plugin->dead, true, memory_order_release);
       syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead "
              "(will return SERVFAIL until restart)", domain);
-      kill(plugin->pid, SIGKILL);
-      waitpid(plugin->pid, NULL, WNOHANG);
+      if (plugin->pid > 0) {
+        kill(plugin->pid, SIGKILL);
+        waitpid(plugin->pid, NULL, WNOHANG);
+      }
     }
     result_len = build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
   } else {
@@ -2129,7 +2175,7 @@ static int dispatch_to_program_zone(const char *domain, const uint8_t *req, size
  * 含む部分)が、respの中に(先頭12バイトの直後に)存在するかを確認する。
  * QNAMEのドメイン名ラベル文字はRFCに準拠して大文字小文字を区別せず(case-insensitive)
  * 比較し、末尾のQTYPE/QCLASSは完全一致を検証する。 */
-static bool question_section_matches(const uint8_t *resp, size_t resp_len,
+STATIC_TEST bool question_section_matches(const uint8_t *resp, size_t resp_len,
                                      const uint8_t *req, size_t req_len) {
   if (req_len <= DNS_HEADER_SIZE || resp_len <= DNS_HEADER_SIZE) return false;
   size_t roff = DNS_HEADER_SIZE;
@@ -2162,10 +2208,11 @@ static bool question_section_matches(const uint8_t *resp, size_t resp_len,
   return memcmp(req + roff, resp + soff, 4) == 0;
 }
 
-static ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
+STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                                const uint8_t *query, size_t query_len,
                                uint8_t *resp_out, size_t resp_out_cap,
                                uint32_t timeout_ms) {
+  if (!ss || !query || !resp_out) return -1;
   int fd = broker_connect(ss->ss_family, SOCK_STREAM, (struct sockaddr *)ss, ss_len);
   if (fd < 0) return -1;
 
@@ -2189,7 +2236,7 @@ static ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
 _Thread_local static uint8_t s_forward_req_buf[65535];
 _Thread_local static uint8_t s_forward_res_buf[65535];
 
-static int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
+STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                                  uint8_t *res, size_t max_res_len) {
   if (req_len < DNS_HEADER_SIZE || zcfg->forwarders_count == 0) {
     return build_synthetic_servfail(req, req_len, res, max_res_len);
@@ -2391,6 +2438,7 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
   pthread_mutex_init(&out->lock, NULL);
   out->timeout_ms = zcfg->program_timeout_ms > 0 ? zcfg->program_timeout_ms : 2000;
   out->max_failures = zcfg->program_max_failures > 0 ? zcfg->program_max_failures : 5;
+  out->disable_auto_tc_flag = zcfg->disable_auto_tc_flag;
   compute_program_zone_fingerprint(zcfg, out->config_fingerprint, sizeof(out->config_fingerprint));
   atomic_init(&out->consecutive_failures, 0);
   atomic_init(&out->dead, false);
@@ -2821,7 +2869,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (edns.present) {
       if (edns.has_cookie) {
         // Refresh server cookie for cookie-only probes (RFC 7873 §5.4)
-        if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
+        if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie, (uint32_t)time(NULL))) {
             edns.server_cookie_len = 0;
             edns.has_cookie = false;
         } else {
@@ -2871,7 +2919,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           }
         }
         if (zcfg->tsig_key && zcfg->tsig_key[0] != '\0') {
-          tsig_key_t *k = cfg->keys;
+          tsig_key_t *k = cfg ? cfg->keys : NULL;
           while (k) {
             if (strcmp(k->name, zcfg->tsig_key) == 0) {
               matched_key = k;
@@ -2897,7 +2945,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (has_tsig && (!matched_key || tsig_error_code != 0)) {
       auth = false;
       if (!attempted_key) {
-        tsig_key_t *k = cfg->keys;
+        tsig_key_t *k = cfg ? cfg->keys : NULL;
         while (k) {
           int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
           if (err == 0) {
@@ -2999,7 +3047,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
         } else if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
           auth = true;
         }
-        tsig_key_t *k = cfg->keys;
+        tsig_key_t *k = cfg ? cfg->keys : NULL;
         while (k) {
           bool key_allowed = false;
           for (int i = 0; i < zcfg->allow_update_count; i++) {
@@ -3013,6 +3061,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
             int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
             if (err == 0) {
               matched_key = k;
+              attempted_key = k;
+              tsig_error_code = 0;
               auth = true;
               break;
             } else {
@@ -3022,7 +3072,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           k = k->next;
         }
         if (has_tsig && !attempted_key) {
-          k = cfg->keys;
+          k = cfg ? cfg->keys : NULL;
           while (k) {
             int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
             if (err == 0) {
@@ -3101,7 +3151,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (!is_tcp) {
       if (edns.udp_payload_size > 1232)
         edns.udp_payload_size = 1232;
-      if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN)
+      /* max_res_len は呼び出し側バッファの容量上限も兼ねる。呼び出し側が
+       * UDP 既定値 (512) 未満の小さなバッファを渡した場合に EDNS の
+       * payload size で拡大すると res[] の範囲外へ書き込む (スタック破壊)。
+       * 本番経路は常に >= 512 を渡すため挙動は変わらない。 */
+      if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN &&
+          max_res_len >= UDP_DEFAULT_MAX_RES_LEN)
         max_res_len = edns.udp_payload_size;
     }
   }
@@ -3110,40 +3165,31 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   bool is_badcookie = false;
   
   if (edns.has_cookie) {
+      bool need_new_cookie = false;
       if (edns.server_cookie_len == 0) {
-          if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
-              edns.server_cookie_len = 0;
-              edns.has_cookie = false;
-          } else {
-              edns.server_cookie_len = 16;
-          }
+          need_new_cookie = true;               // client-only cookie: hand out a Server Cookie
       } else {
-          bool valid = false;
-          if (edns.server_cookie_len == 16 && edns.server_cookie[0] == 1) {
-              uint32_t ts = ((uint32_t)edns.server_cookie[4] << 24) |
-                            ((uint32_t)edns.server_cookie[5] << 16) |
-                            ((uint32_t)edns.server_cookie[6] << 8) |
-                            edns.server_cookie[7];
-              uint32_t now = time(NULL);
-              if ((now >= ts && now - ts <= 3600) || (now < ts && ts - now <= 300)) {
-                  uint8_t expected_server_cookie[16];
-                  if (generate_server_cookie(client_ip, edns.client_cookie, expected_server_cookie, ts) &&
-                      const_time_memcmp(edns.server_cookie + 8, expected_server_cookie + 8, 8) == 0) {
-                      valid = true;
-                  }
-              }
-          }
-          if (!valid) {
+          // RFC 9018 §4.2-4.4: SipHash-2-4, Reserved hashed as received, RFC 1982 timestamp window
+          server_cookie_status_t cst = verify_server_cookie(cfg, client_ip, edns.client_cookie,
+                                                            edns.server_cookie, edns.server_cookie_len,
+                                                            (uint32_t)time(NULL));
+          if (cst == SERVER_COOKIE_INVALID) {
               if (!is_tcp) {
                   is_badcookie = true;
                   ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
               }
-              if (!generate_server_cookie(client_ip, edns.client_cookie, edns.server_cookie, time(NULL))) {
-                  edns.server_cookie_len = 0;
-                  edns.has_cookie = false;
-              } else {
-                  edns.server_cookie_len = 16;
-              }
+              need_new_cookie = true;
+          } else if (cst == SERVER_COOKIE_VALID_REFRESH) {
+              need_new_cookie = true;           // RFC 9018 §4.3: renew cookies older than 30 minutes
+          }
+      }
+      if (need_new_cookie) {
+          if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie,
+                                      (uint32_t)time(NULL))) {
+              edns.server_cookie_len = 0;
+              edns.has_cookie = false;
+          } else {
+              edns.server_cookie_len = SERVER_COOKIE_LEN;
           }
       }
   }
@@ -3238,9 +3284,6 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
   res[2] |= 0x84;
   res[3] &= 0xF0;
-  uint16_t *res_ancount = (uint16_t *)&res[6],
-           *res_nscount = (uint16_t *)&res[8],
-           *res_arcount = (uint16_t *)&res[10];
   if (db_entry && view) {
     server_config_t *cfg_lookup = cfg;
     zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
@@ -3270,9 +3313,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  *res_ancount = 0;
-  *res_nscount = 0;
-  *res_arcount = 0;
+  res[6] = 0; res[7] = 0;
+  res[8] = 0; res[9] = 0;
+  res[10] = 0; res[11] = 0;
 
   if (!current_zone) {
     res[3] = (res[3] & 0xF0) | 5;
@@ -3285,7 +3328,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
-      *res_arcount = htons(arcount);
+      res[10] = (uint8_t)(arcount >> 8);
+      res[11] = (uint8_t)(arcount & 0xFF);
     }
     return offset;
   }
@@ -3297,7 +3341,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
-      *res_arcount = htons(arcount);
+      res[10] = (uint8_t)(arcount >> 8);
+      res[11] = (uint8_t)(arcount & 0xFF);
     }
     return offset;
   }
@@ -3306,25 +3351,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (is_badcookie) {
     res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
-    res[3] = (res[3] & 0xF0) | 0x07;
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
-    }
-    *res_arcount = htons(arcount);
-    return offset;
-  }
-
-  if (is_badcookie) {
-    res[2] &= ~0x04; // RFC 7873 §5.2.3: AA MUST be 0
     res[3] = (res[3] & 0xF0) | 0x07; // BADCOOKIE (Base RCODE 7)
-    uint16_t offset = q_offset;
-    uint16_t arcount = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
     }
-    *res_ancount = 0;
-    *res_nscount = 0;
-    *res_arcount = htons(arcount);
+    res[6] = 0; res[7] = 0;
+    res[8] = 0; res[9] = 0;
+    res[10] = (uint8_t)(arcount >> 8);
+    res[11] = (uint8_t)(arcount & 0xFF);
     return offset;
   }
 
@@ -3415,12 +3449,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
         ancount = 1;
       }
     }
-    *res_ancount = htons(ancount);
-    *res_nscount = 0;
+    res[6] = (uint8_t)(ancount >> 8);
+    res[7] = (uint8_t)(ancount & 0xFF);
+    res[8] = 0; res[9] = 0;
     if (edns.present) {
       assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
     }
-    *res_arcount = htons(arcount);
+    res[10] = (uint8_t)(arcount >> 8);
+    res[11] = (uint8_t)(arcount & 0xFF);
     return offset;
   }
 
@@ -3437,6 +3473,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
        !edns.has_keepalive_query &&
        !edns.has_karidns_ext &&
        edns.ede_count == 0 &&
+       !edns.has_cookie &&
        !edns.has_malformed_cookie);
 
   if (edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&
@@ -3454,9 +3491,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           if (edns.present) {
             assemble_edns_opt(res, max_res_len, &body_offset, &arcount, &edns, 0, is_tcp, cfg);
           }
-          *res_ancount = htons(e->ancount);
-          *res_nscount = htons(e->nscount);
-          *res_arcount = htons(arcount);
+          res[6] = (uint8_t)(e->ancount >> 8);
+          res[7] = (uint8_t)(e->ancount & 0xFF);
+          res[8] = (uint8_t)(e->nscount >> 8);
+          res[9] = (uint8_t)(e->nscount & 0xFF);
+          res[10] = (uint8_t)(arcount >> 8);
+          res[11] = (uint8_t)(arcount & 0xFF);
           if (db_entry) atomic_fetch_add_explicit(&db_entry->observatory.wirecache_hits, 1, memory_order_relaxed);
           return body_offset;
         }
@@ -3481,7 +3521,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       offset = q_offset;
       arcount = 0;
       if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-      *res_arcount = htons(arcount);
+      res[10] = (uint8_t)(arcount >> 8);
+      res[11] = (uint8_t)(arcount & 0xFF);
       return offset;
     }
     int limit = (cfg_for_ede && cfg_for_ede->max_mqtypes > 0) ? cfg_for_ede->max_mqtypes : 4;
@@ -3494,7 +3535,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           res[8] = 0; res[9] = 0;
           offset = q_offset; arcount = 0;
           if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-          *res_arcount = htons(arcount);
+          res[10] = (uint8_t)(arcount >> 8);
+          res[11] = (uint8_t)(arcount & 0xFF);
           return offset;
        }
        bool dup = false;
@@ -3506,7 +3548,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
           res[8] = 0; res[9] = 0;
           offset = q_offset; arcount = 0;
           if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-          *res_arcount = htons(arcount);
+          res[10] = (uint8_t)(arcount >> 8);
+          res[11] = (uint8_t)(arcount & 0xFF);
           return offset;
        }
        qtypes[num_qtypes++] = mq;
@@ -3547,13 +3590,16 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
   }
 
-  *res_ancount = htons(ancount);
-  *res_nscount = htons(nscount);
-  *res_arcount = htons(arcount);
+  res[6] = (uint8_t)(ancount >> 8);
+  res[7] = (uint8_t)(ancount & 0xFF);
+  res[8] = (uint8_t)(nscount >> 8);
+  res[9] = (uint8_t)(nscount & 0xFF);
+  res[10] = (uint8_t)(arcount >> 8);
+  res[11] = (uint8_t)(arcount & 0xFF);
   return offset;
 }
 
-static inline void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount) {
+STATIC_TEST void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount) {
     if (!entry) return;
     if (rcode == 0) {
         if (ancount == 0) {

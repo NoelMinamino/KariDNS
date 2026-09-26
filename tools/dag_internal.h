@@ -150,15 +150,7 @@ static inline uint32_t dag_arc4random(void) {
 #define arc4random dag_arc4random
 #endif
 
-static inline const char *dag_strcasestr(const char *haystack, const char *needle) {
-    if (!haystack || !needle) return NULL;
-    if (*needle == '\0') return haystack;
-    size_t needle_len = strlen(needle);
-    for (; *haystack; haystack++) {
-        if (strncasecmp(haystack, needle, needle_len) == 0) return haystack;
-    }
-    return NULL;
-}
+const char *dag_strcasestr(const char *haystack, const char *needle);
 
 extern bool g_dag_suppress_stdout;
 #define printf(...) do { if (!g_dag_suppress_stdout) { fprintf(stdout, __VA_ARGS__); } } while(0)

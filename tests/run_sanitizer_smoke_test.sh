@@ -206,9 +206,18 @@ for variant in asan tsan; do
     PID5=$!
     wait $PID1 $PID2 $PID3 $PID4 $PID5
     ./karictl-asan -f "$CTL_CONF" stop >/dev/null 2>&1
-    sleep 1
+    for _wait_i in $(seq 1 30); do
+        if ! kill -0 "$KARIDNS_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
     if kill -0 "$KARIDNS_PID" 2>/dev/null; then
-        kill -9 "$KARIDNS_PID" 2>/dev/null
+        kill -TERM "$KARIDNS_PID" 2>/dev/null
+        sleep 0.5
+        if kill -0 "$KARIDNS_PID" 2>/dev/null; then
+            kill -9 "$KARIDNS_PID" 2>/dev/null
+        fi
     fi
     unset KARIDNS_PID
     if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)|WARNING: ThreadSanitizer" "$logf"; then

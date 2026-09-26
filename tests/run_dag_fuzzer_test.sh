@@ -3,7 +3,9 @@ set -e
 
 [ -x tests/fuzz/fuzz_dag_response ] || {
     echo "[+] Building fuzz_dag_response with ASan..."
-    cc -fsanitize=fuzzer,address -O1 -g tests/fuzz/fuzz_dag_response.c dns_wire.o dns_utils.o dns_zone_parser.o -I. -o tests/fuzz/fuzz_dag_response -pthread -lssl -lcrypto -lm -lz
+    # the Makefile rule links every dag module the harness needs (the old
+    # hand-written command missed dag_transport.c etc. and failed to link)
+    make fuzz_dag
 }
 
 echo "[+] Running fuzz_dag_response on corpus..."

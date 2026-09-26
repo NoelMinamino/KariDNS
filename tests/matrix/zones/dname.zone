@@ -1,0 +1,12 @@
+$ORIGIN dname.test.
+$TTL 3600
+dname.test. IN SOA ns1.dname.test. hostmaster.dname.test. 1 7200 3600 1209600 3600
+dname.test. IN NS ns1.dname.test.
+ns1.dname.test. IN A 192.0.2.1
+target.dname.test. IN A 192.0.2.50
+target.dname.test. IN AAAA 2001:db8::50
+foo.target.dname.test. IN A 192.0.2.50
+foo.target.dname.test. IN AAAA 2001:db8::50
+sub.dname.test. IN DNAME target.dname.test.
+sub2.dname.test. IN DNAME sub3.dname.test.
+sub3.dname.test. IN DNAME sub2.dname.test.

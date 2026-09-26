@@ -3,6 +3,7 @@
 #include "dns_server_internal.h"
 #include "dns_utils.h"
 #include "dns_tsig_acl.h"
+#include "dns_siphash.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -19,50 +20,95 @@ _Atomic uint64_t g_ede_not_authoritative_total = 0;
 _Atomic uint64_t g_ede_not_supported_total = 0;
 _Atomic uint64_t g_ede_other_total = 0;
 
-static uint8_t g_server_cookie_secret[16];
+static uint8_t g_server_cookie_secret[SERVER_COOKIE_SECRET_LEN];
 
 void init_server_cookie_secret(void) {
   arc4random_buf(g_server_cookie_secret, sizeof(g_server_cookie_secret));
 }
 
-bool generate_server_cookie(const char *client_ip, const uint8_t client_cookie[8], uint8_t server_cookie[16], uint32_t timestamp) {
-    uint8_t hash[SHA256_DIGEST_LENGTH];
-    unsigned int hash_len = 0;
-    
-    server_cookie[0] = 1; // Version
-    server_cookie[1] = 0; // Reserved
-    server_cookie[2] = 0;
-    server_cookie[3] = 0;
-    server_cookie[4] = (timestamp >> 24) & 0xFF;
-    server_cookie[5] = (timestamp >> 16) & 0xFF;
-    server_cookie[6] = (timestamp >> 8) & 0xFF;
-    server_cookie[7] = timestamp & 0xFF;
-
-    uint8_t data[64];
+bool compute_server_cookie_hash(const uint8_t secret[SERVER_COOKIE_SECRET_LEN], const char *client_ip,
+                                const uint8_t client_cookie[8], const uint8_t ver_rsvd_ts[8],
+                                uint8_t hash_out[8]) {
+    /* RFC 9018 §4.4 input order: Client Cookie | Version | Reserved | Timestamp | Client-IP */
+    uint8_t data[8 + 8 + 16];
     size_t data_len = 0;
-    
-    struct sockaddr_storage addr;
-    memset(&addr, 0, sizeof(addr));
-    if (client_ip && inet_pton(AF_INET, client_ip, &((struct sockaddr_in *)&addr)->sin_addr) == 1) {
-        memcpy(data, &((struct sockaddr_in *)&addr)->sin_addr, 4);
-        data_len = 4;
-    } else if (client_ip && inet_pton(AF_INET6, client_ip, &((struct sockaddr_in6 *)&addr)->sin6_addr) == 1) {
-        memcpy(data, &((struct sockaddr_in6 *)&addr)->sin6_addr, 16);
-        data_len = 16;
+    memcpy(data, client_cookie, 8);
+    memcpy(data + 8, ver_rsvd_ts, 8);
+    data_len = 16;
+
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (client_ip && inet_pton(AF_INET, client_ip, &a4) == 1) {
+        memcpy(data + data_len, &a4, 4);
+        data_len += 4;
+    } else if (client_ip && inet_pton(AF_INET6, client_ip, &a6) == 1) {
+        memcpy(data + data_len, &a6, 16);
+        data_len += 16;
     } else {
         syslog(LOG_WARNING, "[Cookie] client_ip could not be parsed as IPv4/IPv6; refusing to bind cookie to address");
         return false;
     }
-    memcpy(data + data_len, client_cookie, 8);
-    data_len += 8;
-    memcpy(data + data_len, server_cookie, 8); // Include Version, Reserved, Timestamp
-    data_len += 8;
-    
-    HMAC(EVP_sha256(), g_server_cookie_secret, sizeof(g_server_cookie_secret),
-         data, data_len, hash, &hash_len);
-    
-    memcpy(server_cookie + 8, hash, 8);
+
+    uint64_t key[2];
+    dns_siphash_key_from_bytes(secret, key);
+    uint64_t h = dns_siphash24(data, data_len, key);
+    for (int i = 0; i < 8; i++) hash_out[i] = (uint8_t)(h >> (8 * i));   /* little-endian */
     return true;
+}
+
+static const uint8_t *cookie_active_secret(const server_config_t *cfg) {
+    return (cfg && cfg->cookie_secret_count > 0) ? cfg->cookie_secrets[0] : g_server_cookie_secret;
+}
+
+bool generate_server_cookie(const server_config_t *cfg, const char *client_ip,
+                            const uint8_t client_cookie[8], uint8_t server_cookie[SERVER_COOKIE_LEN],
+                            uint32_t timestamp) {
+    server_cookie[0] = SERVER_COOKIE_VERSION;
+    server_cookie[1] = 0;   /* Reserved: MUST be zero on construction */
+    server_cookie[2] = 0;
+    server_cookie[3] = 0;
+    server_cookie[4] = (uint8_t)((timestamp >> 24) & 0xFF);
+    server_cookie[5] = (uint8_t)((timestamp >> 16) & 0xFF);
+    server_cookie[6] = (uint8_t)((timestamp >> 8) & 0xFF);
+    server_cookie[7] = (uint8_t)(timestamp & 0xFF);
+    return compute_server_cookie_hash(cookie_active_secret(cfg), client_ip, client_cookie,
+                                      server_cookie, server_cookie + 8);
+}
+
+server_cookie_status_t verify_server_cookie(const server_config_t *cfg, const char *client_ip,
+                                            const uint8_t client_cookie[8],
+                                            const uint8_t *server_cookie, size_t server_cookie_len,
+                                            uint32_t now) {
+    if (!server_cookie || server_cookie_len != SERVER_COOKIE_LEN ||
+        server_cookie[0] != SERVER_COOKIE_VERSION)
+        return SERVER_COOKIE_INVALID;
+
+    /* RFC 9018 §4.3: all timestamp comparisons use RFC 1982 serial arithmetic (wrap-safe). */
+    uint32_t ts = ((uint32_t)server_cookie[4] << 24) | ((uint32_t)server_cookie[5] << 16) |
+                  ((uint32_t)server_cookie[6] << 8)  |  (uint32_t)server_cookie[7];
+    int32_t age = (int32_t)(now - ts);          /* >0: cookie is `age` seconds old; <0: from the future */
+    if (age > SERVER_COOKIE_VALID_PAST_SECS || age < -SERVER_COOKIE_VALID_FUTURE_SECS)
+        return SERVER_COOKIE_INVALID;
+
+    /* Reserved (bytes 1..3) is deliberately NOT required to be zero; it is hashed as received. */
+    bool match = false;
+    if (cfg && cfg->cookie_secret_count > 0) {
+        for (int i = 0; i < cfg->cookie_secret_count && !match; i++) {
+            uint8_t expected[8];
+            if (!compute_server_cookie_hash(cfg->cookie_secrets[i], client_ip, client_cookie,
+                                            server_cookie, expected))
+                return SERVER_COOKIE_INVALID;
+            match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
+        }
+    } else {
+        uint8_t expected[8];
+        if (!compute_server_cookie_hash(g_server_cookie_secret, client_ip, client_cookie,
+                                        server_cookie, expected))
+            return SERVER_COOKIE_INVALID;
+        match = (const_time_memcmp(server_cookie + 8, expected, 8) == 0);
+    }
+    if (!match) return SERVER_COOKIE_INVALID;
+    return (age > SERVER_COOKIE_REFRESH_SECS) ? SERVER_COOKIE_VALID_REFRESH : SERVER_COOKIE_VALID;
 }
 
 void add_ede(edns_info_t *edns, bool enabled, uint16_t code, const char *text) {
@@ -193,7 +239,7 @@ bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_
   if (!data || len < 3 || !locs_out || !count_out) return false;
   char code[2] = { (char)data[0], (char)data[1] };
   uint8_t prefix_len = data[2];
-  if (3 + prefix_len > len || prefix_len > 4) return false;
+  if (prefix_len > 4 || (size_t)(3 + prefix_len) > len) return false;
 
   tinydns_location_entry_t loc;
   memset(&loc, 0, sizeof(loc));

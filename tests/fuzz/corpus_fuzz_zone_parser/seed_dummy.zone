@@ -1,0 +1,2 @@
+example.com. 86400 IN SOA ns1.example.com. admin.example.com. 1 2 3 4 5
+example.com. 86400 IN CSYNC 1 1 A BADCORD

@@ -1,0 +1,1 @@
+example.com TXT +subnet=192.0.2.0/24 +cookie

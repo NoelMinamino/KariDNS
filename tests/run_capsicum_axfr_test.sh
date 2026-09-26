@@ -19,7 +19,13 @@ cp tests/zones/example.com.zone tests/zones/example.com.zone.bak
 echo "\$INCLUDE capsicum_include_test/dir1/init.inc" >> tests/zones/example.com.zone
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
+    if [ -n "$SERVER_PID" ]; then
+        kill -TERM "$SERVER_PID" 2>/dev/null || true
+        sleep 0.5 2>/dev/null || true
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+    fi
+    killall -TERM karidns 2>/dev/null || true
+    sleep 0.2 2>/dev/null || true
     killall -9 karidns 2>/dev/null || true
     killall -9 karidns-asan 2>/dev/null || true
     [ -f tests/zones/example.com.zone.bak ] && mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true

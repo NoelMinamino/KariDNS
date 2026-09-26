@@ -76,7 +76,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
         uint8_t out_buf[512];
         uint16_t out_offset = 0;
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         serialize_dns_record(out_buf, sizeof(out_buf), &out_offset, &srec, &comp_ctx, "fuzz.test.", 0);
     }

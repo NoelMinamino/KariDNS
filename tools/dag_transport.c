@@ -1,6 +1,16 @@
 #include "dag_transport.h"
 #include "dag_internal.h"
 
+const char *dag_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (*needle == '\0') return haystack;
+    size_t needle_len = strlen(needle);
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, needle_len) == 0) return haystack;
+    }
+    return NULL;
+}
+
 bool parse_proxy_arg(const char *arg, query_opts_t *qo) {
     if (!arg || !*arg) {
         qo->proxy_use_local_cmd = true;

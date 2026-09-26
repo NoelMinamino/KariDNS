@@ -53,7 +53,7 @@ TSAN_PID=$!
 sleep 2
 
 # バックグラウンドで猛烈なクエリ負荷をかける
-dnsperf -s 127.0.0.1 -p 10053 -d tests/test_queries.txt -l 60 > dnsperf_tsan.log 2>&1
+dnsperf -s 127.0.0.1 -p 10053 -d tests/test_queries.txt -l 60 > dnsperf_tsan.log 2>&1 &
 DNSPERF_PID=$!
 
 # 並行してIXFR/AXFRを要求するクライアント（dig）を回す
@@ -89,19 +89,30 @@ done
 wait $DNSPERF_PID 2>/dev/null
 kill $IXFR_CLIENT_PID 2>/dev/null
 
-# dnsperfの完了率をチェック (()のエスケープをFreeBSD grepに最適化)
-if ! grep -E -q "Queries completed:.*\([9][0-9]\." dnsperf_tsan.log; then
+# dnsperfの完了率をチェック (100%または90%台の完了を許容)
+if ! grep -E -q "Queries completed:.*(100(\.00)?%|9[0-9]\.)" dnsperf_tsan.log; then
     echo "TSan Test WARNING: dnsperf completion rate looks low; the server may have hung."
     grep "Queries completed" dnsperf_tsan.log
 fi
 
 echo "Stopping karidns cleanly via karictl stop..."
 ./karictl -f "$CTL_CONF" stop > /dev/null 2>&1
-sleep 2
+
+# 正常終了を最大5秒待機
+for _wait_i in $(seq 1 50); do
+    if ! kill -0 $TSAN_PID 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
 
 if kill -0 $TSAN_PID 2>/dev/null; then
-    echo "TSan Test WARNING: frontend did not exit after 'karictl stop'; forcing kill."
-    kill -9 $TSAN_PID 2>/dev/null
+    echo "TSan Test WARNING: karidns did not exit after 'karictl stop'; forcing kill."
+    kill -TERM $TSAN_PID 2>/dev/null
+    sleep 1
+    if kill -0 $TSAN_PID 2>/dev/null; then
+        kill -9 $TSAN_PID 2>/dev/null
+    fi
 fi
 
 # pgrep -l -f を使用してFreeBSDでのプロセス残骸検知を確実にする
@@ -156,10 +167,21 @@ if ! kill -0 $ASAN_PID 2>/dev/null; then
 fi
 
 ./karictl -f "$CTL_CONF" stop > /dev/null 2>&1
-sleep 2
+
+# 正常終了を最大5秒待機
+for _wait_i in $(seq 1 50); do
+    if ! kill -0 $ASAN_PID 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
 
 if kill -0 $ASAN_PID 2>/dev/null; then
-    kill -9 $ASAN_PID 2>/dev/null
+    kill -TERM $ASAN_PID 2>/dev/null
+    sleep 1
+    if kill -0 $ASAN_PID 2>/dev/null; then
+        kill -9 $ASAN_PID 2>/dev/null
+    fi
 fi
 
 if pgrep -l -f karidns-asan >/dev/null 2>&1; then

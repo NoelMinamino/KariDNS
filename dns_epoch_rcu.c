@@ -42,8 +42,8 @@ bool rcu_writer_wait_until_safe(uint64_t retire_epoch, int timeout_ms) {
 
   for (;;) {
     bool all_safe = true;
-    int num_workers = g_worker_count;
-    worker_ctx_t *workers = g_worker_ctxs;
+    int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+    worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
 
     if (workers && num_workers > 0) {
       for (int i = 0; i < num_workers; i++) {

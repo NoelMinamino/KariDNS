@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #endif
 #include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/md5.h>
@@ -44,23 +45,31 @@
 // ============================================================================
 // 5. 名前圧縮アルゴリズム (FNV-1a, Branchless, 無限ループ防御)
 // ============================================================================
+void compress_ctx_init(compress_ctx_t *ctx) {
+    if (!ctx) return;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->current_generation = 1;
+}
+
 void compress_ctx_init_packet(compress_ctx_t *ctx) {
+    if (!ctx) return;
     ctx->current_generation++;
-    if (ctx->current_generation == 0) { memset(ctx->table, 0, sizeof(ctx->table)); ctx->current_generation = 1; }
+    if (ctx->current_generation == 0) {
+        memset(ctx->table, 0, sizeof(ctx->table));
+        ctx->current_generation = 1;
+    }
 }
 
 
 static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, const uint8_t *name) {
     const uint8_t *p = packet_buf + offset;
     const uint8_t *n = name;
-    int jump_count = 0;
 
     while (*n != 0) {
         // パケット側が圧縮ポインタの場合はジャンプ
         if ((*p & 0xC0) == 0xC0) {
-            if (++jump_count > MAX_JUMPS) return false;
             uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
-            // 無限ループや未来へのジャンプを防止
+            // 無限ループや未来へのジャンプを防止 (オフセットが真に減少すること)
             if (next_offset >= offset) return false;
             offset = next_offset;
             p = packet_buf + offset;
@@ -84,9 +93,7 @@ static inline bool suffix_equals(const uint8_t *packet_buf, uint16_t offset, con
     }
 
     // name 側が終端(0)に達した場合、パケット側も最終的に 0 に到達しなければならない
-    jump_count = 0;
     while ((*p & 0xC0) == 0xC0) {
-        if (++jump_count > MAX_JUMPS) return false;
         uint16_t next_offset = ((*p & 0x3F) << 8) | *(p + 1);
         if (next_offset >= offset) return false;
         offset = next_offset;
@@ -260,8 +267,13 @@ int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) 
 }
 
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset) {
-    size_t p = current_offset; int jump_count = 0; bool jumped = false; size_t jumped_offset = 0;
-    uint16_t visited[MAX_JUMPS];
+    if (!packet || current_offset >= packet_len) return -1;
+    size_t p = current_offset; bool jumped = false; size_t jumped_offset = 0;
+    uint64_t visited[(65536 + 63) / 64];
+    size_t words_to_clear = (packet_len + 63) / 64;
+    if (words_to_clear > (65536 + 63) / 64) words_to_clear = (65536 + 63) / 64;
+    memset(visited, 0, words_to_clear * sizeof(uint64_t));
+
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t raw = packet[p];
@@ -269,12 +281,10 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
         if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
             uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
+            if (ptr >= packet_len) return -1;
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
-            if (jump_count >= MAX_JUMPS) return -1;
-            for (int i = 0; i < jump_count; i++) {
-                if (visited[i] == ptr) return -1;
-            }
-            visited[jump_count++] = ptr;
+            if (visited[ptr / 64] & (1ULL << (ptr % 64))) return -1;
+            visited[ptr / 64] |= (1ULL << (ptr % 64));
             p = ptr; continue;
         } else if (label_type == 0x00) {
             uint8_t len = raw;
@@ -289,8 +299,13 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
 }
 
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
-    size_t p = current_offset, jumped_offset = 0; bool jumped = false; int jump_count = 0;
-    uint16_t visited[MAX_JUMPS];
+    if (!packet || current_offset >= packet_len) return -1;
+    size_t p = current_offset, jumped_offset = 0; bool jumped = false;
+    uint64_t visited[(65536 + 63) / 64];
+    size_t words_to_clear = (packet_len + 63) / 64;
+    if (words_to_clear > (65536 + 63) / 64) words_to_clear = (65536 + 63) / 64;
+    memset(visited, 0, words_to_clear * sizeof(uint64_t));
+
     char buf[1025]; size_t written = 0;
     size_t total_wire_len = 0;
     while (1) {
@@ -301,12 +316,10 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
         if (label_type == 0xC0) {
             if (p + 1 >= packet_len) return -1;
             uint16_t ptr = ((raw & 0x3F) << 8) | packet[p+1];
+            if (ptr >= packet_len) return -1;
             if (!jumped) { jumped_offset = p + 2; jumped = true; }
-            if (jump_count >= MAX_JUMPS) return -1;
-            for (int i = 0; i < jump_count; i++) {
-                if (visited[i] == ptr) return -1;
-            }
-            visited[jump_count++] = ptr;
+            if (visited[ptr / 64] & (1ULL << (ptr % 64))) return -1;
+            visited[ptr / 64] |= (1ULL << (ptr % 64));
             p = ptr; continue;
         } else if (label_type == 0x00) {
             len = raw;
@@ -367,7 +380,8 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
     char *dst = arena_alloc(arena, written);
     if (!dst) return -1;
     memcpy(dst, buf, written);
-    *name_out = dst; return 0;
+    if (name_out) *name_out = dst;
+    return 0;
 }
 
 const char *get_type_str(uint16_t type, zone_arena_t *arena) {
@@ -764,25 +778,53 @@ int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t
     return 0;
 }
 
+/* TSIGアルゴリズム名 -> EVP_MD の対応表。tsig_algorithm_from_name() と
+ * tsig_prewarm_crypto() の両方がこの表を参照するため、アルゴリズムを追加/削除
+ * しても「プリウォーム対象」が自動的に追従する(表の更新漏れによる
+ * Capsicum内でのOpenSSL遅延初期化の再発を防ぐ)。 */
+static const struct { const char *name; const EVP_MD *(*fn)(void); } g_tsig_alg_table[] = {
+    { "hmac-md5.sig-alg.reg.int", EVP_md5 },
+    { "hmac-md5",    EVP_md5    },
+    { "hmac-sha1",   EVP_sha1   },
+    { "hmac-sha224", EVP_sha224 },
+    { "hmac-sha256", EVP_sha256 },
+    { "hmac-sha384", EVP_sha384 },
+    { "hmac-sha512", EVP_sha512 },
+};
+#define TSIG_ALG_TABLE_LEN (sizeof(g_tsig_alg_table) / sizeof(g_tsig_alg_table[0]))
+
 static const EVP_MD *tsig_algorithm_from_name(const char *alg) {
     if (!alg) return NULL;
     size_t len = strlen(alg);
     if (len > 0 && alg[len - 1] == '.') len--;
-    struct { const char *name; const EVP_MD *(*fn)(void); } table[] = {
-        { "hmac-md5.sig-alg.reg.int", EVP_md5 },
-        { "hmac-md5",    EVP_md5    },
-        { "hmac-sha1",   EVP_sha1   },
-        { "hmac-sha224", EVP_sha224 },
-        { "hmac-sha256", EVP_sha256 },
-        { "hmac-sha384", EVP_sha384 },
-        { "hmac-sha512", EVP_sha512 },
-    };
-    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
-        if (strncasecmp(alg, table[i].name, len) == 0 && strlen(table[i].name) == len) {
-            return table[i].fn();
+    for (size_t i = 0; i < TSIG_ALG_TABLE_LEN; i++) {
+        if (strncasecmp(alg, g_tsig_alg_table[i].name, len) == 0 && strlen(g_tsig_alg_table[i].name) == len) {
+            return g_tsig_alg_table[i].fn();
         }
     }
     return NULL;
+}
+
+bool tsig_prewarm_crypto(void) {
+    /* OpenSSL 3.x は最初の暗号API呼び出しで遅延初期化を行い、その際に
+     * openssl.cnf をopen()する(1.1.x でも同様の遅延初期化がある)。Capsicum の
+     * capability mode (cap_enter後) では open() が ECAPMODE で失敗し、
+     * PROC_TRAPCAP_CTL_ENABLE 下では SIGTRAP でプロセスが即死する。
+     * そのため cap_enter() より前に、サンドボックス内で使う全HMACアルゴリズム
+     * (TSIG各種 + karictl制御チャネルのHMAC-SHA256)を一度実行して初期化と
+     * アルゴリズムのfetchを済ませておく。 */
+    bool all_ok = true;
+    unsigned char md[EVP_MAX_MD_SIZE];
+    static const unsigned char key[] = "prewarm-key";
+    static const unsigned char msg[] = "prewarm-msg";
+    for (size_t i = 0; i < TSIG_ALG_TABLE_LEN; i++) {
+        const EVP_MD *evp_md = g_tsig_alg_table[i].fn();
+        unsigned int md_len = 0;
+        if (!evp_md || !HMAC(evp_md, key, (int)(sizeof(key) - 1), msg, sizeof(msg) - 1, md, &md_len) || md_len == 0)
+            all_ok = false;
+    }
+    OPENSSL_cleanse(md, sizeof(md));
+    return all_ok;
 }
 
 bool tsig_algorithm_is_supported(const char *alg) {
@@ -1233,7 +1275,7 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
     }
     p += (size_t)name_len;
 
-    // 3. 署名対象データ = 現在のメッセージ全体(ARCOUNT加算済) || sig_rdata_prefix
+    // 3. 署名対象データ = sig_rdata_prefix || 元のメッセージ全体(ARCOUNTは加算前の値) (RFC 2931 3.1)
     // 4096バイト以下ならスタックバッファでゼロアロケーション
     size_t to_sign_len = *packet_len + p;
     uint8_t stack_to_sign[4096];
@@ -1243,8 +1285,13 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
         packet[11] = (uint8_t)(orig_arcount & 0xFF);
         return -1;
     }
-    memcpy(to_sign, packet, *packet_len);
-    memcpy(to_sign + *packet_len, sig_rdata_prefix, p);
+    /* RFC 2931 section 3.1: data = RDATA(sig fields, signature omitted) | (request - SIG(0)), where the request is
+     * taken BEFORE its RR counts are adjusted for the SIG(0). The order used to be "message(ARCOUNT+1) | RDATA",
+     * which no RFC-conformant verifier (BIND, ...) accepts. */
+    memcpy(to_sign, sig_rdata_prefix, p);
+    memcpy(to_sign + p, packet, *packet_len);
+    to_sign[p + 10] = (uint8_t)(orig_arcount >> 8);
+    to_sign[p + 11] = (uint8_t)(orig_arcount & 0xFF);
 
     // 4. EVP_DigestSign で署名
     const EVP_MD *md = NULL;
@@ -1391,7 +1438,7 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
 
 
 // Type Bitmap (NSEC/NSEC3/CSYNC用) を構築するヘルパー
-static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset, char **types, int type_count) {
+static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset, char *const *types, int type_count) {
     if (type_count == 0) return 0;
     
     uint16_t *codes = malloc(sizeof(uint16_t) * type_count);
@@ -1505,7 +1552,7 @@ static double parse_double_c(const char *s, char **endptr) {
     return val;
 }
 
-static int loc_parse_coord(char **rdata, int rdata_count, int *idx, double *out_seconds, char *dir_out) {
+static int loc_parse_coord(char *const *rdata, int rdata_count, int *idx, double *out_seconds, char *dir_out) {
     double parts[3] = {0, 0, 0};
     int n = 0;
     while (n < 3 && *idx < rdata_count) {
@@ -1542,8 +1589,9 @@ static uint8_t loc_encode_precsize(double meters) {
 }
 
 
-static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
+static int decode_concat_b64_rdata(char *const *fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
+    if (!fields || !res || !offset || *offset > max_res_len) return -1;
     char b64[2048] = "";
     size_t b64_len = 0;
     for (int i = 0; i < count; i++) {
@@ -1570,8 +1618,9 @@ static int decode_concat_b64_rdata(char **fields, int count, uint8_t *res,
     return 0;
 }
 
-static int decode_concat_hex_rdata(char **fields, int count, uint8_t *res,
+static int decode_concat_hex_rdata(char *const *fields, int count, uint8_t *res,
                                     size_t max_res_len, size_t *offset) {
+    if (!fields || !res || !offset || *offset > max_res_len) return -1;
     char hex[2048] = "";
     size_t hex_len = 0;
     for (int i = 0; i < count; i++) {
@@ -1630,7 +1679,33 @@ uint32_t parse_ttl_value(const char *ttl_str) {
     return (uint32_t)total;
 }
 
-int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
+/* RFC 6742 2.3/2.4: the NID/L64 identifier is written like the low 64 bits of an IPv6 address - four
+ * ':'-separated groups of 1-4 hex digits, no leading zeros required (both "14:4f01:0:1" and "0014:4f01:0000:0001"
+ * denote the same 8 bytes). Returns true and fills node_id[8] on success. */
+static bool parse_nid_identifier(const char *s, uint8_t node_id[8]) {
+    unsigned groups[4];
+    for (int g = 0; g < 4; g++) {
+        const char *start = s;
+        int ndig = 0;
+        unsigned val = 0;
+        while (isxdigit((unsigned char)*s)) {
+            val = (val << 4) | (unsigned)hex_char_to_val(*s);
+            s++; ndig++;
+            if (ndig > 4) return false;
+        }
+        if (ndig == 0 || s == start) return false;
+        groups[g] = val;
+        if (g < 3) {
+            if (*s != ':') return false;
+            s++;
+        }
+    }
+    if (*s != '\0') return false;
+    for (int g = 0; g < 4; g++) { node_id[g * 2] = (uint8_t)(groups[g] >> 8); node_id[g * 2 + 1] = (uint8_t)groups[g]; }
+    return true;
+}
+
+int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl) {
     uint16_t offset = *offset_ptr;
     uint16_t rec_type = rec->type_code;
 
@@ -2122,7 +2197,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
                 uint8_t nodeid[8];
-                if (hex_decode(rec->rdata[1], nodeid, 8) != 8) return -1;
+                if (!parse_nid_identifier(rec->rdata[1], nodeid)) return -1;
                 memcpy(&res[offset], nodeid, 8); offset += 8;
                 break;
             }
@@ -2144,7 +2219,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
                 uint8_t loc64[8];
-                if (hex_decode(rec->rdata[1], loc64, 8) != 8) return -1;
+                if (!parse_nid_identifier(rec->rdata[1], loc64)) return -1;
                 memcpy(&res[offset], loc64, 8); offset += 8;
                 break;
             }
@@ -2228,7 +2303,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 break;
             }
             case 50: { // NSEC3
-                if (rec->rdata_count < 6) return -1;
+                /* RFC 5155 3.2.1: the Type Bit Maps field may be empty (that is exactly what an NSEC3 for an
+                 * Empty Non-Terminal looks like), so only the five fixed fields are mandatory. */
+                if (rec->rdata_count < 5) return -1;
                 uint8_t halg, flags;
                 uint16_t iterations;
                 if (!parse_u8(rec->rdata[0], &halg) ||
@@ -2429,6 +2506,18 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     } else {
                         strncpy(key_str, param, sizeof(key_str) - 1);
                         key_str[sizeof(key_str) - 1] = '\0';
+                    }
+                    /* RFC 9460 section 2.1: a SvcParamValue may be written contiguous or as a quoted string
+                     * (alpn="h2,h3"). dag and dig print the quoted form for some values, so it must read back. */
+                    char unquoted_val[4096];
+                    if (val_str) {
+                        size_t vl = strlen(val_str);
+                        if (vl >= 2 && val_str[0] == '"' && val_str[vl - 1] == '"') {
+                            if (vl - 2 >= sizeof(unquoted_val)) return -1;
+                            memcpy(unquoted_val, val_str + 1, vl - 2);
+                            unquoted_val[vl - 2] = '\0';
+                            val_str = unquoted_val;
+                        }
                     }
                     
                     uint16_t key = 0;
@@ -3477,6 +3566,21 @@ int process_update_sections(const uint8_t *req, size_t req_len,
             uint16_t dummy_type;
             if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
             
+            if (parsed_rec.type_code == 2 && domain_names_match_ci(parsed_rec.name, zone_name)) {
+                // RFC 2136 §3.4.2.4: At least one NS RR must remain at the zone apex
+                int active_apex_ns = 0;
+                for (size_t r = 0; r < standby->count; r++) {
+                    if (standby->records[r].name &&
+                        standby->records[r].type_code == 2 &&
+                        domain_names_match_ci(standby->records[r].name, zone_name)) {
+                        active_apex_ns++;
+                    }
+                }
+                if (active_apex_ns <= 1) {
+                    return 5; // REFUSED (cannot delete last NS at apex)
+                }
+            }
+
             uint32_t ph = calc_fnv1a_str(parsed_rec.name);
             size_t phidx = ph & (standby->hash_size - 1);
             for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
@@ -3597,10 +3701,10 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
     
     switch (rec->type_code) {
         case 1: // A
-            if (inet_pton(AF_INET, rec->rdata[0], &rec->cache.a.addr) == 1) rec->is_cached = true;
+            if (rec->rdata_count >= 1 && rec->rdata[0] && inet_pton(AF_INET, rec->rdata[0], &rec->cache.a.addr) == 1) rec->is_cached = true;
             break;
         case 28: // AAAA
-            if (inet_pton(AF_INET6, rec->rdata[0], &rec->cache.aaaa.addr) == 1) rec->is_cached = true;
+            if (rec->rdata_count >= 1 && rec->rdata[0] && inet_pton(AF_INET6, rec->rdata[0], &rec->cache.aaaa.addr) == 1) rec->is_cached = true;
             break;
         case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: case 23: case 39: { // NS, MD, MF, CNAME, MB, MG, MR, PTR, NSAP-PTR, DNAME
             if (rec->rdata_count >= 1 && rec->rdata[0] && arena) {
@@ -3659,7 +3763,8 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             break;
         }
         case 6: // SOA
-            if (rec->rdata_count >= 7) {
+            if (rec->rdata_count >= 7 && rec->rdata[0] && rec->rdata[1] && rec->rdata[2] &&
+                rec->rdata[3] && rec->rdata[4] && rec->rdata[5] && rec->rdata[6]) {
                 rec->cache.soa.mname = rec->rdata[0];
                 rec->cache.soa.rname = rec->rdata[1];
                 rec->cache.soa.serial = strtoul(rec->rdata[2], NULL, 10);
@@ -3688,7 +3793,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                 rec->cache.soa.numbers_wire[16] = (min >> 24) & 0xFF; rec->cache.soa.numbers_wire[17] = (min >> 16) & 0xFF;
                 rec->cache.soa.numbers_wire[18] = (min >> 8) & 0xFF;  rec->cache.soa.numbers_wire[19] = min & 0xFF;
 
-                if (rec->rdata[0] && rec->rdata[1] && arena) {
+                if (arena) {
                     uint8_t m_wire[256], r_wire[256];
                     long mw = write_uncompressed_name_ext(m_wire, 0, sizeof(m_wire), rec->rdata[0], false);
                     long rw = write_uncompressed_name_ext(r_wire, 0, sizeof(r_wire), rec->rdata[1], false);
@@ -3709,12 +3814,12 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             }
             break;
         case 15: // MX
-            if (rec->rdata_count >= 2) {
+            if (rec->rdata_count >= 2 && rec->rdata[0] && rec->rdata[1]) {
                 if (parse_u16(rec->rdata[0], &rec->cache.mx.pref)) {
                     rec->cache.mx.target = rec->rdata[1];
                     rec->cache.mx.target_wire = NULL;
                     rec->cache.mx.target_wire_len = 0;
-                    if (rec->rdata[1] && arena) {
+                    if (arena) {
                         uint8_t tmp_wire[256];
                         long wlen = write_uncompressed_name_ext(tmp_wire, 0, sizeof(tmp_wire), rec->rdata[1], false);
                         if (wlen > 0) {
@@ -3732,7 +3837,9 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             break;
         case 24: // SIG — cache identical to RRSIG
         case 46: // RRSIG
-            if (rec->rdata_count >= 9) {
+            if (rec->rdata_count >= 9 && rec->rdata[0] && rec->rdata[1] && rec->rdata[2] &&
+                rec->rdata[3] && rec->rdata[4] && rec->rdata[5] && rec->rdata[6] &&
+                rec->rdata[7] && rec->rdata[8]) {
                 if (parse_u8(rec->rdata[1], &rec->cache.rrsig.algorithm) &&
                     parse_u8(rec->rdata[2], &rec->cache.rrsig.labels) &&
                     parse_u16(rec->rdata[6], &rec->cache.rrsig.key_tag)) {
@@ -3747,7 +3854,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                     if (arena) {
                         size_t b64_len = strlen(rec->rdata[8]);
                         for (int i = 9; i < rec->rdata_count; i++) {
-                            b64_len += strlen(rec->rdata[i]);
+                            if (rec->rdata[i]) b64_len += strlen(rec->rdata[i]);
                         }
                         size_t max_dec_len = b64_len * 3 / 4 + 4;
                         uint8_t *dec_buf = arena_alloc(arena, max_dec_len);
@@ -3764,14 +3871,14 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
             }
             break;
         case 33: // SRV
-            if (rec->rdata_count >= 4) {
+            if (rec->rdata_count >= 4 && rec->rdata[0] && rec->rdata[1] && rec->rdata[2] && rec->rdata[3]) {
                 if (parse_u16(rec->rdata[0], &rec->cache.srv.priority) &&
                     parse_u16(rec->rdata[1], &rec->cache.srv.weight) &&
                     parse_u16(rec->rdata[2], &rec->cache.srv.port)) {
                     rec->cache.srv.target = rec->rdata[3];
                     rec->cache.srv.target_wire = NULL;
                     rec->cache.srv.target_wire_len = 0;
-                    if (rec->rdata[3] && arena) {
+                    if (arena) {
                         uint8_t tmp_wire[256];
                         long wlen = write_uncompressed_name_ext(tmp_wire, 0, sizeof(tmp_wire), rec->rdata[3], false);
                         if (wlen > 0) {
@@ -3841,3 +3948,95 @@ size_t pb_encode_fixed32_field(uint8_t *out, size_t out_cap, uint32_t field_no, 
     out[tag_len + 3] = (uint8_t)((value >> 24) & 0xFF);
     return tag_len + 4;
 }
+
+// ============================================================================
+// 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
+// ============================================================================
+bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size_t qname_size,
+                               uint16_t *qtype, uint16_t *qclass, size_t *question_end) {
+    if (!buf || len <= DNS_HEADER_SIZE || !qname || qname_size == 0) {
+        if (qname && qname_size > 0) qname[0] = '\0';
+        if (qtype) *qtype = 0;
+        if (qclass) *qclass = 1;
+        if (question_end) *question_end = DNS_HEADER_SIZE;
+        return false;
+    }
+
+    size_t offset = DNS_HEADER_SIZE;
+    size_t written = 0;
+    bool qname_completed = false;
+
+    while (offset < len) {
+        uint8_t label_len = buf[offset];
+        if (label_len == 0) {
+            offset++;
+            qname_completed = true;
+            break;
+        }
+        if ((label_len & 0xC0) == 0xC0) {
+            if (offset + 2 > len) {
+                break;
+            }
+            offset += 2;
+            qname_completed = true;
+            break;
+        }
+        // RFC 1035 s2.3.4: max label length is 63 octets
+        if (label_len > 63 || offset + 1 + label_len > len) {
+            break;
+        }
+        offset++;
+        if (written > 0 && qname[written - 1] != '.') {
+            if (written + 1 < qname_size) {
+                qname[written++] = '.';
+            }
+        }
+        for (size_t b = 0; b < label_len; b++) {
+            uint8_t c = buf[offset + b];
+            if (c == '.' || c == '\\') {
+                if (written + 2 < qname_size) {
+                    qname[written++] = '\\';
+                    qname[written++] = (char)c;
+                }
+            } else {
+                if (written + 1 < qname_size) {
+                    qname[written++] = (char)c;
+                }
+            }
+        }
+        offset += label_len;
+    }
+
+    if (!qname_completed) {
+        if (qname && qname_size > 0) qname[0] = '\0';
+        if (qtype) *qtype = 0;
+        if (qclass) *qclass = 1;
+        if (question_end) *question_end = offset;
+        return false;
+    }
+
+    if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
+        if (written + 1 < qname_size) {
+            qname[written++] = '.';
+        }
+    }
+    if (written < qname_size) {
+        qname[written] = '\0';
+    } else {
+        qname[qname_size - 1] = '\0';
+    }
+
+    if (offset + 4 <= len) {
+        if (qtype) *qtype = (uint16_t)((buf[offset] << 8) | buf[offset + 1]);
+        if (qclass) *qclass = (uint16_t)((buf[offset + 2] << 8) | buf[offset + 3]);
+        offset += 4;
+        if (question_end) *question_end = offset;
+        return true;
+    }
+
+    if (qtype) *qtype = 0;
+    if (qclass) *qclass = 1;
+    if (question_end) *question_end = offset;
+    return false;
+}
+

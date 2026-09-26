@@ -194,7 +194,6 @@ sub run_standalone_mode {
 }
 
 # ==============================================================================
-# ==============================================================================
 # Wire Format Parsing & Encoding Helpers
 # ==============================================================================
 sub sanitize_domain_name {
@@ -202,30 +201,23 @@ sub sanitize_domain_name {
     return 'anomaly.test' unless defined $name && length($name) > 0;
 
     my $clean = lc($name);
-    # Remove leading/trailing dots and whitespace
     $clean =~ s/^\s+//;
     $clean =~ s/\s+$//;
     $clean =~ s/^\.+//;
     $clean =~ s/\.+$//;
 
-    # Replace dangerous characters (quotes `, ", ', shell metachars, control chars, spaces) with hyphen
     $clean =~ s/[^a-z0-9_.-]/-/g;
-
-    # Normalize consecutive dots and hyphens
     $clean =~ s/\.{2,}/\./g;
     $clean =~ s/-{2,}/-/g;
     $clean =~ s/^\.+//;
     $clean =~ s/\.+$//;
 
-    # Enforce label length limits (RFC 1035: max 63 chars per label)
     my @labels = split(/\./, $clean);
     @labels = grep { length($_) > 0 } @labels;
     for my $l (@labels) {
         $l = substr($l, 0, 63) if length($l) > 63;
     }
     $clean = join('.', @labels);
-
-    # Enforce total FQDN length limit (RFC 1035: max 253 chars)
     $clean = substr($clean, 0, 253) if length($clean) > 253;
 
     return (length($clean) > 0) ? $clean : 'anomaly.test';
@@ -261,7 +253,7 @@ sub encode_name {
     my $wire = '';
     for my $label (split /\./, $name) {
         next if length($label) == 0;
-        my $l = substr($label, 0, 63); # RFC 1035 max 63 bytes
+        my $l = substr($label, 0, 63);
         $wire .= pack('C', length($l)) . $l;
     }
     $wire .= "\x00";
@@ -275,7 +267,7 @@ sub encode_soa_rr {
     my $name_wire = encode_name($safe_zone);
     my $mname_wire = encode_name("ns1." . $safe_zone);
     my $rname_wire = encode_name("hostmaster." . $safe_zone);
-    my $soa_rdata = $mname_wire . $rname_wire . pack('NNNNN', 2026083101, 3600, 900, 604800, $ttl);
+    my $soa_rdata = $mname_wire . $rname_wire . pack('NNNNN', 2026091301, 3600, 900, 604800, $ttl);
     return $name_wire . pack('nnNn', 6, 1, $ttl, length($soa_rdata)) . $soa_rdata;
 }
 
@@ -283,12 +275,9 @@ sub encode_txt_rr {
     my ($name, $text, $ttl) = @_;
     $ttl //= 300;
     my $name_wire = encode_name($name);
-    
-    # Sanitize text to printable ASCII to prevent escape injection or terminal corruption
     $text =~ s/[^\x20-\x7E]/ /g;
 
     my $rdata = '';
-    # Split text into 255-byte chunks as per RFC 1035 §3.3.14
     for (my $i = 0; $i < length($text); $i += 255) {
         my $chunk = substr($text, $i, 255);
         $rdata .= pack('C', length($chunk)) . $chunk;
@@ -327,9 +316,10 @@ sub process_query_packet {
         }
     }
 
-    # Detect EDNS / Cookie in request
+    # Detect EDNS / Cookie / Buffer size in request
     my $client_cookie = undef;
     my $server_cookie = undef;
+    my $client_bufsize = 512;
     if ($req_len > 12) {
         if ($req =~ /\x00\x0a\x00\x10(.{8})(.{8})/s) {
             $client_cookie = $1;
@@ -337,11 +327,18 @@ sub process_query_packet {
         } elsif ($req =~ /\x00\x0a\x00\x08(.{8})/s) {
             $client_cookie = $1;
         }
+        if ($req =~ /\x00\x00\x29(..)/s) {
+            $client_bufsize = unpack('n', $1);
+        }
     }
 
     my %KNOWN_SCENARIOS = map { $_ => 1 } qw(
         normal header-only short-header trailing-garbage qdcount-mismatch
-        ancount-underflow ancount-overflow compression-loop compression-forward-ptr
+        ancount-underflow ancount-overflow compression-loop compression-indirect-loop
+        compression-forward-ptr compression-bad-bits compression-deep-chain ptr-chain
+        compression-misaligned ptr-chain-name-overflow label-overflow label-64
+        null-byte-in-label case-0x20-mismatch class-mismatch meta-type-in-answer
+        dname-loop dname-overflow edns-bufsize-exceeded tcp-max-65535 huge-tcp-65535
         unclosed-label rdata-short-a rdata-short-aaaa rdata-soa-truncated
         rdata-mx-truncated rdata-txt-len-mismatch rdata-svcb-overflow
         rdata-opt-truncated cookie-badcookie truncated-tc
@@ -355,10 +352,9 @@ sub process_query_packet {
         flag-rd flag-ra flag-ad flag-cd flag-z flag-mbz flag-no-aa flag-aa0
         flag-no-qr flag-qr0 flag-tc flag-tc-record flag-all flag-all-tc
         flag-rd-ra flag-ad-cd flag-do flag-co flag-do-co flag-all-do-co
-        flag-all-do flag-all-co flag-all-tc-do-co flag-none
+        flag-all-do flag-all-co flag-all-tc-do-co flag-none what-is-my-ip
         id-mismatch no-question query-mismatch multi-question
         opcode-unassigned opcode-status opcode-notify
-        compression-indirect-loop compression-bad-bits compression-deep-chain
         nscount-underflow nscount-overflow arcount-underflow arcount-overflow
         zero-ttl huge-ttl cname-loop cname-with-data
         multi-opt opt-in-answer opt-badvers opt-unknown-option opt-option-len-overflow
@@ -368,18 +364,32 @@ sub process_query_packet {
     }
 
     my $qname_clean = lc($qname);
-    $qname_clean =~ s/\.+$//; # Strip trailing dots
+    $qname_clean =~ s/\.+$//;
 
     my ($first_label, $rest_domain) = ($qname_clean =~ /^([^.]+)(?:\.(.*))?$/);
     $first_label //= '';
     $rest_domain //= '';
 
+    # QNAME の中に dname-loop / dname-a / dname-b が含まれているか判定
+    my $is_dname_scenario = 0;
+    my $dname_sublabel = '1';
+    if ($qname_clean =~ /^(?:(.*)\.)?(dname-(?:loop|[ab]))\.(.*)$/) {
+        $dname_sublabel = $1 if defined $1 && length($1) > 0;
+        $first_label    = $2;
+        $rest_domain    = $3;
+        $is_dname_scenario = 1;
+    }
+
+    
     my $scenario = '';
     my $zone_apex = '';
 
     if (exists $KNOWN_SCENARIOS{$first_label} ||
+	$first_label =~ /^dname-[ab]$/ ||
         $first_label =~ /^ede-(\d+)$/ ||
         $first_label =~ /^ede-all2?$/ ||
+        $first_label =~ /^(?:ptr-chain|compression-chain|ptr-hops)(?:-(\d+))?$/ ||
+	$first_label =~ /^(?:tcp-size|packet-size)-(\d+)$/ ||
         $first_label =~ /^flags?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
         $first_label =~ /^flags?-[a-z0-9+_-]+$/i ||
         $first_label =~ /^rcodes?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
@@ -406,6 +416,7 @@ sub process_query_packet {
             "",
             "[Normal]",
             "  normal.$display_zone                    - Standard NOERROR answer (192.0.2.1)",
+            "  what-is-my-ip.$display_zone             - Show your resolver IP address",
             "",
             "[Header & Structure Anomalies]",
             "  header-only.$display_zone               - Header-only packet (QD=0, AN=0)",
@@ -428,9 +439,21 @@ sub process_query_packet {
             "  compression-forward-ptr.$display_zone   - Out-of-bounds pointer (0x3000)",
             "  compression-bad-bits.$display_zone      - Reserved/unsupported label type bits (0x40/0x80)",
             "  compression-deep-chain.$display_zone    - Deep chain of 60 consecutive compression pointers",
+            "  ptr-chain-<hops>.$display_zone          - Arbitrary N-hop compression pointer chain (e.g. ptr-chain-10)",
+            "  compression-misaligned.$display_zone    - Pointer points into the middle of a string (non-aligned)",
+            "  ptr-chain-name-overflow.$display_zone   - Pointer chain expanding domain name beyond 255 bytes limit",
             "  unclosed-label.$display_zone            - Unterminated label without trailing 0x00",
             "",
+            "[Label & Name Boundary Violations]",
+            "  label-overflow.$display_zone            - Label length octet is 64 (> 63 bytes RFC 1035 limit)",
+            "  null-byte-in-label.$display_zone        - Label contains embedded 0x00 byte (C-string poison test)",
+            "  case-0x20-mismatch.$display_zone        - Reflected Question section with inverted ASCII casing",
+            "",
             "[Section Count & Record Semantics]",
+            "  class-mismatch.$display_zone            - QCLASS=IN query answered with CLASS=CH (Chaosnet) RR",
+            "  meta-type-in-answer.$display_zone       - Meta-type (QTYPE=ANY) injected into Answer section",
+            "  dname-loop.$display_zone                - Mutual DNAME loop (A -> B -> A)",
+            "  dname-overflow.$display_zone            - DNAME synthesis exceeds 255-byte limit (returns YXDOMAIN)",
             "  nscount-underflow.$display_zone         - Claims NSCOUNT=3, but only 1 record present",
             "  nscount-overflow.$display_zone          - Claims NSCOUNT=1, but 2 records present",
             "  arcount-underflow.$display_zone         - Claims ARCOUNT=3, but only 1 record present",
@@ -439,6 +462,10 @@ sub process_query_packet {
             "  huge-ttl.$display_zone                  - Answer record with TTL = 0xFFFFFFFF (RFC 2181 §8)",
             "  cname-loop.$display_zone                - Mutually referencing CNAME loop (A -> B -> A)",
             "  cname-with-data.$display_zone           - CNAME and A record coexistence (RFC 1034 §3.6.2)",
+            "",
+            "[Transport & Buffer Oversize]",
+            "  edns-bufsize-exceeded.$display_zone     - UDP answer exceeding advertised EDNS buffer size (TC=0)",
+            "  tcp-max-65535.$display_zone             - Maximum legal DNS message size of 65,535 bytes (TCP)",
             "",
             "[RDATA Truncation & Boundary Violations]",
             "  rdata-short-a.$display_zone             - Truncated A record (RDLENGTH=4 with 2 bytes)",
@@ -515,7 +542,7 @@ sub process_query_packet {
             "  ede-long-text.$display_zone             - EDE with long description string",
             "",
             "[Drop / Discard]",
-            "  drop.$display_zone                      - Silently discards query without reply (requires timeout=1 with +tcp / +tcp時にはtimeout=1を設定しないと体験できません)",
+            "  drop.$display_zone                      - Silently discards query without reply",
         );
 
         my $soa_start = encode_soa_rr($qname, 300);
@@ -525,7 +552,6 @@ sub process_query_packet {
         my $ans_count = 0;
 
         if ($qtype == 252) {
-            # AXFR transfer format (RFC 5936): Full 35+ scenarios list
             $answers .= $soa_start;
             $ans_count++;
             for my $line (@help_lines) {
@@ -540,7 +566,7 @@ sub process_query_packet {
             my @summary_lines = (
                 "=== KariDNS Anomalous DNS Packet Test Server ===",
                 "Usage: dag @<server> -p <port> <scenario>.$display_zone <type>",
-                "Query AXFR (Zone Transfer) to view all 30+ anomalous test scenarios."
+                "Query AXFR (Zone Transfer) to view all 40+ anomalous test scenarios."
             );
             for my $line (@summary_lines) {
                 next if $line eq '';
@@ -560,25 +586,21 @@ sub process_query_packet {
     # --------------------------------------------------------------------------
     if ($scenario eq 'drop') {
         if ($is_tcp) {
-            # Delay TCP connection teardown so client waits/freezes instead of instant EOF
             sleep(2);
         }
-        return ""; # 0 length tells KariDNS not to send anything
+        return "";
     }
 
     # --------------------------------------------------------------------------
     # 1. Basic Header / Structure Anomalies
     # --------------------------------------------------------------------------
     if ($scenario eq 'header-only') {
-        # Valid header but 0 questions, 0 answers
         return $id_raw . pack('n5', 0x8400, 0, 0, 0, 0);
     }
     if ($scenario eq 'short-header') {
-        # Only 6 bytes (truncated header)
         return $id_raw . pack('n2', 0x8400, 1);
     }
     if ($scenario eq 'trailing-garbage') {
-        # Normal Answer + 24 extra garbage bytes
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
@@ -586,20 +608,17 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'qdcount-mismatch') {
-        # Header says QDCOUNT=2, but only 1 question present
         my $pkt = $id_raw . pack('n5', 0x8400, 2, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
     }
     if ($scenario eq 'ancount-underflow') {
-        # Header says ANCOUNT=5, but only 1 record present
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 5, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
         return $pkt;
     }
     if ($scenario eq 'ancount-overflow') {
-        # Header says ANCOUNT=1, but 2 records present
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
@@ -607,7 +626,6 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'id-mismatch') {
-        # Mismatched Transaction ID in response (spoofing detection test)
         my $bad_id = pack('n', $id ^ 0x55aa);
         my $pkt = $bad_id . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
@@ -615,13 +633,11 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'no-question') {
-        # Header declares QDCOUNT=0, but Answer section contains a record
         my $pkt = $id_raw . pack('n5', 0x8400, 0, 1, 0, 0);
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
         return $pkt;
     }
     if ($scenario eq 'query-mismatch') {
-        # Question section in response has mismatched QNAME
         my $spoofed_name = "mismatch-spoofed." . ($zone_apex ne '' ? $zone_apex : "anomaly.test");
         my $spoofed_qwire = encode_name($spoofed_name) . pack('nn', $qtype, $qclass);
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
@@ -630,90 +646,319 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'multi-question') {
-        # QDCOUNT=2 with 2 real Question sections in packet (RFC 9619 violation)
-        my $sub_qwire = encode_name("sub." . $qname) . pack('nn', 28, 1); # QTYPE=AAAA
+        my $sub_qwire = encode_name("sub." . $qname) . pack('nn', 28, 1);
         my $pkt = $id_raw . pack('n5', 0x8400, 2, 1, 0, 0);
         $pkt .= $question_wire . $sub_qwire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
         return $pkt;
     }
     if ($scenario eq 'opcode-unassigned') {
-        # Unassigned Opcode 3 in DNS header
-        my $pkt = $id_raw . pack('n5', 0x9c00, 1, 0, 0, 0); # QR=1, Opcode=3 (0x8400 | (3 << 11))
+        my $pkt = $id_raw . pack('n5', 0x9c00, 1, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
     }
     if ($scenario eq 'opcode-status') {
-        # Opcode 2 (STATUS) in DNS header
-        my $pkt = $id_raw . pack('n5', 0x9400, 1, 0, 0, 0); # QR=1, Opcode=2 (0x8400 | (2 << 11))
+        my $pkt = $id_raw . pack('n5', 0x9400, 1, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
     }
     if ($scenario eq 'opcode-notify') {
-        # Opcode 4 (NOTIFY) unsolicited response in DNS header
-        my $pkt = $id_raw . pack('n5', 0xa400, 1, 0, 0, 0); # QR=1, Opcode=4 (0x8400 | (4 << 11))
+        my $pkt = $id_raw . pack('n5', 0xa400, 1, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
     }
-
+    
     # --------------------------------------------------------------------------
-    # 2. Name Compression / Pointer Anomalies
+    # 2. Name Compression & Pointer Safety
     # --------------------------------------------------------------------------
     if ($scenario eq 'compression-loop') {
-        # Offset 12 starts name: 0xc0 0x0c (direct loop)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\xc0\x0c" . pack('nn', 1, 1);
         return $pkt;
     }
     if ($scenario eq 'compression-indirect-loop') {
-        # Mutual indirect loop: offset 12 points to 22, offset 22 points back to 12
-        # Header: 12 bytes (0..11)
-        # Offset 12: "\x03foo\xc0\x16" (6 bytes, offsets 12..17 -> ptr to 22)
-        # Offset 18: pack('nn', 1, 1)   (4 bytes, offsets 18..21)
-        # Offset 22: "\x03bar\xc0\x0c" (6 bytes, offsets 22..27 -> ptr to 12)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\x03foo\xc0\x16" . pack('nn', 1, 1) . "\x03bar\xc0\x0c";
         return $pkt;
     }
     if ($scenario eq 'compression-forward-ptr') {
-        # Pointer to offset 0x3000 (far beyond packet length)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\xc0\xff" . pack('nn', 1, 1);
         return $pkt;
     }
     if ($scenario eq 'compression-bad-bits') {
-        # Label starts with reserved/unsupported bits 0x40 (01000000b) or 0x80 (10000000b)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\x45badlabel\x00" . pack('nn', 1, 1);
         return $pkt;
     }
-    if ($scenario eq 'compression-deep-chain') {
-        # A chain of 60 consecutive compression pointers
+    if ($scenario eq 'compression-misaligned') {
+        # Pointer to offset 13 (inside the first label string 'compression-misaligned')
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
-        $pkt .= "\x03end\x00" . pack('nn', 1, 1); # Question at offset 12..20
-        # Pointer chain starting at offset 21:
-        my $chain = pack('n', 0xc00c); # offset 21 points to 12
-        for (my $hop = 0; $hop < 60; $hop++) {
-            my $prev_offset = 21 + $hop * 2;
-            $chain .= pack('n', 0xc000 | $prev_offset);
+        $pkt .= $question_wire;
+        $pkt .= "\xc0\x0d" . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+        return $pkt;
+    }
+    if ($scenario eq 'ptr-chain-name-overflow') {
+        # Pointer chain expanding domain name beyond 255-byte limit
+        # 5 labels of 60 bytes chained together = 305 bytes expanded FQDN
+        my $flags_val = 0x8400;
+        my $rr1_prefix = pack('n', 0xc00c) . pack('nnN', 10, 1, 300); # NULL RR
+        my $root_offset = 12 + length($question_wire) + length($rr1_prefix) + 2;
+
+        my $rdata = '';
+        my @label_offsets;
+        for my $idx (1 .. 5) {
+            my $curr_off = $root_offset + length($rdata);
+            push @label_offsets, $curr_off;
+            my $lstr = ("a" x 59) . $idx;
+            $rdata .= pack('C', 60) . $lstr;
+            if ($idx == 1) {
+                $rdata .= "\x00"; # Label 1 ends with root
+            } else {
+                my $prev_off = $label_offsets[$idx - 2];
+                $rdata .= pack('n', 0xC000 | $prev_off);
+            }
         }
-        $pkt .= $chain;
-        my $last_offset = 21 + 60 * 2;
-        $pkt .= pack('n', 0xc000 | $last_offset) . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+        my $rr1 = $rr1_prefix . pack('n', length($rdata)) . $rdata;
+
+        # Answer 2: NAME points to Label 5, expanding to > 300 bytes
+        my $last_label_off = $label_offsets[-1];
+        my $rr2 = pack('n', 0xC000 | $last_label_off) . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+
+        my $pkt = $id_raw . pack('n5', $flags_val, 1, 2, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $rr1;
+        $pkt .= $rr2;
+        return $pkt;
+    }
+    if ($scenario =~ /^(?:ptr-chain|compression-chain|ptr-hops)(?:-(\d+))?$/ || $scenario eq 'compression-deep-chain') {
+        my $hops = 10;
+        if ($scenario eq 'compression-deep-chain') {
+            $hops = 60;
+        } elsif (defined $1) {
+            $hops = int($1);
+        }
+        $hops = 1 if $hops < 1;
+
+        my $flags_val = 0x8400;
+        my $rr1_prefix = pack('n', 0xc00c) . pack('nnN', 10, 1, 300);
+        my $root_offset = 12 + length($question_wire) + length($rr1_prefix) + 2;
+
+        my $max_hops = int((0x3FFF - $root_offset - 1) / 2) + 1;
+        $hops = $max_hops if $hops > $max_hops;
+
+        my $rdata = "\x00";
+        my $last_target_offset = $root_offset;
+
+        if ($hops > 1) {
+            my $curr_ptr_offset = $root_offset + 1;
+            for (my $i = 0; $i < $hops - 1; $i++) {
+                my $target = ($i == 0) ? $root_offset : ($curr_ptr_offset - 2);
+                $rdata .= pack('n', 0xC000 | $target);
+                $last_target_offset = $curr_ptr_offset;
+                $curr_ptr_offset += 2;
+            }
+        }
+
+        my $rr1 = $rr1_prefix . pack('n', length($rdata)) . $rdata;
+        my $rr2_name = pack('n', 0xC000 | $last_target_offset);
+        my $rr2 = $rr2_name . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+
+        my $desc = "Pointer chain: $hops hops successfully traversed to root (.)";
+        my $add_rr = encode_txt_rr($qname, $desc, 300);
+
+        my $pkt = $id_raw . pack('n5', $flags_val, 1, 2, 0, 1);
+        $pkt .= $question_wire;
+        $pkt .= $rr1;
+        $pkt .= $rr2;
+        $pkt .= $add_rr;
         return $pkt;
     }
     if ($scenario eq 'unclosed-label') {
-        # Unterminated label without 0x00
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
         $pkt .= "\x05hello\x0aabc";
         return $pkt;
     }
+    
+    # --------------------------------------------------------------------------
+    # Arbitrary Packet Size Generator: tcp-size-<bytes> / packet-size-<bytes>
+    # Generates exact N bytes packet (from 1 byte to 65535+ bytes)
+    # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+    # Arbitrary Packet Size Generator: tcp-size-<bytes> / packet-size-<bytes>
+    # --------------------------------------------------------------------------
+    if ($scenario =~ /^(?:tcp-size|packet-size)-(\d+)$/) {
+        my $target_size = int($1);
+        $target_size = 1 if $target_size < 1;
+
+        # 16-bit 境界ガード (TypeProgram IPC および DNS over TCP の絶対上限)
+        $target_size = 65535 if $target_size > 65535;
+
+        # 1. ヘッダー未満 (1 〜 11 バイト)
+        if ($target_size < 12) {
+            my $raw_hdr = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0);
+            return substr($raw_hdr, 0, $target_size);
+        }
+
+        # 2. ヘッダー以上だが Question を含めると溢れる場合
+        my $base_min = 12 + length($question_wire);
+        if ($target_size < $base_min) {
+            my $full = $id_raw . pack('n5', 0x8400, 1, 0, 0, 0) . $question_wire;
+            return substr($full, 0, $target_size);
+        }
+
+        # 3. Question のみで Answer なし (QDCOUNT=1, ANCOUNT=0)
+        if ($target_size == $base_min) {
+            return $id_raw . pack('n5', 0x8400, 1, 0, 0, 0) . $question_wire;
+        }
+
+        # 4. Answer (NULL RR) で target_size ぴったりにパディング
+        my $rr_prefix = pack('n', 0xc00c) . pack('nnN', 10, 1, 300);
+        my $min_with_rr = $base_min + length($rr_prefix) + 2;
+
+        if ($target_size < $min_with_rr) {
+            my $partial_rr = $rr_prefix . pack('n', 0);
+            my $full = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0) . $question_wire . $partial_rr;
+            return substr($full, 0, $target_size);
+        }
+
+        my $rdlen = $target_size - $min_with_rr;
+        my $rdata = "X" x $rdlen;
+
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $rr_prefix . pack('n', $rdlen) . $rdata;
+
+        return $pkt;
+    }
+    
+    # --------------------------------------------------------------------------
+    # 3. Label & Name Boundary Violations
+    # --------------------------------------------------------------------------
+    if ($scenario eq 'label-overflow' || $scenario eq 'label-64') {
+        # Label length declared as 64 (0x40), exceeding RFC 1035 max of 63
+        my $bad_name = pack('C', 64) . ("a" x 64) . "\x00";
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $bad_name . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+        return $pkt;
+    }
+    if ($scenario eq 'null-byte-in-label') {
+        # Embedded 0x00 byte inside label (poison test for C-string functions)
+        my $poison_label = "\x0bnull\x00byte\x00x" . encode_name($zone_apex);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $poison_label . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+        return $pkt;
+    }
+    if ($scenario eq 'case-0x20-mismatch') {
+        # Inverts ASCII casing in reflected Question section to test 0x20 verification
+        my $raw_qname_wire = substr($req, 12, length($qname_wire));
+        my $inverted_wire = $raw_qname_wire;
+        my $pos = 0;
+        my $wlen = length($inverted_wire);
+        while ($pos < $wlen) {
+            my $llen = ord(substr($inverted_wire, $pos, 1));
+            last if $llen == 0 || ($llen & 0xC0) == 0xC0;
+            $pos++;
+            for (my $i = 0; $i < $llen && $pos < $wlen; $i++, $pos++) {
+                my $c = substr($inverted_wire, $pos, 1);
+                $c =~ tr/a-zA-Z/A-Za-z/;
+                substr($inverted_wire, $pos, 1, $c);
+            }
+        }
+        my $bad_question = $inverted_wire . pack('nn', $qtype, $qclass);
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
+        $pkt .= $bad_question;
+        $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+        return $pkt;
+    }
 
     # --------------------------------------------------------------------------
-    # 3. Section Count & Record Semantics
+    # 4. Section Count & Record Semantics
     # --------------------------------------------------------------------------
+    if ($scenario eq 'class-mismatch') {
+        # QCLASS=IN (1), but Answer CLASS=3 (CH / Chaosnet)
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $qname_wire . pack('nnNn', 1, 3, 300, 4) . pack('C4', 192, 0, 2, 1);
+        return $pkt;
+    }
+    if ($scenario eq 'meta-type-in-answer') {
+        # Answer section contains Meta-QTYPE 255 (ANY)
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $qname_wire . pack('nnNn', 255, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
+        return $pkt;
+    }
+    # --------------------------------------------------------------------------
+    # Genuine DNAME Loop (RFC 6672)
+    # Returns 4 records (2x DNAME + 2x CNAME) with NOERROR to test client-side loop detection
+    # --------------------------------------------------------------------------
+    if ($scenario eq 'dname-loop' || $scenario =~ /^dname-[ab]$/) {
+        # サーバー側はループを気にせず、何食わぬ顔で NOERROR (RCODE=0) を返す
+        my $flags_val = 0x8400; # QR=1, AA=1, RCODE=0 (NOERROR)
+        $flags_val |= 0x0100 if ($flags & 0x0100); # クエリの RD ビットを反映
+
+        # 相互参照する2つの親ドメイン
+        my $base1 = "dname1." . ($zone_apex ne '' ? $zone_apex : "anomaly.test");
+        my $base2 = "dname2." . ($zone_apex ne '' ? $zone_apex : "anomaly.test");
+
+        # サブドメイン名（1.dname-loop... で引かれたら '1'、単体なら 'loop'）
+        my $sub = $dname_sublabel // 'loop';
+
+        my $name1 = "$sub.$base1";
+        my $name2 = "$sub.$base2";
+
+        # 起点の決定
+        my ($curr_base, $target_base, $curr_name, $target_name);
+        if ($scenario eq 'dname-b' || $qname_clean =~ /\Q$base2\E$/i) {
+            $curr_base   = $base2;
+            $target_base = $base1;
+            $curr_name   = $name2;
+            $target_name = $name1;
+        } else {
+            $curr_base   = $base1;
+            $target_base = $base2;
+            $curr_name   = $name1;
+            $target_name = $name2;
+        }
+
+        my $curr_base_wire   = encode_name($curr_base);
+        my $target_base_wire = encode_name($target_base);
+        # QNAME のワイヤフォーマットをそのまま第1 CNAME の所有名として利用
+        my $curr_name_wire   = ($qname_clean eq $curr_name) ? $qname_wire : encode_name($curr_name);
+        my $target_name_wire = encode_name($target_name);
+
+        # ----------------------------------------------------------------------
+        # BIND と同じ 4つの ANSWER レコード (DNAME 2つ + 合成 CNAME 2つ)
+        # 1. curr_base   DNAME target_base
+        # 2. curr_name   CNAME target_name (合成)
+        # 3. target_base DNAME curr_base
+        # 4. target_name CNAME curr_name   (合成 -> 2へループバック)
+        # ----------------------------------------------------------------------
+        my $answers = '';
+        $answers .= $curr_base_wire   . pack('nnNn', 39, 1, 1800, length($target_base_wire)) . $target_base_wire;
+        $answers .= $curr_name_wire   . pack('nnNn',  5, 1, 1800, length($target_name_wire)) . $target_name_wire;
+        $answers .= $target_base_wire . pack('nnNn', 39, 1, 1800, length($curr_base_wire))   . $curr_base_wire;
+        $answers .= $target_name_wire . pack('nnNn',  5, 1, 1800, length($curr_name_wire))   . $curr_name_wire;
+
+        # QDCOUNT=1, ANCOUNT=4, NSCOUNT=0, ARCOUNT=0
+        my $pkt = $id_raw . pack('n5', $flags_val, 1, 4, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $answers;
+        return $pkt;
+    }
+    if ($scenario eq 'dname-overflow') {
+        # Synthesized domain name exceeds 255 bytes limit -> returns YXDOMAIN (RFC 6672 §2.4)
+        my $long_target = ("x" x 60) . "." . ("y" x 60) . "." . ("z" x 60) . "." . ("w" x 60) . ".test.";
+        my $target_wire = encode_name($long_target);
+        my $pkt = $id_raw . pack('n5', 0x8406, 1, 1, 0, 0); # RCODE=6 (YXDOMAIN)
+        $pkt .= $question_wire;
+        $pkt .= $qname_wire . pack('nnNn', 39, 1, 300, length($target_wire)) . $target_wire;
+        return $pkt;
+    }
     if ($scenario eq 'nscount-underflow') {
-        # Header claims NSCOUNT=3, but only 1 NS RR is present
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 3, 0);
         $pkt .= $question_wire;
         my $ns_target = encode_name("ns1." . ($zone_apex ne '' ? $zone_apex : "anomaly.test"));
@@ -721,7 +966,6 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'nscount-overflow') {
-        # Header claims NSCOUNT=1, but 2 NS RRs are present
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 1, 0);
         $pkt .= $question_wire;
         my $ns1 = encode_name("ns1." . ($zone_apex ne '' ? $zone_apex : "anomaly.test"));
@@ -731,7 +975,6 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'arcount-underflow') {
-        # Header claims ARCOUNT=3, but only 1 TXT RR is present in Additional section
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 3);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
@@ -739,7 +982,6 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'arcount-overflow') {
-        # Header claims ARCOUNT=1, but 2 TXT RRs are present in Additional section
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 1);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
@@ -748,21 +990,18 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'zero-ttl') {
-        # Answer record with TTL = 0
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 0, 4) . pack('C4', 192, 0, 2, 1);
         return $pkt;
     }
     if ($scenario eq 'huge-ttl') {
-        # Answer record with TTL = 0xFFFFFFFF (RFC 2181 §8 boundary)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 0xFFFFFFFF, 4) . pack('C4', 192, 0, 2, 1);
         return $pkt;
     }
     if ($scenario eq 'cname-loop') {
-        # Mutually referencing CNAME loop (A -> B -> A)
         my $target_name = "cname-loop-target." . ($zone_apex ne '' ? $zone_apex : "anomaly.test");
         my $target_wire = encode_name($target_name);
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 2, 0, 0);
@@ -772,7 +1011,6 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'cname-with-data') {
-        # CNAME and A record coexistence at same owner name (RFC 1034 §3.6.2 violation)
         my $target_name = "cname-target." . ($zone_apex ne '' ? $zone_apex : "anomaly.test");
         my $target_wire = encode_name($target_name);
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 2, 0, 0);
@@ -783,52 +1021,80 @@ sub process_query_packet {
     }
 
     # --------------------------------------------------------------------------
-    # 4. RDATA Truncation & Boundary Violations
+    # 5. Transport & Buffer Oversize
+    # --------------------------------------------------------------------------
+    if ($scenario eq 'edns-bufsize-exceeded') {
+        # Intentionally exceeds advertised buffer size by ~300 bytes without setting TC=1
+        my $target_size = $client_bufsize + 300;
+        $target_size = 1420 if $target_size < 1420;
+        my $flags_val = 0x8400; # TC=0 intentionally
+        my $rr_prefix = pack('n', 0xc00c) . pack('nnN', 10, 1, 300); # NULL RR
+        my $base_len = 12 + length($question_wire) + length($rr_prefix) + 2;
+        my $pad_len = $target_size - $base_len;
+        $pad_len = 500 if $pad_len < 500;
+        my $rdata = "X" x $pad_len;
+
+        my $pkt = $id_raw . pack('n5', $flags_val, 1, 1, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $rr_prefix . pack('n', length($rdata)) . $rdata;
+        return $pkt;
+    }
+    if ($scenario eq 'tcp-max-65535' || $scenario eq 'huge-tcp-65535') {
+        # Generates exact maximum possible DNS message size: 65,535 bytes
+        # When queried via UDP, KariDNS will automatically truncate (TC=1) and client falls back to TCP
+        my $flags_val = 0x8400;
+        my $rr_prefix = pack('n', 0xc00c) . pack('nnN', 10, 1, 300);
+        my $base_len = 12 + length($question_wire) + length($rr_prefix) + 2;
+        my $rdlen = 65535 - $base_len;
+        $rdlen = 0 if $rdlen < 0;
+        my $rdata = "\x00" x $rdlen;
+
+        my $pkt = $id_raw . pack('n5', $flags_val, 1, 1, 0, 0);
+        $pkt .= $question_wire;
+        $pkt .= $rr_prefix . pack('n', $rdlen) . $rdata;
+        return $pkt;
+    }
+
+    # --------------------------------------------------------------------------
+    # 6. RDATA Truncation & Boundary Violations   
     # --------------------------------------------------------------------------
     if ($scenario eq 'rdata-short-a') {
-        # TYPE=A, RDLENGTH=4, but only 2 bytes provided
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . "\xc0\x00";
         return $pkt;
     }
     if ($scenario eq 'rdata-short-aaaa') {
-        # TYPE=AAAA, RDLENGTH=16, but only 8 bytes provided
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 28, 1, 300, 16) . pack('C8', 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1);
         return $pkt;
     }
     if ($scenario eq 'rdata-soa-truncated') {
-        # SOA record ends abruptly
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 6, 1, 300, 30) . "\x02ns\x07example";
         return $pkt;
     }
     if ($scenario eq 'rdata-mx-truncated') {
-        # MX with preference only
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 15, 1, 300, 2) . pack('n', 10);
         return $pkt;
     }
     if ($scenario eq 'rdata-txt-len-mismatch') {
-        # TXT length declares 100, but RDLENGTH is 10
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 16, 1, 300, 10) . pack('C', 100) . "123456789";
         return $pkt;
     }
     if ($scenario eq 'rdata-svcb-overflow') {
-        # SVCB TargetName length exceeds RDLENGTH
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 64, 1, 300, 8) . pack('n', 1) . "\x14target";
         return $pkt;
     }
     if ($scenario eq 'rdata-opt-truncated') {
-        # OPT RR with truncated option
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 1);
         $pkt .= $question_wire;
         $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, 8) . pack('nn', 10, 16) . "1234";
@@ -836,10 +1102,9 @@ sub process_query_packet {
     }
 
     # --------------------------------------------------------------------------
-    # 5. EDNS0 (RFC 6891) Boundary & Violations
+    # 7. EDNS0 (RFC 6891) Boundary & Violations
     # --------------------------------------------------------------------------
     if ($scenario eq 'multi-opt') {
-        # Multiple (2) OPT pseudo-RRs in Additional section (RFC 6891 §6.1.1 FORMERR)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 2);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
@@ -848,7 +1113,6 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'opt-in-answer') {
-        # OPT pseudo-RR placed in Answer section instead of Additional (RFC 6891 §6.1.1)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 2, 0, 0);
         $pkt .= $question_wire;
         $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
@@ -856,15 +1120,12 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'opt-badvers') {
-        # OPT pseudo-RR with EDNS Version=1 (RFC 6891: unsupported version -> BADVERS=16)
-        # TTL layout: EXT-RCODE(8) | VERSION(8) | EDNS-FLAGS(16) -> VERSION=1 is 0x00010000
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 1);
         $pkt .= $question_wire;
         $pkt .= "\x00" . pack('nnNn', 41, 4096, 0x00010000, 0);
         return $pkt;
     }
     if ($scenario eq 'opt-unknown-option') {
-        # OPT RR containing unknown option code 65001 (0xFDE9)
         my $unknown_opt = pack('nn', 65001, 4) . "\xde\xad\xbe\xef";
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 1);
         $pkt .= $question_wire;
@@ -873,7 +1134,6 @@ sub process_query_packet {
         return $pkt;
     }
     if ($scenario eq 'opt-option-len-overflow') {
-        # OPT RR RDLENGTH=6, but Option Length declared as 20 bytes (exceeds RDLENGTH)
         my $pkt = $id_raw . pack('n5', 0x8400, 1, 0, 0, 1);
         $pkt .= $question_wire;
         $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, 6) . pack('nn', 15, 20) . "12";
@@ -881,13 +1141,12 @@ sub process_query_packet {
     }
 
     # --------------------------------------------------------------------------
-    # 6. Protocol & Security Flags (Cookies, Truncation)
+    # 8. Protocol & Security Flags (Cookies, Truncation)
     # --------------------------------------------------------------------------
     if ($scenario eq 'cookie-badcookie') {
         my $srv_cookie = "\x11\x22\x33\x44\x55\x66\x77\x88";
         my $cl_c = $client_cookie // "\x01\x02\x03\x04\x05\x06\x07\x08";
         if (defined $server_cookie && $server_cookie eq $srv_cookie) {
-            # Verified server cookie returned on retry: respond with NOERROR Answer
             my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 1);
             $pkt .= $question_wire;
             $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
@@ -895,7 +1154,6 @@ sub process_query_packet {
             $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, length($copt)) . $copt;
             return $pkt;
         } else {
-            # First query without valid server cookie: return BADCOOKIE (RCODE 23)
             my $pkt = $id_raw . pack('n5', 0x8407, 1, 0, 0, 1);
             $pkt .= $question_wire;
             my $copt = pack('nn', 10, 16) . $cl_c . $srv_cookie;
@@ -904,14 +1162,13 @@ sub process_query_packet {
         }
     }
     if ($scenario eq 'truncated-tc') {
-        # TC=1 (Truncated) response
         my $pkt = $id_raw . pack('n5', 0x8600, 1, 0, 0, 0);
         $pkt .= $question_wire;
         return $pkt;
     }
     if ($scenario =~ /^flags?-(.*)$/) {
         my $spec = lc($1);
-        my $flag_val = 0x8400; # Base: QR=1, AA=1
+        my $flag_val = 0x8400;
         my $desc = "Flag test: ";
         my $edns_do = 0;
         my $edns_co = 0;
@@ -923,40 +1180,40 @@ sub process_query_packet {
             $flag_val = int($1) & 0xFFFF;
             $desc .= sprintf("Custom flags %d (0x%04X)", $flag_val, $flag_val);
         } elsif ($spec eq 'rd') {
-            $flag_val = 0x8500; # QR=1, AA=1, RD=1
+            $flag_val = 0x8500;
             $desc .= "RD=1 (Recursion Desired) unsolicitedly set in response";
         } elsif ($spec eq 'ra') {
-            $flag_val = 0x8480; # QR=1, AA=1, RA=1
+            $flag_val = 0x8480;
             $desc .= "RA=1 (Recursion Available) unsolicitedly set in response";
         } elsif ($spec eq 'ad') {
-            $flag_val = 0x8420; # QR=1, AA=1, AD=1
+            $flag_val = 0x8420;
             $desc .= "AD=1 (Authentic Data) set in response";
         } elsif ($spec eq 'cd') {
-            $flag_val = 0x8410; # QR=1, AA=1, CD=1
+            $flag_val = 0x8410;
             $desc .= "CD=1 (Checking Disabled) set in response";
         } elsif ($spec eq 'z' || $spec eq 'mbz') {
-            $flag_val = 0x8440; # QR=1, AA=1, Z=1 (MBZ bit 0x0040)
+            $flag_val = 0x8440;
             $desc .= "Reserved Z-bit (MBZ 0x0040) set to 1 in response";
         } elsif ($spec eq 'no-aa' || $spec eq 'aa0') {
-            $flag_val = 0x8000; # QR=1, AA=0
+            $flag_val = 0x8000;
             $desc .= "AA=0 (Authoritative Answer bit cleared) in response";
         } elsif ($spec eq 'no-qr' || $spec eq 'qr0') {
-            $flag_val = 0x0400; # QR=0, AA=1 (claims to be query)
+            $flag_val = 0x0400;
             $desc .= "QR=0 (Query/Response bit cleared, response masquerade) in packet";
         } elsif ($spec eq 'tc' || $spec eq 'tc-record') {
-            $flag_val = 0x8600; # QR=1, AA=1, TC=1
+            $flag_val = 0x8600;
             $desc .= "TC=1 (Truncation) with answer records attached";
         } elsif ($spec eq 'rd-ra') {
-            $flag_val = 0x8580; # QR=1, AA=1, RD=1, RA=1
+            $flag_val = 0x8580;
             $desc .= "Both RD=1 and RA=1 unsolicitedly set in response";
         } elsif ($spec eq 'ad-cd') {
-            $flag_val = 0x8430; # QR=1, AA=1, AD=1, CD=1
+            $flag_val = 0x8430;
             $desc .= "Both AD=1 and CD=1 set in response";
         } elsif ($spec eq 'all') {
-            $flag_val = 0x85F0; # QR=1, AA=1, RD=1, RA=1, Z=1, AD=1, CD=1
+            $flag_val = 0x85F0;
             $desc .= "ALL header flags set (QR=1, AA=1, RD=1, RA=1, AD=1, CD=1, Z=1 [0x85F0])";
         } elsif ($spec eq 'all-tc') {
-            $flag_val = 0x87F0; # All flags including TC
+            $flag_val = 0x87F0;
             $desc .= "ALL header flags set including TC (QR=1, AA=1, TC=1, RD=1, RA=1, AD=1, CD=1, Z=1 [0x87F0])";
         } elsif ($spec eq 'do') {
             $flag_val = 0x8400;
@@ -993,7 +1250,6 @@ sub process_query_packet {
             $flag_val = 0x0000;
             $desc .= "No flags set (0x0000)";
         } else {
-            # Combinations like flag-rd-ad, flag-rd+do, flag-ad-co, etc.
             my $norm = $spec;
             $norm =~ s/[+_]/-/g;
 
@@ -1029,16 +1285,13 @@ sub process_query_packet {
         my $additionals = '';
 
         if ($qtype == 16) {
-            # QTYPE=TXT: Return explanation in ANSWER section
             $answers .= encode_txt_rr($qname, $desc, 300);
             $ancount++;
         } elsif ($qtype == 255) {
-            # QTYPE=ANY: Return both A and TXT in ANSWER section
             $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
             $answers .= encode_txt_rr($qname, $desc, 300);
             $ancount += 2;
         } else {
-            # Default (A or others): Return A record in ANSWER, TXT in ADDITIONAL
             $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
             $ancount++;
             $additionals .= encode_txt_rr($qname, $desc, 300);
@@ -1047,9 +1300,8 @@ sub process_query_packet {
 
         if ($edns_do || $edns_co) {
             my $ext_flags = 0;
-            $ext_flags |= 0x8000 if $edns_do; # DO bit
-            $ext_flags |= 0x4000 if $edns_co; # CO bit
-            # OPT pseudo-RR: Name=\x00, TYPE=41, CLASS=4096 (UDP size), TTL=ext_flags (32-bit: lower 16 bits are EDNS flags), RDLEN=0
+            $ext_flags |= 0x8000 if $edns_do;
+            $ext_flags |= 0x4000 if $edns_co;
             $additionals .= "\x00" . pack('nnNn', 41, 4096, $ext_flags, 0);
             $arcount++;
         }
@@ -1062,7 +1314,7 @@ sub process_query_packet {
     }
 
     # --------------------------------------------------------------------------
-    # 7. RFC Standard & Extended RCODEs
+    # 9. RFC Standard & Extended RCODEs
     # --------------------------------------------------------------------------
     my %RCODE_INFO = (
         0  => { name => 'NOERROR',       rfc => 'RFC 1035', desc => 'No Error condition' },
@@ -1155,33 +1407,26 @@ sub process_query_packet {
             my $additionals = '';
 
             if ($qtype == 16) {
-                # QTYPE=TXT: Return explanation in ANSWER section
                 $answers .= encode_txt_rr($qname, $desc, 300);
                 $ancount++;
             } elsif ($qtype == 255) {
-                # QTYPE=ANY: Return both A and TXT in ANSWER section
                 $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
                 $answers .= encode_txt_rr($qname, $desc, 300);
                 $ancount += 2;
             } else {
-                # Default (A or others):
                 if ($rcode_val == 0) {
-                    # NOERROR: Return A record in ANSWER
                     $answers .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', 192, 0, 2, 1);
                     $ancount++;
                 }
-                # Attach explanation TXT in ADDITIONAL section for diagnostic experience
                 $additionals .= encode_txt_rr($qname, $desc, 300);
                 $arcount++;
             }
 
-            # If RCODE > 15 (EDNS Extended RCODE) or client had EDNS, append OPT pseudo-RR
             my $client_has_edns = (defined($client_cookie) || $req =~ /\x00\x00\x29/s);
             if ($ext_rc > 0 || $client_has_edns) {
                 my $ttl_ext = ($ext_rc << 24);
                 my $opt_rdata = '';
                 if ($rcode_val == 23) {
-                    # BADCOOKIE (RFC 7873): return Server Cookie in OPT RR
                     my $srv_c = "\x11\x22\x33\x44\x55\x66\x77\x88";
                     my $cl_c  = $client_cookie // "\x01\x02\x03\x04\x05\x06\x07\x08";
                     $opt_rdata = pack('nn', 10, 16) . $cl_c . $srv_c;
@@ -1199,7 +1444,7 @@ sub process_query_packet {
     }
 
     # --------------------------------------------------------------------------
-    # 8. Extended DNS Errors (EDE, RFC 8914)
+    # 10. Extended DNS Errors (EDE, RFC 8914)
     # --------------------------------------------------------------------------
     if ($scenario eq 'ede-all') {
         my $pkt = $id_raw . pack('n5', 0x8402, 1, 0, 0, 1);
@@ -1249,6 +1494,13 @@ sub process_query_packet {
         my $ede_opt = pack('nnn', 15, length($ede_text) + 2, 0) . $ede_text;
         $pkt .= "\x00" . pack('nnNn', 41, 4096, 0, length($ede_opt)) . $ede_opt;
         return $pkt;
+    }
+    if ($scenario eq 'what-is-my-ip') {
+        my $pkt = $id_raw . pack('n5', 0x8400, 1, 1, 0, 0);
+        my @ip_adr = split(/\./, $client_ip);
+        $pkt .= $question_wire;
+        $pkt .= $qname_wire . pack('nnNn', 1, 1, 300, 4) . pack('C4', $ip_adr[0], $ip_adr[1], $ip_adr[2], $ip_adr[3]);
+        return $pkt; 
     }
 
     # --------------------------------------------------------------------------

@@ -92,11 +92,13 @@ _https._tcp     IN URI 10 1 "https://www.example.com/"
 ; ----------------------------------------------------------------------------
 ; HTTPS / SVCB (RFC 9460)
 ; ----------------------------------------------------------------------------
-@       IN HTTPS 1 . alpn=h2,h3
+@       IN HTTPS 1 . alpn=h2,h3 ipv4hint=192.0.2.1 ipv6hint=2001:db8::1
 www     IN HTTPS 1 . alpn=h2
+hints   IN HTTPS 1 . alpn=h2 ipv4hint=192.0.2.1 ipv6hint=2001:db8::1
 
 svc             IN A 192.0.2.40
 _8443._tcp.svc  IN SVCB 1 svc.example.com. alpn=h2 port=8443
+svchints        IN SVCB 1 svc.example.com. alpn=h2 port=8443 ipv4hint=192.0.2.40 ipv6hint=2001:db8::40
 
 dns             IN A 192.0.2.53
                 IN AAAA 2001:db8::53

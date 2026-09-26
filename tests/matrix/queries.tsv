@@ -1,0 +1,43 @@
+# ==============================================================================
+# KariDNS Matrix Query Test Specification
+# Format:
+# ZONE	QNAME	QTYPE	FLAGS	EXPECT_RCODE	EXPECT_ANS	EXPECT_AUTH	RFC_REF
+# ==============================================================================
+wildcard.test	foo.wildcard.test	A	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	foo.sub.wildcard.test	A	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	foo.sub.wildcard.test	AAAA	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	ent.sub.wildcard.test	A	+nodnssec	NOERROR	0	SOA	RFC 1034 §4.3.3 (ENT NODATA)
+wildcard.test	exact.wildcard.test	A	+nodnssec	NOERROR	1	-	RFC 1034 §4.3.3
+wildcard.test	cname-wild.wildcard.test	A	+nodnssec	NOERROR	2	-	RFC 1034 §3.6.2
+dname.test	foo.sub.dname.test	A	+nodnssec	NOERROR	3	-	RFC 6672 §2.2 (DNAME + Synthetic CNAME + Target A)
+dname.test	foo.sub.dname.test	AAAA	+nodnssec	NOERROR	3	-	RFC 6672 §2.2 (DNAME + Synthetic CNAME + Target AAAA)
+deleg.test	host.sub1.deleg.test	A	+nodnssec	NOERROR	0	NS	RFC 1034 §4.2.1 (In-bailiwick Referral)
+deleg.test	sub2.deleg.test	A	+nodnssec	NOERROR	0	NS	RFC 1034 §4.2.1 (Out-of-bailiwick Referral)
+nsec.test	host.nsec.test	A	+dnssec	NOERROR	2	-	RFC 4035 §3.1.1 (A + covering RRSIG)
+nsec.test	nonexistent.nsec.test	A	+dnssec	NXDOMAIN	0	NSEC	RFC 4035 §3.1.3.2 (NSEC NXDOMAIN Denial)
+nsec.test	host.nsec.test	TXT	+dnssec	NOERROR	0	NSEC	RFC 4035 §3.1.3.1 (NSEC NODATA Proof)
+nsec.test	bar.wild.nsec.test	A	+dnssec	NOERROR	2	NSEC	RFC 4035 §3.1.3.3 (Wildcard Expansion + RRSIG + NSEC)
+chain.test	c1.chain.test	A	+nodnssec	NOERROR	4	-	RFC 1034 §3.6.2 (CNAME Chain Resolution)
+chain.test	loop-a.chain.test	A	+nodnssec	NOERROR	-	-	RFC 1034 §3.6.2 (CNAME Loop Protection)
+alltypes.test	host-a.alltypes.test	A	+nodnssec	NOERROR	1	-	RFC 1035 (A record)
+alltypes.test	host-aaaa.alltypes.test	AAAA	+nodnssec	NOERROR	1	-	RFC 3596 (AAAA record)
+alltypes.test	host-txt.alltypes.test	TXT	+nodnssec	NOERROR	1	-	RFC 1035 (TXT record)
+alltypes.test	host-mx.alltypes.test	MX	+nodnssec	NOERROR	1	-	RFC 1035 (MX record)
+alltypes.test	host-srv.alltypes.test	SRV	+nodnssec	NOERROR	1	-	RFC 2782 (SRV record)
+alltypes.test	host-caa.alltypes.test	CAA	+nodnssec	NOERROR	1	-	RFC 8659 (CAA record)
+alltypes.test	host-naptr.alltypes.test	NAPTR	+nodnssec	NOERROR	1	-	RFC 3403 (NAPTR record)
+alltypes.test	host-sshfp.alltypes.test	SSHFP	+nodnssec	NOERROR	1	-	RFC 4255 (SSHFP record)
+alltypes.test	host-tlsa.alltypes.test	TLSA	+nodnssec	NOERROR	1	-	RFC 6698 (TLSA record)
+alltypes.test	host-svcb.alltypes.test	SVCB	+nodnssec	NOERROR	1	-	RFC 9460 (SVCB record)
+alltypes.test	host-https.alltypes.test	HTTPS	+nodnssec	NOERROR	1	-	RFC 9460 (HTTPS record)
+alltypes.test	host-hinfo.alltypes.test	HINFO	+nodnssec	NOERROR	1	-	RFC 1035 (HINFO record)
+alltypes.test	host-rp.alltypes.test	RP	+nodnssec	NOERROR	1	-	RFC 1183 (RP record)
+alltypes.test	host-afsdb.alltypes.test	AFSDB	+nodnssec	NOERROR	1	-	RFC 1183 (AFSDB record)
+alltypes.test	host-loc.alltypes.test	LOC	+nodnssec	NOERROR	1	-	RFC 1876 (LOC record)
+alltypes.test	host-spf.alltypes.test	SPF	+nodnssec	NOERROR	1	-	RFC 4408 (SPF record)
+alltypes.test	host-uri.alltypes.test	URI	+nodnssec	NOERROR	1	-	RFC 7553 (URI record)
+alltypes.test	host-cert.alltypes.test	CERT	+nodnssec	NOERROR	1	-	RFC 4398 (CERT record)
+alltypes.test	host-kx.alltypes.test	KX	+nodnssec	NOERROR	1	-	RFC 2230 (KX record)
+alltypes.test	host-dname.alltypes.test	DNAME	+nodnssec	NOERROR	1	-	RFC 6672 (DNAME record)
+alltypes.test	nonexistent.alltypes.test	A	+nodnssec	NXDOMAIN	0	SOA	RFC 1034 (NXDOMAIN negative response)
+alltypes.test	host-a.alltypes.test	TXT	+nodnssec	NOERROR	0	SOA	RFC 1034 (NODATA negative response)

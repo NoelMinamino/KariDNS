@@ -733,8 +733,7 @@ static void test_third_party_patch_records(void) {
         // Wire serialization dry-run check
         uint8_t wire[512];
         uint16_t offset = 0;
-        compress_ctx_t comp;
-        memset(&comp, 0, sizeof(comp));
+        compress_ctx_t comp = {0};
         compress_ctx_init_packet(&comp);
         int wire_res = serialize_dns_record(wire, sizeof(wire), &offset, r, &comp, NULL, 0xFFFFFFFF);
         TEST_ASSERT(wire_res == 0, "Record wire serialization must succeed");

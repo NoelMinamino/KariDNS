@@ -10,6 +10,11 @@ on:
       - 'feature/**'
       - 'fix/**'
       - 'improve/**'
+    # "labeled": adding the "coverage" label to a PR starts the coverage job
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # nightly coverage gate (03:17 JST)
+    - cron: '17 18 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -19,7 +24,10 @@ concurrency:
 jobs:
   build-and-test-freebsd:
     name: Build and Test on FreeBSD ${{ matrix.release }}
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ubuntu-latest
+    # a hung test must fail the job instead of blocking it for hours
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -45,13 +53,24 @@ jobs:
             make -j"$NCPU" all asan tsan tools-asan fuzz_all asan_test tinydns_test hash_test include_test response_cache_test vulnerability_test bench_serialize
             echo "::endgroup::"
 
-            echo "::group::🛡️ [Security Test] Run ASan Boundary Tests"
-            ./test_asan_overflow
-            ./test_tinydns_parser
-            ./test_hash_table
-            ./test_conf_include
-            ./test_response_cache
-            ./test_vulnerability_fixes
+            echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests)"
+            # Previously only 6 of the C unit tests ran in CI (asan, tinydns, hash, include,
+            # response_cache, vulnerability). `unit-tests` builds and runs every binary, sequentially.
+            # build every test binary in parallel first; the tests then run one by one
+            # (stdin from /dev/null: no test may block reading the VM session's stdin)
+            make -j"$NCPU" unit-test-bins
+            make unit-tests < /dev/null
+            echo "::endgroup::"
+
+            echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan"
+            # The plain test_* binaries use production CFLAGS, so they are NOT sanitizer-checked
+            # (test_asan_overflow included). This rebuilds every unit test with
+            # -fsanitize=address,undefined (UBSan findings are fatal); leak checks are off by default
+            # (UT_ASAN_LEAKS=1 enables them once the tests' teardown is complete).
+            # Burn-in: first FreeBSD run is reported as a warning; remove the fallback to make it blocking.
+            # -j: the ASan binaries (each compiles ~18 sources) build in parallel; the
+            # recipe still runs the tests sequentially
+            make -j"$NCPU" unit-tests-asan < /dev/null || echo "::warning title=unit-tests-asan::ASan/UBSan unit tests failed on FreeBSD ${{ matrix.release }} - see log above (non-blocking during burn-in)"
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
@@ -124,8 +143,57 @@ jobs:
             echo ""
             echo "🎉 All FreeBSD builds and smoke tests passed!"
 
+  unit-tests-portable:
+    name: Portable unit tests (+ASan/UBSan) on ${{ matrix.name }}
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc >= 2.36 is required for arc4random_buf(); ubuntu-24.04 ships 2.39.
+          - os: ubuntu-24.04
+            name: Linux (Ubuntu 24.04)
+            experimental: false
+          # macOS is verified only by CI itself (not locally): non-blocking until the first green run.
+          - os: macos-14
+            name: macOS 14 (ARM64)
+            experimental: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev zlib1g-dev libidn2-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3 zlib libidn2
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          LIBIDN2_PREFIX=$(brew --prefix libidn2 2>/dev/null || echo "")
+          echo "PKG_CONFIG_PATH=${OPENSSL_PREFIX}/lib/pkgconfig:${LIBIDN2_PREFIX}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+      # The server core needs FreeBSD (kqueue/Capsicum) and is covered by the FreeBSD job. These are
+      # the unit tests that do not touch FreeBSD-only APIs: cidr, tinydns parser, ASan-boundary,
+      # config include, dnstap, EDNS/cookies, RRL, RFC published vectors, dag tools.
+      - name: Portable unit tests
+        run: |
+          make clean
+          make unit-tests-portable
+
+      - name: Portable unit tests under ASan + UBSan
+        run: |
+          make unit-tests-portable-asan
+
   build-dag-unix:
     name: Build & Smoke Test dag on ${{ matrix.name }}
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -174,6 +242,7 @@ jobs:
 
   build-dag-windows:
     name: Build & Smoke Test dag on Windows (MinGW-w64)
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: windows-latest
     steps:
       - name: Checkout code
@@ -209,3 +278,56 @@ jobs:
           echo "Testing multiple UDP query..."
           ./dag.exe www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
           echo "::endgroup::"
+
+  # ---------------------------------------------------------------------------
+  # Coverage quality gate (FreeBSD only: the server core needs kqueue/Capsicum).
+  # Too slow for every PR, so it runs on pushes to main, nightly, on demand, and
+  # for PRs labelled "coverage". `make coverage` builds in parallel, skips the
+  # ASan/TSan-only suites (they run in build-and-test-freebsd) and runs the
+  # server fault-injection sweep and the dag network sweep in parallel lanes.
+  # ---------------------------------------------------------------------------
+  coverage-freebsd:
+    name: Coverage gate (FreeBSD 15.1)
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'coverage'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: make coverage inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '15.1'
+          copyback: true
+          run: |
+            set -e
+
+            echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
+            # Base llvm-cov on FreeBSD 15 aborts in "show"; the llvmNN-lite package
+            # provides llvm-covNN / llvm-profdataNN, which the Makefile picks up.
+            V=$(cc --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1)
+            pkg install -y perl5 "llvm${V}-lite"
+            echo "::endgroup::"
+
+            echo "::group::🧪 [Coverage] make coverage"
+            START=$(date +%s)
+            make coverage < /dev/null
+            echo "make coverage took $(( $(date +%s) - START ))s"
+            echo "::endgroup::"
+
+            echo "::group::🚦 [Gate] Phase 2 thresholds"
+            perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict
+            echo "::endgroup::"
+
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage_html
+          if-no-files-found: warn

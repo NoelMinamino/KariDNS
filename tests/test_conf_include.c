@@ -365,7 +365,94 @@ int main(void) {
         printf("  -> PASS (zone-level additional-from-auth correctly parsed)\n");
     }
 
+    // Test 11: Unknown blocks & unknown key properties (skip_unknown_block)
+    {
+        printf("[Test 11] Unknown blocks & properties (skip_unknown_block)...\n");
+        create_file("tests_inc_tmp/unknown_blocks.conf",
+                    "unknown-top-block { opt1 \"val\"; nested { opt2 \"val\"; }; };\n"
+                    "key \"test-key\" { unknown-prop \"val\"; algorithm \"hmac-sha256\"; secret \"k7e8vW8f0W4v9B+5Y8f0W4v9B+5Y8f0W4v9B+5Y8f0U=\"; };\n"
+                    "zone \"example.com\" { type master; file \"example.com.zone\"; unknown-zone-prop \"ignore\"; };\n");
+
+        char *buf = read_entire_file("tests_inc_tmp/unknown_blocks.conf", NULL, NULL);
+        assert(buf != NULL);
+        server_config_t cfg;
+        int res = parse_named_conf_ext(buf, "tests_inc_tmp/unknown_blocks.conf", &cfg);
+        free(buf);
+
+        assert(res == 0);
+        assert(cfg.keys != NULL && strcmp(cfg.keys->name, "test-key") == 0);
+        assert(cfg.zones != NULL && strcmp(cfg.zones->domain, "example.com.") == 0);
+        free_server_config_fields(&cfg);
+        printf("  -> PASS\n");
+    }
+
+    // Test 12: Comprehensive options (buffer sizes, dnstap, minimal-any, nsid)
+    {
+        printf("[Test 12] Comprehensive options & dnstap configuration block...\n");
+        create_file("tests_inc_tmp/full_options.conf",
+                    "options {\n"
+                    "    port 5353;\n"
+                    "    udp-recvbuf-size 8M;\n"
+                    "    udp-sndbuf-size 16M;\n"
+                    "    query-log-buffer-size 65536;\n"
+                    "    query-log-max-qps 10000;\n"
+                    "    minimal-any yes;\n"
+                    "    minimal-any-ttl 300;\n"
+                    "    minimal-responses yes;\n"
+                    "    wire-cache-max-records 5000;\n"
+                    "    max-mqtypes 8;\n"
+                    "    allow-program-zones yes;\n"
+                    "    nsid \"karidns-tokyo\";\n"
+                    "    tcp-idle-timeout 15000;\n"
+                    "    bind-address 127.0.0.1;\n"
+                    "};\n"
+                    "dnstap {\n"
+                    "    socket-path \"/tmp/dnstap.sock\";\n"
+                    "    identity \"karidns-server-1\";\n"
+                    "    version \"0.3.0\";\n"
+                    "    queue-size 8192;\n"
+                    "    log-queries yes;\n"
+                    "    log-responses yes;\n"
+                    "    require-connect yes;\n"
+                    "};\n");
+
+        char *buf = read_entire_file("tests_inc_tmp/full_options.conf", NULL, NULL);
+        assert(buf != NULL);
+        server_config_t cfg;
+        int res = parse_named_conf_ext(buf, "tests_inc_tmp/full_options.conf", &cfg);
+        free(buf);
+
+        assert(res == 0);
+        assert(cfg.port == 5353);
+        assert(cfg.udp_recvbuf_size == 8 * 1024 * 1024);
+        assert(cfg.udp_sndbuf_size == 16 * 1024 * 1024);
+        assert(cfg.query_log_buffer_size == 65536);
+        assert(cfg.query_log_max_qps == 10000);
+        assert(cfg.minimal_any == true);
+        assert(cfg.minimal_any_ttl == 300);
+        assert(cfg.minimal_responses == true);
+        assert(cfg.wire_cache_max_records == 5000);
+        assert(cfg.max_mqtypes == 8);
+        assert(cfg.allow_program_zones == true);
+        assert(cfg.nsid_string != NULL && strcmp(cfg.nsid_string, "karidns-tokyo") == 0);
+        assert(cfg.tcp_idle_timeout == 15000);
+        assert(cfg.bind_address_count == 1);
+        assert(cfg.dnstap.enabled == true);
+        assert(strcmp(cfg.dnstap.socket_path, "/tmp/dnstap.sock") == 0);
+        assert(strcmp(cfg.dnstap.identity, "karidns-server-1") == 0);
+        assert(strcmp(cfg.dnstap.version, "0.3.0") == 0);
+        assert(cfg.dnstap.queue_size == 8192);
+        assert(cfg.dnstap.log_auth_query == true);
+        assert(cfg.dnstap.log_auth_response == true);
+        assert(cfg.dnstap.require_connect == true);
+
+        free_server_config_fields(&cfg);
+        printf("  -> PASS\n");
+    }
+
     // Clean up temporary test files
+    unlink("tests_inc_tmp/unknown_blocks.conf");
+    unlink("tests_inc_tmp/full_options.conf");
     unlink("tests_inc_tmp/keys.conf");
     unlink("tests_inc_tmp/main_key.conf");
     unlink("tests_inc_tmp/slaves.conf");

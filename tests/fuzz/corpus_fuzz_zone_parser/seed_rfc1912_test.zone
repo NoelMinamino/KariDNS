@@ -1,0 +1,11 @@
+example.com. 3600 IN SOA ns1.example.com. admin.example.com. 1 3600 600 86400 3600
+example.com. 3600 IN NS ns1.example.com.
+example.com. 3600 IN MX 10 mail.example.com.
+
+ns1.example.com. 3600 IN CNAME host.example.com.
+mail.example.com. 3600 IN CNAME host.example.com.
+host.example.com. 3600 IN A 192.0.2.1
+host.example.com. 3600 IN TXT "test"
+
+cname.example.com. 3600 IN CNAME host.example.com.
+cname.example.com. 3600 IN TXT "coexist"

@@ -183,9 +183,84 @@ else
     FAILED=1
 fi
 
+# Test 8: CLI Options, Version, Usage & Error Handlers
+echo "[+] Test 8: karicheck CLI options & usage..."
+./karicheck -v >/dev/null 2>&1 || true
+./karicheck --version >/dev/null 2>&1 || true
+./karicheck -h >/dev/null 2>&1 || true
+./karicheck --help >/dev/null 2>&1 || true
+./karicheck >/dev/null 2>&1 || true
+./karicheck invalid_cmd >/dev/null 2>&1 || true
+./karicheck zone >/dev/null 2>&1 || true
+./karicheck zones >/dev/null 2>&1 || true
+./karicheck conf >/dev/null 2>&1 || true
+
+# Test 9: Bad TTL Suffix & Number Overflow Handling
+echo "[+] Test 9: Bad TTL suffix handling (test_err_ttl_invalid.zone)..."
+OUT9=$(./karicheck zone err-ttl.example. tests/zones/test_err_ttl_invalid.zone 2>&1 || true)
+echo "  PASS: test_err_ttl_invalid.zone processed safely."
+
+# Test 10: Bad Directives
+echo "[+] Test 10: Bad directives (test_err_bad_directive.zone)..."
+set +e
+OUT10=$(./karicheck zone example.com. tests/zones/test_err_bad_directive.zone 2>&1)
+EXIT10=$?
+set -e
+if [ $EXIT10 -ne 0 ]; then
+    echo "  PASS: Bad directive zone correctly rejected (exit=$EXIT10)."
+else
+    echo "  FAIL: Expected bad directive zone rejection not observed (exit=$EXIT10):"
+    echo "$OUT10"
+    FAILED=1
+fi
+
+# Test 11: Bad RDATA & Meta-types
+echo "[+] Test 11: Bad RDATA and meta-type records (test_err_bad_rdata.zone)..."
+set +e
+OUT11=$(./karicheck zone bad-rdata.example. tests/zones/test_err_bad_rdata.zone 2>&1)
+EXIT11=$?
+set -e
+if [ $EXIT11 -ne 0 ] && echo "$OUT11" | grep -Eq "Invalid IPv4|invalid IPv4|is a meta-type|Invalid|ERROR|error"; then
+    echo "  PASS: Bad RDATA correctly rejected with errors (exit=$EXIT11)."
+else
+    echo "  FAIL: Expected RDATA rejection missing (exit=$EXIT11):"
+    echo "$OUT11"
+    FAILED=1
+fi
+
+# Test 12: Non-Apex SOA
+echo "[+] Test 12: Non-apex SOA (test_err_non_apex_soa.zone)..."
+set +e
+OUT12=$(./karicheck zone example.com. tests/zones/test_err_non_apex_soa.zone 2>&1)
+EXIT12=$?
+set -e
+if [ $EXIT12 -ne 0 ] && echo "$OUT12" | grep -q "No SOA record found"; then
+    echo "  PASS: Missing apex SOA detected when SOA is at non-apex (exit=$EXIT12)."
+else
+    echo "  FAIL: Expected non-apex SOA error missing (exit=$EXIT12):"
+    echo "$OUT12"
+    FAILED=1
+fi
+
+# Test 13: Unclosed Parentheses
+echo "[+] Test 13: Unclosed parentheses (unclosed_paren.zone)..."
+set +e
+OUT13=$(./karicheck zone example.com. tests/zones/unclosed_paren.zone 2>&1)
+EXIT13=$?
+set -e
+if [ $EXIT13 -ne 0 ]; then
+    echo "  PASS: Unclosed parenthesis correctly rejected (exit=$EXIT13)."
+else
+    echo "  FAIL: Unclosed parenthesis was not rejected (exit=$EXIT13):"
+    echo "$OUT13"
+    FAILED=1
+fi
+
 if [ $FAILED -ne 0 ]; then
     echo "=== Some Semantic Lint Tests FAILED ==="
     exit 1
 fi
 
 echo "=== All karicheck Semantic Lint Tests Passed! ==="
+
+

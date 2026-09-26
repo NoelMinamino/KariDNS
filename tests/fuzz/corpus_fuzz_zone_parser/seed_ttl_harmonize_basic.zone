@@ -1,0 +1,26 @@
+$TTL 3600
+$ORIGIN harmonize.test.
+; Test zone for RFC 2181 s5.2 TTL harmonization (Task 9)
+
+@ 3600 IN SOA ns1 hostmaster 2026090901 3600 900 604800 300
+@ 3600 IN NS ns1
+ns1 3600 IN A 127.0.0.1
+
+; Case 1: mixed A records with inconsistent TTLs -> normalized to 300
+mixed 300  IN A 1.2.3.4
+mixed 900  IN A 1.2.3.5
+
+; Case 2: RRSIG(A) TTL 3600 -> adjusted to 300 (covered A normalized TTL)
+mixed 3600 IN RRSIG A 13 2 300 20271231235959 20261231235959 12345 harmonize.test. YWJjZGVmZ2g=
+
+; Case 3: MX TTL 600 consistent + RRSIG(MX) TTL 600 (not confused with RRSIG(A)=300)
+mixed 600  IN MX 10 mail.harmonize.test.
+mixed 600  IN RRSIG MX 13 2 600 20271231235959 20261231235959 12345 harmonize.test. aGlqa2xtbm8=
+mail 600   IN A 10.0.0.1
+
+; Case 4: stable A records, TTL 1800 consistent (control group)
+stable 1800 IN A 192.168.0.1
+stable 1800 IN A 192.168.0.2
+
+; Case 5: orphan RRSIG - covered type NSEC absent -> no crash, TTL unchanged
+orphan 3600 IN RRSIG NSEC 13 2 3600 20271231235959 20261231235959 12345 harmonize.test. b3JwaGFucnNpZw==

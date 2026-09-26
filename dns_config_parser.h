@@ -97,6 +97,9 @@ typedef struct zone_config {
   additional_from_auth_t additional_from_auth;
   bool additional_from_auth_specified;
 
+  /* --- disable-auto-tc-flag (ゾーン単位の上書き: 既定 no) --- */
+  bool disable_auto_tc_flag;
+
   struct zone_config *next;
 } zone_config_t;
 
@@ -185,6 +188,12 @@ typedef struct server_config_s {
   bool tcp_connection_reuse;
   uint32_t tcp_idle_timeout;
   char *nsid_string;
+  /* RFC 9018 DNS Server Cookies. `cookie-secret "<32 hex>";` may be repeated: the first
+   * secret generates new Server Cookies, all secrets are accepted for verification
+   * (secret rollover). count == 0 -> a random per-process secret is used
+   * (NOT interoperable across anycast/multi-server deployments). */
+  uint8_t cookie_secrets[4][16];
+  int cookie_secret_count;
   int udp_recvbuf_size;
   int udp_sndbuf_size;
   bool allow_program_zones; /* 既定 false。trueでない限り type program は起動時エラーで拒否 */

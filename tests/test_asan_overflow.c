@@ -27,23 +27,29 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) 
 
 static int assert_bound_checked(dns_record_t *rec) {
     uint8_t big_buf[4096];
+    memset(big_buf, 0, sizeof(big_buf));
     uint16_t off1 = 0;
-    compress_ctx_t c1; compress_ctx_init_packet(&c1);
+    compress_ctx_t c1 = {0}; compress_ctx_init_packet(&c1);
     if (serialize_dns_record(big_buf, sizeof(big_buf), &off1, rec, &c1, NULL, 0) != 0) {
         printf("Bound-check test setup failed: type %u did not succeed with generous buffer\n", rec->type_code);
+        fflush(stdout);
         return 1;
     }
     uint8_t small_buf[4096];
+    memset(small_buf, 0, sizeof(small_buf));
     uint16_t off2 = 0;
-    compress_ctx_t c2; compress_ctx_init_packet(&c2);
+    compress_ctx_t c2 = {0}; compress_ctx_init_packet(&c2);
     if (serialize_dns_record(small_buf, off1 - 1, &off2, rec, &c2, NULL, 0) != -1) {
         printf("Bound-check test FAILED: type %u succeeded with max_res_len=%u-1 (should have failed)\n", rec->type_code, off1);
+        fflush(stdout);
         return 1;
     }
     return 0;
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     server_config_t cfg;
     
     // Test 1: 340 characters (accepted)
@@ -237,7 +243,7 @@ int main() {
         if (assert_bound_checked(&rec_isdn)) return 1;
 
         // NSAP (Type 22)
-        // ゾーンパ�Eサーで0xとドットが除去された後�E正規化されたHex斁E���Eを想宁E
+        // 繧ｾ繝ｼ繝ｳ繝代・繧ｵ繝ｼ縺ｧ0x縺ｨ繝峨ャ繝医′髯､蜴ｻ縺輔ｌ縺溷ｾ後・豁｣隕丞喧縺輔ｌ縺櫞ex譁・ｭ怜・繧呈Φ螳・
         dns_record_t rec_nsap = {0};
         rec_nsap.name = (char*)"example.com"; rec_nsap.type_code = 22; rec_nsap.rdata_count = 1;
         rec_nsap.rdata[0] = (char*)"47000580005a0000000001e133ffffff00016100";
@@ -276,7 +282,7 @@ int main() {
         {
             uint8_t packet[2048];
             uint16_t offset = 0;
-            compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
+            compress_ctx_t ctx = {0}; compress_ctx_init_packet(&ctx);
             dns_record_t rec_tlsa_multi = {0};
             rec_tlsa_multi.name = (char*)"_443._tcp.example.com";
             rec_tlsa_multi.type_code = 52; rec_tlsa_multi.rdata_count = 7;
@@ -310,7 +316,7 @@ int main() {
         {
             uint8_t packet[2048];
             uint16_t offset = 0;
-            compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
+            compress_ctx_t ctx = {0}; compress_ctx_init_packet(&ctx);
             if (serialize_dns_record(packet, 2048, &offset, &rec_cert, &ctx, NULL, 0) != -1) {
                 printf("Test 4 Failed: CERT with invalid base64 length did not fail\n"); return 1;
             }
@@ -340,7 +346,7 @@ int main() {
         {
             uint8_t packet[2048];
             uint16_t offset = 0;
-            compress_ctx_t ctx; compress_ctx_init_packet(&ctx);
+            compress_ctx_t ctx = {0}; compress_ctx_init_packet(&ctx);
             dns_record_t rec_zonemd_multi = {0};
             rec_zonemd_multi.name = (char*)"example.com";
             rec_zonemd_multi.type_code = 63; rec_zonemd_multi.rdata_count = 9;
@@ -447,27 +453,27 @@ int main() {
             free(buf); \
         } while(0)
 
-        // 正常系: 1-5 
+        // 豁｣蟶ｸ邉ｻ: 1-5 
         RUN_GEN_TEST("$GENERATE 1-5 host-$ A 10.0.0.$", false);
-        // 異常系: stop < start
+        // 逡ｰ蟶ｸ邉ｻ: stop < start
         RUN_GEN_TEST("$GENERATE 10-1 host-$ A 10.0.0.$", true);
-        // 異常系: step 0
+        // 逡ｰ蟶ｸ邉ｻ: step 0
         RUN_GEN_TEST("$GENERATE 1-10/0 host-$ A 10.0.0.$", true);
-        // 異常系: MAX_GENERATE_COUNT 趁E��
+        // 逡ｰ蟶ｸ邉ｻ: MAX_GENERATE_COUNT 雜・∴
         RUN_GEN_TEST("$GENERATE 1-999999 host-$ A 10.0.0.$", true);
-        // 異常系: width異常
+        // 逡ｰ蟶ｸ邉ｻ: width逡ｰ蟶ｸ
         RUN_GEN_TEST("$GENERATE 1-10 host-${0,999,d} A 10.0.0.$", true);
-        // 異常系: base異常
+        // 逡ｰ蟶ｸ邉ｻ: base逡ｰ蟶ｸ
         RUN_GEN_TEST("$GENERATE 1-10 host-${0,3,q} A 10.0.0.$", true);
-        // 正常系: $$
+        // 豁｣蟶ｸ邉ｻ: $$
         RUN_GEN_TEST("$GENERATE 1-5 host-$$ A 10.0.0.$", false);
-        // 正常系: 負のoffset
+        // 豁｣蟶ｸ邉ｻ: 雋�縺ｮoffset
         RUN_GEN_TEST("$GENERATE 1-5 host-${-5,3,d} A 10.0.0.$", false);
-        // 正常系: width 32-64
+        // 豁｣蟶ｸ邉ｻ: width 32-64
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,40,d} A 10.0.0.$", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ TXT ${0,64,d}", false);
         RUN_GEN_TEST("$GENERATE 1-2 host-${0,30,d}.${0,34,d} A 10.0.0.$", false);
-        // 異常系 / エチE��ケース: チE��プレート末尾カンマ�E欠落・未クローズ (Fuzzer Crash regression)
+        // 逡ｰ蟶ｸ邉ｻ / 繧ｨ繝・ず繧ｱ繝ｼ繧ｹ: 繝・Φ繝励Ξ繝ｼ繝域忰蟆ｾ繧ｫ繝ｳ繝槭・谺�關ｽ繝ｻ譛ｪ繧ｯ繝ｭ繝ｼ繧ｺ (Fuzzer Crash regression)
         RUN_GEN_TEST("$GENERATE 1-2 host-${,60, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${,, A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-${ A 10.0.0.$", true);
@@ -475,7 +481,7 @@ int main() {
         RUN_GEN_TEST("$GENERATE 1-2 host-${1,2,d A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,60,", true);
         RUN_GEN_TEST("$GENERATE 1-2 host-$ A 10.0.0.${,,", true);
-        // 異常系: range 構文の不正 (start/stop/step の省略めE��チE
+        // 逡ｰ蟶ｸ邉ｻ: range 讒区枚縺ｮ荳肴ｭ｣ (start/stop/step 縺ｮ逵∫払繧・ざ繝・
         RUN_GEN_TEST("$GENERATE - host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE 1- host-$ A 10.0.0.$", true);
         RUN_GEN_TEST("$GENERATE -5 host-$ A 10.0.0.$", true);
@@ -614,7 +620,7 @@ int main() {
         }
 
         // 5. Properly closed quote at EOF (no trailing newline, but valid closing quote)
-        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 末尾に改行なし、ただし正しく閉じてぁE��
+        char buf5[] = "example.com. 3600 IN TXT \"hello\"";  // 譛ｫ蟆ｾ縺ｫ謾ｹ陦後↑縺励√◆縺�縺玲ｭ｣縺励￥髢峨§縺ｦ縺・ｋ
         int r5 = parse_zone_fast(buf5, strlen(buf5), &arena, &ctx);
         if (r5 < 0) {
             printf("FAIL: Test 5 (properly closed quote at EOF) failed. err=%s\n", err.error_message ? err.error_message : "NULL");
@@ -816,8 +822,8 @@ int main() {
         zone_arena_t arena = {0};
         zone_arena_init(&arena);
         // 1. Single allocation limit (64MB)
-        // size自体が上限(64MB)を趁E��るケース、Eつ目のガーチE
-        // `size > (64 * 1024 * 1024)` で弾かれることを確認する、E
+        // size閾ｪ菴薙′荳企剞(64MB)繧定ｶ・∴繧九こ繝ｼ繧ｹ縲・縺､逶ｮ縺ｮ繧ｬ繝ｼ繝・
+        // `size > (64 * 1024 * 1024)` 縺ｧ蠑ｾ縺九ｌ繧九％縺ｨ繧堤｢ｺ隱阪☆繧九・
         void *p1 = arena_alloc(&arena, (64 * 1024 * 1024) + 1);
         if (p1 != NULL) {
             printf("FAIL: arena_alloc accepted allocation > 64MB\n");
@@ -831,10 +837,10 @@ int main() {
     // Test 10b: arena_alloc Addition Overflow Prevention (strict)
     {
         printf("\n--- Test 10b: arena_alloc Addition Overflow Prevention (strict) ---\n");
-        // current_pool_idx めESIZE_MAX 近傍まで意図皁E��進めた状態を偽裁E��、E
-        // size自体�E64MB未満だぁEcurrent_pool_idx + size ぁEsize_t の篁E��で
-        // オーバ�Eフローするケースを作る。これにより1つ目のガードをすり抜けて
-        // 2つ目のガーチE(current_pool_idx > SIZE_MAX - size) を確実に踏ませる、E
+        // current_pool_idx 繧・SIZE_MAX 霑大ｍ縺ｾ縺ｧ諢丞峙逧・↓騾ｲ繧√◆迥ｶ諷九ｒ蛛ｽ陬・＠縲・
+        // size閾ｪ菴薙・64MB譛ｪ貅縺�縺・current_pool_idx + size 縺・size_t 縺ｮ遽・峇縺ｧ
+        // 繧ｪ繝ｼ繝舌・繝輔Ο繝ｼ縺吶ｋ繧ｱ繝ｼ繧ｹ繧剃ｽ懊ｋ縲ゅ％繧後↓繧医ｊ1縺､逶ｮ縺ｮ繧ｬ繝ｼ繝峨ｒ縺吶ｊ謚懊￠縺ｦ
+        // 2縺､逶ｮ縺ｮ繧ｬ繝ｼ繝・(current_pool_idx > SIZE_MAX - size) 繧堤｢ｺ螳溘↓雕上∪縺帙ｋ縲・
         zone_arena_t arena2 = {0};
         zone_arena_init(&arena2);
         arena2.current_pool_idx = SIZE_MAX - 100;
@@ -1023,7 +1029,7 @@ int main() {
 
     // --- Test 14: RFC 9460 SVCB/HTTPS SvcParamKey sort & duplicate rejection ---
     {
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
 
         // Case 1: Out-of-order SvcParamKeys (port=443 before alpn=h2) must be sorted in wire format
@@ -1208,7 +1214,7 @@ int main() {
             return 1;
         }
 
-        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 §8)
+        // Case 5: mandatory referencing absent SvcParam must be rejected (RFC 9460 ﾂｧ8)
         dns_record_t incomplete_mand_rec;
         memset(&incomplete_mand_rec, 0, sizeof(incomplete_mand_rec));
         incomplete_mand_rec.name = "example.com.";
@@ -1254,7 +1260,7 @@ int main() {
             return 1;
         }
 
-        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 §14.3.2)
+        // Case 6: key65535 (Invalid key) must be rejected (RFC 9460 ﾂｧ14.3.2)
         dns_record_t invalid_key_rec;
         memset(&invalid_key_rec, 0, sizeof(invalid_key_rec));
         invalid_key_rec.name = "example.com.";
@@ -1383,7 +1389,7 @@ int main() {
         printf("PASS: karictl control secret base64 overflow protection\n");
     }
 
-    // --- Test 17: RFC 10029 §3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
+    // --- Test 17: RFC 10029 ﾂｧ3.3: MQTYPE-Query option with QDCOUNT=0 FORMERR ---
     {
         uint8_t req[512] = {0};
         req[0] = 0x56; req[1] = 0x78;
@@ -1423,7 +1429,7 @@ int main() {
             printf("FAIL: Expected FORMERR (1) response for MQTYPE-Query with QDCOUNT=0\n");
             return 1;
         }
-        printf("PASS: RFC 10029 §3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
+        printf("PASS: RFC 10029 ﾂｧ3.3 MQTYPE-Query with QDCOUNT=0 FORMERR response\n");
     }
 
     // --- Test 18: BIND-compatible TTL unit suffix parsing (w/d/h/m/s) ---
@@ -1464,7 +1470,7 @@ int main() {
             printf("FAIL: parse_ttl_value('invalid') != 3600\n");
             return 1;
         }
-        // RFC 2181 §8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
+        // RFC 2181 ﾂｧ8: Maximum TTL clamp (2147483647) for both numeric and unit suffixes
         if (parse_ttl_value("4000000000") != 2147483647) {
             printf("FAIL: parse_ttl_value('4000000000') != 2147483647 (got %u)\n", parse_ttl_value("4000000000"));
             return 1;
@@ -1546,7 +1552,7 @@ int main() {
     {
         uint8_t buf[1024];
         uint16_t off = 0;
-        compress_ctx_t c; compress_ctx_init_packet(&c);
+        compress_ctx_t c = {0}; compress_ctx_init_packet(&c);
 
         char long_tag[300];
         memset(long_tag, 'a', 256);
@@ -1585,7 +1591,7 @@ int main() {
     {
         uint8_t buf[1024];
         uint16_t off = 0;
-        compress_ctx_t c; compress_ctx_init_packet(&c);
+        compress_ctx_t c = {0}; compress_ctx_init_packet(&c);
 
         dns_record_t nsec3param_rec = {
             .name = "example.com.",
@@ -1707,7 +1713,7 @@ int main() {
     {
         uint8_t buf[1024];
         uint16_t off = 0;
-        compress_ctx_t c; compress_ctx_init_packet(&c);
+        compress_ctx_t c = {0}; compress_ctx_init_packet(&c);
 
         // 1. uint16_t overflow: MX preference = 70000 (> 65535)
         dns_record_t mx_rec = {
@@ -1941,7 +1947,7 @@ int main() {
         printf("PASS: RRL token refill 32-bit overflow & normal refill test\n");
     }
 
-    // --- Test 27: RFC 4034 §6.1 Canonical ordering & NSEC non-existence proof tests ---
+    // --- Test 27: RFC 4034 ﾂｧ6.1 Canonical ordering & NSEC non-existence proof tests ---
     {
         // 1. Canonical DNS name comparison tests
         if (compare_canonical_name("example.com.", "example.com.") != 0) {
@@ -2042,10 +2048,10 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: RFC 4034 §6.1 Canonical ordering & NSEC index tests\n");
+        printf("PASS: RFC 4034 ﾂｧ6.1 Canonical ordering & NSEC index tests\n");
     }
 
-    // --- Test 28: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests ---
+    // --- Test 28: RFC 4592 ﾂｧ3.3.1 Closest encloser & empty non-terminal wildcard tests ---
     {
         zone_arena_t arena;
         zone_arena_init(&arena);
@@ -2185,7 +2191,7 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: RFC 4592 §3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
+        printf("PASS: RFC 4592 ﾂｧ3.3.1 Closest encloser & empty non-terminal wildcard tests\n");
     }
 
     // --- Test 29: RFC 1982 Serial arithmetic & wraparound tests ---
@@ -2377,9 +2383,7 @@ int main() {
         uint8_t dirty_buf[256];
         memset(dirty_buf, 0xAA, sizeof(dirty_buf)); // fill with garbage
 
-        uint8_t res[512];
-        compress_ctx_t comp_ctx;
-        memset(&comp_ctx, 0, sizeof(comp_ctx));
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
 
         // Test with lengths 0 through 11 (< DNS_HEADER_SIZE)
@@ -2415,7 +2419,7 @@ int main() {
         printf("PASS: DNS record type parsing & non-fatal type resolution test\n");
     }
 
-    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 §6.1.1) and RCODE bitmask test ---
+    // --- Test 33: Multiple EDNS OPT RR rejection (RFC 6891 ﾂｧ6.1.1) and RCODE bitmask test ---
     {
         uint8_t pkt[512];
         memset(pkt, 0, sizeof(pkt));
@@ -2457,7 +2461,7 @@ int main() {
 
         int ret2 = parse_edns_opt(pkt, off, 1, 0, 0, 2, &edns);
         if (ret2 != -1) {
-            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 §6.1.1\n");
+            printf("FAIL: parse_edns_opt should return -1 on multiple OPT RRs per RFC 6891 ﾂｧ6.1.1\n");
             return 1;
         }
 
@@ -2686,7 +2690,7 @@ int main() {
         // Test serialize DNS record for SOA and RRSIG
         uint8_t buf[2048];
         uint16_t offset = 12; // after DNS header
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
 
         for (int i = arena.hash_table[apex_idx]; i != -1; i = arena.records[i].next_record) {
@@ -2706,7 +2710,7 @@ int main() {
         printf("PASS: SOA RRSIG covering record parsing and serialization for DNSSEC negative responses\n");
     }
 
-    // --- Test 37: Delegation point DS record (RFC 4035 §3.1.4.1) in parent zone ---
+    // --- Test 37: Delegation point DS record (RFC 4035 ﾂｧ3.1.4.1) in parent zone ---
     {
         const char *zone_text =
             "$ORIGIN example.com.\n"
@@ -2767,7 +2771,7 @@ int main() {
         // Test serialize DS record
         uint8_t buf[2048];
         uint16_t offset = 12;
-        compress_ctx_t comp_ctx;
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
 
         for (int i = arena.hash_table[sub_idx]; i != -1; i = arena.records[i].next_record) {
@@ -2784,10 +2788,10 @@ int main() {
 
         free(zone_copy);
         zone_arena_destroy(&arena);
-        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 §3.1.4.1)\n");
+        printf("PASS: Delegation point DS record & RRSIG parsing and lookup (RFC 4035 ﾂｧ3.1.4.1)\n");
     }
 
-    // --- Test 38: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
+    // --- Test 38: RFC 1035 ﾂｧ3.1 Domain Name Length Validation (label <= 63, wire total <= 255) ---
     {
         // 1. Label exceeds 63 octets (64 'a's)
         const char *long_label_zone =
@@ -2858,12 +2862,12 @@ int main() {
             return 1;
         }
 
-        printf("PASS: RFC 1035 §3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
+        printf("PASS: RFC 1035 ﾂｧ3.1 Domain Name Length Validation (label <= 63, wire total <= 255)\n");
     }
 
     // --- Test 39: Duplicate zone/view/key block rejection & FIFO key order ---
     {
-        // 1. 正常系: 異なるドメイン名を持つ褁E��トップレベルゾーン
+        // 1. 豁｣蟶ｸ邉ｻ: 逡ｰ縺ｪ繧九ラ繝｡繧､繝ｳ蜷阪ｒ謖√▽隍・焚繝医ャ繝励Ξ繝吶Ν繧ｾ繝ｼ繝ｳ
         const char *valid_zones_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; };\n"
@@ -2881,7 +2885,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vz);
 
-        // 2. 正常系: 異なるビュー名を持つ褁E��ビュー
+        // 2. 豁｣蟶ｸ邉ｻ: 逡ｰ縺ｪ繧九ン繝･繝ｼ蜷阪ｒ謖√▽隍・焚繝薙Η繝ｼ
         const char *valid_views_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
@@ -2899,7 +2903,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vv);
 
-        // 3. 正常系: ビュー冁E�E異なるゾーン
+        // 3. 豁｣蟶ｸ邉ｻ: 繝薙Η繝ｼ蜀・・逡ｰ縺ｪ繧九だ繝ｼ繝ｳ
         const char *valid_view_zones_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" {\n"
@@ -2914,7 +2918,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vvz);
 
-        // 4. 正常系: 褁E��TSIGキー�E�EIFO定義頁E���E検証�E�E
+        // 4. 豁｣蟶ｸ邉ｻ: 隍・焚TSIG繧ｭ繝ｼ・・IFO螳夂ｾｩ鬆・ｺ上・讀懆ｨｼ・・
         const char *valid_keys_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "key \"key1\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
@@ -2935,7 +2939,7 @@ int main() {
         }
         free_server_config_fields(&cfg_vk);
 
-        // 5. 異常系: 重褁E��チE�Eレベルゾーン
+        // 5. 逡ｰ蟶ｸ邉ｻ: 驥崎､・ヨ繝・・繝ｬ繝吶Ν繧ｾ繝ｼ繝ｳ
         const char *dup_zone_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example.com\" { type master; file \"/tmp/z1.zone\"; };\n"
@@ -2948,7 +2952,7 @@ int main() {
             return 1;
         }
 
-        // 6. 異常系: 重複TSIGキー
+        // 6. 逡ｰ蟶ｸ邉ｻ: 驥崎､ⅠSIG繧ｭ繝ｼ
         const char *dup_key_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "key \"tsig-test\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
@@ -2961,7 +2965,7 @@ int main() {
             return 1;
         }
 
-        // 7. 異常系: 重褁E��ュー
+        // 7. 逡ｰ蟶ｸ邉ｻ: 驥崎､・ン繝･繝ｼ
         const char *dup_view_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" { zone \"example1.com\" { type master; file \"/tmp/z1.zone\"; }; };\n"
@@ -2974,7 +2978,7 @@ int main() {
             return 1;
         }
 
-        // 8. 異常系: 同一ビュー冁E�E重褁E��ーン
+        // 8. 逡ｰ蟶ｸ邉ｻ: 蜷御ｸ繝薙Η繝ｼ蜀・・驥崎､・だ繝ｼ繝ｳ
         const char *dup_view_zone_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "view \"internal\" {\n"
@@ -2994,7 +2998,7 @@ int main() {
 
     // --- Test 40: Zone type validation and normalization (primary/master, secondary/slave) ---
     {
-        // 1. 正常系: primary -> master 正規化
+        // 1. 豁｣蟶ｸ邉ｻ: primary -> master 豁｣隕丞喧
         const char *primary_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example1.com\" { type primary; file \"/tmp/z1.zone\"; };\n";
@@ -3012,7 +3016,7 @@ int main() {
         }
         free_server_config_fields(&cfg1);
 
-        // 2. 正常系: secondary -> slave 正規化
+        // 2. 豁｣蟶ｸ邉ｻ: secondary -> slave 豁｣隕丞喧
         const char *secondary_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example2.com\" { type secondary; masters { 192.0.2.1; }; };\n";
@@ -3030,7 +3034,7 @@ int main() {
         }
         free_server_config_fields(&cfg2);
 
-        // 3. 正常系: master そ�Eまま
+        // 3. 豁｣蟶ｸ邉ｻ: master 縺昴・縺ｾ縺ｾ
         const char *master_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example3.com\" { type master; file \"/tmp/z3.zone\"; };\n";
@@ -3048,7 +3052,7 @@ int main() {
         }
         free_server_config_fields(&cfg_m);
 
-        // 4. 正常系: slave そ�Eまま
+        // 4. 豁｣蟶ｸ邉ｻ: slave 縺昴・縺ｾ縺ｾ
         const char *slave_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example4.com\" { type slave; masters { 192.0.2.1; }; };\n";
@@ -3066,7 +3070,7 @@ int main() {
         }
         free_server_config_fields(&cfg_s);
 
-        // 5. 異常系: 未知のゾーン種別を拒絶
+        // 5. 逡ｰ蟶ｸ邉ｻ: 譛ｪ遏･縺ｮ繧ｾ繝ｼ繝ｳ遞ｮ蛻･繧呈拠邨ｶ
         const char *invalid_type_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"example5.com\" { type unknown_type; file \"/tmp/z5.zone\"; };\n";
@@ -3083,7 +3087,7 @@ int main() {
 
     // --- Test 41: allow-update in master vs slave zones and type defaulting ---
     {
-        // 1. 正常系: master zone with allow-update
+        // 1. 豁｣蟶ｸ邉ｻ: master zone with allow-update
         const char *master_update_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "key \"upd-key\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
@@ -3106,7 +3110,7 @@ int main() {
         }
         free_server_config_fields(&cfg1);
 
-        // 2. 正常系: zone without explicit type defaults to master
+        // 2. 豁｣蟶ｸ邉ｻ: zone without explicit type defaults to master
         const char *no_type_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "zone \"default-type.com\" { file \"/tmp/z.zone\"; };\n";
@@ -3124,7 +3128,7 @@ int main() {
         }
         free_server_config_fields(&cfg2);
 
-        // 3. 正常系 (警告付き): slave zone with allow-update (parses safely, logs warning)
+        // 3. 豁｣蟶ｸ邉ｻ (隴ｦ蜻贋ｻ倥″): slave zone with allow-update (parses safely, logs warning)
         const char *slave_update_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "key \"upd-key\" { algorithm hmac-sha256; secret \"k123456789012345678901234567890123456789012=\"; };\n"
@@ -3146,7 +3150,7 @@ int main() {
 
     // --- Test 42: Logging category channel validation & multiple TSIG keys in allow-transfer ---
     {
-        // 1. 正常系: 正しいチャンネル名を参�Eする logging category
+        // 1. 豁｣蟶ｸ邉ｻ: 豁｣縺励＞繝√Ε繝ｳ繝阪Ν蜷阪ｒ蜿ら・縺吶ｋ logging category
         const char *valid_logging_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "logging {\n"
@@ -3228,7 +3232,7 @@ int main() {
         }
         free_server_config_fields(&cfg_qps);
 
-        // 2. 正常系: allow-transfer に褁E�� key を指宁E(両方の key が�E刁Etsig_keys に保持されめE
+        // 2. 豁｣蟶ｸ邉ｻ: allow-transfer 縺ｫ隍・焚 key 繧呈欠螳・(荳｡譁ｹ縺ｮ key 縺碁・蛻・tsig_keys 縺ｫ菫晄戟縺輔ｌ繧・
         const char *multi_key_conf =
             "key \"key1\" { algorithm hmac-sha256; secret \"dGVzdA==\"; };\n"
             "key \"key2\" { algorithm hmac-sha256; secret \"dGVzdA==\"; };\n"
@@ -3255,7 +3259,7 @@ int main() {
         }
         free_server_config_fields(&cfg2);
 
-        // 3. 異常系: 未定義チャンネル名を参�Eする category queries
+        // 3. 逡ｰ蟶ｸ邉ｻ: 譛ｪ螳夂ｾｩ繝√Ε繝ｳ繝阪Ν蜷阪ｒ蜿ら・縺吶ｋ category queries
         const char *undef_qchannel_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "logging {\n"
@@ -3270,7 +3274,7 @@ int main() {
             return 1;
         }
 
-        // 4. 異常系: 未定義チャンネル名を参�Eする category responses
+        // 4. 逡ｰ蟶ｸ邉ｻ: 譛ｪ螳夂ｾｩ繝√Ε繝ｳ繝阪Ν蜷阪ｒ蜿ら・縺吶ｋ category responses
         const char *undef_rchannel_conf =
             "options { port 53; bind-address { 127.0.0.1; }; };\n"
             "logging {\n"

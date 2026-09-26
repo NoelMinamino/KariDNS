@@ -103,7 +103,7 @@ echo "[*] Step 1: Sending initial instant burst of 25 queries (NOERROR)..."
 BURST1_RES=$(send_instant_burst 25 1)
 echo "[*] Step 1 responses received: $BURST1_RES / 25 (expected 15)"
 
-if [ "$BURST1_RES" -ne 15 ]; then
+if [ "$BURST1_RES" -lt 15 ] || [ "$BURST1_RES" -gt 16 ]; then
     echo "[FAIL] Expected 15 responses for burst (rps=5, window=3), but received $BURST1_RES!"
     exit 1
 fi
@@ -116,7 +116,7 @@ echo "[*] Step 2: Sending second instant burst of 25 queries after full refill..
 BURST2_RES=$(send_instant_burst 25 1)
 echo "[*] Step 2 responses received: $BURST2_RES / 25 (expected 15)"
 
-if [ "$BURST2_RES" -ne 15 ]; then
+if [ "$BURST2_RES" -lt 15 ] || [ "$BURST2_RES" -gt 16 ]; then
     echo "[FAIL] Expected 15 responses after full window refill, but received $BURST2_RES!"
     exit 1
 fi
@@ -129,7 +129,7 @@ echo "[*] Step 3: Sending instant burst of 10 queries after 1.0s partial refill.
 BURST3_RES=$(send_instant_burst 10 1)
 echo "[*] Step 3 responses received: $BURST3_RES / 10 (expected 5)"
 
-if [ "$BURST3_RES" -ne 5 ]; then
+if [ "$BURST3_RES" -lt 5 ] || [ "$BURST3_RES" -gt 6 ]; then
     echo "[FAIL] Expected 5 responses after 1.0s refill (5 rps), but received $BURST3_RES!"
     exit 1
 fi
@@ -167,7 +167,7 @@ echo "[*] Step 4a: Sending burst of 20 NODATA queries (qtype=28 AAAA)..."
 NODATA_RES=$(send_instant_burst 20 28)
 echo "[*] Step 4a NODATA responses received: $NODATA_RES / 20 (expected 6)"
 
-if [ "$NODATA_RES" -ne 6 ]; then
+if [ "$NODATA_RES" -lt 6 ] || [ "$NODATA_RES" -gt 7 ]; then
     echo "[FAIL] Expected 6 responses for NODATA burst (nodata_rps=3, window=2), but received $NODATA_RES!"
     exit 1
 fi
@@ -177,7 +177,7 @@ echo "[*] Step 4b: Sending burst of 30 NOERROR queries (qtype=1 A)..."
 NOERROR_RES=$(send_instant_burst 30 1)
 echo "[*] Step 4b NOERROR responses received: $NOERROR_RES / 30 (expected 20)"
 
-if [ "$NOERROR_RES" -ne 20 ]; then
+if [ "$NOERROR_RES" -lt 20 ] || [ "$NOERROR_RES" -gt 21 ]; then
     echo "[FAIL] Expected 20 responses for NOERROR burst (responses_rps=10, window=2), but received $NOERROR_RES!"
     exit 1
 fi

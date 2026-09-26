@@ -71,7 +71,6 @@ typedef struct {
 // 定数 (dns_server_core.c から移動)
 // ============================================================================
 #define MAX_RDATA 48
-#define MAX_JUMPS 16
 #define COMPRESS_HASH_SIZE 4096
 #define COMPRESS_HASH_MASK (COMPRESS_HASH_SIZE - 1)
 #define MAX_PROBE_DEPTH 8
@@ -292,6 +291,7 @@ typedef struct {
 // ============================================================================
 
 // 名前圧縮
+void compress_ctx_init(compress_ctx_t *ctx);
 void compress_ctx_init_packet(compress_ctx_t *ctx);
 int compress_name(uint8_t *packet_buf, uint16_t *offset, const uint8_t *name, compress_ctx_t *ctx, size_t max_len);
 void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t start_offset, compress_ctx_t *ctx);
@@ -306,6 +306,12 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);
+
+/* Capsicum(cap_enter)突入前に呼ぶこと。TSIGで使う全HMACアルゴリズムを一度実行し、
+ * OpenSSLの遅延初期化(openssl.cnfのopen等)をcapability mode突入前に完了させる。
+ * cap_enter後に初回のHMAC()が走ると ECAPMODE -> SIGTRAP でプロセスが落ちる。
+ * 全アルゴリズムのHMAC計算に成功した場合のみ true (FIPS環境でMD5が使えない場合等は false)。 */
+bool tsig_prewarm_crypto(void);
 int const_time_memcmp(const void *a, const void *b, size_t len);
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
                      uint8_t *prior_mac, size_t *prior_mac_len,
@@ -329,7 +335,7 @@ int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_k
 int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size);
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
-int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
+int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
 uint32_t parse_ttl_value(const char *ttl_str);
 
 // EDNS
@@ -394,5 +400,11 @@ typedef struct {
     uint64_t wirecache_entries;
     uint64_t wirecache_bytes;
 } zone_observatory_snapshot_t;
+
+// ============================================================================
+// 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
+// ============================================================================
+bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size_t qname_size,
+                               uint16_t *qtype, uint16_t *qclass, size_t *question_end);
 
 #endif // DNS_WIRE_H

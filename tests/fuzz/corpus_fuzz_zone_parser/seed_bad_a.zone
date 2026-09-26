@@ -1,0 +1,4 @@
+example.com. 3600 IN SOA ns1.example.com. admin.example.com. 20260812 3600 1800 604800 86400
+example.com. 3600 IN NS ns1.example.com.
+bad.example.com. 3600 IN A not-an-ip
+bad6.example.com. 3600 IN AAAA invalid:ipv6

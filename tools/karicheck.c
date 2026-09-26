@@ -17,10 +17,11 @@
 #include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include "karidns_tool_linkage.h"
 
 /* [T6] RFC 2181 §5.2 TTL不整合検出用ソート比較関数
  * build_zone_index() 実行前の生データを qsort で正規化前に冗丸を検出する */
-static int cmp_rec_by_name_type(const void *pa, const void *pb) {
+KARIDNS_TOOL_FN int cmp_rec_by_name_type(const void *pa, const void *pb) {
     const dns_record_t *ra = *(const dns_record_t **)pa;
     const dns_record_t *rb = *(const dns_record_t **)pb;
     if (!ra->name || !rb->name) return ra->name ? 1 : (rb->name ? -1 : 0);
@@ -47,7 +48,7 @@ static const dnssec_alg_info_t KNOWN_DNSSEC_ALGS[] = {
     {16, "ED448",               "MAY"},
 };
 
-static void check_dnssec_algorithm(int alg_num, const char *rec_name, const char *rec_type, int flags, int protocol) {
+KARIDNS_TOOL_FN void check_dnssec_algorithm(int alg_num, const char *rec_name, const char *rec_type, int flags, int protocol) {
     // RFC 8078 §4: CDNSKEY delete signal (flags=0, protocol=3, algorithm=0)
     if (strcmp(rec_type, "CDNSKEY") == 0 && alg_num == 0 && flags == 0 && protocol == 3) {
         return;
@@ -73,7 +74,7 @@ static const ds_digest_info_t KNOWN_DS_DIGESTS[] = {
     {4, "SHA-384",          "MAY"},
 };
 
-static void check_ds_digest_type(int digest_type, int algorithm, int key_tag,
+KARIDNS_TOOL_FN void check_ds_digest_type(int digest_type, int algorithm, int key_tag,
                                  const char *rec_name, const char *rec_type) {
     // RFC 8078 §4: CDS delete signal (digest_type=0, algorithm=0, key_tag=0)
     if (strcmp(rec_type, "CDS") == 0 && digest_type == 0 &&
@@ -106,11 +107,21 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) 
 }
 
 // Helper to read entire file
-static char *read_file_or_die(const char *path, bool *out_failed) {
+KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
     FILE *f = fopen(path, "r");
     if (!f) {
         if (out_failed) *out_failed = true;
         fprintf(stderr, "[ERROR] Could not open file: %s (%s)\n", path, strerror(errno));
+        return NULL;
+    }
+    /* A directory (or FIFO/device) opens fine on some systems, but its ftell()
+     * result is meaningless (e.g. LONG_MAX for a directory on Linux), which
+     * would overflow the "len + 1" allocation below. Require a regular file. */
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
+        fclose(f);
+        if (out_failed) *out_failed = true;
+        fprintf(stderr, "[ERROR] Not a regular file: %s\n", path);
         return NULL;
     }
     fseek(f, 0, SEEK_END);
@@ -136,7 +147,7 @@ static char *read_file_or_die(const char *path, bool *out_failed) {
     return buf;
 }
 
-static char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
+KARIDNS_TOOL_FN char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path, dev_t *out_dev, ino_t *out_ino) {
     (void)ctx;
     
     if (out_dev || out_ino) {
@@ -154,7 +165,7 @@ static char *karicheck_load_file_cb(parse_context_t *ctx, const char *rel_path, 
 
 
 // Print error context with caret
-static void print_error_context(const char *root_file_path, const char *root_buf, const parse_error_t *err, zone_arena_t *arena) {
+KARIDNS_TOOL_FN void print_error_context(const char *root_file_path, const char *root_buf, const parse_error_t *err, zone_arena_t *arena) {
     const char *file_path = root_file_path;
     const char *buf = root_buf;
 
@@ -237,7 +248,7 @@ static void print_error_context(const char *root_file_path, const char *root_buf
 // are guaranteed to be contiguous after qsort(), regardless of qsort's stability.
 // Adjacent-after-sort duplicate detection in verify_zonemd() is therefore complete,
 // not merely a common-case heuristic. See KariDNS_RFC_GUIDELINE.md, RFC 8976 entry.
-static int cmp_canonical_rr(const void *a, const void *b) {
+KARIDNS_TOOL_FN int cmp_canonical_rr(const void *a, const void *b) {
     dns_record_t *r1 = *(dns_record_t **)a;
     dns_record_t *r2 = *(dns_record_t **)b;
     
@@ -271,7 +282,7 @@ static int cmp_canonical_rr(const void *a, const void *b) {
     return len1 - len2;
 }
 
-static bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_scheme,
+KARIDNS_TOOL_FN bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_scheme,
                                         uint8_t *out_halg, bool warn) {
     if (!zm || zm->rdata_count < 3 || !zm->rdata[1] || !zm->rdata[2]) return false;
     char *scheme_endptr, *halg_endptr;
@@ -296,7 +307,7 @@ static bool validate_zonemd_scheme_halg(const dns_record_t *zm, uint8_t *out_sch
     return true;
 }
 
-static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
+KARIDNS_TOOL_FN bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     dns_record_t *zonemds[16];
     int zonemd_count = 0;
     for (size_t i = 0; i < arena->count; i++) {
@@ -405,7 +416,7 @@ static bool verify_zonemd(const char *domain, zone_arena_t *arena) {
     return all_valid;
 }
 
-static bool is_cname(zone_arena_t *arena, const char *name) {
+KARIDNS_TOOL_FN bool is_cname(zone_arena_t *arena, const char *name) {
     if (!arena->hash_table || arena->hash_size == 0) return false;
     uint32_t hash = calc_fnv1a_str(name);
     size_t idx = hash & (arena->hash_size - 1);
@@ -417,7 +428,7 @@ static bool is_cname(zone_arena_t *arena, const char *name) {
     return false;
 }
 
-static void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
+KARIDNS_TOOL_FN void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
     size_t len = strlen(in);
     if (len > 0 && in[len - 1] != '.' && len + 1 < out_cap) {
         memcpy(out, in, len);
@@ -428,7 +439,7 @@ static void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
     }
 }
 
-static bool is_in_bailiwick(const char *name, const char *domain) {
+KARIDNS_TOOL_FN bool is_in_bailiwick(const char *name, const char *domain) {
     if (!name || !domain) return false;
     size_t nlen = strlen(name);
     size_t dlen = strlen(domain);
@@ -441,7 +452,7 @@ static bool is_in_bailiwick(const char *name, const char *domain) {
     return false;
 }
 
-static bool validate_cidr_syntax(const char *cidr) {
+KARIDNS_TOOL_FN bool validate_cidr_syntax(const char *cidr) {
     if (!cidr) return false;
     char buf[128];
     strncpy(buf, cidr, sizeof(buf) - 1);
@@ -466,7 +477,7 @@ static bool validate_cidr_syntax(const char *cidr) {
     return false;
 }
 
-static bool is_subdomain_of(const char *name, const char *parent) {
+KARIDNS_TOOL_FN bool is_subdomain_of(const char *name, const char *parent) {
     if (!name || !parent) return false;
     size_t nlen = strlen(name);
     size_t plen = strlen(parent);
@@ -476,7 +487,7 @@ static bool is_subdomain_of(const char *name, const char *parent) {
     return (name[nlen - plen - 1] == '.');
 }
 
-static bool is_strict_subdomain_of(const char *name, const char *parent) {
+KARIDNS_TOOL_FN bool is_strict_subdomain_of(const char *name, const char *parent) {
     if (!name || !parent) return false;
     size_t nlen = strlen(name);
     size_t plen = strlen(parent);
@@ -485,7 +496,7 @@ static bool is_strict_subdomain_of(const char *name, const char *parent) {
     return (name[nlen - plen - 1] == '.');
 }
 
-static void lint_glue_consistency(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
+KARIDNS_TOOL_FN void lint_glue_consistency(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
     char checked_targets[64][256];
     int checked_count = 0;
 
@@ -567,7 +578,7 @@ static void lint_glue_consistency(const char *domain, zone_arena_t *arena, int *
     }
 }
 
-static void lint_cname_coexistence(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
+KARIDNS_TOOL_FN void lint_cname_coexistence(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
     (void)domain;
     (void)out_warnings;
     for (size_t i = 0; i < arena->count; i++) {
@@ -589,7 +600,7 @@ static void lint_cname_coexistence(const char *domain, zone_arena_t *arena, int 
     }
 }
 
-static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
+KARIDNS_TOOL_FN void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
     (void)out_errors;
     for (size_t i = 0; i < arena->count; i++) {
         dns_record_t *del_ns = &arena->records[i];
@@ -622,7 +633,7 @@ static void lint_delegation_occlusion(const char *domain, zone_arena_t *arena, i
     }
 }
 
-static void lint_cname_targets(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
+KARIDNS_TOOL_FN void lint_cname_targets(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
     (void)domain;
     // 1. RFC 2181 section 10.3: NS and MX targets must not point to CNAME (ERROR)
     for (size_t i = 0; i < arena->count; i++) {
@@ -675,7 +686,7 @@ static void lint_cname_targets(const char *domain, zone_arena_t *arena, int *out
     }
 }
 
-static void lint_zonemd_serial(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
+KARIDNS_TOOL_FN void lint_zonemd_serial(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
     (void)out_warnings;
     dns_record_t *soa_rec = NULL;
     for (size_t i = 0; i < arena->count; i++) {
@@ -708,7 +719,7 @@ static void lint_zonemd_serial(const char *domain, zone_arena_t *arena, int *out
     }
 }
 
-static int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg) {
+KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
     char domain_buf[256];
@@ -1015,6 +1026,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                                 fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SSHFP algorithm '%s' out of range (0-255)\n",
                                         domain, linenum, fld[1]);
                                 error_found = true;
+                            } else if (alg == 0 || alg > 4) {
+                                fprintf(stderr, "[WARNING] Zone '%s' (line %lu): SSHFP algorithm '%lu' is outside standard RFC assignments (1-4)\n",
+                                        domain, linenum, alg);
                             }
                         }
                         if (flen[2] > 0) {
@@ -1024,6 +1038,9 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                                 fprintf(stderr, "[ERROR] Zone '%s' (line %lu): SSHFP fp_type '%s' out of range (0-255)\n",
                                         domain, linenum, fld[2]);
                                 error_found = true;
+                            } else if (fpt == 0 || fpt > 2) {
+                                fprintf(stderr, "[WARNING] Zone '%s' (line %lu): SSHFP fp_type '%lu' is outside standard RFC assignments (1-2)\n",
+                                        domain, linenum, fpt);
                             }
                         }
                         uint8_t fp_bin[64];
@@ -1353,12 +1370,18 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
                     fprintf(stderr, "[ERROR] SSHFP algorithm '%s' out of range (0-255) for name '%s' in zone '%s'\n",
                             rdata[0], arena.records[i].name, domain);
                     error_found = true;
+                } else if (alg == 0 || alg > 4) {
+                    fprintf(stderr, "[WARNING] SSHFP record for '%s' uses algorithm '%lu' which is outside standard RFC assignments (1=RSA, 2=DSA, 3=ECDSA, 4=Ed25519)\n",
+                            arena.records[i].name, alg);
                 }
                 unsigned long fpt = strtoul(rdata[1], &endp, 10);
                 if (*endp != '\0' || fpt > 255) {
                     fprintf(stderr, "[ERROR] SSHFP fp_type '%s' out of range (0-255) for name '%s' in zone '%s'\n",
                             rdata[1], arena.records[i].name, domain);
                     error_found = true;
+                } else if (fpt == 0 || fpt > 2) {
+                    fprintf(stderr, "[WARNING] SSHFP record for '%s' uses fp_type '%lu' which is outside standard RFC assignments (1=SHA-1, 2=SHA-256)\n",
+                            arena.records[i].name, fpt);
                 }
                 uint8_t fp_bin[64];
                 size_t dec_len = hex_decode(rdata[2], fp_bin, sizeof(fp_bin));
@@ -1512,8 +1535,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
         // --- Dry-run serialize_dns_record ---
         uint8_t scratch[65535];
         uint16_t scratch_offset = 0;
-        compress_ctx_t comp_ctx;
-        memset(&comp_ctx, 0, sizeof(comp_ctx));
+        compress_ctx_t comp_ctx = {0};
         compress_ctx_init_packet(&comp_ctx);
         int wire_result = serialize_dns_record(
             scratch, sizeof(scratch), &scratch_offset,
@@ -1645,7 +1667,7 @@ static int check_zone(const char *domain_raw, const char *file_path, bool is_sta
     return 0;
 }
 
-static int check_config(const char *config_path, server_config_t *cfg) {
+KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) {
     printf("[INFO] Loading config %s...\n", config_path);
     bool failed = false;
     char *buf = read_file_or_die(config_path, &failed);
@@ -1790,7 +1812,7 @@ static int check_config(const char *config_path, server_config_t *cfg) {
     return 0;
 }
 
-static void print_usage(const char *prog) {
+KARIDNS_TOOL_FN void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s [-v | --version]\n", prog);
     fprintf(stderr, "  %s conf [config_path]\n", prog);
@@ -1799,6 +1821,14 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  %s zone <domain> <zone_file_path>\n", prog);
 }
 
+#if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
+/* Coverage builds: the tests #include this file with "#define main karicheck_main",
+ * so the body below is named karicheck_main here as well; llvm-cov then merges the
+ * counters of every binary that runs it (see karidns_tool_linkage.h). */
+int karicheck_main(int argc, char **argv);
+int main(int argc, char **argv) { return karicheck_main(argc, argv); }
+#define main karicheck_main
+#endif
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage(argv[0]);

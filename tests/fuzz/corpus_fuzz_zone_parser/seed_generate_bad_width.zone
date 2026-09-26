@@ -1,0 +1,3 @@
+$ORIGIN example.com.
+$TTL 3600
+$GENERATE 1-10 host-${0,999,d} A 10.0.0.$

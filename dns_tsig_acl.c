@@ -72,7 +72,7 @@ bool check_acl_bin(const char *client_ip, const acl_entry_t *parsed, int count) 
 tsig_key_t *find_tsig_key_by_name(const server_config_t *cfg, const char *key_name) {
     if (!cfg || !key_name || !*key_name) return NULL;
     for (tsig_key_t *k = cfg->keys; k; k = k->next) {
-        if (strcasecmp(k->name, key_name) == 0) return k;
+        if (k->name && strcasecmp(k->name, key_name) == 0) return k;
     }
     return NULL;
 }

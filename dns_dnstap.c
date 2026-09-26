@@ -82,7 +82,8 @@ int dnstap_connect_and_handshake(const char *socket_path, const char *identity, 
         close(sock);
         return -1;
     }
-    uint32_t acc_type = ntohl(*(uint32_t *)acc_buf);
+    uint32_t acc_type = ((uint32_t)acc_buf[0] << 24) | ((uint32_t)acc_buf[1] << 16) |
+                        ((uint32_t)acc_buf[2] << 8) | (uint32_t)acc_buf[3];
     if (acc_type != FSTRM_CONTROL_ACCEPT) {
         close(sock);
         return -1;
@@ -248,10 +249,16 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
     }
     meta->has_server_addr = has_server_addr;
     if (has_server_addr && server_addr) {
-        socklen_t srv_len = sizeof(meta->server_addr);
-        size_t copy_len = srv_len < sizeof(meta->server_addr) ? srv_len : sizeof(meta->server_addr);
+        /* server_addr carries no length. TCP callers pass a full sockaddr_storage
+         * but the UDP path passes the compact ipc_sockaddr_t (max 28 bytes), so
+         * copying sizeof(sockaddr_storage) over-reads the caller's object.
+         * Copy only what the address family guarantees to be present. */
+        const struct sockaddr *sa = (const struct sockaddr *)server_addr;
+        size_t copy_len = (sa->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6)
+                                                       : sizeof(struct sockaddr_in);
+        memset(&meta->server_addr, 0, sizeof(meta->server_addr));
         memcpy(&meta->server_addr, server_addr, copy_len);
-        meta->server_addr_len = sizeof(meta->server_addr);
+        meta->server_addr_len = (socklen_t)copy_len;
     } else {
         memset(&meta->server_addr, 0, sizeof(meta->server_addr));
         meta->server_addr_len = 0;
@@ -324,8 +331,8 @@ void *dnstap_sender_thread_func(void *arg) {
     static uint8_t g_dnstap_scratch_buf[65535 + 128]; // 送信スレッドは1本のみなので競合しない
     while (1) {
         bool any_work = false;
-        int num_workers = g_worker_count;
-        worker_ctx_t *workers = g_worker_ctxs;
+        int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+        worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
             if (num_workers > 0 && workers) {
                 for (int w = 0; w < num_workers; w++) {

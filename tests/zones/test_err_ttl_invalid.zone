@@ -1,0 +1,9 @@
+$ORIGIN err-ttl.example.
+$TTL 100X
+@ IN SOA ns1.err-ttl.example. hostmaster.err-ttl.example. (
+    2026092401 7200 3600 1209600 86400
+)
+@ IN NS ns1.err-ttl.example.
+ns1 IN A 192.0.2.1
+bad1 99999999999999999999 IN A 192.0.2.2
+bad2 500Z IN A 192.0.2.3

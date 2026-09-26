@@ -1,4 +1,5 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
+#define STATIC_TEST
 #include "dns_zone_parser.h"
 #include "dns_config_parser.h"
 #include "dns_utils.h"
@@ -85,10 +86,10 @@ void release_config_snapshot(server_config_t *snap) {
 }
 int g_control_kq = -1;
 int g_cwd_fd = -1;
-static const char *g_config_path = NULL;
+STATIC_TEST const char *g_config_path = NULL;
 static int g_cli_port_override = 0;
-static _Atomic int g_bound_workers = 0;
-static _Atomic bool g_privilege_drop_complete = false;
+_Atomic int g_bound_workers = 0;
+STATIC_TEST _Atomic bool g_privilege_drop_complete = false;
 #define MAX_ZONE_AXFR 4
 
 #define NUM_FRONTEND_ROUTERS 2
@@ -96,13 +97,13 @@ static _Atomic bool g_privilege_drop_complete = false;
 #define MAX_WORKERS 128
 
 // Frontend/Backend IPC用グローバル変数
-static int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
-static int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
-static int g_num_workers = 0;
+STATIC_TEST int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
+STATIC_TEST int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
+STATIC_TEST int g_num_workers = 0;
 char g_startup_cwd[PATH_MAX] = "";
 int g_notify_ipc[2];
-static int g_control_sock = -1;
-static _Atomic(bool) g_frontend_alive = true;
+int g_control_sock = -1;
+_Atomic(bool) g_frontend_alive = true;
 
 time_t g_boot_time = 0;
 time_t g_last_configured_time = 0;
@@ -112,15 +113,15 @@ _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
 
 #define response_log_enabled(cfg) ((cfg) && (cfg)->logging.responses_channel != NULL)
 
-static resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
-static _Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
-static _Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
+resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
+_Atomic uint64_t g_resp_log_tail = ATOMIC_VAR_INIT(0);
+_Atomic uint64_t g_resp_log_head = ATOMIC_VAR_INIT(0);
 
-static _Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
-worker_ctx_t *g_worker_ctxs = NULL;
-int g_worker_count = 0;
+_Atomic bool g_qlog_circuit_broken = ATOMIC_VAR_INIT(false);
+_Atomic(worker_ctx_t *) g_worker_ctxs = ATOMIC_VAR_INIT(NULL);
+_Atomic int g_worker_count = ATOMIC_VAR_INIT(0);
 
-static inline uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
+uint32_t get_effective_query_log_max_qps(const server_config_t *cfg) {
     if (!cfg) return 0;
     // チャンネル側に 0 より大きい値が明示されている場合のみそれを採用
     if (cfg->logging.queries_channel && 
@@ -147,9 +148,9 @@ void dec_tcp_clients(void) {
 
 
 // Broker
-static int g_broker_sock = -1;
-static pid_t g_broker_pid = -1;
-static void start_connect_broker(void) {
+STATIC_TEST int g_broker_sock = -1;
+STATIC_TEST pid_t g_broker_pid = -1;
+__attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
     return;
@@ -391,7 +392,7 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
 // 10. Logging
 // ============================================================================
 
-static void init_logging_channels(server_config_t *cfg) {
+void init_logging_channels(server_config_t *cfg) {
   uid_t target_uid = (uid_t)-1;
   gid_t target_gid = (gid_t)-1;
   if (geteuid() == 0 && cfg->user) {
@@ -522,7 +523,7 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
     // データ書き込み完了をConsumerに通知
     atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
-static void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
+void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
   if (!dst || dst_size == 0) return;
   if (!src) {
     dst[0] = '\0';
@@ -555,7 +556,7 @@ static void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
   dst[di < dst_size ? di : dst_size - 1] = '\0';
 }
 
-static void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
+void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
     int today = (tm_info->tm_year + 1900) * 10000 + (tm_info->tm_mon + 1) * 100 + tm_info->tm_mday;
     pthread_mutex_lock(&ch->lock);
     bool rotate = false;
@@ -707,7 +708,7 @@ void *response_logger_thread_func(void *arg) {
     return NULL;
 }
 
-static inline void write_query_log(worker_ctx_t *ctx,
+void write_query_log(worker_ctx_t *ctx,
                                    const void *client_addr,
                                    socklen_t addr_len,
                                    const char *qname, uint16_t qclass, uint16_t qtype,
@@ -727,8 +728,9 @@ static inline void write_query_log(worker_ctx_t *ctx,
         ctx->log_current_sec = now_sec;
         ctx->log_emitted_this_sec = 0;
     }
-    uint32_t quota = (limit >= (uint32_t)g_worker_count && g_worker_count > 0)
-                     ? (limit / g_worker_count) : 1;
+    int nw = atomic_load_explicit(&g_worker_count, memory_order_relaxed);
+    uint32_t quota = (nw > 0 && limit >= (uint32_t)nw)
+                     ? (limit / (uint32_t)nw) : 1;
     if (ctx->log_emitted_this_sec >= quota) {
         // 閾値超過: リングバッファ操作やメモリコピーを一切行わず即座にリターン
         return;
@@ -805,8 +807,8 @@ void *query_logger_thread_func(void *arg) {
         server_config_t *cfg = acquire_config_snapshot();
         log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
 
-        int num_workers = g_worker_count;
-        worker_ctx_t *workers = g_worker_ctxs;
+        int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+        worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         bool any_work = false;
 
         if (ch && num_workers > 0 && workers) {
@@ -942,7 +944,7 @@ void *query_logger_thread_func(void *arg) {
     return NULL;
 }
 
-static void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out) {
+void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out) {
     if (!e || !out) return;
     strlcpy(out->domain, e->domain, sizeof(out->domain));
     strlcpy(out->view_name, e->view_name, sizeof(out->view_name));
@@ -1014,47 +1016,9 @@ ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
   return sent;
 }
 
-#define ASYNC_IO_POOL_SIZE 16
-#define ASYNC_IO_QUEUE_CAPACITY 4096
+async_io_pool_t g_async_io_pool;
 
-typedef struct {
-  bool is_tcp;
-  int active_fd; // For UDP, IPC socket to frontend
-  int client_fd; // For TCP, client socket
-  udp_ipc_t ipc_hdr;
-  uint8_t *req_buf;   // ヒープ確保（可変長）。UDP経路は最大 BUFFER_SIZE、TCP経路は最大 65535 バイトまで許容
-  size_t req_buf_cap; // malloc したバイト数（free 時の追跡・デバッグ用）
-  size_t req_len;
-  char client_ip[INET6_ADDRSTRLEN];
-  int client_port;
-  struct sockaddr_storage client_addr;
-  socklen_t client_len;
-  struct sockaddr_storage server_addr;
-  socklen_t server_len;
-  bool has_server_addr;
-  char qname[256];
-  uint16_t qtype;
-  uint16_t qclass;
-  bool has_edns;
-  bool dnssec_ok;
-  size_t question_end;
-  zone_db_snapshot_t *snap;
-} async_io_task_t;
-
-typedef struct {
-  async_io_task_t queue[ASYNC_IO_QUEUE_CAPACITY];
-  size_t head;
-  size_t tail;
-  size_t count;
-  pthread_mutex_t lock;
-  pthread_cond_t cond_not_empty;
-  pthread_t threads[ASYNC_IO_POOL_SIZE];
-  bool running;
-} async_io_pool_t;
-
-static async_io_pool_t g_async_io_pool;
-
-static bool enqueue_async_io_task(const async_io_task_t *task) {
+STATIC_TEST bool enqueue_async_io_task(const async_io_task_t *task) {
   pthread_mutex_lock(&g_async_io_pool.lock);
   if (!g_async_io_pool.running || g_async_io_pool.count >= ASYNC_IO_QUEUE_CAPACITY) {
     pthread_mutex_unlock(&g_async_io_pool.lock);
@@ -1068,7 +1032,7 @@ static bool enqueue_async_io_task(const async_io_task_t *task) {
   return true;
 }
 
-static void *async_io_worker_func(void *arg) {
+STATIC_TEST void *async_io_worker_func(void *arg) {
   int thread_idx = (int)(uintptr_t)arg;
   if (thread_idx < 0 || thread_idx >= MAX_ASYNC_IO_RCU_WORKERS) {
     thread_idx = 0;
@@ -1091,7 +1055,7 @@ static void *async_io_worker_func(void *arg) {
     rcu_reader_enter(&g_async_io_rcu_ctxs[thread_idx]);
     if (!task.is_tcp) {
       // UDP async resolution
-      uint8_t res_buf_full[BUFFER_SIZE + sizeof(udp_ipc_t)];
+      alignas(udp_ipc_t) uint8_t res_buf_full[UDP_IPC_BUFFER_SIZE];
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
       rate_limit_config_t *rrl_cfg = NULL;
       size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
@@ -1176,7 +1140,7 @@ static void *async_io_worker_func(void *arg) {
   return NULL;
 }
 
-static void init_async_io_pool(void) {
+void init_async_io_pool(void) {
   memset(&g_async_io_pool, 0, sizeof(g_async_io_pool));
   pthread_mutex_init(&g_async_io_pool.lock, NULL);
   pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
@@ -1186,7 +1150,7 @@ static void init_async_io_pool(void) {
   }
 }
 
-static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
   if (!snap || !qname) return false;
   view_snapshot_t *view = select_view(snap, client_ip);
   if (!view) return false;
@@ -1205,7 +1169,7 @@ static bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_
   return is_synth;
 }
 
-static inline void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
+void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
   uint8_t *p = (uint8_t *)&ip_be;
   for (int i = 0; i < 4; i++) {
     uint8_t v = p[i];
@@ -1227,9 +1191,14 @@ static inline void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
 
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
+#ifndef CPU_SETSIZE
+#define CPU_SETSIZE 256
+#endif
   cpuset_t cpuset;
   CPU_ZERO(&cpuset);
-  CPU_SET(ctx->core_id, &cpuset);
+  if (ctx->core_id >= 0 && ctx->core_id < (int)CPU_SETSIZE) {
+    CPU_SET(ctx->core_id, &cpuset);
+  }
   if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(cpuset_t),
                          &cpuset) != 0)
     goto worker_startup_failed;
@@ -1348,7 +1317,7 @@ worker_startup_success:;
   while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
     sched_yield();
   if (getppid() != parent_pid)
-    _exit(0);
+    exit(0);
   compress_ctx_t thread_compress_ctx = {0};
   struct kevent ev_list[MAX_EVENTS];
 
@@ -1381,7 +1350,7 @@ worker_startup_success:;
 
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].udata == (void *)(uintptr_t)1001) {
-        _exit(0);
+        exit(0);
       } else if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
@@ -1421,7 +1390,6 @@ worker_startup_success:;
             break;
           }
 
-          zone_db_snapshot_t *snap = acquire_zone_snapshot();
           int n_tx = 0;
           for (int p = 0; p < n_recv; p++) {
             ssize_t received = (ssize_t)batch->rx_msgs[p].msg_len;
@@ -1444,6 +1412,7 @@ worker_startup_success:;
 
             char client_ip[INET6_ADDRSTRLEN] = "";
             rcu_reader_enter(ctx);
+            zone_db_snapshot_t *snap = acquire_zone_snapshot();
             if (__builtin_expect(client_addr->ss_family == AF_INET, 1)) {
               fast_ipv4_to_str(client_addr->sin.sin_addr.s_addr, client_ip);
             } else if (client_addr->ss_family == AF_INET6) {
@@ -1461,44 +1430,10 @@ worker_startup_success:;
             bool dnssec_ok = false;
 
             if (payload_received > DNS_HEADER_SIZE) {
-              size_t offset = DNS_HEADER_SIZE;
+              parse_query_question_fast(req_buf, (size_t)payload_received, qname, sizeof(qname),
+                                        &qtype, &qclass, &question_end);
+              size_t offset = question_end;
               size_t recv_len = (size_t)payload_received;
-              size_t written = 0;
-
-              // 1回のループで qname と question_end を同時に確定
-              while (offset < recv_len) {
-                uint8_t len = req_buf[offset];
-                if (len == 0 || (len & 0xC0) == 0xC0) {
-                  offset += (len == 0) ? 1 : 2;
-                  break;
-                }
-                if (offset + len + 1 > recv_len) break;
-                offset++;
-                if (written > 0 && qname[written - 1] != '.') {
-                  if (written < 255) qname[written++] = '.';
-                }
-                if (offset + len <= recv_len) {
-                  for (size_t b = 0; b < len; b++) {
-                    uint8_t c = req_buf[offset + b];
-                    if (written < 254) {
-                      if (c == '.' || c == '\\') qname[written++] = '\\';
-                      qname[written++] = (char)c;
-                    }
-                  }
-                }
-                offset += len;
-              }
-              if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-                if (written < 255) qname[written++] = '.';
-              }
-              qname[written] = '\0';
-
-              if (offset + 4 <= recv_len) {
-                qtype = (req_buf[offset] << 8) | req_buf[offset + 1];
-                qclass = (req_buf[offset + 2] << 8) | req_buf[offset + 3];
-                offset += 4;
-                question_end = offset;
-              }
 
               // EDNSの走査 (Questionの直後から無駄なくスキャン)
               uint16_t arcount = (req_buf[10] << 8) | req_buf[11];
@@ -1676,9 +1611,6 @@ worker_startup_success:;
             }
           }
           atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
-          if (snap) {
-            release_zone_snapshot(snap);
-          }
           if (n_tx > 0) {
             sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
             n_tx = 0;
@@ -1862,44 +1794,11 @@ process_tcp_client: ;
 
           char qname[256] = "";
           uint16_t qtype = 0;
+          uint16_t qclass = 1;
+          size_t question_end = DNS_HEADER_SIZE;
           if (msg_len > DNS_HEADER_SIZE) {
-            size_t offset = DNS_HEADER_SIZE;
-            size_t written = 0;
-            while (offset < msg_len) {
-              uint8_t len = msg[offset];
-              if (len == 0 || (len & 0xC0) == 0xC0) {
-                offset++;
-                break;
-              }
-              offset++;
-              if (written > 0 && qname[written - 1] != '.') {
-                if (written < 255)
-                  qname[written++] = '.';
-              }
-              if (offset + len <= msg_len) {
-                for (size_t b = 0; b < len; b++) {
-                  uint8_t c = msg[offset + b];
-                  if (c == '.' || c == '\\') {
-                    if (written + 2 < 255) {
-                      qname[written++] = '\\';
-                      qname[written++] = (char)c;
-                    }
-                  } else {
-                    if (written < 255) {
-                      qname[written++] = (char)c;
-                    }
-                  }
-                }
-              }
-              offset += len;
-            }
-            if (offset + 1 < msg_len)
-              qtype = (msg[offset] << 8) | msg[offset + 1];
-            if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-              if (written < 255)
-                qname[written++] = '.';
-            }
-            qname[written] = '\0';
+            parse_query_question_fast(msg, msg_len, qname, sizeof(qname),
+                                      &qtype, &qclass, &question_end);
           }
           struct sockaddr_storage client_addr;
           socklen_t c_len = sizeof(client_addr);
@@ -1910,24 +1809,10 @@ process_tcp_client: ;
           else if (client_addr.ss_family == AF_INET6)
             client_port =
                 ntohs(((struct sockaddr_in6 *)&client_addr)->sin6_port);
-          uint16_t qclass = 1;
           edns_info_t edns;
           memset(&edns, 0, sizeof(edns));
           edns.present = false;
           if (msg_len >= DNS_HEADER_SIZE) {
-            size_t offset = DNS_HEADER_SIZE;
-            while (offset < msg_len) {
-              uint8_t len = msg[offset];
-              if (len == 0 || (len & 0xC0) == 0xC0) {
-                offset += (len == 0) ? 1 : 2;
-                break;
-              }
-              if (offset + len + 1 > msg_len) break;
-              offset += len + 1;
-            }
-            if (offset + 3 < msg_len)
-              qclass = (msg[offset + 2] << 8) | msg[offset + 3];
-
             uint16_t qd = (msg[4] << 8) | msg[5];
             uint16_t an = (msg[6] << 8) | msg[7];
             uint16_t ns = (msg[8] << 8) | msg[9];
@@ -2156,7 +2041,6 @@ process_tcp_client: ;
                 }
                 if (sign_rc != 0) {
                   release_config_snapshot(cfg);
-                  release_zone_snapshot(snap);
                   close(client_fd);
                   dec_tcp_clients();
                   free(ctx_tcp);
@@ -2182,7 +2066,6 @@ process_tcp_client: ;
                 copy_len = offset;
               }
               release_config_snapshot(cfg);
-              release_zone_snapshot(snap);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
                                  &ctx_tcp->client_addr, ctx_tcp->client_len,
@@ -2202,14 +2085,11 @@ process_tcp_client: ;
               client_closed = true;
               rcu_reader_exit(ctx);
               break;
-            } else {
-              release_zone_snapshot(snap);
             }
           } else {
             if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
               uint8_t *heap_req = malloc(msg_len);
               if (!heap_req) {
-                release_zone_snapshot(snap);
                 free(ctx_tcp);
                 close(client_fd);
                 dec_tcp_clients();
@@ -2248,7 +2128,7 @@ process_tcp_client: ;
 
               rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
-                release_zone_snapshot(snap);
+                release_zone_snapshot(task.snap);
                 free(task.req_buf);
                 close(client_fd);
                 dec_tcp_clients();
@@ -2261,7 +2141,6 @@ process_tcp_client: ;
               int res_len = process_dns_query(msg, msg_len, tcp_res, 65535,
                                               qname, qtype, ctx_tcp->client_ip,
                                               &thread_compress_ctx, true, NULL, snap);
-              release_zone_snapshot(snap);
               if (res_len > 0) {
                 submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                     tcp_res[3] & 0x0F, has_edns, dnssec_ok);
@@ -2283,8 +2162,6 @@ process_tcp_client: ;
                                     0, 0, 0, false, false);
               }
               free(tcp_res);
-            } else {
-              release_zone_snapshot(snap);
             }
             
             server_config_t *cfg = acquire_config_snapshot();
@@ -2380,17 +2257,17 @@ static ctrl_client_t *get_ctrl_client(int fd) {
   return NULL;
 }
 
-static void perform_config_reload_ext(bool skip_unchanged);
+STATIC_TEST void perform_config_reload_ext(bool skip_unchanged);
 
-static void reload_all_zones(void) {
+STATIC_TEST void reload_all_zones(void) {
   perform_config_reload_ext(false);
 }
 
-static void perform_config_reload(void) {
+STATIC_TEST void perform_config_reload(void) {
   perform_config_reload_ext(true);
 }
 
-static void perform_config_reload_ext(bool skip_unchanged) {
+STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
   g_last_configured_time = time(NULL);
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
@@ -2462,7 +2339,7 @@ static void perform_config_reload_ext(bool skip_unchanged) {
   free(config_str);
 }
 
-static const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
+const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
   if (!out_buf || out_size == 0) return arg;
   snprintf(out_buf, out_size, "%s", arg);
   server_config_t *active = acquire_config_snapshot();
@@ -2665,6 +2542,7 @@ void *control_thread_func(void *arg) {
                 char canon_buf[256];
                 const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
                 zone_db_snapshot_t *snap = acquire_zone_snapshot();
+                if (snap) retain_zone_snapshot(snap);
                 server_config_t *active = acquire_config_snapshot();
                 zone_lookup_result_t lr = {0};
                 int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
@@ -2739,6 +2617,7 @@ void *control_thread_func(void *arg) {
               
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
               if (snap) {
+                retain_zone_snapshot(snap);
                 for (size_t v = 0; v < snap->view_count; v++) {
                   st.num_zones += snap->views[v].zone_count;
                 }
@@ -2783,6 +2662,7 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2802,6 +2682,7 @@ void *control_thread_func(void *arg) {
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "observatory") == 0) {
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               char canon_buf[256];
               const char *canon_arg = (arg && strlen(arg) > 0) ? find_configured_domain(arg, canon_buf, sizeof(canon_buf)) : NULL;
@@ -2843,6 +2724,7 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2864,6 +2746,7 @@ void *control_thread_func(void *arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
               zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              if (snap) retain_zone_snapshot(snap);
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2924,6 +2807,7 @@ void *control_thread_func(void *arg) {
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_zone_snapshot();
         if (snap) {
+            retain_zone_snapshot(snap);
             for (size_t v = 0; v < snap->view_count; v++) {
                 for (size_t i = 0; i < snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = snap->views[v].entries[i];
@@ -3047,7 +2931,7 @@ void *control_thread_func(void *arg) {
 // 13. Frontend Router Process (マルチプロセス UDP送受信ルーティング)
 // ============================================================================
 
-static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
+void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
   if (desired_rcv > 0) {
     if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
       syslog(LOG_WARNING, "[Network] Failed to set SO_RCVBUF to %d: %m", desired_rcv);
@@ -3082,7 +2966,7 @@ static void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
   }
 }
 
-static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
+int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
   int num_fds = 0;
   int port = cfg->port > 0 ? cfg->port : DNS_PORT;
   int bind_count = cfg->bind_address_count;
@@ -3216,7 +3100,7 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
 
         bool already_bound = false;
         for (int k = 0; k < num_fds; k++) {
-          struct sockaddr_storage ss;
+          struct sockaddr_storage ss = {0};
           socklen_t slen = sizeof(ss);
           if (getsockname(out_fds[k], (struct sockaddr *)&ss, &slen) == 0) {
             if (is_v4 && ss.ss_family == AF_INET) {
@@ -3298,10 +3182,13 @@ static int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_AD
   return num_fds;
 }
 
-static void run_frontend_router(pid_t backend_pid, int router_id) {
+STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
+  (void)backend_pid;
   cpuset_t cpuset;
   CPU_ZERO(&cpuset);
-  CPU_SET(router_id, &cpuset);
+  if (router_id >= 0 && router_id < (int)CPU_SETSIZE) {
+    CPU_SET(router_id, &cpuset);
+  }
   if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(cpuset), &cpuset) < 0) {
     syslog(LOG_WARNING, "[Frontend %d] Failed to set CPU affinity: %m", router_id);
   }
@@ -3395,7 +3282,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
   int notify_v4_sock = -1;
   int notify_v6_sock = -1;
   for (int i = 0; i < local_num_udp_fds; i++) {
-    struct sockaddr_storage ss;
+    struct sockaddr_storage ss = {0};
     socklen_t slen = sizeof(ss);
     if (getsockname(local_udp_fds[i], (struct sockaddr *)&ss, &slen) == 0) {
       if (ss.ss_family == AF_INET) {
@@ -3423,6 +3310,9 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     kevent(kq, &ev, 1, NULL, 0, NULL);
   }
   signal(SIGCHLD, SIG_DFL);
+  signal(SIGTERM, SIG_DFL);
+  signal(SIGINT, SIG_DFL);
+  signal(SIGHUP, SIG_IGN);
   if (router_id == 0) {
     struct kevent ev_notify;
     EV_SET(&ev_notify, g_notify_ipc[0], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
@@ -3479,7 +3369,7 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
     fctx->cli_tx_msgs[k].msg_hdr.msg_controllen = 0;
   }
 
-  uint8_t buffer[65536];
+  alignas(udp_ipc_t) uint8_t buffer[UDP_IPC_BUFFER_SIZE];
   int rr = 0; // ラウンドロビン分配用
   struct kevent ev_list[128];
   syslog(LOG_NOTICE, "[Frontend %d] UDP Router process started.", router_id);
@@ -3508,8 +3398,8 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
             }
           }
         }
-        syslog(LOG_CRIT, "[Frontend %d] Backend process (pid=%d) exited unexpectedly. Shutting down.", router_id, backend_pid);
-        exit(1);
+        syslog(LOG_NOTICE, "[Frontend %d] Backend process (pid=%d) terminated. Shutting down.", router_id, backend_pid);
+        exit(0);
       }
       if (ud == 1001) {
         syslog(LOG_NOTICE, "[Frontend %d] Parent supervisor process exited. Shutting down.", router_id);
@@ -3878,13 +3768,31 @@ static void run_frontend_router(pid_t backend_pid, int router_id) {
 // 14. メインエントリーポイント & UDP/IPC 初期化
 // ============================================================================
 
-static pid_t g_supervisor_pid = 0;
-static char g_pid_file_path[1024] = "";
-static int g_pid_fd = -1;
-static volatile sig_atomic_t g_supervisor_should_exit = 0;
-static volatile sig_atomic_t g_supervisor_got_sighup = 0;
+STATIC_TEST pid_t g_supervisor_pid = 0;
+STATIC_TEST char g_pid_file_path[1024] = "";
+STATIC_TEST int g_pid_fd = -1;
+STATIC_TEST volatile sig_atomic_t g_supervisor_should_exit = 0;
+STATIC_TEST volatile sig_atomic_t g_supervisor_got_sighup = 0;
 
-static void supervisor_sig_handler(int sig) {
+#if defined(__FreeBSD__) || defined(__linux__) || defined(__APPLE__)
+#ifdef __clang__
+__attribute__((weak)) int __llvm_profile_write_file(void);
+#endif
+#endif
+
+STATIC_TEST volatile sig_atomic_t g_backend_should_exit = 0;
+STATIC_TEST void backend_sig_handler(int sig) {
+  (void)sig;
+  g_backend_should_exit = 1;
+#ifdef __clang__
+  if (__llvm_profile_write_file) {
+    __llvm_profile_write_file();
+  }
+#endif
+  _exit(0);
+}
+
+STATIC_TEST void supervisor_sig_handler(int sig) {
   if (sig == SIGHUP) {
     g_supervisor_got_sighup = 1;
   } else {
@@ -3892,7 +3800,7 @@ static void supervisor_sig_handler(int sig) {
   }
 }
 
-static void cleanup_pid_file(void) {
+STATIC_TEST void cleanup_pid_file(void) {
   if (g_supervisor_pid != 0 && getpid() == g_supervisor_pid) {
     if (g_pid_fd >= 0) {
       close(g_pid_fd);
@@ -3905,7 +3813,7 @@ static void cleanup_pid_file(void) {
   }
 }
 
-static void daemonize(void) {
+STATIC_TEST void daemonize(void) {
   pid_t pid = fork();
   if (pid < 0)
     exit(EXIT_FAILURE);
@@ -3940,7 +3848,7 @@ static void daemonize(void) {
     cap_rights_limit(stdio_fd, &io_rights);
 }
 
-static void setup_ipc_tables(int num_workers) {
+STATIC_TEST void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
   server_config_t *cfg = &g_config_db.config_a;
   int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
@@ -3997,7 +3905,7 @@ static void setup_ipc_tables(int num_workers) {
  * root所有でなく、group/otherに書き込み可能な場合は「事前に仕込まれた
  * ディレクトリ」の可能性があるため、起動をfail-closedで拒否する。
  * geteuid()!=0(非root実行)の場合は特権境界を跨がないため検証しない。 */
-static bool ensure_priv_dir_safe(const char *dir_buf) {
+bool ensure_priv_dir_safe(const char *dir_buf) {
   if (!dir_buf || dir_buf[0] == '\0')
     return true;
   if (geteuid() != 0)
@@ -4028,6 +3936,7 @@ static bool ensure_priv_dir_safe(const char *dir_buf) {
   return ok;
 }
 
+#ifndef KARIDNS_UNIT_TEST
 int main(int argc, char **argv) {
   assert(calc_fnv1a_str("*.") == FNV1A_WILDCARD_PREFIX_HASH);
   init_server_cookie_secret();
@@ -4040,18 +3949,25 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 15; i++) tv_msg[i] = (uint8_t)i;
     uint64_t tv_result = siphash24(tv_msg, sizeof(tv_msg), tv_key);
     if (tv_result != 0xa129ca6149be45e5ULL) {
+      /* LCOV_EXCL_START */
       syslog(LOG_CRIT, "FATAL: SipHash-2-4 self-test failed (got %016llx, expected a129ca6149be45e5)",
              (unsigned long long)tv_result);
       abort();
+      /* LCOV_EXCL_STOP */
     }
   }
   tzset();
   g_boot_time = time(NULL);
   g_last_configured_time = g_boot_time;
   
-  // Force OpenSSL lazy initialization before entering Capsicum sandbox
-  uint8_t dummy_cookie[16];
-  generate_server_cookie("127.0.0.1", (const uint8_t *)"12345678", dummy_cookie, time(NULL));
+  // Force OpenSSL lazy initialization before entering Capsicum sandbox.
+  // NOTE: RFC 9018 Server Cookie は SipHash-2-4 (OpenSSL非依存) になったため、従来のように
+  // generate_server_cookie() を呼んでもOpenSSLは初期化されない。かつてはその内部の
+  // HMAC(EVP_sha256) が副作用として初期化を済ませていたが、それに依存してはならない。
+  // 初期化を怠ると、cap_enter() 後の最初のHMAC (TSIG検証/署名, karictl制御チャネルのAUTH) が
+  // openssl.cnf を open() しようとして ECAPMODE -> SIGTRAP となりbackendが死ぬ。
+  // 明示的に全TSIGアルゴリズムのHMACを事前実行する。
+  const bool crypto_prewarm_ok = tsig_prewarm_crypto();  // 警告はopenlog()後に出す
   {
     SHA_CTX dummy_sha;
     uint8_t dummy_digest[20];
@@ -4109,6 +4025,9 @@ int main(int argc, char **argv) {
 
   openlog("KariDNS", LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_DAEMON);
   syslog(LOG_INFO, "Starting KariDNS %s...", KARIDNS_VERSION);
+  if (!crypto_prewarm_ok) {
+    syslog(LOG_WARNING, "[Startup] OpenSSL HMAC pre-warm incomplete: some TSIG algorithms are unavailable in this OpenSSL build (e.g. FIPS mode)");
+  }
 
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
   if (!config_str)
@@ -4455,14 +4374,19 @@ int main(int argc, char **argv) {
       if (w < 0 && errno == EINTR) continue;
       break;
     }
-    if (!g_supervisor_should_exit && child_exit_code == 0) {
-      child_exit_code = 1;
-    }
     cleanup_pid_file();
     exit(child_exit_code);
   }
 
   // === Backend Process (backend_pid == 0) ===
+  struct sigaction b_sa;
+  memset(&b_sa, 0, sizeof(b_sa));
+  b_sa.sa_handler = backend_sig_handler;
+  sigemptyset(&b_sa.sa_mask);
+  b_sa.sa_flags = 0;
+  sigaction(SIGTERM, &b_sa, NULL);
+  sigaction(SIGINT, &b_sa, NULL);
+
   g_pid_file_path[0] = '\0';
   if (g_pid_fd >= 0) {
     close(g_pid_fd);
@@ -4479,10 +4403,6 @@ int main(int argc, char **argv) {
   init_async_io_pool();
   rrl_init();
 
-  pthread_t control_thread;
-  if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
-    exit(1);
-
   server_config_t *cfg = &g_config_db.config_a;
   uint32_t qlog_buf_size = cfg->query_log_buffer_size;
   if (qlog_buf_size < 1024 || (qlog_buf_size & (qlog_buf_size - 1)) != 0) {
@@ -4493,8 +4413,6 @@ int main(int argc, char **argv) {
   worker_ctx_t *ctxs = calloc(num_workers, sizeof(worker_ctx_t));
   if (!threads || !ctxs)
     exit(1);
-  g_worker_ctxs = ctxs;
-  g_worker_count = num_workers;
   for (int i = 0; i < num_workers; i++) {
     ctxs[i].thread_id = i;
     ctxs[i].core_id = (g_num_frontend_routers + i) % total_cores;
@@ -4522,6 +4440,16 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
     if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
       exit(EXIT_FAILURE);
+  }
+
+  atomic_store_explicit(&g_worker_ctxs, ctxs, memory_order_release);
+  atomic_store_explicit(&g_worker_count, num_workers, memory_order_release);
+
+  pthread_t control_thread;
+  if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
+    exit(1);
+
+  for (int i = 0; i < num_workers; i++) {
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
       exit(EXIT_FAILURE);
   }
@@ -4693,5 +4621,11 @@ int main(int argc, char **argv) {
     free_server_config_fields(active);
   }
   rrl_shutdown();
+#ifdef __clang__
+  if (__llvm_profile_write_file) {
+    __llvm_profile_write_file();
+  }
+#endif
   return 0;
 }
+#endif /* !KARIDNS_UNIT_TEST */

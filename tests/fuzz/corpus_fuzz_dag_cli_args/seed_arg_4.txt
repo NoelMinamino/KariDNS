@@ -1,0 +1,1 @@
+example.com HTTPS +yaml +edns=0 +bufsize=1232

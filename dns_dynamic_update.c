@@ -92,6 +92,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   }
 
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
+  if (cur_snap) retain_zone_snapshot(cur_snap);
   server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
   additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
@@ -186,6 +187,7 @@ static bool is_addr_notified(const struct sockaddr_storage *addrs, int count, co
 void send_notify_to_all(const char *domain, const char *view_name) {
   server_config_t *active = acquire_config_snapshot();
   zone_db_snapshot_t *snap = acquire_zone_snapshot();
+  if (snap) retain_zone_snapshot(snap);
   if (!active && !snap) {
     if (active) release_config_snapshot(active);
     if (snap) release_zone_snapshot(snap);

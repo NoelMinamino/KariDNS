@@ -1,0 +1,19 @@
+$ORIGIN deleg.test.
+$TTL 3600
+deleg.test. IN SOA ns1.deleg.test. hostmaster.deleg.test. 1 7200 3600 1209600 3600
+deleg.test. IN NS ns1.deleg.test.
+ns1.deleg.test. IN A 192.0.2.1
+
+; In-bailiwick delegation with glue
+sub1.deleg.test. IN NS ns.sub1.deleg.test.
+ns.sub1.deleg.test. IN A 192.0.2.11
+ns.sub1.deleg.test. IN AAAA 2001:db8::11
+sub1.deleg.test. IN DS 12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+
+; Out-of-bailiwick delegation (no glue required)
+sub2.deleg.test. IN NS ns.example.net.
+
+; Sibling delegation with sibling glue
+sub3.deleg.test. IN NS ns.sibling.deleg.test.
+sibling.deleg.test. IN NS ns1.deleg.test.
+ns.sibling.deleg.test. IN A 192.0.2.33

@@ -43,6 +43,16 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 
+#if defined(__APPLE__)
+/* macOS has no recvmmsg/sendmmsg and no struct mmsghdr. The server itself is
+ * FreeBSD-only, but portable modules (e.g. dns_tsig_acl.c, built on macOS for
+ * the portable unit tests) include this header for its shared types. */
+struct mmsghdr {
+  struct msghdr msg_hdr;
+  unsigned int msg_len;
+};
+#endif
+
 #include "dns_dnstap.h"
 #include "dns_edns_ecs.h"
 #include "dns_rrl.h"
@@ -90,18 +100,19 @@ typedef struct {
 } udp_ipc_t;
 
 #define UDP_BATCH_SIZE 16
-#define UDP_IPC_BUFFER_SIZE (sizeof(udp_ipc_t) + BUFFER_SIZE)
+#define UDP_IPC_PAYLOAD_MAX 65535
+#define UDP_IPC_BUFFER_SIZE ((sizeof(udp_ipc_t) + UDP_IPC_PAYLOAD_MAX + 7) & ~7)
 
 // ワーカーローカル用 UDPバッチコンテキスト (ヒープ保持)
 typedef struct {
   struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
   struct iovec   rx_iov[UDP_BATCH_SIZE];
-  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
   struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
 
   struct mmsghdr tx_msgs[UDP_BATCH_SIZE];
   struct iovec   tx_iov[UDP_BATCH_SIZE];
-  uint8_t        tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
 } udp_batch_ctx_t;
 
 // Frontend ルーター用 UDP制御メッセージバッファ共用体
@@ -115,7 +126,7 @@ typedef union {
 typedef struct {
   struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
   struct iovec   rx_iov[UDP_BATCH_SIZE];
-  uint8_t        rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
   struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
   router_cmsg_buf_t rx_cbuf[UDP_BATCH_SIZE];
 
@@ -124,7 +135,7 @@ typedef struct {
 
   struct mmsghdr ipc_rx_msgs[UDP_BATCH_SIZE];
   struct iovec   ipc_rx_iov[UDP_BATCH_SIZE];
-  uint8_t        ipc_rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
+  alignas(8) uint8_t ipc_rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
 
   struct mmsghdr cli_tx_msgs[UDP_BATCH_SIZE];
   struct iovec   cli_tx_iov[UDP_BATCH_SIZE];
@@ -213,8 +224,8 @@ struct worker_ctx {
 
 #include "dns_epoch_rcu.h"
 
-extern worker_ctx_t *g_worker_ctxs;
-extern int g_worker_count;
+extern _Atomic(worker_ctx_t *) g_worker_ctxs;
+extern _Atomic int g_worker_count;
 
 typedef struct {
   uint32_t old_serial;
@@ -343,6 +354,7 @@ typedef struct program_plugin {
   pthread_mutex_t lock;    /* 1子プロセスを複数workerから同時に叩かないための直列化 */
   uint32_t timeout_ms;
   uint32_t max_failures;
+  bool disable_auto_tc_flag;
   _Atomic unsigned int consecutive_failures;
   _Atomic bool dead;        /* max_failures超過、またはexec失敗でtrueになったら以後SERVFAIL固定 */
   char config_fingerprint[512]; /* M-4: reload時の設定変更検知用 */
@@ -410,5 +422,119 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
                         bool has_edns, bool dnssec_ok);
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len);
 size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_storage *out);
+
+void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
+void fast_ipv4_to_str(uint32_t ip_be, char *dst);
+uint32_t get_effective_query_log_max_qps(const server_config_t *cfg);
+void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info);
+void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool ensure_priv_dir_safe(const char *dir_buf);
+void init_logging_channels(server_config_t *cfg);
+const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
+void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
+                     const char *qname, uint16_t qclass, uint16_t qtype,
+                     bool has_edns, bool dnssec_ok, uint8_t protocol, uint32_t max_qps);
+void *control_thread_func(void *arg);
+void *response_logger_thread_func(void *arg);
+void *query_logger_thread_func(void *arg);
+void init_async_io_pool(void);
+int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
+void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
+
+#define ASYNC_IO_POOL_SIZE 16
+#define ASYNC_IO_QUEUE_CAPACITY 4096
+
+typedef struct {
+  bool is_tcp;
+  int active_fd; // For UDP, IPC socket to frontend
+  int client_fd; // For TCP, client socket
+  udp_ipc_t ipc_hdr;
+  uint8_t *req_buf;
+  size_t req_buf_cap;
+  size_t req_len;
+  char client_ip[INET6_ADDRSTRLEN];
+  int client_port;
+  struct sockaddr_storage client_addr;
+  socklen_t client_len;
+  struct sockaddr_storage server_addr;
+  socklen_t server_len;
+  bool has_server_addr;
+  char qname[256];
+  uint16_t qtype;
+  uint16_t qclass;
+  bool has_edns;
+  bool dnssec_ok;
+  size_t question_end;
+  zone_db_snapshot_t *snap;
+} async_io_task_t;
+
+typedef struct {
+  async_io_task_t queue[ASYNC_IO_QUEUE_CAPACITY];
+  size_t head;
+  size_t tail;
+  size_t count;
+  pthread_mutex_t lock;
+  pthread_cond_t cond_not_empty;
+  pthread_t threads[ASYNC_IO_POOL_SIZE];
+  bool running;
+} async_io_pool_t;
+
+extern async_io_pool_t g_async_io_pool;
+
+#ifdef KARIDNS_UNIT_TEST
+extern const char *g_config_path;
+extern int g_broker_sock;
+extern pid_t g_broker_pid;
+void start_connect_broker(void);
+extern int g_num_workers;
+extern int g_num_frontend_routers;
+extern int g_ipc_fds[4][128][2];
+extern pid_t g_supervisor_pid;
+extern int g_pid_fd;
+extern char g_pid_file_path[1024];
+extern volatile sig_atomic_t g_supervisor_should_exit;
+extern volatile sig_atomic_t g_supervisor_got_sighup;
+extern volatile sig_atomic_t g_backend_should_exit;
+
+bool enqueue_async_io_task(const async_io_task_t *task);
+void *async_io_worker_func(void *arg);
+void reload_all_zones(void);
+void perform_config_reload(void);
+void perform_config_reload_ext(bool skip_unchanged);
+void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
+void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
+                     const char *qname, uint16_t qclass, uint16_t qtype,
+                     bool has_edns, bool dnssec_ok, uint8_t protocol,
+                     uint32_t max_qps);
+void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg,
+                               zone_observatory_snapshot_t *out);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
+void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
+void backend_sig_handler(int sig);
+void supervisor_sig_handler(int sig);
+void cleanup_pid_file(void);
+void daemonize(void);
+void setup_ipc_tables(int num_workers);
+void run_frontend_router(pid_t backend_pid, int router_id);
+void *worker_thread_func(void *arg);
+#endif
+
+
+extern config_rcu_t g_config_db;
+extern int g_control_sock;
+extern int g_control_kq;
+extern time_t g_boot_time;
+extern time_t g_last_configured_time;
+extern _Atomic int g_tcp_clients;
+extern _Atomic int g_tcp_high_water;
+extern _Atomic int g_bound_workers;
+extern _Atomic bool g_frontend_alive;
+extern _Atomic bool g_privilege_drop_complete;
+extern _Atomic bool g_qlog_circuit_broken;
+extern resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
+extern _Atomic uint64_t g_resp_log_tail;
+extern _Atomic uint64_t g_resp_log_head;
 
 #endif /* DNS_SERVER_INTERNAL_H */

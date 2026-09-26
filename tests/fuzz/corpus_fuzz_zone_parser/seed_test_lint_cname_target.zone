@@ -1,0 +1,17 @@
+$ORIGIN example.com.
+$TTL 3600
+@ IN SOA ns1.example.com. hostmaster.example.com. (
+    2026091101 ; serial
+    7200       ; refresh
+    3600       ; retry
+    1209600    ; expire
+    3600       ; minimum
+)
+@ IN NS ns-target.example.com.
+@ IN MX 10 mx-target.example.com.
+
+ns-target.example.com. IN CNAME real-ns.example.com.
+mx-target.example.com. IN CNAME real-mx.example.com.
+
+real-ns.example.com. IN A 192.0.2.1
+real-mx.example.com. IN A 192.0.2.2
