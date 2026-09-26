@@ -2680,6 +2680,20 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
 }
 
 
+/* program / forward ゾーンが上限超過で切り詰めた応答 (TC=1、質問セクションのみ) は、
+ * 上流の OPT を失っている。問い合わせに OPT があれば付け直す (RFC 6891 §7)。 */
+static int add_opt_to_truncated_passthrough(uint8_t *res, size_t max_res_len, int len,
+                                            edns_info_t *edns, bool is_tcp, server_config_t *cfg) {
+  if (len < DNS_HEADER_SIZE || !edns->present || !(res[2] & 0x02)) return len;
+  if (dns_find_opt_rr(res, (size_t)len, NULL, NULL)) return len;
+  uint16_t offset = (uint16_t)len;
+  uint16_t arcount = (uint16_t)((res[10] << 8) | res[11]);
+  assemble_edns_opt(res, max_res_len, &offset, &arcount, edns, 0, is_tcp, cfg);
+  res[10] = (uint8_t)(arcount >> 8);
+  res[11] = (uint8_t)(arcount & 0xFF);
+  return (int)offset;
+}
+
 int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             size_t max_res_len, const char *qname, uint16_t qtype,
                             const char *client_ip, compress_ctx_t *comp_ctx,
@@ -3201,6 +3215,15 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       }
   }
 
+  /* RFC 6891 §7: OPT 付きの問い合わせには、切り詰め (TC=1) 応答でも OPT を返す。
+   * 本文 (回答・権威・追加セクション) の上限から OPT 分を先に差し引いておく。 */
+  size_t body_max_len = max_res_len;
+  if (edns.present) {
+    size_t opt_reserve = edns_opt_reserve_len(&edns, is_tcp, cfg);
+    if (max_res_len > opt_reserve + DNS_HEADER_SIZE)
+      body_max_len = max_res_len - opt_reserve;
+  }
+
   size_t q_offset = DNS_HEADER_SIZE;
   if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) {
     return -1;
@@ -3306,6 +3329,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       }
       int plugin_result_len = dispatch_to_program_zone(
           zcfg->domain, req, req_len, res, max_res_len, client_ip, is_tcp);
+      plugin_result_len = add_opt_to_truncated_passthrough(res, max_res_len, plugin_result_len,
+                                                            &edns, is_tcp, cfg);
 
       // programゾーンも他ゾーンと同じRRL設定(out_rrl_cfgは関数冒頭で既に
       // このゾーン用に正しくセット済み)でレート制限を受けさせる。
@@ -3316,7 +3341,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     }
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "forward") == 0) {
       int fwd_len = dispatch_forward_zone(zcfg, req, req_len, res, max_res_len);
-      return fwd_len;
+      return add_opt_to_truncated_passthrough(res, max_res_len, fwd_len, &edns, is_tcp, cfg);
     }
   }
 
@@ -3452,7 +3477,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 
     if (soa_rec) {
       dns_record_t rec_copy = *soa_rec;
-      if (serialize_dns_record(res, max_res_len, &offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) >= 0) {
+      if (serialize_dns_record(res, body_max_len, &offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) >= 0) {
         ancount = 1;
       }
     }
@@ -3491,7 +3516,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     for (response_cache_entry_t *e = current_zone->response_cache.buckets[hash_idx]; e != NULL; e = e->next) {
       if (e->qtype == qtype && e->qclass == qclass && e->name_hash == qname_hash &&
           strcmp(e->name, current_qname_lc) == 0) {
-        if ((size_t)q_offset + e->body_len <= max_res_len) {
+        if ((size_t)q_offset + e->body_len <= body_max_len) {
           memcpy(res + q_offset, e->body, e->body_len);
           uint16_t body_offset = (uint16_t)(q_offset + e->body_len);
           uint16_t arcount = e->arcount;
@@ -3569,7 +3594,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   zone_config_t *zcfg = (db_entry && view) ? find_zone_config_in_view(cfg, view->name, db_entry->domain) : NULL;
   bool ecs_trusted = (cfg && cfg->ecs_enable && edns.has_ecs && client_ip &&
                       is_ecs_trusted_resolver(current_zone, cfg, zcfg, client_ip));
-  resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, max_res_len,
+  resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                cfg_for_ede ? cfg_for_ede->minimal_responses : false,
                cfg_for_ede ? cfg_for_ede->minimal_any : false,

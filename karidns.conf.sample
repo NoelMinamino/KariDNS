@@ -61,7 +61,9 @@ control-channel {
     // socket "/var/run/karidns/control.sock";
     algorithm "hmac-sha256";
     // karictl.conf側の key "karictl" に設定した secret と一致させてください
-    secret "BASE64_ENCODED_SECRET_HERE=";
+    // 下の値はプレースホルダです (このままだと起動時に警告が出ます)。
+    // 必ず `openssl rand -base64 32` の出力に置き換えてください
+    secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy";
 };
 
 // 外部設定ファイルのインクルード (include ディレクティブ)
@@ -72,7 +74,8 @@ control-channel {
 // ゾーン転送(AXFR)やNOTIFYで使用するTSIGキー
 key "tsig-key-example" {
     algorithm "hmac-sha256";
-    secret "BASE64_ENCODED_SECRET_HERE=";
+    // プレースホルダです。`openssl rand -base64 32` の出力に置き換えてください
+    secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy";
 };
 
 // マスターゾーンの定義
@@ -111,4 +114,6 @@ zone "slave.example.net" {
     file "/usr/local/etc/namedb/slave/slave.example.net.zone";
     masters { 10.0.0.1 port 53; };
     tsig-key "tsig-key-example";
+    // マスターからの転送を受ける TCP 接続にも適用されます (受信バッファは connect 前に設定)
+    // zone-tcp-window 1M;
 };

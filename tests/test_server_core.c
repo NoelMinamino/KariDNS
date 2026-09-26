@@ -1240,7 +1240,7 @@ static void test_tcp_listen_and_zone_socket_opts(void) {
     /* tcp-mss: lowers the established connection's MSS; a larger value later is a no-op */
     apply_tcp_mss(sfd, c, 1200);
     assert(c->applied_mss == 1200);
-#ifdef TCP_MAXSEG
+#if defined(__FreeBSD__) && defined(TCP_MAXSEG)
     int mss_now = sockopt_int(sfd, IPPROTO_TCP, TCP_MAXSEG);
     assert(mss_now > 0 && mss_now <= 1200);
 #endif
@@ -1751,6 +1751,88 @@ static void test_active_broker_connect_loop(void) {
         }
     }
     printf("  -> active start_connect_broker passed.\n");
+}
+
+static void test_broker_connect_opts_and_xfr_tcp_sockopts(void) {
+    printf("[TEST] Server Core: xfr_tcp_sockopts & broker_connect_opts TCP options...\n");
+
+    /* zone values win, the global tcp-mss / tcp-window fill the gaps, catalog members (no zone{}) get the globals */
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    tcp_sockopts_t o = xfr_tcp_sockopts(NULL, NULL);
+    assert(o.mss == 0 && o.rcvbuf == 0 && o.sndbuf == 0);
+    cfg.tcp_mss = 1400;
+    cfg.tcp_window = 256 * 1024;
+    o = xfr_tcp_sockopts(&cfg, NULL);
+    assert(o.mss == 1400 && o.rcvbuf == 256 * 1024 && o.sndbuf == 256 * 1024);
+    zone_config_t z;
+    memset(&z, 0, sizeof(z));
+    z.zone_tcp_window = 1024 * 1024;
+    o = xfr_tcp_sockopts(&cfg, &z);
+    assert(o.mss == 1400 && o.rcvbuf == 1024 * 1024 && o.sndbuf == 256 * 1024);
+    z.zone_tcp_mss = 1200;
+    z.zone_tcp_sndbuf = 128 * 1024;
+    o = xfr_tcp_sockopts(&cfg, &z);
+    assert(o.mss == 1200 && o.rcvbuf == 1024 * 1024 && o.sndbuf == 128 * 1024);
+
+    /* the broker applies them to the socket it connects: buffers before connect(), MSS after */
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(lfd >= 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    socklen_t salen = sizeof(sa);
+    assert(getsockname(lfd, (struct sockaddr *)&sa, &salen) == 0);
+    assert(listen(lfd, 4) == 0);
+
+    /* as root the broker drops to the configured user and refuses to run without one */
+    char *saved_user = g_config_db.config_a.user;
+    static char nobody_user[] = "nobody";
+    g_config_db.config_a.user = nobody_user;
+    start_connect_broker();
+    g_config_db.config_a.user = saved_user;
+    assert(g_broker_sock >= 0);
+
+    tcp_sockopts_t want = { 1200, 512 * 1024, 256 * 1024 };
+    int fd = broker_connect_opts(AF_INET, SOCK_STREAM, (struct sockaddr *)&sa, sizeof(sa), &want);
+    assert(fd >= 0);
+    int v = 0;
+    socklen_t vl = sizeof(v);
+    assert(getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v, &vl) == 0 && v >= 512 * 1024);
+    vl = sizeof(v);
+    assert(getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, &vl) == 0 && v >= 256 * 1024);
+#if defined(__FreeBSD__) && defined(TCP_MAXSEG)
+    /* FreeBSD reports t_maxseg, which the setsockopt lowered (Linux keeps reporting the path MSS) */
+    vl = sizeof(v);
+    assert(getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &v, &vl) == 0 && v > 0 && v <= 1200);
+#endif
+    close(fd);
+    int afd = accept(lfd, NULL, NULL);
+    if (afd >= 0) close(afd);
+
+    /* plain broker_connect() still works and asks for nothing */
+    fd = broker_connect(AF_INET, SOCK_STREAM, (struct sockaddr *)&sa, sizeof(sa));
+    assert(fd >= 0);
+    close(fd);
+    afd = accept(lfd, NULL, NULL);
+    if (afd >= 0) close(afd);
+
+    /* an address longer than sockaddr_storage is rejected before anything is sent */
+    uint8_t huge[sizeof(struct sockaddr_storage) + 8];
+    memset(huge, 0, sizeof(huge));
+    assert(broker_connect_opts(AF_INET, SOCK_STREAM, (struct sockaddr *)huge, sizeof(huge), &want) == -1);
+
+    close(g_broker_sock);
+    g_broker_sock = -1;
+    if (g_broker_pid > 0) {
+        kill(g_broker_pid, SIGTERM);
+        waitpid(g_broker_pid, NULL, 0);
+        g_broker_pid = -1;
+    }
+    close(lfd);
+    printf("  -> xfr_tcp_sockopts & broker_connect_opts passed.\n");
 }
 
 static void test_setup_ipc_tables_and_reload_error_paths(void) {
@@ -5126,6 +5208,7 @@ int main(void) {
     test_setup_ipc_tables_and_reload_error_paths();
     test_perform_config_reload_valid_and_diff();
     test_active_broker_connect_loop();
+    test_broker_connect_opts_and_xfr_tcp_sockopts();
     test_server_core_process_lifecycle_and_signals();
     test_control_multiview_and_timeout_cases();
     test_control_reload_zone_specific();

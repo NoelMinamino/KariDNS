@@ -3267,6 +3267,59 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
     return 0;
 }
 
+size_t edns_opt_reserve_len(const edns_info_t *edns, bool is_tcp, const struct server_config_s *cfg) {
+    if (!edns) return 11;
+    size_t rdlen = 0;
+    if (edns->has_cookie) rdlen += 4 + 8 + 32;  /* server cookie は最大 32 バイト */
+    if (edns->has_mqtype_query) rdlen += 4 + (size_t)edns->mqtype_count * 2;
+    if (edns->has_nsid_query && cfg && cfg->nsid_string) rdlen += 4 + strlen(cfg->nsid_string);
+    if (is_tcp && edns->has_keepalive_query && cfg && cfg->tcp_connection_reuse) rdlen += 4 + 2;
+    if (edns->has_karidns_ext) rdlen += 4 + 5;
+    if (edns->has_ecs && (!cfg || cfg->ecs_enable)) rdlen += 4 + 4 + 16; /* SCOPE は解決中に決まる */
+    return 11 + rdlen;
+}
+
+bool dns_find_opt_rr(const uint8_t *msg, size_t msg_len, size_t *opt_off, size_t *opt_len) {
+    if (!msg || msg_len < DNS_HEADER_SIZE) return false;
+    uint16_t qd = (uint16_t)((msg[4] << 8) | msg[5]);
+    uint32_t rrs = (uint32_t)((msg[6] << 8) | msg[7]) + (uint32_t)((msg[8] << 8) | msg[9]) +
+                   (uint32_t)((msg[10] << 8) | msg[11]);
+    size_t off = DNS_HEADER_SIZE;
+    for (uint16_t i = 0; i < qd; i++) {
+        if (skip_wire_name(msg, msg_len, off, &off) != 0 || off + 4 > msg_len) return false;
+        off += 4;
+    }
+    for (uint32_t i = 0; i < rrs; i++) {
+        size_t start = off;
+        if (skip_wire_name(msg, msg_len, off, &off) != 0 || off + 10 > msg_len) return false;
+        uint16_t type = (uint16_t)((msg[off] << 8) | msg[off + 1]);
+        uint16_t rdlen = (uint16_t)((msg[off + 8] << 8) | msg[off + 9]);
+        off += 10;
+        if (off + rdlen > msg_len) return false;
+        off += rdlen;
+        if (type == 41) {
+            if (opt_off) *opt_off = start;
+            if (opt_len) *opt_len = off - start;
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end) {
+    if (!res || res_len < DNS_HEADER_SIZE) return res_len;
+    if (q_end < DNS_HEADER_SIZE || q_end > res_len) q_end = DNS_HEADER_SIZE;
+    size_t opt_off = 0, opt_len = 0;
+    bool has_opt = dns_find_opt_rr(res, res_len, &opt_off, &opt_len) && opt_off >= q_end;
+    res[6] = 0; res[7] = 0;   /* ANCOUNT */
+    res[8] = 0; res[9] = 0;   /* NSCOUNT */
+    res[10] = 0; res[11] = 0; /* ARCOUNT */
+    if (!has_opt) return q_end;
+    memmove(res + q_end, res + opt_off, opt_len);
+    res[11] = 1;
+    return q_end + opt_len;
+}
+
 void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                        uint16_t *offset_inout, uint16_t *arcount_inout,
                        edns_info_t *edns, uint8_t rcode_ext, bool is_tcp,
@@ -3276,14 +3329,16 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     if (edns && edns->has_cookie) {
         rdlen += 4 + 8 + edns->server_cookie_len;
     }
+    uint16_t ede_rdlen = 0;
     if (edns && edns->ede_count > 0) {
         for (uint16_t i = 0; i < edns->ede_count; i++) {
-            rdlen += 4 + 2;
+            ede_rdlen += 4 + 2;
             if (edns->ede_list[i].text[0] != '\0') {
-                rdlen += strlen(edns->ede_list[i].text);
+                ede_rdlen += strlen(edns->ede_list[i].text);
             }
         }
     }
+    rdlen += ede_rdlen;
     if (edns && edns->has_mqtype_query) {
         rdlen += 4 + (edns->mqtype_count * 2);
     }
@@ -3317,6 +3372,13 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
         rdlen += 4 + 4 + ecs_addr_bytes;
     }
 
+    /* RFC 6891 §7: OPT 付きの問い合わせには OPT で応える。本文側は edns_opt_reserve_len()
+     * 分を空けてあるので、入りきらないのは EDE が多い場合だけ。EDE (RFC 8914) は
+     * 省略可能な補足情報なので、OPT ごと落とすより EDE を落とす。 */
+    if ((size_t)offset + 11 + rdlen > max_res_len && edns && edns->ede_count > 0) {
+        rdlen -= ede_rdlen;
+        edns->ede_count = 0;
+    }
     if ((size_t)offset + 11 + rdlen <= max_res_len) {
         res[offset++] = 0; // Root name
         res[offset++] = 0; res[offset++] = 41; // TYPE OPT

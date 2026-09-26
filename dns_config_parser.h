@@ -12,6 +12,10 @@
 #define KARIDNS_UDP_BUFSIZE_MAX  4096
 #define KARIDNS_UDP_BUFSIZE_DEFAULT 1232             /* DNS Flag Day 2020 */
 
+/* karidns.conf.sample / karictl.conf.sample の secret プレースホルダ (Base64 として正しい値)。
+ * デコードすると "REPLACE-ME:openssl-rand-base64-32"。このまま使われていたら警告する。 */
+#define KARIDNS_SAMPLE_SECRET_PLACEHOLDER "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"
+
 
 #include <stdbool.h>
 #include <stdint.h>

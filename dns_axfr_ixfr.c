@@ -729,8 +729,8 @@ void *axfr_bg_thread_func(void *arg) {
 
   size_t addr_len = (domain_family == AF_INET) ? sizeof(struct sockaddr_in)
                                                : sizeof(struct sockaddr_in6);
-  int tcp_fd = broker_connect(domain_family, SOCK_STREAM,
-                              (struct sockaddr *)&master_addr, addr_len);
+  int tcp_fd = broker_connect_opts(domain_family, SOCK_STREAM,
+                                   (struct sockaddr *)&master_addr, addr_len, &ctx->tcp_opts);
   if (tcp_fd >= 0) {
     limit_client_socket_rights(tcp_fd);
     struct timeval tv;

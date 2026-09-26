@@ -199,6 +199,15 @@ conf_case zones_nofile  zones 1 "Could not open file" 'zone "m.example" { type m
 zone "s.example" { type slave; file "s"; masters { 192.0.2.1; }; };'
 out=$("$KC" conf /nonexistent/x.conf 2>&1); rc=$?
 check "conf:missing" 1 "Could not open file" "$out" "$rc"
+# the shipped sample must stay loadable; its placeholder secrets are flagged but are not errors
+out=$("$KC" conf karidns.conf.sample 2>&1); rc=$?
+check "conf:sample" 0 "is valid" "$out" "$rc"
+check "conf:sample-placeholder" 0 "secret is still the sample placeholder" "$out" "$rc"
+conf_case tcp_opts      conf 0 "is valid" 'options { tcp-mss 1220; tcp-window 256K; udp-bufsize 1232; };
+zone "t.example" { type master; file "t.zone"; zone-tcp-mss 1200; zone-tcp-window 128K; zone-tcp-sndbuf 2M; zone-udp-bufsize 1400; };'
+conf_case tcp_opts_bad  conf 1 "invalid zone-tcp-sndbuf value" 'zone "t.example" { type master; file "t.zone"; zone-tcp-sndbuf 2MB; };'
+conf_case bad_b64       conf 1 "secret is not valid base64" 'key "k" { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
+conf_case bad_b64_ctl   conf 1 "control-channel: secret is not valid base64" 'control-channel { algorithm "hmac-sha256"; secret "NOT_BASE64="; };'
 printf '$ORIGIN m.example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' > "$TMP/m.zone"
 printf 'zone "m.example" { type master; file "%s/m.zone"; };\nzone "p.example" { type program; program "/bin/true"; };\noptions { allow-program-zones yes; };\n' "$TMP" > "$TMP/zm.conf"
 out=$("$KC" zone m.example. "$TMP/zm.conf" 2>&1); rc=$?

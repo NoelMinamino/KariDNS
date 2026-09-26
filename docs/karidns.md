@@ -98,12 +98,12 @@ logging {
 control-channel {
     socket "/var/run/karidns/control.sock";
     algorithm "hmac-sha256";
-    secret "BASE64_SECRET_HERE=";
+    secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"; // placeholder: replace with `openssl rand -base64 32`
 };
 
 key "transfer-key" {
     algorithm "hmac-sha256";
-    secret "BASE64_SECRET_HERE=";
+    secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"; // placeholder: replace with `openssl rand -base64 32`
 };
 
 zone "example.com" {
@@ -146,7 +146,7 @@ being clamped, so a tuning setting can never be silently ignored.
 
 | Directive | Applied to | When | Effect |
 |---|---|---|---|
-| `tcp-window` | `SO_RCVBUF` and `SO_SNDBUF` of every TCP listener | before `listen()` | Inherited by accepted connections, so it covers the initial window advertised in the SYN-ACK. **Needs a restart**: listeners are not recreated on reload. |
+| `tcp-window` | `SO_RCVBUF` and `SO_SNDBUF` of every TCP listener | before `listen()` | Inherited by accepted connections, so it covers the initial window advertised in the SYN-ACK. **Needs a restart**: listeners are not recreated on reload. Also the default for secondary-zone transfers (see below). |
 | `tcp-mss` | `TCP_MAXSEG` of each accepted connection | right after `accept()` | Lowers the MSS KariDNS **sends** with. Picked up on reload by new connections. |
 | `zone-tcp-mss` | `TCP_MAXSEG` of the connection | after a query for the zone is read | Same as `tcp-mss`, and can only lower the MSS further (see limits). |
 | `zone-tcp-window` | `SO_RCVBUF` of the connection | after a query for the zone is read | Receive window, within the window scale already agreed in the handshake. |
@@ -178,6 +178,19 @@ established connection, which means:
   happens.
 
 When no zone uses `zone-tcp-*`, the TCP query path does no extra zone lookup and no `setsockopt()` calls.
+
+### Secondary zones: transfers from the primary
+
+For a `type slave;` / `type secondary;` zone, KariDNS is the TCP *client* of the zone transfer, and the
+connection to the primary is opened by the privilege-separated connect broker. The same settings apply
+there, taken from the zone and falling back to the server-wide values (catalog member zones have no
+`zone {}` block and use the server-wide values):
+
+| Socket option | Value used | When |
+|---|---|---|
+| `SO_RCVBUF` | `zone-tcp-window`, else `tcp-window` | before `connect()`, so it covers the window advertised in the SYN; this is the one that speeds up receiving a large AXFR/IXFR |
+| `SO_SNDBUF` | `zone-tcp-sndbuf`, else `tcp-window` | before `connect()` |
+| `TCP_MAXSEG` | `zone-tcp-mss`, else `tcp-mss` | after `connect()`: lowers the send MSS only, for the same FreeBSD reason as above |
 
 Per-zone UDP *socket* buffers are not possible: all zones share the same UDP sockets. The server-wide
 `udp-recvbuf-size` / `udp-sndbuf-size` stay the knobs for those. What can be set per zone on UDP is the

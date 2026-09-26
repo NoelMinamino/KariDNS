@@ -206,16 +206,20 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         _exit(1);
       }
     }
-    struct {
-      int family;
-      int type;
-      struct sockaddr_storage addr;
-    } req;
+    broker_req_t req;
     while (recv(sv[1], &req, sizeof(req), MSG_WAITALL) == sizeof(req)) {
       int sock = socket(req.family, req.type, 0);
       if (sock >= 0) {
         size_t addr_len = (req.family == AF_INET) ? sizeof(struct sockaddr_in)
                                                   : sizeof(struct sockaddr_in6);
+        if (req.type == SOCK_STREAM) {
+          /* zone-tcp-window / zone-tcp-sndbuf (または tcp-window): connect() 前なので
+           * SYN で通知する初期ウィンドウから効く */
+          if (req.tcp_opts.rcvbuf > 0)
+            setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &req.tcp_opts.rcvbuf, sizeof(int));
+          if (req.tcp_opts.sndbuf > 0)
+            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &req.tcp_opts.sndbuf, sizeof(int));
+        }
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
         int ret = connect(sock, (struct sockaddr *)&req.addr, addr_len);
         if (ret < 0 && errno == EINPROGRESS) {
@@ -230,6 +234,11 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         }
         if (ret == 0) {
           fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) & ~O_NONBLOCK);
+#ifdef TCP_MAXSEG
+          /* zone-tcp-mss / tcp-mss: 確立後に送信 MSS を下げる (apply_tcp_mss() と同じ理由) */
+          if (req.type == SOCK_STREAM && req.tcp_opts.mss > 0)
+            setsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, &req.tcp_opts.mss, sizeof(int));
+#endif
           struct msghdr msg = {0};
           struct cmsghdr *cmsg;
           char buf[CMSG_SPACE(sizeof(int))];
@@ -273,17 +282,21 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
 
 int broker_connect(int family, int type, struct sockaddr *addr,
                    size_t addr_len) {
+  return broker_connect_opts(family, type, addr, addr_len, NULL);
+}
+
+int broker_connect_opts(int family, int type, struct sockaddr *addr,
+                        size_t addr_len, const tcp_sockopts_t *tcp_opts) {
   if (g_broker_sock < 0)
     return -1;
-  struct {
-    int family;
-    int type;
-    struct sockaddr_storage addr;
-  } req;
+  if (addr_len > sizeof(struct sockaddr_storage))
+    return -1;
+  broker_req_t req;
   memset(&req, 0, sizeof(req));
   req.family = family;
   req.type = type;
   memcpy(&req.addr, addr, addr_len);
+  if (tcp_opts) req.tcp_opts = *tcp_opts;
   static pthread_mutex_t broker_lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&broker_lock);
   if (send(g_broker_sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -1084,12 +1097,11 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
           res_buf[2] |= 0x02; // Set TC bit
-          res_buf[6] = 0; res_buf[7] = 0;
-          res_buf[8] = 0; res_buf[9] = 0;
-          res_buf[10] = 0; res_buf[11] = 0;
           int qlen = (int)task.question_end;
           if (qlen > res_len) qlen = res_len;
           if (qlen > (int)task.req_len) qlen = (int)task.req_len;
+          // 質問セクションまで切り詰めるが、OPT は残す (RFC 6891 §7)
+          qlen = (int)dns_truncate_keep_opt(res_buf, (size_t)res_len, (size_t)qlen);
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, qlen,
                              &task.client_addr, task.client_len,
                              task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_UDP);
@@ -1188,6 +1200,24 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
     if (i < 3) *dst++ = '.';
   }
   *dst = '\0';
+}
+
+/* セカンダリゾーンがマスターから転送を受ける TCP 接続の値。ゾーン指定
+ * (zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf) があればそれを、なければ
+ * グローバルの tcp-mss / tcp-window を使う。受信側なので rcvbuf が主に効く。 */
+STATIC_TEST tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zone_config_t *zcfg) {
+  tcp_sockopts_t o = {0, 0, 0};
+  if (cfg) {
+    o.mss = cfg->tcp_mss;
+    o.rcvbuf = cfg->tcp_window;
+    o.sndbuf = cfg->tcp_window;
+  }
+  if (zcfg) {
+    if (zcfg->zone_tcp_mss > 0) o.mss = zcfg->zone_tcp_mss;
+    if (zcfg->zone_tcp_window > 0) o.rcvbuf = zcfg->zone_tcp_window;
+    if (zcfg->zone_tcp_sndbuf > 0) o.sndbuf = zcfg->zone_tcp_sndbuf;
+  }
+  return o;
 }
 
 /* tcp-window: listen() 前に listen ソケットの SO_RCVBUF / SO_SNDBUF を設定する。
@@ -1646,12 +1676,11 @@ worker_startup_success:;
 
               if (__builtin_expect(tc_packet, 0)) {
                 res_buf[2] |= 0x02; // Set TC bit
-                res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
-                res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
-                res_buf[10] = 0; res_buf[11] = 0; // ARCOUNT = 0
                 int qlen = (int)question_end;
                 if (qlen > res_len) qlen = res_len;
                 if (qlen > payload_received) qlen = payload_received;
+                // 質問セクションまで切り詰めるが、OPT は残す (RFC 6891 §7)
+                qlen = (int)dns_truncate_keep_opt(res_buf, (size_t)res_len, (size_t)qlen);
                 res_msg->payload_len = qlen;
                 batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
               } else {
@@ -2913,6 +2942,7 @@ void *control_thread_func(void *arg) {
                     char master_ip[64] = {0};
                     int master_port = 53;
                     char tsig_key_name[64] = {0};
+                    zone_config_t *slave_zcfg = NULL; /* カタログのメンバーゾーンは zone{} を持たない */
                     
                     if (entry->is_catalog_member) {
                         is_slave = true;
@@ -2921,6 +2951,7 @@ void *control_thread_func(void *arg) {
                         strncpy(tsig_key_name, entry->cached_tsig_key_name, sizeof(tsig_key_name) - 1);
                     } else {
                         zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
+                        slave_zcfg = zcfg;
                         if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
                             zcfg->masters_count > 0 && zcfg->masters[0].ip != NULL) {
                             is_slave = true;
@@ -2965,6 +2996,7 @@ void *control_thread_func(void *arg) {
                                     bg_ctx->entry = entry;
                                     bg_ctx->snap = snap;
                                     retain_zone_snapshot(snap);
+                                    bg_ctx->tcp_opts = xfr_tcp_sockopts(active, slave_zcfg);
                                     
                                     /* [H-4] config ポインタをそのまま渡すと UAF になるため、
                                      * TSIG キーのデータをスレッド起動前に bg_ctx へ値コピーする。*/

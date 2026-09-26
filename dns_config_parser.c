@@ -2450,6 +2450,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                                       (const unsigned char *)tsig->secret,
                                       slen);
             if (len < 0) {
+              syslog(LOG_ERR, "[Config] key '%s': secret is not valid base64", tsig->name);
+              fprintf(stderr, "[ERROR] key '%s': secret is not valid base64\n", tsig->name);
               free(key_prop);
               free(val);
               tsig->secret = NULL;
@@ -2464,6 +2466,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             if (slen > 1 && tsig->secret[slen - 2] == '=')
               padding++;
             tsig->secret_decoded_len = len - padding;
+            if (strcmp(tsig->secret, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
+              syslog(LOG_WARNING, "[Config] key '%s': secret is still the sample placeholder; "
+                     "replace it with the output of 'openssl rand -base64 32'", tsig->name);
+              fprintf(stderr, "[WARNING] key '%s': secret is still the sample placeholder; "
+                      "replace it with the output of 'openssl rand -base64 32'\n", tsig->name);
+            }
           }
         } else
           skip_unknown_block(ctx);
@@ -2571,6 +2579,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                                       (const unsigned char *)config->control.secret,
                                       slen);
             if (len < 0) {
+              syslog(LOG_ERR, "[Config] control-channel: secret is not valid base64");
+              fprintf(stderr, "[ERROR] control-channel: secret is not valid base64\n");
               free(key_prop);
               free(config->control.secret);
               config->control.secret = NULL;
@@ -2582,6 +2592,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             if (slen > 1 && config->control.secret[slen - 2] == '=')
               padding++;
             config->control.secret_decoded_len = len - padding;
+            if (strcmp(config->control.secret, KARIDNS_SAMPLE_SECRET_PLACEHOLDER) == 0) {
+              syslog(LOG_WARNING, "[Config] control-channel: secret is still the sample placeholder; "
+                     "replace it with the output of 'openssl rand -base64 32'");
+              fprintf(stderr, "[WARNING] control-channel: secret is still the sample placeholder; "
+                      "replace it with the output of 'openssl rand -base64 32'\n");
+            }
           }
         } else
           skip_unknown_block(ctx);
