@@ -2996,7 +2996,7 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
     return 0;
 }
 
-KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
+KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml, bool is_trace) {
     if (is_yaml || g_server_count == 0) return;
     
     if (g_server_count > 1) {
@@ -3083,8 +3083,12 @@ KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml) {
     
     // URL出力 (+ldnsz が指定された場合のみ)
     if (use_ldnsz) {
-        if (g_server_count > 1) {
-            printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
+        if (is_trace || g_server_count > 1) {
+            if (is_trace) {
+                printf(";; View trace in browser:\n;; https://ldns.jp/trace/#c=");
+            } else {
+                printf(";; Compare details in browser:\n;; https://ldns.jp/diff/#c=");
+            }
             for (int i = 0; i < g_server_count; i++) {
                 server_result_t *r = &g_results[i];
                 printf("%s", (i > 0) ? "," : "");
@@ -3178,9 +3182,11 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +tcp-mss=N                   Force TCP Maximum Segment Size (MSS) to N bytes\n"
         "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
-        "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses)\n"
+        "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses;\n"
+        "                               ignores ADDITIONAL section unless +glue is given)\n"
         "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +noglue by default)\n"
-        "  +[no]glue                    Prefer in-bailiwick Glue records from ADDITIONAL section for +nssearch [default: +noglue]\n"
+        "  +[no]glue                    Use in-bailiwick Glue records from ADDITIONAL section for +trace / +nssearch\n"
+        "                               (+noglue: ignore ADDITIONAL and resolve NS names via resolver) [default: +noglue]\n"
         "  +[no]search / +[no]defname   Use search list defined in /etc/resolv.conf\n"
         "  +domain=domain               Set default search domain\n"
         "  +ndots=N                     Set search NDOTS threshold\n"
@@ -5043,7 +5049,7 @@ int main(int argc, char **argv) {
     // -f バッチファイルモードの処理
     if (global_spec.batch_file) {
         int batch_rc = execute_batch_spec(&global_spec);
-        print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml);
+        print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, global_spec.do_trace);
 #ifndef _WIN32
         if (global_spec.qo.mem_debug) {
             struct rusage ru;
@@ -5066,6 +5072,7 @@ int main(int argc, char **argv) {
     }
 
     int last_exit_code = 0;
+    bool any_trace = global_spec.do_trace;
     for (int q = 0; q < query_count; q++) {
         query_spec_t local_spec = global_spec;
         deep_copy_query_opts(&local_spec.qo, &global_spec.qo);
@@ -5087,6 +5094,7 @@ int main(int argc, char **argv) {
 
         if (local_spec.qo.mem_debug) global_spec.qo.mem_debug = true;
         if (local_spec.use_ldnsz) global_spec.use_ldnsz = true;
+        if (local_spec.do_trace) any_trace = true;
         int rc = execute_query_spec(&local_spec);
         if (rc != 0) last_exit_code = rc;
         free_query_opts(&local_spec.qo);
@@ -5094,7 +5102,7 @@ int main(int argc, char **argv) {
         if (query_count > 1) {
             bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
             if (!used_nofail) {
-                print_multi_server_summary(local_spec.use_ldnsz, local_spec.dopt.yaml);
+                print_multi_server_summary(local_spec.use_ldnsz, local_spec.dopt.yaml, local_spec.do_trace);
             }
             g_server_count = 0;
         }
@@ -5103,7 +5111,7 @@ int main(int argc, char **argv) {
     if (query_count <= 1) {
         bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
         if (!used_nofail_failover) {
-            print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml);
+            print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, any_trace);
         }
     }
 

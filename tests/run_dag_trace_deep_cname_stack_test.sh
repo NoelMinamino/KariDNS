@@ -90,6 +90,11 @@ while (1) {
                 "\x00" . pack("nn", 2, 1) .
                 "\x00" . pack("nnNn", 2, 1, 3600, 20) . "\x01a\x0croot-servers\x03net\x00" .
                 "\x01a\x0croot-servers\x03net\x00" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("127.0.0.1");
+    } elsif ($qname =~ /^a\.root-servers\.net\./i && unpack("n", substr($query, $off, 2)) == 1) {
+        # Root server address resolution (+noglue default): return 127.0.0.1
+        $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
+                "\x01a\x0croot-servers\x03net\x00" . pack("nn", 1, 1) .
+                "\x01a\x0croot-servers\x03net\x00" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("127.0.0.1");
     } elsif ($qname =~ /^c(\d+)\.example\.com\./i) {
         my $n = int($1);
         my $qwire = substr($query, 12, $off - 12);
