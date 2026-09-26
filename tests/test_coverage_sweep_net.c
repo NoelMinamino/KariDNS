@@ -444,8 +444,60 @@ static void fs_start(fsrv_t *s, int variant) {
  * Running dag's main() in a child process
  * ==================================================================== */
 static int g_runs, g_nonzero;
+
+/* Runs can overlap: with g_jobs > 1, run_dag() returns as soon as the child is
+ * started and at most g_jobs children run at once. Only the sections whose
+ * runs do not depend on each other (or on the fake server's per-name hop
+ * counters) are run that way; run_barrier() waits for all of them. */
+static int g_jobs = 1, g_inflight;
+static struct { pid_t pid; char cmd[256]; } g_slots[16];
+
+static void account(pid_t pid, int st, const char *cmd) {
+    (void)pid;
+    g_runs++;
+    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+    if (rc) g_nonzero++;
+    if (WIFSIGNALED(st) && WTERMSIG(st) != SIGALRM) {
+        fprintf(stderr, "  !! dag crashed with signal %d: %s\n", WTERMSIG(st), cmd);
+        assert(!"dag crashed");
+    }
+}
+
+static void reap_one(void) {
+    int st = 0;
+    pid_t pid = waitpid(-1, &st, 0);
+    if (pid <= 0) { g_inflight = 0; return; }
+    for (size_t i = 0; i < sizeof(g_slots) / sizeof(g_slots[0]); i++) {
+        if (g_slots[i].pid == pid) {
+            g_slots[i].pid = 0;
+            g_inflight--;
+            account(pid, st, g_slots[i].cmd);
+            return;
+        }
+    }
+}
+
+static void run_barrier(void) {
+    while (g_inflight > 0) reap_one();
+}
+
+static void set_parallel(bool on) {
+    run_barrier();
+    g_jobs = 1;
+    if (on) {
+        const char *e = getenv("SWNET_JOBS");
+        long n = e ? strtol(e, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN) * 2;
+        if (n < 1) n = 1;
+        if (n > (long)(sizeof(g_slots) / sizeof(g_slots[0]))) n = (long)(sizeof(g_slots) / sizeof(g_slots[0]));
+        g_jobs = (int)n;
+    }
+}
+
 static int run_dag(int argc, char **argv) {
     fflush(stdout); fflush(stderr);
+    if (g_jobs > 1) {
+        while (g_inflight >= g_jobs) reap_one();
+    }
     pid_t pid = fork();
     if (pid == 0) {
         const char *v = getenv("SWNET_VERBOSE");   /* debugging aid: show output of runs containing this token */
@@ -457,17 +509,24 @@ static int run_dag(int argc, char **argv) {
         fflush(stdout);
         exit(rc & 0xFF);
     }
-    int st = 0; waitpid(pid, &st, 0);
-    g_runs++;
-    int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-    if (rc) g_nonzero++;
-    if (WIFSIGNALED(st) && WTERMSIG(st) != SIGALRM) {
-        fprintf(stderr, "  !! dag crashed with signal %d:", WTERMSIG(st));
-        for (int i = 0; i < argc; i++) fprintf(stderr, " %s", argv[i]);
-        fprintf(stderr, "\n");
-        assert(!"dag crashed");
+    char cmd[256] = "";
+    for (int i = 0; i < argc; i++) {
+        size_t l = strlen(cmd);
+        snprintf(cmd + l, sizeof(cmd) - l, "%s%s", i ? " " : "", argv[i]);
     }
-    return rc;
+    if (g_jobs > 1 && pid > 0) {
+        for (size_t i = 0; i < sizeof(g_slots) / sizeof(g_slots[0]); i++) {
+            if (g_slots[i].pid == 0) {
+                g_slots[i].pid = pid;
+                snprintf(g_slots[i].cmd, sizeof(g_slots[i].cmd), "%s", cmd);
+                g_inflight++;
+                return 0;
+            }
+        }
+    }
+    int st = 0; waitpid(pid, &st, 0);
+    account(pid, st, cmd);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 
 #define MAXA 48
@@ -642,6 +701,8 @@ static void test_dag_cli_matrix(fsrv_t *s, fsrv_t *s2) {
         "-4", "-u", "+tcp +ednsopt=12:0000", "+norec +adflag +cdflag +aaflag +tcflag +zflag", "+opcode=5", "+coflag",
     };
     const char *types[] = { "A", "AAAA", "TXT", "ANY", "MX", "SOA", "NS", "DNSKEY", "RRSIG", "TYPE65534" };
+    /* the option matrix, DoT/DoH and PROXY runs are independent: overlap them */
+    set_parallel(true);
     for (size_t l = 0; l < N(labels); l++) {
         for (size_t o = 0; o < N(opts); o++) {
             if (l > 3 && o % 3 != l % 3) continue;          /* keep the matrix size reasonable */
@@ -725,6 +786,7 @@ static void test_dag_cli_matrix(fsrv_t *s, fsrv_t *s2) {
     run_line("%s +proxy=192.0.2.1#1234-192.0.2.2#53 +tcp ok.test.", srv);
     run_line("%s +proxy=[2001:db8::1]:1-[2001:db8::2]:2 ok.test.", srv);
     run_line("%s +proxy-plain=bogus ok.test.", srv);
+    set_parallel(false);   /* from here on, order matters (trace hop counters, closeafter, ...) */
     /* malformed-query generator (--break) and trace/nssearch variants */
     const char *brk[] = { "compression-loop", "compression-forward", "label-too-long", "reserved-length-bits", "oversized-qname",
                           "qdcount=2", "truncated-question", "opt-rdlen=3", "arcount=4", "opcode=9", "qr-bit", "notify-no-question",
@@ -901,6 +963,7 @@ static void test_replay(fsrv_t *s, fsrv_t *s2) {
     FILE *f = fopen(p5, "w"); fprintf(f, "ok.test. A\ndiffextra.test. A\ndiffrc.test. AAAA\n# c\n\nbig.test. TXT\nbad line with too many tokens here\nx.test. BOGUS\n"); fclose(f);
     snprintf(out, sizeof(out), "%s/diff.out", g_tmp);
     const char *inputs[] = { p1, p2, p3, p6, p4, p5, "/nonexistent/file" };
+    set_parallel(true);   /* replays are independent of each other */
     for (size_t i = 0; i < N(inputs); i++) {
         run_line("--replay %s --server1 127.0.0.1:%d --timeout-ms 300", inputs[i], s->port);
         run_line("--replay %s --server1 127.0.0.1:%d --server2 127.0.0.1:%d --timeout-ms 300 --output json --output-diff %s", inputs[i], s->port, s2->port, out);
@@ -912,6 +975,7 @@ static void test_replay(fsrv_t *s, fsrv_t *s2) {
     run_line("--replay %s", p1);
     run_line("--replay %s --server1 [::1]:1 --timeout-ms 100 --workers 99 --output yaml", p5);
     run_line("--replay %s --server1 127.0.0.1:notaport --bogus-option", p5);
+    set_parallel(false);
     printf("  -> replay runs done.\n");
 }
 

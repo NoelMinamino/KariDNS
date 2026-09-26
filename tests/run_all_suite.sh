@@ -14,6 +14,9 @@
 #                           update, edns, rrl, catalog, tinydns, core, dag,
 #                           regression, all). Comma-separated or multiple -c.
 #   -f, --filter <pattern>  Run tests whose name matches pattern.
+#   -e, --exclude <list>    Skip tests whose name contains any of the
+#                           comma-separated substrings (e.g. used by
+#                           `make coverage` to skip ASan/TSan-only suites).
 #   -q, --quick             Run fast unit and core tests only.
 #   -x, --stop-on-failure   Abort immediately upon first test failure.
 #   -v, --verbose           Print verbose real-time test output.
@@ -57,6 +60,7 @@ mkdir -p "${LOG_DIR}"
 
 SELECTED_CATEGORIES=""
 NAME_FILTER=""
+EXCLUDE_LIST=""
 STOP_ON_FAILURE=0
 VERBOSE=0
 QUICK_MODE=0
@@ -104,6 +108,13 @@ while [ $# -gt 0 ]; do
         --filter=*)
             NAME_FILTER="${1#*=}"
             ;;
+        -e|--exclude)
+            shift
+            [ $# -gt 0 ] && EXCLUDE_LIST="${EXCLUDE_LIST:+${EXCLUDE_LIST},}$1"
+            ;;
+        --exclude=*)
+            EXCLUDE_LIST="${EXCLUDE_LIST:+${EXCLUDE_LIST},}${1#*=}"
+            ;;
         -q|--quick)
             QUICK_MODE=1
             ;;
@@ -129,6 +140,7 @@ while [ $# -gt 0 ]; do
             echo "                          dnstap, tinydns, core, regression, dag, all"
             echo "  --no-dag, --skip-dag    Skip dag diagnostic client test suite"
             echo "  -f, --filter <pattern>  Filter tests matching name substring"
+            echo "  -e, --exclude <list>    Skip tests whose name contains any comma-separated substring"
             echo "  -q, --quick             Run quick unit and core tests only"
             echo "  -x, --stop-on-failure   Stop on first test failure"
             echo "  -v, --verbose           Print verbose output during execution"
@@ -414,6 +426,16 @@ is_category_selected() {
 # Function to check if name filter matches
 is_name_matched() {
     _name="$1"
+    if [ -n "${EXCLUDE_LIST}" ]; then
+        _old_ifs="$IFS"; IFS=","
+        for _ex in ${EXCLUDE_LIST}; do
+            [ -n "${_ex}" ] || continue
+            case "${_name}" in
+                *"${_ex}"*) IFS="$_old_ifs"; return 1 ;;
+            esac
+        done
+        IFS="$_old_ifs"
+    fi
     if [ -z "${NAME_FILTER}" ]; then
         return 0
     fi
@@ -440,6 +462,7 @@ echo "${C_BOLD}             KariDNS Automated Test Suite Runner${C_RESET}"
 echo "${C_BOLD}======================================================================${C_RESET}"
 [ -n "${SELECTED_CATEGORIES}" ] && echo "  Category Filter : ${C_CYAN}${SELECTED_CATEGORIES}${C_RESET}"
 [ -n "${NAME_FILTER}" ]        && echo "  Name Filter     : ${C_CYAN}${NAME_FILTER}${C_RESET}"
+[ -n "${EXCLUDE_LIST}" ]       && echo "  Excluded        : ${C_CYAN}${EXCLUDE_LIST}${C_RESET}"
 [ "${QUICK_MODE}" -eq 1 ]      && echo "  Mode            : ${C_YELLOW}Quick Mode${C_RESET}"
 echo ""
 

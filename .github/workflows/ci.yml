@@ -10,6 +10,11 @@ on:
       - 'feature/**'
       - 'fix/**'
       - 'improve/**'
+    # "labeled": adding the "coverage" label to a PR starts the coverage job
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # nightly coverage gate (03:17 JST)
+    - cron: '17 18 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -19,6 +24,7 @@ concurrency:
 jobs:
   build-and-test-freebsd:
     name: Build and Test on FreeBSD ${{ matrix.release }}
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -132,6 +138,7 @@ jobs:
 
   unit-tests-portable:
     name: Portable unit tests (+ASan/UBSan) on ${{ matrix.name }}
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     strategy:
@@ -178,6 +185,7 @@ jobs:
 
   build-dag-unix:
     name: Build & Smoke Test dag on ${{ matrix.name }}
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -226,6 +234,7 @@ jobs:
 
   build-dag-windows:
     name: Build & Smoke Test dag on Windows (MinGW-w64)
+    if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: windows-latest
     steps:
       - name: Checkout code
@@ -261,3 +270,56 @@ jobs:
           echo "Testing multiple UDP query..."
           ./dag.exe www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
           echo "::endgroup::"
+
+  # ---------------------------------------------------------------------------
+  # Coverage quality gate (FreeBSD only: the server core needs kqueue/Capsicum).
+  # Too slow for every PR, so it runs on pushes to main, nightly, on demand, and
+  # for PRs labelled "coverage". `make coverage` builds in parallel, skips the
+  # ASan/TSan-only suites (they run in build-and-test-freebsd) and runs the
+  # server fault-injection sweep and the dag network sweep in parallel lanes.
+  # ---------------------------------------------------------------------------
+  coverage-freebsd:
+    name: Coverage gate (FreeBSD 15.1)
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'coverage'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: make coverage inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '15.1'
+          copyback: true
+          run: |
+            set -e
+
+            echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
+            # Base llvm-cov on FreeBSD 15 aborts in "show"; the llvmNN-lite package
+            # provides llvm-covNN / llvm-profdataNN, which the Makefile picks up.
+            V=$(cc --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1)
+            pkg install -y perl5 "llvm${V}-lite"
+            echo "::endgroup::"
+
+            echo "::group::🧪 [Coverage] make coverage"
+            START=$(date +%s)
+            make coverage
+            echo "make coverage took $(( $(date +%s) - START ))s"
+            echo "::endgroup::"
+
+            echo "::group::🚦 [Gate] Phase 2 thresholds"
+            perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict
+            echo "::endgroup::"
+
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage_html
+          if-no-files-found: warn

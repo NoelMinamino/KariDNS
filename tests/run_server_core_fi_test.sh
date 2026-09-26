@@ -19,8 +19,6 @@ ROOT="$DIR/.."
 KARIDNS="$ROOT/karidns"
 DAG="$ROOT/dag"
 KARICTL="$ROOT/karictl"
-PORT=10153
-CTRL_PORT=10954
 SHIM_SRC="$ROOT/tests/fi/kari_fi_preload.c"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -92,20 +90,35 @@ www IN A   192.0.2.1
 txt IN TXT "fault injection"
 ZEOF
 
-cat > "$TMP/karidns.conf" <<CEOF
+# -----------------------------------------------------------------------------
+# The sweeps run in parallel "lanes". Every lane has its own directory, DNS and
+# control ports, so the karidns instances of different lanes never meet.
+# FI_LANES overrides the lane count (default: number of CPUs, 1..4).
+# -----------------------------------------------------------------------------
+NCPU=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 1)
+LANES=${FI_LANES:-$NCPU}
+[ "$LANES" -lt 1 ] 2>/dev/null && LANES=1
+[ "$LANES" -gt 4 ] && LANES=4
+
+setup_lane() { # <lane>
+    L="$TMP/lane$1"
+    LPORT=$((10153 + $1 * 4))
+    LCTRL=$((10954 + $1 * 4))
+    mkdir -p "$L"
+    cat > "$L/karidns.conf" <<CEOF
 options {
-    port $PORT;
+    port $LPORT;
     bind-address { 127.0.0.1; };
     user "nobody";
     group "nobody";
-    pid-file "$TMP/run/karidns.pid";
+    pid-file "$L/run/karidns.pid";
 };
 logging {
-    channel q { file "$TMP/run/query.log" versions 2 size 1k; print-time yes; };
+    channel q { file "$L/run/query.log" versions 2 size 1k; print-time yes; };
     category queries { q; };
 };
 control-channel {
-    port $CTRL_PORT;
+    port $LCTRL;
     bind-address 127.0.0.1;
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
@@ -114,59 +127,57 @@ zone "fi.test" {
     type master;
     file "$TMP/fi.zone";
     allow-transfer { 127.0.0.1; };
-    also-notify { 127.0.0.1 port 10155; };
+    also-notify { 127.0.0.1 port $((LPORT + 2)); };
 };
 CEOF
-
-cat > "$TMP/karictl.conf" <<KEOF
+    cat > "$L/karictl.conf" <<KEOF
 server 127.0.0.1;
-port $CTRL_PORT;
+port $LCTRL;
 key "karictl" {
     algorithm hmac-sha256;
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
 KEOF
-
-CRASHES=0
-RUNS=0
-FIRED=0
+    : > "$L/stats"
+    : > "$L/out"
+}
 
 # run_one "<KARI_FI_SPEC>" -> 0 if the injected fault fired, 1 otherwise
 run_one() {
     spec="$1"
-    rm -f "$TMP/fired.log"
+    rm -f "$L/fired.log"
     # karidns hands the pid/log directory over to the unprivileged user, and
     # then refuses a directory it does not trust on the next start: recreate it
-    rm -rf "$TMP/run"; mkdir -m 755 "$TMP/run"
-    RUNS=$((RUNS + 1))
-    env LD_PRELOAD="$SHIM" KARI_FI_SPEC="$spec" KARI_FI_LOG="$TMP/fired.log" \
-        "$KARIDNS" -f "$TMP/karidns.conf" > "$TMP/server.log" 2>&1 &
+    rm -rf "$L/run"; mkdir -m 755 "$L/run"
+    echo run >> "$L/stats"
+    env LD_PRELOAD="$SHIM" KARI_FI_SPEC="$spec" KARI_FI_LOG="$L/fired.log" \
+        "$KARIDNS" -f "$L/karidns.conf" > "$L/server.log" 2>&1 &
     SERVER_PID=$!
     # wait up to ~3s for the server to answer (or to exit)
     i=0
     while [ $i -lt 30 ]; do
         kill -0 "$SERVER_PID" 2>/dev/null || break
         # dag exits 0 even on a timeout, so look for an actual answer
-        out="$("$DAG" @127.0.0.1 -p $PORT fi.test. SOA +time=1 +tries=1 +short 2>/dev/null)"
+        out="$("$DAG" @127.0.0.1 -p $LPORT fi.test. SOA +time=1 +tries=1 +short 2>/dev/null)"
         case "$out" in *hostmaster*) break ;; esac
         sleep 0.1
         i=$((i + 1))
     done
     if kill -0 "$SERVER_PID" 2>/dev/null; then
-        "$DAG" @127.0.0.1 -p $PORT www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
-        "$DAG" @127.0.0.1 -p $PORT txt.fi.test. TXT +tcp +time=1 +tries=1 >/dev/null 2>&1
-        "$DAG" @127.0.0.1 -p $PORT nx.fi.test. A +keepopen +tcp www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
-        "$DAG" @127.0.0.1 -p $PORT fi.test. AXFR +time=1 +tries=1 >/dev/null 2>&1
-        "$KARICTL" -f "$TMP/karictl.conf" status >/dev/null 2>&1
-        "$KARICTL" -f "$TMP/karictl.conf" notify fi.test >/dev/null 2>&1
-        "$KARICTL" -f "$TMP/karictl.conf" reload fi.test >/dev/null 2>&1
-        "$KARICTL" -f "$TMP/karictl.conf" reconfig >/dev/null 2>&1
-        "$DAG" @127.0.0.1 -p $PORT www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $LPORT www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $LPORT txt.fi.test. TXT +tcp +time=1 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $LPORT nx.fi.test. A +keepopen +tcp www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $LPORT fi.test. AXFR +time=1 +tries=1 >/dev/null 2>&1
+        "$KARICTL" -f "$L/karictl.conf" status >/dev/null 2>&1
+        "$KARICTL" -f "$L/karictl.conf" notify fi.test >/dev/null 2>&1
+        "$KARICTL" -f "$L/karictl.conf" reload fi.test >/dev/null 2>&1
+        "$KARICTL" -f "$L/karictl.conf" reconfig >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $LPORT www.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
         if [ -n "${HEAVY:-}" ]; then
             # enough logged queries to rotate the 1k query log a few times
             j=0
             while [ $j -lt 40 ]; do
-                "$DAG" @127.0.0.1 -p $PORT q$j.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
+                "$DAG" @127.0.0.1 -p $LPORT q$j.fi.test. A +time=1 +tries=1 >/dev/null 2>&1
                 j=$((j + 1))
             done
             sleep 1
@@ -179,18 +190,22 @@ run_one() {
     wait "$SERVER_PID" 2>/dev/null
     rc=$?
     SERVER_PID=""
-    pkill -9 -f "karidns -f $TMP" 2>/dev/null
+    pkill -9 -f "karidns -f $L/karidns.conf" 2>/dev/null
     # 128+SIGABRT(6) / SIGBUS(10) / SIGSEGV(11), or a sanitizer report
-    if [ $rc -eq 134 ] || [ $rc -eq 138 ] || [ $rc -eq 139 ] || grep -q "Sanitizer\|Segmentation fault" "$TMP/server.log"; then
-        echo "  !! crash (rc=$rc) with KARI_FI_SPEC=$spec"
-        tail -n 5 "$TMP/server.log" | sed 's/^/     /'
-        CRASHES=$((CRASHES + 1))
+    if [ $rc -eq 134 ] || [ $rc -eq 138 ] || [ $rc -eq 139 ] || grep -q "Sanitizer\|Segmentation fault" "$L/server.log"; then
+        {
+            echo "  !! crash (rc=$rc) with KARI_FI_SPEC=$spec"
+            tail -n 5 "$L/server.log" | sed 's/^/     /'
+        } >> "$L/out"
+        echo crash >> "$L/stats"
     fi
-    if [ -s "$TMP/fired.log" ]; then FIRED=$((FIRED + 1)); return 0; fi
+    if [ -s "$L/fired.log" ]; then echo fired >> "$L/stats"; return 0; fi
     return 1
 }
 
 # sweep <call> <max-N> [errno]   (CHILD=1: only count calls in forked children)
+# The loop stops at the first N whose call is never reached, so a large cap
+# only costs runs on machines that really make that many calls.
 sweep() {
     call="$1"; max="$2"; err="${3:-}"
     n=1
@@ -200,58 +215,85 @@ sweep() {
         run_one "$spec" || break
         n=$((n + 1))
     done
-    echo "  $call${err:+ ($err)}${CHILD:+ [children]}: swept N=1..$((n - 1))"
+    echo "  $call${err:+ ($err)}${CHILD:+ [children]}${HEAVY:+ [log rotation]}: swept N=1..$((n - 1))" >> "$L/out"
 }
 
-echo "=== KariDNS server fault-injection sweep ==="
-sweep socket 64
-sweep bind 32 EADDRINUSE
-sweep setsockopt 160 ENOBUFS
-sweep listen 16
-sweep socketpair 64
-sweep fork 32 EAGAIN
-sweep pthread_create 160
-sweep kqueue 40 EMFILE
-sweep setgroups 3 EPERM
-sweep setgid 3 EPERM
-sweep setuid 3 EPERM
-sweep getpwnam 3
-sweep getgrnam 3
-sweep cap_enter 3 ENOSYS
-sweep mkdir 16 EACCES
-sweep accept 16 EMFILE
-sweep accept 3 ECONNABORTED
-sweep sendmsg 16 ENOBUFS
-sweep sendto 16 ENOBUFS
-sweep rename 3 EXDEV
-sweep getsockname 32
-sweep connect 6 ECONNREFUSED
-# the same calls failing inside the broker / frontend / backend processes
-CHILD=1
-sweep setgroups 2 EPERM
-sweep setgid 2 EPERM
-sweep setuid 2 EPERM
-sweep getpwnam 3
-sweep getgrnam 3
-sweep kqueue 16 EMFILE
-sweep socket 24
-sweep bind 16 EADDRINUSE
-sweep socketpair 16
-sweep pthread_create 64
-sweep cap_enter 2 ENOSYS
-CHILD=
-# log rotation: rename and re-open of the query log fail
-HEAVY=1
-sweep renameat 6 EXDEV
-sweep openat 48 EMFILE
-HEAVY=
+# One sweep per line: <child 0|1> <heavy 0|1> <call> <max-N> [errno]
+#   child: the same calls failing inside the broker / frontend / backend
+#   heavy: with enough logged queries to rotate the query log
+cat > "$TMP/sweeps" <<'SEOF'
+0 0 pthread_create 160
+0 0 setsockopt 160 ENOBUFS
+0 1 openat 48 EMFILE
+0 0 accept 16 EMFILE
+1 0 pthread_create 64
+0 0 socket 64
+0 0 bind 32 EADDRINUSE
+0 0 listen 16
+0 0 socketpair 64
+0 0 fork 32 EAGAIN
+0 0 kqueue 40 EMFILE
+0 0 setgroups 3 EPERM
+0 0 setgid 3 EPERM
+0 0 setuid 3 EPERM
+0 0 getpwnam 3
+0 0 getgrnam 3
+0 0 cap_enter 3 ENOSYS
+0 0 mkdir 16 EACCES
+0 0 accept 3 ECONNABORTED
+0 0 sendmsg 16 ENOBUFS
+0 0 sendto 16 ENOBUFS
+0 0 rename 3 EXDEV
+0 0 getsockname 32
+0 0 connect 6 ECONNREFUSED
+1 0 setgroups 2 EPERM
+1 0 setgid 2 EPERM
+1 0 setuid 2 EPERM
+1 0 getpwnam 3
+1 0 getgrnam 3
+1 0 kqueue 16 EMFILE
+1 0 socket 24
+1 0 bind 16 EADDRINUSE
+1 0 socketpair 16
+1 0 cap_enter 2 ENOSYS
+0 1 renameat 6 EXDEV
+SEOF
+
+run_lane() { # <lane>: the sweeps whose line number modulo LANES is <lane>
+    setup_lane "$1"
+    k=0
+    while read -r c h call max err; do
+        if [ $((k % LANES)) -eq "$1" ]; then
+            CHILD=; HEAVY=
+            [ "$c" = 1 ] && CHILD=1
+            [ "$h" = 1 ] && HEAVY=1
+            sweep "$call" "$max" "$err"
+        fi
+        k=$((k + 1))
+    done < "$TMP/sweeps"
+}
+
+echo "=== KariDNS server fault-injection sweep ($LANES lane(s)) ==="
+LANE_PIDS=""
+lane=0
+while [ $lane -lt $LANES ]; do
+    run_lane $lane &
+    LANE_PIDS="$LANE_PIDS $!"
+    lane=$((lane + 1))
+done
+for p in $LANE_PIDS; do wait "$p"; done
+
+cat "$TMP"/lane*/out
+RUNS=$(cat "$TMP"/lane*/stats | grep -c '^run$')
+FIRED=$(cat "$TMP"/lane*/stats | grep -c '^fired$')
+CRASHES=$(cat "$TMP"/lane*/stats | grep -c '^crash$')
 
 echo "  -> $RUNS runs, $FIRED with an injected fault, $CRASHES crash(es)"
-if [ $FIRED -eq 0 ]; then
+if [ "$FIRED" -eq 0 ]; then
     echo "FAIL: no fault was ever injected"
     exit 1
 fi
-if [ $CRASHES -ne 0 ]; then
+if [ "$CRASHES" -ne 0 ]; then
     echo "FAIL: karidns crashed under fault injection"
     exit 1
 fi

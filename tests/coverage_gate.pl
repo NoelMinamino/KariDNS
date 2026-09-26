@@ -76,9 +76,13 @@ if ($json_file && -f $json_file) {
     open my $fh, '<', $json_file or die "Cannot open $json_file: $!";
     $json_text = do { local $/; <$fh> };
     close $fh;
-} elsif (! -t STDIN) {
+} elsif ($json_file eq '-' || -p STDIN || -f STDIN) {
+    # JSON piped in (llvm-cov export ... | coverage_gate.pl). Only a real pipe or
+    # redirected file counts: under make/cron/CI stdin is often just a non-tty
+    # (e.g. /dev/null), which must not turn into an empty "summary".
     $json_text = do { local $/; <STDIN> };
-} else {
+}
+if ($json_text eq "") {
     # Generate on the fly using llvm-cov
     my @objs = ();
     for my $obj (qw(dag karictl karicheck test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_dag_format test_dag_reassembly test_query_engine_protocol test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools)) {

@@ -653,8 +653,12 @@ test: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
 test-all: test
 
 # --- Code Coverage (Clang Source-Based Instrumentation) ---
-LLVM_PROFDATA ?= llvm-profdata
-LLVM_COV      ?= llvm-cov
+# Prefer the versioned LLVM tools matching the compiler (e.g. llvm-cov19 from the
+# llvm19 / llvm19-lite package): FreeBSD 15's base llvm-cov aborts in "show"
+# ("Option 'o' registered more than once"). Falls back to the unversioned tools.
+LLVM_TOOL_SUFFIX != v=$$(clang --version 2>/dev/null | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -n 1); if [ -n "$$v" ] && command -v llvm-cov$$v >/dev/null 2>&1 && command -v llvm-profdata$$v >/dev/null 2>&1; then echo $$v; fi
+LLVM_PROFDATA ?= llvm-profdata$(LLVM_TOOL_SUFFIX)
+LLVM_COV      ?= llvm-cov$(LLVM_TOOL_SUFFIX)
 
 # Continuous-mode profiling (LLVM "%c"): the profile file is mmap'ed at process start -- while the process is
 # still root -- and counters are updated IN PLACE. Processes that later drop privileges, enter Capsicum or leave
@@ -671,6 +675,13 @@ COV_PROFILE_PAT_0 = karidns_%p_%m.profraw
 COV_CFLAGS  = $(COV_CONT_CFLAGS_$(COV_CONTINUOUS)) -Wno-unused-command-line-argument -fprofile-instr-generate -fcoverage-mapping -DKARIDNS_COVERAGE_LINKAGE -O0 -g -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -Wall -Wextra -std=c11 -fPIE $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 COV_LDFLAGS = -fprofile-instr-generate -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 COV_DIR     = coverage_raw
+# Parallel jobs for the coverage build (the test suite itself stays sequential:
+# many tests share fixed ports).
+COV_JOBS != (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 2) | head -n 1
+# Suites that only exercise ASan/TSan/libFuzzer binaries. Those binaries are not
+# coverage-instrumented, so the suites add ~5 minutes and no coverage; the
+# regular CI job still runs them.
+COV_SUITE_EXCLUDE ?= run_sanitizer_smoke_test,run_stress_test,run_fuzz_smoke_test
 COV_HTML_DIR = coverage_html
 COV_DATA    = coverage.profdata
 
@@ -800,15 +811,18 @@ coverage-clean:
 coverage-build:
 	@echo "=== Building KariDNS & Test Suite with Profile Coverage ==="
 	$(MAKE) clean
-	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
-	$(MAKE) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools
-	$(MAKE) coverage-fuzz-build
+	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" all karicheck
+	$(MAKE) -j$(COV_JOBS) CC="clang" CFLAGS="$(COV_CFLAGS)" LDFLAGS="$(COV_LDFLAGS)" test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools
+	$(MAKE) -j$(COV_JOBS) coverage-fuzz-build
+	@# ASan builds some integration tests use (built here in parallel, instead of
+	@# one by one in the middle of the suite)
+	$(MAKE) -j$(COV_JOBS) asan tools-asan fuzz_dag
 
 coverage-run:
 	@echo "=== Executing Test Suite with Instrumentation ==="
 	@mkdir -p $(COV_DIR)
 	@chmod 1777 $(COV_DIR)
-	@LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh || true
+	@LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh --exclude "$(COV_SUITE_EXCLUDE)" || true
 	@$(MAKE) coverage-fuzz-run || true
 	@echo "Profile files in $(COV_DIR): $$(ls $(COV_DIR) | wc -l | tr -d ' ') (continuous mode: one file per instrumented binary)"
 
@@ -824,7 +838,7 @@ coverage-report:
 	$(LLVM_COV) report $(TARGET) $(COV_BIN_OBJS) -instr-profile=$(COV_DATA) -ignore-filename-regex="tests/|scratch/|old_patches/|third_party/"
 	@echo ""
 	@echo "Full HTML coverage report available at: $(COV_HTML_DIR)/index.html"
-	@if [ -f tests/coverage_gate.pl ]; then perl tests/coverage_gate.pl --profdata=$(COV_DATA) || true; fi
+	@if [ -f tests/coverage_gate.pl ]; then perl tests/coverage_gate.pl --llvm-cov=$(LLVM_COV) --profdata=$(COV_DATA) || true; fi
 
 coverage: coverage-clean coverage-build coverage-run coverage-report
 
