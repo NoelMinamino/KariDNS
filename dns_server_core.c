@@ -422,71 +422,91 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
 // 10. Logging
 // ============================================================================
 
-/* file 指定のあるログチャンネルをすべて open する。1つでも open できなければ
- * false を返す (起動時は起動中止、reload時は reload 拒否)。 */
-bool init_logging_channels(server_config_t *cfg) {
-  bool ok = true;
-  uid_t target_uid = (uid_t)-1;
-  gid_t target_gid = (gid_t)-1;
+/* 実行ユーザー(options { user / group })へ引き渡すログの所有者を求める。
+ * root起動かつ user 指定時以外は (uid_t)-1 (所有者変更なし)。 */
+static void resolve_log_owner(const server_config_t *cfg, uid_t *uid, gid_t *gid) {
+  *uid = (uid_t)-1;
+  *gid = (gid_t)-1;
   if (geteuid() == 0 && cfg->user) {
     struct passwd *pwd = getpwnam(cfg->user);
     if (pwd) {
-      target_uid = pwd->pw_uid;
-      target_gid = pwd->pw_gid;
+      *uid = pwd->pw_uid;
+      *gid = pwd->pw_gid;
       if (cfg->group) {
         struct group *grp = getgrnam(cfg->group);
-        if (grp) target_gid = grp->gr_gid;
+        if (grp) *gid = grp->gr_gid;
       }
     }
   }
+}
+
+/* root起動時: ログファイルの親ディレクトリを(無ければ)作成し、
+ * target_uid が指定されていればその所有者へ変更する。 */
+static void prepare_log_dir(const char *file_path, uid_t target_uid, gid_t target_gid) {
+  if (geteuid() != 0)
+    return;
+  char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+  if (split_path_for_openat(file_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+    if (dirbuf[0] != '\0' && strcmp(dirbuf, ".") != 0) {
+      /* [SEC] 以前は stat(dirbuf) -> mkdir(dirbuf) -> chown(dirbuf) と
+       * パス文字列を都度再解決していたため、各呼び出しの間に
+       * dirbuf を(攻撃者が書き込み可能な親ディレクトリ経由で)
+       * シンボリックリンクへ差し替えられると、root権限で任意の
+       * パス(例: /etc 配下)の所有者をサービス実行ユーザーへ
+       * 変更されてしまうTOCTOUレースが存在した(CWE-367)。
+       * ここでは親ディレクトリのfdを取得した上でmkdirat/openatを
+       * 用い、最終的にO_NOFOLLOWで開いたディレクトリfdに対して
+       * のみfchown()する。シンボリックリンクが置かれていた場合は
+       * openatがELOOPで失敗し、所有者変更は行われない
+       * (fail-closed)。 */
+      char parent_buf[PATH_MAX], leaf_buf[PATH_MAX];
+      int pfd = -1;
+      const char *leaf = NULL;
+      if (strcmp(dirbuf, "/") == 0) {
+        pfd = -1; /* ルートは対象外 */
+      } else if (split_path_for_openat(dirbuf, parent_buf, sizeof(parent_buf), leaf_buf, sizeof(leaf_buf))) {
+        const char *popen_path = parent_buf[0] ? parent_buf : "/";
+        pfd = open(popen_path, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+        leaf = leaf_buf;
+      }
+      if (pfd >= 0 && leaf) {
+        if (mkdirat(pfd, leaf, 0755) != 0 && errno != EEXIST) {
+          /* 作成失敗時もopenatへフォールスルーし、既存の可能性を試す */
+        }
+        int ddfd = openat(pfd, leaf, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
+        if (ddfd >= 0) {
+          if (target_uid != (uid_t)-1 &&
+              strcmp(dirbuf, "/var") != 0 &&
+              strcmp(dirbuf, "/var/log") != 0 && strcmp(dirbuf, "/tmp") != 0 &&
+              strcmp(dirbuf, "/etc") != 0) {
+            fchown(ddfd, target_uid, target_gid);
+          }
+          close(ddfd);
+        }
+        close(pfd);
+      }
+    }
+  }
+}
+
+/* file 指定のあるログチャンネルをすべて open する。1つでも open できなければ
+ * false を返す (起動時は起動中止、reload時は reload 拒否)。
+ * hand_off=false の場合はディレクトリ/ファイルの所有者変更を行わない。
+ * 起動時は daemonize() 前にこれで open だけを済ませ、所有者の引き渡しは
+ * pid file / 制御ソケットのディレクトリ検証 (ensure_priv_dir_safe) の後に
+ * hand_off_logging_channels() で行う (ログと pid file が同じディレクトリの
+ * 場合、先に実行ユーザーへ chown すると検証が失敗するため)。 */
+bool init_logging_channels_ex(server_config_t *cfg, bool hand_off) {
+  bool ok = true;
+  uid_t target_uid = (uid_t)-1;
+  gid_t target_gid = (gid_t)-1;
+  if (hand_off)
+    resolve_log_owner(cfg, &target_uid, &target_gid);
 
   log_channel_t *ch = cfg->logging.channels;
   while (ch) {
     if (ch->file_path) {
-      if (geteuid() == 0) {
-        char dirbuf[PATH_MAX], basebuf[PATH_MAX];
-        if (split_path_for_openat(ch->file_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
-          if (dirbuf[0] != '\0' && strcmp(dirbuf, ".") != 0) {
-            /* [SEC] 以前は stat(dirbuf) -> mkdir(dirbuf) -> chown(dirbuf) と
-             * パス文字列を都度再解決していたため、各呼び出しの間に
-             * dirbuf を(攻撃者が書き込み可能な親ディレクトリ経由で)
-             * シンボリックリンクへ差し替えられると、root権限で任意の
-             * パス(例: /etc 配下)の所有者をサービス実行ユーザーへ
-             * 変更されてしまうTOCTOUレースが存在した(CWE-367)。
-             * ここでは親ディレクトリのfdを取得した上でmkdirat/openatを
-             * 用い、最終的にO_NOFOLLOWで開いたディレクトリfdに対して
-             * のみfchown()する。シンボリックリンクが置かれていた場合は
-             * openatがELOOPで失敗し、所有者変更は行われない
-             * (fail-closed)。 */
-            char parent_buf[PATH_MAX], leaf_buf[PATH_MAX];
-            int pfd = -1;
-            const char *leaf = NULL;
-            if (strcmp(dirbuf, "/") == 0) {
-              pfd = -1; /* ルートは対象外 */
-            } else if (split_path_for_openat(dirbuf, parent_buf, sizeof(parent_buf), leaf_buf, sizeof(leaf_buf))) {
-              const char *popen_path = parent_buf[0] ? parent_buf : "/";
-              pfd = open(popen_path, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
-              leaf = leaf_buf;
-            }
-            if (pfd >= 0 && leaf) {
-              if (mkdirat(pfd, leaf, 0755) != 0 && errno != EEXIST) {
-                /* 作成失敗時もopenatへフォールスルーし、既存の可能性を試す */
-              }
-              int ddfd = openat(pfd, leaf, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY);
-              if (ddfd >= 0) {
-                if (target_uid != (uid_t)-1 &&
-                    strcmp(dirbuf, "/var") != 0 &&
-                    strcmp(dirbuf, "/var/log") != 0 && strcmp(dirbuf, "/tmp") != 0 &&
-                    strcmp(dirbuf, "/etc") != 0) {
-                  fchown(ddfd, target_uid, target_gid);
-                }
-                close(ddfd);
-              }
-              close(pfd);
-            }
-          }
-        }
-      }
+      prepare_log_dir(ch->file_path, target_uid, target_gid);
 
       ch->fd = open_via_dir_cache(ch->file_path, O_WRONLY | O_CREAT | O_APPEND,
                                   0644, true);
@@ -517,6 +537,26 @@ bool init_logging_channels(server_config_t *cfg) {
     ch = ch->next;
   }
   return ok;
+}
+
+bool init_logging_channels(server_config_t *cfg) {
+  return init_logging_channels_ex(cfg, true);
+}
+
+/* init_logging_channels_ex(cfg, false) で開いたログのディレクトリとファイルを
+ * 実行ユーザーへ引き渡す (root起動かつ user 指定時のみ)。 */
+void hand_off_logging_channels(server_config_t *cfg) {
+  uid_t target_uid;
+  gid_t target_gid;
+  resolve_log_owner(cfg, &target_uid, &target_gid);
+  if (target_uid == (uid_t)-1)
+    return;
+  for (log_channel_t *ch = cfg->logging.channels; ch; ch = ch->next) {
+    if (!ch->file_path || ch->fd < 0)
+      continue;
+    prepare_log_dir(ch->file_path, target_uid, target_gid);
+    fchown(ch->fd, target_uid, target_gid);
+  }
 }
 
 
@@ -4406,7 +4446,9 @@ int main(int argc, char **argv) {
   }
 
   // ログファイルを開く (開けなければ起動しない)。fd は daemonize() 後も引き継がれる。
-  if (!init_logging_channels(&g_config_db.config_a)) {
+  // 実行ユーザーへの所有者の引き渡しは pid file / 制御ソケットのディレクトリ検証の
+  // 後 (hand_off_logging_channels) に行う。
+  if (!init_logging_channels_ex(&g_config_db.config_a, false)) {
     syslog(LOG_ERR, "[Startup] Refusing to start: one or more log files could not be opened.");
     fprintf(stderr, "[ERROR] Refusing to start: one or more log files could not be opened.\n");
     free_server_config_fields(&g_config_db.config_a);
@@ -4608,6 +4650,11 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
+
+  // pid file / 制御ソケットのディレクトリを ensure_priv_dir_safe() で検証し終えた
+  // 後で、ログのディレクトリとファイルを実行ユーザーへ引き渡す。先に chown すると、
+  // ログと同じディレクトリに置いた pid file 等の検証が「root所有でない」として失敗する。
+  hand_off_logging_channels(&g_config_db.config_a);
 
   pid_t backend_pid = fork();
   if (backend_pid < 0) {

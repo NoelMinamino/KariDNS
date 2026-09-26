@@ -1817,6 +1817,54 @@ static void test_nonroot_startup_identity_and_preflight(void) {
     printf("  -> non-root startup identity / preflight checks passed.\n");
 }
 
+
+/* Regression: with the pid file in the same directory as a log file, handing the
+ * log directory to "user" before ensure_priv_dir_safe() made startup refuse the
+ * (now non-root-owned) directory. Logs are opened first without a chown, and the
+ * hand-off happens after the directory checks. */
+static void test_log_hand_off_after_priv_dir_check(void) {
+    printf("[TEST] Server Core: log ownership hand-off after pid-dir check...\n");
+    if (geteuid() != 0 || !getpwnam("nobody")) {
+        printf("  -> skipped (needs root and user 'nobody').\n");
+        return;
+    }
+    char tmpl[] = "/tmp/karidns_handoff_XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    assert(dir);
+    assert(chmod(dir, 0755) == 0);
+    char sub[256], logp[300];
+    snprintf(sub, sizeof(sub), "%s/a", dir);
+    assert(mkdir(sub, 0755) == 0);
+    snprintf(logp, sizeof(logp), "%s/q.log", sub);
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char user[] = "nobody";
+    cfg.user = user;
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    char ch_name[] = "q";
+    ch.name = ch_name;
+    ch.file_path = logp;
+    ch.fd = -1;
+    cfg.logging.channels = &ch;
+
+    assert(init_logging_channels_ex(&cfg, false));
+    struct stat st;
+    assert(stat(sub, &st) == 0 && st.st_uid == 0);   /* not handed off yet */
+    assert(ensure_priv_dir_safe(sub));               /* pid file dir check passes */
+    hand_off_logging_channels(&cfg);
+    uid_t nobody = getpwnam("nobody")->pw_uid;
+    assert(stat(sub, &st) == 0 && st.st_uid == nobody);
+    assert(stat(logp, &st) == 0 && st.st_uid == nobody);
+
+    close(ch.fd);
+    unlink(logp);
+    rmdir(sub);
+    rmdir(dir);
+    printf("  -> log ownership hand-off after pid-dir check passed.\n");
+}
+
 // ----------------------------------------------------------------------------
 // Main Test Runner
 // ----------------------------------------------------------------------------
@@ -5436,6 +5484,7 @@ int main(void) {
     test_ensure_priv_dir_safe_world_writable();
     test_open_router_udp_sockets_port_binding();
     test_nonroot_startup_identity_and_preflight();
+    test_log_hand_off_after_priv_dir_check();
     test_setup_udp_socket_buffers_failure();
     test_setup_ipc_tables_max_workers_boundary();
     test_perform_config_reload_identical_config();
