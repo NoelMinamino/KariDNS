@@ -20,7 +20,7 @@ esac
 if [ ! -f dag ]; then
     echo "==> Building dag binary for Linux (${ARCH}, version ${VERSION})..."
     make clean || true
-    make VERSION="${VERSION}" dag
+    make VERSION="${VERSION}" MARCH_FLAGS= dag
 else
     echo "==> Using existing dag binary for Linux (${ARCH}, version ${VERSION})..."
 fi

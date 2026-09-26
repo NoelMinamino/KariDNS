@@ -17,7 +17,7 @@ elif [ -f "dag" ]; then
 else
     echo "==> Compiling dag..."
     make clean
-    make VERSION="${VERSION}" dag
+    make VERSION="${VERSION}" MARCH_FLAGS= dag
     if [ -f "dag.exe" ]; then
         DAG_BIN="dag.exe"
     else

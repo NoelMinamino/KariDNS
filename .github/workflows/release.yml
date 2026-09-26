@@ -55,6 +55,11 @@ jobs:
               if ldd "$b" | grep -E 'lib(crypto|ssl)[.]so' | grep -q '/usr/local/'; then
                 echo "::error::$b links the ports OpenSSL"; exit 1
               fi
+              # AVX-512 code means the build host CPU leaked in (-march=native):
+              # such a binary dies with SIGILL on CPUs without AVX-512
+              if objdump -d "$b" | grep -q '%zmm'; then
+                echo "::error::$b contains AVX-512 instructions (built with -march=native?)"; exit 1
+              fi
             done
             
             # Verify installed binaries and files
@@ -100,7 +105,7 @@ jobs:
             set -e
             dnf install -y gcc make openssl-devel zlib-devel libidn2-devel rpm-build
             make clean
-            make dag
+            make VERSION=\"$TAG_VER\" MARCH_FLAGS= dag
             chmod +x ./packaging/linux/build_linux_pkgs.sh
             ./packaging/linux/build_linux_pkgs.sh \"$TAG_VER\" /src/dist
             chmod -R a+rwX /src/dist /src/dag
@@ -223,7 +228,7 @@ jobs:
           TAG_VER="${{ env.RELEASE_VER }}"
           mkdir -p dist
           make clean
-          make dag
+          make VERSION="$TAG_VER" MARCH_FLAGS= dag
           chmod +x packaging/windows/build_windows_zip.sh
           ./packaging/windows/build_windows_zip.sh "$TAG_VER" ./dist
 

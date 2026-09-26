@@ -15,7 +15,8 @@ MANIFEST_DIR="$(mktemp -d -t karidns-pkg-manifest)"
 
 echo "==> Building KariDNS binaries for FreeBSD (${ARCH}, version ${VERSION})..."
 make clean
-make VERSION="${VERSION}" all
+# MARCH_FLAGS=: portable baseline ISA, not the build host CPU (-march=native)
+make VERSION="${VERSION}" MARCH_FLAGS= all
 
 # The package must link the base system OpenSSL (/lib, /usr/lib): the ports
 # OpenSSL (security/openssl, /usr/local/lib/libcrypto.so.NN) is not a declared

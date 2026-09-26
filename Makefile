@@ -24,7 +24,11 @@ BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib 
 VERSION ?= 0.4.1
 
 CC ?= cc
-CFLAGS += -O3 -flto -march=native -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
+# CPU tuning. -march=native suits binaries built and run on the same machine;
+# distributable packages must be built with MARCH_FLAGS= (baseline ISA), or they
+# die with SIGILL on CPUs lacking the build host's extensions (e.g. AVX-512).
+MARCH_FLAGS ?= -march=native
+CFLAGS += -O3 -flto $(MARCH_FLAGS) -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 LDFLAGS = -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS)
 
 
