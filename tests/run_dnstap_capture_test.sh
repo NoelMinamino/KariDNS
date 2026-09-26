@@ -82,7 +82,7 @@ options {
 dnstap {
     socket "$SOCK_PATH";
     identity "karidns-test";
-    version "0.4.0";
+    version "0.4.1";
     log-queries yes;
     log-responses yes;
     queue-size 1024;
@@ -177,8 +177,8 @@ else
     exit 1
 fi
 
-if grep -q "version=0.4.0" "$LOG_PATH"; then
-    echo "  PASS: dnstap version matched '0.4.0'."
+if grep -q "version=0.4.1" "$LOG_PATH"; then
+    echo "  PASS: dnstap version matched '0.4.1'."
 else
     echo "FAIL: dnstap version mismatch."
     exit 1
