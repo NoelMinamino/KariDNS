@@ -32,14 +32,30 @@ jobs:
           release: ${{ matrix.release }}
           run: |
             set -e
-            pkg install -y openssl pkgconf libidn2
+            # No "openssl" package: the binaries must link the base system OpenSSL.
+            # The ports OpenSSL (/usr/local/lib/libcrypto.so.12) is not a package
+            # dependency, so a pkg linked against it fails to install elsewhere
+            # ("Missing shlib libcrypto.so.12"). build_pkg.sh refuses such a build.
+            pkg install -y pkgconf libidn2
+            # in case the VM image ships it preinstalled
+            if pkg info -e openssl; then pkg delete -fy openssl; fi
             mkdir -p dist
             TAG_VER="${{ env.RELEASE_VER }}"
             chmod +x packaging/freebsd/build_pkg.sh
             ./packaging/freebsd/build_pkg.sh "$TAG_VER" ./dist
 
             echo "::group::🧪 [Verification] Test installing generated FreeBSD pkg on ${{ matrix.release }}"
-            pkg install -y dist/karidns-*.pkg
+            # Install the way users do (pkg add) with the build-only tools removed,
+            # so a shlib that only the build VM provides makes this step fail.
+            pkg delete -y pkgconf
+            pkg add dist/karidns-*.pkg
+            pkg info -d karidns
+            for b in /usr/local/sbin/karidns /usr/local/bin/karictl /usr/local/bin/karicheck /usr/local/bin/dag; do
+              echo "== ldd $b"; ldd "$b"
+              if ldd "$b" | grep -E 'lib(crypto|ssl)[.]so' | grep -q '/usr/local/'; then
+                echo "::error::$b links the ports OpenSSL"; exit 1
+              fi
+            done
             
             # Verify installed binaries and files
             test -x /usr/local/sbin/karidns

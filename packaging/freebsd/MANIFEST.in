@@ -21,6 +21,7 @@ categories: [
     "sysutils"
 ]
 deps: {
+__DEPS__
 }
 files: {
     /usr/local/sbin/karidns: "",
