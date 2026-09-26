@@ -536,101 +536,114 @@ UT_ASAN_LEAKS ?= 0
 UT_ASAN_CFLAGS = -O1 -g -Wall -Wextra -std=c11 -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED -DSANITIZER_BUILD -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -fPIE -DKARIDNS_VERSION=\"$(VERSION)\" $(BREW_CFLAGS) $(DARWIN_CFLAGS) $(IDN_CFLAGS)
 UT_ASAN_LDFLAGS = -fsanitize=address,undefined -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS)
 
-test_cidr-asan: $(TEST_CIDR_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_CIDR_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+# Every source is compiled once per variant and the objects are shared by all
+# the -asan test binaries (.uta.o: with -DKARIDNS_UNIT_TEST=1, .utn.o: without);
+# compiling each binary from source rebuilt ~18 files per binary.
+.SUFFIXES: .uta.o .utn.o .c
+.c.uta.o:
+	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. -c $< -o $@
+.c.utn.o:
+	$(CC) $(UT_ASAN_CFLAGS) -I. -c $< -o $@
+# test sources that #include a tool's .c file
+tests/test_dag_format.uta.o tests/test_coverage_sweep_dag.uta.o tests/test_coverage_sweep_net.uta.o: tools/dag.c
+tests/test_coverage_sweep_tools.uta.o: tools/karicheck.c tools/karictl.c
+tests/test_coverage_sweep_karictl_main.uta.o: tools/karictl.c
 
-test_tinydns_parser-asan: $(TEST_TINYDNS_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_TINYDNS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_cidr-asan: $(TEST_CIDR_SRCS:.c=.uta.o)
+	$(CC) $(TEST_CIDR_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_asan_overflow-asan: $(TEST_ASAN_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_ASAN_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_tinydns_parser-asan: $(TEST_TINYDNS_SRCS:.c=.utn.o)
+	$(CC) $(TEST_TINYDNS_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_conf_include-asan: $(TEST_CONF_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_CONF_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_asan_overflow-asan: $(TEST_ASAN_SRCS:.c=.utn.o)
+	$(CC) $(TEST_ASAN_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_config_directives-asan: $(TEST_CONFDIR_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_CONFDIR_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_conf_include-asan: $(TEST_CONF_SRCS:.c=.utn.o)
+	$(CC) $(TEST_CONF_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_wire_helpers-asan: $(TEST_WIREHELP_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_WIREHELP_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_config_directives-asan: $(TEST_CONFDIR_SRCS:.c=.utn.o)
+	$(CC) $(TEST_CONFDIR_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_zone_parser_paths-asan: $(TEST_ZONEPATHS_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_ZONEPATHS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_wire_helpers-asan: $(TEST_WIREHELP_SRCS:.c=.utn.o)
+	$(CC) $(TEST_WIREHELP_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_tinydns_paths-asan: $(TEST_TINYPATHS_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_TINYPATHS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_zone_parser_paths-asan: $(TEST_ZONEPATHS_SRCS:.c=.utn.o)
+	$(CC) $(TEST_ZONEPATHS_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_sig0_sign-asan: $(TEST_SIG0_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_SIG0_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_tinydns_paths-asan: $(TEST_TINYPATHS_SRCS:.c=.utn.o)
+	$(CC) $(TEST_TINYPATHS_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_snapshot_rebuild-asan: $(TEST_SNAPREBUILD_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_SNAPREBUILD_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_sig0_sign-asan: $(TEST_SIG0_SRCS:.c=.utn.o)
+	$(CC) $(TEST_SIG0_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_dnssec_proofs-asan: $(TEST_DNSSECPROOFS_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DNSSECPROOFS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_snapshot_rebuild-asan: $(TEST_SNAPREBUILD_SRCS:.c=.uta.o)
+	$(CC) $(TEST_SNAPREBUILD_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_query_engine_protocol-asan: $(TEST_QEPROTO_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_QEPROTO_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_dnssec_proofs-asan: $(TEST_DNSSECPROOFS_SRCS:.c=.uta.o)
+	$(CC) $(TEST_DNSSECPROOFS_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_hash_table-asan: $(TEST_HASH_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_HASH_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_query_engine_protocol-asan: $(TEST_QEPROTO_SRCS:.c=.uta.o)
+	$(CC) $(TEST_QEPROTO_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_dnstap_engine-asan: $(TEST_DNSTAP_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DNSTAP_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_hash_table-asan: $(TEST_HASH_SRCS:.c=.uta.o)
+	$(CC) $(TEST_HASH_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_edns_ecs_engine-asan: $(TEST_EDNS_ECS_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_EDNS_ECS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_dnstap_engine-asan: $(TEST_DNSTAP_SRCS:.c=.uta.o)
+	$(CC) $(TEST_DNSTAP_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_rfc_vectors-asan: $(TEST_RFC_VECTORS_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_RFC_VECTORS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_edns_ecs_engine-asan: $(TEST_EDNS_ECS_SRCS:.c=.uta.o)
+	$(CC) $(TEST_EDNS_ECS_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_dynamic_update_engine-asan: $(TEST_DYN_UPDATE_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DYN_UPDATE_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_rfc_vectors-asan: $(TEST_RFC_VECTORS_SRCS:.c=.uta.o)
+	$(CC) $(TEST_RFC_VECTORS_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_axfr_ixfr_engine-asan: $(TEST_AXFR_IXFR_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_AXFR_IXFR_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_dynamic_update_engine-asan: $(TEST_DYN_UPDATE_SRCS:.c=.uta.o)
+	$(CC) $(TEST_DYN_UPDATE_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_rrl_engine-asan: $(TEST_RRL_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_RRL_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_axfr_ixfr_engine-asan: $(TEST_AXFR_IXFR_SRCS:.c=.uta.o)
+	$(CC) $(TEST_AXFR_IXFR_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_query_engine_expanded-asan: $(TEST_QUERY_EXP_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_QUERY_EXP_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_rrl_engine-asan: $(TEST_RRL_SRCS:.c=.uta.o)
+	$(CC) $(TEST_RRL_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_response_cache-asan: $(RESPONSE_CACHE_TEST_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(RESPONSE_CACHE_TEST_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_query_engine_expanded-asan: $(TEST_QUERY_EXP_SRCS:.c=.uta.o)
+	$(CC) $(TEST_QUERY_EXP_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_vulnerability_fixes-asan: $(VULN_TEST_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(VULN_TEST_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_response_cache-asan: $(RESPONSE_CACHE_TEST_SRCS:.c=.uta.o)
+	$(CC) $(RESPONSE_CACHE_TEST_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_catalog_zone_engine-asan: $(TEST_CATALOG_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_CATALOG_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_vulnerability_fixes-asan: $(VULN_TEST_SRCS:.c=.uta.o)
+	$(CC) $(VULN_TEST_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_snapshot_sandbox_engine-asan: $(TEST_SANDBOX_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_SANDBOX_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_catalog_zone_engine-asan: $(TEST_CATALOG_SRCS:.c=.uta.o)
+	$(CC) $(TEST_CATALOG_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_dag_tools-asan: $(TEST_DAG_TOOLS_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DAG_TOOLS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
+test_snapshot_sandbox_engine-asan: $(TEST_SANDBOX_SRCS:.c=.uta.o)
+	$(CC) $(TEST_SANDBOX_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_dag_format-asan: $(TEST_DAGFORMAT_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_DAGFORMAT_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
+test_dag_tools-asan: $(TEST_DAG_TOOLS_SRCS:.c=.uta.o)
+	$(CC) $(TEST_DAG_TOOLS_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
 
-test_coverage_sweep-asan: $(TEST_COV_SWEEP_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_dag_format-asan: $(TEST_DAGFORMAT_SRCS:.c=.uta.o)
+	$(CC) $(TEST_DAGFORMAT_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
 
-test_coverage_sweep_dag-asan: $(TEST_COV_SWEEP_DAG_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_DAG_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
+test_coverage_sweep-asan: $(TEST_COV_SWEEP_SRCS:.c=.uta.o)
+	$(CC) $(TEST_COV_SWEEP_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_coverage_sweep_net-asan: $(TEST_COV_SWEEP_NET_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_NET_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+test_coverage_sweep_dag-asan: $(TEST_COV_SWEEP_DAG_SRCS:.c=.uta.o)
+	$(CC) $(TEST_COV_SWEEP_DAG_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto   -lz $(IDN_LDFLAGS)
 
-test_coverage_sweep_tools-asan: $(TEST_COV_SWEEP_TOOLS_SRCS) tools/karicheck.c tools/karictl.c
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_COV_SWEEP_TOOLS_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_coverage_sweep_net-asan: $(TEST_COV_SWEEP_NET_SRCS:.c=.uta.o)
+	$(CC) $(TEST_COV_SWEEP_NET_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-test_dag_reassembly-asan: $(TEST_DAGREASM_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -I. $(TEST_DAGREASM_SRCS) -o $@ $(UT_ASAN_LDFLAGS)
+test_coverage_sweep_tools-asan: $(TEST_COV_SWEEP_TOOLS_SRCS:.c=.uta.o)
+	$(CC) $(TEST_COV_SWEEP_TOOLS_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
-test_server_core-asan: $(TEST_SERVER_CORE_SRCS)
-	$(CC) $(UT_ASAN_CFLAGS) -DKARIDNS_UNIT_TEST=1 -I. $(TEST_SERVER_CORE_SRCS) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
+test_dag_reassembly-asan: $(TEST_DAGREASM_SRCS:.c=.utn.o)
+	$(CC) $(TEST_DAGREASM_SRCS:.c=.utn.o) -o $@ $(UT_ASAN_LDFLAGS)
+
+test_server_core-asan: $(TEST_SERVER_CORE_SRCS:.c=.uta.o)
+	$(CC) $(TEST_SERVER_CORE_SRCS:.c=.uta.o) -o $@ $(UT_ASAN_LDFLAGS) -lcrypto
 
 UT_ASAN_BINS = test_cidr-asan test_tinydns_parser-asan test_asan_overflow-asan test_conf_include-asan test_config_directives-asan test_wire_helpers-asan test_zone_parser_paths-asan test_tinydns_paths-asan test_sig0_sign-asan test_snapshot_rebuild-asan test_dnssec_proofs-asan test_query_engine_protocol-asan test_dag_format-asan test_dag_reassembly-asan test_hash_table-asan test_dnstap_engine-asan test_edns_ecs_engine-asan test_rfc_vectors-asan test_dynamic_update_engine-asan test_axfr_ixfr_engine-asan test_rrl_engine-asan test_query_engine_expanded-asan test_response_cache-asan test_vulnerability_fixes-asan test_catalog_zone_engine-asan test_snapshot_sandbox_engine-asan test_dag_tools-asan test_server_core-asan
 
@@ -863,58 +876,66 @@ clean: clean-fuzz coverage-clean
 	rm -f $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck bench_serialize bench_rrl $(OBJS) $(DAG_OBJS) $(KARICTL_OBJS)
 	rm -f karidns-asan karidns-tsan *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools
 	rm -f $(UT_ASAN_BINS)
+	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so
 
 run: $(TARGET)
 	./$(TARGET)
 
-fuzz: $(FUZZ_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TARGET) $(FUZZ_SRCS) $(LDFLAGS) -lcrypto
+# Fuzz sources are compiled once (fuzzer-no-link instrumentation) and the objects
+# shared by every fuzzer; only the link step adds libFuzzer (-fsanitize=fuzzer).
+FUZZ_OBJ_CFLAGS = -O1 -g -fsanitize=fuzzer-no-link,address,undefined -fPIE
+.SUFFIXES: .fz.o .c
+.c.fz.o:
+	$(CC) $(FUZZ_OBJ_CFLAGS) -c $< -o $@
 
-fuzz_core: $(FUZZ_CORE_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS) $(LDFLAGS) -lcrypto
+fuzz: $(FUZZ_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TARGET) $(FUZZ_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
-fuzz_zone: $(FUZZ_ZONE_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_SRCS) $(LDFLAGS) -lcrypto
+fuzz_core: $(FUZZ_CORE_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CORE_TARGET) $(FUZZ_CORE_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
-fuzz_conf: $(FUZZ_CONF_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CONF_TARGET) $(FUZZ_CONF_SRCS) $(LDFLAGS) -lcrypto
+fuzz_zone: $(FUZZ_ZONE_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
-fuzz_tsig: $(FUZZ_TSIG_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_TARGET) $(FUZZ_TSIG_SRCS) $(LDFLAGS) -lcrypto
+fuzz_conf: $(FUZZ_CONF_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_CONF_TARGET) $(FUZZ_CONF_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
-fuzz_dag: $(FUZZ_DAG_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TARGET) $(FUZZ_DAG_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_tsig: $(FUZZ_TSIG_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_TARGET) $(FUZZ_TSIG_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
-fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS) $(LDFLAGS) -lcrypto
+fuzz_dag: $(FUZZ_DAG_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TARGET) $(FUZZ_DAG_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_hash: $(FUZZ_DAG_HASH_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_HASH_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
-fuzz_dag_chunked_http: $(FUZZ_DAG_CHUNKED_HTTP_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_CHUNKED_HTTP_TARGET) $(FUZZ_DAG_CHUNKED_HTTP_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_hash: $(FUZZ_DAG_HASH_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_HASH_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_rdata_yaml: $(FUZZ_DAG_RDATA_YAML_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_RDATA_YAML_TARGET) $(FUZZ_DAG_RDATA_YAML_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_chunked_http: $(FUZZ_DAG_CHUNKED_HTTP_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_CHUNKED_HTTP_TARGET) $(FUZZ_DAG_CHUNKED_HTTP_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_axfr_stream: $(FUZZ_DAG_AXFR_STREAM_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_AXFR_STREAM_TARGET) $(FUZZ_DAG_AXFR_STREAM_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_rdata_yaml: $(FUZZ_DAG_RDATA_YAML_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_RDATA_YAML_TARGET) $(FUZZ_DAG_RDATA_YAML_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_cli_args: $(FUZZ_DAG_CLI_ARGS_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_CLI_ARGS_TARGET) $(FUZZ_DAG_CLI_ARGS_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_axfr_stream: $(FUZZ_DAG_AXFR_STREAM_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_AXFR_STREAM_TARGET) $(FUZZ_DAG_AXFR_STREAM_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_batch_file: $(FUZZ_DAG_BATCH_FILE_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_BATCH_FILE_TARGET) $(FUZZ_DAG_BATCH_FILE_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_cli_args: $(FUZZ_DAG_CLI_ARGS_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_CLI_ARGS_TARGET) $(FUZZ_DAG_CLI_ARGS_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_replay_pcap_reader: $(FUZZ_DAG_REPLAY_PCAP_READER_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_PCAP_READER_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_batch_file: $(FUZZ_DAG_BATCH_FILE_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_BATCH_FILE_TARGET) $(FUZZ_DAG_BATCH_FILE_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_replay_diff: $(FUZZ_DAG_REPLAY_DIFF_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_REPLAY_DIFF_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_replay_pcap_reader: $(FUZZ_DAG_REPLAY_PCAP_READER_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_PCAP_READER_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_tcp_reassembly: $(FUZZ_DAG_TCP_REASSEMBLY_SRCS)
-	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_SRCS) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+fuzz_dag_replay_diff: $(FUZZ_DAG_REPLAY_DIFF_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_REPLAY_DIFF_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
+fuzz_dag_tcp_reassembly: $(FUZZ_DAG_TCP_REASSEMBLY_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
 fuzz_dag_all: fuzz_dag fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly
 
@@ -932,6 +953,7 @@ fuzz_test: fuzz_all
 	@sh tests/run_fuzz_smoke_test.sh all
 
 clean-fuzz:
+	rm -f *.fz.o tests/fuzz/*.fz.o tools/*.fz.o
 	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET) $(FUZZ_TSIG_TARGET) $(FUZZ_DAG_TARGET) $(FUZZ_TSIG_VERIFY_TARGET)
 	rm -f $(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_CHUNKED_HTTP_TARGET) $(FUZZ_DAG_RDATA_YAML_TARGET) $(FUZZ_DAG_AXFR_STREAM_TARGET) $(FUZZ_DAG_CLI_ARGS_TARGET) $(FUZZ_DAG_BATCH_FILE_TARGET)
 	rm -f $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_TARGET)
