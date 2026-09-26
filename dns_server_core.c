@@ -11,6 +11,7 @@
 #include <grp.h>
 #include <limits.h> // PATH_MAX, NAME_MAX
 #include <netinet/in.h>
+#include <netinet/tcp.h> // TCP_MAXSEG
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/md5.h>
@@ -205,16 +206,20 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         _exit(1);
       }
     }
-    struct {
-      int family;
-      int type;
-      struct sockaddr_storage addr;
-    } req;
+    broker_req_t req;
     while (recv(sv[1], &req, sizeof(req), MSG_WAITALL) == sizeof(req)) {
       int sock = socket(req.family, req.type, 0);
       if (sock >= 0) {
         size_t addr_len = (req.family == AF_INET) ? sizeof(struct sockaddr_in)
                                                   : sizeof(struct sockaddr_in6);
+        if (req.type == SOCK_STREAM) {
+          /* zone-tcp-window / zone-tcp-sndbuf (または tcp-window): connect() 前なので
+           * SYN で通知する初期ウィンドウから効く */
+          if (req.tcp_opts.rcvbuf > 0)
+            setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &req.tcp_opts.rcvbuf, sizeof(int));
+          if (req.tcp_opts.sndbuf > 0)
+            setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &req.tcp_opts.sndbuf, sizeof(int));
+        }
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
         int ret = connect(sock, (struct sockaddr *)&req.addr, addr_len);
         if (ret < 0 && errno == EINPROGRESS) {
@@ -229,6 +234,11 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
         }
         if (ret == 0) {
           fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) & ~O_NONBLOCK);
+#ifdef TCP_MAXSEG
+          /* zone-tcp-mss / tcp-mss: 確立後に送信 MSS を下げる (apply_tcp_mss() と同じ理由) */
+          if (req.type == SOCK_STREAM && req.tcp_opts.mss > 0)
+            setsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, &req.tcp_opts.mss, sizeof(int));
+#endif
           struct msghdr msg = {0};
           struct cmsghdr *cmsg;
           char buf[CMSG_SPACE(sizeof(int))];
@@ -272,17 +282,21 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
 
 int broker_connect(int family, int type, struct sockaddr *addr,
                    size_t addr_len) {
+  return broker_connect_opts(family, type, addr, addr_len, NULL);
+}
+
+int broker_connect_opts(int family, int type, struct sockaddr *addr,
+                        size_t addr_len, const tcp_sockopts_t *tcp_opts) {
   if (g_broker_sock < 0)
     return -1;
-  struct {
-    int family;
-    int type;
-    struct sockaddr_storage addr;
-  } req;
+  if (addr_len > sizeof(struct sockaddr_storage))
+    return -1;
+  broker_req_t req;
   memset(&req, 0, sizeof(req));
   req.family = family;
   req.type = type;
   memcpy(&req.addr, addr, addr_len);
+  if (tcp_opts) req.tcp_opts = *tcp_opts;
   static pthread_mutex_t broker_lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&broker_lock);
   if (send(g_broker_sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -1083,12 +1097,11 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
           res_buf[2] |= 0x02; // Set TC bit
-          res_buf[6] = 0; res_buf[7] = 0;
-          res_buf[8] = 0; res_buf[9] = 0;
-          res_buf[10] = 0; res_buf[11] = 0;
           int qlen = (int)task.question_end;
           if (qlen > res_len) qlen = res_len;
           if (qlen > (int)task.req_len) qlen = (int)task.req_len;
+          // 質問セクションまで切り詰めるが、OPT は残す (RFC 6891 §7)
+          qlen = (int)dns_truncate_keep_opt(res_buf, (size_t)res_len, (size_t)qlen);
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, qlen,
                              &task.client_addr, task.client_len,
                              task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_UDP);
@@ -1189,6 +1202,92 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
   *dst = '\0';
 }
 
+/* セカンダリゾーンがマスターから転送を受ける TCP 接続の値。ゾーン指定
+ * (zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf) があればそれを、なければ
+ * グローバルの tcp-mss / tcp-window を使う。受信側なので rcvbuf が主に効く。 */
+STATIC_TEST tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zone_config_t *zcfg) {
+  tcp_sockopts_t o = {0, 0, 0};
+  if (cfg) {
+    o.mss = cfg->tcp_mss;
+    o.rcvbuf = cfg->tcp_window;
+    o.sndbuf = cfg->tcp_window;
+  }
+  if (zcfg) {
+    if (zcfg->zone_tcp_mss > 0) o.mss = zcfg->zone_tcp_mss;
+    if (zcfg->zone_tcp_window > 0) o.rcvbuf = zcfg->zone_tcp_window;
+    if (zcfg->zone_tcp_sndbuf > 0) o.sndbuf = zcfg->zone_tcp_sndbuf;
+  }
+  return o;
+}
+
+/* tcp-window: listen() 前に listen ソケットの SO_RCVBUF / SO_SNDBUF を設定する。
+ * accept 済みソケットはこの値を引き継ぐため、SYN-ACK で通知する初期ウィンドウから効く。
+ * listen ソケットは reload で作り直さないので、変更の反映には再起動が必要。
+ * (tcp-mss はここでは設定しない。FreeBSD の TCP_MAXSEG は現在の t_maxseg 以下しか
+ * 受け付けず、未接続ソケットの t_maxseg は net.inet.tcp.mssdflt (既定 536) なので
+ * 通常の値は EINVAL になるうえ、SYN-ACK の MSS は経路 MTU から決まり引き継がれない。
+ * accept 直後に apply_tcp_mss() で各接続へ当てる。)
+ * ワーカーごとに listen ソケットを作るので、ログは verbose なワーカーだけが出す。 */
+STATIC_TEST void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose) {
+  if (!cfg || cfg->tcp_window <= 0) return;
+  static const int opts[2] = { SO_RCVBUF, SO_SNDBUF };
+  static const char *const names[2] = { "SO_RCVBUF", "SO_SNDBUF" };
+  for (int k = 0; k < 2; k++) {
+    int want = cfg->tcp_window;
+    if (setsockopt(fd, SOL_SOCKET, opts[k], &want, sizeof(want)) != 0) {
+      if (verbose)
+        syslog(LOG_WARNING, "[Network] Failed to set TCP %s to %d (tcp-window): %m", names[k], want);
+      continue;
+    }
+    int actual = 0;
+    socklen_t optlen = sizeof(actual);
+    if (verbose && getsockopt(fd, SOL_SOCKET, opts[k], &actual, &optlen) == 0 && actual < want)
+      syslog(LOG_WARNING,
+             "[Network] TCP %s truncated by OS: requested %d bytes (tcp-window), got %d bytes "
+             "(raise kern.ipc.maxsockbuf)", names[k], want, actual);
+  }
+}
+
+/* tcp-mss / zone-tcp-mss: 確立済み接続の送信 MSS を下げる。FreeBSD の TCP_MAXSEG は
+ * 現在の MSS を超える値を EINVAL にし、相手へ通知済みの MSS も変わらないため、
+ * 一度下げた値は接続が終わるまで残る (複数の値が当たる場合は最小値が勝つ)。 */
+STATIC_TEST void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss) {
+#ifdef TCP_MAXSEG
+  if (mss <= 0 || (c->applied_mss != 0 && mss >= c->applied_mss)) return;
+  setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
+  c->applied_mss = mss;
+#else
+  (void)fd; (void)c; (void)mss;
+#endif
+}
+
+/* zone-tcp-window / zone-tcp-sndbuf の1項目分。want == 0 (このゾーンは未指定) なら、
+ * 以前のクエリで別ゾーンの値を当てていた場合に限り元の値へ戻す。 */
+static void apply_zone_sockbuf(int fd, int opt, int want, int *applied, int *orig) {
+  if (want > 0) {
+    if (*applied == want) return;
+    if (*orig == 0) {
+      socklen_t optlen = sizeof(*orig);
+      if (getsockopt(fd, SOL_SOCKET, opt, orig, &optlen) != 0 || *orig <= 0) *orig = -1;
+    }
+    setsockopt(fd, SOL_SOCKET, opt, &want, sizeof(want));
+    *applied = want;
+  } else if (*applied != 0) {
+    if (*orig > 0) setsockopt(fd, SOL_SOCKET, opt, orig, sizeof(*orig));
+    *applied = 0;
+  }
+}
+
+/* zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf を accept 済みソケットへ適用する。
+ * ゾーンはクエリを読むまで分からないため、1接続で複数ゾーンへ問い合わせると
+ * クエリごとに切り替わる (値が変わるときだけ setsockopt する)。MSS だけは
+ * apply_tcp_mss() の通り下げる方向のみで、戻さない。 */
+STATIC_TEST void apply_zone_tcp_opts(int fd, tcp_stream_ctx_t *c, const zone_config_t *zcfg) {
+  if (zcfg) apply_tcp_mss(fd, c, zcfg->zone_tcp_mss);
+  apply_zone_sockbuf(fd, SO_RCVBUF, zcfg ? zcfg->zone_tcp_window : 0, &c->applied_rcvbuf, &c->orig_rcvbuf);
+  apply_zone_sockbuf(fd, SO_SNDBUF, zcfg ? zcfg->zone_tcp_sndbuf : 0, &c->applied_sndbuf, &c->orig_sndbuf);
+}
+
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
 #ifndef CPU_SETSIZE
@@ -1252,6 +1351,7 @@ void *worker_thread_func(void *arg) {
 #else
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
+        apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
         if (bind(tcp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
@@ -1274,6 +1374,7 @@ void *worker_thread_func(void *arg) {
 #else
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
+        apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
         if (bind(tcp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
@@ -1575,12 +1676,11 @@ worker_startup_success:;
 
               if (__builtin_expect(tc_packet, 0)) {
                 res_buf[2] |= 0x02; // Set TC bit
-                res_buf[6] = 0; res_buf[7] = 0; // ANCOUNT = 0
-                res_buf[8] = 0; res_buf[9] = 0; // NSCOUNT = 0
-                res_buf[10] = 0; res_buf[11] = 0; // ARCOUNT = 0
                 int qlen = (int)question_end;
                 if (qlen > res_len) qlen = res_len;
                 if (qlen > payload_received) qlen = payload_received;
+                // 質問セクションまで切り詰めるが、OPT は残す (RFC 6891 §7)
+                qlen = (int)dns_truncate_keep_opt(res_buf, (size_t)res_len, (size_t)qlen);
                 res_msg->payload_len = qlen;
                 batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
               } else {
@@ -1620,6 +1720,12 @@ worker_startup_success:;
         // TCP
         int active_tcp_fd = ev_list[i].ident;
         int accept_count = 0;
+        int accept_tcp_mss = 0;
+        rcu_reader_enter(ctx);
+        server_config_t *accept_cfg = acquire_config_snapshot();
+        if (accept_cfg) accept_tcp_mss = accept_cfg->tcp_mss;
+        release_config_snapshot(accept_cfg);
+        rcu_reader_exit(ctx);
         while (accept_count < 100) {
           struct sockaddr_storage client_addr;
           socklen_t client_len = sizeof(client_addr);
@@ -1651,6 +1757,7 @@ worker_startup_success:;
             continue;
           }
           clock_gettime(CLOCK_MONOTONIC, &ctx_tcp->connect_time);
+          apply_tcp_mss(client_fd, ctx_tcp, accept_tcp_mss);
           struct kevent ev_timeout;
           EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
                  10000, ctx_tcp);
@@ -1842,6 +1949,20 @@ process_tcp_client: ;
           bool is_synthetic_zone = (zcfg && zcfg->type &&
                                     (strcasecmp(zcfg->type, "program") == 0 ||
                                      strcasecmp(zcfg->type, "forward") == 0));
+
+          /* zone-tcp-*: zcfg は QNAME がゾーン頂点と一致したときだけ見つかるので
+           * (AXFR/IXFR 用)、それ以外は QNAME を含む最も近いゾーンを引き直す。
+           * どのゾーンにも指定がなければ検索自体を省く。AXFR ワーカーへ渡す前に
+           * 適用しておくことで、転送スレッドもこの値で送信する。 */
+          if (cfg && cfg->any_zone_tcp_opts) {
+            zone_config_t *tcp_zcfg = zcfg;
+            if (!tcp_zcfg && xfr_view) {
+              zone_db_entry_t *tcp_entry = find_zone_in_view(xfr_view, qname);
+              if (tcp_entry)
+                tcp_zcfg = find_zone_config_in_view(cfg, xfr_view->name, tcp_entry->domain);
+            }
+            apply_zone_tcp_opts(client_fd, ctx_tcp, tcp_zcfg);
+          }
 
           if ((qtype == 252 || qtype == 251) && !is_synthetic_zone) {
             bool allowed = false;
@@ -2821,6 +2942,7 @@ void *control_thread_func(void *arg) {
                     char master_ip[64] = {0};
                     int master_port = 53;
                     char tsig_key_name[64] = {0};
+                    zone_config_t *slave_zcfg = NULL; /* カタログのメンバーゾーンは zone{} を持たない */
                     
                     if (entry->is_catalog_member) {
                         is_slave = true;
@@ -2829,6 +2951,7 @@ void *control_thread_func(void *arg) {
                         strncpy(tsig_key_name, entry->cached_tsig_key_name, sizeof(tsig_key_name) - 1);
                     } else {
                         zone_config_t *zcfg = find_zone_config_in_view(active, entry->view_name, entry->domain);
+                        slave_zcfg = zcfg;
                         if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "slave") == 0 || strcasecmp(zcfg->type, "secondary") == 0) &&
                             zcfg->masters_count > 0 && zcfg->masters[0].ip != NULL) {
                             is_slave = true;
@@ -2873,6 +2996,7 @@ void *control_thread_func(void *arg) {
                                     bg_ctx->entry = entry;
                                     bg_ctx->snap = snap;
                                     retain_zone_snapshot(snap);
+                                    bg_ctx->tcp_opts = xfr_tcp_sockopts(active, slave_zcfg);
                                     
                                     /* [H-4] config ポインタをそのまま渡すと UAF になるため、
                                      * TSIG キーのデータをスレッド起動前に bg_ctx へ値コピーする。*/

@@ -10,5 +10,6 @@
 key "karictl" {
     algorithm "hmac-sha256";
     // サーバー側の control-channel { secret "..."; } と同じ Base64 文字列を指定してください。
-    secret "BASE64_ENCODED_SECRET_HERE=";
+    // 下の値はプレースホルダです。`openssl rand -base64 32` の出力に置き換えてください。
+    secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy";
 };

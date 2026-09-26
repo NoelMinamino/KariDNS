@@ -88,7 +88,7 @@ socket "/var/run/karidns/control.sock";
 
 key "karictl" {
     algorithm "hmac-sha256";
-    secret "BASE64_ENCODED_SECRET_HERE=";
+    secret "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"; // placeholder: replace with `openssl rand -base64 32`
 };
 ```
 

@@ -81,3 +81,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     zone_arena_destroy(&active);
     return 0;
 }
+
+/* broker_connect_opts(): the TCP socket options are applied by the real broker only; the mock ignores them. */
+int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
+                        const tcp_sockopts_t *tcp_opts) {
+    (void)tcp_opts;
+    return broker_connect(family, type, addr, addr_len);
+}

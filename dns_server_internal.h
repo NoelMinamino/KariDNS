@@ -158,6 +158,12 @@ typedef struct {
   bool has_server_addr;
   bool quota_yield;
   struct timespec connect_time;
+  /* zone-tcp-* の適用状態 (apply_zone_tcp_opts)。0 = 未適用 / 未取得 */
+  int applied_mss;
+  int applied_rcvbuf;
+  int applied_sndbuf;
+  int orig_rcvbuf;   /* ゾーン値を当てる前の SO_RCVBUF (未指定ゾーンへ戻すため)。-1 = 取得失敗 */
+  int orig_sndbuf;
 } tcp_stream_ctx_t;
 
 typedef struct {
@@ -420,7 +426,27 @@ void inc_tcp_clients(void);
 void submit_response_log(log_action_t action, const char *client_ip, int client_port, const char *qname,
                         uint16_t qclass, uint16_t qtype, uint8_t rcode,
                         bool has_edns, bool dnssec_ok);
+/* broker_connect_opts() がブローカー側で TCP ソケットへ設定する値 (0 = 未指定)。
+ * rcvbuf / sndbuf は connect() 前に設定するので SYN で通知する初期ウィンドウから効く。
+ * mss は FreeBSD では未接続ソケットに mssdflt (既定 536) を超える値を設定できないため、
+ * connect() 成功後に設定する (送信 MSS を下げる方向のみ)。 */
+typedef struct {
+  int mss;
+  int rcvbuf;
+  int sndbuf;
+} tcp_sockopts_t;
+
+/* ブローカーへの connect 代行要求 (要求側と子プロセスで共有する唯一の定義) */
+typedef struct {
+  int family;
+  int type;
+  struct sockaddr_storage addr;
+  tcp_sockopts_t tcp_opts;
+} broker_req_t;
+
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len);
+int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
+                        const tcp_sockopts_t *tcp_opts);
 size_t resolve_ip_port_to_sockaddr(const char *ip, int port, struct sockaddr_storage *out);
 
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
@@ -441,6 +467,10 @@ void *query_logger_thread_func(void *arg);
 void init_async_io_pool(void);
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
+void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
+void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss);
+tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zone_config_t *zcfg);
+void apply_zone_tcp_opts(int fd, tcp_stream_ctx_t *c, const zone_config_t *zcfg);
 
 #define ASYNC_IO_POOL_SIZE 16
 #define ASYNC_IO_QUEUE_CAPACITY 4096

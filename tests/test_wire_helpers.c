@@ -793,6 +793,89 @@ static void test_assemble_edns_opt_with_ede_and_ecs(void) {
     CHECK(off > 20);
 }
 
+/* RFC 6891 §7 helpers: OPT reservation, EDE fallback, OPT lookup and TC truncation keeping the OPT. */
+static void test_truncation_keeps_opt_helpers(void) {
+    printf("[TEST] Wire: edns_opt_reserve_len / EDE fallback / dns_find_opt_rr / dns_truncate_keep_opt...\n");
+
+    /* the reservation covers everything assemble_edns_opt() writes except EDE */
+    edns_info_t edns;
+    memset(&edns, 0, sizeof(edns));
+    edns.present = true;
+    CHECK(edns_opt_reserve_len(&edns, false, NULL) == 11);
+    edns.has_cookie = true;
+    edns.server_cookie_len = 16;
+    edns.has_ecs = true;
+    edns.ecs_family = 2;
+    edns.ecs_source_prefix = 56;
+    edns.ecs_scope_prefix = 56;
+    size_t reserve = edns_opt_reserve_len(&edns, false, NULL);
+    uint8_t res[512];
+    memset(res, 0, sizeof(res));
+    uint16_t off = 12, arcount = 0;
+    assemble_edns_opt(res, sizeof(res), &off, &arcount, &edns, 0, false, NULL);
+    CHECK(arcount == 1);
+    CHECK((size_t)(off - 12) <= reserve);
+
+    /* no room for the EDE text: the OPT is still written, without EDE */
+    memset(&edns, 0, sizeof(edns));
+    edns.present = true;
+    edns.ede_count = 1;
+    edns.ede_list[0].code = 3;
+    memset(edns.ede_list[0].text, 'x', 200);
+    edns.ede_list[0].text[200] = '\0';
+    off = 100; arcount = 0;
+    assemble_edns_opt(res, 100 + 11 + 20, &off, &arcount, &edns, 0, false, NULL);
+    CHECK(arcount == 1);
+    CHECK(off == 100 + 11);
+    CHECK(res[100 + 9] == 0 && res[100 + 10] == 0);   /* RDLEN 0 */
+    CHECK(edns.ede_count == 0);
+    /* no room at all: nothing is written */
+    off = 100; arcount = 0;
+    assemble_edns_opt(res, 100 + 10, &off, &arcount, &edns, 0, false, NULL);
+    CHECK(arcount == 0 && off == 100);
+
+    /* a response: question, 2 answers (A), 1 additional A, then OPT with a 12-byte cookie option */
+    uint8_t msg[256];
+    memset(msg, 0, sizeof(msg));
+    size_t n = 0;
+    msg[0] = 0x12; msg[1] = 0x34; msg[2] = 0x84;
+    msg[5] = 1; msg[7] = 2; msg[11] = 2;           /* QD=1 AN=2 NS=0 AR=2 */
+    n = 12;
+    static const uint8_t qname[] = {1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0};
+    memcpy(msg + n, qname, sizeof(qname)); n += sizeof(qname);
+    msg[n++] = 0; msg[n++] = 1; msg[n++] = 0; msg[n++] = 1;
+    size_t q_end = n;
+    for (int i = 0; i < 3; i++) {                  /* 2 answers + 1 additional */
+        msg[n++] = 0xC0; msg[n++] = 12;
+        msg[n++] = 0; msg[n++] = 1; msg[n++] = 0; msg[n++] = 1;
+        msg[n++] = 0; msg[n++] = 0; msg[n++] = 0x0E; msg[n++] = 0x10;
+        msg[n++] = 0; msg[n++] = 4;
+        msg[n++] = 192; msg[n++] = 0; msg[n++] = 2; msg[n++] = (uint8_t)(1 + i);
+    }
+    size_t opt_at = n;
+    static const uint8_t opt[] = {0, 0, 41, 0x04, 0xD0, 0, 0, 0x80, 0, 0, 12,
+                                  0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8};
+    memcpy(msg + n, opt, sizeof(opt)); n += sizeof(opt);
+
+    size_t fo = 0, fl = 0;
+    CHECK(dns_find_opt_rr(msg, n, &fo, &fl));
+    CHECK(fo == opt_at && fl == sizeof(opt));
+    CHECK(!dns_find_opt_rr(msg, opt_at, &fo, &fl));   /* cut before the OPT: not found, no overread */
+    CHECK(!dns_find_opt_rr(msg, 5, NULL, NULL));
+
+    size_t newlen = dns_truncate_keep_opt(msg, n, q_end);
+    CHECK(newlen == q_end + sizeof(opt));
+    CHECK(msg[6] == 0 && msg[7] == 0 && msg[8] == 0 && msg[9] == 0);
+    CHECK(msg[10] == 0 && msg[11] == 1);
+    CHECK(memcmp(msg + q_end, opt, sizeof(opt)) == 0);
+    CHECK(dns_find_opt_rr(msg, newlen, &fo, &fl) && fo == q_end);
+
+    /* without an OPT the response is cut back to the question */
+    msg[11] = 0;
+    CHECK(dns_truncate_keep_opt(msg, newlen, q_end) == q_end);
+    CHECK(msg[10] == 0 && msg[11] == 0);
+}
+
 static void test_compute_sig0_keytag_algorithms(void) {
     printf("[TEST] Wire: compute_sig0_keytag with various algorithms...\n");
     sig0_key_t key;
@@ -2456,6 +2539,7 @@ int main(void) {
     test_parse_edns_opt_ede_list_extraction();
     test_parse_edns_opt_ecs_ipv4_ipv6_scope();
     test_assemble_edns_opt_with_ede_and_ecs();
+    test_truncation_keeps_opt_helpers();
     test_compute_sig0_keytag_algorithms();
     test_pb_encode_varint_and_tag();
     test_domain_names_match_ci_edge_cases();

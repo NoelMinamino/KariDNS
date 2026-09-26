@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <openssl/hmac.h>
@@ -1185,6 +1186,115 @@ static void test_open_router_udp_sockets_and_buffers(void) {
     printf("  -> open_router_udp_sockets & setup_udp_socket_buffers passed.\n");
 }
 
+// ----------------------------------------------------------------------------
+// tcp-window / tcp-mss and zone-tcp-* socket options on a real loopback connection
+// ----------------------------------------------------------------------------
+static int sockopt_int(int fd, int level, int opt) {
+    int v = 0;
+    socklen_t len = sizeof(v);
+    assert(getsockopt(fd, level, opt, &v, &len) == 0);
+    return v;
+}
+
+static void test_tcp_listen_and_zone_socket_opts(void) {
+    printf("[TEST] Server Core: tcp-window / tcp-mss / zone-tcp-* socket options...\n");
+
+    /* tcp-window is set on the listener and inherited by the accepted socket */
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.tcp_window = 256 * 1024;
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(lfd >= 0);
+    apply_tcp_listen_opts(lfd, &cfg, true);
+    assert(sockopt_int(lfd, SOL_SOCKET, SO_RCVBUF) >= 256 * 1024);
+    assert(sockopt_int(lfd, SOL_SOCKET, SO_SNDBUF) >= 256 * 1024);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    socklen_t salen = sizeof(sa);
+    assert(getsockname(lfd, (struct sockaddr *)&sa, &salen) == 0);
+    assert(listen(lfd, 4) == 0);
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(cfd >= 0);
+    assert(connect(cfd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    int sfd = accept(lfd, NULL, NULL);
+    assert(sfd >= 0);
+    assert(sockopt_int(sfd, SOL_SOCKET, SO_SNDBUF) >= 256 * 1024);
+
+    /* a listener without tcp-window is left alone */
+    server_config_t cfg_none;
+    memset(&cfg_none, 0, sizeof(cfg_none));
+    int lfd2 = socket(AF_INET, SOCK_STREAM, 0);
+    assert(lfd2 >= 0);
+    int before = sockopt_int(lfd2, SOL_SOCKET, SO_RCVBUF);
+    apply_tcp_listen_opts(lfd2, &cfg_none, true);
+    apply_tcp_listen_opts(lfd2, NULL, true);
+    assert(sockopt_int(lfd2, SOL_SOCKET, SO_RCVBUF) == before);
+    close(lfd2);
+
+    tcp_stream_ctx_t *c = calloc(1, sizeof(*c));
+    assert(c);
+
+    /* tcp-mss: lowers the established connection's MSS; a larger value later is a no-op */
+    apply_tcp_mss(sfd, c, 1200);
+    assert(c->applied_mss == 1200);
+#if defined(__FreeBSD__) && defined(TCP_MAXSEG)
+    int mss_now = sockopt_int(sfd, IPPROTO_TCP, TCP_MAXSEG);
+    assert(mss_now > 0 && mss_now <= 1200);
+#endif
+    apply_tcp_mss(sfd, c, 1400);
+    assert(c->applied_mss == 1200);
+    apply_tcp_mss(sfd, c, 0);
+    assert(c->applied_mss == 1200);
+
+    /* zone A sets everything; the MSS only goes further down */
+    zone_config_t za;
+    memset(&za, 0, sizeof(za));
+    za.zone_tcp_mss = 1000;
+    za.zone_tcp_window = 512 * 1024;
+    za.zone_tcp_sndbuf = 1024 * 1024;
+    int orig_snd = sockopt_int(sfd, SOL_SOCKET, SO_SNDBUF);
+    int orig_rcv = sockopt_int(sfd, SOL_SOCKET, SO_RCVBUF);
+    apply_zone_tcp_opts(sfd, c, &za);
+    assert(c->applied_mss == 1000);
+    assert(c->applied_rcvbuf == 512 * 1024);
+    assert(c->applied_sndbuf == 1024 * 1024);
+    assert(c->orig_rcvbuf == orig_rcv);
+    assert(c->orig_sndbuf == orig_snd);
+    assert(sockopt_int(sfd, SOL_SOCKET, SO_RCVBUF) >= 512 * 1024);
+    assert(sockopt_int(sfd, SOL_SOCKET, SO_SNDBUF) >= 1024 * 1024);
+    apply_zone_tcp_opts(sfd, c, &za);     /* same zone again: nothing changes */
+    assert(c->applied_sndbuf == 1024 * 1024 && c->orig_sndbuf == orig_snd);
+
+    /* zone B has no zone-tcp-*: buffers go back to the pre-zone values, MSS stays lowered */
+    zone_config_t zb;
+    memset(&zb, 0, sizeof(zb));
+    zb.zone_tcp_mss = 1300;
+    apply_zone_tcp_opts(sfd, c, &zb);
+    assert(c->applied_mss == 1000);
+    assert(c->applied_rcvbuf == 0 && c->applied_sndbuf == 0);
+    assert(sockopt_int(sfd, SOL_SOCKET, SO_SNDBUF) == orig_snd);
+    assert(sockopt_int(sfd, SOL_SOCKET, SO_RCVBUF) == orig_rcv);
+
+    /* only zone-tcp-sndbuf on zone C; a query outside any configured zone (NULL) resets it */
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.zone_tcp_sndbuf = 2 * 1024 * 1024;
+    apply_zone_tcp_opts(sfd, c, &zc);
+    assert(c->applied_sndbuf == 2 * 1024 * 1024 && c->applied_rcvbuf == 0);
+    apply_zone_tcp_opts(sfd, c, NULL);
+    assert(c->applied_sndbuf == 0);
+    assert(sockopt_int(sfd, SOL_SOCKET, SO_SNDBUF) == orig_snd);
+
+    free(c);
+    close(sfd);
+    close(cfd);
+    close(lfd);
+    printf("  -> tcp-window / tcp-mss / zone-tcp-* socket options passed.\n");
+}
+
 static void build_dns_query(uint8_t *buf, size_t *out_len, uint16_t txid, const char *qname, uint16_t qtype, bool dnssec_ok) {
     memset(buf, 0, 12);
     buf[0] = (uint8_t)(txid >> 8);
@@ -1641,6 +1751,88 @@ static void test_active_broker_connect_loop(void) {
         }
     }
     printf("  -> active start_connect_broker passed.\n");
+}
+
+static void test_broker_connect_opts_and_xfr_tcp_sockopts(void) {
+    printf("[TEST] Server Core: xfr_tcp_sockopts & broker_connect_opts TCP options...\n");
+
+    /* zone values win, the global tcp-mss / tcp-window fill the gaps, catalog members (no zone{}) get the globals */
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    tcp_sockopts_t o = xfr_tcp_sockopts(NULL, NULL);
+    assert(o.mss == 0 && o.rcvbuf == 0 && o.sndbuf == 0);
+    cfg.tcp_mss = 1400;
+    cfg.tcp_window = 256 * 1024;
+    o = xfr_tcp_sockopts(&cfg, NULL);
+    assert(o.mss == 1400 && o.rcvbuf == 256 * 1024 && o.sndbuf == 256 * 1024);
+    zone_config_t z;
+    memset(&z, 0, sizeof(z));
+    z.zone_tcp_window = 1024 * 1024;
+    o = xfr_tcp_sockopts(&cfg, &z);
+    assert(o.mss == 1400 && o.rcvbuf == 1024 * 1024 && o.sndbuf == 256 * 1024);
+    z.zone_tcp_mss = 1200;
+    z.zone_tcp_sndbuf = 128 * 1024;
+    o = xfr_tcp_sockopts(&cfg, &z);
+    assert(o.mss == 1200 && o.rcvbuf == 1024 * 1024 && o.sndbuf == 128 * 1024);
+
+    /* the broker applies them to the socket it connects: buffers before connect(), MSS after */
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(lfd >= 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    socklen_t salen = sizeof(sa);
+    assert(getsockname(lfd, (struct sockaddr *)&sa, &salen) == 0);
+    assert(listen(lfd, 4) == 0);
+
+    /* as root the broker drops to the configured user and refuses to run without one */
+    char *saved_user = g_config_db.config_a.user;
+    static char nobody_user[] = "nobody";
+    g_config_db.config_a.user = nobody_user;
+    start_connect_broker();
+    g_config_db.config_a.user = saved_user;
+    assert(g_broker_sock >= 0);
+
+    tcp_sockopts_t want = { 1200, 512 * 1024, 256 * 1024 };
+    int fd = broker_connect_opts(AF_INET, SOCK_STREAM, (struct sockaddr *)&sa, sizeof(sa), &want);
+    assert(fd >= 0);
+    int v = 0;
+    socklen_t vl = sizeof(v);
+    assert(getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v, &vl) == 0 && v >= 512 * 1024);
+    vl = sizeof(v);
+    assert(getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, &vl) == 0 && v >= 256 * 1024);
+#if defined(__FreeBSD__) && defined(TCP_MAXSEG)
+    /* FreeBSD reports t_maxseg, which the setsockopt lowered (Linux keeps reporting the path MSS) */
+    vl = sizeof(v);
+    assert(getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &v, &vl) == 0 && v > 0 && v <= 1200);
+#endif
+    close(fd);
+    int afd = accept(lfd, NULL, NULL);
+    if (afd >= 0) close(afd);
+
+    /* plain broker_connect() still works and asks for nothing */
+    fd = broker_connect(AF_INET, SOCK_STREAM, (struct sockaddr *)&sa, sizeof(sa));
+    assert(fd >= 0);
+    close(fd);
+    afd = accept(lfd, NULL, NULL);
+    if (afd >= 0) close(afd);
+
+    /* an address longer than sockaddr_storage is rejected before anything is sent */
+    uint8_t huge[sizeof(struct sockaddr_storage) + 8];
+    memset(huge, 0, sizeof(huge));
+    assert(broker_connect_opts(AF_INET, SOCK_STREAM, (struct sockaddr *)huge, sizeof(huge), &want) == -1);
+
+    close(g_broker_sock);
+    g_broker_sock = -1;
+    if (g_broker_pid > 0) {
+        kill(g_broker_pid, SIGTERM);
+        waitpid(g_broker_pid, NULL, 0);
+        g_broker_pid = -1;
+    }
+    close(lfd);
+    printf("  -> xfr_tcp_sockopts & broker_connect_opts passed.\n");
 }
 
 static void test_setup_ipc_tables_and_reload_error_paths(void) {
@@ -5010,11 +5202,13 @@ int main(void) {
     test_query_logger_thread_func();
     test_control_socket_thread_and_commands();
     test_open_router_udp_sockets_and_buffers();
+    test_tcp_listen_and_zone_socket_opts();
     test_async_io_pool_and_tasks();
     test_meta_types_and_utils_helpers();
     test_setup_ipc_tables_and_reload_error_paths();
     test_perform_config_reload_valid_and_diff();
     test_active_broker_connect_loop();
+    test_broker_connect_opts_and_xfr_tcp_sockopts();
     test_server_core_process_lifecycle_and_signals();
     test_control_multiview_and_timeout_cases();
     test_control_reload_zone_specific();

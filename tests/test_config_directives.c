@@ -115,6 +115,10 @@ static void test_defaults(void) {
     CHECK(cfg.additional_from_auth == ADDITIONAL_AUTH_YES);
     CHECK(cfg.udp_recvbuf_size == 4 * 1024 * 1024);
     CHECK(cfg.udp_sndbuf_size == 4 * 1024 * 1024);
+    CHECK(cfg.tcp_mss == 0);                /* 0 = leave the OS default alone */
+    CHECK(cfg.tcp_window == 0);
+    CHECK(cfg.udp_bufsize == 0);            /* 0 = the built-in 1232 */
+    CHECK(cfg.any_zone_tcp_opts == false);
     CHECK(cfg.cookie_secret_count == 0);
     CHECK(cfg.dnstap.enabled == false);
     CHECK(cfg.control.enabled == false);
@@ -239,6 +243,84 @@ static void test_buffer_sizes(void) {
             free_server_config_fields(&cfg);
         }
     }
+}
+
+static void test_transport_params(void) {
+    printf("[TEST] tcp-mss / tcp-window / udp-bufsize and their zone-* overrides...\n");
+    server_config_t cfg;
+
+    /* options{}: plain integers, K/M suffixes on the window only */
+    if (parse_ok("options { tcp-mss 1220; tcp-window 256k; udp-bufsize 1400; };", &cfg)) {
+        CHECK(cfg.tcp_mss == 1220);
+        CHECK(cfg.tcp_window == 256 * 1024);
+        CHECK(cfg.udp_bufsize == 1400);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { tcp-window 4M; };", &cfg)) {
+        CHECK(cfg.tcp_window == 4 * 1024 * 1024);
+        free_server_config_fields(&cfg);
+    }
+    /* range boundaries are inclusive */
+    if (parse_ok("options { tcp-mss 536; tcp-window 4096; udp-bufsize 512; };", &cfg)) {
+        CHECK(cfg.tcp_mss == 536);
+        CHECK(cfg.tcp_window == 4096);
+        CHECK(cfg.udp_bufsize == 512);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { tcp-mss 65495; tcp-window 64M; udp-bufsize 4096; };", &cfg)) {
+        CHECK(cfg.tcp_mss == 65495);
+        CHECK(cfg.tcp_window == 64 * 1024 * 1024);
+        CHECK(cfg.udp_bufsize == 4096);
+        free_server_config_fields(&cfg);
+    }
+
+    /* zone{} overrides; the global flag tracks whether any zone uses zone-tcp-* */
+    if (parse_ok("zone \"a.example\" { type master; file \"a.zone\"; zone-tcp-mss 1200; zone-tcp-window 128k;"
+                 " zone-tcp-sndbuf 2M; zone-udp-bufsize 1400; };"
+                 "zone \"b.example\" { type master; file \"b.zone\"; };", &cfg)) {
+        const zone_config_t *a = first_zone(&cfg);
+        const zone_config_t *b = a ? a->next : NULL;
+        CHECK(a && a->zone_tcp_mss == 1200);
+        CHECK(a && a->zone_tcp_window == 128 * 1024);
+        CHECK(a && a->zone_tcp_sndbuf == 2 * 1024 * 1024);
+        CHECK(a && a->zone_udp_bufsize == 1400);
+        CHECK(b && b->zone_tcp_mss == 0 && b->zone_tcp_window == 0 && b->zone_tcp_sndbuf == 0);
+        CHECK(b && b->zone_udp_bufsize == 0);
+        CHECK(cfg.any_zone_tcp_opts == true);
+        free_server_config_fields(&cfg);
+    }
+    /* zone-udp-bufsize alone does not touch the TCP path */
+    if (parse_ok("zone \"a.example\" { type master; file \"a.zone\"; zone-udp-bufsize 1232; };", &cfg)) {
+        CHECK(cfg.any_zone_tcp_opts == false);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("zone \"a.example\" { type master; file \"a.zone\"; zone-tcp-sndbuf 1m; };", &cfg)) {
+        CHECK(cfg.any_zone_tcp_opts == true);
+        free_server_config_fields(&cfg);
+    }
+
+    /* out-of-range and malformed values are rejected, never silently clamped */
+    expect_reject("tcp-mss below RFC 1122 default", "options { tcp-mss 535; };");
+    expect_reject("tcp-mss above 65535-40", "options { tcp-mss 65496; };");
+    expect_reject("tcp-mss with suffix", "options { tcp-mss 1k; };");
+    expect_reject("tcp-mss negative", "options { tcp-mss -1220; };");
+    expect_reject("tcp-mss trailing junk", "options { tcp-mss 1220x; };");
+    expect_reject("tcp-window below 4K", "options { tcp-window 4095; };");
+    expect_reject("tcp-window above 64M", "options { tcp-window 65M; };");
+    expect_reject("tcp-window G suffix", "options { tcp-window 1G; };");
+    expect_reject("tcp-window junk", "options { tcp-window big; };");
+    expect_reject("tcp-window huge overflow", "options { tcp-window 99999999999999999999M; };");
+    expect_reject("udp-bufsize below 512", "options { udp-bufsize 511; };");
+    expect_reject("udp-bufsize above 4096", "options { udp-bufsize 4097; };");
+    expect_reject("tcp-mss missing semicolon", "options { tcp-mss 1220 };");
+    expect_reject("zone-tcp-mss out of range",
+                  "zone \"a.example\" { type master; file \"a.zone\"; zone-tcp-mss 100; };");
+    expect_reject("zone-tcp-window out of range",
+                  "zone \"a.example\" { type master; file \"a.zone\"; zone-tcp-window 1k; };");
+    expect_reject("zone-tcp-sndbuf junk",
+                  "zone \"a.example\" { type master; file \"a.zone\"; zone-tcp-sndbuf 2MB; };");
+    expect_reject("zone-udp-bufsize out of range",
+                  "zone \"a.example\" { type master; file \"a.zone\"; zone-udp-bufsize 8192; };");
 }
 
 static void test_additional_from_auth(void) {
@@ -1080,6 +1162,7 @@ int main(void) {
     test_numeric_directives();
     test_numeric_directives_invalid();
     test_buffer_sizes();
+    test_transport_params();
     test_additional_from_auth();
     test_options_syntax_errors();
     test_ecs_and_location_tags();

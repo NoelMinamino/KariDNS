@@ -25,6 +25,8 @@ typedef struct {
   char tsig_algorithm[64];
   uint8_t tsig_secret_decoded[256];
   size_t tsig_secret_decoded_len;
+  /* マスターへの TCP 接続に使う zone-tcp-* / tcp-* (xfr_tcp_sockopts()) */
+  tcp_sockopts_t tcp_opts;
 } axfr_bg_ctx_t;
 
 typedef struct {

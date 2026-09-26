@@ -3,6 +3,19 @@
 
 #define KARIDNS_MAX_CONFIG_FILE_SIZE (256 * 1024 * 1024)
 
+/* tcp-mss / tcp-window / udp-bufsize と zone-tcp-* / zone-udp-bufsize の許容範囲 */
+#define KARIDNS_TCP_MSS_MIN      536                 /* RFC 1122 §3.3.3 の既定 MSS */
+#define KARIDNS_TCP_MSS_MAX      65495               /* 65535 - IPv4/TCP ヘッダ 40 */
+#define KARIDNS_TCP_BUF_MIN      4096
+#define KARIDNS_TCP_BUF_MAX      (64 * 1024 * 1024)
+#define KARIDNS_UDP_BUFSIZE_MIN  512                 /* RFC 6891 §6.2.3 */
+#define KARIDNS_UDP_BUFSIZE_MAX  4096
+#define KARIDNS_UDP_BUFSIZE_DEFAULT 1232             /* DNS Flag Day 2020 */
+
+/* karidns.conf.sample / karictl.conf.sample の secret プレースホルダ (Base64 として正しい値)。
+ * デコードすると "REPLACE-ME:openssl-rand-base64-32"。このまま使われていたら警告する。 */
+#define KARIDNS_SAMPLE_SECRET_PLACEHOLDER "UkVQTEFDRS1NRTpvcGVuc3NsLXJhbmQtYmFzZTY0LTMy"
+
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -100,6 +113,15 @@ typedef struct zone_config {
   /* --- disable-auto-tc-flag (ゾーン単位の上書き: 既定 no) --- */
   bool disable_auto_tc_flag;
 
+  /* --- TCP/UDP 転送パラメータ (ゾーン単位の上書き: 0 = 未指定) ---
+   * ゾーンはクエリを受信するまで確定しないため、TCP 系は accept 済みソケットへ
+   * クエリ受信後に setsockopt する。ハンドシェイクで決まる値 (相手へ通知済みの MSS、
+   * ウィンドウスケール) には影響しない。詳細は docs/karidns.md を参照。 */
+  int zone_tcp_mss;         /* TCP_MAXSEG。確立済み接続なので現在値より小さくする方向のみ有効 */
+  int zone_tcp_window;      /* SO_RCVBUF (受信ウィンドウ) */
+  int zone_tcp_sndbuf;      /* SO_SNDBUF (送信バッファ) */
+  uint16_t zone_udp_bufsize; /* EDNS UDP ペイロードサイズ上限 (512..4096) */
+
   struct zone_config *next;
 } zone_config_t;
 
@@ -196,6 +218,12 @@ typedef struct server_config_s {
   int cookie_secret_count;
   int udp_recvbuf_size;
   int udp_sndbuf_size;
+  /* TCP の転送パラメータ (0 = OS 既定) */
+  int tcp_mss;              /* TCP_MAXSEG。accept 直後に各接続へ設定 (送信 MSS を下げる方向のみ) */
+  int tcp_window;           /* SO_RCVBUF と SO_SNDBUF。listen() 前に設定し accept 済みソケットへ
+                             * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
+  uint16_t udp_bufsize;     /* EDNS UDP ペイロードサイズ上限 (0 = 既定 1232) */
+  bool any_zone_tcp_opts;   /* zone-tcp-* を持つゾーンが1つでもあるか (TCP 経路の追加検索を省く) */
   bool allow_program_zones; /* 既定 false。trueでない限り type program は起動時エラーで拒否 */
   bool ecs_enable;
   char **ecs_trusted_resolvers;

@@ -250,6 +250,9 @@ typedef struct {
     uint8_t version;
     bool dnssec_ok;
     bool compact_answers_ok;
+    // 応答の OPT で通知する UDP ペイロードサイズ (udp-bufsize / zone-udp-bufsize)。
+    // 0 なら既定の 1232。受信 OPT の解析では設定しない。
+    uint16_t server_udp_size;
     
     // DNS Cookie
     bool has_cookie;
@@ -346,6 +349,15 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
                        uint16_t *offset_inout, uint16_t *arcount_inout,
                        edns_info_t *edns, uint8_t rcode_ext, bool is_tcp,
                        struct server_config_s *cfg);
+// assemble_edns_opt() が書く OPT RR のうち、EDE を除いた部分のバイト数の上限。
+// 応答本文を組み立てる前に差し引いておくと、切り詰め (TC=1) 応答にも OPT が必ず入る
+// (EDE は解決中に増えるので含めない。入りきらない場合は assemble_edns_opt() が EDE を省く)。
+size_t edns_opt_reserve_len(const edns_info_t *edns, bool is_tcp, const struct server_config_s *cfg);
+// msg (ヘッダの各カウントが有効な DNS メッセージ) の中から OPT RR を探す。
+bool dns_find_opt_rr(const uint8_t *msg, size_t msg_len, size_t *opt_off, size_t *opt_len);
+// 応答を質問セクションまで切り詰める (AN/NS/AR を落とす) が、OPT RR があれば
+// 質問の直後へ移して残す (RFC 6891 §7)。TC ビットは呼び出し側で立てる。戻り値は新しい長さ。
+size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end);
 
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,

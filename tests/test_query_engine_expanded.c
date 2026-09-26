@@ -2955,6 +2955,228 @@ static void test_dns_cookie_badcookie_and_timestamp_drift(void) {
     printf("  -> DNS Cookie BADCOOKIE test passed.\n");
 }
 
+/* udp-bufsize / zone-udp-bufsize: the server-side UDP payload cap (was hard-wired to 1232) and the
+ * size advertised in the response OPT. A ~2.5 KB TXT RRset is used: it truncates at 1232 and fits
+ * in 4096. The OPT checks read the last 11 bytes of the response, valid because the query carries
+ * no EDNS options (so the response OPT has RDLEN 0). */
+static int ubuf_query_name(zone_db_snapshot_t *snap, const char *qname, uint16_t qtype, uint16_t client_payload,
+                           bool is_tcp, uint8_t *rbuf, size_t rcap) {
+    uint8_t qbuf[512];
+    size_t qlen = 0;
+    build_dns_query(qbuf, &qlen, 0x4242, qname, qtype, true);
+    qbuf[qlen - 8] = (uint8_t)(client_payload >> 8);   /* OPT CLASS = requestor's UDP payload size */
+    qbuf[qlen - 7] = (uint8_t)(client_payload & 0xFF);
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    rate_limit_config_t *rrl_cfg = NULL;
+    /* production UDP callers pass the 512-byte default; the engine widens it up to the cap */
+    size_t max_res = is_tcp ? rcap : UDP_DEFAULT_MAX_RES_LEN;
+    return process_dns_query(qbuf, qlen, rbuf, max_res, qname, qtype, "127.0.0.1",
+                             &comp_ctx, is_tcp, &rrl_cfg, snap);
+}
+
+static int ubuf_query(zone_db_snapshot_t *snap, uint16_t client_payload, bool is_tcp, uint8_t *rbuf, size_t rcap) {
+    return ubuf_query_name(snap, "big.ubuf.example.", 16 /*TXT*/, client_payload, is_tcp, rbuf, rcap);
+}
+
+static uint16_t ubuf_opt_payload(const uint8_t *r, int rlen) {
+    assert(rlen >= 12 + 11);
+    const uint8_t *opt = r + rlen - 11;
+    assert(opt[0] == 0 && opt[1] == 0 && opt[2] == 41);
+    return (uint16_t)((opt[3] << 8) | opt[4]);
+}
+
+/* OPT advertisement also checked on a small, untruncated answer. */
+static uint16_t ubuf_small_opt_payload(zone_db_snapshot_t *snap) {
+    uint8_t r[4096];
+    int rlen = ubuf_query_name(snap, "ns1.ubuf.example.", 1 /*A*/, 4096, false, r, sizeof(r));
+    assert(rlen >= 12 && (r[2] & 0x02) == 0);
+    return ubuf_opt_payload(r, rlen);
+}
+
+static void test_udp_bufsize_global_and_zone(void) {
+    printf("[TEST] Query Engine: udp-bufsize / zone-udp-bufsize cap and OPT advertisement...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+
+    char ztext[8192];
+    size_t zo = (size_t)snprintf(ztext, sizeof(ztext),
+        "ubuf.example. 3600 IN SOA ns1.ubuf.example. admin.ubuf.example. 1 3600 1800 604800 86400\n"
+        "ubuf.example. 3600 IN NS ns1.ubuf.example.\n"
+        "ns1.ubuf.example. 3600 IN A 192.0.2.1\n");
+    for (int i = 0; i < 40; i++)   /* 40 x (2 + 10 + 1 + 50) = 2520 bytes of answer */
+        zo += (size_t)snprintf(ztext + zo, sizeof(ztext) - zo,
+                               "big.ubuf.example. 3600 IN TXT \"%02d-abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstu\"\n", i);
+
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "ubuf.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "ubuf.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "__default__", sizeof(entry.view_name));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    zone_db_entry_t *entries[1] = {&entry};
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "__default__";   /* the parser's implicit view for top-level zone{} blocks */
+    view.entries = entries;
+    view.zone_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    atomic_init(&snap.reader_count, 10);
+
+    server_config_t *saved = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    uint8_t rbuf[65535];
+    int rlen;
+
+    /* 1. no config at all: the built-in 1232 cap truncates and is what the OPT advertises */
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    rlen = ubuf_query(&snap, 4096, false, rbuf, sizeof(rbuf));
+    assert(rlen >= 12 && rlen <= 1232);
+    assert((rbuf[2] & 0x02) != 0);
+    assert(ubuf_opt_payload(rbuf, rlen) == 1232);   /* RFC 6891 §7: the TC=1 response keeps its OPT */
+    assert(ubuf_small_opt_payload(&snap) == 1232);
+
+    /* 2. options { udp-bufsize 4096; } lifts the cap for every zone */
+    server_config_t cfg_global;
+    assert(parse_named_conf("options { udp-bufsize 4096; };"
+                            "zone \"ubuf.example\" { type master; file \"ubuf.zone\"; };", &cfg_global) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg_global, memory_order_release);
+    rlen = ubuf_query(&snap, 4096, false, rbuf, sizeof(rbuf));
+    assert(rlen > 2520 && rlen <= 4096);
+    assert((rbuf[2] & 0x02) == 0);
+    assert(((rbuf[6] << 8) | rbuf[7]) == 40);
+    assert(ubuf_opt_payload(rbuf, rlen) == 4096);
+    /* the requestor's smaller payload size still wins */
+    rlen = ubuf_query(&snap, 1400, false, rbuf, sizeof(rbuf));
+    assert(rlen >= 12 && rlen <= 1400);
+    assert((rbuf[2] & 0x02) != 0);
+    assert(ubuf_opt_payload(rbuf, rlen) == 4096);
+    assert(ubuf_small_opt_payload(&snap) == 4096);
+    free_server_config_fields(&cfg_global);
+
+    /* 3. zone-udp-bufsize overrides the global value (here: back down to 1232) */
+    server_config_t cfg_zone_low;
+    assert(parse_named_conf("options { udp-bufsize 4096; };"
+                            "zone \"ubuf.example\" { type master; file \"ubuf.zone\"; zone-udp-bufsize 1232; };",
+                            &cfg_zone_low) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg_zone_low, memory_order_release);
+    rlen = ubuf_query(&snap, 4096, false, rbuf, sizeof(rbuf));
+    assert(rlen >= 12 && rlen <= 1232);
+    assert((rbuf[2] & 0x02) != 0);
+    assert(ubuf_opt_payload(rbuf, rlen) == 1232);
+    assert(ubuf_small_opt_payload(&snap) == 1232);
+    free_server_config_fields(&cfg_zone_low);
+
+    /* 4. zone-udp-bufsize alone raises the cap for that zone only */
+    server_config_t cfg_zone_high;
+    assert(parse_named_conf("zone \"ubuf.example\" { type master; file \"ubuf.zone\"; zone-udp-bufsize 3000; };",
+                            &cfg_zone_high) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg_zone_high, memory_order_release);
+    rlen = ubuf_query(&snap, 4096, false, rbuf, sizeof(rbuf));
+    assert(rlen > 2520 && rlen <= 3000);
+    assert((rbuf[2] & 0x02) == 0);
+    assert(ubuf_opt_payload(rbuf, rlen) == 3000);
+
+    /* 5. TCP is not capped by either setting */
+    rlen = ubuf_query(&snap, 1232, true, rbuf, sizeof(rbuf));
+    assert(rlen > 2520);
+    assert((rbuf[2] & 0x02) == 0);
+    free_server_config_fields(&cfg_zone_high);
+
+    atomic_store_explicit(&g_config_db.active, saved, memory_order_release);
+    zone_arena_destroy(&arena);
+    printf("  -> udp-bufsize / zone-udp-bufsize passed.\n");
+}
+
+/* RFC 6891 §7: a truncated (TC=1) UDP answer to an EDNS query must still carry the OPT RR, including
+ * the DNS Cookie (RFC 7873 §5.2.x: the server must return the COOKIE option). The header counts must
+ * describe exactly the RRs present (the OPT being the last one). */
+static void test_truncated_response_keeps_opt(void) {
+    printf("[TEST] Query Engine: TC=1 responses keep the OPT RR (RFC 6891 §7)...\n");
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    char ztext[8192];
+    size_t zo = (size_t)snprintf(ztext, sizeof(ztext),
+        "tcopt.example. 3600 IN SOA ns1.tcopt.example. admin.tcopt.example. 1 3600 1800 604800 86400\n"
+        "tcopt.example. 3600 IN NS ns1.tcopt.example.\n"
+        "ns1.tcopt.example. 3600 IN A 192.0.2.1\n");
+    for (int i = 0; i < 40; i++)
+        zo += (size_t)snprintf(ztext + zo, sizeof(ztext) - zo,
+                               "big.tcopt.example. 3600 IN TXT \"%02d-abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstu\"\n", i);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "tcopt.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
+    build_zone_index(&arena, true);
+
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strlcpy(entry.domain, "tcopt.example.", sizeof(entry.domain));
+    strlcpy(entry.view_name, "default", sizeof(entry.view_name));
+    atomic_store_explicit(&entry.rcu.active, &arena, memory_order_release);
+    zone_db_entry_t *entries[1] = {&entry};
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+    atomic_init(&snap.reader_count, 10);
+
+    server_config_t *saved = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+
+    for (int with_cookie = 0; with_cookie <= 1; with_cookie++) {
+        uint8_t qbuf[512];
+        size_t qlen = 0;
+        build_dns_query(qbuf, &qlen, 0x5151, "big.tcopt.example.", 16, true);
+        if (with_cookie) {
+            /* append a client-only COOKIE option (code 10, 8 bytes) to the OPT RDATA */
+            static const uint8_t ck[12] = {0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8};
+            memcpy(qbuf + qlen, ck, sizeof(ck));
+            qlen += sizeof(ck);
+            qbuf[qlen - 12 - 2] = 0;
+            qbuf[qlen - 12 - 1] = 12;   /* OPT RDLEN */
+        }
+        compress_ctx_t comp_ctx;
+        compress_ctx_init(&comp_ctx);
+        rate_limit_config_t *rrl_cfg = NULL;
+        uint8_t rbuf[65535];
+        int rlen = process_dns_query(qbuf, qlen, rbuf, UDP_DEFAULT_MAX_RES_LEN, "big.tcopt.example.", 16,
+                                     "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+        assert(rlen >= 12 && rlen <= 1232);
+        assert((rbuf[2] & 0x02) != 0);                     /* TC=1 */
+        size_t opt_off = 0, opt_len = 0;
+        assert(dns_find_opt_rr(rbuf, (size_t)rlen, &opt_off, &opt_len));
+        assert(opt_off + opt_len == (size_t)rlen);          /* OPT is the last RR, nothing after it */
+        assert(((rbuf[10] << 8) | rbuf[11]) >= 1);          /* ARCOUNT counts the OPT */
+        assert(rbuf[opt_off + 7] & 0x80);                   /* DO bit echoed */
+        uint16_t rdlen = (uint16_t)((rbuf[opt_off + 9] << 8) | rbuf[opt_off + 10]);
+        if (with_cookie) {
+            /* COOKIE option: client cookie echoed + a server cookie */
+            assert(rdlen >= 4 + 8 + 8);
+            assert(rbuf[opt_off + 11] == 0 && rbuf[opt_off + 12] == 10);
+            assert(memcmp(rbuf + opt_off + 15, qbuf + qlen - 8, 8) == 0);
+        } else {
+            assert(rdlen == 0);
+        }
+    }
+
+    atomic_store_explicit(&g_config_db.active, saved, memory_order_release);
+    zone_arena_destroy(&arena);
+    printf("  -> TC=1 responses keep the OPT RR passed.\n");
+}
+
 static void test_rrl_slip_and_tc_response(void) {
     printf("[TEST] Query Engine: Response Rate Limiting (RRL) SLIP & drop...\n");
     zone_arena_t arena;
@@ -9126,6 +9348,8 @@ int main(void) {
     test_edns_client_subnet_cache_matching();
     test_dns_cookie_badcookie_and_timestamp_drift();
     test_rrl_slip_and_tc_response();
+    test_udp_bufsize_global_and_zone();
+    test_truncated_response_keeps_opt();
     test_proxy_v2_header_parsing();
     test_catalog_zone_queries_and_member_zones();
     test_any_query_with_dnssec_rrsigs();
@@ -9488,4 +9712,11 @@ int main(void) {
     printf("=== All Query Engine Tests PASSED ===\n");
     fflush(stdout);
     exit(0);
+}
+
+/* broker_connect_opts(): the TCP socket options are applied by the real broker only; the mock ignores them. */
+int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
+                        const tcp_sockopts_t *tcp_opts) {
+    (void)tcp_opts;
+    return broker_connect(family, type, addr, addr_len);
 }
