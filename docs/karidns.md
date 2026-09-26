@@ -192,6 +192,14 @@ there, taken from the zone and falling back to the server-wide values (catalog m
 | `SO_SNDBUF` | `zone-tcp-sndbuf`, else `tcp-window` | before `connect()` |
 | `TCP_MAXSEG` | `zone-tcp-mss`, else `tcp-mss` | after `connect()`: lowers the send MSS only, for the same FreeBSD reason as above |
 
+### Forward and program zones: not applied upstream
+
+The TCP connection a `type forward;` zone opens to its forwarder (the fallback after a truncated UDP answer)
+does not use `zone-tcp-*` / `tcp-mss` / `tcp-window`; it keeps the OS defaults. The right values for that
+connection depend on the forwarder and the path to it, not on the zone's settings. A `type program;` zone
+talks to its program over a pipe, so there is no TCP connection to tune. In both cases the settings still
+apply to the client's connection to KariDNS, like for any other zone.
+
 Per-zone UDP *socket* buffers are not possible: all zones share the same UDP sockets. The server-wide
 `udp-recvbuf-size` / `udp-sndbuf-size` stay the knobs for those. What can be set per zone on UDP is the
 EDNS payload size (`zone-udp-bufsize`). Values above 1232 risk IP fragmentation on paths with a smaller
