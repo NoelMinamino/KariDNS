@@ -451,13 +451,34 @@ static int g_runs, g_nonzero;
  * runs do not depend on each other (or on the fake server's per-name hop
  * counters) are run that way; run_barrier() waits for all of them. */
 static int g_jobs = 1, g_inflight;
-static struct { pid_t pid; char cmd[256]; } g_slots[16];
+static struct { pid_t pid; time_t start; char cmd[256]; } g_slots[16];
 
-static void account(pid_t pid, int st, const char *cmd) {
+/* Every dag run should finish within a few seconds (+time is 1-2s). Slow runs
+ * and runs killed by the per-run alarm are reported as they happen, so a CI
+ * log shows what an environment cannot do; if almost every early run times
+ * out, the environment cannot reach the fake server at all and the sweep
+ * stops instead of spending hours on timeouts. */
+#define RUN_ALARM 20
+static int g_timeouts;
+
+static void account(pid_t pid, int st, const char *cmd, time_t start) {
     (void)pid;
     g_runs++;
+    long took = (long)(time(NULL) - start);
     int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
     if (rc) g_nonzero++;
+    if (WIFSIGNALED(st) && WTERMSIG(st) == SIGALRM) {
+        g_timeouts++;
+        printf("  .. run timed out after %ds: %s\n", RUN_ALARM, cmd);
+    } else if (took >= 5) {
+        printf("  .. slow run (%lds): %s\n", took, cmd);
+    }
+    if (g_runs == 24 && g_timeouts >= 18) {
+        printf("  !! %d of the first %d dag runs timed out: the fake DNS server on 127.0.0.1 "
+               "is not reachable in this environment; stopping the sweep.\n", g_timeouts, g_runs);
+        fflush(stdout);
+        _exit(1);
+    }
     if (WIFSIGNALED(st) && WTERMSIG(st) != SIGALRM) {
         fprintf(stderr, "  !! dag crashed with signal %d: %s\n", WTERMSIG(st), cmd);
         assert(!"dag crashed");
@@ -472,7 +493,7 @@ static void reap_one(void) {
         if (g_slots[i].pid == pid) {
             g_slots[i].pid = 0;
             g_inflight--;
-            account(pid, st, g_slots[i].cmd);
+            account(pid, st, g_slots[i].cmd, g_slots[i].start);
             return;
         }
     }
@@ -499,6 +520,7 @@ static int run_dag(int argc, char **argv) {
     if (g_jobs > 1) {
         while (g_inflight >= g_jobs) reap_one();
     }
+    time_t t0 = time(NULL);
     pid_t pid = fork();
     if (pid == 0) {
         const char *v = getenv("SWNET_VERBOSE");   /* debugging aid: show output of runs containing this token */
@@ -506,7 +528,7 @@ static int run_dag(int argc, char **argv) {
         if (v) for (int i = 0; i < argc; i++) if (strstr(argv[i], v)) show = true;
         if (!show) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); dup2(dn, 2); }
         wd_child();
-        alarm(20);
+        alarm(RUN_ALARM);
         int rc = dag_main(argc, argv);
         fflush(stdout);
         exit(rc & 0xFF);
@@ -520,6 +542,7 @@ static int run_dag(int argc, char **argv) {
         for (size_t i = 0; i < sizeof(g_slots) / sizeof(g_slots[0]); i++) {
             if (g_slots[i].pid == 0) {
                 g_slots[i].pid = pid;
+                g_slots[i].start = t0;
                 snprintf(g_slots[i].cmd, sizeof(g_slots[i].cmd), "%s", cmd);
                 g_inflight++;
                 return 0;
@@ -527,7 +550,7 @@ static int run_dag(int argc, char **argv) {
         }
     }
     int st = 0; waitpid(pid, &st, 0);
-    account(pid, st, cmd);
+    account(pid, st, cmd, t0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
 }
 
@@ -861,7 +884,7 @@ static void test_dag_cli_matrix(fsrv_t *s, fsrv_t *s2) {
     run_line("-v");
     run_line("-h");
     run_line("%s", "");
-    printf("  -> %d dag runs (%d non-zero exits).\n", g_runs, g_nonzero);
+    printf("  -> %d dag runs (%d non-zero exits, %d timed out).\n", g_runs, g_nonzero, g_timeouts);
 }
 
 /* ======================================================================
@@ -1083,7 +1106,7 @@ static void test_client_helpers(void) {
 }
 
 int main(void) {
-    wd_start("test_coverage_sweep_net", 600);
+    wd_start("test_coverage_sweep_net", 480);
     printf("=== dag Network Coverage Sweep Tests ===\n");
     signal(SIGPIPE, SIG_IGN);
     snprintf(g_tmp, sizeof(g_tmp), "/tmp/kdag_net_XXXXXX");
