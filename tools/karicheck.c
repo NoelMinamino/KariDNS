@@ -1706,9 +1706,8 @@ KARIDNS_TOOL_FN int check_config(const char *config_path, server_config_t *cfg) 
                     fprintf(stderr,
                         "[WARNING] Zone '%s': program-user '%s' differs from options.user '%s'. "
                         "This only works if karidns itself starts as root (no prior privilege drop); "
-                        "if karidns is started as a non-root user, this zone's plugin will fail to "
-                        "start (setuid to a different non-root user is not permitted by the OS) and "
-                        "will silently never answer queries.\n",
+                        "if karidns is started as a non-root user, it refuses to start "
+                        "(setuid to a different non-root user is not permitted by the OS).\n",
                         z->domain, z->program_user, cfg->user);
                 }
                 if (z->program_args_count > 62) {

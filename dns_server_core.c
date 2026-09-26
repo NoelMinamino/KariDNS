@@ -148,6 +148,22 @@ void dec_tcp_clients(void) {
 }
 
 
+// リスニングソケットの bind() 失敗時にログへ添えるヒント。
+const char *bind_error_hint(int err, int port) {
+  if (err == EACCES && port > 0 && port < 1024)
+    return " (ports below 1024 require root privileges: start karidns as root, "
+           "or use a port >= 1024 such as 'port 10053;' / -p 10053)";
+  if (err == EADDRINUSE)
+    return " (address already in use by another process)";
+  if (err == EADDRNOTAVAIL)
+    return " (address is not configured on this host)";
+  return "";
+}
+
+// ワーカースレッドのTCPリスニングソケットの bind() 失敗数。
+// Backendは全ワーカーのbind完了後にこれを確認し、1件でもあれば起動を中止する。
+STATIC_TEST _Atomic int g_tcp_bind_failures = 0;
+
 // Broker
 STATIC_TEST int g_broker_sock = -1;
 STATIC_TEST pid_t g_broker_pid = -1;
@@ -406,7 +422,10 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
 // 10. Logging
 // ============================================================================
 
-void init_logging_channels(server_config_t *cfg) {
+/* file 指定のあるログチャンネルをすべて open する。1つでも open できなければ
+ * false を返す (起動時は起動中止、reload時は reload 拒否)。 */
+bool init_logging_channels(server_config_t *cfg) {
+  bool ok = true;
   uid_t target_uid = (uid_t)-1;
   gid_t target_gid = (gid_t)-1;
   if (geteuid() == 0 && cfg->user) {
@@ -479,7 +498,15 @@ void init_logging_channels(server_config_t *cfg) {
         if (fstat(ch->fd, &st) == 0)
           ch->current_size = st.st_size;
       } else {
-        syslog(LOG_ERR, "[Logging] Failed to open log file '%s': %m", ch->file_path);
+        int open_errno = errno;
+        const char *hint = (open_errno == EACCES || open_errno == EPERM || open_errno == EROFS)
+            ? " (not writable by the user karidns runs as; choose a log path in a directory that user can write to)"
+            : "";
+        syslog(LOG_ERR, "[Logging] Failed to open log file '%s': %s%s",
+               ch->file_path, strerror(open_errno), hint);
+        fprintf(stderr, "[ERROR] [Logging] Failed to open log file '%s': %s%s\n",
+                ch->file_path, strerror(open_errno), hint);
+        ok = false;
       }
       time_t now = time(NULL);
       struct tm tm_info;
@@ -489,6 +516,7 @@ void init_logging_channels(server_config_t *cfg) {
     }
     ch = ch->next;
   }
+  return ok;
 }
 
 
@@ -1358,8 +1386,14 @@ void *worker_thread_func(void *arg) {
           struct kevent ev;
           EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
-        } else
+        } else {
+          int bind_errno = errno;
+          syslog(LOG_CRIT, "[Backend] Failed to bind TCPv4 socket to %s:%d: %s%s",
+                 (bind_count > 0 ? active_cfg->bind_addresses[i] : "0.0.0.0"), port,
+                 strerror(bind_errno), bind_error_hint(bind_errno, port));
+          atomic_fetch_add(&g_tcp_bind_failures, 1);
           close(tcp_fd);
+        }
       }
     }
     if (is_v6) {
@@ -1381,8 +1415,14 @@ void *worker_thread_func(void *arg) {
           struct kevent ev;
           EV_SET(&ev, tcp_fd, EVFILT_READ, EV_ADD, 0, 0, (void *)2);
           kevent(kq, &ev, 1, NULL, 0, NULL);
-        } else
+        } else {
+          int bind_errno = errno;
+          syslog(LOG_CRIT, "[Backend] Failed to bind TCPv6 socket to %s:%d: %s%s",
+                 (bind_count > 0 ? active_cfg->bind_addresses[i] : "::"), port,
+                 strerror(bind_errno), bind_error_hint(bind_errno, port));
+          atomic_fetch_add(&g_tcp_bind_failures, 1);
           close(tcp_fd);
+        }
       }
     }
   }
@@ -2420,7 +2460,15 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
       free(config_str);
       return;
     }
-    init_logging_channels(standby);
+    if (!init_logging_channels(standby)) {
+      syslog(LOG_ERR, "[Config] Reload rejected: one or more log files could not be opened; "
+                      "keeping the current configuration.");
+      fprintf(stderr, "[ERROR] Reload rejected: one or more log files could not be opened; "
+                      "keeping the current configuration.\n");
+      free_server_config_fields(standby);
+      free(config_str);
+      return;
+    }
     g_config_db.retire_epoch = rcu_writer_advance_epoch();
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
@@ -3156,8 +3204,13 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
           out_is_wildcard[num_fds] = is_wildcard;
           out_fds[num_fds++] = udp_fd;
         } else {
-          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv4 socket to %s:%d: %m",
-                 (bind_count > 0 ? cfg->bind_addresses[i] : "0.0.0.0"), port);
+          int bind_errno = errno;
+          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv4 socket to %s:%d: %s%s",
+                 (bind_count > 0 ? cfg->bind_addresses[i] : "0.0.0.0"), port,
+                 strerror(bind_errno), bind_error_hint(bind_errno, port));
+          fprintf(stderr, "[ERROR] [Frontend] Failed to bind UDPv4 socket to %s:%d: %s%s\n",
+                  (bind_count > 0 ? cfg->bind_addresses[i] : "0.0.0.0"), port,
+                  strerror(bind_errno), bind_error_hint(bind_errno, port));
           close(udp_fd);
           exit(EXIT_FAILURE);
         }
@@ -3189,8 +3242,13 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
           out_is_wildcard[num_fds] = is_wildcard;
           out_fds[num_fds++] = udp_fd;
         } else {
-          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv6 socket to %s:%d: %m",
-                 (bind_count > 0 ? cfg->bind_addresses[i] : "::"), port);
+          int bind_errno = errno;
+          syslog(LOG_CRIT, "[Frontend] Failed to bind UDPv6 socket to %s:%d: %s%s",
+                 (bind_count > 0 ? cfg->bind_addresses[i] : "::"), port,
+                 strerror(bind_errno), bind_error_hint(bind_errno, port));
+          fprintf(stderr, "[ERROR] [Frontend] Failed to bind UDPv6 socket to %s:%d: %s%s\n",
+                  (bind_count > 0 ? cfg->bind_addresses[i] : "::"), port,
+                  strerror(bind_errno), bind_error_hint(bind_errno, port));
           close(udp_fd);
           exit(EXIT_FAILURE);
         }
@@ -3267,6 +3325,12 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
               out_is_wildcard[num_fds] = (addr4.sin_addr.s_addr == INADDR_ANY);
               out_fds[num_fds++] = udp_fd;
             } else {
+              // notify-source の事前bindは best-effort (NOTIFY送信時に再試行し、
+              // 失敗すればエフェメラルポートで送信する)。非root起動で1024未満の
+              // ポートを指定した場合などに気付けるよう警告だけ残す。
+              int bind_errno = errno;
+              syslog(LOG_WARNING, "[Frontend] Could not pre-bind notify-source for zone '%s': %s%s",
+                     z->domain, strerror(bind_errno), bind_error_hint(bind_errno, port));
               close(udp_fd);
             }
           }
@@ -3296,6 +3360,12 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
               out_is_wildcard[num_fds] = IN6_IS_ADDR_UNSPECIFIED(&addr6.sin6_addr);
               out_fds[num_fds++] = udp_fd;
             } else {
+              // notify-source の事前bindは best-effort (NOTIFY送信時に再試行し、
+              // 失敗すればエフェメラルポートで送信する)。非root起動で1024未満の
+              // ポートを指定した場合などに気付けるよう警告だけ残す。
+              int bind_errno = errno;
+              syslog(LOG_WARNING, "[Frontend] Could not pre-bind notify-source for zone '%s': %s%s",
+                     z->domain, strerror(bind_errno), bind_error_hint(bind_errno, port));
               close(udp_fd);
             }
           }
@@ -3349,53 +3419,17 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   bool local_udp_is_wildcard[MAX_BIND_ADDRS];
   int local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds, local_udp_is_wildcard);
 
-  // 特権破棄 (setgid / setuid)
-  if (cfg && cfg->user) {
-    struct passwd *pwd = getpwnam(cfg->user);
-    if (!pwd) {
-      syslog(LOG_ERR, "[Frontend %d] user '%s' not found, aborting privilege drop", router_id, cfg->user);
+  // 特権破棄 (setgid / setuid)。非root起動で user/group が実行ユーザー自身を
+  // 指している場合は降格不要としてそのまま続行する (resolve_run_identity 参照)。
+  {
+    char id_err[512];
+    if (!apply_run_identity(cfg ? cfg->user : NULL, cfg ? cfg->group : NULL,
+                            id_err, sizeof(id_err))) {
+      syslog(LOG_ERR, "[Frontend %d] %s", router_id, id_err);
+      fprintf(stderr, "[ERROR] [Frontend %d] %s\n", router_id, id_err);
       release_config_snapshot(cfg);
       exit(EXIT_FAILURE);
     }
-    gid_t target_gid = pwd->pw_gid;
-    if (cfg->group) {
-      struct group *grp = getgrnam(cfg->group);
-      if (!grp) {
-        syslog(LOG_ERR, "[Frontend %d] group '%s' not found, aborting privilege drop", router_id, cfg->group);
-        release_config_snapshot(cfg);
-        exit(EXIT_FAILURE);
-      }
-      target_gid = grp->gr_gid;
-    }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend %d] setgroups failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    if (setgid(target_gid) != 0) { syslog(LOG_ERR, "[Frontend %d] setgid failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    if (setuid(pwd->pw_uid) != 0) { syslog(LOG_ERR, "[Frontend %d] setuid failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    
-    if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid || getgid() != target_gid || getegid() != target_gid) {
-      syslog(LOG_ERR, "[Frontend %d] privilege drop verification failed", router_id);
-      release_config_snapshot(cfg);
-      exit(EXIT_FAILURE);
-    }
-  } else if (cfg && cfg->group) {
-    struct group *grp = getgrnam(cfg->group);
-    if (!grp) {
-      syslog(LOG_ERR, "[Frontend %d] group '%s' not found, aborting privilege drop", router_id, cfg->group);
-      release_config_snapshot(cfg);
-      exit(EXIT_FAILURE);
-    }
-    if (setgroups(0, NULL) != 0) { syslog(LOG_ERR, "[Frontend %d] setgroups failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    if (setgid(grp->gr_gid) != 0) { syslog(LOG_ERR, "[Frontend %d] setgid failed: %m", router_id); release_config_snapshot(cfg); exit(EXIT_FAILURE); }
-    
-    if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
-      syslog(LOG_ERR, "[Frontend %d] privilege drop verification failed (group only)", router_id);
-      release_config_snapshot(cfg);
-      exit(EXIT_FAILURE);
-    }
-  } else if (geteuid() == 0) {
-    syslog(LOG_ERR, "[Frontend %d] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop", router_id);
-    fprintf(stderr, "[ERROR] [Frontend %d] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n", router_id);
-    release_config_snapshot(cfg);
-    exit(EXIT_FAILURE);
   }
   release_config_snapshot(cfg);
 
@@ -4015,6 +4049,156 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   cap_rights_limit(g_notify_ipc[1], &n_rights_1);
 }
 
+/* 非root起動時に、path (pid file / 制御ソケット) を作成できるかを
+ * daemonize() 前に検査する。root起動時は ensure_priv_dir_safe() が
+ * ディレクトリを用意するため対象外。daemonize() は chdir("/") するため、
+ * デーモン起動時の相対パスは後段の実処理 (失敗すれば起動中止) に任せる。
+ * check_existing: 既存ファイルを上書きオープンする場合 (pid file) は
+ * ファイル自体の書き込み権も検査する。 */
+STATIC_TEST bool preflight_writable_path(const char *path, const char *what, bool foreground,
+                                         bool check_existing, const char *hint) {
+  if (!path || path[0] == '\0' || strcmp(path, "none") == 0 || geteuid() == 0)
+    return true;
+  if (path[0] != '/' && !foreground)
+    return true;
+
+  char dir[PATH_MAX];
+  if (strlen(path) >= sizeof(dir))
+    return true; /* 長すぎるパスは後段の実処理がエラーにする */
+  strcpy(dir, path);
+  char *slash = strrchr(dir, '/');
+  if (!slash)
+    strcpy(dir, ".");
+  else if (slash == dir)
+    dir[1] = '\0';
+  else
+    *slash = '\0';
+
+  const char *problem = NULL;
+  int err = 0;
+  if (access(dir, W_OK | X_OK) != 0) {
+    err = errno;
+    problem = dir;
+  } else if (check_existing && access(path, F_OK) == 0 && access(path, W_OK) != 0) {
+    err = errno;
+    problem = path;
+  }
+  if (!problem)
+    return true;
+  syslog(LOG_ERR, "[Startup] Cannot create %s '%s': '%s' is not writable by uid %u (%s). %s",
+         what, path, problem, (unsigned)geteuid(), strerror(err), hint);
+  fprintf(stderr, "[ERROR] Cannot create %s '%s': '%s' is not writable by uid %u (%s). %s\n",
+          what, path, problem, (unsigned)geteuid(), strerror(err), hint);
+  return false;
+}
+
+/* 非root起動時、type "program" ゾーンの program-user (未指定なら options.user を
+ * 継承) が実行ユーザーと異なると、プラグイン子プロセスは setuid できず
+ * 応答不能のまま動き続けてしまう。起動前に検出して起動を中止する。 */
+STATIC_TEST bool validate_program_zone_users(server_config_t *cfg) {
+  if (!cfg || geteuid() == 0)
+    return true;
+  for (view_config_t *v = cfg->views; v; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (!z->type || strcasecmp(z->type, "program") != 0 || !z->program_user)
+        continue;
+      struct passwd *pwd = getpwnam(z->program_user);
+      if (pwd && pwd->pw_uid == geteuid() && pwd->pw_uid == getuid())
+        continue;
+      syslog(LOG_ERR, "[Config] Refusing to start: zone '%s': program-user '%s' %s; a non-root "
+                      "process (uid %u) cannot switch to another user. Start karidns as root, or "
+                      "set program-user to the user karidns runs as.",
+             z->domain, z->program_user, pwd ? "differs from the running user" : "not found",
+             (unsigned)geteuid());
+      fprintf(stderr, "[ERROR] Refusing to start: zone '%s': program-user '%s' %s; a non-root "
+                      "process (uid %u) cannot switch to another user. Start karidns as root, or "
+                      "set program-user to the user karidns runs as.\n",
+              z->domain, z->program_user, pwd ? "differs from the running user" : "not found",
+              (unsigned)geteuid());
+      return false;
+    }
+  }
+  return true;
+}
+
+/* 待受アドレス/ポートへ UDP・TCP を実際に bind できるかを daemonize() 前に
+ * 試す。ソケットオプションは open_router_udp_sockets() / worker_thread_func()
+ * の実処理と揃え、結果が食い違わないようにする。確認後は即 close する
+ * (実際の待受ソケットは Frontend / Backend 子プロセスが開く)。 */
+STATIC_TEST bool preflight_listen_ports(server_config_t *cfg) {
+  int port = cfg->port > 0 ? cfg->port : DNS_PORT;
+  int bind_count = cfg->bind_address_count;
+  int opt = 1;
+
+  for (int i = 0; i < (bind_count > 0 ? bind_count : 1); i++) {
+    struct sockaddr_storage addrs[2];
+    socklen_t lens[2];
+    const char *names[2];
+    int n = 0;
+    memset(addrs, 0, sizeof(addrs));
+    if (bind_count == 0) {
+      struct sockaddr_in *a4 = (struct sockaddr_in *)&addrs[n];
+      a4->sin_family = AF_INET;
+      a4->sin_addr.s_addr = INADDR_ANY;
+      a4->sin_port = htons(port);
+      lens[n] = sizeof(*a4);
+      names[n++] = "0.0.0.0";
+      struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addrs[n];
+      a6->sin6_family = AF_INET6;
+      a6->sin6_addr = in6addr_any;
+      a6->sin6_port = htons(port);
+      lens[n] = sizeof(*a6);
+      names[n++] = "::";
+    } else {
+      struct sockaddr_in *a4 = (struct sockaddr_in *)&addrs[0];
+      struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&addrs[0];
+      if (inet_pton(AF_INET, cfg->bind_addresses[i], &a4->sin_addr) == 1) {
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons(port);
+        lens[n] = sizeof(*a4);
+        names[n++] = cfg->bind_addresses[i];
+      } else if (inet_pton(AF_INET6, cfg->bind_addresses[i], &a6->sin6_addr) == 1) {
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons(port);
+        lens[n] = sizeof(*a6);
+        names[n++] = cfg->bind_addresses[i];
+      }
+    }
+
+    for (int k = 0; k < n; k++) {
+      int family = addrs[k].ss_family;
+      for (int t = 0; t < 2; t++) {
+        int type = (t == 0) ? SOCK_DGRAM : SOCK_STREAM;
+        int fd = socket(family, type, 0);
+        if (fd < 0)
+          continue; /* 実処理と同じく、未対応のアドレスファミリは対象外 */
+        if (type == SOCK_STREAM)
+          setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (family == AF_INET6)
+          setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT_LB
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt, sizeof(opt)) < 0)
+          setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#else
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+        if (bind(fd, (struct sockaddr *)&addrs[k], lens[k]) != 0) {
+          int err = errno;
+          close(fd);
+          const char *proto = (type == SOCK_DGRAM) ? "UDP" : "TCP";
+          syslog(LOG_ERR, "[Startup] Refusing to start: cannot bind %s port %d on %s: %s%s",
+                 proto, port, names[k], strerror(err), bind_error_hint(err, port));
+          fprintf(stderr, "[ERROR] Refusing to start: cannot bind %s port %d on %s: %s%s\n",
+                  proto, port, names[k], strerror(err), bind_error_hint(err, port));
+          return false;
+        }
+        close(fd);
+      }
+    }
+  }
+  return true;
+}
+
 /* [SEC] pidfile / control-socket 用ディレクトリの安全性検証。
  *
  * mkdir(dir_buf, 0755) 自体はシンボリックリンクを追跡しないため作成時の
@@ -4166,6 +4350,76 @@ int main(int argc, char **argv) {
     g_config_db.config_a.port = g_cli_port_override;
   }
 
+  const char *effective_pid_file = NULL;
+  if (cli_pid_file) {
+    effective_pid_file = cli_pid_file;
+  } else if (g_config_db.config_a.pid_file) {
+    effective_pid_file = g_config_db.config_a.pid_file;
+  } else if (!foreground) {
+    effective_pid_file = "/var/run/karidns/karidns.pid";
+  }
+
+  // ---- 起動前検証 ----------------------------------------------------------
+  // 失敗を端末(stderr)と終了コードで確実に返せるよう、daemonize() より前に行う。
+  // (daemonize() 後は親プロセスが即 exit(0) し、stderr も /dev/null になるため)
+
+  // 特権分離が本サーバの前提とするセキュリティモデルであるため、
+  // rootとして起動された場合は user の明示的指定を必須とする。
+  if (geteuid() == 0 && !g_config_db.config_a.user) {
+    syslog(LOG_ERR,
+           "[Config] Server started as root but no 'user' directive is set in options{}. "
+           "Refusing to start: running as root without privilege drop is not permitted. "
+           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.");
+    fprintf(stderr,
+           "[ERROR] Server started as root but no 'user' directive is set in options{}. "
+           "Refusing to start: running as root without privilege drop is not permitted. "
+           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.\n");
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+
+  // user/group がこのプロセスで適用可能か (非root起動なら実行ユーザー自身か)
+  {
+    run_identity_t id;
+    char id_err[512];
+    if (!resolve_run_identity(g_config_db.config_a.user, g_config_db.config_a.group,
+                              &id, id_err, sizeof(id_err))) {
+      syslog(LOG_ERR, "[Config] Refusing to start: %s", id_err);
+      fprintf(stderr, "[ERROR] Refusing to start: %s\n", id_err);
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
+    }
+  }
+  if (!validate_program_zone_users(&g_config_db.config_a) ||
+      !preflight_writable_path(effective_pid_file, "pid file", foreground, true,
+                               "Use -P <path> or options { pid-file \"<path>\"; } to point it at a "
+                               "directory you can write to, or pid-file \"none\".") ||
+      (g_config_db.config_a.control.enabled &&
+       !preflight_writable_path(g_config_db.config_a.control.socket_path ?
+                                    g_config_db.config_a.control.socket_path :
+                                    "/var/run/karidns/control.sock",
+                                "control socket", foreground, false,
+                                "Set control-channel { socket \"<path>\"; } to a path in a directory you "
+                                "can write to, or disable the control channel."))) {
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+
+  // ログファイルを開く (開けなければ起動しない)。fd は daemonize() 後も引き継がれる。
+  if (!init_logging_channels(&g_config_db.config_a)) {
+    syslog(LOG_ERR, "[Startup] Refusing to start: one or more log files could not be opened.");
+    fprintf(stderr, "[ERROR] Refusing to start: one or more log files could not be opened.\n");
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+
+  // 待受ポートを実際に bind できるか確認する (実際の bind は子プロセスで行う)。
+  if (!preflight_listen_ports(&g_config_db.config_a)) {
+    free_server_config_fields(&g_config_db.config_a);
+    return 1;
+  }
+  // ---------------------------------------------------------------------------
+
   if (!foreground) {
     daemonize();
   }
@@ -4175,15 +4429,6 @@ int main(int argc, char **argv) {
   sigemptyset(&set);
   sigaddset(&set, SIGHUP);
   sigprocmask(SIG_BLOCK, &set, NULL);
-
-  const char *effective_pid_file = NULL;
-  if (cli_pid_file) {
-    effective_pid_file = cli_pid_file;
-  } else if (g_config_db.config_a.pid_file) {
-    effective_pid_file = g_config_db.config_a.pid_file;
-  } else if (!foreground) {
-    effective_pid_file = "/var/run/karidns/karidns.pid";
-  }
 
   if (effective_pid_file && strcmp(effective_pid_file, "none") != 0 && effective_pid_file[0] != '\0') {
     strncpy(g_pid_file_path, effective_pid_file, sizeof(g_pid_file_path) - 1);
@@ -4236,23 +4481,6 @@ int main(int argc, char **argv) {
     write(g_pid_fd, pid_str, strlen(pid_str));
   }
 
-  // 特権分離が本サーバの前提とするセキュリティモデルであるため、
-  // rootとして起動された場合は user の明示的指定を必須とする。
-  if (geteuid() == 0 && !g_config_db.config_a.user) {
-    syslog(LOG_ERR,
-           "[Config] Server started as root but no 'user' directive is set in options{}. "
-           "Refusing to start: running as root without privilege drop is not permitted. "
-           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.");
-    fprintf(stderr,
-           "[ERROR] Server started as root but no 'user' directive is set in options{}. "
-           "Refusing to start: running as root without privilege drop is not permitted. "
-           "Add 'user \"named\";' (and optionally 'group \"named\";') to the options block.\n");
-    cleanup_pid_file();
-    free_server_config_fields(&g_config_db.config_a);
-    return 1;
-  }
-
-  init_logging_channels(&g_config_db.config_a);
   atomic_init(&g_config_db.active, &g_config_db.config_a);
   rebuild_zone_db_from_config(&g_config_db.config_a, false);
 
@@ -4348,20 +4576,36 @@ int main(int argc, char **argv) {
         cap_rights_init(&ctrl_rights, CAP_ACCEPT, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_RECV, CAP_SEND);
         cap_rights_limit(g_control_sock, &ctrl_rights);
       } else {
-        syslog(LOG_ERR, "Failed to bind control socket: %m");
+        // control-channel 有効時に制御ソケットを bind できなければ起動しない
+        int bind_errno = errno;
+        const char *hint = (bind_errno == EACCES || bind_errno == EPERM || bind_errno == EROFS ||
+                            bind_errno == ENOENT)
+            ? " (set control-channel { socket \"<path>\"; } to a path in a directory the user "
+              "karidns runs as can write to, or remove the control-channel block)"
+            : "";
+        syslog(LOG_ERR, "[Startup] Failed to bind control socket '%s': %s%s",
+               sock_path, strerror(bind_errno), hint);
+        fprintf(stderr, "[ERROR] Failed to bind control socket '%s': %s%s\n",
+                sock_path, strerror(bind_errno), hint);
+        umask(old_mask);
         close(g_control_sock);
         g_control_sock = -1;
-        if (dir_fd >= 0) {
+        if (dir_fd >= 0)
           close(dir_fd);
-          dir_fd = -1;
-        }
+        cleanup_pid_file();
+        free_server_config_fields(&g_config_db.config_a);
+        return 1;
       }
       umask(old_mask);
     } else {
-      if (dir_fd >= 0) {
+      int sock_errno = errno;
+      syslog(LOG_ERR, "[Startup] Failed to create control socket: %s", strerror(sock_errno));
+      fprintf(stderr, "[ERROR] Failed to create control socket: %s\n", strerror(sock_errno));
+      if (dir_fd >= 0)
         close(dir_fd);
-        dir_fd = -1;
-      }
+      cleanup_pid_file();
+      free_server_config_fields(&g_config_db.config_a);
+      return 1;
     }
   }
 
@@ -4594,6 +4838,14 @@ int main(int argc, char **argv) {
   while (atomic_load(&g_bound_workers) < num_workers)
     sched_yield();
 
+  // TCPリスニングソケットの bind() に失敗したワーカーがあれば起動を中止する
+  // (UDP側の open_router_udp_sockets() と同じく fail-closed)。
+  if (atomic_load(&g_tcp_bind_failures) > 0) {
+    syslog(LOG_ERR, "[Backend] Failed to bind TCP listening socket(s); aborting startup");
+    fprintf(stderr, "[ERROR] [Backend] Failed to bind TCP listening socket(s); aborting startup\n");
+    exit(EXIT_FAILURE);
+  }
+
   // 重要: type "program" ゾーンの子プロセスへの権限降格(program-user)は
   // fork元(karidns自身)がまだroot権限を持っている間でなければ成立しない
   // (POSIXでは非root→別の非rootユーザへのsetuid()は許可されない)。
@@ -4601,46 +4853,13 @@ int main(int argc, char **argv) {
   // プラグインをspawnすること。この順序を変更してはならない。
   spawn_program_zone_plugins(&g_config_db.config_a);
 
-  if (cfg->user) {
-    struct passwd *pwd = getpwnam(cfg->user);
-    if (!pwd)
-      exit(EXIT_FAILURE);
-    gid_t target_gid = pwd->pw_gid;
-    if (cfg->group) {
-      struct group *grp = getgrnam(cfg->group);
-      if (!grp)
-        exit(EXIT_FAILURE);
-      target_gid = grp->gr_gid;
-    }
-    if (setgroups(0, NULL) != 0)
-      exit(EXIT_FAILURE);
-    if (setgid(target_gid) != 0)
-      exit(EXIT_FAILURE);
-    if (setuid(pwd->pw_uid) != 0)
-      exit(EXIT_FAILURE);
-
-    if (getuid() != pwd->pw_uid || geteuid() != pwd->pw_uid ||
-        getgid() != target_gid || getegid() != target_gid) {
-      syslog(LOG_ERR, "[Backend] privilege drop verification failed");
+  {
+    char id_err[512];
+    if (!apply_run_identity(cfg->user, cfg->group, id_err, sizeof(id_err))) {
+      syslog(LOG_ERR, "[Backend] %s", id_err);
+      fprintf(stderr, "[ERROR] [Backend] %s\n", id_err);
       exit(EXIT_FAILURE);
     }
-  } else if (cfg->group) {
-    struct group *grp = getgrnam(cfg->group);
-    if (!grp)
-      exit(EXIT_FAILURE);
-    if (setgroups(0, NULL) != 0)
-      exit(EXIT_FAILURE);
-    if (setgid(grp->gr_gid) != 0)
-      exit(EXIT_FAILURE);
-
-    if (getgid() != grp->gr_gid || getegid() != grp->gr_gid) {
-      syslog(LOG_ERR, "[Backend] privilege drop verification failed (group only)");
-      exit(EXIT_FAILURE);
-    }
-  } else if (geteuid() == 0) {
-    syslog(LOG_ERR, "[Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop");
-    fprintf(stderr, "[ERROR] [Backend] Running as root with no 'user'/'group' configured; refusing to continue without privilege drop\n");
-    exit(EXIT_FAILURE);
   }
 
   // 重要: この行より後(Capsicumサンドボックス突入後)にワーカースレッド等から

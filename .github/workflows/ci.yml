@@ -124,6 +124,7 @@ jobs:
             sh ./tests/run_mx_srv_glue_test.sh
             sh ./tests/run_notify_source_test.sh
             sh ./tests/run_privilege_drop_root_test.sh
+            sh ./tests/run_nonroot_startup_test.sh
             sh ./tests/run_query_log_rate_limit_test.sh
             sh ./tests/run_response_cache_test.sh
             sh ./tests/run_rrl_window_test.sh

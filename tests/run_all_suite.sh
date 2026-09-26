@@ -303,6 +303,7 @@ register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog
 register_test "core" "sh" "tests/run_mx_srv_glue_test.sh" "MX & SRV target additional glue inclusion"
 register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding"
 register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setuid/setgid privilege drop"
+register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"
 register_test "core" "sh" "tests/run_response_cache_test.sh" "Response cache hit/miss functional verification"
 register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load"
 register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "RFC 2181 31-bit signed TTL clamp"
