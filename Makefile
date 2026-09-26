@@ -103,7 +103,7 @@ FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tc
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
 	karicheck_matrix_test unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan test test-all rfc_vectors_test cidr_test tinydns_test asan_test include_test config_directives_test wire_helpers_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_reassembly_test hash_test vulnerability_test \
-	dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test sweep-tests coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test \
+	dnstap_test edns_ecs_test dynamic_update_test axfr_ixfr_test rrl_test query_expanded_test sweep-tests unit-test-bins coverage_sweep_test coverage_sweep_dag_test coverage_sweep_net_test coverage_sweep_tools_test \
 	coverage coverage-build coverage-run coverage-report coverage-clean
 
 all: $(TARGET) $(DAG_TARGET) $(KARICTL_TARGET) karicheck
@@ -511,6 +511,12 @@ test_fi_dag: $(TEST_FI_DAG_SRCS)
 
 fi_dag_test: test_fi_dag
 	./test_fi_dag
+
+# Binaries behind unit-tests, so they can be built in parallel first
+# (`make -j$(nproc) unit-test-bins`); the tests themselves then run one by one.
+UT_BINS = test_cidr test_tinydns_parser test_asan_overflow test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag
+
+unit-test-bins: $(UT_BINS)
 
 # The coverage sweeps (engine / dag options / dag network / tools) are long,
 # coverage-oriented drivers: `make coverage` runs them through run_all_suite.sh,

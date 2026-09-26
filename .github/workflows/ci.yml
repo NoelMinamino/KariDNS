@@ -56,7 +56,9 @@ jobs:
             echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests)"
             # Previously only 6 of the C unit tests ran in CI (asan, tinydns, hash, include,
             # response_cache, vulnerability). `unit-tests` builds and runs every binary, sequentially.
-            # stdin from /dev/null: no test may block reading the VM session's stdin
+            # build every test binary in parallel first; the tests then run one by one
+            # (stdin from /dev/null: no test may block reading the VM session's stdin)
+            make -j"$NCPU" unit-test-bins
             make unit-tests < /dev/null
             echo "::endgroup::"
 
@@ -66,7 +68,9 @@ jobs:
             # -fsanitize=address,undefined (UBSan findings are fatal); leak checks are off by default
             # (UT_ASAN_LEAKS=1 enables them once the tests' teardown is complete).
             # Burn-in: first FreeBSD run is reported as a warning; remove the fallback to make it blocking.
-            make unit-tests-asan < /dev/null || echo "::warning title=unit-tests-asan::ASan/UBSan unit tests failed on FreeBSD ${{ matrix.release }} - see log above (non-blocking during burn-in)"
+            # -j: the ASan binaries (each compiles ~18 sources) build in parallel; the
+            # recipe still runs the tests sequentially
+            make -j"$NCPU" unit-tests-asan < /dev/null || echo "::warning title=unit-tests-asan::ASan/UBSan unit tests failed on FreeBSD ${{ matrix.release }} - see log above (non-blocking during burn-in)"
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
