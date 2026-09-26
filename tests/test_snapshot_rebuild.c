@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <stdarg.h>
 #include <strings.h>
+#include <ftw.h>
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
@@ -25,6 +26,7 @@
 #include "dns_cidr.h"
 #include "dns_tsig_acl.h"
 #include "dns_utils.h"
+#include "sweep_watchdog.h"
 
 // Mock globals
 int g_control_kq = -1;
@@ -774,7 +776,15 @@ static void test_snapshot_standby_ecs_and_soa_serial(void) {
     printf("  -> Standby ECS and SOA serial reload passed.\n");
 }
 
+static int rm_entry(const char *path, const struct stat *sb, int type, struct FTW *ftw) {
+    (void)sb; (void)type; (void)ftw;
+    return remove(path);
+}
+
 int main(void) {
+    /* Line-buffered progress + a hang watchdog (exit 124 with the phase) so a
+     * stalled run fails fast in CI instead of blocking the job. */
+    wd_start("test_snapshot_rebuild", 300);
     printf("=== Starting Snapshot Rebuild Tests ===\n");
     snprintf(g_dir, sizeof(g_dir), "/tmp/karidns_snap_XXXXXX");
     assert(mkdtemp(g_dir));
@@ -818,7 +828,11 @@ int main(void) {
     test_snapshot_rebuild_case_33();
     test_snapshot_rebuild_case_34();
     test_snapshot_rebuild_case_35();
-    char cmd[200]; snprintf(cmd, sizeof(cmd), "rm -rf %s", g_dir); assert(system(cmd) == 0);
+    /* Remove the scratch directory in-process: detached snapshot GC threads may
+     * still be running here, and fork()/exec from a multi-threaded process (as
+     * system("rm -rf") did) can deadlock the child under ASan. */
+    WD_PHASE("cleanup");
+    assert(nftw(g_dir, rm_entry, 16, FTW_DEPTH | FTW_PHYS) == 0);
     printf("=== All Snapshot Rebuild Tests PASSED ===\n");
     return 0;
 }
