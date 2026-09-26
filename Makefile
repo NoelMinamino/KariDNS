@@ -21,7 +21,7 @@ BREW_CFLAGS  = -I/opt/homebrew/opt/openssl@3/include -I/usr/local/opt/openssl@3/
 BREW_LDFLAGS = -L/opt/homebrew/opt/openssl@3/lib -L/usr/local/opt/openssl@3/lib -L/opt/homebrew/lib -L/usr/local/lib
 
 # Version definition
-VERSION ?= 0.4.1
+VERSION ?= 0.4.2
 
 CC ?= cc
 # CPU tuning. -march=native suits binaries built and run on the same machine;
