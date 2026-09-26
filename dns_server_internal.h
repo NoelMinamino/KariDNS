@@ -456,7 +456,8 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
 bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
 bool ensure_priv_dir_safe(const char *dir_buf);
-void init_logging_channels(server_config_t *cfg);
+bool init_logging_channels(server_config_t *cfg);
+const char *bind_error_hint(int err, int port);
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,

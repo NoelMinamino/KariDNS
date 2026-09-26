@@ -35,6 +35,9 @@
 #include "dns_utils.h"
 #include "dns_query_engine.h"
 #include "dns_edns_ecs.h"
+#include "dns_priv_sandbox.h"
+#include <pwd.h>
+#include <grp.h>
 
 // Internal server core prototypes for testing
 void perform_config_reload(void);
@@ -51,6 +54,10 @@ void *async_io_worker_func(void *arg);
 void start_connect_broker(void);
 extern pid_t g_broker_pid;
 extern _Atomic bool g_privilege_drop_complete;
+bool preflight_writable_path(const char *path, const char *what, bool foreground,
+                             bool check_existing, const char *hint);
+bool validate_program_zone_users(server_config_t *cfg);
+bool preflight_listen_ports(server_config_t *cfg);
 
 // ----------------------------------------------------------------------------
 // 1. fast_ipv4_to_str Test
@@ -1633,6 +1640,181 @@ static void test_server_core_process_lifecycle_and_signals(void) {
     assert(WIFEXITED(status3));
 
     printf("  -> Process lifecycle, signals, router & worker passed.\n");
+}
+
+
+// ----------------------------------------------------------------------------
+// Non-root startup: run identity / preflight checks
+// ----------------------------------------------------------------------------
+/* 非rootとしての検証本体。root で実行されている場合は fork した子で nobody へ
+ * 降格してから呼ぶ。失敗時は assert で abort する。 */
+static void nonroot_startup_checks(void) {
+    assert(geteuid() != 0);
+    char err[512];
+    run_identity_t id;
+
+    /* user/group 未指定: 実行ユーザーのまま */
+    assert(resolve_run_identity(NULL, NULL, &id, err, sizeof(err)));
+    assert(!id.privileged);
+    assert(apply_run_identity(NULL, NULL, err, sizeof(err)));
+
+    /* 自分自身を指す user: 降格不要として受理 (setgroups を呼ばない) */
+    struct passwd *me = getpwuid(geteuid());
+    assert(me);
+    char myname[256];
+    snprintf(myname, sizeof(myname), "%s", me->pw_name);
+    assert(resolve_run_identity(myname, NULL, &id, err, sizeof(err)));
+    assert(!id.privileged && id.uid == geteuid());
+    assert(apply_run_identity(myname, NULL, err, sizeof(err)));
+    assert(geteuid() == id.uid);
+
+    /* 他ユーザー / 存在しないユーザー: 拒否 */
+    err[0] = '\0';
+    assert(!resolve_run_identity("root", NULL, &id, err, sizeof(err)));
+    assert(strstr(err, "cannot switch") != NULL);
+    assert(!apply_run_identity("root", NULL, err, sizeof(err)));
+    assert(!resolve_run_identity("nonexistent_user_12345", NULL, &id, err, sizeof(err)));
+    assert(strstr(err, "not found") != NULL);
+    /* 現在の gid と異なる group: 拒否 */
+    struct group *gr0 = getgrgid(0);
+    if (gr0 && getegid() != 0) {
+        char g0name[256];
+        snprintf(g0name, sizeof(g0name), "%s", gr0->gr_name);
+        assert(!resolve_run_identity(NULL, g0name, &id, err, sizeof(err)));
+        assert(strstr(err, "primary group") != NULL);
+    }
+
+    /* pid file / 制御ソケット: 書き込めないディレクトリは拒否 */
+    assert(!preflight_writable_path("/nonexistent_dir_karidns_test/karidns.pid", "pid file",
+                                    true, true, ""));
+    assert(!preflight_writable_path("/var/run/karidns_test_no_perm/control.sock", "control socket",
+                                    true, false, ""));
+    char tmpl[] = "/tmp/karidns_nonroot_XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    assert(dir);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/karidns.pid", dir);
+    assert(preflight_writable_path(path, "pid file", true, true, ""));
+    assert(preflight_writable_path("none", "pid file", true, true, ""));
+    /* デーモン起動時の相対パスは後段の実処理に任せる */
+    assert(preflight_writable_path("rel/karidns.pid", "pid file", false, true, ""));
+    rmdir(dir);
+
+    /* program-user が実行ユーザーと異なる program ゾーンは拒否 */
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    view_config_t view;
+    memset(&view, 0, sizeof(view));
+    zone_config_t zone;
+    memset(&zone, 0, sizeof(zone));
+    char zdomain[] = "plugin.example.";
+    char ztype[] = "program";
+    char zuser_other[] = "root";
+    zone.domain = zdomain;
+    zone.type = ztype;
+    zone.program_user = zuser_other;
+    view.zones = &zone;
+    cfg.views = &view;
+    assert(!validate_program_zone_users(&cfg));
+    zone.program_user = myname;
+    assert(validate_program_zone_users(&cfg));
+    zone.program_user = NULL;
+    assert(validate_program_zone_users(&cfg));
+
+    /* 1024未満のポートは非rootでは bind できず、起動前検証で拒否される */
+    memset(&cfg, 0, sizeof(cfg));
+    char *binds[1] = { "127.0.0.1" };
+    cfg.bind_addresses = binds;
+    cfg.bind_address_count = 1;
+    cfg.port = 53;
+    assert(!preflight_listen_ports(&cfg));
+}
+
+static void test_nonroot_startup_identity_and_preflight(void) {
+    printf("[TEST] Server Core: non-root startup identity / preflight checks...\n");
+    char err[512];
+    run_identity_t id;
+
+    if (geteuid() == 0) {
+        /* root: user/group の指定が必須、指定があれば降格対象 */
+        assert(!resolve_run_identity(NULL, NULL, &id, err, sizeof(err)));
+        assert(strstr(err, "refusing") != NULL);
+        assert(resolve_run_identity("nobody", NULL, &id, err, sizeof(err)));
+        assert(id.privileged && id.has_user);
+        /* root では pid file / 制御ソケットの事前検査は行わない */
+        assert(preflight_writable_path("/nonexistent_dir_karidns_test/karidns.pid", "pid file",
+                                       true, true, ""));
+
+        struct passwd *nb = getpwnam("nobody");
+        assert(nb);
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            if (setgroups(0, NULL) != 0 || setgid(nb->pw_gid) != 0 || setuid(nb->pw_uid) != 0)
+                _exit(2);
+            nonroot_startup_checks();
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    } else {
+        nonroot_startup_checks();
+    }
+
+    /* bind_error_hint */
+    assert(strstr(bind_error_hint(EACCES, 53), "root") != NULL);
+    assert(strcmp(bind_error_hint(EACCES, 10053), "") == 0);
+    assert(strstr(bind_error_hint(EADDRINUSE, 10053), "in use") != NULL);
+
+    /* 既に(SO_REUSEPORT なしで)使用中のポートは起動前検証で拒否される */
+    int busy = socket(AF_INET, SOCK_STREAM, 0);
+    assert(busy >= 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(busy, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    socklen_t salen = sizeof(sa);
+    assert(getsockname(busy, (struct sockaddr *)&sa, &salen) == 0);
+    assert(listen(busy, 1) == 0);
+    int busy_port = ntohs(sa.sin_port);
+
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char *binds[1] = { "127.0.0.1" };
+    cfg.bind_addresses = binds;
+    cfg.bind_address_count = 1;
+    cfg.port = busy_port;
+    assert(!preflight_listen_ports(&cfg));
+    close(busy);
+
+    /* 空いている高位ポートは受理される */
+    int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(probe >= 0);
+    sa.sin_port = 0;
+    assert(bind(probe, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    salen = sizeof(sa);
+    assert(getsockname(probe, (struct sockaddr *)&sa, &salen) == 0);
+    close(probe);
+    cfg.port = ntohs(sa.sin_port);
+    assert(preflight_listen_ports(&cfg));
+
+    /* ログファイルを開けなければ init_logging_channels は false を返す */
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    char ch_name[] = "bad";
+    char ch_path[] = "/nonexistent_dir_karidns_test/sub/queries.log";
+    ch.name = ch_name;
+    ch.file_path = ch_path;
+    ch.fd = -1;
+    server_config_t lcfg;
+    memset(&lcfg, 0, sizeof(lcfg));
+    lcfg.logging.channels = &ch;
+    assert(!init_logging_channels(&lcfg));
+    assert(ch.fd < 0);
+
+    printf("  -> non-root startup identity / preflight checks passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -5253,6 +5435,7 @@ int main(void) {
     test_ensure_priv_dir_safe_symlink_attack();
     test_ensure_priv_dir_safe_world_writable();
     test_open_router_udp_sockets_port_binding();
+    test_nonroot_startup_identity_and_preflight();
     test_setup_udp_socket_buffers_failure();
     test_setup_ipc_tables_max_workers_boundary();
     test_perform_config_reload_identical_config();

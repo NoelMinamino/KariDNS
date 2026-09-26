@@ -2400,9 +2400,17 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
     if (zcfg->program_user) {
       struct passwd *pwd = getpwnam(zcfg->program_user);
       if (!pwd) { _exit(126); }
-      if (setgroups(0, NULL) != 0) _exit(126);
-      if (setgid(pwd->pw_gid) != 0) _exit(126);
-      if (setuid(pwd->pw_uid) != 0) _exit(126);
+      if (geteuid() == 0) {
+        if (setgroups(0, NULL) != 0) _exit(126);
+        if (setgid(pwd->pw_gid) != 0) _exit(126);
+        if (setuid(pwd->pw_uid) != 0) _exit(126);
+      } else if (pwd->pw_uid != geteuid() || pwd->pw_uid != getuid()) {
+        // 非root起動では別ユーザーへ切り替えられない。main()の起動前検証
+        // (validate_program_zone_users) で弾かれるはずだが念のため fail-closed。
+        fprintf(stderr, "[FATAL] Zone '%s': program-user '%s' differs from the non-root user "
+                "karidns runs as; refusing to exec plugin.\n", zcfg->domain, zcfg->program_user);
+        _exit(126);
+      }
     }
 
     char *argv[64];

@@ -1,14 +1,19 @@
 options {
+    // 待受ポート。1024未満 (53など) はroot起動が必要。一般ユーザーで起動する
+    // 場合は 10053 などを指定する (bindできないポートでは起動エラーになる)
     port 53;
     
     // リッスンするIPアドレス (IPv4 / IPv6)
     bind-address { 0.0.0.0; ::; };
     
     // 起動後にドロップする特権ユーザーとグループ
+    // root起動時は必須。一般ユーザーで直接起動する場合は省略するか、
+    // 起動ユーザー自身を指定する (他ユーザーを指定すると起動エラー)
     user "named";
     group "named";
 
     // PIDファイル ("none" で作成を無効化、未指定時は /var/run/karidns/karidns.pid)
+    // 一般ユーザーで起動する場合は書き込み可能なディレクトリを指定する
     // pid-file "/var/run/karidns/karidns.pid";
 
     // UDPソケットバッファサイズ (未指定時のデフォルト: 4M)
@@ -41,6 +46,8 @@ options {
 
 logging {
     channel queries_log {
+        // ログファイルを開けない場合は起動エラーになる。一般ユーザーで起動する
+        // 場合は /var/log ではなく、そのユーザーが書き込めるパスを指定する
         // 容量ベースのローテーション (10MBを超えたらローテーション、3世代保存)
         file "/var/log/named/queries.log" versions 3 size 10M;
         
@@ -58,6 +65,8 @@ logging {
 // karictlコマンドによる動的リロードやステータス確認を許可する場合に設定します
 control-channel {
     // コントロール用UNIXドメインソケットパス (未指定時は /var/run/karidns/control.sock)
+    // 一般ユーザーで起動する場合は書き込み可能なディレクトリを指定する
+    // (bindできない場合は起動エラーになる)
     // socket "/var/run/karidns/control.sock";
     algorithm "hmac-sha256";
     // karictl.conf側の key "karictl" に設定した secret と一致させてください

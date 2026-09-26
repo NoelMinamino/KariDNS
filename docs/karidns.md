@@ -27,7 +27,7 @@ karidns [-f] [-p pid_file] [-c config_file | config_file] [-v | --version]
 ### Architectural Structure
 
 1. **Privilege Separation & Capsicum Sandboxing**:
-   - **Frontend Process**: Manages privileged network socket binding (UDP/TCP port 53), drops root privileges, and dispatches network traffic.
+   - **Frontend Process**: Manages privileged network socket binding (UDP/TCP port 53), drops root privileges (when started as root), and dispatches network traffic.
    - **Backend Process**: Operates in FreeBSD Capsicum capability mode (`cap_enter(2)`). DNS packet parsing and response generation are performed without direct filesystem access or socket creation permissions. Configuration and zone files are accessed via pre-opened directory descriptors (`openat(2)` / `renameat(2)`).
 2. **Read-Copy-Update (RCU) Architecture**:
    - Zone data and configuration pointers are swapped atomically using C11 atomic operations (`memory_order_acquire` / `memory_order_release`), allowing worker threads to serve queries concurrently during zone reloads without locking.
@@ -57,6 +57,48 @@ karidns [-f] [-p pid_file] [-c config_file | config_file] [-v | --version]
 > **User, Group, and Sandboxing Controls:**
 > - Process privileges (`user` and `group`) are configured exclusively via the `options { user "..."; group "..."; }` directive in the configuration file rather than command-line arguments.
 > - Traditional `chroot` is not implemented; filesystem and system call sandboxing is enforced via FreeBSD native **Capsicum** (`cap_enter(2)` capability mode) in the backend worker process.
+
+### Running as a non-root user
+
+`karidns` does not have to be started as root. There are two supported ways to run it:
+
+| Started as | `options { user ...; }` | Behavior |
+|---|---|---|
+| root | set | Binds sockets and opens files as root, then drops to `user`/`group` (recommended for port 53). |
+| root | not set | Refused: running as root without a privilege drop is not permitted. |
+| non-root user *U* | not set | Runs as *U*. |
+| non-root user *U* | `user "U";` (itself) | Runs as *U*; the privilege drop is skipped. |
+| non-root user *U* | another user | Refused: a non-root process cannot switch users. |
+
+When started as a non-root user, `group` (if set) must be that user's current primary group, and `program-user` of `type program` zones (which defaults to `options { user }`) must be that user as well.
+
+Everything the process needs must then be usable by that user. **karidns refuses to start** (non-zero exit status and an `[ERROR]` message on stderr and syslog) instead of running half-broken when:
+
+- the listen port cannot be bound over UDP **or** TCP — ports below 1024 (such as 53) require root, so use e.g. `port 10053;` or `-p 10053`; a port already in use by another process is refused too;
+- a `logging { channel { file "..."; }; }` file cannot be opened (e.g. under `/var/log`); choose a directory the user can write to;
+- the PID file cannot be created: when daemonized, the default is `/var/run/karidns/karidns.pid`, so pass `-P <path>` / `pid-file "<path>";`, or `pid-file "none";`;
+- `control-channel` is enabled and its UNIX socket cannot be bound: the default is `/var/run/karidns/control.sock`, so set `control-channel { socket "<path>"; ... };` to a path in a directory the user can write to (and point `karictl` at the same path).
+
+These checks run **before** the process daemonizes, so in daemon mode the failure is reported to the invoking shell/rc script as well. The same fail-closed rules apply when started as root (a log file that cannot be opened, an unbindable port or control socket all abort startup). On `karictl reconfig` / `SIGHUP`, a configuration whose log files cannot be opened is rejected and the running configuration is kept.
+
+Example (`/home/dns/karidns.conf`, started by user `dns` with `karidns /home/dns/karidns.conf`):
+
+```text
+options {
+    port 10053;
+    user "dns";                          // optional: the invoking user itself
+    pid-file "/home/dns/run/karidns.pid";
+};
+logging {
+    channel queries_log { file "/home/dns/log/queries.log" versions 3 size 10M; };
+    category queries { queries_log; };
+};
+control-channel {
+    socket "/home/dns/run/control.sock";
+    algorithm "hmac-sha256";
+    secret "...";
+};
+```
 
 ---
 

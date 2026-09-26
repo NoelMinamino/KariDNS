@@ -6,9 +6,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
 #include <nl_types.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -190,4 +192,91 @@ void enter_capsicum_sandbox(void) {
   }
 #endif
   atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);
+}
+
+// ============================================================================
+// 実行ユーザー (options { user / group }) の解決と権限降格
+// ============================================================================
+bool resolve_run_identity(const char *user, const char *group, run_identity_t *id,
+                          char *err, size_t errlen) {
+  memset(id, 0, sizeof(*id));
+  id->uid = (uid_t)-1;
+  id->gid = (gid_t)-1;
+  if (user) {
+    struct passwd *pwd = getpwnam(user);
+    if (!pwd) {
+      snprintf(err, errlen, "user '%s' not found", user);
+      return false;
+    }
+    id->has_user = true;
+    id->uid = pwd->pw_uid;
+    id->gid = pwd->pw_gid;
+  }
+  if (group) {
+    struct group *grp = getgrnam(group);
+    if (!grp) {
+      snprintf(err, errlen, "group '%s' not found", group);
+      return false;
+    }
+    id->has_group = true;
+    id->gid = grp->gr_gid;
+  }
+
+  if (geteuid() == 0) {
+    if (!user && !group) {
+      snprintf(err, errlen, "running as root with no 'user'/'group' configured; "
+                            "refusing to continue without privilege drop");
+      return false;
+    }
+    id->privileged = true;
+    return true;
+  }
+
+  /* 非root起動: POSIXでは非rootプロセスが別ユーザー/別グループへ切り替える
+   * ことはできない。設定が実行ユーザー自身を指している場合のみ、降格を
+   * 省略してそのまま稼働する。 */
+  if (user && (getuid() != id->uid || geteuid() != id->uid)) {
+    snprintf(err, errlen,
+             "started as non-root uid %u but options { user \"%s\"; } is uid %u; "
+             "a non-root process cannot switch to another user. Start karidns as root "
+             "(it drops to '%s'), start it as '%s' itself, or remove the 'user' directive",
+             (unsigned)geteuid(), user, (unsigned)id->uid, user, user);
+    return false;
+  }
+  if (group && (getgid() != id->gid || getegid() != id->gid)) {
+    snprintf(err, errlen,
+             "started as non-root gid %u but options { group \"%s\"; } is gid %u; "
+             "a non-root process cannot switch its primary group. Start karidns as root, "
+             "start it with '%s' as its primary group, or remove the 'group' directive",
+             (unsigned)getegid(), group, (unsigned)id->gid, group);
+    return false;
+  }
+  return true;
+}
+
+bool apply_run_identity(const char *user, const char *group, char *err, size_t errlen) {
+  run_identity_t id;
+  if (!resolve_run_identity(user, group, &id, err, errlen))
+    return false;
+  if (!id.privileged)
+    return true; /* 非root: 既に目的のユーザー/グループで稼働している */
+
+  if (setgroups(0, NULL) != 0) {
+    snprintf(err, errlen, "setgroups failed: %s", strerror(errno));
+    return false;
+  }
+  if (setgid(id.gid) != 0) {
+    snprintf(err, errlen, "setgid failed: %s", strerror(errno));
+    return false;
+  }
+  if (id.has_user && setuid(id.uid) != 0) {
+    snprintf(err, errlen, "setuid failed: %s", strerror(errno));
+    return false;
+  }
+  if ((id.has_user && (getuid() != id.uid || geteuid() != id.uid)) ||
+      getgid() != id.gid || getegid() != id.gid) {
+    snprintf(err, errlen, "privilege drop verification failed");
+    return false;
+  }
+  return true;
 }
