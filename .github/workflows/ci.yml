@@ -26,6 +26,8 @@ jobs:
     name: Build and Test on FreeBSD ${{ matrix.release }}
     if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ubuntu-latest
+    # a hung test must fail the job instead of blocking it for hours
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +56,8 @@ jobs:
             echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests)"
             # Previously only 6 of the C unit tests ran in CI (asan, tinydns, hash, include,
             # response_cache, vulnerability). `unit-tests` builds and runs every binary, sequentially.
-            make unit-tests
+            # stdin from /dev/null: no test may block reading the VM session's stdin
+            make unit-tests < /dev/null
             echo "::endgroup::"
 
             echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan"
@@ -63,7 +66,7 @@ jobs:
             # -fsanitize=address,undefined (UBSan findings are fatal); leak checks are off by default
             # (UT_ASAN_LEAKS=1 enables them once the tests' teardown is complete).
             # Burn-in: first FreeBSD run is reported as a warning; remove the fallback to make it blocking.
-            make unit-tests-asan || echo "::warning title=unit-tests-asan::ASan/UBSan unit tests failed on FreeBSD ${{ matrix.release }} - see log above (non-blocking during burn-in)"
+            make unit-tests-asan < /dev/null || echo "::warning title=unit-tests-asan::ASan/UBSan unit tests failed on FreeBSD ${{ matrix.release }} - see log above (non-blocking during burn-in)"
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
@@ -140,6 +143,7 @@ jobs:
     name: Portable unit tests (+ASan/UBSan) on ${{ matrix.name }}
     if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
@@ -308,7 +312,7 @@ jobs:
 
             echo "::group::🧪 [Coverage] make coverage"
             START=$(date +%s)
-            make coverage
+            make coverage < /dev/null
             echo "make coverage took $(( $(date +%s) - START ))s"
             echo "::endgroup::"
 

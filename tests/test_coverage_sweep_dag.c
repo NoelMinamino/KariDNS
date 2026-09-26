@@ -22,6 +22,8 @@
 
 #define main dag_main
 #include "../tools/dag.c"
+#include "sweep_watchdog.h"
+#include <fcntl.h>
 #undef main
 
 #include "dns_zone_parser.h"
@@ -291,6 +293,15 @@ static int run_parse(int argc, char **argv) {
 
 static void test_option_sweep(void) {
     printf("[TEST] dag sweep: every option token x value forms...\n");
+    /* dag reports every rejected token with a usage line on stderr: tens of
+     * thousands of lines (~575 KB) that only bloat the CI log. Mute stderr
+     * for the sweep (SWEEP_VERBOSE=1 keeps it). */
+    fflush(stderr);
+    int saved_err = -1;
+    if (!getenv("SWEEP_VERBOSE")) {
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { saved_err = dup(2); dup2(dn, 2); close(dn); }
+    }
     size_t calls = 0;
     for (size_t o = 0; o < N(OPTS); o++) {
         const char *opt = OPTS[o];
@@ -343,6 +354,8 @@ static void test_option_sweep(void) {
     const char *types[] = { "A", "a", "TYPE1", "TYPE65535", "TYPE65536", "TYPE", "TYPEx", "IXFR=5", "ANY", "NSEC3PARAM",
                             "", "CLASS1", "NONE", "SPF", "ZONEMD", "DLV", "bogus" };
     for (size_t t = 0; t < N(types); t++) { uint16_t out; (void)resolve_qtype(types[t], &out); (void)parse_qtype(types[t]); }
+    fflush(stderr);
+    if (saved_err >= 0) { dup2(saved_err, 2); close(saved_err); }
     printf("  -> %zu option parses done.\n", calls);
 }
 
@@ -477,10 +490,11 @@ static void test_dns64_and_svcb(void) {
 }
 
 int main(void) {
+    wd_start("test_coverage_sweep_dag", 300);
     printf("=== dag Coverage Sweep Tests ===\n");
-    test_option_sweep();
-    test_dns64_and_svcb();
-    test_print_response_sweep();
+    WD_PHASE("test_option_sweep"); test_option_sweep();
+    WD_PHASE("test_dns64_and_svcb"); test_dns64_and_svcb();
+    WD_PHASE("test_print_response_sweep"); test_print_response_sweep();
     printf("=== All dag Coverage Sweep Tests PASSED ===\n");
     return 0;
 }

@@ -23,6 +23,8 @@
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 
+#include "sweep_watchdog.h"
+
 #define main karicheck_main
 #include "../tools/karicheck.c"
 #undef main
@@ -38,6 +40,7 @@ static int run_child(int (*fn)(int, char **), int argc, char **argv) {
     pid_t pid = fork();
     if (pid == 0) {
         if (!getenv("SWTOOLS_VERBOSE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); dup2(dn, 2); }
+        wd_child();
         alarm(20);
         exit(fn(argc, argv) & 0xFF);
     }
@@ -305,12 +308,13 @@ static void test_karictl(void) {
 }
 
 int main(void) {
+    wd_start("test_coverage_sweep_tools", 300);
     printf("=== Tools Coverage Sweep Tests ===\n");
     signal(SIGPIPE, SIG_IGN);
     snprintf(g_tmp, sizeof(g_tmp), "/tmp/ktools_XXXXXX");
     if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 1; }
-    test_karicheck();
-    test_karictl();
+    WD_PHASE("test_karicheck"); test_karicheck();
+    WD_PHASE("test_karictl"); test_karictl();
     printf("=== All Tools Coverage Sweep Tests PASSED (%d runs) ===\n", g_runs);
     return 0;
 }

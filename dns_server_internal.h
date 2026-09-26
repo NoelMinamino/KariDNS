@@ -43,6 +43,16 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 
+#if defined(__APPLE__)
+/* macOS has no recvmmsg/sendmmsg and no struct mmsghdr. The server itself is
+ * FreeBSD-only, but portable modules (e.g. dns_tsig_acl.c, built on macOS for
+ * the portable unit tests) include this header for its shared types. */
+struct mmsghdr {
+  struct msghdr msg_hdr;
+  unsigned int msg_len;
+};
+#endif
+
 #include "dns_dnstap.h"
 #include "dns_edns_ecs.h"
 #include "dns_rrl.h"

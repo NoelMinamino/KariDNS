@@ -30,6 +30,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <pthread.h>
+#include "sweep_watchdog.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -2299,6 +2300,7 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     int sp[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
     int one = 1 << 22; setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &one, sizeof(one)); setsockopt(sp[1], SOL_SOCKET, SO_RCVBUF, &one, sizeof(one));
     pid_t pid = fork();
+    if (pid == 0) wd_child();
     if (pid == 0) { close(sp[1]); size_t w = 0; while (w < len) { ssize_t n = write(sp[0], stream + w, len - w); if (n <= 0) break; w += (size_t)n; } close(sp[0]); _exit(0); }
     close(sp[0]);
     tcp_stream_ctx_t sc; memset(&sc, 0, sizeof(sc));
@@ -2587,25 +2589,26 @@ static void test_opcode_tsig_matrix(void) {
 }
 
 int main(void) {
+    wd_start("test_coverage_sweep", 600);
     printf("=== Coverage Sweep Tests ===\n");
     signal(SIGPIPE, SIG_IGN);
-    test_engine_helper_edges();
-    test_wire_name_edges();
-    test_wire_rr_sweep();
-    test_wire_tsig_sweep();
-    test_wire_edns_sweep();
-    test_zone_parser_sweep();
-    test_tinydns_sweep();
-    test_snapshot_catalog_sequence();
-    test_ecs_cookie_rrl_dnstap_edges();
-    test_dnstap_edges();
-    test_update_matrix();
-    test_xfr_roundtrips();
-    test_config_sweep();
-    test_program_zone_emulated();
-    test_forward_zone_scenarios();
-    test_sweep_query_engine();
-    test_opcode_tsig_matrix();
+    WD_PHASE("test_engine_helper_edges"); test_engine_helper_edges();
+    WD_PHASE("test_wire_name_edges"); test_wire_name_edges();
+    WD_PHASE("test_wire_rr_sweep"); test_wire_rr_sweep();
+    WD_PHASE("test_wire_tsig_sweep"); test_wire_tsig_sweep();
+    WD_PHASE("test_wire_edns_sweep"); test_wire_edns_sweep();
+    WD_PHASE("test_zone_parser_sweep"); test_zone_parser_sweep();
+    WD_PHASE("test_tinydns_sweep"); test_tinydns_sweep();
+    WD_PHASE("test_snapshot_catalog_sequence"); test_snapshot_catalog_sequence();
+    WD_PHASE("test_ecs_cookie_rrl_dnstap_edges"); test_ecs_cookie_rrl_dnstap_edges();
+    WD_PHASE("test_dnstap_edges"); test_dnstap_edges();
+    WD_PHASE("test_update_matrix"); test_update_matrix();
+    WD_PHASE("test_xfr_roundtrips"); test_xfr_roundtrips();
+    WD_PHASE("test_config_sweep"); test_config_sweep();
+    WD_PHASE("test_program_zone_emulated"); test_program_zone_emulated();
+    WD_PHASE("test_forward_zone_scenarios"); test_forward_zone_scenarios();
+    WD_PHASE("test_sweep_query_engine"); test_sweep_query_engine();
+    WD_PHASE("test_opcode_tsig_matrix"); test_opcode_tsig_matrix();
     printf("=== All Coverage Sweep Tests PASSED ===\n");
     return 0;
 }

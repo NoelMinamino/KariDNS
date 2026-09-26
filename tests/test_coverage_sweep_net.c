@@ -36,6 +36,7 @@
 
 #define main dag_main
 #include "../tools/dag.c"
+#include "sweep_watchdog.h"
 #undef main
 
 #include "dns_zone_parser.h"
@@ -504,6 +505,7 @@ static int run_dag(int argc, char **argv) {
         bool show = false;
         if (v) for (int i = 0; i < argc; i++) if (strstr(argv[i], v)) show = true;
         if (!show) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); dup2(dn, 2); }
+        wd_child();
         alarm(20);
         int rc = dag_main(argc, argv);
         fflush(stdout);
@@ -1081,6 +1083,7 @@ static void test_client_helpers(void) {
 }
 
 int main(void) {
+    wd_start("test_coverage_sweep_net", 600);
     printf("=== dag Network Coverage Sweep Tests ===\n");
     signal(SIGPIPE, SIG_IGN);
     snprintf(g_tmp, sizeof(g_tmp), "/tmp/kdag_net_XXXXXX");
@@ -1093,7 +1096,7 @@ int main(void) {
     static fsrv_t s1, s2;
     fs_start(&s1, 0);
     fs_start(&s2, 1);
-    test_key_files();
+    WD_PHASE("test_key_files"); test_key_files();
     {   /* helpers mutate dag's global break list: run them in a child so the CLI matrix starts clean */
         fflush(stdout);
         pid_t pid = fork();
@@ -1101,8 +1104,8 @@ int main(void) {
         int st = 0; waitpid(pid, &st, 0);
         assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     }
-    test_dag_cli_matrix(&s1, &s2);
-    test_replay(&s1, &s2);
+    WD_PHASE("test_dag_cli_matrix"); test_dag_cli_matrix(&s1, &s2);
+    WD_PHASE("test_replay"); test_replay(&s1, &s2);
     g_stop = 1;
     pthread_join(s1.thr, NULL); pthread_join(s2.thr, NULL);
     printf("=== All dag Network Coverage Sweep Tests PASSED ===\n");

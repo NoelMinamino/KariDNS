@@ -1208,7 +1208,8 @@ PROCESS_RECORD:
   if ((rec->type_code == 31 || rec->type_code == 32) && rec->rdata_count == 1 &&
       strcmp(rec->rdata[0], "\\#") != 0 && strcmp(rec->rdata[0], "#") != 0) {
     char hex_copy[512];
-    strlcpy(hex_copy, rec->rdata[0], sizeof(hex_copy));
+    /* snprintf rather than strlcpy: MinGW (Windows dag build) has no strlcpy */
+    snprintf(hex_copy, sizeof(hex_copy), "%s", rec->rdata[0]);
     size_t hexlen = strlen(hex_copy);
     if (hexlen > 0 && (hexlen % 2) == 0 && hexlen < sizeof(hex_copy) &&
         strspn(hex_copy, "0123456789abcdefABCDEF") == hexlen && MAX_RDATA >= 3) {
