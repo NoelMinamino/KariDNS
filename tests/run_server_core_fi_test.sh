@@ -21,23 +21,63 @@ DAG="$ROOT/dag"
 KARICTL="$ROOT/karictl"
 PORT=10153
 CTRL_PORT=10954
-SHIM="$ROOT/tests/fi/kari_fi_preload.so"
+SHIM_SRC="$ROOT/tests/fi/kari_fi_preload.c"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "SKIP: run_server_core_fi_test.sh needs root (privilege drop)"
     exit 0
 fi
 [ -x "$KARIDNS" ] && [ -x "$DAG" ] && [ -x "$KARICTL" ] || make -C "$ROOT" karidns dag karictl >/dev/null
-if [ ! -f "$SHIM" ] || [ "$ROOT/tests/fi/kari_fi_preload.c" -nt "$SHIM" ]; then
-    ${CC:-cc} -O1 -g -fPIC -shared -o "$SHIM" "$ROOT/tests/fi/kari_fi_preload.c" || { echo "FAIL: cannot build $SHIM"; exit 1; }
+# The sweep relies on the shim's KARI_FI_LOG / ":child" support; an older
+# kari_fi_preload.c injects nothing this test can observe.
+if ! grep -q "KARI_FI_LOG" "$SHIM_SRC" || ! grep -q "child_only" "$SHIM_SRC"; then
+    echo "FAIL: $SHIM_SRC is older than this test (no KARI_FI_LOG / :child support)."
+    echo "      Update it from git (git checkout HEAD -- tests/fi/kari_fi_preload.c)."
+    exit 1
 fi
 
 TMP="$(mktemp -d /tmp/karidns_fi.XXXXXX)"
 chmod 755 "$TMP"
+# always build the shim fresh from the checked-out source (never reuse a
+# possibly stale kari_fi_preload.so)
+SHIM="$TMP/kari_fi_preload.so"
+${CC:-cc} -O1 -g -fPIC -shared -o "$SHIM" "$SHIM_SRC" > "$TMP/shim_build.log" 2>&1 || {
+    echo "FAIL: cannot build the fault-injection shim:"; sed 's/^/    /' "$TMP/shim_build.log"; exit 1; }
+chmod 755 "$SHIM"
+
+# Make sure the preload actually takes effect before sweeping. Without this
+# check a shim that cannot be loaded (e.g. the checkout lives on a noexec
+# mount) makes every run a no-op and the sweep "passes" without injecting
+# anything. Try the checkout first, then a copy in /var/tmp and /tmp.
+probe_shim() {
+    rm -f "$TMP/probe.log"
+    env LD_PRELOAD="$1" KARI_FI_SPEC="socket@1:errno=EACCES" KARI_FI_LOG="$TMP/probe.log" \
+        perl -MSocket -e 'socket(my $s, PF_INET, SOCK_DGRAM, 0);' > "$TMP/probe.out" 2>&1
+    grep -q "socket@1" "$TMP/probe.log" 2>/dev/null
+}
+SHIM_OK=0
+for dir in "" /var/tmp /tmp; do
+    if [ -n "$dir" ]; then
+        cand="$dir/kari_fi_preload.$$.so"
+        cp "$SHIM" "$cand" 2>/dev/null || continue
+        chmod 755 "$cand"
+    else
+        cand="$SHIM"
+    fi
+    if probe_shim "$cand"; then SHIM="$cand"; SHIM_OK=1; break; fi
+    echo "  note: fault-injection shim not effective from $cand"
+    [ -s "$TMP/probe.out" ] && sed 's/^/    /' "$TMP/probe.out" | head -3
+done
+if [ $SHIM_OK -ne 1 ]; then
+    echo "FAIL: LD_PRELOAD fault-injection shim could not be activated (see notes above)"
+    exit 1
+fi
+echo "  fault-injection shim: $SHIM"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null
     pkill -9 -f "karidns -f $TMP" 2>/dev/null
+    rm -f /var/tmp/kari_fi_preload.$$.so /tmp/kari_fi_preload.$$.so
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -89,6 +129,7 @@ KEOF
 
 CRASHES=0
 RUNS=0
+FIRED=0
 
 # run_one "<KARI_FI_SPEC>" -> 0 if the injected fault fired, 1 otherwise
 run_one() {
@@ -145,7 +186,8 @@ run_one() {
         tail -n 5 "$TMP/server.log" | sed 's/^/     /'
         CRASHES=$((CRASHES + 1))
     fi
-    [ -s "$TMP/fired.log" ]
+    if [ -s "$TMP/fired.log" ]; then FIRED=$((FIRED + 1)); return 0; fi
+    return 1
 }
 
 # sweep <call> <max-N> [errno]   (CHILD=1: only count calls in forked children)
@@ -162,27 +204,27 @@ sweep() {
 }
 
 echo "=== KariDNS server fault-injection sweep ==="
-sweep socket 16
-sweep bind 8 EADDRINUSE
-sweep setsockopt 40 ENOBUFS
-sweep listen 4
-sweep socketpair 12
-sweep fork 8 EAGAIN
-sweep pthread_create 24
-sweep kqueue 10 EMFILE
+sweep socket 64
+sweep bind 32 EADDRINUSE
+sweep setsockopt 160 ENOBUFS
+sweep listen 16
+sweep socketpair 64
+sweep fork 32 EAGAIN
+sweep pthread_create 160
+sweep kqueue 40 EMFILE
 sweep setgroups 3 EPERM
 sweep setgid 3 EPERM
 sweep setuid 3 EPERM
 sweep getpwnam 3
 sweep getgrnam 3
 sweep cap_enter 3 ENOSYS
-sweep mkdir 4 EACCES
-sweep accept 6 EMFILE
+sweep mkdir 16 EACCES
+sweep accept 16 EMFILE
 sweep accept 3 ECONNABORTED
-sweep sendmsg 4 ENOBUFS
-sweep sendto 6 ENOBUFS
+sweep sendmsg 16 ENOBUFS
+sweep sendto 16 ENOBUFS
 sweep rename 3 EXDEV
-sweep getsockname 6
+sweep getsockname 32
 sweep connect 6 ECONNREFUSED
 # the same calls failing inside the broker / frontend / backend processes
 CHILD=1
@@ -191,20 +233,24 @@ sweep setgid 2 EPERM
 sweep setuid 2 EPERM
 sweep getpwnam 3
 sweep getgrnam 3
-sweep kqueue 4 EMFILE
-sweep socket 6
-sweep bind 4 EADDRINUSE
-sweep socketpair 3
-sweep pthread_create 10
+sweep kqueue 16 EMFILE
+sweep socket 24
+sweep bind 16 EADDRINUSE
+sweep socketpair 16
+sweep pthread_create 64
 sweep cap_enter 2 ENOSYS
 CHILD=
 # log rotation: rename and re-open of the query log fail
 HEAVY=1
 sweep renameat 6 EXDEV
-sweep openat 12 EMFILE
+sweep openat 48 EMFILE
 HEAVY=
 
-echo "  -> $RUNS runs, $CRASHES crash(es)"
+echo "  -> $RUNS runs, $FIRED with an injected fault, $CRASHES crash(es)"
+if [ $FIRED -eq 0 ]; then
+    echo "FAIL: no fault was ever injected"
+    exit 1
+fi
 if [ $CRASHES -ne 0 ]; then
     echo "FAIL: karidns crashed under fault injection"
     exit 1

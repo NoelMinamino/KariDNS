@@ -164,8 +164,12 @@ tcp_session() {
         my ($port, $mode) = @ARGV;
         my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $port, Proto => "tcp", Timeout => 2) or exit 0;
         my $q = sub { my ($id, $fl) = @_; my $m = pack("nnnnnn", $id, $fl, 1, 0, 0, 0) . "\3www\1m\4test\0" . pack("nn", 1, 1); pack("n", length $m) . $m };
+        my $buf;
+        # "qr0" / "short0": misbehave with the very first message
+        if ($mode eq "qr0")    { print $s $q->(1, 0x8100); my $t = time; while (time - $t < 2) { last unless sysread($s, $buf, 65535); } exit 0; }
+        if ($mode eq "short0") { print $s pack("n", 4) . "abcd"; my $t = time; while (time - $t < 2) { last unless sysread($s, $buf, 65535); } exit 0; }
         print $s $q->(1, 0x0100);
-        my $buf; sysread($s, $buf, 4096);
+        sysread($s, $buf, 4096);
         select(undef, undef, undef, 0.2);   # let the server go back to waiting
         if ($mode eq "qr")      { print $s $q->(2, 0x8100); }
         elsif ($mode eq "short") { print $s pack("n", 4) . "abcd"; }
@@ -337,7 +341,7 @@ if wait_up 127.0.0.1 $PA m.test; then
     udp_flood 127.0.0.1 $PA 4000 www.m.test
     udp_flood ::1 $PA 2000 www.m.test
     for round in 1 2 3; do
-        for mode in qr short eof burst partial; do tcp_session $PA $mode; done
+        for mode in qr0 short0 qr short eof burst partial; do tcp_session $PA $mode; done
     done
     tcp_session $PA burst & T1=$!
     tcp_session $PA burst & T2=$!
@@ -544,6 +548,7 @@ check_exit $NPID "notify instance"
 echo "[C] primary + secondary with TSIG"
 fresh_dir "$TMP/m"; fresh_dir "$TMP/s"
 make_zone "$TMP/p.zone" p.test
+make_zone "$TMP/deny.zone" deny.test
 cat > "$TMP/prim.conf" <<CEOF
 options { port $PM; bind-address { 127.0.0.1; ::1; }; user "nobody"; group "nobody"; pid-file "$TMP/m/m.pid"; };
 key "xfr" { algorithm hmac-sha256; secret "$SECRET"; };
@@ -554,6 +559,11 @@ zone "p.test" {
     allow-transfer { 127.0.0.1; ::1; };
     tsig-key "xfr";
     also-notify { 127.0.0.1 port $PS; };
+};
+zone "deny.test" {
+    type master;
+    file "$TMP/deny.zone";
+    allow-transfer { 192.0.2.99; };
 };
 CEOF
 cat > "$TMP/sec.conf" <<CEOF
@@ -575,6 +585,19 @@ MPID=$!
 SPID=$!
 PIDS="$PIDS $MPID $SPID"
 if wait_up 127.0.0.1 $PM p.test; then
+    # transfers the primary must refuse: not in allow-transfer, unsigned
+    # where TSIG is required, signed with the right key name but a wrong secret
+    for proto in "" +tcp; do
+        "$DAG" @127.0.0.1 -p $PM deny.test AXFR +time=2 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $PM p.test AXFR +time=2 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $PM p.test AXFR -y hmac-sha256:xfr:d3Jvbmctc2VjcmV0LXdyb25nLXNlY3JldA== +time=2 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $PM p.test AXFR -y hmac-sha256:other-key:$SECRET +time=2 +tries=1 >/dev/null 2>&1
+        "$DAG" @127.0.0.1 -p $PM p.test IXFR=1 -y hmac-sha256:xfr:d3Jvbmctc2VjcmV0LXdyb25nLXNlY3JldA== $proto +time=2 +tries=1 >/dev/null 2>&1
+    done
+    case "$("$DAG" @127.0.0.1 -p $PM deny.test AXFR +time=2 +tries=1 2>/dev/null)" in
+        *REFUSED*) ok "AXFR outside allow-transfer refused" ;;
+        *) echo "  note: no REFUSED seen for a disallowed AXFR" ;;
+    esac
     ctl "$TMP/s.ctl" retransfer p.test >/dev/null
     i=0
     while [ $i -lt 40 ]; do
