@@ -14,6 +14,7 @@
 #include <openssl/evp.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <errno.h>
 #include "dns_wire.h"
 #include "dns_tsig_acl.h"
 
@@ -1189,6 +1190,60 @@ static int parse_ecs_tags_block(token_ctx_t *ctx, ecs_tag_def_t **out_tags, int 
   return 0;
 }
 
+/* tcp-mss / tcp-window / udp-bufsize / zone-tcp-* / zone-udp-bufsize の値を1つ読み、
+ * 終端の ';' まで消費する。allow_suffix なら K/M 接尾辞 (1024 倍) を受け付ける。
+ * parse_buffer_size_value() と違い、末尾のゴミや範囲外の値を丸めずに拒否する
+ * (黙って OS 既定値のまま動くと、意図した性能設定が効いていないことに気付けない)。 */
+static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, const char *name,
+                                 bool allow_suffix, long long lo, long long hi, int *out) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING || !tok.value) {
+    free_token(&tok);
+    return -1;
+  }
+  const char *s = tok.value;
+  bool ok = false;
+  long long v = 0;
+  if (isdigit((unsigned char)s[0])) {
+    char *end = NULL;
+    errno = 0;
+    v = strtoll(s, &end, 10);
+    if (errno == 0) {
+      long long mult = 1;
+      if (allow_suffix && (*end == 'k' || *end == 'K')) { mult = 1024LL; end++; }
+      else if (allow_suffix && (*end == 'm' || *end == 'M')) { mult = 1024LL * 1024; end++; }
+      if (*end == '\0' && v <= hi / mult) {
+        v *= mult;
+        ok = (v >= lo && v <= hi);
+      }
+    }
+  }
+  if (!ok) {
+    const char *suffix_hint = allow_suffix ? ", K/M suffix allowed" : "";
+    if (zone_domain) {
+      syslog(LOG_ERR, "[Config] zone '%s': invalid %s value '%s' (expected %lld..%lld%s)",
+             zone_domain, name, s, lo, hi, suffix_hint);
+      fprintf(stderr, "[ERROR] zone '%s': invalid %s value '%s' (expected %lld..%lld%s)\n",
+              zone_domain, name, s, lo, hi, suffix_hint);
+    } else {
+      syslog(LOG_ERR, "[Config] Invalid %s value '%s' (expected %lld..%lld%s)", name, s, lo, hi, suffix_hint);
+      fprintf(stderr, "[ERROR] Invalid %s value '%s' (expected %lld..%lld%s)\n", name, s, lo, hi, suffix_hint);
+    }
+    free_token(&tok);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  *out = (int)v;
+  return 0;
+}
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
   if (tok.type != TOKEN_STRING) {
@@ -1500,6 +1555,25 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
       free_token(&tok);
+    } else if (strcmp(key, "zone-tcp-mss") == 0 || strcmp(key, "zone-tcp-window") == 0 ||
+               strcmp(key, "zone-tcp-sndbuf") == 0 || strcmp(key, "zone-udp-bufsize") == 0) {
+      int v = 0;
+      int rc;
+      if (strcmp(key, "zone-tcp-mss") == 0)
+        rc = parse_transport_param(ctx, zone->domain, key, false, KARIDNS_TCP_MSS_MIN, KARIDNS_TCP_MSS_MAX, &v);
+      else if (strcmp(key, "zone-udp-bufsize") == 0)
+        rc = parse_transport_param(ctx, zone->domain, key, false, KARIDNS_UDP_BUFSIZE_MIN, KARIDNS_UDP_BUFSIZE_MAX, &v);
+      else
+        rc = parse_transport_param(ctx, zone->domain, key, true, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX, &v);
+      if (rc != 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
+      if (strcmp(key, "zone-tcp-mss") == 0) zone->zone_tcp_mss = v;
+      else if (strcmp(key, "zone-tcp-window") == 0) zone->zone_tcp_window = v;
+      else if (strcmp(key, "zone-tcp-sndbuf") == 0) zone->zone_tcp_sndbuf = v;
+      else zone->zone_udp_bufsize = (uint16_t)v;
     } else
       skip_unknown_block(ctx);
     free(key);
@@ -2121,6 +2195,26 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "tcp-mss") == 0) {
+          if (parse_transport_param(ctx, NULL, key, false, KARIDNS_TCP_MSS_MIN, KARIDNS_TCP_MSS_MAX,
+                                    &config->tcp_mss) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "tcp-window") == 0) {
+          if (parse_transport_param(ctx, NULL, key, true, KARIDNS_TCP_BUF_MIN, KARIDNS_TCP_BUF_MAX,
+                                    &config->tcp_window) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "udp-bufsize") == 0) {
+          int v = 0;
+          if (parse_transport_param(ctx, NULL, key, false, KARIDNS_UDP_BUFSIZE_MIN, KARIDNS_UDP_BUFSIZE_MAX,
+                                    &v) != 0) {
+            free(key);
+            return -1;
+          }
+          config->udp_bufsize = (uint16_t)v;
         } else if (strcmp(key, "udp-recvbuf-size") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -2906,6 +3000,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   }
   config->zones = flat_zones;
   config->zones_are_flat = true;
+
+  config->any_zone_tcp_opts = false;
+  for (zone_config_t *z = config->zones; z; z = z->next) {
+    if (z->zone_tcp_mss > 0 || z->zone_tcp_window > 0 || z->zone_tcp_sndbuf > 0) {
+      config->any_zone_tcp_opts = true;
+      break;
+    }
+  }
 
   for (log_channel_t *c = config->logging.channels; c; c = c->next) {
     if (!c->max_qps_specified) {

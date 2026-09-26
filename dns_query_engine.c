@@ -2713,13 +2713,13 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
+  zone_config_t *matched_zcfg = (db_entry && view && cfg)
+      ? find_zone_config_in_view(cfg, view->name, db_entry->domain)
+      : NULL;
   if (out_rrl_cfg) {
     *out_rrl_cfg = cfg ? &cfg->rrl : NULL;
-    if (db_entry && view && cfg) {
-      zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
-      if (zcfg && zcfg->rrl.configured) {
-        *out_rrl_cfg = &zcfg->rrl;
-      }
+    if (matched_zcfg && matched_zcfg->rrl.configured) {
+      *out_rrl_cfg = &matched_zcfg->rrl;
     }
   }
   
@@ -2742,6 +2742,12 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   if (edns.present && edns.udp_payload_size < 512) {
     edns.udp_payload_size = 512;
   }
+  /* udp-bufsize / zone-udp-bufsize: UDP 応答サイズの上限であり、OPT で通知する値。
+   * 範囲はパーサで 512..4096 に制限済み (呼び出し側の UDP 応答バッファは >= 4096)。 */
+  if (matched_zcfg && matched_zcfg->zone_udp_bufsize > 0)
+    edns.server_udp_size = matched_zcfg->zone_udp_bufsize;
+  else if (cfg && cfg->udp_bufsize > 0)
+    edns.server_udp_size = cfg->udp_bufsize;
 
   if (out_matched_entry) *out_matched_entry = db_entry;
   if (db_entry) {
@@ -3149,8 +3155,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     if (edns.udp_payload_size < 512)
       edns.udp_payload_size = 512;
     if (!is_tcp) {
-      if (edns.udp_payload_size > 1232)
-        edns.udp_payload_size = 1232;
+      uint16_t server_udp_size = edns.server_udp_size ? edns.server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
+      if (edns.udp_payload_size > server_udp_size)
+        edns.udp_payload_size = server_udp_size;
       /* max_res_len は呼び出し側バッファの容量上限も兼ねる。呼び出し側が
        * UDP 既定値 (512) 未満の小さなバッファを渡した場合に EDNS の
        * payload size で拡大すると res[] の範囲外へ書き込む (スタック破壊)。

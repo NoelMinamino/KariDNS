@@ -118,6 +118,74 @@ zone "example.com" {
 
 ---
 
+## TRANSPORT TUNING (TCP MSS / WINDOW, UDP PAYLOAD SIZE)
+
+These directives correspond to `dag`'s `+tcp-mss`, `+tcp-window` and `+bufsize`. Each has a server-wide
+form in `options {}` and a per-zone override in `zone {}`. All of them default to "not set", which keeps
+the previous behaviour (OS defaults for TCP, a 1232-byte UDP payload cap).
+
+```
+options {
+    tcp-mss 1220;          # 536..65495
+    tcp-window 256K;       # 4K..64M, K/M suffix allowed
+    udp-bufsize 1232;      # 512..4096
+};
+
+zone "example.com" {
+    type master;
+    file "/usr/local/etc/namedb/master/example.com.zone";
+    zone-tcp-mss 1200;     # 536..65495
+    zone-tcp-window 128K;  # 4K..64M (receive side, SO_RCVBUF)
+    zone-tcp-sndbuf 2M;    # 4K..64M (send side, SO_SNDBUF; e.g. faster AXFR)
+    zone-udp-bufsize 1400; # 512..4096
+};
+```
+
+Out-of-range or malformed values (`1k` for an MSS, `2MB`, `65M`, ...) are rejected at load time instead of
+being clamped, so a tuning setting can never be silently ignored.
+
+| Directive | Applied to | When | Effect |
+|---|---|---|---|
+| `tcp-window` | `SO_RCVBUF` and `SO_SNDBUF` of every TCP listener | before `listen()` | Inherited by accepted connections, so it covers the initial window advertised in the SYN-ACK. **Needs a restart**: listeners are not recreated on reload. |
+| `tcp-mss` | `TCP_MAXSEG` of each accepted connection | right after `accept()` | Lowers the MSS KariDNS **sends** with. Picked up on reload by new connections. |
+| `zone-tcp-mss` | `TCP_MAXSEG` of the connection | after a query for the zone is read | Same as `tcp-mss`, and can only lower the MSS further (see limits). |
+| `zone-tcp-window` | `SO_RCVBUF` of the connection | after a query for the zone is read | Receive window, within the window scale already agreed in the handshake. |
+| `zone-tcp-sndbuf` | `SO_SNDBUF` of the connection | after a query for the zone is read | Send buffer; the setting that matters for large responses and AXFR/IXFR. Applied before the transfer thread takes over the connection. |
+| `udp-bufsize` / `zone-udp-bufsize` | UDP response size cap and the payload size advertised in the response OPT | per query | Replaces the built-in 1232. The requestor's own EDNS payload size still wins when it is smaller; TCP responses are not affected. |
+
+### Limits of the per-zone TCP settings
+
+A DNS server only learns which zone a TCP connection is for once it has read the query, i.e. after the
+three-way handshake. The `zone-tcp-*` settings are therefore applied with `setsockopt()` to the already
+established connection, which means:
+
+- **MSS can only go down.** On FreeBSD, `TCP_MAXSEG` on an established connection accepts only values at
+  or below the current MSS (larger values fail with `EINVAL` and are ignored), and the MSS the client was
+  told in the SYN-ACK does not change. `zone-tcp-mss` therefore only shrinks the segments KariDNS sends,
+  and once lowered the value stays for the rest of the connection. If `tcp-mss` and `zone-tcp-mss` (or two
+  zones queried over one connection) disagree, the smallest value wins. The SYN-ACK MSS itself comes from
+  the route MTU; to change it, use the route MTU or a packet-filter MSS clamp (for example pf `scrub max-mss`).
+- **The window scale is fixed by the handshake.** `zone-tcp-window` can resize the receive buffer only
+  within that scale. Queries are small, so for a DNS server the send side (`zone-tcp-sndbuf`) is usually the
+  one worth tuning.
+- **Setting a buffer turns off the kernel's automatic sizing** for that socket (FreeBSD
+  `net.inet.tcp.sendbuf_auto` / `recvbuf_auto`).
+- **Several zones on one connection.** With `tcp-connection-reuse`, a client can query more than one zone over
+  the same connection. The buffers are switched per query, and only when the value changes. A query for
+  a zone without `zone-tcp-window` / `zone-tcp-sndbuf` puts back the value the socket had before any zone
+  setting was applied (that is, the `tcp-window` value or the OS default).
+- Values above `kern.ipc.maxsockbuf` are truncated by the kernel; `tcp-window` logs a warning when that
+  happens.
+
+When no zone uses `zone-tcp-*`, the TCP query path does no extra zone lookup and no `setsockopt()` calls.
+
+Per-zone UDP *socket* buffers are not possible: all zones share the same UDP sockets. The server-wide
+`udp-recvbuf-size` / `udp-sndbuf-size` stay the knobs for those. What can be set per zone on UDP is the
+EDNS payload size (`zone-udp-bufsize`). Values above 1232 risk IP fragmentation on paths with a smaller
+MTU (this is the reason for the DNS Flag Day 2020 default); lower values push more answers to TCP.
+
+---
+
 ## CONTROL CHANNEL & MANAGEMENT
 
 Runtime administration of `karidns` is managed over a local UNIX domain socket (`/var/run/karidns/control.sock`) authenticated via HMAC-SHA256 challenge-response using the [`karictl(8)`](karictl.md) utility.

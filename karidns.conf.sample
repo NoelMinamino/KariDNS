@@ -16,6 +16,15 @@ options {
     udp-recvbuf-size 4M;
     udp-sndbuf-size 4M;
 
+    // TCP / UDP の転送パラメータ (未指定時は OS 既定値、UDP ペイロード上限は 1232)
+    // tcp-window は listen ソケットに設定するため、変更の反映には再起動が必要です
+    // tcp-mss は接続確立後に送信 MSS を下げる方向にのみ効きます
+    // ゾーン単位の上書き (zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf /
+    // zone-udp-bufsize) と制約は docs/karidns.md の TRANSPORT TUNING を参照
+    // tcp-mss 1220;
+    // tcp-window 256K;
+    // udp-bufsize 1232;
+
     // Response Rate Limiting (RRL) - DNSリフレクション攻撃対策
     // 指定しない場合はRRLは無効（制限なし）となります
     rate-limit {
@@ -82,6 +91,11 @@ zone "example.com" {
     };
     also-notify { 192.168.1.100 port 53; };
     notify-source "192.168.1.1";
+    // ゾーン単位の転送パラメータ (クエリ受信後に接続へ適用。MSS は下げる方向のみ)
+    // zone-tcp-sndbuf 2M;       // AXFR など大きな応答の送信バッファ
+    // zone-tcp-window 128K;
+    // zone-tcp-mss 1200;
+    // zone-udp-bufsize 1232;
     
     // 特定のゾーンに対してRRL設定を上書きすることも可能
     // 指定した場合はグローバルオプションより優先されます

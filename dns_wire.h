@@ -250,6 +250,9 @@ typedef struct {
     uint8_t version;
     bool dnssec_ok;
     bool compact_answers_ok;
+    // 応答の OPT で通知する UDP ペイロードサイズ (udp-bufsize / zone-udp-bufsize)。
+    // 0 なら既定の 1232。受信 OPT の解析では設定しない。
+    uint16_t server_udp_size;
     
     // DNS Cookie
     bool has_cookie;

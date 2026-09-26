@@ -3320,7 +3320,8 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     if ((size_t)offset + 11 + rdlen <= max_res_len) {
         res[offset++] = 0; // Root name
         res[offset++] = 0; res[offset++] = 41; // TYPE OPT
-        res[offset++] = 1232 >> 8; res[offset++] = 1232 & 0xFF; // UDP Payload size
+        uint16_t udp_size = (edns && edns->server_udp_size) ? edns->server_udp_size : 1232;
+        res[offset++] = udp_size >> 8; res[offset++] = udp_size & 0xFF; // UDP Payload size
         
         res[offset++] = rcode_ext; 
         res[offset++] = 0; // Version (0)

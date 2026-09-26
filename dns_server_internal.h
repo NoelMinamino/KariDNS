@@ -158,6 +158,12 @@ typedef struct {
   bool has_server_addr;
   bool quota_yield;
   struct timespec connect_time;
+  /* zone-tcp-* の適用状態 (apply_zone_tcp_opts)。0 = 未適用 / 未取得 */
+  int applied_mss;
+  int applied_rcvbuf;
+  int applied_sndbuf;
+  int orig_rcvbuf;   /* ゾーン値を当てる前の SO_RCVBUF (未指定ゾーンへ戻すため)。-1 = 取得失敗 */
+  int orig_sndbuf;
 } tcp_stream_ctx_t;
 
 typedef struct {
@@ -441,6 +447,9 @@ void *query_logger_thread_func(void *arg);
 void init_async_io_pool(void);
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
+void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
+void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss);
+void apply_zone_tcp_opts(int fd, tcp_stream_ctx_t *c, const zone_config_t *zcfg);
 
 #define ASYNC_IO_POOL_SIZE 16
 #define ASYNC_IO_QUEUE_CAPACITY 4096

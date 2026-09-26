@@ -11,6 +11,7 @@
 #include <grp.h>
 #include <limits.h> // PATH_MAX, NAME_MAX
 #include <netinet/in.h>
+#include <netinet/tcp.h> // TCP_MAXSEG
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/md5.h>
@@ -1189,6 +1190,74 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
   *dst = '\0';
 }
 
+/* tcp-window: listen() 前に listen ソケットの SO_RCVBUF / SO_SNDBUF を設定する。
+ * accept 済みソケットはこの値を引き継ぐため、SYN-ACK で通知する初期ウィンドウから効く。
+ * listen ソケットは reload で作り直さないので、変更の反映には再起動が必要。
+ * (tcp-mss はここでは設定しない。FreeBSD の TCP_MAXSEG は現在の t_maxseg 以下しか
+ * 受け付けず、未接続ソケットの t_maxseg は net.inet.tcp.mssdflt (既定 536) なので
+ * 通常の値は EINVAL になるうえ、SYN-ACK の MSS は経路 MTU から決まり引き継がれない。
+ * accept 直後に apply_tcp_mss() で各接続へ当てる。)
+ * ワーカーごとに listen ソケットを作るので、ログは verbose なワーカーだけが出す。 */
+STATIC_TEST void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose) {
+  if (!cfg || cfg->tcp_window <= 0) return;
+  static const int opts[2] = { SO_RCVBUF, SO_SNDBUF };
+  static const char *const names[2] = { "SO_RCVBUF", "SO_SNDBUF" };
+  for (int k = 0; k < 2; k++) {
+    int want = cfg->tcp_window;
+    if (setsockopt(fd, SOL_SOCKET, opts[k], &want, sizeof(want)) != 0) {
+      if (verbose)
+        syslog(LOG_WARNING, "[Network] Failed to set TCP %s to %d (tcp-window): %m", names[k], want);
+      continue;
+    }
+    int actual = 0;
+    socklen_t optlen = sizeof(actual);
+    if (verbose && getsockopt(fd, SOL_SOCKET, opts[k], &actual, &optlen) == 0 && actual < want)
+      syslog(LOG_WARNING,
+             "[Network] TCP %s truncated by OS: requested %d bytes (tcp-window), got %d bytes "
+             "(raise kern.ipc.maxsockbuf)", names[k], want, actual);
+  }
+}
+
+/* tcp-mss / zone-tcp-mss: 確立済み接続の送信 MSS を下げる。FreeBSD の TCP_MAXSEG は
+ * 現在の MSS を超える値を EINVAL にし、相手へ通知済みの MSS も変わらないため、
+ * 一度下げた値は接続が終わるまで残る (複数の値が当たる場合は最小値が勝つ)。 */
+STATIC_TEST void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss) {
+#ifdef TCP_MAXSEG
+  if (mss <= 0 || (c->applied_mss != 0 && mss >= c->applied_mss)) return;
+  setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
+  c->applied_mss = mss;
+#else
+  (void)fd; (void)c; (void)mss;
+#endif
+}
+
+/* zone-tcp-window / zone-tcp-sndbuf の1項目分。want == 0 (このゾーンは未指定) なら、
+ * 以前のクエリで別ゾーンの値を当てていた場合に限り元の値へ戻す。 */
+static void apply_zone_sockbuf(int fd, int opt, int want, int *applied, int *orig) {
+  if (want > 0) {
+    if (*applied == want) return;
+    if (*orig == 0) {
+      socklen_t optlen = sizeof(*orig);
+      if (getsockopt(fd, SOL_SOCKET, opt, orig, &optlen) != 0 || *orig <= 0) *orig = -1;
+    }
+    setsockopt(fd, SOL_SOCKET, opt, &want, sizeof(want));
+    *applied = want;
+  } else if (*applied != 0) {
+    if (*orig > 0) setsockopt(fd, SOL_SOCKET, opt, orig, sizeof(*orig));
+    *applied = 0;
+  }
+}
+
+/* zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf を accept 済みソケットへ適用する。
+ * ゾーンはクエリを読むまで分からないため、1接続で複数ゾーンへ問い合わせると
+ * クエリごとに切り替わる (値が変わるときだけ setsockopt する)。MSS だけは
+ * apply_tcp_mss() の通り下げる方向のみで、戻さない。 */
+STATIC_TEST void apply_zone_tcp_opts(int fd, tcp_stream_ctx_t *c, const zone_config_t *zcfg) {
+  if (zcfg) apply_tcp_mss(fd, c, zcfg->zone_tcp_mss);
+  apply_zone_sockbuf(fd, SO_RCVBUF, zcfg ? zcfg->zone_tcp_window : 0, &c->applied_rcvbuf, &c->orig_rcvbuf);
+  apply_zone_sockbuf(fd, SO_SNDBUF, zcfg ? zcfg->zone_tcp_sndbuf : 0, &c->applied_sndbuf, &c->orig_sndbuf);
+}
+
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
 #ifndef CPU_SETSIZE
@@ -1252,6 +1321,7 @@ void *worker_thread_func(void *arg) {
 #else
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
+        apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
         if (bind(tcp_fd, (struct sockaddr *)&addr4, sizeof(addr4)) == 0) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
@@ -1274,6 +1344,7 @@ void *worker_thread_func(void *arg) {
 #else
         setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
+        apply_tcp_listen_opts(tcp_fd, active_cfg, ctx->thread_id == 0);
         if (bind(tcp_fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
           listen(tcp_fd, 1024);
           limit_server_socket_rights(tcp_fd, true);
@@ -1620,6 +1691,12 @@ worker_startup_success:;
         // TCP
         int active_tcp_fd = ev_list[i].ident;
         int accept_count = 0;
+        int accept_tcp_mss = 0;
+        rcu_reader_enter(ctx);
+        server_config_t *accept_cfg = acquire_config_snapshot();
+        if (accept_cfg) accept_tcp_mss = accept_cfg->tcp_mss;
+        release_config_snapshot(accept_cfg);
+        rcu_reader_exit(ctx);
         while (accept_count < 100) {
           struct sockaddr_storage client_addr;
           socklen_t client_len = sizeof(client_addr);
@@ -1651,6 +1728,7 @@ worker_startup_success:;
             continue;
           }
           clock_gettime(CLOCK_MONOTONIC, &ctx_tcp->connect_time);
+          apply_tcp_mss(client_fd, ctx_tcp, accept_tcp_mss);
           struct kevent ev_timeout;
           EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
                  10000, ctx_tcp);
@@ -1842,6 +1920,20 @@ process_tcp_client: ;
           bool is_synthetic_zone = (zcfg && zcfg->type &&
                                     (strcasecmp(zcfg->type, "program") == 0 ||
                                      strcasecmp(zcfg->type, "forward") == 0));
+
+          /* zone-tcp-*: zcfg は QNAME がゾーン頂点と一致したときだけ見つかるので
+           * (AXFR/IXFR 用)、それ以外は QNAME を含む最も近いゾーンを引き直す。
+           * どのゾーンにも指定がなければ検索自体を省く。AXFR ワーカーへ渡す前に
+           * 適用しておくことで、転送スレッドもこの値で送信する。 */
+          if (cfg && cfg->any_zone_tcp_opts) {
+            zone_config_t *tcp_zcfg = zcfg;
+            if (!tcp_zcfg && xfr_view) {
+              zone_db_entry_t *tcp_entry = find_zone_in_view(xfr_view, qname);
+              if (tcp_entry)
+                tcp_zcfg = find_zone_config_in_view(cfg, xfr_view->name, tcp_entry->domain);
+            }
+            apply_zone_tcp_opts(client_fd, ctx_tcp, tcp_zcfg);
+          }
 
           if ((qtype == 252 || qtype == 251) && !is_synthetic_zone) {
             bool allowed = false;
