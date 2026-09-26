@@ -1290,11 +1290,14 @@ static void test_async_io_pool_and_tasks(void) {
 
     // Wait and read response from sp_udp[1]
     alignas(udp_ipc_t) uint8_t rx_resp[512 + sizeof(udp_ipc_t)];
+    // Wait for the worker's reply before closing sp_udp[0]: on a slow (CI) VM a
+    // 500 ms poll could expire, and the worker would then send to a closed fd
+    // whose number the TCP socketpair below may already reuse.
     struct pollfd pfd = { .fd = sp_udp[1], .events = POLLIN };
-    if (poll(&pfd, 1, 500) > 0) {
-        ssize_t got = recv(sp_udp[1], rx_resp, sizeof(rx_resp), 0);
-        assert(got > (ssize_t)sizeof(udp_ipc_t));
-    }
+    int prc = poll(&pfd, 1, 10000);
+    assert(prc > 0);
+    ssize_t got_udp = recv(sp_udp[1], rx_resp, sizeof(rx_resp), 0);
+    assert(got_udp > (ssize_t)sizeof(udp_ipc_t));
     close(sp_udp[0]);
     close(sp_udp[1]);
 
@@ -1324,12 +1327,23 @@ static void test_async_io_pool_and_tasks(void) {
     enq_ok = enqueue_async_io_task(&tcp_task);
     assert(enq_ok == true);
 
-    struct pollfd pfd_tcp = { .fd = sp_tcp[1], .events = POLLIN };
-    if (poll(&pfd_tcp, 1, 500) > 0) {
-        uint8_t tcp_rx[512];
-        ssize_t got = recv(sp_tcp[1], tcp_rx, sizeof(tcp_rx), 0);
-        assert(got > 2); // 2-byte prefix + DNS message
+    // The worker sends the 2-byte length prefix and the message with separate
+    // send() calls, so one recv() may return just the prefix: read until the
+    // worker closes its end (it closes client_fd after the reply).
+    uint8_t tcp_rx[512];
+    size_t tcp_got = 0;
+    for (;;) {
+        struct pollfd pfd_tcp = { .fd = sp_tcp[1], .events = POLLIN };
+        int trc = poll(&pfd_tcp, 1, 10000);
+        assert(trc > 0);
+        ssize_t n = recv(sp_tcp[1], tcp_rx + tcp_got, sizeof(tcp_rx) - tcp_got, 0);
+        if (n < 0 && errno == EINTR) continue;
+        assert(n >= 0);
+        if (n == 0 || tcp_got + (size_t)n == sizeof(tcp_rx)) { tcp_got += (size_t)n; break; }
+        tcp_got += (size_t)n;
     }
+    assert(tcp_got > 2); // 2-byte prefix + DNS message
+    assert(tcp_got == 2 + (((size_t)tcp_rx[0] << 8) | tcp_rx[1]));
     close(sp_tcp[1]);
 
     // Stop pool
