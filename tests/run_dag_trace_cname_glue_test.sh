@@ -65,6 +65,14 @@ socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname('udp')) or die "socket: $!";
 bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
 
 my $example_count = 0;
+my %deleg_count;
+
+sub enc_name {
+    my ($n) = @_;
+    my $w = "";
+    for my $l (split /\./, $n) { $w .= chr(length($l)) . $l; }
+    return $w . "\x00";
+}
 
 while (1) {
     my $query;
@@ -102,6 +110,7 @@ while (1) {
         $resp = $qid . pack("nnnnn", 0x8405, 1, 0, 0, 0) . substr($query, 12, $off + 4 - 12);
     } elsif ($qname eq "" || $qname eq ".") {
         $example_count = 0;
+        %deleg_count = ();
         # Root NS query: return a.root-servers.net with glue 127.0.0.1
         $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 1) .
                 "\x00" . pack("nn", 2, 1) .
@@ -112,6 +121,30 @@ while (1) {
         $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
                 "\x01a\x0croot-servers\x03net\x00" . pack("nn", 1, 1) .
                 "\x01a\x0croot-servers\x03net\x00" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("127.0.0.1");
+    } elsif ($qname =~ /^(indomain|sibling)\.test\.$/i && $qtype == 1) {
+        # +glue=indomain scenarios:
+        #   indomain.test NS ns1.indomain.test (in-domain glue -> trusted)
+        #   sibling.test  NS ns1.other.test    (out-of-domain glue -> ignored by +glue=indomain)
+        my $zone = lc($1) . ".test";
+        my $ns = ($zone eq "indomain.test") ? "ns1.indomain.test" : "ns1.other.test";
+        my $zw = enc_name($zone);
+        my $nw = enc_name($ns);
+        if (++$deleg_count{$zone} == 1) {
+            $resp = $qid . pack("nnnnn", 0x8000, 1, 0, 1, 1) .
+                    $zw . pack("nn", 1, 1) .
+                    $zw . pack("nnNn", 2, 1, 300, length($nw)) . $nw .
+                    $nw . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
+        } else {
+            $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 0) .
+                    $zw . pack("nn", 1, 1) .
+                    $zw . pack("nnNn", 1, 1, 300, 4) . inet_aton("192.0.2.200");
+        }
+    } elsif ($qname =~ /^ns1\.(indomain|other)\.test\.$/i && $qtype == 1) {
+        # NS address resolution for the scenarios above
+        my $nw = enc_name(lc($qname));
+        $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
+                $nw . pack("nn", 1, 1) .
+                $nw . pack("nnNn", 1, 1, 300, 4) . inet_aton("127.0.0.1");
     } elsif ($qname =~ /^ns1\.external\.org\./i) {
         # Glue resolution query: return 127.0.0.1
         $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
@@ -188,6 +221,46 @@ else
     echo "  Output:"
     echo "$OUT" | sed 's/^/    /'
     FAILED=$((FAILED + 1))
+fi
+
+echo "=== 3a. Testing +trace +glue=indomain (BIND named 9.18.41/9.20.15+ strict glue) ==="
+if [ "$DAG" = "dig" ]; then
+    echo "Test: +glue=indomain ... SKIP (dag-only option)"
+else
+    echo -n "Test: +glue=indomain trusts in-domain glue without resolver lookup ... "
+    : > "$QUERY_LOG"
+    OUT=$("$DAG" @127.0.0.1 -p $PORT indomain.test A +trace +glue=indomain +timeout=2 +nohexdump 2>&1 || true)
+    if echo "$OUT" | grep -q "192\.0\.2\.200" && ! grep -q "^ns1\.indomain\.test\." "$QUERY_LOG" && ! echo "$OUT" | grep -q "ignoring out-of-domain glue"; then
+        echo "OK"
+    else
+        echo "FAILED"; sed 's/^/    /' "$QUERY_LOG"; echo "$OUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+    fi
+
+    echo -n "Test: +glue=indomain ignores sibling glue and resolves the NS name ... "
+    : > "$QUERY_LOG"
+    OUT=$("$DAG" @127.0.0.1 -p $PORT sibling.test A +trace +glue=indomain +timeout=2 +nohexdump 2>&1 || true)
+    if echo "$OUT" | grep -q "192\.0\.2\.200" && grep -q "^ns1\.other\.test\. 1$" "$QUERY_LOG" && echo "$OUT" | grep -q "ignoring out-of-domain glue for 'ns1\.other\.test\.'"; then
+        echo "OK"
+    else
+        echo "FAILED"; sed 's/^/    /' "$QUERY_LOG"; echo "$OUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+    fi
+
+    echo -n "Test: +glue (all) still uses sibling glue ... "
+    : > "$QUERY_LOG"
+    OUT=$("$DAG" @127.0.0.1 -p $PORT sibling.test A +trace +glue +timeout=2 +nohexdump 2>&1 || true)
+    if echo "$OUT" | grep -q "192\.0\.2\.200" && ! grep -q "^ns1\.other\.test\." "$QUERY_LOG"; then
+        echo "OK"
+    else
+        echo "FAILED"; sed 's/^/    /' "$QUERY_LOG"; echo "$OUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+    fi
+
+    echo -n "Test: invalid +glue mode is rejected ... "
+    OUT=$("$DAG" @127.0.0.1 -p $PORT sibling.test A +trace +glue=bogus 2>&1 || true)
+    if echo "$OUT" | grep -q "invalid +glue mode"; then
+        echo "OK"
+    else
+        echo "FAILED"; echo "$OUT" | sed 's/^/    /'; FAILED=$((FAILED + 1))
+    fi
 fi
 
 echo "=== 3b. Testing +trace hides ADDITIONAL section like dig (+additional re-enables) ==="

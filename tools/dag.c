@@ -3185,8 +3185,10 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses;\n"
         "                               ignores ADDITIONAL section unless +glue is given; implies +noadditional)\n"
         "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +noglue by default)\n"
-        "  +[no]glue                    Use in-bailiwick Glue records from ADDITIONAL section for +trace / +nssearch\n"
+        "  +[no]glue                    Use Glue records (A/AAAA) from ADDITIONAL section for +trace / +nssearch\n"
         "                               (+noglue: ignore ADDITIONAL and resolve NS names via resolver) [default: +noglue]\n"
+        "  +glue=all|indomain           all: same as +glue; indomain: trust only glue whose NS target is under the\n"
+        "                               NS owner (BIND named 9.18.41/9.20.15+ strict glue), resolve the rest\n"
         "  +[no]search / +[no]defname   Use search list defined in /etc/resolv.conf\n"
         "  +domain=domain               Set default search domain\n"
         "  +ndots=N                     Set search NDOTS threshold\n"
@@ -3826,8 +3828,18 @@ void prescan_always_global_options(int argc, char **argv, query_spec_t *global_s
         else if (strcmp(argv[i], "+noldnsz") == 0) global_spec->use_ldnsz = false;
         else if (strcmp(argv[i], "-m") == 0) global_spec->qo.mem_debug = true;
         else if (strcmp(argv[i], "+allcompare") == 0) g_want_allcompare = true;
-        else if (strcmp(argv[i], "+glue") == 0) global_spec->qo.use_glue = true;
-        else if (strcmp(argv[i], "+noglue") == 0) global_spec->qo.use_glue = false;
+        else if (strcmp(argv[i], "+glue") == 0 || strcmp(argv[i], "+glue=all") == 0) {
+            global_spec->qo.use_glue = true;
+            global_spec->qo.glue_indomain = false;
+        }
+        else if (strcmp(argv[i], "+glue=indomain") == 0) {
+            global_spec->qo.use_glue = true;
+            global_spec->qo.glue_indomain = true;
+        }
+        else if (strcmp(argv[i], "+noglue") == 0) {
+            global_spec->qo.use_glue = false;
+            global_spec->qo.glue_indomain = false;
+        }
         else if (strcmp(argv[i], "+search") == 0 || strcmp(argv[i], "+defname") == 0) {
             global_spec->qo.use_search_list = true;
             global_spec->qo.use_glue = false;
@@ -4232,10 +4244,18 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->do_nssearch = true;
         } else if (strcmp(arg, "+nonssearch") == 0) {
             spec->do_nssearch = false;
-        } else if (strcmp(arg, "+glue") == 0) {
+        } else if (strcmp(arg, "+glue") == 0 || strcmp(arg, "+glue=all") == 0) {
             spec->qo.use_glue = true;
+            spec->qo.glue_indomain = false;
+        } else if (strcmp(arg, "+glue=indomain") == 0) {
+            spec->qo.use_glue = true;
+            spec->qo.glue_indomain = true;
+        } else if (strncmp(arg, "+glue=", 6) == 0) {
+            fprintf(stderr, "dag: invalid +glue mode '%s' (expected 'all' or 'indomain')\n", arg + 6);
+            return -1;
         } else if (strcmp(arg, "+noglue") == 0) {
             spec->qo.use_glue = false;
+            spec->qo.glue_indomain = false;
         } else if (strcmp(arg, "+search") == 0 || strcmp(arg, "+defname") == 0) {
             spec->qo.use_search_list = true;
             spec->qo.use_glue = false;

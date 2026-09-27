@@ -28,14 +28,66 @@ static void record_ldnsz_result(const char *server, ssize_t n, const uint8_t *re
  * out配列(out_cap個まで)に集める。roffは呼び出し元で更新される。 */
 static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff,
                                 int section_count, uint16_t want_type,
-                                char out[][256], int *out_count, int out_cap) {
+                                char out[][256], char owners[][256], int *out_count, int out_cap) {
     for (int i = 0; i < section_count; i++) {
         dns_record_t rec; uint16_t type;
         if (parse_resource_record(pkt, pkt_len, roff, &g_dag_arena, &rec, &type) != 0) break;
         if (type == want_type && *out_count < out_cap && rec.rdata_count > 0) {
+            if (owners) snprintf(owners[*out_count], 256, "%s", rec.name);
             snprintf(out[(*out_count)++], 256, "%s", rec.rdata[0]);
         }
     }
+}
+
+/* name が owner と等しいか owner の配下なら true (大文字小文字・末尾ドット無視) */
+static bool name_is_subdomain(const char *name, const char *owner) {
+    size_t nl = strlen(name), ol = strlen(owner);
+    while (nl > 0 && name[nl - 1] == '.') nl--;
+    while (ol > 0 && owner[ol - 1] == '.') ol--;
+    if (ol == 0) return true; /* root */
+    if (nl < ol) return false;
+    if (strncasecmp(name + nl - ol, owner, ol) != 0) return false;
+    return nl == ol || name[nl - ol - 1] == '.';
+}
+
+/* ADDITIONAL セクションから NS 名に一致する A/AAAA (glue) を集める。
+ * qo->glue_indomain のときは BIND named 9.18.41/9.20.15 以降と同様、NS のターゲットが
+ * NS の owner 配下 (in-domain) の glue だけを採用し、それ以外 (sibling/unrelated) は
+ * 無視して報告する。無視された NS 名は後段で解決される。 */
+static int collect_glue(const uint8_t *pkt, size_t pkt_len, size_t *roff, int arcount,
+                        char ns_names[][256], char ns_owners[][256], int ns_count,
+                        const query_opts_t *qo, char out[][64], int count, int out_cap, bool report) {
+    char ignored[16][256];
+    int ignored_count = 0;
+    for (int i = 0; i < arcount; i++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(pkt, pkt_len, roff, &g_dag_arena, &rec, &type) != 0) break;
+        bool want = false;
+        if (type == 1 && (qo->pref_family == AF_UNSPEC || qo->pref_family == AF_INET)) want = true;
+        if (type == 28 && (qo->pref_family == AF_UNSPEC || qo->pref_family == AF_INET6)) want = true;
+        if (!want || rec.rdata_count == 0) continue;
+        for (int j = 0; j < ns_count; j++) {
+            if (strcasecmp(rec.name, ns_names[j]) != 0) continue;
+            if (qo->glue_indomain && !name_is_subdomain(ns_names[j], ns_owners[j])) {
+                bool seen = false;
+                for (int k = 0; k < ignored_count; k++) {
+                    if (strcasecmp(ignored[k], ns_names[j]) == 0) { seen = true; break; }
+                }
+                if (!seen && ignored_count < 16) {
+                    snprintf(ignored[ignored_count++], 256, "%s", ns_names[j]);
+                    if (report) {
+                        printf(";; ignoring out-of-domain glue for '%s' (NS of '%s')\n", ns_names[j], ns_owners[j]);
+                    }
+                }
+                continue;
+            }
+            if (count < out_cap) {
+                snprintf(out[count++], 64, "%s", rec.rdata[0]);
+            }
+            break;
+        }
+    }
+    return count;
 }
 
 typedef struct {
@@ -228,25 +280,17 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             }
 
             char rns_names[32][256];
+            char rns_owners[32][256];
             int rns_count = 0;
-            collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, &rns_count, 32);
-            collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, &rns_count, 32);
+            collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
+            collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
             /* +noglue (default, BIND 9.20+ dig compatible): ADDITIONAL section is ignored and
              * nameserver addresses are resolved via the configured resolver below.
-             * +glue: legacy behavior, use in-bailiwick A/AAAA from ADDITIONAL first. */
-            for (int i = 0; root_qo.use_glue && i < r_ar; i++) {
-                dns_record_t rec; uint16_t type;
-                if (parse_resource_record(root_resp, root_n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-                bool want = false;
-                if (type == 1 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET)) want = true;
-                if (type == 28 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET6)) want = true;
-                if (want && rec.rdata_count > 0) {
-                    for (int j = 0; j < rns_count; j++) {
-                        if (strcasecmp(rec.name, rns_names[j]) == 0 && target_count < 32) {
-                            snprintf(target_ips[target_count++], sizeof(target_ips[0]), "%s", rec.rdata[0]);
-                        }
-                    }
-                }
+             * +glue: legacy behavior, use A/AAAA from ADDITIONAL first.
+             * +glue=indomain: use only in-domain glue (BIND named 9.18.41/9.20.15+). */
+            if (root_qo.use_glue) {
+                target_count = collect_glue(root_resp, root_n, &offset, r_ar, rns_names, rns_owners, rns_count,
+                                            &root_qo, target_ips, target_count, 32, !dopt->yaml);
             }
 
             if (rns_count > 0) {
@@ -401,26 +445,15 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             }
 
             char ns_names[16][256];
+            char ns_owners[16][256];
             int ns_count = 0;
-            collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, &ns_count, 16);
+            collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, ns_owners, &ns_count, 16);
 
             int new_target_count = 0;
             char new_target_ips[16][64];
-            for (int i = 0; hop_qo.use_glue && i < arcount; i++) {
-                dns_record_t rec; uint16_t type;
-                if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
-                bool want = false;
-                if (type == 1 && (hop_qo.pref_family == AF_UNSPEC || hop_qo.pref_family == AF_INET)) want = true;
-                if (type == 28 && (hop_qo.pref_family == AF_UNSPEC || hop_qo.pref_family == AF_INET6)) want = true;
-                if (want && rec.rdata_count > 0) {
-                    bool match = false;
-                    for (int j=0; j<ns_count; j++) {
-                        if (strcasecmp(rec.name, ns_names[j]) == 0) { match = true; break; }
-                    }
-                    if (match && new_target_count < 16) {
-                        snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
-                    }
-                }
+            if (hop_qo.use_glue) {
+                new_target_count = collect_glue(resp, n, &offset, arcount, ns_names, ns_owners, ns_count,
+                                                &hop_qo, new_target_ips, 0, 16, !dopt->yaml);
             }
 
             if (new_target_count == 0 && ns_count > 0) {
@@ -573,6 +606,7 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
             if (want && rec.rdata_count > 0) {
                 for (int j = 0; j < ns_count; j++) {
                     if (strcasecmp(rec.name, ns_names[j]) == 0) {
+                        if (qo.glue_indomain && !name_is_subdomain(ns_names[j], qname)) continue;
                         ns_has_glue[j] = true;
                         bool duplicate = false;
                         for (int d = 0; d < all_ns_count; d++) {
