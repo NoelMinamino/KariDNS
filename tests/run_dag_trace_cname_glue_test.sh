@@ -190,6 +190,29 @@ else
     FAILED=$((FAILED + 1))
 fi
 
+echo "=== 3b. Testing +trace hides ADDITIONAL section like dig (+additional re-enables) ==="
+echo -n "Test: Root glue A record is not displayed by default ... "
+OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +timeout=2 +nohexdump 2>&1 || true)
+if [ "$DAG" = "dig" ]; then OUT=$(dig @127.0.0.1 -p $PORT example.com A +trace +timeout=2 2>&1 || true); fi
+if ! echo "$OUT" | grep -qE "^a\.root-servers\.net\.[[:space:]].*[[:space:]]A[[:space:]]"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+if [ "$DAG" != "dig" ]; then
+    echo -n "Test: +trace +additional displays root glue A record ... "
+    OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +additional +timeout=2 +nohexdump 2>&1 || true)
+    if echo "$OUT" | grep -qE "^a\.root-servers\.net\.[[:space:]].*[[:space:]]A[[:space:]]"; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "$OUT" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    fi
+fi
+
 echo "=== 4. Testing +trace against authoritative-only @server (RA=0) ==="
 echo -n "Test: NS names are resolved via system resolver, not the non-recursive @server ... "
 AUTH_PORT=$((PORT + 1))
