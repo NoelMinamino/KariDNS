@@ -38,6 +38,86 @@ static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff
     }
 }
 
+typedef struct {
+    const char *server;
+    int port;
+    bool is_system; /* @server ではなくシステムリゾルバを使う */
+} ns_resolver_t;
+
+/* NS 名のアドレス解決に使うリゾルバを決める。
+ * BIND dig +trace は @server を最初の ". NS" 問い合わせにのみ使い、NS 名の解決は
+ * システムリゾルバで行う。@198.41.0.4 のような権威専用サーバ (RA=0) に A/AAAA を
+ * 再帰要求しても referral しか返らないため、その場合はシステムリゾルバへ切り替える。
+ * @server が再帰応答する (RA=1) 場合は従来どおり @server (と -p) を使う。 */
+static void choose_ns_resolver(ns_resolver_t *rsv, const char *eff_server, int port, bool server_ra) {
+    rsv->server = eff_server;
+    rsv->port = port;
+    rsv->is_system = false;
+    if (!server_ra) {
+        const char *sys = get_system_resolver();
+        if (sys && sys[0] != '\0' && strcmp(sys, eff_server) != 0) {
+            rsv->server = sys;
+            rsv->port = 53;
+            rsv->is_system = true;
+        }
+    }
+}
+
+static int resolve_ns_addr_type(const char *ns_name, uint16_t qtype, const ns_resolver_t *rsv,
+                                const query_opts_t *base_qo, bool use_tcp,
+                                char out[][64], int count, int out_cap) {
+    query_opts_t resolve_qo = *base_qo;
+    resolve_qo.rd_flag = true;
+    /* TSIG 鍵は @server 用なのでシステムリゾルバには付けない */
+    if (rsv->is_system) resolve_qo.want_tsig = false;
+    uint8_t res_qbuf[512];
+    uint8_t res_req_mac[64];
+    size_t res_req_mac_len = 0;
+    size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), ns_name, qtype, &resolve_qo, res_req_mac, &res_req_mac_len);
+    if (res_qlen == 0) return count;
+    uint8_t res_resp[4096];
+    ssize_t res_n = do_dns_exchange_auto(rsv->server, rsv->port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, use_tcp);
+    if (res_n <= 12) return count;
+    int qd = (res_resp[4] << 8) | res_resp[5];
+    int an = (res_resp[6] << 8) | res_resp[7];
+    size_t roff = 12;
+    for (int k = 0; k < qd; k++) {
+        char *d;
+        if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) return count;
+        roff += 4;
+    }
+    for (int k = 0; k < an; k++) {
+        dns_record_t rec; uint16_t type;
+        if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
+        if (type == qtype && rec.rdata_count > 0 && count < out_cap) {
+            snprintf(out[count++], 64, "%s", rec.rdata[0]);
+        }
+    }
+    return count;
+}
+
+/* NS 名群の A/AAAA を解決して out に集める。解決できなかった NS 名は dig と同様に報告する。 */
+static int resolve_ns_addresses(char names[][256], int name_count, const ns_resolver_t *rsv,
+                                const query_opts_t *base_qo, bool use_tcp,
+                                char out[][64], int out_cap, bool report) {
+    int count = 0;
+    for (int j = 0; j < name_count && count < out_cap; j++) {
+        int before = count;
+        if (base_qo->pref_family == AF_UNSPEC || base_qo->pref_family == AF_INET) {
+            count = resolve_ns_addr_type(names[j], 1 /* A */, rsv, base_qo, use_tcp, out, count, out_cap);
+        }
+        if (count < out_cap && (base_qo->pref_family == AF_UNSPEC || base_qo->pref_family == AF_INET6)) {
+            count = resolve_ns_addr_type(names[j], 28 /* AAAA */, rsv, base_qo, use_tcp, out, count, out_cap);
+        }
+        if (count == before && report) {
+            size_t nlen = strlen(names[j]);
+            if (nlen > 1 && names[j][nlen - 1] == '.') nlen--;
+            printf(";; couldn't get address for '%.*s' from %s#%d\n", (int)nlen, names[j], rsv->server, rsv->port);
+        }
+    }
+    return count;
+}
+
 static int run_trace_query_impl(const char *qname, const char *server, const char *qtype_s, int port, bool use_tcp, bool force_udp, bool no_hexdump_query, bool no_hexdump_response, const query_opts_t *qo, const char *hex_payload, const display_opts_t *dopt) {
     bool eff_use_tcp = (!force_udp && use_tcp);
     const char *eff_server = server ? server : get_system_resolver();
@@ -74,6 +154,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
     for (int cname_depth = 0; cname_depth <= TRACE_MAX_CNAME_DEPTH; cname_depth++) {
         char target_ips[32][64];
         int target_count = 0;
+        ns_resolver_t trace_rsv = { eff_server, port, false };
 
         query_opts_t root_qo = *qo;
         root_qo.rd_flag = true;
@@ -168,61 +249,16 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
                 }
             }
 
-            if (target_count == 0 && rns_count > 0) {
-                query_opts_t resolve_qo = root_qo;
-                resolve_qo.rd_flag = true;
-                for (int j = 0; j < rns_count && target_count < 32; j++) {
-                    if (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET) {
-                        uint8_t res_qbuf[512];
-                        uint8_t res_req_mac[64];
-                        size_t res_req_mac_len = 0;
-                        size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), rns_names[j], 1 /* A */, &resolve_qo, res_req_mac, &res_req_mac_len);
-                        uint8_t res_resp[4096];
-                        ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
-                        if (res_n > 12) {
-                            int qd = (res_resp[4] << 8) | res_resp[5];
-                            int an = (res_resp[6] << 8) | res_resp[7];
-                            size_t roff = 12;
-                            for (int k = 0; k < qd; k++) {
-                                char *d;
-                                if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) break;
-                                roff += 4;
-                            }
-                            for (int k = 0; k < an; k++) {
-                                dns_record_t rec; uint16_t type;
-                                if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
-                                if (type == 1 && rec.rdata_count > 0 && target_count < 32) {
-                                    snprintf(target_ips[target_count++], sizeof(target_ips[0]), "%s", rec.rdata[0]);
-                                }
-                            }
-                        }
-                    }
-                    if (target_count < 32 && (root_qo.pref_family == AF_UNSPEC || root_qo.pref_family == AF_INET6)) {
-                        uint8_t res_qbuf[512];
-                        uint8_t res_req_mac[64];
-                        size_t res_req_mac_len = 0;
-                        size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), rns_names[j], 28 /* AAAA */, &resolve_qo, res_req_mac, &res_req_mac_len);
-                        uint8_t res_resp[4096];
-                        ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
-                        if (res_n > 12) {
-                            int qd = (res_resp[4] << 8) | res_resp[5];
-                            int an = (res_resp[6] << 8) | res_resp[7];
-                            size_t roff = 12;
-                            for (int k = 0; k < qd; k++) {
-                                char *d;
-                                if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) break;
-                                roff += 4;
-                            }
-                            for (int k = 0; k < an; k++) {
-                                dns_record_t rec; uint16_t type;
-                                if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
-                                if (type == 28 && rec.rdata_count > 0 && target_count < 32) {
-                                    snprintf(target_ips[target_count++], sizeof(target_ips[0]), "%s", rec.rdata[0]);
-                                }
-                            }
-                        }
-                    }
+            if (rns_count > 0) {
+                /* @server が再帰応答しない (RA=0, 例: @198.41.0.4) 場合は dig と同様に
+                 * システムリゾルバで NS 名を解決する。 */
+                ns_resolver_t rsv;
+                choose_ns_resolver(&rsv, eff_server, port, (root_resp[3] & 0x80) != 0);
+                if (target_count == 0) {
+                    target_count = resolve_ns_addresses(rns_names, rns_count, &rsv, &root_qo, eff_use_tcp,
+                                                        target_ips, 32, !dopt->yaml);
                 }
+                trace_rsv = rsv;
             }
         }
 
@@ -388,60 +424,8 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             }
 
             if (new_target_count == 0 && ns_count > 0) {
-                query_opts_t resolve_qo = hop_qo;
-                resolve_qo.rd_flag = true;
-                for (int j = 0; j < ns_count && new_target_count < 16; j++) {
-                    if (hop_qo.pref_family == AF_UNSPEC || hop_qo.pref_family == AF_INET) {
-                        uint8_t res_qbuf[512];
-                        uint8_t res_req_mac[64];
-                        size_t res_req_mac_len = 0;
-                        size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), ns_names[j], 1 /* A */, &resolve_qo, res_req_mac, &res_req_mac_len);
-                        uint8_t res_resp[4096];
-                        ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
-                        if (res_n > 12) {
-                            int r_qd = (res_resp[4] << 8) | res_resp[5];
-                            int r_an = (res_resp[6] << 8) | res_resp[7];
-                            size_t roff = 12;
-                            for (int k = 0; k < r_qd; k++) {
-                                char *d;
-                                if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) break;
-                                roff += 4;
-                            }
-                            for (int k = 0; k < r_an; k++) {
-                                dns_record_t rec; uint16_t type;
-                                if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
-                                if (type == 1 && rec.rdata_count > 0 && new_target_count < 16) {
-                                    snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
-                                }
-                            }
-                        }
-                    }
-                    if (new_target_count < 16 && (hop_qo.pref_family == AF_UNSPEC || hop_qo.pref_family == AF_INET6)) {
-                        uint8_t res_qbuf[512];
-                        uint8_t res_req_mac[64];
-                        size_t res_req_mac_len = 0;
-                        size_t res_qlen = build_and_sign_query(res_qbuf, sizeof(res_qbuf), ns_names[j], 28 /* AAAA */, &resolve_qo, res_req_mac, &res_req_mac_len);
-                        uint8_t res_resp[4096];
-                        ssize_t res_n = do_dns_exchange_auto(eff_server, port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, eff_use_tcp);
-                        if (res_n > 12) {
-                            int r_qd = (res_resp[4] << 8) | res_resp[5];
-                            int r_an = (res_resp[6] << 8) | res_resp[7];
-                            size_t roff = 12;
-                            for (int k = 0; k < r_qd; k++) {
-                                char *d;
-                                if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) break;
-                                roff += 4;
-                            }
-                            for (int k = 0; k < r_an; k++) {
-                                dns_record_t rec; uint16_t type;
-                                if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
-                                if (type == 28 && rec.rdata_count > 0 && new_target_count < 16) {
-                                    snprintf(new_target_ips[new_target_count++], sizeof(new_target_ips[0]), "%s", rec.rdata[0]);
-                                }
-                            }
-                        }
-                    }
-                }
+                new_target_count = resolve_ns_addresses(ns_names, ns_count, &trace_rsv, &hop_qo, eff_use_tcp,
+                                                        new_target_ips, 16, !dopt->yaml);
             }
 
             if (new_target_count == 0) {

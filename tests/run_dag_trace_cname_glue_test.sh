@@ -56,8 +56,11 @@ use strict;
 use warnings;
 use Socket;
 
-my $port = $ARGV[0] or die "Usage: $0 <port> [query_log]\n";
+my $port = $ARGV[0] or die "Usage: $0 <port> [query_log] [authonly]\n";
 my $query_log = $ARGV[1];
+# authonly: behave like an authoritative-only root server (RA=0) whose NS name
+# can only be resolved through the system resolver (e.g. dig +trace @198.41.0.4)
+my $authonly = (defined $ARGV[2] && $ARGV[2] eq "authonly");
 socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname('udp')) or die "socket: $!";
 bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
 
@@ -88,7 +91,16 @@ while (1) {
     }
 
     my $resp = "";
-    if ($qname eq "" || $qname eq ".") {
+    if ($authonly && ($qname eq "" || $qname eq ".")) {
+        # Root NS query (AA=1, RA=0): NS ns.root.invalid with glue 127.0.0.1
+        $resp = $qid . pack("nnnnn", 0x8400, 1, 1, 0, 1) .
+                "\x00" . pack("nn", 2, 1) .
+                "\x00" . pack("nnNn", 2, 1, 3600, 17) . "\x02ns\x04root\x07invalid\x00" .
+                "\x02ns\x04root\x07invalid\x00" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("127.0.0.1");
+    } elsif ($authonly) {
+        # Authoritative-only server refuses recursion
+        $resp = $qid . pack("nnnnn", 0x8405, 1, 0, 0, 0) . substr($query, 12, $off + 4 - 12);
+    } elsif ($qname eq "" || $qname eq ".") {
         $example_count = 0;
         # Root NS query: return a.root-servers.net with glue 127.0.0.1
         $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 1) .
@@ -178,7 +190,28 @@ else
     FAILED=$((FAILED + 1))
 fi
 
-echo "=== 4. Testing +trace +ldnsz emits ldns.jp trace viewer URL ==="
+echo "=== 4. Testing +trace against authoritative-only @server (RA=0) ==="
+echo -n "Test: NS names are resolved via system resolver, not the non-recursive @server ... "
+AUTH_PORT=$((PORT + 1))
+AUTH_LOG="$TMP_DIR/auth_queries.log"
+: > "$AUTH_LOG"
+perl "$TMP_DIR/mock_trace_server.pl" "$AUTH_PORT" "$AUTH_LOG" authonly &
+AUTH_PID=$!
+sleep 0.5
+OUT=$("$DAG" @127.0.0.1 -p $AUTH_PORT example.com A +trace +timeout=1 +tries=1 2>&1 || true)
+kill -9 "$AUTH_PID" 2>/dev/null || true
+if echo "$OUT" | grep -q "couldn't get address for 'ns\.root\.invalid'" && ! grep -q "^ns\.root\.invalid\." "$AUTH_LOG" && ! echo "$OUT" | grep -q "from 127\.0\.0\.1#$AUTH_PORT\$"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Queries:"
+    sed 's/^/    /' "$AUTH_LOG"
+    echo "  Output:"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== 5. Testing +trace +ldnsz emits ldns.jp trace viewer URL ==="
 if [ "$DAG" = "dig" ]; then
     echo "Test: +trace +ldnsz emits https://ldns.jp/trace/#c= URL ... SKIP (dag-only +ldnsz option)"
 else
