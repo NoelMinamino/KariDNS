@@ -150,7 +150,10 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             int rns_count = 0;
             collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, &rns_count, 32);
             collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, &rns_count, 32);
-            for (int i = 0; i < r_ar; i++) {
+            /* +noglue (default, BIND 9.20+ dig compatible): ADDITIONAL section is ignored and
+             * nameserver addresses are resolved via the configured resolver below.
+             * +glue: legacy behavior, use in-bailiwick A/AAAA from ADDITIONAL first. */
+            for (int i = 0; root_qo.use_glue && i < r_ar; i++) {
                 dns_record_t rec; uint16_t type;
                 if (parse_resource_record(root_resp, root_n, &offset, &g_dag_arena, &rec, &type) != 0) break;
                 bool want = false;
@@ -224,6 +227,10 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         }
 
         if (target_count == 0) {
+            if (root_n > 12 && !dopt->yaml) {
+                printf(";; No root nameserver addresses %s, stopping trace.\n",
+                       root_qo.use_glue ? "found" : "resolved");
+            }
             ret = 0;
             goto cleanup;
         }
@@ -363,7 +370,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
 
             int new_target_count = 0;
             char new_target_ips[16][64];
-            for (int i = 0; i < arcount; i++) {
+            for (int i = 0; hop_qo.use_glue && i < arcount; i++) {
                 dns_record_t rec; uint16_t type;
                 if (parse_resource_record(resp, n, &offset, &g_dag_arena, &rec, &type) != 0) break;
                 bool want = false;
@@ -439,7 +446,11 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
 
             if (new_target_count == 0) {
                 if (!dopt->yaml) {
-                    printf(";; No glue found for next hop, stopping trace.\n");
+                    if (hop_qo.use_glue) {
+                        printf(";; No glue found for next hop, stopping trace.\n");
+                    } else {
+                        printf(";; No nameserver addresses resolved for next hop, stopping trace.\n");
+                    }
                 }
                 break;
             }

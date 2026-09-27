@@ -217,13 +217,13 @@ dag [global-queryopt...] [query...]
 : When querying multiple nameservers or using failover lists, controls whether to try the next nameserver when receiving a `SERVFAIL` response.
 
 `+[no]trace`
-: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). By default, `dag +trace` utilizes in-bailiwick Glue records from the `ADDITIONAL` section of referral responses (`+glue`) to follow delegation paths down to authoritative servers, displaying each intermediate answer. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses.
+: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). By default (`+noglue`, matching BIND 9.20+ `dig` behavior), `dag +trace` ignores the `ADDITIONAL` section of referral responses and resolves the delegated nameserver names (A/AAAA) via the configured resolver (`@server` or `/etc/resolv.conf`) to follow delegation paths down to authoritative servers, displaying each intermediate answer. Specify `+glue` to restore the previous behavior of using in-bailiwick Glue records from the `ADDITIONAL` section (falling back to resolver lookups only when no glue is present). Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses.
 
 `+[no]nssearch`
 : Look up authoritative nameservers for the zone containing the query name and display the SOA record from each responding nameserver. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses. By default, `dag +nssearch` resolves nameserver addresses using the system resolver (matching BIND 9 `dig` behavior, `+noglue`). You can also specify `+glue` to query nameservers directly using in-bailiwick A/AAAA records from the `ADDITIONAL` section without consulting `/etc/resolv.conf` (useful in isolated or test network environments).
 
 `+[no]glue`
-: Control whether in-bailiwick Glue records (A/AAAA) present in the `ADDITIONAL` section are prioritized over system resolver lookups (`/etc/resolv.conf`). For `+trace`, `+glue` is enabled by default to follow referral chains. For `+nssearch`, `+noglue` is the default (matching BIND 9 `dig`), and enabling `+glue` allows `dag` to query authoritative nameservers directly using attached glue records from NS responses without relying on the system resolver.
+: Control whether in-bailiwick Glue records (A/AAAA) present in the `ADDITIONAL` section are prioritized over system resolver lookups (`/etc/resolv.conf`). For `+trace`, `+noglue` is the default (matching BIND 9.20+ `dig`, which no longer trusts `ADDITIONAL` section data while tracing); `+glue` restores the legacy behavior of following referral chains via attached glue records. For `+nssearch`, `+noglue` is the default (matching BIND 9 `dig`), and enabling `+glue` allows `dag` to query authoritative nameservers directly using attached glue records from NS responses without relying on the system resolver.
 
 `+[no]search`, `+[no]defname`
 : Enable or disable domain search list processing as defined in `/etc/resolv.conf`.
@@ -485,6 +485,7 @@ SERVER               | PROTO | RCODE    | QD | AN | NS | AR | TIME   | STATUS
 When `+ldnsz` is supplied:
 - **Single Server**: Generates a web inspector URL on `https://ldns.jp/?dnsz=<payload>`, allowing detailed GUI analysis of wire-format packets.
 - **Multiple Servers**: Generates a diff URL on `https://ldns.jp/diff/#c=<payload1>,<payload2>`, allowing visual side-by-side binary comparison.
+- **`+trace`**: Generates a trace viewer URL on `https://ldns.jp/trace/#c=<payload1>,<payload2>,...` (one payload per delegation hop, same encoding as the diff URL), allowing the delegation path to be inspected step by step.
 
 ---
 

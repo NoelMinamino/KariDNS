@@ -46,6 +46,7 @@ trap cleanup EXIT INT TERM
 
 # Create a mock DNS server handling trace steps:
 # 1. Root query (". NS") -> returns NS "a.root-servers.net" with glue "127.0.0.1"
+#    (default +noglue ignores that glue and asks "a.root-servers.net A" -> "127.0.0.1")
 # 2. Query "example.com A" -> returns referral to "ns1.external.org" WITHOUT glue
 # 3. Query "ns1.external.org A" (glue resolution fallback) -> returns "127.0.0.1"
 # 4. Query "example.com A" to authoritative -> returns "example.com CNAME cdn.example.net"
@@ -55,7 +56,8 @@ use strict;
 use warnings;
 use Socket;
 
-my $port = $ARGV[0] or die "Usage: $0 <port>\n";
+my $port = $ARGV[0] or die "Usage: $0 <port> [query_log]\n";
+my $query_log = $ARGV[1];
 socket(my $srv, PF_INET, SOCK_DGRAM, getprotobyname('udp')) or die "socket: $!";
 bind($srv, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
 
@@ -79,12 +81,24 @@ while (1) {
         $off += $len;
     }
 
+    my $qtype = unpack("n", substr($query, $off, 2));
+    if ($query_log && open(my $lfh, ">>", $query_log)) {
+        print $lfh "$qname $qtype\n";
+        close($lfh);
+    }
+
     my $resp = "";
     if ($qname eq "" || $qname eq ".") {
+        $example_count = 0;
         # Root NS query: return a.root-servers.net with glue 127.0.0.1
         $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 1) .
                 "\x00" . pack("nn", 2, 1) .
                 "\x00" . pack("nnNn", 2, 1, 3600, 20) . "\x01a\x0croot-servers\x03net\x00" .
+                "\x01a\x0croot-servers\x03net\x00" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("127.0.0.1");
+    } elsif ($qname =~ /^a\.root-servers\.net\./i && $qtype == 1) {
+        # Root server address resolution (+noglue): return 127.0.0.1
+        $resp = $qid . pack("nnnnn", 0x8180, 1, 1, 0, 0) .
+                "\x01a\x0croot-servers\x03net\x00" . pack("nn", 1, 1) .
                 "\x01a\x0croot-servers\x03net\x00" . pack("nnNn", 1, 1, 3600, 4) . inet_aton("127.0.0.1");
     } elsif ($qname =~ /^ns1\.external\.org\./i) {
         # Glue resolution query: return 127.0.0.1
@@ -117,7 +131,8 @@ while (1) {
 }
 PL_EOF
 
-perl "$TMP_DIR/mock_trace_server.pl" "$PORT" &
+QUERY_LOG="$TMP_DIR/queries.log"
+perl "$TMP_DIR/mock_trace_server.pl" "$PORT" "$QUERY_LOG" &
 MOCK_PID=$!
 sleep 0.5
 
@@ -131,6 +146,52 @@ else
     echo "  Output:"
     echo "$OUT" | sed 's/^/    /'
     FAILED=$((FAILED + 1))
+fi
+
+echo "=== 2. Testing +trace default (+noglue) ignores ADDITIONAL section glue ==="
+echo -n "Test: Root server address is resolved via resolver instead of glue ... "
+: > "$QUERY_LOG"
+OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +timeout=2 2>&1 || true)
+if grep -q "^a\.root-servers\.net\. 1$" "$QUERY_LOG" && echo "$OUT" | grep -q "cdn\.example\.net"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Queries:"
+    sed 's/^/    /' "$QUERY_LOG"
+    echo "  Output:"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== 3. Testing +trace +glue uses ADDITIONAL section glue (legacy behavior) ==="
+echo -n "Test: Root server glue is used without resolver lookup ... "
+: > "$QUERY_LOG"
+OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +glue +timeout=2 2>&1 || true)
+if ! grep -q "^a\.root-servers\.net\." "$QUERY_LOG" && echo "$OUT" | grep -q "ns1\.external\.org" && echo "$OUT" | grep -q "cdn\.example\.net"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Queries:"
+    sed 's/^/    /' "$QUERY_LOG"
+    echo "  Output:"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "=== 4. Testing +trace +ldnsz emits ldns.jp trace viewer URL ==="
+if [ "$DAG" = "dig" ]; then
+    echo "Test: +trace +ldnsz emits https://ldns.jp/trace/#c= URL ... SKIP (dag-only +ldnsz option)"
+else
+    echo -n "Test: +trace +ldnsz emits https://ldns.jp/trace/#c= URL ... "
+    OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +ldnsz +timeout=2 2>&1 || true)
+    if echo "$OUT" | grep -q "https://ldns\.jp/trace/#c=" && ! echo "$OUT" | grep -q "https://ldns\.jp/diff/"; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "  Output:"
+        echo "$OUT" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    fi
 fi
 
 echo "========================================================="
