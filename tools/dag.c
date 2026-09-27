@@ -3183,7 +3183,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses;\n"
-        "                               ignores ADDITIONAL section unless +glue is given)\n"
+        "                               ignores ADDITIONAL section unless +glue is given; implies +noadditional)\n"
         "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +noglue by default)\n"
         "  +[no]glue                    Use in-bailiwick Glue records from ADDITIONAL section for +trace / +nssearch\n"
         "                               (+noglue: ignore ADDITIONAL and resolve NS names via resolver) [default: +noglue]\n"
@@ -4224,6 +4224,8 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->dopt.yaml = false;
         } else if (strcmp(arg, "+trace") == 0) {
             spec->do_trace = true;
+            /* BIND dig 同様、+trace は +noadditional を含意する (後続の +additional で上書き可) */
+            spec->dopt.show_additional = false;
         } else if (strcmp(arg, "+notrace") == 0) {
             spec->do_trace = false;
         } else if (strcmp(arg, "+nssearch") == 0) {
