@@ -312,6 +312,7 @@ typedef struct {
     bool ignore_tc;
     bool nofail;
     bool use_glue;
+    bool glue_indomain; /* +glue=indomain: named 9.18.41/9.20.15+ strict glue (NS target under owner only) */
 
     // PROXYv2
     bool use_proxy;

@@ -225,6 +225,9 @@ dag [global-queryopt...] [query...]
 `+[no]glue`
 : Control whether in-bailiwick Glue records (A/AAAA) present in the `ADDITIONAL` section are prioritized over system resolver lookups (`/etc/resolv.conf`). For `+trace`, `+noglue` is the default (matching BIND 9.20+ `dig`, which no longer trusts `ADDITIONAL` section data while tracing); `+glue` restores the legacy behavior of following referral chains via attached glue records. For `+nssearch`, `+noglue` is the default (matching BIND 9 `dig`), and enabling `+glue` allows `dag` to query authoritative nameservers directly using attached glue records from NS responses without relying on the system resolver.
 
+`+glue=all|indomain`
+: Select which glue records `+glue` trusts. `all` is the same as plain `+glue` (any A/AAAA in `ADDITIONAL` whose owner matches an NS target). `indomain` reproduces the stricter glue checking introduced in BIND `named` 9.18.41 / 9.20.15 / 9.21.14 ([ISC KB: Impact of Stricter Glue Checking](https://kb.isc.org/docs/strict-glue)): glue is trusted only when the NS target (right side) is a subdomain of the NS owner (left side), e.g. `example.org. NS ns1.example.org.`. Sibling or unrelated glue (e.g. `ben.jp. NS ns1.xserver.jp.`) is ignored and reported as `;; ignoring out-of-domain glue for '<ns>' (NS of '<zone>')`, and those NS names are resolved instead. This is useful for checking whether a delegation that relied on out-of-domain glue still resolves on updated BIND resolvers. Applies to both `+trace` and `+nssearch`.
+
 `+[no]search`, `+[no]defname`
 : Enable or disable domain search list processing as defined in `/etc/resolv.conf`.
 
