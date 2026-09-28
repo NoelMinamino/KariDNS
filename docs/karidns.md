@@ -317,8 +317,8 @@ Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `
 | Option | Default | Description |
 |---|---|---|
 | `socket "<path>";` (alias `socket-path`) | `/var/run/karidns/control.sock` | UNIX socket for `karictl`. |
-| `secret "<base64>";` | none | Shared secret; must match `karictl.conf`. Authentication is an HMAC-SHA256 challenge-response. |
-| `algorithm "<name>";` | — | Checked against the TSIG algorithm names above, but the control channel always uses HMAC-SHA256. |
+| `secret "<base64>";` | none | Shared secret; must match `karictl.conf`. Authentication is an HMAC challenge-response. |
+| `algorithm "<name>";` | `hmac-sha256` | HMAC of the challenge-response: one of the TSIG algorithm names above. `karictl.conf` must name the same algorithm. |
 
 ### `view "<name>" { ... }`
 
@@ -450,7 +450,7 @@ MTU (this is the reason for the DNS Flag Day 2020 default); lower values push mo
 
 ## CONTROL CHANNEL & MANAGEMENT
 
-Runtime administration of `karidns` is managed over a local UNIX domain socket (default `/var/run/karidns/control.sock`, see `control-channel`) authenticated via HMAC-SHA256 challenge-response using the [`karictl(8)`](karictl.md) utility.
+Runtime administration of `karidns` is managed over a local UNIX domain socket (default `/var/run/karidns/control.sock`, see `control-channel`) authenticated via an HMAC challenge-response (`control-channel { algorithm }`, default HMAC-SHA256) using the [`karictl(8)`](karictl.md) utility.
 
 ---
 

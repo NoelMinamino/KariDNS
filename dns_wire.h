@@ -309,6 +309,9 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);
+/* TSIG アルゴリズム名 (hmac-sha256 等) に対応する OpenSSL のダイジェスト。未対応なら NULL。
+ * (EVP_MD は struct evp_md_st の typedef。ヘッダに openssl を持ち込まないためタグ名で宣言する) */
+const struct evp_md_st *tsig_algorithm_evp_md(const char *alg);
 
 /* Capsicum(cap_enter)突入前に呼ぶこと。TSIGで使う全HMACアルゴリズムを一度実行し、
  * OpenSSLの遅延初期化(openssl.cnfのopen等)をcapability mode突入前に完了させる。

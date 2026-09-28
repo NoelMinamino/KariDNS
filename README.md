@@ -92,7 +92,7 @@ KariDNS natively parses, validates, and serializes the following standard and ex
 The main authoritative DNS server daemon. For detailed architecture and configuration options, see the **[karidns(8) Manual](docs/karidns.md)**.
 
 ### 2. `karictl`
-An authenticated management tool (RNDC-style) that communicates with the server over a UNIX domain socket using HMAC-SHA256. Besides the commands below it provides `reconfig`, `zonestatus`, per-zone statistics (`observatory`) and `tsig-keygen`. For command reference and configuration details, see the **[karictl(8) Manual](docs/karictl.md)**.
+An authenticated management tool (RNDC-style) that communicates with the server over a UNIX domain socket using an HMAC challenge-response (HMAC-SHA256 by default). Besides the commands below it provides `reconfig`, `zonestatus`, per-zone statistics (`observatory`) and `tsig-keygen`. For command reference and configuration details, see the **[karictl(8) Manual](docs/karictl.md)**.
 
 ```sh
 # Check server status

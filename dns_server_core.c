@@ -2717,11 +2717,18 @@ void *control_thread_func(void *arg) {
             if (cfg && strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
               char *client_hmac = c->buf + 5;
               unsigned char md[EVP_MAX_MD_SIZE];
-              unsigned int md_len;
-              HMAC(EVP_sha256(), cfg->control.secret_decoded, cfg->control.secret_decoded_len,
-                   (unsigned char*)c->challenge, 64, md, &md_len);
-              char expected[65];
-              for(unsigned int k=0; k<md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
+              unsigned int md_len = 0;
+              /* control-channel { algorithm } で指定した HMAC を使う (省略時 hmac-sha256)。
+               * 名前は設定読込時に tsig_algorithm_is_supported() で検証済み。 */
+              const EVP_MD *ctrl_md = cfg->control.algorithm ? tsig_algorithm_evp_md(cfg->control.algorithm)
+                                                             : EVP_sha256();
+              char expected[2 * EVP_MAX_MD_SIZE + 1];
+              expected[0] = '\0';
+              if (ctrl_md &&
+                  HMAC(ctrl_md, cfg->control.secret_decoded, cfg->control.secret_decoded_len,
+                       (unsigned char*)c->challenge, 64, md, &md_len) != NULL) {
+                for (unsigned int k = 0; k < md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
+              }
               /* [H-5] タイミング攻撃対策: 長さ比較も定数時間で行う。
                * client_hmac が expected と長さが異なる場合も const_time_memcmp を
                * 必ず呼んでキャッシュタイミングを均一化し、その後 len_ok で弾く。*/
@@ -2732,7 +2739,8 @@ void *control_thread_func(void *arg) {
               size_t cmp_len = len_ok ? elen : elen;
               bool hmac_ok = (const_time_memcmp(client_hmac, expected,
                                                 clen >= cmp_len ? cmp_len : clen) == 0);
-              if (len_ok && hmac_ok) {
+              /* elen == 0 は HMAC 計算失敗。空の AUTH と一致させない (fail-closed) */
+              if (len_ok && hmac_ok && elen > 0) {
                 auth_ok = true;
               }
             }

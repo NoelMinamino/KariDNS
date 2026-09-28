@@ -831,6 +831,10 @@ bool tsig_algorithm_is_supported(const char *alg) {
     return tsig_algorithm_from_name(alg) != NULL;
 }
 
+const EVP_MD *tsig_algorithm_evp_md(const char *alg) {
+    return tsig_algorithm_from_name(alg);
+}
+
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
                      uint8_t *prior_mac, size_t *prior_mac_len,
                      const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,

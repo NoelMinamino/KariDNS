@@ -24,7 +24,7 @@ karictl tsig-keygen [keyname]
 
 ## DESCRIPTION
 
-`karictl` is the management utility for the [`karidns(8)`](karidns.md) authoritative DNS server daemon. It communicates with the daemon over a local UNIX domain socket (default `/var/run/karidns/control.sock`) and authenticates each connection with an HMAC-SHA256 challenge-response handshake: the server sends a 64-character challenge, and `karictl` answers with the HMAC-SHA256 of the challenge keyed with the shared secret.
+`karictl` is the management utility for the [`karidns(8)`](karidns.md) authoritative DNS server daemon. It communicates with the daemon over a local UNIX domain socket (default `/var/run/karidns/control.sock`) and authenticates each connection with an HMAC challenge-response handshake: the server sends a 64-character challenge, and `karictl` answers with the HMAC of the challenge keyed with the shared secret. The HMAC algorithm is `control-channel { algorithm }` on the server and `algorithm` in `karictl.conf` (both default to `hmac-sha256`).
 
 ---
 
@@ -101,7 +101,7 @@ key "karictl" {
 
 The `secret` defined in `karictl.conf` must match the secret configured in the `control-channel` block of [`karidns.conf`](karidns.md).
 
-The file is not parsed as a full configuration file: `karictl` takes the quoted value that follows the **first** occurrence of the word `secret`, and the quoted value that follows the first occurrence of the word `socket`, anywhere in the file (comments included). The key name and `algorithm` are not used; the control channel always uses HMAC-SHA256. The secret may decode to at most 256 bytes. `karictl` prints a warning when the file is readable by group or other users; it should have mode `0600`.
+The file is not parsed as a full configuration file: `karictl` takes the quoted value that follows the **first** occurrence of the word `secret`, and the quoted value that follows the first occurrence of the word `socket`, anywhere in the file (comments included). The value after the first `algorithm` (quoted or not) selects the HMAC: `hmac-md5`, `hmac-sha1`, `hmac-sha224`, `hmac-sha256` (default), `hmac-sha384` or `hmac-sha512`; it must match the server's `control-channel { algorithm }`, and an unsupported name exits with status 2. The key name is not used. The secret may decode to at most 256 bytes. `karictl` prints a warning when the file is readable by group or other users; it should have mode `0600`.
 
 ---
 

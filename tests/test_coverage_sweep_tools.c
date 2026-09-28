@@ -219,6 +219,8 @@ static void test_karicheck(void) {
 static char g_sock[200];
 static volatile int g_ctl_mode;
 static const char *CTL_SECRET_B64 = "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0";
+static const char *CTL_SECRET_RAW = "secretsecretsecretsecret";     /* CTL_SECRET_B64 decoded */
+static volatile int g_ctl_auth_ok;                                  /* mode 9: result of the HMAC check */
 
 static void *ctl_server(void *arg) {
     int ls = *(int *)arg;
@@ -235,6 +237,16 @@ static void *ctl_server(void *arg) {
         int n = snprintf(b, sizeof(b), "CHALLENGE %s\n", chal); send(c, b, (size_t)n, 0);
         ssize_t r = recv(c, b, sizeof(b) - 1, 0);
         if (r <= 0 || mode == 4) { close(c); continue; }                                  /* no auth reply */
+        if (mode == 9) {                                  /* verify an HMAC-SHA512 challenge response */
+            b[r] = 0;
+            unsigned char md[EVP_MAX_MD_SIZE]; unsigned int md_len = 0;
+            HMAC(EVP_sha512(), CTL_SECRET_RAW, strlen(CTL_SECRET_RAW), (const unsigned char *)chal, 64, md, &md_len);
+            char want[2 * EVP_MAX_MD_SIZE + 8] = "AUTH ";
+            for (unsigned int k = 0; k < md_len; k++) snprintf(want + 5 + 2 * k, 3, "%02x", md[k]);
+            strcat(want, "\n");
+            g_ctl_auth_ok = (strcmp(b, want) == 0);
+            if (!g_ctl_auth_ok) { send(c, "DENIED\n", 7, 0); close(c); continue; }
+        }
         if (mode == 5) { send(c, "DENIED\n", 7, 0); close(c); continue; }
         send(c, "OK\n", 3, 0);
         r = recv(c, b, sizeof(b) - 1, 0);
@@ -294,6 +306,29 @@ static void test_karictl(void) {
     run_tool(karictl_main, "karictl", "-c", cp, "-s", "/tmp/definitely-not-a-socket", "status", NULL);
     run_tool(karictl_main, "karictl", "-c", cp, "-s",
              "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sock", "status", NULL);
+    /* control-channel algorithm: karictl uses the algorithm of karictl.conf (quoted or bare) */
+    {
+        char c512[600], c256[600], cbad[600], cbare[600];
+        snprintf(c512, sizeof(c512), "socket \"%s\";\nkey \"k\" { algorithm \"hmac-sha512\"; secret \"%s\"; };\n", g_sock, CTL_SECRET_B64);
+        snprintf(cbare, sizeof(cbare), "socket \"%s\";\nkey \"k\" { algorithm hmac-sha512; secret \"%s\"; };\n", g_sock, CTL_SECRET_B64);
+        snprintf(c256, sizeof(c256), "socket \"%s\";\nkey \"k\" { algorithm hmac-sha256; secret \"%s\"; };\n", g_sock, CTL_SECRET_B64);
+        snprintf(cbad, sizeof(cbad), "socket \"%s\";\nkey \"k\" { algorithm hmac-sha999; secret \"%s\"; };\n", g_sock, CTL_SECRET_B64);
+        const char *p512 = wfile("karictl_512.conf", c512);
+        const char *pbare = wfile("karictl_bare.conf", cbare);
+        const char *p256 = wfile("karictl_256.conf", c256);
+        const char *pbad = wfile("karictl_bad_alg.conf", cbad);
+        g_ctl_mode = 9;
+        g_ctl_auth_ok = 0;
+        assert(run_tool(karictl_main, "karictl", "-c", p512, "reconfig", NULL) == 0);
+        assert(g_ctl_auth_ok == 1);
+        g_ctl_auth_ok = 0;
+        assert(run_tool(karictl_main, "karictl", "-c", pbare, "reconfig", NULL) == 0);
+        assert(g_ctl_auth_ok == 1);
+        assert(run_tool(karictl_main, "karictl", "-c", p256, "reconfig", NULL) == 2);   /* wrong algorithm: denied */
+        assert(g_ctl_auth_ok == 0);
+        assert(run_tool(karictl_main, "karictl", "-c", pbad, "reconfig", NULL) == 2);   /* unsupported: no connect */
+        g_ctl_mode = 0;
+    }
     run_tool(karictl_main, "karictl", "tsig-keygen", NULL);
     run_tool(karictl_main, "karictl", "tsig-keygen", "mykey", NULL);
     run_tool(karictl_main, "karictl", "-v", NULL);

@@ -894,7 +894,8 @@ static void test_query_logger_thread_func(void) {
 // ----------------------------------------------------------------------------
 // 14. Control Socket HMAC Auth & Commands Test
 // ----------------------------------------------------------------------------
-static int run_ctrl_cmd(const struct sockaddr_un *sun, const char *secret, const char *cmd, char *out_buf, size_t out_buf_sz) {
+static int run_ctrl_cmd_md(const struct sockaddr_un *sun, const EVP_MD *hmac_md, const char *secret, const char *cmd,
+                           char *out_buf, size_t out_buf_sz) {
     int cfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (cfd < 0) return -1;
     if (connect(cfd, (struct sockaddr *)sun, sizeof(*sun)) != 0) {
@@ -913,11 +914,12 @@ static int run_ctrl_cmd(const struct sockaddr_un *sun, const char *secret, const
 
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int md_len = 0;
-    HMAC(EVP_sha256(), secret, strlen(secret), (unsigned char *)challenge, 64, md, &md_len);
-    char hmac_hex[65];
+    HMAC(hmac_md, secret, strlen(secret), (unsigned char *)challenge, 64, md, &md_len);
+    char hmac_hex[2 * EVP_MAX_MD_SIZE + 1];
+    hmac_hex[0] = '\0';
     for (unsigned int k = 0; k < md_len; k++) snprintf(&hmac_hex[k * 2], 3, "%02x", md[k]);
 
-    char auth_cmd[128];
+    char auth_cmd[2 * EVP_MAX_MD_SIZE + 16];
     snprintf(auth_cmd, sizeof(auth_cmd), "AUTH %s\n", hmac_hex);
     send(cfd, auth_cmd, strlen(auth_cmd), 0);
 
@@ -937,6 +939,10 @@ static int run_ctrl_cmd(const struct sockaddr_un *sun, const char *secret, const
     out_buf[total] = '\0';
     close(cfd);
     return (int)total;
+}
+
+static int run_ctrl_cmd(const struct sockaddr_un *sun, const char *secret, const char *cmd, char *out_buf, size_t out_buf_sz) {
+    return run_ctrl_cmd_md(sun, EVP_sha256(), secret, cmd, out_buf, out_buf_sz);
 }
 
 // Blocking recv() in a unit test turns any server-side regression into a hung CI job.
@@ -1084,6 +1090,36 @@ static void test_control_socket_thread_and_commands(void) {
     len = run_ctrl_cmd(&sun, secret_key, "observatory\n", out, sizeof(out));
     assert(len > 0);
     assert(strncmp(out, "OK 2\n", 5) == 0);
+
+    /* control-channel { algorithm } selects the HMAC of the challenge-response */
+    mock_cfg.control.algorithm = "hmac-sha512";
+    len = run_ctrl_cmd_md(&sun, EVP_sha512(), secret_key, "zonestatus example.com.\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "OK serial=", 10) == 0);
+    assert(run_ctrl_cmd_md(&sun, EVP_sha256(), secret_key, "zonestatus example.com.\n", out, sizeof(out)) == -1);
+    mock_cfg.control.algorithm = "HMAC-MD5.";
+    len = run_ctrl_cmd_md(&sun, EVP_md5(), secret_key, "zonestatus example.com.\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "OK serial=", 10) == 0);
+    mock_cfg.control.algorithm = "hmac-sha256";
+    len = run_ctrl_cmd_md(&sun, EVP_sha256(), secret_key, "zonestatus example.com.\n", out, sizeof(out));
+    assert(len > 0 && strncmp(out, "OK serial=", 10) == 0);
+    /* an unknown algorithm (never accepted by the parser) must fail closed; an empty AUTH never matches */
+    mock_cfg.control.algorithm = "hmac-unknown";
+    assert(run_ctrl_cmd_md(&sun, EVP_sha256(), secret_key, "zonestatus example.com.\n", out, sizeof(out)) == -1);
+    {
+        int cfd_e = socket(AF_UNIX, SOCK_STREAM, 0);
+        assert(cfd_e >= 0);
+        test_set_io_timeout(cfd_e, 5);
+        assert(connect(cfd_e, (struct sockaddr *)&sun, sizeof(sun)) == 0);
+        n = recv(cfd_e, rbuf, sizeof(rbuf) - 1, 0);
+        assert(n > 0);
+        send(cfd_e, "AUTH \n", 6, 0);
+        n = recv(cfd_e, rbuf, sizeof(rbuf) - 1, 0);
+        assert(n > 0);
+        rbuf[n] = '\0';
+        assert(strcmp(rbuf, "AUTH_FAILED\n") == 0);
+        close(cfd_e);
+    }
+    mock_cfg.control.algorithm = NULL;
 
     len = run_ctrl_cmd(&sun, secret_key, "notify example.com.\n", out, sizeof(out));
     assert(len > 0);
