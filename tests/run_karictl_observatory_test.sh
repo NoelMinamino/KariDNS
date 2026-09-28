@@ -96,9 +96,8 @@ fi
 
 # 5. Send Queries via dag
 echo "[+] Sending DNS queries to generate observatory metrics..."
-# UDP query -> NOERROR. +nocookie: queries with a DNS COOKIE bypass the wire cache,
-# and dag (like dig) sends a client cookie by default.
-"$DAG" @127.0.0.1 -p $PORT +nocookie www.obs.example.com A > /dev/null 2>&1 || true
+# UDP query -> NOERROR (with a client cookie, as dag sends by default: still a wire cache hit)
+"$DAG" @127.0.0.1 -p $PORT www.obs.example.com A > /dev/null 2>&1 || true
 
 # TCP query -> NOERROR
 "$DAG" @127.0.0.1 -p $PORT +tcp mail.obs.example.com A > /dev/null 2>&1 || true
