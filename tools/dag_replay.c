@@ -41,9 +41,16 @@
 #include <strings.h>
 #endif
 
+#include <openssl/ssl.h>
+
 #include "dag_replay.h"
 #include "dag_pcap_l4.h"
 #include "dag_tcp_reassembly.h"
+
+/* dag_transport.c: RFC 8484 の HTTP 応答から DNS メッセージを取り出す純粋関数
+ * (dag_transport.h は dag 本体の query_opts_t 等を持ち込むため、宣言だけ使う) */
+ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_len,
+                                  uint8_t *resp, size_t resp_cap);
 
 
 #define REPLAY_QUEUE_CAPACITY 1024
@@ -1055,46 +1062,47 @@ static inline void set_replay_socket_timeouts(int sock, int timeout_ms) {
 #endif
 }
 
+/* server (IP リテラルまたはホスト名) と port を sockaddr に解決する。失敗時 false。 */
+static bool replay_resolve(const char *server, int port, bool stream,
+                           struct sockaddr_storage *ss, socklen_t *slen) {
+    memset(ss, 0, sizeof(*ss));
+    *slen = 0;
+    struct sockaddr_in *sin = (struct sockaddr_in *)ss;
+    if (inet_pton(AF_INET, server, &sin->sin_addr) == 1) {
+        sin->sin_family = AF_INET;
+        sin->sin_port = htons(port);
+        *slen = sizeof(*sin);
+        return true;
+    }
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
+    if (inet_pton(AF_INET6, server, &sin6->sin6_addr) == 1) {
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_port = htons(port);
+        *slen = sizeof(*sin6);
+        return true;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = stream ? SOCK_STREAM : SOCK_DGRAM;
+    char pbuf[16];
+    snprintf(pbuf, sizeof(pbuf), "%d", port);
+    bool ok = false;
+    if (getaddrinfo(server, pbuf, &hints, &res) == 0 && res != NULL && res->ai_addrlen <= sizeof(*ss)) {
+        memcpy(ss, res->ai_addr, res->ai_addrlen);
+        *slen = (socklen_t)res->ai_addrlen;
+        ok = true;
+    }
+    if (res) freeaddrinfo(res);
+    return ok;
+}
+
 static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
                                      const uint8_t *pkt, size_t pkt_len,
                                      uint8_t *resp, size_t resp_cap, int timeout_ms) {
     struct sockaddr_storage ss;
-    memset(&ss, 0, sizeof(ss));
     socklen_t slen = 0;
-
-    struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
-    if (inet_pton(AF_INET, server, &sin->sin_addr) == 1) {
-        sin->sin_family = AF_INET;
-        sin->sin_port = htons(port > 0 ? port : 53);
-        slen = sizeof(*sin);
-    } else {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
-        if (inet_pton(AF_INET6, server, &sin6->sin6_addr) == 1) {
-            sin6->sin6_family = AF_INET6;
-            sin6->sin6_port = htons(port > 0 ? port : 53);
-            slen = sizeof(*sin6);
-        } else {
-            struct addrinfo hints, *res = NULL;
-            memset(&hints, 0, sizeof(hints));
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = use_tcp ? SOCK_STREAM : SOCK_DGRAM;
-            char pbuf[16];
-            snprintf(pbuf, sizeof(pbuf), "%d", port > 0 ? port : 53);
-            if (getaddrinfo(server, pbuf, &hints, &res) == 0 && res != NULL) {
-                if (res->ai_addrlen <= sizeof(ss)) {
-                    memcpy(&ss, res->ai_addr, res->ai_addrlen);
-                    slen = (socklen_t)res->ai_addrlen;
-                    freeaddrinfo(res);
-                } else {
-                    freeaddrinfo(res);
-                    return -1;
-                }
-            } else {
-                if (res) freeaddrinfo(res);
-                return -1;
-            }
-        }
-    }
+    if (!replay_resolve(server, port > 0 ? port : 53, use_tcp, &ss, &slen)) return -1;
 
     if (!use_tcp) {
         int fd = socket(ss.ss_family, SOCK_DGRAM, 0);
@@ -1146,11 +1154,151 @@ static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
     }
 }
 
+typedef enum { REPLAY_TR_UDP, REPLAY_TR_TCP, REPLAY_TR_TLS, REPLAY_TR_DOH } replay_transport_t;
+
+static replay_transport_t replay_transport_kind(const char *transport) {
+    if (transport && strcasecmp(transport, "tcp") == 0) return REPLAY_TR_TCP;
+    if (transport && (strcasecmp(transport, "tls") == 0 || strcasecmp(transport, "dot") == 0)) return REPLAY_TR_TLS;
+    if (transport && (strcasecmp(transport, "doh") == 0 || strcasecmp(transport, "https") == 0)) return REPLAY_TR_DOH;
+    return REPLAY_TR_UDP;
+}
+
+static bool replay_transport_valid(const char *transport) {
+    return strcasecmp(transport, "udp") == 0 || strcasecmp(transport, "tcp") == 0 ||
+           strcasecmp(transport, "tls") == 0 || strcasecmp(transport, "dot") == 0 ||
+           strcasecmp(transport, "doh") == 0 || strcasecmp(transport, "https") == 0;
+}
+
+/* --server1/--server2 にポートを書かなかった場合の既定ポート (RFC 7858 §3.1: 853, RFC 8484: 443) */
+static int replay_default_port(replay_transport_t kind) {
+    return kind == REPLAY_TR_TLS ? 853 : (kind == REPLAY_TR_DOH ? 443 : 53);
+}
+
+/* ワーカー起動前に1回だけ作る (以後は各スレッドが SSL_new するだけなのでスレッド安全)。
+ * dag 本体の DoT/DoH 実装はグローバルな接続キャッシュを使うため、並列ワーカーからは呼ばない。
+ * replay の対象は検証用のサーバなので、dag の +tls / +https と同じく証明書は検証しない。 */
+static SSL_CTX *g_replay_ssl_ctx = NULL;
+
+static bool replay_init_tls(void) {
+    if (g_replay_ssl_ctx) return true;
+    g_replay_ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!g_replay_ssl_ctx) return false;
+    SSL_CTX_set_verify(g_replay_ssl_ctx, SSL_VERIFY_NONE, NULL);
+    return true;
+}
+
+static int ssl_write_all(SSL *ssl, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int w = SSL_write(ssl, buf + off, (int)(len - off));
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static int ssl_read_exact(SSL *ssl, uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        int r = SSL_read(ssl, buf + off, (int)(len - off));
+        if (r <= 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+/* DNS over TLS (RFC 7858) / DNS over HTTPS (RFC 8484, POST /dns-query) で1クエリを送受信する。
+ * 接続はクエリごとに張って閉じる (スレッド間で状態を共有しない)。 */
+static ssize_t replay_exchange_tls(const char *server, int port, bool doh,
+                                   const uint8_t *pkt, size_t pkt_len,
+                                   uint8_t *resp, size_t resp_cap, int timeout_ms) {
+    if (!g_replay_ssl_ctx || pkt_len > 65535) return -1;
+    struct sockaddr_storage ss;
+    socklen_t slen = 0;
+    if (!replay_resolve(server, port, true, &ss, &slen)) return -1;
+    int fd = socket(ss.ss_family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    set_replay_socket_timeouts(fd, timeout_ms);
+    if (connect(fd, (struct sockaddr *)&ss, slen) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    ssize_t result = -1;
+    SSL *ssl = SSL_new(g_replay_ssl_ctx);
+    if (!ssl) {
+        close(fd);
+        return -1;
+    }
+    SSL_set_fd(ssl, (int)fd);
+    struct in_addr a4;
+    struct in6_addr a6;
+    if (inet_pton(AF_INET, server, &a4) != 1 && inet_pton(AF_INET6, server, &a6) != 1) {
+        SSL_set_tlsext_host_name(ssl, server);   // RFC 6066 SNI (IP リテラルには付けない)
+    }
+    if (!doh) {
+        SSL_set_alpn_protos(ssl, (const unsigned char *)"\x03" "dot", 4);  // RFC 7858 §3.1
+    } else {
+        SSL_set_alpn_protos(ssl, (const unsigned char *)"\x08" "http/1.1", 9);
+    }
+    if (SSL_connect(ssl) != 1) goto done;
+
+    if (!doh) {
+        uint8_t len_prefix[2] = { (uint8_t)(pkt_len >> 8), (uint8_t)(pkt_len & 0xFF) };
+        if (ssl_write_all(ssl, len_prefix, 2) != 0 || ssl_write_all(ssl, pkt, pkt_len) != 0) goto done;
+        uint8_t rlen_buf[2];
+        if (ssl_read_exact(ssl, rlen_buf, 2) != 0) goto done;
+        size_t rlen = ((size_t)rlen_buf[0] << 8) | rlen_buf[1];
+        if (rlen > resp_cap) goto done;
+        if (ssl_read_exact(ssl, resp, rlen) != 0) goto done;
+        result = (ssize_t)rlen;
+    } else {
+        char hdr[512];
+        int hlen = snprintf(hdr, sizeof(hdr),
+                            "POST /dns-query HTTP/1.1\r\n"
+                            "Host: %s\r\n"
+                            "Content-Type: application/dns-message\r\n"
+                            "Accept: application/dns-message\r\n"
+                            "Content-Length: %zu\r\n"
+                            "User-Agent: KariDNS-dag-replay\r\n"
+                            "Connection: close\r\n\r\n",
+                            server, pkt_len);
+        if (hlen <= 0 || (size_t)hlen >= sizeof(hdr)) goto done;
+        if (ssl_write_all(ssl, (const uint8_t *)hdr, (size_t)hlen) != 0 || ssl_write_all(ssl, pkt, pkt_len) != 0) goto done;
+        uint8_t *http_buf = malloc(65535 + 4096);
+        if (!http_buf) goto done;
+        size_t http_len = 0;
+        const size_t http_cap = 65535 + 4096;
+        for (;;) {
+            if (http_len >= http_cap) break;
+            int r = SSL_read(ssl, http_buf + http_len, (int)(http_cap - http_len));
+            if (r <= 0) break;
+            http_len += (size_t)r;
+            ssize_t dl = decode_http_response_body(http_buf, http_len, resp, resp_cap);
+            if (dl >= 0) {
+                result = dl;
+                break;
+            }
+        }
+        free(http_buf);
+    }
+
+done:
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(fd);
+    return result;
+}
+
 static ssize_t replay_exchange(const char *server, int port, const char *transport,
                                const uint8_t *pkt, size_t pkt_len,
                                uint8_t *resp, size_t resp_cap, int timeout_ms) {
-    bool use_tcp = (transport && strcasecmp(transport, "tcp") == 0);
-    return replay_exchange_posix(server, port, use_tcp, pkt, pkt_len, resp, resp_cap, timeout_ms);
+    replay_transport_t kind = replay_transport_kind(transport);
+    if (port <= 0) port = replay_default_port(kind);
+    if (kind == REPLAY_TR_TLS || kind == REPLAY_TR_DOH) {
+        return replay_exchange_tls(server, port, kind == REPLAY_TR_DOH, pkt, pkt_len, resp, resp_cap, timeout_ms);
+    }
+    return replay_exchange_posix(server, port, kind == REPLAY_TR_TCP, pkt, pkt_len, resp, resp_cap, timeout_ms);
 }
 
 static void *replay_worker_func(void *arg) {
@@ -1304,8 +1452,9 @@ static void *replay_worker_func(void *arg) {
     return NULL;
 }
 
+/* ポート省略時は 0 (= トランスポートの既定ポート: udp/tcp 53, tls 853, doh 443) */
 static void parse_host_port(const char *arg, char *out_host, size_t host_cap, int *out_port) {
-    *out_port = 53;
+    *out_port = 0;
     if (!arg) return;
     const char *colon = strchr(arg, ':');
     if (colon) {
@@ -1594,8 +1743,8 @@ __attribute__((noinline))
 int run_replay_mode(int argc, char **argv) {
     replay_options_t opts;
     memset(&opts, 0, sizeof(opts));
-    opts.server1_port = 53;
-    opts.server2_port = 53;
+    opts.server1_port = 0;   /* 0 = transport default (53 / 853 / 443) */
+    opts.server2_port = 0;
     opts.num_workers = 1;
     strncpy(opts.transport, "udp", sizeof(opts.transport) - 1);
 
@@ -1688,6 +1837,27 @@ int run_replay_mode(int argc, char **argv) {
                         "Choose either comparing two live servers or comparing with recorded responses.\n");
         return 1;
     }
+
+    const char *tr_opts[3] = { opts.transport, opts.server1_transport, opts.server2_transport };
+    bool need_tls = false;
+    for (int i = 0; i < 3; i++) {
+        if (!tr_opts[i][0]) continue;
+        if (!replay_transport_valid(tr_opts[i])) {
+            fprintf(stderr, "[ERROR] Unknown transport '%s' (expected udp, tcp, tls or doh)\n", tr_opts[i]);
+            return 1;
+        }
+        replay_transport_t k = replay_transport_kind(tr_opts[i]);
+        if (k == REPLAY_TR_TLS || k == REPLAY_TR_DOH) need_tls = true;
+    }
+    if (need_tls && !replay_init_tls()) {
+        fprintf(stderr, "[ERROR] Failed to initialize TLS\n");
+        return 1;
+    }
+    /* 表示用: ポート省略時はそのサーバのトランスポートの既定ポート */
+    const char *s1_tr = opts.server1_transport[0] ? opts.server1_transport : opts.transport;
+    const char *s2_tr = opts.server2_transport[0] ? opts.server2_transport : opts.transport;
+    int s1_port_disp = opts.server1_port > 0 ? opts.server1_port : replay_default_port(replay_transport_kind(s1_tr));
+    int s2_port_disp = opts.server2_port > 0 ? opts.server2_port : replay_default_port(replay_transport_kind(s2_tr));
 
     if (opts.output_diff_path[0]) {
         if (strcmp(opts.output_diff_path, "-") == 0) {
@@ -2052,7 +2222,7 @@ int run_replay_mode(int argc, char **argv) {
         printf("{\n");
         printf("  \"total_queries\": %lu,\n", total_queries_count);
         printf("  \"server1\": {\n");
-        printf("    \"target\": \"%s:%d\",\n", opts.server1_host, opts.server1_port);
+        printf("    \"target\": \"%s:%d\",\n", opts.server1_host, s1_port_disp);
         printf("    \"sent\": %lu,\n", (unsigned long)ws.s1_stats.queries_sent);
         printf("    \"received\": %lu,\n", (unsigned long)ws.s1_stats.responses_received);
         printf("    \"timeouts\": %lu,\n", (unsigned long)ws.s1_stats.timeouts);
@@ -2066,7 +2236,7 @@ int run_replay_mode(int argc, char **argv) {
             if (opts.compare_recorded) {
                 printf("    \"source\": \"%s\",\n", opts.input_path);
             } else {
-                printf("    \"target\": \"%s:%d\",\n", opts.server2_host, opts.server2_port);
+                printf("    \"target\": \"%s:%d\",\n", opts.server2_host, s2_port_disp);
             }
             printf("    \"sent\": %lu,\n", (unsigned long)ws.s2_stats.queries_sent);
             printf("    \"received\": %lu,\n", (unsigned long)ws.s2_stats.responses_received);
@@ -2100,7 +2270,7 @@ int run_replay_mode(int argc, char **argv) {
         printf("Total Queries Replayed: %lu\n", total_queries_count);
         printf("Transport:              %s\n", opts.transport);
         printf("Workers:                %d\n", opts.num_workers);
-        printf("\n--- Server 1 (%s:%d) ---\n", opts.server1_host, opts.server1_port);
+        printf("\n--- Server 1 (%s:%d) ---\n", opts.server1_host, s1_port_disp);
         printf("  Server 1: %lu responses\n", (unsigned long)ws.s1_stats.responses_received);
         printf("  Sent:     %lu\n", (unsigned long)ws.s1_stats.queries_sent);
         printf("  Received: %lu\n", (unsigned long)ws.s1_stats.responses_received);
@@ -2115,7 +2285,7 @@ int run_replay_mode(int argc, char **argv) {
                 printf("\n--- %s ---\n", s2_label_text);
                 printf("  Source:   %s\n", opts.input_path);
             } else {
-                printf("\n--- %s (%s:%d) ---\n", s2_label_text, opts.server2_host, opts.server2_port);
+                printf("\n--- %s (%s:%d) ---\n", s2_label_text, opts.server2_host, s2_port_disp);
             }
             printf("  Responses: %lu\n", (unsigned long)ws.s2_stats.responses_received);
             printf("  Sent/Pairs: %lu\n", (unsigned long)ws.s2_stats.queries_sent);
@@ -2155,12 +2325,19 @@ int run_replay_mode(int argc, char **argv) {
     pthread_cond_destroy(&queue->not_empty);
     pthread_cond_destroy(&queue->not_full);
     pthread_mutex_destroy(&ws.stats_lock);
+    uint64_t mismatched = ws.diff_stats.total_compared - ws.diff_stats.identical;
+    bool compared = opts.has_server2 || opts.compare_recorded;
     free(queue);
     free(io_buf);
+    if (g_replay_ssl_ctx) {
+        SSL_CTX_free(g_replay_ssl_ctx);
+        g_replay_ssl_ctx = NULL;
+    }
 
 #ifdef _WIN32
     WSACleanup();
 #endif
 
-    return 0;
+    /* 比較モードで不一致があれば 1 (CI で失敗として扱えるように) */
+    return (compared && mismatched > 0) ? 1 : 0;
 }

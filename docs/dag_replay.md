@@ -19,7 +19,7 @@ dag --replay <traffic_file> --server1 <host[:port]> [--server2 <host[:port]>]
     [--compare-recorded] [--diff] [--ignore-ttl] [--output-diff <file>]
     [--rate <qps>] [--workers <N>] [--timeout-ms <ms>]
     [--stop-after <N>] [--max-queries <N>]
-    [--transport <udp|tcp>] [--server1-transport <transport>] [--server2-transport <transport>]
+    [--transport <udp|tcp|tls|doh>] [--server1-transport <transport>] [--server2-transport <transport>]
     [--output <text|json>] [+dnssec | +do] [+nodnssec | +nodo]
 ```
 
@@ -40,10 +40,10 @@ When dual servers are specified (`--server1` and `--server2`), or when single se
 ### Server Target Specifications
 
 `--server1 <host[:port]>`
-: Address and optional port of the primary target nameserver (default port: `53`). Supports IPv4 addresses, IPv6 addresses, and hostnames.
+: Address and optional port of the primary target nameserver. Without a port, the default of the server's transport is used: `53` (udp/tcp), `853` (tls), `443` (doh). Supports IPv4 addresses and hostnames; an IPv6 address cannot be combined with a port (the value is split at the first `:`).
 
 `--server2 <host[:port]>`
-: Address and optional port of the secondary comparison nameserver (default port: `53`). Specifying `--server2` automatically enables differential testing mode (`--diff`). Mutually exclusive with `--compare-recorded`.
+: Address and optional port of the secondary comparison nameserver (default port as for `--server1`). Specifying `--server2` automatically enables differential testing mode (`--diff`). Mutually exclusive with `--compare-recorded`.
 
 `--compare-recorded`
 : Compare live responses from `--server1` against the original recorded responses stored within the capture file (`.pcap` or `.dnstap`). Does not require a secondary live server. Mutually exclusive with `--server2`. Not supported for text query files (`queries.txt`). It is strongly recommended to specify `--ignore-ttl` with this option to avoid false differences caused by normal cache/TTL aging.
@@ -84,13 +84,13 @@ When dual servers are specified (`--server1` and `--server2`), or when single se
 
 ### Transport Control
 
-`--transport <udp|tcp>`
-: Explicitly force the global transport protocol for all replayed queries, overriding any transport recorded in the input capture file. Only `tcp` selects TCP; any other value (including the `tls` and `doh` names shown in the usage message) is treated as UDP.
+`--transport <udp|tcp|tls|doh>`
+: Explicitly force the global transport protocol for all replayed queries, overriding any transport recorded in the input capture file. `tls` (alias `dot`) is DNS over TLS (RFC 7858, ALPN `dot`) and `doh` (alias `https`) is DNS over HTTPS (RFC 8484, `POST /dns-query` over HTTP/1.1). Each DoT/DoH query uses its own TLS connection; server certificates are not verified (as with `dag +tls` / `+https` without `+tls-ca`), and SNI is sent when the server is given by name. Any other value is an error (exit status 1).
 
-`--server1-transport <udp|tcp>`
+`--server1-transport <udp|tcp|tls|doh>`
 : Force the transport protocol specifically for queries sent to `--server1`. Allows cross-transport differential testing (e.g., UDP vs. TCP validation on the same server).
 
-`--server2-transport <udp|tcp>`
+`--server2-transport <udp|tcp|tls|doh>`
 : Force the transport protocol specifically for queries sent to `--server2`.
 
 ### Query Options & Output Format
@@ -297,10 +297,10 @@ Each mismatch records the query sequence number, the names of the differing cate
 ## EXIT STATUS
 
 `0`
-: The replay ran to completion (or was stopped by `--max-queries` / `--stop-after`). **Mismatches do not change the exit status**; check `mismatched_queries` in the JSON report (or the `--output-diff` file) to fail a CI job.
+: The replay ran to completion (or was stopped by `--max-queries` / `--stop-after`) and, when responses were compared (`--server2` or `--compare-recorded`), no mismatch was found. A single-server replay without comparison always exits with 0.
 
 `1`
-: Usage error (missing `--replay` / `--server1`), `--compare-recorded` combined with `--server2` or with a text query file, the input file cannot be opened, or a memory allocation failure.
+: Responses were compared and at least one mismatch was found (`mismatched_queries > 0`, including one server not answering); or a usage error (missing `--replay` / `--server1`, unknown transport), `--compare-recorded` combined with `--server2` or with a text query file, the input file cannot be opened, TLS could not be initialized, or a memory allocation failure.
 
 ---
 
@@ -341,7 +341,7 @@ dag --replay queries.txt \
 
 ### 4. Continuous Integration Early Abort
 
-In automated CI pipelines, stop at the first response mismatch and evaluate the JSON report (`diff.mismatched_queries`), since the exit status stays 0:
+In automated CI pipelines, stop at the first response mismatch; the exit status is 1 when a mismatch was found:
 
 ```sh
 dag --replay regression_suite.txt \
@@ -360,6 +360,18 @@ dag --replay queries.txt \
     --server1 127.0.0.1:53 --server1-transport udp \
     --server2 127.0.0.1:53 --server2-transport tcp \
     --diff
+```
+
+Compare a server's DNS over TLS (port 853) and DNS over HTTPS (port 443) front ends with its plain TCP answers:
+
+```sh
+dag --replay queries.txt \
+    --server1 dns.example.net --server1-transport tls \
+    --server2 dns.example.net --server2-transport tcp --diff
+
+dag --replay queries.txt \
+    --server1 dns.example.net --server1-transport doh \
+    --server2 dns.example.net --server2-transport tcp --diff
 ```
 
 ### 6. Single-Server Recorded Response Comparison

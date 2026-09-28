@@ -10,6 +10,23 @@
 
 set -e
 
+# Comparison mode exit status: 1 when a mismatch was found, 0 otherwise.
+check_replay_rc() {
+    _name="$1"; _out="$2"; _rc="$3"
+    _mm=$(printf '%s\n' "$_out" | sed -n -e 's/.*"mismatched_queries": \([0-9]*\).*/\1/p' \
+                                      -e 's/.*Mismatched responses: \([0-9]*\).*/\1/p' | head -n 1)
+    if [ -z "$_mm" ]; then
+        echo "FAIL: $_name: no mismatch count in the report"
+        exit 1
+    fi
+    if [ "$_mm" -gt 0 ]; then _want=1; else _want=0; fi
+    if [ "$_rc" -ne "$_want" ]; then
+        echo "FAIL: $_name: exit status $_rc, expected $_want (mismatched=$_mm)"
+        exit 1
+    fi
+    echo "  PASS: $_name exit status $_rc (mismatched=$_mm)"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$BASE_DIR"
@@ -183,7 +200,9 @@ fi
 
 # 6. Test 2: Differential Replay with Text Report
 echo "[+] Test 2: Differential replay (text output)..."
-OUT2=$(./dag --replay "$QUERY_FILE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff)
+RC_OUT2=0
+OUT2=$(./dag --replay "$QUERY_FILE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff) || RC_OUT2=$?
+check_replay_rc "OUT2" "$OUT2" "$RC_OUT2"
 echo "$OUT2"
 if echo "$OUT2" | grep -q "Identical responses: 2" && echo "$OUT2" | grep -q "Mismatched responses: 1"; then
     echo "  PASS: Differential test detected 2 matching and 1 differing response."
@@ -194,7 +213,9 @@ fi
 
 # 7. Test 3: Differential Replay with JSON Output
 echo "[+] Test 3: Differential replay (JSON output)..."
-OUT3=$(./dag --replay "$QUERY_FILE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json)
+RC_OUT3=0
+OUT3=$(./dag --replay "$QUERY_FILE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json) || RC_OUT3=$?
+check_replay_rc "OUT3" "$OUT3" "$RC_OUT3"
 echo "$OUT3"
 if echo "$OUT3" | grep -q '"mismatched_queries": 1' && echo "$OUT3" | grep -q '"identical_queries": 2'; then
     echo "  PASS: JSON report accurately reported identical and mismatched query counts."
@@ -218,7 +239,9 @@ fi
 echo "[+] Test 5: Order-independent set comparison..."
 Q_SHUFFLE="$TMP_DIR/q_shuffle.txt"
 echo "round.example.com A" > "$Q_SHUFFLE"
-OUT5=$(./dag --replay "$Q_SHUFFLE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json)
+RC_OUT5=0
+OUT5=$(./dag --replay "$Q_SHUFFLE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json) || RC_OUT5=$?
+check_replay_rc "OUT5" "$OUT5" "$RC_OUT5"
 echo "$OUT5"
 if echo "$OUT5" | grep -q '"identical_queries": 1' && echo "$OUT5" | grep -q '"mismatched_queries": 0'; then
     echo "  PASS: Shuffled RRset records correctly recognized as identical set."
@@ -232,7 +255,9 @@ echo "[+] Test 6: TTL difference with and without --ignore-ttl..."
 Q_TTL="$TMP_DIR/q_ttl.txt"
 echo "ttltest.example.com A" > "$Q_TTL"
 
-OUT6_STRICT=$(./dag --replay "$Q_TTL" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json)
+RC_OUT6_STRICT=0
+OUT6_STRICT=$(./dag --replay "$Q_TTL" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json) || RC_OUT6_STRICT=$?
+check_replay_rc "OUT6_STRICT" "$OUT6_STRICT" "$RC_OUT6_STRICT"
 echo "$OUT6_STRICT"
 if echo "$OUT6_STRICT" | grep -q '"mismatched_queries": 1'; then
     echo "  PASS: Strict mode flagged TTL difference as mismatch."
@@ -241,7 +266,9 @@ else
     exit 1
 fi
 
-OUT6_IGNORE=$(./dag --replay "$Q_TTL" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --ignore-ttl --output json)
+RC_OUT6_IGNORE=0
+OUT6_IGNORE=$(./dag --replay "$Q_TTL" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --ignore-ttl --output json) || RC_OUT6_IGNORE=$?
+check_replay_rc "OUT6_IGNORE" "$OUT6_IGNORE" "$RC_OUT6_IGNORE"
 echo "$OUT6_IGNORE"
 if echo "$OUT6_IGNORE" | grep -q '"identical_queries": 1' && echo "$OUT6_IGNORE" | grep -q '"mismatched_queries": 0'; then
     echo "  PASS: --ignore-ttl successfully suppressed false positive on TTL difference."
@@ -255,7 +282,9 @@ echo "[+] Test 7: Positive detection of missing glue (DIFF_GLUE_MISSING)..."
 Q_GLUE="$TMP_DIR/q_glue.txt"
 echo "host.sub.example.com A" > "$Q_GLUE"
 DIFF_GLUE_LOG="$TMP_DIR/diff_glue.log"
-OUT7=$(./dag --replay "$Q_GLUE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output-diff "$DIFF_GLUE_LOG" --output json)
+RC_OUT7=0
+OUT7=$(./dag --replay "$Q_GLUE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output-diff "$DIFF_GLUE_LOG" --output json) || RC_OUT7=$?
+check_replay_rc "OUT7" "$OUT7" "$RC_OUT7"
 echo "$OUT7"
 if echo "$OUT7" | grep -q '"glue_missing_diffs": 1'; then
     echo "  PASS: DIFF_GLUE_MISSING counter incremented in JSON output."
@@ -275,7 +304,9 @@ echo "[+] Test 8: Positive detection of CNAME chain differences (DIFF_CNAME_CHAI
 Q_CNAME="$TMP_DIR/q_cname.txt"
 echo "cnamechain.example.com A" > "$Q_CNAME"
 DIFF_CNAME_LOG="$TMP_DIR/diff_cname.log"
-OUT8=$(./dag --replay "$Q_CNAME" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output-diff "$DIFF_CNAME_LOG" --output json)
+RC_OUT8=0
+OUT8=$(./dag --replay "$Q_CNAME" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output-diff "$DIFF_CNAME_LOG" --output json) || RC_OUT8=$?
+check_replay_rc "OUT8" "$OUT8" "$RC_OUT8"
 echo "$OUT8"
 if echo "$OUT8" | grep -q '"cname_chain_diffs": 1'; then
     echo "  PASS: DIFF_CNAME_CHAIN counter incremented in JSON output."
@@ -298,7 +329,9 @@ sec.example.com A +dnssec
 sec.example.com TXT +dnssec
 EOF
 DIFF_SEC_LOG="$TMP_DIR/diff_sec.log"
-OUT9=$(./dag --replay "$Q_SEC" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output-diff "$DIFF_SEC_LOG" --output json)
+RC_OUT9=0
+OUT9=$(./dag --replay "$Q_SEC" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output-diff "$DIFF_SEC_LOG" --output json) || RC_OUT9=$?
+check_replay_rc "OUT9" "$OUT9" "$RC_OUT9"
 echo "$OUT9"
 if echo "$OUT9" | grep -q '"dnssec_rrsig_diffs": 1' && echo "$OUT9" | grep -q '"dnssec_nsec_diffs": 1'; then
     echo "  PASS: DIFF_DNSSEC_RRSIG and DIFF_DNSSEC_NSEC counters incremented in JSON output."
@@ -321,7 +354,9 @@ differ.example.com A
 cnamechain.example.com A
 sec.example.com A
 EOF
-OUT10=$(./dag --replay "$Q_STOP" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --stop-after 1 --output json)
+RC_OUT10=0
+OUT10=$(./dag --replay "$Q_STOP" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --stop-after 1 --output json) || RC_OUT10=$?
+check_replay_rc "OUT10" "$OUT10" "$RC_OUT10"
 echo "$OUT10"
 if echo "$OUT10" | grep -q '"mismatched_queries": 1'; then
     echo "  PASS: --stop-after 1 terminated after recording exactly 1 mismatch."
@@ -337,7 +372,9 @@ cat << 'EOF' > "$Q_PROTO"
 sec.example.com A
 sec.example.com A +tcp
 EOF
-OUT11_TEXT=$(./dag --replay "$Q_PROTO" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json)
+RC_OUT11_TEXT=0
+OUT11_TEXT=$(./dag --replay "$Q_PROTO" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json) || RC_OUT11_TEXT=$?
+check_replay_rc "OUT11_TEXT" "$OUT11_TEXT" "$RC_OUT11_TEXT"
 echo "$OUT11_TEXT"
 if echo "$OUT11_TEXT" | grep -q '"total_queries": 2' && echo "$OUT11_TEXT" | grep -q '"identical_queries": 2'; then
     echo "  PASS: Text query replay with +tcp reproduced successfully."
@@ -364,7 +401,9 @@ for my $proto (1, 2) { # 1 = UDP, 2 = TCP
 close($fh);
 ' "$DNSTAP_FILE"
 
-OUT11_DNSTAP=$(./dag --replay "$DNSTAP_FILE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json)
+RC_OUT11_DNSTAP=0
+OUT11_DNSTAP=$(./dag --replay "$DNSTAP_FILE" --server1 "127.0.0.1:$PORT1" --server2 "127.0.0.1:$PORT2" --diff --output json) || RC_OUT11_DNSTAP=$?
+check_replay_rc "OUT11_DNSTAP" "$OUT11_DNSTAP" "$RC_OUT11_DNSTAP"
 echo "$OUT11_DNSTAP"
 if echo "$OUT11_DNSTAP" | grep -q '"total_queries": 2' && echo "$OUT11_DNSTAP" | grep -q '"identical_queries": 2'; then
     echo "  PASS: dnstap Frame Streams replay preserved and reproduced UDP and TCP transports."
