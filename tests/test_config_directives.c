@@ -982,6 +982,10 @@ static void test_structure_and_validation(void) {
                   "view \"v\" { match-clients { any; }; zone \"b.test\" { type master; file \"z\"; }; };");
     expect_reject("view first, then top-level zone", "view \"v\" { match-clients { any; }; };"
                   "zone \"b.test\" { type master; file \"z\"; };");
+    /* match-clients is an address match list only: a key entry would never match */
+    expect_reject("key in match-clients", "key \"k1\" { algorithm hmac-sha256; secret \"c2VjcmV0\"; };"
+                  "view \"v\" { match-clients { key \"k1\"; }; zone \"b.test\" { type master; file \"z\"; }; };");
+    expect_reject("key after an address in match-clients", "view \"v\" { match-clients { 192.0.2.0/24; key k1; }; };");
 
     if (parse_ok("acl \"trusted\" { 192.0.2.0/24; }; statistics-channels { inet 127.0.0.1; };"
                  "options { port 5300; }; " ZONE_MIN, &cfg)) {

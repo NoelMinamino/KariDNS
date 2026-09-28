@@ -321,7 +321,7 @@ Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `
 
 | Item | Description |
 |---|---|
-| `match-clients { <acl>; ... };` | Clients that use this view. A view without `match-clients` matches every client. |
+| `match-clients { <acl>; ... };` | Clients that use this view, by source address only; a `key` entry is a configuration error. A view without `match-clients` matches every client. |
 | `zone "<name>" { ... };` | Zones of this view. The same zone name may appear in several views. |
 
 Views are checked in the order they are defined; the first match is used. A query from a client that matches no view is answered as if no zone matched (REFUSED). Without any `view` block, all top-level zones are placed in an implicit view that matches all clients.

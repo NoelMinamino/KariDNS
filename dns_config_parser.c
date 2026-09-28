@@ -775,7 +775,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
   return parse_string_list_inner(ctx, list, count);
 }
 
-typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD } acl_key_mode_t;
+typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD, ACL_KEY_REJECT } acl_key_mode_t;
 
 static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                            acl_key_mode_t key_mode, char ***tsig_keys_out, int *tsig_keys_count_out) {
@@ -808,6 +808,14 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
 
         if (strcmp(tok.value, "key") == 0) {
             free_token(&tok);
+            if (key_mode == ACL_KEY_REJECT) {
+                /* match-clients はクライアントアドレスだけで評価する。key を受け付けると
+                 * 何にもマッチしないエントリーが黙って残るので、設定エラーにする。 */
+                syslog(LOG_ERR, "[Config] 'key' entries are not supported in match-clients (address match only)");
+                fprintf(stderr, "[ERROR] 'key' entries are not supported in match-clients (address match only)\n");
+                if (ctx) ctx->error_occurred = true;
+                return -1;
+            }
             tok = get_next_token(ctx);
             if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
             char *val = tok.value;
@@ -2281,7 +2289,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
           if (parse_acl_list(ctx, &view->match_clients, &view->match_clients_count,
-                             ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
+                             ACL_KEY_REJECT, NULL, NULL) != 0) {
             free_partial_view(view);
             return -1;
           }
