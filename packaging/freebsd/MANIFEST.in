@@ -8,7 +8,7 @@ maintainer: "noel@karidns.org"
 prefix: "/usr/local"
 licenselogic: "single"
 licenses: [
-    "BSD2CLAUSE"
+    "MIT"
 ]
 desc: <<EOD
 KariDNS is a FreeBSD-native authoritative DNS server engineered for ultra-low latency,
