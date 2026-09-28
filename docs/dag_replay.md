@@ -66,7 +66,7 @@ When dual servers are specified (`--server1` and `--server2`), or when single se
 : Stop replay processing after dispatching `N` queries.
 
 `--timeout-ms <ms>`
-: Network socket I/O timeout in milliseconds for each query-response exchange (default: `2000` ms).
+: Network socket I/O timeout in milliseconds for each query-response exchange (default: `2000` ms; `0` or a negative value means the default).
 
 ### Differential Testing Options
 
@@ -77,15 +77,15 @@ When dual servers are specified (`--server1` and `--server2`), or when single se
 : Ignore TTL differences when comparing resource records across servers or against recorded responses. When enabled, two identical record sets with differing TTL values (e.g., due to caching state, TTL countdown, or differing zone minimum TTL configurations) are treated as identical. Strongly recommended when using `--compare-recorded`.
 
 `--stop-after <N>`
-: Early termination threshold. Immediately halts replay after encountering `N` mismatched query responses between `--server1` and `--server2`. Useful for automated CI regressions where an early failure should abort immediately.
+: Early termination threshold. Stops reading the input and discards the queued queries once `N` mismatched responses have been found (between `--server1` and `--server2`, or against the recorded responses). Queries already being processed by the workers are still completed.
 
 `--output-diff <file>`
-: Write detailed per-query difference summaries to `<file>`. Use `-` to stream difference reports directly to `stdout`.
+: Write one line per mismatched query to `<file>`. Use `-` to stream the lines to `stdout`. Without this option, the first mismatches (while at most 10 responses have been compared) are printed to `stderr` in text output mode.
 
 ### Transport Control
 
 `--transport <udp|tcp>`
-: Explicitly force the global transport protocol for all replayed queries, overriding any transport recorded in the input capture file.
+: Explicitly force the global transport protocol for all replayed queries, overriding any transport recorded in the input capture file. Only `tcp` selects TCP; any other value (including the `tls` and `doh` names shown in the usage message) is treated as UDP.
 
 `--server1-transport <udp|tcp>`
 : Force the transport protocol specifically for queries sent to `--server1`. Allows cross-transport differential testing (e.g., UDP vs. TCP validation on the same server).
@@ -176,7 +176,7 @@ The comparison engine normalizes and evaluates differences across 13 distinct ca
 | Flag Name | Bitmask | Description |
 |---|---|---|
 | **`DIFF_RCODE`** | `0x0001` | Response RCODE mismatch (e.g., `NOERROR` vs. `NXDOMAIN` or `SERVFAIL`). |
-| **`DIFF_FLAGS`** | `0x0002` | Header flags mismatch (`AA`, `TC`, `RD`, `RA`, `AD`, `CD`). |
+| **`DIFF_FLAGS`** | `0x0002` | Header flags mismatch (`AA` or `TC`). |
 | **`DIFF_ANCOUNT`** | `0x0004` | Record count mismatch in the Answer section. |
 | **`DIFF_NSCOUNT`** | `0x0008` | Record count mismatch in the Authority section. |
 | **`DIFF_ARCOUNT`** | `0x0010` | Record count mismatch in the Additional section. |
@@ -184,7 +184,7 @@ The comparison engine normalizes and evaluates differences across 13 distinct ca
 | **`DIFF_AUTH_RRSET`** | `0x0040` | Semantic mismatch in Authority RRset data. |
 | **`DIFF_ADD_RRSET`** | `0x0080` | Semantic mismatch in Additional RRset data. |
 | **`DIFF_GLUE_MISSING`** | `0x0100` | In-bailiwick glue record missing or mismatched in referral responses. |
-| **`DIFF_EDNS`** | `0x0200` | EDNS0 presence, buffer size, version, or option code mismatch. |
+| **`DIFF_EDNS`** | `0x0200` | EDNS0 presence, UDP payload size, extended RCODE, version, DO bit, COOKIE presence, or option mismatch. |
 | **`DIFF_DNSSEC_RRSIG`**| `0x0400` | DNSSEC RRSIG signature presence, type covered, or validity difference. |
 | **`DIFF_DNSSEC_NSEC`** | `0x0800` | DNSSEC NSEC / NSEC3 denial of existence record difference. |
 | **`DIFF_CNAME_CHAIN`** | `0x1000` | CNAME redirection alias chain length or target mismatch. |
@@ -195,48 +195,51 @@ The comparison engine normalizes and evaluates differences across 13 distinct ca
 
 ### 1. Standard Text Report (Default)
 
-Printed to standard output upon completion:
+Printed to standard output upon completion. The server 2 and differential blocks appear only with `--server2` or `--compare-recorded` (with `--compare-recorded` the second block is titled `Recorded (from capture)` and shows the capture file instead of an address, without an RTT):
 
 ```text
-=== DNS Replay & Differential Report ===
-Total queries processed: 1000
-Replay duration: 0.85s (1176.47 QPS)
+================ DNS Replay Summary ================
+Total Queries Replayed: 1000
+Transport:              udp
+Workers:                1
 
-[Server 1: 127.0.0.1:53]
-  Sent:               1000
-  Received:           1000 (100.0%)
-  Timeouts:           0
-  Average RTT:        0.42 ms
-  RCODE NOERROR:      950
-  RCODE NXDOMAIN:     50
+--- Server 1 (127.0.0.1:53) ---
+  Server 1: 1000 responses
+  Sent:     1000
+  Received: 1000
+  Timeouts: 0
+  Avg RTT:  0.42 ms
+  RCODEs:   NOERROR=950 NXDOMAIN=50 SERVFAIL=0 REFUSED=0
 
-[Server 2: 127.0.0.1:5353]
-  Sent:               1000
-  Received:           1000 (100.0%)
-  Timeouts:           0
-  Average RTT:        0.38 ms
-  RCODE NOERROR:      950
-  RCODE NXDOMAIN:     50
+--- Server 2 (127.0.0.1:5353) ---
+  Responses: 1000
+  Sent/Pairs: 1000
+  Received:  1000
+  Timeouts:  0
+  Avg RTT:   0.38 ms
+  RCODEs:    NOERROR=950 NXDOMAIN=50 SERVFAIL=0 REFUSED=0
 
-[Differential Results]
-  Total compared:     1000
-  Identical:          998 (99.8%)
-  Mismatched:         2 (0.2%)
-    RCODE diffs:      0
-    Flags diffs:      0
-    Answer diffs:     1
-    Authority diffs:  0
-    Additional diffs: 0
-    Glue diffs:       0
-    EDNS diffs:       0
-    DNSSEC RRSIG:     1
-    DNSSEC NSEC:      0
-    CNAME Chain:      0
+--- Differential Comparison ---
+  Compared:           1000
+  Identical responses: 998 (99.8%)
+  Mismatched responses: 2
+  RCODE Mismatches:   0
+  Flags Mismatches:   0
+  ANCOUNT Mismatches: 1
+  RRset Mismatches:   1
+  Glue Missing:       0
+  EDNS Diffs:         0
+  DNSSEC RRSIG Diffs: 1
+  DNSSEC NSEC Diffs:  0
+  CNAME Chain Diffs:  0
+====================================================
 ```
+
+`Transport` shows the `--transport` value (default `udp`), not the per-query transport taken from the capture.
 
 ### 2. JSON Report (`--output json`)
 
-Structured document suitable for CI/CD assertions and telemetry ingestion:
+Structured document suitable for CI/CD assertions and telemetry ingestion. With `--compare-recorded`, the second object is named `recorded` and has a `source` (the capture file) instead of `target`; without a second server or `--compare-recorded`, only `total_queries` and `server1` are printed.
 
 ```json
 {
@@ -281,12 +284,12 @@ Structured document suitable for CI/CD assertions and telemetry ingestion:
 
 ### 3. Difference Stream (`--output-diff <file>`)
 
-Each mismatch records the sequence number, description, and hexadecimal bitmask:
+Each mismatch records the query sequence number, the names of the differing categories, and the hexadecimal bitmask:
 
 ```text
-[DIFF #42] Reachability mismatch: S1=OK S2=TIMEOUT (flags=0x0001)
-[DIFF #108] RRSIG presence mismatch: S1=present S2=absent (flags=0x0420)
-[DIFF #512] Answer RRset record count mismatch: S1=2 S2=1 (flags=0x0024)
+[DIFF #42] Reachability mismatch: Live=OK Recorded/S2=TIMEOUT (flags=0x0001)
+[DIFF #108] Diff: [DNSSEC_RRSIG]  (flags=0x0400)
+[DIFF #512] Diff: [ANCOUNT] [ANSWER]  (flags=0x0024)
 ```
 
 ---
@@ -294,10 +297,10 @@ Each mismatch records the sequence number, description, and hexadecimal bitmask:
 ## EXIT STATUS
 
 `0`
-: Replay completed successfully. In differential mode (`--diff`), all compared responses matched identically (`mismatched_queries == 0`).
+: The replay ran to completion (or was stopped by `--max-queries` / `--stop-after`). **Mismatches do not change the exit status**; check `mismatched_queries` in the JSON report (or the `--output-diff` file) to fail a CI job.
 
 `1`
-: Syntax error, input file read error, socket binding failure, or one or more response mismatches detected in differential testing mode.
+: Usage error (missing `--replay` / `--server1`), `--compare-recorded` combined with `--server2` or with a text query file, the input file cannot be opened, or a memory allocation failure.
 
 ---
 
@@ -338,7 +341,7 @@ dag --replay queries.txt \
 
 ### 4. Continuous Integration Early Abort
 
-In automated CI pipelines, fail immediately upon the first response mismatch:
+In automated CI pipelines, stop at the first response mismatch and evaluate the JSON report (`diff.mismatched_queries`), since the exit status stays 0:
 
 ```sh
 dag --replay regression_suite.txt \

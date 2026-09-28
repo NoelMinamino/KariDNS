@@ -5,9 +5,9 @@ spirit as NLnet Labs' (NSD) [RFC Compliance](https://nsd.docs.nlnetlabs.nl/en/la
 page and PowerDNS's [Compliance](https://www.powerdns.com/compliance) page.
 
 **This document is based on direct source-code inspection.** Each entry cites the relevant file /
-function name as evidence. "Test coverage" is tracked separately in `RFC_COVERAGE.md` (the QA test
-suite's RFC coverage report). **Implementation status and test coverage are two different axes** —
-many items are implemented but not yet covered by automated tests, and vice versa.
+function name as evidence. Test coverage is tracked separately: the tests are indexed in
+[`tests/TEST_MATRIX.md`](tests/TEST_MATRIX.md) and line/branch coverage in
+[`docs/COVERAGE_STATUS.md`](docs/COVERAGE_STATUS.md). **Implementation status and test coverage are two different axes.**
 
 Legend:
 - ✅ **Full** — Core requirements (MUST/SHOULD) are implemented
@@ -25,28 +25,28 @@ Legend:
 | RFC 1035 | Domain Names - Implementation and Specification | ✅ Full | Zone file syntax, wire format, base record types. Text string escaping (`\DDD`, `\X`) is fully supported for both domain names and character strings per §5.1 (`dns_zone_parser.c`, `dns_wire.c`) |
 | RFC 1123 | Requirements for Internet Hosts (applicable parts) | ✅ Full | General hostname rules |
 | RFC 1912 | Common DNS Operational and Configuration Errors | ✅ Full | `karicheck` now warns when MX/NS/SOA(MNAME) targets point to a CNAME, and when a CNAME co-exists with non-DNSSEC record types at the same owner name (`tools/karicheck.c`, `is_cname()` and related checks) |
-| RFC 1982 | Serial Number Arithmetic | ✅ Full | Serial number arithmetic is used to evaluate SOA serial increments during IXFR/NOTIFY (`dns_server_core.c`, e.g., `(int32_t)(new_serial - old_serial) <= 0`) |
-| RFC 1995 | Incremental Zone Transfer (IXFR) | ✅ Full | `ixfr_history_t`, `compute_ixfr_diff` (`dns_server_core.c`) |
-| RFC 1996 | A Mechanism for Prompt Notification of Zone Changes (NOTIFY) | ✅ Full | Send and receive supported. Inbound NOTIFY authenticated via `masters` IP match, plus optional TSIG (`dns_server_core.c`). For `type "forward"` / `type "program"` zones, NOTIFY is cleanly rejected with `NOTIMP` |
+| RFC 1982 | Serial Number Arithmetic | ✅ Full | Serial number arithmetic is used to evaluate SOA serial increments during IXFR/NOTIFY (`serial_is_newer()` in `dns_utils.c`) |
+| RFC 1995 | Incremental Zone Transfer (IXFR) | ✅ Full | `ixfr_history_t` (`dns_server_internal.h`), `compute_ixfr_diff()` (`dns_axfr_ixfr.c`) |
+| RFC 1996 | A Mechanism for Prompt Notification of Zone Changes (NOTIFY) | ✅ Full | Send and receive supported. Outbound NOTIFY goes to `also-notify` and the apex NS hosts except the SOA MNAME host (`send_notify_to_all()` in `dns_dynamic_update.c`). Inbound NOTIFY authenticated via `masters` IP match, plus optional TSIG (`dns_query_engine.c`). For `type "forward"` / `type "program"` zones, NOTIFY is cleanly rejected with `NOTIMP` |
 | RFC 2181 | Clarifications to the DNS Specification | ✅ Full | TTL values with the high bit set (≥ 2^31) are now capped to 0 at the single conversion point in `serialize_dns_record` (`dns_wire.c`), per §8 |
-| RFC 2308 | Negative Caching of DNS Queries | ✅ Full | On NXDOMAIN/NODATA, the SOA MINIMUM field is used as the TTL override for the authority-section SOA (`dns_server_core.c`, ~line 3290) |
+| RFC 2308 | Negative Caching of DNS Queries | ✅ Full | On NXDOMAIN/NODATA, the SOA MINIMUM field is used as the TTL override for the authority-section SOA (`dns_query_engine.c`) |
 | RFC 2317 | Classless IN-ADDR.ARPA Delegation (BCP 20) | ✅ Full | Sub-/24 reverse DNS delegation is supported via standard CNAME redirection |
-| RFC 3225 | Indicating Resolver Support of DNSSEC (DO bit in EDNS) | ✅ Full | Supported; DO bit (0x8000) parsed from EDNS flags and used to gate DNSSEC (RRSIG/NSEC) inclusion (`dns_wire.c`, `dns_server_core.c`) |
+| RFC 3225 | Indicating Resolver Support of DNSSEC (DO bit in EDNS) | ✅ Full | Supported; DO bit (0x8000) parsed from EDNS flags and used to gate DNSSEC (RRSIG/NSEC) inclusion (`dns_wire.c`, `dns_query_engine.c`) |
 | RFC 3597 | Handling of Unknown DNS Resource Record (RR) Types | ✅ Full | `TYPE<n>` and `\#` unknown RDATA syntax supported (`dns_utils.c`, `get_type_code`, `dns_wire.c`) |
-| RFC 4343 | DNS Case Insensitivity Clarification | ✅ Full | Name comparisons consistently use `strcasecmp` / case-insensitive ASCII wire label matching throughout (`dns_server_core.c`, `dns_zone_parser.c`) |
-| RFC 4592 | The Definition of Phrases with Wildcards in the Domain Name System | ✅ Full | Wildcard expansion/synthesis (e.g., `*.example.com`) is fully implemented in the resolution path (`dns_server_core.c`) |
+| RFC 4343 | DNS Case Insensitivity Clarification | ✅ Full | Name comparisons consistently use `strcasecmp` / case-insensitive ASCII wire label matching throughout (`dns_query_engine.c`, `dns_zone_parser.c`) |
+| RFC 4592 | The Definition of Phrases with Wildcards in the Domain Name System | ✅ Full | Wildcard expansion/synthesis (e.g., `*.example.com`) is fully implemented in the resolution path, including NODATA for empty non-terminals (`dns_query_engine.c`) |
 | RFC 6891 | Extension Mechanisms for DNS (EDNS(0)) | ✅ Full | OPT pseudo-RR parsing and assembly (`dns_wire.c`). Obsoletes RFC 2671 |
-| RFC 7766 | DNS Transport over TCP - Implementation Requirements | ✅ Full (opt-in, default OFF) | TCP connection reuse/pipelining is supported in server core via `tcp-connection-reuse yes;` (idle timeout default 10s per RFC 9210 §4.5 via `tcp-idle-timeout`). `dag` client supports `+keepopen` with framing-safe connection reuse (`tools/dag.c`). Obsoletes RFC 5966 |
+| RFC 7766 | DNS Transport over TCP - Implementation Requirements | ✅ Full (opt-in, default OFF) | TCP connection reuse/pipelining is supported in server core via `tcp-connection-reuse yes;` (idle timeout default 10 s per RFC 9210 §4.5, set in milliseconds with `tcp-idle-timeout`). `dag` client supports `+keepopen` with framing-safe connection reuse (`tools/dag_transport.c`). Obsoletes RFC 5966 |
 | RFC 8482 | Providing Minimal-Sized Responses to ANY Queries | ✅ Full | `minimal_any` / `minimal_any_ttl` settings (`dns_config_parser.h`) |
 | RFC 8767 | Serving Stale Data to Improve DNS Resiliency | 🟡 Partial | This RFC targets recursive resolver caches; KariDNS repurposes the term for a `serve-stale` toggle controlling whether a secondary keeps serving its last-known zone data after the SOA EXPIRE interval has passed without a successful refresh. Scope differs from the RFC's original target (recursive caching) |
-| RFC 8906 | A Common Operational Problem in DNS Servers: Failure to Communicate (Fragmentation) | ✅ Full | EDNS UDP payload size is force-clamped to 1232 bytes (avoids IP fragmentation, matches the 2020 DNS Flag Day recommendation) |
-| RFC 9619 | In the DNS, QDCOUNT Is (Usually) One | ✅ Full | For OPCODE=0 (QUERY), QDCOUNT > 1 returns FORMERR and QDCOUNT = 0 returns a minimal response with no question section, per the RFC's normative requirements. OPCODE=4 (NOTIFY) and OPCODE=5 (UPDATE) continue to require QDCOUNT == 1 (`dns_server_core.c`, ~line 4208) |
+| RFC 8906 | A Common Operational Problem in DNS Servers: Failure to Communicate (Fragmentation) | ✅ Full | The UDP response size and the advertised EDNS UDP payload size are capped at 1232 bytes by default (avoids IP fragmentation, matches the 2020 DNS Flag Day recommendation). The cap can be changed with `udp-bufsize` / `zone-udp-bufsize` (512–4096); the requestor's smaller payload size always wins |
+| RFC 9619 | In the DNS, QDCOUNT Is (Usually) One | ✅ Full | For OPCODE=0 (QUERY), QDCOUNT > 1 returns FORMERR and QDCOUNT = 0 returns a minimal response with no question section, per the RFC's normative requirements. OPCODE=4 (NOTIFY) and OPCODE=5 (UPDATE) continue to require QDCOUNT == 1 (`dns_query_engine.c`) |
 | RFC 9210 | DNS Transport over TCP - Operational Requirements | ✅ Full (opt-in, default OFF) | Same mechanism as RFC 7766 above; default idle timeout (10s) matches §4.5's recommendation |
-| RFC 9471 | DNS Glue Requirements in Referral Responses | ✅ Full | `append_glue_records` adds both A(1) and AAAA(28) glue (`dns_server_core.c`) |
+| RFC 9471 | DNS Glue Requirements in Referral Responses | ✅ Full | `append_glue_records` adds both A(1) and AAAA(28) glue (`dns_query_engine.c`) |
 | RFC 7314 | Extension Mechanisms for DNS (EDNS) EXPIRE Option | ❌ No (Server) / ✅ Full (Client `dag`) | Server does not emit option 9. `dag` client supports sending and parsing EDNS EXPIRE option (`+expire`) |
 | RFC 5001 | DNS Name Server Identifier (NSID) Option | ✅ Full (requires `nsid` config) | Server responds with a configured identifier string via EDNS option code 3 when queried with an empty NSID option, provided `nsid "<value>";` is set. `dag` client supports requesting and decoding NSID (`+nsid`) |
 | RFC 7828 | The edns-tcp-keepalive EDNS0 Extension | ✅ Full (opt-in, tied to `tcp-connection-reuse`) | When `tcp-connection-reuse yes;` is set and a client requests the option over TCP, the server echoes its configured idle timeout (`tcp-idle-timeout`, encoded in 100ms units per §3.2). Never included in UDP responses (RFC 7828 §3.2.1). `dag` client fully supports sending and decoding `+keepalive` |
-| RFC 7871 | Client Subnet in DNS Queries (ECS) | ✅ Full (Server, scope limited to authoritative record steering) / ✅ Full (Client `dag`) | Server parses the ECS option (FAMILY/SOURCE PREFIX-LENGTH/SCOPE PREFIX-LENGTH/ADDRESS) from trusted resolvers only (`ecs-enable`, `ecs-trusted-resolvers`), uses it for `$ECS-SUBNET-TAG` split-horizon record selection (`resolve_ecs_subnet_tag()` in `dns_server_core.c`, ECS parsing in `dns_wire.c`), and echoes SCOPE PREFIX-LENGTH in the response per §7.1.2. This is authoritative-side record steering, not recursive-resolver ECS forwarding/caching. `dag` client supports sending and parsing ECS options (`+subnet=addr/prefix`) |
+| RFC 7871 | Client Subnet in DNS Queries (ECS) | ✅ Full (Server, scope limited to authoritative record steering) / ✅ Full (Client `dag`) | Server parses the ECS option (FAMILY/SOURCE PREFIX-LENGTH/SCOPE PREFIX-LENGTH/ADDRESS) from trusted resolvers only (`ecs-enable`, `ecs-trusted-resolvers`), uses it for `$ECS-SUBNET-TAG` split-horizon record selection (`resolve_ecs_subnet_tag()` in `dns_edns_ecs.c`, ECS parsing in `dns_wire.c`), and echoes SCOPE PREFIX-LENGTH in the response per §7.1.2. This is authoritative-side record steering, not recursive-resolver ECS forwarding/caching. `dag` client supports sending and parsing ECS options (`+subnet=addr/prefix`) |
 
 ---
 
@@ -54,12 +54,12 @@ Legend:
 
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
-| RFC 5936 | DNS Zone Transfer Protocol (AXFR) | ✅ Full | `handle_axfr_event` (`dns_server_core.c`) |
+| RFC 5936 | DNS Zone Transfer Protocol (AXFR) | ✅ Full | Serving: `send_axfr_response()`; receiving (secondary zones): `handle_axfr_event()` (`dns_axfr_ixfr.c`) |
 | RFC 1995 | IXFR | ✅ Full | See section 1 above |
-| RFC 9432 | DNS Catalog Zones | ✅ Full | `catalog_process_membership`, `is_catalog` (`dns_server_core.c`, `dns_config_parser.h`) |
+| RFC 9432 | DNS Catalog Zones | ✅ Full | `catalog_process_membership()` (`dns_catalog_zone.c`), `catalog-zone yes;` / `is_catalog` (`dns_config_parser.c`) |
 | RFC 7477 | Child-to-Parent Synchronization in DNS (CSYNC) | ✅ Full | Supported and serialized (`dns_wire.c`, case 62) |
 | RFC 9859 | Generalized DNS Notifications (DSYNC) | ✅ Full | DSYNC(66) is fully serialized in the wire-format path (`dns_wire.c`, case 66), including the notify-RRtype, scheme (`NOTIFY` or numeric), port, and target fields. `karicheck` additionally validates that the DSYNC RRtype mnemonic is a recognized type (`tools/karicheck.c`). `dag` client formats DSYNC RDATA per RFC 9859 |
-| (Zone Forwarding) | Forward Zone Query Relaying | ✅ Full | `type "forward"` zones forward queries to designated upstream `forwarders` with shared absolute deadline budgeting (H-3), automatic failover, cryptographically random transaction IDs, TC-triggered TCP fallback, and Question/ID verification (`dns_server_core.c`, `dispatch_forward_zone`) |
+| (Zone Forwarding) | Forward Zone Query Relaying | ✅ Full | `type "forward"` zones forward queries to designated upstream `forwarders` with shared absolute deadline budgeting (H-3), automatic failover, cryptographically random transaction IDs, TC-triggered TCP fallback, and Question/ID verification (`dispatch_forward_zone()` in `dns_query_engine.c`) |
 
 ---
 
@@ -68,7 +68,7 @@ Legend:
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
 | RFC 4033/4034/4035 | DNS Security Introduction / Resource Records / Protocol Modifications | 🟡 Partial | **Static DNSSEC support**: pre-signed RRSIG/DNSKEY/DS etc. placed in the zone file are served correctly. No online signing or automated key management (ZSK/KSK rollover). Obsoletes RFC 2535 |
-| RFC 5155 | DNSSEC Hashed Authenticated Denial of Existence (NSEC3) | 🟡 Partial | `zone_uses_nsec3` detection is implemented and correctly suppresses NSEC attachment for NSEC3-signed zones (`dns_server_core.c`, `zone_uses_nsec3()`). Direct queries for NSEC3/NSEC3PARAM records are fully supported. Negative response closest-encloser proof synthesis is not implemented (static serving only) |
+| RFC 5155 | DNSSEC Hashed Authenticated Denial of Existence (NSEC3) | 🟡 Partial | `zone_uses_nsec3` detection is implemented and correctly suppresses NSEC attachment for NSEC3-signed zones (`zone_uses_nsec3()` in `dns_query_engine.c`). Direct queries for NSEC3/NSEC3PARAM records are fully supported. Negative response closest-encloser proof synthesis is not implemented (static serving only) |
 | RFC 6840 | Clarifications and Implementation Notes for DNSSEC | ✅ Full | The canonical-form errata this RFC documents (NSEC's Next Domain Name is NOT lowercased; RRSIG's Signer's Name IS lowercased) is now correctly implemented in the canonical-serialization path used for ZONEMD verification (`dns_wire.c`, `write_uncompressed_name_ext`) |
 | RFC 7344 | Automating DNSSEC Delegation Trust Maintenance (CDS/CDNSKEY) | 🟡 Partial (serving only, automation ➖ N/A by design) | CDS(59)/CDNSKEY(60) record types are recognized, stored, and served (`dns_utils.c`), fulfilling this server's role as the *child*-side authoritative server. The RFC's automation mechanism (parent-side scanning of CDS/CDNSKEY, or child-side push to the parent registrar) is intentionally out of scope: it either belongs to the parent registry's own software, or to a registrar-API integration layer that is architecturally independent of an authoritative DNS server. This is a permanent design decision consistent with this server's "static DNSSEC only" scope, not a pending TODO. |
 | RFC 8078 | Managing DS Records from the Parent via CDS/CDNSKEY | 🟡 Partial (serving only, automation ➖ N/A by design) | Updates RFC 7344 for parent-side automation. Child-side CDS/CDNSKEY serving is supported; parent-side registry synchronization is out of scope by design |
@@ -76,7 +76,7 @@ Legend:
 | RFC 8624 | Algorithm Implementation Requirements and Usage Guidance for DNSSEC | ✅ Full | `karicheck` now maintains a table of DNSSEC algorithm numbers and their RFC 8624 status, and emits a warning (non-fatal) when a DNSKEY/CDNSKEY/RRSIG uses an algorithm marked MUST NOT or NOT RECOMMENDED (e.g., RSAMD5, DSA, RSASHA1) (`tools/karicheck.c`). The server itself remains algorithm-agnostic by design (static DNSSEC); this is an advisory check only. Obsoletes RFC 6944 |
 | RFC 8901 | Multi-Signer DNSSEC Models | ➖ N/A | Not applicable — this server does not perform online signing, so multi-signer coordination models don't apply |
 | RFC 9824 | Compact Denial of Existence in DNSSEC (NXNAME) | ➖ N/A (mechanism) / 🟡 Partial (validation) | The Compact DoE *mechanism* itself requires online signing and is out of scope for this static-DNSSEC server. However, `karicheck` enforces the RFC's own requirement that NXNAME(128) — a synthetic meta-type — must never appear as a standalone RRset in zone-file data, flagging it as an error if found (`tools/karicheck.c`). The NXNAME(128) type mnemonic is also recognized by the record-type table (`dns_utils.c`) |
-| RFC 8976 | Message Digest for DNS Zones (ZONEMD) | ✅ Full | `karicheck --verify-zonemd` implements the full RFC 8976 §3 digest algorithm: canonical RRset ordering (owner name → type → RDATA per RFC 4034 §6.3), canonical (uncompressed, lowercased per §6.2/RFC 6840) wire-form serialization, exclusion of the apex ZONEMD RRset **and** its covering RRSIG from the digest input, and deduplication of identical RRs. **Verified against official RFC 8976 Appendix A test vectors (including Appendix A.4 `uri.arpa.`)** |
+| RFC 8976 | Message Digest for DNS Zones (ZONEMD) | ✅ Full | `karicheck zone` / `karicheck zones` verify every ZONEMD record with scheme 1 (SIMPLE) and hash algorithm 1 (SHA-384) or 2 (SHA-512) (`verify_zonemd()` in `tools/karicheck.c`), implementing the full RFC 8976 §3 digest algorithm: canonical RRset ordering (owner name → type → RDATA per RFC 4034 §6.3), canonical (uncompressed, lowercased per §6.2/RFC 6840) wire-form serialization, exclusion of the apex ZONEMD RRset **and** its covering RRSIG from the digest input, and deduplication of identical RRs. **Verified against official RFC 8976 Appendix A test vectors (including Appendix A.4 `uri.arpa.`)** |
 | RFC 9276 | Guidance for NSEC3 Parameter Settings | ✅ Full | `karicheck` enforces RFC 9276 guidance by emitting warnings if NSEC3/NSEC3PARAM iterations are greater than 0, or if the opt-out flag is set unnecessarily (`tools/karicheck.c`) |
 
 ---
@@ -85,11 +85,11 @@ Legend:
 
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
-| RFC 2136 | Dynamic Updates in the Domain Name System (DNS UPDATE) | ✅ Full | Ephemeral UPDATE (no persistence). Includes strict validation for meta-types, class matching, bailiwick, and exact-match deduplication in `process_update_sections` (`dns_wire.c`, ~line 2466), `handle_dynamic_update` (`dns_server_core.c`). Rejected with `NOTIMP` on forward/program zones |
+| RFC 2136 | Dynamic Updates in the Domain Name System (DNS UPDATE) | ✅ Full | Ephemeral UPDATE (no persistence). Includes strict validation for meta-types, class matching, bailiwick, and exact-match deduplication in `process_update_sections()` (`dns_wire.c`) and `handle_dynamic_update()` (`dns_dynamic_update.c`). Enabled per zone with `allow-update`. Rejected with `NOTIMP` on forward/program zones |
 | RFC 3007 | Secure Domain Name System (DNS) Dynamic Update | ✅ Full | Effectively satisfied by the combination of RFC 2136 (UPDATE) and RFC 8945 (TSIG); no dedicated code path, but the requirements are met |
-| RFC 8945 | Secret Key Transaction Authentication for DNS (TSIG) | ✅ Full | Exact-match algorithm dispatch (MD5/SHA1/SHA224/SHA256/SHA384/SHA512), BADALG handling, RFC 4635-compliant MAC truncation, and NOTAUTH + TSIG RR responses on both UPDATE and NOTIFY failure paths (`dns_wire.c`, `dns_server_core.c`). Obsoletes RFC 2845 and RFC 4635 |
+| RFC 8945 | Secret Key Transaction Authentication for DNS (TSIG) | ✅ Full | Exact-match algorithm dispatch (MD5/SHA1/SHA224/SHA256/SHA384/SHA512), BADALG handling, RFC 4635-compliant MAC truncation, and NOTAUTH + TSIG RR responses on both UPDATE and NOTIFY failure paths (`dns_wire.c`, `dns_query_engine.c`, `dns_dynamic_update.c`). Obsoletes RFC 2845 and RFC 4635 |
 | RFC 2930 | Secret Key Establishment for DNS (TKEY) | ❌ No | Not implemented (explicitly out of scope) |
-| RFC 7873 | Domain Name System (DNS) Cookies | ✅ Full | Client/server cookie parsing and generation, including FORMERR for malformed OPTION-LENGTH (`dns_wire.c`, `dns_server_core.c`) |
+| RFC 7873 | Domain Name System (DNS) Cookies | ✅ Full | Client/server cookie parsing and generation, including FORMERR for malformed OPTION-LENGTH (`dns_wire.c`, `dns_edns_ecs.c`, `dns_query_engine.c`) |
 | RFC 9018 | Interoperable Domain Name System (DNS) Server Cookies | ✅ Full | Version-1 Server Cookie (Version(1) + Reserved(3) + Timestamp(4) + Hash(8)) with `Hash = SipHash-2-4(Client Cookie \| Version \| Reserved \| Timestamp \| Client-IP, Server Secret)` (`dns_edns_ecs.c`: `generate_server_cookie()` / `verify_server_cookie()`, `dns_siphash.h`). Server Secret is configurable via `cookie-secret` (up to 4; first generates, all verify = RFC 9018 §5 rollover); `cookie-algorithm` accepts only `siphash24`. Reserved is zero on construction and hashed as received on verification (§4.2); timestamps use RFC 1982 serial arithmetic with a 1 h past / 5 min future window (§4.3); cookies older than 30 min are refreshed; the option length must be exactly 16 (§4.4). Without `cookie-secret` a random per-process secret is used (valid, but not interoperable across servers). Verified by RFC 9018 Appendix A.1–A.4 vectors in `tests/test_rfc_vectors.c` and end-to-end in `tests/test_query_engine_expanded.c` |
 
 ---
@@ -98,8 +98,9 @@ Legend:
 
 | RFC / Draft | Title | Status | Evidence / Notes |
 |---|---|---|---|
-| (Not formally standardized; de facto industry practice. Originating draft `draft-vixie-dnsext-rrl` has expired) | Response Rate Limiting (RRL) | ✅ Full | Keyed-hash bucket table, per-class token buckets, slip mechanism (`dns_server_core.c`). Applies equally to standard, forward, and program zones |
-| RFC 8914 | Extended DNS Errors (EDE) | ✅ Full | `add_ede` used across numerous response paths (`dns_server_core.c`) |
+| (Not formally standardized; de facto industry practice. Originating draft `draft-vixie-dnsext-rrl` has expired) | Response Rate Limiting (RRL) | ✅ Full | Keyed-hash bucket table, per-class token buckets, slip mechanism (`dns_rrl.c`). Server-wide or per-zone `rate-limit` blocks; applies equally to standard, forward, and program zones (`early-drop` skips the program for exhausted clients) |
+| RFC 8914 | Extended DNS Errors (EDE) | ✅ Full | `add_ede()` (`dns_edns_ecs.c`) used across numerous response paths (`dns_query_engine.c`, `dns_server_core.c`); can be disabled with `send-extended-errors no;` |
+| (dnstap, not an RFC) | dnstap query/response logging | ✅ Full | `AUTH_QUERY` / `AUTH_RESPONSE` messages over Frame Streams to a UNIX socket (`dns_dnstap.c`), configured with `dnstap { socket ...; }` |
 | RFC 5452 | Measures for Making DNS More Resilient against Forged Answers | ✅ Full | Outbound connections use OS-assigned ephemeral ports; transaction IDs for AXFR/IXFR pulls, outbound NOTIFY, and forward zones are generated via `arc4random() & 0xFFFF` (cryptographically secure) |
 
 ---
@@ -108,10 +109,10 @@ Legend:
 
 | RFC | Title | Status | Evidence / Notes |
 |---|---|---|---|
-| RFC 10029 | DNS Multiple QTYPEs (MQTYPE) | ✅ Full (opt-in, default OFF) | Implemented and hardened over multiple review rounds: strict truncation-avoidance semantics (additional QTYPEs must never force truncation of the primary response) and full FORMERR / duplicate query option rejection. Gated behind `rfc10029-mqtype yes;` (`dns_server_core.c`, `dns_wire.c`, `dns_config_parser.c`). `dag` formats MQTYPE-Query / MQTYPE-Response per Appendix A.1 (`tools/dag.c`) |
+| RFC 10029 | DNS Multiple QTYPEs (MQTYPE) | ✅ Full (opt-in, default OFF) | Implemented and hardened over multiple review rounds: strict truncation-avoidance semantics (additional QTYPEs must never force truncation of the primary response) and full FORMERR / duplicate query option rejection. Gated behind `rfc10029-mqtype yes;`, at most `max-mqtypes` (default 4) additional types (`dns_query_engine.c`, `dns_wire.c`, `dns_config_parser.c`). `dag` formats MQTYPE-Query / MQTYPE-Response per Appendix A.1 (`tools/dag.c`) |
 | RFC 9460 | Service Binding and Parameter Specification via the DNS (SVCB/HTTPS) | ✅ Full | Complete server-side serialization implementation in `dns_wire.c`'s `serialize_dns_record`, correctly encoding `alpn`, `port`, `ipv4hint`/`ipv6hint`, `ech`, `mandatory`, and generic `keyNNN` SvcParams into wire format. `dag` supports full structured decoding and presentation |
-| RFC 6066 | Transport Layer Security (TLS) Extensions: Extension Definitions (SNI) | ✅ Full (Client `dag`) | `dag` enforces RFC 6066 §3 by stripping trailing dots from domain names before setting TLS Server Name Indication (`clean_sni_host`, `tools/dag.c`) |
-| RFC 7230 | Hypertext Transfer Protocol (HTTP/1.1): Message Syntax and Routing | ✅ Full (Client `dag`) | `dag` DoH exchange enforces RFC 7230 §3.3.3 framing precedence where `Transfer-Encoding: chunked` overrides `Content-Length` (`tools/dag.c`) |
+| RFC 6066 | Transport Layer Security (TLS) Extensions: Extension Definitions (SNI) | ✅ Full (Client `dag`) | `dag` enforces RFC 6066 §3 by stripping trailing dots from domain names before setting TLS Server Name Indication (`clean_sni_host`, `tools/dag_transport.c`) |
+| RFC 7230 | Hypertext Transfer Protocol (HTTP/1.1): Message Syntax and Routing | ✅ Full (Client `dag`) | `dag` DoH exchange enforces RFC 7230 §3.3.3 framing precedence where `Transfer-Encoding: chunked` overrides `Content-Length` (`decode_http_response_body()` in `tools/dag_transport.c`) |
 | RFC 7050 | Discovery of the IPv6 Prefix Used for IPv6 Address Synthesis | ✅ Full (Client `dag`) | `dag` supports RFC 7050 prefix discovery queries via `+dns64prefix` (`tools/dag.c`) |
 
 ---
@@ -133,7 +134,7 @@ Legend:
 | RFC 4255 | Using DNS to Securely Publish Secure Shell (SSH) Key Fingerprints (SSHFP) | ✅ Full | SSHFP supported and serialized (`dns_wire.c`, case 44) |
 | RFC 4398 | Storing Certificates in the Domain Name System (CERT) | ✅ Full | Supported and serialized (`dns_wire.c`, case 37) |
 | RFC 4701 | Encoding Dynamic Host Configuration Protocol (DHCP) Information (DHCID) | ✅ Full | Supported and serialized (`dns_wire.c`, case 49) |
-| RFC 6672 | DNAME Redirection in the DNS | ✅ Full | DNAME→CNAME synthesis logic present (`dns_server_core.c`, `synth_name`). Obsoletes RFC 2672 |
+| RFC 6672 | DNAME Redirection in the DNS | ✅ Full | DNAME→CNAME synthesis logic present (`synth_name` in `dns_query_engine.c`). Obsoletes RFC 2672 |
 | RFC 6698 | DANE TLSA | ✅ Full | TLSA supported and serialized (`dns_wire.c`, case 52) |
 | RFC 6742 | DNS Resource Records for ILNP (NID, L32, L64, LP) | ✅ Full | Supported and serialized (`dns_wire.c`, cases 104-107) |
 | RFC 7043 | Resource Records for EUI-48 and EUI-64 Addresses in the DNS | ✅ Full | Supported and serialized (`dns_wire.c`, cases 108-109) |
@@ -156,7 +157,7 @@ Legend:
 | RFC 9498 | Fully Encrypted Authority | ➖ N/A | Depends on encrypted-transport infrastructure outside the current design's scope |
 | RFC 7830 | The EDNS(0) Padding Option | ❌ No (Server) / ✅ Full (Client `dag`) | Server does not pad responses. `dag` client supports sending and displaying EDNS padding (`+padding=N`) |
 | RFC 8020 | NXDOMAIN: There Really Is Nothing Underneath | ➖ N/A | Recursive-resolver caching guidance; does not apply to an authoritative server |
-| RFC 9156 | DNS Query Name Minimisation to Improve Privacy | ➖ N/A | Obsoletes RFC 7816. Recursive-resolver caching and upstream query minimization; authoritative servers handle minimized queries transparently |
+| RFC 9156 | DNS Query Name Minimisation to Improve Privacy | ➖ N/A (Server) / ✅ Full (Client `dag +trace2 +qmin`) | Obsoletes RFC 7816. Recursive-resolver upstream query minimization; authoritative servers handle minimized queries transparently. `dag +trace2` can minimise its own iterative queries (`+qmin` / `+qmin=ns`, `tools/dag_iter.c`) |
 | RFC 8499 | DNS Terminology | ➖ N/A | Glossary; not an implementation target. Obsoletes RFC 7719 |
 | RFC 6895 | DNS IANA Considerations | ➖ N/A | Registry operating procedures; not an implementation target |
 | RFC 6761 | Special-Use Domain Names | ➖ N/A | Operational guidance for IANA special-use names |

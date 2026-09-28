@@ -39,7 +39,7 @@ dag [global-queryopt...] [query...]
 1. **Protocol Mutation & Fuzzing (`--break`)**:
    `dag` can craft malformed, edge-case, or boundary-testing DNS packets (such as compression pointer loops, oversized labels, invalid header counts, or TCP stream anomalies) to evaluate the robustness of DNS server implementations.
 2. **Multi-Server Consistency Comparison (`+allcompare`)**:
-   Users can supply a comma-separated list of nameservers (e.g., `@1.1.1.1,8.8.8.8,9.9.9.9:5353`). `dag` queries each server and can output a matrix comparing response equivalence (`MATCH_EXACT`, `MATCH_SEMANTIC`, or `[DIFF]`).
+   Users can supply a comma-separated list of nameservers (e.g., `@192.0.2.1,198.51.100.1,203.0.113.1:5353`). `dag` queries each server and can output a matrix comparing response equivalence (`MATCH_EXACT`, `MATCH_SEMANTIC`, or `[DIFF]`).
 3. **Web Wire-Format Inspection (`+ldnsz`)**:
    Encodes the raw wire-format query and response using zlib compression and Base64URL encoding, generating inspection URLs for [ldns.jp](https://ldns.jp/) or multi-server binary diff URLs.
 4. **Transports & Protocol Extensions**:
@@ -51,9 +51,13 @@ dag [global-queryopt...] [query...]
 
 ### Default Lookup Behavior
 
-- Unless `@server` is explicitly provided, `dag` reads nameserver addresses from `/etc/resolv.conf`. If no server is found, it queries `127.0.0.1`.
-- When no domain name is supplied, `dag` queries the root zone (`.`) for `NS` records. If a domain name is supplied without a type, it defaults to `A` (or `PTR` if `-x` is specified).
+- Unless `@server` is explicitly provided, `dag` reads nameserver addresses from `/etc/resolv.conf` (on Windows, from the system's DNS server list). If no server is found, it queries `127.0.0.1`.
+- When no domain name is supplied, `dag` queries the root zone (`.`) for `NS` records. If a domain name is supplied without a type, it defaults to `A` (or `PTR` if `-x` is specified). The name, type and class may be given in any order.
+- The query has the RD and AD bits set, like `dig`.
+- **No EDNS OPT record is sent by default.** EDNS is enabled by `+edns` or by any option that needs it (`+bufsize`, `+dnssec`, `+nsid`, `+cookie`, `+badcookie`, `+subnet`, `+padding`, `+ednsopt`, `+ednsflags=N`, `+mqtype`, `+expire`, `+keepalive`, `+coflag`, `+dns64prefix`). This differs from `dig`, which sends EDNS by default.
+- In the normal output format, a hex dump of the query (`Query (N bytes):`) and of the response is printed in addition to the dig-style sections. Use `+nohexdump` to turn this off; the dumps are not printed with `+short` or `+yaml` (and the response dump not with `+nocomments`).
 - Per-user defaults can be configured via `${HOME}/.digrc`. This file is read and its options applied before command-line arguments, unless the `-r` option is supplied.
+- Up to 64 queries can be given on one command line (see [MULTIPLE QUERIES & BATCH PROCESSING](#multiple-queries--batch-processing)).
 
 ---
 
@@ -83,7 +87,7 @@ dag [global-queryopt...] [query...]
 : Print the list of all available `--break` mutation and fuzzing options and exit.
 
 `-k keyfile`
-: Sign queries using TSIG with credentials read from a BIND-compatible key file.
+: Sign queries using TSIG with credentials read from a BIND-compatible key file, or with SIG(0) when the file is a BIND `.private` key (see [TSIG TRANSACTION SECURITY](#tsig-transaction-security)).
 
 `-m`
 : Enable memory usage debugging. Upon completion, `dag` prints process maximum resident set size (`ru_maxrss`) via `getrusage(2)`. *(Not available on Windows)*
@@ -120,10 +124,16 @@ dag [global-queryopt...] [query...]
 ## TRANSPORT & PROTOCOL OPTIONS
 
 `+[no]tcp`, `+[no]vc`
-: Use TCP transport instead of UDP. `+vc` ("virtual circuit") is a synonym for `+tcp`. `+novc` disables TCP. `AXFR` and large `IXFR` queries automatically elevate to TCP unless `+udp` is explicitly forced.
+: Use TCP transport instead of UDP. `+vc` ("virtual circuit") and `--tcp` are synonyms for `+tcp`. `+novc` / `+notcp` force UDP. `AXFR` and large `IXFR` queries automatically elevate to TCP unless `+udp` is explicitly forced.
 
 `+udp`
 : Force UDP transport.
+
+`+tcp-mss=N`
+: Set the TCP maximum segment size (`TCP_MAXSEG`) of the query connection to `N` bytes. Implies `+tcp`. Corresponds to the server's `tcp-mss` (see [karidns(8)](karidns.md#transport-tuning-tcp-mss--window-udp-payload-size)).
+
+`+tcp-window=N`
+: Set the TCP receive and send buffer sizes (`SO_RCVBUF` / `SO_SNDBUF`) of the query connection to `N` bytes before connecting. Implies `+tcp`.
 
 `+[no]tls`
 : Use **DNS over TLS (DoT)** (RFC 7858). When enabled, default destination port switches to 853.
@@ -146,23 +156,20 @@ dag [global-queryopt...] [query...]
 `+[no]https-post[=endpoint]`
 : Use DoH with HTTP POST method (transmitting wire query in HTTP payload body).
 
-`+[no]http-plain[=endpoint]`, `+[no]http-plain-get`, `+[no]http-plain-post`
-: Send DNS queries over unencrypted plain HTTP (RFC 8484). Default port is 80; default endpoint is `/dns-query`.
+`+[no]http-plain[=endpoint]`, `+[no]http-plain-get[=endpoint]`, `+[no]http-plain-post[=endpoint]`
+: Send DNS queries over unencrypted plain HTTP (RFC 8484 message format). Default port is 80; default endpoint is `/dns-query`; the default method is POST. `+http`, `+http-get` and `+http-post` are aliases.
 
 `+[no]proxy[=spec]`
 : Prepend a **HAProxy PROXYv2** binary header before the DNS packet.
   - If `spec` is omitted (`+proxy`), sends a PROXYv2 header with `LOCAL` command.
   - If `spec` is provided in `src_addr[#src_port]-dst_addr[#dst_port]` format (e.g., `+proxy=192.0.2.1#1234-192.0.2.2#53`), sends a PROXYv2 `PROXY` command reflecting the specified connection endpoints.
-  - For encrypted transports (DoT/DoH), the PROXYv2 header is sent after the TLS handshake completes.
+  - On TCP-based transports the header is sent right after the TCP connection is established, **before** any TLS handshake (DoT/DoH). On UDP it is prepended to each datagram.
 
 `+[no]proxy-plain[=spec]`
-: Same as `+proxy`, but transmits PROXYv2 headers ahead of TLS encryption handshakes.
-
-`+[no]keepalive`
-: Include the EDNS TCP Keepalive option (RFC 7828) in the query.
+: Alias for `+proxy`, kept for `dig`/`kdig` compatibility; behaves identically.
 
 `+[no]keepopen`
-: Keep the TCP or TLS socket open between consecutive queries when executing multiple queries in a batch. *(Note: HTTP Keep-Alive is currently unsupported in DoH `+https` mode, and connections will be closed after each query).*
+: Keep the TCP, TLS or HTTPS connection open between consecutive queries to the same server (RFC 7766 connection reuse), e.g. when several queries are given on the command line or in a batch file.
 
 `+[no]dns64prefix`
 : Automatically query `ipv4only.arpa` for `AAAA` records to discover local DNS64 prefixes (RFC 7050).
@@ -217,7 +224,7 @@ dag [global-queryopt...] [query...]
 : When querying multiple nameservers or using failover lists, controls whether to try the next nameserver when receiving a `SERVFAIL` response.
 
 `+[no]trace`
-: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). By default (`+noglue`, matching BIND 9.20+ `dig` behavior), `dag +trace` ignores the `ADDITIONAL` section of referral responses and resolves the delegated nameserver names (A/AAAA) to follow delegation paths down to authoritative servers, displaying each intermediate answer. Nameserver names are resolved through `@server` when it offers recursion (`RA=1` in its root `NS` response); when `@server` is authoritative-only (e.g. `@198.41.0.4`), they are resolved through the system resolver (`/etc/resolv.conf`, port 53) like BIND `dig`, and names that cannot be resolved are reported as `;; couldn't get address for '<name>'`. Specify `+glue` to restore the previous behavior of using in-bailiwick Glue records from the `ADDITIONAL` section (falling back to resolver lookups only when no glue is present). Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses. Like BIND `dig`, `+trace` implies `+noadditional`, so the `ADDITIONAL` section of each hop is not displayed; give `+additional` after `+trace` to show it again.
+: Trace the DNS delegation path iteratively starting from the root nameservers (`.`). By default (`+noglue`, matching BIND 9.20+ `dig` behavior), `dag +trace` ignores the `ADDITIONAL` section of referral responses and resolves the delegated nameserver names (A/AAAA) to follow delegation paths down to authoritative servers, displaying each intermediate answer. Nameserver names are resolved through `@server` when it offers recursion (`RA=1` in its root `NS` response); when `@server` is authoritative-only (e.g. a root server address such as `@192.0.2.1`), they are resolved through the system resolver (`/etc/resolv.conf`, port 53) like BIND `dig`, and names that cannot be resolved are reported as `;; couldn't get address for '<name>'`. Specify `+glue` to restore the previous behavior of using in-bailiwick Glue records from the `ADDITIONAL` section (falling back to resolver lookups only when no glue is present). Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses. Like BIND `dig`, `+trace` implies `+noadditional`, so the `ADDITIONAL` section of each hop is not displayed; give `+additional` after `+trace` to show it again.
 
 `+[no]trace2[=brief|normal|verbose]`
 : Resolve the name the way a full iterative resolver (BIND `named`, Unbound) does, **without relying on any local or system resolver**. Unlike `+trace`, which asks `@server` / `/etc/resolv.conf` for the root NS set and for nameserver addresses, `+trace2` primes from built-in root hints (IANA `named.root`; or `@server` / `+roothints=FILE` when given) with a `. NS` query (RFC 8109), follows referrals with RD=0, and resolves nameserver names that come without glue (e.g. `example.jp. NS ns1.example.net.`) itself, starting from the closest zone cut it has already learned. Referral data outside the queried zone's bailiwick is discarded (RFC 2181 §5.4.1). CNAME and DNAME chains are followed across zones; DS queries are sent to the parent side of the zone cut. Lame servers (REFUSED, upward/sideways referrals, non-authoritative empty answers), SERVFAIL and timeouts make it try the next server; FORMERR/NOTIMP to an EDNS query is retried without EDNS. CNAME loops, nameserver dependency loops (`a.test NS ns.b.alt` / `b.alt NS ns.a.test`), recursion depth (8) and the total query budget (`+trace2-maxqueries`, default 200) all end the resolution with `;; resolution failed: <reason>` instead of looping. Every hop on the main delegation path is displayed like `+trace` (`;; Received N bytes from ADDR#PORT(ns-name) in T ms`). The mode selects how nameserver-name sub-resolutions are shown: `normal` (default) prints one line per sub-resolution (`;; [sub] ns1.example.net -> 192.0.2.53 (4 queries)`), `verbose` prints every sub query and response prefixed with `;; [sub N] name/type @addr(ns) for zone`, and `brief` hides them. A final summary line reports the status, total/sub-resolution query counts, lame servers, timeouts and elapsed time. Query IDs are randomized per query. `-p` applies to every hop (useful for test hierarchies); `-4`/`-6`, `+tcp`, `+time`, `+tries`, `+edns`/`+bufsize`/`+dnssec` apply to every query. Glue: by default (and with `+glue`/`+glue=all`) any glue within the bailiwick of the referring zone is used; `+glue=indomain` or an explicit `+noglue` uses only in-domain glue (which a delegation cannot work without, RFC 9471) and resolves the rest. Glue outside the bailiwick of the referring zone (e.g. an `A` record for `ns.other.example.` returned in a referral from the `zone.example.` servers) is never trusted, not even with `+glue=all`, because those servers are not authoritative for it; it is reported as `;; ignoring out-of-bailiwick glue for '<ns>' (not under <zone>)` and the nameserver name is resolved from its own authoritative servers instead. Implies `+noadditional`. Cannot be combined with `+trace` or `+nssearch`. `+trace2` does not validate DNSSEC. Like `dig +trace`, the exit status is 0 whenever the trace ran, including when resolution fails (`;; resolution failed: ...` / `;; trace2: SERVFAIL`); it is 9 only when priming fails (no root server could be reached). When given on the command line with `-f`, `+trace2` and its options apply to every line of the batch file.
@@ -259,17 +266,16 @@ dag [global-queryopt...] [query...]
 
 ## EDNS0 EXTENSIONS
 
+No OPT record is sent unless one of the options in this section (or `+edns`) is given.
+
 `+[no]edns[=N]`
-: Specify the EDNS version to advertise in the OPT pseudo-RR (default: 0). `+noedns` completely disables EDNS0 in the query.
+: `+edns` adds an OPT pseudo-RR to the query; `+edns=N` also sets the EDNS version to `N` (default: 0). `+noedns` removes the OPT record.
 
 `+bufsize=N`
-: Set the advertised EDNS0 UDP buffer size (default: 1232 bytes, compliant with DNS Flag Day recommendations).
+: Set the advertised EDNS0 UDP buffer size, 0–65535 (default when EDNS is sent: 1232 bytes, compliant with DNS Flag Day recommendations). Enables EDNS.
 
 `+[no]dnssec`, `+[no]do`
 : Set the **DO (DNSSEC OK)** bit in the EDNS0 OPT record, requesting DNSSEC RRs (RRSIG, NSEC, NSEC3, DS) from the authoritative server.
-
-`+[no]keepopen`
-: Keep the TCP or TLS socket open between consecutive queries to the same nameserver (RFC 7766 DNS over TCP connection reuse).
 
 `+[no]keepalive`
 : Send the **EDNS TCP Keepalive (RFC 7828)** option (Option Code 11) in the OPT pseudo-RR.
@@ -287,19 +293,19 @@ dag [global-queryopt...] [query...]
 : Print a diagnostic message when a `BADCOOKIE` retry occurs.
 
 `+subnet=addr[/prefix]`
-: Send the **EDNS Client Subnet (ECS)** option (RFC 7871) with the specified IPv4 or IPv6 network prefix (e.g., `+subnet=192.0.2.0/24` or `+subnet=2001:db8::/56`). Specifying `+subnet=0` sends an empty source address with prefix length 0 to signal privacy preference.
+: Send the **EDNS Client Subnet (ECS)** option (RFC 7871) with the specified IPv4 or IPv6 network prefix (e.g., `+subnet=192.0.2.0/24` or `+subnet=2001:db8::/56`). Specifying `+subnet=0` (or `0/0`, `0.0.0.0/0`, `::/0`) sends an empty source address with prefix length 0 to signal privacy preference. `+nosubnet` removes the option.
 
 `+[no]nsid`
 : Request the **Name Server Identifier (NSID)** option (RFC 5001).
 
-`+padding[=N]`
-: Add exactly `N` bytes of EDNS0 Padding option payload (useful for packet size fuzzing).
+`+padding[=N]`, `+nopadding`
+: Add the EDNS(0) Padding option (RFC 7830) so that the query size becomes a multiple of the block size `N` (default: 468, the RFC 8467 recommendation). The expected TSIG record is taken into account when TSIG is used.
 
-`+mqtype=TYPE[,TYPE...]`
-: Send the **Multiple QTYPE (RFC 10029)** EDNS option (Option Code 20), requesting multiple resource record types (e.g., `+mqtype=A,AAAA,HTTPS`) in a single query transaction.
+`+[no]mqtype=TYPE[,TYPE...]`
+: Send the **Multiple QTYPE (RFC 10029)** EDNS option (Option Code 20), requesting multiple resource record types (e.g., `+mqtype=A,AAAA,HTTPS`) in a single query transaction. Up to 16 types; `+nomqtype` removes the option.
 
 `+ednsopt=code[:hex]`
-: Specify a custom EDNS option code (0–65535) and optional payload encoded in hexadecimal string. Multiple `+ednsopt` parameters can be supplied.
+: Specify a custom EDNS option code (0–65535) and optional payload encoded in hexadecimal string. Up to 8 `+ednsopt` parameters can be supplied.
 
 `+noednsopt`
 : Clear all configured custom EDNS options.
@@ -377,7 +383,7 @@ dag [global-queryopt...] [query...]
 
 ## DYNAMIC DNS UPDATE (RFC 2136)
 
-`dag` can formulate and send Dynamic DNS UPDATE requests (`OPCODE=5`), supporting record additions, deletions, and prerequisite evaluations.
+`dag` can formulate and send Dynamic DNS UPDATE requests (`OPCODE=5`), supporting record additions, deletions, and prerequisite evaluations. The query name is used as the zone name. Up to 16 update operations and 16 prerequisites can be given per message.
 
 ### Update Operations
 
@@ -442,20 +448,22 @@ dag [global-queryopt...] [query...]
 | `truncated-question` | Truncates the wire packet abruptly in the middle of a label or type field. | Premature EOF parsing panic |
 | `opt-rdlen=N` | Overstates OPT record `RDLENGTH` (e.g., 500 bytes when actual payload is small). | EDNS0 RDATA boundary overrun |
 | `arcount=N` | Overrides header `ARCOUNT` to indicate non-existent additional records. | Additional record array indexing errors |
-| `opcode=N` | Sets an unallocated or reserved DNS `OPCODE` (`N=15`). | Unhandled Opcode crash / state machine |
+| `opcode=N` | Overrides the header `OPCODE` with `N` (e.g. an unassigned value such as 15). | Unhandled Opcode crash / state machine |
 | `qr-bit` | Sets the `QR` bit to 1 on an outgoing query (sending a response as a query). | Server reflection / loop amplification |
 | `notify-no-question` | Sends `OPCODE=4` (NOTIFY) with `QDCOUNT=0`. | RFC 1996 missing zone question panic |
 | `too-short[=N]` | Sends only the first `N` bytes of the message (default: 3). | Short packet header read violation |
 | `short-header[=N]` | Alias for `too-short[=N]`. | (same as `too-short`) |
 | `tcp-length-overclaim[=N]` | (*TCP only*) Prefixes a 2-byte TCP length `N` bytes larger than sent data (default: `N=10`). | TCP frame starvation / hanging worker |
 | `tcp-zero-length` | (*TCP only*) Sends a 2-byte TCP length prefix of `0`. | Zero-length packet hang or memory leak |
-| `tcp-idle-hold[=SEC]` | (*TCP only*) Sends length prefix, holds connection open for `SEC` seconds (default: `SEC=20`). | Slowloris / connection pool exhaustion |
-| `update-meta-type[=N]` | (*UPDATE only*) Injects a meta-type RR (e.g., OPT / TSIG) into the Update Section. | Meta-RR validation in dynamic updates |
+| `tcp-idle-hold[=SEC]` | (*TCP only*) Sends only the length prefix, holds the connection for up to `SEC` seconds (default: `SEC=20`) and reports when/if the server disconnects. | Slowloris / connection pool exhaustion |
+| `update-meta-type[=N]` | (*UPDATE only*) Injects a meta-type RR of type `N` (default: 41 = OPT) into the Update Section. | Meta-RR validation in dynamic updates |
+
+The TCP-only kinds require `+tcp` (or `--tcp`).
 
 ### Automated Batch Fuzzing
 
 `--break all`, `--test-all`
-: Sequentially executes the predefined set of built-in anomaly test cases against the target server, printing the response status or timeout for each test case.
+: Sequentially executes the predefined set of built-in anomaly test cases against the target server (each with a 1-second timeout and a single try), printing the response status or timeout for each test case.
 
 `--hex=<hexstring>`
 : Directly transmits the raw hexadecimal byte stream as a DNS packet without validation or reconstruction.
@@ -470,26 +478,28 @@ dag [global-queryopt...] [query...]
 
 Multiple servers are specified via a comma-separated list after `@`:
 ```sh
-dag example.com A @1.1.1.1,8.8.8.8,9.9.9.9:5353,[2001:4860:4860::8888]
+dag example.com A @192.0.2.1,198.51.100.1,203.0.113.1:5353,[2001:db8::53]
 ```
 
 ### Response Equivalence Comparison (`+allcompare`)
 
-When `+allcompare` is specified, `dag` performs automated differential analysis across all responding servers:
+Whenever more than one response is collected (several servers, or a UDP answer followed by a TCP retry), `dag` prints a comparison summary after the individual answers. Each response is compared with the base response (the first complete, non-truncated one):
 
-- `[BASE]`: The reference response from the base server.
+- `[BASE]`: The reference response.
 - `MATCH_EXACT`: Binary byte-for-byte match (excluding the 16-bit Query ID).
-- `MATCH_SEMANTIC`: Semantic match — all Resource Records, RDATA sets, and section counts match regardless of record ordering or TTL differences.
-- `[DIFF]`: Discrepancy detected in RCODE, flags, answer sets, or authority data.
+- `MATCH_SEMANTIC`: Same RCODE, and the same set of resource records in the answer, authority and additional sections, regardless of record order. By default TTLs are ignored.
+- `[DIFF]`: Different RCODE or a different record set.
 
-A summary table is printed:
+`+allcompare` makes the semantic comparison stricter: TTLs are included in the record hash (column `SEM_HASH(+TTL)`), so records that differ only in their TTL are reported as `[DIFF]`.
+
 ```text
-;; --- Multi-Server Query Summary ---
-SERVER               | PROTO | RCODE    | QD | AN | NS | AR | TIME   | STATUS
----------------------+-------+----------+----+----+----+----+--------+------------------------
-1.1.1.1              | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 12 ms  | [BASE]
-8.8.8.8              | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 18 ms  | MATCH_SEMANTIC
-9.9.9.9:5353         | UDP   | NOERROR  | 1  | 1  | 0  | 1  | 15 ms  | MATCH_EXACT
+;; === MULTI-SERVER COMPARISON SUMMARY ===
+SERVER             | PROTO | RCODE   | ANS | AUT | ADD | SEM_HASH   | TIME   | MATCH STATUS
+-------------------+-------+---------+-----+-----+-----+------------+--------+------------------------
+192.0.2.1          | UDP   | NOERROR |   1 |   0 |   1 | 0x5A3C19E2 |   12ms | [BASE]
+198.51.100.1       | UDP   | NOERROR |   1 |   0 |   1 | 0x5A3C19E2 |   18ms | MATCH_SEMANTIC
+203.0.113.1#5353   | UDP   | NOERROR |   1 |   0 |   1 | 0x5A3C19E2 |   15ms | MATCH_EXACT
+-------------------+-------+---------+-----+-----+-----+------------+--------+------------------------
 ```
 
 > **Note on TC (Truncation) Retries:**
@@ -516,7 +526,7 @@ When `+ldnsz` is supplied:
 : Output the complete parsed DNS response in structured YAML format.
 
 `+[no]ttlunits`
-: Display TTL values using human-friendly time unit suffixes (`s`, `m`, `h`, `d`, `w`).
+: Display TTL values using human-friendly time unit suffixes (`s`, `m`, `h`, `d`, `w`). Implies `+ttlid`.
 
 `+[no]class`
 : Toggle display of the CLASS field in record listings.
@@ -564,25 +574,22 @@ When `+ldnsz` is supplied:
 : Display IPv6 AAAA record addresses in fully expanded 8-group notation (e.g. `2001:0db8:0000:0000:...`) instead of compressed notation.
 
 `+[no]split=N`
-: Split long base64 and hex strings into chunks of `N` characters (default: 56; 44 in multiline mode). `+nosplit` disables splitting.
+: Split long base64 and hex strings into chunks of `N` characters, rounded up to a multiple of 4 (default: 56; 44 in multiline mode). `+nosplit` or `+split=0` disables splitting.
 
 `+[no]besteffort`
 : Attempt to parse and print malformed or corrupted packets.
 
-`+[no]expire`
-: Request and display the zone expiration timer for SOA queries.
+`+[no]showsearch`
+: Show the intermediate results of search list processing (implies `+search`).
 
-`+[no]nohexdump`
-: Suppress binary hex dumps for both outgoing query and incoming response packets.
+`+[no]hexdump`
+: Show (default) or suppress the hex dumps of both the outgoing query and the incoming response.
 
-`+[no]nohexdump-query`
-: Suppress hex dump for outgoing queries only.
+`+[no]hexdump-query`
+: Show or suppress the hex dump of the outgoing query only.
 
-`+[no]nohexdump-response`
-: Suppress hex dump for incoming responses only.
-
-`+[no]yaml`
-: Output parsed response in structured YAML format (including headers, question, answer, authority, and additional sections with decoded `rdata:` fields).
+`+[no]hexdump-response`
+: Show or suppress the hex dump of the incoming response only.
 
 ---
 
@@ -591,7 +598,7 @@ When `+ldnsz` is supplied:
 `dag` allows specifying multiple query tuples on a single command line:
 
 ```sh
-dag +qr example.com A @1.1.1.1 +subnet=192.0.2.0/24 -x 192.0.2.1 @8.8.8.8 +noqr
+dag +qr example.com A @192.0.2.53 +subnet=192.0.2.0/24 -x 192.0.2.1 @198.51.100.53 +noqr
 ```
 
 In this mode:
@@ -664,11 +671,11 @@ dag example.jp A +trace2=verbose +qmin
 
 ### Multi-Server Comparison & LDNSZ Integration
 ```sh
-# Compare answers across Quad9, Cloudflare, and Google DNS
-dag example.com A @9.9.9.9,1.1.1.1,8.8.8.8 +allcompare
+# Compare answers across three servers (TTLs included)
+dag example.com A @192.0.2.1,198.51.100.1,203.0.113.1 +allcompare
 
 # Generate visual online diff URL
-dag example.com A @1.1.1.1,8.8.8.8 +ldnsz
+dag example.com A @192.0.2.1,198.51.100.1 +ldnsz
 ```
 
 ### Modern Transports (DoT / DoH / PROXYv2)
@@ -677,7 +684,7 @@ dag example.com A @1.1.1.1,8.8.8.8 +ldnsz
 dag example.com A @127.0.0.1 +tls +tls-ca=/etc/ssl/cert.pem
 
 # Query via DNS over HTTPS (DoH) using GET
-dag example.com A @cloudflare-dns.com +https-get
+dag example.com A @doh.example.net +https-get
 
 # Query via HAProxy PROXYv2 encapsulation
 dag example.com A @127.0.0.1 +proxy=192.0.2.10#45000-192.0.2.1#53
@@ -749,7 +756,8 @@ dag example.com A @127.0.0.1 --test-all
 
 - [`karidns(8)`](karidns.md) — KariDNS authoritative DNS server daemon
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
-- [`karicheck(1)`](karicheck.md) — Zone file syntax and ZONEMD validation utility
+- [`karicheck(1)`](karicheck.md) — Configuration and zone file validation utility
+- [`dag_replay(1)`](dag_replay.md) — Traffic replay and differential testing (`dag --replay`)
 - [`dag.c`](../tools/dag.c) — Source implementation of the DNS Anomaly Generator
 - [`KariDNS RFC Guideline`](../KariDNS_RFC_GUIDELINE.md) — Detailed RFC compliance and design boundary document
 
@@ -769,11 +777,16 @@ dag example.com A @127.0.0.1 --test-all
 
 ### Fuzzing & Differential Test Harnesses
 
-In addition to `fuzz_dag_response`, the following test harnesses ensure protocol security and parser integrity:
+`make fuzz_dag_all` builds the following libFuzzer harnesses (`sh tests/run_fuzz_smoke_test.sh dag` runs a short smoke test of them):
 
 | Target | Description | Scope |
 |---|---|---|
+| `fuzz_dag` (`fuzz_dag_response`) | Response parser and display | Response decoding and dig-style formatting |
 | `fuzz_dag_hash` | Packet semantic hash & RDATA formatting | `calculate_packet_hashes()` → `format_rdata_for_display()` |
+| `fuzz_dag_iter_classify` | `+trace2` response classification | `dag_iter_classify()`: CNAME/DNAME chains, referral and glue extraction with bailiwick checks, SOA detection |
+| `fuzz_dag_replay_pcap_reader` | `--replay` PCAP frame decoder | Link-layer (Ethernet, Linux SLL, raw, NULL) / IP / UDP / TCP decoding |
+| `fuzz_dag_replay_diff` | `--replay` differential engine | `diff_dns_responses()` |
+| `fuzz_dag_tcp_reassembly` | TCP stream reassembly for PCAP replay | Segment ordering and DNS-over-TCP framing |
 | `fuzz_dag_chunked_http` | DoH HTTP/1.1 chunked transfer decoder | `decode_http_response_body()` boundary values |
 | `fuzz_dag_rdata_yaml` | Direct RDATA parser & display formatter | `format_rdata_for_display()` with `dopt=NULL` and `+yaml` |
 | `fuzz_dag_axfr_stream` | Multi-message AXFR streaming state machine | Stateful multi-packet `axfr_state_t` sequence transitions |
@@ -783,16 +796,10 @@ In addition to `fuzz_dag_response`, the following test harnesses ensure protocol
 
 ---
 
-## SEE ALSO
-
-[`dag_replay(1)`](dag_replay.md), [`karidns(8)`](karidns.md), [`karicheck(1)`](karicheck.md), [`karictl(8)`](karictl.md)
-
----
-
 ## AUTHORS
 
 Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
 
 ```text
-KariDNS                          August 2026                          DAG(1)
+KariDNS                         September 2026                        DAG(1)
 ```

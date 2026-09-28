@@ -42,20 +42,21 @@ Unlike traditional CGI-like designs, KariDNS **does not fork or execute a new pr
 ### Key Architectural Characteristics
 
 1. **Persistent Process Model**
-   - KariDNS launches the external plugin during server startup (`spawn_program_zone_plugins`).
+   - KariDNS launches one plugin process per program zone during server startup (`spawn_program_zone_plugins`), before the backend enters Capsicum capability mode. The plugin inherits standard error; all other inherited descriptors are closed.
    - The plugin runs as a persistent daemon process that blocks on STDIN and loops over incoming queries, eliminating per-query process instantiation overhead.
+   - Plugins are not restarted by a reload: a program zone added by `karictl reload` / `reconfig` / `SIGHUP` returns `SERVFAIL` until KariDNS is restarted, and changes to the `program*` settings of an existing zone take effect only after a restart.
 
-2. **Thread-Safe Asynchronous I/O Pool**
-   - Queries targeting a `type program` zone are dispatched to KariDNS's asynchronous I/O worker pool.
-   - Access to the plugin's STDIN and STDOUT is serialized via an internal mutex, ensuring request and response stream order integrity across concurrent worker threads.
+2. **Serialized Access from the Worker Threads**
+   - A query for a `type program` zone is handled directly by the worker thread that received it: the thread writes the request to the plugin and waits for the reply.
+   - Access to each plugin's STDIN and STDOUT is serialized with a per-plugin mutex, ensuring request and response stream order integrity across concurrent worker threads. A plugin therefore handles one query at a time, and a slow plugin also delays the worker threads waiting for it.
 
 3. **Fault Tolerance and Deadline Monitoring**
-   - Each query is assigned a deadline based on `program-timeout` (default: 2000 ms). If the plugin does not respond within this deadline, KariDNS terminates the waiting cycle and synthesizes a `SERVFAIL` response to the client.
-   - If communication fails repeatedly (e.g., plugin crashes or times out), an atomic failure counter is incremented. When `program-max-failures` is reached, KariDNS forcibly kills the process (`SIGKILL`) and marks the zone dead to protect system resources.
+   - Each query is assigned a single deadline based on `program-timeout` (default: 2000 ms), shared by all reads and writes of that exchange. If the plugin does not respond within this deadline, KariDNS stops waiting and synthesizes a `SERVFAIL` response to the client.
+   - Every failed exchange (timeout, broken pipe, a declared response length above 65,535) increments a counter of consecutive failures, and a successful exchange resets it. When the counter reaches `program-max-failures` (default: 5), KariDNS kills the process (`SIGKILL`) and marks the zone dead: it answers `SERVFAIL` until KariDNS is restarted.
 
 4. **Transparent Binary Wire Passthrough & Truncation**
    - KariDNS passes the raw DNS query packet directly to the plugin and returns the plugin's response bytes directly to the client.
-   - If the plugin's response exceeds the maximum allowed transmission size (e.g., 512 bytes for standard UDP or the client's EDNS buffer limit), KariDNS automatically truncates the response and sets the `TC=1` bit to trigger TCP fallback.
+   - If the plugin's response exceeds the maximum allowed transmission size (e.g., 512 bytes for standard UDP or the client's EDNS buffer limit), KariDNS reads and discards the rest of it and sends a reply with `TC=1` that contains only the header and the question, to trigger TCP fallback.
    - With `disable-auto-tc-flag yes;` on the zone, this truncation is skipped and the plugin's response (up to 65,535 bytes) is sent as-is, even over UDP. The plugin must then set `TC=1` itself when a UDP reply is too large (see [Troubleshooting §4](#4-oversized-udp-replies-with-disable-auto-tc-flag-yes)).
 
 ---
@@ -144,7 +145,7 @@ zone "dynamic.example.com." {
     # Plugin response timeout in milliseconds (default: 2000)
     program-timeout 1500;
 
-    # Maximum consecutive communication failures before isolation (default: 500)
+    # Maximum consecutive communication failures before isolation (default: 5)
     program-max-failures 50;
 
     # yes: send oversized UDP replies as-is instead of truncating them to TC=1 (default: no)
@@ -307,9 +308,23 @@ static ssize_t read_exact(int fd, void *buf, size_t count) {
     return (ssize_t)got;
 }
 
+/* Read the text header line with read(2) as well: stdio (fgets) would buffer
+ * the binary length prefix and query that follow the line. */
+static int read_line(int fd, char *buf, size_t cap) {
+    size_t n = 0;
+    for (;;) {
+        char c;
+        if (read(fd, &c, 1) != 1) return -1;
+        if (c == '\n') break;
+        if (n + 1 < cap) buf[n++] = c;
+    }
+    buf[n] = '\0';
+    return 0;
+}
+
 int main(void) {
     char line[128];
-    while (fgets(line, sizeof(line), stdin)) {
+    while (read_line(STDIN_FILENO, line, sizeof(line)) == 0) {
         char cmd[16], proto[16], ip[64];
         if (sscanf(line, "%15s %15s %63s", cmd, proto, ip) != 3 || strcmp(cmd, "QUERY") != 0) {
             continue;
@@ -327,7 +342,7 @@ int main(void) {
 
         // Locate end of Question section
         size_t off = 12;
-        while off < req_len {
+        while (off < req_len) {
             uint8_t l = req[off];
             if (l == 0) { off++; break; }
             if ((l & 0xC0) == 0xC0) { off += 2; break; }
@@ -547,12 +562,12 @@ func main() {
 ### 2. Standalone CLI Testing (Piping Without KariDNS)
 You can test your plugin independently from the command line without launching KariDNS.
 
-On FreeBSD `/bin/sh` or `/bin/csh` / `/bin/tcsh`, use `printf` with hexadecimal escapes (`\xHH`) to construct the IPC header and wire-format query (avoids bash-specific `<(...)` process substitution):
+On FreeBSD `/bin/sh` or `/bin/csh` / `/bin/tcsh`, use `printf` with octal escapes (`\NNN`) to construct the IPC header and wire-format query. The `printf` of FreeBSD `sh` and `tcsh` does not support hexadecimal `\xHH` escapes (they are printed literally), and bash-specific `<(...)` process substitution is not needed:
 
 ```sh
 # FreeBSD sh / tcsh compatible:
 # Transmits "QUERY udp 127.0.0.1\n" + 2-byte length (29 bytes) + query for "example.com A"
-printf 'QUERY udp 127.0.0.1\n\x00\x1d\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' | ./my_plugin.py | hd
+printf 'QUERY udp 127.0.0.1\n\000\035\022\064\001\000\000\001\000\000\000\000\000\000\007example\003com\000\000\001\000\001' | ./my_plugin.py | hd
 ```
 
 Alternatively, you can use a portable Perl one-liner to generate the test query stream:
@@ -574,7 +589,7 @@ To drop queries silently without sending any reply to the client (for rate limit
 stdout.write(b'\x00\x00')
 stdout.flush()
 ```
-KariDNS will release the connection and suppress response transmission entirely.
+KariDNS sends no response for that query (the exchange still counts as successful).
 
 ### 4. Oversized UDP Replies with `disable-auto-tc-flag yes`
 With `disable-auto-tc-flag yes;`, KariDNS forwards whatever the plugin returns. A UDP reply larger than the client's advertised buffer may be discarded or cut off by the client or the network, and one larger than the UDP maximum (65,507 bytes over IPv4) cannot be sent at all. In both cases the client times out instead of retrying over TCP. The plugin receives the transport in the `QUERY <proto> ...` line and should truncate UDP replies itself:
