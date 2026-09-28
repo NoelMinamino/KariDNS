@@ -97,6 +97,9 @@ run_check "+bufsize changes the advertised size" "$DAG @127.0.0.1 -p 10053 examp
 run_check "UPDATE +qr prints the sent message" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "opcode: UPDATE.*|ADDITIONAL: 0"
 run_not_check "UPDATE sends no OPT by default" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "OPT PSEUDOSECTION"
 run_not_check "NOTIFY sends no OPT by default" "$DAG @127.0.0.1 -p 10053 example.com SOA +opcode=NOTIFY +qr +timeout=1" "OPT PSEUDOSECTION"
+run_check "UPDATE sends RD=0 and AD=0 (RFC 2136 Z bits)" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "^;; flags:; QUERY: 1"
+run_check "UPDATE with explicit +rec sets RD" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +rec +qr +timeout=1" "^;; flags: rd; QUERY: 1"
+run_check "ordinary query keeps RD and AD" "$DAG @127.0.0.1 -p 10053 example.com A +qr +timeout=1" "^;; flags: rd ad; QUERY: 1"
 run_check "UPDATE with explicit +edns sends OPT" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +edns +qr +timeout=1" "OPT PSEUDOSECTION"
 
 echo "=== 3. Testing Dynamic DNS UPDATE prerequisites (--prereq-*) ==="

@@ -293,6 +293,8 @@ typedef struct {
     bool rd_flag;
     bool aa_flag;
     bool ad_flag;
+    bool rd_explicit;   /* +[no]rec / +[no]recurse / +[no]rdflag was given */
+    bool ad_explicit;   /* +[no]adflag was given */
     bool cd_flag;
     bool tc_flag;
     bool z_flag;

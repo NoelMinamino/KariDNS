@@ -4424,9 +4424,9 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             printf("KariDNS dag v%s\n", KARIDNS_VERSION);
             exit(0);
         } else if (strcmp(arg, "+norec") == 0 || strcmp(arg, "+norecurse") == 0 || strcmp(arg, "+nordflag") == 0) {
-            spec->norecurse = true; spec->qo.rd_flag = false;
+            spec->norecurse = true; spec->qo.rd_flag = false; spec->qo.rd_explicit = true;
         } else if (strcmp(arg, "+rec") == 0 || strcmp(arg, "+recurse") == 0 || strcmp(arg, "+rdflag") == 0) {
-            spec->norecurse = false; spec->qo.rd_flag = true;
+            spec->norecurse = false; spec->qo.rd_flag = true; spec->qo.rd_explicit = true;
         } else if (strcmp(arg, "+raflag") == 0) {
             spec->qo.ra_flag = true;
         } else if (strcmp(arg, "+noraflag") == 0) {
@@ -4590,9 +4590,9 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
                 spec->qo.want_opt = true; spec->qo.udp_payload_size = (uint16_t)bsz;
             }
         } else if (strcmp(arg, "+adflag") == 0) {
-            spec->adflag = true; spec->qo.ad_flag = true;
+            spec->adflag = true; spec->qo.ad_flag = true; spec->qo.ad_explicit = true;
         } else if (strcmp(arg, "+noadflag") == 0) {
-            spec->adflag = false; spec->qo.ad_flag = false;
+            spec->adflag = false; spec->qo.ad_flag = false; spec->qo.ad_explicit = true;
         } else if (strcmp(arg, "+cdflag") == 0) {
             spec->cdflag = true; spec->qo.cd_flag = true;
         } else if (strcmp(arg, "+nocdflag") == 0) {
@@ -4879,9 +4879,12 @@ void free_query_opts(query_opts_t *qo) {
  * 通常の問い合わせに EDNS0 (udp_payload_size は既定 1232) と client cookie を付ける。
  * UPDATE (--update-* / --prereq-* / +opcode=UPDATE) と NOTIFY (+opcode=NOTIFY) には
  * 既定では付けない (nsupdate と同じ)。明示した EDNS オプションはそのまま有効。 */
+KARIDNS_TOOL_FN bool dag_is_update_message(const query_opts_t *qo) {
+    return qo->update_op_count > 0 || qo->prereq_count > 0 || qo->opcode_override == 5;
+}
+
 KARIDNS_TOOL_FN void dag_apply_dig_defaults(query_opts_t *qo) {
-    bool update_or_notify = qo->update_op_count > 0 || qo->prereq_count > 0 ||
-                            qo->opcode_override == 4 || qo->opcode_override == 5;
+    bool update_or_notify = dag_is_update_message(qo) || qo->opcode_override == 4;
     if (update_or_notify) return;
     if (qo->edns_default) qo->want_opt = true;
     if (qo->cookie_default && qo->want_opt && !qo->want_cookie) {
@@ -4896,6 +4899,13 @@ KARIDNS_TOOL_FN void dag_apply_dig_defaults(query_opts_t *qo) {
 
 int execute_query_spec(query_spec_t *spec) {
     dag_apply_dig_defaults(&spec->qo);
+    /* RFC 2136 §2.2: in an UPDATE header everything between Opcode and RCODE (the bits of AA/TC/RD/
+     * RA/Z/AD/CD in a query) is "Z: reserved, should be zero" (nsupdate sends them clear). The query
+     * defaults (RD=1, AD=1 like dig) are therefore not applied to UPDATE unless given explicitly. */
+    if (dag_is_update_message(&spec->qo)) {
+        if (!spec->qo.rd_explicit) { spec->qo.rd_flag = false; spec->norecurse = true; }
+        if (!spec->qo.ad_explicit) { spec->qo.ad_flag = false; spec->adflag = false; }
+    }
     if ((spec->qo.want_tsig || spec->qo.tsig_specified) && (spec->qo.want_sig0 || spec->qo.sig0_specified)) {
         fprintf(stderr, "error: TSIG (-k/-y) and SIG(0) (+sig0-pkey) cannot be combined in this version of dag\n");
         return 1;

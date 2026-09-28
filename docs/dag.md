@@ -383,7 +383,7 @@ Queries carry an EDNS0 OPT record and a client cookie by default (like `dig`). U
 
 ## DYNAMIC DNS UPDATE (RFC 2136)
 
-`dag` can formulate and send Dynamic DNS UPDATE requests (`OPCODE=5`), supporting record additions, deletions, and prerequisite evaluations. The query name is used as the zone name. Up to 16 update operations and 16 prerequisites can be given per message.
+`dag` can formulate and send Dynamic DNS UPDATE requests (`OPCODE=5`), supporting record additions, deletions, and prerequisite evaluations. The query name is used as the zone name. Up to 16 update operations and 16 prerequisites can be given per message. The header bits between Opcode and RCODE are Z in an UPDATE message (RFC 2136 §2.2), so RD and AD are sent as 0 unless `+rec` or `+adflag` is given explicitly.
 
 ### Update Operations
 
