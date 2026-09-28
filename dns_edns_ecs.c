@@ -236,18 +236,21 @@ bool unpack_trusted_resolvers_rdata(const uint8_t *data, size_t len, char ***res
 }
 
 bool unpack_tinydns_loc_rdata(const uint8_t *data, size_t len, tinydns_location_entry_t **locs_out, int *count_out) {
-  if (!data || len < 3 || !locs_out || !count_out) return false;
-  char code[2] = { (char)data[0], (char)data[1] };
-  uint8_t prefix_len = data[2];
-  if (prefix_len > 4 || (size_t)(3 + prefix_len) > len) return false;
+  /* Extended AXFR v2 の TYPE 65405: code(2) + prefix length in bits(1) + network(4) = 7 octets */
+  if (!data || len != 7 || !locs_out || !count_out) return false;
+  uint8_t prefix_bits = data[2];
+  if (prefix_bits > 32) return false;
 
   tinydns_location_entry_t loc;
   memset(&loc, 0, sizeof(loc));
-  loc.code[0] = code[0];
-  loc.code[1] = code[1];
-  loc.prefix_len = prefix_len;
-  if (prefix_len > 0) {
-    memcpy(loc.prefix, &data[3], prefix_len);
+  loc.code[0] = (char)data[0];
+  loc.code[1] = (char)data[1];
+  loc.prefix_bits = prefix_bits;
+  memcpy(loc.prefix, &data[3], 4);
+  /* 受信側でもネットワーク部以外をクリアしておく (照合はマスク前提) */
+  for (unsigned int i = 0; i < 4; i++) {
+    unsigned int keep = (prefix_bits >= (i + 1) * 8) ? 8 : (prefix_bits > i * 8 ? prefix_bits - i * 8 : 0);
+    loc.prefix[i] &= (uint8_t)(keep == 0 ? 0 : (0xFFu << (8 - keep)));
   }
 
   int cur_count = *count_out;
@@ -444,17 +447,25 @@ void tinydns_resolve_client_location(const zone_arena_t *zone, const char *clien
 
     struct in_addr addr;
     if (inet_pton(AF_INET, client_ip, &addr) != 1) return; /* IPv6は非対応(仕様通り) */
-    const uint8_t *ipb = (const uint8_t *)&addr.s_addr;
+    uint32_t ip = ntohl(addr.s_addr);
 
-    for (int plen = 4; plen >= 0; plen--) {
-        for (int li = 0; li < zone->location_count; li++) {
-            const tinydns_location_entry_t *loc = &zone->locations[li];
-            if (loc->prefix_len != plen) continue;
-            if (plen == 0 || memcmp(loc->prefix, ipb, plen) == 0) {
-                out_loc[0] = loc->code[0];
-                out_loc[1] = loc->code[1];
-                return;
-            }
+    /* 最長一致 (同じ長さなら先に定義された方)。prefix[] は読込時にマスク済み。 */
+    int best = -1;
+    int best_bits = -1;
+    for (int li = 0; li < zone->location_count; li++) {
+        const tinydns_location_entry_t *loc = &zone->locations[li];
+        int bits = loc->prefix_bits > 32 ? 32 : loc->prefix_bits;
+        if (bits <= best_bits) continue;
+        uint32_t mask = bits == 0 ? 0 : (0xFFFFFFFFu << (32 - bits));
+        uint32_t net = ((uint32_t)loc->prefix[0] << 24) | ((uint32_t)loc->prefix[1] << 16) |
+                       ((uint32_t)loc->prefix[2] << 8) | (uint32_t)loc->prefix[3];
+        if ((ip & mask) == (net & mask)) {
+            best = li;
+            best_bits = bits;
         }
+    }
+    if (best >= 0) {
+        out_loc[0] = zone->locations[best].code[0];
+        out_loc[1] = zone->locations[best].code[1];
     }
 }

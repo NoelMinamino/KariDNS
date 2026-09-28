@@ -953,21 +953,47 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             loc.code[1] = flen[0] > 1 ? f[0][1] : 0;
 
             uint8_t prefix[4] = {0};
-            uint8_t prefix_len = 0;
+            uint8_t octets = 0;
             size_t pos = 0;
-            while (prefix_len < 4 && pos < flen[1]) {
+            while (octets < 4 && pos < flen[1]) {
                 unsigned long val = 0;
                 size_t start = pos;
                 while (pos < flen[1] && isdigit((unsigned char)f[1][pos])) {
-                    val = val * 10 + (f[1][pos] - '0');
+                    if (val < 1000) val = val * 10 + (f[1][pos] - '0');
                     pos++;
                 }
                 if (pos == start) break;
-                prefix[prefix_len++] = (uint8_t)(val & 0xFF);
+                prefix[octets++] = (uint8_t)(val & 0xFF);   // djbdns 互換: オクテット値は検証しない
                 if (pos < flen[1] && f[1][pos] == '.') pos++;
                 else break;
             }
-            loc.prefix_len = prefix_len;
+            // djbdns の接頭辞長はオクテット数 x 8。KariDNS 拡張として "/n" (0..32) を CIDR 長として受け付ける。
+            // 以前は "/n" を黙って無視していたため "10.0.0.0/8" が /32 として扱われていた。
+            unsigned int bits = (unsigned int)octets * 8;
+            if (pos < flen[1] && f[1][pos] == '/') {
+                pos++;
+                size_t dstart = pos;
+                unsigned long b = 0;
+                while (pos < flen[1] && isdigit((unsigned char)f[1][pos])) {
+                    if (b <= 32) b = b * 10 + (f[1][pos] - '0');
+                    pos++;
+                }
+                if (pos == dstart || pos != flen[1] || b > 32) {
+                    if (ctx && ctx->err_out) {
+                        ctx->err_out->error_message = "Invalid location prefix length (expected /0 to /32)";
+                        ctx->err_out->error_offset = (size_t)(line_start - buf);
+                        ctx->err_out->token_length = 1;
+                    }
+                    return false;
+                }
+                bits = (unsigned int)b;
+            }
+            // ネットワーク部だけを残す (10.1.2.3/8 -> 10.0.0.0/8)
+            for (unsigned int i = 0; i < 4; i++) {
+                unsigned int keep = (bits >= (i + 1) * 8) ? 8 : (bits > i * 8 ? bits - i * 8 : 0);
+                prefix[i] &= (uint8_t)(keep == 0 ? 0 : (0xFFu << (8 - keep)));
+            }
+            loc.prefix_bits = (uint8_t)bits;
             memcpy(loc.prefix, prefix, 4);
 
             tinydns_location_entry_t *new_locs = realloc(arena->locations,

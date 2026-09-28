@@ -1493,7 +1493,7 @@ static void test_send_axfr_response_full_matrix(void) {
     cur->location_count = 1;
     cur->locations = calloc(1, sizeof(tinydns_location_entry_t));
     cur->locations[0].code[0] = 'j'; cur->locations[0].code[1] = 'p';
-    cur->locations[0].prefix_len = 3;
+    cur->locations[0].prefix_bits = 24;
     memcpy(cur->locations[0].prefix, "\xC0\x00\x02", 3);
 
     // Records with tags & tinydns

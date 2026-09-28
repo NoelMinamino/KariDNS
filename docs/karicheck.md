@@ -71,7 +71,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 1. **Zone File Directives**:
    - `$ORIGIN`, `$TTL`, `$INCLUDE` (up to 16 nesting levels and 32 files per zone), `$GENERATE` (at most 100,000 records per directive)
    - KariDNS steering directives `$LOCATION`, `$LOCATION-TAG`, `$ECS-SUBNET`, `$ECS-SUBNET-TAG`: records that reference an undefined location or ECS tag are errors
-   - tinydns `data` files (through a configuration file with `file-format tinydns;`): location prefixes longer than 4 octets (error), duplicate location codes, malformed IPv6 fields of `3`/`6` lines, and SRV/NAPTR/SSHFP field ranges of generic lines
+   - tinydns `data` files (through a configuration file with `file-format tinydns;`): invalid location prefix lengths (`/n` above 32, error), duplicate location codes, malformed IPv6 fields of `3`/`6` lines, and SRV/NAPTR/SSHFP field ranges of generic lines
 2. **Zone Integrity & Structural Invariants**:
    - Exactly one SOA record at the zone apex, and at least one NS record at the apex
    - CNAME exclusivity (CNAME must not co-exist with other record types at the same owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), and NS/MX/SRV targets that point to a CNAME (RFC 2181 §10.3)

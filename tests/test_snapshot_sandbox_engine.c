@@ -183,7 +183,7 @@ static void test_snapshot_rcu_lifecycle_and_suffix_lookup(void) {
     memset(&loc1, 0, sizeof(loc1));
     loc1.code[0] = 'u'; loc1.code[1] = 's';
     loc1.prefix[0] = 192; loc1.prefix[1] = 0; loc1.prefix[2] = 2; loc1.prefix[3] = 0;
-    loc1.prefix_len = 24;
+    loc1.prefix_bits = 24;
     src.locations = malloc(sizeof(tinydns_location_entry_t));
     memcpy(src.locations, &loc1, sizeof(loc1));
     src.location_count = 1;

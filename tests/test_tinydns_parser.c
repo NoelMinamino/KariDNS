@@ -559,16 +559,16 @@ static void test_location_directive_and_records(void) {
 
     if (arena.location_count >= 3) {
         TEST_ASSERT(arena.locations[0].code[0] == 'i' && arena.locations[0].code[1] == 'n', "loc 0 code is 'in'");
-        TEST_ASSERT(arena.locations[0].prefix_len == 2, "loc 0 prefix_len is 2");
+        TEST_ASSERT(arena.locations[0].prefix_bits == 16, "loc 0 prefix is /16");
         TEST_ASSERT(arena.locations[0].prefix[0] == 192 && arena.locations[0].prefix[1] == 168, "loc 0 prefix 192.168");
 
         TEST_ASSERT(arena.locations[1].code[0] == 'e' && arena.locations[1].code[1] == 'x', "loc 1 code is 'ex'");
-        TEST_ASSERT(arena.locations[1].prefix_len == 4, "loc 1 prefix_len is 4");
+        TEST_ASSERT(arena.locations[1].prefix_bits == 32, "loc 1 prefix is /32");
         TEST_ASSERT(arena.locations[1].prefix[0] == 10 && arena.locations[1].prefix[1] == 0 &&
                     arena.locations[1].prefix[2] == 1 && arena.locations[1].prefix[3] == 2, "loc 1 prefix 10.0.1.2");
 
         TEST_ASSERT(arena.locations[2].code[0] == 'd' && arena.locations[2].code[1] == 'f', "loc 2 code is 'df'");
-        TEST_ASSERT(arena.locations[2].prefix_len == 0, "loc 2 prefix_len is 0");
+        TEST_ASSERT(arena.locations[2].prefix_bits == 0, "loc 2 prefix is /0");
     }
 
     // Verify records have correct location codes
@@ -603,6 +603,56 @@ static void test_location_directive_and_records(void) {
         TEST_ASSERT(arena4k.location_count == 4096, "location_count capped at 4096");
         zone_arena_destroy(&arena4k);
         free(bigbuf);
+    }
+}
+
+/* ============================================================================
+ * Test 8b: "%lo:prefix/n" CIDR prefix lengths (KariDNS extension)
+ * ============================================================================ */
+static void test_location_cidr_prefix(void) {
+    printf("--- Test 8b: Location CIDR Prefix Lengths ---\n");
+
+    const char *data =
+        "%aa:10.0.0.0/8\n"        /* /8 although four octets are given */
+        "%bb:10.16.3.4/12\n"      /* host bits are cleared: 10.16.0.0/12 */
+        "%cc:192.168/24\n"        /* missing octets are zero: 192.168.0.0/24 */
+        "%dd:172.16.\n"           /* djbdns form: two octets = /16 */
+        "%ee:0.0.0.0/0\n"
+        "+www.example.com:192.0.2.1:300\n";
+    char *buf = strdup(data);
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+    int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
+    TEST_ASSERT(count > 0, "CIDR location lines parse");
+    TEST_ASSERT(arena.location_count == 5, "five CIDR locations");
+    if (arena.location_count == 5) {
+        tinydns_location_entry_t *l = arena.locations;
+        TEST_ASSERT(l[0].prefix_bits == 8 && l[0].prefix[0] == 10 && l[0].prefix[1] == 0, "10.0.0.0/8 is /8");
+        TEST_ASSERT(l[1].prefix_bits == 12 && l[1].prefix[1] == 16 && l[1].prefix[2] == 0 && l[1].prefix[3] == 0,
+                    "10.16.3.4/12 masked to 10.16.0.0/12");
+        TEST_ASSERT(l[2].prefix_bits == 24 && l[2].prefix[0] == 192 && l[2].prefix[1] == 168 && l[2].prefix[2] == 0,
+                    "192.168/24");
+        TEST_ASSERT(l[3].prefix_bits == 16, "172.16. stays /16");
+        TEST_ASSERT(l[4].prefix_bits == 0, "0.0.0.0/0");
+
+    }
+    zone_arena_destroy(&arena);
+    free(buf);
+
+    /* invalid prefix lengths are rejected */
+    static const char *bad[] = { "%xx:10.0.0.0/33\n", "%xx:10.0.0.0/\n", "%xx:10.0.0.0/8x\n", "%xx:10.0.0.0/999\n" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char *b = strdup(bad[i]);
+        zone_arena_t a;
+        zone_arena_init(&a);
+        parse_error_t e = {0};
+        parse_context_t c = { .default_origin = "example.com.", .err_out = &e };
+        int rc = parse_tinydns_data(b, strlen(b), &a, &c);
+        TEST_ASSERT(rc < 0 && a.location_count == 0 && e.error_message != NULL, "invalid /n rejected");
+        zone_arena_destroy(&a);
+        free(b);
     }
 }
 
@@ -766,6 +816,7 @@ int main(void) {
     test_config_file_format();
     test_timestamp_evaluation();
     test_location_directive_and_records();
+    test_location_cidr_prefix();
     test_third_party_patch_records();
 
     printf("==================================================\n");

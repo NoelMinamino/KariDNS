@@ -547,7 +547,9 @@ correctly without duplicate records).
 >   during query resolution. KariDNS compiles `%<loc>:<prefix>` location
 >   lines and trailing `:loc` record fields into memory, performing bitwise
 >   longest-prefix matching against the querying client's source IPv4
->   address with zero heap allocation on the hot path.
+>   address with zero heap allocation on the hot path. As an extension,
+>   `<prefix>` may end in `/n` (`/0`–`/32`) to give the prefix length in
+>   bits, e.g. `%in:10.0.0.0/8`.
 
 ---
 

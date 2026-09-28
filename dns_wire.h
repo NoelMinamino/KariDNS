@@ -96,7 +96,9 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 #define DNS_TYPE_KARIDNS_ECS_TRUSTED    65407
 
 #define EDNS_OPTION_KARIDNS_EXT         65153
-#define KARIDNS_EXT_VERSION             1
+/* 2: TYPE 65405 (tinydns location) carries the prefix length in bits + 4-octet network.
+ * Peers with a different version fall back to a standard AXFR. */
+#define KARIDNS_EXT_VERSION             2
 
 // ECS / Location サブネットタグ構造体
 typedef struct {

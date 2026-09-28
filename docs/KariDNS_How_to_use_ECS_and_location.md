@@ -56,7 +56,8 @@ In a tinydns data file (`file-format tinydns;`), location prefixes are defined w
 #### Syntax Rules:
 - **Location Definition**: `%<loc>:<prefix>`
   - `<loc>`: 1- or 2-character ASCII identifier (e.g. `lo`, `in`, `ex`, `df`); only the first two characters are used.
-  - `<prefix>`: Decimal IPv4 prefix with 1 to 4 octets separated by dots, as in djbdns. The prefix length is the number of octets times 8 (e.g. `192.168.` = `/16`, `10.` = `/8`, `127.0.0.1` = `/32`). Anything after the last octet, such as a `/32` suffix, is ignored, so `10.0.0.0/8` means the `/32` host `10.0.0.0`, not `10.0.0.0/8`.
+  - `<prefix>`: Decimal IPv4 prefix with 1 to 4 octets separated by dots, as in djbdns. The prefix length is the number of octets times 8 (e.g. `192.168.` = `/16`, `10.` = `/8`, `127.0.0.1` = `/32`).
+  - KariDNS extension: a `/n` suffix (`/0` to `/32`) sets the prefix length in bits, e.g. `10.0.0.0/8`, `10.16.0.0/12` or `192.168/24` (missing octets are zero). Bits beyond the prefix are cleared (`10.16.3.4/12` is `10.16.0.0/12`). Any other text after `/` or a length above 32 is a parse error. djbdns `tinydns-data` does not understand `/n`, so such a file is KariDNS-specific.
   - Empty prefix `%<loc>:` (or `%df:`): Catch-all location when no other prefix matches.
   - At most 4096 `%` lines are loaded per zone; further lines are ignored with a warning.
 - **Record Assignment**:
@@ -64,7 +65,7 @@ In a tinydns data file (`file-format tinydns;`), location prefixes are defined w
   - If the location field is omitted, the record is **unrestricted** and is served to all clients.
 
 ### 2.2 Evaluation Logic
-1. **Longest Prefix Match (LPM)**: KariDNS performs a bitwise longest-prefix match against all `%` entries loaded in the zone.
+1. **Longest Prefix Match (LPM)**: KariDNS performs a bitwise longest-prefix match against all `%` entries loaded in the zone (on equal lengths, the entry defined first wins). Only IPv4 clients can match.
 2. **Filtering**: If the client matches location `L`, records tagged with `L` are returned alongside any unrestricted (untagged) records. Records with non-matching locations are excluded.
 
 ---
@@ -207,7 +208,7 @@ Traditional AXFR (RFC 5936) transfers plain DNS resource records and loses propr
 KariDNS solves this with **Extended AXFR**:
 
 ### 6.1 Automatic Negotiation (EDNS Option 65153)
-- When a KariDNS secondary requests an AXFR from a master, it attaches EDNS Option `65153` containing a version marker and an FNV-1a hash of the zone name. The primary uses the extended format only when both match.
+- When a KariDNS secondary requests an AXFR from a master, it attaches EDNS Option `65153` containing a version number and an FNV-1a hash of the zone name. The primary uses the extended format only when both match. The current version is **2** (TYPE `65405` carries the location prefix length in bits and a 4-octet network); KariDNS servers with version 1 and version 2 do not negotiate the extended format with each other and fall back to a standard AXFR (Plan B).
 - A KariDNS primary recognizes Option 65153 and replies with an Extended AXFR stream in which the KariDNS-specific data is carried as private-use record types in the private CLASS `65302`:
   - In BIND zones: tag definitions (`$LOCATION-TAG` as TYPE `65403`, `$ECS-SUBNET-TAG` as TYPE `65404`), record state transitions (`$LOCATION` as TYPE `65401`, `$ECS-SUBNET` as TYPE `65402`) and the zone's trusted ECS resolvers (TYPE `65407`).
   - In tinydns zones: location definitions (`%`, TYPE `65405`) and wrapped records (TYPE `65406`) preserving location tags and countdown timestamps.
@@ -233,7 +234,7 @@ karicheck zones /usr/local/etc/karidns/karidns.conf
 ```
 - Reports an error for records that reference an undefined location tag or ECS tag.
 - Verifies the CIDR syntax (address and prefix length) in `ecs-tags` and `location-tags`, and warns when `ecs-tags` are defined without `ecs-enable yes;`.
-- Reports tinydns location prefixes longer than 4 octets and duplicate location codes.
+- Reports invalid tinydns location prefix lengths (`/n` above 32) and duplicate location codes.
 
 ### 7.2 Query Testing with `dag`
 Test client source-IP steering:
