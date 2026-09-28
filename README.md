@@ -335,7 +335,7 @@ Start KariDNS by providing the configuration file path (`-f` keeps it in the for
 ./karidns /usr/local/etc/karidns/karidns.conf
 ```
 
-KariDNS can also run as an unprivileged user: omit `user` (or set it to that user itself), use a port >= 1024 (e.g. `port 10053;` or `-p 10053`; a numeric `-p` argument is the port, any other `-p` argument is a PID file path), and point log files, `pid-file` and the `control-channel` `socket` at directories that user can write to. If a port cannot be bound or a log file / PID file / control socket cannot be created, KariDNS refuses to start with an error. See [karidns(8)](docs/karidns.md#running-as-a-non-root-user).
+KariDNS can also run as an unprivileged user: omit `user` (or set it to that user itself), use a port >= 1024 (e.g. `port 10053;` or `-p 10053`; `-p` with a decimal number sets the port; use `-P` for a PID file), and point log files, `pid-file` and the `control-channel` `socket` at directories that user can write to. If a port cannot be bound or a log file / PID file / control socket cannot be created, KariDNS refuses to start with an error. See [karidns(8)](docs/karidns.md#running-as-a-non-root-user).
 
 ---
 

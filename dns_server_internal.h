@@ -460,6 +460,7 @@ bool init_logging_channels(server_config_t *cfg);
 bool init_logging_channels_ex(server_config_t *cfg, bool hand_off);
 void hand_off_logging_channels(server_config_t *cfg);
 const char *bind_error_hint(int err, int port);
+int parse_cli_port_arg(const char *val, int *port_out);
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,

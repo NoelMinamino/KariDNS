@@ -1762,6 +1762,23 @@ static void test_nonroot_startup_identity_and_preflight(void) {
         nonroot_startup_checks();
     }
 
+    /* parse_cli_port_arg: -p is a port only when the whole value is a decimal number */
+    {
+        int port = 0;
+        assert(parse_cli_port_arg("10053", &port) == 1 && port == 10053);
+        assert(parse_cli_port_arg("1", &port) == 1 && port == 1);
+        assert(parse_cli_port_arg("65535", &port) == 1 && port == 65535);
+        assert(parse_cli_port_arg("0", &port) == -1);
+        assert(parse_cli_port_arg("65536", &port) == -1);
+        assert(parse_cli_port_arg("99999999999999999999", &port) == -1);
+        assert(parse_cli_port_arg("1.pid", &port) == 0);
+        assert(parse_cli_port_arg("53abc", &port) == 0);
+        assert(parse_cli_port_arg("/var/run/karidns.pid", &port) == 0);
+        assert(parse_cli_port_arg("none", &port) == 0);
+        assert(parse_cli_port_arg("", &port) == 0);
+        assert(parse_cli_port_arg(NULL, &port) == 0);
+    }
+
     /* bind_error_hint */
     assert(strstr(bind_error_hint(EACCES, 53), "root") != NULL);
     assert(strcmp(bind_error_hint(EACCES, 10053), "") == 0);

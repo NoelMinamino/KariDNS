@@ -148,6 +148,22 @@ void dec_tcp_clients(void) {
 }
 
 
+// -p の値の判定。全体が 10 進数字だけのときだけポート番号として扱う
+// (先頭1文字だけで判定すると "1.pid" のような PID ファイル名がポートになる)。
+// 戻り値: 1 = ポート (*port_out に格納), 0 = 数字以外を含む (PID ファイル), -1 = 範囲外のポート番号
+int parse_cli_port_arg(const char *val, int *port_out) {
+  if (!val || !*val) return 0;
+  for (const char *p = val; *p; p++) {
+    if (!isdigit((unsigned char)*p)) return 0;
+  }
+  char *end = NULL;
+  errno = 0;
+  long v = strtol(val, &end, 10);
+  if (errno != 0 || *end != '\0' || v < 1 || v > 65535) return -1;
+  if (port_out) *port_out = (int)v;
+  return 1;
+}
+
 // リスニングソケットの bind() 失敗時にログへ添えるヒント。
 const char *bind_error_hint(int err, int port) {
   if (err == EACCES && port > 0 && port < 1024)
@@ -4338,9 +4354,17 @@ int main(int argc, char **argv) {
           config_file = argv[++i];
       } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
           const char *val = argv[++i];
-          if (isdigit((unsigned char)val[0])) {
-              g_cli_port_override = atoi(val);
+          int port = 0;
+          int kind = parse_cli_port_arg(val, &port);
+          if (kind == 1) {
+              g_cli_port_override = port;
+          } else if (kind < 0) {
+              fprintf(stderr, "[ERROR] Invalid port '%s' for -p (expected 1-65535)\n", val);
+              return 1;
           } else {
+              // 互換のため PID ファイル指定も受け付けるが、-P を案内する
+              fprintf(stderr, "[WARNING] '-p %s' is taken as a PID file path; use -P <pid_file> for PID files "
+                              "(-p <number> sets the port)\n", val);
               cli_pid_file = val;
           }
       } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {

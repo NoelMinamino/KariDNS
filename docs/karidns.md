@@ -50,7 +50,7 @@ karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c con
 : Run in the foreground instead of daemonizing into the background. In foreground mode, no PID file is created unless one is set explicitly (`-P`, `-p <path>` or `pid-file`).
 
 `-p port`, `-p pid_file`
-: The meaning depends on the value. If it starts with a digit, it is the **listen port** and overrides `options { port ...; }` (also on reload); for example `-p 10053`. Otherwise it is the path of the PID lock file, like `-P`.
+: The meaning depends on the value. If the whole value is a decimal number, it is the **listen port** (1–65535; other numbers are an error) and overrides `options { port ...; }` (also on reload); for example `-p 10053`. Any other value is taken as the path of the PID lock file, like `-P`, with a warning that recommends `-P`.
 
 `-P pid_file`
 : Path to the PID lock file (overrides `options { pid-file "..."; }`; default: `/var/run/karidns/karidns.pid` when daemonized). Specify `none` to disable PID locking.
