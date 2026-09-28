@@ -12,6 +12,10 @@
 #
 #   2. Standalone Server Mode (via --standalone or --port):
 #      Binds UDP and TCP sockets directly on the specified host:port.
+#
+# In both modes, oversized UDP responses are truncated to TC=1 by
+# apply_udp_tc_policy() so that tests work on zones with
+# "disable-auto-tc-flag yes" (udp-size-<N> and edns-bufsize-exceeded are exempt).
 # ==============================================================================
 
 use strict;
@@ -285,10 +289,100 @@ sub encode_txt_rr {
     return $name_wire . pack('nnNn', 16, 1, $ttl, length($rdata)) . $rdata;
 }
 
+# 圧縮ポインタを含む名前を読み飛ばし、直後のオフセットを返す (範囲外なら undef)
+sub skip_wire_name {
+    my ($pkt, $offset) = @_;
+    my $len = length($pkt);
+    while ($offset < $len) {
+        my $l = ord(substr($pkt, $offset, 1));
+        return $offset + 1 if $l == 0;
+        return (($offset + 2 <= $len) ? $offset + 2 : undef) if ($l & 0xC0) == 0xC0;
+        return undef if ($l & 0xC0) != 0;
+        $offset += 1 + $l;
+    }
+    return undef;
+}
+
+# 要求の追加セクションから OPT RR (TYPE=41) を探す (RFC 6891 §6.1.2)。
+# 戻り値: (has_edns, udp_payload_size)
+sub parse_request_edns {
+    my ($req) = @_;
+    my $len = length($req);
+    return (0, 0) if $len < 12;
+    my ($qd, $an, $ns, $ar) = unpack('n4', substr($req, 4, 8));
+    my $off = 12;
+    for (1 .. $qd) {
+        $off = skip_wire_name($req, $off);
+        return (0, 0) unless defined $off && $off + 4 <= $len;
+        $off += 4;
+    }
+    for my $i (1 .. $an + $ns + $ar) {
+        $off = skip_wire_name($req, $off);
+        return (0, 0) unless defined $off && $off + 10 <= $len;
+        my ($type, $class, undef, $rdlen) = unpack('nnNn', substr($req, $off, 10));
+        return (1, $class) if $type == 41 && $i > $an + $ns;
+        $off += 10 + $rdlen;
+    }
+    return (0, 0);
+}
+
+# UDP 応答の自動TC。karidns の disable-auto-tc-flag yes ゾーンでも、
+# 通常の権威サーバと同様に大きな UDP 応答を TC=1 に切り詰めて返す。
+#   上限: EDNS あり → 要求の UDP payload size (512 未満は 512, RFC 6891 §6.2.5)
+#         EDNS なし → 1232 (テスト用 mock の意図的な設定。RFC 1035 §4.2.1 の 512 ではない)
+#   除外: TCP、空応答 (drop)、udp-size-<N>、edns-bufsize-exceeded (TC=0 のまま返すのが目的)
+use constant MOCK_UDP_NOEDNS_LIMIT => 1232;
+use constant MOCK_OPT_UDP_SIZE     => 1232;
+
+sub apply_udp_tc_policy {
+    my ($resp, $req, $is_tcp) = @_;
+    return $resp if $is_tcp || !defined $resp || length($resp) < 12;
+
+    my ($qname) = decode_qname($req, 12);
+    my ($first_label) = (lc($qname) =~ /^([^.]+)/);
+    $first_label //= '';
+    return $resp if $first_label =~ /^udp-size-\d+$/ || $first_label eq 'edns-bufsize-exceeded';
+
+    my ($has_edns, $bufsize) = parse_request_edns($req);
+    my $limit = MOCK_UDP_NOEDNS_LIMIT;
+    if ($has_edns) {
+        $limit = $bufsize < 512 ? 512 : $bufsize;
+    }
+    return $resp if length($resp) <= $limit;
+
+    # ヘッダ (ID/OPCODE/AA/RD/RA/AD/CD/RCODE) は生成済み応答を引き継ぎ、TC=1 を立てる
+    # (RFC 1035 §4.1.1)。Question は要求のものを返し、AN/NS は空にする。
+    my $flags = unpack('n', substr($resp, 2, 2)) | 0x0200;
+    my $question = '';
+    my $qdcount = unpack('n', substr($req, 4, 2));
+    if ($qdcount > 0) {
+        my $qend = skip_wire_name($req, 12);
+        if (defined $qend && $qend + 4 <= length($req)) {
+            $question = substr($req, 12, $qend + 4 - 12);
+        }
+    }
+    my $arcount = $has_edns ? 1 : 0;
+    my $pkt = substr($resp, 0, 2) . pack('n5', $flags, ($question ne '' ? 1 : 0), 0, 0, $arcount) . $question;
+    # 要求に EDNS があれば切り詰め応答にも OPT を含める (RFC 6891 §7)。
+    # 拡張 RCODE は生成済み応答から引き継がない (ここでは 0)
+    $pkt .= "\x00" . pack('nnNn', 41, MOCK_OPT_UDP_SIZE, 0, 0) if $has_edns;
+    return $pkt;
+}
+
+# ==============================================================================
+# Response entry point: scenario generation followed by the UDP auto-TC policy
+# (plugin mode and standalone mode both call this)
+# ==============================================================================
+sub process_query_packet {
+    my ($req, $is_tcp, $client_ip) = @_;
+    my $resp = build_scenario_response($req, $is_tcp, $client_ip);
+    return apply_udp_tc_policy($resp, $req, $is_tcp);
+}
+
 # ==============================================================================
 # Scenario Dispatcher: Generates crafted anomalous response packets
 # ==============================================================================
-sub process_query_packet {
+sub build_scenario_response {
     my ($req, $is_tcp, $client_ip) = @_;
     my $req_len = length($req);
 
@@ -319,16 +413,14 @@ sub process_query_packet {
     # Detect EDNS / Cookie / Buffer size in request
     my $client_cookie = undef;
     my $server_cookie = undef;
-    my $client_bufsize = 512;
+    my ($req_has_edns, $req_edns_size) = parse_request_edns($req);
+    my $client_bufsize = $req_has_edns ? $req_edns_size : 512;
     if ($req_len > 12) {
         if ($req =~ /\x00\x0a\x00\x10(.{8})(.{8})/s) {
             $client_cookie = $1;
             $server_cookie = $2;
         } elsif ($req =~ /\x00\x0a\x00\x08(.{8})/s) {
             $client_cookie = $1;
-        }
-        if ($req =~ /\x00\x00\x29(..)/s) {
-            $client_bufsize = unpack('n', $1);
         }
     }
 
@@ -389,7 +481,7 @@ sub process_query_packet {
         $first_label =~ /^ede-(\d+)$/ ||
         $first_label =~ /^ede-all2?$/ ||
         $first_label =~ /^(?:ptr-chain|compression-chain|ptr-hops)(?:-(\d+))?$/ ||
-	$first_label =~ /^(?:tcp-size|packet-size)-(\d+)$/ ||
+	$first_label =~ /^(?:tcp-size|udp-size|packet-size)-(\d+)$/ ||
         $first_label =~ /^flags?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
         $first_label =~ /^flags?-[a-z0-9+_-]+$/i ||
         $first_label =~ /^rcodes?-(?:0x[0-9a-fA-F]+|\d+)$/i ||
@@ -466,6 +558,10 @@ sub process_query_packet {
             "[Transport & Buffer Oversize]",
             "  edns-bufsize-exceeded.$display_zone     - UDP answer exceeding advertised EDNS buffer size (TC=0)",
             "  tcp-max-65535.$display_zone             - Maximum legal DNS message size of 65,535 bytes (TCP)",
+            "  tcp-size-<N>.$display_zone              - Exactly N-byte response; UDP over the limit is truncated (TC=1)",
+            "  packet-size-<N>.$display_zone           - Same as tcp-size-<N> (subject to UDP auto-TC)",
+            "  udp-size-<N>.$display_zone              - Exactly N-byte response; never truncated, even over UDP",
+            "  (UDP auto-TC limit: EDNS UDP payload size (min 512), or 1232 bytes without EDNS)",
             "",
             "[RDATA Truncation & Boundary Violations]",
             "  rdata-short-a.$display_zone             - Truncated A record (RDLENGTH=4 with 2 bytes)",
@@ -781,13 +877,12 @@ sub process_query_packet {
     }
     
     # --------------------------------------------------------------------------
-    # Arbitrary Packet Size Generator: tcp-size-<bytes> / packet-size-<bytes>
-    # Generates exact N bytes packet (from 1 byte to 65535+ bytes)
+    # Arbitrary Packet Size Generator: tcp-size-<bytes> / udp-size-<bytes> / packet-size-<bytes>
+    # Generates exact N bytes packet (1 to 65535 bytes).
+    # tcp-size / packet-size は UDP では apply_udp_tc_policy() により TC=1 に切り詰められる。
+    # udp-size は自動TC の対象外で、UDP でもそのまま返す (65507 超は送信失敗 → タイムアウト)。
     # --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
-    # Arbitrary Packet Size Generator: tcp-size-<bytes> / packet-size-<bytes>
-    # --------------------------------------------------------------------------
-    if ($scenario =~ /^(?:tcp-size|packet-size)-(\d+)$/) {
+    if ($scenario =~ /^(?:tcp-size|udp-size|packet-size)-(\d+)$/) {
         my $target_size = int($1);
         $target_size = 1 if $target_size < 1;
 
@@ -1041,7 +1136,7 @@ sub process_query_packet {
     }
     if ($scenario eq 'tcp-max-65535' || $scenario eq 'huge-tcp-65535') {
         # Generates exact maximum possible DNS message size: 65,535 bytes
-        # When queried via UDP, KariDNS will automatically truncate (TC=1) and client falls back to TCP
+        # When queried via UDP, apply_udp_tc_policy() truncates it (TC=1) and the client falls back to TCP
         my $flags_val = 0x8400;
         my $rr_prefix = pack('n', 0xc00c) . pack('nnN', 10, 1, 300);
         my $base_len = 12 + length($question_wire) + length($rr_prefix) + 2;
@@ -1422,7 +1517,7 @@ sub process_query_packet {
                 $arcount++;
             }
 
-            my $client_has_edns = (defined($client_cookie) || $req =~ /\x00\x00\x29/s);
+            my $client_has_edns = (defined($client_cookie) || $req_has_edns);
             if ($ext_rc > 0 || $client_has_edns) {
                 my $ttl_ext = ($ext_rc << 24);
                 my $opt_rdata = '';

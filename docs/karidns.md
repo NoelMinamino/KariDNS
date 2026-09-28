@@ -272,12 +272,14 @@ zone "anomaly.test." {
     program-args { "--verbose"; };
     program-timeout 2000; # timeout in milliseconds (default: 2000)
     program-user "nobody"; # optional privilege drop for plugin process
+    disable-auto-tc-flag no; # yes: send oversized UDP replies as-is (default: no)
 };
 ```
 
 > [!NOTE]
 > **Design Boundaries and Processing Semantics:**
 > - **Pre-filtering & Packet Validation**: KariDNS enforces standard basic DNS header validation (QDCOUNT, valid OPCODES, EDNS version <= 0, valid QCLASS) prior to dispatching queries to the program plugin. Corrupted queries that violate fundamental DNS framing are responded to directly by KariDNS (e.g. FORMERR / NOTIMP / REFUSED) before reaching the plugin.
+> - **UDP Truncation (`disable-auto-tc-flag`)**: With the default `no`, a plugin reply larger than the UDP limit (EDNS UDP payload size, capped by the server's UDP buffer size; 512 without EDNS) is replaced by a TC=1 reply with an empty answer. With `yes`, KariDNS sends the plugin reply as-is (up to 65,535 bytes), so the plugin itself is responsible for setting TC=1 on UDP.
 > - **TCP & AXFR Semantics**: TCP queries (including `AXFR` / `IXFR`) sent to a program zone are forwarded directly to the plugin as a single query-response transaction. Multi-envelope streaming AXFR is not supported.
 > - **Security & Isolation**: Plugin child processes are spawned prior to Capsicum capability mode and drop privileges (`program-user`). All internal control channels, frontend IPC, and network sockets are strictly closed via `closefrom(3)` before executing the plugin.
 >

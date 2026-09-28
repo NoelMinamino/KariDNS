@@ -2089,7 +2089,7 @@ STATIC_TEST int dispatch_to_program_zone(const char *domain, const uint8_t *req,
                domain, (unsigned int)resp_len);
         ok = false;
       } else if (plugin->disable_auto_tc_flag) {
-        // disable-auto-tc-flag yes (default): do not truncate or force TC=1; send full response as-is (up to 65535)
+        // disable-auto-tc-flag yes (default: no): do not truncate or force TC=1; send full response as-is (up to 65535)
         if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
           result_len = (int)resp_len;
           ok = true;
