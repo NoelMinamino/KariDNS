@@ -8,7 +8,7 @@
  *
  * <server> accepts IPv4/IPv6 literals or FQDNs (resolved via getaddrinfo()),
  * and a comma-separated list to query multiple servers in a single run, e.g.
- * @8.8.8.8,9.9.9.9,1.1.1.1
+ * @192.0.2.1,198.51.100.1,203.0.113.1
  *
  * Builds a DNS query, sends it over UDP/TCP, and pretty-prints the response
  * with a hexdump. Supports intentional packet malformation via --break.
@@ -3123,7 +3123,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "                               (Use IXFR=serial for incremental zone transfer)\n"
         "  @server[:port]               Target server IPv4/IPv6 address or FQDN (default: system resolver)\n"
         "                               Supports direct port specification (e.g. @127.0.0.1:10053 or @[::1]:5353)\n"
-        "                               Accepts comma-separated list to query multiple servers (e.g. @8.8.8.8,9.9.9.9:5353,1.1.1.1)\n"
+        "                               Accepts comma-separated list to query multiple servers (e.g. @192.0.2.1,198.51.100.1:5353,203.0.113.1)\n"
         "  -p <port>                    Port number (default: 53)\n"
         "  -x <addr>                    Shortcut for reverse DNS lookups (IPv4/IPv6)\n"
         "  -c <class>                   Specify query class (IN, CH, HS, etc.) [default: IN]\n"
@@ -3206,10 +3206,11 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +ndots=N                     Set search NDOTS threshold\n"
         "\n"
         "EDNS0 Extension Options:\n"
-        "  +[no]edns[=N]                Set EDNS version (0 to disable: +noedns) [0]\n"
+        "  +[no]edns[=N]                Send EDNS with version N (+noedns: no OPT record) [on, 0; like dig]\n"
+        "                               (UPDATE and NOTIFY messages get no OPT unless an EDNS option is given)\n"
         "  +bufsize=N                   Set EDNS0 advertised UDP buffer size [1232]\n"
         "  +[no]dnssec                  Request DNSSEC records by setting DO (DNSSEC OK) bit (+[no]do)\n"
-        "  +[no]cookie[=hex]            Send EDNS COOKIE option with optional client/server cookie hex\n"
+        "  +[no]cookie[=hex]            Send EDNS COOKIE option with optional client/server cookie hex [on; like dig]\n"
         "  +[no]badcookie               Automatically retry with returned server cookie on BADCOOKIE\n"
         "  +[no]showbadcookie           Display diagnostic message when BADCOOKIE retry occurs\n"
         "  +subnet=addr[/prefix]        Send EDNS Client Subnet (ECS) option (e.g. +subnet=192.0.2.0/24)\n"
@@ -3265,10 +3266,11 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "    dag example.com SOA @127.0.0.1 -k /etc/rndc.key --update-add 'web.example.com 3600 IN A 192.0.2.80'\n"
         "\n"
         "KariDNS / dag Unique Features & Protocol Fuzzing:\n"
-        "  +[no]ldnsz                   Enable LDNSZ extended query compression / format (RFC draft)\n"
+        "  +[no]ldnsz                   Print ldns.jp inspection URLs for the wire-format query/response\n"
+        "                               (diff URL for several servers, trace viewer URL with +trace)\n"
         "                               Example: dag example.com A @127.0.0.1 +ldnsz\n"
-        "  +[no]allcompare              Compare responses across all queried nameservers for consistency\n"
-        "                               Example: dag example.com A @8.8.8.8,1.1.1.1,9.9.9.9 +allcompare\n"
+        "  +[no]allcompare              Include TTLs in the multi-server semantic comparison (SEM_HASH(+TTL))\n"
+        "                               Example: dag example.com A @192.0.2.1,198.51.100.1,203.0.113.1 +allcompare\n"
         "  +mqtype=TYPE[,TYPE...]       Send Multiple QTYPE EDNS option (RFC 10029)\n"
         "                               Example: dag example.com A @127.0.0.1 +mqtype=A,AAAA,HTTPS\n"
         "  +[no]header-only             Send DNS query packet without a QUESTION section\n"
@@ -3754,6 +3756,8 @@ void init_query_spec(query_spec_t *spec) {
     spec->qo.bind_port = 0;
     spec->qo.retry_on_badcookie = true;
     spec->qo.edns_negotiation = true;
+    spec->qo.edns_default = true;     /* dig: +edns=0 +bufsize=1232 */
+    spec->qo.cookie_default = true;   /* dig: +cookie */
     spec->qo.rd_flag = true;
     spec->trace2.verbosity = TRACE2_NORMAL;
     spec->trace2.qmin = TRACE2_QMIN_OFF;
@@ -4570,6 +4574,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->qo.edns_version = (uint8_t)strtoul(arg + 6, NULL, 10);
         } else if (strcmp(arg, "+noedns") == 0) {
             spec->qo.want_opt = false;
+            spec->qo.edns_default = false;
         } else if (strcmp(arg, "+dnssec") == 0 || strcmp(arg, "+do") == 0) {
             spec->qo.want_opt = true; spec->qo.dnssec_ok = true;
         } else if (strcmp(arg, "+nodo") == 0 || strcmp(arg, "+nodnssec") == 0) {
@@ -4734,6 +4739,7 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             }
         } else if (strcmp(arg, "+nocookie") == 0) {
             spec->qo.want_cookie = false;
+            spec->qo.cookie_default = false;
         } else if (strncmp(arg, "+tsig=", 6) == 0) {
             if (spec->qo.want_sig0 || spec->qo.sig0_specified) {
                 fprintf(stderr, "error: TSIG (-k/-y) and SIG(0) (+sig0-pkey) cannot be combined in this version of dag\n");
@@ -4869,7 +4875,27 @@ void free_query_opts(query_opts_t *qo) {
 
 
 
+/* dig と同じ既定値を反映する: 明示的に +noedns / +nocookie されていなければ、
+ * 通常の問い合わせに EDNS0 (udp_payload_size は既定 1232) と client cookie を付ける。
+ * UPDATE (--update-* / --prereq-* / +opcode=UPDATE) と NOTIFY (+opcode=NOTIFY) には
+ * 既定では付けない (nsupdate と同じ)。明示した EDNS オプションはそのまま有効。 */
+KARIDNS_TOOL_FN void dag_apply_dig_defaults(query_opts_t *qo) {
+    bool update_or_notify = qo->update_op_count > 0 || qo->prereq_count > 0 ||
+                            qo->opcode_override == 4 || qo->opcode_override == 5;
+    if (update_or_notify) return;
+    if (qo->edns_default) qo->want_opt = true;
+    if (qo->cookie_default && qo->want_opt && !qo->want_cookie) {
+        qo->want_cookie = true;
+        bool all_zero = true;
+        for (int k = 0; k < 8; k++) { if (qo->client_cookie[k] != 0) { all_zero = false; break; } }
+        if (all_zero) {
+            for (int k = 0; k < 8; k++) qo->client_cookie[k] = (uint8_t)(arc4random() & 0xFF);
+        }
+    }
+}
+
 int execute_query_spec(query_spec_t *spec) {
+    dag_apply_dig_defaults(&spec->qo);
     if ((spec->qo.want_tsig || spec->qo.tsig_specified) && (spec->qo.want_sig0 || spec->qo.sig0_specified)) {
         fprintf(stderr, "error: TSIG (-k/-y) and SIG(0) (+sig0-pkey) cannot be combined in this version of dag\n");
         return 1;

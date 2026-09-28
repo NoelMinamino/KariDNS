@@ -83,7 +83,21 @@ echo "=== 2. Testing +noednsopt and +mqtype flags ==="
 # +ednsopt=65001:0102 adds custom option 65001 (0xfde9 in hex dump)
 run_check "+ednsopt adds custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +qr +timeout=1" "(fd e9 00 02 01 02|OPT[ =]65001|OPTION: 65001)"
 run_not_check "+noednsopt clears custom EDNS option" "$DAG @127.0.0.1 -p 10053 example.com A +ednsopt=65001:0102 +noednsopt +qr +timeout=1" "(fd e9 00 02 01 02|OPTION: 65001|OPT[ =]65001)"
-run_check "multiple +mqtype flags merge into single option" "$DAG @127.0.0.1 -p 10053 example.com A +mqtype=A +mqtype=AAAA +qr +timeout=1" "(00 14 00 04 00 01 00 1c|OPT[ =]20|OPTION: 20)"
+# +nocookie: the default client cookie (dig parity) would move the option so that its bytes wrap across hexdump lines
+run_check "multiple +mqtype flags merge into single option" "$DAG @127.0.0.1 -p 10053 example.com A +mqtype=A +mqtype=AAAA +nocookie +qr +timeout=1" "(00 14 00 04 00 01 00 1c|OPT[ =]20|OPTION: 20)"
+
+# dig defaults: EDNS0 with udp 1232 and a client cookie on ordinary queries
+run_check "default query sends EDNS0 udp 1232" "$DAG @127.0.0.1 -p 10053 example.com A +qr +timeout=1" "EDNS: version: 0, flags:; udp: 1232"
+run_check "default query sends a client cookie" "$DAG @127.0.0.1 -p 10053 example.com A +qr +timeout=1" "; COOKIE: [0-9a-f]{16}"
+run_not_check "+noedns sends no OPT record" "$DAG @127.0.0.1 -p 10053 example.com A +noedns +qr +timeout=1" "OPT PSEUDOSECTION"
+run_check "+nocookie keeps EDNS" "$DAG @127.0.0.1 -p 10053 example.com A +nocookie +qr +timeout=1" "EDNS: version: 0"
+run_not_check "+nocookie sends no cookie" "$DAG @127.0.0.1 -p 10053 example.com A +nocookie +qr +timeout=1" "; COOKIE:"
+run_check "+bufsize changes the advertised size" "$DAG @127.0.0.1 -p 10053 example.com A +bufsize=4096 +qr +timeout=1" "udp: 4096"
+# UPDATE and NOTIFY keep no OPT by default (like nsupdate); an explicit EDNS option still adds one
+run_check "UPDATE +qr prints the sent message" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "opcode: UPDATE.*|ADDITIONAL: 0"
+run_not_check "UPDATE sends no OPT by default" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "OPT PSEUDOSECTION"
+run_not_check "NOTIFY sends no OPT by default" "$DAG @127.0.0.1 -p 10053 example.com SOA +opcode=NOTIFY +qr +timeout=1" "OPT PSEUDOSECTION"
+run_check "UPDATE with explicit +edns sends OPT" "$DAG @127.0.0.1 -p 10053 example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +edns +qr +timeout=1" "OPT PSEUDOSECTION"
 
 echo "=== 3. Testing Dynamic DNS UPDATE prerequisites (--prereq-*) ==="
 if [ "$DAG" = "dig" ]; then

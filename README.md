@@ -128,7 +128,7 @@ A zone file syntax and configuration validation utility. It performs pre-flight 
 ### 4. `dag` (DNS Anomaly Generator)
 A test client, protocol debugger, and packet fuzzer for DNS servers. For full option specifications and fuzzing modes, see the **[dag(1) Manual](docs/dag.md)**.
 
-`dag` can construct custom queries (including EDNS options, Cookie, EDNS Client Subnet, IXFR, Dynamic Updates, etc.), output formatted responses (`+short`, `+yaml`, `+multiline`), resolve iteratively without any local resolver (`+trace2`), replay captured traffic against servers (`--replay`), generate web links (`+ldnsz`) for online wire-format analysis, and intentionally generate malformed or boundary-testing packets using the `--break` option. Unlike `dig`, it does not add an EDNS OPT record unless an EDNS option (or `+edns`) is given, and it prints hex dumps of the query and response by default (`+nohexdump` turns them off).
+`dag` can construct custom queries (including EDNS options, Cookie, EDNS Client Subnet, IXFR, Dynamic Updates, etc.), output formatted responses (`+short`, `+yaml`, `+multiline`), resolve iteratively without any local resolver (`+trace2`), replay captured traffic against servers (`--replay`), generate web links (`+ldnsz`) for online wire-format analysis, and intentionally generate malformed or boundary-testing packets using the `--break` option. Its defaults follow `dig` (EDNS0 with a 1232-byte UDP payload size and a client cookie); unlike `dig`, it also prints hex dumps of the query and response by default (`+nohexdump` turns them off).
 
 > [!WARNING]
 > **Intended for Local Testing Only**

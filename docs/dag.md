@@ -51,10 +51,10 @@ dag [global-queryopt...] [query...]
 
 ### Default Lookup Behavior
 
-- Unless `@server` is explicitly provided, `dag` reads nameserver addresses from `/etc/resolv.conf` (on Windows, from the system's DNS server list). If no server is found, it queries `127.0.0.1`.
+- Unless `@server` is explicitly provided, `dag` reads nameserver addresses from `/etc/resolv.conf` (on Windows, from the system's DNS server list). If no server is found, it queries `127.0.0.1` (on Windows: `1.1.1.1`).
 - When no domain name is supplied, `dag` queries the root zone (`.`) for `NS` records. If a domain name is supplied without a type, it defaults to `A` (or `PTR` if `-x` is specified). The name, type and class may be given in any order.
 - The query has the RD and AD bits set, like `dig`.
-- **No EDNS OPT record is sent by default.** EDNS is enabled by `+edns` or by any option that needs it (`+bufsize`, `+dnssec`, `+nsid`, `+cookie`, `+badcookie`, `+subnet`, `+padding`, `+ednsopt`, `+ednsflags=N`, `+mqtype`, `+expire`, `+keepalive`, `+coflag`, `+dns64prefix`). This differs from `dig`, which sends EDNS by default.
+- Like `dig`, queries carry an EDNS0 OPT record (version 0, UDP payload size 1232) with a random 8-byte client cookie by default; `+noedns` and `+nocookie` turn them off. Dynamic UPDATE and NOTIFY messages (`--update-*`, `--prereq-*`, `+opcode=UPDATE`, `+opcode=NOTIFY`) get no OPT record unless an EDNS option is given explicitly, like `nsupdate`.
 - In the normal output format, a hex dump of the query (`Query (N bytes):`) and of the response is printed in addition to the dig-style sections. Use `+nohexdump` to turn this off; the dumps are not printed with `+short` or `+yaml` (and the response dump not with `+nocomments`).
 - Per-user defaults can be configured via `${HOME}/.digrc`. This file is read and its options applied before command-line arguments, unless the `-r` option is supplied.
 - Up to 64 queries can be given on one command line (see [MULTIPLE QUERIES & BATCH PROCESSING](#multiple-queries--batch-processing)).
@@ -266,13 +266,13 @@ dag [global-queryopt...] [query...]
 
 ## EDNS0 EXTENSIONS
 
-No OPT record is sent unless one of the options in this section (or `+edns`) is given.
+Queries carry an EDNS0 OPT record and a client cookie by default (like `dig`). UPDATE and NOTIFY messages get an OPT record only when one of the options in this section is given.
 
 `+[no]edns[=N]`
-: `+edns` adds an OPT pseudo-RR to the query; `+edns=N` also sets the EDNS version to `N` (default: 0). `+noedns` removes the OPT record.
+: Send an OPT pseudo-RR (on by default); `+edns=N` sets the EDNS version to `N` (default: 0). `+noedns` sends no OPT record.
 
 `+bufsize=N`
-: Set the advertised EDNS0 UDP buffer size, 0–65535 (default when EDNS is sent: 1232 bytes, compliant with DNS Flag Day recommendations). Enables EDNS.
+: Set the advertised EDNS0 UDP buffer size, 0–65535 (default: 1232 bytes, compliant with DNS Flag Day recommendations). Enables EDNS.
 
 `+[no]dnssec`, `+[no]do`
 : Set the **DO (DNSSEC OK)** bit in the EDNS0 OPT record, requesting DNSSEC RRs (RRSIG, NSEC, NSEC3, DS) from the authoritative server.
@@ -284,7 +284,7 @@ No OPT record is sent unless one of the options in this section (or `+edns`) is 
 : Send the **EDNS EXPIRE (RFC 7314)** option (Option Code 9) in query and highlight the zone expiration TTL field in SOA responses.
 
 `+[no]cookie[=hex]`
-: Send the **DNS Cookie (RFC 7873 / RFC 9018)** option. If `hex` is supplied, sets the client (8 bytes) or client+server cookie value. If omitted, a random 8-byte client cookie is generated.
+: Send the **DNS Cookie (RFC 7873 / RFC 9018)** option. Sent by default with a random 8-byte client cookie (like `dig`); `+nocookie` turns it off. If `hex` is supplied, sets the client (8 bytes) or client+server cookie value.
 
 `+[no]badcookie`
 : Automatically retry the query once if the server returns a `BADCOOKIE` error, attaching the returned Server Cookie. Enabled by default.
