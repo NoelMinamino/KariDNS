@@ -3249,6 +3249,18 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                             if (copy_len > 0) {
                                 memcpy(edns->ecs_addr, req + rdata_offset + 4, copy_len);
                             }
+                        } else if (opt_code == EDNS_OPTION_EXPIRE) {
+                            // RFC 7314 §2: 問い合わせは長さ 0、§3: 応答は長さ 4 (秒, ネットワークバイトオーダ)。
+                            // それ以外の長さは無視する。
+                            if (opt_len == 0) {
+                                edns->has_expire_query = true;
+                            } else if (opt_len == 4 && !edns->has_expire_value) {
+                                edns->has_expire_value = true;
+                                edns->expire_value = ((uint32_t)req[rdata_offset] << 24) |
+                                                     ((uint32_t)req[rdata_offset + 1] << 16) |
+                                                     ((uint32_t)req[rdata_offset + 2] << 8) |
+                                                     (uint32_t)req[rdata_offset + 3];
+                            }
                         } else if (opt_code == EDNS_OPTION_KARIDNS_EXT) { // 65153
                             if (opt_len == 5) {
                                 edns->has_karidns_ext = true;
@@ -3279,6 +3291,7 @@ size_t edns_opt_reserve_len(const edns_info_t *edns, bool is_tcp, const struct s
     if (edns->has_nsid_query && cfg && cfg->nsid_string) rdlen += 4 + strlen(cfg->nsid_string);
     if (is_tcp && edns->has_keepalive_query && cfg && cfg->tcp_connection_reuse) rdlen += 4 + 2;
     if (edns->has_karidns_ext) rdlen += 4 + 5;
+    if (edns->has_expire_query || edns->send_expire) rdlen += 4 + 4;  /* RFC 7314 */
     if (edns->has_ecs && (!cfg || cfg->ecs_enable)) rdlen += 4 + 4 + 16; /* SCOPE は解決中に決まる */
     return 11 + rdlen;
 }
@@ -3364,6 +3377,9 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
     }
     if (edns && edns->has_karidns_ext) {
         rdlen += 4 + 5;
+    }
+    if (edns && edns->send_expire) {
+        rdlen += 4 + 4;
     }
 
     uint8_t ecs_addr_bytes = 0;
@@ -3455,6 +3471,16 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
             res[offset++] = (edns->karidns_ext_hash >> 16) & 0xFF;
             res[offset++] = (edns->karidns_ext_hash >> 8) & 0xFF;
             res[offset++] = edns->karidns_ext_hash & 0xFF;
+        }
+
+        if (edns && edns->send_expire) {
+            // RFC 7314 §3: EXPIRE, 長さ 4, 秒 (ネットワークバイトオーダ)
+            res[offset++] = 0; res[offset++] = EDNS_OPTION_EXPIRE;
+            res[offset++] = 0; res[offset++] = 4;
+            res[offset++] = (edns->send_expire_value >> 24) & 0xFF;
+            res[offset++] = (edns->send_expire_value >> 16) & 0xFF;
+            res[offset++] = (edns->send_expire_value >> 8) & 0xFF;
+            res[offset++] = edns->send_expire_value & 0xFF;
         }
 
         if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {

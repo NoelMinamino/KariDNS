@@ -96,6 +96,7 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 #define DNS_TYPE_KARIDNS_ECS_TRUSTED    65407
 
 #define EDNS_OPTION_KARIDNS_EXT         65153
+#define EDNS_OPTION_EXPIRE              9     /* RFC 7314 */
 /* 2: TYPE 65405 (tinydns location) carries the prefix length in bits + 4-octet network.
  * Peers with a different version fall back to a standard AXFR. */
 #define KARIDNS_EXT_VERSION             2
@@ -289,6 +290,13 @@ typedef struct {
     bool has_karidns_ext;
     uint8_t karidns_ext_version;
     uint32_t karidns_ext_hash;
+
+    // EDNS EXPIRE (RFC 7314)
+    bool has_expire_query;      // 受信: 長さ 0 の EXPIRE (§2 問い合わせ)
+    bool has_expire_value;      // 受信: 長さ 4 の EXPIRE (§3 応答)
+    uint32_t expire_value;
+    bool send_expire;           // 送信: 応答の OPT に EXPIRE を付ける (受信値は反映しない)
+    uint32_t send_expire_value;
 } edns_info_t;
 
 // ============================================================================

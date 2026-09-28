@@ -5898,8 +5898,170 @@ static void test_axfr_ixfr_feature_case_157(void) {
     printf("  -> Case 157 passed.\n");
 }
 
+/* EXPIRE オプション (code 9, len 4) の値を DNS メッセージの OPT から探す。無ければ -1。 */
+static long find_expire_option(const uint8_t *msg, size_t len) {
+    size_t opt_off = 0, opt_len = 0;
+    if (!dns_find_opt_rr(msg, len, &opt_off, &opt_len)) return -1;
+    size_t p = opt_off + 11, end = opt_off + opt_len;
+    while (p + 4 <= end) {
+        uint16_t code = (uint16_t)((msg[p] << 8) | msg[p + 1]);
+        uint16_t olen = (uint16_t)((msg[p + 2] << 8) | msg[p + 3]);
+        p += 4;
+        if (p + olen > end) return -1;
+        if (code == 9 && olen == 4)
+            return (long)(((uint32_t)msg[p] << 24) | ((uint32_t)msg[p + 1] << 16) | ((uint32_t)msg[p + 2] << 8) | msg[p + 3]);
+        p += olen;
+    }
+    return -1;
+}
+
+static void test_edns_expire_rfc7314(void) {
+    printf("[TEST] AXFR/IXFR: EDNS EXPIRE option (RFC 7314)...\n");
+    time_t now = 1000000;
+
+    /* §4 expire timer: no option -> 0 (SOA EXPIRE from the last transfer, as before) */
+    assert(xfr_expire_deadline(true, false, 0, 86400, 0, now) == 0);
+    assert(xfr_expire_deadline(false, false, 0, 86400, now + 5, now) == 0);
+    /* transfer: initialised from the option, SOA EXPIRE is the maximum */
+    assert(xfr_expire_deadline(true, true, 100, 86400, now + 5000, now) == now + 100);
+    assert(xfr_expire_deadline(true, true, 999999, 86400, 0, now) == now + 86400);
+    assert(xfr_expire_deadline(true, true, 0, 86400, 0, now) == now);
+    /* up to date: maximum of the option and the current timer, capped by SOA EXPIRE */
+    assert(xfr_expire_deadline(false, true, 100, 86400, now + 5000, now) == now + 5000);
+    assert(xfr_expire_deadline(false, true, 7000, 86400, now + 5000, now) == now + 7000);
+    assert(xfr_expire_deadline(false, true, 100, 86400, 0, now) == now + 100);
+    assert(xfr_expire_deadline(false, true, 100, 50, now + 5000, now) == now + 50);
+    assert(xfr_expire_deadline(false, true, 100, 0, now + 5000, now) == now + 5000);
+
+    /* §3 value: primary -> SOA EXPIRE, secondary -> remaining time of the timer */
+    zone_db_entry_t e;
+    memset(&e, 0, sizeof(e));
+    atomic_store(&e.expire, 600);
+    assert(zone_expire_option_value(&e, now) == 600);
+    e.is_secondary = true;
+    assert(zone_expire_option_value(&e, now) == 600);            /* no timer yet */
+    atomic_store(&e.last_successful_transfer, now - 100);
+    assert(zone_expire_deadline(&e) == now + 500);
+    assert(zone_expire_option_value(&e, now) == 500);
+    atomic_store(&e.expire_at, now + 42);
+    assert(zone_expire_deadline(&e) == now + 42);
+    assert(zone_expire_option_value(&e, now) == 42);
+    assert(zone_expire_option_value(&e, now + 43) == 0);         /* expired */
+    atomic_store(&e.expire_at, now + 5000);
+    assert(zone_expire_option_value(&e, now) == 600);            /* never above SOA EXPIRE */
+
+    /* parse_edns_opt: §2 query (length 0), §3 response (length 4), other lengths ignored */
+    static const uint8_t opt_query[] = { 0, 9, 0, 0,  0, 9, 0, 2, 1, 2 };   /* len 0 + bad len 2 */
+    static const uint8_t opt_resp[]  = { 0, 9, 0, 4, 0, 1, 0x51, 0x80 };     /* len 4: 86400 */
+    const struct { const uint8_t *opts; size_t len; } cases[] = {
+        { opt_query, sizeof(opt_query) }, { opt_resp, sizeof(opt_resp) } };
+    edns_info_t ed[2];
+    for (int c = 0; c < 2; c++) {
+        uint8_t q[64] = {0};
+        q[5] = 1; q[11] = 1;
+        size_t o = 12;
+        q[o++] = 0; q[o++] = 0; q[o++] = 6; q[o++] = 0; q[o++] = 1;       /* . SOA IN */
+        q[o++] = 0; q[o++] = 0; q[o++] = 41; q[o++] = 0x04; q[o++] = 0xd0;
+        q[o++] = 0; q[o++] = 0; q[o++] = 0; q[o++] = 0;
+        q[o++] = 0; q[o++] = (uint8_t)cases[c].len;                        /* RDLEN */
+        memcpy(q + o, cases[c].opts, cases[c].len);
+        o += cases[c].len;
+        memset(&ed[c], 0, sizeof(ed[c]));
+        assert(parse_edns_opt(q, o, 1, 0, 0, 1, &ed[c]) == 0);
+    }
+    assert(ed[0].has_expire_query && !ed[0].has_expire_value && !ed[0].send_expire);
+    assert(!ed[1].has_expire_query && ed[1].has_expire_value && ed[1].expire_value == 86400);
+    assert(!ed[1].send_expire);   /* a received value is never echoed */
+
+    /* assemble_edns_opt: the option is written only when send_expire is set */
+    uint8_t res[128] = {0};
+    uint16_t off = 12, ar = 0;
+    edns_info_t out;
+    memset(&out, 0, sizeof(out));
+    out.present = true;
+    out.has_expire_query = true;
+    assemble_edns_opt(res, sizeof(res), &off, &ar, &out, 0, false, NULL);
+    assert(ar == 1 && off == 12 + 11);
+    off = 12; ar = 0;
+    out.send_expire = true;
+    out.send_expire_value = 0x01020304;
+    assemble_edns_opt(res, sizeof(res), &off, &ar, &out, 0, false, NULL);
+    assert(ar == 1 && off == 12 + 11 + 8);
+    assert(memcmp(res + 12 + 11, "\x00\x09\x00\x04\x01\x02\x03\x04", 8) == 0);
+    assert(edns_opt_reserve_len(&out, false, NULL) >= 11 + 8);
+
+    /* send_axfr_response: an up-to-date IXFR with EXPIRE gets the value in the OPT, and
+     * parse_xfr_packet() on the secondary picks it up. */
+    zone_db_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strncpy(entry.domain, "example.com.", sizeof(entry.domain) - 1);
+    strncpy(entry.view_name, "default", sizeof(entry.view_name) - 1);
+    pthread_mutex_init(&entry.writer_lock, NULL);
+    pthread_mutex_init(&entry.ixfr_history.lock, NULL);
+    init_axfr_zone(&entry.rcu.arena_a, "example.com.", "200");
+    atomic_store_explicit(&entry.rcu.active, &entry.rcu.arena_a, memory_order_release);
+    atomic_store_explicit(&entry.serial, 200, memory_order_release);
+    atomic_store_explicit(&entry.expire, 1209600, memory_order_release);
+
+    uint8_t req[512] = {0};
+    req[0] = 0x77; req[1] = 0x88;
+    req[5] = 1; req[9] = 1; req[11] = 1;   /* QD=1, NS=1 (client SOA), AR=1 (OPT) */
+    size_t qo = 12;
+    qo += write_uncompressed_name(req, qo, sizeof(req), "example.com.");
+    req[qo++] = 0; req[qo++] = 251; req[qo++] = 0; req[qo++] = 1;
+    qo += write_uncompressed_name(req, qo, sizeof(req), "example.com.");
+    req[qo++] = 0; req[qo++] = 6; req[qo++] = 0; req[qo++] = 1;
+    req[qo++] = 0; req[qo++] = 0; req[qo++] = 0; req[qo++] = 0;
+    size_t rdp = qo; qo += 2;
+    qo += write_uncompressed_name(req, qo, sizeof(req), "ns1.example.com.");
+    qo += write_uncompressed_name(req, qo, sizeof(req), "admin.example.com.");
+    req[qo++] = 0; req[qo++] = 0; req[qo++] = 0; req[qo++] = 200;
+    for (int k = 0; k < 16; k++) req[qo++] = 0;
+    req[rdp] = (uint8_t)((qo - rdp - 2) >> 8); req[rdp + 1] = (uint8_t)((qo - rdp - 2) & 0xFF);
+    req[qo++] = 0; req[qo++] = 0; req[qo++] = 41; req[qo++] = 0x10; req[qo++] = 0;
+    req[qo++] = 0; req[qo++] = 0; req[qo++] = 0; req[qo++] = 0;
+    req[qo++] = 0; req[qo++] = 4;
+    req[qo++] = 0; req[qo++] = 9; req[qo++] = 0; req[qo++] = 0;
+
+    g_tcp_out_len = 0;
+    g_tcp_send_count = 0;
+    send_axfr_response(1, "example.com.", req, (uint16_t)qo, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    assert(g_tcp_out_len > 2);
+    size_t mlen = (size_t)((g_tcp_out[0] << 8) | g_tcp_out[1]);
+    assert(find_expire_option(g_tcp_out + 2, mlen) == 1209600);   /* primary: SOA EXPIRE */
+
+    zone_arena_t standby;
+    memset(&standby, 0, sizeof(standby));
+    zone_arena_init(&standby);
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.is_ixfr = true;
+    session.client_serial = 200;
+    parse_xfr_packet(g_tcp_out + 2, mlen, &standby, &entry.rcu.arena_a, &session, "example.com.");
+    assert(session.has_expire && session.expire == 1209600);
+    zone_arena_destroy(&standby);
+
+    /* secondary: remaining time */
+    entry.is_secondary = true;
+    atomic_store_explicit(&entry.expire_at, time(NULL) + 300, memory_order_release);
+    g_tcp_out_len = 0;
+    send_axfr_response(1, "example.com.", req, (uint16_t)qo, NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    mlen = (size_t)((g_tcp_out[0] << 8) | g_tcp_out[1]);
+    long v = find_expire_option(g_tcp_out + 2, mlen);
+    assert(v >= 298 && v <= 300);
+
+    /* without the option in the request: no OPT as before */
+    req[11] = 0;
+    g_tcp_out_len = 0;
+    send_axfr_response(1, "example.com.", req, (uint16_t)(qo - 15), NULL, &entry, NULL, 0, NULL, 0, NULL, false);
+    mlen = (size_t)((g_tcp_out[0] << 8) | g_tcp_out[1]);
+    assert(find_expire_option(g_tcp_out + 2, mlen) == -1);
+    printf("  -> EDNS EXPIRE passed.\n");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    test_edns_expire_rfc7314();
     printf("=== Starting AXFR/IXFR Engine Unit Tests ===\n");
     test_wait_for_active_axfr_branches();
     test_compute_ixfr_diff();

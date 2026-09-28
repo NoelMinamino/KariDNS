@@ -65,6 +65,10 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tsig_key_t *tsig_key,
                       const uint8_t *req_mac, size_t req_mac_len);
 
+/* RFC 7314 §4: 転送 / 最新確認の結果からセカンダリの expire タイマー期限を決める (0 = SOA EXPIRE で数える) */
+time_t xfr_expire_deadline(bool transferred, bool has_expire, uint32_t expire_opt,
+                           uint32_t soa_expire, time_t cur_deadline, time_t now);
+
 void *axfr_bg_thread_func(void *arg);
 
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,

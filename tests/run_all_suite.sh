@@ -248,6 +248,7 @@ register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXF
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
 register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer"
 register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone SOA refresh polling"
+register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE option (primary, secondary, chained secondaries)"
 
 # 3. DNSSEC & Message Digests
 register_test "dnssec" "sh" "tests/run_zonemd_val_test.sh" "RFC 8976 ZONEMD verification against test vectors"

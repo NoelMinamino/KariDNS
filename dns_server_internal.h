@@ -175,6 +175,8 @@ typedef struct {
   uint32_t client_serial;
   char initial_soa_name[256];
   bool is_extended_mode;
+  bool has_expire;        /* RFC 7314: 最初の応答に付いていた EXPIRE の値 */
+  uint32_t expire;
   char current_loc_tag[64];
   bool has_current_loc_tag;
   char current_ecs_tag[64];
@@ -311,9 +313,34 @@ typedef struct {
   char cached_tsig_key_name[64];
   char owning_catalog_domain[256];
   _Atomic(time_t) last_successful_transfer;
+  /* RFC 7314 §4: セカンダリの expire タイマーが切れる時刻。0 なら
+   * last_successful_transfer + expire (従来どおり SOA EXPIRE で数える)。 */
+  _Atomic(time_t) expire_at;
   _Atomic(time_t) last_stale_log_time;
   time_t last_loaded_mtime;
 } zone_db_entry_t;
+
+/* セカンダリゾーンが期限切れになる時刻。期限が無い (プライマリ、未転送) なら 0。 */
+static inline time_t zone_expire_deadline(zone_db_entry_t *e) {
+  time_t at = atomic_load_explicit(&e->expire_at, memory_order_acquire);
+  if (at > 0) return at;
+  time_t last_ok = atomic_load_explicit(&e->last_successful_transfer, memory_order_acquire);
+  uint32_t expire = atomic_load_explicit(&e->expire, memory_order_acquire);
+  if (last_ok > 0 && expire > 0) return last_ok + (time_t)expire;
+  return 0;
+}
+
+/* RFC 7314 §3: EXPIRE オプションで返す値。プライマリは SOA EXPIRE、セカンダリは
+ * expire タイマーの残り秒数 (期限切れなら 0)。 */
+static inline uint32_t zone_expire_option_value(zone_db_entry_t *e, time_t now) {
+  uint32_t expire = atomic_load_explicit(&e->expire, memory_order_acquire);
+  if (!e->is_secondary) return expire;
+  time_t deadline = zone_expire_deadline(e);
+  if (deadline == 0) return expire;
+  if (deadline <= now) return 0;
+  time_t left = deadline - now;
+  return (left > (time_t)expire && expire > 0) ? expire : (uint32_t)left;
+}
 
 typedef struct {
   char *name;
