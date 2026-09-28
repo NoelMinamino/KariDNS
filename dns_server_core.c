@@ -1114,6 +1114,56 @@ ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
   return sent;
 }
 
+// UDP / IPC 送信失敗のログ。ホットパスで syslog が溢れないよう、スレッドごとに
+// 1 秒 1 回へ間引き、間引いた件数を次のログにまとめて出す。
+// is_ipc: Frontend/Backend 間の AF_UNIX SOCK_DGRAM (EMSGSIZE は net.local.dgram.maxdgram 超過)
+static void log_udp_send_drop(const char *path, bool is_ipc, int err, int dropped) {
+  static _Thread_local time_t last_log;
+  static _Thread_local unsigned long suppressed;
+  time_t now = time(NULL);
+  if (now == last_log) {
+    suppressed += (unsigned long)dropped;
+    return;
+  }
+  last_log = now;
+  syslog(LOG_WARNING, "[%s] dropped %d UDP message(s): %s%s (+%lu suppressed in the last second)",
+         path, dropped, strerror(err),
+         (is_ipc && err == EMSGSIZE) ? "; reply exceeds net.local.dgram.maxdgram - IPC header" : "",
+         suppressed);
+  suppressed = 0;
+}
+
+// sendmmsg() は途中の 1 通が失敗するとそこで止まり、送れた件数だけを返す
+// (失敗した 1 通以降は送られない)。戻り値を無視すると、過大な応答 (EMSGSIZE) や
+// 到達不能な宛先 (EHOSTUNREACH 等) 1 通のために同じバッチの他クライアント宛て応答まで
+// 捨ててしまうため、失敗した 1 通だけを飛ばして残りを送り直す。
+// EAGAIN / ENOBUFS (非ブロッキングで送信バッファ満杯) は送り直しても失敗するので
+// 従来どおり残りを破棄する。戻り値: 破棄した件数。
+STATIC_TEST int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc) {
+  int off = 0;
+  int dropped = 0;
+  int last_err = 0;
+  while (off < n) {
+    int r = sendmmsg(fd, msgs + off, (unsigned int)(n - off), MSG_DONTWAIT);
+    if (r > 0) {
+      off += r;
+      continue;
+    }
+    if (r < 0 && errno == EINTR)
+      continue;
+    last_err = (r < 0) ? errno : EIO;
+    if (last_err == EAGAIN || last_err == EWOULDBLOCK || last_err == ENOBUFS) {
+      dropped += n - off;
+      break;
+    }
+    dropped++;  // msgs[off] だけを破棄して続行
+    off++;
+  }
+  if (dropped > 0)
+    log_udp_send_drop(path, is_ipc, last_err, dropped);
+  return dropped;
+}
+
 async_io_pool_t g_async_io_pool;
 
 STATIC_TEST bool enqueue_async_io_task(const async_io_task_t *task) {
@@ -1176,7 +1226,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = res_len;
-          send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0);
+          if (send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0) < 0)
+            log_udp_send_drop("Backend->Frontend IPC", true, errno, 1);
         } else if (slip_triggered) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
@@ -1192,7 +1243,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = qlen;
-          send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0);
+          if (send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0) < 0)
+            log_udp_send_drop("Backend->Frontend IPC", true, errno, 1);
         } else {
           submit_response_log(LOG_ACT_DROP_RRL, task.client_ip, task.client_port, task.qname,
                               task.qclass, task.qtype, res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
@@ -1794,7 +1846,7 @@ worker_startup_success:;
               batch->tx_msgs[n_tx].msg_hdr.msg_controllen = 0;
               n_tx++;
               if (n_tx == UDP_BATCH_SIZE) {
-                sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
+                sendmmsg_skip_failed(active_fd, batch->tx_msgs, n_tx, "Backend->Frontend IPC", true);
                 n_tx = 0;
               }
               rcu_reader_exit(ctx);
@@ -1808,7 +1860,7 @@ worker_startup_success:;
           }
           atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
           if (n_tx > 0) {
-            sendmmsg(active_fd, batch->tx_msgs, n_tx, MSG_DONTWAIT);
+            sendmmsg_skip_failed(active_fd, batch->tx_msgs, n_tx, "Backend->Frontend IPC", true);
             n_tx = 0;
           }
         }
@@ -3697,7 +3749,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
           }
           if (tx_count > 0 && g_num_workers > 0) {
             int target_worker = rr;
-            sendmmsg(g_ipc_fds[router_id][target_worker][0], fctx->ipc_tx_msgs, tx_count, MSG_DONTWAIT);
+            sendmmsg_skip_failed(g_ipc_fds[router_id][target_worker][0], fctx->ipc_tx_msgs, tx_count,
+                                 "Frontend->Backend IPC", true);
             rr = (rr + 1) % g_num_workers;
           }
         }
@@ -3920,7 +3973,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             }
 
             if (cur_sock_idx != -1 && msg->sock_fd_idx != cur_sock_idx && tx_count > 0) {
-              sendmmsg(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
+              sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false);
               tx_count = 0;
             }
             cur_sock_idx = msg->sock_fd_idx;
@@ -3980,7 +4033,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             tx_count++;
           }
           if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) {
-            sendmmsg(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, MSG_DONTWAIT);
+            sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false);
             tx_count = 0;
           }
         }

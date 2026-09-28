@@ -58,6 +58,7 @@ bool preflight_writable_path(const char *path, const char *what, bool foreground
                              bool check_existing, const char *hint);
 bool validate_program_zone_users(server_config_t *cfg);
 bool preflight_listen_ports(server_config_t *cfg);
+int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc);
 
 // ----------------------------------------------------------------------------
 // 1. fast_ipv4_to_str Test
@@ -1201,6 +1202,66 @@ static void test_control_socket_thread_and_commands(void) {
 // ----------------------------------------------------------------------------
 // 15. open_router_udp_sockets & setup_udp_socket_buffers Test
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// sendmmsg_skip_failed: one failing message must not drop the rest of the batch
+// ----------------------------------------------------------------------------
+static void test_sendmmsg_skip_failed(void) {
+    printf("[TEST] Server Core: sendmmsg_skip_failed skips only the failing message...\n");
+
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    fcntl(sv[1], F_SETFL, fcntl(sv[1], F_GETFL, 0) | O_NONBLOCK);
+
+    // [1] は AF_UNIX データグラムの上限 (FreeBSD: net.local.dgram.maxdgram,
+    // Linux: SO_SNDBUF) を超えるので EMSGSIZE になる
+    static uint8_t big[256 * 1024];
+    static const char *small[3] = {"A-first", "C-third", "D-fourth"};
+    struct iovec iov[4];
+    struct mmsghdr msgs[4];
+    memset(msgs, 0, sizeof(msgs));
+    iov[0].iov_base = (void *)small[0]; iov[0].iov_len = strlen(small[0]);
+    iov[1].iov_base = big;              iov[1].iov_len = sizeof(big);
+    iov[2].iov_base = (void *)small[1]; iov[2].iov_len = strlen(small[1]);
+    iov[3].iov_base = (void *)small[2]; iov[3].iov_len = strlen(small[2]);
+    for (int i = 0; i < 4; i++) {
+        msgs[i].msg_hdr.msg_iov = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    assert(sendmmsg_skip_failed(sv[0], msgs, 4, "test", true) == 1);
+    for (int i = 0; i < 3; i++) {
+        char buf[64];
+        ssize_t n = recv(sv[1], buf, sizeof(buf) - 1, MSG_DONTWAIT);
+        assert(n == (ssize_t)strlen(small[i]));
+        buf[n] = '\0';
+        assert(strcmp(buf, small[i]) == 0);
+    }
+    char extra[8];
+    assert(recv(sv[1], extra, sizeof(extra), MSG_DONTWAIT) < 0);
+
+    // 全件失敗 (EBADF) でも 1 通ずつ飛ばして終了し、無限ループしない
+    assert(sendmmsg_skip_failed(-1, msgs, 4, "test", false) == 4);
+
+    // 受信側が満杯 (EAGAIN / ENOBUFS) なら残りをまとめて破棄する
+    fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL, 0) | O_NONBLOCK);
+    // 1 バイトずつ詰め、どの小さなメッセージも入らない状態にする
+    uint8_t fill = 0;
+    int filled = 0;
+    while (send(sv[0], &fill, 1, MSG_DONTWAIT) > 0 && filled < 1000000)
+        filled++;
+    assert(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS);
+    struct mmsghdr small_msgs[3];
+    memset(small_msgs, 0, sizeof(small_msgs));
+    small_msgs[0].msg_hdr.msg_iov = &iov[0]; small_msgs[0].msg_hdr.msg_iovlen = 1;
+    small_msgs[1].msg_hdr.msg_iov = &iov[2]; small_msgs[1].msg_hdr.msg_iovlen = 1;
+    small_msgs[2].msg_hdr.msg_iov = &iov[3]; small_msgs[2].msg_hdr.msg_iovlen = 1;
+    assert(sendmmsg_skip_failed(sv[0], small_msgs, 3, "test", true) == 3);
+
+    close(sv[0]);
+    close(sv[1]);
+    printf("  -> sendmmsg_skip_failed passed.\n");
+}
+
 static void test_open_router_udp_sockets_and_buffers(void) {
     printf("[TEST] Server Core: open_router_udp_sockets & setup_udp_socket_buffers...\n");
 
@@ -5489,6 +5550,7 @@ int main(void) {
     test_query_logger_thread_func();
     test_control_socket_thread_and_commands();
     test_open_router_udp_sockets_and_buffers();
+    test_sendmmsg_skip_failed();
     test_tcp_listen_and_zone_socket_opts();
     test_async_io_pool_and_tasks();
     test_meta_types_and_utils_helpers();

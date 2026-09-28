@@ -610,6 +610,17 @@ The test plugin [`tests/mock_anomalous_dns_server.pl`](../tests/mock_anomalous_d
 
 TCP replies are never truncated. The behavior is covered by `tests/run_mock_anomalous_tc_test.sh`.
 
+#### Size limits for large UDP replies
+Large UDP replies sent as-is can hit these limits along the way:
+
+| Limit | Where | Default (FreeBSD) | Largest reply that passes |
+|---|---|---|---|
+| `net.local.dgram.maxdgram` | Server: KariDNS Backend → Frontend IPC (80-byte header + reply) | 8192 | 8112 bytes. Set it to 65616 or more for 65,535 |
+| `net.inet.udp.recvspace` | Client: default UDP receive buffer (reply + source address, 16 bytes for IPv4) | 42080 | 42064 bytes over IPv4 |
+| IPv4 / IPv6 datagram size | Protocol (RFC 791, RFC 768, RFC 8200) | — | 65,507 bytes (IPv4), 65,527 bytes (IPv6) |
+
+A reply KariDNS cannot send is logged instead of being dropped silently, for example `[Backend->Frontend IPC] dropped 1 UDP message(s): Message too long; reply exceeds net.local.dgram.maxdgram - IPC header`. A failed reply never causes the other replies in the same send batch to be dropped.
+
 ---
 
 ## AUTHORS
