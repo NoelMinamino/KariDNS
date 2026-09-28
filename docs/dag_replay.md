@@ -40,7 +40,7 @@ When dual servers are specified (`--server1` and `--server2`), or when single se
 ### Server Target Specifications
 
 `--server1 <host[:port]>`
-: Address and optional port of the primary target nameserver. Without a port, the default of the server's transport is used: `53` (udp/tcp), `853` (tls), `443` (doh). Supports IPv4 addresses and hostnames; an IPv6 address cannot be combined with a port (the value is split at the first `:`).
+: Address and optional port of the primary target nameserver. Without a port, the default of the server's transport is used: `53` (udp/tcp), `853` (tls), `443` (doh). Accepted forms: `host`, `host:port`, `host#port`, `[IPv6]`, `[IPv6]:port`, `[IPv6]#port` and `IPv6#port` (e.g. `192.0.2.1:5353`, `[2001:db8::1]:5353`, `2001:db8::1#5353`). A bare IPv6 address without brackets or `#` is taken as an address without a port. `%` is not accepted as a port separator because it is the IPv6 zone ID delimiter (RFC 6874). An invalid value or a port outside 1-65535 is a usage error (exit 1). IPv6 targets are shown as `[addr]:port` in the reports.
 
 `--server2 <host[:port]>`
 : Address and optional port of the secondary comparison nameserver (default port as for `--server1`). Specifying `--server2` automatically enables differential testing mode (`--diff`). Mutually exclusive with `--compare-recorded`.

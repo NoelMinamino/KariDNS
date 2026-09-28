@@ -1450,20 +1450,65 @@ static void *replay_worker_func(void *arg) {
 }
 
 /* ポート省略時は 0 (= トランスポートの既定ポート: udp/tcp 53, tls 853, doh 443) */
-static void parse_host_port(const char *arg, char *out_host, size_t host_cap, int *out_port) {
-    *out_port = 0;
-    if (!arg) return;
-    const char *colon = strchr(arg, ':');
-    if (colon) {
-        size_t hlen = colon - arg;
-        if (hlen >= host_cap) hlen = host_cap - 1;
-        strncpy(out_host, arg, hlen);
-        out_host[hlen] = '\0';
-        *out_port = atoi(colon + 1);
-    } else {
-        strncpy(out_host, arg, host_cap - 1);
-        out_host[host_cap - 1] = '\0';
+/* "1-65535" の10進数だけを受け付ける */
+static bool parse_port_str(const char *s, size_t len, int *out_port) {
+    if (len == 0 || len > 5) return false;
+    long v = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v * 10 + (s[i] - '0');
     }
+    if (v < 1 || v > 65535) return false;
+    *out_port = (int)v;
+    return true;
+}
+
+/* --server1 / --server2 の値を host と port に分ける。受け付ける形式:
+ *   host, host:port, host#port            (IPv4 アドレスまたはホスト名)
+ *   2001:db8::1, [2001:db8::1],
+ *   [2001:db8::1]:port, 2001:db8::1#port  (IPv6。RFC 3986 §3.2.2 の角括弧表記と dig/BIND の '#')
+ * ':' が2つ以上あって角括弧も '#' も無ければ、全体をポート無しの IPv6 アドレスとみなす。
+ * '%' は IPv6 のゾーン ID (fe80::1%em0, RFC 6874) なのでポート区切りには使わない。
+ * ポート省略時は *out_port = 0 (トランスポートの既定ポート)。書式・ポート値が不正なら false。 */
+static bool parse_host_port(const char *arg, char *out_host, size_t host_cap, int *out_port) {
+    *out_port = 0;
+    if (!arg || !*arg || host_cap == 0) return false;
+    const char *host = arg;
+    size_t hlen = 0;
+    const char *port = NULL;
+    size_t plen = 0;
+
+    if (arg[0] == '[') {
+        const char *rb = strchr(arg, ']');
+        if (!rb || rb == arg + 1) return false;
+        host = arg + 1;
+        hlen = (size_t)(rb - host);
+        if (rb[1] == ':' || rb[1] == '#') {
+            port = rb + 2;
+            plen = strlen(port);
+        } else if (rb[1] != '\0') {
+            return false;
+        }
+    } else {
+        const char *hash = strchr(arg, '#');
+        const char *colon = strchr(arg, ':');
+        if (hash) {
+            hlen = (size_t)(hash - arg);
+            port = hash + 1;
+            plen = strlen(port);
+        } else if (colon && !strchr(colon + 1, ':')) {
+            hlen = (size_t)(colon - arg);          /* host:port (only one ':') */
+            port = colon + 1;
+            plen = strlen(port);
+        } else {
+            hlen = strlen(arg);                    /* no port, or a bare IPv6 address */
+        }
+    }
+    if (hlen == 0 || hlen >= host_cap) return false;
+    if (port && !parse_port_str(port, plen, out_port)) return false;
+    memcpy(out_host, host, hlen);
+    out_host[hlen] = '\0';
+    return true;
 }
 
 static bool enqueue_task_full(replay_queue_t *q, const uint8_t *pkt, size_t len, uint64_t seq,
@@ -1753,11 +1798,21 @@ int run_replay_mode(int argc, char **argv) {
             }
         } else if (strcmp(argv[idx], "--server1") == 0) {
             if (idx + 1 < argc) {
-                parse_host_port(argv[++idx], opts.server1_host, sizeof(opts.server1_host), &opts.server1_port);
+                if (!parse_host_port(argv[idx + 1], opts.server1_host, sizeof(opts.server1_host), &opts.server1_port)) {
+                    fprintf(stderr, "[ERROR] Invalid --server1 '%s' (expected host, host:port, [IPv6]:port or host#port)\n",
+                            argv[idx + 1]);
+                    return 1;
+                }
+                idx++;
             }
         } else if (strcmp(argv[idx], "--server2") == 0) {
             if (idx + 1 < argc) {
-                parse_host_port(argv[++idx], opts.server2_host, sizeof(opts.server2_host), &opts.server2_port);
+                if (!parse_host_port(argv[idx + 1], opts.server2_host, sizeof(opts.server2_host), &opts.server2_port)) {
+                    fprintf(stderr, "[ERROR] Invalid --server2 '%s' (expected host, host:port, [IPv6]:port or host#port)\n",
+                            argv[idx + 1]);
+                    return 1;
+                }
+                idx++;
                 opts.has_server2 = true;
                 opts.do_diff = true;
             }
@@ -1855,6 +1910,12 @@ int run_replay_mode(int argc, char **argv) {
     const char *s2_tr = opts.server2_transport[0] ? opts.server2_transport : opts.transport;
     int s1_port_disp = opts.server1_port > 0 ? opts.server1_port : replay_default_port(replay_transport_kind(s1_tr));
     int s2_port_disp = opts.server2_port > 0 ? opts.server2_port : replay_default_port(replay_transport_kind(s2_tr));
+    /* host:port, IPv6 は [addr]:port */
+    char s1_target[160], s2_target[160];
+    snprintf(s1_target, sizeof(s1_target), strchr(opts.server1_host, ':') ? "[%s]:%d" : "%s:%d",
+             opts.server1_host, s1_port_disp);
+    snprintf(s2_target, sizeof(s2_target), strchr(opts.server2_host, ':') ? "[%s]:%d" : "%s:%d",
+             opts.server2_host, s2_port_disp);
 
     if (opts.output_diff_path[0]) {
         if (strcmp(opts.output_diff_path, "-") == 0) {
@@ -2219,7 +2280,7 @@ int run_replay_mode(int argc, char **argv) {
         printf("{\n");
         printf("  \"total_queries\": %lu,\n", total_queries_count);
         printf("  \"server1\": {\n");
-        printf("    \"target\": \"%s:%d\",\n", opts.server1_host, s1_port_disp);
+        printf("    \"target\": \"%s\",\n", s1_target);
         printf("    \"sent\": %lu,\n", (unsigned long)ws.s1_stats.queries_sent);
         printf("    \"received\": %lu,\n", (unsigned long)ws.s1_stats.responses_received);
         printf("    \"timeouts\": %lu,\n", (unsigned long)ws.s1_stats.timeouts);
@@ -2233,7 +2294,7 @@ int run_replay_mode(int argc, char **argv) {
             if (opts.compare_recorded) {
                 printf("    \"source\": \"%s\",\n", opts.input_path);
             } else {
-                printf("    \"target\": \"%s:%d\",\n", opts.server2_host, s2_port_disp);
+                printf("    \"target\": \"%s\",\n", s2_target);
             }
             printf("    \"sent\": %lu,\n", (unsigned long)ws.s2_stats.queries_sent);
             printf("    \"received\": %lu,\n", (unsigned long)ws.s2_stats.responses_received);
@@ -2267,7 +2328,7 @@ int run_replay_mode(int argc, char **argv) {
         printf("Total Queries Replayed: %lu\n", total_queries_count);
         printf("Transport:              %s\n", opts.transport);
         printf("Workers:                %d\n", opts.num_workers);
-        printf("\n--- Server 1 (%s:%d) ---\n", opts.server1_host, s1_port_disp);
+        printf("\n--- Server 1 (%s) ---\n", s1_target);
         printf("  Server 1: %lu responses\n", (unsigned long)ws.s1_stats.responses_received);
         printf("  Sent:     %lu\n", (unsigned long)ws.s1_stats.queries_sent);
         printf("  Received: %lu\n", (unsigned long)ws.s1_stats.responses_received);
@@ -2282,7 +2343,7 @@ int run_replay_mode(int argc, char **argv) {
                 printf("\n--- %s ---\n", s2_label_text);
                 printf("  Source:   %s\n", opts.input_path);
             } else {
-                printf("\n--- %s (%s:%d) ---\n", s2_label_text, opts.server2_host, s2_port_disp);
+                printf("\n--- %s (%s) ---\n", s2_label_text, s2_target);
             }
             printf("  Responses: %lu\n", (unsigned long)ws.s2_stats.responses_received);
             printf("  Sent/Pairs: %lu\n", (unsigned long)ws.s2_stats.queries_sent);

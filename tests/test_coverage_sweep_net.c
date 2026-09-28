@@ -1021,6 +1021,18 @@ static void test_replay(fsrv_t *s, fsrv_t *s2) {
     /* single-server replay (no comparison) always exits 0 */
     rc = run_line("--replay %s --server1 127.0.0.1:%d --transport doh --timeout-ms 2000", pok, s->tls_port);
     assert(rc == 0);
+    /* --server1/--server2 forms: host#port and [addr]:port reach the same server */
+    rc = run_line("--replay %s --server1 127.0.0.1#%d --server2 [127.0.0.1]:%d --timeout-ms 2000", pok, s->port, s->port);
+    assert(rc == 0);
+    rc = run_line("--replay %s --server1 [::1]#%d --timeout-ms 100", pok, s->port);   /* IPv6 + port parses */
+    assert(rc == 0);
+    const char *bad_targets[] = { "[::1", "[::1]x", "[]:53", "::1#0", "127.0.0.1:99999", "127.0.0.1:", "#53", "[::1]:5x" };
+    for (size_t i = 0; i < N(bad_targets); i++) {
+        rc = run_line("--replay %s --server1 %s", pok, bad_targets[i]);
+        assert(rc == 1);
+        rc = run_line("--replay %s --server1 127.0.0.1:%d --server2 %s", pok, s->port, bad_targets[i]);
+        assert(rc == 1);
+    }
     printf("  -> replay runs done.\n");
 }
 
