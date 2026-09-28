@@ -219,6 +219,18 @@ dag [global-queryopt...] [query...]
 `+[no]trace`
 : Trace the DNS delegation path iteratively starting from the root nameservers (`.`). By default (`+noglue`, matching BIND 9.20+ `dig` behavior), `dag +trace` ignores the `ADDITIONAL` section of referral responses and resolves the delegated nameserver names (A/AAAA) to follow delegation paths down to authoritative servers, displaying each intermediate answer. Nameserver names are resolved through `@server` when it offers recursion (`RA=1` in its root `NS` response); when `@server` is authoritative-only (e.g. `@198.41.0.4`), they are resolved through the system resolver (`/etc/resolv.conf`, port 53) like BIND `dig`, and names that cannot be resolved are reported as `;; couldn't get address for '<name>'`. Specify `+glue` to restore the previous behavior of using in-bailiwick Glue records from the `ADDITIONAL` section (falling back to resolver lookups only when no glue is present). Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses. Like BIND `dig`, `+trace` implies `+noadditional`, so the `ADDITIONAL` section of each hop is not displayed; give `+additional` after `+trace` to show it again.
 
+`+[no]trace2[=brief|normal|verbose]`
+: Resolve the name the way a full iterative resolver (BIND `named`, Unbound) does, **without relying on any local or system resolver**. Unlike `+trace`, which asks `@server` / `/etc/resolv.conf` for the root NS set and for nameserver addresses, `+trace2` primes from built-in root hints (IANA `named.root`; or `@server` / `+roothints=FILE` when given) with a `. NS` query (RFC 8109), follows referrals with RD=0, and resolves nameserver names that come without glue (e.g. `example.jp. NS ns1.example.net.`) itself, starting from the closest zone cut it has already learned. Referral data outside the queried zone's bailiwick is discarded (RFC 2181 §5.4.1). CNAME and DNAME chains are followed across zones; DS queries are sent to the parent side of the zone cut. Lame servers (REFUSED, upward/sideways referrals, non-authoritative empty answers), SERVFAIL and timeouts make it try the next server; FORMERR/NOTIMP to an EDNS query is retried without EDNS. CNAME loops, nameserver dependency loops (`a.test NS ns.b.alt` / `b.alt NS ns.a.test`), recursion depth (8) and the total query budget (`+trace2-maxqueries`, default 200) all end the resolution with `;; resolution failed: <reason>` instead of looping. Every hop on the main delegation path is displayed like `+trace` (`;; Received N bytes from ADDR#PORT(ns-name) in T ms`). The mode selects how nameserver-name sub-resolutions are shown: `normal` (default) prints one line per sub-resolution (`;; [sub] ns1.example.net -> 192.0.2.53 (4 queries)`), `verbose` prints every sub query and response prefixed with `;; [sub N] name/type @addr(ns) for zone`, and `brief` hides them. A final summary line reports the status, total/sub-resolution query counts, lame servers, timeouts and elapsed time. Query IDs are randomized per query. `-p` applies to every hop (useful for test hierarchies); `-4`/`-6`, `+tcp`, `+time`, `+tries`, `+edns`/`+bufsize`/`+dnssec` apply to every query. Glue: by default (and with `+glue`/`+glue=all`) any glue within the bailiwick of the referring zone is used; `+glue=indomain` or an explicit `+noglue` uses only in-domain glue (which a delegation cannot work without, RFC 9471) and resolves the rest. Implies `+noadditional`. Cannot be combined with `+trace` or `+nssearch`. `+trace2` does not validate DNSSEC.
+
+`+[no]qmin`, `+qmin=a|ns|off`
+: QNAME minimisation (RFC 9156) for `+trace2`. Off by default. When enabled, each zone is asked only for the next label below it (`+qmin` / `+qmin=a` probes with type A as RFC 9156 recommends; `+qmin=ns` probes with type NS as in RFC 7816) until the delegation for the full name is reached, then the real question is sent. If a server answers a minimised probe with NXDOMAIN or an error, `dag` falls back to the full name (relaxed mode, like Unbound). At most 10 minimised queries are sent per resolution.
+
+`+roothints=FILE`
+: Use root hints from `FILE` (named.root format: `. NS name` and `name A/AAAA address` lines, TTL and class optional; plain `name address` lines are also accepted) instead of the built-in hints for `+trace2` priming. `@server` takes precedence.
+
+`+trace2-maxqueries=N`
+: Abort `+trace2` after `N` queries in total (1-100000, default 200), counting priming and nameserver-name sub-resolutions.
+
 `+[no]nssearch`
 : Look up authoritative nameservers for the zone containing the query name and display the SOA record from each responding nameserver. Honors `+tcp` and automatically falls back to TCP when receiving truncated (`TC=1`) responses. By default, `dag +nssearch` resolves nameserver addresses using the system resolver (matching BIND 9 `dig` behavior, `+noglue`). You can also specify `+glue` to query nameservers directly using in-bailiwick A/AAAA records from the `ADDITIONAL` section without consulting `/etc/resolv.conf` (useful in isolated or test network environments).
 
@@ -642,6 +654,12 @@ dag example.com ANY @127.0.0.1 +yaml -u
 
 # Trace delegation hierarchy from root
 dag example.com A +trace
+
+# Resolve like a full resolver, without any local resolver
+dag example.jp A +trace2
+
+# Same, showing every query made to resolve glueless nameservers, with QNAME minimisation
+dag example.jp A +trace2=verbose +qmin
 ```
 
 ### Multi-Server Comparison & LDNSZ Integration

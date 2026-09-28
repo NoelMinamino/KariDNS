@@ -313,6 +313,7 @@ typedef struct {
     bool nofail;
     bool use_glue;
     bool glue_indomain; /* +glue=indomain: named 9.18.41/9.20.15+ strict glue (NS target under owner only) */
+    bool glue_specified; /* +glue / +noglue が明示された (+trace2 は未指定時に bailiwick 内の glue を使う) */
 
     // PROXYv2
     bool use_proxy;
@@ -377,6 +378,17 @@ typedef struct {
     bool check_dns64prefix;
 } display_opts_t;
 
+/* +trace2 (フルリゾルバ相当の反復解決) の設定 */
+typedef enum { TRACE2_BRIEF = 0, TRACE2_NORMAL = 1, TRACE2_VERBOSE = 2 } trace2_verbosity_t;
+typedef enum { TRACE2_QMIN_OFF = 0, TRACE2_QMIN_A = 1, TRACE2_QMIN_NS = 2 } trace2_qmin_t;
+
+typedef struct {
+    int verbosity;              /* trace2_verbosity_t */
+    int qmin;                   /* trace2_qmin_t */
+    const char *roothints_file; /* +roothints=FILE (NULL = 内蔵ヒント) */
+    int max_queries;            /* +trace2-maxqueries=N (0 = 既定値) */
+} trace2_opts_t;
+
 typedef struct query_spec_s {
     const char *server_arg;
     int port;
@@ -385,6 +397,8 @@ typedef struct query_spec_s {
     bool force_udp;
     bool use_ldnsz;
     bool do_trace;
+    bool do_trace2;
+    trace2_opts_t trace2;
     bool do_nssearch;
     bool norecurse;
     bool adflag;
