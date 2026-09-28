@@ -215,7 +215,7 @@ Duplicate zones (in the same view or at top level), duplicate views and duplicat
 | `minimal-any-ttl <seconds>;` | `86400` | TTL of the synthesized RFC 8482 `HINFO` record. |
 | `additional-from-auth yes\|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Unknown values are treated as `yes` with a warning. Can be overridden per zone. |
 | `send-extended-errors yes\|no;` | `yes` | Add Extended DNS Errors (EDE, RFC 8914) to responses of EDNS queries. |
-| `serve-stale yes\|no;` | `yes` | When a secondary zone has expired (SOA EXPIRE passed since the last successful transfer), keep answering from the stale data. With `no` such queries get SERVFAIL with EDE 3. |
+| `serve-stale yes\|no;` | `yes` | When a secondary zone has expired (SOA EXPIRE passed since the last successful transfer, or earlier when the server it transfers from returned a shorter EDNS EXPIRE value, RFC 7314), keep answering from the stale data. With `no` such queries get SERVFAIL with EDE 3. |
 | `nsid "<string>";` | not set | NSID (RFC 5001) value returned to queries that request it. |
 | `cookie-secret "<32 hex digits>";` | random per process | 128-bit SipHash-2-4 server cookie secret (RFC 7873 / RFC 9018). Up to 4 entries: the first creates cookies, all of them are accepted (secret rollover). Use the same secret on all servers of an anycast set. |
 | `cookie-algorithm siphash24;` | `siphash24` | The only supported algorithm (RFC 9018); any other value is an error. |
@@ -340,7 +340,7 @@ Views are checked in the order they are defined; the first match is used. A quer
 | `type <type>;` | all | `master` (alias `primary`, the default), `slave` (alias `secondary`), `forward`, or `program`. |
 | `file "<path>";` | master, slave | Zone file. For a secondary zone, the transferred zone is written there. Ignored (with a warning) for `forward` and `program` zones. |
 | `file-format bind\|tinydns;` | master | `bind` (default) or `tinydns` (djbdns `data` file). See TINYDNS ZONE FORMAT. |
-| `masters { <addr> [port <n>]; ... };` | slave, catalog | Primary servers. NOTIFY is accepted from any listed address; the refresh and transfer use the **first** entry. Port default 53. |
+| `masters { <addr> [port <n>]; ... };` | slave, catalog | Primary servers. NOTIFY is accepted from any listed address; the refresh and transfer use the **first** entry. Port default 53. Transfer requests carry the EDNS EXPIRE option (RFC 7314); the returned value (capped by SOA EXPIRE) sets the zone's expire timer, so a secondary that transfers from another secondary expires no later than its source. |
 | `tsig-key "<name>";` | slave, master | Key used to sign SOA/AXFR/IXFR requests to the primary. On a primary it is also accepted for incoming transfers. |
 | `allow-transfer { <acl>; key "<name>"; ... };` | master, slave | Who may transfer the zone (AXFR/IXFR over TCP). **Without `allow-transfer` and `tsig-key`, transfers are refused.** If both addresses and keys are listed, a request must match an address **and** be signed with one of the keys. At most 4 transfers per zone run at the same time. |
 | `also-notify { <addr> [port <n>]; ... };` | master | Additional servers that receive NOTIFY (RFC 1996) when the zone changes. NOTIFY is also sent to the addresses of the apex NS hosts, except the SOA MNAME host (RFC 1996 §3.2). |

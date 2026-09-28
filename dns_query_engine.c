@@ -3253,9 +3253,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     res[11] = arcount & 0xFF;
     return offset;
   }
-    if (db_entry && db_entry->expire > 0) {
-        time_t last_ok = atomic_load_explicit(&db_entry->last_successful_transfer, memory_order_acquire);
-        if (last_ok > 0 && (time(NULL) - last_ok) > (time_t)db_entry->expire) {
+    if (db_entry) {
+        time_t deadline = zone_expire_deadline(db_entry);
+        if (deadline > 0 && time(NULL) > deadline) {
             bool serve_stale = (cfg_for_ede != NULL && cfg_for_ede->serve_stale);
             if (!serve_stale) {
                 size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
@@ -3385,6 +3385,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       res[11] = (uint8_t)(arcount & 0xFF);
     }
     return offset;
+  }
+
+  /* RFC 7314 §3: 権威を持つゾーンへの EXPIRE 付き問い合わせには、SOA EXPIRE (プライマリ)
+   * または expire タイマーの残り (セカンダリ) を返す。権威が無い応答 (上の REFUSED) には
+   * 付けない (§3.3)。値は本体に依存しないので wire キャッシュのヒット時も同じく付く。 */
+  if (edns.present && edns.has_expire_query && db_entry && !is_badcookie) {
+    edns.send_expire = true;
+    edns.send_expire_value = zone_expire_option_value(db_entry, time(NULL));
   }
 
   uint16_t offset = q_offset, ancount = 0, nscount = 0, arcount = 0;

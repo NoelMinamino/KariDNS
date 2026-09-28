@@ -212,13 +212,17 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     offset = next_offset + 4;
   }
 
-  // Check EDNS OPT Option 65153 on the initial packet
+  // Check EDNS OPT Option 65153 (and RFC 7314 EXPIRE) on the initial packet
   if (session->soa_count == 0) {
     uint16_t nscount = (packet[8] << 8) | packet[9];
     uint16_t arcount = (packet[10] << 8) | packet[11];
     if (arcount > 0) {
       edns_info_t edns = {0};
       if (parse_edns_opt(packet, packet_len, qdcount, ancount, nscount, arcount, &edns) == 0) {
+        if (edns.has_expire_value) {
+          session->has_expire = true;
+          session->expire = edns.expire_value;
+        }
         if (edns.has_karidns_ext && edns.karidns_ext_version == KARIDNS_EXT_VERSION) {
           uint32_t exp_hash = calc_fnv1a_str(domain);
           if (edns.karidns_ext_hash == exp_hash) {
@@ -482,6 +486,21 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
   return 0;
 }
 
+/* RFC 7314 §4: 転送・更新確認の結果から expire タイマーの期限 (絶対時刻) を決める。
+ *   - ゾーンを転送した (transferred): EXPIRE があればその値で、無ければ SOA EXPIRE で初期化
+ *   - 最新だった (IXFR で serial 一致): EXPIRE があれば現在のタイマーとの大きい方。
+ *     無ければ従来どおり SOA EXPIRE で数え直す (EXPIRE 非対応のプライマリ)
+ *   いずれも SOA EXPIRE を上限とする。戻り値 0 は「last_successful_transfer + SOA EXPIRE」。 */
+time_t xfr_expire_deadline(bool transferred, bool has_expire, uint32_t expire_opt,
+                                       uint32_t soa_expire, time_t cur_deadline, time_t now) {
+  if (!has_expire) return 0;
+  uint32_t v = (soa_expire > 0 && expire_opt > soa_expire) ? soa_expire : expire_opt;
+  time_t deadline = now + (time_t)v;
+  if (!transferred && cur_deadline > deadline) deadline = cur_deadline;
+  if (soa_expire > 0 && deadline > now + (time_t)soa_expire) deadline = now + (time_t)soa_expire;
+  return deadline;
+}
+
 int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tcp_stream_ctx_t *stream_ctx, axfr_session_t *session,
                       tsig_key_t *tsig_key,
@@ -612,12 +631,16 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
 
         if (has_soa) {
+          time_t now = time(NULL);
           entry->serial = serial;
           entry->refresh = refresh;
           entry->retry = retry;
           entry->expire = expire;
-          atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
-          atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
+          atomic_store_explicit(&entry->next_check, now + entry->refresh, memory_order_release);
+          atomic_store_explicit(&entry->expire_at,
+                                xfr_expire_deadline(true, session->has_expire, session->expire, expire, 0, now),
+                                memory_order_release);
+          atomic_store_explicit(&entry->last_successful_transfer, now, memory_order_release);
         }
 
         clone_zone_arena(&tmp_arena, standby);
@@ -659,8 +682,13 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         ret_code = 1;
       } else {
         pthread_mutex_lock(&entry->writer_lock);
-        atomic_store_explicit(&entry->next_check, time(NULL) + entry->refresh, memory_order_release);
-        atomic_store_explicit(&entry->last_successful_transfer, time(NULL), memory_order_release);
+        time_t now = time(NULL);
+        atomic_store_explicit(&entry->next_check, now + entry->refresh, memory_order_release);
+        atomic_store_explicit(&entry->expire_at,
+                              xfr_expire_deadline(false, session->has_expire, session->expire, entry->expire,
+                                                  zone_expire_deadline(entry), now),
+                              memory_order_release);
+        atomic_store_explicit(&entry->last_successful_transfer, now, memory_order_release);
         pthread_mutex_unlock(&entry->writer_lock);
         ret_code = 2;
       }
@@ -823,8 +851,13 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[req_len++] = 0x00;
     axfr_req[req_len++] = 0x00;
     uint32_t domain_hash = calc_fnv1a_str(ctx->domain);
-    axfr_req[req_len++] = 0x00; // RDLEN: 9
-    axfr_req[req_len++] = 0x09;
+    axfr_req[req_len++] = 0x00; // RDLEN: 9 (Extended AXFR) + 4 (EXPIRE)
+    axfr_req[req_len++] = 0x0D;
+    // RFC 7314 §4: 転送要求には長さ 0 の EXPIRE を付ける
+    axfr_req[req_len++] = 0x00;
+    axfr_req[req_len++] = EDNS_OPTION_EXPIRE;
+    axfr_req[req_len++] = 0x00;
+    axfr_req[req_len++] = 0x00;
     axfr_req[req_len++] = (EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF;
     axfr_req[req_len++] = EDNS_OPTION_KARIDNS_EXT & 0xFF;
     axfr_req[req_len++] = 0x00;
@@ -898,6 +931,7 @@ typedef struct {
   const uint8_t *req;
   int client_fd;
   bool is_extended_axfr;
+  bool send_opt;         /* 最初のメッセージに OPT を付ける (Extended AXFR / RFC 7314 EXPIRE) */
   bool opt_sent;
   bool is_subsequent;
   tsig_key_t *tsig_key;
@@ -916,7 +950,7 @@ static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
   if (serialize_dns_record(ec->res, KARIDNS_AXFR_MSG_LIMIT, &ec->offset, rec, &ec->comp_ctx, NULL, 0xFFFFFFFF) < 0) {
     ec->res[6] = (uint8_t)(ec->answers >> 8);
     ec->res[7] = (uint8_t)(ec->answers & 0xFF);
-    if (ec->is_extended_axfr && !ec->opt_sent) {
+    if (ec->send_opt && !ec->opt_sent) {
       uint16_t arcount = 0;
       assemble_edns_opt(ec->res, 65535, &prev_offset, &arcount, &ec->resp_edns, 0, true, NULL);
       ec->res[10] = (arcount >> 8) & 0xFF;
@@ -1120,6 +1154,13 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     resp_edns.karidns_ext_version = KARIDNS_EXT_VERSION;
     resp_edns.karidns_ext_hash = calc_fnv1a_str(entry->domain);
   }
+  /* RFC 7314 §3: EXPIRE 付きの AXFR/IXFR には SOA EXPIRE (プライマリ) または
+   * expire タイマーの残り (セカンダリ) を最初のメッセージの OPT で返す。 */
+  if (req_edns.has_expire_query) {
+    resp_edns.present = true;
+    resp_edns.send_expire = true;
+    resp_edns.send_expire_value = zone_expire_option_value(entry, time(NULL));
+  }
 
   int soa_idx = -1;
   for (size_t i = 0; i < current_zone->count; i++) {
@@ -1197,6 +1238,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   ec.req = req;
   ec.client_fd = client_fd;
   ec.is_extended_axfr = is_extended_axfr;
+  ec.send_opt = resp_edns.present;
   ec.opt_sent = false;
   ec.is_subsequent = false;
   ec.tsig_key = tsig_key;
@@ -1387,7 +1429,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   if (ec.answers > 0) {
     ec.res[6] = (uint8_t)(ec.answers >> 8);
     ec.res[7] = (uint8_t)(ec.answers & 0xFF);
-    if (ec.is_extended_axfr && !ec.opt_sent) {
+    if (ec.send_opt && !ec.opt_sent) {
       uint16_t arcount = 0;
       assemble_edns_opt(ec.res, 65535, &ec.offset, &arcount, &ec.resp_edns, 0, true, NULL);
       ec.res[10] = (arcount >> 8) & 0xFF;

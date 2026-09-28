@@ -3080,9 +3080,8 @@ void *control_thread_func(void *arg) {
                     }
 
                     if (is_slave && master_ip[0] != '\0') {
-                        time_t last_ok = atomic_load_explicit(&entry->last_successful_transfer, memory_order_acquire);
-                        uint32_t expire = atomic_load_explicit(&entry->expire, memory_order_acquire);
-                        if (last_ok > 0 && expire > 0 && (now - last_ok) > expire) {
+                        time_t deadline = zone_expire_deadline(entry);
+                        if (deadline > 0 && now > deadline) {
                             time_t last_log = atomic_load_explicit(&entry->last_stale_log_time, memory_order_acquire);
                             if (now - last_log > 900) {
                                 if (active && active->serve_stale) {

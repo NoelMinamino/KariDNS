@@ -44,6 +44,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
   - **TCP Connection Reuse & Keepalive (RFC 7766, RFC 9210, RFC 7828):** Configurable TCP connection reuse and idle timeout parameters.
   - **Minimal ANY & Minimal Responses (RFC 8482):** Prevents ANY query response amplification.
   - **NSID (RFC 5001):** Server identifier transmission via EDNS.
+  - **EDNS EXPIRE (RFC 7314):** Returns the SOA EXPIRE (primary) or the remaining expire timer (secondary); secondaries request it on transfers so that chained secondaries expire with their source.
 - **Views:** Split-horizon configuration using `view` blocks and `match-clients` IP matching.
 - **Client Geolocation & Subnet Steering (ECS & Location Tags):**
   - **BIND Zone Steering:** Granular record-level split-horizon steering based on immediate client IP (`$LOCATION` / `$LOCATION-TAG`, or `location-tags` in `karidns.conf`) and EDNS0 Client Subnet (`$ECS-SUBNET` / `$ECS-SUBNET-TAG`, or `ecs-tags`; RFC 7871), accepted only from trusted resolvers (`ecs-enable yes;` and `ecs-trusted-resolvers`).
