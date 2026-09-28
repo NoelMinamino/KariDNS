@@ -234,4 +234,55 @@ else
     exit 1
 fi
 
+# 9. Message type selection: only log-queries given -> AUTH_QUERY frames only
+echo "[+] Testing log-queries only (no AUTH_RESPONSE)..."
+PORT_Q=$((PORT + 20))
+SOCK_Q="$TMP_DIR/dnstap_q.sock"
+LOG_Q="$TMP_DIR/dnstap_q.log"
+CONF_Q="$TMP_DIR/karidns_queries_only.conf"
+cat << EOF > "$CONF_Q"
+options {
+    port $PORT_Q;
+    bind-address { 127.0.0.1; };
+    $USER_OPT
+};
+
+dnstap {
+    socket "$SOCK_Q";
+    log-queries yes;
+};
+
+zone "example.com" {
+    type primary;
+    file "$ZONE_PATH";
+};
+EOF
+chmod 644 "$CONF_Q"
+perl "$SCRIPT_DIR/mock_dnstap_receiver.pl" --socket "$SOCK_Q" --output "$LOG_Q" --max-frames 4 --timeout 4 &
+PID_RECEIVER=$!
+for i in 1 2 3 4 5; do
+    [ -S "$SOCK_Q" ] && break
+    sleep 0.2
+done
+chmod 777 "$SOCK_Q" 2>/dev/null || true
+"$KARIDNS" -f -c "$CONF_Q" > "$TMP_DIR/queries_only.log" 2>&1 &
+PID_SERVER=$!
+sleep 1
+"$DAG" @127.0.0.1 -p $PORT_Q www.example.com A > /dev/null 2>&1 || true
+"$DAG" @127.0.0.1 -p $PORT_Q +tcp www.example.com A > /dev/null 2>&1 || true
+# the receiver stops after 4 frames or after its 4-second timeout (only 2 frames are expected)
+wait $PID_RECEIVER 2>/dev/null || true
+PID_RECEIVER=""
+NUM_Q=$(grep -c "type=AUTH_QUERY" "$LOG_Q" 2>/dev/null || true)
+if [ "${NUM_Q:-0}" -ge 2 ] && ! grep -q "type=AUTH_RESPONSE" "$LOG_Q"; then
+    echo "  PASS: log-queries only: $NUM_Q AUTH_QUERY frames, no AUTH_RESPONSE."
+else
+    echo "FAIL: log-queries only: expected AUTH_QUERY frames and no AUTH_RESPONSE."
+    cat "$LOG_Q" 2>/dev/null || true
+    exit 1
+fi
+kill -TERM "$PID_SERVER" 2>/dev/null || true
+wait "$PID_SERVER" 2>/dev/null || true
+PID_SERVER=""
+
 echo "=== KariDNS dnstap Capture Test Passed Successfully ==="
