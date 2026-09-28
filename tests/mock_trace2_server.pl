@@ -7,6 +7,8 @@
 #   *.tc.test.        UDP: TC=1 の空応答 / TCP: A 192.0.2.10 (AA)
 #   *.noedns.test.    OPT 付きクエリ: FORMERR / OPT なし: A 192.0.2.11 (AA)
 #   *.deadonly.test.  応答しない (タイムアウト)
+#   *.child.mockp.test.  child.mockp.test. NS ns.evil.alt. への referral と、
+#                     bailiwick 外の偽 glue ns.evil.alt. A 127.0.0.66
 #   ". NS"            glue なしの NS a.root-servers. (最小応答のプライベートルート)
 #   unrelated.alt.    SOA (起動確認用)
 #   それ以外           REFUSED (lame サーバ役)
@@ -54,6 +56,15 @@ while (1) {
     }
 }
 
+sub encode_name {
+    my ($n) = @_;
+    my $b = '';
+    for my $l (split /\./, $n) {
+        $b .= chr(length $l) . $l if length $l;
+    }
+    return $b . "\0";
+}
+
 sub read_n {
     my ($s, $n) = @_;
     my $buf = '';
@@ -98,6 +109,13 @@ sub answer {
     };
 
     return undef if $name =~ /(^|\.)deadonly\.test\.$/;
+    if ($name =~ /(^|\.)child\.mockp\.test\.$/) {
+        # 権威なし referral。ADDITIONAL の glue は mockp.test. の bailiwick 外 (ポイズニングの試み)
+        my $ns = encode_name('ns.evil.alt.');
+        my $auth = encode_name('child.mockp.test.') . pack('n n N n', 2, 1, 3600, length $ns) . $ns;
+        my $glue = $ns . pack('n n N n', 1, 1, 3600, 4) . pack('C4', 127, 0, 0, 66);
+        return pack('n6', $id, 0x8000 | $rd, 1, 0, 1, 1) . $question . $auth . $glue;
+    }
     if ($name eq '.' && $qtype == 2) {
         my $rdata = "\x01a\x0Croot-servers\x00";
         return $hdr->(0x0400, 1) . pack('n n n N n', 0xC00C, 2, 1, 3600, length $rdata) . $rdata;
