@@ -56,6 +56,7 @@ Unlike traditional CGI-like designs, KariDNS **does not fork or execute a new pr
 4. **Transparent Binary Wire Passthrough & Truncation**
    - KariDNS passes the raw DNS query packet directly to the plugin and returns the plugin's response bytes directly to the client.
    - If the plugin's response exceeds the maximum allowed transmission size (e.g., 512 bytes for standard UDP or the client's EDNS buffer limit), KariDNS automatically truncates the response and sets the `TC=1` bit to trigger TCP fallback.
+   - With `disable-auto-tc-flag yes;` on the zone, this truncation is skipped and the plugin's response (up to 65,535 bytes) is sent as-is, even over UDP. The plugin must then set `TC=1` itself when a UDP reply is too large (see [Troubleshooting §4](#4-oversized-udp-replies-with-disable-auto-tc-flag-yes)).
 
 ---
 
@@ -145,6 +146,9 @@ zone "dynamic.example.com." {
 
     # Maximum consecutive communication failures before isolation (default: 500)
     program-max-failures 50;
+
+    # yes: send oversized UDP replies as-is instead of truncating them to TC=1 (default: no)
+    disable-auto-tc-flag no;
 };
 ```
 
@@ -571,6 +575,25 @@ stdout.write(b'\x00\x00')
 stdout.flush()
 ```
 KariDNS will release the connection and suppress response transmission entirely.
+
+### 4. Oversized UDP Replies with `disable-auto-tc-flag yes`
+With `disable-auto-tc-flag yes;`, KariDNS forwards whatever the plugin returns. A UDP reply larger than the client's advertised buffer may be discarded or cut off by the client or the network, and one larger than the UDP maximum (65,507 bytes over IPv4) cannot be sent at all. In both cases the client times out instead of retrying over TCP. The plugin receives the transport in the `QUERY <proto> ...` line and should truncate UDP replies itself:
+
+- Find the OPT RR (TYPE 41) in the query's additional section; its CLASS field is the client's UDP payload size (RFC 6891 §6.1.2). Treat values below 512 as 512 (RFC 6891 §6.2.5).
+- If the reply exceeds the limit, return the header with `TC=1` (RFC 1035 §4.1.1) plus the question, with ANCOUNT/NSCOUNT set to 0. If the query had EDNS, include an OPT RR in the truncated reply (RFC 6891 §7).
+
+The test plugin [`tests/mock_anomalous_dns_server.pl`](../tests/mock_anomalous_dns_server.pl) implements this in `apply_udp_tc_policy()`, for both plugin mode and its standalone mode (`--port`):
+
+| Query over UDP | Limit / behavior |
+|---|---|
+| With EDNS | The EDNS UDP payload size (minimum 512) |
+| Without EDNS | 1232 bytes (a deliberate choice for this test mock; RFC 1035 §4.2.1 specifies 512) |
+| Truncated reply | `TC=1`, question only; OPT RR with UDP payload size 1232 when the query had EDNS |
+| `tcp-size-<N>`, `packet-size-<N>`, `tcp-max-65535`, other scenarios | Truncated when over the limit |
+| `udp-size-<N>` | Never truncated: exactly N bytes (up to 65,535), even over UDP. Replies above the UDP maximum fail to send, and the client times out |
+| `edns-bufsize-exceeded` | Never truncated (the scenario deliberately exceeds the buffer with `TC=0`) |
+
+TCP replies are never truncated. The behavior is covered by `tests/run_mock_anomalous_tc_test.sh`.
 
 ---
 

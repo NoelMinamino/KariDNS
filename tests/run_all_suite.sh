@@ -341,6 +341,7 @@ register_test "dag" "sh" "tests/run_dag_cli_options_test.sh" "dag CLI Options, I
 register_test "dag" "sh" "tests/run_dag_compat_test.sh" "dag BIND 9.20.26 compatibility test suite"
 register_test "dag" "sh" "tests/run_dag_cookie_mismatch_discard_test.sh" "dag RFC 7873 DNS Cookie echo verification & mismatch discard"
 register_test "dag" "sh" "tests/run_dag_dig_anomalous_suite.sh" "dag & dig anomalous DNS packet comprehensive validation suite"
+register_test "dag" "sh" "tests/run_mock_anomalous_tc_test.sh" "Anomalous mock UDP auto-TC (tcp-size/udp-size) in plugin and standalone modes"
 register_test "dag" "sh" "tests/run_dag_dns64prefix_short_yaml_test.sh" "dag +dns64prefix in +short and +yaml mode validation"
 register_test "dag" "sh" "tests/run_dag_dns64prefix_test.sh" "dag RFC 7050 DNS64 prefix discovery (+dns64prefix)"
 register_test "dag" "sh" "tests/run_dag_doh_cache_cleanup_test.sh" "dag DoH connection cache invalidation test"

@@ -64,6 +64,8 @@ zone "anomaly.test." {
     $PROG_USER_OPT
     program-timeout 2000;
     program-max-failures 500;
+    # The mock sets TC=1 on oversized UDP responses itself (apply_udp_tc_policy)
+    disable-auto-tc-flag yes;
 };
 EOF
 
