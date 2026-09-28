@@ -513,6 +513,20 @@ static void test_dnstap_block(void) {
         CHECK(cfg.dnstap.enabled == true);
         CHECK(cfg.dnstap.queue_size == 4096);
         CHECK(cfg.dnstap.socket_path == NULL);
+        /* neither message type given: both queries and responses are logged */
+        CHECK(cfg.dnstap.log_auth_query == true);
+        CHECK(cfg.dnstap.log_auth_response == true);
+        free_server_config_fields(&cfg);
+    }
+    /* only one type given: the other one is off */
+    if (parse_ok("dnstap { socket \"/s\"; log-queries yes; };", &cfg)) {
+        CHECK(cfg.dnstap.log_auth_query == true);
+        CHECK(cfg.dnstap.log_auth_response == false);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("dnstap { socket \"/s\"; auth-response yes; };", &cfg)) {
+        CHECK(cfg.dnstap.log_auth_query == false);
+        CHECK(cfg.dnstap.log_auth_response == true);
         free_server_config_fields(&cfg);
     }
     /* a repeated property replaces (and frees) the earlier value */

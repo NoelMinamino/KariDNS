@@ -259,7 +259,10 @@ Negative or non-numeric values are ignored with a warning; unknown keys are igno
 | `version "<string>";` | none | dnstap `version` field. |
 | `queue-size <n>;` (alias `queue_size`) | `4096` | Entries in each worker's dnstap ring buffer (values below 64 use the default; rounded up to a power of two). |
 | `require-connect yes\|no;` | `no` | Abort startup when the collector cannot be reached (otherwise dnstap is disabled with a warning). |
-| `log-queries` / `auth-query`, `log-responses` / `auth-response` | `no` | Accepted for compatibility but currently have no effect: `AUTH_QUERY` and `AUTH_RESPONSE` messages are always both emitted. |
+| `log-queries yes\|no;` (alias `auth-query`) | see below | Emit `AUTH_QUERY` messages. |
+| `log-responses yes\|no;` (alias `auth-response`) | see below | Emit `AUTH_RESPONSE` messages. |
+
+When neither `log-queries` nor `log-responses` is given, both queries and responses are logged. When one of them is given, only the types set to `yes` are logged (the other one defaults to `no`). The message types are taken over on reload; the collector socket itself is connected only at startup.
 
 `karictl status` reports the number of truncated dnstap messages.
 

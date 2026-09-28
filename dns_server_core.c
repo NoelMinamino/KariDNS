@@ -2528,6 +2528,10 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
     g_config_db.retire_epoch = rcu_writer_advance_epoch();
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
+    // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
+    if (standby->dnstap.enabled) {
+      dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
+    }
     rebuild_zone_db_from_config(standby, skip_unchanged);
     for (view_config_t *v = standby->views; v; v = v->next) {
       for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -4946,6 +4950,7 @@ int main(int argc, char **argv) {
   if (pthread_create(&query_logger_thread, NULL, query_logger_thread_func, NULL) != 0) exit(1);
 
   if (cfg->dnstap.enabled && cfg->dnstap.socket_path) {
+    dnstap_set_message_types(cfg->dnstap.log_auth_query, cfg->dnstap.log_auth_response);
     g_dnstap_sock = dnstap_connect_and_handshake(cfg->dnstap.socket_path, cfg->dnstap.identity, cfg->dnstap.version);
     if (g_dnstap_sock >= 0) {
       atomic_store_explicit(&g_dnstap_connected, true, memory_order_release);

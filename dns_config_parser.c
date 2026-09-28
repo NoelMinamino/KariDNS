@@ -1652,6 +1652,7 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
   free_token(&tok);
   config->dnstap.enabled = true;
   config->dnstap.queue_size = 4096;
+  bool msg_type_specified = false;
   while (1) {
     tok = get_next_token(ctx);
     if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
@@ -1682,9 +1683,11 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
       free(val);
     } else if (strcmp(key_prop, "log-queries") == 0 || strcmp(key_prop, "auth-query") == 0) {
       config->dnstap.log_auth_query = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+      msg_type_specified = true;
       free(val);
     } else if (strcmp(key_prop, "log-responses") == 0 || strcmp(key_prop, "auth-response") == 0) {
       config->dnstap.log_auth_response = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+      msg_type_specified = true;
       free(val);
     } else if (strcmp(key_prop, "require-connect") == 0) {
       config->dnstap.require_connect = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
@@ -1693,6 +1696,11 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
       free(val);
     }
     free(key_prop);
+  }
+  if (!msg_type_specified) {
+    // どちらも指定されていなければ従来どおりクエリと応答の両方を出力する
+    config->dnstap.log_auth_query = true;
+    config->dnstap.log_auth_response = true;
   }
   tok = get_next_token(ctx);
   if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }

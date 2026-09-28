@@ -338,6 +338,25 @@ static void test_dnstap_rings_and_queuing(void) {
     write_dnstap_event(NULL, 2, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_TCP);
     assert(atomic_load(&g_aux_dnstap_ring.dropped) == 1);
 
+    // Test 3: message type filter (dnstap { log-queries; log-responses; })
+    atomic_store(&worker.dnstap_ring.head, 0);
+    atomic_store(&worker.dnstap_ring.tail, 0);
+    atomic_store(&worker.dnstap_ring.dropped, 0);
+    dnstap_set_message_types(false, true);   // responses only
+    write_dnstap_event(&worker, DNSTAP_MSG_AUTH_QUERY, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);
+    assert(atomic_load(&worker.dnstap_ring.head) == 0);
+    write_dnstap_event(&worker, DNSTAP_MSG_AUTH_RESPONSE, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);
+    assert(atomic_load(&worker.dnstap_ring.head) == 1);
+    dnstap_set_message_types(true, false);   // queries only
+    write_dnstap_event(&worker, DNSTAP_MSG_AUTH_RESPONSE, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);
+    assert(atomic_load(&worker.dnstap_ring.head) == 1);
+    write_dnstap_event(&worker, DNSTAP_MSG_AUTH_QUERY, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);
+    assert(atomic_load(&worker.dnstap_ring.head) == 2);
+    write_dnstap_event(&worker, 200, dummy, sizeof(dummy), NULL, 0, NULL, false, IPPROTO_UDP);  // out-of-range type
+    assert(atomic_load(&worker.dnstap_ring.head) == 2);
+    dnstap_set_message_types(true, true);
+    assert(atomic_load(&worker.dnstap_ring.dropped) == 0);
+
     free(worker.dnstap_ring.events);
     free(g_aux_dnstap_ring.events);
     g_aux_dnstap_ring.events = NULL;

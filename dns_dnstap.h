@@ -72,6 +72,13 @@ typedef struct worker_ctx worker_ctx_t;
 extern int g_dnstap_sock;
 extern _Atomic bool g_dnstap_connected;
 extern _Atomic uint64_t g_dnstap_truncated_total;
+
+// 出力する dnstap Message.type のビットマスク (bit N = type N)。
+// dnstap { log-queries; log-responses; } から dnstap_set_message_types() で設定する。
+#define DNSTAP_MSG_AUTH_QUERY    1
+#define DNSTAP_MSG_AUTH_RESPONSE 2
+extern _Atomic uint32_t g_dnstap_message_mask;
+void dnstap_set_message_types(bool log_auth_query, bool log_auth_response);
 extern dnstap_aux_ring_t g_aux_dnstap_ring;
 
 int dnstap_connect_and_handshake(const char *socket_path, const char *identity, const char *version);
