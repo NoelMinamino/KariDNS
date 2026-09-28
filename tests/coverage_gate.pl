@@ -56,7 +56,7 @@ my %tier_c_files = map { $_ => 1 } (
     "tools/dag_axfr_client.c", "tools/dag_trace.c", "tools/dag_trace_common.c",
     "tools/dag_iter.c", "tools/dag_roothints.c", "tools/dag_tsig_client.c",
     "tools/dag_edns_client.c", "tools/dag_transport.c", "tools/dag_replay.c",
-    "tools/dag_pcap_l4.c", "tools/dag_tcp_reassembly.c",
+    "tools/dag_pcap_l4.c", "tools/dag_tcp_reassembly.c", "tools/dag_http.c",
     "tools/karicheck.c", "tools/karictl.c"
 );
 

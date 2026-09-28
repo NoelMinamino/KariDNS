@@ -47,10 +47,7 @@
 #include "dag_pcap_l4.h"
 #include "dag_tcp_reassembly.h"
 
-/* dag_transport.c: RFC 8484 の HTTP 応答から DNS メッセージを取り出す純粋関数
- * (dag_transport.h は dag 本体の query_opts_t 等を持ち込むため、宣言だけ使う) */
-ssize_t decode_http_response_body(const uint8_t *http_buf, size_t http_len,
-                                  uint8_t *resp, size_t resp_cap);
+#include "dag_http.h"
 
 
 #define REPLAY_QUEUE_CAPACITY 1024
