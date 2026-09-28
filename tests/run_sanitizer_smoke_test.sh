@@ -243,7 +243,7 @@ echo "=========================================="
 
 pids=""
 for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
-              fuzz_dag_response fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file; do
+              fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file; do
     bin="tests/fuzz/$target"
     corpus="tests/fuzz/corpus_$target"
     if [ ! -x "$bin" ]; then

@@ -18,6 +18,7 @@
 #include "dag_batch.h"
 #include "dag_axfr_client.h"
 #include "dag_trace.h"
+#include "dag_iter.h"
 #include "dag_tsig_client.h"
 #include "dag_edns_client.h"
 #include "dag_transport.h"
@@ -3184,6 +3185,15 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses;\n"
         "                               ignores ADDITIONAL section unless +glue is given; implies +noadditional)\n"
+        "  +[no]trace2[=brief|normal|verbose]\n"
+        "                               Resolve iteratively like a full resolver (BIND/Unbound) without any local resolver:\n"
+        "                               primes from built-in root hints (or @server), resolves glueless NS names itself.\n"
+        "                               normal: one-line summary per NS-name sub-resolution; verbose: show every sub query;\n"
+        "                               brief: main delegation path only. -p applies to every hop. Implies +noadditional\n"
+        "  +[no]qmin / +qmin=a|ns|off   QNAME minimisation for +trace2 (RFC 9156). a: probe with A (default when enabled),\n"
+        "                               ns: probe with NS (RFC 7816 style) [default: off]\n"
+        "  +roothints=FILE              Root hints file (named.root format) for +trace2 priming\n"
+        "  +trace2-maxqueries=N         Abort +trace2 after N queries in total [default: 200]\n"
         "  +[no]nssearch                Search all authoritative nameservers for zone (honors +tcp; falls back to TCP; uses +noglue by default)\n"
         "  +[no]glue                    Use Glue records (A/AAAA) from ADDITIONAL section for +trace / +nssearch\n"
         "                               (+noglue: ignore ADDITIONAL and resolve NS names via resolver) [default: +noglue]\n"
@@ -3743,6 +3753,8 @@ void init_query_spec(query_spec_t *spec) {
     spec->qo.retry_on_badcookie = true;
     spec->qo.edns_negotiation = true;
     spec->qo.rd_flag = true;
+    spec->trace2.verbosity = TRACE2_NORMAL;
+    spec->trace2.qmin = TRACE2_QMIN_OFF;
     spec->adflag = true;
     spec->qo.ad_flag = true;
     spec->qo.opcode_override = -1;
@@ -3831,14 +3843,17 @@ void prescan_always_global_options(int argc, char **argv, query_spec_t *global_s
         else if (strcmp(argv[i], "+glue") == 0 || strcmp(argv[i], "+glue=all") == 0) {
             global_spec->qo.use_glue = true;
             global_spec->qo.glue_indomain = false;
+            global_spec->qo.glue_specified = true;
         }
         else if (strcmp(argv[i], "+glue=indomain") == 0) {
             global_spec->qo.use_glue = true;
             global_spec->qo.glue_indomain = true;
+            global_spec->qo.glue_specified = true;
         }
         else if (strcmp(argv[i], "+noglue") == 0) {
             global_spec->qo.use_glue = false;
             global_spec->qo.glue_indomain = false;
+            global_spec->qo.glue_specified = true;
         }
         else if (strcmp(argv[i], "+search") == 0 || strcmp(argv[i], "+defname") == 0) {
             global_spec->qo.use_search_list = true;
@@ -4240,6 +4255,43 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->dopt.show_additional = false;
         } else if (strcmp(arg, "+notrace") == 0) {
             spec->do_trace = false;
+        } else if (strcmp(arg, "+trace2") == 0 || strncmp(arg, "+trace2=", 8) == 0) {
+            const char *mode = (arg[7] == '=') ? arg + 8 : "normal";
+            if (strcmp(mode, "brief") == 0) spec->trace2.verbosity = TRACE2_BRIEF;
+            else if (strcmp(mode, "normal") == 0) spec->trace2.verbosity = TRACE2_NORMAL;
+            else if (strcmp(mode, "verbose") == 0) spec->trace2.verbosity = TRACE2_VERBOSE;
+            else {
+                fprintf(stderr, "dag: invalid +trace2 mode '%s' (expected 'brief', 'normal' or 'verbose')\n", mode);
+                return -1;
+            }
+            spec->do_trace2 = true;
+            /* +trace と同様に +noadditional を含意する (後続の +additional で上書き可) */
+            spec->dopt.show_additional = false;
+        } else if (strcmp(arg, "+notrace2") == 0) {
+            spec->do_trace2 = false;
+        } else if (strcmp(arg, "+qmin") == 0 || strcmp(arg, "+qmin=a") == 0) {
+            spec->trace2.qmin = TRACE2_QMIN_A;
+        } else if (strcmp(arg, "+qmin=ns") == 0) {
+            spec->trace2.qmin = TRACE2_QMIN_NS;
+        } else if (strcmp(arg, "+noqmin") == 0 || strcmp(arg, "+qmin=off") == 0) {
+            spec->trace2.qmin = TRACE2_QMIN_OFF;
+        } else if (strncmp(arg, "+qmin=", 6) == 0) {
+            fprintf(stderr, "dag: invalid +qmin mode '%s' (expected 'a', 'ns' or 'off')\n", arg + 6);
+            return -1;
+        } else if (strncmp(arg, "+roothints=", 11) == 0) {
+            if (arg[11] == '\0') {
+                fprintf(stderr, "dag: +roothints requires a file name\n");
+                return -1;
+            }
+            spec->trace2.roothints_file = arg + 11;
+        } else if (strncmp(arg, "+trace2-maxqueries=", 19) == 0) {
+            char *endp = NULL;
+            long v = strtol(arg + 19, &endp, 10);
+            if (!endp || *endp != '\0' || v < 1 || v > 100000) {
+                fprintf(stderr, "dag: invalid +trace2-maxqueries value '%s' (1-100000)\n", arg + 19);
+                return -1;
+            }
+            spec->trace2.max_queries = (int)v;
         } else if (strcmp(arg, "+nssearch") == 0) {
             spec->do_nssearch = true;
         } else if (strcmp(arg, "+nonssearch") == 0) {
@@ -4247,15 +4299,18 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
         } else if (strcmp(arg, "+glue") == 0 || strcmp(arg, "+glue=all") == 0) {
             spec->qo.use_glue = true;
             spec->qo.glue_indomain = false;
+            spec->qo.glue_specified = true;
         } else if (strcmp(arg, "+glue=indomain") == 0) {
             spec->qo.use_glue = true;
             spec->qo.glue_indomain = true;
+            spec->qo.glue_specified = true;
         } else if (strncmp(arg, "+glue=", 6) == 0) {
             fprintf(stderr, "dag: invalid +glue mode '%s' (expected 'all' or 'indomain')\n", arg + 6);
             return -1;
         } else if (strcmp(arg, "+noglue") == 0) {
             spec->qo.use_glue = false;
             spec->qo.glue_indomain = false;
+            spec->qo.glue_specified = true;
         } else if (strcmp(arg, "+search") == 0 || strcmp(arg, "+defname") == 0) {
             spec->qo.use_search_list = true;
             spec->qo.use_glue = false;
@@ -4853,7 +4908,20 @@ int execute_query_spec(query_spec_t *spec) {
     if (spec->qo.idnin) spec->qname = (char *)idn_to_ascii(spec->qname, &q_allocated);
 
     int exit_code = 0;
-    if (spec->do_trace) {
+    if (spec->do_trace2) {
+        if (spec->do_trace || spec->do_nssearch) {
+            fprintf(stderr, "dag: +trace2 cannot be combined with +trace or +nssearch\n");
+            exit_code = 1;
+        } else if (spec->hex_payload) {
+            fprintf(stderr, "dag: +trace2 does not support raw hex payloads\n");
+            exit_code = 1;
+        } else {
+            exit_code = run_trace2_query(spec->qname, spec->server_arg, spec->qo.server_explicit, spec->qtype_s,
+                                         spec->port, spec->use_tcp, spec->force_udp,
+                                         spec->no_hexdump_query, spec->no_hexdump_response,
+                                         &spec->qo, &spec->dopt, &spec->trace2);
+        }
+    } else if (spec->do_trace) {
         exit_code = run_trace_query(spec->qname, spec->server_arg, spec->qtype_s, spec->port, spec->use_tcp, spec->force_udp,
                                     spec->no_hexdump_query, spec->no_hexdump_response, &spec->qo, spec->hex_payload, &spec->dopt);
     } else if (spec->do_nssearch) {
@@ -5071,7 +5139,7 @@ int main(int argc, char **argv) {
     // -f バッチファイルモードの処理
     if (global_spec.batch_file) {
         int batch_rc = execute_batch_spec(&global_spec);
-        print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, global_spec.do_trace);
+        print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, global_spec.do_trace || global_spec.do_trace2);
 #ifndef _WIN32
         if (global_spec.qo.mem_debug) {
             struct rusage ru;
@@ -5094,7 +5162,7 @@ int main(int argc, char **argv) {
     }
 
     int last_exit_code = 0;
-    bool any_trace = global_spec.do_trace;
+    bool any_trace = global_spec.do_trace || global_spec.do_trace2;
     for (int q = 0; q < query_count; q++) {
         query_spec_t local_spec = global_spec;
         deep_copy_query_opts(&local_spec.qo, &global_spec.qo);
@@ -5116,22 +5184,22 @@ int main(int argc, char **argv) {
 
         if (local_spec.qo.mem_debug) global_spec.qo.mem_debug = true;
         if (local_spec.use_ldnsz) global_spec.use_ldnsz = true;
-        if (local_spec.do_trace) any_trace = true;
+        if (local_spec.do_trace || local_spec.do_trace2) any_trace = true;
         int rc = execute_query_spec(&local_spec);
         if (rc != 0) last_exit_code = rc;
         free_query_opts(&local_spec.qo);
 
         if (query_count > 1) {
-            bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
+            bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_trace2) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
             if (!used_nofail) {
-                print_multi_server_summary(local_spec.use_ldnsz, local_spec.dopt.yaml, local_spec.do_trace);
+                print_multi_server_summary(local_spec.use_ldnsz, local_spec.dopt.yaml, local_spec.do_trace || local_spec.do_trace2);
             }
             g_server_count = 0;
         }
     }
 
     if (query_count <= 1) {
-        bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
+        bool used_nofail_failover = global_spec.qo.nofail && (!global_spec.test_all) && (!global_spec.do_trace) && (!global_spec.do_trace2) && (!global_spec.do_nssearch) && (!global_spec.batch_file) && (global_spec.server_arg && strchr(global_spec.server_arg, ',') != NULL);
         if (!used_nofail_failover) {
             print_multi_server_summary(global_spec.use_ldnsz, global_spec.dopt.yaml, any_trace);
         }

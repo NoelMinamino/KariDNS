@@ -1,94 +1,6 @@
 #include "dag_trace.h"
 #include "dag_output_yaml.h"
-
-static void record_ldnsz_result(const char *server, ssize_t n, const uint8_t *resp, long elapsed_ms, const char *proto) {
-    if (n < 12) return;
-    server_result_t *sres = alloc_result_row();
-    if (!sres) return;
-    sres->rcode = resp[3] & 0x0F;
-    sres->qdcount = (resp[4] << 8) | resp[5];
-    sres->ancount = (resp[6] << 8) | resp[7];
-    sres->nscount = (resp[8] << 8) | resp[9];
-    sres->arcount = (resp[10] << 8) | resp[11];
-    sres->qr = resp[2] & 0x80; sres->aa = resp[2] & 0x04; sres->tc = resp[2] & 0x02; sres->rd = resp[2] & 0x01;
-    sres->ra = resp[3] & 0x80; sres->ad = resp[3] & 0x20; sres->cd = resp[3] & 0x10;
-    sres->msg_index = 1;
-    sres->msg_total = 1;
-    size_t to_copy = (size_t)n < sizeof(sres->resp_buf) ? (size_t)n : sizeof(sres->resp_buf);
-    memcpy(sres->resp_buf, resp, to_copy);
-    sres->resp_len = (ssize_t)to_copy;
-    calculate_packet_hashes(resp, n, &sres->semantic_hash, &sres->record_hash);
-    snprintf(sres->server_ip, sizeof(sres->server_ip), "%s", server);
-    snprintf(sres->proto, sizeof(sres->proto), "%s", proto ? proto : "UDP");
-    sres->elapsed_ms = elapsed_ms;
-    g_server_count++;
-}
-
-/* pkt内のsection_count分のRRをパースし、want_typeに一致するレコードのrdata[0]を
- * out配列(out_cap個まで)に集める。roffは呼び出し元で更新される。 */
-static void collect_rrs_by_type(const uint8_t *pkt, size_t pkt_len, size_t *roff,
-                                int section_count, uint16_t want_type,
-                                char out[][256], char owners[][256], int *out_count, int out_cap) {
-    for (int i = 0; i < section_count; i++) {
-        dns_record_t rec; uint16_t type;
-        if (parse_resource_record(pkt, pkt_len, roff, &g_dag_arena, &rec, &type) != 0) break;
-        if (type == want_type && *out_count < out_cap && rec.rdata_count > 0) {
-            if (owners) snprintf(owners[*out_count], 256, "%s", rec.name);
-            snprintf(out[(*out_count)++], 256, "%s", rec.rdata[0]);
-        }
-    }
-}
-
-/* name が owner と等しいか owner の配下なら true (大文字小文字・末尾ドット無視) */
-static bool name_is_subdomain(const char *name, const char *owner) {
-    size_t nl = strlen(name), ol = strlen(owner);
-    while (nl > 0 && name[nl - 1] == '.') nl--;
-    while (ol > 0 && owner[ol - 1] == '.') ol--;
-    if (ol == 0) return true; /* root */
-    if (nl < ol) return false;
-    if (strncasecmp(name + nl - ol, owner, ol) != 0) return false;
-    return nl == ol || name[nl - ol - 1] == '.';
-}
-
-/* ADDITIONAL セクションから NS 名に一致する A/AAAA (glue) を集める。
- * qo->glue_indomain のときは BIND named 9.18.41/9.20.15 以降と同様、NS のターゲットが
- * NS の owner 配下 (in-domain) の glue だけを採用し、それ以外 (sibling/unrelated) は
- * 無視して報告する。無視された NS 名は後段で解決される。 */
-static int collect_glue(const uint8_t *pkt, size_t pkt_len, size_t *roff, int arcount,
-                        char ns_names[][256], char ns_owners[][256], int ns_count,
-                        const query_opts_t *qo, char out[][64], int count, int out_cap, bool report) {
-    char ignored[16][256];
-    int ignored_count = 0;
-    for (int i = 0; i < arcount; i++) {
-        dns_record_t rec; uint16_t type;
-        if (parse_resource_record(pkt, pkt_len, roff, &g_dag_arena, &rec, &type) != 0) break;
-        bool want = false;
-        if (type == 1 && (qo->pref_family == AF_UNSPEC || qo->pref_family == AF_INET)) want = true;
-        if (type == 28 && (qo->pref_family == AF_UNSPEC || qo->pref_family == AF_INET6)) want = true;
-        if (!want || rec.rdata_count == 0) continue;
-        for (int j = 0; j < ns_count; j++) {
-            if (strcasecmp(rec.name, ns_names[j]) != 0) continue;
-            if (qo->glue_indomain && !name_is_subdomain(ns_names[j], ns_owners[j])) {
-                bool seen = false;
-                for (int k = 0; k < ignored_count; k++) {
-                    if (strcasecmp(ignored[k], ns_names[j]) == 0) { seen = true; break; }
-                }
-                if (!seen && ignored_count < 16) {
-                    snprintf(ignored[ignored_count++], 256, "%s", ns_names[j]);
-                    if (report) {
-                        printf(";; ignoring out-of-domain glue for '%s' (NS of '%s')\n", ns_names[j], ns_owners[j]);
-                    }
-                }
-                continue;
-            }
-            if (count < out_cap) {
-                snprintf(out[count++], 64, "%s", rec.rdata[0]);
-            }
-            break;
-        }
-    }
-    return count;
-}
+#include "dag_trace_common.h"
 
 typedef struct {
     const char *server;
@@ -241,7 +153,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         }
 
         int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        record_ldnsz_result(eff_server, root_n, root_resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
+        trace_record_result(eff_server, root_n, root_resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
         if (!no_hexdump_response && !dopt->yaml) {
             printf("Response (%zd bytes):\n", root_n);
             hexdump(root_resp, (size_t)root_n);
@@ -282,14 +194,14 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             char rns_names[32][256];
             char rns_owners[32][256];
             int rns_count = 0;
-            collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
-            collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
+            trace_collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
+            trace_collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
             /* +noglue (default, BIND 9.20+ dig compatible): ADDITIONAL section is ignored and
              * nameserver addresses are resolved via the configured resolver below.
              * +glue: legacy behavior, use A/AAAA from ADDITIONAL first.
              * +glue=indomain: use only in-domain glue (BIND named 9.18.41/9.20.15+). */
             if (root_qo.use_glue) {
-                target_count = collect_glue(root_resp, root_n, &offset, r_ar, rns_names, rns_owners, rns_count,
+                target_count = trace_collect_glue(root_resp, root_n, &offset, r_ar, rns_names, rns_owners, rns_count,
                                             &root_qo, target_ips, target_count, 32, !dopt->yaml);
             }
 
@@ -375,7 +287,7 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             }
 
             int dt_ms_hop = timespec_diff_ms(&start_ts, &end_ts);
-            record_ldnsz_result(target_ips[active_target_idx], n, resp, dt_ms_hop, eff_use_tcp ? "TCP" : "UDP");
+            trace_record_result(target_ips[active_target_idx], n, resp, dt_ms_hop, eff_use_tcp ? "TCP" : "UDP");
 
             if (!no_hexdump_response && !dopt->yaml) {
                 printf("Response (%zd bytes):\n", n);
@@ -447,12 +359,12 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             char ns_names[16][256];
             char ns_owners[16][256];
             int ns_count = 0;
-            collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, ns_owners, &ns_count, 16);
+            trace_collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, ns_owners, &ns_count, 16);
 
             int new_target_count = 0;
             char new_target_ips[16][64];
             if (hop_qo.use_glue) {
-                new_target_count = collect_glue(resp, n, &offset, arcount, ns_names, ns_owners, ns_count,
+                new_target_count = trace_collect_glue(resp, n, &offset, arcount, ns_names, ns_owners, ns_count,
                                                 &hop_qo, new_target_ips, 0, 16, !dopt->yaml);
             }
 
@@ -521,7 +433,7 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
     clock_gettime(CLOCK_MONOTONIC, &end_ts);
     if (n > 0) {
         int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        record_ldnsz_result(eff_server, n, resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
+        trace_record_result(eff_server, n, resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
         if (!no_hexdump_response) {
             printf("Response (%zd bytes):\n", n);
             hexdump(resp, (size_t)n);
@@ -606,7 +518,7 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
             if (want && rec.rdata_count > 0) {
                 for (int j = 0; j < ns_count; j++) {
                     if (strcasecmp(rec.name, ns_names[j]) == 0) {
-                        if (qo.glue_indomain && !name_is_subdomain(ns_names[j], qname)) continue;
+                        if (qo.glue_indomain && !trace_name_is_subdomain(ns_names[j], qname)) continue;
                         ns_has_glue[j] = true;
                         bool duplicate = false;
                         for (int d = 0; d < all_ns_count; d++) {
@@ -699,7 +611,7 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
         int dt_ms = 0;
         if (sn > 0) {
             dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-            record_ldnsz_result(all_ns_ips[k].ip, sn, resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
+            trace_record_result(all_ns_ips[k].ip, sn, resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
             if (!no_hexdump_response) {
                 printf("Response (%zd bytes):\n", sn);
                 hexdump(resp, (size_t)sn);

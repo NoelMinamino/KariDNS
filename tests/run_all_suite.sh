@@ -367,6 +367,7 @@ register_test "dag" "sh" "tests/run_dag_trace_cname_glue_test.sh" "dag +trace gl
 register_test "dag" "sh" "tests/run_dag_trace_deep_cname_stack_test.sh" "dag +trace deep CNAME stack exhaustion test"
 register_test "dag" "sh" "tests/run_dag_trace_nssearch_opts_test.sh" "dag +trace and +nssearch options (--hex, +udp)"
 register_test "dag" "sh" "tests/run_dag_trace_nssearch_tcp_test.sh" "dag +trace / +nssearch TCP validation suite"
+register_test "dag" "sh" "tests/run_dag_trace2_test.sh" "dag +trace2 iterative resolution over a KariDNS delegation tree (needs 127.0.0.2-5)"
 register_test "dag" "sh" "tests/run_dag_udp_id_mismatch_discard_test.sh" "dag UDP transaction ID mismatch packet discard and retry"
 register_test "dag" "sh" "tests/run_dag_udp_spoofing_source_test.sh" "dag UDP spoofing source rejection per RFC 5452"
 register_test "dag" "sh" "tests/run_dag_update_del_exact_ttl_notype_crash_test.sh" "dag --update-del-exact TTL support regression test"
