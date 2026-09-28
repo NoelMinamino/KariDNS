@@ -199,6 +199,12 @@ fi
 
 run_cases "karidns plugin" "$KARIDNS_PORT"
 
+# The unsendable udp-size-65535 reply must be logged, not dropped silently
+# (Backend->Frontend IPC over net.local.dgram.maxdgram, or Frontend UDP over 65507)
+run_check "[karidns plugin] unsendable reply is logged" \
+    "cat $TMP_DIR/karidns.log" \
+    "dropped [0-9]+ UDP message\(s\): Message too long"
+
 kill "$SERVER_PID" 2>/dev/null || true
 pkill -P "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
