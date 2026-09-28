@@ -44,6 +44,9 @@ typedef struct {
     int nns;
     it_glue_t glue[IT_MAX_GLUE];   /* ns[] に対応する bailiwick 内の A/AAAA */
     int nglue;
+    char oob_glue[IT_MAX_NS][256]; /* ns[] に対応するが bailiwick 外のため捨てた glue の owner */
+    int noob_glue;
+    char zone[256];                /* 問い合わせたゾーン (bailiwick) */
     char addrs[IT_MAX_ADDRS][64];  /* ANSWER の A/AAAA */
     int naddr;
     int nanswer;                   /* qtype に一致した RR 数 */

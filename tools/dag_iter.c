@@ -162,8 +162,17 @@ static bool it_dname_substitute(const char *cur, const char *owner, const char *
 static void it_collect_glue(it_resp_t *out, const it_rr_t *ad, int nad, const char *zone) {
     for (int i = 0; i < nad && out->nglue < IT_MAX_GLUE; i++) {
         if (ad[i].type != 1 && ad[i].type != 28) continue;
-        /* bailiwick: 問い合わせたゾーンの配下にない A/AAAA は信用しない */
-        if (!trace_name_is_subdomain(ad[i].owner, zone)) continue;
+        /* bailiwick: 問い合わせたゾーンの配下にない A/AAAA は信用しない (RFC 2181 §5.4.1)。
+         * NS 名に一致するものは、捨てたことを表示できるよう owner を記録する */
+        if (!trace_name_is_subdomain(ad[i].owner, zone)) {
+            bool is_ns = false, seen = false;
+            for (int j = 0; j < out->nns && !is_ns; j++) is_ns = trace_name_equal(ad[i].owner, out->ns[j]);
+            for (int j = 0; j < out->noob_glue && !seen; j++) seen = trace_name_equal(ad[i].owner, out->oob_glue[j]);
+            if (is_ns && !seen && out->noob_glue < IT_MAX_NS) {
+                snprintf(out->oob_glue[out->noob_glue++], sizeof(out->oob_glue[0]), "%s", ad[i].owner);
+            }
+            continue;
+        }
         for (int j = 0; j < out->nns; j++) {
             if (!trace_name_equal(ad[i].owner, out->ns[j])) continue;
             it_glue_t *g = &out->glue[out->nglue++];
@@ -179,6 +188,7 @@ it_resp_kind_t dag_iter_classify(const uint8_t *pkt, size_t len, const char *qna
                                  const char *zone, it_resp_t *out) {
     memset(out, 0, sizeof(*out));
     it_name_copy(out->target, sizeof(out->target), qname);
+    it_name_copy(out->zone, sizeof(out->zone), zone);
     it_rr_t *secs = NULL;
 
 #define IT_RET(k, ...) do { out->kind = (k); snprintf(out->why, sizeof(out->why), __VA_ARGS__); goto done; } while (0)
@@ -611,6 +621,12 @@ static it_zone_t *it_zone_store(it_ctx_t *ctx, const it_resp_t *r) {
             it_ns_t *n = &z->ns[z->nns++];
             memset(n, 0, sizeof(*n));
             snprintf(n->name, sizeof(n->name), "%s", r->ns[i]);
+        }
+    }
+    for (int g = 0; g < r->noob_glue; g++) {
+        if (it_show_note(ctx)) {
+            printf(";; ignoring out-of-bailiwick glue for '%.*s' (not under %.*s)\n",
+                   it_disp_len(r->oob_glue[g]), r->oob_glue[g], it_disp_len(r->zone), r->zone);
         }
     }
     for (int g = 0; g < r->nglue; g++) {

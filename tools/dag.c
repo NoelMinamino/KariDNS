@@ -3199,6 +3199,8 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "                               (+noglue: ignore ADDITIONAL and resolve NS names via resolver) [default: +noglue]\n"
         "  +glue=all|indomain           all: same as +glue; indomain: trust only glue whose NS target is under the\n"
         "                               NS owner (BIND named 9.18.41/9.20.15+ strict glue), resolve the rest\n"
+        "                               +trace2: default = +glue (glue within the referring zone's bailiwick);\n"
+        "                               out-of-bailiwick glue is always ignored and reported\n"
         "  +[no]search / +[no]defname   Use search list defined in /etc/resolv.conf\n"
         "  +domain=domain               Set default search domain\n"
         "  +ndots=N                     Set search NDOTS threshold\n"

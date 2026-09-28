@@ -191,6 +191,10 @@ static void test_classify_referral(void) {
     }
     CHECK(in_domain == 2);
     CHECK(sibling == 1);
+    /* 捨てた bailiwick 外の glue は NS 名に一致するものだけ記録される */
+    CHECK(r.noob_glue == 1);
+    CHECK(strcmp(r.oob_glue[0], "ns.other.alt.") == 0);
+    CHECK(strcmp(r.zone, "test.") == 0);
 
     /* 上向きの referral (example.test. のサーバが test. を返す) は lame */
     pkt_begin(&p, QR, "www.example.test.", 1);

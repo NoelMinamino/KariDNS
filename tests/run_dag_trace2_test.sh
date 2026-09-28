@@ -10,6 +10,7 @@
 #   127.0.0.3  "example.test." "other.alt." "lame.test." "sibling.test."
 #   127.0.0.4  "glueless.test."                  (NS ns2.other.alt. / glue なし)
 #   127.0.0.5  mock_trace2_server.pl            "tc.test." (UDP は TC=1) / "noedns.test." (EDNS に FORMERR)
+#                                               "mockp.test." (bailiwick 外の偽 glue を返す)
 #                                               それ以外は REFUSED (lame 役)
 #
 # 127.0.0.2 以降の loopback alias がない場合、root なら追加し、そうでなければ SKIP する。
@@ -99,6 +100,8 @@ ns.noedns    IN A   127.0.0.5
 deadonly     IN NS  ns.deadonly
 ns.deadonly  IN A   127.0.0.5
 noglue       IN NS  ns.noglue.test.
+mockp        IN NS  ns.mockp
+ns.mockp     IN A   127.0.0.5
 EOF
 
 cat > "$WORK/alt.zone" <<EOF
@@ -338,6 +341,11 @@ expect "(a.root-servers)" && expect "trace2: NOERROR for www.example.test" && ok
 run "timeout moves to the next server and fails when none answers" www.deadonly.test A +trace2 +time=1
 expect "connection to 127.0.0.5#$PORT(ns.deadonly.test) for deadonly.test failed; trying next server" \
     && expect "resolution failed: all nameservers for deadonly.test failed" && expect ", 1 timeout," && ok
+
+run "out-of-bailiwick glue is ignored even with +glue=all" www.child.mockp.test A +trace2 +glue=all
+expect "ignoring out-of-bailiwick glue for 'ns.evil.alt' (not under mockp.test)" \
+    && expect "couldn't get address for 'ns.evil.alt': NXDOMAIN" && expect "resolution failed" \
+    && expect_not "127.0.0.66" && ok
 
 run "in-domain NS without glue" www.noglue.test A +trace2
 expect "no glue for in-domain nameserver 'ns.noglue.test' of 'noglue.test'" && expect "resolution failed" && ok

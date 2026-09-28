@@ -45,7 +45,8 @@ static void fuzz_classify(uint8_t mode, const uint8_t *pkt, size_t len) {
     /* 分類結果の文字列が必ず NUL 終端されていること */
     if (strnlen(r->target, sizeof(r->target)) == sizeof(r->target) ||
         strnlen(r->cut, sizeof(r->cut)) == sizeof(r->cut) ||
-        r->nns > IT_MAX_NS || r->nglue > IT_MAX_GLUE || r->naddr > IT_MAX_ADDRS) {
+        r->nns > IT_MAX_NS || r->nglue > IT_MAX_GLUE || r->naddr > IT_MAX_ADDRS ||
+        r->noob_glue > IT_MAX_NS) {
         abort();
     }
     (void)dag_iter_kind_name(r->kind);
