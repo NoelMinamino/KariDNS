@@ -775,7 +775,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
   return parse_string_list_inner(ctx, list, count);
 }
 
-typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD } acl_key_mode_t;
+typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD, ACL_KEY_REJECT } acl_key_mode_t;
 
 static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                            acl_key_mode_t key_mode, char ***tsig_keys_out, int *tsig_keys_count_out) {
@@ -808,6 +808,14 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
 
         if (strcmp(tok.value, "key") == 0) {
             free_token(&tok);
+            if (key_mode == ACL_KEY_REJECT) {
+                /* match-clients はクライアントアドレスだけで評価する。key を受け付けると
+                 * 何にもマッチしないエントリーが黙って残るので、設定エラーにする。 */
+                syslog(LOG_ERR, "[Config] 'key' entries are not supported in match-clients (address match only)");
+                fprintf(stderr, "[ERROR] 'key' entries are not supported in match-clients (address match only)\n");
+                if (ctx) ctx->error_occurred = true;
+                return -1;
+            }
             tok = get_next_token(ctx);
             if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
             char *val = tok.value;
@@ -1644,6 +1652,7 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
   free_token(&tok);
   config->dnstap.enabled = true;
   config->dnstap.queue_size = 4096;
+  bool msg_type_specified = false;
   while (1) {
     tok = get_next_token(ctx);
     if (tok.type == TOKEN_RBRACE) { free_token(&tok); break; }
@@ -1674,9 +1683,11 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
       free(val);
     } else if (strcmp(key_prop, "log-queries") == 0 || strcmp(key_prop, "auth-query") == 0) {
       config->dnstap.log_auth_query = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+      msg_type_specified = true;
       free(val);
     } else if (strcmp(key_prop, "log-responses") == 0 || strcmp(key_prop, "auth-response") == 0) {
       config->dnstap.log_auth_response = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+      msg_type_specified = true;
       free(val);
     } else if (strcmp(key_prop, "require-connect") == 0) {
       config->dnstap.require_connect = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
@@ -1685,6 +1696,11 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
       free(val);
     }
     free(key_prop);
+  }
+  if (!msg_type_specified) {
+    // どちらも指定されていなければ従来どおりクエリと応答の両方を出力する
+    config->dnstap.log_auth_query = true;
+    config->dnstap.log_auth_response = true;
   }
   tok = get_next_token(ctx);
   if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
@@ -2281,7 +2297,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         if (strcmp(tok.value, "match-clients") == 0) {
           free_token(&tok);
           if (parse_acl_list(ctx, &view->match_clients, &view->match_clients_count,
-                             ACL_KEY_AS_LIST_ENTRY, NULL, NULL) != 0) {
+                             ACL_KEY_REJECT, NULL, NULL) != 0) {
             free_partial_view(view);
             return -1;
           }

@@ -5,7 +5,7 @@ Version:        %{?version}%{!?version:1.0.0}
 Release:        1%{?dist}
 Summary:        DNS Anomaly Generator - High-performance DNS query tool and fuzzer
 
-License:        BSD-2-Clause
+License:        MIT
 URL:            https://github.com/NoelMinamino/KariDNS
 Source0:        %{name}-%{version}.tar.gz
 

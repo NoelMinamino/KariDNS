@@ -829,7 +829,7 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[req_len++] = EDNS_OPTION_KARIDNS_EXT & 0xFF;
     axfr_req[req_len++] = 0x00;
     axfr_req[req_len++] = 0x05; // Option Length: 5
-    axfr_req[req_len++] = KARIDNS_EXT_VERSION; // 1
+    axfr_req[req_len++] = KARIDNS_EXT_VERSION;
     axfr_req[req_len++] = (domain_hash >> 24) & 0xFF;
     axfr_req[req_len++] = (domain_hash >> 16) & 0xFF;
     axfr_req[req_len++] = (domain_hash >> 8) & 0xFF;
@@ -1330,13 +1330,12 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       if (axfr_cfg) release_config_snapshot(axfr_cfg);
       for (int i = 0; i < current_zone->location_count; i++) {
         const tinydns_location_entry_t *loc = &current_zone->locations[i];
-        uint8_t loc_buf[8];
+        /* Extended AXFR v2: code(2) + prefix length in bits(1) + network(4) */
+        uint8_t loc_buf[7];
         loc_buf[0] = loc->code[0];
         loc_buf[1] = loc->code[1];
-        loc_buf[2] = loc->prefix_len;
-        if (loc->prefix_len > 0) {
-          memcpy(&loc_buf[3], loc->prefix, loc->prefix_len);
-        }
+        loc_buf[2] = loc->prefix_bits;
+        memcpy(&loc_buf[3], loc->prefix, 4);
         dns_record_t loc_rec;
         memset(&loc_rec, 0, sizeof(loc_rec));
         loc_rec.name = entry->domain;
@@ -1344,7 +1343,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
         loc_rec.class_val = DNS_CLASS_KARIDNS_EXT;
         loc_rec.class_str = "KARIDNS";
         loc_rec.generic_data = loc_buf;
-        loc_rec.generic_len = 3 + loc->prefix_len;
+        loc_rec.generic_len = sizeof(loc_buf);
         if (axfr_emit_record(&ec, &loc_rec) < 0) goto axfr_error;
       }
     }

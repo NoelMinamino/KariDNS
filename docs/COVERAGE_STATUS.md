@@ -1,19 +1,69 @@
 # KariDNS Code Coverage Status & Improvement Log
 
-## 1. Baseline Status & Current Metrics
-- **Toolchain:** llvm-cov 19.1.7 (FreeBSD 15-CURRENT / amd64)
-- **Functions:** 100.0% (514 / 514)
-- **Lines:** 88.4% (29,880+ / 33,800)
-- **Regions:** 85.2% (34,500+ / 40,500)
-- **Branches:** 75.8% (19,850+ / 26,180)
+## 1. Current Metrics
 
-### Target Milestones
-| Metric | Golden Standard Milestone 1 | Phase 2 Strict Target | Status |
+Measured on 2026-09-28 at commit `bea0c17` (`main`).
+
+- **Toolchain:** clang / llvm-cov / llvm-profdata 19.1.7 (FreeBSD 15.1-RELEASE / amd64), continuous-mode profiling (`COV_CONTINUOUS=1`)
+- **Procedure:** the `make coverage` steps: `make coverage-clean coverage-build` as a normal user, `make coverage-run` as root (integration tests that need loopback aliases run only as root), then `make coverage-report` and `perl tests/coverage_gate.pl --llvm-cov=llvm-cov19 --profdata=coverage.profdata --phase=2`
+- **Test suite:** `tests/run_all_suite.sh` with `run_sanitizer_smoke_test`, `run_stress_test` and `run_fuzz_smoke_test` excluded (`COV_SUITE_EXCLUDE`, they run only non-instrumented sanitizer/fuzzer binaries): 157 suites executed, 157 passed, 0 failed. The libFuzzer corpora are replayed by `coverage-fuzz-run` and included.
+- **Functions:** 100.00% (596 / 596)
+- **Lines:** 92.10% (32,997 / 35,826)
+- **Regions:** 89.97% (37,587 / 41,779)
+- **Branches:** 78.88% (21,443 / 27,186)
+
+### Coverage Gate (`tests/coverage_gate.pl`)
+
+The CI job "Coverage gate" runs the Phase 2 thresholds with `--strict`. The tiers are defined in `tests/coverage_gate.pl`: Tier A = protocol and parser modules (`dns_wire.c`, `dns_zone_parser.c`, `dns_config_parser.c`, `dns_tinydns_parser.c`, `dns_utils.c`, `dns_cidr.c`, `dns_tsig_acl.c`, `dns_query_engine.c`, `dns_axfr_ixfr.c`, `dns_dynamic_update.c`, `dns_catalog_zone.c`, `dns_rrl.c`, `dns_edns_ecs.c`), Tier B = server runtime (`dns_server_core.c`, `dns_snapshot_rcu.c`, `dns_dnstap.c`, `dns_priv_sandbox.c`, `dns_epoch_rcu.c`), Tier C = tools (`tools/dag*.c`, `tools/karicheck.c`, `tools/karictl.c`).
+
+| Tier | Line (target) | Region (target) | Branch (target) | Status |
+|---|---|---|---|---|
+| Tier A | 93.83% (93.0%) | 91.36% (89.0%) | 82.56% (80.0%) | **PASS** |
+| Tier B | 89.08% (87.0%) | 89.01% (80.0%) | 76.25% (68.0%) | **PASS** |
+| Tier C | 91.62% (90.0%) | 88.87% (84.0%) | 75.78% (72.0%) | **PASS** |
+| Total, Phase 1 | 92.10% (90.0%) | 89.97% (84.0%) | 78.88% (72.0%) | **PASS** |
+| Total, Phase 2 | 92.10% (92.0%) | 89.97% (85.0%) | 78.88% (75.0%) | **PASS** |
+
+### Per-File Results
+
+| File | Lines | Regions | Branches |
 |---|---|---|---|
-| **Function Coverage** | 100% | 100% | **PASSED (100.0%)** |
-| **Line Coverage** | >= 88.0% | >= 92.0% | **PASSED (>= 88.4%)** |
-| **Region Coverage** | >= 85.0% | >= 85.0% | **PASSED (>= 85.2%)** |
-| **Branch Coverage** | >= 75.0% | >= 75.0% | **PASSED (>= 75.8%)** |
+| `dns_axfr_ixfr.c` | 93.78% | 90.54% | 74.87% |
+| `dns_catalog_zone.c` | 98.92% | 97.51% | 87.50% |
+| `dns_cidr.c` | 99.07% | 90.64% | 81.82% |
+| `dns_config_parser.c` | 93.86% | 91.91% | 83.46% |
+| `dns_dnstap.c` | 92.02% | 92.53% | 78.99% |
+| `dns_dynamic_update.c` | 95.21% | 95.84% | 73.39% |
+| `dns_edns_ecs.c` | 95.25% | 93.15% | 87.50% |
+| `dns_epoch_rcu.c` | 91.03% | 91.51% | 76.79% |
+| `dns_priv_sandbox.c` | 88.63% | 91.26% | 77.00% |
+| `dns_query_engine.c` | 89.42% | 87.64% | 76.94% |
+| `dns_rrl.c` | 96.30% | 96.27% | 89.16% |
+| `dns_server_core.c` | 87.93% | 87.60% | 73.95% |
+| `dns_snapshot_rcu.c` | 91.27% | 91.30% | 79.62% |
+| `dns_tinydns_parser.c` | 96.36% | 89.30% | 83.28% |
+| `dns_tsig_acl.c` | 100.00% | 93.81% | 85.19% |
+| `dns_utils.c` | 97.31% | 96.48% | 96.05% |
+| `dns_wire.c` | 96.69% | 92.80% | 86.10% |
+| `dns_zone_parser.c` | 91.71% | 91.33% | 82.66% |
+| `tools/dag.c` | 95.07% | 92.48% | 83.16% |
+| `tools/dag_axfr_client.c` | 88.24% | 83.87% | 65.91% |
+| `tools/dag_batch.c` | 95.00% | 89.04% | 74.00% |
+| `tools/dag_edns_client.c` | 97.79% | 95.69% | 82.94% |
+| `tools/dag_iter.c` | 91.03% | 85.65% | 71.40% |
+| `tools/dag_output_yaml.c` | 98.39% | 87.36% | 59.01% |
+| `tools/dag_pcap_l4.c` | 100.00% | 98.55% | 92.22% |
+| `tools/dag_replay.c` | 87.21% | 82.30% | 68.67% |
+| `tools/dag_roothints.c` | 77.56% | 84.76% | 65.38% |
+| `tools/dag_tcp_reassembly.c` | 80.62% | 82.69% | 73.33% |
+| `tools/dag_trace.c` | 88.27% | 80.48% | 62.44% |
+| `tools/dag_trace_common.c` | 97.50% | 82.17% | 67.39% |
+| `tools/dag_transport.c` | 86.86% | 86.39% | 68.25% |
+| `tools/dag_tsig_client.c` | 91.77% | 89.16% | 67.95% |
+| `tools/karicheck.c` | 90.02% | 89.16% | 76.42% |
+| `tools/karictl.c` | 89.41% | 88.92% | 79.21% |
+
+Header files with inline functions (`dns_epoch_rcu.h`, `dns_siphash.h`, `dns_utils.h`, `dns_wire.h`, `dns_zone_parser.h`, `tools/dag_internal.h`) are included in the totals but not in the table.
 
 ---
 

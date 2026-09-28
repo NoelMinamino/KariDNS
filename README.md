@@ -11,9 +11,10 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
 
 ## Architecture & Design
 
-- **Dual-Process Model & Capsicum Sandboxing:**
-  - **Frontend:** Binds privileged ports (UDP/TCP 53) and manages network sockets.
+- **Privilege-Separated Processes & Capsicum Sandboxing:**
+  - **Frontend:** Binds privileged ports (UDP/TCP 53) and manages network sockets (one or two frontend router processes, depending on the number of CPU cores).
   - **Backend:** Enters Capsicum capability mode (`cap_enter()`) to parse DNS queries and generate responses without direct filesystem or network socket creation privileges. Zone and configuration files are reloaded using pre-opened directory descriptors (`openat`/`renameat`).
+  - A supervisor process starts and monitors the others, and a small connect broker opens the outbound TCP connections the sandboxed backend needs (e.g. zone transfers from a primary).
 - **Memory Arenas:**
   - Zone data is loaded into memory arenas (`zone_arena_t`), avoiding `malloc`/`free` allocations during query processing.
 - **Lock-Free Read-Copy-Update (RCU):**
@@ -45,11 +46,12 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
   - **NSID (RFC 5001):** Server identifier transmission via EDNS.
 - **Views:** Split-horizon configuration using `view` blocks and `match-clients` IP matching.
 - **Client Geolocation & Subnet Steering (ECS & Location Tags):**
-  - **BIND Zone Steering:** Granular record-level split-horizon steering based on immediate client IP (`$LOCATION` / `$LOCATION-TAG`) and EDNS0 Client Subnet (`$ECS-SUBNET` / `$ECS-SUBNET-TAG`, RFC 7871) with ACL validation (`ecs-trusted-resolvers`).
+  - **BIND Zone Steering:** Granular record-level split-horizon steering based on immediate client IP (`$LOCATION` / `$LOCATION-TAG`, or `location-tags` in `karidns.conf`) and EDNS0 Client Subnet (`$ECS-SUBNET` / `$ECS-SUBNET-TAG`, or `ecs-tags`; RFC 7871), accepted only from trusted resolvers (`ecs-enable yes;` and `ecs-trusted-resolvers`).
   - **tinydns `%` Location Steering:** Native djbdns-compatible IPv4 longest-prefix matching and record steering.
   - **KariDNS Extended AXFR:** Primary-to-Secondary zone replication preserving location and ECS directives via EDNS Option 65153 negotiation, with automatic fallback (Plan B) to standard AXFR for non-KariDNS secondaries.
   - For detailed configuration, usage, and examples, see **[KariDNS: Client Geolocation & Subnet Steering Guide](docs/KariDNS_How_to_use_ECS_and_location.md)**.
-- **Logging:** Non-blocking multi-producer single-consumer (MPSC) logging channels with size- and date-based rotation.
+- **Logging:** Query and response logs written through per-worker ring buffers by a separate logger thread (rate-limited with `query-log-max-qps`), with size- and date-based rotation. **dnstap** output (Frame Streams over a UNIX socket) is also available.
+- **Catalog Zones (RFC 9432):** Member zones listed in a catalog zone are served as secondary zones automatically.
 
 ---
 
@@ -69,17 +71,17 @@ KariDNS implements specifications according to official IETF RFC standards. For 
 ### Supported Resource Record (RR) Types
 KariDNS natively parses, validates, and serializes the following standard and experimental DNS record types, as well as RFC 3597 unknown record syntax (`TYPE<n>` / `\#`):
 
-- **Core & Routing:** `A`, `AAAA`, `NS`, `CNAME`, `DNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `WKS`, `X25`, `ISDN`, `NSAP`, `NSAP-PTR`, `GPOS`, `NULL`, `MD`, `MF`, `MB`, `MG`, `MR`, `NXT`, `EID`, `NIMLOC`, `ATMA`, `A6`, `SINK`
-- **DNSSEC & Cryptographic Identities:** `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `OPENPGPKEY`, `IPSECKEY`, `HIP`, `TA`, `DLV`, `SIG`, `KEY`
-- **Modern Web, Discovery & Service Bindings:** `HTTPS`, `SVCB`, `NAPTR`, `DSYNC`, `ZONEMD`, `CSYNC`, `DHCID`, `EUI48`, `EUI64`, `NID`, `L32`, `L64`, `NXNAME`, `AVC`, `DOA`, `AMTRELAY`
-- **Pseudo & Meta Types:** `OPT` (EDNS0), `TSIG`, `TKEY`, `AXFR`, `IXFR`, `ANY` (RFC 8482), `MAILB`, `MAILA`, `TYPE<n>` (RFC 3597)
+- **Core & Routing:** `A`, `AAAA`, `NS`, `CNAME`, `DNAME`, `PTR`, `MX`, `SOA`, `TXT`, `SPF`, `SRV`, `LOC`, `APL`, `CAA`, `URI`, `HINFO`, `MINFO`, `RP`, `AFSDB`, `RT`, `KX`, `LP`, `PX`, `WKS`, `X25`, `ISDN`, `NSAP`, `NSAP-PTR`, `GPOS`, `NULL`, `MD`, `MF`, `MB`, `MG`, `MR`, `NXT`, `EID`, `NIMLOC`, `ATMA`, `A6`, `SINK`, `NINFO`
+- **DNSSEC & Cryptographic Identities:** `DS`, `CDS`, `DNSKEY`, `CDNSKEY`, `RRSIG`, `NSEC`, `NSEC3`, `NSEC3PARAM`, `SSHFP`, `TLSA`, `SMIMEA`, `CERT`, `OPENPGPKEY`, `IPSECKEY`, `HIP`, `TA`, `DLV`, `SIG`, `KEY`, `RKEY`, `TALINK`
+- **Modern Web, Discovery & Service Bindings:** `HTTPS`, `SVCB`, `NAPTR`, `DSYNC`, `ZONEMD`, `CSYNC`, `DHCID`, `EUI48`, `EUI64`, `NID`, `L32`, `L64`, `AVC`, `DOA`, `AMTRELAY`, `HHIT`, `BRID`
+- **Pseudo & Meta Types:** `OPT` (EDNS0), `TSIG`, `TKEY`, `AXFR`, `IXFR`, `ANY` (RFC 8482), `MAILB`, `MAILA`, `NXNAME` (RFC 9824; synthesized only, not accepted as zone data), `TYPE<n>` (RFC 3597)
 
 ### Zone File Formats & Directives
 - **Standard BIND Format (Default):**
   - Directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (supports up to 32 files and 16 nesting levels within Capsicum constraints), `$GENERATE`, `$LOCATION`, `$LOCATION-TAG`, `$ECS-SUBNET`, `$ECS-SUBNET-TAG`.
 - **djbdns/tinydns Plain-Text Format (`file-format tinydns;`):**
   - Loads zone data directly from djbdns/tinydns plain-text `data` files (not compiled `data.cdb`).
-  - Supports record markers `.` (SOA+NS+A), `&` (NS+A), `+` (A), `=` (A+PTR), `-` (disabled/comment), `@` (MX+A), `'` (TXT, 127-byte chunking), `^` (PTR), `C` (CNAME), `Z` (complete SOA), and `:` (generic RR).
+  - Supports record markers `.` (SOA+NS+A), `&` (NS+A), `+` (A), `=` (A+PTR), `-` (disabled/comment), `@` (MX+A), `'` (TXT, 127-byte chunking), `^` (PTR), `C` (CNAME), `Z` (complete SOA), `:` (generic RR), and the common extensions `3` (AAAA), `6` (AAAA+PTR), `S` (SRV), `N` (NAPTR) and `_` (SSHFP).
   - Handles client geolocation steering with `%` location prefixes and trailing `:loc` record tags, parent/child zone delegation with longest-suffix matching, and load-time TAI64 `timestamp` / countdown TTL evaluation.
 
 ---
@@ -90,19 +92,19 @@ KariDNS natively parses, validates, and serializes the following standard and ex
 The main authoritative DNS server daemon. For detailed architecture and configuration options, see the **[karidns(8) Manual](docs/karidns.md)**.
 
 ### 2. `karictl`
-An authenticated management tool (RNDC-style) that communicates with the server over a UNIX domain socket using HMAC-SHA256. For command reference and configuration details, see the **[karictl(8) Manual](docs/karictl.md)**.
+An authenticated management tool (RNDC-style) that communicates with the server over a UNIX domain socket using an HMAC challenge-response (HMAC-SHA256 by default). Besides the commands below it provides `reconfig`, `zonestatus`, per-zone statistics (`observatory`) and `tsig-keygen`. For command reference and configuration details, see the **[karictl(8) Manual](docs/karictl.md)**.
 
 ```sh
 # Check server status
 ./karictl status
 
-# Reload configuration and zone files without restart
+# Reload configuration and all zone files without restart
 ./karictl reload
 
 # Send NOTIFY to slave servers for a specific zone
 ./karictl notify example.com
 
-# Request an AXFR zone transfer from the master
+# Request a new zone transfer from the master for a slave zone
 ./karictl retransfer example.com
 
 # Stop the server
@@ -126,7 +128,7 @@ A zone file syntax and configuration validation utility. It performs pre-flight 
 ### 4. `dag` (DNS Anomaly Generator)
 A test client, protocol debugger, and packet fuzzer for DNS servers. For full option specifications and fuzzing modes, see the **[dag(1) Manual](docs/dag.md)**.
 
-`dag` can construct custom queries (including EDNS options, Cookie, EDNS Client Subnet, IXFR, Dynamic Updates, etc.), output formatted responses (`+short`, `+yaml`, `+multiline`), generate web links (`+ldnsz`) for online wire-format analysis, and intentionally generate malformed or boundary-testing packets using the `--break` option.
+`dag` can construct custom queries (including EDNS options, Cookie, EDNS Client Subnet, IXFR, Dynamic Updates, etc.), output formatted responses (`+short`, `+yaml`, `+multiline`), resolve iteratively without any local resolver (`+trace2`), replay captured traffic against servers (`--replay`), generate web links (`+ldnsz`) for online wire-format analysis, and intentionally generate malformed or boundary-testing packets using the `--break` option. Its defaults follow `dig` (EDNS0 with a 1232-byte UDP payload size and a client cookie); unlike `dig`, it also prints hex dumps of the query and response by default (`+nohexdump` turns them off).
 
 > [!WARNING]
 > **Intended for Local Testing Only**
@@ -163,13 +165,13 @@ A test client, protocol debugger, and packet fuzzer for DNS servers. For full op
 ./dag example.com A @127.0.0.1 --break label-too-long
 
 # Test invalid QDCOUNT handling
-./dag example.com A @127.0.0.1 --break qdcount:2
+./dag example.com A @127.0.0.1 --break qdcount=2
 
 # Test malformed OPT RDLEN
-./dag example.com A @127.0.0.1 --break opt-rdlen:500
+./dag example.com A @127.0.0.1 --break opt-rdlen=500
 
 # Test TCP length overclaim
-./dag example.com A @127.0.0.1 --tcp --break tcp-length-overclaim:50
+./dag example.com A @127.0.0.1 +tcp --break tcp-length-overclaim=50
 
 # Run all built-in anomaly tests sequentially
 ./dag example.com A @127.0.0.1 --break all
@@ -178,9 +180,10 @@ A test client, protocol debugger, and packet fuzzer for DNS servers. For full op
 ./dag --break-help
 ```
 
-For complete command-line options, advanced transport modes (DoT/DoH/PROXYv2), multi-server consistency checking (`+allcompare`), and protocol anomaly generator specifications, please consult the dedicated manual:
+For complete command-line options, advanced transport modes (DoT/DoH/PROXYv2), multi-server consistency checking (`+allcompare`), and protocol anomaly generator specifications, please consult the dedicated manuals:
 
 - **[KariDNS `dag(1)` Reference Manual](docs/dag.md)**
+- **[`dag --replay` Traffic Replay & Differential Testing](docs/dag_replay.md)**
 
 ---
 
@@ -191,7 +194,7 @@ KariDNS and its tools are distributed as pre-built packages for FreeBSD, Linux, 
 > [!IMPORTANT]
 > **Platform Support Scope:**
 > - **FreeBSD (Full Suite):** Includes the authoritative server daemon (`karidns`), management tool (`karictl`), syntax validator (`karicheck`), and DNS testing client (`dag`), along with sample configs and `rc.d` service scripts.
-> - **Linux, macOS & Windows (Client Only):** Since `karidns` relies on FreeBSD-native kernel features (`kqueue`, `Capsicum`), non-FreeBSD platforms distribute **`dag` only** (as an ultra-fast, feature-rich DNS query tool and fuzzer alternative to `dig`).
+> - **Linux, macOS & Windows (Client Only):** Since `karidns` relies on FreeBSD-native kernel features (`kqueue`, `Capsicum`), non-FreeBSD platforms distribute **`dag` only** (as an ultra-fast, feature-rich DNS query tool and fuzzer alternative to `dig`). macOS packages are built for Apple Silicon (arm64) only; on Intel Macs use Homebrew or build from source.
 
 ### 1. FreeBSD Installation (`karidns` Full Suite)
 
@@ -200,6 +203,9 @@ Download the `.pkg` file matching your FreeBSD version from [GitHub Releases](ht
 ```sh
 # Switch to root
 su -
+
+# Runtime dependency (pkg add of a downloaded package does not fetch it)
+pkg install -y libidn2
 
 # For FreeBSD 14.x (amd64)
 pkg add https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/karidns-?.?.?-FreeBSD-14-amd64.pkg
@@ -226,24 +232,18 @@ service karidns start
 
 ### 2. macOS Installation (`dag` only)
 
-#### Option A: Generic Tarball (.tar.gz) [Fastest]
+#### Option A: Generic Tarball (.tar.gz) [Apple Silicon]
 ```sh
-# For Apple Silicon (M1/M2/M3/M4):
 curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-macos-arm64.tar.gz
 tar -xzf dag-?.?.?-macos-arm64.tar.gz
 sudo cp dag-?.?.?/dag /usr/local/bin/
-
-# For Intel Macs:
-curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag-?.?.?-macos-x86_64.tar.gz
-tar -xzf dag-?.?.?-macos-x86_64.tar.gz
-sudo cp dag-?.?.?/dag /usr/local/bin/
 ```
 
-#### Option B: Standalone DMG (.dmg)
-1. Download `dag-?.?.?-macos-arm64.dmg` (or `x86_64`) from GitHub Releases.
-2. Double-click the DMG and copy `dag` to `/usr/local/bin` (or your preferred `$PATH`).
+#### Option B: Standalone DMG (.dmg) [Apple Silicon]
+1. Download `dag-?.?.?-macos-arm64.dmg` from GitHub Releases.
+2. Double-click the DMG and copy `bin/dag` to `/usr/local/bin` (or your preferred `$PATH`).
 
-#### Option C: Homebrew Tap
+#### Option C: Homebrew Tap (Apple Silicon and Intel; builds from source)
 ```sh
 brew install NoelMinamino/tap/dag
 ```
@@ -261,7 +261,7 @@ sudo dnf install https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.
 sudo rpm -ivh dag-?.?.?-1.el9.x86_64.rpm
 ```
 
-#### DEB-based (Ubuntu 22.04 / 24.04, Debian 11 / 12)
+#### DEB-based (Ubuntu, Debian)
 ```sh
 # Download and install with DPKG
 curl -LO https://github.com/NoelMinamino/KariDNS/releases/download/v?.?.?/dag_?.?.?_amd64.deb
@@ -279,13 +279,13 @@ sudo cp dag-?.?.?/dag /usr/local/bin/
 
 ### 4. Windows Installation (`dag.exe` only)
 
-Download `dag-?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
+Download `dag-v?.?.?-windows-x86_64.zip` from [GitHub Releases](https://github.com/NoelMinamino/KariDNS/releases).
 
 1. Extract the ZIP archive.
-2. Place `dag.exe` in a directory registered in your system `%PATH%` (e.g., `C:\Windows\System32` or your local tools directory).
+2. Keep `dag.exe` together with the DLLs next to it, and add that folder to your `%PATH%` (or copy them all into a directory that is already in `%PATH%`).
 3. Open Command Prompt or PowerShell:
    ```cmd
-   dag.exe www.google.com A @8.8.8.8
+   dag.exe example.com A @192.0.2.53
    ```
 
 For complete packaging details and checksum verification, see the **[Distribution Guide](docs/distribution.md)**.
@@ -295,39 +295,56 @@ For complete packaging details and checksum verification, see the **[Distributio
 ## Building from Source
 
 ### Prerequisites
-- **Operating System:** FreeBSD (for full suite), Linux / macOS (for `dag` client)
+- **Operating System:** FreeBSD (for full suite), Linux / macOS / Windows (MSYS2 MinGW-w64) (for `dag` client)
 - **Compiler:** Clang or GCC (C11 support required)
 - **Libraries:** OpenSSL (`libcrypto`, `libssl`), `zlib`, `libidn2` (optional, for IDN support), `pthread`
 
 ### Compilation
-To compile all utilities on FreeBSD:
+To compile all utilities on FreeBSD (`karidns`, `dag`, `karictl`, `karicheck`):
 ```sh
 make all
 ```
 
-To compile only the `dag` client (on Linux, macOS, or FreeBSD):
+To compile only the `dag` client (on Linux, macOS, Windows MSYS2, or FreeBSD):
 ```sh
 make dag
 ```
 
-To run test suites with AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan):
+The default build uses `-march=native`; use `make MARCH_FLAGS= ...` for a binary that runs on other CPUs of the same architecture.
+
+### Tests
 ```sh
-make asan_test
+# Unit tests
+make unit-tests
+
+# AddressSanitizer / UndefinedBehaviorSanitizer builds
+make karidns-asan dag-asan
+
+# Full test suite (integration tests that need loopback aliases run only as root)
+sh tests/run_all_suite.sh
+
+# Coverage report (clang source-based coverage; see docs/COVERAGE_STATUS.md)
+make coverage
 ```
 
+The test index is [tests/TEST_MATRIX.md](tests/TEST_MATRIX.md).
+
 ### Running the Server
-Start KariDNS by providing the configuration file path:
+Start KariDNS by providing the configuration file path (`-f` keeps it in the foreground):
 ```sh
 ./karidns /usr/local/etc/karidns/karidns.conf
 ```
 
-KariDNS can also run as an unprivileged user: omit `user` (or set it to that user itself), use a port >= 1024 (e.g. `port 10053;` or `-p 10053`), and point log files, `pid-file` and the `control-channel` `socket` at directories that user can write to. If a port cannot be bound or a log file / PID file / control socket cannot be created, KariDNS refuses to start with an error. See [karidns(8)](docs/karidns.md#running-as-a-non-root-user).
+KariDNS can also run as an unprivileged user: omit `user` (or set it to that user itself), use a port >= 1024 (e.g. `port 10053;` or `-p 10053`; `-p` with a decimal number sets the port; use `-P` for a PID file), and point log files, `pid-file` and the `control-channel` `socket` at directories that user can write to. If a port cannot be bound or a log file / PID file / control socket cannot be created, KariDNS refuses to start with an error. See [karidns(8)](docs/karidns.md#running-as-a-non-root-user).
 
 ---
 
 ## Configuration Example
 
 ### Server Configuration (`karidns.conf`)
+
+A representative example. Every configuration statement and option is listed in the [CONFIGURATION REFERENCE of karidns(8)](docs/karidns.md#configuration-reference).
+
 ```
 options {
     port 53;
@@ -337,7 +354,7 @@ options {
 
     allow-program-zones yes; # Required if using type program zones
     tcp-connection-reuse yes;
-    tcp-idle-timeout 10;
+    tcp-idle-timeout 10000; # milliseconds
     minimal-any yes;
     nsid "karidns-node-01";
 
@@ -372,7 +389,6 @@ control-channel {
 logging {
     channel query_log {
         file "/var/log/karidns/queries.log" versions 5 size 100m;
-        severity info;
         print-time yes;
         print-category yes;
     };
@@ -406,7 +422,7 @@ zone "slave.example.net" {
 zone "corp.example.org" {
     type forward;
     forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
-    forward-timeout 2000; # timeout in milliseconds
+    forward-timeout 2000; # total time budget in milliseconds
 };
 
 # Dynamic external program plugin zone (testing/anomaly fuzzing)

@@ -221,6 +221,10 @@ typedef enum { UPDATE_OP_ADD, UPDATE_OP_DEL, UPDATE_OP_DEL_EXACT } update_op_kin
 typedef struct {
     uint16_t qclass;
     bool want_opt;
+    /* dig と同じ既定値: EDNS0 (bufsize 1232) と client cookie を送る。+noedns / +nocookie で false。
+     * UPDATE / NOTIFY には既定では付けない (nsupdate と同じ)。dag_apply_dig_defaults() で解決する。 */
+    bool edns_default;
+    bool cookie_default;
     uint8_t edns_version;
     uint16_t udp_payload_size;
     bool dnssec_ok;
@@ -289,6 +293,8 @@ typedef struct {
     bool rd_flag;
     bool aa_flag;
     bool ad_flag;
+    bool rd_explicit;   /* +[no]rec / +[no]recurse / +[no]rdflag was given */
+    bool ad_explicit;   /* +[no]adflag was given */
     bool cd_flag;
     bool tc_flag;
     bool z_flag;

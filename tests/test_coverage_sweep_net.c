@@ -1001,6 +1001,38 @@ static void test_replay(fsrv_t *s, fsrv_t *s2) {
     run_line("--replay %s --server1 [::1]:1 --timeout-ms 100 --workers 99 --output yaml", p5);
     run_line("--replay %s --server1 127.0.0.1:notaport --bogus-option", p5);
     set_parallel(false);
+
+    /* --transport tls / doh: the same server over DoT / DoH and over TCP must give identical
+     * answers (exit status 0 = no mismatch); a failed TLS handshake is a mismatch (exit 1). */
+    char pok[400];
+    snprintf(pok, sizeof(pok), "%s/ok.txt", g_tmp);
+    f = fopen(pok, "w"); fprintf(f, "ok.test. A\nok.test. AAAA\n"); fclose(f);
+    int rc = run_line("--replay %s --server1 127.0.0.1:%d --server1-transport tls --server2 127.0.0.1:%d --server2-transport tcp --timeout-ms 2000",
+                      pok, s->tls_port, s->port);
+    assert(rc == 0);
+    rc = run_line("--replay %s --server1 127.0.0.1:%d --server1-transport doh --server2 127.0.0.1:%d --server2-transport tcp --timeout-ms 2000",
+                  pok, s->tls_port, s->port);
+    assert(rc == 0);
+    rc = run_line("--replay %s --server1 127.0.0.1:%d --server1-transport tls --server2 127.0.0.1:%d --server2-transport tcp --timeout-ms 500",
+                  pok, s->port, s->port);                               /* plain TCP port: no TLS */
+    assert(rc == 1);
+    rc = run_line("--replay %s --server1 127.0.0.1:%d --transport quic", pok, s->port);
+    assert(rc == 1);
+    /* single-server replay (no comparison) always exits 0 */
+    rc = run_line("--replay %s --server1 127.0.0.1:%d --transport doh --timeout-ms 2000", pok, s->tls_port);
+    assert(rc == 0);
+    /* --server1/--server2 forms: host#port and [addr]:port reach the same server */
+    rc = run_line("--replay %s --server1 127.0.0.1#%d --server2 [127.0.0.1]:%d --timeout-ms 2000", pok, s->port, s->port);
+    assert(rc == 0);
+    rc = run_line("--replay %s --server1 [::1]#%d --timeout-ms 100", pok, s->port);   /* IPv6 + port parses */
+    assert(rc == 0);
+    const char *bad_targets[] = { "[::1", "[::1]x", "[]:53", "::1#0", "127.0.0.1:99999", "127.0.0.1:", "#53", "[::1]:5x" };
+    for (size_t i = 0; i < N(bad_targets); i++) {
+        rc = run_line("--replay %s --server1 %s", pok, bad_targets[i]);
+        assert(rc == 1);
+        rc = run_line("--replay %s --server1 127.0.0.1:%d --server2 %s", pok, s->port, bad_targets[i]);
+        assert(rc == 1);
+    }
     printf("  -> replay runs done.\n");
 }
 

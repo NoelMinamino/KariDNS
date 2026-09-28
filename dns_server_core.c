@@ -148,6 +148,22 @@ void dec_tcp_clients(void) {
 }
 
 
+// -p の値の判定。全体が 10 進数字だけのときだけポート番号として扱う
+// (先頭1文字だけで判定すると "1.pid" のような PID ファイル名がポートになる)。
+// 戻り値: 1 = ポート (*port_out に格納), 0 = 数字以外を含む (PID ファイル), -1 = 範囲外のポート番号
+int parse_cli_port_arg(const char *val, int *port_out) {
+  if (!val || !*val) return 0;
+  for (const char *p = val; *p; p++) {
+    if (!isdigit((unsigned char)*p)) return 0;
+  }
+  char *end = NULL;
+  errno = 0;
+  long v = strtol(val, &end, 10);
+  if (errno != 0 || *end != '\0' || v < 1 || v > 65535) return -1;
+  if (port_out) *port_out = (int)v;
+  return 1;
+}
+
 // リスニングソケットの bind() 失敗時にログへ添えるヒント。
 const char *bind_error_hint(int err, int port) {
   if (err == EACCES && port > 0 && port < 1024)
@@ -2512,6 +2528,10 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
     g_config_db.retire_epoch = rcu_writer_advance_epoch();
     atomic_store_explicit(&g_config_db.active, standby,
                           memory_order_release);
+    // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
+    if (standby->dnstap.enabled) {
+      dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
+    }
     rebuild_zone_db_from_config(standby, skip_unchanged);
     for (view_config_t *v = standby->views; v; v = v->next) {
       for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -2697,11 +2717,18 @@ void *control_thread_func(void *arg) {
             if (cfg && strncmp(c->buf, "AUTH ", 5) == 0 && cfg->control.enabled && cfg->control.secret_decoded_len > 0) {
               char *client_hmac = c->buf + 5;
               unsigned char md[EVP_MAX_MD_SIZE];
-              unsigned int md_len;
-              HMAC(EVP_sha256(), cfg->control.secret_decoded, cfg->control.secret_decoded_len,
-                   (unsigned char*)c->challenge, 64, md, &md_len);
-              char expected[65];
-              for(unsigned int k=0; k<md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
+              unsigned int md_len = 0;
+              /* control-channel { algorithm } で指定した HMAC を使う (省略時 hmac-sha256)。
+               * 名前は設定読込時に tsig_algorithm_is_supported() で検証済み。 */
+              const EVP_MD *ctrl_md = cfg->control.algorithm ? tsig_algorithm_evp_md(cfg->control.algorithm)
+                                                             : EVP_sha256();
+              char expected[2 * EVP_MAX_MD_SIZE + 1];
+              expected[0] = '\0';
+              if (ctrl_md &&
+                  HMAC(ctrl_md, cfg->control.secret_decoded, cfg->control.secret_decoded_len,
+                       (unsigned char*)c->challenge, 64, md, &md_len) != NULL) {
+                for (unsigned int k = 0; k < md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
+              }
               /* [H-5] タイミング攻撃対策: 長さ比較も定数時間で行う。
                * client_hmac が expected と長さが異なる場合も const_time_memcmp を
                * 必ず呼んでキャッシュタイミングを均一化し、その後 len_ok で弾く。*/
@@ -2712,7 +2739,8 @@ void *control_thread_func(void *arg) {
               size_t cmp_len = len_ok ? elen : elen;
               bool hmac_ok = (const_time_memcmp(client_hmac, expected,
                                                 clen >= cmp_len ? cmp_len : clen) == 0);
-              if (len_ok && hmac_ok) {
+              /* elen == 0 は HMAC 計算失敗。空の AUTH と一致させない (fail-closed) */
+              if (len_ok && hmac_ok && elen > 0) {
                 auth_ok = true;
               }
             }
@@ -4338,9 +4366,17 @@ int main(int argc, char **argv) {
           config_file = argv[++i];
       } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
           const char *val = argv[++i];
-          if (isdigit((unsigned char)val[0])) {
-              g_cli_port_override = atoi(val);
+          int port = 0;
+          int kind = parse_cli_port_arg(val, &port);
+          if (kind == 1) {
+              g_cli_port_override = port;
+          } else if (kind < 0) {
+              fprintf(stderr, "[ERROR] Invalid port '%s' for -p (expected 1-65535)\n", val);
+              return 1;
           } else {
+              // 互換のため PID ファイル指定も受け付けるが、-P を案内する
+              fprintf(stderr, "[WARNING] '-p %s' is taken as a PID file path; use -P <pid_file> for PID files "
+                              "(-p <number> sets the port)\n", val);
               cli_pid_file = val;
           }
       } else if (strcmp(argv[i], "-P") == 0 && i + 1 < argc) {
@@ -4922,6 +4958,7 @@ int main(int argc, char **argv) {
   if (pthread_create(&query_logger_thread, NULL, query_logger_thread_func, NULL) != 0) exit(1);
 
   if (cfg->dnstap.enabled && cfg->dnstap.socket_path) {
+    dnstap_set_message_types(cfg->dnstap.log_auth_query, cfg->dnstap.log_auth_response);
     g_dnstap_sock = dnstap_connect_and_handshake(cfg->dnstap.socket_path, cfg->dnstap.identity, cfg->dnstap.version);
     if (g_dnstap_sock >= 0) {
       atomic_store_explicit(&g_dnstap_connected, true, memory_order_release);

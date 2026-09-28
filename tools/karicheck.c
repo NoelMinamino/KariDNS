@@ -893,9 +893,9 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     if (arena.is_tinydns_format) {
         for (int i = 0; i < arena.location_count; i++) {
             const tinydns_location_entry_t *loc = &arena.locations[i];
-            if (loc->prefix_len > 4) {
-                fprintf(stderr, "[ERROR] Location prefix length %u exceeds 4 for location '%.2s' in zone '%s'\n",
-                        loc->prefix_len, loc->code, domain);
+            if (loc->prefix_bits > 32) {
+                fprintf(stderr, "[ERROR] Location prefix length /%u exceeds /32 for location '%.2s' in zone '%s'\n",
+                        loc->prefix_bits, loc->code, domain);
                 error_found = true;
             }
             for (int j = i + 1; j < arena.location_count; j++) {

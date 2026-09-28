@@ -513,6 +513,20 @@ static void test_dnstap_block(void) {
         CHECK(cfg.dnstap.enabled == true);
         CHECK(cfg.dnstap.queue_size == 4096);
         CHECK(cfg.dnstap.socket_path == NULL);
+        /* neither message type given: both queries and responses are logged */
+        CHECK(cfg.dnstap.log_auth_query == true);
+        CHECK(cfg.dnstap.log_auth_response == true);
+        free_server_config_fields(&cfg);
+    }
+    /* only one type given: the other one is off */
+    if (parse_ok("dnstap { socket \"/s\"; log-queries yes; };", &cfg)) {
+        CHECK(cfg.dnstap.log_auth_query == true);
+        CHECK(cfg.dnstap.log_auth_response == false);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("dnstap { socket \"/s\"; auth-response yes; };", &cfg)) {
+        CHECK(cfg.dnstap.log_auth_query == false);
+        CHECK(cfg.dnstap.log_auth_response == true);
         free_server_config_fields(&cfg);
     }
     /* a repeated property replaces (and frees) the earlier value */
@@ -982,6 +996,10 @@ static void test_structure_and_validation(void) {
                   "view \"v\" { match-clients { any; }; zone \"b.test\" { type master; file \"z\"; }; };");
     expect_reject("view first, then top-level zone", "view \"v\" { match-clients { any; }; };"
                   "zone \"b.test\" { type master; file \"z\"; };");
+    /* match-clients is an address match list only: a key entry would never match */
+    expect_reject("key in match-clients", "key \"k1\" { algorithm hmac-sha256; secret \"c2VjcmV0\"; };"
+                  "view \"v\" { match-clients { key \"k1\"; }; zone \"b.test\" { type master; file \"z\"; }; };");
+    expect_reject("key after an address in match-clients", "view \"v\" { match-clients { 192.0.2.0/24; key k1; }; };");
 
     if (parse_ok("acl \"trusted\" { 192.0.2.0/24; }; statistics-channels { inet 127.0.0.1; };"
                  "options { port 5300; }; " ZONE_MIN, &cfg)) {

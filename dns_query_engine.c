@@ -3503,6 +3503,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   // Pre-rendered wire-format response cache (Fast Path)
   // [策A] プレーンな標準EDNSクエリ（DO=0, MQTYPEなし, ECSなし等）のみ安全にキャッシュを適用し、
   // DNSSEC(DO=1)やMQTYPE、ECS等の動的機能は通常パスへフォールバックさせる。
+  // DNS Cookie (RFC 7873 / RFC 9018) は応答本体に影響しないのでキャッシュを使う。Server Cookie は
+  // 上で検証・生成済みで、ヒット時も assemble_edns_opt() がクエリごとに OPT へ付ける
+  // (body_max_len は Cookie 分を差し引き済み)。BADCOOKIE と不正な Cookie は通常パスで処理する。
   bool edns_safe_for_cache = (!edns.present) ||
       (edns.version == 0 &&
        !edns.dnssec_ok &&
@@ -3513,7 +3516,6 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
        !edns.has_keepalive_query &&
        !edns.has_karidns_ext &&
        edns.ede_count == 0 &&
-       !edns.has_cookie &&
        !edns.has_malformed_cookie);
 
   if (edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 &&

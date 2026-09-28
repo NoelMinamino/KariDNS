@@ -478,6 +478,8 @@ static void test_wire_cache_consistency(void) {
                                                 "mail.example.com.", 1,
                                                 "192.0.2.1", &comp_ctx, false, NULL, &snap, &cfg, &matched1);
         assert(len1_cached > 0);
+        assert(matched1 != NULL);
+        uint64_t hits_before = atomic_load(&matched1->observatory.wirecache_hits);
 
         // Client 1 query (uncached)
         response_cache_entry_t **saved_buckets = arena.response_cache.buckets;
@@ -501,6 +503,9 @@ static void test_wire_cache_consistency(void) {
                                                 "mail.example.com.", 1,
                                                 "192.0.2.2", &comp_ctx, false, NULL, &snap, &cfg, &matched3);
         assert(len2_cached > 0);
+        // A cookie query is served from the wire cache (the cookie itself is appended per query)
+        assert(matched3 == matched1);
+        assert(atomic_load(&matched3->observatory.wirecache_hits) == hits_before + 1);
 
         // Verify body portion (ANSWER section) is identical between Client 1 and Client 2
         // while the OPT / Cookie portion is independently generated

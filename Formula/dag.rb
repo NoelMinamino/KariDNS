@@ -3,7 +3,7 @@ class Dag < Formula
   homepage "https://github.com/NoelMinamino/KariDNS"
   url "https://github.com/NoelMinamino/KariDNS/archive/refs/tags/v0.0.1.tar.gz"
   sha256 "08cdae30c276bf2648ce78cd685b0b44f78780c98d575eef6cdd7eb19ac12232"
-  license "BSD-2-Clause"
+  license "MIT"
 
   depends_on "openssl@3"
   depends_on "zlib"

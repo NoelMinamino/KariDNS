@@ -10,6 +10,23 @@
 
 set -e
 
+# Comparison mode exit status: 1 when a mismatch was found, 0 otherwise.
+check_replay_rc() {
+    _name="$1"; _out="$2"; _rc="$3"
+    _mm=$(printf '%s\n' "$_out" | sed -n -e 's/.*"mismatched_queries": \([0-9]*\).*/\1/p' \
+                                      -e 's/.*Mismatched responses: \([0-9]*\).*/\1/p' | head -n 1)
+    if [ -z "$_mm" ]; then
+        echo "FAIL: $_name: no mismatch count in the report"
+        exit 1
+    fi
+    if [ "$_mm" -gt 0 ]; then _want=1; else _want=0; fi
+    if [ "$_rc" -ne "$_want" ]; then
+        echo "FAIL: $_name: exit status $_rc, expected $_want (mismatched=$_mm)"
+        exit 1
+    fi
+    echo "  PASS: $_name exit status $_rc (mismatched=$_mm)"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$BASE_DIR"
@@ -341,7 +358,9 @@ close($fh_diff);
 # ------------------------------------------------------------------------------
 echo "[+] Test 3: PCAP UDP Query-Response Pairing..."
 RES_JSON="$TMP_DIR/res_pcap_udp.json"
-./dag --replay "$TMP_DIR/udp_pairs.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON"
+RC_CR=0
+./dag --replay "$TMP_DIR/udp_pairs.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" || RC_CR=$?
+check_replay_rc "compare-recorded #1" "$(cat "$RES_JSON")" "$RC_CR"
 
 COMPARED=$(grep '"compared":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
 IDENTICAL=$(grep '"identical":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
@@ -358,7 +377,9 @@ echo "    [OK] PCAP UDP 2/2 pairs matched perfectly."
 # ------------------------------------------------------------------------------
 echo "[+] Test 4: PCAP TCP Stream Reassembly (Split Segments)..."
 RES_JSON="$TMP_DIR/res_tcp_split.json"
-./dag --replay "$TMP_DIR/tcp_split.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON"
+RC_CR=0
+./dag --replay "$TMP_DIR/tcp_split.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" || RC_CR=$?
+check_replay_rc "compare-recorded #2" "$(cat "$RES_JSON")" "$RC_CR"
 
 COMPARED=$(grep '"compared":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
 IDENTICAL=$(grep '"identical":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
@@ -375,7 +396,9 @@ echo "    [OK] PCAP TCP split reassembly succeeded (1/1 matched)."
 # ------------------------------------------------------------------------------
 echo "[+] Test 5: PCAP TCP Stream Reassembly (Out-Of-Order Segments)..."
 RES_JSON="$TMP_DIR/res_tcp_ooo.json"
-./dag --replay "$TMP_DIR/tcp_ooo.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON"
+RC_CR=0
+./dag --replay "$TMP_DIR/tcp_ooo.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" || RC_CR=$?
+check_replay_rc "compare-recorded #3" "$(cat "$RES_JSON")" "$RC_CR"
 
 COMPARED=$(grep '"compared":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
 IDENTICAL=$(grep '"identical":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
@@ -392,7 +415,9 @@ echo "    [OK] PCAP TCP out-of-order reassembly succeeded (1/1 matched)."
 # ------------------------------------------------------------------------------
 echo "[+] Test 5b: PCAP TCP Stream Reassembly (Post-Drain Duplicate Retransmission)..."
 RES_JSON="$TMP_DIR/res_tcp_dup.json"
-./dag --replay "$TMP_DIR/tcp_post_drain_dup.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON"
+RC_CR=0
+./dag --replay "$TMP_DIR/tcp_post_drain_dup.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" || RC_CR=$?
+check_replay_rc "compare-recorded #4" "$(cat "$RES_JSON")" "$RC_CR"
 
 COMPARED=$(grep '"compared":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
 IDENTICAL=$(grep '"identical":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
@@ -410,7 +435,9 @@ echo "    [OK] PCAP TCP post-drain duplicate properly ignored (2/2 matched)."
 echo "[+] Test 6: Missing Response in capture handling..."
 RES_JSON="$TMP_DIR/res_missing.json"
 STDERR_OUT="$TMP_DIR/missing.err"
-./dag --replay "$TMP_DIR/udp_missing.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" 2> "$STDERR_OUT"
+RC_CR=0
+./dag --replay "$TMP_DIR/udp_missing.pcap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" 2> "$STDERR_OUT" || RC_CR=$?
+check_replay_rc "compare-recorded #5" "$(cat "$RES_JSON")" "$RC_CR"
 
 COMPARED=$(grep '"compared":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
 IDENTICAL=$(grep '"identical":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
@@ -434,7 +461,9 @@ echo "[+] Test 1 & 2: dnstap capture & difference detection..."
 
 # Test 1: dnstap replay with recorded responses matching live responses
 RES_JSON="$TMP_DIR/res_dnstap1.json"
-./dag --replay "$TMP_DIR/traffic.dnstap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON"
+RC_CR=0
+./dag --replay "$TMP_DIR/traffic.dnstap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" || RC_CR=$?
+check_replay_rc "compare-recorded #6" "$(cat "$RES_JSON")" "$RC_CR"
 
 COMPARED=$(grep '"compared":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
 IDENTICAL=$(grep '"identical":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
@@ -448,7 +477,9 @@ echo "    [OK] dnstap 2/2 pairs matched perfectly."
 
 # Test 2: Difference detection (synthetic modified recorded response in traffic_diff.dnstap)
 RES_JSON="$TMP_DIR/res_dnstap2.json"
-./dag --replay "$TMP_DIR/traffic_diff.dnstap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON"
+RC_CR=0
+./dag --replay "$TMP_DIR/traffic_diff.dnstap" --server1 127.0.0.1:$PORT1 --compare-recorded --ignore-ttl --output json > "$RES_JSON" || RC_CR=$?
+check_replay_rc "compare-recorded #7" "$(cat "$RES_JSON")" "$RC_CR"
 
 COMPARED=$(grep '"compared":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')
 IDENTICAL=$(grep '"identical":' "$RES_JSON" | awk -F': ' '{print $2}' | tr -d ', ')

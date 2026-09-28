@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -111,6 +112,50 @@ char* extract_socket_from_config(const char* path) {
     return sock;
 }
 
+/* karictl.conf の algorithm を読む (引用符付き・無しの両方)。未指定なら NULL。
+ * secret/socket と同じく、ファイル中で最初に現れる "algorithm" の値を使う。 */
+char* extract_algorithm_from_config(const char* path) {
+    char *cfg = karictl_read_entire_file(path);
+    if (!cfg) return NULL;
+
+    char *alg = NULL;
+    char *p = strstr(cfg, "algorithm");
+    if (p) {
+        p += 9;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        bool quoted = (*p == '"');
+        if (quoted) p++;
+        size_t n = 0;
+        while (p[n] && n < 64 &&
+               (quoted ? p[n] != '"' : (p[n] != ';' && p[n] != ' ' && p[n] != '\t' && p[n] != '\n' && p[n] != '\r'))) {
+            n++;
+        }
+        if (n > 0 && n < 64) alg = strndup(p, n);
+    }
+    free(cfg);
+    return alg;
+}
+
+/* 制御チャネルの HMAC。karidns 側 (dns_wire.c の TSIG アルゴリズム表) と同じ名前を受け付ける。 */
+const EVP_MD *karictl_hmac_md(const char *alg) {
+    if (!alg) return EVP_sha256();
+    size_t len = strlen(alg);
+    if (len > 0 && alg[len - 1] == '.') len--;   // "hmac-sha256." のような FQDN 形式も許す
+    static const struct { const char *name; const EVP_MD *(*fn)(void); } tbl[] = {
+        { "hmac-md5.sig-alg.reg.int", EVP_md5 },
+        { "hmac-md5",    EVP_md5    },
+        { "hmac-sha1",   EVP_sha1   },
+        { "hmac-sha224", EVP_sha224 },
+        { "hmac-sha256", EVP_sha256 },
+        { "hmac-sha384", EVP_sha384 },
+        { "hmac-sha512", EVP_sha512 },
+    };
+    for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++) {
+        if (strlen(tbl[i].name) == len && strncasecmp(alg, tbl[i].name, len) == 0) return tbl[i].fn();
+    }
+    return NULL;
+}
+
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
 /* Coverage builds: the tests #include this file with "#define main karictl_main",
  * so the body below is named karictl_main here as well; llvm-cov then merges the
@@ -205,6 +250,18 @@ int main(int argc, char **argv) {
     explicit_bzero(secret_b64, b64_len);
     free(secret_b64);
 
+    /* karidns の control-channel { algorithm } と同じアルゴリズムを使う (省略時 hmac-sha256) */
+    char *cfg_alg = extract_algorithm_from_config(conf_path);
+    const EVP_MD *hmac_md = karictl_hmac_md(cfg_alg);
+    if (!hmac_md) {
+        fprintf(stderr, "Unsupported algorithm '%s' in %s (expected hmac-md5, hmac-sha1, hmac-sha224, "
+                        "hmac-sha256, hmac-sha384 or hmac-sha512)\n", cfg_alg, conf_path);
+        free(cfg_alg);
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
+        return 2;
+    }
+    free(cfg_alg);
+
     char *cfg_sock = extract_socket_from_config(conf_path);
     const char *target_sock = cli_sock_path ? cli_sock_path :
                               (cfg_sock ? cfg_sock : "/var/run/karidns/control.sock");
@@ -284,15 +341,20 @@ int main(int argc, char **argv) {
     if (nl) *nl = '\0';
 
     unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int md_len;
-    HMAC(EVP_sha256(), secret_decoded, secret_decoded_len, 
-         (unsigned char*)challenge, challenge_len, md, &md_len);
+    unsigned int md_len = 0;
+    if (!HMAC(hmac_md, secret_decoded, secret_decoded_len,
+              (unsigned char*)challenge, challenge_len, md, &md_len)) {
+        fprintf(stderr, "HMAC computation failed\n");
+        explicit_bzero(secret_decoded, sizeof(secret_decoded));
+        close(sock);
+        return 2;
+    }
     explicit_bzero(secret_decoded, sizeof(secret_decoded));
-    
+
     char auth_msg[256];
-    char expected[65];
+    char expected[2 * EVP_MAX_MD_SIZE + 1];
     for(unsigned int k=0; k<md_len; k++) snprintf(&expected[k*2], 3, "%02x", md[k]);
-    expected[64] = '\0';
+    expected[2 * md_len] = '\0';
     
     int mlen = snprintf(auth_msg, sizeof(auth_msg), "AUTH %s\n", expected);
     send(sock, auth_msg, mlen, 0);

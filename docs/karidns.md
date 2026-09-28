@@ -15,20 +15,22 @@ KARIDNS(8)                     KariDNS Manual                     KARIDNS(8)
 ## SYNOPSIS
 
 ```sh
-karidns [-f] [-p pid_file] [-c config_file | config_file] [-v | --version]
+karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c config_file | config_file]
 ```
 
 ---
 
 ## DESCRIPTION
 
-`karidns` is an authoritative DNS server designed for FreeBSD. It uses a two-process privilege separation architecture with FreeBSD `Capsicum` sandboxing, atomic RCU-based configuration/zone management, and pre-allocated memory arenas.
+`karidns` is an authoritative DNS server designed for FreeBSD. It uses a privilege-separated multi-process architecture with FreeBSD `Capsicum` sandboxing, atomic RCU-based configuration/zone management, and pre-allocated memory arenas.
 
 ### Architectural Structure
 
 1. **Privilege Separation & Capsicum Sandboxing**:
-   - **Frontend Process**: Manages privileged network socket binding (UDP/TCP port 53), drops root privileges (when started as root), and dispatches network traffic.
-   - **Backend Process**: Operates in FreeBSD Capsicum capability mode (`cap_enter(2)`). DNS packet parsing and response generation are performed without direct filesystem access or socket creation permissions. Configuration and zone files are accessed via pre-opened directory descriptors (`openat(2)` / `renameat(2)`).
+   - **Manager (Supervisor) Process**: The process started by the administrator. It parses the configuration, performs the startup checks, forks the other processes and supervises them: if any child exits, all children are stopped. `SIGHUP` is forwarded to the backend.
+   - **Frontend Router Processes**: Bind the privileged network sockets (UDP/TCP port 53) and dispatch network traffic to the backend workers. One router is started on hosts with up to 3 CPU cores, two on larger hosts.
+   - **Backend Process**: Operates in FreeBSD Capsicum capability mode (`cap_enter(2)`). DNS packet parsing and response generation are performed by the worker threads (one or two on hosts with up to 3 cores, otherwise the number of cores minus two) without direct filesystem access or socket creation permissions. Configuration and zone files are accessed via pre-opened directory descriptors (`openat(2)` / `renameat(2)`).
+   - **Connect Broker**: A small unprivileged helper that opens the outbound TCP connections the sandboxed backend cannot create itself (for example zone transfers of secondary zones from their primary).
 2. **Read-Copy-Update (RCU) Architecture**:
    - Zone data and configuration pointers are swapped atomically using C11 atomic operations (`memory_order_acquire` / `memory_order_release`), allowing worker threads to serve queries concurrently during zone reloads without locking.
 3. **Memory Arena Allocator (`zone_arena_t`)**:
@@ -42,13 +44,16 @@ karidns [-f] [-p pid_file] [-c config_file | config_file] [-v | --version]
 ## OPTIONS & ARGUMENTS
 
 `<config_file>`, `-c config_file`
-: Specify the path to the configuration file (e.g., `/usr/local/etc/karidns/karidns.conf`). This argument is required.
+: Path to the configuration file (e.g., `/usr/local/etc/karidns/karidns.conf`). This argument is required; there is no built-in default path. Any argument that is not one of the options below is taken as the configuration file.
 
 `-f`
-: Run in the foreground instead of daemonizing into the background. In foreground mode, PID file creation is disabled by default unless explicitly specified.
+: Run in the foreground instead of daemonizing into the background. In foreground mode, no PID file is created unless one is set explicitly (`-P`, `-p <path>` or `pid-file`).
 
-`-p pid_file`
-: Path to the PID lock file (overrides `options { pid-file "..."; }`; default: `/var/run/karidns/karidns.pid` when daemonized). Specify `"none"` to disable PID locking.
+`-p port`, `-p pid_file`
+: The meaning depends on the value. If the whole value is a decimal number, it is the **listen port** (1–65535; other numbers are an error) and overrides `options { port ...; }` (also on reload); for example `-p 10053`. Any other value is taken as the path of the PID lock file, like `-P`, with a warning that recommends `-P`.
+
+`-P pid_file`
+: Path to the PID lock file (overrides `options { pid-file "..."; }`; default: `/var/run/karidns/karidns.pid` when daemonized). Specify `none` to disable PID locking.
 
 `-v`, `--version`, `-V`
 : Print the version information and exit.
@@ -104,7 +109,7 @@ control-channel {
 
 ## CONFIGURATION OVERVIEW
 
-The configuration file format follows standard structured block syntax.
+The configuration file uses the `named.conf`-style block syntax. A complete reference of every statement follows in [CONFIGURATION REFERENCE](#configuration-reference).
 
 ```
 options {
@@ -157,6 +162,200 @@ zone "example.com" {
     notify-source "192.168.1.1";
 };
 ```
+
+---
+
+## CONFIGURATION REFERENCE
+
+### General syntax
+
+- Statements end with `;`, and blocks are written as `name { ... };` (the `;` after the closing brace is required).
+- Comments: `# ...`, `// ...` and `/* ... */`.
+- Values may be quoted (`"..."`) or bare words. A single token is limited to 4096 bytes (longer tokens are truncated with a warning). The configuration file (and each included file) may be at most 256 MiB.
+- `include "file";` may appear anywhere and inserts the file in place. Relative paths are resolved against the directory of the file that contains the `include`. Includes can be nested up to 16 levels deep; circular includes are rejected.
+- Boolean values accept `yes` / `true` and `no` / `false`. For the `rate-limit` and `dnstap` flags, `1` is accepted as true as well, and any other value means false.
+- Zone names are normalized to their fully qualified form (a trailing `.` is added), so `"example.com"` and `"example.com."` are the same zone. A class after the zone name (`zone "example.com" IN { ... };`) is **not** accepted.
+- Relative file paths (zone `file`, log `file`, `pid-file`, ...) are resolved against the working directory `karidns` was started from. Use absolute paths when starting from an rc script.
+- Unknown statements and options are skipped silently (up to the next `;` at the same block level), so a misspelled option has no effect. Use [`karicheck conf`](karicheck.md) to validate a configuration.
+- Settings that are fixed when the server starts (`port`, `bind-address`, `user`, `group`, `pid-file`, `udp-recvbuf-size`, `udp-sndbuf-size`, `tcp-window`, the `control-channel` socket path, `dnstap`, the `type program` zone processes) need a restart; a reload (`SIGHUP`, `karictl reload` / `reconfig`) applies everything else.
+
+### Top-level statements
+
+| Statement | Description |
+|---|---|
+| `options { ... };` | Server-wide options (below). |
+| `zone "<name>" { ... };` | A zone. Top-level zones and `view` blocks cannot be mixed in one configuration. |
+| `view "<name>" { ... };` | A view containing `match-clients` and `zone` blocks. |
+| `key "<name>" { ... };` | A TSIG key. |
+| `control-channel { ... };` | Enables the [`karictl(8)`](karictl.md) control socket. |
+| `logging { ... };` | Log channels and categories. |
+| `dnstap { ... };` | dnstap output (same block as inside `options`). |
+| `include "<file>";` | Includes another file. |
+
+Duplicate zones (in the same view or at top level), duplicate views and duplicate keys (names compared case-insensitively) are rejected.
+
+### `options { ... }`
+
+| Option | Default | Description |
+|---|---|---|
+| `port <n>;` | `53` | Listen port (UDP and TCP), 1–65535. An invalid value keeps the default. Overridden by `-p <port>`. |
+| `bind-address { <addr>; ... };` or `bind-address <addr>;` | all addresses (`0.0.0.0` and `::`) | Addresses to listen on (IPv4 and IPv6). |
+| `user "<name>";` | none | User to drop to after binding sockets. Required when started as root. |
+| `group "<name>";` | the user's primary group | Group to drop to. |
+| `pid-file "<path>";` | `/var/run/karidns/karidns.pid` when daemonized, none in foreground | PID lock file; `"none"` disables it. Overridden by `-P` / `-p <path>`. |
+| `udp-recvbuf-size <size>;` | `4M` | `SO_RCVBUF` of the UDP sockets. Accepts a `K`/`M`/`G` suffix; an invalid value keeps the default. The kernel caps it at `kern.ipc.maxsockbuf`. |
+| `udp-sndbuf-size <size>;` | `4M` | `SO_SNDBUF` of the UDP sockets (same syntax). |
+| `tcp-mss <n>;` | not set (OS default) | 536–65495. See [TRANSPORT TUNING](#transport-tuning-tcp-mss--window-udp-payload-size). |
+| `tcp-window <size>;` | not set (OS default) | 4K–64M, `K`/`M` suffix allowed. See TRANSPORT TUNING. |
+| `udp-bufsize <n>;` | `1232` | 512–4096. Maximum UDP response size and the payload size advertised in the response OPT. See TRANSPORT TUNING. |
+| `tcp-connection-reuse yes\|no;` | `no` | Keep TCP connections open for further queries (RFC 7766). |
+| `tcp-idle-timeout <ms>;` | `10000` | Idle timeout of TCP connections in **milliseconds** (0 means the default). |
+| `minimal-responses yes\|no;` | `no` | Do not add glue / additional-section records. |
+| `minimal-any yes\|no;` | `no` | RFC 8482: answer `QTYPE=ANY` with a synthesized `HINFO "RFC8482" ""` record instead of all RRsets. When the query has DO=1 and the name has RRSIG records, a single RRset is returned instead (RFC 8482 §4.2). |
+| `minimal-any-ttl <seconds>;` | `86400` | TTL of the synthesized RFC 8482 `HINFO` record. |
+| `additional-from-auth yes\|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Unknown values are treated as `yes` with a warning. Can be overridden per zone. |
+| `send-extended-errors yes\|no;` | `yes` | Add Extended DNS Errors (EDE, RFC 8914) to responses of EDNS queries. |
+| `serve-stale yes\|no;` | `yes` | When a secondary zone has expired (SOA EXPIRE passed since the last successful transfer), keep answering from the stale data. With `no` such queries get SERVFAIL with EDE 3. |
+| `nsid "<string>";` | not set | NSID (RFC 5001) value returned to queries that request it. |
+| `cookie-secret "<32 hex digits>";` | random per process | 128-bit SipHash-2-4 server cookie secret (RFC 7873 / RFC 9018). Up to 4 entries: the first creates cookies, all of them are accepted (secret rollover). Use the same secret on all servers of an anycast set. |
+| `cookie-algorithm siphash24;` | `siphash24` | The only supported algorithm (RFC 9018); any other value is an error. |
+| `rfc10029-mqtype yes\|no;` | `no` | Enables multiple QTYPEs in one query (RFC 10029). |
+| `max-mqtypes <n>;` | `4` | Maximum number of additional QTYPEs processed per query (0–16; `0` means the default 4). |
+| `ecs-enable yes\|no;` | `no` | Enables EDNS Client Subnet (RFC 7871) processing, used by `$ECS-SUBNET` steering. Global only. |
+| `ecs-trusted-resolvers { <addr/cidr>; ... };` | none | Resolvers whose ECS option is trusted. Can be overridden per zone. |
+| `ecs-tags { tag "<name>" { <cidr>; ... }; ... };` | none | ECS tag definitions used by `$ECS-SUBNET` (see [TAG BLOCKS](#ecs-tags--location-tags)). |
+| `location-tags { tag "<name>" { <cidr>; ... }; ... };` | none | Location tag definitions used by `$LOCATION`. |
+| `allow-program-zones yes\|no;` | `no` | Must be `yes` for `type program` zones to be loaded. |
+| `wire-cache-max-records <n>;` | `0` (no limit) | Zones with more records than this do not get the precomputed wire-format response cache. The cache is never built for tinydns zones or zones using location/ECS steering. |
+| `query-log-max-qps <n>;` | `5000` | Maximum number of query log lines per second, shared by all worker threads (`0` means 5000). Queries over the limit are not logged. |
+| `query-log-buffer-size <n>;` | `32768` | Entries in each worker's query log ring buffer; a power of two between 1024 and 1048576. When a ring is 80 % full, query logging is suspended to protect query processing. |
+| `rate-limit { ... };` | not set (no RRL) | Response Rate Limiting (below). |
+| `dnstap { ... };` | not set | dnstap output (below). |
+
+### `rate-limit { ... }` (in `options` or `zone`)
+
+A `rate-limit` block in a zone replaces the server-wide block for that zone. Rates are per client address and response class; `0` means no limit for that class.
+
+| Option | Default | Description |
+|---|---|---|
+| `responses-per-second <n>;` | `0` | Limit for positive (NOERROR with data) responses. |
+| `nodata-per-second <n>;` | value of `responses-per-second` | Limit for NODATA responses. |
+| `nxdomains-per-second <n>;` | `0` | Limit for NXDOMAIN responses. |
+| `errors-per-second <n>;` | `0` | Limit for error responses. |
+| `window <seconds>;` | `15` | Accounting window (maximum 3600). |
+| `slip <n>;` | `2` | Every *n*-th limited UDP response is sent truncated (TC=1) instead of being dropped; `0` drops all. |
+| `log-only yes\|no;` | `no` | Only log what would be limited. |
+| `early-drop yes\|no;` | `no` | For `type program` zones: drop UDP queries from clients whose budget is already exhausted before the query is passed to the program. |
+| `exempt-clients { <addr/cidr>; ... };` | none | Clients that are never limited. |
+
+Negative or non-numeric values are ignored with a warning; unknown keys are ignored with a warning.
+
+### `dnstap { ... }` (top level or in `options`)
+
+| Option | Default | Description |
+|---|---|---|
+| `socket "<path>";` (alias `socket-path`) | none | UNIX socket of the Frame Streams collector (e.g. `fstrm_capture`). The connection is made once at startup. |
+| `identity "<string>";` | none | dnstap `identity` field. |
+| `version "<string>";` | none | dnstap `version` field. |
+| `queue-size <n>;` (alias `queue_size`) | `4096` | Entries in each worker's dnstap ring buffer (values below 64 use the default; rounded up to a power of two). |
+| `require-connect yes\|no;` | `no` | Abort startup when the collector cannot be reached (otherwise dnstap is disabled with a warning). |
+| `log-queries yes\|no;` (alias `auth-query`) | see below | Emit `AUTH_QUERY` messages. |
+| `log-responses yes\|no;` (alias `auth-response`) | see below | Emit `AUTH_RESPONSE` messages. |
+
+When neither `log-queries` nor `log-responses` is given, both queries and responses are logged. When one of them is given, only the types set to `yes` are logged (the other one defaults to `no`). The message types are taken over on reload; the collector socket itself is connected only at startup.
+
+`karictl status` reports the number of truncated dnstap messages.
+
+### `ecs-tags` / `location-tags`
+
+```
+ecs-tags {
+    tag "eu-tier" { 198.51.100.0/24; 2001:db8:ee::/48; };
+    tag "us-tier" { 203.0.113.0/24; };
+};
+```
+
+The same syntax is used for `location-tags`. The blocks can be placed in `options` and in `zone`. For each zone, tags defined inside the zone file (`$ECS-SUBNET-TAG` / `$LOCATION-TAG`) take precedence, then the `zone` block, then `options`. Tags are checked in the order they are defined and the first tag with a matching CIDR wins. See the [Client Geolocation & Subnet Steering Guide](KariDNS_How_to_use_ECS_and_location.md).
+
+### `logging { ... }`
+
+```
+logging {
+    channel <name> {
+        file "<path>" [versions <n>] [size <n>[K|M|G]] [suffix timestamp];
+        print-time yes|no;
+        print-category yes|no;
+        print-severity yes|no;
+        max-qps <n>;
+    };
+    category queries   { <channel>; };
+    category responses { <channel>; };
+};
+```
+
+| Item | Description |
+|---|---|
+| `file` | Log file. With `size`, the file is rotated when it would exceed the size: with `versions <n>` the old files are kept as `<path>.0` … `<path>.<n-1>`, without `versions` the file is truncated. With `suffix timestamp`, the file is also rotated daily and renamed to `<path>.YYYYMMDD`. |
+| `print-time`, `print-category`, `print-severity` | Add the timestamp, category and severity to each line (default `no`). |
+| `max-qps` | Per-channel override of `query-log-max-qps` for the `queries` category. |
+| `category queries` | Query log. |
+| `category responses` | Response log. |
+
+Only the `queries` and `responses` categories exist; other categories are ignored with a warning. Each category uses one channel (the first name in the braces), and a category that names an undefined channel is an error. Other channel options (such as BIND's `severity`) are ignored. Operational messages go to syslog (facility `daemon`).
+
+### `key "<name>" { ... }`
+
+| Option | Description |
+|---|---|
+| `algorithm "<name>";` | `hmac-md5` (also `hmac-md5.sig-alg.reg.int`), `hmac-sha1`, `hmac-sha224`, `hmac-sha256`, `hmac-sha384`, `hmac-sha512`. MD5 and SHA-1 are accepted with a deprecation warning (RFC 8945). When omitted, `hmac-sha256` is used. |
+| `secret "<base64>";` | Shared secret. Invalid base64 is an error. |
+
+Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `tsig-key`. A zone that references an undefined key in `tsig-key` or `allow-transfer` is an error. [`karictl tsig-keygen`](karictl.md) prints a new key block.
+
+### `control-channel { ... }`
+
+| Option | Default | Description |
+|---|---|---|
+| `socket "<path>";` (alias `socket-path`) | `/var/run/karidns/control.sock` | UNIX socket for `karictl`. |
+| `secret "<base64>";` | none | Shared secret; must match `karictl.conf`. Authentication is an HMAC challenge-response. |
+| `algorithm "<name>";` | `hmac-sha256` | HMAC of the challenge-response: one of the TSIG algorithm names above. `karictl.conf` must name the same algorithm. |
+
+### `view "<name>" { ... }`
+
+| Item | Description |
+|---|---|
+| `match-clients { <acl>; ... };` | Clients that use this view, by source address only; a `key` entry is a configuration error. A view without `match-clients` matches every client. |
+| `zone "<name>" { ... };` | Zones of this view. The same zone name may appear in several views. |
+
+Views are checked in the order they are defined; the first match is used. A query from a client that matches no view is answered as if no zone matched (REFUSED). Without any `view` block, all top-level zones are placed in an implicit view that matches all clients.
+
+### Address match lists (ACLs)
+
+`allow-transfer`, `allow-update`, `match-clients` and `ecs-trusted-resolvers` take a list of entries evaluated in order; the first matching entry decides. An entry is an IPv4/IPv6 address, a CIDR prefix or `any`; a leading `!` (or a nested `! { ... };` block) negates it. A client that matches no entry is denied. In `allow-transfer` and `allow-update`, `key "<name>";` adds a TSIG key.
+
+### `zone "<name>" { ... }`
+
+| Option | Applies to | Description |
+|---|---|---|
+| `type <type>;` | all | `master` (alias `primary`, the default), `slave` (alias `secondary`), `forward`, or `program`. |
+| `file "<path>";` | master, slave | Zone file. For a secondary zone, the transferred zone is written there. Ignored (with a warning) for `forward` and `program` zones. |
+| `file-format bind\|tinydns;` | master | `bind` (default) or `tinydns` (djbdns `data` file). See TINYDNS ZONE FORMAT. |
+| `masters { <addr> [port <n>]; ... };` | slave, catalog | Primary servers. NOTIFY is accepted from any listed address; the refresh and transfer use the **first** entry. Port default 53. |
+| `tsig-key "<name>";` | slave, master | Key used to sign SOA/AXFR/IXFR requests to the primary. On a primary it is also accepted for incoming transfers. |
+| `allow-transfer { <acl>; key "<name>"; ... };` | master, slave | Who may transfer the zone (AXFR/IXFR over TCP). **Without `allow-transfer` and `tsig-key`, transfers are refused.** If both addresses and keys are listed, a request must match an address **and** be signed with one of the keys. At most 4 transfers per zone run at the same time. |
+| `also-notify { <addr> [port <n>]; ... };` | master | Additional servers that receive NOTIFY (RFC 1996) when the zone changes. NOTIFY is also sent to the addresses of the apex NS hosts, except the SOA MNAME host (RFC 1996 §3.2). |
+| `notify-source "<addr>";` | master | Source address of outgoing NOTIFY messages. |
+| `allow-update { <acl>; key "<name>"; ... };` | master | Enables Dynamic Update (RFC 2136) for matching clients or TSIG keys. Updates are kept in memory only. On a secondary zone, updates are rejected with NOTAUTH (a warning is printed at load time). |
+| `catalog-zone yes;` | master, slave | Marks the zone as a catalog zone (RFC 9432, schema version 2: `version.<zone> TXT "2"` is required). Member zones listed under `zones.<zone>` are served as secondary zones that transfer from the catalog zone's first `masters` entry. |
+| `rate-limit { ... };` | all | Per-zone RRL block (replaces the server-wide one). |
+| `ecs-tags { ... };`, `location-tags { ... };` | master, slave | Per-zone tag definitions. |
+| `ecs-trusted-resolvers { ... };` | master, slave | Per-zone trusted ECS resolvers. |
+| `additional-from-auth yes\|in-domain\|no;` | all | Per-zone override of the `options` value. |
+| `disable-auto-tc-flag yes\|no;` | program | See PROGRAM ZONE PLUGINS. Any other value is an error. |
+| `zone-tcp-mss`, `zone-tcp-window`, `zone-tcp-sndbuf`, `zone-udp-bufsize` | all | Per-zone transport settings; see TRANSPORT TUNING. |
+| `forwarders { <addr> [port <n>]; ... };` | forward | Upstream servers; see FORWARD ZONES. |
+| `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000). |
+| `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;` | program | See PROGRAM ZONE PLUGINS. |
 
 ---
 
@@ -251,9 +450,7 @@ MTU (this is the reason for the DNS Flag Day 2020 default); lower values push mo
 
 ## CONTROL CHANNEL & MANAGEMENT
 
-Runtime administration of `karidns` is managed over a local UNIX domain socket (`/var/run/karidns/control.sock`) authenticated via HMAC-SHA256 challenge-response using the [`karictl(8)`](karictl.md) utility.
-
----
+Runtime administration of `karidns` is managed over a local UNIX domain socket (default `/var/run/karidns/control.sock`, see `control-channel`) authenticated via an HMAC challenge-response (`control-channel { algorithm }`, default HMAC-SHA256) using the [`karictl(8)`](karictl.md) utility.
 
 ---
 
@@ -271,7 +468,8 @@ zone "anomaly.test." {
     program "/usr/local/bin/mock_server.pl";
     program-args { "--verbose"; };
     program-timeout 2000; # timeout in milliseconds (default: 2000)
-    program-user "nobody"; # optional privilege drop for plugin process
+    program-max-failures 5; # consecutive failures before the circuit breaker opens (default: 5)
+    program-user "nobody"; # optional privilege drop for plugin process (default: options { user })
     disable-auto-tc-flag no; # yes: send oversized UDP replies as-is (default: no)
 };
 ```
@@ -282,6 +480,7 @@ zone "anomaly.test." {
 > - **UDP Truncation (`disable-auto-tc-flag`)**: With the default `no`, a plugin reply larger than the UDP limit (EDNS UDP payload size, capped by the server's UDP buffer size; 512 without EDNS) is replaced by a TC=1 reply with an empty answer. With `yes`, KariDNS sends the plugin reply as-is (up to 65,535 bytes), so the plugin itself is responsible for setting TC=1 on UDP.
 > - **TCP & AXFR Semantics**: TCP queries (including `AXFR` / `IXFR`) sent to a program zone are forwarded directly to the plugin as a single query-response transaction. Multi-envelope streaming AXFR is not supported.
 > - **Security & Isolation**: Plugin child processes are spawned prior to Capsicum capability mode and drop privileges (`program-user`). All internal control channels, frontend IPC, and network sockets are strictly closed via `closefrom(3)` before executing the plugin.
+> - **Reload**: Plugin processes are started only at server startup. A program zone added by a reload returns SERVFAIL until the next restart, and changes to `program`, `program-args`, `program-user`, `program-timeout` or `program-max-failures` are logged but take effect only after a restart.
 >
 > For full architectural details, IPC wire specifications, and complete runnable examples in Perl, Python, C, Rust, and Go, see **[KariDNS: Complete Guide to 'type program' Zones](KariDNS_how_to_use_type_program_zone.md)**.
 
@@ -295,13 +494,13 @@ KariDNS supports forwarding queries for specific zones to designated upstream na
 zone "corp.example.com." {
     type forward;
     forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
-    forward-timeout 2000; # timeout in milliseconds per forwarder (default: 2000)
+    forward-timeout 2000; # total time budget in milliseconds for all forwarders (default: 2000)
 };
 ```
 
 > [!NOTE]
 > **Forward Zone Processing Semantics:**
-> - **Transparent Query Relaying**: KariDNS does not maintain zone resource records locally for forward zones. Incoming queries matching the zone are forwarded directly to the configured `forwarders` list in order.
+> - **Transparent Query Relaying**: KariDNS does not maintain zone resource records locally for forward zones. Incoming queries matching the zone are forwarded to the configured `forwarders` list in order, failing over to the next forwarder within the shared `forward-timeout` budget.
 > - **No Subprocess Overhead**: Unlike `type program` zones, forward zones do not spawn external processes and do not require global opt-in flags like `allow-program-zones`.
 > - **Immediate Reload Support**: Changes to `forwarders` or `forward-timeout` take effect immediately upon configuration reload (`SIGHUP` / `karictl reload`) without requiring a full server restart.
 > - **Unsupported Operations**: Dynamic Update (RFC 2136), Zone Transfer (`AXFR`/`IXFR`), and `NOTIFY` requests are not supported on forward zones and are rejected with `NOTIMP`.
@@ -348,7 +547,9 @@ correctly without duplicate records).
 >   during query resolution. KariDNS compiles `%<loc>:<prefix>` location
 >   lines and trailing `:loc` record fields into memory, performing bitwise
 >   longest-prefix matching against the querying client's source IPv4
->   address with zero heap allocation on the hot path.
+>   address with zero heap allocation on the hot path. As an extension,
+>   `<prefix>` may end in `/n` (`/0`–`/32`) to give the prefix length in
+>   bits, e.g. `%in:10.0.0.0/8`.
 
 ---
 
@@ -356,8 +557,8 @@ correctly without duplicate records).
 
 KariDNS provides high-performance, record-level split-horizon response steering across both BIND and tinydns zone formats:
 
-- **BIND Zone `$LOCATION` & `$LOCATION-TAG`**: Steers responses based on the querying client's immediate socket IP address (IPv4 and IPv6). Tags can be defined directly in zone files (`$LOCATION-TAG <tag> <cidrs>`) or in `karidns.conf` (`ecs-tags`).
-- **BIND Zone `$ECS-SUBNET` & `$ECS-SUBNET-TAG`**: Steers responses based on EDNS0 Client Subnet (ECS, RFC 7871) options supplied by trusted recursive resolvers (`ecs-trusted-resolvers`).
+- **BIND Zone `$LOCATION` & `$LOCATION-TAG`**: Steers responses based on the querying client's immediate socket IP address (IPv4 and IPv6). Tags can be defined directly in zone files (`$LOCATION-TAG <tag> <cidrs>`) or in `karidns.conf` (`location-tags`).
+- **BIND Zone `$ECS-SUBNET` & `$ECS-SUBNET-TAG`**: Steers responses based on EDNS0 Client Subnet (ECS, RFC 7871) options supplied by trusted recursive resolvers (`ecs-enable yes;` and `ecs-trusted-resolvers`). Tags can be defined in zone files (`$ECS-SUBNET-TAG`) or in `karidns.conf` (`ecs-tags`).
 - **tinydns `location` (`%`)**: Steers responses based on client IPv4 longest-prefix matching declared with `%<loc>:<prefix>` lines and trailing `:loc` record tags.
 - **KariDNS Extended AXFR (Option 65153)**: Replicates zone directives and tags across KariDNS primary and secondary servers, while providing a clean standard AXFR fallback (Plan B) for non-KariDNS clients.
 
@@ -368,30 +569,30 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 ## SIGNALS
 
 `SIGHUP`
-: Reloads the configuration file and all master/slave zone files gracefully using atomic RCU pointer swapping.
+: Same as `karictl reconfig`: re-reads the configuration file and swaps it in atomically (RCU). Zone files whose modification time has not changed since they were loaded are not re-read; use `karictl reload` to re-read all zone files.
 
 `SIGTERM`, `SIGINT`
-: Gracefully shuts down the server, completing in-flight transactions and closing sockets.
+: Sent to the manager process, stops all child processes (backend, frontend routers, connect broker), removes the PID file and exits.
 
 ---
 
 ## FILES
 
 `/usr/local/etc/karidns/karidns.conf`
-: Default primary configuration file.
+: Configuration file used by the FreeBSD `rc.d` script (`karidns_config`). The package installs `karidns.conf.sample` next to it.
 
 `/var/run/karidns/control.sock`
-: UNIX domain socket for control communication with `karictl`.
+: Default UNIX domain socket for control communication with `karictl`.
 
 `/var/run/karidns/karidns.pid`
-: Process ID file.
+: Default process ID file when daemonized.
 
 ---
 
 ## SEE ALSO
 
 - [`karictl(8)`](karictl.md) — KariDNS server management and control utility
-- [`karicheck(1)`](karicheck.md) — Zone file syntax and ZONEMD validation utility
+- [`karicheck(1)`](karicheck.md) — Configuration and zone file validation utility
 - [`dag(1)`](dag.md) — DNS anomaly generator and test client
 - [`KariDNS 'type program' Zone Guide`](KariDNS_how_to_use_type_program_zone.md) — Complete guide to external dynamic program zone plugins (IPC specs, Perl/Python/C/Rust/Go implementations)
 - [`KariDNS Client Geolocation & Subnet Steering Guide`](KariDNS_How_to_use_ECS_and_location.md) — Comprehensive guide for BIND $LOCATION, $ECS-SUBNET, tinydns location, and Extended AXFR
@@ -404,5 +605,5 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 Copyright (c) 2026 Noel Minamino. Made with AI Assistance(Gemini, Claude)
 
 ```text
-KariDNS                          August 2026                      KARIDNS(8)
+KariDNS                         September 2026                    KARIDNS(8)
 ```

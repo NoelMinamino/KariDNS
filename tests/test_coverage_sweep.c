@@ -1857,7 +1857,7 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
         for (int i = 0; i < rc2; i++) free(res[i]);
         free(res);
         tinydns_location_entry_t *locs = NULL; int lc = 0;
-        rb[2] = (uint8_t)(cut % 6);
+        rb[2] = (uint8_t)(cut * 3 % 40);
         (void)unpack_tinydns_loc_rdata(rb, cut, &locs, &lc);
         free(locs);
     }
@@ -1918,7 +1918,7 @@ static void test_ecs_cookie_rrl_dnstap_edges(void) {
     free(trp);
     za.bind_ecs_trusted_resolvers = NULL; za.bind_ecs_trusted_resolver_count = 0; za.bind_ecs_trusted_resolvers_parsed = NULL;
     /* tinydns client location */
-    tinydns_location_entry_t locs[3] = { { {'j','p'}, {192,0,2,0}, 3 }, { {'u','s'}, {10,0,0,0}, 1 }, { {'a','l'}, {0}, 0 } };
+    tinydns_location_entry_t locs[3] = { { {'j','p'}, {192,0,2,0}, 24 }, { {'u','s'}, {10,0,0,0}, 8 }, { {'a','l'}, {0}, 0 } };
     za.locations = locs; za.location_count = 3;
     for (size_t i = 0; i < NELEM(ips); i++) { char lo[2]; tinydns_resolve_client_location(&za, ips[i], lo); }
     char lo2[2]; tinydns_resolve_client_location(&za, "192.0.2.77", lo2); tinydns_resolve_client_location(NULL, "1.2.3.4", lo2);

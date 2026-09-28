@@ -166,8 +166,8 @@ typedef struct {
   char *socket_path;
   char *identity;
   char *version;
-  bool log_auth_query;   // auth-query yes; (デフォルト false)
-  bool log_auth_response;// auth-response yes; (デフォルト false)
+  bool log_auth_query;   // log-queries / auth-query yes; (両方省略時は true、片方だけ指定時は未指定側 false)
+  bool log_auth_response;// log-responses / auth-response yes; (同上)
   bool require_connect;  // require-connect yes; (デフォルト false)
   uint32_t queue_size;   // queue-size 4096; (既定 4096)
 } dnstap_config_t;

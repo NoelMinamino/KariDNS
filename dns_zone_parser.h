@@ -44,7 +44,7 @@ typedef struct parse_context_s {
 typedef struct {
     char code[2];
     uint8_t prefix[4];
-    uint8_t prefix_len; /* 0縲・ */
+    uint8_t prefix_bits; /* 0..32: CIDR prefix length in bits (prefix[] holds the masked network) */
 } tinydns_location_entry_t;
 
 typedef struct {

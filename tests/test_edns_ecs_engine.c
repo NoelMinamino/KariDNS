@@ -212,16 +212,22 @@ static void test_trusted_resolvers_unpack(void) {
 static void test_tinydns_loc_and_wrap(void) {
     printf("[TEST] EDNS/ECS: tinydns location unpack & record wrap...\n");
     // 1. unpack_tinydns_loc_rdata
-    // code[2], prefix_len, prefix[4]
-    uint8_t loc_data[7] = { 'j', 'p', 3, 192, 0, 2, 0 };
+    // Extended AXFR v2: code[2], prefix length in bits, network[4]
+    uint8_t loc_data[7] = { 'j', 'p', 24, 192, 0, 2, 77 };
     tinydns_location_entry_t *locs = NULL;
     int loc_count = 0;
-    bool ok = unpack_tinydns_loc_rdata(loc_data, 6, &locs, &loc_count);
+    bool ok = unpack_tinydns_loc_rdata(loc_data, 7, &locs, &loc_count);
     assert(ok == true);
     assert(loc_count == 1);
     assert(locs[0].code[0] == 'j' && locs[0].code[1] == 'p');
-    assert(locs[0].prefix_len == 3);
-    assert(locs[0].prefix[0] == 192 && locs[0].prefix[1] == 0 && locs[0].prefix[2] == 2);
+    assert(locs[0].prefix_bits == 24);
+    /* host bits beyond the prefix are cleared on receipt */
+    assert(locs[0].prefix[0] == 192 && locs[0].prefix[1] == 0 && locs[0].prefix[2] == 2 && locs[0].prefix[3] == 0);
+    /* the v1 layout (variable length) and prefix lengths above /32 are rejected */
+    assert(!unpack_tinydns_loc_rdata(loc_data, 6, &locs, &loc_count));
+    loc_data[2] = 33;
+    assert(!unpack_tinydns_loc_rdata(loc_data, 7, &locs, &loc_count));
+    assert(loc_count == 1);
     free(locs);
 
     // 2. wrap_tinydns_record
@@ -303,12 +309,13 @@ static void test_ecs_resolution(void) {
 
     // Test tinydns_resolve_client_location
     tinydns_location_entry_t loc_entries[2];
+    memset(loc_entries, 0, sizeof(loc_entries));
     loc_entries[0].code[0] = 'j'; loc_entries[0].code[1] = 'p';
-    loc_entries[0].prefix_len = 3;
+    loc_entries[0].prefix_bits = 24;
     loc_entries[0].prefix[0] = 192; loc_entries[0].prefix[1] = 0; loc_entries[0].prefix[2] = 2;
 
     loc_entries[1].code[0] = 'u'; loc_entries[1].code[1] = 's';
-    loc_entries[1].prefix_len = 0; // default /0
+    loc_entries[1].prefix_bits = 0; // default /0
 
     zone.locations = loc_entries;
     zone.location_count = 2;
@@ -319,6 +326,29 @@ static void test_ecs_resolution(void) {
 
     tinydns_resolve_client_location(&zone, "1.2.3.4", resolved_loc);
     assert(resolved_loc[0] == 'u' && resolved_loc[1] == 's');
+
+    /* bit-granular CIDR prefixes: longest match wins, ties go to the first definition */
+    tinydns_location_entry_t cidr_entries[4];
+    memset(cidr_entries, 0, sizeof(cidr_entries));
+    cidr_entries[0].code[0] = 'a'; cidr_entries[0].prefix_bits = 8;  cidr_entries[0].prefix[0] = 10;        /* 10/8 */
+    cidr_entries[1].code[0] = 'b'; cidr_entries[1].prefix_bits = 12; cidr_entries[1].prefix[0] = 10;
+    cidr_entries[1].prefix[1] = 16;                                                                      /* 10.16/12 */
+    cidr_entries[2].code[0] = 'c'; cidr_entries[2].prefix_bits = 12; cidr_entries[2].prefix[0] = 10;
+    cidr_entries[2].prefix[1] = 16;                                                                      /* duplicate */
+    cidr_entries[3].code[0] = 'd'; cidr_entries[3].prefix_bits = 32; cidr_entries[3].prefix[0] = 10;
+    cidr_entries[3].prefix[1] = 31; cidr_entries[3].prefix[2] = 0; cidr_entries[3].prefix[3] = 1;          /* host */
+    zone.locations = cidr_entries;
+    zone.location_count = 4;
+    tinydns_resolve_client_location(&zone, "10.20.1.1", resolved_loc);   /* in 10.16.0.0-10.31.255.255 */
+    assert(resolved_loc[0] == 'b');
+    tinydns_resolve_client_location(&zone, "10.31.0.1", resolved_loc);
+    assert(resolved_loc[0] == 'd');
+    tinydns_resolve_client_location(&zone, "10.32.0.1", resolved_loc);   /* outside /12 */
+    assert(resolved_loc[0] == 'a');
+    tinydns_resolve_client_location(&zone, "192.0.2.1", resolved_loc);   /* no match */
+    assert(resolved_loc[0] == 0 && resolved_loc[1] == 0);
+    tinydns_resolve_client_location(&zone, "2001:db8::1", resolved_loc); /* IPv6 never matches */
+    assert(resolved_loc[0] == 0);
 
     printf("  -> ECS & location resolution passed.\n");
 }

@@ -96,7 +96,9 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 #define DNS_TYPE_KARIDNS_ECS_TRUSTED    65407
 
 #define EDNS_OPTION_KARIDNS_EXT         65153
-#define KARIDNS_EXT_VERSION             1
+/* 2: TYPE 65405 (tinydns location) carries the prefix length in bits + 4-octet network.
+ * Peers with a different version fall back to a standard AXFR. */
+#define KARIDNS_EXT_VERSION             2
 
 // ECS / Location サブネットタグ構造体
 typedef struct {
@@ -309,6 +311,9 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
 
 // TSIG
 bool tsig_algorithm_is_supported(const char *alg);
+/* TSIG アルゴリズム名 (hmac-sha256 等) に対応する OpenSSL のダイジェスト。未対応なら NULL。
+ * (EVP_MD は struct evp_md_st の typedef。ヘッダに openssl を持ち込まないためタグ名で宣言する) */
+const struct evp_md_st *tsig_algorithm_evp_md(const char *alg);
 
 /* Capsicum(cap_enter)突入前に呼ぶこと。TSIGで使う全HMACアルゴリズムを一度実行し、
  * OpenSSLの遅延初期化(openssl.cnfのopen等)をcapability mode突入前に完了させる。

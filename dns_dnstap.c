@@ -4,6 +4,15 @@
 int g_dnstap_sock = -1;
 _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
 _Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
+_Atomic uint32_t g_dnstap_message_mask =
+    ATOMIC_VAR_INIT((1u << DNSTAP_MSG_AUTH_QUERY) | (1u << DNSTAP_MSG_AUTH_RESPONSE));
+
+void dnstap_set_message_types(bool log_auth_query, bool log_auth_response) {
+    uint32_t mask = 0;
+    if (log_auth_query) mask |= 1u << DNSTAP_MSG_AUTH_QUERY;
+    if (log_auth_response) mask |= 1u << DNSTAP_MSG_AUTH_RESPONSE;
+    atomic_store_explicit(&g_dnstap_message_mask, mask, memory_order_relaxed);
+}
 dnstap_aux_ring_t g_aux_dnstap_ring;
 
 static const char DNSTAP_CONTENT_TYPE[] = "protobuf:dnstap.Dnstap";
@@ -279,6 +288,8 @@ void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
                         const void *server_addr,
                         bool has_server_addr, uint8_t protocol) {
     if (!atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) return;
+    if (message_type >= 32 ||
+        !(atomic_load_explicit(&g_dnstap_message_mask, memory_order_relaxed) & (1u << message_type))) return;
 
     if (ctx) {
         // Fast path: Worker-local SPSC ring buffer (no locks, no CAS, zero contention)
