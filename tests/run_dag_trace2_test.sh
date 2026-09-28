@@ -1,7 +1,7 @@
 #!/bin/sh
 # dag +trace2 (フルリゾルバ相当の反復解決) の統合テスト
 #
-# KariDNS を 127.0.0.1〜127.0.0.5 の 5 プロセス (同じポート) で起動し、
+# KariDNS を 127.0.0.1〜127.0.0.4 の 4 プロセスと、異常応答用の mock (127.0.0.5) を同じポートで起動し、
 # ルートからの委任ツリーを組んで dag @127.0.0.1 -p PORT +trace2 で解決させる。
 # referral の glue にはポートを書けないため、すべての hop で -p のポートを使う。
 #
@@ -9,7 +9,8 @@
 #   127.0.0.2  "test." "alt."                    TLD
 #   127.0.0.3  "example.test." "other.alt." "lame.test." "sibling.test."
 #   127.0.0.4  "glueless.test."                  (NS ns2.other.alt. / glue なし)
-#   127.0.0.5  "unrelated.alt."                  lame 用 (他ゾーンには REFUSED)
+#   127.0.0.5  mock_trace2_server.pl            "tc.test." (UDP は TC=1) / "noedns.test." (EDNS に FORMERR)
+#                                               それ以外は REFUSED (lame 役)
 #
 # 127.0.0.2 以降の loopback alias がない場合、root なら追加し、そうでなければ SKIP する。
 
@@ -91,6 +92,13 @@ alllame      IN NS  ns.alllame
 ns.alllame   IN A   127.0.0.5
 loop1        IN NS  ns.loop2.alt.
 sibling      IN NS  ns.example.test.
+tc           IN NS  ns.tc
+ns.tc        IN A   127.0.0.5
+noedns       IN NS  ns.noedns
+ns.noedns    IN A   127.0.0.5
+deadonly     IN NS  ns.deadonly
+ns.deadonly  IN A   127.0.0.5
+noglue       IN NS  ns.noglue.test.
 EOF
 
 cat > "$WORK/alt.zone" <<EOF
@@ -115,6 +123,7 @@ loopa        IN CNAME loopb
 loopb        IN CNAME loopa
 deep.a.b     IN A   192.0.2.7
 dn           IN DNAME other.alt.
+xloop        IN CNAME yloop.other.alt.
 EOF
 
 cat > "$WORK/other.alt.zone" <<EOF
@@ -125,6 +134,7 @@ cat > "$WORK/other.alt.zone" <<EOF
 ns           IN A   127.0.0.3
 ns2          IN A   127.0.0.4
 x            IN A   192.0.2.9
+yloop        IN CNAME xloop.example.test.
 EOF
 
 cat > "$WORK/lame.test.zone" <<EOF
@@ -154,14 +164,6 @@ cat > "$WORK/glueless.test.zone" <<EOF
 www          IN A   192.0.2.2
 EOF
 
-cat > "$WORK/unrelated.alt.zone" <<EOF
-\$ORIGIN unrelated.alt.
-\$TTL 3600
-@            IN SOA ns hostmaster $SOA_TAIL
-@            IN NS  ns
-ns           IN A   127.0.0.5
-EOF
-
 # ---------------------------------------------------------------- servers
 # write_conf <ip> <zone>...
 write_conf() {
@@ -189,12 +191,13 @@ write_conf 127.0.0.1 .
 write_conf 127.0.0.2 test alt
 write_conf 127.0.0.3 example.test other.alt lame.test sibling.test
 write_conf 127.0.0.4 glueless.test
-write_conf 127.0.0.5 unrelated.alt
 
-for ip in $IPS; do
+for ip in 127.0.0.1 127.0.0.2 127.0.0.3 127.0.0.4; do
     "$BIN" -f -c "$WORK/karidns-$ip.conf" -P "$WORK/karidns-$ip.pid" > "$WORK/karidns-$ip.log" 2>&1 &
     PIDS="$PIDS $!"
 done
+perl "$DIR/mock_trace2_server.pl" --host 127.0.0.5 --port "$PORT" > "$WORK/karidns-127.0.0.5.log" 2>&1 &
+PIDS="$PIDS $!"
 
 # 起動待ち: 各サーバの SOA が引けるまで
 for ip in $IPS; do
@@ -292,6 +295,13 @@ run "NS dependency loop terminates" www.loop1.test A +trace2
 expect "couldn't get address for 'ns.loop2.alt': dependency loop on ns.loop2.alt (nameservers of loop2.alt)"     && expect "resolution failed: dependency loop on ns.loop2.alt (nameservers of loop1.test)" \
     && expect "resolution failed" && expect "trace2: SERVFAIL for www.loop1.test" && ok
 
+run "TC=1 over UDP falls back to TCP" www.tc.test A +trace2
+expect "^www.tc.test.*192.0.2.10" && expect "trace2: NOERROR for www.tc.test" && ok
+
+run "FORMERR to EDNS is retried without EDNS" www.noedns.test A +trace2 +edns
+expect "FORMERR from 127.0.0.5, retrying without EDNS" && expect "^www.noedns.test.*192.0.2.11" \
+    && expect "trace2: NOERROR for www.noedns.test" && ok
+
 run "query budget" www.glueless.test A +trace2 +trace2-maxqueries=3
 expect "query budget exhausted (3 queries)" && ok
 
@@ -324,6 +334,70 @@ NAME="+roothints file without @server"
 OUT="$WORK/out.txt"
 "$DAG_BIN" -p "$PORT" +nohexdump +noldnsz +time=2 www.example.test A +trace2 +roothints="$WORK/named.root" > "$OUT" 2>&1
 expect "(a.root-servers)" && expect "trace2: NOERROR for www.example.test" && ok
+
+run "timeout moves to the next server and fails when none answers" www.deadonly.test A +trace2 +time=1
+expect "connection to 127.0.0.5#$PORT(ns.deadonly.test) for deadonly.test failed; trying next server" \
+    && expect "resolution failed: all nameservers for deadonly.test failed" && expect ", 1 timeout," && ok
+
+run "in-domain NS without glue" www.noglue.test A +trace2
+expect "no glue for in-domain nameserver 'ns.noglue.test' of 'noglue.test'" && expect "resolution failed" && ok
+
+run "CNAME loop across zones is detected" xloop.example.test A +trace2
+expect "following alias xloop.example.test -> yloop.other.alt" \
+    && expect "resolution failed: CNAME loop at xloop.example.test" && ok
+
+run "qname minimisation falls back on NXDOMAIN" a.b.nx.example.test A +trace2 +qmin
+expect "qname minimisation: NXDOMAIN for nx.example.test/A, retrying with full name" \
+    && expect "trace2: NXDOMAIN for a.b.nx.example.test" && ok
+
+run "short output with TTL" www.example.test A +trace2 +short +ttlid
+expect "^3600 192.0.2.1$" && ok
+
+NAME="-6 with an IPv4-only root"
+"$DAG_BIN" -6 @127.0.0.1 -p "$PORT" +nohexdump +noldnsz www.example.test A +trace2 > "$OUT" 2>&1
+RC=$?
+expect "no usable root server address" && expect "priming failed" && [ "$RC" -eq 9 ] && ok
+
+NAME="-6 priming failure in YAML"
+"$DAG_BIN" -6 @127.0.0.1 -p "$PORT" +nohexdump +noldnsz www.example.test A +trace2 +yaml > "$OUT" 2>&1
+expect "type: DIG_ERROR" && ok
+
+NAME="unreachable IPv6 root hint"
+printf 'a.root-servers. ::1\n' > "$WORK/named6.root"
+"$DAG_BIN" -6 -p "$PORT" +nohexdump +noldnsz +time=1 www.example.test A +trace2 +roothints="$WORK/named6.root" > "$OUT" 2>&1
+expect "connection to ::1#$PORT(a.root-servers) for . failed" && expect "priming failed" && ok
+
+NAME="@server given as a host name is resolved iteratively"
+"$DAG_BIN" @a.root-servers -p "$PORT" +nohexdump +noldnsz +time=2 www.example.test A +trace2 +roothints="$WORK/named.root" > "$OUT" 2>&1
+expect "(a.root-servers)" && expect "trace2: NOERROR for www.example.test" && ok
+
+NAME="unreadable +roothints file"
+"$DAG_BIN" www.example.test A +trace2 +roothints="$WORK/does-not-exist" > "$OUT" 2>&1
+RC=$?
+expect "dag: +roothints: " && [ "$RC" -eq 1 ] && ok
+
+NAME="priming answer without glue uses the priming server itself"
+"$DAG_BIN" @127.0.0.5 -p "$PORT" +nohexdump +noldnsz +time=2 www.example.test A +trace2 > "$OUT" 2>&1
+expect "a.root-servers." && expect "lame server 127.0.0.5(127.0.0.5) for .: REFUSED" && expect "resolution failed" && ok
+
+NAME="priming to a non-root server fails"
+"$DAG_BIN" @127.0.0.3 -p "$PORT" +nohexdump +noldnsz +time=2 www.example.test A +trace2 > "$OUT" 2>&1
+RC=$?
+expect "priming query to 127.0.0.3 failed" && expect "priming failed" && [ "$RC" -eq 9 ] && ok
+
+NAME="+ldnsz trace URL has one entry per main-path hop"
+# glueless: プライミング / ルート / test. / glueless.test. の 4 hop。NS 名の再帰解決の 3 hop は含めない
+"$DAG_BIN" @127.0.0.1 -p "$PORT" +nohexdump +time=2 www.glueless.test A +trace2 +ldnsz > "$OUT" 2>&1
+if expect "https://ldns.jp/trace/#c="; then
+    hops=$(grep "https://ldns.jp/trace/#c=" "$OUT" | sed 's/.*#c=//' | tr ',' '\n' | grep -c '|UDP|')
+    if [ "$hops" -eq 4 ]; then ok; else echo "[FAIL] $NAME: expected 4 hops, got $hops"; FAIL=$((FAIL + 1)); fi
+fi
+
+NAME="batch file (-f) inherits +trace2"
+printf 'www.example.test A\nwww.glueless.test A\n' > "$WORK/batch.txt"
+"$DAG_BIN" @127.0.0.1 -p "$PORT" +nohexdump +noldnsz +time=2 +trace2 -f "$WORK/batch.txt" > "$OUT" 2>&1
+expect "trace2: NOERROR for www.example.test" && expect "trace2: NOERROR for www.glueless.test" \
+    && expect "\[sub\] ns2.other.alt" && ok
 
 NAME="+trace2 and +trace are exclusive"
 "$DAG_BIN" -p "$PORT" www.example.test +trace2 +trace > "$OUT" 2>&1

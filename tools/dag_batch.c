@@ -44,6 +44,8 @@ int execute_batch_spec(const query_spec_t *spec) {
                 init_query_spec(&local_spec);
                 deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
                 local_spec.dopt = spec->dopt;
+                local_spec.do_trace2 = spec->do_trace2;
+                local_spec.trace2 = spec->trace2;
                 if (spec->server_arg) local_spec.server_arg = spec->server_arg;
                 if (spec->port != 53) local_spec.port = spec->port;
                 prescan_always_global_options(line_argc, line_argv, &local_spec);
@@ -65,6 +67,8 @@ int execute_batch_spec(const query_spec_t *spec) {
                 init_query_spec(&local_spec);
                 deep_copy_query_opts(&local_spec.qo, &spec->qo);
                 local_spec.dopt = spec->dopt;
+                local_spec.do_trace2 = spec->do_trace2;
+                local_spec.trace2 = spec->trace2;
                 if (spec->server_arg) local_spec.server_arg = spec->server_arg;
                 if (spec->port != 53) local_spec.port = spec->port;
                 prescan_always_global_options(line_argc, line_argv, &local_spec);
@@ -80,6 +84,8 @@ int execute_batch_spec(const query_spec_t *spec) {
             init_query_spec(&local_spec);
             deep_copy_query_opts(&local_spec.qo, &spec->qo); // グローバル設定を継承
             local_spec.dopt = spec->dopt;
+            local_spec.do_trace2 = spec->do_trace2;
+            local_spec.trace2 = spec->trace2;
             if (spec->server_arg) local_spec.server_arg = spec->server_arg;
             if (spec->port != 53) local_spec.port = spec->port;
             prescan_always_global_options(line_argc, line_argv, &local_spec);

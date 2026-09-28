@@ -77,6 +77,9 @@ FUZZ_DAG_SRCS = tests/fuzz/fuzz_dag_response.c $(DAG_MOD_SRCS) dns_wire.c dns_ut
 FUZZ_TSIG_VERIFY_TARGET = tests/fuzz/fuzz_tsig_verify
 FUZZ_TSIG_VERIFY_SRCS = tests/fuzz/fuzz_tsig_verify.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
+FUZZ_DAG_ITER_TARGET = tests/fuzz/fuzz_dag_iter_classify
+FUZZ_DAG_ITER_SRCS = tests/fuzz/fuzz_dag_iter_classify.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
+
 FUZZ_DAG_HASH_TARGET = tests/fuzz/fuzz_dag_hash
 FUZZ_DAG_HASH_SRCS = tests/fuzz/fuzz_dag_hash.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
@@ -105,7 +108,7 @@ FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
 FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 .PHONY: all clean run fuzz fuzz_core fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
-	fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
+	fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
 	karicheck_matrix_test unit-tests unit-tests-asan unit-tests-portable unit-tests-portable-asan test test-all rfc_vectors_test cidr_test tinydns_test asan_test include_test config_directives_test wire_helpers_test zone_parser_paths_test tinydns_paths_test sig0_sign_test snapshot_rebuild_test dnssec_proofs_test qe_protocol_test dag_format_test dag_iter_test dag_reassembly_test hash_test vulnerability_test \
@@ -747,6 +750,7 @@ COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_dag_chunked_http $(COV_FUZZ_DIR)/fuzz_dag_
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_dag_axfr_stream $(COV_FUZZ_DIR)/fuzz_dag_cli_args
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_dag_batch_file $(COV_FUZZ_DIR)/fuzz_dag_replay_pcap_reader
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_dag_replay_diff $(COV_FUZZ_DIR)/fuzz_dag_tcp_reassembly
+COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_dag_iter_classify
 
 COV_FUZZ_OBJS  = -object=$(COV_FUZZ_DIR)/fuzz_dns_wire -object=$(COV_FUZZ_DIR)/fuzz_dns_server_core
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_query_engine -object=$(COV_FUZZ_DIR)/fuzz_xfr_packet -object=$(COV_FUZZ_DIR)/fuzz_dynamic_update
@@ -757,6 +761,7 @@ COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_dag_chunked_http -object=$(COV_FUZ
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_dag_axfr_stream -object=$(COV_FUZZ_DIR)/fuzz_dag_cli_args
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_dag_batch_file -object=$(COV_FUZZ_DIR)/fuzz_dag_replay_pcap_reader
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_dag_replay_diff -object=$(COV_FUZZ_DIR)/fuzz_dag_tcp_reassembly
+COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_dag_iter_classify
 
 $(COV_FUZZ_DIR)/fuzz_dns_wire: $(FUZZ_SRCS)
 	@mkdir -p $(COV_FUZZ_DIR)
@@ -797,6 +802,10 @@ $(COV_FUZZ_DIR)/fuzz_dag_response: $(FUZZ_DAG_SRCS)
 $(COV_FUZZ_DIR)/fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS)
 	@mkdir -p $(COV_FUZZ_DIR)
 	$(CC) $(COV_FUZZ_CFLAGS) -o $@ $(FUZZ_TSIG_VERIFY_SRCS) $(COV_FUZZ_LDFLAGS) -lcrypto
+
+$(COV_FUZZ_DIR)/fuzz_dag_iter_classify: $(FUZZ_DAG_ITER_SRCS)
+	@mkdir -p $(COV_FUZZ_DIR)
+	$(CC) $(COV_FUZZ_CFLAGS) -o $@ $(FUZZ_DAG_ITER_SRCS) $(COV_FUZZ_LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
 $(COV_FUZZ_DIR)/fuzz_dag_hash: $(FUZZ_DAG_HASH_SRCS)
 	@mkdir -p $(COV_FUZZ_DIR)
@@ -935,6 +944,9 @@ fuzz_dag: $(FUZZ_DAG_SRCS:.c=.fz.o)
 fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
+fuzz_dag_iter_classify: $(FUZZ_DAG_ITER_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_ITER_TARGET) $(FUZZ_DAG_ITER_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
+
 fuzz_dag_hash: $(FUZZ_DAG_HASH_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_HASH_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
@@ -962,7 +974,7 @@ fuzz_dag_replay_diff: $(FUZZ_DAG_REPLAY_DIFF_SRCS:.c=.fz.o)
 fuzz_dag_tcp_reassembly: $(FUZZ_DAG_TCP_REASSEMBLY_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
-fuzz_dag_all: fuzz_dag fuzz_dag_hash fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly
+fuzz_dag_all: fuzz_dag fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly
 
 fuzz_dag_test: fuzz_dag_all
 	@sh tests/run_fuzz_smoke_test.sh dag
@@ -981,7 +993,7 @@ clean-fuzz:
 	rm -f *.fz.o tests/fuzz/*.fz.o tools/*.fz.o
 	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_CONF_TARGET) $(FUZZ_TSIG_TARGET) $(FUZZ_DAG_TARGET) $(FUZZ_TSIG_VERIFY_TARGET)
 	rm -f $(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_CHUNKED_HTTP_TARGET) $(FUZZ_DAG_RDATA_YAML_TARGET) $(FUZZ_DAG_AXFR_STREAM_TARGET) $(FUZZ_DAG_CLI_ARGS_TARGET) $(FUZZ_DAG_BATCH_FILE_TARGET)
-	rm -f $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_TARGET)
+	rm -f $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_ITER_TARGET)
 
 ASAN_TARGET = karidns-asan
 ASAN_CFLAGS = -O1 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DSANITIZER_BUILD -g -fsanitize=address,undefined -fno-omit-frame-pointer -fPIE

@@ -155,6 +155,12 @@ static void test_name_helpers(void) {
     CHECK(strcmp(out, ".") == 0);
     dag_iter_name_suffix("a\\.b.example.", 2, out, sizeof(out));
     CHECK(strcmp(out, "a\\.b.example.") == 0);
+
+    const char *kinds[] = { "BAD", "ANSWER", "CNAME", "NXDOMAIN", "NODATA", "REFERRAL", "LAME", "SERVFAIL", "FORMERR" };
+    for (int k = IT_RESP_BAD; k <= IT_RESP_FORMERR; k++) {
+        CHECK(strcmp(dag_iter_kind_name((it_resp_kind_t)k), kinds[k]) == 0);
+    }
+    CHECK(strcmp(dag_iter_kind_name((it_resp_kind_t)99), "?") == 0);
 }
 
 static void test_classify_referral(void) {
@@ -366,6 +372,23 @@ static void test_roothints(void) {
     CHECK(roothints_parse_text("; only comments\n", rh, err, sizeof(err)) == -1);
     CHECK(roothints_parse_text("a.root.test. A\n", rh, err, sizeof(err)) == -1);
     CHECK(roothints_load_file("/nonexistent/named.root", rh, err, sizeof(err)) == -1);
+
+    /* ファイルからの読み込み: 正常系と 1MB 超の拒否 */
+    char path[] = "/tmp/test_dag_iter_rootsXXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        FILE *fp = fdopen(fd, "w");
+        fputs(named_root, fp);
+        fclose(fp);
+        CHECK(roothints_load_file(path, rh, err, sizeof(err)) == 2);
+        fp = fopen(path, "w");
+        for (int i = 0; i < 40000; i++) fputs("; padding line to exceed the one megabyte limit\n", fp);
+        fclose(fp);
+        CHECK(roothints_load_file(path, rh, err, sizeof(err)) == -1);
+        CHECK(strstr(err, "file too large") != NULL);
+        unlink(path);
+    }
     free(rh);
 }
 
