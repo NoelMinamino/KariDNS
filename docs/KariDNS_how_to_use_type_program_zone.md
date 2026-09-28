@@ -46,9 +46,9 @@ Unlike traditional CGI-like designs, KariDNS **does not fork or execute a new pr
    - The plugin runs as a persistent daemon process that blocks on STDIN and loops over incoming queries, eliminating per-query process instantiation overhead.
    - Plugins are not restarted by a reload: a program zone added by `karictl reload` / `reconfig` / `SIGHUP` returns `SERVFAIL` until KariDNS is restarted, and changes to the `program*` settings of an existing zone take effect only after a restart.
 
-2. **Serialized Access from the Worker Threads**
-   - A query for a `type program` zone is handled directly by the worker thread that received it: the thread writes the request to the plugin and waits for the reply.
-   - Access to each plugin's STDIN and STDOUT is serialized with a per-plugin mutex, ensuring request and response stream order integrity across concurrent worker threads. A plugin therefore handles one query at a time, and a slow plugin also delays the worker threads waiting for it.
+2. **Asynchronous I/O Pool with Serialized Plugin Access**
+   - The worker thread that receives a query for a `type program` (or `type forward`) zone does not wait for the plugin: it hands the query to KariDNS's asynchronous I/O pool (16 threads, queue of 4096 queries), and a pool thread writes the request to the plugin and waits for the reply. When the queue is full, the query is dropped.
+   - Access to each plugin's STDIN and STDOUT is serialized with a per-plugin mutex, ensuring request and response stream order integrity across concurrent pool threads. A plugin therefore handles one query at a time; a slow plugin ties up pool threads, not the query workers.
 
 3. **Fault Tolerance and Deadline Monitoring**
    - Each query is assigned a single deadline based on `program-timeout` (default: 2000 ms), shared by all reads and writes of that exchange. If the plugin does not respond within this deadline, KariDNS stops waiting and synthesizes a `SERVFAIL` response to the client.
