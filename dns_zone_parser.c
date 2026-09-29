@@ -146,8 +146,8 @@ bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
   return false;
 }
 
-static char *expand_domain_name(char *name, const char *origin,
-                                zone_arena_t *arena) {
+static char *expand_domain_name_raw(char *name, const char *origin,
+                                    zone_arena_t *arena) {
   if (!name)
     return name;
   size_t n_len = strlen(name);
@@ -208,6 +208,22 @@ static char *expand_domain_name(char *name, const char *origin,
   return fqdn;
 }
 
+/* origin を補った名前を、クエリ名・転送で受けた名前と同じ正規形 (dns_wire.h) にする (R-29)。
+ * RFC 1035 §5.1: \X と \DDD はそのオクテットを表す。"sp\032ace" と "c\(p" はそれぞれ
+ * "sp\032ace"、"c(p" に、"\065bc" は "Abc" になる。正規化できない名前 (不正なエスケープ、
+ * 空ラベル、長すぎる名前) はそのまま返し、validate_domain_name_length() がエラーにする。 */
+static char *expand_domain_name(char *name, const char *origin, zone_arena_t *arena) {
+  char *fqdn = expand_domain_name_raw(name, origin, arena);
+  if (!fqdn || strcmp(fqdn, "@") == 0) return fqdn;
+  char norm[DNS_NAME_TEXT_SIZE];
+  size_t n = dns_name_normalize(fqdn, norm, sizeof(norm));
+  if (n == (size_t)-1 || strcmp(norm, fqdn) == 0) return fqdn;
+  char *copy = (char *)arena_alloc(arena, n + 1);
+  if (!copy) return fqdn;
+  memcpy(copy, norm, n + 1);
+  return copy;
+}
+
 // RFC 1035 §3.1: 各ラベルは63オクテット以下、ドメイン名全体は255オクテット以下を検証
 static bool validate_domain_name_length(const char *fqdn, parse_error_t *err_out,
                                         const char *field_pos_in_buf, const char *buf) {
@@ -261,6 +277,17 @@ static bool validate_domain_name_length(const char *fqdn, parse_error_t *err_out
     if (total_wire_len > 255) {
         if (err_out) {
             err_out->error_message = "Domain name exceeds 255 octets total (RFC 1035 §3.1)";
+            if (buf && field_pos_in_buf) err_out->error_offset = (size_t)(field_pos_in_buf - buf);
+            err_out->token_length = strlen(fqdn);
+        }
+        return false;
+    }
+    /* 長さ以外の理由で正規形にできない名前 (RFC 1035 §5.1 の \DDD が 255 を超える、
+     * 末尾の '\'、空ラベル "a..b") も、ワイヤ形式に書けないのでロード時に弾く。 */
+    char norm[DNS_NAME_TEXT_SIZE];
+    if (strcmp(fqdn, "@") != 0 && dns_name_normalize(fqdn, norm, sizeof(norm)) == (size_t)-1) {
+        if (err_out) {
+            err_out->error_message = "Invalid domain name (bad escape or empty label, RFC 1035 §5.1)";
             if (buf && field_pos_in_buf) err_out->error_offset = (size_t)(field_pos_in_buf - buf);
             err_out->token_length = strlen(fqdn);
         }

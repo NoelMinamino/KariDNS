@@ -546,7 +546,7 @@ typedef struct {
   struct sockaddr_storage server_addr;
   socklen_t server_len;
   bool has_server_addr;
-  char qname[256];
+  char qname[DNS_NAME_TEXT_SIZE];
   uint16_t qtype;
   uint16_t qclass;
   bool has_edns;

@@ -634,8 +634,10 @@ void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
     if (c >= 0x21 && c <= 0x7E && c != '\\' && c != '"' && c != ';') {
       dst[di++] = (char)c;
     } else if (c == '\\') {
+      // qname は正規形 (dns_wire.h) で、エスケープ (\., \\, \DDD) 済み。二重にエスケープしない
       dst[di++] = '\\';
-      dst[di++] = '\\';
+      if (src[si + 1] != '\0') dst[di++] = src[++si];
+      else dst[di++] = '\\';
     } else if (c == '"') {
       dst[di++] = '\\';
       dst[di++] = '"';
@@ -1681,7 +1683,7 @@ worker_startup_success:;
             }
 
             // --- 高速ワンパス走査 ---
-            char qname[256] = "";
+            char qname[DNS_NAME_TEXT_SIZE] = "";
             uint16_t qtype = 0;
             uint16_t qclass = 1;
             size_t question_end = DNS_HEADER_SIZE;
@@ -2057,7 +2059,7 @@ process_tcp_client: ;
           EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
           kevent(kq, &ev_del, 1, NULL, 0, NULL);
 
-          char qname[256] = "";
+          char qname[DNS_NAME_TEXT_SIZE] = "";
           uint16_t qtype = 0;
           uint16_t qclass = 1;
           size_t question_end = DNS_HEADER_SIZE;
@@ -2225,8 +2227,7 @@ process_tcp_client: ;
                   memcpy(&args->server_addr, &ctx_tcp->server_addr, sizeof(ctx_tcp->server_addr));
                   args->server_len = ctx_tcp->server_len;
                   args->has_server_addr = ctx_tcp->has_server_addr;
-                  strncpy(args->qname, qname, 255);
-                  args->qname[255] = '\0';
+                  strlcpy(args->qname, qname, sizeof(args->qname));
                   args->qclass = qclass;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
@@ -2631,6 +2632,10 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
 
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
   if (!out_buf || out_size == 0) return arg;
+  /* karictl の引数も設定のゾーン名と同じ正規形 (dns_wire.h) にしてから比べる
+   * ("sp\032ace.test" と "c\(p.test" などのエスケープの書き方の違いを吸収する)。 */
+  char norm[DNS_NAME_TEXT_SIZE];
+  if (dns_name_normalize(arg, norm, sizeof(norm)) != (size_t)-1) arg = norm;
   snprintf(out_buf, out_size, "%s", arg);
   server_config_t *active = acquire_config_snapshot();
   if (!active) return out_buf;

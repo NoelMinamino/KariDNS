@@ -57,15 +57,18 @@ void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, cons
     }
 }
 
-static void normalize_domain_fqdn_local(const char *in, char *out, size_t out_cap) {
+/* 名前 (正規形) を絶対名にして out に入れる。入りきらなければ false (ゾーン名は 255 文字まで)。 */
+static bool normalize_domain_fqdn_local(const char *in, char *out, size_t out_cap) {
     size_t len = strlen(in);
-    if (len > 0 && in[len - 1] != '.' && len + 1 < out_cap) {
-        memcpy(out, in, len);
-        out[len] = '.';
-        out[len + 1] = '\0';
-    } else {
-        snprintf(out, out_cap, "%s", in);
+    bool add_dot = len > 0 && dns_name_len_no_root(in, len) == len;
+    if (len + (add_dot ? 1 : 0) + 1 > out_cap) {
+        if (out_cap > 0) out[0] = '\0';
+        return false;
     }
+    memcpy(out, in, len);
+    if (add_dot) out[len++] = '.';
+    out[len] = '\0';
+    return true;
 }
 
 STATIC_TEST void free_catalog_desired_list(catalog_member_id_t *list, int count) {
@@ -86,6 +89,7 @@ STATIC_TEST void free_catalog_desired_list(catalog_member_id_t *list, int count)
  * coo.<unique-N>.zones.<catalog>) are properties, not members. */
 static bool catalog_prefix_is_single_label(const char *name, size_t prefix_len) {
     if (prefix_len == 0) return false;
+    if (dns_char_is_escaped(name, prefix_len)) return false; /* 続く ".zones." の '.' がラベルの一部 */
     for (size_t i = 0; i < prefix_len; i++) {
         if (name[i] == '\\') { i++; continue; }  /* skip escaped character */
         if (name[i] == '.') return false;
@@ -152,7 +156,10 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                 if (arena->records[i].rdata_count > 0) {
                     char *target = arena->records[i].rdata[0];
                     char norm_target[256];
-                    normalize_domain_fqdn_local(target, norm_target, sizeof(norm_target));
+                    if (!normalize_domain_fqdn_local(target, norm_target, sizeof(norm_target))) {
+                        syslog(LOG_WARNING, "[Catalog] Zone '%s': member name too long. Skipping.", catalog_entry->domain);
+                        continue;
+                    }
                     
                     // Collision check with static config
                     zone_config_t *zcfg = find_zone_config_in_view(cfg, view_name, norm_target);

@@ -93,7 +93,7 @@ zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *doma
     // エントリの domain は常に末尾ドット付き (create_new_zone_entry)。ハッシュも同じ形で計算する
     char fqdn[256];
     size_t dlen = strlen(domain);
-    if (dlen > 0 && domain[dlen - 1] != '.' && dlen + 1 < sizeof(fqdn)) {
+    if (dlen > 0 && dns_name_len_no_root(domain, dlen) == dlen && dlen + 1 < sizeof(fqdn)) {
       memcpy(fqdn, domain, dlen);
       fqdn[dlen] = '.';
       fqdn[dlen + 1] = '\0';
@@ -171,6 +171,14 @@ zone_db_entry_t *snapshot_get_zone(zone_db_snapshot_t *snap, const char *domain)
   return NULL;
 }
 
+/* サフィックス検索のキー長: 末尾のエスケープされない '.' を全て除いた長さ
+ * (設定や呼び出し側の "example.com..." も "example.com" として扱ってきた挙動を保つ)。 */
+static size_t zone_key_len(const char *name) {
+  size_t len = strlen(name), bare;
+  while ((bare = dns_name_len_no_root(name, len)) != len) len = bare;
+  return len;
+}
+
 static zone_db_entry_t *view_suffix_hash_lookup(view_snapshot_t *view, const char *key, size_t key_len) {
   if (!view || !view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
     return NULL;
@@ -180,8 +188,7 @@ static zone_db_entry_t *view_suffix_hash_lookup(view_snapshot_t *view, const cha
   for (int i = view->suffix_hash_table[idx]; i != -1; i = view->suffix_chain_next[i]) {
     zone_db_entry_t *entry = view->entries[i];
     if (!entry) continue;
-    size_t z_len = strlen(entry->domain);
-    while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
+    size_t z_len = zone_key_len(entry->domain);
     if (z_len == key_len && strncasecmp(entry->domain, key, key_len) == 0) {
       return entry;
     }
@@ -194,26 +201,19 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
   if (!view->suffix_hash_table || !view->suffix_chain_next || view->suffix_hash_size == 0) {
     // Suffix hash table not built (e.g. manually constructed mock view in fuzzers/tests)
     // Fall back to linear scan
-    size_t q_len = strlen(qname);
-    while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
-
+    size_t q_len = zone_key_len(qname);
     zone_db_entry_t *best_entry = NULL;
     size_t longest_match_len = 0;
     for (size_t i = 0; i < view->zone_count; i++) {
       zone_db_entry_t *entry = view->entries[i];
       if (!entry) continue;
-      size_t z_len = strlen(entry->domain);
-      while (z_len > 0 && entry->domain[z_len - 1] == '.') z_len--;
-
-      bool match = false;
-      if (z_len == 0 && (strcmp(entry->domain, ".") == 0 || entry->domain[0] == '\0')) {
-        match = true;
-      } else if (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) {
-        match = true;
-      } else if (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
-                 strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0) {
-        match = true;
-      }
+      size_t z_len = zone_key_len(entry->domain);
+      // ラベル境界はエスケープされない '.' だけ (O-08)
+      bool match = z_len == 0 ||
+                   (q_len == z_len && strncasecmp(qname, entry->domain, z_len) == 0) ||
+                   (q_len > z_len && qname[q_len - z_len - 1] == '.' &&
+                    !dns_char_is_escaped(qname, q_len - z_len - 1) &&
+                    strncasecmp(qname + (q_len - z_len), entry->domain, z_len) == 0);
       if (match && (!best_entry || z_len > longest_match_len)) {
         longest_match_len = z_len;
         best_entry = entry;
@@ -222,17 +222,18 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
     return best_entry;
   }
 
-  size_t q_len = strlen(qname);
-  while (q_len > 0 && qname[q_len - 1] == '.') q_len--;
+  // O-08: ラベル境界はエスケープされない '.' だけ ("a\.example.test" は "example.test" の下ではない)。
+  // 名前は正規形 (dns_wire.h) なので、ゾーン名とは大文字小文字を無視した文字列比較でよい。
+  size_t q_len = zone_key_len(qname);
 
   const char *cursor = qname;
   size_t remaining = q_len;
   while (remaining > 0) {
     zone_db_entry_t *hit = view_suffix_hash_lookup(view, cursor, remaining);
     if (hit) return hit;
-    // 次のラベル境界まで進める（cursor内、remaining文字の範囲でドットを探す）
-    const char *dot = memchr(cursor, '.', remaining);
-    if (!dot) break;
+    // 次のラベル境界まで進める (末尾のルートの '.' は remaining の外)
+    const char *dot = strchr_unescaped(cursor, '.');
+    if (!dot || (size_t)(dot - cursor) >= remaining) break;
     remaining -= (size_t)(dot - cursor) + 1;
     cursor = dot + 1;
   }
@@ -247,7 +248,7 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
   atomic_init(&z->snapshot_refs, 1);
 
   size_t dlen = domain ? strlen(domain) : 0;
-  if (dlen > 0 && domain[dlen - 1] != '.' && dlen + 1 < sizeof(z->domain)) {
+  if (dlen > 0 && dns_name_len_no_root(domain, dlen) == dlen && dlen + 1 < sizeof(z->domain)) {
     memcpy(z->domain, domain, dlen);
     z->domain[dlen] = '.';
     z->domain[dlen + 1] = '\0';
@@ -458,22 +459,9 @@ void prelink_zone_additional_glue(zone_arena_t *current_zone,
   prelinked_glue_entry_t entries[MAX_PRELINK_TARGETS];
   int entry_count = 0;
 
-  size_t z_len = strlen(zone_domain);
-  while (z_len > 0 && zone_domain[z_len - 1] == '.') z_len--;
-
   for (int t = 0; t < raw_target_count; t++) {
     const char *tgt = raw_targets[t];
-    size_t t_len = strlen(tgt);
-    while (t_len > 0 && tgt[t_len - 1] == '.') t_len--;
-
-    bool in_domain = false;
-    if (t_len >= z_len) {
-      if (strncasecmp(tgt + (t_len - z_len), zone_domain, z_len) == 0) {
-        if (t_len == z_len || tgt[t_len - z_len - 1] == '.') {
-          in_domain = true;
-        }
-      }
-    }
+    bool in_domain = domain_name_is_at_or_below(tgt, zone_domain);
 
     if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !in_domain) {
       continue;
@@ -487,15 +475,8 @@ void prelink_zone_additional_glue(zone_arena_t *current_zone,
       uint32_t hashes[2];
       int h_count = 1;
       hashes[0] = calc_fnv1a_str(tgt);
-      char alt_tgt[256];
-      size_t raw_len = strlen(tgt);
-      if (raw_len > 0 && tgt[raw_len - 1] == '.') {
-        snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), tgt);
-        hashes[1] = calc_fnv1a_str(alt_tgt);
-        h_count = 2;
-      } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
-        snprintf(alt_tgt, sizeof(alt_tgt), "%s.", tgt);
-        hashes[1] = calc_fnv1a_str(alt_tgt);
+      if (tgt[0] != '\0') {
+        hashes[1] = calc_fnv1a_other_root_form(tgt);
         h_count = 2;
       }
 
@@ -527,15 +508,8 @@ void prelink_zone_additional_glue(zone_arena_t *current_zone,
           uint32_t hashes[2];
           int h_count = 1;
           hashes[0] = calc_fnv1a_str(tgt);
-          char alt_tgt[256];
-          size_t raw_len = strlen(tgt);
-          if (raw_len > 0 && tgt[raw_len - 1] == '.') {
-            snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), tgt);
-            hashes[1] = calc_fnv1a_str(alt_tgt);
-            h_count = 2;
-          } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
-            snprintf(alt_tgt, sizeof(alt_tgt), "%s.", tgt);
-            hashes[1] = calc_fnv1a_str(alt_tgt);
+          if (tgt[0] != '\0') {
+            hashes[1] = calc_fnv1a_other_root_form(tgt);
             h_count = 2;
           }
           for (int h = 0; h < h_count; h++) {
@@ -834,7 +808,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   }
   if (!has_soa) {
       size_t elen = strlen(entry->domain);
-      if (elen > 0 && entry->domain[elen - 1] != '.' && elen + 2 < 256) {
+      if (elen > 0 && dns_name_len_no_root(entry->domain, elen) == elen && elen + 2 < 256) {
           char dot_domain[256];
           memcpy(dot_domain, entry->domain, elen);
           dot_domain[elen] = '.';
@@ -1745,8 +1719,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         if (vs->suffix_hash_table && vs->suffix_chain_next) {
             for (size_t i = 0; i < vs->zone_count; i++) {
                 if (!vs->entries[i]) continue;
-                size_t z_len = strlen(vs->entries[i]->domain);
-                while (z_len > 0 && vs->entries[i]->domain[z_len - 1] == '.') z_len--;
+                size_t z_len = zone_key_len(vs->entries[i]->domain);
                 uint32_t hash = calc_fnv1a_strn(vs->entries[i]->domain, z_len);
                 size_t idx = hash & (vs->suffix_hash_size - 1);
                 vs->suffix_chain_next[i] = vs->suffix_hash_table[idx];

@@ -348,8 +348,28 @@ uint16_t compute_dnskey_tag(const uint8_t *rdata, size_t rdlen);
 uint16_t compute_sig0_keytag(const sig0_key_t *key);
 int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_key_t *key);
 
+// ============================================================================
+// 名前の内部表現 (サーバー・karicheck 共通の正規テキスト形式)
+//   ラベル中のオクテット '.' と '\' は "\." と "\\"、0x00-0x20 と 0x7F-0xFF は "\DDD"、
+//   それ以外はそのまま。大文字小文字は保持し、絶対名は末尾にエスケープされない '.'、
+//   ルートは "."。RFC 4343 §2.1 のエスケープ規則。この形では、DNS 名としての一致
+//   (RFC 4343 §2: オクテット比較、ASCII 英字のみ大文字小文字を区別しない) が
+//   文字列の strcasecmp の一致と同じになる (英字は必ずそのまま書かれるため)。
+//   ゾーンパーサ、tinydns ローダー、クエリ名、XFR/UPDATE の受信名は全てこの形で作る。
+// ============================================================================
+// 255 オクテットの名前を全て \DDD で書いても収まる大きさ (RFC 1035 §2.3.4)
+#define DNS_NAME_TEXT_SIZE 1025
+// 1 ラベル (len オクテット) を正規形で out に書く。書いた文字数、入りきらなければ (size_t)-1。NUL は付けない。
+size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap);
+// 表示形式の名前 (\X, \DDD を含んでよい) を正規形にする。末尾ドットの有無は入力に従う。
+// 戻り値は strlen(out)。不正なエスケープ、空ラベル、63 オクテット超のラベル、
+// 255 オクテット超の名前 (RFC 1035 §2.3.4)、バッファ不足なら (size_t)-1。
+size_t dns_name_normalize(const char *in, char *out, size_t cap);
+
 int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size);
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);
+// downcase=true なら RFC 4034 §6.2 の正規ワイヤ形式 (英字を小文字化)
+long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
 uint32_t parse_ttl_value(const char *ttl_str);

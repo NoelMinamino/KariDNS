@@ -7,6 +7,7 @@
 #include <stdatomic.h>
 #include <sys/types.h>
 #include "dns_wire.h"
+#include "dns_utils.h"
 
 typedef struct {
     const char *error_message;
@@ -142,6 +143,14 @@ static inline uint32_t calc_fnv1a_continue(uint32_t hash, const char *str) {
         hash *= 16777619u;
     }
     return hash;
+}
+/* name の末尾ドットを付け外しした形のハッシュ (レコード名と参照先の名前で末尾ドットの有無が
+ * 違っても同じバケットを引くため)。末尾の '.' がエスケープされたもの ("a\.") はラベルの一部。
+ * 一時バッファを使わない。 */
+static inline uint32_t calc_fnv1a_other_root_form(const char *name) {
+    size_t len = strlen(name);
+    size_t bare = dns_name_len_no_root(name, len);
+    return (bare != len) ? calc_fnv1a_strn(name, bare) : calc_fnv1a_continue(calc_fnv1a_str(name), ".");
 }
 int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);

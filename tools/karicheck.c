@@ -332,13 +332,8 @@ KARIDNS_TOOL_FN bool verify_zonemd(const char *domain, zone_arena_t *arena) {
         if (r->type_code == 46 && strcasecmp(r->name, domain) == 0 &&
             r->rdata_count > 0 && get_type_code(r->rdata[0]) == 63) continue;
 
-        size_t name_len = strlen(r->name);
-        size_t domain_len = strlen(domain);
-        bool in_bailiwick =
-            (name_len == domain_len && strcasecmp(r->name, domain) == 0) ||
-            (name_len > domain_len &&
-             strcasecmp(r->name + (name_len - domain_len), domain) == 0 &&
-             r->name[name_len - domain_len - 1] == '.');
+        /* ラベル境界はエスケープされない '.' だけ ("a\.example.com." は "example.com." の下ではない) */
+        bool in_bailiwick = domain_name_is_at_or_below(r->name, domain);
         if (!in_bailiwick) {
             fprintf(stderr, "[WARNING] Zone '%s': out-of-zone record '%s' excluded from ZONEMD digest calculation (RFC 8976 SIMPLE scheme)\n", domain, r->name);
             continue;
@@ -430,7 +425,7 @@ KARIDNS_TOOL_FN bool is_cname(zone_arena_t *arena, const char *name) {
 
 KARIDNS_TOOL_FN void normalize_domain_fqdn(const char *in, char *out, size_t out_cap) {
     size_t len = strlen(in);
-    if (len > 0 && in[len - 1] != '.' && len + 1 < out_cap) {
+    if (len > 0 && dns_name_len_no_root(in, len) == len && len + 1 < out_cap) {
         memcpy(out, in, len);
         out[len] = '.';
         out[len + 1] = '\0';
@@ -439,17 +434,11 @@ KARIDNS_TOOL_FN void normalize_domain_fqdn(const char *in, char *out, size_t out
     }
 }
 
+/* 以下 3 つは名前 (ゾーンパーサが作る正規形) のラベル単位の包含判定。ラベル境界はエスケープ
+ * されない '.' だけ (R-29 / O-08 と同じ規則。domain_name_is_at_or_below() を使う)。 */
 KARIDNS_TOOL_FN bool is_in_bailiwick(const char *name, const char *domain) {
     if (!name || !domain) return false;
-    size_t nlen = strlen(name);
-    size_t dlen = strlen(domain);
-    if (nlen == dlen) {
-        return strcasecmp(name, domain) == 0;
-    }
-    if (nlen > dlen && name[nlen - dlen - 1] == '.') {
-        return strcasecmp(name + nlen - dlen, domain) == 0;
-    }
-    return false;
+    return domain_name_is_at_or_below(name, domain);
 }
 
 KARIDNS_TOOL_FN bool validate_cidr_syntax(const char *cidr) {
@@ -479,21 +468,12 @@ KARIDNS_TOOL_FN bool validate_cidr_syntax(const char *cidr) {
 
 KARIDNS_TOOL_FN bool is_subdomain_of(const char *name, const char *parent) {
     if (!name || !parent) return false;
-    size_t nlen = strlen(name);
-    size_t plen = strlen(parent);
-    if (nlen == plen) return domain_names_match_ci(name, parent);
-    if (nlen < plen + 2) return false;
-    if (strcasecmp(name + (nlen - plen), parent) != 0) return false;
-    return (name[nlen - plen - 1] == '.');
+    return domain_name_is_at_or_below(name, parent);
 }
 
 KARIDNS_TOOL_FN bool is_strict_subdomain_of(const char *name, const char *parent) {
     if (!name || !parent) return false;
-    size_t nlen = strlen(name);
-    size_t plen = strlen(parent);
-    if (nlen <= plen + 1) return false;
-    if (strcasecmp(name + (nlen - plen), parent) != 0) return false;
-    return (name[nlen - plen - 1] == '.');
+    return domain_name_is_at_or_below(name, parent) && !domain_names_match_ci(name, parent);
 }
 
 KARIDNS_TOOL_FN void lint_glue_consistency(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {

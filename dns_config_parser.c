@@ -1273,15 +1273,26 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     if (ctx) ctx->error_occurred = true;
     return -1;
   }
-  size_t dl = strlen(zone->domain);
-  if (dl > 0 && zone->domain[dl - 1] != '.') {
-    char *norm = malloc(dl + 2);
-    if (norm) {
-      memcpy(norm, zone->domain, dl);
-      norm[dl] = '.';
-      norm[dl + 1] = '\0';
+  /* ゾーン名はゾーンデータ・クエリ名と同じ正規形 (dns_wire.h) の絶対名にする (R-29)。
+   * 正規形が 255 文字を超える名前はゾーン名として扱わない (ゾーンのエントリは 256 バイト)。 */
+  char norm[DNS_NAME_TEXT_SIZE];
+  size_t nl = dns_name_normalize(zone->domain, norm, sizeof(norm) - 1);
+  if (nl != (size_t)-1 && (nl == 0 || dns_name_len_no_root(norm, nl) == nl)) {
+    norm[nl++] = '.'; // 相対名 (末尾ドットなし) を絶対名に。"" はルート
+    norm[nl] = '\0';
+  }
+  if (nl == (size_t)-1 || nl > 255) {
+    syslog(LOG_ERR, "[Config] invalid zone name '%s' (bad escape, empty label, or name too long)", zone->domain);
+    fprintf(stderr, "[ERROR] invalid zone name '%s' (bad escape, empty label, or name too long)\n", zone->domain);
+    free_zone_config(zone);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  if (strcmp(norm, zone->domain) != 0) {
+    char *copy = strdup(norm);
+    if (copy) {
       free(zone->domain);
-      zone->domain = norm;
+      zone->domain = copy;
     }
   }
   tok = get_next_token(ctx);

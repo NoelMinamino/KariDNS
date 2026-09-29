@@ -43,6 +43,224 @@ static int g_checks = 0, g_failed = 0;
     if (!a_ || strcmp(a_, e_) != 0) { g_failed++; \
         printf("  [FAIL] %s:%d: %s == \"%s\" (got \"%s\")\n", __FILE__, __LINE__, #actual, e_, a_ ? a_ : "(null)"); } } while (0)
 
+/* ------------------------------------------------------------------ canonical name form (R-29, R-23) */
+/* Every name producer (zone parser, tinydns loader, query parser, XFR/UPDATE decoders) must emit the one
+ * text form documented in dns_wire.h: '.' and '\' as "\." and "\\", octets 0x00-0x20 / 0x7F-0xFF as "\DDD"
+ * (RFC 4343 §2.1), everything else literal. Expected strings below are written from that rule by hand. */
+static const dns_record_t *find_rec(const zone_arena_t *a, const char *name, uint16_t type) {
+    for (size_t i = 0; i < a->count; i++)
+        if (a->records[i].type_code == type && a->records[i].name && strcmp(a->records[i].name, name) == 0)
+            return &a->records[i];
+    return NULL;
+}
+
+static void test_name_label_to_text(void) {
+    printf("[TEST] dns_label_to_text: RFC 4343 §2.1 escaping of one label...\n");
+    const uint8_t label[] = { 'a', '.', 'b', '\\', ' ', 0x00, 0xFF, '~', '!', '(', 'Z' };
+    char out[64];
+    size_t n = dns_label_to_text(label, sizeof(label), out, sizeof(out));
+    CHECK(n != (size_t)-1);
+    if (n != (size_t)-1) { out[n] = '\0'; CHECK_STR(out, "a\\.b\\\\\\032\\000\\255~!(Z"); }
+    CHECK(dns_label_to_text(label, sizeof(label), out, 5) == (size_t)-1);          /* does not fit */
+    CHECK(dns_label_to_text((const uint8_t *)"abc", 3, out, 3) == 3);               /* exact fit, no NUL */
+}
+
+static void test_name_normalize(void) {
+    printf("[TEST] dns_name_normalize: one text form for every spelling (RFC 1035 §5.1)...\n");
+    static const struct { const char *in, *out; } ok[] = {
+        { "sp\\032ace.esc.test.", "sp\\032ace.esc.test." },
+        { "c\\(p.esc.test.", "c(p.esc.test." },              /* \X of a printable character: X itself */
+        { "\\065bc.test", "Abc.test" },                      /* \DDD of a letter; relative stays relative */
+        { "a\\046b.test.", "a\\.b.test." },                  /* \046 is '.' inside the label */
+        { "a\\092b.", "a\\\\b." },                           /* \092 is '\' */
+        { "\\255\\128.", "\\255\\128." },
+        { "Donald\\032E\\.\\032Eastlake\\0323rd.example.", "Donald\\032E\\.\\032Eastlake\\0323rd.example." }, /* RFC 4343 §2.2 */
+        { "a\\000\\\\\\255z.example.", "a\\000\\\\\\255z.example." },                                       /* RFC 4343 §2.2 */
+        { ".", "." },
+        { "", "" },
+    };
+    char out[DNS_NAME_TEXT_SIZE];
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        size_t n = dns_name_normalize(ok[i].in, out, sizeof(out));
+        CHECK(n != (size_t)-1);
+        if (n != (size_t)-1) { CHECK_STR(out, ok[i].out); CHECK(n == strlen(ok[i].out)); }
+    }
+    static const char *bad[] = { "a..b.", ".a.", "a\\256.", "a\\", "..",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test." /* 64-octet label */ };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) CHECK(dns_name_normalize(bad[i], out, sizeof(out)) == (size_t)-1);
+    /* RFC 1035 §2.3.4: 255 octets in wire form. 4 labels of 62 = 4*63 + 1 = 253; "c." makes 255 (fits),
+     * a second "c." makes 257 (does not). */
+    char name[400] = "";
+    for (int l = 0; l < 4; l++) { strcat(name, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); strcat(name, "."); }
+    CHECK(dns_name_normalize(name, out, sizeof(out)) == strlen(name));
+    strcat(name, "c.");
+    CHECK(dns_name_normalize(name, out, sizeof(out)) == strlen(name));
+    strcat(name, "c.");
+    CHECK(dns_name_normalize(name, out, sizeof(out)) == (size_t)-1);
+    /* all-escape name of 250 content octets: 1000 characters of \DDD plus 4 dots fit in DNS_NAME_TEXT_SIZE */
+    char big[DNS_NAME_TEXT_SIZE + 16] = "";
+    for (int l = 0; l < 4; l++) {
+        for (int k = 0; k < (l < 3 ? 63 : 61); k++) strcat(big, "\\200");
+        strcat(big, ".");
+    }
+    CHECK(dns_name_normalize(big, out, sizeof(out)) == strlen(big));
+    CHECK(dns_name_normalize("a.b.", out, 4) == (size_t)-1);   /* buffer too small */
+}
+
+static void test_name_wire_decoders(void) {
+    printf("[TEST] expand_wire_name / extract_wire_name_to_buffer / parse_query_question_fast: same text form...\n");
+    /* \x02 'a' '.' \x04 test \x00: the first label ends with the octet '.'; the separator must still follow */
+    const uint8_t w1[] = { 2, 'a', '.', 4, 't', 'e', 's', 't', 0 };
+    /* \x06 's' 'p' ' ' 'a' 'c' 'e' \x03 esc \x04 test \x00 */
+    const uint8_t w2[] = { 6, 's', 'p', ' ', 'a', 'c', 'e', 3, 'e', 's', 'c', 4, 't', 'e', 's', 't', 0 };
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    size_t next = 0;
+    char *name = NULL;
+    CHECK(expand_wire_name(w1, sizeof(w1), 0, &next, &arena, &name) == 0 && next == sizeof(w1));
+    CHECK_STR(name, "a\\..test.");
+    CHECK(expand_wire_name(w2, sizeof(w2), 0, &next, &arena, &name) == 0);
+    CHECK_STR(name, "sp\\032ace.esc.test.");
+    const uint8_t root[] = { 0 };
+    CHECK(expand_wire_name(root, 1, 0, &next, &arena, &name) == 0);
+    CHECK_STR(name, ".");
+    zone_arena_destroy(&arena);
+
+    char buf[DNS_NAME_TEXT_SIZE];
+    CHECK(extract_wire_name_to_buffer(w1, sizeof(w1), 0, &next, buf, sizeof(buf)) == 0);
+    CHECK_STR(buf, "a\\..test.");
+    CHECK(extract_wire_name_to_buffer(w2, sizeof(w2), 0, &next, buf, sizeof(buf)) == 0);
+    CHECK_STR(buf, "sp\\032ace.esc.test.");
+    CHECK(extract_wire_name_to_buffer(w2, sizeof(w2), 0, &next, buf, 10) == -1);   /* too small: fail, no truncation */
+
+    uint8_t q[12 + sizeof(w2) + 4] = { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+    memcpy(q + 12, w2, sizeof(w2));
+    q[12 + sizeof(w2) + 1] = 1;                 /* QTYPE A */
+    q[12 + sizeof(w2) + 3] = 1;                 /* QCLASS IN */
+    uint16_t qtype = 0, qclass = 0;
+    size_t qend = 0;
+    CHECK(parse_query_question_fast(q, sizeof(q), buf, sizeof(buf), &qtype, &qclass, &qend));
+    CHECK_STR(buf, "sp\\032ace.esc.test.");
+    CHECK(qtype == 1 && qclass == 1 && qend == sizeof(q));
+    /* a buffer that cannot hold the name: fail with an empty name instead of a truncated (different) name */
+    char small[12];
+    CHECK(!parse_query_question_fast(q, sizeof(q), small, sizeof(small), &qtype, &qclass, &qend));
+    CHECK_STR(small, "");
+}
+
+/* Found by fuzz_query_engine in phase 2: a QNAME that ends in a compression pointer is copied into the
+ * response, and register_wire_name_for_compression() read the pointer octet 0xC0 as a label length and walked
+ * past the buffer. A pointer / extended label ends the walk (nothing is registered). The buffer below is exactly
+ * the question, so the -asan build fails on any read past it. */
+static void test_name_register_stops_at_pointer(void) {
+    printf("[TEST] register_wire_name_for_compression: a compression pointer in the name is not a length...\n");
+    const uint8_t pkt[] = { 0x12, 0x34, 0x81, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+                            4, 0xC0, 0x00, 0x02, 0x01, 0xC0, 0x0C };
+    uint8_t *copy = malloc(sizeof(pkt));
+    CHECK(copy != NULL);
+    if (!copy) return;
+    memcpy(copy, pkt, sizeof(pkt));
+    compress_ctx_t *ctx = malloc(sizeof(*ctx));
+    CHECK(ctx != NULL);
+    if (ctx) {
+        compress_ctx_init(ctx);
+        register_wire_name_for_compression(copy, DNS_HEADER_SIZE, ctx);
+        free(ctx);
+    }
+    free(copy);
+}
+
+static void test_name_canonical_order(void) {
+    printf("[TEST] compare_canonical_name: RFC 4034 §6.1 order on wire-format labels (R-23)...\n");
+    /* RFC 4034 §6.1 example, complete (the \001 and \200 names need escape handling) */
+    static const char *seq[] = { "example.", "a.example.", "yljkjljk.a.example.", "Z.a.example.",
+        "zABC.a.EXAMPLE.", "z.example.", "\\001.z.example.", "*.z.example.", "\\200.z.example." };
+    for (size_t i = 0; i + 1 < sizeof(seq) / sizeof(seq[0]); i++) {
+        CHECK(compare_canonical_name(seq[i], seq[i + 1]) < 0);
+        CHECK(compare_canonical_name(seq[i + 1], seq[i]) > 0);
+    }
+    /* "a\.b" is ONE label "a.b" under example, so it sorts before "b.example" (labels "a.b" < "b") */
+    CHECK(compare_canonical_name("a\\.b.example.", "b.example.") < 0);
+    CHECK(compare_canonical_name("a\\.b.example.", "a.example.") > 0);   /* "a" is a prefix of "a.b" */
+    CHECK(compare_canonical_name("\\065.example.", "a.example.") == 0);  /* \065 is 'A', case-insensitive */
+    CHECK(compare_canonical_name("sp\\032ace.test.", "sp\\032ace.test") == 0);
+    CHECK(compare_canonical_name("\\255.test.", "z.test.") > 0);          /* unsigned octets */
+}
+
+static void test_name_zone_parser_normalizes(void) {
+    printf("[TEST] parse_zone_fast: owner and RDATA names in the canonical form (R-29)...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    parse_error_t err;
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&err, 0, sizeof(err));
+    ctx.default_origin = "esc.test.";
+    ctx.err_out = &err;
+    const char *zstr =
+        "$TTL 300\n"
+        "@ IN SOA ns1 host\\.master 1 3600 600 86400 60\n"
+        "sp\\032ace IN A 192.0.2.3\n"
+        "c\\(p IN A 192.0.2.4\n"
+        "\\065bc IN A 192.0.2.5\n"
+        "a\\.b IN CNAME t\\040x.esc.test.\n"
+        "mx IN MX 10 m\\032x\n";
+    char *b = arena_strdup(&arena, zstr);
+    CHECK(parse_zone_fast(b, strlen(b), &arena, &ctx) > 0);
+    CHECK(find_rec(&arena, "sp\\032ace.esc.test.", 1) != NULL);
+    CHECK(find_rec(&arena, "c(p.esc.test.", 1) != NULL);
+    CHECK(find_rec(&arena, "Abc.esc.test.", 1) != NULL);
+    const dns_record_t *cn = find_rec(&arena, "a\\.b.esc.test.", 5);
+    CHECK(cn != NULL && cn->rdata_count >= 1);
+    if (cn && cn->rdata_count >= 1) CHECK_STR(cn->rdata[0], "t(x.esc.test.");   /* master files: \040 is DECIMAL 40 = '(' */
+    const dns_record_t *mx = find_rec(&arena, "mx.esc.test.", 15);
+    CHECK(mx != NULL && mx->rdata_count >= 2);
+    if (mx && mx->rdata_count >= 2) CHECK_STR(mx->rdata[1], "m\\032x.esc.test.");
+    const dns_record_t *soa = find_rec(&arena, "esc.test.", 6);
+    CHECK(soa != NULL && soa->rdata_count >= 2);
+    if (soa && soa->rdata_count >= 2) CHECK_STR(soa->rdata[1], "host\\.master.esc.test.");
+    zone_arena_destroy(&arena);
+
+    /* names that have no wire form are rejected at load time */
+    static const char *bad[] = { "a..b IN A 192.0.2.1\n", "x\\256 IN A 192.0.2.1\n", "w IN CNAME a..b.test.\n" };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        zone_arena_init(&arena);
+        memset(&err, 0, sizeof(err));
+        char *bb = arena_strdup(&arena, bad[i]);
+        CHECK(parse_zone_fast(bb, strlen(bb), &arena, &ctx) < 0);
+        zone_arena_destroy(&arena);
+    }
+}
+
+static void test_name_tinydns_normalizes(void) {
+    printf("[TEST] parse_tinydns_data: octal escapes decoded, labels stored in the canonical form...\n");
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    /* tinydns-data: \ooo is OCTAL. \040 = space, \056 = '.', \000 = NUL, \134 = '\'. */
+    char data[] =
+        ".e\\040s.test:192.0.2.1:a:300\n"          /* NS a.ns.e s.test + SOA rname hostmaster.e s.test */
+        "+d\\056t.e\\040s.test:192.0.2.9:300\n"
+        "+n\\000l.e\\040s.test:192.0.2.8:300\n"
+        "+b\\134s.e\\040s.test:192.0.2.7:300\n"
+        "@e\\040s.test::m\\040x:10:300\n";          /* MX m x.mx.e s.test */
+    CHECK(parse_tinydns_data(data, strlen(data), &arena, &ctx) > 0);
+    CHECK(find_rec(&arena, "d\\.t.e\\032s.test.", 1) != NULL);
+    CHECK(find_rec(&arena, "n\\000l.e\\032s.test.", 1) != NULL);
+    CHECK(find_rec(&arena, "b\\\\s.e\\032s.test.", 1) != NULL);
+    const dns_record_t *ns = find_rec(&arena, "e\\032s.test.", 2);
+    CHECK(ns != NULL && ns->rdata_count >= 1);
+    if (ns && ns->rdata_count >= 1) CHECK_STR(ns->rdata[0], "a.ns.e\\032s.test.");
+    const dns_record_t *soa = find_rec(&arena, "e\\032s.test.", 6);
+    CHECK(soa != NULL && soa->rdata_count >= 2);
+    if (soa && soa->rdata_count >= 2) CHECK_STR(soa->rdata[1], "hostmaster.e\\032s.test.");
+    const dns_record_t *mx = find_rec(&arena, "e\\032s.test.", 15);
+    CHECK(mx != NULL && mx->rdata_count >= 2);
+    if (mx && mx->rdata_count >= 2) CHECK_STR(mx->rdata[1], "m\\032x.mx.e\\032s.test.");
+    zone_arena_destroy(&arena);
+}
+
 /* ------------------------------------------------------------------------ dns_utils */
 static void test_type_to_string(void) {
     printf("[TEST] dns_type_to_string: IANA mnemonics and RFC 3597 TYPEnnn form...\n");
@@ -2680,6 +2898,13 @@ int main(void) {
     test_wire_feature_case_40();
     test_wire_edns0_opt_parsing_boundaries();
     test_wire_unpack_rr_all_types_underflow_matrix();
+    test_name_label_to_text();
+    test_name_normalize();
+    test_name_wire_decoders();
+    test_name_canonical_order();
+    test_name_register_stops_at_pointer();
+    test_name_zone_parser_normalizes();
+    test_name_tinydns_normalizes();
     printf("[*] Final checks: %d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) {
         printf("=== Wire / Utility Helper Tests FAILED ===\n");

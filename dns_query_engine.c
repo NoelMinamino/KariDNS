@@ -182,13 +182,7 @@ STATIC_TEST bool append_glue_records(zone_arena_t *current_zone, const char *tar
   }
 
   // 2. In-zone search (covers in-domain glue and out-of-zone glue in current_zone)
-  size_t t_len = strlen(target), a_len = strlen(zone_apex);
-  while (t_len > 0 && target[t_len - 1] == '.') t_len--;
-  while (a_len > 0 && zone_apex[a_len - 1] == '.') a_len--;
-
-  bool is_in_domain = (t_len >= a_len &&
-                       strncasecmp(target + (t_len - a_len), zone_apex, a_len) == 0 &&
-                       (t_len == a_len || target[t_len - a_len - 1] == '.'));
+  bool is_in_domain = domain_name_is_at_or_below(target, zone_apex);
 
   if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !is_in_domain) {
     return true;
@@ -200,15 +194,8 @@ STATIC_TEST bool append_glue_records(zone_arena_t *current_zone, const char *tar
     uint32_t hashes[2];
     int h_count = 1;
     hashes[0] = calc_fnv1a_str(target);
-    char alt_tgt[256];
-    size_t raw_len = strlen(target);
-    if (raw_len > 0 && target[raw_len - 1] == '.') {
-      snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), target);
-      hashes[1] = calc_fnv1a_str(alt_tgt);
-      h_count = 2;
-    } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
-      snprintf(alt_tgt, sizeof(alt_tgt), "%s.", target);
-      hashes[1] = calc_fnv1a_str(alt_tgt);
+    if (target[0] != '\0') {
+      hashes[1] = calc_fnv1a_other_root_form(target);
       h_count = 2;
     }
 
@@ -263,15 +250,8 @@ STATIC_TEST bool append_glue_records(zone_arena_t *current_zone, const char *tar
         uint32_t hashes[2];
         int h_count = 1;
         hashes[0] = calc_fnv1a_str(target);
-        char alt_tgt[256];
-        size_t raw_len = strlen(target);
-        if (raw_len > 0 && target[raw_len - 1] == '.') {
-          snprintf(alt_tgt, sizeof(alt_tgt), "%.*s", (int)(raw_len - 1), target);
-          hashes[1] = calc_fnv1a_str(alt_tgt);
-          h_count = 2;
-        } else if (raw_len > 0 && raw_len + 1 < sizeof(alt_tgt)) {
-          snprintf(alt_tgt, sizeof(alt_tgt), "%s.", target);
-          hashes[1] = calc_fnv1a_str(alt_tgt);
+        if (target[0] != '\0') {
+          hashes[1] = calc_fnv1a_other_root_form(target);
           h_count = 2;
         }
 
@@ -399,7 +379,6 @@ STATIC_TEST dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *nam
 
 STATIC_TEST bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !name || !zone->hash_table || zone->hash_size == 0) return false;
-  size_t name_len = strlen(name);
   time_t tinydns_now = (zone && zone->is_tinydns_format) ? time(NULL) : 0;
 
   // (a) Exact match check via hash table
@@ -430,35 +409,23 @@ STATIC_TEST bool name_exists_in_zone(zone_arena_t *zone, const char *name, const
 
   if (pos >= (int)zone->sorted_unique_count) return false;
 
+  // 正規順序で name の次に来る名前が name の下にあれば、name は空の非終端 (ENT)
   const char *rn = zone->sorted_unique_names[pos];
-  size_t rn_len = strlen(rn);
-  if (rn_len > name_len &&
-      rn[rn_len - name_len - 1] == '.' &&
-      strcasecmp(rn + rn_len - name_len, name) == 0) {
-    return true;
-  }
-  return false;
+  return domain_name_is_at_or_below(rn, name) && !domain_names_match_ci(rn, name);
 }
 
 STATIC_TEST const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag) {
   if (!zone || !qname || !zone_apex || !zone->hash_table || zone->hash_size == 0)
     return zone_apex;
   const char *parent = qname;
-  size_t apex_len = strlen(zone_apex);
   while ((parent = strchr_unescaped(parent, '.')) != NULL) {
     parent++;
     if (*parent == '\0') break;
 
-    size_t p_len = strlen(parent);
-    if (p_len < apex_len) break;
-    if (strcasecmp(parent, zone_apex) == 0)
+    if (domain_names_match_ci(parent, zone_apex))
       return zone_apex;
-    if (p_len > apex_len) {
-      if (parent[p_len - apex_len - 1] != '.' ||
-          strcasecmp(parent + p_len - apex_len, zone_apex) != 0) {
-        break; // Outside zone apex
-      }
-    }
+    if (!domain_name_is_at_or_below(parent, zone_apex))
+      break; // Outside zone apex
 
     if (name_exists_in_zone(zone, parent, client_loc, client_ecs_tag, client_loc_tag)) {
       return parent;
@@ -500,27 +467,12 @@ STATIC_TEST size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
     return count;
 }
 
+/* RFC 5155 §5 / RFC 4034 §6.2: NSEC3 ハッシュの入力は、完全修飾・非圧縮・英字小文字化した
+ * ワイヤ形式のオーナー名。表示形式のエスケープ (\., \DDD) はオクテットに戻す。失敗なら 0。 */
 STATIC_TEST size_t name_to_canonical_wire(const char *name, uint8_t *wire, size_t max_wire) {
     if (!name || max_wire < 1) return 0;
-    size_t pos = 0;
-    const char *p = name;
-    while (*p) {
-        const char *dot = strchr(p, '.');
-        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
-        if (label_len == 0) break;
-        if (label_len > 63 || pos + 1 + label_len >= max_wire) return 0;
-        wire[pos++] = (uint8_t)label_len;
-        for (size_t i = 0; i < label_len; i++) {
-            char c = p[i];
-            if (c >= 'A' && c <= 'Z') c += 32;
-            wire[pos++] = (uint8_t)c;
-        }
-        if (!dot) break;
-        p = dot + 1;
-    }
-    if (pos >= max_wire) return 0;
-    wire[pos++] = 0; // Root label
-    return pos;
+    long w = write_uncompressed_name_ext(wire, 0, max_wire, name, true);
+    return w > 0 ? (size_t)w : 0;
 }
 
 STATIC_TEST bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
@@ -584,7 +536,7 @@ STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *ta
         dns_record_t *rec = &zone->records[i];
         if (rec->type_code == 50 && rec->name && rec->rdata_count >= 5 && rec->rdata[4]) {
             char owner_hash[64] = {0};
-            const char *dot = strchr(rec->name, '.');
+            const char *dot = strchr_unescaped(rec->name, '.');
             if (!dot || dot <= rec->name) continue;
             size_t hlen = (size_t)(dot - rec->name);
             if (hlen >= sizeof(owner_hash)) continue;
@@ -600,22 +552,18 @@ STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *ta
 
 STATIC_TEST bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz) {
     if (!qname || !encloser || !out || out_sz == 0) return false;
-    size_t qlen = strlen(qname);
-    size_t elen = strlen(encloser);
-    while (qlen > 0 && qname[qlen - 1] == '.') qlen--;
-    while (elen > 0 && encloser[elen - 1] == '.') elen--;
-    if (qlen <= elen) return false;
-    if (strncasecmp(qname + qlen - elen, encloser, elen) != 0) return false;
-    if (qname[qlen - elen - 1] != '.') return false;
-    /* [C-3] qlen - elen - 2 がアンダーフローする条件を除外する。
-     * next-closer name が存在するには qname は encloser より少なくとも
-     * "X." (2文字) 長い必要がある。*/
-    if (qlen < elen + 2) return false;
-
-    const char *p = qname + qlen - elen - 2;
-    while (p >= qname && *p != '.') p--;
-    const char *start = p + 1;
-    size_t nc_len = (qname + qlen) - start;
+    if (!domain_name_is_at_or_below(qname, encloser) || domain_names_match_ci(qname, encloser)) return false;
+    /* RFC 5155 §1.3: next closer name = closest encloser に qname のラベルを 1 つ足した名前。
+     * ラベル境界はエスケープされない '.' だけ。出力は末尾ドットなし。 */
+    const char *start = qname;
+    for (;;) {
+        const char *dot = strchr_unescaped(start, '.');
+        if (!dot) return false;
+        if (domain_names_match_ci(dot + 1, encloser)) break;
+        if (dot[1] == '\0') return false;
+        start = dot + 1;
+    }
+    size_t nc_len = dns_name_len_no_root(start, strlen(start));
     if (nc_len + 1 >= out_sz) return false;
     memcpy(out, start, nc_len);
     out[nc_len] = '\0';
@@ -862,11 +810,11 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
   uint16_t initial_arcount = *arcount;
   uint8_t temp_scope_prefix = 0;
   bool ecs_used = false;
-  char current_qname[256];
+  char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   size_t current_qname_len = strlen(current_qname);
   uint32_t current_qname_hash = calc_fnv1a_str(current_qname);
-  char visited_qnames[16][256];
+  char visited_qnames[16][DNS_NAME_TEXT_SIZE];
   int visited_count = 0;
   strlcpy(visited_qnames[visited_count++], current_qname, sizeof(visited_qnames[0]));
   const char *glue_targets[16];
@@ -874,9 +822,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
   memset(glue_targets, 0, sizeof(glue_targets));
   bool chain_exhausted = true;
   bool any_cname_wc_expanded = false;
-  char first_wc_qname[256] = {0};
+  char first_wc_qname[DNS_NAME_TEXT_SIZE] = {0};
   zone_arena_t *first_wc_zone = NULL;
-  char first_wc_apex[256] = {0};
+  char first_wc_apex[DNS_NAME_TEXT_SIZE] = {0};
   for (int depth = 0; depth < 16; depth++) {
     zone_db_entry_t *db_entry = *db_entry_ptr;
     zone_arena_t *current_zone = *current_zone_ptr;
@@ -1110,20 +1058,16 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
               }
             }
 
-            // [RFC 6672 §4.1] 合成名長の検証
+            // [RFC 6672 §4.1] 合成名が 255 オクテットを超えるなら、合成 CNAME は含めず、
+            // DNAME のみを載せて YXDOMAIN を返す。長さはワイヤ形式で数える (テキストの長さは
+            // エスケープの分だけ長い)。
             size_t prefix_len = dname_parent - current_qname;
-            size_t target_len = strlen(rec->rdata[0]);
-            if (prefix_len + target_len > 255) {
-              // 合成 CNAME は含めず、DNAME のみを載せて YXDOMAIN を返す
-              res[3] = (res[3] & 0xF0) | 6; // YXDOMAIN
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
-              return;
-            }
-
-            char synth_name[256];
+            char synth_name[DNS_NAME_TEXT_SIZE];
+            uint8_t synth_wire[256];
             memcpy(synth_name, current_qname, prefix_len);
             int written = snprintf(synth_name + prefix_len, sizeof(synth_name) - prefix_len, "%s", rec->rdata[0]);
-            if (written < 0 || (size_t)written >= sizeof(synth_name) - prefix_len || (prefix_len + (size_t)written > 255)) {
+            if (written < 0 || (size_t)written >= sizeof(synth_name) - prefix_len ||
+                write_uncompressed_name_ext(synth_wire, 0, sizeof(synth_wire), synth_name, false) < 0) {
               res[3] = (res[3] & 0xF0) | 6; // YXDOMAIN
               if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
@@ -1174,7 +1118,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       // (it has descendants) still EXISTS, so a wildcard must not synthesize an answer for it (NODATA instead).
       if (!dname_found && !name_exists_in_zone(current_zone, current_qname, client_loc, client_ecs_tag, client_loc_tag)) {
         const char *parent = current_qname;
-        char wc_name[256];
+        char wc_name[DNS_NAME_TEXT_SIZE];
         wc_name[0] = '*';
         wc_name[1] = '.';
         while ((parent = strchr_unescaped(parent, '.')) != NULL) {
@@ -1304,12 +1248,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     
     // ==== フェーズ5: CNAMEチェーン処理・クロスゾーン切り替え ====
     if (cname_followed) {
-      size_t cq_len = current_qname_len, z_len = strlen(db_entry->domain);
-      bool in_zone = false;
-      if (cq_len >= z_len &&
-          strcasecmp(current_qname + cq_len - z_len, db_entry->domain) == 0 &&
-          (cq_len == z_len || current_qname[cq_len - z_len - 1] == '.'))
-        in_zone = true;
+      bool in_zone = domain_name_is_at_or_below(current_qname, db_entry->domain);
       if (in_zone)
         continue;
       else {
@@ -1366,7 +1305,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
 
         if (!qtx_matched && !this_qtx_failed) {
           const char *parent = current_qname;
-          char wc_name[256];
+          char wc_name[DNS_NAME_TEXT_SIZE];
           wc_name[0] = '*'; wc_name[1] = '.';
           while ((parent = strchr_unescaped(parent, '.')) != NULL) {
             parent++; if (*parent == '\0') break;
@@ -1443,7 +1382,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
         const char *apex_lookup = db_entry->domain;
         char dot_buf[256];
         size_t dlen = strlen(apex_lookup);
-        if (dlen > 0 && apex_lookup[dlen - 1] != '.' && dlen + 2 <= sizeof(dot_buf)) {
+        if (dlen > 0 && dns_name_len_no_root(apex_lookup, dlen) == dlen && dlen + 2 <= sizeof(dot_buf)) {
           memcpy(dot_buf, apex_lookup, dlen);
           dot_buf[dlen] = '.';
           dot_buf[dlen + 1] = '\0';
@@ -1548,7 +1487,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
         if (!all_matched && !nsec_failed) {
           const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag, client_loc_tag);
           if (encloser) {
-            char wc_name[256];
+            char wc_name[DNS_NAME_TEXT_SIZE];
             snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
             uint32_t wc_hash = calc_fnv1a_str(wc_name);
             size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
@@ -1628,7 +1567,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
         if (!nsec_failed) {
           const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag, client_loc_tag);
           if (encloser) {
-            char wc_name[256];
+            char wc_name[DNS_NAME_TEXT_SIZE];
             int written = snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
             if (written > 0 && (size_t)written < sizeof(wc_name)) {
               if (!cover || !nsec_covers_name(cover, wc_name)) {
@@ -1686,7 +1625,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
           }
 
-          char nc_name[256];
+          char nc_name[DNS_NAME_TEXT_SIZE];
           if (!nsec_failed && find_next_closer_name(current_qname, encloser, nc_name, sizeof(nc_name))) {
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
@@ -1700,7 +1639,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
           }
 
           if (!all_matched && !nsec_failed) {
-            char wc_name[256];
+            char wc_name[DNS_NAME_TEXT_SIZE];
             snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
             char wc_hash[64];
             if (compute_nsec3_hash(wc_name, algo, iterations, salt, salt_len, wc_hash, sizeof(wc_hash))) {
@@ -1737,7 +1676,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
           }
 
-          char nc_name[256];
+          char nc_name[DNS_NAME_TEXT_SIZE];
           if (!nsec_failed && find_next_closer_name(current_qname, encloser, nc_name, sizeof(nc_name))) {
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
@@ -1750,7 +1689,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
           }
 
-          char wc_name[256];
+          char wc_name[DNS_NAME_TEXT_SIZE];
           snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
           char wc_hash[64];
           if (!nsec_failed && compute_nsec3_hash(wc_name, algo, iterations, salt, salt_len, wc_hash, sizeof(wc_hash))) {
@@ -1819,7 +1758,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
           }
 
-          char nc_name[256];
+          char nc_name[DNS_NAME_TEXT_SIZE];
           if (!nsec_failed && find_next_closer_name(first_wc_qname, encloser, nc_name, sizeof(nc_name))) {
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
@@ -2719,9 +2658,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
   static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
   size_t tsig_mac_len = 0;
-  char current_qname[256];
+  char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
-  char current_qname_lc[256];
+  char current_qname_lc[DNS_NAME_TEXT_SIZE];
   size_t current_qname_lc_len = 0;
   for (; current_qname[current_qname_lc_len] != '\0' && current_qname_lc_len < sizeof(current_qname_lc) - 1; current_qname_lc_len++) {
     char c = current_qname[current_qname_lc_len];

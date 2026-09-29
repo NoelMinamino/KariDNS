@@ -199,6 +199,9 @@ void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t star
     while (packet_buf[p] != 0) {
         if (label_count >= 127) return; // 異常に長い名前は無視 (安全側)
         if (p >= 0x4000) return;        // 圧縮ポインタで表現できない範囲は登録不要
+        // 圧縮ポインタ / 拡張ラベル (上位 2 ビットが 0 でない) は長さではない (RFC 1035 §4.1.4)。
+        // 長さとして読み進めると、コピーした質問の外 (バッファの外) を読む。登録しないで戻る。
+        if ((packet_buf[p] & 0xC0) != 0) return;
         label_offsets[label_count++] = p;
         p += 1 + packet_buf[p];
     }
@@ -331,50 +334,18 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
         total_wire_len += 1 + len;
         if (total_wire_len > 255) return -1;
         if (len == 0) {
-            if (written == 0 || buf[written - 1] != '.') { 
-                if (written >= sizeof(buf) - 1) return -1; 
-                buf[written++] = '.'; 
-            } 
-            buf[written++] = '\0'; 
-            break; 
-        }
-        if (written > 0 && buf[written - 1] != '.') { 
-            if (written >= sizeof(buf) - 1) return -1; 
-            buf[written++] = '.'; 
+            if (written == 0) buf[written++] = '.'; // ルート
+            buf[written++] = '\0';
+            break;
         }
         if (p + len > packet_len) return -1;
-        bool needs_escape = false;
-        for (int i = 0; i < len; i++) {
-            uint8_t c = packet[p + i];
-            if (c == '.' || c == '\\' || c < 0x21 || c >= 0x7F) {
-                needs_escape = true;
-                break;
-            }
-        }
-        if (!needs_escape) {
-            if (written + len >= sizeof(buf)) return -1;
-            memcpy(&buf[written], &packet[p], len);
-            written += len;
-            p += len;
-        } else {
-            for (int i = 0; i < len; i++) {
-                uint8_t c = packet[p++];
-                if (c == '.' || c == '\\') {
-                    if (written + 2 >= sizeof(buf)) return -1;
-                    buf[written++] = '\\';
-                    buf[written++] = (char)c;
-                } else if (c < 0x21 || c >= 0x7F) {
-                    if (written + 4 >= sizeof(buf)) return -1;
-                    buf[written++] = '\\';
-                    buf[written++] = '0' + (c / 100);
-                    buf[written++] = '0' + ((c / 10) % 10);
-                    buf[written++] = '0' + (c % 10);
-                } else {
-                    if (written + 1 >= sizeof(buf)) return -1;
-                    buf[written++] = (char)c;
-                }
-            }
-        }
+        // ラベルの後に区切りの '.' を置く (前の文字で判定すると、'.' で終わるラベルの後に区切りが入らない)。
+        // 255 オクテット以下の名前は正規形で必ず buf に収まる。
+        size_t n = dns_label_to_text(&packet[p], len, &buf[written], sizeof(buf) - written - 2);
+        if (n == (size_t)-1) return -1;
+        written += n;
+        buf[written++] = '.';
+        p += len;
     }
     *next_offset = jumped ? jumped_offset : p; 
     char *dst = arena_alloc(arena, written);
@@ -632,11 +603,69 @@ long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, co
     }
     if (offset + w_len + 1 > max_len) return -1;
     buf[offset + w_len++] = 0;
+    if (w_len > 255) return -1; // RFC 1035 §2.3.4: 名前は 255 オクテット以下
     return (long)w_len;
 }
 
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name) {
     return write_uncompressed_name_ext(buf, offset, max_len, name, true);
+}
+
+size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = label[i];
+        if (c == '.' || c == '\\') {
+            if (w + 2 > cap) return (size_t)-1;
+            out[w++] = '\\';
+            out[w++] = (char)c;
+        } else if (c < 0x21 || c >= 0x7F) {
+            // RFC 4343 §2.1: 0x21-0x7E の外は \DDD (10 進 3 桁)
+            if (w + 4 > cap) return (size_t)-1;
+            out[w++] = '\\';
+            out[w++] = (char)('0' + c / 100);
+            out[w++] = (char)('0' + (c / 10) % 10);
+            out[w++] = (char)('0' + c % 10);
+        } else {
+            if (w + 1 > cap) return (size_t)-1;
+            out[w++] = (char)c;
+        }
+    }
+    return w;
+}
+
+size_t dns_name_normalize(const char *in, char *out, size_t cap) {
+    if (!in || !out || cap < 2) return (size_t)-1;
+    if (in[0] == '\0' || strcmp(in, ".") == 0) {
+        size_t n = (in[0] == '\0') ? 0 : 1;
+        memcpy(out, ".", n);
+        out[n] = '\0';
+        return n;
+    }
+    size_t w = 0, wire_len = 1; // 終端のルートラベル分
+    const char *p = in;
+    uint8_t label[64];
+    while (p && *p) {
+        const char *next_p = NULL;
+        int len = parse_label(p, label, &next_p);
+        if (len <= 0) return (size_t)-1; // 不正なエスケープ / 63 オクテット超 / 空ラベル ("a..b", ".a")
+        wire_len += (size_t)len + 1;
+        if (wire_len > 255) return (size_t)-1;
+        if (w > 0) {
+            if (w + 1 >= cap) return (size_t)-1;
+            out[w++] = '.';
+        }
+        size_t n = dns_label_to_text(label, (size_t)len, out + w, cap - w - 1);
+        if (n == (size_t)-1) return (size_t)-1;
+        w += n;
+        if (next_p && *next_p == '\0') { // 末尾のエスケープされない '.' (絶対名)
+            if (w + 1 >= cap) return (size_t)-1;
+            out[w++] = '.';
+        }
+        p = next_p;
+    }
+    out[w] = '\0';
+    return w;
 }
 
 
@@ -735,6 +764,7 @@ static size_t wire_name_length(const char *name) {
 int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size) {
     size_t p = current_offset;
     size_t written = 0;
+    size_t total_wire_len = 0;
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t len = packet[p];
@@ -742,37 +772,24 @@ int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t
             return -1; // RFC 8945 TSIG algorithm names MUST NOT be compressed (and reject extended labels)
         }
         p++;
+        total_wire_len += 1 + len;
+        if (total_wire_len > 255) return -1; // RFC 1035 §2.3.4
         if (len == 0) {
-            if (written == 0 || buf[written - 1] != '.') { 
-                if (written >= buf_size) return -1; 
-                buf[written++] = '.'; 
-            } 
-            if (written >= buf_size) return -1;
-            buf[written++] = '\0'; 
-            break; 
-        }
-        if (written > 0 && buf[written - 1] != '.') { 
-            if (written >= buf_size) return -1; 
-            buf[written++] = '.'; 
-        }
-        if (written + (len * 4) >= buf_size || p + len > packet_len) return -1;
-        for (int i = 0; i < len; i++) {
-            uint8_t c = packet[p++];
-            if (c == '.' || c == '\\') {
-                if (written + 2 > buf_size) return -1;
-                buf[written++] = '\\';
-                buf[written++] = (char)c;
-            } else if (c < 0x21 || c >= 0x7F) {
-                if (written + 4 > buf_size) return -1;
-                buf[written++] = '\\';
-                buf[written++] = '0' + (c / 100);
-                buf[written++] = '0' + ((c / 10) % 10);
-                buf[written++] = '0' + (c % 10);
-            } else {
-                if (written + 1 > buf_size) return -1;
-                buf[written++] = (char)c;
+            if (written == 0) {
+                if (written + 1 >= buf_size) return -1;
+                buf[written++] = '.'; // ルート
             }
+            if (written >= buf_size) return -1;
+            buf[written++] = '\0';
+            break;
         }
+        if (p + len > packet_len || written + 1 >= buf_size) return -1;
+        // expand_wire_name() と同じ正規形。区切りの '.' はラベルの後に置く。
+        size_t n = dns_label_to_text(&packet[p], len, &buf[written], buf_size - written - 1);
+        if (n == (size_t)-1) return -1;
+        written += n;
+        buf[written++] = '.';
+        p += len;
     }
     *next_offset = p; 
     return 0;
@@ -3502,20 +3519,7 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
 }
 
 static bool name_is_in_zone(const char *name, const char *zone_name) {
-    if (!name || !zone_name) return false;
-    if (strcmp(zone_name, ".") == 0) return true;
-    size_t n_len = strlen(name);
-    size_t z_len = strlen(zone_name);
-    if (n_len < z_len) return false;
-    if (strcasecmp(name + n_len - z_len, zone_name) != 0) return false;
-    if (n_len > z_len) {
-        if (name[n_len - z_len - 1] != '.') return false;
-        // Verify the dot is not escaped
-        int bs = 0;
-        for (int i = (int)(n_len - z_len - 2); i >= 0 && name[i] == '\\'; i--) bs++;
-        if (bs % 2 != 0) return false;
-    }
-    return true;
+    return domain_name_is_at_or_below(name, zone_name);
 }
 
 int process_update_sections(const uint8_t *req, size_t req_len,
@@ -4058,6 +4062,8 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
     size_t offset = DNS_HEADER_SIZE;
     size_t written = 0;
     bool qname_completed = false;
+    bool too_long = false;
+    size_t wire_len = 1; // 終端のルートラベル
 
     while (offset < len) {
         uint8_t label_len = buf[offset];
@@ -4079,28 +4085,26 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
             break;
         }
         offset++;
-        if (written > 0 && qname[written - 1] != '.') {
-            if (written + 1 < qname_size) {
-                qname[written++] = '.';
-            }
+        wire_len += 1 + (size_t)label_len;
+        if (wire_len > 255) { // RFC 1035 §2.3.4
+            too_long = true;
+            break;
         }
-        for (size_t b = 0; b < label_len; b++) {
-            uint8_t c = buf[offset + b];
-            if (c == '.' || c == '\\') {
-                if (written + 2 < qname_size) {
-                    qname[written++] = '\\';
-                    qname[written++] = (char)c;
-                }
-            } else {
-                if (written + 1 < qname_size) {
-                    qname[written++] = (char)c;
-                }
-            }
+        // 正規形 (dns_label_to_text)。ゾーンデータの名前と同じ規則で書くので、そのまま比較できる。
+        // 入りきらない名前は切り詰めずに失敗させる (切り詰めた名前は別の名前に一致しうる)。
+        size_t n = (written + 1 < qname_size)
+                       ? dns_label_to_text(&buf[offset], label_len, &qname[written], qname_size - written - 1)
+                       : (size_t)-1;
+        if (n == (size_t)-1 || written + n + 1 >= qname_size) {
+            too_long = true;
+            break;
         }
+        written += n;
+        qname[written++] = '.';
         offset += label_len;
     }
 
-    if (!qname_completed) {
+    if (!qname_completed || too_long) {
         if (qname && qname_size > 0) qname[0] = '\0';
         if (qtype) *qtype = 0;
         if (qclass) *qclass = 1;
@@ -4108,16 +4112,14 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
         return false;
     }
 
-    if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-        if (written + 1 < qname_size) {
-            qname[written++] = '.';
+    if (written == 0) {
+        if (qname_size < 2) {
+            qname[0] = '\0';
+            return false;
         }
+        qname[written++] = '.'; // ルート
     }
-    if (written < qname_size) {
-        qname[written] = '\0';
-    } else {
-        qname[qname_size - 1] = '\0';
-    }
+    qname[written] = '\0';
 
     if (offset + 4 <= len) {
         if (qtype) *qtype = (uint16_t)((buf[offset] << 8) | buf[offset + 1]);

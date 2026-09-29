@@ -140,7 +140,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&comp_ctx, 0, sizeof(comp_ctx));
         compress_ctx_init_packet(&comp_ctx);
 
-        char qname[256] = "";
+        char qname[DNS_NAME_TEXT_SIZE] = "";
         uint16_t qtype = 0;
         uint16_t qclass = 1;
         size_t qend = 0;

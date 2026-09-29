@@ -320,6 +320,7 @@ register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend reco
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
 register_test "core" "sh" "tests/run_view_same_zone_test.sh" "Same zone name in two views: data, glue and program plugin per view (R-26, O-12)"
+register_test "core" "sh" "tests/run_name_escape_test.sh" "Owner names with master-file escapes: BIND/tinydns zones, AXFR, NSEC3 hashes (R-29, R-23, O-08)"
 register_test "core" "sh" "tests/run_config_duplicate_rejection_test.sh" "Duplicate view/zone rejection in config parser"
 register_test "core" "sh" "tests/run_domain_length_rfc1035_test.sh" "RFC 1035 255-byte domain & 63-byte label limits"
 register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog & file logging channels configuration"

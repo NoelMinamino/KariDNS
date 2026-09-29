@@ -1,4 +1,5 @@
 #include "dns_utils.h"
+#include "dns_wire.h"
 
 _Atomic bool g_capsicum_enabled = false;
 
@@ -471,47 +472,73 @@ size_t hex_decode(const char *hex, uint8_t *out, size_t out_cap) {
     return out_len;
 }
 
+/* 名前を小文字化したワイヤ形式にし、各ラベルの先頭位置を labels[] に入れる。ラベル数 (ルートを除く)、失敗なら -1。 */
+static int canonical_wire_labels(const char *name, uint8_t wire[256], const uint8_t *labels[128]) {
+    long w = write_uncompressed_name_ext(wire, 0, 256, name, true);
+    if (w <= 0) return -1;
+    int n = 0;
+    for (long p = 0; p < w && wire[p] != 0; p += 1 + wire[p]) {
+        if (n >= 128) return -1;
+        labels[n++] = &wire[p];
+    }
+    return n;
+}
+
+/* RFC 4034 §6.1: 右端のラベルから順に、各ラベルを符号なしの左詰めオクテット列として比較する
+ * (オクテットが無い方が小さい、英大文字は小文字として扱う)。表示形式のエスケープ (\., \DDD) は
+ * ワイヤ形式に直してから比べる。 */
 int compare_canonical_name(const char *name1, const char *name2) {
     if (!name1 && !name2) return 0;
     if (!name1) return -1;
     if (!name2) return 1;
 
-    int len1 = (int)strlen(name1);
-    int len2 = (int)strlen(name2);
-    if (len1 > 0 && name1[len1 - 1] == '.') len1--;
-    if (len2 > 0 && name2[len2 - 1] == '.') len2--;
-
-    int p1 = len1, p2 = len2;
-    while (p1 > 0 || p2 > 0) {
-        int d1 = p1 - 1;
-        while (d1 >= 0 && name1[d1] != '.') d1--;
-        int d2 = p2 - 1;
-        while (d2 >= 0 && name2[d2] != '.') d2--;
-
-        int label_len1 = (p1 > 0) ? (p1 - d1 - 1) : 0;
-        int label_len2 = (p2 > 0) ? (p2 - d2 - 1) : 0;
-
-        int min_len = label_len1 < label_len2 ? label_len1 : label_len2;
-        int cmp = 0;
-        if (min_len > 0) {
+    /* 速い経路: エスケープを含まない名前は、テキストのラベルがそのままオクテット列。
+     * (クエリ経路の二分探索で毎回呼ばれるので、ワイヤ形式への変換を避ける) */
+    if (!strchr(name1, '\\') && !strchr(name2, '\\')) {
+        int p1 = (int)strlen(name1), p2 = (int)strlen(name2);
+        if (p1 > 0 && name1[p1 - 1] == '.') p1--;
+        if (p2 > 0 && name2[p2 - 1] == '.') p2--;
+        while (p1 > 0 || p2 > 0) {
+            int d1 = p1 - 1, d2 = p2 - 1;
+            while (d1 >= 0 && name1[d1] != '.') d1--;
+            while (d2 >= 0 && name2[d2] != '.') d2--;
+            if (p1 <= 0) return -1;  /* name1 のラベルが尽きた: 祖先が先 */
+            if (p2 <= 0) return 1;
+            int len1 = p1 - d1 - 1, len2 = p2 - d2 - 1;
+            int min_len = len1 < len2 ? len1 : len2;
             for (int i = 0; i < min_len; i++) {
-                char c1 = name1[d1 + 1 + i];
-                char c2 = name2[d2 + 1 + i];
+                unsigned char c1 = (unsigned char)name1[d1 + 1 + i];
+                unsigned char c2 = (unsigned char)name2[d2 + 1 + i];
                 if (c1 >= 'A' && c1 <= 'Z') c1 |= 0x20;
                 if (c2 >= 'A' && c2 <= 'Z') c2 |= 0x20;
-                if (c1 != c2) {
-                    cmp = (unsigned char)c1 - (unsigned char)c2;
-                    break;
-                }
+                if (c1 != c2) return (int)c1 - (int)c2;
             }
+            if (len1 != len2) return len1 - len2;
+            p1 = d1;
+            p2 = d2;
         }
-        if (cmp != 0) return cmp;
-        if (label_len1 != label_len2) return label_len1 - label_len2;
-
-        p1 = d1;
-        p2 = d2;
+        return 0;
     }
-    return 0;
+
+    uint8_t w1[256], w2[256];
+    const uint8_t *l1[128], *l2[128];
+    int n1 = canonical_wire_labels(name1, w1, l1);
+    int n2 = canonical_wire_labels(name2, w2, l2);
+    if (n1 >= 0 && n2 >= 0) {
+        for (int i1 = n1 - 1, i2 = n2 - 1; i1 >= 0 || i2 >= 0; i1--, i2--) {
+            if (i1 < 0) return -1;
+            if (i2 < 0) return 1;
+            size_t len1 = l1[i1][0], len2 = l2[i2][0];
+            int cmp = memcmp(l1[i1] + 1, l2[i2] + 1, len1 < len2 ? len1 : len2);
+            if (cmp != 0) return cmp;
+            if (len1 != len2) return len1 < len2 ? -1 : 1;
+        }
+        return 0;
+    }
+    /* 名前として不正なもの (ゾーンのロード時に弾かれる) は正当な名前の後ろに置き、
+     * 不正なもの同士は文字列で比べる (qsort 用に全順序を保つ)。 */
+    if (n1 < 0 && n2 < 0) return strcmp(name1, name2);
+    return n1 < 0 ? 1 : -1;
 }
 
 bool serial_is_newer(uint32_t s1, uint32_t s2) {

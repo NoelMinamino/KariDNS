@@ -74,6 +74,11 @@ zone "alltypes.test" {
     type master;
     file "${ROOT_DIR}/tests/matrix/zones/all_types.zone";
 };
+
+zone "escape.test" {
+    type master;
+    file "${ROOT_DIR}/tests/matrix/zones/escape.zone";
+};
 EOF
 
 # Start server

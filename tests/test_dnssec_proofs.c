@@ -650,8 +650,36 @@ static void test_nsec_rfc4035_appendix_b(void) {
     printf("  -> NSEC proofs match RFC 4035 Appendix B.\n");
 }
 
+/* RFC 5155 §5: the hash input is the canonical wire form of the owner name (RFC 4034 §6.2), so presentation
+ * escapes must be turned back into octets first (R-29 addendum). Expected values: BIND 9 `nsec3hash AABBCCDD 1 2
+ * <name>` on the build host. */
+static void test_nsec3_hash_escaped_names(void) {
+    printf("[TEST] DNSSEC: NSEC3 hash of names with presentation escapes...\n");
+    static const uint8_t salt[] = { 0xAA, 0xBB, 0xCC, 0xDD };
+    static const struct { const char *name, *hash; } v[] = {
+        { "a\\.b.example.",       "KP1CUN00K75M528RJK5JGHIATMGMSPKO" },   /* one label "a.b" */
+        { "a.b.example.",         "MDEAMRQN8A0FLP3ECAHP6HNG4MDGA9BP" },   /* two labels: a different hash */
+        { "sp\\032ace.example.",  "NOH2GVBVCS98IT5JGU1FCMEODEHMVJ3A" },
+        { "abc.example.",         "IPUMAFN055RCK0CCQIH8C1MV44DK27JS" },
+        { "\\065bc.example.",     "IPUMAFN055RCK0CCQIH8C1MV44DK27JS" },   /* \065 = 'A', lower-cased */
+    };
+    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        char out[64];
+        assert(compute_nsec3_hash(v[i].name, 1, 2, salt, sizeof(salt), out, sizeof(out)));
+        if (strcasecmp(out, v[i].hash) != 0) {
+            fprintf(stderr, "nsec3 hash of %s: got %s, expected %s\n", v[i].name, out, v[i].hash);
+            assert(0);
+        }
+    }
+    uint8_t wire[256];
+    assert(name_to_canonical_wire("A\\.B.example.", wire, sizeof(wire)) == 13);
+    assert(wire[0] == 3 && memcmp(wire + 1, "a.b", 3) == 0 && wire[4] == 7);
+    printf("  -> NSEC3 hashes match nsec3hash.\n");
+}
+
 int main(void) {
     printf("=== Starting DNSSEC Negative-Proof Tests ===\n");
+    test_nsec3_hash_escaped_names();
     test_nsec3_rfc5155_appendix_b();
     test_nsec_rfc4035_appendix_b();
     printf("=== All DNSSEC Negative-Proof Tests PASSED ===\n");

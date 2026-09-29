@@ -111,9 +111,16 @@ static void test_escape_qname_for_log(void) {
     escape_qname_for_log("example.com.", dst, sizeof(dst));
     assert(strcmp(dst, "example.com.") == 0);
 
-    // 4. Special characters: quote, backslash, semicolon
-    escape_qname_for_log("foo\"bar\\baz;test", dst, sizeof(dst));
+    // 4. Special characters: quote, semicolon. A backslash starts an escape of the canonical name form
+    //    (dns_wire.h) and is copied with the next character, not escaped again.
+    escape_qname_for_log("foo\"bar\\\\baz;test", dst, sizeof(dst));
     assert(strcmp(dst, "foo\\\"bar\\\\baz\\059test") == 0);
+
+    // 4b. Canonical escapes from the query parser pass through unchanged (R-29)
+    escape_qname_for_log("sp\\032ace.a\\.b.test.", dst, sizeof(dst));
+    assert(strcmp(dst, "sp\\032ace.a\\.b.test.") == 0);
+    escape_qname_for_log("trailing\\", dst, sizeof(dst));
+    assert(strcmp(dst, "trailing\\\\") == 0);
 
     // 5. Control characters and space (\n, \r, \t, space, 0x01)
     escape_qname_for_log("hello world\n\t\r", dst, sizeof(dst));

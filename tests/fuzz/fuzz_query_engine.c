@@ -203,7 +203,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (query_len > sizeof(query_buf)) query_len = sizeof(query_buf);
     memcpy(query_buf, data, query_len);
 
-    char qname[256] = {0};
+    char qname[DNS_NAME_TEXT_SIZE] = {0};
     uint16_t qtype = 0;
     uint16_t qclass = 1;
     size_t qend = 0;
@@ -230,7 +230,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         // Must have QR bit set in response flags
         uint16_t flags = ((uint16_t)resp_buf[2] << 8) | resp_buf[3];
         (void)flags;
-        char rqname[256] = {0};
+        char rqname[DNS_NAME_TEXT_SIZE] = {0};
         uint16_t rqtype = 0;
         uint16_t rqclass = 1;
         size_t rqend = 0;

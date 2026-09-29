@@ -32,13 +32,10 @@
 static bool is_record_owned_by_zone(const char *record_name, const char *target_zone, const char **all_zones, int all_zone_count) {
     if (!record_name || !target_zone || !*target_zone) return true;
 
-    size_t rlen = strlen(record_name);
-    size_t tlen = strlen(target_zone);
+    size_t tlen = dns_name_len_no_root(target_zone, strlen(target_zone));
 
-    // target_zone へのサフィックス一致確認 (末尾一致 + ラベル境界)
-    if (rlen < tlen) return false;
-    if (strcasecmp(record_name + (rlen - tlen), target_zone) != 0) return false;
-    if (rlen > tlen && record_name[rlen - tlen - 1] != '.') return false;
+    // target_zone へのサフィックス一致確認 (末尾一致 + エスケープされない '.' のラベル境界)
+    if (!domain_name_is_at_or_below(record_name, target_zone)) return false;
 
     // 親子ゾーン重複防止: all_zones の中で record_name に最長一致するゾーンを探す
     if (all_zones && all_zone_count > 0) {
@@ -46,13 +43,9 @@ static bool is_record_owned_by_zone(const char *record_name, const char *target_
         for (int i = 0; i < all_zone_count; i++) {
             const char *z = all_zones[i];
             if (!z) continue;
-            size_t zlen = strlen(z);
-            if (rlen >= zlen && strcasecmp(record_name + (rlen - zlen), z) == 0) {
-                if (rlen == zlen || record_name[rlen - zlen - 1] == '.') {
-                    if (zlen > longest_len) {
-                        longest_len = zlen;
-                    }
-                }
+            size_t zlen = dns_name_len_no_root(z, strlen(z));
+            if (domain_name_is_at_or_below(record_name, z) && zlen > longest_len) {
+                longest_len = zlen;
             }
         }
         if (longest_len > tlen) {
@@ -85,23 +78,35 @@ static bool tinydns_owned(parse_context_t *ctx, const char *record_name, bool co
  * セクション2-1(a): FQDNフィールド用デコーダ
  * ドット区切り、空ラベルは黙って読み飛ばす(先頭/末尾/連続ドット許容)、
  * \nnn(8進数、最大3桁)と \x(リテラル文字)エスケープに対応。
- * 出力は末尾ドット付きの表示形式文字列("example.com." のような形)。
+ * 出力は末尾ドット付きの正規形 (dns_wire.h) の文字列 ("example.com." のような形)。
+ * 復号したラベルのオクテットは dns_label_to_text() で書く (\056 で得た '.' や \000 を
+ * そのまま文字列に入れると、区切りや終端と区別できない)。名前全体は 255 オクテットまで
+ * (RFC 1035 §2.3.4。超える名前はワイヤ形式に書けない)。
  * ============================================================================ */
+static bool tinydns_flush_label(const char *label, size_t labellen, char *out, size_t out_cap,
+                                size_t *outlen, size_t *wirelen) {
+    *wirelen += labellen + 1;
+    if (*wirelen > 255) return false; // FQDN超過 (RFC 1035 §2.3.4)
+    size_t n = dns_label_to_text((const uint8_t *)label, labellen, out + *outlen, out_cap - *outlen - 2);
+    if (n == (size_t)-1) return false;
+    *outlen += n;
+    out[(*outlen)++] = '.';
+    return true;
+}
+
 static char *tinydns_decode_fqdn(zone_arena_t *arena, const char *field, size_t flen) {
     char label[64];
     size_t labellen = 0;
-    char out[512];
+    char out[DNS_NAME_TEXT_SIZE];
     size_t outlen = 0;
+    size_t wirelen = 1; // 終端のルートラベル
     size_t i = 0;
 
     while (i < flen) {
         char ch = field[i++];
         if (ch == '.') {
             if (labellen > 0) {
-                if (outlen + labellen + 1 >= sizeof(out)) return NULL; // FQDN超過
-                memcpy(out + outlen, label, labellen);
-                outlen += labellen;
-                out[outlen++] = '.';
+                if (!tinydns_flush_label(label, labellen, out, sizeof(out), &outlen, &wirelen)) return NULL;
                 labellen = 0;
             }
             continue; // 連続ドットや先頭ドットは読み飛ばす
@@ -124,10 +129,7 @@ static char *tinydns_decode_fqdn(zone_arena_t *arena, const char *field, size_t 
     }
 
     if (labellen > 0) {
-        if (outlen + labellen + 1 >= sizeof(out)) return NULL;
-        memcpy(out + outlen, label, labellen);
-        outlen += labellen;
-        out[outlen++] = '.';
+        if (!tinydns_flush_label(label, labellen, out, sizeof(out), &outlen, &wirelen)) return NULL;
     }
 
     if (outlen == 0) {
@@ -263,6 +265,25 @@ static void tinydns_parse_ttd_field(const char *ts_field, size_t ts_len,
 }
 
 /* ============================================================================
+ * ヘルパー: 復号済みの名前 (正規形) 2 つを prefix.fqdn として連結する。
+ * 復号済みの文字列を tinydns_decode_fqdn() に通し直すと、正規形の \DDD (10 進) を
+ * tinydns の 8 進エスケープとして読んでしまうため、文字列のまま連結する。
+ * ============================================================================ */
+static char *tinydns_join_names(zone_arena_t *arena, const char *prefix, const char *fqdn) {
+    if (!prefix || !fqdn) return NULL;
+    size_t plen = strlen(prefix);                      // "x.ns." (末尾ドット付き)
+    size_t flen = strcmp(fqdn, ".") == 0 ? 0 : strlen(fqdn);
+    char joined[DNS_NAME_TEXT_SIZE];
+    if (plen + flen + 1 > sizeof(joined)) return NULL;
+    memcpy(joined, prefix, plen);
+    memcpy(joined + plen, fqdn, flen);
+    joined[plen + flen] = '\0';
+    uint8_t wire[256];
+    if (write_uncompressed_name_ext(wire, 0, sizeof(wire), joined, false) < 0) return NULL; // 255 オクテット超
+    return arena_strdup(arena, joined);
+}
+
+/* ============================================================================
  * ヘルパー: x展開ルール (., &, @ 用)
  * xに '.' が含まれていなければ x + suffix + fqdn として展開
  * ============================================================================ */
@@ -277,20 +298,15 @@ static char *tinydns_expand_x(zone_arena_t *arena, const char *x_field, size_t x
     if (!has_dot) {
         // x + suffix + fqdn
         // tinydns_decode_fqdn は先頭ドットや連続ドットを無視するため、
-        // x_len == 0 の時は ".ns." + fqdn -> ns.<fqdn> となる
-        size_t fqdn_len = fqdn ? strlen(fqdn) : 0;
+        // x_len == 0 の時は ".ns." -> "ns." となり、ns.<fqdn> になる
         size_t suf_len = strlen(suffix);
-        size_t combined_len = x_len + suf_len + fqdn_len;
-        char *comb = malloc(combined_len + 1);
-        if (!comb) return NULL;
+        char comb[512];
+        if (x_len + suf_len + 1 > sizeof(comb)) return NULL;
         if (x_len > 0) memcpy(comb, x_field, x_len);
         memcpy(comb + x_len, suffix, suf_len);
-        if (fqdn_len > 0) memcpy(comb + x_len + suf_len, fqdn, fqdn_len);
-        comb[combined_len] = '\0';
-
-        char *res = tinydns_decode_fqdn(arena, comb, combined_len);
-        free(comb);
-        return res;
+        comb[x_len + suf_len] = '\0';
+        char *prefix = tinydns_decode_fqdn(arena, comb, x_len + suf_len);
+        return tinydns_join_names(arena, prefix, fqdn ? fqdn : ".");
     } else {
         return tinydns_decode_fqdn(arena, x_field, x_len);
     }
@@ -374,9 +390,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                     if (flen[3] > 0 && flen[3] == 1 && f[3][0] == '0') soa_ttl = 0;
 
                     // rname は "\12hostmaster" + fqdn
-                    char rname_buf[512];
-                    snprintf(rname_buf, sizeof(rname_buf), "hostmaster.%s", fqdn);
-                    char *rname = tinydns_decode_fqdn(arena, rname_buf, strlen(rname_buf));
+                    char *rname = tinydns_join_names(arena, "hostmaster.", fqdn);
 
                     dns_record_t *soa_rec = tinydns_new_record(arena, ctx, line_start, buf, fqdn, "SOA", 6, soa_ttl, f[4], flen[4], f[5], flen[5]);
                     if (!soa_rec) return false;
