@@ -233,6 +233,7 @@ register_test "unit" "bin" "test_query_engine_protocol" "Query engine protocol: 
 register_test "unit" "bin" "test_response_cache" "Response cache: hot-path LRU, TTL countdown, negative caching & invalidation"
 register_test "unit" "bin" "test_dnssec_proofs" "DNSSEC negative proofs: RFC 5155 App A/B (NSEC3) & RFC 4035 App A/B (NSEC) example zones"
 register_test "unit" "bin" "test_hash_table" "Fixed-size FNV1a hash table collisions"
+register_test "unit" "bin" "test_epoch_rcu" "Epoch RCU publish order, grace period, auxiliary reader slots (R-25)"
 register_test "unit" "bin" "test_server_core" "Server Core internals: fast IPv4, log esc/rot, ring buffers, TCP & observatory"
 register_test "unit" "bin" "test_fi_parsers" "Fault Injection: Zone, Config, and tinydns parser error path sweeps"
 register_test "unit" "bin" "test_fi_wire" "Fault Injection: Wire serialize, TSIG sign/verify error sweeps"
@@ -323,6 +324,7 @@ register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command
 # 11. Regression, Sanitizer & Concurrency Stress
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
 register_test "regression" "sh" "tests/run_stress_test.sh" "TSan & ASan concurrency stress test (dnsperf + IXFR)"
+register_test "regression" "sh" "tests/run_rcu_tsan_test.sh" "TSan: queries concurrent with reload, UPDATE and AXFR (R-25 RCU publish order)"
 register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-resistance smoke verification"
 register_test "regression" "sh" "tests/run_break_duplicate_kind_override_test.sh" "Duplicate --break kind parameter override validation"
 
@@ -480,7 +482,7 @@ FAILED_TEST_NAMES=""
 # Ensure unit test binaries are built if category 'unit' is active
 if is_category_selected "unit"; then
     echo "${C_CYAN}==> Ensuring unit test binaries are built...${C_RESET}"
-    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
+    for _b in test_vulnerability_fixes test_response_cache test_asan_overflow test_tinydns_parser test_conf_include test_config_directives test_wire_helpers test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_reassembly test_hash_table test_epoch_rcu test_cidr test_dnstap_engine test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core; do
         if [ ! -x "./${_b}" ]; then
             make "${_b}" >/dev/null 2>&1 || true
         fi

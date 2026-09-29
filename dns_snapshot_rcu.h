@@ -20,6 +20,7 @@ typedef enum {
 extern _Atomic(zone_db_snapshot_t *) g_zone_db_active;
 zone_db_snapshot_t *acquire_zone_snapshot(void);
 void retain_zone_snapshot(zone_db_snapshot_t *snap);
+zone_db_snapshot_t *acquire_retained_zone_snapshot(void);
 void release_zone_snapshot(zone_db_snapshot_t *snap);
 zone_config_t *find_zone_config_in_view(server_config_t *cfg,
                                         const char *view_name,

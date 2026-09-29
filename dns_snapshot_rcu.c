@@ -43,6 +43,17 @@ void retain_zone_snapshot(zone_db_snapshot_t *snap) {
   }
 }
 
+/* worker_ctx_t を持たないスレッド用。load から参照獲得までを読み取り区間で守る。
+ * 区間の外で load すると、retain する前に GC スレッドが epoch 待ちと
+ * reader_count == 0 の確認を通り抜けて解放できてしまう。*/
+zone_db_snapshot_t *acquire_retained_zone_snapshot(void) {
+  rcu_aux_read_lock();
+  zone_db_snapshot_t *snap = acquire_zone_snapshot();
+  retain_zone_snapshot(snap);
+  rcu_aux_read_unlock();
+  return snap;
+}
+
 void release_zone_snapshot(zone_db_snapshot_t *snap) {
   if (snap) {
     int old = atomic_load_explicit(&snap->reader_count, memory_order_relaxed);
@@ -318,7 +329,9 @@ void free_zone_db_snapshot(zone_db_snapshot_t *snap) {
 void *gc_snapshot_thread(void *arg) {
   zone_db_snapshot_t *snap = (zone_db_snapshot_t *)arg;
   if (!snap) return NULL;
-  rcu_writer_wait_until_safe(snap->retire_epoch, 60000);
+  // タイムアウトしても解放しない (まだ読んでいるリーダーがいる)。待機関数が停滞を syslog に出す。
+  while (!rcu_writer_wait_until_safe(snap->retire_epoch, 60000)) {
+  }
   int retries = 0;
   useconds_t sleep_time = 1;
   while (atomic_load_explicit(&snap->reader_count, memory_order_acquire) > 0) {
@@ -821,8 +834,9 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       return RELOAD_ERR_MISSING_SOA;
   }
 
+  // prelink は他ゾーンの active arena を読むので、読み取り区間で他の writer の再利用から守る
+  rcu_aux_read_lock();
   zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
-  if (cur_snap) retain_zone_snapshot(cur_snap);
   server_config_t *active_cfg_prelink = acquire_config_snapshot();
   additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                       ? zcfg->additional_from_auth
@@ -830,11 +844,10 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
   build_zone_response_cache(z_standby, active_cfg_prelink, entry->domain);
   release_config_snapshot(active_cfg_prelink);
-  if (cur_snap) release_zone_snapshot(cur_snap);
+  rcu_aux_read_unlock();
 
   compute_ixfr_diff(entry, z_active, z_standby);
-  entry->rcu.retire_epoch = rcu_writer_advance_epoch();
-  atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+  entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
   struct stat st_loaded;
   if (stat_via_dir_cache(file, &st_loaded) == 0) {
     entry->last_loaded_mtime = st_loaded.st_mtime;
@@ -1689,12 +1702,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
     }
 
-    uint64_t retire_epoch = 0;
+    uint64_t retire_epoch = rcu_writer_publish(&g_zone_db_active, new_snap);
     if (old_snap) {
-        retire_epoch = rcu_writer_advance_epoch();
         old_snap->retire_epoch = retire_epoch;
     }
-    atomic_store_explicit(&g_zone_db_active, new_snap, memory_order_release);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 
     if (old_snap) {
@@ -1718,9 +1729,8 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
 
     for (view_config_t *v = config->views; v; v = v->next) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
-            zone_db_snapshot_t *snap = acquire_zone_snapshot();
+            zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
             if (snap) {
-                retain_zone_snapshot(snap);
                 zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
                 if (entry && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
                     struct stat st;
@@ -1738,9 +1748,8 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
     for (view_config_t *v = config->views; v; v = v->next) {
         for (zone_config_t *z = v->zones; z; z = z->next) {
             if (z->is_catalog && z->type && (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0) && z->file) {
-                zone_db_snapshot_t *snap = acquire_zone_snapshot();
+                zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
                 if (snap) {
-                    retain_zone_snapshot(snap);
                     zone_db_entry_t *entry = snapshot_get_zone(snap, z->domain);
                     if (entry) {
                         catalog_process_membership(entry, z, v->name);
@@ -1752,14 +1761,17 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
     }
 
     // Pass 2: Pre-link additional glue across authoritative zones in each view
-    zone_db_snapshot_t *relink_snap = acquire_zone_snapshot();
+    zone_db_snapshot_t *relink_snap = acquire_retained_zone_snapshot();
     if (relink_snap) {
-        retain_zone_snapshot(relink_snap);
         for (size_t v = 0; v < relink_snap->view_count; v++) {
             view_snapshot_t *view = &relink_snap->views[v];
             for (size_t i = 0; i < view->zone_count; i++) {
                 zone_db_entry_t *entry = view->entries[i];
                 if (!entry) continue;
+                /* 受信転送中のゾーンは飛ばす。転送スレッドは開始時の active arena を
+                 * 読み取り区間の外で最後まで使い続け、完了時に自分で prelink する。
+                 * 転送の開始もこの処理も制御スレッドで行うので、判定と開始は競合しない。*/
+                if (atomic_load_explicit(&entry->is_transferring, memory_order_acquire)) continue;
                 pthread_mutex_lock(&entry->writer_lock);
                 if (!wait_for_active_axfr(entry, 5000)) {
                     pthread_mutex_unlock(&entry->writer_lock);
@@ -1775,10 +1787,12 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                         additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                                             ? zcfg->additional_from_auth
                                                             : (config ? config->additional_from_auth : ADDITIONAL_AUTH_YES);
+                        // 兄弟ゾーンの active arena を読むので読み取り区間に入れる
+                        rcu_aux_read_lock();
                         prelink_zone_additional_glue(z_standby, entry->domain, relink_snap, view, policy);
+                        rcu_aux_read_unlock();
                         build_zone_response_cache(z_standby, config, entry->domain);
-                        entry->rcu.retire_epoch = rcu_writer_advance_epoch();
-                        atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+                        entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
                     } else {
                         syslog(LOG_WARNING, "[Zone] Pass 2 glue prelink for '%s' skipped: RCU wait timeout", entry->domain);
                     }

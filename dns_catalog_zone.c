@@ -112,8 +112,15 @@ static bool catalog_prefix_is_single_label(const char *name, size_t prefix_len) 
 void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *catalog_cfg, const char *view_name) {
     if (!catalog_entry || !catalog_cfg) return;
 
+    /* 制御スレッドと受信転送スレッドから呼ばれる。arena の走査中に UPDATE などの
+     * writer がこの arena を standby として再利用しないよう、読み取り区間に入れる。
+     * 区間は rebuild_zone_db_snapshot() の前で抜ける (ロック待ちを区間に含めない)。*/
+    rcu_aux_read_lock();
     zone_arena_t *arena = atomic_load_explicit(&catalog_entry->rcu.active, memory_order_acquire);
-    if (!arena) return;
+    if (!arena) {
+        rcu_aux_read_unlock();
+        return;
+    }
 
     atomic_fetch_add_explicit(&arena->reader_count, 1, memory_order_acquire);
 
@@ -133,6 +140,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     if (!found_version) {
         syslog(LOG_ERR, "[Catalog] Zone '%s' is missing '%s TXT \"2\"', aborting catalog update", catalog_entry->domain, version_txt);
         atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+        rcu_aux_read_unlock();
         return;
     }
 
@@ -142,6 +150,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     if (!new_desired) {
         syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building member list", catalog_entry->domain);
         atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+        rcu_aux_read_unlock();
         return;
     }
     int new_desired_count = 0;
@@ -222,6 +231,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     if (catalog_broken) {
         free_catalog_desired_list(new_desired, new_desired_count);
         atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+        rcu_aux_read_unlock();
         return; // カタログゾーン全体の更新を中止(既存の状態を維持)
     }
 
@@ -242,6 +252,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                 syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory building group list for member '%s'", catalog_entry->domain, new_desired[d].domain);
                 free_catalog_desired_list(new_desired, new_desired_count);
                 atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+                rcu_aux_read_unlock();
                 return;
             }
             new_desired[d].group_count = 0;
@@ -253,6 +264,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
                             syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory duplicating group string", catalog_entry->domain);
                             free_catalog_desired_list(new_desired, new_desired_count);
                             atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+                            rcu_aux_read_unlock();
                             return;
                         }
                         new_desired[d].groups[new_desired[d].group_count++] = g;
@@ -289,6 +301,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
             syslog(LOG_ERR, "[Catalog] Multiple coo PTR records found for member '%s' in catalog '%s'; catalog zone is broken and will NOT be processed", new_desired[d].domain, catalog_entry->domain);
             free_catalog_desired_list(new_desired, new_desired_count);
             atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+            rcu_aux_read_unlock();
             return;
         } else {
             new_desired[d].coo_target[0] = '\0';
@@ -301,6 +314,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
             syslog(LOG_ERR, "[Catalog] Zone '%s': out of memory finalizing member list", catalog_entry->domain);
             free_catalog_desired_list(new_desired, new_desired_count);
             atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+            rcu_aux_read_unlock();
             return;
         }
         for (int i = 0; i < new_desired_count; i++) shrunk[i] = new_desired[i];
@@ -312,6 +326,7 @@ void catalog_process_membership(zone_db_entry_t *catalog_entry, zone_config_t *c
     }
 
     atomic_fetch_sub_explicit(&arena->reader_count, 1, memory_order_release);
+    rcu_aux_read_unlock();
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(NULL, view_name, catalog_entry, catalog_cfg, new_desired, new_desired_count);
     if (!new_snap) {
         syslog(LOG_ERR, "[Catalog] Failed to rebuild zone DB snapshot; catalog membership update skipped for '%s'", catalog_entry->domain);

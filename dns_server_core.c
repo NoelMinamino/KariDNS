@@ -1160,10 +1160,10 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, max_res,
                                       task.qname, task.qtype, task.client_ip,
                                       &thread_compress_ctx, false, &rrl_cfg, task.snap);
-      rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
-      release_zone_snapshot(task.snap);
       free(task.req_buf);
 
+      // rrl_cfg は設定の中を指し、submit_response_log() も設定を読むので、
+      // 応答の送出まで読み取り区間を保つ (IPC への send は非ブロッキング)。
       if (res_len > 0) {
         bool slip_triggered = false;
         rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
@@ -1201,6 +1201,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
         submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                             0, 0, 0, false, false);
       }
+      rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
+      release_zone_snapshot(task.snap);
     } else {
       // TCP async resolution
       uint8_t *tcp_res = malloc(65535);
@@ -1208,21 +1210,25 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
         int res_len = process_dns_query(task.req_buf, task.req_len, tcp_res, 65535,
                                         task.qname, task.qtype, task.client_ip,
                                         &thread_compress_ctx, true, NULL, task.snap);
-        rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
-        release_zone_snapshot(task.snap);
         free(task.req_buf);
+        // submit_response_log() は設定を読むので読み取り区間の中で呼ぶ。
+        // send_tcp_robust() はブロックしうるので区間の外で行う。
         if (res_len > 0) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
+        } else {
+          submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
+                              0, 0, 0, false, false);
+        }
+        rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
+        release_zone_snapshot(task.snap);
+        if (res_len > 0) {
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, tcp_res, res_len,
                              &task.client_addr, task.client_len,
                              task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_TCP);
           uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
           send_tcp_robust(task.client_fd, len_prefix, 2);
           send_tcp_robust(task.client_fd, tcp_res, res_len);
-        } else {
-          submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
-                              0, 0, 0, false, false);
         }
         free(tcp_res);
       } else {
@@ -1390,6 +1396,7 @@ void *worker_thread_func(void *arg) {
   if (kq < 0)
     goto worker_startup_failed;
   int opt = 1;
+  rcu_reader_enter(ctx);
   server_config_t *active_cfg = acquire_config_snapshot();
   int port = active_cfg && active_cfg->port > 0 ? active_cfg->port : DNS_PORT;
   int bind_count = active_cfg ? active_cfg->bind_address_count : 0;
@@ -1483,6 +1490,7 @@ void *worker_thread_func(void *arg) {
     }
   }
   release_config_snapshot(active_cfg);
+  rcu_reader_exit(ctx);
 
   // 全FrontendからのUDP転送を受け取るIPCパイプをkqueueに登録 (udata=1)
   int w = ctx->thread_id;
@@ -1539,11 +1547,13 @@ worker_startup_success:;
       break;
     }
 
+    rcu_reader_enter(ctx);
     server_config_t *active = acquire_config_snapshot();
     bool qlog_enabled = (active && active->logging.queries_channel != NULL);
     uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
     bool rlog_enabled = response_log_enabled(active);
     release_config_snapshot(active);
+    rcu_reader_exit(ctx);
 
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].udata == (void *)(uintptr_t)1001) {
@@ -1674,10 +1684,10 @@ worker_startup_success:;
             if (is_zone_synthetic_type(snap, client_ip, qname)) {
               uint8_t *heap_req = malloc((size_t)payload_received);
               if (!heap_req) {
-                rcu_reader_exit(ctx);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
+                rcu_reader_exit(ctx);
                 continue;
               }
               memcpy(heap_req, req_buf, (size_t)payload_received);
@@ -1705,7 +1715,6 @@ worker_startup_success:;
               task.question_end = question_end;
               task.snap = acquire_zone_snapshot();
               retain_zone_snapshot(task.snap);
-              rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
                 free(task.req_buf);
@@ -1713,6 +1722,7 @@ worker_startup_success:;
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
               }
+              rcu_reader_exit(ctx);
               continue;
             }
 
@@ -2401,9 +2411,11 @@ process_tcp_client: ;
         }
 
         if (!client_closed) {
+          rcu_reader_enter(ctx);
           server_config_t *cfg = acquire_config_snapshot();
           uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
           release_config_snapshot(cfg);
+          rcu_reader_exit(ctx);
 
           // [Slowloris対策] 未完了データ受信中の場合は3秒タイムアウト
           if (ctx_tcp->state == TCP_STATE_READ_BODY || ctx_tcp->accumulated > 0) {
@@ -2495,7 +2507,11 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
   
-  /* [H-2] 既存のリーダーが参照を終えるのを待機。*/
+  /* [H-2] 既存のリーダーが参照を終えるのを待機。
+   * standby は前回の公開で退いた設定で、retire_epoch はその公開で得た値
+   * (公開してから世代を進めるので、これ以下の世代のリーダーだけが standby を持ちうる)。
+   * 設定の writer は制御スレッドだけで、ワーカー以外のスレッドも設定は
+   * 読み取り区間の中で読むので、この待機の後は standby を解放してよい。*/
   if (!rcu_writer_wait_until_safe(g_config_db.retire_epoch, 10000)) {
     syslog(LOG_WARNING, "[Config] Reload postponed: existing readers still active on previous configuration (timeout 10s).");
     free(config_str);
@@ -2525,9 +2541,7 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
       free(config_str);
       return;
     }
-    g_config_db.retire_epoch = rcu_writer_advance_epoch();
-    atomic_store_explicit(&g_config_db.active, standby,
-                          memory_order_release);
+    g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
     // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
     if (standby->dnstap.enabled) {
       dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
@@ -2587,6 +2601,10 @@ const char *find_configured_domain(const char *arg, char *out_buf, size_t out_si
 
 void *control_thread_func(void *arg) {
   (void)arg;
+  /* 制御スレッドは設定・ゾーン DB・arena の writer で、ロックを持ったまま
+   * 読み取り区間に入るので、スロットを常時確保しておく (空き待ちを起こさない)。
+   * 設定の writer はこのスレッドだけなので、ここでの設定の読み取りは区間不要。*/
+  rcu_aux_thread_pin();
   int kq = kqueue();
   if (kq < 0)
     pthread_exit(NULL);
@@ -2778,8 +2796,7 @@ void *control_thread_func(void *arg) {
               if (arg && strlen(arg) > 0) {
                 char canon_buf[256];
                 const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
-                zone_db_snapshot_t *snap = acquire_zone_snapshot();
-                if (snap) retain_zone_snapshot(snap);
+                zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
                 server_config_t *active = acquire_config_snapshot();
                 zone_lookup_result_t lr = {0};
                 int nmatches = lookup_zone_across_views(snap, active, canon_arg, view_arg, &lr);
@@ -2852,9 +2869,8 @@ void *control_thread_func(void *arg) {
               st.boot_time = g_boot_time;
               st.last_configured_time = g_last_configured_time;
               
-              zone_db_snapshot_t *snap = acquire_zone_snapshot();
+              zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               if (snap) {
-                retain_zone_snapshot(snap);
                 for (size_t v = 0; v < snap->view_count; v++) {
                   st.num_zones += snap->views[v].zone_count;
                 }
@@ -2898,8 +2914,7 @@ void *control_thread_func(void *arg) {
             } else if (strcmp(cmd, "zonestatus") == 0 && arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
-              zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              if (snap) retain_zone_snapshot(snap);
+              zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2918,8 +2933,7 @@ void *control_thread_func(void *arg) {
               release_config_snapshot(active_cfg);
               release_zone_snapshot(snap);
             } else if (strcmp(cmd, "observatory") == 0) {
-              zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              if (snap) retain_zone_snapshot(snap);
+              zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               server_config_t *active_cfg = acquire_config_snapshot();
               char canon_buf[256];
               const char *canon_arg = (arg && strlen(arg) > 0) ? find_configured_domain(arg, canon_buf, sizeof(canon_buf)) : NULL;
@@ -2950,7 +2964,10 @@ void *control_thread_func(void *arg) {
                     if (canon_arg && !domain_names_match_ci(e->domain, canon_arg)) continue;
                     zone_observatory_snapshot_t snap_item;
                     memset(&snap_item, 0, sizeof(snap_item));
+                    // active arena を読むので読み取り区間に入れる (send は区間の外)
+                    rcu_aux_read_lock();
                     fill_observatory_snapshot(e, active_cfg, &snap_item);
+                    rcu_aux_read_unlock();
                     send(cfd, &snap_item, sizeof(snap_item), 0);
                   }
                 }
@@ -2960,8 +2977,7 @@ void *control_thread_func(void *arg) {
             } else if (strcmp(cmd, "notify") == 0 && arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
-              zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              if (snap) retain_zone_snapshot(snap);
+              zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -2982,8 +2998,7 @@ void *control_thread_func(void *arg) {
             } else if (strcmp(cmd, "retransfer") == 0 && arg) {
               char canon_buf[256];
               const char *canon_arg = find_configured_domain(arg, canon_buf, sizeof(canon_buf));
-              zone_db_snapshot_t *snap = acquire_zone_snapshot();
-              if (snap) retain_zone_snapshot(snap);
+              zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
               server_config_t *active_cfg = acquire_config_snapshot();
               zone_lookup_result_t lr = {0};
               int nmatches = lookup_zone_across_views(snap, active_cfg, canon_arg, view_arg, &lr);
@@ -3042,9 +3057,8 @@ void *control_thread_func(void *arg) {
         }
 
         server_config_t *active = acquire_config_snapshot();
-        zone_db_snapshot_t *snap = acquire_zone_snapshot();
+        zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
         if (snap) {
-            retain_zone_snapshot(snap);
             for (size_t v = 0; v < snap->view_count; v++) {
                 for (size_t i = 0; i < snap->views[v].zone_count; i++) {
                     zone_db_entry_t *entry = snap->views[v].entries[i];
