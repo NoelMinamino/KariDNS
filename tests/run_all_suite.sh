@@ -157,17 +157,36 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# karidns processes that were already running when the suite started (another
+# working copy, a long-running server). cleanup_stale_processes() leaves them
+# alone and stops only servers that the tests started. Match the process name,
+# not the argument list: "-f karidns" would also match any command whose path
+# contains "karidns" (e.g. a checkout in ~/karidns).
+KARIDNS_PROC_RE='karidns(-asan|-tsan)?'
+PREEXISTING_KARIDNS_PIDS=" $(pgrep -x "$KARIDNS_PROC_RE" 2>/dev/null | tr '\n' ' ')"
+
+suite_karidns_pids() {
+    for _p in $(pgrep -x "$KARIDNS_PROC_RE" 2>/dev/null); do
+        case "$PREEXISTING_KARIDNS_PIDS" in
+            *" $_p "*) ;;
+            *) echo "$_p" ;;
+        esac
+    done
+}
+
 # Environment cleanup helper
 cleanup_stale_processes() {
     # 1. Kill stale background servers / mocks gracefully with TERM, then KILL
-    pkill -TERM -f "karidns" 2>/dev/null || true
+    _stale=$(suite_karidns_pids)
+    [ -n "$_stale" ] && kill -TERM $_stale 2>/dev/null || true
     pkill -TERM -f "mock_server.pl" 2>/dev/null || true
     pkill -TERM -f "mock_anomalous_dns_server.pl" 2>/dev/null || true
     pkill -TERM -f "mock_dnstap_receiver.pl" 2>/dev/null || true
     pkill -TERM -f "mock_dns_server.pl" 2>/dev/null || true
     pkill -TERM -f "rr_differential_test.pl" 2>/dev/null || true
     sleep 0.1 2>/dev/null || true
-    pkill -9 -f "karidns" 2>/dev/null || true
+    _stale=$(suite_karidns_pids)
+    [ -n "$_stale" ] && kill -9 $_stale 2>/dev/null || true
     pkill -9 -f "mock_server.pl" 2>/dev/null || true
     pkill -9 -f "mock_anomalous_dns_server.pl" 2>/dev/null || true
     pkill -9 -f "mock_dnstap_receiver.pl" 2>/dev/null || true
@@ -325,6 +344,7 @@ register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
 register_test "regression" "sh" "tests/run_stress_test.sh" "TSan & ASan concurrency stress test (dnsperf + IXFR)"
 register_test "regression" "sh" "tests/run_rcu_tsan_test.sh" "TSan: queries concurrent with reload, UPDATE and AXFR (R-25 RCU publish order)"
+register_test "regression" "sh" "tests/run_bind_differential_test.sh" "Differential check against BIND named: wildcard answers (SKIP without named)"
 register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-resistance smoke verification"
 register_test "regression" "sh" "tests/run_break_duplicate_kind_override_test.sh" "Duplicate --break kind parameter override validation"
 

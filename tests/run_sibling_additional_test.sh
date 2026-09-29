@@ -2,6 +2,7 @@
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -225,12 +226,11 @@ EOF
 
 cleanup() {
     echo "[*] Cleaning up test processes..."
-    [ -n "$SERVER_PID_YES" ] && kill -9 "$SERVER_PID_YES" 2>/dev/null || true
-    [ -n "$SERVER_PID_IN" ] && kill -9 "$SERVER_PID_IN" 2>/dev/null || true
-    [ -n "$SERVER_PID_NO" ] && kill -9 "$SERVER_PID_NO" 2>/dev/null || true
-    [ -n "$SERVER_PID_SIBLING" ] && kill -9 "$SERVER_PID_SIBLING" 2>/dev/null || true
-    [ -n "$SERVER_PID_OVERRIDE" ] && kill -9 "$SERVER_PID_OVERRIDE" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID_YES:-}"
+    kari_kill_tree "${SERVER_PID_IN:-}"
+    kari_kill_tree "${SERVER_PID_NO:-}"
+    kari_kill_tree "${SERVER_PID_SIBLING:-}"
+    kari_kill_tree "${SERVER_PID_OVERRIDE:-}"
     rm -rf "$TMP_DIR" 2>/dev/null || true
     rm -f "$DIR"/server_sibling_*.log
 }
@@ -294,7 +294,7 @@ fi
 
 echo "[PASS] Test 1: additional-from-auth yes returned all 5 Additional records!"
 
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$SERVER_PID_YES"
 SERVER_PID_YES=""
 sleep 1
 
@@ -334,7 +334,7 @@ fi
 
 echo "[PASS] Test 2: additional-from-auth in-domain returned ONLY in-domain glue!"
 
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$SERVER_PID_IN"
 SERVER_PID_IN=""
 sleep 1
 
@@ -364,7 +364,7 @@ fi
 
 echo "[PASS] Test 3: additional-from-auth no returned 0 Additional address records!"
 
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$SERVER_PID_NO"
 SERVER_PID_NO=""
 sleep 1
 
@@ -410,7 +410,7 @@ fi
 
 echo "[PASS] Test 4: Sibling domain (ns-sibling.v6.example-sibling.jp A/AAAA) successfully resolved in Additional!"
 
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$SERVER_PID_SIBLING"
 SERVER_PID_SIBLING=""
 sleep 1
 
@@ -462,7 +462,7 @@ fi
 
 echo "[PASS] Test 5: Zone-level additional-from-auth overrides successfully verified!"
 
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$SERVER_PID_OVERRIDE"
 SERVER_PID_OVERRIDE=""
 
 echo "[ALL PASS] Sibling domain Additional glue test suite passed successfully!"

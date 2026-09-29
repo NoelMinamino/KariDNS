@@ -2,12 +2,14 @@
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 BIN="$DIR/../karidns-asan"
 KARICTL="$DIR/../karictl-asan"
 DAG="$DIR/../dag"
 
 [ -x dag ] || make dag
 [ -x karidns-asan ] || make asan
+[ -x karictl-asan ] || make karictl-asan
 if [ ! -x "$BIN" ]; then
     echo "failed: karidns-asan not found."
     exit 1
@@ -51,9 +53,7 @@ sleep 2
 
 cleanup() {
     echo "[*] Stopping KariDNS (PID $SERVER_PID)..."
-    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -f "$CONF" update.txt out.txt res.txt
 }
 trap cleanup EXIT INT TERM
@@ -200,9 +200,6 @@ if grep -q "1.2.3.4" res.txt; then
     exit 1
 fi
 check_asan_log
-if killall -0 karidns-asan 2>/dev/null; then
-    killall -9 karidns-asan 2>/dev/null
-fi
 
 echo "[OK] Dynamic Update tests passed!"
 rm -f update.txt out.txt res.txt

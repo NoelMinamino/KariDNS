@@ -2,6 +2,7 @@
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -14,8 +15,7 @@ CONF_FILE="$DIR/axfr_multikey_test.conf"
 ZONE_FILE="$DIR/axfr_multikey_test.zone"
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -f "$CONF_FILE" "$ZONE_FILE" /tmp/karidns_axfr_multikey.log
 }
 trap cleanup EXIT INT TERM

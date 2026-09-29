@@ -1,8 +1,6 @@
 #!/bin/sh
 set -e
-
-killall -9 karidns karidns-asan 2>/dev/null || true
-sleep 1
+. "$(dirname "$0")/lib_proc.sh"
 
 # 1. ASanビルドでサーバーとdagを構築(メモリ破壊系のバグを最大限検出するため)
 [ -x karidns-asan ] && [ -x dag-asan ] || make karidns-asan dag-asan
@@ -11,9 +9,7 @@ sleep 1
 ./karidns-asan -f tests/karidns-test.conf > server_asan.log 2>&1 &
 SERVER_PID=$!
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
 }
 trap cleanup EXIT INT TERM
 sleep 1 # 起動待ち
@@ -57,8 +53,5 @@ fi
 
 echo "[OK] Round-trip test passed: all record types present, server did not crash."
 
-if killall -0 karidns-asan 2>/dev/null; then
-    killall -9 karidns-asan 2>/dev/null
-fi
 
 

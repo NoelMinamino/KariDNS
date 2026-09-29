@@ -13,6 +13,7 @@
 set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+. "$(dirname "$0")/lib_proc.sh"
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 PORT=53556
 TEST_DIR=".compare_tmp_$$"
@@ -66,8 +67,7 @@ SERVER_PID=$!
 sleep 1
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$SCRIPT_DIR/$TEST_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

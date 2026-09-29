@@ -25,6 +25,7 @@ set -e
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 [ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] || {
@@ -44,7 +45,9 @@ rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${PID1:-}" "${PID2:-}" "${PRIM_PID:-}" "${SEC_PID:-}" "${NOPID_PID:-}" "${K2_PID:-}"
+    # Test 6 kills only the supervisor; its children are orphans by now.
+    kari_kill_conf "$TMP_DIR/server1.conf" "$TMP_DIR/server2.conf" "$TMP_DIR/server_nopid.conf"
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -281,8 +284,8 @@ else
 fi
 
 # Clean up running test instances
-kill -9 "$PID1" "$PID2" 2>/dev/null || true
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$PID1" "$PID2"
+PID1=""; PID2=""
 sleep 0.5
 
 echo ""
@@ -317,8 +320,8 @@ else
 fi
 
 # Stop primary instance
-kill -9 "$PRIM_PID" 2>/dev/null || true
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$PRIM_PID"
+PRIM_PID=""
 sleep 0.5
 
 echo -n "Starting secondary instance with released PID file ... "
@@ -328,8 +331,8 @@ sleep 1
 
 if kill -0 "$SEC_PID" 2>/dev/null; then
     echo "OK (Secondary successfully acquired released PID file)"
-    kill -9 "$SEC_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "$SEC_PID"
+    SEC_PID=""
 else
     echo "FAILED (Could not acquire released PID file)"
     cat "$TMP_DIR/sec.log"
@@ -359,8 +362,8 @@ sleep 1
 
 if kill -0 "$NOPID_PID" 2>/dev/null; then
     echo "OK (Started cleanly without PID file)"
-    kill -9 "$NOPID_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "$NOPID_PID"
+    NOPID_PID=""
 else
     echo "FAILED"
     cat "$TMP_DIR/nopid.log"
@@ -392,8 +395,9 @@ if "$KARIDNS" -f -p "$FLOCK_PID_FILE" "$TMP_DIR/server2.conf" > "$TMP_DIR/kill2.
     sleep 1
     if kill -0 "$K2_PID" 2>/dev/null; then
         echo "OK (Lock was freed immediately; new instance acquired lock)"
-        kill -9 "$K2_PID" 2>/dev/null || true
-        killall -9 karidns 2>/dev/null || true
+        kari_kill_tree "$K2_PID"
+        K2_PID=""
+        kari_kill_conf "$TMP_DIR/server1.conf"
     else
         echo "FAILED (New instance could not acquire lock)"
         cat "$TMP_DIR/kill2.log"

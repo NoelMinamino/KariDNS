@@ -2,6 +2,7 @@
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 BIN="$DIR/../karidns-asan"
 KARICTL="$DIR/../karictl-asan"
 DAG="$DIR/../dag-asan"
@@ -11,6 +12,9 @@ if [ ! -x "$DAG" ]; then
 fi
 if [ ! -x "$BIN" ]; then
     make asan
+fi
+if [ ! -x "$KARICTL" ]; then
+    make karictl-asan
 fi
 
 CONF_FILE="$DIR/karidns-test.conf"
@@ -29,9 +33,7 @@ sleep 2
 
 cleanup() {
     echo "[*] Stopping KariDNS (PID $SERVER_PID)..."
-    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     # Restore original zone
     mv "${ZONE_FILE}.orig" "$ZONE_FILE" 2>/dev/null || true
 }
@@ -98,9 +100,6 @@ if ! echo "$AXFR_FB_OUT" | grep -q "192.0.2.1"; then
 fi
 echo "[OK] IXFR correctly fell back to full AXFR for old serial."
 
-if killall -0 karidns-asan 2>/dev/null; then
-    killall -9 karidns-asan 2>/dev/null
-fi
 
 echo "[OK] IXFR Round-trip test passed!"
 exit 0

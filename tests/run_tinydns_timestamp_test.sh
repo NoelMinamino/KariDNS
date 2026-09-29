@@ -6,23 +6,19 @@ set -e
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$BASE_DIR}"
 KARIDNS="${BIN_DIR}/karidns"
 KARICHECK="${BIN_DIR}/karicheck"
 DAG="${DAG:-$BIN_DIR/dag}"
 
-killall -9 karidns karidns-asan 2>/dev/null || true
 
 TMP_DIR="$(mktemp -d /tmp/karidns_tinydns_ts_test.XXXXXX)"
 SERVER_PID=""
 
 cleanup() {
-    if [ -n "$SERVER_PID" ]; then
-        kill -9 "$SERVER_PID" 2>/dev/null || true
-    fi
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

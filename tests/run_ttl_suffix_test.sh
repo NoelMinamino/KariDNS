@@ -3,6 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="ttl_suffix_test_dir"
@@ -50,9 +51,7 @@ SERVER_PID=$!
 sleep 1
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$SCRIPT_DIR/$TEST_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

@@ -8,6 +8,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 BIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_DIR="dag_ci_test_dir"
 PORT=53555
@@ -73,8 +74,7 @@ WORKER_PIDS=""
 cleanup() {
     echo "=== Cleaning up ==="
     [ -n "$WORKER_PIDS" ] && kill $WORKER_PIDS 2>/dev/null || true
-    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$SCRIPT_DIR/$TEST_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

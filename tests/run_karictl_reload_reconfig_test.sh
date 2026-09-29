@@ -11,6 +11,7 @@ set -e
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 [ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] || {
@@ -30,8 +31,7 @@ rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -103,8 +103,7 @@ key "karictl" {
 };
 EOF
 
-# Kill any existing server and start local test server
-killall -9 karidns 2>/dev/null || true
+# Start local test server
 "$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns.log" 2>&1 &
 SERVER_PID=$!
 sleep 1

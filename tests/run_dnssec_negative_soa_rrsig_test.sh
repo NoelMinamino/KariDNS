@@ -2,6 +2,7 @@
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -54,9 +55,7 @@ SERVER_PID=$!
 
 cleanup() {
     echo "[*] Cleaning up test processes..."
-    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -f "$CONF" "$ZONE" "$DIR/server_dnssec_neg.log"
 }
 trap cleanup EXIT INT TERM
