@@ -39,7 +39,8 @@ static void init_fuzz_environment(void) {
         .is_standalone_mode = true,
         .err_out = &err,
     };
-    char zone_text[] = "fuzz.local. 3600 IN SOA ns1.fuzz.local. admin.fuzz.local. 1 3600 1800 604800 86400\n"
+    /* parse_zone_fast() のレコードはこのバッファを指し続けるので static にする */
+    static char zone_text[] = "fuzz.local. 3600 IN SOA ns1.fuzz.local. admin.fuzz.local. 1 3600 1800 604800 86400\n"
                        "fuzz.local. 3600 IN NS ns1.fuzz.local.\n"
                        "fuzz.local. 3600 IN A 192.0.2.1\n"
                        "fuzz.local. 3600 IN AAAA 2001:db8::1\n"

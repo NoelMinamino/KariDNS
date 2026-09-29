@@ -132,7 +132,8 @@ static void init_rich_fuzz_engine(void) {
     // Main zone
     zone_arena_init(&g_fuzz_arena_main);
     parse_context_t ctx1 = { .base_dir = ".", .default_origin = "example.com.", .is_standalone_mode = true, .err_out = &err };
-    char main_buf[sizeof(g_main_zone_text)];
+    /* パース結果のレコードは入力バッファを指し続けるので、関数を抜けても残る static にする */
+    static char main_buf[sizeof(g_main_zone_text)];
     memcpy(main_buf, g_main_zone_text, sizeof(g_main_zone_text));
     parse_zone_fast(main_buf, sizeof(g_main_zone_text) - 1, &g_fuzz_arena_main, &ctx1);
     build_zone_index(&g_fuzz_arena_main, true);
@@ -145,7 +146,7 @@ static void init_rich_fuzz_engine(void) {
     // Sub zone
     zone_arena_init(&g_fuzz_arena_sub);
     parse_context_t ctx2 = { .base_dir = ".", .default_origin = "sub.example.org.", .is_standalone_mode = true, .err_out = &err };
-    char sub_buf[sizeof(g_sub_zone_text)];
+    static char sub_buf[sizeof(g_sub_zone_text)];
     memcpy(sub_buf, g_sub_zone_text, sizeof(g_sub_zone_text));
     parse_zone_fast(sub_buf, sizeof(g_sub_zone_text) - 1, &g_fuzz_arena_sub, &ctx2);
     build_zone_index(&g_fuzz_arena_sub, true);
@@ -158,7 +159,7 @@ static void init_rich_fuzz_engine(void) {
     // NSEC3 zone
     zone_arena_init(&g_fuzz_arena_nsec3);
     parse_context_t ctx3 = { .base_dir = ".", .default_origin = "signed.local.", .is_standalone_mode = true, .err_out = &err };
-    char nsec3_buf[sizeof(g_nsec3_zone_text)];
+    static char nsec3_buf[sizeof(g_nsec3_zone_text)];
     memcpy(nsec3_buf, g_nsec3_zone_text, sizeof(g_nsec3_zone_text));
     parse_zone_fast(nsec3_buf, sizeof(g_nsec3_zone_text) - 1, &g_fuzz_arena_nsec3, &ctx3);
     build_zone_index(&g_fuzz_arena_nsec3, true);
