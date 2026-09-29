@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -181,6 +182,7 @@ typedef struct {
   bool has_current_loc_tag;
   char current_ecs_tag[64];
   bool has_current_ecs_tag;
+  uint32_t out_of_zone_skipped; /* R-27: 読み飛ばしたゾーン外 RR の数 */
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
@@ -284,9 +286,28 @@ typedef struct {
   _Atomic time_t   last_notify_time;
 } zone_observatory_t;
 
+/* ゾーンの役割。リロードで既存エントリを再利用してよいかの判定に使う (O-13) */
+typedef enum {
+  ZONE_KIND_OTHER = 0,
+  ZONE_KIND_PRIMARY,
+  ZONE_KIND_SECONDARY,
+  ZONE_KIND_FORWARD,
+  ZONE_KIND_PROGRAM,
+} zone_kind_t;
+
+static inline zone_kind_t zone_kind_from_type(const char *type) {
+  if (!type) return ZONE_KIND_OTHER;
+  if (strcasecmp(type, "master") == 0 || strcasecmp(type, "primary") == 0) return ZONE_KIND_PRIMARY;
+  if (strcasecmp(type, "slave") == 0 || strcasecmp(type, "secondary") == 0) return ZONE_KIND_SECONDARY;
+  if (strcasecmp(type, "forward") == 0) return ZONE_KIND_FORWARD;
+  if (strcasecmp(type, "program") == 0) return ZONE_KIND_PROGRAM;
+  return ZONE_KIND_OTHER;
+}
+
 typedef struct {
   char domain[256];
   char view_name[64];
+  zone_kind_t kind;
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
@@ -381,6 +402,7 @@ typedef struct {
 
 typedef struct program_plugin {
   char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
+  char view_name[64];     /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
   pid_t pid;
   int stdin_fd;           /* karidns -> script への書き込み側 */
   int stdout_fd;          /* script -> karidns への読み込み側 */
@@ -440,9 +462,11 @@ void zone_arena_clear_data_pools(zone_arena_t *arena);
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
 void free_ixfr_txn(ixfr_txn_t *txn);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
+zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
+view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_name);
+zone_db_entry_t *snapshot_get_zone_in_view(zone_db_snapshot_t *snap, const char *view_name, const char *domain);
 void prelink_zone_additional_glue(zone_arena_t *current_zone,
                                   const char *zone_domain,
-                                  zone_db_snapshot_t *snap,
                                   view_snapshot_t *view,
                                   additional_from_auth_t policy);
 

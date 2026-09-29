@@ -473,7 +473,7 @@ static void test_parse_xfr_packet(void) {
     assert(session.soa_count == 1);
     assert(standby.count == 1);
 
-    // 3. Out of zone record rejection
+    // 3. Out-of-zone record: skipped, not stored; the transfer continues (R-27, RFC 1034 §4.2)
     uint8_t bad_pkt[512];
     memcpy(bad_pkt, pkt, off);
     bad_pkt[6] = 0; bad_pkt[7] = 1; // ANCOUNT=1
@@ -490,8 +490,11 @@ static void test_parse_xfr_packet(void) {
     bad_pkt[bad_off++] = 0; bad_pkt[bad_off++] = 4; // RDLEN=4
     bad_pkt[bad_off++] = 10; bad_pkt[bad_off++] = 0; bad_pkt[bad_off++] = 0; bad_pkt[bad_off++] = 1;
 
+    size_t count_before = standby.count;
     int r_bad = parse_xfr_packet(bad_pkt, bad_off, &standby, NULL, &session, "example.com");
-    assert(r_bad == -1);
+    assert(r_bad == 0);
+    assert(standby.count == count_before);
+    assert(session.out_of_zone_skipped == 1);
 
     zone_arena_destroy(&standby);
     printf("  -> parse_xfr_packet passed.\n");
@@ -1167,9 +1170,12 @@ static void test_parse_xfr_packet_error_and_out_of_zone_rejections(void) {
     out_pkt[off++] = 0; out_pkt[off++] = 0; out_pkt[off++] = 1; out_pkt[off++] = 0x2C;
     out_pkt[off++] = 0; out_pkt[off++] = 4;
     out_pkt[off++] = 192; out_pkt[off++] = 0; out_pkt[off++] = 2; out_pkt[off++] = 1;
-    assert(parse_xfr_packet(out_pkt, off, &standby, &active, &session, "example.com.") == -1);
+    /* R-27: skipped and counted, not stored; one such record must not abort the transfer */
+    assert(parse_xfr_packet(out_pkt, off, &standby, &active, &session, "example.com.") == 0);
+    assert(standby.count == 0);
+    assert(session.out_of_zone_skipped == 1);
 
-    // 4. Same length but mismatch domain name
+    // 4. Same length but mismatch domain name (also out of zone -> skipped)
     uint8_t diff_pkt[256] = {0};
     diff_pkt[6] = 0; diff_pkt[7] = 1;
     off = 12;
@@ -1178,7 +1184,46 @@ static void test_parse_xfr_packet_error_and_out_of_zone_rejections(void) {
     diff_pkt[off++] = 0; diff_pkt[off++] = 0; diff_pkt[off++] = 1; diff_pkt[off++] = 0x2C;
     diff_pkt[off++] = 0; diff_pkt[off++] = 4;
     diff_pkt[off++] = 192; diff_pkt[off++] = 0; diff_pkt[off++] = 2; diff_pkt[off++] = 1;
-    assert(parse_xfr_packet(diff_pkt, off, &standby, &active, &session, "example.com.") == -1);
+    assert(parse_xfr_packet(diff_pkt, off, &standby, &active, &session, "example.com.") == 0);
+    assert(standby.count == 0);
+    assert(session.out_of_zone_skipped == 2);
+
+    // 4b. Suffix look-alike (label boundary): xexample.com. is not in example.com.
+    uint8_t look_pkt[256] = {0};
+    look_pkt[6] = 0; look_pkt[7] = 2; // ANCOUNT = 2
+    off = 12;
+    off += write_uncompressed_name(look_pkt, off, sizeof(look_pkt), "xexample.com.");
+    look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0; look_pkt[off++] = 1;
+    look_pkt[off++] = 0; look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0x2C;
+    look_pkt[off++] = 0; look_pkt[off++] = 4;
+    look_pkt[off++] = 192; look_pkt[off++] = 0; look_pkt[off++] = 2; look_pkt[off++] = 1;
+    off += write_uncompressed_name(look_pkt, off, sizeof(look_pkt), "in.example.com.");
+    look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0; look_pkt[off++] = 1;
+    look_pkt[off++] = 0; look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0x2C;
+    look_pkt[off++] = 0; look_pkt[off++] = 4;
+    look_pkt[off++] = 192; look_pkt[off++] = 0; look_pkt[off++] = 2; look_pkt[off++] = 2;
+    assert(parse_xfr_packet(look_pkt, off, &standby, &active, &session, "example.com.") == 0);
+    assert(session.out_of_zone_skipped == 3);
+    assert(standby.count == 1 && strcasecmp(standby.records[0].name, "in.example.com.") == 0);
+    standby.count = 0;
+
+    // 4c. An SOA whose owner is outside the zone is a protocol error: the transfer is rejected
+    uint8_t oosoa_pkt[256] = {0};
+    oosoa_pkt[6] = 0; oosoa_pkt[7] = 1;
+    off = 12;
+    off += write_uncompressed_name(oosoa_pkt, off, sizeof(oosoa_pkt), "other.test.");
+    oosoa_pkt[off++] = 0; oosoa_pkt[off++] = 6; oosoa_pkt[off++] = 0; oosoa_pkt[off++] = 1;
+    oosoa_pkt[off++] = 0; oosoa_pkt[off++] = 0; oosoa_pkt[off++] = 1; oosoa_pkt[off++] = 0x2C;
+    size_t oordp = off; off += 2;
+    off += write_uncompressed_name(oosoa_pkt, off, sizeof(oosoa_pkt), "ns1.other.test.");
+    off += write_uncompressed_name(oosoa_pkt, off, sizeof(oosoa_pkt), "admin.other.test.");
+    for (int k = 0; k < 5; k++) { oosoa_pkt[off++] = 0; oosoa_pkt[off++] = 0; oosoa_pkt[off++] = 0; oosoa_pkt[off++] = 10; }
+    uint16_t oordl = (uint16_t)(off - (oordp + 2));
+    oosoa_pkt[oordp] = oordl >> 8; oosoa_pkt[oordp + 1] = oordl & 0xFF;
+    memset(&session, 0, sizeof(session));
+    assert(parse_xfr_packet(oosoa_pkt, off, &standby, &active, &session, "example.com.") == -1);
+    assert(session.soa_count == 0);
+    standby.count = 0;
 
     // 5. Serial rollback / not newer check
     uint8_t rollback_pkt[256] = {0};
@@ -2824,9 +2869,50 @@ static void test_axfr_ixfr_catalog_zone_member_sync(void) {
 
 static void test_axfr_ixfr_out_of_bailiwick_record_drop(void) {
     printf("[TEST] AXFR/IXFR: drop out-of-bailiwick records in zone payload...\n");
-    const char *origin = "example.com.";
-    const char *bad_name = "evil.attacker.org.";
-    assert(!domain_names_match_ci(origin, bad_name));
+    /* R-27: a full AXFR (SOA, in-zone A, out-of-zone PTR, in-zone A, SOA) completes and keeps
+     * only the in-zone data. */
+    zone_arena_t standby, active;
+    zone_arena_init(&standby);
+    zone_arena_init(&active);
+    axfr_session_t session;
+    memset(&session, 0, sizeof(session));
+    uint8_t pkt[512] = {0};
+    pkt[6] = 0; pkt[7] = 5; // ANCOUNT = 5
+    size_t off = 12;
+    const char *names[5] = { "example.com.", "www.example.com.", "10.2.0.192.in-addr.arpa.",
+                             "mail.example.com.", "example.com." };
+    const uint16_t types[5] = { 6, 1, 12, 1, 6 };
+    for (int r = 0; r < 5; r++) {
+        off += write_uncompressed_name(pkt, off, sizeof(pkt), names[r]);
+        pkt[off++] = 0; pkt[off++] = (uint8_t)types[r]; pkt[off++] = 0; pkt[off++] = 1;
+        pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0x2C;
+        size_t rdp = off; off += 2;
+        if (types[r] == 6) {
+            off += write_uncompressed_name(pkt, off, sizeof(pkt), "ns1.example.com.");
+            off += write_uncompressed_name(pkt, off, sizeof(pkt), "admin.example.com.");
+            for (int k = 0; k < 5; k++) { pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 7; }
+        } else if (types[r] == 12) {
+            off += write_uncompressed_name(pkt, off, sizeof(pkt), "www.example.com.");
+        } else {
+            pkt[off++] = 192; pkt[off++] = 0; pkt[off++] = 2; pkt[off++] = (uint8_t)(10 + r);
+        }
+        uint16_t rdl = (uint16_t)(off - (rdp + 2));
+        pkt[rdp] = rdl >> 8; pkt[rdp + 1] = rdl & 0xFF;
+    }
+    assert(parse_xfr_packet(pkt, off, &standby, &active, &session, "example.com.") == 0);
+    assert(session.is_finished);
+    assert(session.out_of_zone_skipped == 1);
+    bool saw_ptr = false;
+    size_t a_count = 0;
+    for (size_t i = 0; i < standby.count; i++) {
+        if (standby.records[i].type_code == 12) saw_ptr = true;
+        if (standby.records[i].type_code == 1) a_count++;
+        assert(domain_name_is_at_or_below(standby.records[i].name, "example.com."));
+    }
+    assert(!saw_ptr);
+    assert(a_count == 2);
+    zone_arena_destroy(&standby);
+    zone_arena_destroy(&active);
     printf("  -> out-of-bailiwick drop passed.\n");
 }
 

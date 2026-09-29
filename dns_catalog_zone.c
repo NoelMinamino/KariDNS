@@ -27,23 +27,7 @@ void free_catalog_member_ids(catalog_member_id_t *arr, int count) {
 }
 
 zone_db_entry_t *find_catalog_parent_in_snapshot(view_snapshot_t *view, const char *catalog_domain) {
-    if (!view || !catalog_domain) return NULL;
-    if (view->hash_size > 0 && view->hash_table && view->chain_next) {
-        uint32_t hash = calc_fnv1a_str(catalog_domain);
-        size_t idx = hash & (view->hash_size - 1);
-        for (int i = view->hash_table[idx]; i != -1; i = view->chain_next[i]) {
-            if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
-                return view->entries[i];
-            }
-        }
-        return NULL;
-    }
-    for (size_t i = 0; i < view->zone_count; i++) {
-        if (strcasecmp(view->entries[i]->domain, catalog_domain) == 0) {
-            return view->entries[i];
-        }
-    }
-    return NULL;
+    return find_zone_exact_in_view(view, catalog_domain);
 }
 
 void remove_member_from_catalog_bookkeeping(zone_db_entry_t *catalog_entry, const char *unique_id, const char *domain) {

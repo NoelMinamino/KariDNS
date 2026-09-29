@@ -56,4 +56,26 @@ static inline bool domain_names_match_ci(const char *a, const char *b) {
     return false;
 }
 
+/* name (表示形式) が apex と同じか、その下にあるか。末尾ドットの有無は問わない。
+ * ラベル境界は、エスケープされていない '.' だけとする ("a\.example.test" は
+ * "example.test" の下ではない)。apex が "." または "" ならルートなので常に true。
+ * RFC 1034 §4.2: ゾーンは apex とその下の (カットより上の) データからなる。 */
+static inline bool dns_char_is_escaped(const char *s, size_t pos) {
+    size_t bs = 0;
+    while (pos > bs && s[pos - bs - 1] == '\\') bs++;
+    return (bs % 2) == 1;
+}
+
+static inline bool domain_name_is_at_or_below(const char *name, const char *apex) {
+    if (!name || !apex) return false;
+    size_t nl = strlen(name), al = strlen(apex);
+    if (nl > 0 && name[nl - 1] == '.' && !dns_char_is_escaped(name, nl - 1)) nl--;
+    if (al > 0 && apex[al - 1] == '.' && !dns_char_is_escaped(apex, al - 1)) al--;
+    if (al == 0) return true;
+    if (nl < al || strncasecmp(name + (nl - al), apex, al) != 0) return false;
+    if (nl == al) return true;
+    size_t dot = nl - al - 1;
+    return name[dot] == '.' && !dns_char_is_escaped(name, dot);
+}
+
 #endif

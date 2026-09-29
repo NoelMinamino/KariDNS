@@ -133,7 +133,7 @@ static void test_rebuild_two_views(void) {
     wfile("b.zone", ZONE_B);
     wfile("broken.zone", "$ORIGIN c.example.\n@ IN SOA ns h 1 2 3 4 5\nwww IN A\n");
     wfile("nosoa.zone", "$ORIGIN d.example.\n$TTL 60\n@ IN NS ns.d.example.\nns IN A 192.0.2.4\n");
-    wfile("dname.zone", "$ORIGIN e.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nd IN DNAME t.example.\nx.d IN A 192.0.2.5\n");
+    wfile("dname.zone", "$ORIGIN a.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nd IN DNAME t.example.\nx.d IN A 192.0.2.5\n");
 
     server_config_t *cfg = load_conf(
         "options { additional-from-auth yes; };\n"
@@ -194,6 +194,7 @@ static void test_rebuild_two_views(void) {
     assert(reload_master_zone(ea, &bad) == RELOAD_ERR_PARSE || reload_master_zone(ea, &bad) == RELOAD_ERR_MISSING_SOA);
     snprintf(zpath, sizeof(zpath), "%s/nosoa.zone", g_dir); bad.file = zpath;
     assert(reload_master_zone(ea, &bad) == RELOAD_ERR_MISSING_SOA);
+    /* dname.zone は a.example. のデータ (別ゾーンのデータはゾーン外として捨てられ、SOA 欠落になる: R-27) */
     snprintf(zpath, sizeof(zpath), "%s/dname.zone", g_dir); bad.file = zpath;
     assert(reload_master_zone(ea, &bad) == RELOAD_ERR_PARSE);
     snprintf(zpath, sizeof(zpath), "%s/does-not-exist.zone", g_dir); bad.file = zpath;
@@ -675,22 +676,100 @@ static void test_snapshot_rebuild_case_29(void) {
     assert(snapshot_get_zone(&snap, "nonexistent.domain.") == NULL);
 }
 
+/* www.shared.example. の A レコードの値を返す (無ければ NULL) */
+static const char *shared_www_addr(zone_db_entry_t *e) {
+    zone_arena_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
+    for (size_t i = 0; a && i < a->count; i++) {
+        if (a->records[i].type_code == 1 && strcasecmp(a->records[i].name, "www.shared.example.") == 0)
+            return a->records[i].rdata[0];
+    }
+    return NULL;
+}
+
+/* R-26: the same zone name in two views keeps each view's own data, at start-up and after every
+ * reload (rebuild_zone_db_from_config() used to load the last view's file into the first view's entry). */
 static void test_snapshot_rebuild_case_30(void) {
-    printf("[TEST] Snapshot Rebuild: Multiple views lookup precedence...\n");
-    wfile("v1_shared.zone", "$ORIGIN shared.example.\n$TTL 60\n@ IN SOA ns1 h 1 2 3 4 5\n@ IN NS ns1\n");
-    wfile("v2_shared.zone", "$ORIGIN shared.example.\n$TTL 60\n@ IN SOA ns2 h 1 2 3 4 5\n@ IN NS ns2\n");
+    printf("[TEST] Snapshot Rebuild: same zone name in two views serves each view's data...\n");
+    wfile("v1_shared.zone", "$ORIGIN shared.example.\n$TTL 60\n@ IN SOA ns1 h 1 2 3 4 5\n@ IN NS ns1\n"
+                            "ns1 IN A 192.0.2.1\nwww IN A 192.0.2.11\n");
+    wfile("v2_shared.zone", "$ORIGIN shared.example.\n$TTL 60\n@ IN SOA ns2 h 1 2 3 4 5\n@ IN NS ns2\n"
+                            "ns2 IN A 192.0.2.2\nwww IN A 198.51.100.22\n");
     server_config_t *cfg = load_conf(
         "options { directory \"%s\"; };\n"
-        "view \"view1\" { zone \"shared.example\" { type master; file \"%s/v1_shared.zone\"; }; };\n"
-        "view \"view2\" { zone \"shared.example\" { type master; file \"%s/v2_shared.zone\"; }; };\n",
+        "view \"view1\" { match-clients { 127.0.0.1; }; zone \"shared.example\" { type master; file \"%s/v1_shared.zone\"; }; };\n"
+        "view \"view2\" { match-clients { any; }; zone \"shared.example\" { type master; file \"%s/v2_shared.zone\"; }; };\n",
         g_dir, g_dir, g_dir);
-    zone_db_snapshot_t *snap = build(cfg, false);
-    assert(snap != NULL);
-    assert(snap->view_count == 2);
-    zone_db_entry_t *z = snapshot_get_zone(snap, "shared.example.");
-    assert(z != NULL);
-    assert(strcmp(z->domain, "shared.example.") == 0);
-    release_zone_snapshot(snap);
+    for (int round = 0; round < 3; round++) {
+        /* round 0: start-up, round 1: reload of every zone, round 2: reload with skip_unchanged */
+        zone_db_snapshot_t *snap = build(cfg, round == 2);
+        assert(snap != NULL);
+        assert(snap->view_count == 2);
+        zone_db_entry_t *z1 = snapshot_get_zone_in_view(snap, "view1", "shared.example.");
+        zone_db_entry_t *z2 = snapshot_get_zone_in_view(snap, "view2", "shared.example");
+        assert(z1 && z2 && z1 != z2);
+        assert(strcmp(z1->view_name, "view1") == 0 && strcmp(z2->view_name, "view2") == 0);
+        assert(find_zone_exact_in_view(snapshot_find_view(snap, "VIEW1"), "SHARED.example.") == z1);
+        assert(snapshot_get_zone_in_view(snap, "view3", "shared.example.") == NULL);
+        assert(snapshot_get_zone_in_view(snap, "view1", "www.shared.example.") == NULL); /* exact apex only */
+        const char *a1 = shared_www_addr(z1), *a2 = shared_www_addr(z2);
+        assert(a1 && strcmp(a1, "192.0.2.11") == 0);
+        assert(a2 && strcmp(a2, "198.51.100.22") == 0);
+        /* query path: the client address selects the view, the view selects the entry */
+        assert(find_zone_in_view(select_view(snap, "127.0.0.1"), "www.shared.example.") == z1);
+        assert(find_zone_in_view(select_view(snap, "192.0.2.200"), "www.shared.example.") == z2);
+        /* karictl reload <zone> <view> */
+        zone_lookup_result_t lr;
+        memset(&lr, 0, sizeof(lr));
+        assert(lookup_zone_across_views(snap, cfg, "shared.example.", "view2", &lr) == 1);
+        assert(lr.entry == z2 && lr.zcfg && strcmp(lr.view_name, "view2") == 0);
+        assert(lookup_zone_across_views(snap, cfg, "shared.example.", NULL, &lr) == 2);
+        release_zone_snapshot(snap);
+    }
+}
+
+/* O-13: a zone whose type changes on reload gets a new entry (is_secondary/kind follow the new type);
+ * an unchanged zone keeps its entry. */
+static void test_snapshot_rebuild_type_change(void) {
+    printf("[TEST] Snapshot Rebuild: zone type change recreates the zone entry...\n");
+    wfile("tc.zone", "$ORIGIN tc.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n");
+    wfile("keep.zone", "$ORIGIN keep.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 192.0.2.1\n");
+    server_config_t *c1 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "zone \"tc.example\" { type master; file \"%s/tc.zone\"; };\n"
+        "zone \"keep.example\" { type primary; file \"%s/keep.zone\"; };\n", g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s1 = build(c1, false);
+    zone_db_entry_t *tc1 = snapshot_get_zone_in_view(s1, "__default__", "tc.example.");
+    zone_db_entry_t *keep1 = snapshot_get_zone_in_view(s1, "__default__", "keep.example.");
+    assert(tc1 && keep1);
+    assert(tc1->kind == ZONE_KIND_PRIMARY && !tc1->is_secondary);
+
+    server_config_t *c2 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "zone \"tc.example\" { type slave; masters { 192.0.2.53; }; };\n"
+        "zone \"keep.example\" { type master; file \"%s/keep.zone\"; };\n", g_dir, g_dir);
+    zone_db_snapshot_t *s2 = build(c2, false);
+    zone_db_entry_t *tc2 = snapshot_get_zone_in_view(s2, "__default__", "tc.example.");
+    zone_db_entry_t *keep2 = snapshot_get_zone_in_view(s2, "__default__", "keep.example.");
+    assert(tc2 && tc2 != tc1);
+    assert(tc2->kind == ZONE_KIND_SECONDARY && tc2->is_secondary);
+    assert(keep2 == keep1); /* "primary" and "master" are the same kind */
+
+    server_config_t *c3 = load_conf(
+        "options { directory \"%s\"; };\n"
+        "zone \"tc.example\" { type master; file \"%s/tc.zone\"; };\n"
+        "zone \"keep.example\" { type master; file \"%s/keep.zone\"; };\n", g_dir, g_dir, g_dir);
+    zone_db_snapshot_t *s3 = build(c3, false);
+    zone_db_entry_t *tc3 = snapshot_get_zone_in_view(s3, "__default__", "tc.example.");
+    assert(tc3 && tc3 != tc2 && tc3->kind == ZONE_KIND_PRIMARY && !tc3->is_secondary);
+    zone_arena_t *a3 = atomic_load_explicit(&tc3->rcu.active, memory_order_acquire);
+    assert(a3 && a3->count >= 3); /* the recreated primary loaded its file */
+    assert(zone_kind_from_type("Secondary") == ZONE_KIND_SECONDARY);
+    assert(zone_kind_from_type("forward") == ZONE_KIND_FORWARD);
+    assert(zone_kind_from_type("program") == ZONE_KIND_PROGRAM);
+    assert(zone_kind_from_type(NULL) == ZONE_KIND_OTHER);
+    release_zone_snapshot(s1);
+    release_zone_snapshot(s2);
+    release_zone_snapshot(s3);
 }
 
 static void test_snapshot_rebuild_case_31(void) {
@@ -823,6 +902,7 @@ int main(void) {
     test_snapshot_rebuild_case_28();
     test_snapshot_rebuild_case_29();
     test_snapshot_rebuild_case_30();
+    test_snapshot_rebuild_type_change();
     test_snapshot_rebuild_case_31();
     test_snapshot_rebuild_case_32();
     test_snapshot_rebuild_case_33();

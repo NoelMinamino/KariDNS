@@ -1021,11 +1021,11 @@ static void test_prelink_zone_additional_glue_policies(void) {
     snap.view_count = 1;
 
     // 1. Policy NO
-    prelink_zone_additional_glue(&arena, "glue.example.", &snap, &view, ADDITIONAL_AUTH_NO);
+    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_NO);
     assert(arena.prelinked_glue == NULL);
 
     // 2. Policy YES
-    prelink_zone_additional_glue(&arena, "glue.example.", &snap, &view, ADDITIONAL_AUTH_YES);
+    prelink_zone_additional_glue(&arena, "glue.example.", &view, ADDITIONAL_AUTH_YES);
     assert(arena.prelinked_glue != NULL);
     assert(arena.prelinked_glue_count >= 1);
 
@@ -1845,7 +1845,7 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
 
     // 6. dispatch_to_program_zone with no plugin registered -> returns synthetic SERVFAIL
     uint8_t prog_res[512];
-    int pr_len = dispatch_to_program_zone("unregistered.prog.", qpkt, qlen, prog_res, sizeof(prog_res), "127.0.0.1", false);
+    int pr_len = dispatch_to_program_zone("", "unregistered.prog.", qpkt, qlen, prog_res, sizeof(prog_res), "127.0.0.1", false);
     assert(pr_len > 0);
     assert((prog_res[3] & 0x0F) == 2); // SERVFAIL
 
@@ -1870,7 +1870,7 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     memset(&null_prog_cfg, 0, sizeof(null_prog_cfg));
     null_prog_cfg.domain = "null.prog.";
     program_plugin_t null_out;
-    assert(spawn_one_program_plugin(&null_prog_cfg, &null_out) == false);
+    assert(spawn_one_program_plugin(&null_prog_cfg, "", &null_out) == false);
 
     // 10. nsec_covers_name & find_covering_nsec
     zone_arena_t nsec_arena;
@@ -2070,7 +2070,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     server_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.wire_cache_max_records = 100;
-    build_zone_response_cache(&test_arena, &cfg, "example.com.");
+    build_zone_response_cache(&test_arena, &cfg, NULL, "example.com.");
     zone_arena_destroy(&test_arena);
 
     // 8. name_to_canonical_wire
@@ -2116,8 +2116,27 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     zone_arena_destroy(&nsec3_arena);
 
     // 14. find_program_plugin
-    assert(find_program_plugin(NULL) == NULL);
-    assert(find_program_plugin("unknown.domain.invalid.") == NULL);
+    assert(find_program_plugin("", NULL) == NULL);
+    assert(find_program_plugin("", "unknown.domain.invalid.") == NULL);
+    {
+        /* O-12: the same program zone name in two views has two plugins; the lookup uses the view */
+        program_plugin_t two[2];
+        memset(two, 0, sizeof(two));
+        strlcpy(two[0].domain, "prog.example.", sizeof(two[0].domain));
+        strlcpy(two[0].view_name, "internal", sizeof(two[0].view_name));
+        strlcpy(two[1].domain, "prog.example.", sizeof(two[1].domain));
+        strlcpy(two[1].view_name, "external", sizeof(two[1].view_name));
+        program_plugin_t *saved = g_program_plugins;
+        int saved_count = g_program_plugins_count;
+        g_program_plugins = two;
+        g_program_plugins_count = 2;
+        assert(find_program_plugin("internal", "prog.example.") == &two[0]);
+        assert(find_program_plugin("EXTERNAL", "PROG.example.") == &two[1]);
+        assert(find_program_plugin("other", "prog.example.") == NULL);
+        assert(find_program_plugin(NULL, "prog.example.") == NULL);
+        g_program_plugins = saved;
+        g_program_plugins_count = saved_count;
+    }
 
     // 15. forward_via_tcp
     struct sockaddr_storage fwd_ss;
@@ -2190,7 +2209,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     assert(question_section_matches(valid_qpkt, valid_qlen, valid_qpkt, valid_qlen) == true);
     assert(question_section_matches(qpkt, sizeof(qpkt), qpkt, sizeof(qpkt)) == false);
     assert(question_section_matches(NULL, 0, valid_qpkt, valid_qlen) == false);
-    int pgm_res = dispatch_to_program_zone("invalid.zone.", valid_qpkt, valid_qlen, rpkt, sizeof(rpkt), "127.0.0.1", false);
+    int pgm_res = dispatch_to_program_zone("", "invalid.zone.", valid_qpkt, valid_qlen, rpkt, sizeof(rpkt), "127.0.0.1", false);
     assert(pgm_res >= 12);
     assert((rpkt[3] & 0x0F) == 2); // SERVFAIL
 
@@ -9074,21 +9093,21 @@ static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(voi
     size_t req_len = 0;
     build_dns_query(req, &req_len, 0x1234, "plugtest.example.", 1, false);
 
-    int rc1 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc1 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
     assert(rc1 >= 12); // Returns synthetic SERVFAIL packet length
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
     assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 1);
     assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == false);
 
     // Second failure -> reaches max_failures (2) -> marks dead
-    int rc2 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc2 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
     assert(rc2 >= 12);
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
     assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 2);
     assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == true);
 
     // Third call while dead -> immediately returns SERVFAIL without pipe I/O
-    int rc3 = dispatch_to_program_zone("plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc3 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
     assert(rc3 >= 12);
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
 

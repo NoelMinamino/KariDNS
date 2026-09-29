@@ -39,6 +39,10 @@ typedef struct parse_context_s {
     // --- 隍・焚繧ｾ繝ｼ繝ｳ繝ｻ隕ｪ蟄舌だ繝ｼ繝ｳ謖ｯ繧雁・縺醍畑 ---
     const char **all_zone_names;
     int all_zone_count;
+    /* tinydns: all_zone_names のどのゾーンにも属さないため捨てたレコードの数と、
+     * その最初のオーナー名 (arena 内の文字列)。all_zone_names が無ければ数えない。 */
+    size_t out_of_zone_count;
+    const char *first_out_of_zone;
 } parse_context_t;
 
 typedef struct {
@@ -114,11 +118,14 @@ void zone_arena_init(zone_arena_t *arena);
 void zone_arena_destroy(zone_arena_t *arena);
 void zone_arena_free_include_buffers(zone_arena_t *arena);
 void free_zone_response_cache(zone_arena_t *arena);
-void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *domain);
+void build_zone_response_cache(zone_arena_t *arena, struct server_config_s *cfg, const char *view_name, const char *domain);
 void *arena_alloc(zone_arena_t *arena, size_t size);
 char *arena_strdup(zone_arena_t *arena, const char *str);
 /* RFC 2181 s5.2 / RFC 4035 s2.2: harmonize_ttls=true normalizes RRset TTLs. */
 int build_zone_index(zone_arena_t *arena, bool harmonize_ttls);
+/* RFC 1034 s4.2: drop records whose owner is not at or below apex (call before build_zone_index). */
+size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
+                                   void (*report)(const dns_record_t *rec, void *ud), void *ud);
 bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);

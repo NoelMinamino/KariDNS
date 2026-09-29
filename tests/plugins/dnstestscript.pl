@@ -6,6 +6,9 @@ use Socket;
 
 $| = 1; # Autoflush stdout
 
+# Optional first argument (program-args): the address returned in "normal" A answers.
+my $A_ADDR = $ARGV[0] // "192.0.2.1";
+
 sub extract_qname {
     my ($pkt) = @_;
     return "" if length($pkt) < 12;
@@ -41,8 +44,8 @@ sub build_normal_a_response {
     $q_offset += 5; # 0x00 + QTYPE(2) + QCLASS(2)
     my $question = substr($req, 12, $q_offset - 12);
 
-    # Answer section: pointer to question (0xc00c), TYPE=1 (A), CLASS=1 (IN), TTL=300, RDLENGTH=4, RDATA=192.0.2.1
-    my $answer = pack("n", 0xc00c) . pack("nnNn", 1, 1, 300, 4) . inet_aton("192.0.2.1");
+    # Answer section: pointer to question (0xc00c), TYPE=1 (A), CLASS=1 (IN), TTL=300, RDLENGTH=4, RDATA=$A_ADDR
+    my $answer = pack("n", 0xc00c) . pack("nnNn", 1, 1, 300, 4) . inet_aton($A_ADDR);
 
     return $header . $question . $answer;
 }

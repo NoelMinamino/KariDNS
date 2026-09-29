@@ -666,8 +666,8 @@ static void sw_setup_all(const char *conf, bool optout) {
 
 static void sw_prelink_and_cache(additional_from_auth_t policy) {
     for (int i = 0; i < g_sw.zone_count; i++) {
-        prelink_zone_additional_glue(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.snap, &g_sw.view, policy);
-        build_zone_response_cache(&g_sw.arena[i], g_sw.cfg, g_sw.entry[i].domain);
+        prelink_zone_additional_glue(&g_sw.arena[i], g_sw.entry[i].domain, &g_sw.view, policy);
+        build_zone_response_cache(&g_sw.arena[i], g_sw.cfg, NULL, g_sw.entry[i].domain);
     }
 }
 
@@ -917,7 +917,7 @@ static void pg_run(int scn, bool disable_tc, size_t max_res, int rounds, uint32_
     uint8_t req[512], res[8192];
     for (int r = 0; r < rounds; r++) {
         size_t len = sw_build(req, (uint16_t)(0x7100 + r), 0x01, 0, "a.prog.test.", 1, 1, 0);
-        int n = dispatch_to_program_zone("prog.test.", req, len, res, max_res, r & 1 ? NULL : "192.0.2.9", r & 1);
+        int n = dispatch_to_program_zone("", "prog.test.", req, len, res, max_res, r & 1 ? NULL : "192.0.2.9", r & 1);
         assert(n >= 0);
     }
     close(in_p[1]);
@@ -946,8 +946,8 @@ static void test_program_zone_emulated(void) {
     /* unknown zone / dead plugin / helpers */
     uint8_t req[512], res[512];
     size_t len = sw_build(req, 1, 1, 0, "a.prog.test.", 1, 1, 0);
-    assert(dispatch_to_program_zone("none.test.", req, len, res, sizeof(res), NULL, false) > 0);
-    assert(find_program_plugin(NULL) == NULL);
+    assert(dispatch_to_program_zone("", "none.test.", req, len, res, sizeof(res), NULL, false) > 0);
+    assert(find_program_plugin("", NULL) == NULL);
     assert(build_synthetic_servfail(req, 5, res, sizeof(res)) == 0);
     assert(build_synthetic_servfail(req, len, res, 5) == 0);
     assert(build_synthetic_servfail(req, len, res, 16) == 16 && res[5] == 0);

@@ -31,7 +31,7 @@ int build_synthetic_servfail(const uint8_t *req, size_t req_len,
                              uint8_t *res, size_t max_res_len);
 ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms);
 ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
-int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
+int dispatch_to_program_zone(const char *view_name, const char *domain, const uint8_t *req, size_t req_len,
                              uint8_t *res, size_t max_res_len,
                              const char *client_ip, bool is_tcp);
 bool question_section_matches(const uint8_t *resp, size_t resp_len,
@@ -52,7 +52,7 @@ bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                          dns_record_t **attached, int *attached_count);
 bool name_exists_in_zone(zone_arena_t *zone, const char *name, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
 const char *find_closest_encloser(zone_arena_t *zone, const char *qname, const char *zone_apex, const char client_loc[2], const char *client_ecs_tag, const char *client_loc_tag);
-program_plugin_t *find_program_plugin(const char *domain);
+program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,
                         uint8_t *resp_out, size_t resp_out_cap,

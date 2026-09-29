@@ -264,6 +264,7 @@ register_test "unit" "bin" "test_fi_dag" "Fault Injection: dag client query pack
 # 2. Zone Transfer / Redundancy (AXFR / IXFR)
 register_test "xfr" "sh" "tests/run_capsicum_axfr_test.sh" "Capsicum sandbox capability mode AXFR"
 register_test "xfr" "sh" "tests/run_ixfr_roundtrip_test.sh" "RFC 1995 IXFR incremental diff roundtrip"
+register_test "xfr" "sh" "tests/run_xfr_out_of_zone_test.sh" "Out-of-zone records ignored by loader/karicheck; KariDNS primary -> secondary transfer (R-27)"
 register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXFR (Option 65153)"
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
 register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer"
@@ -318,6 +319,7 @@ register_test "core" "sh" "tests/run_forward_zone_test.sh" "RFC 5452 Forward zon
 register_test "core" "sh" "tests/run_program_zone_test.sh" "Dynamic backend records via program zone plugin"
 register_test "core" "sh" "tests/run_karictl_observatory_test.sh" "karictl observatory IPC metrics query"
 register_test "core" "sh" "tests/run_karictl_reload_reconfig_test.sh" "karictl reload & dynamic reconfig IPC"
+register_test "core" "sh" "tests/run_view_same_zone_test.sh" "Same zone name in two views: data, glue and program plugin per view (R-26, O-12)"
 register_test "core" "sh" "tests/run_config_duplicate_rejection_test.sh" "Duplicate view/zone rejection in config parser"
 register_test "core" "sh" "tests/run_domain_length_rfc1035_test.sh" "RFC 1035 255-byte domain & 63-byte label limits"
 register_test "core" "sh" "tests/run_logging_channel_validation_test.sh" "Syslog & file logging channels configuration"

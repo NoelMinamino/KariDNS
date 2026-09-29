@@ -2602,27 +2602,22 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
     for (view_config_t *v = standby->views; v; v = v->next) {
       for (zone_config_t *z = v->zones; z; z = z->next) {
         if (z->type && strcasecmp(z->type, "program") == 0) {
-          bool already_running = false;
-          for (int i = 0; i < g_program_plugins_count; i++) {
-            if (strcasecmp(g_program_plugins[i].domain, z->domain) == 0) {
-              already_running = true;
-              /* M-4: 実行中の設定と新しい設定を比較し、変わっていれば警告 */
-              char new_fingerprint[512];
-              compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
-              if (strcmp(g_program_plugins[i].config_fingerprint, new_fingerprint) != 0) {
-                syslog(LOG_WARNING, "[Plugin] zone '%s' (type program) configuration changed "
-                       "(program/program-args/program-user/program-timeout/program-max-failures), "
-                       "but the running plugin process cannot be restarted without a full karidns "
-                       "restart (Capsicum sandbox is already active). The OLD configuration is "
-                       "still in effect for this zone.", z->domain);
-              }
-              break;
+          program_plugin_t *running = find_program_plugin(v->name, z->domain);
+          if (running) {
+            /* M-4: 実行中の設定と新しい設定を比較し、変わっていれば警告 */
+            char new_fingerprint[512];
+            compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
+            if (strcmp(running->config_fingerprint, new_fingerprint) != 0) {
+              syslog(LOG_WARNING, "[Plugin] zone '%s' in view '%s' (type program) configuration changed "
+                     "(program/program-args/program-user/program-timeout/program-max-failures), "
+                     "but the running plugin process cannot be restarted without a full karidns "
+                     "restart (Capsicum sandbox is already active). The OLD configuration is "
+                     "still in effect for this zone.", z->domain, v->name);
             }
-          }
-          if (!already_running) {
-            syslog(LOG_ERR, "[Plugin] zone '%s' (type program) was added via reload but "
+          } else {
+            syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s' (type program) was added via reload but "
                    "cannot be started without a full restart (Capsicum sandbox is already active). "
-                   "This zone will return SERVFAIL until karidns is restarted.", z->domain);
+                   "This zone will return SERVFAIL until karidns is restarted.", z->domain, v->name);
           }
         }
       }

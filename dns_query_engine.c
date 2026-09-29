@@ -1929,10 +1929,11 @@ size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount)
     return (offset <= len) ? offset : len;
 }
 
-STATIC_TEST program_plugin_t *find_program_plugin(const char *domain) {
-  if (!domain) return NULL;
+program_plugin_t *find_program_plugin(const char *view_name, const char *domain) {
+  if (!view_name || !domain) return NULL;
   for (int i = 0; i < g_program_plugins_count; i++) {
-    if (strcasecmp(g_program_plugins[i].domain, domain) == 0)
+    if (strcasecmp(g_program_plugins[i].view_name, view_name) == 0 &&
+        strcasecmp(g_program_plugins[i].domain, domain) == 0)
       return &g_program_plugins[i];
   }
   return NULL;
@@ -2051,10 +2052,11 @@ STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t 
   return (ssize_t)nread;
 }
 
-STATIC_TEST int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
+STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *domain,
+                                    const uint8_t *req, size_t req_len,
                                     uint8_t *res, size_t max_res_len,
                                     const char *client_ip, bool is_tcp) {
-  program_plugin_t *plugin = find_program_plugin(domain);
+  program_plugin_t *plugin = find_program_plugin(view_name, domain);
   if (!plugin || atomic_load_explicit(&plugin->dead, memory_order_acquire)) {
     return build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
   }
@@ -2351,7 +2353,7 @@ STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, s
   return build_synthetic_servfail(req, req_len, res, max_res_len);
 }
 
-bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
+bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out) {
   if (!zcfg->program_path) {
     syslog(LOG_ERR, "[Plugin] zone '%s' program_path is NULL; refusing to spawn", zcfg->domain);
     return false;
@@ -2440,6 +2442,7 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out) {
 
   strncpy(out->domain, zcfg->domain, sizeof(out->domain) - 1);
   out->domain[sizeof(out->domain) - 1] = '\0';
+  strlcpy(out->view_name, view_name ? view_name : "", sizeof(out->view_name));
   out->pid = pid;
   out->stdin_fd = in_pipe[1];
   out->stdout_fd = out_pipe[0];
@@ -2489,7 +2492,7 @@ void spawn_program_zone_plugins(server_config_t *cfg) {
       if (!z->program_user && cfg->user) {
         z->program_user = strdup(cfg->user);
       }
-      if (spawn_one_program_plugin(z, &g_program_plugins[idx])) idx++;
+      if (spawn_one_program_plugin(z, v->name, &g_program_plugins[idx])) idx++;
     }
   }
   g_program_plugins_count = idx;
@@ -2513,7 +2516,7 @@ view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip) {
   return NULL;
 }
 
-void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *domain) {
+void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain) {
   if (!arena || arena->count == 0) return;
 
   // If per-client location/ECS features or tinydns format are active, skip static wire cache
@@ -2529,7 +2532,8 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
     return;
   }
 
-  zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, NULL, domain) : NULL;
+  // O-07: 同じゾーン名が別の view にもあるので、このエントリの view の設定を見る
+  zone_config_t *zcfg = cfg ? find_zone_config_in_view(cfg, view_name, domain) : NULL;
   if (zcfg) {
     if (zcfg->location_tags != NULL && zcfg->location_tag_count > 0) return;
     if (zcfg->ecs_tags != NULL && zcfg->ecs_tag_count > 0) return;
@@ -3336,7 +3340,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
         }
       }
       int plugin_result_len = dispatch_to_program_zone(
-          zcfg->domain, req, req_len, res, max_res_len, client_ip, is_tcp);
+          view->name, zcfg->domain, req, req_len, res, max_res_len, client_ip, is_tcp);
       plugin_result_len = add_opt_to_truncated_passthrough(res, max_res_len, plugin_result_len,
                                                             &edns, is_tcp, cfg);
 

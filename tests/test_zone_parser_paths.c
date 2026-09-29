@@ -945,8 +945,63 @@ static void test_extended_negative_paths(void) {
     printf("  -> extended negative paths verified.\n");
 }
 
+static int g_ooz_reports;
+static void count_ooz(const dns_record_t *rec, void *ud) {
+    (void)rec;
+    assert(ud == &g_ooz_reports);
+    g_ooz_reports++;
+}
+
+/* R-27 (RFC 1034 §4.2): out-of-zone records are removed before indexing; label boundaries and
+ * presentation escapes are respected. */
+static void test_drop_out_of_zone(void) {
+    printf("[TEST] zone_arena_drop_out_of_zone / domain_name_is_at_or_below...\n");
+    assert(domain_name_is_at_or_below("example.test.", "example.test."));
+    assert(domain_name_is_at_or_below("example.test", "EXAMPLE.test."));
+    assert(domain_name_is_at_or_below("a.b.example.test.", "example.test"));
+    assert(!domain_name_is_at_or_below("xexample.test.", "example.test."));
+    assert(!domain_name_is_at_or_below("test.", "example.test."));
+    assert(!domain_name_is_at_or_below("a\\.example.test.", "example.test.")); /* one label "a.example" */
+    assert(domain_name_is_at_or_below("a\\\\.example.test.", "example.test.")); /* "a\\" then "example" */
+    assert(domain_name_is_at_or_below("anything.example.", "."));
+    assert(domain_name_is_at_or_below("anything.example.", ""));
+    assert(!domain_name_is_at_or_below(NULL, "example.test."));
+
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "example.test.", .is_standalone_mode = true, .err_out = &err };
+    static char text[] =
+        "$TTL 60\n"
+        "@ IN SOA ns1 h 1 2 3 4 5\n"
+        "@ IN NS ns1\n"
+        "@ IN NS ns.other.test.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "ns.other.test. IN A 192.0.2.2\n"            /* out-of-zone glue */
+        "10.2.0.192.in-addr.arpa. IN PTR www.example.test.\n"
+        "xexample.test. IN A 192.0.2.3\n"
+        "www IN A 192.0.2.4\n";
+    assert(parse_zone_fast(text, strlen(text), &arena, &ctx) >= 0);
+    size_t before = arena.count;
+    g_ooz_reports = 0;
+    size_t dropped = zone_arena_drop_out_of_zone(&arena, "example.test.", count_ooz, &g_ooz_reports);
+    assert(dropped == 3 && g_ooz_reports == 3);
+    assert(arena.count == before - 3);
+    for (size_t i = 0; i < arena.count; i++)
+        assert(domain_name_is_at_or_below(arena.records[i].name, "example.test."));
+    /* the in-zone records keep their order and data */
+    assert(strcasecmp(arena.records[arena.count - 1].name, "www.example.test.") == 0);
+    assert(strcmp(arena.records[arena.count - 1].rdata[0], "192.0.2.4") == 0);
+    assert(build_zone_index(&arena, true) == 0);
+    assert(zone_arena_drop_out_of_zone(&arena, "example.test.", NULL, NULL) == 0);
+    assert(zone_arena_drop_out_of_zone(NULL, "example.test.", NULL, NULL) == 0);
+    zone_arena_destroy(&arena);
+    printf("  -> out-of-zone drop passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
+    test_drop_out_of_zone();
     test_all_types_parse_and_serialize();
     test_rfc3597_generic_form();
     test_svcb_quoted_values();

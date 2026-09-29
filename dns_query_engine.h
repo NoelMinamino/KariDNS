@@ -26,7 +26,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                           zone_db_entry_t **out_matched_entry);
 
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
-bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out);
+bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void spawn_program_zone_plugins(server_config_t *cfg);
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap);
 size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount);
@@ -52,7 +52,8 @@ typedef struct resolve_checkpoint {
     uint16_t arcount;
 } resolve_checkpoint_t;
 
-void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *domain);
+void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain);
+program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 
 #ifdef KARIDNS_UNIT_TEST
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
@@ -115,8 +116,7 @@ ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeo
 ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
 int64_t monotonic_ms(void);
 uint32_t remaining_ms(int64_t deadline);
-program_plugin_t *find_program_plugin(const char *domain);
-int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
+int dispatch_to_program_zone(const char *view_name, const char *domain, const uint8_t *req, size_t req_len,
                              uint8_t *res, size_t max_res_len,
                              const char *client_ip, bool is_tcp);
 ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
@@ -127,7 +127,7 @@ int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_le
                           uint8_t *res, size_t max_res_len);
 bool nsec_covers_name(const dns_record_t *rec, const char *name);
 dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
-bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out);
+bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount);
 #endif
 

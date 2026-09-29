@@ -1930,3 +1930,27 @@ int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err) {
   return 0;
 }
 
+
+/* ゾーン外のレコード (オーナーが apex でもその下でもない) を取り除く。
+ * RFC 1034 §4.2: ゾーンは apex とその下のデータからなる。RFC 5936 §2.2: AXFR は
+ * そのゾーンを転送する。ゾーン外のデータを読み込むと AXFR で送られ、セカンダリが
+ * 受け取れない (R-27)。BIND と同様に警告して無視する。
+ * build_zone_index() より前 (レコードの添字を指すものが無い間) に呼ぶこと。
+ * report が NULL でなければ、取り除くレコードごとに呼ぶ。戻り値は取り除いた件数。 */
+size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
+                                   void (*report)(const dns_record_t *rec, void *ud), void *ud) {
+  if (!arena || !apex || !arena->records) return 0;
+  size_t kept = 0, dropped = 0;
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *r = &arena->records[i];
+    if (r->name && !domain_name_is_at_or_below(r->name, apex)) {
+      if (report) report(r, ud);
+      dropped++;
+      continue;
+    }
+    if (kept != i) arena->records[kept] = *r;
+    kept++;
+  }
+  arena->count = kept;
+  return dropped;
+}

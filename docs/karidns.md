@@ -329,6 +329,8 @@ Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `
 
 Views are checked in the order they are defined; the first match is used. A query from a client that matches no view is answered as if no zone matched (REFUSED). Without any `view` block, all top-level zones are placed in an implicit view that matches all clients.
 
+A zone that appears in several views is a separate zone in each view: its own file, data, additional-section glue from the other zones of the same view, wire cache settings and `program` plugin. `karictl reload <zone> <view>` reloads one view's copy. If a reload changes a zone's `type` (for example `master` to `slave`), the zone is recreated with the new type.
+
 ### Address match lists (ACLs)
 
 `allow-transfer`, `allow-update`, `match-clients` and `ecs-trusted-resolvers` take a list of entries evaluated in order; the first matching entry decides. An entry is an IPv4/IPv6 address, a CIDR prefix or `any`; a leading `!` (or a nested `! { ... };` block) negates it. A client that matches no entry is denied. In `allow-transfer` and `allow-update`, `key "<name>";` adds a TSIG key.
@@ -338,7 +340,7 @@ Views are checked in the order they are defined; the first match is used. A quer
 | Option | Applies to | Description |
 |---|---|---|
 | `type <type>;` | all | `master` (alias `primary`, the default), `slave` (alias `secondary`), `forward`, or `program`. |
-| `file "<path>";` | master, slave | Zone file. For a secondary zone, the transferred zone is written there. Ignored (with a warning) for `forward` and `program` zones. |
+| `file "<path>";` | master, slave | Zone file. For a secondary zone, the transferred zone is written there. Ignored (with a warning) for `forward` and `program` zones. Records whose owner is not at or below the zone name (out-of-zone data, including address records for name servers outside the zone) are not loaded; each is logged as "ignoring out-of-zone data", as BIND does (RFC 1034 §4.2). A secondary likewise skips and logs out-of-zone records received in a transfer instead of rejecting the transfer. |
 | `file-format bind\|tinydns;` | master | `bind` (default) or `tinydns` (djbdns `data` file). See TINYDNS ZONE FORMAT. |
 | `masters { <addr> [port <n>]; ... };` | slave, catalog | Primary servers. NOTIFY is accepted from any listed address; the refresh and transfer use the **first** entry. Port default 53. Transfer requests carry the EDNS EXPIRE option (RFC 7314); the returned value (capped by SOA EXPIRE) sets the zone's expire timer, so a secondary that transfers from another secondary expires no later than its source. |
 | `tsig-key "<name>";` | slave, master | Key used to sign SOA/AXFR/IXFR requests to the primary. On a primary it is also accepted for incoming transfers. |

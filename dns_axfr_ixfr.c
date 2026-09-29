@@ -195,8 +195,12 @@ void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_are
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
                      zone_arena_t *standby, zone_arena_t *active,
                      axfr_session_t *session, const char *domain) {
-  if (packet_len < DNS_HEADER_SIZE)
+  /* 拒否する経路では、運用者が原因を探せるよう必ずゾーン名と理由をログに出す (R-27) */
+  if (packet_len < DNS_HEADER_SIZE) {
+    syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer message: %zu bytes, shorter than a DNS header",
+           domain, packet_len);
     return -1;
+  }
   uint16_t qdcount = (packet[4] << 8) | packet[5],
            ancount = (packet[6] << 8) | packet[7];
   size_t offset = DNS_HEADER_SIZE;
@@ -205,10 +209,10 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
   // Safely skip any question records present in the packet.
   for (int i = 0; i < qdcount; i++) {
     size_t next_offset;
-    if (skip_wire_name(packet, packet_len, offset, &next_offset) != 0)
+    if (skip_wire_name(packet, packet_len, offset, &next_offset) != 0 || next_offset + 4 > packet_len) {
+      syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer message: malformed question section", domain);
       return -1;
-    if (next_offset + 4 > packet_len)
-      return -1;
+    }
     offset = next_offset + 4;
   }
 
@@ -233,16 +237,17 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     }
   }
 
-  size_t domain_len = strlen(domain);
   for (int i = 0; i < ancount; i++) {
     if (standby->count >= standby->records_cap) {
       size_t new_cap =
           standby->records_cap == 0 ? 16 : standby->records_cap * 2;
-      if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return -1;
-      dns_record_t *new_records =
-          realloc(standby->records, new_cap * sizeof(dns_record_t));
-      if (!new_records)
+      dns_record_t *new_records = NULL;
+      if (new_cap <= SIZE_MAX / sizeof(dns_record_t))
+        new_records = realloc(standby->records, new_cap * sizeof(dns_record_t));
+      if (!new_records) {
+        syslog(LOG_ERR, "[AXFR] zone '%s': out of memory storing %zu records", domain, standby->count);
         return -1;
+      }
       memset(new_records + standby->records_cap, 0,
              (new_cap - standby->records_cap) * sizeof(dns_record_t));
       standby->records = new_records;
@@ -252,8 +257,11 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
     memset(rec, 0, sizeof(*rec));
     uint16_t type;
     if (parse_resource_record(packet, packet_len, &offset, standby, rec,
-                              &type) != 0)
+                              &type) != 0) {
+      syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer message: malformed answer RR %d of %u",
+             domain, i + 1, ancount);
       return -1;
+    }
     standby->count++;
 
     // KariDNS Extended AXFR record interception:
@@ -392,26 +400,28 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
       }
     }
 
+    /* RFC 1034 §4.2 / RFC 5936 §2.2: ゾーンは apex とその下のデータ。ゾーン外の RR は
+     * 1件で転送全体を捨てず、格納せずに読み飛ばす (BIND も同様に無視する)。
+     * SOA は転送の始まりと終わりを示すので、ゾーン外の SOA はプロトコル違反として拒否する。*/
+    if (!domain_name_is_at_or_below(rec->name, domain)) {
+      const char *owner = rec->name ? rec->name : "";
+      if (type == 6) {
+        syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting transfer: SOA with out-of-zone owner '%s'",
+               domain, owner);
+        return -1;
+      }
+      standby->count--;
+      if (session->out_of_zone_skipped++ < 10) {
+        syslog(LOG_WARNING, "[AXFR] zone '%s': ignoring out-of-zone record '%s' type %u in transfer",
+               domain, owner, (unsigned)type);
+      }
+      continue;
+    }
     if (session->has_current_loc_tag && session->current_loc_tag[0] != '\0') {
       rec->bind_location_tag = arena_strdup(standby, session->current_loc_tag);
     }
     if (session->has_current_ecs_tag && session->current_ecs_tag[0] != '\0') {
       rec->ecs_subnet_tag = arena_strdup(standby, session->current_ecs_tag);
-    }
-    size_t name_len = strlen(rec->name);
-    size_t dlen = domain_len;
-    if (dlen > 0 && domain[dlen - 1] == '.') dlen--;
-    size_t nlen = name_len;
-    if (nlen > 0 && rec->name[nlen - 1] == '.') nlen--;
-    if (nlen < dlen)
-      return -1;
-    if (nlen == dlen) {
-      if (strncasecmp(rec->name, domain, dlen) != 0)
-        return -1;
-    } else {
-      if (rec->name[nlen - dlen - 1] != '.' ||
-          strncasecmp(rec->name + nlen - dlen, domain, dlen) != 0)
-        return -1;
     }
     if (type == 6) {
       session->soa_count++;
@@ -665,8 +675,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                             ? zcfg->additional_from_auth
                                             : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-        prelink_zone_additional_glue(standby, entry->domain, cur_snap, NULL, policy);
-        build_zone_response_cache(standby, active_cfg_prelink, entry->domain);
+        prelink_zone_additional_glue(standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+        build_zone_response_cache(standby, active_cfg_prelink, entry->view_name, entry->domain);
         release_config_snapshot(active_cfg_prelink);
         rcu_aux_read_unlock();
 
@@ -904,6 +914,10 @@ void *axfr_bg_thread_func(void *arg) {
       int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, tsig_key_ptr,
                                        req_mac_len > 0 ? req_mac : NULL, req_mac_len);
       rcu_aux_thread_unpin();
+      if (session.out_of_zone_skipped > 0) {
+        syslog(LOG_WARNING, "[AXFR] zone %s: ignored %u out-of-zone record(s) sent by %s",
+               ctx->domain, session.out_of_zone_skipped, ctx->master_ip);
+      }
       if (axfr_res == 1) {
         syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
       } else if (axfr_res == 2) {

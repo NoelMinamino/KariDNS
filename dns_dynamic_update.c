@@ -102,8 +102,8 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                       ? zcfg->additional_from_auth
                                       : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
-  prelink_zone_additional_glue(z_standby, entry->domain, cur_snap, NULL, policy);
-  build_zone_response_cache(z_standby, active_cfg_prelink, entry->domain);
+  prelink_zone_additional_glue(z_standby, entry->domain, snapshot_find_view(cur_snap, entry->view_name), policy);
+  build_zone_response_cache(z_standby, active_cfg_prelink, entry->view_name, entry->domain);
   if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);
@@ -250,20 +250,10 @@ void send_notify_to_all(const char *domain, const char *view_name) {
 
   // 2. Send to NS records (RFC 1996 §3.2)
   if (snap) {
-    view_snapshot_t *view = NULL;
-    if (view_name) {
-      for (size_t v = 0; v < snap->view_count; v++) {
-        if (strcasecmp(snap->views[v].name, view_name) == 0) {
-          view = &snap->views[v];
-          break;
-        }
-      }
-    }
-    if (!view && snap->view_count > 0) {
-      view = &snap->views[0];
-    }
+    // 同じゾーン名が別の view にもあり得るので、呼び出し元のエントリの view で引く (R-26)
+    view_snapshot_t *view = snapshot_find_view(snap, view_name);
     if (view) {
-      zone_db_entry_t *entry = find_zone_in_view(view, domain);
+      zone_db_entry_t *entry = find_zone_exact_in_view(view, domain);
       if (entry) {
         zone_arena_t *arena = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
         if (arena && arena->hash_size > 0 && arena->hash_table) {
@@ -366,18 +356,9 @@ void send_notify_to_all(const char *domain, const char *view_name) {
   }
 
   if (snap && notified_count > 0) {
-    view_snapshot_t *v_snap = NULL;
-    if (view_name) {
-      for (size_t v = 0; v < snap->view_count; v++) {
-        if (strcasecmp(snap->views[v].name, view_name) == 0) {
-          v_snap = &snap->views[v];
-          break;
-        }
-      }
-    }
-    if (!v_snap && snap->view_count > 0) v_snap = &snap->views[0];
+    view_snapshot_t *v_snap = snapshot_find_view(snap, view_name);
     if (v_snap) {
-      zone_db_entry_t *entry = find_zone_in_view(v_snap, domain);
+      zone_db_entry_t *entry = find_zone_exact_in_view(v_snap, domain);
       if (entry) {
         atomic_fetch_add_explicit(&entry->observatory.notify_sent, notified_count, memory_order_relaxed);
         atomic_store_explicit(&entry->observatory.last_notify_time, (uint64_t)time(NULL), memory_order_relaxed);

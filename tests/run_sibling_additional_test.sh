@@ -387,12 +387,18 @@ OUT_SIBLING=$($DAG NS example-parent.jp @127.0.0.1 -p 10056)
 echo "$OUT_SIBLING"
 
 # Verify all Additional records
-if ! echo "$OUT_SIBLING" | grep -q "ns-ext.example.org.*192.0.2.88"; then
-    echo "[FAIL] A record for ns-ext.example.org missing in Additional!"
+if ! echo "$OUT_SIBLING" | grep -q "status: NOERROR"; then
+    echo "[FAIL] NS example-parent.jp did not return NOERROR!"
     exit 1
 fi
-if ! echo "$OUT_SIBLING" | grep -q "ns-ext.example.org.*2001:db8:1::88"; then
-    echo "[FAIL] AAAA record for ns-ext.example.org missing in Additional!"
+# ns-ext.example.org. A/AAAA in the example-parent.jp zone file are out-of-zone data (RFC 1034 §4.2):
+# the loader ignores them with a warning (R-27, as BIND does), so they are not served as glue.
+if echo "$OUT_SIBLING" | grep -q "ns-ext.example.org.*192.0.2.88\|ns-ext.example.org.*2001:db8:1::88"; then
+    echo "[FAIL] Out-of-zone address records for ns-ext.example.org were served in Additional!"
+    exit 1
+fi
+if ! grep -q "ignoring out-of-zone data 'ns-ext.example.org.' A" "$DIR/server_sibling_dyn.log"; then
+    echo "[FAIL] The server did not log the ignored out-of-zone record ns-ext.example.org!"
     exit 1
 fi
 if ! echo "$OUT_SIBLING" | grep -q "ns1.city.example-parent.jp.*192.0.2.61"; then

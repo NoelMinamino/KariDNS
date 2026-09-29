@@ -116,7 +116,8 @@ $TTL 3600
 ns1     IN A     192.0.2.1
 orphan.otherdomain.org. IN A 192.0.2.99
 EOF
-run_check_zone_warn "Warn on out-of-bailiwick orphan glue" "example.com" "$TMP_DIR/orphan_glue.zone" "Out-of-bailiwick glue record"
+# R-27: out-of-zone glue is reported (and ignored) as out-of-zone data, like the server loader does
+run_check_zone_warn "Warn on out-of-bailiwick orphan glue" "example.com" "$TMP_DIR/orphan_glue.zone" "out-of-zone record 'orphan.otherdomain.org.' A ignored"
 
 # 4. In-bailiwick glue with invalid IPv4 / IPv6 address
 cat <<'EOF' > "$TMP_DIR/invalid_glue_ip.zone"

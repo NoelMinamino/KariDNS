@@ -566,16 +566,9 @@ KARIDNS_TOOL_FN void lint_glue_consistency(const char *domain, zone_arena_t *are
             (*out_errors)++;
         }
     }
-
-    // 2. Check for out-of-bailiwick address records (WARNING)
-    for (size_t i = 0; i < arena->count; i++) {
-        dns_record_t *r = &arena->records[i];
-        if (r->type_code != 1 && r->type_code != 28) continue;
-        if (!is_subdomain_of(r->name, domain)) {
-            fprintf(stderr, "[WARNING] Out-of-bailiwick glue record '%s' in zone '%s'\n", r->name, domain);
-            (*out_warnings)++;
-        }
-    }
+    /* Out-of-zone address records (glue for out-of-bailiwick targets) are reported and removed by
+     * zone_arena_drop_out_of_zone() in check_zone(), like the server loader does (R-27). */
+    (void)out_warnings;
 }
 
 KARIDNS_TOOL_FN void lint_cname_coexistence(const char *domain, zone_arena_t *arena, int *out_errors, int *out_warnings) {
@@ -719,7 +712,14 @@ KARIDNS_TOOL_FN void lint_zonemd_serial(const char *domain, zone_arena_t *arena,
     }
 }
 
-KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg) {
+static void karicheck_report_out_of_zone(const dns_record_t *rec, void *ud) {
+    const char *zone = ud;
+    fprintf(stderr, "[WARNING] Zone '%s': out-of-zone record '%s' %s ignored (not at or below the zone apex; "
+                    "the server does not load it)\n",
+            zone, rec->name ? rec->name : "", rec->type ? rec->type : "");
+}
+
+KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bool is_standalone, bool is_catalog, const char *file_format, const zone_config_t *zcfg, const server_config_t *cfg, const view_config_t *view) {
     // Normalize domain to FQDN: append trailing dot if missing.
     // Without this, "example.com" wouldn't match records expanded to "example.com."
     char domain_buf[256];
@@ -812,6 +812,18 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     ctx.visited_devs[0] = root_dev;
     ctx.visited_inos[0] = root_ino;
 
+    /* サーバー (reload_master_zone) と同じく、tinydns の親子ゾーンの振り分けには
+     * このゾーンと同じ view のゾーン名を使う */
+    const char *view_zone_ptrs[256];
+    int view_zone_cnt = 0;
+    if (view) {
+        for (const zone_config_t *vz = view->zones; vz && view_zone_cnt < 256; vz = vz->next) {
+            if (vz->domain) view_zone_ptrs[view_zone_cnt++] = vz->domain;
+        }
+    }
+    ctx.all_zone_names = view_zone_cnt > 0 ? view_zone_ptrs : NULL;
+    ctx.all_zone_count = view_zone_cnt;
+
     int res;
     if (file_format && strcasecmp(file_format, "tinydns") == 0) {
         res = parse_tinydns_data(mutable_buf, strlen(mutable_buf), &arena, &ctx);
@@ -824,6 +836,15 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         zone_arena_destroy(&arena);
         free(root_path);
         return 1;
+    }
+
+    /* R-27: サーバーと同じく、ゾーン外のデータは警告して読み込まない (RFC 1034 §4.2) */
+    warning_count += (int)zone_arena_drop_out_of_zone(&arena, domain, karicheck_report_out_of_zone, (void *)domain);
+    if (ctx.out_of_zone_count > 0) {
+        fprintf(stderr, "[WARNING] Zone '%s': %zu tinydns record(s) belong to no zone configured in the same "
+                        "view and are ignored (first: '%s')\n",
+                domain, ctx.out_of_zone_count, ctx.first_out_of_zone ? ctx.first_out_of_zone : "");
+        warning_count++;
     }
 
     if (arena.count == 0) {
@@ -1425,27 +1446,9 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
                                     "(RFC 1912 section 2.8 / delegation will fail to resolve)\n",
                             arena.records[i].name, ns_target);
                 }
-            } else {
-                bool extra_glue_found = false;
-                if (arena.hash_table && arena.hash_size > 0) {
-                    uint32_t hash = calc_fnv1a_str(ns_target);
-                    size_t idx = hash & (arena.hash_size - 1);
-                    for (int j = arena.hash_table[idx]; j != -1; j = arena.records[j].next_record) {
-                        if (strcasecmp(arena.records[j].name, ns_target) == 0) {
-                            if (arena.records[j].type_code == 1 || arena.records[j].type_code == 28) {
-                                extra_glue_found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (extra_glue_found) {
-                    fprintf(stderr, "[INFO] Out-of-bailiwick glue record found for '%s' "
-                                    "(target of NS at '%s'); this glue will be ignored by "
-                                    "compliant resolvers and should be removed\n",
-                            ns_target, arena.records[i].name);
-                }
             }
+            /* Address records for out-of-zone NS targets were already reported and removed as
+             * out-of-zone data (zone_arena_drop_out_of_zone(), R-27). */
         }
         if (tcode == 6 && rcount >= 2) { // SOA
             if (is_cname(&arena, rdata[0])) {
@@ -1858,18 +1861,18 @@ int main(int argc, char **argv) {
 
         int error_count = 0;
         int checked = 0;
-        zone_config_t *z = cfg.zones;
-        while (z) {
-            if (z->type && strcasecmp(z->type, "program") == 0) {
-                printf("[INFO] Skipping file validation for program zone '%s'\n", z->domain);
-                checked++;
-            } else if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
-                if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg) != 0) {
-                    error_count++;
+        for (view_config_t *v = cfg.views; v; v = v->next) {
+            for (zone_config_t *z = v->zones; z; z = z->next) {
+                if (z->type && strcasecmp(z->type, "program") == 0) {
+                    printf("[INFO] Skipping file validation for program zone '%s'\n", z->domain);
+                    checked++;
+                } else if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
+                    if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg, v) != 0) {
+                        error_count++;
+                    }
+                    checked++;
                 }
-                checked++;
             }
-            z = z->next;
         }
         printf("[INFO] Checked %d zones. Errors: %d\n", checked, error_count);
         return (error_count > 0) ? 1 : 0;
@@ -1881,7 +1884,7 @@ int main(int argc, char **argv) {
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
-            return check_zone(domain, argv[3], true, false, NULL, NULL, NULL);
+            return check_zone(domain, argv[3], true, false, NULL, NULL, NULL, NULL);
         } else {
             // From config: karicheck zone <domain> [config_path]
             const char *cfg_path = (argc >= 4) ? argv[3] : default_config;
@@ -1893,19 +1896,26 @@ int main(int argc, char **argv) {
             char norm_domain[256];
             normalize_domain_fqdn(domain, norm_domain, sizeof(norm_domain));
 
-            zone_config_t *z = cfg.zones;
-            while (z) {
-                if (strcasecmp(z->domain, norm_domain) == 0) {
+            /* 同じゾーン名が複数の view にあれば、それぞれの view の定義を検査する (R-26) */
+            int found = 0;
+            int failed = 0;
+            for (view_config_t *v = cfg.views; v; v = v->next) {
+                for (zone_config_t *z = v->zones; z; z = z->next) {
+                    if (strcasecmp(z->domain, norm_domain) != 0) continue;
+                    found++;
                     if (z->type && strcasecmp(z->type, "program") == 0) {
                         printf("[INFO] Zone '%s' is type 'program'; skipping file validation.\n", z->domain);
-                        return 0;
+                    } else if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg, v) != 0) {
+                        failed++;
                     }
-                    return check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg);
+                    break;
                 }
-                z = z->next;
             }
-            fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
-            return 1;
+            if (found == 0) {
+                fprintf(stderr, "[ERROR] Zone '%s' not found in config %s\n", domain, cfg_path);
+                return 1;
+            }
+            return failed > 0 ? 1 : 0;
         }
     } else {
         print_usage(argv[0]);

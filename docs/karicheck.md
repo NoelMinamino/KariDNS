@@ -47,7 +47,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 : Validate the configuration file, then every `type master` / `type primary` zone declared in it, using each zone's `file-format`. `type program` zones are reported as skipped; secondary and forward zones are not checked. Prints the number of checked zones and errors at the end.
 
 `zone <domain> [config_path]`
-: Look up `<domain>` in the configuration file and validate its zone file with the zone's settings (`file-format`, `catalog-zone`, tags).
+: Look up `<domain>` in the configuration file and validate its zone file with the zone's settings (`file-format`, `catalog-zone`, tags). If several views define the zone, each view's definition is checked; the exit status is 1 if any of them fails.
 
 `zone <domain> <zone_file_path>`
 : Standalone mode: parse and validate `<zone_file_path>` as a BIND-format zone for `<domain>` without a configuration file. The third argument is treated as a configuration file if it contains `.conf`, and as a zone file otherwise. A path that is absolute or contains `../` gives a warning, because the server resolves zone paths inside its sandbox.
@@ -75,7 +75,8 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 2. **Zone Integrity & Structural Invariants**:
    - Exactly one SOA record at the zone apex, and at least one NS record at the apex
    - CNAME exclusivity (CNAME must not co-exist with other record types at the same owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), and NS/MX/SRV targets that point to a CNAME (RFC 2181 §10.3)
-   - In-bailiwick delegation targets must have A/AAAA glue, glue addresses must be valid; out-of-bailiwick glue and records occluded by a delegation give warnings
+   - Out-of-zone records (owner not at or below the zone name, e.g. address records for name servers outside the zone) give a warning and are left out of all further checks, because the server does not load them (RFC 1034 §4.2); the exit status is not affected
+   - In-bailiwick delegation targets must have A/AAAA glue, glue addresses must be valid; records occluded by a delegation give warnings
    - Inconsistent TTLs within one RRset (warning)
    - SOA MNAME pointing to a CNAME (warning)
    - Meta-types (e.g. `OPT`, `TSIG`, `AXFR`) must not appear in zone data
@@ -90,7 +91,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - Recognizes RFC 8078 CDS and CDNSKEY delete signals (Algorithm=0 / DigestType=0) without false-positive warnings
 5. **RFC 8976 ZONEMD Message Digest Verification**:
    - The ZONEMD serial must match the SOA serial, and ZONEMD should be at the zone apex.
-   - ZONEMD records with scheme 1 (SIMPLE) and hash algorithm 1 (SHA-384) or 2 (SHA-512) are verified by computing the canonical zone digest; other schemes and algorithms are skipped. Out-of-zone records are excluded from the digest (with a warning).
+   - ZONEMD records with scheme 1 (SIMPLE) and hash algorithm 1 (SHA-384) or 2 (SHA-512) are verified by computing the canonical zone digest; other schemes and algorithms are skipped. Out-of-zone records are not part of the zone and therefore not part of the digest.
 
 Each zone check prints `[RESULT] Zone '<zone>': <n> error(s), <n> warning(s)` followed by `[OK]` or `[FAIL]`.
 
