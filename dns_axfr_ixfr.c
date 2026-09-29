@@ -512,6 +512,9 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   memset(&tmp_arena, 0, sizeof(tmp_arena));
   zone_arena_init(&tmp_arena);
 
+  /* 転送の間ずっと読み取り区間の外で使う。このゾーンの arena を入れ替えるのは
+   * この転送 (is_transferring で1本に限る) と制御スレッドの Pass 2 prelink だけで、
+   * Pass 2 は転送中のゾーンを飛ばすので、この arena は転送の完了まで再利用されない。*/
   zone_arena_t *active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   int ret_code = -1;
 
@@ -654,21 +657,21 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           return -1;
         }
 
+        // 設定は制御スレッドが並行して入れ替えるので、読み取り区間の中で読む
+        rcu_aux_read_lock();
         zone_db_snapshot_t *cur_snap = acquire_zone_snapshot();
-        if (cur_snap) retain_zone_snapshot(cur_snap);
-        server_config_t *active_cfg_prelink = atomic_load_explicit(&g_config_db.active, memory_order_acquire);
+        server_config_t *active_cfg_prelink = acquire_config_snapshot();
         zone_config_t *zcfg = find_zone_config_in_view(active_cfg_prelink, entry->view_name, entry->domain);
         additional_from_auth_t policy = (zcfg && zcfg->additional_from_auth_specified)
                                             ? zcfg->additional_from_auth
                                             : (active_cfg_prelink ? active_cfg_prelink->additional_from_auth : ADDITIONAL_AUTH_YES);
         prelink_zone_additional_glue(standby, entry->domain, cur_snap, NULL, policy);
         build_zone_response_cache(standby, active_cfg_prelink, entry->domain);
-        if (cur_snap) release_zone_snapshot(cur_snap);
+        release_config_snapshot(active_cfg_prelink);
+        rcu_aux_read_unlock();
 
         compute_ixfr_diff(entry, cur_active, standby);
-        entry->rcu.retire_epoch = rcu_writer_advance_epoch();
-        atomic_store_explicit(&entry->rcu.active, standby,
-                              memory_order_release);
+        entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, standby);
         pthread_mutex_unlock(&entry->writer_lock);
 
         if (session->is_ixfr) {
@@ -700,12 +703,17 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   zone_arena_destroy(&tmp_arena);
 
   // Hook for catalog zone processing
+  // zcfg は設定の中を指し、catalog_process_membership() の最後まで使われるので区間で守る。
+  // この区間の中で rcu_writer_wait_until_safe() を呼ぶ経路は無い (カタログの差分更新は
+  // rebuild_zone_db_snapshot() の構築と公開だけで、解放は GC スレッドが待つ)。
+  rcu_aux_read_lock();
   server_config_t *cfg = acquire_config_snapshot();
   zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
   if (zcfg && zcfg->is_catalog) {
       catalog_process_membership(entry, zcfg, entry->view_name);
   }
   release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
   return ret_code;
 }
 
@@ -891,8 +899,11 @@ void *axfr_bg_thread_func(void *arg) {
     axfr_req[0] = msg_len >> 8;
     axfr_req[1] = msg_len & 0xFF;
     if (send(tcp_fd, axfr_req, req_len, 0) == req_len) {
+      // handle_axfr_event() は writer_lock を持ったまま読み取り区間に入るので、先にスロットを確保する
+      rcu_aux_thread_pin();
       int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, tsig_key_ptr,
                                        req_mac_len > 0 ? req_mac : NULL, req_mac_len);
+      rcu_aux_thread_unpin();
       if (axfr_res == 1) {
         syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
       } else if (axfr_res == 2) {
@@ -1478,9 +1489,10 @@ void *axfr_worker_thread(void *arg) {
   atomic_fetch_add_explicit(&g_xfers_running, 1, memory_order_relaxed);
   axfr_worker_args_t *args = (axfr_worker_args_t *)arg;
   zone_db_entry_t *entry = args->entry;
-  static _Atomic int axfr_slot_counter = ATOMIC_VAR_INIT(0);
-  int slot = (int)(atomic_fetch_add(&axfr_slot_counter, 1) % MAX_AXFR_RCU_WORKERS);
-  rcu_reader_enter(&g_axfr_rcu_ctxs[slot]);
+  /* 転送の間、arena を読み取り区間で守る。スロットはスレッドごとに確保する
+   * (以前は通し番号の剰余で割り当てており、同時に動くスレッドが同じスロットを
+   * 共有すると、先に終わった側が区間を閉じてしまった)。*/
+  rcu_aux_read_lock();
 
   tsig_key_t key_val;
   tsig_key_t *pkey = NULL;
@@ -1506,7 +1518,7 @@ void *axfr_worker_thread(void *arg) {
   free(args);
   if (entry)
     atomic_fetch_sub(&entry->active_axfr, 1);
-  rcu_reader_exit(&g_axfr_rcu_ctxs[slot]);
+  rcu_aux_read_unlock();
   release_zone_snapshot(worker_snap);
   atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
   pthread_exit(NULL);

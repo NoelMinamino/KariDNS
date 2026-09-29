@@ -6,6 +6,7 @@ set -e
 # ==============================================================================
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT_DIR="$(cd "$DIR/.." && pwd)"
 BIN="$ROOT_DIR/karidns-asan"
 DAG="$ROOT_DIR/dag-asan"
@@ -34,9 +35,7 @@ sleep 2
 
 cleanup() {
     echo "[*] Stopping KariDNS (PID $SERVER_PID)..."
-    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM

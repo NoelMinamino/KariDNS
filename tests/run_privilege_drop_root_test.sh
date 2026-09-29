@@ -2,6 +2,7 @@
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 
@@ -14,8 +15,8 @@ CONF_NO_USER="$DIR/conf_no_user.conf"
 CONF_WITH_USER="$DIR/conf_with_user.conf"
 
 cleanup() {
+    kari_kill_conf "$CONF_NO_USER" "$CONF_WITH_USER"
     rm -f "$CONF_NO_USER" "$CONF_WITH_USER"
-    killall -9 karidns 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

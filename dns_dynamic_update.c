@@ -63,7 +63,11 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
-  if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
+  /* ワーカーの読み取り区間の中から呼ばれる。区間に入った後で別の writer がこのゾーンを
+   * 公開していると、通常の待機は自分自身を待ってタイムアウトする (60 秒間 writer_lock を
+   * 持ったまま他の writer も止める)。自分の区間だけを除いて待つ。UPDATE の応答は
+   * 設定だけから作り、待機前に読んだ arena を使わない (process_dns_query_impl)。*/
+  if (!rcu_writer_wait_until_safe_in_reader(entry->rcu.retire_epoch, 60000)) {
     pthread_mutex_unlock(&entry->writer_lock);
     syslog(LOG_ERR, "[Update] Dynamic update on zone '%s' aborted: RCU grace period wait timed out", entry->domain);
     return 2; // SERVFAIL
@@ -104,8 +108,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   compute_ixfr_diff(entry, z_active, z_standby);
 
-  entry->rcu.retire_epoch = rcu_writer_advance_epoch();
-  atomic_store_explicit(&entry->rcu.active, z_standby, memory_order_release);
+  entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
   pthread_mutex_unlock(&entry->writer_lock);
 
   atomic_store_explicit(&entry->notify_now, true, memory_order_release);
@@ -185,12 +188,16 @@ static bool is_addr_notified(const struct sockaddr_storage *addrs, int count, co
 }
 
 void send_notify_to_all(const char *domain, const char *view_name) {
+  /* 制御スレッドと受信転送スレッドから呼ばれる。設定・スナップショット・arena を
+   * 読むので、全体を読み取り区間に入れる (UDP の送信だけで、待ちは無い)。*/
+  rcu_aux_read_lock();
   server_config_t *active = acquire_config_snapshot();
   zone_db_snapshot_t *snap = acquire_zone_snapshot();
   if (snap) retain_zone_snapshot(snap);
   if (!active && !snap) {
     if (active) release_config_snapshot(active);
     if (snap) release_zone_snapshot(snap);
+    rcu_aux_read_unlock();
     return;
   }
 
@@ -380,4 +387,5 @@ void send_notify_to_all(const char *domain, const char *view_name) {
 
   if (snap) release_zone_snapshot(snap);
   if (active) release_config_snapshot(active);
+  rcu_aux_read_unlock();
 }

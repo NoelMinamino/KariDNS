@@ -67,10 +67,10 @@ jobs:
             # (test_asan_overflow included). This rebuilds every unit test with
             # -fsanitize=address,undefined (UBSan findings are fatal); leak checks are off by default
             # (UT_ASAN_LEAKS=1 enables them once the tests' teardown is complete).
-            # Burn-in: first FreeBSD run is reported as a warning; remove the fallback to make it blocking.
+            # Blocking: any ASan/UBSan unit-test failure fails the job.
             # -j: the ASan binaries (each compiles ~18 sources) build in parallel; the
             # recipe still runs the tests sequentially
-            make -j"$NCPU" unit-tests-asan < /dev/null || echo "::warning title=unit-tests-asan::ASan/UBSan unit tests failed on FreeBSD ${{ matrix.release }} - see log above (non-blocking during burn-in)"
+            make -j"$NCPU" unit-tests-asan < /dev/null
             echo "::endgroup::"
 
             echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"

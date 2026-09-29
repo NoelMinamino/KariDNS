@@ -2,6 +2,7 @@
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT="$DIR/.."
 BIN="$ROOT/karidns"
 DAG="$ROOT/dag"
@@ -76,15 +77,7 @@ EOF
 
 cleanup() {
     echo "[*] Cleaning up test processes and temp files..."
-    if [ -n "$PID_LIMITED" ] && kill -0 "$PID_LIMITED" 2>/dev/null; then
-        kill -9 "$PID_LIMITED" 2>/dev/null || true
-        wait "$PID_LIMITED" 2>/dev/null || true
-    fi
-    if [ -n "$PID_UNLIMITED" ] && kill -0 "$PID_UNLIMITED" 2>/dev/null; then
-        kill -9 "$PID_UNLIMITED" 2>/dev/null || true
-        wait "$PID_UNLIMITED" 2>/dev/null || true
-    fi
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${PID_LIMITED:-}" "${PID_UNLIMITED:-}"
     rm -f "$CONF_LIMITED" "$CONF_UNLIMITED" "$LOG_LIMITED" "$LOG_UNLIMITED" "$ZONE_FILE"
     rm -f "$DIR"/server_limited.log "$DIR"/server_unlimited.log
 }
@@ -140,8 +133,7 @@ fi
 
 echo "[OK] Rate-limiting successfully throttled query logging ($LINE_COUNT lines logged for 150 queries)."
 
-kill -9 "$PID_LIMITED" 2>/dev/null || true
-killall -9 karidns 2>/dev/null || true
+kari_kill_tree "$PID_LIMITED"
 wait "$PID_LIMITED" 2>/dev/null || true
 PID_LIMITED=""
 sleep 2

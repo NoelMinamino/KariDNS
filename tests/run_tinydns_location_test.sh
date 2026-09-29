@@ -6,13 +6,13 @@ set -e
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$BASE_DIR}"
 KARIDNS="${BIN_DIR}/karidns"
 KARICHECK="${BIN_DIR}/karicheck"
 DAG="${DAG:-$BIN_DIR/dag}"
 
-killall -9 karidns karidns-asan 2>/dev/null || true
 
 TMP_DIR="$(mktemp -d /tmp/karidns_tinydns_loc_test.XXXXXX)"
 SERVER_PID=""
@@ -27,11 +27,7 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 cleanup() {
-    if [ -n "$SERVER_PID" ]; then
-        kill -9 "$SERVER_PID" 2>/dev/null || true
-    fi
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     if [ "$ALIAS_ADDED" = "1" ]; then
         ifconfig lo0 inet "$ALIAS_IP" netmask 255.0.0.0 -alias 2>/dev/null || true
         echo "=== Removed alias $ALIAS_IP from lo0 ==="

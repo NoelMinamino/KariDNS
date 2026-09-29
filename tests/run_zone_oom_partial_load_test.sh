@@ -13,6 +13,7 @@ set -e
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 [ -x "$ROOT_DIR/karidns" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/dag" ] || {
@@ -32,8 +33,7 @@ rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -127,9 +127,6 @@ key "karictl" {
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
 EOF
-
-# Kill any existing server
-killall -9 karidns 2>/dev/null || true
 
 echo "=== 1. Starting KariDNS with fault-injected OOM on zone2 (call #1) ==="
 # OOM_FAIL_NTH_ZONE_CALLOC=1 will fail create_new_zone_entry() for the 2nd zone (zone2.example.com)

@@ -1,13 +1,13 @@
 #!/bin/sh
 set -e
+. "$(dirname "$0")/lib_proc.sh"
 
 [ -x karidns-asan ] && [ -x dag-asan ] || make karidns-asan dag-asan
 
 ./karidns-asan -f tests/karidns-test.conf > server_asan.log 2>&1 &
+SERVER_PID=$!
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
 }
 trap cleanup EXIT INT TERM
 sleep 1

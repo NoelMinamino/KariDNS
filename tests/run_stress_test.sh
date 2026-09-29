@@ -8,9 +8,13 @@ export UBSAN_OPTIONS=abort_on_error=1:print_stacktrace=1
 export TSAN_OPTIONS=halt_on_error=1
 
 # スクリプトのディレクトリを基準にプロジェクトルートへ移動
+. "$(dirname "$0")/lib_proc.sh"
 cd "$(dirname "$0")/.."
 
 CONF_FILE="tests/karidns-test.conf"
+# Absolute path on the server command line, so cleanup and the leftover checks
+# see only this instance and not other karidns processes on the host.
+SERVER_CONF="$(pwd)/$CONF_FILE"
 CTL_CONF="tests/karictl-test.conf"
 chmod 0600 "$CTL_CONF" 2>/dev/null || true
 ZONE_FILE="tests/zones/example.com.zone"
@@ -30,8 +34,8 @@ fi
 cleanup() {
     ./karictl -f "$CTL_CONF" stop >/dev/null 2>&1
     sleep 1
-    pkill -9 -f karidns-tsan 2>/dev/null
-    pkill -9 -f karidns-asan 2>/dev/null
+    kari_kill_tree "${TSAN_PID:-}" "${ASAN_PID:-}"
+    kari_kill_conf "$SERVER_CONF"
     pkill -9 -f dnsperf 2>/dev/null
 }
 trap cleanup EXIT INT TERM
@@ -48,7 +52,7 @@ fi
 # ゾーンファイルのバックアップを作成
 cp "$ZONE_FILE" "${ZONE_FILE}.orig"
 
-./karidns-tsan -f "$CONF_FILE" 2> tsan_error.log &
+./karidns-tsan -f "$SERVER_CONF" 2> tsan_error.log &
 TSAN_PID=$!
 sleep 2
 
@@ -110,15 +114,14 @@ if kill -0 $TSAN_PID 2>/dev/null; then
     echo "TSan Test WARNING: karidns did not exit after 'karictl stop'; forcing kill."
     kill -TERM $TSAN_PID 2>/dev/null
     sleep 1
-    if kill -0 $TSAN_PID 2>/dev/null; then
-        kill -9 $TSAN_PID 2>/dev/null
-    fi
+    kari_kill_tree "$TSAN_PID"
 fi
 
-# pgrep -l -f を使用してFreeBSDでのプロセス残骸検知を確実にする
-if pgrep -l -f karidns-tsan >/dev/null 2>&1; then
+# このテストで起動したインスタンスの残骸 (backend / router 等の子プロセスを含む) を検知する
+LEFT=$(kari_conf_pids "$SERVER_CONF")
+if [ -n "$LEFT" ]; then
     echo "TSan Test FAILED: a karidns-tsan process is still running after shutdown."
-    pgrep -l -f karidns-tsan
+    for p in $LEFT; do ps -ww -o pid=,command= -p "$p"; done
     mv "${ZONE_FILE}.orig" "$ZONE_FILE"
     exit 1
 fi
@@ -143,7 +146,7 @@ if [ ! -f "./karidns-asan" ]; then
     exit 1
 fi
 
-./karidns-asan -f "$CONF_FILE" 2> asan_error.log &
+./karidns-asan -f "$SERVER_CONF" 2> asan_error.log &
 ASAN_PID=$!
 sleep 2
 
@@ -179,14 +182,13 @@ done
 if kill -0 $ASAN_PID 2>/dev/null; then
     kill -TERM $ASAN_PID 2>/dev/null
     sleep 1
-    if kill -0 $ASAN_PID 2>/dev/null; then
-        kill -9 $ASAN_PID 2>/dev/null
-    fi
+    kari_kill_tree "$ASAN_PID"
 fi
 
-if pgrep -l -f karidns-asan >/dev/null 2>&1; then
+LEFT=$(kari_conf_pids "$SERVER_CONF")
+if [ -n "$LEFT" ]; then
     echo "ASan Test FAILED: a karidns-asan process is still running after shutdown."
-    pgrep -l -f karidns-asan
+    for p in $LEFT; do ps -ww -o pid=,command= -p "$p"; done
     exit 1
 fi
 

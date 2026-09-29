@@ -1,11 +1,10 @@
 #!/bin/sh
 set -e
+. "$(dirname "$0")/lib_proc.sh"
 
 # 1. 本番ビルドでサーバーとdagを構築 (Capsicumを有効にするため)
 [ -f tests/zones/example.com.zone.bak ] && mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true
 rm -rf tests/zones/capsicum_include_test || true
-killall -9 karidns karidns-asan 2>/dev/null || true
-sleep 1
 [ -x karidns ] && [ -x dag ] && [ -x karictl ] || make karidns dag karictl
 
 # 1.5. テスト用ディレクトリを事前に作成・キャッシュさせるための準備
@@ -22,12 +21,8 @@ cleanup() {
     if [ -n "$SERVER_PID" ]; then
         kill -TERM "$SERVER_PID" 2>/dev/null || true
         sleep 0.5 2>/dev/null || true
-        kill -9 "$SERVER_PID" 2>/dev/null || true
+        kari_kill_tree "$SERVER_PID"
     fi
-    killall -TERM karidns 2>/dev/null || true
-    sleep 0.2 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
     [ -f tests/zones/example.com.zone.bak ] && mv tests/zones/example.com.zone.bak tests/zones/example.com.zone 2>/dev/null || true
     rm -rf tests/zones/capsicum_include_test 2>/dev/null || true
 }
@@ -122,6 +117,3 @@ echo "[OK] Circular \$INCLUDE correctly detected."
 mv tests/zones/example.com.zone.bak tests/zones/example.com.zone
 rm -rf tests/zones/capsicum_include_test
 
-if killall -0 karidns 2>/dev/null; then
-    killall -9 karidns >/dev/null
-fi

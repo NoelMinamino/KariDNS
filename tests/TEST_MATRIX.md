@@ -1,6 +1,6 @@
 # KariDNS Test Suite Matrix & RFC Traceability Document
 
-This document provides a comprehensive traceability matrix mapping every test in the KariDNS test suite (161 test targets registered in `tests/run_all_suite.sh` — C unit test binaries, integration shell scripts, sanitizer tests and fuzzing harnesses — plus the targets listed in §3.13) to its corresponding **IETF RFC / Technical Specification**, target **KariDNS Component**, and **Test Classification** (Positive, Negative, Boundary, Concurrency/RCU, Memory/ASan, Fuzzing).
+This document provides a comprehensive traceability matrix mapping every test in the KariDNS test suite (164 test targets registered in `tests/run_all_suite.sh` — C unit test binaries, integration shell scripts, sanitizer tests and fuzzing harnesses — plus the targets listed in §3.13) to its corresponding **IETF RFC / Technical Specification**, target **KariDNS Component**, and **Test Classification** (Positive, Negative, Boundary, Concurrency/RCU, Memory/ASan, Fuzzing).
 
 It directly cross-references the implementation status documented in [`KariDNS_RFC_GUIDELINE.md`](../KariDNS_RFC_GUIDELINE.md).
 
@@ -16,7 +16,7 @@ The KariDNS automated test suite is managed via the unified runner script [`test
 
 | Category Code | Category Name | Target Domain | Registered Tests | Primary Execution Method |
 |:---|:---|:---|:---:|:---|
-| `unit` | **Unit Tests & Fault Injection** | C unit tests (also built with ASan/UBSan by `make unit-tests-asan`), fail-Nth FI sweeps and coverage sweeps | 38 | Native binary execution |
+| `unit` | **Unit Tests & Fault Injection** | C unit tests (also built with ASan/UBSan by `make unit-tests-asan`), fail-Nth FI sweeps and coverage sweeps | 39 | Native binary execution |
 | `xfr` | **Zone Transfer** | RFC 5936 AXFR, RFC 1995 IXFR, Extended AXFR, Capsicum, RFC 7314 EXPIRE | 7 | Shell script + multi-instance KariDNS |
 | `dnssec` | **DNSSEC & Digest** | RFC 4034/4035 DNSSEC serving, RFC 8976 ZONEMD, SIG(0) | 3 | Shell script + `karicheck` / `dag` |
 | `update` | **Dynamic Update** | RFC 2136 DNS UPDATE prerequisites & updates | 3 | Shell script + `dag` UPDATE |
@@ -27,8 +27,8 @@ The KariDNS automated test suite is managed via the unified runner script [`test
 | `tinydns` | **tinydns Format** | djbdns data format, %location split-horizon, TAI64 timestamps | 2 | Shell script + `karidns` |
 | `core` | **Server Core Engine** | RFC 1034/1035 resolution, forward & program zones, glue, RCU reload, lifecycle, adversarial inputs, `karicheck` / `karictl` | 38 | Shell script + `karidns` / `karictl` / `karicheck` |
 | `dag` | **Diagnostic Tool** | `run_dag_ci_test.sh` (Part 1-19 + Part 20-21 parallel sub-suites) and the individual dag test scripts | 58 | Shell scripts (included by default; skip with `--no-dag`) |
-| `regression` | **Regression & Fuzz** | ASan/UBSan smoke, concurrency stress, libFuzzer harnesses, coverage tooling | 4 | Shell script + libFuzzer / ASan binaries |
-| **Total** | | | **161** | *(103 without the `dag` category)* |
+| `regression` | **Regression & Fuzz** | ASan/UBSan smoke, concurrency stress, libFuzzer harnesses, coverage tooling, BIND differential | 6 | Shell script + libFuzzer / ASan binaries |
+| **Total** | | | **164** | *(106 without the `dag` category)* |
 
 ---
 
@@ -76,10 +76,11 @@ This table maps RFC standards recognized in [`KariDNS_RFC_GUIDELINE.md`](../Kari
 | **RRL Draft** | DNS Response Rate Limiting | `dns_rrl.c`, `dns_server_core.c` | [`tests/test_rrl_engine.c`](test_rrl_engine.c), [`tests/run_rrl_window_test.sh`](run_rrl_window_test.sh), [`tests/bench_rrl.c`](bench_rrl.c) |
 | **DNSTAP** | DNS Telemetry & Frame Streams | `dns_dnstap.c`, `dns_wire.c` | [`tests/test_dnstap_engine.c`](test_dnstap_engine.c), [`tests/run_dnstap_capture_test.sh`](run_dnstap_capture_test.sh) |
 | **FreeBSD Capsicum** | Capability Mode Sandboxing | `dns_priv_sandbox.c` | [`tests/run_capsicum_axfr_test.sh`](run_capsicum_axfr_test.sh), [`tests/test_vulnerability_fixes.c`](test_vulnerability_fixes.c) |
+| **Epoch RCU** | Lock-free publish / grace period (R-25) | `dns_epoch_rcu.c`, `dns_snapshot_rcu.c`, `dns_server_core.c`, `dns_dynamic_update.c`, `dns_axfr_ixfr.c` | [`tests/test_epoch_rcu.c`](test_epoch_rcu.c), [`tests/run_rcu_tsan_test.sh`](run_rcu_tsan_test.sh), [`tests/test_vulnerability_fixes.c`](test_vulnerability_fixes.c) |
 
 ---
 
-## 3. Exhaustive Test Inventory (161 Registered Tests)
+## 3. Exhaustive Test Inventory (164 Registered Tests)
 
 The complete inventory of all test targets registered in `tests/run_all_suite.sh` (`sh tests/run_all_suite.sh --list`), grouped by their registered category in registration order. `bin` targets are C unit test binaries built by the Makefile; the others are shell scripts.
 
@@ -125,6 +126,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 36 | [`test_fi_xfr`](test_fi_xfr.c) | `dns_axfr_ixfr.c`, `dns_dynamic_update.c` | RFC 5936, RFC 1995, RFC 1982 | **Fault Injection / XFR** | Fail-Nth fault injection sweeps across AXFR/IXFR inbound packet parsing and SOA serial incrementation. |
 | 37 | [`test_fi_misc`](test_fi_misc.c) | `dns_dynamic_update.c`, `dns_catalog_zone.c`, `dns_dnstap.c`, `dns_edns_ecs.c` | RFC 2136, RFC 9432, DNSTAP | **Fault Injection / Extensions** | Fail-Nth fault injection sweeps across dynamic updates, catalog zone bookkeeping, and DNSTAP Protobuf message construction. |
 | 38 | [`test_fi_dag`](test_fi_dag.c) | `tools/dag.c`, `tools/dag_output_yaml.c` | RFC 1035, YAML | **Fault Injection / Tools** | Fail-Nth fault injection sweeps across dag client query packet generation and YAML formatting helpers. |
+| 162 | [`test_epoch_rcu`](test_epoch_rcu.c) | `dns_epoch_rcu.c` | Epoch RCU (R-25) | **Positive / Concurrency** | `rcu_writer_publish()` makes the new pointer visible before the epoch advances and returns the pre-publish epoch; a reader that entered before the publish blocks `rcu_writer_wait_until_safe(retire)`, one that entered after does not; auxiliary reader slots (nesting keeps the outer epoch, pin/unpin, release); 3-thread double-buffer stress where the writer poisons the retired buffer after the grace period and readers must never see it. Also built as `test_epoch_rcu-tsan` and run by `run_rcu_tsan_test.sh`. |
 
 ---
 
@@ -325,6 +327,8 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 159 | [`run_stress_test.sh`](run_stress_test.sh) | `dns_server_core.c`, `dns_snapshot_rcu.c` | Concurrency Stress | **Standalone Benchmark** | High-throughput concurrent query flood (dnsperf 60s); run manually outside automated suite. |
 | 160 | [`run_fuzz_smoke_test.sh`](run_fuzz_smoke_test.sh) | `tests/fuzz/` (all 10 harnesses) | LLVM libFuzzer | **Fuzzing Smoke** | Crash-resistance verification across wire, config, zone, TSIG, and server core fuzzers. |
 | 161 | [`run_break_duplicate_kind_override_test.sh`](run_break_duplicate_kind_override_test.sh) | `dag` (`tools/dag_edns_client.c`) | dag `--break` | **Positive** | Giving the same `--break` kind several times: the last parameter wins and a note is printed. |
+| 163 | [`run_rcu_tsan_test.sh`](run_rcu_tsan_test.sh) | `dns_epoch_rcu.c`, `dns_snapshot_rcu.c`, `dns_server_core.c`, `dns_dynamic_update.c`, `dns_axfr_ixfr.c`, `dns_catalog_zone.c` | Epoch RCU (R-25) | **Concurrency / TSan** | Builds `karidns-tsan` and `test_epoch_rcu-tsan`. Part 1: the unit test under TSan. Part 2: `karidns-tsan` primary; UDP and TCP (connection reuse) queries from 4 clients concurrently with SIGHUP reloads (config swap, snapshot rebuild, zone reload, Pass 2 prelink), dynamic UPDATEs and AXFRs. Part 3: `karidns-tsan` secondary of a `karidns` primary with a catalog zone; queries concurrently with UPDATE-triggered NOTIFY/IXFR, catalog membership changes and SIGHUP reloads of the secondary. Fails on any ThreadSanitizer report, if a server exits, stops answering, or the last UPDATE does not reach the secondary. Load is adjustable with `CLIENTS`, `ROUNDS`, `HUPS`, `UPDATES`. |
+| 164 | [`run_bind_differential_test.sh`](run_bind_differential_test.sh) | `dns_query_engine.c` (`resolve_name`) | RFC 4592 §2.2, RFC 1034 §4.3.2 | **Differential (BIND oracle)** | Serves `tests/matrix/zones/wildcard.zone` from KariDNS and from BIND `named` on two ports and compares the RCODE and the sorted answer RDATA of wildcard, wildcard-under-subdomain, exact-match, empty-non-terminal and NXDOMAIN-below-existing-name queries. Fails if either server does not answer, if `named` returns no status line, or on any difference. SKIP when `named` is not installed. |
 
 ---
 
@@ -372,6 +376,8 @@ sh tests/run_all_suite.sh --list
 ```
 
 Integration tests that need loopback aliases (127.0.0.2 and up) add them when run as root and report SKIP otherwise.
+
+Tests stop only the servers they started, so other karidns instances on the host (another working copy, a long-running server) survive a suite run. Test scripts source [`tests/lib_proc.sh`](lib_proc.sh) and use `kari_kill_tree "$SERVER_PID"` (the karidns supervisor and its backend/router/broker children) or `kari_kill_conf <test-specific config path>`; do not use `killall` or an unscoped `pkill`/`pgrep`. `run_all_suite.sh` records the karidns processes that exist when it starts and its stale-process cleanup leaves those alone.
 
 Unit test binaries can also be built and run from the Makefile: `make unit-tests` (all), `make <name>_test` (one), and `make unit-tests-asan` / `make test_<name>-asan` for ASan/UBSan builds.
 

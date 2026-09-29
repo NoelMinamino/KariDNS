@@ -15,9 +15,13 @@ export ASAN_OPTIONS=abort_on_error=1:halt_on_error=1
 export UBSAN_OPTIONS=abort_on_error=1:print_stacktrace=1
 export TSAN_OPTIONS=halt_on_error=1
 
+. "$(dirname "$0")/lib_proc.sh"
 cd "$(dirname "$0")/.."
 
 CONF_FILE="tests/karidns-test.conf"
+# Absolute path on the server command line, so cleanup can find this instance
+# without touching other karidns processes on the host.
+SERVER_CONF="$(pwd)/$CONF_FILE"
 CTL_CONF="tests/karictl-test.conf"
 chmod 0600 "$CTL_CONF" 2>/dev/null || true
 ZONE_FILE="tests/zones/example.com.zone"
@@ -43,9 +47,8 @@ log_fail() { echo "  -> FAIL: $1"; FAILED=1; }
 log_ok()   { echo "  -> OK: $1"; }
 
 cleanup() {
-    [ -n "${KARIDNS_PID:-}" ] && kill -9 "$KARIDNS_PID" >/dev/null 2>&1
-    pkill -9 -f karidns-asan >/dev/null 2>&1
-    pkill -9 -f karidns-tsan >/dev/null 2>&1
+    kari_kill_tree "${KARIDNS_PID:-}"
+    kari_kill_conf "$SERVER_CONF"
 }
 trap cleanup EXIT INT TERM
 
@@ -159,7 +162,7 @@ for variant in asan tsan; do
         echo "  -> SKIP: $bin not built"
         continue
     fi
-    "$bin" -f "$CONF_FILE" > "$logf" 2>&1 &
+    "$bin" -f "$SERVER_CONF" > "$logf" 2>&1 &
     KARIDNS_PID=$!
     sleep 2
     if ! kill -0 "$KARIDNS_PID" 2>/dev/null; then
@@ -215,10 +218,9 @@ for variant in asan tsan; do
     if kill -0 "$KARIDNS_PID" 2>/dev/null; then
         kill -TERM "$KARIDNS_PID" 2>/dev/null
         sleep 0.5
-        if kill -0 "$KARIDNS_PID" 2>/dev/null; then
-            kill -9 "$KARIDNS_PID" 2>/dev/null
-        fi
+        kari_kill_tree "$KARIDNS_PID"
     fi
+    kari_kill_conf "$SERVER_CONF"
     unset KARIDNS_PID
     if grep -qE "ERROR: (AddressSanitizer|UndefinedBehaviorSanitizer)|WARNING: ThreadSanitizer" "$logf"; then
         log_fail "$variant quick smoke (Sanitizer error, see $logf)"

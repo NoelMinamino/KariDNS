@@ -3,6 +3,7 @@
 # 鬩搾ｽｵ繝ｻ・ｺ鬮ｦ・ｮ陷ｷ・ｮ郢晢ｽｻ鬩幢ｽ｢繝ｻ・ｧ髯ｷ・ｻ髣鯉ｽｨ繝ｻ・ｽ繝ｻ・､髫ｲ蟶吶・繝ｻ・ｽ繝ｻ・ｨ郢晢ｽｻ繝ｻ・ｼ鬩搾ｽｵ繝ｻ・ｺ髯ｷ・ｷ繝ｻ・ｶ郢晢ｽｻ霑｢證ｦ・ｽ・ｹ隴擾ｽｴ郢晢ｽｻ驍ｵ・ｺ陝ｶ・ｷ繝ｻ・ｹ隴主・讓溘・縺､ﾂ驛｢譎｢・ｽ・ｻset -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$(dirname "$0")/lib_proc.sh"
 BIN_DIR="$SCRIPT_DIR/.."
 ZONES_DIR="$SCRIPT_DIR/zones"
 TEST_DIR="ttl_harmonization_update_test_dir"
@@ -54,9 +55,7 @@ SERVER_PID=$!
 sleep 1
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill -9 $SERVER_PID 2>/dev/null || true
-    killall -9 karidns 2>/dev/null || true
-    killall -9 karidns-asan 2>/dev/null || true
+    kari_kill_tree "${SERVER_PID:-}"
     rm -rf "$SCRIPT_DIR/$TEST_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
