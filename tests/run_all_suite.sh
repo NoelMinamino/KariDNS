@@ -265,6 +265,7 @@ register_test "unit" "bin" "test_fi_dag" "Fault Injection: dag client query pack
 register_test "xfr" "sh" "tests/run_capsicum_axfr_test.sh" "Capsicum sandbox capability mode AXFR"
 register_test "xfr" "sh" "tests/run_ixfr_roundtrip_test.sh" "RFC 1995 IXFR incremental diff roundtrip"
 register_test "xfr" "sh" "tests/run_xfr_out_of_zone_test.sh" "Out-of-zone records ignored by loader/karicheck; KariDNS primary -> secondary transfer (R-27)"
+register_test "xfr" "sh" "tests/run_dnssec_secondary_test.sh" "DNSSEC data on KariDNS secondaries: DO=1 answers equal to the primary after Extended AXFR, AXFR and IXFR (R-33; SKIP without dnssec-signzone)"
 register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXFR (Option 65153)"
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
 register_test "xfr" "sh" "tests/run_tsig_error_matrix_test.sh" "RFC 8945 TSIG errors and authorization for UPDATE/AXFR/NOTIFY/QUERY (R-07, R-08, R-10, R-30, D-03)"

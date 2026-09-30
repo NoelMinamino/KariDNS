@@ -312,6 +312,8 @@ void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t star
 
 // ワイヤーフォーマット名前操作
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset);
+/* RFC 4648 §7 base32hex (upper case, no padding; RFC 5155 §3.3). */
+void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap);
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out);
 
 // レコード型変換・解析

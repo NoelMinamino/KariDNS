@@ -373,6 +373,225 @@ const char *get_type_str(uint16_t type, zone_arena_t *arena) {
     return buf;
 }
 
+/* RFC 4648 §7 base32hex, upper case, without padding (RFC 5155 §3.3). */
+void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    size_t out_len = 0;
+    uint32_t buffer = 0;
+    int bits_left = 0;
+    for (size_t i = 0; i < len; i++) {
+        buffer = (buffer << 8) | data[i];
+        bits_left += 8;
+        while (bits_left >= 5) {
+            if (out_len + 1 >= out_cap) { out[out_len] = '\0'; return; }
+            out[out_len++] = alphabet[(buffer >> (bits_left - 5)) & 0x1F];
+            bits_left -= 5;
+        }
+    }
+    if (bits_left > 0 && out_len + 1 < out_cap) {
+        out[out_len++] = alphabet[(buffer << (5 - bits_left)) & 0x1F];
+    }
+    out[out_len] = '\0';
+}
+
+/* ---------------------------------------------------------------------------
+ * 転送・UPDATE で受け取った DNSSEC レコード (R-33)
+ *
+ * RDATA は generic_data にそのまま残し (応答はプライマリが送ったバイト列のまま)、DNSSEC の処理が読む
+ * テキストのフィールドを、ゾーンファイルのパーサと同じ並びで rdata[] に追加する:
+ *   RRSIG      型 / アルゴリズム / ラベル数 / 元の TTL / 失効 / 開始 (YYYYMMDDHHmmSS) / 鍵タグ / 署名者 / 署名 (base64)
+ *   NSEC       次の名前 / 型...
+ *   NSEC3      アルゴリズム / フラグ / 反復回数 / ソルト (hex、空なら "-") / 次のハッシュ (base32hex) / 型...
+ *   NSEC3PARAM アルゴリズム / フラグ / 反復回数 / ソルト
+ *   DNSKEY     フラグ / プロトコル / アルゴリズム / 公開鍵 (base64)
+ *   DS         鍵タグ / アルゴリズム / ダイジェスト型 / ダイジェスト (hex)
+ * 戻り値: 0 = 展開した、-1 = RDATA が壊れている、-2 = arena の確保に失敗。
+ * ------------------------------------------------------------------------- */
+
+/* RDATA 中の名前。RFC 4034 §3.1.7 / §4.1.1: Signer's Name と Next Domain Name は圧縮してはならない。
+ * RDATA は応答にそのまま写すので (RFC 3597 §4 と同じ理由)、ポインタを含む名前は壊れた RDATA とする。 */
+static int dnssec_rdata_name(const uint8_t *rd, size_t rdlen, size_t *pos, zone_arena_t *arena, char **out) {
+    for (size_t p = *pos;;) {
+        if (p >= rdlen) return -1;
+        uint8_t len = rd[p];
+        if (len & 0xC0) return -1;
+        p += 1 + (size_t)len;
+        if (len == 0) break;
+    }
+    char buf[DNS_NAME_TEXT_SIZE];
+    size_t next;
+    int written = expand_wire_name_to_buffer(rd, rdlen, *pos, &next, buf, sizeof(buf));
+    if (written < 0) return -1;
+    char *dst = arena_alloc(arena, (size_t)written);
+    if (!dst) return -2;
+    memcpy(dst, buf, (size_t)written);
+    *out = dst;
+    *pos = next;
+    return 0;
+}
+
+static int dnssec_rdata_push(dns_record_t *rec, char *field) {
+    if (!field) return -2;
+    rec->rdata[rec->rdata_count++] = field;
+    return 0;
+}
+
+static char *dnssec_rdata_uint(zone_arena_t *arena, uint32_t v) {
+    char *s = arena_alloc(arena, 11);
+    if (s) snprintf(s, 11, "%u", v);
+    return s;
+}
+
+/* RFC 4034 §3.2: 時刻は UTC の YYYYMMDDHHmmSS。parse_dnssec_time() の逆 (days-to-civil, H. Hinnant)。
+ * gmtime() は使わない: Backend は capability mode で動き、gmtime() は UTC のゾーン情報ファイルを開くことがある。 */
+static char *dnssec_rdata_time(zone_arena_t *arena, uint32_t t) {
+    uint64_t z = (uint64_t)t / 86400 + 719468;
+    uint32_t secs = t % 86400;
+    uint64_t era = z / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint64_t y = yoe + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    unsigned m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y++;
+    char *s = arena_alloc(arena, 15);
+    if (s) snprintf(s, 15, "%04u%02u%02u%02u%02u%02u", (unsigned)y, m, d,
+                    secs / 3600, (secs / 60) % 60, secs % 60);
+    return s;
+}
+
+static char *dnssec_rdata_hex(zone_arena_t *arena, const uint8_t *d, size_t n) {
+    static const char digits[] = "0123456789ABCDEF";
+    char *s = arena_alloc(arena, n * 2 + 1);
+    if (!s) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        s[2 * i] = digits[d[i] >> 4];
+        s[2 * i + 1] = digits[d[i] & 0x0F];
+    }
+    s[n * 2] = '\0';
+    return s;
+}
+
+static char *dnssec_rdata_b64(zone_arena_t *arena, const uint8_t *d, size_t n) {
+    char *s = arena_alloc(arena, 4 * ((n + 2) / 3) + 1);
+    if (!s) return NULL;
+    if (n == 0) s[0] = '\0';
+    else EVP_EncodeBlock((unsigned char *)s, d, (int)n);
+    return s;
+}
+
+/* RFC 4034 §4.1.2 / RFC 5155 §3.2.1: ウィンドウ番号は昇順、ビットマップ長は 1〜32。ビットマップは空でもよい
+ * (RFC 6840 §6.4: Empty Non-Terminal の NSEC3)。疑似型のビットは読むときに無視する (RFC 4034 §4.1.2)。
+ * 型 0 はデータの型にならない (RFC 6895 §3.1) ので同様に省く (テキストの符号化 encode_type_bitmap() も 0 を捨てる)。
+ * テキストの型一覧を読む処理は無いので、rdata[] に入りきらない分は省いて警告する。 */
+static int dnssec_rdata_bitmap(const uint8_t *rd, size_t rdlen, size_t pos, zone_arena_t *arena, dns_record_t *rec) {
+    int last_window = -1;
+    bool truncated = false;
+    while (pos < rdlen) {
+        if (pos + 2 > rdlen) return -1;
+        uint8_t win = rd[pos], blen = rd[pos + 1];
+        pos += 2;
+        if ((int)win <= last_window || blen < 1 || blen > 32 || pos + blen > rdlen) return -1;
+        last_window = win;
+        for (unsigned i = 0; i < blen; i++) {
+            for (unsigned b = 0; b < 8; b++) {
+                if (!(rd[pos + i] & (0x80 >> b))) continue;
+                uint16_t t = (uint16_t)(win * 256 + i * 8 + b);
+                if (t == 0 || t == 41 || (t >= 249 && t <= 255)) continue; // 0, OPT, TKEY..ANY
+                if (rec->rdata_count >= MAX_RDATA) { truncated = true; continue; }
+                char tmp[16];
+                const char *n = format_type_name(t, tmp, sizeof(tmp));
+                char *field = (char *)n;
+                if (n == tmp) {
+                    field = arena_alloc(arena, strlen(tmp) + 1);
+                    if (!field) return -2;
+                    memcpy(field, tmp, strlen(tmp) + 1);
+                }
+                rec->rdata[rec->rdata_count++] = field;
+            }
+        }
+        pos += blen;
+    }
+    if (truncated)
+        syslog(LOG_WARNING, "[AXFR] %s %s: type bitmap has more types than the text form holds (%d); wire RDATA kept",
+               rec->name ? rec->name : "?", rec->type_code == 47 ? "NSEC" : "NSEC3", MAX_RDATA);
+    return 0;
+}
+
+static int decode_dnssec_rdata(const uint8_t *rd, size_t rdlen, zone_arena_t *arena, dns_record_t *rec) {
+    size_t pos = 0;
+    int rc;
+    switch (rec->type_code) {
+    case 46: { // RRSIG (RFC 4034 §3.1)
+        if (rdlen < 18) return -1;
+        char tmp[16];
+        const char *tn = format_type_name((uint16_t)((rd[0] << 8) | rd[1]), tmp, sizeof(tmp));
+        char *covered = (char *)tn;
+        if (tn == tmp) {
+            covered = arena_alloc(arena, strlen(tmp) + 1);
+            if (covered) memcpy(covered, tmp, strlen(tmp) + 1);
+        }
+        uint32_t orig_ttl = ((uint32_t)rd[4] << 24) | ((uint32_t)rd[5] << 16) | ((uint32_t)rd[6] << 8) | rd[7];
+        uint32_t sig_exp = ((uint32_t)rd[8] << 24) | ((uint32_t)rd[9] << 16) | ((uint32_t)rd[10] << 8) | rd[11];
+        uint32_t sig_inc = ((uint32_t)rd[12] << 24) | ((uint32_t)rd[13] << 16) | ((uint32_t)rd[14] << 8) | rd[15];
+        if ((rc = dnssec_rdata_push(rec, covered)) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[2]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[3]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, orig_ttl))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_time(arena, sig_exp))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_time(arena, sig_inc))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, (uint32_t)((rd[16] << 8) | rd[17])))) != 0)
+            return rc;
+        pos = 18;
+        char *signer;
+        if ((rc = dnssec_rdata_name(rd, rdlen, &pos, arena, &signer)) != 0) return rc;
+        rec->rdata[rec->rdata_count++] = signer;
+        return dnssec_rdata_push(rec, dnssec_rdata_b64(arena, rd + pos, rdlen - pos));
+    }
+    case 47: { // NSEC (RFC 4034 §4.1)
+        char *next;
+        if ((rc = dnssec_rdata_name(rd, rdlen, &pos, arena, &next)) != 0) return rc;
+        rec->rdata[rec->rdata_count++] = next;
+        return dnssec_rdata_bitmap(rd, rdlen, pos, arena, rec);
+    }
+    case 50:   // NSEC3 (RFC 5155 §3.2)
+    case 51: { // NSEC3PARAM (RFC 5155 §4.2)
+        if (rdlen < 5) return -1;
+        size_t salt_len = rd[4];
+        pos = 5 + salt_len;
+        if (pos > rdlen || (rec->type_code == 51 && pos != rdlen)) return -1;
+        if ((rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[0]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[1]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, (uint32_t)((rd[2] << 8) | rd[3])))) != 0 ||
+            (rc = dnssec_rdata_push(rec, salt_len ? dnssec_rdata_hex(arena, rd + 5, salt_len) : "-")) != 0)
+            return rc;
+        if (rec->type_code == 51) return 0;
+        /* RFC 5155 §3.2: Next Hashed Owner Name は Hash Length オクテット。長さ 0 のハッシュは順序を作れない。 */
+        if (pos >= rdlen || rd[pos] == 0 || pos + 1 + rd[pos] > rdlen) return -1;
+        size_t hash_len = rd[pos++];
+        char *hash = arena_alloc(arena, hash_len * 8 / 5 + 2);
+        if (!hash) return -2;
+        dns_base32hex_encode(rd + pos, hash_len, hash, hash_len * 8 / 5 + 2);
+        rec->rdata[rec->rdata_count++] = hash;
+        return dnssec_rdata_bitmap(rd, rdlen, pos + hash_len, arena, rec);
+    }
+    case 48: // DNSKEY (RFC 4034 §2.1)
+    case 43: // DS (RFC 4034 §5.1)
+        if (rdlen < 4) return -1;
+        if ((rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, (uint32_t)((rd[0] << 8) | rd[1])))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[2]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[3]))) != 0)
+            return rc;
+        return dnssec_rdata_push(rec, rec->type_code == 48 ? dnssec_rdata_b64(arena, rd + 4, rdlen - 4)
+                                                           : dnssec_rdata_hex(arena, rd + 4, rdlen - 4));
+    default:
+        return 0;
+    }
+}
+
 int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
     char *name; if (expand_wire_name(packet, packet_len, *offset, offset, arena, &name) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: expand_wire_name failed for owner name"); return -1; }
     rec->name = name; if (*offset + 10 > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: packet too short for header"); return -1; }
@@ -539,6 +758,14 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         rec->generic_data = blob;
         rec->generic_len = rdlen;
         rec->rdata_count = 0;
+        // R-33: DNSSEC の型はテキストのフィールドも持たせる (RDATA は blob のまま応答に使う)
+        int rc = decode_dnssec_rdata(&packet[*offset], rdlen, arena, rec);
+        if (rc == -2) return -1;
+        if (rc != 0) {
+            rec->rdata_count = 0;
+            syslog(LOG_WARNING, "[AXFR] %s %s: malformed RDATA (%u octets); kept as opaque data, not used for DNSSEC",
+                   rec->name, rec->type ? rec->type : "?", rdlen);
+        }
     }
     dns_record_preparse_cache(arena, rec);
     *offset += rdlen; return 0;
@@ -4124,8 +4351,9 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                     rec->cache.rrsig.signer = rec->rdata[7];
                     rec->cache.rrsig.signature = NULL; 
                     rec->cache.rrsig.signature_len = 0;
-                    
-                    if (arena) {
+
+                    // 転送・UPDATE 由来 (R-33) は generic_data をそのまま書き出すので、署名のデコードは不要
+                    if (arena && !rec->generic_data) {
                         size_t b64_len = strlen(rec->rdata[8]);
                         for (int i = 9; i < rec->rdata_count; i++) {
                             if (rec->rdata[i]) b64_len += strlen(rec->rdata[i]);

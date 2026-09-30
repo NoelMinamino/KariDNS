@@ -435,27 +435,6 @@ STATIC_TEST const char *find_closest_encloser(zone_arena_t *zone, const char *qn
 }
 
 
-static void base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
-    if (!out || out_cap == 0) return;
-    static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
-    size_t out_len = 0;
-    uint32_t buffer = 0;
-    int bits_left = 0;
-    for (size_t i = 0; i < len; i++) {
-        buffer = (buffer << 8) | data[i];
-        bits_left += 8;
-        while (bits_left >= 5) {
-            if (out_len + 1 >= out_cap) { out[out_len] = '\0'; return; }
-            out[out_len++] = alphabet[(buffer >> (bits_left - 5)) & 0x1F];
-            bits_left -= 5;
-        }
-    }
-    if (bits_left > 0 && out_len + 1 < out_cap) {
-        out[out_len++] = alphabet[(buffer << (5 - bits_left)) & 0x1F];
-    }
-    out[out_len] = '\0';
-}
-
 STATIC_TEST size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
     if (!hex || strcmp(hex, "-") == 0 || strcmp(hex, "") == 0) return 0;
     size_t hlen = strlen(hex);
@@ -496,7 +475,7 @@ STATIC_TEST bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t ite
         if (salt_len > 0) SHA1_Update(&ctx, salt, salt_len);
         SHA1_Final(digest, &ctx);
     }
-    base32hex_encode(digest, 20, out_b32, out_b32_sz);
+    dns_base32hex_encode(digest, 20, out_b32, out_b32_sz);
     return true;
 }
 

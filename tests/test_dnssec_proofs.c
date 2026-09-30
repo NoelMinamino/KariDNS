@@ -935,8 +935,290 @@ static void test_nsec3_index_performance(void) {
     free(t);
 }
 
+/* ------------------------------------------------------------------------------------------------------------
+ * R-33: DNSSEC records received in wire form (AXFR/IXFR/UPDATE) get the same text fields as the zone file parser
+ * gives them, and keep their RDATA as received.
+ * ---------------------------------------------------------------------------------------------------------- */
+
+/* Serializes `rec` (owner uncompressed) and decodes it again like a transfer does. Returns the wire length. */
+static size_t dw_roundtrip(const dns_record_t *rec, zone_arena_t *arena, dns_record_t *out, uint8_t *wire, size_t cap) {
+    uint16_t off = 0;
+    assert(serialize_dns_record(wire, cap, &off, rec, NULL, NULL, 0xFFFFFFFF) == 0);
+    /* exactly sized copy: ASan reports any read past the RR */
+    uint8_t *exact = malloc(off);
+    assert(exact);
+    memcpy(exact, wire, off);
+    size_t pos = 0;
+    uint16_t type = 0;
+    memset(out, 0, sizeof(*out));
+    assert(parse_resource_record(exact, off, &pos, arena, out, &type) == 0);
+    assert(pos == off && type == rec->type_code);
+    free(exact);
+    return off;
+}
+
+/* RDATA of a serialized RR with an uncompressed owner name */
+static const uint8_t *dw_rdata(const uint8_t *wire, size_t *rdlen) {
+    size_t p = 0;
+    while (wire[p] != 0) p += 1 + wire[p];
+    p += 1 + 8;
+    *rdlen = ((size_t)wire[p] << 8) | wire[p + 1];
+    return wire + p + 2;
+}
+
+static void test_dnssec_wire_decode_roundtrip(void) {
+    printf("[TEST] DNSSEC: RRSIG/NSEC/NSEC3/NSEC3PARAM/DNSKEY/DS decoded from wire like the zone parser (R-33)...\n");
+    char *text = strdup(
+        "$ORIGIN dw.test.\n$TTL 300\n"
+        "@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n"
+        "@ IN NS ns1\n"
+        "@ IN DNSKEY 257 3 13 lvjQ0fEgbjekwhT1Fd4oJttlA/2Nb9qkeCfD2RPp236JZFoXPDX/Q3/um8vFAuDqFtMfSaoK/fqBeMBxJmSKXw==\n"
+        "@ IN DNSKEY 256 3 8 AwEAAQ==\n"
+        "@ IN RRSIG SOA 13 2 300 20300101000000 20200101000000 12345 dw.test. "
+        "tPti5Ij+iPWWb+zOQSfmVt/OAJdo9WOsl6h0DM5NhjIAb/h/cn+2+qrFgHcJjmdThHHca8qp8pRfhPqASxe73A==\n"
+        "@ IN RRSIG TYPE65280 13 2 4294967295 21060207062815 19700101000000 1 dw.test. AAAA\n"
+        "@ IN RRSIG NSEC3PARAM 8 2 60 20290228235959 20240229120000 65535 Dw.Test. AAECAwQFBgc=\n"
+        "@ IN NSEC3PARAM 1 0 10 AABBCCDD\n"
+        "@ IN NSEC3PARAM 1 0 0 -\n"
+        "sec IN DS 12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\n"
+        "www IN NSEC a\\.b.dw.test. A NS SOA MX TXT AAAA RRSIG NSEC DNSKEY CAA TYPE1234 TYPE65534\n"
+        "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM IN NSEC3 1 1 10 AABBCCDD 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A RRSIG\n"
+        "2T7B4G4VSA5SMI47K61MV5BV1A22BOJR IN NSEC3 1 0 0 - 0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM\n");
+    assert(text);
+    n3_zone_t z;
+    memset(&z, 0, sizeof(z));
+    zone_arena_init(&z.arena);
+    z.text = text;
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "dw.test.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text, strlen(text), &z.arena, &ctx) >= 0);
+
+    zone_arena_t w;
+    zone_arena_init(&w);
+    uint8_t wire[2048], wire2[2048];
+    size_t checked = 0;
+    for (size_t i = 0; i < z.arena.count; i++) {
+        dns_record_t *src = &z.arena.records[i];
+        uint16_t t = src->type_code;
+        if (t != 43 && t != 46 && t != 47 && t != 48 && t != 50 && t != 51) continue;
+        dns_record_t got;
+        size_t len = dw_roundtrip(src, &w, &got, wire, sizeof(wire));
+        /* same fields as the zone file parser (names and hex/base32 compared case-insensitively) */
+        if (got.rdata_count != src->rdata_count) {
+            fprintf(stderr, "%s type %u: %d fields, zone parser %d\n", src->name, t, got.rdata_count, src->rdata_count);
+            assert(0);
+        }
+        for (int k = 0; k < got.rdata_count; k++) {
+            if (strcasecmp(got.rdata[k], src->rdata[k]) != 0) {
+                fprintf(stderr, "%s type %u field %d: '%s', zone parser '%s'\n", src->name, t, k, got.rdata[k], src->rdata[k]);
+                assert(0);
+            }
+        }
+        /* RDATA kept as received and written back unchanged */
+        size_t rdlen;
+        const uint8_t *rd = dw_rdata(wire, &rdlen);
+        assert(got.generic_data && got.generic_len == rdlen && memcmp(got.generic_data, rd, rdlen) == 0);
+        uint16_t off2 = 0;
+        assert(serialize_dns_record(wire2, sizeof(wire2), &off2, &got, NULL, NULL, 0xFFFFFFFF) == 0);
+        assert(off2 == len && memcmp(wire, wire2, len) == 0);
+        /* the RRSIG cache the answer code reads */
+        if (t == 46) {
+            assert(got.is_cached && src->is_cached);
+            assert(got.cache.rrsig.type_covered == src->cache.rrsig.type_covered);
+            assert(got.cache.rrsig.sig_exp == src->cache.rrsig.sig_exp && got.cache.rrsig.sig_inc == src->cache.rrsig.sig_inc);
+            assert(got.cache.rrsig.orig_ttl == src->cache.rrsig.orig_ttl && got.cache.rrsig.key_tag == src->cache.rrsig.key_tag);
+            assert(got.cache.rrsig.signature == NULL); /* not decoded again: the blob is written */
+        }
+        checked++;
+    }
+    assert(checked == 11);
+    zone_arena_destroy(&w);
+    n3_zone_free(&z);
+    printf("  -> %zu records: same fields, RDATA unchanged.\n", checked);
+}
+
+/* A zone copied record by record through the wire decoder, as a secondary stores it. */
+static void dw_copy_zone(const zone_arena_t *src, zone_arena_t *dst) {
+    zone_arena_init(dst);
+    dst->records = calloc(src->count, sizeof(dns_record_t));
+    assert(dst->records);
+    dst->records_cap = src->count;
+    uint8_t wire[4096];
+    for (size_t i = 0; i < src->count; i++)
+        (void)dw_roundtrip(&src->records[i], dst, &dst->records[dst->count++], wire, sizeof(wire));
+    assert(build_zone_index(dst, true) == 0);
+}
+
+static void test_dnssec_wire_decode_usable(void) {
+    printf("[TEST] DNSSEC: transferred NSEC/NSEC3 records are indexed and found like file-loaded ones (R-33)...\n");
+    const size_t n = 300, cap = 512 + n * 100;
+    char (*h)[33] = malloc(n * sizeof(*h));
+    char *text = malloc(cap);
+    assert(h && text);
+    size_t off = (size_t)snprintf(text, cap, N3_HDR "@ IN NSEC3PARAM 1 0 0 aa11\n");
+    (void)n3_append_chain(text, off, cap, "AA11", n, h, -1);
+    n3_zone_t z;
+    n3_zone_load(&z, text);
+    zone_arena_t w;
+    dw_copy_zone(&z.arena, &w);
+    dns_record_t *pz = n3_param(&z), *pw = NULL;
+    for (size_t i = 0; i < w.count; i++)
+        if (w.records[i].type_code == 51) pw = &w.records[i];
+    assert(pz && pw && w.nsec3_chain_count == 1 && w.nsec3_chains[0].count == n);
+    for (size_t i = 0; i < 2000; i++) {
+        char t[33];
+        n3_random_hash(t, i % 2 == 0);
+        dns_record_t *a = find_covering_nsec3(&z.arena, pz, t), *b = find_covering_nsec3(&w, pw, t);
+        assert(a && b && strcasecmp(a->name, b->name) == 0);
+    }
+    for (size_t i = 0; i < n; i++) {
+        dns_record_t *m = find_matching_nsec3(&w, pw, h[i], "n3.test.");
+        assert(m && strncasecmp(m->name, h[i], 32) == 0);
+    }
+    zone_arena_destroy(&w);
+    n3_zone_free(&z);
+    free(h);
+
+    /* NSEC chain (RFC 4034 §4.1.1) */
+    char *nt = strdup("$ORIGIN nw.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\n"
+                      "@ IN NSEC b.nw.test. NS SOA RRSIG NSEC\nb IN NSEC d.nw.test. A RRSIG NSEC\n"
+                      "d IN NSEC m.nw.test. A RRSIG NSEC\nm IN NSEC nw.test. A RRSIG NSEC\n"
+                      "b IN A 192.0.2.1\nd IN A 192.0.2.2\nm IN A 192.0.2.3\n");
+    n3_zone_t nz;
+    memset(&nz, 0, sizeof(nz));
+    zone_arena_init(&nz.arena);
+    nz.text = nt;
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "nw.test.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(nt, strlen(nt), &nz.arena, &ctx) >= 0);
+    assert(build_zone_index(&nz.arena, true) == 0);
+    dw_copy_zone(&nz.arena, &w);
+    const char *names[] = { "a.nw.test.", "c.nw.test.", "c.b.nw.test.", "e.nw.test.", "z.nw.test.", "0.nw.test." };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        dns_record_t *a = find_covering_nsec(&nz.arena, names[i]), *b = find_covering_nsec(&w, names[i]);
+        assert(a && b && strcasecmp(a->name, b->name) == 0);
+    }
+    zone_arena_destroy(&w);
+    n3_zone_free(&nz);
+    printf("  -> NSEC3 chain index and NSEC covering lookups equal the file-loaded zone.\n");
+}
+
+/* One RR "x.dw.test. IN <type> 300" with the given RDATA, in an exactly sized buffer. */
+static uint8_t *dw_make_rr(uint16_t type, const uint8_t *rd, size_t rdlen, size_t *len) {
+    static const uint8_t owner[] = { 1, 'x', 2, 'd', 'w', 4, 't', 'e', 's', 't', 0 };
+    *len = sizeof(owner) + 10 + rdlen;
+    uint8_t *p = malloc(*len);
+    assert(p);
+    memcpy(p, owner, sizeof(owner));
+    uint8_t *h = p + sizeof(owner);
+    h[0] = (uint8_t)(type >> 8); h[1] = (uint8_t)type; h[2] = 0; h[3] = 1;
+    h[4] = 0; h[5] = 0; h[6] = 1; h[7] = 44; h[8] = (uint8_t)(rdlen >> 8); h[9] = (uint8_t)rdlen;
+    if (rdlen) memcpy(h + 10, rd, rdlen);
+    return p;
+}
+
+/* Decodes the RR; returns the number of text fields. The RR is always accepted and its RDATA kept. */
+static int dw_decode(uint16_t type, const uint8_t *rd, size_t rdlen, zone_arena_t *arena, dns_record_t *rec) {
+    size_t len, pos = 0;
+    uint16_t t;
+    uint8_t *p = dw_make_rr(type, rd, rdlen, &len);
+    memset(rec, 0, sizeof(*rec));
+    assert(parse_resource_record(p, len, &pos, arena, rec, &t) == 0 && pos == len);
+    assert(rec->generic_len == rdlen && (rdlen == 0 || memcmp(rec->generic_data, rd, rdlen) == 0));
+    free(p);
+    return rec->rdata_count;
+}
+
+static void test_dnssec_wire_decode_malformed(void) {
+    printf("[TEST] DNSSEC: malformed DNSSEC RDATA is kept opaque, never read out of bounds (R-33)...\n");
+    zone_arena_t a;
+    zone_arena_init(&a);
+    dns_record_t r;
+    /* RRSIG fixed part (18 octets) + signer "dw.test." + signature */
+    uint8_t sig[64] = { 0, 1, 13, 2, 0, 0, 1, 44, 0x70, 0, 0, 0, 0x60, 0, 0, 0, 0x30, 0x39,
+                        2, 'd', 'w', 4, 't', 'e', 's', 't', 0, 0xAA, 0xBB, 0xCC };
+    assert(dw_decode(46, sig, 30, &a, &r) == 9);
+    assert(strcmp(r.rdata[0], "A") == 0 && strcmp(r.rdata[6], "12345") == 0 && strcmp(r.rdata[7], "dw.test.") == 0);
+    assert(strcmp(r.rdata[4], "20290718054952") == 0 && strcmp(r.rdata[5], "20210114082536") == 0 && strcmp(r.rdata[8], "qrvM") == 0);
+    assert(dw_decode(46, sig, 17, &a, &r) == 0);          /* fixed part truncated */
+    assert(dw_decode(46, sig, 22, &a, &r) == 0);          /* signer runs past RDLENGTH */
+    assert(dw_decode(46, sig, 27, &a, &r) == 9);          /* empty signature: well formed */
+    uint8_t csig[20];
+    memcpy(csig, sig, 18);
+    csig[18] = 0xC0; csig[19] = 0x0C;                      /* compressed signer (RFC 4034 §3.1.7) */
+    assert(dw_decode(46, csig, 20, &a, &r) == 0);
+    csig[18] = 0x40; csig[19] = 0;                         /* reserved label type */
+    assert(dw_decode(46, csig, 20, &a, &r) == 0);
+
+    /* NSEC: next name "b.dw.test." + bitmap */
+    uint8_t nsec[128] = { 1, 'b', 2, 'd', 'w', 4, 't', 'e', 's', 't', 0 };
+    size_t nb = 11;
+    /* window 0: A(1) OPT(41, pseudo: ignored) ; window 1: 257 (CAA) */
+    const uint8_t bm[] = { 0, 6, 0x40, 0, 0, 0, 0, 0x40, 1, 1, 0x40 };
+    memcpy(nsec + nb, bm, sizeof(bm));
+    assert(dw_decode(47, nsec, nb + sizeof(bm), &a, &r) == 3);
+    assert(strcmp(r.rdata[0], "b.dw.test.") == 0 && strcmp(r.rdata[1], "A") == 0 && strcmp(r.rdata[2], "CAA") == 0);
+    const uint8_t bad_order[] = { 1, 1, 0x40, 0, 1, 0x40 }, bad_len0[] = { 0, 0 }, bad_len33[] = { 0, 33 },
+                  bad_short[] = { 0, 4, 0x40 }, bad_hdr[] = { 0 };
+    const struct { const uint8_t *p; size_t n; } bads[] = {
+        { bad_order, sizeof(bad_order) }, { bad_len0, sizeof(bad_len0) }, { bad_len33, sizeof(bad_len33) },
+        { bad_short, sizeof(bad_short) }, { bad_hdr, sizeof(bad_hdr) } };
+    for (size_t i = 0; i < sizeof(bads) / sizeof(bads[0]); i++) {
+        memcpy(nsec + nb, bads[i].p, bads[i].n);
+        assert(dw_decode(47, nsec, nb + bads[i].n, &a, &r) == 0);
+    }
+    nsec[0] = 0xC0; nsec[1] = 0;                           /* compressed next name (RFC 4034 §4.1.1) */
+    assert(dw_decode(47, nsec, 2, &a, &r) == 0);
+    nsec[0] = 1; nsec[1] = 'b';
+    assert(dw_decode(47, nsec, 5, &a, &r) == 0);           /* next name truncated */
+    /* a bitmap with more types than rdata[] holds: fixed field + MAX_RDATA - 1 types, RDATA kept */
+    uint8_t big[11 + 2 + 32];
+    memcpy(big, nsec, 11);
+    big[11] = 0; big[12] = 32;
+    memset(big + 13, 0xFF, 32);
+    big[13] = 0x7F;                                        /* type 0 not set */
+    big[13 + 5] = 0xBF;                                    /* OPT (41) not set */
+    assert(dw_decode(47, big, sizeof(big), &a, &r) == MAX_RDATA);
+
+    /* NSEC3: alg 1, flags 1, 10 iterations, salt AABB, 20-octet hash, bitmap A */
+    uint8_t n3[64] = { 1, 1, 0, 10, 2, 0xAA, 0xBB, 20 };
+    for (int i = 0; i < 20; i++) n3[8 + i] = (uint8_t)(i * 13);
+    n3[28] = 0; n3[29] = 1; n3[30] = 0x40;
+    assert(dw_decode(50, n3, 31, &a, &r) == 6);
+    assert(strcmp(r.rdata[2], "10") == 0 && strcmp(r.rdata[3], "AABB") == 0 && strlen(r.rdata[4]) == 32 &&
+           strcmp(r.rdata[5], "A") == 0);
+    assert(dw_decode(50, n3, 28, &a, &r) == 5);            /* empty bitmap (RFC 6840 §6.4) */
+    assert(dw_decode(50, n3, 4, &a, &r) == 0);             /* fixed part truncated */
+    n3[4] = 30;
+    assert(dw_decode(50, n3, 31, &a, &r) == 0);            /* salt length past RDLENGTH */
+    n3[4] = 2; n3[7] = 0;
+    assert(dw_decode(50, n3, 31, &a, &r) == 0);            /* hash length 0 */
+    n3[7] = 40;
+    assert(dw_decode(50, n3, 31, &a, &r) == 0);            /* hash past RDLENGTH */
+    n3[7] = 20;
+    assert(dw_decode(50, n3, 7, &a, &r) == 0);             /* no hash length octet */
+
+    /* NSEC3PARAM: exactly 5 + salt length octets (RFC 5155 §4.2) */
+    const uint8_t p3[] = { 1, 0, 0, 0, 0, 0 };
+    assert(dw_decode(51, p3, 5, &a, &r) == 4 && strcmp(r.rdata[3], "-") == 0);
+    assert(dw_decode(51, p3, 6, &a, &r) == 0);
+    assert(dw_decode(51, p3, 4, &a, &r) == 0);
+
+    /* DNSKEY / DS: 4 fixed octets */
+    const uint8_t k[] = { 1, 1, 3, 13, 0xFF };
+    assert(dw_decode(48, k, 5, &a, &r) == 4 && strcmp(r.rdata[0], "257") == 0 && strcmp(r.rdata[3], "/w==") == 0);
+    assert(dw_decode(48, k, 3, &a, &r) == 0);
+    assert(dw_decode(43, k, 5, &a, &r) == 4 && strcmp(r.rdata[3], "FF") == 0);
+    assert(dw_decode(43, k, 0, &a, &r) == 0);
+    zone_arena_destroy(&a);
+    printf("  -> malformed RDATA stays opaque; well-formed edge cases decode.\n");
+}
+
 int main(void) {
     printf("=== Starting DNSSEC Negative-Proof Tests ===\n");
+    test_dnssec_wire_decode_roundtrip();
+    test_dnssec_wire_decode_usable();
+    test_dnssec_wire_decode_malformed();
     test_nsec3_index_matches_linear_scan();
     test_nsec3_index_two_chains();
     test_nsec3_index_broken_chain();

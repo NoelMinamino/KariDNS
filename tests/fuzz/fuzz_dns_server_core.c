@@ -83,6 +83,23 @@ static void init_fuzz_environment(void) {
     g_fuzz_initialized = true;
 }
 
+/* NSEC3 index (R-34): every chain is sorted in hash order and is the chain found for its own RRs */
+static void check_nsec3_index(zone_arena_t *arena) {
+    for (size_t c = 0; c < arena->nsec3_chain_count; c++) {
+        const nsec3_chain_t *ch = &arena->nsec3_chains[c];
+        for (size_t i = 0; i < ch->count; i++) {
+            const nsec3_index_entry_t *e = &ch->entries[i];
+            if (zone_find_nsec3_chain(arena, e->rec) != ch) abort();
+            if (i > 0) {
+                const nsec3_index_entry_t *p = &ch->entries[i - 1];
+                size_t n = p->hash_len < e->hash_len ? p->hash_len : e->hash_len;
+                int d = strncasecmp(p->hash, e->hash, n);
+                if (d > 0 || (d == 0 && p->hash_len > e->hash_len)) abort();
+            }
+        }
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size == 0) return 0;
     init_fuzz_environment();
@@ -120,22 +137,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.default_origin = "fuzz.local.";
 
-        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 && build_zone_index(&arena, true) == 0) {
-            /* NSEC3 index (R-34): every chain is sorted in hash order and is the chain found for its own RRs */
-            for (size_t c = 0; c < arena.nsec3_chain_count; c++) {
-                const nsec3_chain_t *ch = &arena.nsec3_chains[c];
-                for (size_t i = 0; i < ch->count; i++) {
-                    const nsec3_index_entry_t *e = &ch->entries[i];
-                    if (zone_find_nsec3_chain(&arena, e->rec) != ch) abort();
-                    if (i > 0) {
-                        const nsec3_index_entry_t *p = &ch->entries[i - 1];
-                        size_t n = p->hash_len < e->hash_len ? p->hash_len : e->hash_len;
-                        int d = strncasecmp(p->hash, e->hash, n);
-                        if (d > 0 || (d == 0 && p->hash_len > e->hash_len)) abort();
-                    }
-                }
-            }
-        }
+        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 && build_zone_index(&arena, true) == 0)
+            check_nsec3_index(&arena);
         zone_arena_destroy(&arena);
     }
     else if (branch == 2) {
@@ -151,7 +154,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         axfr_session_t session;
         memset(&session, 0, sizeof(session));
 
-        parse_xfr_packet(fuzz_data, fuzz_size, &standby, &active, &session, "fuzz.local.");
+        /* R-33: transferred NSEC3 RRs get text fields and enter the index like file-loaded ones */
+        if (parse_xfr_packet(fuzz_data, fuzz_size, &standby, &active, &session, "fuzz.local.") == 0 &&
+            build_zone_index(&standby, true) == 0)
+            check_nsec3_index(&standby);
 
         zone_arena_destroy(&standby);
         zone_arena_destroy(&active);
