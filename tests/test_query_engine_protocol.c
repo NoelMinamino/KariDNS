@@ -486,27 +486,37 @@ static void test_notify_authorization(void) {
         assert(tsig_verify_packet(g_gr.res, r.len, k1, req_mac, req_mac_len, NULL, 0, false, resp_mac, &resp_mac_len) == 0);
     }
 
-    /* the same TSIG-signed NOTIFY from an address that is not a master: NOTAUTH, no refresh */
+    /* R-30: the TSIG is checked first (RFC 8945 5.2); a policy denial after a valid or absent TSIG is REFUSED,
+     * signed with the request's key when the TSIG was valid (5.3); NOTAUTH only for TSIG errors. */
+    tsig_rr_t trr;
+    /* the same TSIG-signed NOTIFY from an address that is not a master: REFUSED, signed with k1, no refresh */
     atomic_store(&g_gr.entry.refresh_now, false);
     build_notify(&q, "example.", k1);
     ask(&q, "example.", 6, STRANGER, false, &r);
-    CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, r.rcode == 5 && !r.aa && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "k1.") == 0 &&
+              trr.error == 0 && trr.mac_size == 32);
 
-    /* right address but no TSIG although the zone requires one: NOTAUTH */
+    /* right address but no TSIG although the zone requires one: REFUSED, unsigned */
     build_notify(&q, "example.", NULL);
     ask(&q, "example.", 6, MASTER, false, &r);
-    CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 0);
 
-    /* signed with a key that is known but not the zone's key */
+    /* signed with a key that is known but not the zone's key: REFUSED, signed with k2 (never with k1) */
     build_notify(&q, "example.", k2);
     ask(&q, "example.", 6, MASTER, false, &r);
-    CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, r.rcode == 5 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "k2.") == 0 &&
+              trr.error == 0 && trr.mac_size == 32);
 
-    /* corrupted MAC */
+    /* corrupted MAC: NOTAUTH, BADSIG, unsigned, key name echoed */
     build_notify(&q, "example.", k1);
     q.b[q.n - 30] ^= 0x01;                                    /* inside the TSIG RDATA (MAC) */
     ask(&q, "example.", 6, MASTER, false, &r);
     CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "k1.") == 0 &&
+              trr.error == 16 && trr.mac_size == 0);
 
     /* MQTYPE-Query is meaningless in a NOTIFY */
     {
@@ -537,6 +547,9 @@ static void test_notify_authorization(void) {
     build_notify(&q, "example.", bad);
     ask(&q, "example.", 6, MASTER, false, &r);
     CHECK(&r, r.rcode == 9 && !atomic_load(&g_gr.entry.refresh_now));
+    /* unknown key: TSIG error BADKEY, unsigned, the request's key name (RFC 8945 5.2.1, 5.3.2) */
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && strcasecmp(trr.key_name, "nokey.") == 0 &&
+              trr.error == 17 && trr.mac_size == 0);
     free(bad->name); free(bad->algorithm); free(bad);
     free_server_config_fields(cfg); free(cfg);
     zone_arena_destroy(&g_gr.arena);
@@ -558,6 +571,62 @@ static void test_notify_authorization(void) {
         zone_arena_destroy(&g_gr.arena);
     }
     printf("  -> NOTIFY authorization matrix passed.\n");
+}
+
+/* RFC 8945 5.2, 5.3: every response to a signed request carries a TSIG, also for a plain QUERY */
+static void test_signed_query(void) {
+    printf("[TEST] Query engine: responses to TSIG-signed queries (RFC 8945 5.2, 5.3)...\n");
+    server_config_t *cfg = notify_cfg("zone \"example.\" { type master; file \"x\"; };");
+    tsig_key_t *k1 = cfg_key(cfg, "k1");
+    assert(k1);
+    gr_setup("example.", ZONE_TXT);
+    g_gr.cfg = *cfg;
+    g_gr.view.name = "__default__";
+    gr_resp_t r;
+    req_t q;
+    tsig_rr_t trr;
+    uint8_t mac[64], rmac[64];
+    size_t mac_len = 0, rmac_len = 0, len;
+
+    /* valid key, with EDNS: answer + OPT, TSIG last, signed with k1 over the request MAC */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 1); put_question(&q, "www.example.", 1, 1); put_opt(&q, 0, 0, 0, NULL, 0);
+    len = q.n;
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), k1, 0, mac, &mac_len, NULL, 0, false) == 0);
+    q.n = len;
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 1) == 1 && gr_count(&r, 3, 41) == 1);
+    CHECK(&r, r.nrr > 0 && r.rr[r.nrr - 1].type == 250 && gr_count(&r, 3, 250) == 1);
+    CHECK(&r, tsig_verify_packet(g_gr.res, r.len, k1, mac, mac_len, NULL, 0, false, rmac, &rmac_len) == 0);
+
+    /* unsigned query: unchanged, no TSIG */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 3, 250) == 0);
+
+    /* wrong secret: NOTAUTH, no answer, BADSIG unsigned */
+    tsig_key_t bad = *k1;
+    bad.next = NULL;
+    memset(bad.secret_decoded, 0x5A, bad.secret_decoded_len);
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    len = q.n;
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), &bad, 0, mac, &mac_len, NULL, 0, false) == 0);
+    q.n = len;
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 9 && r.counts[0] == 0 && !r.aa);
+    CHECK(&r, tsig_parse_rr(g_gr.res, r.len, &trr) == 1 && trr.error == 16 && trr.mac_size == 0);
+
+    /* two TSIG RRs: FORMERR without TSIG (RFC 8945 5.2) */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "www.example.", 1, 1);
+    len = q.n;
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), k1, 0, mac, &mac_len, NULL, 0, false) == 0);
+    assert(tsig_sign_packet(q.b, &len, sizeof(q.b), k1, 0, mac, &mac_len, NULL, 0, false) == 0);
+    q.n = len;
+    ask(&q, "www.example.", 1, "192.0.2.7", false, &r);
+    CHECK(&r, r.rcode == 1 && gr_count(&r, 3, 250) == 0);
+
+    free_server_config_fields(cfg); free(cfg);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> signed QUERY passed.\n");
 }
 
 static void test_rfc8482_minimal_any_synthesis(void) {
@@ -993,6 +1062,7 @@ int main(void) {
     test_protocol_anomalies();
     test_expired_secondary_zone();
     test_notify_authorization();
+    test_signed_query();
     test_rfc8482_minimal_any_synthesis();
     test_sibling_zone_additional_glue_and_limits();
     test_eff_ttl_resolution_and_clamp();

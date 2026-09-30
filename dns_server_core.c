@@ -2127,16 +2127,16 @@ process_tcp_client: ;
           }
 
           if ((qtype == 252 || qtype == 251) && !is_synthetic_zone) {
+            /* R-07, R-10: TSIG を先に検証する (鍵は要求の鍵名とアルゴリズムで決める。RFC 8945 §5.2)。
+             * TSIG のエラーは NOTAUTH、解釈できない TSIG は FORMERR。その後に allow-transfer を調べ、
+             * 拒否は REFUSED。応答は tsig_finish_response() で署名する (検証できた要求には同じ鍵で)。 */
+            tsig_request_t tsig;
+            tsig_check_request(cfg, msg, msg_len, ctx_tcp->client_ip, &tsig);
+            tsig_key_t *matched_key = (tsig.status == TSIG_REQ_VALID) ? tsig.key : NULL;
             bool allowed = false;
-            uint16_t tsig_error = 0;
-            tsig_key_t *matched_key = NULL;
-            uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
-            static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
-            size_t tsig_mac_len = 0;
-            if (zcfg) {
+            if (zcfg && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
               bool has_acl = (zcfg->allow_transfer_count > 0);
-              bool has_tsig = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
-              
+              bool has_keys = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
               bool acl_ok = false;
               if (has_acl) {
                 if (zcfg->allow_transfer_parsed) {
@@ -2145,72 +2145,25 @@ process_tcp_client: ;
                   acl_ok = check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count);
                 }
               }
-              bool tsig_ok = false;
-              
-              if (has_tsig) {
-                // allow-transfer { key "A"; key "B"; ... } で指定された全キー名を候補として、
-                // それぞれに対応する tsig_key_t を探し、TSIG検証が成功するものが1つでもあれば許可する。
-                // (どの鍵で署名されたかはメッセージを見るまで分からないため、候補を順に試す)
-                bool any_key_recognized = false;
-                for (int ki = 0; ki < zcfg->tsig_keys_count && !tsig_ok; ki++) {
-                  const char *cand_name = zcfg->tsig_keys[ki];
-                  tsig_key_t *k = cfg->keys;
-                  while (k) {
-                    if (strcmp(k->name, cand_name) == 0) break;
-                    k = k->next;
-                  }
-                  if (!k) continue; // このキー名は定義されていない。次の候補へ
-                  any_key_recognized = true;
-                  size_t tmp_mac_len = 0;
-                  uint8_t tmp_mac[64];
-                  int err = tsig_verify_packet(msg, msg_len, k, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
-                  if (err == 0) {
-                    matched_key = k;
-                    memcpy(tsig_mac, tmp_mac, tmp_mac_len);
-                    tsig_mac_len = tmp_mac_len;
-                    tsig_ok = true;
-                    tsig_error = 0;
-                    break;
-                  } else if (tsig_error == 0) {
-                    tsig_error = err > 0 ? err : 16; // 最初に遭遇した検証エラーを記録
-                  }
-                }
-                // 後方互換: 旧来の tsig-key 単一指定(allow-transfer外の標準directive)も引き続きサポートする
-                if (!tsig_ok && zcfg->tsig_key) {
-                  tsig_key_t *k = cfg->keys;
-                  while (k) {
-                    if (strcmp(k->name, zcfg->tsig_key) == 0) break;
-                    k = k->next;
-                  }
-                  if (k) {
-                    any_key_recognized = true;
-                    size_t tmp_mac_len = 0;
-                    uint8_t tmp_mac[64];
-                    int err = tsig_verify_packet(msg, msg_len, k, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
-                    if (err == 0) {
-                      matched_key = k;
-                      memcpy(tsig_mac, tmp_mac, tmp_mac_len);
-                      tsig_mac_len = tmp_mac_len;
-                      tsig_ok = true;
-                      tsig_error = 0;
-                    } else if (tsig_error == 0) {
-                      tsig_error = err > 0 ? err : 16;
-                    }
-                  }
-                }
-                if (!any_key_recognized) {
-                  tsig_error = 17; // BADKEY: 設定されているキー名のうち、どれ一つとして定義済みキーと一致しなかった
-                }
-              }
-              
-              if (has_acl && has_tsig) {
-                  allowed = (acl_ok && tsig_ok);
+              /* allow-transfer { key "A"; ... } の鍵か、ゾーンの tsig-key で署名されていること (D-03: 名前は DNS 名として比較) */
+              bool key_ok = false;
+              for (int ki = 0; matched_key && ki < zcfg->tsig_keys_count && !key_ok; ki++)
+                key_ok = tsig_key_names_equal(matched_key->name, zcfg->tsig_keys[ki]);
+              if (matched_key && !key_ok && zcfg->tsig_key)
+                key_ok = tsig_key_names_equal(matched_key->name, zcfg->tsig_key);
+              /* アドレスと鍵の両方があれば両方を満たすこと (docs/karidns.md allow-transfer) */
+              if (has_acl && has_keys) {
+                  allowed = (acl_ok && key_ok);
               } else if (has_acl) {
                   allowed = acl_ok;
-              } else if (has_tsig) {
-                  allowed = tsig_ok;
+              } else if (has_keys) {
+                  allowed = key_ok;
               }
             }
+            uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
+            static_assert(sizeof(tsig_mac) >= sizeof(tsig.mac), "tsig_mac must hold the request MAC");
+            size_t tsig_mac_len = matched_key ? tsig.mac_len : 0;
+            if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
             zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
             if (allowed && entry) {
               release_config_snapshot(cfg);
@@ -2291,39 +2244,29 @@ process_tcp_client: ;
             }
             if (!allowed || !entry) {
               uint8_t res_buf[1024];
-              size_t copy_len;
-              if (tsig_error) {
-                /* NOTAUTH、AA=0 (R-06)、質問セクションまで (Rule 3)。TSIG の判定と署名は phase 6 (R-07)。 */
-                add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
-                copy_len = (size_t)dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), 9, 0, 1,
-                                                            &edns, true, cfg);
-
-                int sign_rc = 0;
-                if (matched_key)
-                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
-                                             matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
-                else {
-                  tsig_key_t dummy = {0};
-                  dummy.name = (zcfg && zcfg->tsig_keys_count > 0) ? zcfg->tsig_keys[0] : (zcfg ? zcfg->tsig_key : "unknown");
-                  dummy.algorithm = "hmac-sha256";
-                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
-                                             17, tsig_mac, &tsig_mac_len, NULL, 0, false);
-                }
-                if (sign_rc != 0) {
-                  release_config_snapshot(cfg);
-                  close(client_fd);
-                  dec_tcp_clients();
-                  free(ctx_tcp);
-                  client_closed = true;
-                  rcu_reader_exit(ctx);
-                  break;
-                }
+              uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
+              if (tsig.status == TSIG_REQ_FORMERR) {
+                rcode = 1;       /* RFC 8945 §5.2: 解釈できない TSIG */
+              } else if (tsig.status == TSIG_REQ_ERROR) {
+                rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
+                add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Invalid TSIG");
               } else {
-                /* REFUSED、AA=0 (R-06)、質問セクションまで (Rule 3) */
                 add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
-                copy_len = (size_t)dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), 5, 0, 1,
-                                                            &edns, true, cfg);
               }
+              /* 質問セクションまで (Rule 3)。TSIG なしの要求への応答は署名しない (RFC 8945 §5.3) */
+              int built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+                                                   &edns, true, cfg);
+              int signed_len = tsig_finish_response(res_buf, (size_t)built, sizeof(res_buf), &tsig);
+              if (signed_len < DNS_HEADER_SIZE) {
+                release_config_snapshot(cfg);
+                close(client_fd);
+                dec_tcp_clients();
+                free(ctx_tcp);
+                client_closed = true;
+                rcu_reader_exit(ctx);
+                break;
+              }
+              size_t copy_len = (size_t)signed_len;
               release_config_snapshot(cfg);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
@@ -3163,7 +3106,7 @@ void *control_thread_func(void *arg) {
                                     if (tsig_key_name[0] != '\0' && active) {
                                         tsig_key_t *k = active->keys;
                                         while (k) {
-                                            if (strcmp(k->name, tsig_key_name) == 0) {
+                                            if (tsig_key_names_equal(k->name, tsig_key_name)) {
                                                 bg_ctx->has_tsig = true;
                                                 strncpy(bg_ctx->tsig_name, k->name,
                                                         sizeof(bg_ctx->tsig_name) - 1);

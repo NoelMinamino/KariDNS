@@ -197,6 +197,14 @@ static void init_rich_fuzz_engine(void) {
     g_fuzz_cfg.rfc10029_mqtype_enable = true;
     g_fuzz_cfg.max_mqtypes = 4;
     g_fuzz_cfg.minimal_responses = true;
+    /* TSIG key "k" (hmac-sha256): requests signed with it reach the MAC check and the error responses (RFC 8945 §5.2) */
+    static tsig_key_t fuzz_key;
+    memset(&fuzz_key, 0, sizeof(fuzz_key));
+    fuzz_key.name = "k";
+    fuzz_key.algorithm = "hmac-sha256";
+    fuzz_key.secret_decoded_len = 32;
+    memset(fuzz_key.secret_decoded, 0x6b, 32);
+    g_fuzz_cfg.keys = &fuzz_key;
     g_fuzz_cfg.minimal_any = true;
     g_fuzz_cfg.minimal_any_ttl = 60;
     /* ECS from the harness client address (127.0.0.1) is trusted, so the ECS option of the input is used */

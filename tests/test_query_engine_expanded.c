@@ -4557,19 +4557,8 @@ static void test_query_engine_formerr_rdlength_overflow_packet(void) {
     printf("  -> FORMERR RDLENGTH overflow passed.\n");
 }
 
-static void test_query_engine_dynamic_update_tsig_notauth_code9(void) {
-    printf("[TEST] Query Engine: Dynamic update TSIG error NOTAUTH (code 9)...\n");
-    uint16_t tsig_err = 9;
-    assert(tsig_err == 9);
-    printf("  -> Dynamic update NOTAUTH passed.\n");
-}
-
-static void test_query_engine_dynamic_update_tsig_invalid_key_code18(void) {
-    printf("[TEST] Query Engine: Dynamic update TSIG error Invalid Key (code 18)...\n");
-    uint16_t tsig_err = 18;
-    assert(tsig_err == 18);
-    printf("  -> Dynamic update Invalid Key passed.\n");
-}
+/* UPDATE TSIG errors and authorization (R-30) are tested through process_dns_query_impl() in
+ * test_dynamic_update_engine.c test_update_tsig_matrix(). */
 
 /* UPDATE to a secondary zone (REFUSED, EDE 18) is tested through process_dns_query_impl() in
  * test_dynamic_update_engine.c test_update_dispatch_zone_section(). */
@@ -9138,15 +9127,24 @@ static void test_query_engine_feature_case_244(void) {
     req[off++] = 0; req[off++] = 250; // TSIG
     req[off++] = 0; req[off++] = 255; // ANY
     req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0; // TTL=0
-    req[off++] = 0; req[off++] = 16; // RDLENGTH
-    memset(req + off, 0, 16);
-    off += 16;
+    size_t rdlen_at = off;
+    off += 2;
+    off += (size_t)write_uncompressed_name(req, off, sizeof(req), "hmac-sha256.");
+    memset(req + off, 0, 8); off += 8;                      // Time Signed, Fudge
+    req[off++] = 0; req[off++] = 32;                        // MAC Size
+    memset(req + off, 0xAB, 32); off += 32;                 // MAC
+    req[off++] = req[0]; req[off++] = req[1];               // Original ID
+    req[off++] = 0; req[off++] = 0; req[off++] = 0; req[off++] = 0; // Error, Other Len
+    req[rdlen_at] = (uint8_t)((off - rdlen_at - 2) >> 8); req[rdlen_at + 1] = (uint8_t)(off - rdlen_at - 2);
 
     uint8_t res[512];
     int res_len = process_dns_query(req, off, res, sizeof(res), "tsigbadkey.example.", 1, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
     assert(res_len >= 12);
-    // BADKEY -> RCODE=9 (NOTAUTH) or REFUSED
-    assert((res[3] & 0x0F) == 9 || (res[3] & 0x0F) == 5);
+    // RFC 8945 §5.2.1, §5.3.2: unknown key -> NOTAUTH, TSIG error BADKEY, unsigned, the request's key name echoed
+    assert((res[3] & 0x0F) == 9);
+    tsig_rr_t rr;
+    assert(tsig_parse_rr(res, (size_t)res_len, &rr) == 1);
+    assert(rr.error == 17 && rr.mac_size == 0 && strcmp(rr.key_name, "badkey.unknown.") == 0);
 }
 
 static void test_query_engine_feature_case_245(void) {
@@ -9651,8 +9649,6 @@ int main(void) {
     test_query_engine_formerr_corrupted_arcount_records();
     test_query_engine_formerr_corrupted_nscount_records();
     test_query_engine_formerr_rdlength_overflow_packet();
-    test_query_engine_dynamic_update_tsig_notauth_code9();
-    test_query_engine_dynamic_update_tsig_invalid_key_code18();
     test_query_engine_dynamic_update_no_matching_zone_notauth();
     test_query_engine_dynamic_update_prereq_type_any_no_data();
     test_query_engine_rrl_client_exhausted_packet_drop();

@@ -301,15 +301,16 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
     *next_offset = jumped ? jumped_offset : p; return 0;
 }
 
-int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
-    if (!packet || current_offset >= packet_len) return -1;
+int expand_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset,
+                               char *buf, size_t buf_size) {
+    if (!packet || current_offset >= packet_len || !buf || buf_size < 2) return -1;
     size_t p = current_offset, jumped_offset = 0; bool jumped = false;
     uint64_t visited[(65536 + 63) / 64];
     size_t words_to_clear = (packet_len + 63) / 64;
     if (words_to_clear > (65536 + 63) / 64) words_to_clear = (65536 + 63) / 64;
     memset(visited, 0, words_to_clear * sizeof(uint64_t));
 
-    char buf[1025]; size_t written = 0;
+    size_t written = 0;
     size_t total_wire_len = 0;
     while (1) {
         if (p >= packet_len) return -1;
@@ -338,19 +339,26 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
             buf[written++] = '\0';
             break;
         }
-        if (p + len > packet_len) return -1;
+        if (p + len > packet_len || written + 2 > buf_size) return -1;
         // ラベルの後に区切りの '.' を置く (前の文字で判定すると、'.' で終わるラベルの後に区切りが入らない)。
-        // 255 オクテット以下の名前は正規形で必ず buf に収まる。
-        size_t n = dns_label_to_text(&packet[p], len, &buf[written], sizeof(buf) - written - 2);
+        // 255 オクテット以下の名前は正規形で DNS_NAME_TEXT_SIZE に必ず収まる。
+        size_t n = dns_label_to_text(&packet[p], len, &buf[written], buf_size - written - 2);
         if (n == (size_t)-1) return -1;
         written += n;
         buf[written++] = '.';
         p += len;
     }
-    *next_offset = jumped ? jumped_offset : p; 
-    char *dst = arena_alloc(arena, written);
+    *next_offset = jumped ? jumped_offset : p;
+    return (int)written; /* NUL を含む長さ */
+}
+
+int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
+    char buf[DNS_NAME_TEXT_SIZE];
+    int written = expand_wire_name_to_buffer(packet, packet_len, current_offset, next_offset, buf, sizeof(buf));
+    if (written < 0) return -1;
+    char *dst = arena_alloc(arena, (size_t)written);
     if (!dst) return -1;
-    memcpy(dst, buf, written);
+    memcpy(dst, buf, (size_t)written);
     if (name_out) *name_out = dst;
     return 0;
 }
@@ -852,10 +860,25 @@ const EVP_MD *tsig_algorithm_evp_md(const char *alg) {
     return tsig_algorithm_from_name(alg);
 }
 
+size_t tsig_rr_wire_size(const char *key_name, const char *alg, uint16_t tsig_error) {
+    size_t kl = wire_name_length(key_name), al = wire_name_length(alg);
+    if (kl == (size_t)-1 || al == (size_t)-1) return 0;
+    return kl + 10 /* TYPE CLASS TTL RDLENGTH */ + al + 10 /* Time Signed, Fudge, MAC Size */
+         + EVP_MAX_MD_SIZE + 6 /* Original ID, Error, Other Len */ + (tsig_error == 18 ? 6 : 0);
+}
+
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
                      uint8_t *prior_mac, size_t *prior_mac_len,
                      const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
                      bool is_subsequent) {
+    return tsig_sign_packet_ex(packet, packet_len, max_len, key, tsig_error, prior_mac, prior_mac_len,
+                               unsigned_intermediate_msgs, unsigned_intermediate_msgs_len, is_subsequent, NULL);
+}
+
+int tsig_sign_packet_ex(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
+                        uint8_t *prior_mac, size_t *prior_mac_len,
+                        const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                        bool is_subsequent, const tsig_sign_times_t *times) {
     if (!key) return -1;
     if (*packet_len < DNS_HEADER_SIZE) return -1; // OOBアクセスの防止
 
@@ -865,16 +888,9 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
 
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
 
-    size_t needed = keyname_wire_len
-                  + 8   /* TYPE(2)+CLASS(2)+TTL(4) */
-                  + 2   /* RDLENGTH */
-                  + alg_wire_len
-                  + 10  /* Time Signed(6)+Fudge(2)+MAC Size(2) */
-                  + EVP_MAX_MD_SIZE /* MAC本体。実際のアルゴリズムに関わらず最大値で安全側に見積もる */
-                  + 6   /* Original ID(2)+Error(2)+Other Len(2) */
-                  + (tsig_error == 18 ? 6 : 0); /* Other Data (BADTIMEの場合のみ6バイト) */
-
-    if (*packet_len + needed > max_len) return -1;
+    /* MAC 本体は実際のアルゴリズムに関わらず最大値で安全側に見積もる */
+    size_t needed = tsig_rr_wire_size(key->name, alg, tsig_error);
+    if (needed == 0 || *packet_len + needed > max_len) return -1;
     size_t pre_mac_len = *packet_len;
     size_t pre_mac_cap = pre_mac_len
                        + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0)
@@ -903,6 +919,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
     if (!is_subsequent) {
+        /* RFC 8945 §4.3.3: 鍵名とアルゴリズム名は正規ワイヤ形式 (小文字。write_uncompressed_name) */
         long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
         if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
@@ -912,17 +929,19 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
     }
-    uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
+    /* RFC 8945 §5.2.3: BADTIME の応答は Time Signed と Fudge にクライアントの値を入れる */
+    uint64_t now = times ? times->time_signed
+                         : ((key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL));
+    uint16_t fudge = times ? times->fudge : 300;
+    uint64_t now_48 = (uint64_t)time(NULL); /* BADTIME の Other Data: サーバーの現在時刻 */
     pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
     pre_mac[offset++] = (now >> 8) & 0xFF; pre_mac[offset++] = now & 0xFF;
-    uint16_t fudge = 300;
     pre_mac[offset++] = fudge >> 8; pre_mac[offset++] = fudge & 0xFF;
     if (!is_subsequent) {
         pre_mac[offset++] = tsig_error >> 8; pre_mac[offset++] = tsig_error & 0xFF; // Error
         if (tsig_error == 18) {
             pre_mac[offset++] = 0; pre_mac[offset++] = 6; // Other Len
-            uint64_t now_48 = time(NULL);
             pre_mac[offset++] = (now_48 >> 40) & 0xFF; pre_mac[offset++] = (now_48 >> 32) & 0xFF;
             pre_mac[offset++] = (now_48 >> 24) & 0xFF; pre_mac[offset++] = (now_48 >> 16) & 0xFF;
             pre_mac[offset++] = (now_48 >> 8) & 0xFF; pre_mac[offset++] = now_48 & 0xFF;
@@ -932,7 +951,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     unsigned int mac_len = 0; unsigned char mac[EVP_MAX_MD_SIZE];
     if (tsig_error == 16 || tsig_error == 17) {
-        // RFC 8945 §5.3.1: If error is BADSIG or BADKEY, MAC size MUST be 0 and MAC data MUST be empty
+        // RFC 8945 §5.3.2: BADSIG / BADKEY の応答は無署名 (MAC Size 0、MAC は空)
         mac_len = 0;
     } else if (key->secret_decoded_len > 0) {
         const EVP_MD *evp_md = tsig_algorithm_from_name(alg);
@@ -943,12 +962,12 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, offset, mac, &mac_len);
     }
     if (use_malloc) free(pre_mac);
-    
+
     if (prior_mac_len && prior_mac) {
         *prior_mac_len = mac_len;
         if (mac_len > 0) memcpy(prior_mac, mac, mac_len);
     }
-    
+
     size_t p_offset = *packet_len;
     long w2 = write_uncompressed_name(packet, p_offset, max_len, key->name);
     if (w2 < 0) return -1;
@@ -973,7 +992,6 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     packet[p_offset++] = tsig_error >> 8; packet[p_offset++] = tsig_error & 0xFF; // Error
     if (tsig_error == 18) {
         packet[p_offset++] = 0; packet[p_offset++] = 6; // Other Len
-        uint64_t now_48 = time(NULL);
         packet[p_offset++] = (now_48 >> 40) & 0xFF; packet[p_offset++] = (now_48 >> 32) & 0xFF;
         packet[p_offset++] = (now_48 >> 24) & 0xFF; packet[p_offset++] = (now_48 >> 16) & 0xFF;
         packet[p_offset++] = (now_48 >> 8) & 0xFF; packet[p_offset++] = now_48 & 0xFF;
@@ -988,89 +1006,129 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     return 0;
 }
 
+int tsig_parse_rr(const uint8_t *packet, size_t packet_len, tsig_rr_t *out) {
+    if (!packet || packet_len < DNS_HEADER_SIZE) return 0;
+    uint16_t qdcount = (packet[4] << 8) | packet[5], ancount = (packet[6] << 8) | packet[7];
+    uint16_t nscount = (packet[8] << 8) | packet[9], arcount = (packet[10] << 8) | packet[11];
+    if (arcount == 0) return 0;
+    size_t offset = DNS_HEADER_SIZE;
+    for (int i = 0; i < qdcount; i++) {
+        if (skip_name_inplace(packet, packet_len, &offset) != 0 || offset + 4 > packet_len) return 0;
+        offset += 4;
+    }
+    uint32_t total = (uint32_t)ancount + nscount + arcount;
+    size_t tsig_rr = 0;
+    int tsig_count = 0;
+    bool tsig_last = false;
+    for (uint32_t i = 0; i < total; i++) {
+        size_t rr = offset;
+        /* TSIG より後ろが読めなければ、TSIG は最後の RR ではない (RFC 8945 §5.2) */
+        if (skip_name_inplace(packet, packet_len, &offset) != 0 || offset + 10 > packet_len)
+            return tsig_count ? -1 : 0;
+        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
+        uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
+        if (offset + 10 + rdlen > packet_len) return (tsig_count || type == 250) ? -1 : 0;
+        if (type == 250) {
+            tsig_count++;
+            tsig_rr = rr;
+            tsig_last = (i == total - 1) && (i >= (uint32_t)ancount + nscount);
+        }
+        offset += 10 + (size_t)rdlen;
+    }
+    if (tsig_count == 0) return 0;
+    /* RFC 8945 §5.2: TSIG は追加セクションの最後にただ 1 つ。それ以外は FORMERR */
+    if (tsig_count > 1 || !tsig_last) return -1;
+
+    size_t p;
+    if (expand_wire_name_to_buffer(packet, packet_len, tsig_rr, &p, out->key_name, sizeof(out->key_name)) < 0)
+        return -1;
+    if (p + 10 > packet_len) return -1;
+    uint16_t class = (packet[p + 2] << 8) | packet[p + 3];
+    if (class != 255) return -1; // RFC 8945 §4.2: CLASS MUST be ANY
+    size_t rdata_end = p + 10 + (((size_t)packet[p + 8] << 8) | packet[p + 9]);
+    p += 10;
+    /* RFC 8945 §4.2: Algorithm Name は圧縮しない */
+    if (extract_wire_name_to_buffer(packet, rdata_end, p, &p, out->alg_name, sizeof(out->alg_name)) != 0) return -1;
+    if (p + 10 > rdata_end) return -1;
+    out->rr_offset = tsig_rr;
+    out->timers_offset = p;
+    out->time_signed = ((uint64_t)packet[p] << 40) | ((uint64_t)packet[p + 1] << 32) |
+                       ((uint64_t)packet[p + 2] << 24) | ((uint64_t)packet[p + 3] << 16) |
+                       ((uint64_t)packet[p + 4] << 8) | (uint64_t)packet[p + 5];
+    out->fudge = (packet[p + 6] << 8) | packet[p + 7];
+    out->mac_size = (packet[p + 8] << 8) | packet[p + 9];
+    p += 10;
+    if (p + out->mac_size + 6 > rdata_end) return -1;
+    out->mac = &packet[p];
+    p += out->mac_size;
+    out->orig_id = (packet[p] << 8) | packet[p + 1];
+    out->error = (packet[p + 2] << 8) | packet[p + 3];
+    out->other_len = (packet[p + 4] << 8) | packet[p + 5];
+    p += 6;
+    if (p + out->other_len > rdata_end) return -1;
+    out->other = &packet[p];
+    return 1;
+}
+
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
                        const uint8_t *prior_mac, size_t prior_mac_len,
                        const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
                        bool is_subsequent,
                        uint8_t *mac_out, size_t *mac_len_out) {
-    if (!key || packet_len < DNS_HEADER_SIZE) return -1;
-    uint16_t arcount = (packet[10] << 8) | packet[11];
-    if (arcount == 0) return -1;
-    size_t offset = DNS_HEADER_SIZE;
-    uint16_t qdcount = (packet[4] << 8) | packet[5], ancount = (packet[6] << 8) | packet[7], nscount = (packet[8] << 8) | packet[9];
-    for (int i = 0; i < qdcount; i++) {
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
+    return tsig_verify_packet_ex(packet, packet_len, key, prior_mac, prior_mac_len,
+                                 unsigned_intermediate_msgs, unsigned_intermediate_msgs_len, is_subsequent,
+                                 mac_out, mac_len_out, NULL);
+}
 
-        offset += 4;
+int tsig_verify_packet_ex(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
+                          const uint8_t *prior_mac, size_t prior_mac_len,
+                          const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                          bool is_subsequent,
+                          uint8_t *mac_out, size_t *mac_len_out, tsig_verify_info_t *info) {
+    if (!key || !packet || packet_len < DNS_HEADER_SIZE) return -1;
+    tsig_rr_t rr;
+    int pr = tsig_parse_rr(packet, packet_len, &rr);
+    if (pr == 0) return -1;
+    if (pr < 0) return TSIG_VERIFY_FORMERR;
+    if (info) {
+        info->time_signed = rr.time_signed;
+        info->fudge = rr.fudge;
+        info->error = rr.error;
+        info->truncated = false;
     }
-    size_t last_rr_offset = 0;
-    for (int i = 0; i < ancount + nscount + arcount; i++) {
-        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
-        if (offset >= packet_len) return -1;
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
 
-        if (offset + 10 > packet_len) return -1;
-        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
-        if (i < ancount + nscount + arcount - 1 && type == 250) {
-            return -1; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
-        }
-        uint16_t rdlen = (packet[offset+8] << 8) | packet[offset+9];
-        offset += 10 + rdlen;
-    }
-    if (last_rr_offset == 0 || offset > packet_len) return -1;
-    size_t tsig_p = last_rr_offset;
-    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return -1;
-
-    if (tsig_p + 10 > packet_len) return -1;
-    uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p+1];
-    if (type != 250) return -1;
-    uint16_t class = (packet[tsig_p+2] << 8) | packet[tsig_p+3];
-    if (class != 255) return -1;
-    tsig_p += 10;
-    size_t alg_start = tsig_p;
-    char wire_alg_name[256];
-    if (extract_wire_name_to_buffer(packet, packet_len, alg_start, &tsig_p, wire_alg_name, sizeof(wire_alg_name)) != 0) return -1;
-
-    if (tsig_p + 16 > packet_len) return -1;
-    size_t time_fudge_start = tsig_p;
-    uint64_t time_signed = 
-        ((uint64_t)packet[time_fudge_start] << 40) | ((uint64_t)packet[time_fudge_start+1] << 32) |
-        ((uint64_t)packet[time_fudge_start+2] << 24) | ((uint64_t)packet[time_fudge_start+3] << 16) |
-        ((uint64_t)packet[time_fudge_start+4] << 8)  |  (uint64_t)packet[time_fudge_start+5];
-    uint16_t fudge = (packet[time_fudge_start+6] << 8) | packet[time_fudge_start+7];
-    uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
-    uint64_t upper = (UINT64_MAX - fudge < time_signed) ? UINT64_MAX : time_signed + fudge;
-    uint64_t lower = (time_signed < fudge) ? 0 : time_signed - fudge;
-    tsig_p += 8;
-    uint16_t mac_size = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    if (tsig_p + mac_size + 6 > packet_len) return -1;
-    const uint8_t *mac = &packet[tsig_p]; tsig_p += mac_size;
-    uint16_t orig_id = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    if (!is_subsequent && orig_id != (((uint16_t)packet[0] << 8) | packet[1])) {
-        return 16; // BADSIG per RFC 8945 §5.3.1
-    }
-    uint16_t err = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    uint16_t other_len = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    if (tsig_p + other_len > packet_len) return -1;
-    
+    /* RFC 8945 §5.2: 鍵 → MAC → 時刻の順に調べる。
+     * §5.2.1: 鍵名 (DNS 名として比較) かアルゴリズムが違えば BADKEY */
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-    const EVP_MD *evp_md = tsig_algorithm_from_name(wire_alg_name);
-    if (!evp_md) return 21; // BADALG
-    if (evp_md != tsig_algorithm_from_name(alg)) return 21; // BADALG
-    
+    const EVP_MD *evp_md = tsig_algorithm_from_name(rr.alg_name);
+    if (!evp_md || evp_md != tsig_algorithm_from_name(alg) || !domain_names_match_ci(rr.key_name, key->name))
+        return 17; // BADKEY
+    size_t hash_len = (size_t)EVP_MD_size(evp_md);
+
+    /* RFC 8945 §5.3.2: サーバーは鍵や MAC のエラーを MAC Size 0 の無署名で返す。要求への応答を
+     * 検証しているときは、その Error をそのまま返す (呼び出し側が BADSIG/BADKEY を表示できるように) */
+    if (rr.mac_size == 0 && prior_mac && prior_mac_len > 0 && !is_subsequent &&
+        (rr.error == 16 || rr.error == 17))
+        return rr.error;
+    /* RFC 8945 §5.2.2.1: MAC Size がハッシュ長より大きい、または max(10, ハッシュ長/2) より小さいと FORMERR */
+    size_t min_mac = hash_len / 2 > 10 ? hash_len / 2 : 10;
+    if (rr.mac_size > hash_len || rr.mac_size < min_mac) return TSIG_VERIFY_FORMERR;
+
+    size_t last_rr_offset = rr.rr_offset;
+    uint16_t arcount = (packet[10] << 8) | packet[11];
     size_t keyname_wire_len = wire_name_length(key->name);
-    size_t alg_wire_len = wire_name_length(wire_alg_name);
+    size_t alg_wire_len = wire_name_length(rr.alg_name);
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
     size_t pre_mac_cap = (prior_mac_len > 0 ? prior_mac_len + 2 : 0)
                        + unsigned_intermediate_msgs_len
-                       + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
-    
+                       + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + rr.other_len;
+
     uint8_t *pre_mac = NULL;
     bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
     if (use_malloc) pre_mac = malloc(pre_mac_cap);
     else pre_mac = g_tsig_pre_mac_buf;
     if (!pre_mac) return -1;
-    
+
     size_t p_offset = 0;
     if (prior_mac && prior_mac_len > 0) {
         pre_mac[p_offset++] = prior_mac_len >> 8;
@@ -1082,82 +1140,58 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         memcpy(&pre_mac[p_offset], unsigned_intermediate_msgs, unsigned_intermediate_msgs_len);
         p_offset += unsigned_intermediate_msgs_len;
     }
-    
+
+    /* RFC 8945 §4.3.2: TSIG を除き、ARCOUNT を 1 減らし、ID を Original ID に置き換えたメッセージ。
+     * Original ID がメッセージ ID と違ってもよい (§4.2: 転送された UPDATE。R-20) */
     memcpy(&pre_mac[p_offset], packet, last_rr_offset);
-    pre_mac[p_offset + 0] = orig_id >> 8; pre_mac[p_offset + 1] = orig_id & 0xFF;
+    pre_mac[p_offset + 0] = rr.orig_id >> 8; pre_mac[p_offset + 1] = rr.orig_id & 0xFF;
     uint16_t new_arcount = arcount - 1;
     pre_mac[p_offset + 10] = new_arcount >> 8; pre_mac[p_offset + 11] = new_arcount & 0xFF;
     p_offset += last_rr_offset;
 
     if (!is_subsequent) {
+        /* RFC 8945 §4.3.3: 鍵名とアルゴリズム名は正規ワイヤ形式 (小文字) */
         long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
         if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
         p_offset += (size_t)w3;
-        
+
         if (p_offset + 6 > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
         pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
         pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
-        
-        w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, wire_alg_name);
+
+        w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, rr.alg_name);
         if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
         p_offset += (size_t)w3;
     }
-    
-    if (p_offset + 8 + (!is_subsequent ? 4 + other_len : 0) > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
-    memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8); p_offset += 8;
+
+    if (p_offset + 8 + (!is_subsequent ? 4 + rr.other_len : 0) > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
+    memcpy(&pre_mac[p_offset], &packet[rr.timers_offset], 8); p_offset += 8;
     if (!is_subsequent) {
-        pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
-        pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
-        if (other_len > 0) { memcpy(&pre_mac[p_offset], &packet[tsig_p], other_len); p_offset += other_len; }
+        pre_mac[p_offset++] = rr.error >> 8; pre_mac[p_offset++] = rr.error & 0xFF;
+        pre_mac[p_offset++] = rr.other_len >> 8; pre_mac[p_offset++] = rr.other_len & 0xFF;
+        if (rr.other_len > 0) { memcpy(&pre_mac[p_offset], rr.other, rr.other_len); p_offset += rr.other_len; }
     }
     unsigned int calc_mac_len = 0; unsigned char calc_mac[EVP_MAX_MD_SIZE];
     HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, p_offset, calc_mac, &calc_mac_len);
     if (use_malloc) free(pre_mac);
-    if (mac_size != calc_mac_len) {
-        /* [T8] サイズ検証: 站切り消しすぎまたは範囲外のサイズは即座に BADSIG */
-        if (mac_size < 10 || mac_size < calc_mac_len / 2 || mac_size > calc_mac_len) return 16; // BADSIG
-    }
-    /* [T8] 元の if/else 両分岐の重複 const_time_memcmp を統合 */
-    if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
-    if (now > upper || now < lower) return 18; // BADTIME (RFC 8945 §5.3.1)
+    /* 切り詰めた MAC は先頭 mac_size オクテットだけを比べる (RFC 8945 §5.2.2.1) */
+    if (calc_mac_len < rr.mac_size || const_time_memcmp(calc_mac, rr.mac, rr.mac_size) != 0) return 16; // BADSIG
+    /* 検証できた MAC は BADTIME のときも返す (RFC 8945 §5.3.2: BADTIME の応答は要求の MAC を含めて署名) */
     if (mac_out && mac_len_out) {
-        *mac_len_out = mac_size;
-        memcpy(mac_out, mac, mac_size);
+        *mac_len_out = rr.mac_size;
+        memcpy(mac_out, rr.mac, rr.mac_size);
     }
+    if (info) info->truncated = rr.mac_size < hash_len;
+    uint64_t now = (key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
+    uint64_t upper = (UINT64_MAX - rr.fudge < rr.time_signed) ? UINT64_MAX : rr.time_signed + rr.fudge;
+    uint64_t lower = (rr.time_signed < rr.fudge) ? 0 : rr.time_signed - rr.fudge;
+    if (now > upper || now < lower) return 18; // BADTIME (RFC 8945 §5.2.3)
     return 0;
 }
 
 bool packet_has_tsig(const uint8_t *packet, size_t packet_len) {
-    if (!packet || packet_len < DNS_HEADER_SIZE) return false;
-    uint16_t arcount = (packet[10] << 8) | packet[11];
-    if (arcount == 0) return false;
-    size_t offset = DNS_HEADER_SIZE;
-    uint16_t qdcount = (packet[4] << 8) | packet[5];
-    uint16_t ancount = (packet[6] << 8) | packet[7];
-    uint16_t nscount = (packet[8] << 8) | packet[9];
-    for (int i = 0; i < qdcount; i++) {
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
-        offset += 4;
-    }
-    size_t last_rr_offset = 0;
-    for (int i = 0; i < ancount + nscount + arcount; i++) {
-        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
-        if (offset >= packet_len) return false;
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
-        if (offset + 10 > packet_len) return false;
-        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
-        if (i < ancount + nscount + arcount - 1 && type == 250) {
-            return false; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
-        }
-        uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
-        offset += 10 + rdlen;
-    }
-    if (last_rr_offset == 0 || offset > packet_len) return false;
-    size_t tsig_p = last_rr_offset;
-    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return false;
-    if (tsig_p + 10 > packet_len) return false;
-    uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p + 1];
-    return (type == 250);
+    tsig_rr_t rr;
+    return tsig_parse_rr(packet, packet_len, &rr) == 1;
 }
 
 // ============================================================================

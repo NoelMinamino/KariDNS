@@ -267,6 +267,7 @@ register_test "xfr" "sh" "tests/run_ixfr_roundtrip_test.sh" "RFC 1995 IXFR incre
 register_test "xfr" "sh" "tests/run_xfr_out_of_zone_test.sh" "Out-of-zone records ignored by loader/karicheck; KariDNS primary -> secondary transfer (R-27)"
 register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXFR (Option 65153)"
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
+register_test "xfr" "sh" "tests/run_tsig_error_matrix_test.sh" "RFC 8945 TSIG errors and authorization for UPDATE/AXFR/NOTIFY/QUERY (R-07, R-08, R-10, R-30, D-03)"
 register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer"
 register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone SOA refresh polling"
 register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE option (primary, secondary, chained secondaries)"

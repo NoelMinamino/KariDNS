@@ -334,6 +334,19 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
                      uint8_t *prior_mac, size_t *prior_mac_len,
                      const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
                      bool is_subsequent);
+/* 署名する TSIG の Time Signed と Fudge。NULL なら現在時刻と 300。
+ * BADTIME の応答はクライアントの値を使う (RFC 8945 §5.2.3)。 */
+typedef struct {
+    uint64_t time_signed;
+    uint16_t fudge;
+} tsig_sign_times_t;
+int tsig_sign_packet_ex(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
+                        uint8_t *prior_mac, size_t *prior_mac_len,
+                        const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                        bool is_subsequent, const tsig_sign_times_t *times);
+/* key_name / alg で tsig_error の TSIG RR を付けたときに増えるバイト数 (MAC は alg の最大長)。
+ * 名前が不正なら 0。 */
+size_t tsig_rr_wire_size(const char *key_name, const char *alg, uint16_t tsig_error);
 // 注意: mac_out は最低 EVP_MAX_MD_SIZE (64) バイトを確保すること。
 // mac_len_out には実際にコピーされたバイト数（<= EVP_MAX_MD_SIZE）が返る。
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
@@ -342,6 +355,28 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
                        bool is_subsequent,
                        uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
                        size_t *mac_len_out);
+/* tsig_verify_packet() の戻り値: TSIG が解釈できない (複数、最後の RR でない、RDATA の欠け、
+ * MAC Size が範囲外)。RFC 8945 §5.2、§5.2.2.1 により FORMERR。 */
+#define TSIG_VERIFY_FORMERR (-2)
+/* tsig_verify_packet_ex() が返す、検証したメッセージの TSIG の値 */
+typedef struct {
+    uint64_t time_signed;
+    uint16_t fudge;
+    uint16_t error;       /* TSIG の Error */
+    bool truncated;       /* MAC Size がハッシュ長より短い (RFC 8945 §5.2.2.1 で許される切り詰め) */
+} tsig_verify_info_t;
+/* 戻り値: 0 = 検証成功、-1 = TSIG がない、TSIG_VERIFY_FORMERR、
+ * 17 = 鍵名またはアルゴリズムが key と違う (BADKEY)、16 = MAC 不一致 (BADSIG)、18 = 時刻範囲外 (BADTIME)。
+ * 18 のときも mac_out に検証できた MAC を返す (BADTIME の応答の署名に使う。RFC 8945 §5.3.2)。
+ * 応答の検証 (prior_mac を渡した最初のメッセージ) で、MAC Size 0 の無署名エラー (RFC 8945 §5.3.2)
+ * なら TSIG の Error (16/17) を返す。 */
+int tsig_verify_packet_ex(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
+                          const uint8_t *prior_mac, size_t prior_mac_len,
+                          const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                          bool is_subsequent,
+                          uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
+                          size_t *mac_len_out, tsig_verify_info_t *info);
+/* TSIG が追加セクションの最後にただ 1 つあり、読めるときだけ true */
 bool packet_has_tsig(const uint8_t *packet, size_t packet_len);
 
 // SIG(0) & DNSKEY Tag
@@ -367,6 +402,28 @@ size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap
 // 255 オクテット超の名前 (RFC 1035 §2.3.4)、バッファ不足なら (size_t)-1。
 size_t dns_name_normalize(const char *in, char *out, size_t cap);
 
+/* メッセージ中の TSIG RR (RFC 8945 §4.2) */
+typedef struct {
+    size_t rr_offset;               /* TSIG RR の先頭。ここまでが TSIG を除いたメッセージ */
+    size_t timers_offset;           /* Time Signed の位置 */
+    char key_name[DNS_NAME_TEXT_SIZE];
+    char alg_name[DNS_NAME_TEXT_SIZE];
+    uint64_t time_signed;
+    uint16_t fudge;
+    uint16_t mac_size;
+    const uint8_t *mac;
+    uint16_t orig_id;
+    uint16_t error;
+    uint16_t other_len;
+    const uint8_t *other;
+} tsig_rr_t;
+/* TSIG RR を探して読む。0 = TSIG なし、1 = 読めた、-1 = 解釈できない TSIG (複数ある、追加セクションの
+ * 最後の RR でない、CLASS が ANY でない、RDATA が欠けている。RFC 8945 §5.2 で FORMERR)。 */
+int tsig_parse_rr(const uint8_t *packet, size_t packet_len, tsig_rr_t *out);
+
+/* 圧縮ポインタをたどって名前を正規形 (上記) で buf に書く。buf は DNS_NAME_TEXT_SIZE あれば足りる。 */
+int expand_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset,
+                               char *buf, size_t buf_size);
 int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size);
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);
 // downcase=true なら RFC 4034 §6.2 の正規ワイヤ形式 (英字を小文字化)

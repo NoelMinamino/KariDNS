@@ -2813,8 +2813,9 @@ KARIDNS_TOOL_FN int run_test(const char *test_name, const char *qname, const cha
                         printf(";; Couldn't verify signature: tsig verify failure (BADKEY)\n");
                     } else if (err == 18) {
                         printf(";; Couldn't verify signature: tsig verify failure (BADTIME)\n");
-                    } else if (err == 21) {
-                        printf(";; Couldn't verify signature: tsig verify failure (BADALG)\n");
+                    } else if (err == TSIG_VERIFY_FORMERR) {
+                        /* RFC 8945 §5.2、§5.2.2.1: TSIG が複数、最後でない、MAC Size が範囲外 */
+                        printf(";; Couldn't verify signature: tsig verify failure (FORMERR)\n");
                     } else {
                         printf(";; Couldn't verify signature: tsig verify failure (%d)\n", err);
                     }

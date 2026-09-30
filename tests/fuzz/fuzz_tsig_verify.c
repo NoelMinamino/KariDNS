@@ -102,5 +102,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     size_t mac_len_out = 0;
     tsig_verify_packet(pkt, pkt_len, &key, NULL, 0, NULL, 0, false, mac_out, &mac_len_out);
 
+    /* tsig_parse_rr() と、鍵名・アルゴリズムが一致したときの MAC 計算と時刻/切り詰めの判定
+     * (要求の検証と、要求の MAC を渡す応答の検証の両方) */
+    tsig_rr_t rr;
+    if (tsig_parse_rr(pkt, pkt_len, &rr) == 1) {
+        tsig_key_t same;
+        memset(&same, 0, sizeof(same));
+        same.name = rr.key_name;
+        same.algorithm = rr.alg_name;
+        same.secret_decoded_len = 32;
+        memcpy(same.secret_decoded, "12345678901234567890123456789012", 32);
+        tsig_verify_info_t info;
+        static const uint8_t req_mac[32] = { 1 };
+        tsig_verify_packet_ex(pkt, pkt_len, &same, NULL, 0, NULL, 0, false, mac_out, &mac_len_out, &info);
+        tsig_verify_packet_ex(pkt, pkt_len, &same, req_mac, sizeof(req_mac), NULL, 0, false, mac_out, &mac_len_out, &info);
+    }
+
     return 0;
 }

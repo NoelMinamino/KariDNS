@@ -70,6 +70,14 @@ static void init_fuzz_environment(void) {
     memset(&g_fuzz_cfg, 0, sizeof(g_fuzz_cfg));
     g_fuzz_cfg.rfc10029_mqtype_enable = true;
     g_fuzz_cfg.max_mqtypes = 4;
+    /* TSIG key "k" (hmac-sha256): requests signed with it reach the MAC check and the error responses (RFC 8945 §5.2) */
+    static tsig_key_t fuzz_key;
+    memset(&fuzz_key, 0, sizeof(fuzz_key));
+    fuzz_key.name = "k";
+    fuzz_key.algorithm = "hmac-sha256";
+    fuzz_key.secret_decoded_len = 32;
+    memset(fuzz_key.secret_decoded, 0x6b, 32);
+    g_fuzz_cfg.keys = &fuzz_key;
     atomic_store_explicit(&g_config_db.active, &g_fuzz_cfg, memory_order_release);
 
     g_fuzz_initialized = true;

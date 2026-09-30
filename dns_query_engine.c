@@ -2664,8 +2664,18 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                                     is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry);
 }
 
+static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
+                              size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                              const char *client_ip, compress_ctx_t *comp_ctx,
+                              bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                              zone_db_snapshot_t *snap, server_config_t *cfg,
+                              zone_db_entry_t **out_matched_entry, tsig_request_t *tsig);
+
 /* res_cap: res の実際の容量 (バイト)。0 なら不明で、従来どおり max_res_len (UDP では EDNS の
  * サイズに置き換えた後の値) を容量とみなす。max_res_len は応答の上限 (UDP ではクライアントの上限)。 */
+/* RFC 8945 §5.2、§5.3: TSIG の付いた要求は、どの OPCODE でも先に TSIG を検証し (鍵は要求の鍵名と
+ * アルゴリズムで決める)、TSIG RR を除いた要求を処理して、応答に TSIG を付ける (検証できれば同じ鍵で
+ * 署名、鍵と MAC のエラーは無署名)。TSIG のエラーは NOTAUTH、解釈できない TSIG は FORMERR。 */
 int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
                                const char *client_ip, compress_ctx_t *comp_ctx,
@@ -2675,10 +2685,39 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
   if (req_len < DNS_HEADER_SIZE) {
     return 0; // 不正な短いパケットは無応答で破棄
   }
+  tsig_request_t tsig;
+  tsig_check_request(cfg, req, req_len, client_ip, &tsig);
+  if (tsig.status == TSIG_REQ_NONE) {
+    return process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
+                              is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL);
+  }
+  /* TSIG RR を除き ARCOUNT を 1 減らした要求 (RFC 8945 §5.2)。解釈できない TSIG はそのまま渡す。 */
+  static _Thread_local uint8_t stripped[UINT16_MAX];
+  const uint8_t *body_req = req;
+  size_t body_len = req_len;
+  if (tsig.status != TSIG_REQ_FORMERR && tsig.stripped_len <= sizeof(stripped)) {
+    memcpy(stripped, req, tsig.stripped_len);
+    uint16_t arcount = (uint16_t)(((req[10] << 8) | req[11]) - 1);
+    stripped[10] = (uint8_t)(arcount >> 8);
+    stripped[11] = (uint8_t)(arcount & 0xFF);
+    body_req = stripped;
+    body_len = tsig.stripped_len;
+  }
+  tsig.res_limit = max_res_len;
+  int ret = process_query_body(body_req, body_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
+                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, &tsig);
+  if (ret < DNS_HEADER_SIZE) return ret;
+  size_t limit = tsig.res_limit;
+  if (res_cap != 0 && limit > res_cap) limit = res_cap;
+  return tsig_finish_response(res, (size_t)ret, limit, &tsig);
+}
 
-  uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
-  static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
-  size_t tsig_mac_len = 0;
+static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
+                              size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                              const char *client_ip, compress_ctx_t *comp_ctx,
+                              bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                              zone_db_snapshot_t *snap, server_config_t *cfg,
+                              zone_db_entry_t **out_matched_entry, tsig_request_t *tsig) {
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   char current_qname_lc[DNS_NAME_TEXT_SIZE];
@@ -2754,6 +2793,20 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
 
   server_config_t *cfg_for_ede = cfg;
   bool send_ede = (cfg_for_ede != NULL && cfg_for_ede->send_extended_errors);
+
+  /* RFC 8945 §5.2: 解釈できない TSIG は FORMERR (TSIG なし)。鍵・MAC・時刻・切り詰めのエラーは
+   * NOTAUTH で、TSIG は process_dns_query_impl_cap() が付ける (§5.3.2)。どちらも要求の中身は処理しない。 */
+  if (tsig && (tsig->status == TSIG_REQ_FORMERR || tsig->status == TSIG_REQ_ERROR)) {
+    uint8_t rc = 1; // FORMERR
+    if (tsig->status == TSIG_REQ_ERROR) {
+      rc = 9;       // NOTAUTH
+      add_ede(&edns, send_ede, 18, "Invalid TSIG");
+    }
+    int len = dns_build_error_response(req, req_len, res, max_res_len, rc, 0, qdcount == 1 ? 1 : 0, &edns, is_tcp, cfg);
+    uint8_t op = (req[2] >> 3) & 0x0F;
+    if (len >= DNS_HEADER_SIZE && (op == 4 || op == 5)) res[2] &= ~0x01; // NOTIFY/UPDATE: RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)
+    return len;
+  }
   
   if (!cfg_for_ede || !cfg_for_ede->rfc10029_mqtype_enable) {
     edns.has_mqtype_query = false;
@@ -2844,65 +2897,28 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
       res[2] &= ~0x01;
       return len;
     }
-    bool has_tsig = packet_has_tsig(req, req_len);
+    /* R-30: TSIG は process_dns_query_impl_cap() で検証済み (RFC 8945 §5.2)。ここに来るのは TSIG なしか
+     * 検証できた要求だけで、応答の署名もそこで行う。受け付けるのは masters からの NOTIFY で、
+     * tsig-key を設定したゾーンではその鍵で署名されたものだけ。それ以外は方針による拒否 (REFUSED)。 */
+    tsig_key_t *tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
     bool auth = false;
-    tsig_key_t *matched_key = NULL;
-    tsig_key_t *attempted_key = NULL;
-    int tsig_error_code = 0;
-    
     if (db_entry && view) {
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg && zcfg->masters_count > 0) {
+        bool from_master = false;
         for (int k = 0; k < zcfg->masters_count; k++) {
           if (zcfg->masters_parsed ? cidr_entry_match_str(&zcfg->masters_parsed[k], client_ip)
                                    : match_cidr(client_ip, zcfg->masters[k].ip)) {
-            auth = true;
+            from_master = true;
             break;
           }
         }
-        if (zcfg->tsig_key && zcfg->tsig_key[0] != '\0') {
-          tsig_key_t *k = cfg ? cfg->keys : NULL;
-          while (k) {
-            if (strcmp(k->name, zcfg->tsig_key) == 0) {
-              matched_key = k;
-              break;
-            }
-            k = k->next;
-          }
-          if (!matched_key) {
-            auth = false;
-          } else {
-            attempted_key = matched_key;
-            int err = tsig_verify_packet(req, req_len, matched_key, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
-            if (err != 0) {
-              auth = false;
-              tsig_error_code = err > 0 ? err : 16;
-              matched_key = NULL;
-            }
-          }
-        }
+        bool key_ok = !(zcfg->tsig_key && zcfg->tsig_key[0] != '\0') ||
+                      (tkey && tsig_key_names_equal(tkey->name, zcfg->tsig_key));
+        auth = from_master && key_ok;
       }
     }
-    // RFC 2845 / RFC 8945 §5.4: If packet has TSIG, MUST NOT accept based solely on IP match if TSIG verification failed
-    if (has_tsig && (!matched_key || tsig_error_code != 0)) {
-      auth = false;
-      if (!attempted_key) {
-        tsig_key_t *k = cfg ? cfg->keys : NULL;
-        while (k) {
-          int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
-          if (err == 0) {
-            attempted_key = k;
-            tsig_error_code = 9; // key known but not allowed on zone
-            break;
-          }
-          k = k->next;
-        }
-        if (!attempted_key) {
-          tsig_error_code = 17; // BADKEY
-        }
-      }
-    }
-      
+
     uint8_t notify_rcode = 0;
     if (auth) {
       atomic_store_explicit(&db_entry->refresh_now, true, memory_order_release);
@@ -2912,13 +2928,8 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
         kevent(g_control_kq, &ev, 1, NULL, 0, NULL);
       }
     } else {
-      if (attempted_key || has_tsig) {
-          notify_rcode = 9; // NOTAUTH
-          add_ede(&edns, send_ede, 18, "Invalid TSIG");
-      } else {
-          notify_rcode = 5; // REFUSED
-          add_ede(&edns, send_ede, 18, "Query refused due to access control");
-      }
+      notify_rcode = 5; // REFUSED
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
     }
     int offset = dns_build_error_response(req, req_len, res, max_res_len, notify_rcode, 0, qdcount,
                                       &edns, is_tcp, cfg);
@@ -2926,19 +2937,6 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
      * 拒否した NOTIFY はゾーンの権威として答えていないので AA=0 (R-06)。 */
     res[2] &= ~0x01;
     if (auth) res[2] |= 0x04;
-
-    tsig_key_t *sign_key = auth ? matched_key : attempted_key;
-    if (sign_key && offset >= DNS_HEADER_SIZE) {
-      size_t sign_len = (size_t)offset;
-      if (tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false) == 0) {
-        offset = (int)sign_len;
-      } else {
-        res[2] &= ~0x04;
-        res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
-        res[10] = 0; res[11] = 0; // ARCOUNT = 0
-        offset = (int)get_question_end_offset(res, (size_t)offset, qdcount);
-      }
-    }
     return offset;
   }
 
@@ -2974,12 +2972,13 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
     } else if (!db_entry || !view || zclass != 1 || !domain_names_match_ci(db_entry->domain, current_qname)) {
       zone_rcode = 9; // NOTAUTH
     }
-    bool has_tsig = packet_has_tsig(req, req_len);
+    /* R-30: TSIG は process_dns_query_impl_cap() で検証済み (RFC 8945 §5.2)。ここに来るのは TSIG なしか
+     * 検証できた要求だけ。allow-update はアドレスが一致するか、検証できた鍵の名前が書かれていれば許可
+     * (BIND と同じく、アドレスで許可されたクライアントの署名付き要求も受け付ける)。
+     * 許可されない更新は REFUSED (RFC 2136 §3.3)。署名は呼び出し側で付ける。 */
+    tsig_key_t *tkey = (tsig && tsig->status == TSIG_REQ_VALID) ? tsig->key : NULL;
     bool auth = false;
     bool zone_is_master = false;
-    tsig_key_t *matched_key = NULL;
-    tsig_key_t *attempted_key = NULL;
-    int tsig_error_code = 0;
     if (zone_rcode == 0) {
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg) {
@@ -2995,88 +2994,30 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
         } else if (check_acl(client_ip, zcfg->allow_update, zcfg->allow_update_count)) {
           auth = true;
         }
-        tsig_key_t *k = cfg ? cfg->keys : NULL;
-        while (k) {
-          bool key_allowed = false;
-          for (int i = 0; i < zcfg->allow_update_count; i++) {
-            if (strcmp(k->name, zcfg->allow_update[i]) == 0) {
-              key_allowed = true;
-              break;
-            }
-          }
-          if (key_allowed) {
-            attempted_key = k;
-            int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
-            if (err == 0) {
-              matched_key = k;
-              attempted_key = k;
-              tsig_error_code = 0;
-              auth = true;
-              break;
-            } else {
-              tsig_error_code = err > 0 ? err : 16;
-            }
-          }
-          k = k->next;
-        }
-        if (has_tsig && !attempted_key) {
-          k = cfg ? cfg->keys : NULL;
-          while (k) {
-            int err = tsig_verify_packet(req, req_len, k, NULL, 0, NULL, 0, false, tsig_mac, &tsig_mac_len);
-            if (err == 0) {
-              attempted_key = k;
-              tsig_error_code = 9; // NOTAUTH (key valid but not authorized for update)
-              break;
-            }
-            k = k->next;
-          }
-          if (!attempted_key) {
-            tsig_error_code = 17; // BADKEY
-          }
+        for (int i = 0; !auth && tkey && i < zcfg->allow_update_count; i++) {
+          if (tsig_key_names_equal(tkey->name, zcfg->allow_update[i])) auth = true;
         }
       }
     }
-    // RFC 2845 / RFC 8945 §5.4: If packet has TSIG, MUST NOT accept based solely on IP match if TSIG verification failed!
-    if (has_tsig && (!matched_key || tsig_error_code != 0)) {
-      auth = false;
-    }
-    
+
     int rcode = 5; // REFUSED
     if (zone_rcode != 0) {
       rcode = zone_rcode;
-    } else if (!zone_is_master && !(has_tsig && tsig_error_code != 0)) {
+    } else if (!zone_is_master) {
       /* RFC 2136 §3.1.2 はセカンダリに UPDATE をプライマリへ転送させる (§6)。KariDNS は転送しない
-       * ので、方針による拒否 (RFC 1035 §4.1.1 REFUSED) を返す。allow-update を満たしていても同じ。
-       * TSIG の検証エラーは下の NOTAUTH (RFC 8945 §5.2) のまま。*/
+       * ので、方針による拒否 (RFC 1035 §4.1.1 REFUSED) を返す。allow-update を満たしていても同じ。*/
       add_ede(&edns, send_ede, 18, "Updates are not accepted for a secondary zone");
-    } else if (auth && zone_is_master) {
-      rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key ? matched_key->name : "<none>");
+    } else if (auth) {
+      rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, tkey ? tkey->name : "<none>");
     } else {
-      if (attempted_key || has_tsig) {
-        rcode = 9; // NOTAUTH
-        add_ede(&edns, send_ede, 18, "Invalid TSIG");
-      } else {
-        add_ede(&edns, send_ede, 18, "Query refused due to access control");
-      }
+      add_ede(&edns, send_ede, 18, "Query refused due to access control");
     }
-    
+
     /* RFC 2136 §3.8: ID と OPCODE を写し、ゾーンセクション以外のセクションは返さない (カウント 0)。
      * QR=1、RD=0 (§2.2 / §3.8)。AA は UPDATE 応答では意味を持たないので 0。 */
     int offset = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)(rcode & 0x0F), 0, qdcount,
                                       &edns, is_tcp, cfg);
     res[2] &= ~0x01;
-
-    tsig_key_t *sign_key = auth ? matched_key : attempted_key;
-    if (sign_key && offset >= DNS_HEADER_SIZE) {
-      size_t sign_len = (size_t)offset;
-      if (tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false) == 0) {
-        offset = (int)sign_len;
-      } else {
-        res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
-        res[10] = 0; res[11] = 0; // ARCOUNT = 0
-        offset = (int)get_question_end_offset(res, (size_t)offset, qdcount);
-      }
-    }
     return offset;
   }
 
@@ -3102,6 +3043,12 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
         if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
       }
     }
+  }
+  /* RFC 8945 §5.3: 署名する応答は、上限から TSIG RR の分を空けて組み立てる (切り詰めは TC=1 で表す) */
+  if (tsig) {
+    tsig->res_limit = max_res_len;
+    size_t reserve = tsig_response_reserve(tsig);
+    if (reserve > 0 && max_res_len > reserve + DNS_HEADER_SIZE) max_res_len -= reserve;
   }
 
   uint8_t ext_rcode_out = 0;

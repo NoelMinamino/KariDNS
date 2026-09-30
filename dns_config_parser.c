@@ -459,11 +459,12 @@ static void free_partial_view(view_config_t *view) {
   free(view);
 }
 
-/* [T7] 定義済み TSIG キーリストを線形探索するヘルパー */
+/* [T7] 定義済み TSIG キーリストを線形探索するヘルパー。
+ * 鍵名は DNS 名なので大文字小文字と末尾のドットを区別しない (D-03。重複の検出と同じ規則) */
 static bool key_name_is_defined(const tsig_key_t *keys, const char *name) {
   if (!name) return false;
   for (const tsig_key_t *k = keys; k; k = k->next) {
-    if (k->name && strcmp(k->name, name) == 0) return true;
+    if (k->name && domain_names_match_ci(k->name, name)) return true;
   }
   return false;
 }
@@ -2515,7 +2516,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
       free_token(&tok);
       for (tsig_key_t *existing = config->keys; existing; existing = existing->next) {
-        if (strcasecmp(existing->name, tsig->name) == 0) {
+        if (domain_names_match_ci(existing->name, tsig->name)) {
           syslog(LOG_ERR, "[Config] Duplicate TSIG key '%s' defined; rejecting configuration", tsig->name);
           fprintf(stderr, "[ERROR] Duplicate TSIG key '%s' defined\n", tsig->name);
           free(tsig->name);

@@ -77,18 +77,52 @@ if ! grep -q "initial" out.txt; then
     exit 1
 fi
 
-echo "[*] 1. Unauthorized UPDATE (No TSIG)..."
-$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.4' +nohexdump-response > out.txt 2>&1 || true
-if ! grep -q "REFUSED" out.txt && ! grep -q "NOTAUTH" out.txt && ! grep -q "connection refused" out.txt; then
-    $DAG new1.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
-    if grep -q "1.2.3.4" res.txt; then
-        echo "[FAIL] Unauthorized UPDATE succeeded!"
-        exit 1
-    fi
+echo "[*] 1. Unauthorized UPDATE (No TSIG): REFUSED, no TSIG (RFC 2136 §3.3)..."
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.4' +nohexdump > out.txt 2>&1 || true
+if ! grep -q "status: REFUSED" out.txt || grep -q "ANY[[:space:]]*TSIG" out.txt; then
+    echo "[FAIL] Unsigned UPDATE: expected REFUSED without TSIG."
+    cat out.txt
+    exit 1
+fi
+$DAG new1.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
+if grep -q "1.2.3.4" res.txt; then
+    echo "[FAIL] Unauthorized UPDATE succeeded!"
+    exit 1
 fi
 
-echo "[*] 2. Unauthorized UPDATE (Wrong TSIG)..."
-$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.5' +nohexdump-response -y hmac-sha256:wrong-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+# tsig_line <owner> <error>: the response's TSIG RR (dag prints "owner 0 ANY TSIG alg time fudge macsize [mac] id error otherlen")
+tsig_line() {
+    grep -E "^$1\.[[:space:]]+0[[:space:]]+ANY[[:space:]]+TSIG[[:space:]]+hmac-sha256\..*[[:space:]]$2[[:space:]]+[0-9]+" out.txt
+}
+
+echo "[*] 2. UPDATE signed with a defined key that allow-update does not list: REFUSED, signed with that key (RFC 8945 §5.3)..."
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.5' +nohexdump -y hmac-sha256:wrong-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+if ! grep -q "status: REFUSED" out.txt || ! tsig_line wrong-key NOERROR > /dev/null || grep -q "Couldn't verify" out.txt; then
+    echo "[FAIL] Valid but not allowed key: expected REFUSED signed with wrong-key."
+    cat out.txt
+    exit 1
+fi
+$DAG new1.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
+if grep -q "1.2.3.5" res.txt; then
+    echo "[FAIL] Wrong TSIG UPDATE succeeded!"
+    exit 1
+fi
+
+echo "[*] 2b. UPDATE signed with an unknown key: NOTAUTH, BADKEY, unsigned, key name echoed (RFC 8945 §5.2.1)..."
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.5' +nohexdump -y hmac-sha256:no-such-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+if ! grep -q "status: NOTAUTH" out.txt || ! tsig_line no-such-key BADKEY | grep -qE "[[:space:]]0[[:space:]]+[0-9]+[[:space:]]+BADKEY"; then
+    echo "[FAIL] Unknown key: expected NOTAUTH with TSIG error BADKEY and MAC size 0."
+    cat out.txt
+    exit 1
+fi
+
+echo "[*] 2c. UPDATE signed with the allowed key name but a wrong secret: NOTAUTH, BADSIG, unsigned (RFC 8945 §5.2.2)..."
+$DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.5' +nohexdump -y hmac-sha256:test-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
+if ! grep -q "status: NOTAUTH" out.txt || ! tsig_line test-key "BADVERS/BADSIG" | grep -qE "[[:space:]]0[[:space:]]+[0-9]+[[:space:]]+BADVERS/BADSIG"; then
+    echo "[FAIL] Wrong secret: expected NOTAUTH with TSIG error BADSIG and MAC size 0."
+    cat out.txt
+    exit 1
+fi
 $DAG new1.dynupdate.com. A @127.0.0.1 -p 10053 +short > res.txt
 if grep -q "1.2.3.5" res.txt; then
     echo "[FAIL] Wrong TSIG UPDATE succeeded!"

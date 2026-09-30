@@ -310,7 +310,22 @@ Only the `queries` and `responses` categories exist; other categories are ignore
 | `algorithm "<name>";` | `hmac-md5` (also `hmac-md5.sig-alg.reg.int`), `hmac-sha1`, `hmac-sha224`, `hmac-sha256`, `hmac-sha384`, `hmac-sha512`. MD5 and SHA-1 are accepted with a deprecation warning (RFC 8945). When omitted, `hmac-sha256` is used. |
 | `secret "<base64>";` | Shared secret. Invalid base64 is an error. |
 
-Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `tsig-key`. A zone that references an undefined key in `tsig-key` or `allow-transfer` is an error. [`karictl tsig-keygen`](karictl.md) prints a new key block.
+Keys are referenced by `allow-transfer { key "<name>"; }`, `allow-update`, and `tsig-key`. Key names are domain names: references match regardless of case and of a trailing dot (`key "K1"` is referenced by `key "k1."`). A zone that references an undefined key in `tsig-key` or `allow-transfer` is an error. [`karictl tsig-keygen`](karictl.md) prints a new key block.
+
+TSIG processing (RFC 8945 §5.2, §5.3) is the same for every opcode (QUERY, NOTIFY, UPDATE) and for AXFR/IXFR. The server first checks the request's TSIG against the key that the request names (key name and algorithm); only then does it apply `allow-transfer`, `allow-update` or `masters`/`tsig-key`:
+
+| Request | Response |
+|---|---|
+| Several TSIG records, a TSIG that is not the last record, or a MAC size outside RFC 8945 §5.2.2.1 | FORMERR, no TSIG |
+| Unknown key name or algorithm | NOTAUTH, TSIG error BADKEY, unsigned (MAC size 0) with the request's key name |
+| MAC does not verify | NOTAUTH, TSIG error BADSIG, unsigned |
+| Time Signed outside the fudge | NOTAUTH, TSIG error BADTIME, signed with the request's key; Time Signed and Fudge are the client's, Other Data is the server time |
+| MAC truncated (shorter than the full hash length) | NOTAUTH, TSIG error BADTRUNC, signed. KariDNS has no setting for truncated MACs, like BIND without `digest-bits` |
+| Valid TSIG, but not allowed by the zone's access control | REFUSED, signed with the request's key |
+| Valid TSIG | The normal response, signed with the request's key |
+| No TSIG | The normal response or REFUSED, unsigned |
+
+A signed response that would not fit the client's UDP size with its TSIG is truncated (TC=1). A NOTIFY is accepted from a `masters` address and, when the zone has `tsig-key`, only when it is signed with that key. `allow-update` accepts a client whose address matches or whose request is signed with a listed key. A response that is cut down by RRL `slip` carries no TSIG.
 
 ### `control-channel { ... }`
 

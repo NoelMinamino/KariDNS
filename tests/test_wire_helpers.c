@@ -436,10 +436,20 @@ static void test_parse_query_question_fast(void) {
 static void test_packet_has_tsig(void) {
     printf("[TEST] packet_has_tsig: TSIG must be the last additional RR, at most once (RFC 8945 §5.1)...\n");
     uint8_t pkt[512];
+    tsig_rr_t rr;
+    /* 17 zero octets are the smallest readable TSIG RDATA: algorithm ".", Time Signed, Fudge, MAC Size 0,
+     * Original ID, Error, Other Len 0 */
     size_t q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 1);
 
-    size_t len = append_rr(pkt, q, 250 /* TSIG */, 255 /* ANY */, 8);
+    size_t len = append_rr(pkt, q, 250 /* TSIG */, 255 /* ANY */, 17);
     CHECK(packet_has_tsig(pkt, len));
+    CHECK(tsig_parse_rr(pkt, len, &rr) == 1 && rr.rr_offset == q && strcmp(rr.key_name, "k.") == 0 &&
+          strcmp(rr.alg_name, ".") == 0 && rr.mac_size == 0);
+    /* RDATA too short for its fields, CLASS other than ANY: present but not interpretable (FORMERR) */
+    len = append_rr(pkt, q, 250, 255, 16);
+    CHECK(!packet_has_tsig(pkt, len) && tsig_parse_rr(pkt, len, &rr) == -1);
+    len = append_rr(pkt, q, 250, 1, 17);
+    CHECK(!packet_has_tsig(pkt, len) && tsig_parse_rr(pkt, len, &rr) == -1);
 
     /* an OPT (41) as the last RR is not a TSIG */
     q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 1);
@@ -449,33 +459,33 @@ static void test_packet_has_tsig(void) {
     /* OPT followed by TSIG: the TSIG is last, so it counts */
     q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 2);
     len = append_rr(pkt, q, 41, 4096, 0);
-    len = append_rr(pkt, len, 250, 255, 4);
+    len = append_rr(pkt, len, 250, 255, 17);
     CHECK(packet_has_tsig(pkt, len));
 
     /* TSIG followed by another RR: TSIG is not last => not a valid signed message */
     q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 2);
-    len = append_rr(pkt, q, 250, 255, 4);
+    len = append_rr(pkt, q, 250, 255, 17);
     len = append_rr(pkt, len, 41, 4096, 0);
-    CHECK(!packet_has_tsig(pkt, len));
+    CHECK(!packet_has_tsig(pkt, len) && tsig_parse_rr(pkt, len, &rr) == -1);
 
     /* two TSIG RRs must be rejected */
     q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 2);
-    len = append_rr(pkt, q, 250, 255, 4);
-    len = append_rr(pkt, len, 250, 255, 4);
-    CHECK(!packet_has_tsig(pkt, len));
+    len = append_rr(pkt, q, 250, 255, 17);
+    len = append_rr(pkt, len, 250, 255, 17);
+    CHECK(!packet_has_tsig(pkt, len) && tsig_parse_rr(pkt, len, &rr) == -1);
 
     /* ARCOUNT says 0 even though bytes follow */
     q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 0);
-    len = append_rr(pkt, q, 250, 255, 4);
-    CHECK(!packet_has_tsig(pkt, len));
+    len = append_rr(pkt, q, 250, 255, 17);
+    CHECK(!packet_has_tsig(pkt, len) && tsig_parse_rr(pkt, len, &rr) == 0);
 
     /* ARCOUNT larger than what is actually present / rdlength overruns the packet */
     q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 3);
-    len = append_rr(pkt, q, 250, 255, 4);
-    CHECK(!packet_has_tsig(pkt, len));
+    len = append_rr(pkt, q, 250, 255, 17);
+    CHECK(!packet_has_tsig(pkt, len) && tsig_parse_rr(pkt, len, &rr) == -1);
     q = build_query(pkt, WWW_EXAMPLE_COM, sizeof(WWW_EXAMPLE_COM), 1, 1, 1);
-    len = append_rr(pkt, q, 250, 255, 8);
-    CHECK(!packet_has_tsig(pkt, len - 5));
+    len = append_rr(pkt, q, 250, 255, 17);
+    CHECK(!packet_has_tsig(pkt, len - 5) && tsig_parse_rr(pkt, len - 5, &rr) == -1);
 
     /* degenerate inputs */
     CHECK(!packet_has_tsig(NULL, 100));

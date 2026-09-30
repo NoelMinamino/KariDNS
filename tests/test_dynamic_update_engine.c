@@ -1555,6 +1555,214 @@ static void test_update_dispatch_zone_section(void) {
     printf("  -> Zone section dispatch passed.\n");
 }
 
+/* ---- R-30 / R-07 / R-08 / R-09 / R-20 / D-03 / X-18: TSIG outcome first, then authorization ---- */
+
+static void tk_init(tsig_key_t *k, const char *name, uint8_t fill) {
+    memset(k, 0, sizeof(*k));
+    k->name = (char *)name;
+    k->algorithm = "hmac-sha256";
+    k->secret_decoded_len = 32;
+    memset(k->secret_decoded, fill, 32);
+}
+
+/* sign m with key; returns the request MAC in mac/mac_len */
+static void tk_sign(upd_msg_t *m, tsig_key_t *key, uint8_t *mac, size_t *mac_len) {
+    size_t len = m->len;
+    *mac_len = 0;
+    assert(tsig_sign_packet(m->b, &len, sizeof(m->b), key, 0, mac, mac_len, NULL, 0, false) == 0);
+    m->len = len;
+}
+
+/* the response's TSIG: owner, error, MAC size; and whether it verifies against the request MAC */
+static void tk_expect(const uint8_t *res, int len, uint8_t rcode, const char *owner, uint16_t error,
+                      uint16_t mac_size, tsig_key_t *verify_key, const uint8_t *req_mac, size_t req_mac_len) {
+    assert(len >= 12);
+    assert((res[3] & 0x0F) == rcode);
+    tsig_rr_t rr;
+    int pr = tsig_parse_rr(res, (size_t)len, &rr);
+    if (!owner) {
+        assert(pr == 0);    /* no TSIG RR at all */
+        return;
+    }
+    assert(pr == 1);
+    assert(strcasecmp(rr.key_name, owner) == 0);
+    assert(strcasecmp(rr.alg_name, "hmac-sha256.") == 0);
+    assert(rr.error == error);
+    assert(rr.mac_size == mac_size);
+    if (verify_key) {
+        uint8_t m[64];
+        size_t ml = 0;
+        assert(tsig_verify_packet(res, (size_t)len, verify_key, req_mac, req_mac_len, NULL, 0, false, m, &ml) == 0);
+    }
+}
+
+static void test_update_tsig_matrix(void) {
+    printf("[TEST] Dynamic Update: TSIG errors and authorization (RFC 8945 §5.2-§5.3, RFC 2136 §3.3; R-30)...\n");
+    tsig_key_t k1, k2, k3, k1_bad;
+    tk_init(&k1, "k1", 0x11);
+    tk_init(&k2, "K2", 0x22);            /* configured in upper case (D-03) */
+    tk_init(&k3, "k3", 0x33);            /* not configured */
+    tk_init(&k1_bad, "k1", 0x44);        /* right name, wrong secret */
+    k1.next = &k2;
+
+    char *allow_k1[1] = { "K1." };       /* D-03: key references compare as DNS names */
+    char *allow_ip[1] = { "192.0.2.1" };
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zc.domain = UZ;
+    zc.type = "master";
+    zc.allow_update = allow_k1;
+    zc.allow_update_count = 1;
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.zones = &zc;
+    cfg.keys = &k1;
+    cfg.send_extended_errors = true;
+
+    zone_db_entry_t prim;
+    upd_entry_init(&prim);
+    zone_db_entry_t *entries[1] = { &prim };
+    char *any_acl[1] = { "any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view.entries = entries;
+    view.zone_count = 1;
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    uint8_t res[4096];
+    uint8_t mac[64];
+    size_t mac_len;
+    upd_msg_t m;
+    int len;
+    const char *C = "192.0.2.99";
+
+    /* allowed key: NOERROR, signed with k1 */
+    upd_begin(&m); upd_a(&m, false, "t1." UZ, 1, 300, 31); tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, "k1.", 0, 32, &k1, mac, mac_len);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t1." UZ, 1) == 1);
+
+    /* valid key that allow-update does not list: REFUSED, signed with that key (not k1), error 0 */
+    upd_begin(&m); upd_a(&m, false, "t2." UZ, 1, 300, 32); tk_sign(&m, &k2, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 5, "k2.", 0, 32, &k2, mac, mac_len);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t2." UZ, 1) == 0);
+
+    /* unknown key: NOTAUTH, BADKEY, unsigned, the request's key name echoed */
+    upd_begin(&m); upd_a(&m, false, "t3." UZ, 1, 300, 33); tk_sign(&m, &k3, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k3.", 17, 0, NULL, NULL, 0);
+
+    /* wrong secret: NOTAUTH, BADSIG, unsigned */
+    upd_begin(&m); upd_a(&m, false, "t4." UZ, 1, 300, 34); tk_sign(&m, &k1_bad, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t4." UZ, 1) == 0);
+
+    /* BADTIME (R-08): signed with k1, Time Signed and Fudge are the client's, Other Data = server time */
+    k1.fuzztime = 1000000000;
+    upd_begin(&m); upd_a(&m, false, "t5." UZ, 1, 300, 35); tk_sign(&m, &k1, mac, &mac_len);
+    k1.fuzztime = 0;
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    {
+        tsig_rr_t rr;
+        assert(tsig_parse_rr(res, (size_t)len, &rr) == 1);
+        assert(rr.time_signed == 1000000000 && rr.fudge == 300 && rr.other_len == 6);
+        uint64_t srv = ((uint64_t)rr.other[0] << 40) | ((uint64_t)rr.other[1] << 32) | ((uint64_t)rr.other[2] << 24) |
+                       ((uint64_t)rr.other[3] << 16) | ((uint64_t)rr.other[4] << 8) | rr.other[5];
+        assert(srv + 5 >= (uint64_t)time(NULL) && srv <= (uint64_t)time(NULL));
+        k1.fuzztime = 1000000000;     /* a client with the same clock verifies the response incl. the request MAC */
+        tk_expect(res, len, 9, "k1.", 18, 32, &k1, mac, mac_len);
+        k1.fuzztime = 0;
+    }
+    assert(upd_count(atomic_load(&prim.rcu.active), "t5." UZ, 1) == 0);
+
+    /* BADTRUNC: a MAC truncated to 16 octets (allowed by §5.2.2.1) is below the local policy (full length) */
+    upd_begin(&m); upd_a(&m, false, "t6." UZ, 1, 300, 36); tk_sign(&m, &k1, mac, &mac_len);
+    {
+        tsig_rr_t rr;
+        assert(tsig_parse_rr(m.b, m.len, &rr) == 1 && rr.mac_size == 32);
+        size_t mac_at = (size_t)(rr.mac - m.b);
+        memmove(m.b + mac_at + 16, m.b + mac_at + 32, m.len - (mac_at + 32));
+        m.len -= 16;
+        m.b[mac_at - 2] = 0; m.b[mac_at - 1] = 16;                     /* MAC Size */
+        size_t rdlen_at = rr.rr_offset + 4 /* "k1." */ + 8;
+        uint16_t rdlen = (uint16_t)(((m.b[rdlen_at] << 8) | m.b[rdlen_at + 1]) - 16);
+        m.b[rdlen_at] = (uint8_t)(rdlen >> 8); m.b[rdlen_at + 1] = (uint8_t)rdlen;
+    }
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 22, 32, &k1, mac, 16);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t6." UZ, 1) == 0);
+
+    /* R-09: a MAC shorter than max(10, hash/2) is FORMERR, no TSIG in the response */
+    upd_begin(&m); upd_a(&m, false, "t7." UZ, 1, 300, 37); tk_sign(&m, &k1, mac, &mac_len);
+    {
+        tsig_rr_t rr;
+        assert(tsig_parse_rr(m.b, m.len, &rr) == 1);
+        size_t mac_at = (size_t)(rr.mac - m.b);
+        memmove(m.b + mac_at + 8, m.b + mac_at + 32, m.len - (mac_at + 32));
+        m.len -= 24;
+        m.b[mac_at - 1] = 8;
+        size_t rdlen_at = rr.rr_offset + 4 + 8;
+        uint16_t rdlen = (uint16_t)(((m.b[rdlen_at] << 8) | m.b[rdlen_at + 1]) - 24);
+        m.b[rdlen_at] = (uint8_t)(rdlen >> 8); m.b[rdlen_at + 1] = (uint8_t)rdlen;
+    }
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 1, NULL, 0, 0, NULL, NULL, 0);
+
+    /* R-09: two TSIG RRs are FORMERR (they used to make the request count as unsigned) */
+    upd_begin(&m); upd_a(&m, false, "t8." UZ, 1, 300, 38); tk_sign(&m, &k1, mac, &mac_len);
+    tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 1, NULL, 0, 0, NULL, NULL, 0);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t8." UZ, 1) == 0);
+
+    /* R-20: an Original ID that differs from the message ID is accepted (the digest uses it) */
+    upd_begin(&m); upd_a(&m, false, "t9." UZ, 1, 300, 39); tk_sign(&m, &k1, mac, &mac_len);
+    m.b[0] ^= 0x5A;
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, "k1.", 0, 32, &k1, mac, mac_len);
+    assert(res[0] == m.b[0] && res[1] == m.b[1]);
+
+    /* X-18: a zone-section error for a validly signed request is signed */
+    upd_begin_zone(&m, "x." UZ, 6, 1); tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, "x." UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 0, 32, &k1, mac, mac_len);
+
+    /* zone without allow-update: REFUSED, signed with the request's key */
+    zc.allow_update = NULL;
+    zc.allow_update_count = 0;
+    upd_begin(&m); upd_a(&m, false, "t10." UZ, 1, 300, 40); tk_sign(&m, &k1, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, C, &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 5, "k1.", 0, 32, &k1, mac, mac_len);
+
+    /* address ACL: an allowed address with a valid (unlisted) key is accepted and signed, like BIND;
+     * an unsigned request from that address stays accepted and unsigned */
+    zc.allow_update = allow_ip;
+    zc.allow_update_count = 1;
+    upd_begin(&m); upd_a(&m, false, "t11." UZ, 1, 300, 41); tk_sign(&m, &k2, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, "k2.", 0, 32, &k2, mac, mac_len);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t11." UZ, 1) == 1);
+    upd_begin(&m); upd_a(&m, false, "t12." UZ, 1, 300, 42);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 0, NULL, 0, 0, NULL, NULL, 0);
+    /* ... but a TSIG error is never overridden by the address (RFC 8945 §5.2) */
+    upd_begin(&m); upd_a(&m, false, "t13." UZ, 1, 300, 43); tk_sign(&m, &k1_bad, mac, &mac_len);
+    len = upd_query(&m, UZ, 6, "192.0.2.1", &snap, &cfg, res, sizeof(res));
+    tk_expect(res, len, 9, "k1.", 16, 0, NULL, NULL, 0);
+    assert(upd_count(atomic_load(&prim.rcu.active), "t13." UZ, 1) == 0);
+
+    upd_entry_destroy(&prim);
+    printf("  -> TSIG matrix passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Dynamic Update Engine Unit Tests ===\n");
     test_bump_soa_serial();
@@ -1571,6 +1779,7 @@ int main(void) {
     test_update_prerequisite_rules();
     test_handle_dynamic_update_serial_rules();
     test_update_dispatch_zone_section();
+    test_update_tsig_matrix();
     test_send_notify_to_all_comprehensive();
     printf("=== All Dynamic Update Engine Unit Tests PASSED ===\n");
     return 0;
