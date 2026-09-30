@@ -101,6 +101,17 @@ static const char g_main_zone_text[] =
     "*.wild.example.com. IN A 192.0.2.100\n"
     "*.wild.example.com. IN TXT \"wildcard match\"\n"
     "ent.sub.example.com. IN A 192.0.2.101\n"
+    "$ECS-SUBNET-TAG eu 198.51.100.0/24 192.0.2.128/25 2001:db8:1::/48\n"
+    "$ECS-SUBNET-TAG jp 192.0.2.0/24 203.0.113.0/24 2001:db8::/32\n"
+    "$ECS-SUBNET eu\n"
+    "geo.example.com. IN A 192.0.2.50\n"
+    "*.wild.example.com. IN AAAA 2001:db8::50\n"
+    "$ECS-SUBNET jp\n"
+    "geo.example.com. IN A 192.0.2.60\n"
+    "geo.example.com. IN AAAA 2001:db8::60\n"
+    "$ECS-SUBNET \"\"\n"
+    "geo.example.com. IN A 192.0.2.70\n"
+    "geo-alias.example.com. IN CNAME geo.example.com.\n"
     "subzone.example.com. IN NS ns1.subzone.example.com.\n"
     "ns1.subzone.example.com. IN A 192.0.2.200\n"
     "sibling.example.com. IN NS ns1.other.example.com.\n"
@@ -188,6 +199,10 @@ static void init_rich_fuzz_engine(void) {
     g_fuzz_cfg.minimal_responses = true;
     g_fuzz_cfg.minimal_any = true;
     g_fuzz_cfg.minimal_any_ttl = 60;
+    /* ECS from the harness client address (127.0.0.1) is trusted, so the ECS option of the input is used */
+    g_fuzz_cfg.ecs_enable = true;
+    g_fuzz_cfg.ecs_trusted_resolvers = g_fuzz_any_acl;
+    g_fuzz_cfg.ecs_trusted_resolvers_count = 1;
     atomic_store_explicit(&g_config_db.active, &g_fuzz_cfg, memory_order_release);
 
     g_fuzz_qe_initialized = true;

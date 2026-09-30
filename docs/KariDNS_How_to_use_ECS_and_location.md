@@ -191,6 +191,18 @@ ecs-test IN A   172.16.0.1
 - **Fail-Closed Security**:
   If `ecs-enable yes;` is not set, if a query arrives from a resolver not listed in `ecs-trusted-resolvers`, or if no ECS option is provided, only unrestricted (default) records are returned.
 
+### 4.3 ECS Option in Responses (SCOPE PREFIX-LENGTH)
+
+When a query carries an ECS option and `ecs-enable yes;` is set, the response carries an ECS option too (RFC 7871 §7.2.1):
+
+- **FAMILY, SOURCE PREFIX-LENGTH and ADDRESS** are copied unchanged from the query. Resolvers discard responses in which they differ (RFC 7871 §11).
+- **SCOPE PREFIX-LENGTH** tells the resolver for which network it may cache the answer:
+  - If an RRset in the Answer section has `$ECS-SUBNET` variants (whether or not the client matched one of them), SCOPE is the shortest prefix around the client address for which every address gets the same tag decision. For a client inside a tag, that is the prefix of the matching CIDR, made longer where an earlier-defined CIDR lies inside it. For a client in no tag, it is the prefix that keeps clear of every defined CIDR of the same family. Overlapping definitions are therefore split into non-overlapping prefixes, as RFC 7871 §7.2.1 requires ("MUST NOT overlap prefixes"); nothing is rejected at load time.
+  - SCOPE can be longer than SOURCE PREFIX-LENGTH when the client sent too few bits to decide (for example SOURCE /24 against /25 tags). RFC 7871 §7.2.1 allows this; resolvers then keep the answer for that source prefix only.
+  - SCOPE is 0 when the answer does not depend on the subnet: the name has no tagged variants, the resolver is not in `ecs-trusted-resolvers`, or no tag of the client's address family exists.
+  - Negative answers (NXDOMAIN, NODATA) and referrals always have SCOPE 0 (RFC 7871 §7.4). A name that exists only for some tags therefore gets a negative answer with SCOPE 0 for the other clients, which resolvers may cache for all networks. Give such names an unrestricted (default) record if clients outside the tags must not see a negative answer.
+- `$LOCATION` and tinydns `%` locations use the resolver's own address, not the ECS option, and do not change SCOPE.
+
 ---
 
 ## 5. Coexistence of `$LOCATION` and `$ECS-SUBNET` in BIND Zones

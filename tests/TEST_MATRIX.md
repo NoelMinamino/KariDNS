@@ -171,7 +171,7 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 
 | ID | Test Target | Subsystems / Files | RFC / Spec | Test Classification | Verification Objective |
 |:---:|:---|:---|:---|:---|:---|
-| 52 | [`run_bind_ecs_subnet_test.sh`](run_bind_ecs_subnet_test.sh) | `dns_edns_ecs.c`, `dns_query_engine.c` | RFC 7871 | **Positive / Steering** | Parsing ECS client prefix from trusted resolvers, `$ECS-SUBNET` routing, and SCOPE echo. |
+| 52 | [`run_bind_ecs_subnet_test.sh`](run_bind_ecs_subnet_test.sh) | `dns_edns_ecs.c`, `dns_query_engine.c` | RFC 7871 | **Positive / Steering** | Parsing ECS client prefix from trusted resolvers, `$ECS-SUBNET` routing, and the response ECS option: FAMILY/SOURCE/ADDRESS echoed from the query, SCOPE per tag range, SCOPE 0 for untagged names, negative answers and untrusted resolvers (RFC 7871 §6, §7.2.1, §7.4). |
 | 53 | [`run_mqtype_qdcount0_test.sh`](run_mqtype_qdcount0_test.sh) | `dns_wire.c`, `dns_server_core.c` | RFC 10029, RFC 9619 | **Positive / Negative** | RFC 10029 Multi-QTYPE response aggregation; RFC 9619 QDCOUNT=0 minimal reply & QDCOUNT>1 FORMERR. |
 
 ---

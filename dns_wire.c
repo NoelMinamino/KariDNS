@@ -3399,13 +3399,15 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
         rdlen += 4 + 4;
     }
 
+    /* RFC 7871 §7.2.1: FAMILY, SOURCE PREFIX-LENGTH, ADDRESS は問い合わせと同じ値を返す (MUST)。
+     * ADDRESS は SOURCE PREFIX-LENGTH 分のオクテット (§6)。長さとパディングは parse_edns_opt() で
+     * 検査済みなので、受け取ったバイト列をそのまま返す。SCOPE の値は ADDRESS の長さに関係しない。 */
     uint8_t ecs_addr_bytes = 0;
     if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {
-        ecs_addr_bytes = (edns->ecs_scope_prefix + 7) / 8;
+        ecs_addr_bytes = (uint8_t)((edns->ecs_source_prefix + 7) / 8);
         if (edns->ecs_family == 1 && ecs_addr_bytes > 4) ecs_addr_bytes = 4;
         else if (edns->ecs_family == 2 && ecs_addr_bytes > 16) ecs_addr_bytes = 16;
         else if (edns->ecs_family != 1 && edns->ecs_family != 2) ecs_addr_bytes = 0;
-        else if (ecs_addr_bytes > sizeof(edns->ecs_addr)) ecs_addr_bytes = sizeof(edns->ecs_addr);
         rdlen += 4 + 4 + ecs_addr_bytes;
     }
 

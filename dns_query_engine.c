@@ -789,7 +789,17 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
   return false;
 }
 
-void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
+/* RFC 7871 §7.2.1: Answer セクションに入れる RRset にサブネット別の変種 (ECS タグ付きレコード) が
+ * あれば、クライアントに一致したかどうかに関係なく、応答はサブネットに依存する。そのゾーンで求めた
+ * SCOPE を応答の SCOPE にする (複数の RRset や CNAME 先のゾーンがあれば最長のもの)。 */
+static inline void note_ecs_variant(const dns_record_t *rec, uint16_t qtype, uint8_t zone_scope,
+                                    uint8_t *answer_scope) {
+  if (rec->ecs_subnet_tag == NULL) return;
+  if (qtype != 255 && rec->type_code != qtype && rec->type_code != 5 && rec->type_code != 39) return;
+  if (zone_scope > *answer_scope) *answer_scope = zone_scope;
+}
+
+static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_arena_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
@@ -800,16 +810,12 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
                          bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,
-                         uint8_t ecs_source_prefix,
-                         uint8_t *out_ecs_scope_prefix) {
-  if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
+                         uint8_t *answer_scope) {
   if (qtx_included_out) *qtx_included_out = 0;
   uint16_t initial_offset = *offset;
   uint16_t initial_ancount = *ancount;
   uint16_t initial_nscount = *nscount;
   uint16_t initial_arcount = *arcount;
-  uint8_t temp_scope_prefix = 0;
-  bool ecs_used = false;
   char current_qname[DNS_NAME_TEXT_SIZE];
   strlcpy(current_qname, qname, sizeof(current_qname));
   size_t current_qname_len = strlen(current_qname);
@@ -835,7 +841,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       *ancount = initial_ancount;
       *nscount = initial_nscount;
       *arcount = initial_arcount;
-      if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
       return;
     }
 
@@ -853,13 +858,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
     zone_config_t *zcfg = (cfg && db_entry) ? find_zone_config_in_view(cfg, db_entry->view_name, db_entry->domain) : NULL;
     const char *client_loc_tag = resolve_bind_location_tag(current_zone, cfg, zcfg, client_ip);
     const char *client_ecs_tag = NULL;
+    uint8_t zone_scope = 0;
     if (ecs_trusted && ecs_addr) {
-      uint8_t cur_scope = 0;
-      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family, &cur_scope);
-      if (cur_scope > ecs_source_prefix) {
-        cur_scope = ecs_source_prefix;
-      }
-      if (cur_scope > temp_scope_prefix) temp_scope_prefix = cur_scope;
+      client_ecs_tag = resolve_ecs_subnet_tag(current_zone, cfg, zcfg, ecs_addr, ecs_family, &zone_scope);
     }
     
     // ==== フェーズ1: 委任判定 ====
@@ -887,6 +888,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
         dns_record_t *rec = &current_zone->records[i];
         if (strcasecmp(rec->name, current_qname) == 0) {
           uint32_t eff_ttl;
+          note_ecs_variant(rec, 255, zone_scope, answer_scope);
           if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
           name_exists = true;
           if (rec->type_code == 5) has_cname = true;   // CNAME
@@ -926,6 +928,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
         bool class_matches = (qclass == 255 || qclass == r_class);
         if (!class_matches) continue;
         uint32_t eff_ttl;
+        note_ecs_variant(rec, qtypes[0], zone_scope, answer_scope);
         if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
         found = true;
         uint16_t rec_type = rec->type_code;
@@ -936,11 +939,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
         dns_record_t rec_copy = *rec;
         rec_copy.ttl_value = eff_ttl;
         if (follow_cname) {
-          if (rec->ecs_subnet_tag != NULL) ecs_used = true;
           if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                    NULL, 0xFFFFFFFF) < 0) {
             res[2] |= 0x02;
-            if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
             return;
           } else
             (*ancount)++;
@@ -948,7 +949,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 5,
                                       res, max_res_len, offset, comp_ctx, ancount)) {
               res[2] |= 0x02;
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
           }
@@ -963,7 +963,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
             if (loop_detected) {
               res[3] &= 0xF0;
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
             if (visited_count < 16) {
@@ -990,11 +989,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
           }
           if (qtypes[0] == 255 || qtypes[0] == rec_type) {
             type_matched = true;
-            if (rec->ecs_subnet_tag != NULL) ecs_used = true;
             if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                      NULL, 0xFFFFFFFF) < 0) {
               res[2] |= 0x02;
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
             (*ancount)++;
@@ -1036,6 +1033,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
           dns_record_t *rec = &current_zone->records[i];
           if (rec->type_code == 39 && strcasecmp(rec->name, dname_parent) == 0) {
             uint32_t eff_ttl;
+            note_ecs_variant(rec, 39, zone_scope, answer_scope);
             if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             dname_found = true;
             if (rec->rdata_count == 0) break;
@@ -1043,17 +1041,14 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             // 先に DNAME レコード自身を Answer セクションに追加
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
-            if (rec->ecs_subnet_tag != NULL) ecs_used = true;
             if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
               res[2] |= 0x02;
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
             (*ancount)++;
             if (dnssec_ok) {
               if (!attach_covering_rrsig(current_zone, p_idx, dname_parent, NULL, 39, res, max_res_len, offset, comp_ctx, ancount)) {
                 res[2] |= 0x02;
-                if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                 return;
               }
             }
@@ -1069,7 +1064,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             if (written < 0 || (size_t)written >= sizeof(synth_name) - prefix_len ||
                 write_uncompressed_name_ext(synth_wire, 0, sizeof(synth_wire), synth_name, false) < 0) {
               res[3] = (res[3] & 0xF0) | 6; // YXDOMAIN
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
 
@@ -1084,7 +1078,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             synth_cname.rdata[0] = synth_name;
             if (serialize_dns_record(res, max_res_len, offset, &synth_cname, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
               res[2] |= 0x02;
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
             (*ancount)++;
@@ -1098,7 +1091,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
             }
             if (loop_detected) {
               res[3] &= 0xF0;
-              if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
               return;
             }
             if (visited_count < 16) {
@@ -1141,6 +1133,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                 bool class_matches = (qclass == 255 || qclass == r_class);
                 if (!class_matches) continue;
                 uint32_t eff_ttl;
+                note_ecs_variant(rec, qtypes[0], zone_scope, answer_scope);
                 if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
                 found = true;
                 wc_found = true;
@@ -1160,11 +1153,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                     strncpy(first_wc_apex, db_entry->domain, sizeof(first_wc_apex) - 1);
                     first_wc_apex[sizeof(first_wc_apex) - 1] = '\0';
                   }
-                  if (rec->ecs_subnet_tag != NULL) ecs_used = true;
                   if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                            current_qname, 0xFFFFFFFF) < 0) {
                     res[2] |= 0x02;
-                    if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                     return;
                   } else
                     (*ancount)++;
@@ -1172,7 +1163,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                     if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, 5,
                                               res, max_res_len, offset, comp_ctx, ancount)) {
                       res[2] |= 0x02;
-                      if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                       return;
                     }
                   }
@@ -1187,7 +1177,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                     }
                     if (loop_detected) {
                       res[3] &= 0xF0;
-                      if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                       return;
                     }
                     if (visited_count < 16) {
@@ -1202,11 +1191,9 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                 } else {
                   if (qtypes[0] == 255 || qtypes[0] == rec_type) {
                     type_matched = true;
-                    if (rec->ecs_subnet_tag != NULL) ecs_used = true;
                     if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
                                              current_qname, 0xFFFFFFFF) < 0) {
                       res[2] |= 0x02;
-                      if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                       return;
                     } else
                       (*ancount)++;
@@ -1226,7 +1213,6 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                         if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
                                                   res, max_res_len, offset, comp_ctx, ancount)) {
                           res[2] |= 0x02;
-                          if (ecs_used && out_ecs_scope_prefix) *out_ecs_scope_prefix = temp_scope_prefix;
                           return;
                         }
                       }
@@ -1284,11 +1270,11 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
           bool class_matches = (qclass == 255 || qclass == r_class);
           if (class_matches && strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
             uint32_t eff_ttl;
+            note_ecs_variant(rec, qtx, zone_scope, answer_scope);
             if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
             qtx_matched = true;
             dns_record_t rec_copy = *rec;
             rec_copy.ttl_value = eff_ttl;
-            if (rec->ecs_subnet_tag != NULL) ecs_used = true;
             if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
               this_qtx_failed = true; break;
             }
@@ -1323,11 +1309,11 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                 bool class_matches = (qclass == 255 || qclass == r_class);
                 if (class_matches && strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
                   uint32_t eff_ttl;
+                  note_ecs_variant(rec, qtx, zone_scope, answer_scope);
                   if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
                   wc_found = true; qtx_matched = true;
                   dns_record_t rec_copy = *rec;
                   rec_copy.ttl_value = eff_ttl;
-                  if (rec->ecs_subnet_tag != NULL) ecs_used = true;
                   if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
                     this_qtx_failed = true; break;
                   }
@@ -1836,14 +1822,34 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
       *nscount = initial_nscount;
       *arcount = initial_arcount;
     }
-    if (out_ecs_scope_prefix) *out_ecs_scope_prefix = 0;
-  } else {
-    if (ecs_used && out_ecs_scope_prefix) {
-      *out_ecs_scope_prefix = temp_scope_prefix;
-    } else if (out_ecs_scope_prefix) {
-      *out_ecs_scope_prefix = 0;
-    }
   }
+}
+
+void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
+                         zone_db_entry_t **db_entry_ptr,
+                         zone_arena_t **current_zone_ptr, uint8_t *res,
+                         size_t max_res_len, uint16_t *offset,
+                         compress_ctx_t *comp_ctx, uint16_t *ancount,
+                         uint16_t *nscount, uint16_t *arcount,
+                         bool minimal_responses,
+                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
+                         view_snapshot_t *view, uint32_t *qtx_included_out,
+                         const char *client_ip, server_config_t *cfg,
+                         bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,
+                         uint8_t ecs_source_prefix,
+                         uint8_t *out_ecs_scope_prefix) {
+  /* SCOPE は SOURCE PREFIX-LENGTH で切り詰めない。長い SCOPE は「SOURCE では足りない」の
+   * 意味になる (RFC 7871 §7.2.1)。 */
+  (void)ecs_source_prefix;
+  uint16_t initial_ancount = *ancount;
+  uint8_t answer_scope = 0;
+  resolve_name_answer(qname, qclass, qtypes, num_qtypes, db_entry_ptr, current_zone_ptr, res,
+                      max_res_len, offset, comp_ctx, ancount, nscount, arcount, minimal_responses,
+                      minimal_any, minimal_any_ttl, dnssec_ok, view, qtx_included_out, client_ip, cfg,
+                      ecs_trusted, ecs_addr, ecs_family, &answer_scope);
+  /* RFC 7871 §7.4: 否定応答 (NXDOMAIN/NODATA) と委任は SCOPE 0 (SHOULD)。SERVFAIL なども 0。 */
+  bool positive = (res[3] & 0x0F) == 0 && *ancount > initial_ancount;
+  if (out_ecs_scope_prefix) *out_ecs_scope_prefix = positive ? answer_scope : 0;
 }
 
 size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount) {

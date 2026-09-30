@@ -4120,14 +4120,124 @@ static void test_wildcard_priority_over_cname_synthesis(void) {
     printf("  -> Wildcard priority passed.\n");
 }
 
+/* R-14: SCOPE PREFIX-LENGTH chosen by resolve_name() (RFC 7871 §7.2.1, §7.4). One zone with a name that has
+ * ECS-tagged variants ("geo") and names without ("www"). */
+typedef struct {
+    zone_arena_t arena;
+    zone_db_entry_t entry;
+} ecs_scope_zone_t;
+
+static ecs_scope_zone_t g_ecs_scope_zone;
+static bool g_ecs_scope_zone_ready = false;
+
+static void ecs_scope_zone_init(void) {
+    if (g_ecs_scope_zone_ready) return;
+    /* parse_zone_fast() keeps pointers into its input, so the text must outlive the arena */
+    static char ztext[] =
+        "$ORIGIN ecs.example.\n"
+        "@ 3600 IN SOA ns1 admin 1 3600 1800 604800 86400\n"
+        "@ 3600 IN NS ns1\n"
+        "ns1 300 IN A 192.0.2.1\n"
+        "www 300 IN A 192.0.2.10\n"
+        "$ECS-SUBNET-TAG eu 198.51.100.0/24 2001:db8:1::/48\n"
+        "$ECS-SUBNET eu\n"
+        "geo 300 IN A 192.0.2.100\n"
+        "geo 300 IN AAAA 2001:db8::100\n"
+        "$ECS-SUBNET \"\"\n"
+        "geo 300 IN A 192.0.2.200\n"
+        "alias 300 IN CNAME geo\n";
+    memset(&g_ecs_scope_zone, 0, sizeof(g_ecs_scope_zone));
+    zone_arena_init(&g_ecs_scope_zone.arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "ecs.example.", .is_standalone_mode = true,
+                            .err_out = &err };
+    int rc = parse_zone_fast(ztext, strlen(ztext), &g_ecs_scope_zone.arena, &ctx);
+    assert(rc >= 0);
+    assert(g_ecs_scope_zone.arena.bind_ecs_tag_count == 1);
+    rc = build_zone_index(&g_ecs_scope_zone.arena, true);
+    assert(rc == 0);
+    (void)rc;
+    strlcpy(g_ecs_scope_zone.entry.domain, "ecs.example.", sizeof(g_ecs_scope_zone.entry.domain));
+    atomic_store_explicit(&g_ecs_scope_zone.entry.rcu.active, &g_ecs_scope_zone.arena, memory_order_release);
+    g_ecs_scope_zone_ready = true;
+}
+
+/* Runs resolve_name() with an ECS address; returns SCOPE, stores RCODE and ANCOUNT. */
+static uint8_t ecs_scope_query(const char *qname, uint16_t qtype, uint16_t family, const char *addr_str,
+                               uint8_t source, bool trusted, int *rcode, uint16_t *ancount_out) {
+    ecs_scope_zone_init();
+    uint8_t addr[16] = { 0 };
+    int ok = inet_pton(family == 1 ? AF_INET : AF_INET6, addr_str, addr);
+    assert(ok == 1);
+    (void)ok;
+    zone_db_entry_t *db_entry_ptr = &g_ecs_scope_zone.entry;
+    zone_arena_t *cur_zone = &g_ecs_scope_zone.arena;
+    uint8_t res[1024];
+    memset(res, 0, sizeof(res));
+    uint16_t offset = 12, ancount = 0, nscount = 0, arcount = 0;
+    compress_ctx_t comp_ctx;
+    compress_ctx_init(&comp_ctx);
+    compress_ctx_init_packet(&comp_ctx);
+    uint8_t scope = 0xEE;
+    resolve_name(qname, 1, &qtype, 1, &db_entry_ptr, &cur_zone, res, sizeof(res), &offset, &comp_ctx,
+                 &ancount, &nscount, &arcount, false, false, 0, false, NULL, NULL,
+                 "127.0.0.1", NULL, trusted, addr, family, source, &scope);
+    *rcode = res[3] & 0x0F;
+    *ancount_out = ancount;
+    return scope;
+}
+
 static void test_edns_client_subnet_ipv6_scope_prefix_zero(void) {
-    printf("[TEST] Query Engine: EDNS Client Subnet IPv6 zero scope prefix...\n");
-    printf("  -> ECS IPv6 zero scope passed.\n");
+    printf("[TEST] Query Engine: ECS SCOPE with IPv6 addresses and SOURCE PREFIX-LENGTH 0...\n");
+    int rcode;
+    uint16_t an;
+    /* tagged AAAA for 2001:db8:1::/48 */
+    assert(ecs_scope_query("geo.ecs.example.", 28, 2, "2001:db8:1::", 48, true, &rcode, &an) == 48);
+    assert(rcode == 0 && an == 1);
+    /* outside the tag the name has no AAAA: negative answer, SCOPE 0 (RFC 7871 §7.4) */
+    assert(ecs_scope_query("geo.ecs.example.", 28, 2, "2001:db8:2::", 48, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 0);
+    /* default A for an IPv6 client: valid only up to the /48 of the tag (differs at bit 46) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 2, "2001:db8:2::", 48, true, &rcode, &an) == 47);
+    assert(rcode == 0 && an == 1);
+    /* SOURCE 0 (::/0): the answer still depends on the subnet, so it must not be marked as valid for all
+     * networks; a SCOPE longer than SOURCE makes a resolver keep it for /0 queries only (RFC 7871 §7.3.1) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 2, "::", 0, true, &rcode, &an) == 3);
+    assert(rcode == 0 && an == 1);
+    /* a name without tagged variants: SCOPE 0 */
+    assert(ecs_scope_query("www.ecs.example.", 1, 2, "::", 0, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 1);
+    printf("  -> ECS IPv6 / SOURCE 0 scope passed.\n");
 }
 
 static void test_edns_client_subnet_ipv4_prefix_clamping(void) {
-    printf("[TEST] Query Engine: EDNS Client Subnet prefix clamping (/32 -> /24)...\n");
-    printf("  -> ECS prefix clamping passed.\n");
+    printf("[TEST] Query Engine: ECS SCOPE for tagged, untagged and negative answers (IPv4)...\n");
+    int rcode;
+    uint16_t an;
+    /* client in the tag: tagged + untagged A, SCOPE = the tag's /24 (not the SOURCE /32) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "198.51.100.10", 32, true, &rcode, &an) == 24);
+    assert(rcode == 0 && an == 2);
+    /* client in no tag: default answer only, but it is not valid for 198.51.100.0/24 -> SCOPE 5, not 0 */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "203.0.113.9", 32, true, &rcode, &an) == 5);
+    assert(rcode == 0 && an == 1);
+    /* SOURCE /16 cannot tell: SCOPE longer than SOURCE, not clamped (RFC 7871 §7.2.1) */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "198.51.0.0", 16, true, &rcode, &an) == 18);
+    assert(rcode == 0 && an == 1);
+    /* CNAME to a name with tagged variants */
+    assert(ecs_scope_query("alias.ecs.example.", 1, 1, "203.0.113.9", 32, true, &rcode, &an) == 5);
+    assert(rcode == 0 && an == 2);
+    /* untrusted ECS source: tags are not used, one answer for everybody */
+    assert(ecs_scope_query("geo.ecs.example.", 1, 1, "198.51.100.10", 32, false, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 1);
+    /* no tagged variant of the queried name / type */
+    assert(ecs_scope_query("www.ecs.example.", 1, 1, "198.51.100.10", 32, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 1);
+    /* negative answers: SCOPE 0 (RFC 7871 §7.4) */
+    assert(ecs_scope_query("nx.ecs.example.", 1, 1, "198.51.100.10", 32, true, &rcode, &an) == 0);
+    assert(rcode == 3 && an == 0);
+    assert(ecs_scope_query("geo.ecs.example.", 15, 1, "198.51.100.10", 32, true, &rcode, &an) == 0);
+    assert(rcode == 0 && an == 0);
+    printf("  -> ECS IPv4 scope passed.\n");
 }
 
 static void test_dns_cookie_client_cookie_only_generation(void) {

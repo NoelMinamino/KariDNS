@@ -1011,6 +1011,70 @@ static void test_assemble_edns_opt_with_ede_and_ecs(void) {
     CHECK(off > 20);
 }
 
+/* R-02 / RFC 7871 §6, §7.2.1: the response echoes FAMILY, SOURCE PREFIX-LENGTH and ADDRESS of the query
+ * unchanged (ADDRESS is (SOURCE + 7) / 8 octets), whatever SCOPE PREFIX-LENGTH the server chose. */
+static void test_ecs_response_echoes_query_option(void) {
+    printf("[TEST] Wire: ECS response echoes FAMILY/SOURCE/ADDRESS of the query (SOURCE != SCOPE)...\n");
+    static const struct {
+        uint16_t family;
+        uint8_t source;
+        uint8_t scope;
+        uint8_t addr[16];
+    } cases[] = {
+        { 1, 32, 0,  { 198, 51, 100, 10 } },
+        { 1, 32, 24, { 198, 51, 100, 10 } },
+        { 1, 24, 0,  { 203, 0, 113 } },
+        { 1, 22, 30, { 192, 0, 0 } },          /* 3 octets, padding bits zero */
+        { 1, 16, 18, { 198, 51 } },            /* SCOPE longer than SOURCE */
+        { 1, 0, 1,   { 0 } },                  /* no ADDRESS octets */
+        { 2, 56, 0,  { 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x02 } },
+        { 2, 48, 64, { 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01 } },
+        { 2, 128, 128, { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 } },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        uint8_t alen = (uint8_t)((cases[c].source + 7) / 8);
+        uint8_t pkt[128] = { 0 };
+        pkt[5] = 1; pkt[11] = 1;                              /* QDCOUNT 1, ARCOUNT 1 */
+        size_t off = 12;
+        pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 1; pkt[off++] = 0; pkt[off++] = 1;   /* . A IN */
+        pkt[off++] = 0;                                       /* OPT owner: root */
+        pkt[off++] = 0; pkt[off++] = 41;
+        pkt[off++] = 0x10; pkt[off++] = 0;                    /* UDP 4096 */
+        pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0; pkt[off++] = 0;
+        pkt[off++] = 0; pkt[off++] = (uint8_t)(4 + 4 + alen); /* RDLEN */
+        size_t q_opt = off;
+        pkt[off++] = 0; pkt[off++] = 8;
+        pkt[off++] = 0; pkt[off++] = (uint8_t)(4 + alen);
+        pkt[off++] = 0; pkt[off++] = (uint8_t)cases[c].family;
+        pkt[off++] = cases[c].source;
+        pkt[off++] = 0;
+        memcpy(pkt + off, cases[c].addr, alen);
+        off += alen;
+
+        edns_info_t edns;
+        memset(&edns, 0, sizeof(edns));
+        CHECK(parse_edns_opt(pkt, off, 1, 0, 0, 1, &edns) == 0);
+        CHECK(edns.has_ecs);
+        edns.ecs_scope_prefix = cases[c].scope;
+
+        uint8_t res[256];
+        memset(res, 0xEE, sizeof(res));
+        uint16_t roff = 12, arcount = 0;
+        assemble_edns_opt(res, sizeof(res), &roff, &arcount, &edns, 0, false, NULL);
+        CHECK(arcount == 1);
+        /* OPT: root(1) TYPE(2) CLASS(2) TTL(4) RDLEN(2), then options; ECS is the only option */
+        CHECK(roff == 12 + 11 + 4 + 4 + alen);
+        const uint8_t *o = res + 12 + 11;
+        CHECK(o[0] == 0 && o[1] == 8);
+        CHECK(o[2] == 0 && o[3] == 4 + alen);
+        /* FAMILY and SOURCE PREFIX-LENGTH as in the query */
+        CHECK(memcmp(o + 4, pkt + q_opt + 4, 3) == 0);
+        CHECK(o[7] == cases[c].scope);
+        /* ADDRESS: same octets, same length */
+        CHECK(memcmp(o + 8, pkt + q_opt + 8, alen) == 0);
+    }
+}
+
 /* RFC 6891 §7 helpers: OPT reservation, EDE fallback, OPT lookup and TC truncation keeping the OPT. */
 static void test_truncation_keeps_opt_helpers(void) {
     printf("[TEST] Wire: edns_opt_reserve_len / EDE fallback / dns_find_opt_rr / dns_truncate_keep_opt...\n");
@@ -2757,6 +2821,7 @@ int main(void) {
     test_parse_edns_opt_ede_list_extraction();
     test_parse_edns_opt_ecs_ipv4_ipv6_scope();
     test_assemble_edns_opt_with_ede_and_ecs();
+    test_ecs_response_echoes_query_option();
     test_truncation_keeps_opt_helpers();
     test_compute_sig0_keytag_algorithms();
     test_pb_encode_varint_and_tag();
