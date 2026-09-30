@@ -78,6 +78,26 @@ typedef struct {
   size_t total_bytes;
 } response_cache_table_t;
 
+/* RFC 5155 §3.1.7: one NSEC3 RR of a chain, keyed by the hashed owner name (the owner's first label, base32hex;
+ * RFC 5155 §2 "hash order" = canonical order of the base32hex labels, compared case-insensitively). */
+typedef struct {
+  const char *hash;  /* first label of rec->name, not NUL-terminated */
+  uint8_t hash_len;
+  uint8_t algorithm;   /* chain parameters of rec (RDATA fields 0, 2, 3) */
+  uint16_t iterations;
+  const char *salt;
+  dns_record_t *rec;
+} nsec3_index_entry_t;
+
+/* RFC 5155 §4 / §7.2: the NSEC3 RRs with the same hash algorithm, iterations and salt, sorted in hash order. */
+typedef struct {
+  uint8_t algorithm;
+  uint16_t iterations;
+  const char *salt;  /* RDATA text: hex digits, "" or "-" (no salt) */
+  nsec3_index_entry_t *entries;
+  size_t count;
+} nsec3_chain_t;
+
 typedef struct zone_arena_s {
   dns_record_t *records;
   size_t count;
@@ -94,6 +114,9 @@ typedef struct zone_arena_s {
   size_t hash_size;
   dns_record_t **nsec_records;
   size_t nsec_count;
+  nsec3_chain_t *nsec3_chains;         /* built by build_zone_index(); entries point into nsec3_entries */
+  size_t nsec3_chain_count;
+  nsec3_index_entry_t *nsec3_entries;
   char **sorted_unique_names;
   size_t sorted_unique_count;
   _Atomic int reader_count;
@@ -124,6 +147,13 @@ void *arena_alloc(zone_arena_t *arena, size_t size);
 char *arena_strdup(zone_arena_t *arena, const char *str);
 /* RFC 2181 s5.2 / RFC 4035 s2.2: harmonize_ttls=true normalizes RRset TTLs. */
 int build_zone_index(zone_arena_t *arena, bool harmonize_ttls);
+/* Frees the lookup indexes build_zone_index() allocates besides the hash table (NSEC, NSEC3, sorted names). */
+void zone_arena_free_sorted_indexes(zone_arena_t *arena);
+/* RFC 5155 §3.2 / §4.2: algorithm, iterations and salt of an NSEC3 or NSEC3PARAM record (text RDATA fields 0, 2
+ * and 3). false when the record has fewer fields or a number is out of range. */
+bool nsec3_rdata_params(const dns_record_t *rec, uint8_t *algorithm, uint16_t *iterations, const char **salt);
+/* The chain of `arena` with the parameters of the NSEC3PARAM (or NSEC3) record `param`, or NULL. */
+const nsec3_chain_t *zone_find_nsec3_chain(const zone_arena_t *arena, const dns_record_t *param);
 /* RFC 1034 s4.2: drop records whose owner is not at or below apex (call before build_zone_index). */
 size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
                                    void (*report)(const dns_record_t *rec, void *ud), void *ud);

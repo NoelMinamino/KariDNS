@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <time.h>
@@ -43,8 +44,8 @@ bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
                         char *out_b32, size_t out_b32_sz);
 bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash);
+dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *hash_b32, const char *apex);
+dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *target_hash);
 bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
 bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                          uint8_t *res, size_t max_res_len, uint16_t *offset,
@@ -677,8 +678,269 @@ static void test_nsec3_hash_escaped_names(void) {
     printf("  -> NSEC3 hashes match nsec3hash.\n");
 }
 
+/* ---- R-34: sorted NSEC3 index per chain ---------------------------------------------------------------- */
+
+typedef struct {
+    zone_arena_t arena;
+    char *text;  /* parse_zone_fast() keeps pointers into it */
+} n3_zone_t;
+
+static uint64_t g_n3_rng = 0x9E3779B97F4A7C15ULL;
+static uint32_t n3_rand(void) {
+    g_n3_rng = g_n3_rng * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (uint32_t)(g_n3_rng >> 33);
+}
+
+/* A random 160-bit hash in base32hex (RFC 4648 §7): 32 digits. Upper or lower case. */
+static void n3_random_hash(char out[33], bool lower) {
+    static const char up[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV", lo[] = "0123456789abcdefghijklmnopqrstuv";
+    for (int i = 0; i < 32; i++) out[i] = (lower ? lo : up)[n3_rand() % 32];
+    out[32] = '\0';
+}
+
+static int n3_cmp_str_ci(const void *a, const void *b) {
+    return strcasecmp((const char *)a, (const char *)b);
+}
+
+/* Appends a complete chain of n NSEC3 RRs with salt `salt` (RFC 5155 §3.1.7: each next hash is the following
+ * owner in hash order, the last wraps to the first). Owners are written in a scrambled order, every third in
+ * lower case. hashes[] receives the sorted owner hashes (n * 33 bytes). skip >= 0 leaves that record out. */
+static size_t n3_append_chain(char *buf, size_t off, size_t cap, const char *salt, size_t n, char (*hashes)[33],
+                              long skip) {
+    for (size_t i = 0; i < n; i++) n3_random_hash(hashes[i], false);
+    qsort(hashes, n, sizeof(hashes[0]), n3_cmp_str_ci);
+    for (size_t k = 0; k < n; k++) {
+        size_t i = (k * 7919) % n;  /* 7919 is prime and does not divide the sizes used here */
+        if ((long)i == skip) continue;
+        char owner[33];
+        memcpy(owner, hashes[i], sizeof(owner));
+        if (i % 3 == 0)
+            for (char *p = owner; *p; p++) *p = (char)tolower((unsigned char)*p);
+        int w = snprintf(buf + off, cap - off, "%s IN NSEC3 1 0 0 %s %s A RRSIG\n", owner, salt, hashes[(i + 1) % n]);
+        assert(w > 0 && (size_t)w < cap - off);
+        off += (size_t)w;
+    }
+    return off;
+}
+
+static void n3_zone_load(n3_zone_t *z, char *text) {
+    memset(z, 0, sizeof(*z));
+    zone_arena_init(&z->arena);
+    z->text = text;
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "n3.test.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text, strlen(text), &z->arena, &ctx) >= 0);
+    assert(build_zone_index(&z->arena, true) == 0);
+}
+
+static void n3_zone_free(n3_zone_t *z) {
+    zone_arena_destroy(&z->arena);
+    free(z->text);
+}
+
+static dns_record_t *n3_param(n3_zone_t *z) {
+    for (size_t i = 0; i < z->arena.count; i++)
+        if (z->arena.records[i].type_code == 51) return &z->arena.records[i];
+    return NULL;
+}
+
+/* The lookup before R-34: every NSEC3 RR of the zone, in record order, limited to the chain of `param` (the
+ * filtering the index adds, RFC 5155 §7.2). */
+static dns_record_t *n3_linear_cover(zone_arena_t *zone, const dns_record_t *param, const char *target) {
+    for (size_t i = 0; i < zone->count; i++) {
+        dns_record_t *rec = &zone->records[i];
+        if (rec->type_code != 50 || rec->rdata_count < 5 || strcasecmp(rec->rdata[3], param->rdata[3]) != 0)
+            continue;
+        char owner[64];
+        const char *dot = strchr(rec->name, '.');
+        memcpy(owner, rec->name, (size_t)(dot - rec->name));
+        owner[dot - rec->name] = '\0';
+        if (nsec3_covers_hash(owner, rec->rdata[4], target)) return rec;
+    }
+    return NULL;
+}
+
+static const char *n3_salt_of(const dns_record_t *rec) { return rec ? rec->rdata[3] : "(none)"; }
+
+#define N3_HDR "$ORIGIN n3.test.\n$TTL 300\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\n"
+
+static void test_nsec3_index_matches_linear_scan(void) {
+    printf("[TEST] DNSSEC: NSEC3 index lookups equal the linear scan (R-34)...\n");
+    const size_t n = 2000, cap = 256 + n * 100;
+    char (*h)[33] = malloc(n * sizeof(*h));
+    char *text = malloc(cap);
+    assert(h && text);
+    size_t off = (size_t)snprintf(text, cap, N3_HDR "@ IN NSEC3PARAM 1 0 0 -\n");
+    off = n3_append_chain(text, off, cap, "-", n, h, -1);
+    n3_zone_t z;
+    n3_zone_load(&z, text);
+    dns_record_t *param = n3_param(&z);
+    assert(param && z.arena.nsec3_chain_count == 1 && z.arena.nsec3_chains[0].count == n);
+
+    /* every owner: matched, never covered (RFC 5155 §3.1.7: an owner hash is not strictly between owner/next) */
+    for (size_t i = 0; i < n; i++) {
+        dns_record_t *m = find_matching_nsec3(&z.arena, param, h[i], "n3.test.");
+        assert(m && strncasecmp(m->name, h[i], 32) == 0);
+        char lower[33];
+        for (int k = 0; k < 33; k++) lower[k] = (char)tolower((unsigned char)h[i][k]);
+        assert(find_matching_nsec3(&z.arena, param, lower, "n3.test.") == m);
+        assert(find_matching_nsec3(&z.arena, param, h[i], "other.test.") == NULL);
+        assert(find_covering_nsec3(&z.arena, param, h[i]) == NULL);
+        assert(n3_linear_cover(&z.arena, param, h[i]) == NULL);
+    }
+    /* random targets and both ends of the hash space (wrap-around at the last RR) */
+    const char *ends[] = { "00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV",
+                           "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" };
+    for (size_t i = 0; i < 5000 + 3; i++) {
+        char t[33];
+        if (i < 3) memcpy(t, ends[i], sizeof(t)); else n3_random_hash(t, i % 2 == 0);
+        dns_record_t *got = find_covering_nsec3(&z.arena, param, t), *want = n3_linear_cover(&z.arena, param, t);
+        bool owner = find_matching_nsec3(&z.arena, param, t, "n3.test.") != NULL;
+        if (got != want || (!owner && !got)) {
+            fprintf(stderr, "cover %s: index %s, linear %s\n", t, got ? got->name : "NULL", want ? want->name : "NULL");
+            assert(0);
+        }
+    }
+    /* rebuilding the index (as after IXFR/UPDATE) replaces it without leaking */
+    assert(build_zone_index(&z.arena, true) == 0);
+    assert(z.arena.nsec3_chain_count == 1 && z.arena.nsec3_chains[0].count == n);
+    n3_zone_free(&z);
+    free(h);
+    printf("  -> %zu owners and 5003 targets agree with the linear scan.\n", n);
+}
+
+static void test_nsec3_index_two_chains(void) {
+    printf("[TEST] DNSSEC: NSEC3 lookups stay in the chain of the NSEC3PARAM (RFC 5155 §7.2)...\n");
+    const size_t n = 300, cap = 512 + 2 * n * 100;
+    char (*ha)[33] = malloc(n * sizeof(*ha)), (*hb)[33] = malloc(n * sizeof(*hb));
+    char *text = malloc(cap);
+    assert(ha && hb && text);
+    /* chain B first in the file: the order that gave mixed proofs before (R-31 second defect) */
+    size_t off = (size_t)snprintf(text, cap, N3_HDR "@ IN NSEC3PARAM 1 0 0 aa11\n@ IN NSEC3PARAM 1 0 0 BB22\n");
+    off = n3_append_chain(text, off, cap, "bb22", n, hb, -1);
+    off = n3_append_chain(text, off, cap, "AA11", n, ha, -1);
+    n3_zone_t z;
+    n3_zone_load(&z, text);
+    assert(z.arena.nsec3_chain_count == 2);
+    dns_record_t *pa = NULL, *pb = NULL;
+    for (size_t i = 0; i < z.arena.count; i++) {
+        dns_record_t *r = &z.arena.records[i];
+        if (r->type_code == 51) { if (strcasecmp(r->rdata[3], "aa11") == 0) pa = r; else pb = r; }
+    }
+    assert(pa && pb);
+    for (size_t i = 0; i < 2000; i++) {
+        char t[33];
+        n3_random_hash(t, false);
+        dns_record_t *ca = find_covering_nsec3(&z.arena, pa, t), *cb = find_covering_nsec3(&z.arena, pb, t);
+        if (!ca || strcasecmp(n3_salt_of(ca), "aa11") != 0 || !cb || strcasecmp(n3_salt_of(cb), "bb22") != 0) {
+            fprintf(stderr, "cover %s: chain A -> %s, chain B -> %s\n", t, n3_salt_of(ca), n3_salt_of(cb));
+            assert(0);
+        }
+        assert(ca == n3_linear_cover(&z.arena, pa, t) && cb == n3_linear_cover(&z.arena, pb, t));
+    }
+    for (size_t i = 0; i < n; i++) {
+        /* an owner of chain A is matched through chain A only */
+        dns_record_t *m = find_matching_nsec3(&z.arena, pa, ha[i], "n3.test.");
+        assert(m && strcasecmp(n3_salt_of(m), "aa11") == 0);
+        dns_record_t *mb = find_matching_nsec3(&z.arena, pb, ha[i], "n3.test.");
+        assert(mb == NULL || strcasecmp(n3_salt_of(mb), "bb22") == 0);
+    }
+    /* parameters without a chain, and unusable NSEC3PARAM RDATA */
+    dns_record_t p;
+    memset(&p, 0, sizeof(p));
+    p.rdata[0] = "1"; p.rdata[1] = "0"; p.rdata[2] = "0"; p.rdata[3] = "cc33"; p.rdata_count = 4;
+    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL && find_matching_nsec3(&z.arena, &p, ha[0], "n3.test.") == NULL);
+    p.rdata[3] = "aa11"; p.rdata[2] = "1";
+    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    p.rdata[2] = "x";
+    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    p.rdata[2] = "65536";
+    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    p.rdata[2] = "0"; p.rdata_count = 3;
+    assert(find_covering_nsec3(&z.arena, &p, ha[0]) == NULL);
+    n3_zone_free(&z);
+    free(ha);
+    free(hb);
+    printf("  -> both chains answer only with their own RRs.\n");
+}
+
+static void test_nsec3_index_broken_chain(void) {
+    printf("[TEST] DNSSEC: NSEC3 lookups on an incomplete chain...\n");
+    const size_t n = 50, cap = 256 + n * 100;
+    char (*h)[33] = malloc(n * sizeof(*h));
+    char *text = malloc(cap);
+    assert(h && text);
+    size_t off = (size_t)snprintf(text, cap, N3_HDR "@ IN NSEC3PARAM 1 0 0 -\n");
+    /* no salt written as "-" in the RRs and matched by an NSEC3PARAM salt "-" */
+    off = n3_append_chain(text, off, cap, "-", n, h, 10);
+    /* a record the index ignores: the owner label is not base32hex (RFC 4648 §7) */
+    snprintf(text + off, cap - off, "not-a-hash IN NSEC3 1 0 0 - %s A\n", h[0]);
+    n3_zone_t z;
+    n3_zone_load(&z, text);
+    dns_record_t *param = n3_param(&z);
+    assert(z.arena.nsec3_chain_count == 1 && z.arena.nsec3_chains[0].count == n - 1);
+    /* h[10] is missing: a target between h[9] and h[10] has no covering RR (h[9]'s next is h[10]) */
+    char t[33];
+    memcpy(t, h[10], sizeof(t));
+    assert(find_matching_nsec3(&z.arena, param, t, "n3.test.") == NULL);
+    assert(find_covering_nsec3(&z.arena, param, t) == NULL);
+    /* other targets: NULL (inside the gap) or a chain RR that really covers the target, never the ignored RR */
+    size_t gaps = 0;
+    for (size_t i = 0; i < 1000; i++) {
+        n3_random_hash(t, false);
+        dns_record_t *c = find_covering_nsec3(&z.arena, param, t);
+        if (!c) { gaps++; continue; }
+        char owner[33];
+        memcpy(owner, c->name, 32);
+        owner[32] = '\0';
+        assert(c->name[32] == '.' && nsec3_covers_hash(owner, c->rdata[4], t));
+    }
+    assert(gaps < 1000);
+    n3_zone_free(&z);
+    free(h);
+    printf("  -> no crash, no RR from outside the chain.\n");
+}
+
+static double n3_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Performance regression for R-34: 10 000 covering lookups on a 100 000-RR chain. The linear scan needed about
+ * 10^9 comparisons for this (tens of seconds); binary search needs about 1.7 * 10^5. The bound leaves room for
+ * ASan/UBSan builds and slow CI machines. */
+static void test_nsec3_index_performance(void) {
+    printf("[TEST] DNSSEC: NSEC3 covering lookup is logarithmic (R-34 performance regression)...\n");
+    const size_t n = 100000, lookups = 10000, cap = 256 + n * 100;
+    char (*h)[33] = malloc(n * sizeof(*h));
+    char (*t)[33] = malloc(lookups * sizeof(*t));
+    char *text = malloc(cap);
+    assert(h && t && text);
+    size_t off = (size_t)snprintf(text, cap, N3_HDR "@ IN NSEC3PARAM 1 0 0 -\n");
+    (void)n3_append_chain(text, off, cap, "-", n, h, -1);
+    n3_zone_t z;
+    n3_zone_load(&z, text);
+    dns_record_t *param = n3_param(&z);
+    for (size_t i = 0; i < lookups; i++) n3_random_hash(t[i], false);
+    size_t found = 0;
+    double t0 = n3_now();
+    for (size_t i = 0; i < lookups; i++) found += find_covering_nsec3(&z.arena, param, t[i]) != NULL;
+    double elapsed = n3_now() - t0;
+    printf("  -> %zu lookups on %zu NSEC3 RRs: %.3f s (%zu covered)\n", lookups, n, elapsed, found);
+    assert(found == lookups);  /* random 160-bit targets never equal an owner */
+    assert(elapsed < 2.0);
+    n3_zone_free(&z);
+    free(h);
+    free(t);
+}
+
 int main(void) {
     printf("=== Starting DNSSEC Negative-Proof Tests ===\n");
+    test_nsec3_index_matches_linear_scan();
+    test_nsec3_index_two_chains();
+    test_nsec3_index_broken_chain();
+    test_nsec3_index_performance();
     test_nsec3_hash_escaped_names();
     test_nsec3_rfc5155_appendix_b();
     test_nsec_rfc4035_appendix_b();

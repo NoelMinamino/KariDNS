@@ -515,39 +515,51 @@ STATIC_TEST bool nsec3_covers_hash(const char *owner_hash, const char *next_hash
     }
 }
 
-STATIC_TEST dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex) {
-    if (!zone || !hash_b32 || !apex || !zone->hash_table || zone->hash_size == 0) return NULL;
-    char owner_name[300];
-    snprintf(owner_name, sizeof(owner_name), "%s.%s", hash_b32, apex);
-    uint32_t h = calc_fnv1a_str(owner_name);
-    size_t idx = h & (zone->hash_size - 1);
-    for (int i = zone->hash_table[idx]; i != -1; i = zone->records[i].next_record) {
-        dns_record_t *rec = &zone->records[i];
-        if (rec->type_code == 50 && domain_names_match_ci(rec->name, owner_name)) {
-            return rec;
-        }
+/* RFC 5155 §7.2: every NSEC3 RR of an answer belongs to the chain whose parameters were used for hashing, i.e.
+ * the NSEC3PARAM `param`. The chain is sorted in hash order (build_zone_index()), so both lookups are binary
+ * searches (R-34); a zone without an index for these parameters has no usable NSEC3 RR. */
+
+/* Index of the first entry whose hash is >= target (chain->count when there is none). */
+static size_t nsec3_lower_bound(const nsec3_chain_t *chain, const char *target, size_t target_len) {
+    size_t lo = 0, hi = chain->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const nsec3_index_entry_t *e = &chain->entries[mid];
+        int c = strncasecmp(e->hash, target, e->hash_len < target_len ? e->hash_len : target_len);
+        if (c == 0) c = e->hash_len < target_len ? -1 : (e->hash_len > target_len ? 1 : 0);
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+STATIC_TEST dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param,
+                                              const char *hash_b32, const char *apex) {
+    if (!zone || !param || !hash_b32 || !apex) return NULL;
+    const nsec3_chain_t *chain = zone_find_nsec3_chain(zone, param);
+    if (!chain) return NULL;
+    size_t tlen = strlen(hash_b32);
+    for (size_t i = nsec3_lower_bound(chain, hash_b32, tlen); i < chain->count; i++) {
+        const nsec3_index_entry_t *e = &chain->entries[i];
+        if (e->hash_len != tlen || strncasecmp(e->hash, hash_b32, tlen) != 0) break;
+        /* RFC 5155 §3: the owner is the hashed label directly below the zone apex. */
+        if (domain_names_match_ci(e->rec->name + e->hash_len + 1, apex)) return e->rec;
     }
     return NULL;
 }
 
-STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash) {
-    if (!zone || !target_hash || !zone->records || zone->count == 0) return NULL;
-    for (size_t i = 0; i < zone->count; i++) {
-        dns_record_t *rec = &zone->records[i];
-        if (rec->type_code == 50 && rec->name && rec->rdata_count >= 5 && rec->rdata[4]) {
-            char owner_hash[64] = {0};
-            const char *dot = strchr_unescaped(rec->name, '.');
-            if (!dot || dot <= rec->name) continue;
-            size_t hlen = (size_t)(dot - rec->name);
-            if (hlen >= sizeof(owner_hash)) continue;
-            memcpy(owner_hash, rec->name, hlen);
-            owner_hash[hlen] = '\0';
-            if (nsec3_covers_hash(owner_hash, rec->rdata[4], target_hash)) {
-                return rec;
-            }
-        }
-    }
-    return NULL;
+STATIC_TEST dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param,
+                                              const char *target_hash) {
+    if (!zone || !param || !target_hash) return NULL;
+    const nsec3_chain_t *chain = zone_find_nsec3_chain(zone, param);
+    if (!chain || chain->count == 0) return NULL;
+    /* RFC 5155 §3.1.7: the covering RR is the last one in hash order whose owner hash is below the target; below
+     * the first owner, the last RR of the chain covers the target (its next hash wraps to the first owner). */
+    size_t i = nsec3_lower_bound(chain, target_hash, strlen(target_hash));
+    const nsec3_index_entry_t *e = &chain->entries[i > 0 ? i - 1 : chain->count - 1];
+    char owner_hash[64];
+    memcpy(owner_hash, e->hash, e->hash_len);
+    owner_hash[e->hash_len] = '\0';
+    return nsec3_covers_hash(owner_hash, e->rec->rdata[4], target_hash) ? e->rec : NULL;
 }
 
 STATIC_TEST bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz) {
@@ -732,7 +744,7 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
 
               char q_hash[64];
               if (compute_nsec3_hash(name, algo, iterations, salt, salt_len, q_hash, sizeof(q_hash))) {
-                dns_record_t *m_rec = find_matching_nsec3(current_zone, q_hash, zone_apex);
+                dns_record_t *m_rec = find_matching_nsec3(current_zone, param_rec, q_hash, zone_apex);
                 if (m_rec) {
                   if (!attach_nsec3_record(current_zone, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                     res[2] |= 0x02;
@@ -740,7 +752,7 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
                   }
                 } else {
                   // Opt-Out: Next Closer covering NSEC3 and Closest Provable Encloser matching NSEC3 (RFC 5155 §7.2.3)
-                  dns_record_t *c_rec = find_covering_nsec3(current_zone, q_hash);
+                  dns_record_t *c_rec = find_covering_nsec3(current_zone, param_rec, q_hash);
                   if (c_rec) {
                     if (!attach_nsec3_record(current_zone, c_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                       res[2] |= 0x02;
@@ -751,7 +763,7 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
                   if (encloser) {
                     char ce_hash[64];
                     if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
-                      dns_record_t *ce_rec = find_matching_nsec3(current_zone, ce_hash, zone_apex);
+                      dns_record_t *ce_rec = find_matching_nsec3(current_zone, param_rec, ce_hash, zone_apex);
                       if (ce_rec) {
                         if (!attach_nsec3_record(current_zone, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                           res[2] |= 0x02;
@@ -1603,7 +1615,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           if (!encloser) encloser = db_entry->domain;
           char ce_hash[64];
           if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
-            dns_record_t *ce_rec = find_matching_nsec3(current_zone, ce_hash, db_entry->domain);
+            dns_record_t *ce_rec = find_matching_nsec3(current_zone, param_rec, ce_hash, db_entry->domain);
             if (ce_rec) {
               if (!attach_nsec3_record(current_zone, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
@@ -1615,7 +1627,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           if (!nsec_failed && find_next_closer_name(current_qname, encloser, nc_name, sizeof(nc_name))) {
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
-              dns_record_t *nc_cover = find_covering_nsec3(current_zone, nc_hash);
+              dns_record_t *nc_cover = find_covering_nsec3(current_zone, param_rec, nc_hash);
               if (nc_cover) {
                 if (!attach_nsec3_record(current_zone, nc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;
@@ -1629,7 +1641,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
             char wc_hash[64];
             if (compute_nsec3_hash(wc_name, algo, iterations, salt, salt_len, wc_hash, sizeof(wc_hash))) {
-              dns_record_t *wc_rec = find_matching_nsec3(current_zone, wc_hash, db_entry->domain);
+              dns_record_t *wc_rec = find_matching_nsec3(current_zone, param_rec, wc_hash, db_entry->domain);
               if (wc_rec) {
                 if (!attach_nsec3_record(current_zone, wc_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;
@@ -1641,7 +1653,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           // NODATA: matching NSEC3 for current_qname
           char q_hash[64];
           if (compute_nsec3_hash(current_qname, algo, iterations, salt, salt_len, q_hash, sizeof(q_hash))) {
-            dns_record_t *m_rec = find_matching_nsec3(current_zone, q_hash, db_entry->domain);
+            dns_record_t *m_rec = find_matching_nsec3(current_zone, param_rec, q_hash, db_entry->domain);
             if (m_rec) {
               if (!attach_nsec3_record(current_zone, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
@@ -1654,7 +1666,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           if (!encloser) encloser = db_entry->domain;
           char ce_hash[64];
           if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
-            dns_record_t *ce_rec = find_matching_nsec3(current_zone, ce_hash, db_entry->domain);
+            dns_record_t *ce_rec = find_matching_nsec3(current_zone, param_rec, ce_hash, db_entry->domain);
             if (ce_rec) {
               if (!attach_nsec3_record(current_zone, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
@@ -1666,7 +1678,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           if (!nsec_failed && find_next_closer_name(current_qname, encloser, nc_name, sizeof(nc_name))) {
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
-              dns_record_t *nc_cover = find_covering_nsec3(current_zone, nc_hash);
+              dns_record_t *nc_cover = find_covering_nsec3(current_zone, param_rec, nc_hash);
               if (nc_cover) {
                 if (!attach_nsec3_record(current_zone, nc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;
@@ -1679,7 +1691,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           snprintf(wc_name, sizeof(wc_name), "*.%s", encloser);
           char wc_hash[64];
           if (!nsec_failed && compute_nsec3_hash(wc_name, algo, iterations, salt, salt_len, wc_hash, sizeof(wc_hash))) {
-            dns_record_t *wc_cover = find_covering_nsec3(current_zone, wc_hash);
+            dns_record_t *wc_cover = find_covering_nsec3(current_zone, param_rec, wc_hash);
             if (wc_cover) {
               if (!attach_nsec3_record(current_zone, wc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
@@ -1736,7 +1748,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           if (!encloser) encloser = wc_apex;
           char ce_hash[64];
           if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
-            dns_record_t *ce_rec = find_matching_nsec3(wc_zone, ce_hash, wc_apex);
+            dns_record_t *ce_rec = find_matching_nsec3(wc_zone, p_rec, ce_hash, wc_apex);
             if (ce_rec) {
               if (!attach_nsec3_record(wc_zone, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                 nsec_failed = true;
@@ -1748,7 +1760,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           if (!nsec_failed && find_next_closer_name(first_wc_qname, encloser, nc_name, sizeof(nc_name))) {
             char nc_hash[64];
             if (compute_nsec3_hash(nc_name, algo, iterations, salt, salt_len, nc_hash, sizeof(nc_hash))) {
-              dns_record_t *nc_cover = find_covering_nsec3(wc_zone, nc_hash);
+              dns_record_t *nc_cover = find_covering_nsec3(wc_zone, p_rec, nc_hash);
               if (nc_cover) {
                 if (!attach_nsec3_record(wc_zone, nc_cover, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
                   nsec_failed = true;

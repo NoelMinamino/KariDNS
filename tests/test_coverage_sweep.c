@@ -1005,13 +1005,17 @@ static void test_engine_helper_edges(void) {
 
     /* arena helpers on empty / incomplete zones */
     zone_arena_t z; memset(&z, 0, sizeof(z)); zone_arena_init(&z);
-    assert(find_matching_nsec3(NULL, "x", "a.") == NULL);
-    assert(find_matching_nsec3(&z, NULL, "a.") == NULL);
-    assert(find_matching_nsec3(&z, "x", NULL) == NULL);
-    assert(find_matching_nsec3(&z, "x", "a.") == NULL);
-    assert(find_covering_nsec3(NULL, "x") == NULL);
-    assert(find_covering_nsec3(&z, NULL) == NULL);
-    assert(find_covering_nsec3(&z, "x") == NULL);
+    dns_record_t p3; memset(&p3, 0, sizeof(p3));
+    p3.rdata[0] = "1"; p3.rdata[1] = "0"; p3.rdata[2] = "0"; p3.rdata[3] = "-"; p3.rdata_count = 4;
+    assert(find_matching_nsec3(NULL, &p3, "x", "a.") == NULL);
+    assert(find_matching_nsec3(&z, NULL, "x", "a.") == NULL);
+    assert(find_matching_nsec3(&z, &p3, NULL, "a.") == NULL);
+    assert(find_matching_nsec3(&z, &p3, "x", NULL) == NULL);
+    assert(find_matching_nsec3(&z, &p3, "x", "a.") == NULL);
+    assert(find_covering_nsec3(NULL, &p3, "x") == NULL);
+    assert(find_covering_nsec3(&z, NULL, "x") == NULL);
+    assert(find_covering_nsec3(&z, &p3, NULL) == NULL);
+    assert(find_covering_nsec3(&z, &p3, "x") == NULL);
     assert(name_exists_in_zone(NULL, "a.", "\0\0", NULL, NULL) == false);
     assert(name_exists_in_zone(&z, NULL, "\0\0", NULL, NULL) == false);
     assert(name_exists_in_zone(&z, "a.", "\0\0", NULL, NULL) == false);

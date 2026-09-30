@@ -1838,16 +1838,7 @@ void zone_arena_clear_data_pools(zone_arena_t *arena) {
       arena->data_pools[i] = NULL;
     }
   }
-  if (arena->nsec_records) {
-    free(arena->nsec_records);
-    arena->nsec_records = NULL;
-    arena->nsec_count = 0;
-  }
-  if (arena->sorted_unique_names) {
-    free(arena->sorted_unique_names);
-    arena->sorted_unique_names = NULL;
-    arena->sorted_unique_count = 0;
-  }
+  zone_arena_free_sorted_indexes(arena);
   if (arena->locations) {
     free(arena->locations);
     arena->locations = NULL;

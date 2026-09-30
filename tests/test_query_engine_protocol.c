@@ -43,8 +43,8 @@ bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
                         char *out_b32, size_t out_b32_sz);
 bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash);
+dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *hash_b32, const char *apex);
+dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *target_hash);
 bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
 bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                          uint8_t *res, size_t max_res_len, uint16_t *offset,

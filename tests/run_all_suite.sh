@@ -349,6 +349,7 @@ register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command
 register_test "regression" "sh" "tests/run_sanitizer_smoke_test.sh" "ASan & UBSan runtime memory error smoke test"
 register_test "regression" "sh" "tests/run_stress_test.sh" "TSan & ASan concurrency stress test (dnsperf + IXFR)"
 register_test "regression" "sh" "tests/run_rcu_tsan_test.sh" "TSan: queries concurrent with reload, UPDATE and AXFR (R-25 RCU publish order)"
+register_test "regression" "sh" "tests/run_nsec3_nxdomain_perf_test.sh" "NSEC3 NXDOMAIN rate vs NSEC with dnsperf, sorted NSEC3 index (R-34; SKIP without dnsperf)"
 register_test "regression" "sh" "tests/run_bind_differential_test.sh" "Differential check against BIND named: wildcard answers (SKIP without named)"
 register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-resistance smoke verification"
 register_test "regression" "sh" "tests/run_break_duplicate_kind_override_test.sh" "Duplicate --break kind parameter override validation"

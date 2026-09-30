@@ -1169,11 +1169,15 @@ static void test_nsec3_hashing_and_intervals(void) {
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
     assert(build_zone_index(&arena, true) == 0);
 
-    dns_record_t *matched = find_matching_nsec3(&arena, "00000000000000000000000000000000", "example.com.");
+    dns_record_t *p3 = NULL;
+    for (size_t i = 0; i < arena.count && !p3; i++)
+        if (arena.records[i].type_code == 50) p3 = &arena.records[i];
+    assert(p3 != NULL);
+    dns_record_t *matched = find_matching_nsec3(&arena, p3, "00000000000000000000000000000000", "example.com.");
     assert(matched != NULL);
     assert(matched->type_code == 50);
 
-    dns_record_t *covering = find_covering_nsec3(&arena, "55555555555555555555555555555555");
+    dns_record_t *covering = find_covering_nsec3(&arena, p3, "55555555555555555555555555555555");
     assert(covering != NULL);
     assert(covering->type_code == 50);
 
@@ -2110,8 +2114,13 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     // 13. find_matching_nsec3 & find_covering_nsec3 on empty arena
     zone_arena_t nsec3_arena;
     zone_arena_init(&nsec3_arena);
-    assert(find_matching_nsec3(&nsec3_arena, "AAAA", "example.com.") == NULL);
-    assert(find_covering_nsec3(&nsec3_arena, "AAAA") == NULL);
+    dns_record_t p3_empty;
+    memset(&p3_empty, 0, sizeof(p3_empty));
+    p3_empty.rdata[0] = "1"; p3_empty.rdata[1] = "0"; p3_empty.rdata[2] = "0"; p3_empty.rdata[3] = "-";
+    p3_empty.rdata_count = 4;
+    dns_record_t *p3 = &p3_empty;
+    assert(find_matching_nsec3(&nsec3_arena, p3, "AAAA", "example.com.") == NULL);
+    assert(find_covering_nsec3(&nsec3_arena, p3, "AAAA") == NULL);
     dns_record_t *att[8];
     int att_count = 0;
     assert(attach_nsec3_record(&nsec3_arena, NULL, dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, att, &att_count) == true);
@@ -7377,10 +7386,14 @@ static void test_query_engine_feature_case_188(void) {
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
     assert(build_zone_index(&arena, true) == 0);
 
-    dns_record_t *m = find_matching_nsec3(&arena, "00000000000000000000000000000000", "n3.example.");
+    dns_record_t *p3 = NULL;
+    for (size_t i = 0; i < arena.count && !p3; i++)
+        if (arena.records[i].type_code == 50) p3 = &arena.records[i];
+    assert(p3 != NULL);
+    dns_record_t *m = find_matching_nsec3(&arena, p3, "00000000000000000000000000000000", "n3.example.");
     assert(m != NULL);
 
-    dns_record_t *c = find_covering_nsec3(&arena, "55555555555555555555555555555555");
+    dns_record_t *c = find_covering_nsec3(&arena, p3, "55555555555555555555555555555555");
     assert(c != NULL);
 
     zone_arena_destroy(&arena);

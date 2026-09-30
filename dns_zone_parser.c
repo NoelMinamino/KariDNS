@@ -1609,12 +1609,7 @@ void zone_arena_destroy(zone_arena_t *arena) {
   for (int i = 0; i < arena->data_pool_count; i++)
     free(arena->data_pools[i]);
   free(arena->hash_table);
-  free(arena->nsec_records);
-  arena->nsec_records = NULL;
-  arena->nsec_count = 0;
-  free(arena->sorted_unique_names);
-  arena->sorted_unique_names = NULL;
-  arena->sorted_unique_count = 0;
+  zone_arena_free_sorted_indexes(arena);
   free(arena->locations);
   arena->locations = NULL;
   arena->location_count = 0;
@@ -1679,6 +1674,129 @@ static int cmp_canonical_name_ptr(const void *a, const void *b) {
   const char *s1 = *(const char * const *)a;
   const char *s2 = *(const char * const *)b;
   return compare_canonical_name(s1, s2);
+}
+
+void zone_arena_free_sorted_indexes(zone_arena_t *arena) {
+  free(arena->nsec_records);
+  arena->nsec_records = NULL;
+  arena->nsec_count = 0;
+  free(arena->nsec3_chains);
+  arena->nsec3_chains = NULL;
+  arena->nsec3_chain_count = 0;
+  free(arena->nsec3_entries);
+  arena->nsec3_entries = NULL;
+  free(arena->sorted_unique_names);
+  arena->sorted_unique_names = NULL;
+  arena->sorted_unique_count = 0;
+}
+
+bool nsec3_rdata_params(const dns_record_t *rec, uint8_t *algorithm, uint16_t *iterations, const char **salt) {
+  if (!rec || rec->rdata_count < 4 || !rec->rdata[3] ||
+      !parse_u8(rec->rdata[0], algorithm) || !parse_u16(rec->rdata[2], iterations))
+    return false;
+  *salt = rec->rdata[3];
+  return true;
+}
+
+/* RFC 5155 §3.3: the salt field is "-" when the salt is empty; hex digits compare case-insensitively. */
+static int cmp_nsec3_salt(const char *a, const char *b) {
+  if (strcmp(a, "-") == 0) a = "";
+  if (strcmp(b, "-") == 0) b = "";
+  return strcasecmp(a, b);
+}
+
+static int cmp_nsec3_params(uint8_t a_alg, uint16_t a_it, const char *a_salt,
+                            uint8_t b_alg, uint16_t b_it, const char *b_salt) {
+  if (a_alg != b_alg) return a_alg < b_alg ? -1 : 1;
+  if (a_it != b_it) return a_it < b_it ? -1 : 1;
+  return cmp_nsec3_salt(a_salt, b_salt);
+}
+
+static int cmp_nsec3_hash(const char *a, size_t a_len, const char *b, size_t b_len) {
+  int c = strncasecmp(a, b, a_len < b_len ? a_len : b_len);
+  if (c != 0) return c;
+  return a_len < b_len ? -1 : (a_len > b_len ? 1 : 0);
+}
+
+static int cmp_nsec3_entry_params(const nsec3_index_entry_t *x, const nsec3_index_entry_t *y) {
+  return cmp_nsec3_params(x->algorithm, x->iterations, x->salt, y->algorithm, y->iterations, y->salt);
+}
+
+static int cmp_nsec3_entry(const void *a, const void *b) {
+  const nsec3_index_entry_t *x = a, *y = b;
+  int c = cmp_nsec3_entry_params(x, y);
+  return c != 0 ? c : cmp_nsec3_hash(x->hash, x->hash_len, y->hash, y->hash_len);
+}
+
+/* Fills `e` for an NSEC3 RR that can be indexed: all five fixed RDATA fields, and an owner whose first label is
+ * base32hex digits only (RFC 4648 §7, at most 63 octets) followed by the zone name. */
+static bool nsec3_index_entry_init(dns_record_t *rec, nsec3_index_entry_t *e) {
+  if (!rec->name || rec->type_code != 50 || rec->rdata_count < 5 || !rec->rdata[4] ||
+      !nsec3_rdata_params(rec, &e->algorithm, &e->iterations, &e->salt))
+    return false;
+  const char *dot = strchr(rec->name, '.');
+  if (!dot || dot == rec->name || dot[1] == '\0' || dot - rec->name > 63) return false;
+  for (const char *p = rec->name; p < dot; p++) {
+    char c = (char)toupper((unsigned char)*p);
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'V'))) return false;
+  }
+  e->hash = rec->name;
+  e->hash_len = (uint8_t)(dot - rec->name);
+  e->rec = rec;
+  return true;
+}
+
+/* RFC 5155 §7.2: the covering and matching NSEC3 RRs of an answer come from one chain. Group the NSEC3 RRs by
+ * (algorithm, iterations, salt) and sort each group in hash order for binary search (R-34). Returns -1 on OOM. */
+static int build_nsec3_index(zone_arena_t *arena) {
+  size_t n = 0;
+  nsec3_index_entry_t tmp;
+  for (size_t i = 0; i < arena->count; i++)
+    if (nsec3_index_entry_init(&arena->records[i], &tmp)) n++;
+  if (n == 0) return 0;
+
+  nsec3_index_entry_t *entries = malloc(sizeof(*entries) * n);
+  if (!entries) return -1;
+  size_t k = 0;
+  for (size_t i = 0; i < arena->count && k < n; i++)
+    if (nsec3_index_entry_init(&arena->records[i], &entries[k])) k++;
+  qsort(entries, k, sizeof(*entries), cmp_nsec3_entry);
+
+  size_t chains = 0;
+  for (size_t i = 0; i < k; i++)
+    if (i == 0 || cmp_nsec3_entry_params(&entries[i - 1], &entries[i]) != 0) chains++;
+  nsec3_chain_t *chain = calloc(chains, sizeof(*chain));
+  if (!chain) {
+    free(entries);
+    return -1;
+  }
+  size_t c = 0;
+  for (size_t i = 0; i < k; i++) {
+    if (i == 0 || cmp_nsec3_entry_params(&entries[i - 1], &entries[i]) != 0) {
+      nsec3_chain_t *ch = &chain[c++];
+      ch->algorithm = entries[i].algorithm;
+      ch->iterations = entries[i].iterations;
+      ch->salt = entries[i].salt;
+      ch->entries = &entries[i];
+    }
+    chain[c - 1].count++;
+  }
+  arena->nsec3_entries = entries;
+  arena->nsec3_chains = chain;
+  arena->nsec3_chain_count = chains;
+  return 0;
+}
+
+const nsec3_chain_t *zone_find_nsec3_chain(const zone_arena_t *arena, const dns_record_t *param) {
+  uint8_t alg;
+  uint16_t it;
+  const char *salt;
+  if (!arena || !nsec3_rdata_params(param, &alg, &it, &salt)) return NULL;
+  for (size_t i = 0; i < arena->nsec3_chain_count; i++) {
+    const nsec3_chain_t *ch = &arena->nsec3_chains[i];
+    if (cmp_nsec3_params(ch->algorithm, ch->iterations, ch->salt, alg, it, salt) == 0) return ch;
+  }
+  return NULL;
 }
 
 /* [T9] RFC 2181 s5.2: same owner+type RRset TTLs normalized to minimum.
@@ -1771,16 +1889,7 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
     free(arena->hash_table);
     arena->hash_table = NULL;
   }
-  if (arena->nsec_records) {
-    free(arena->nsec_records);
-    arena->nsec_records = NULL;
-    arena->nsec_count = 0;
-  }
-  if (arena->sorted_unique_names) {
-    free(arena->sorted_unique_names);
-    arena->sorted_unique_names = NULL;
-    arena->sorted_unique_count = 0;
-  }
+  zone_arena_free_sorted_indexes(arena);
   arena->hash_size = next_pow2(arena->count * 2);
   if (arena->hash_size == 0) arena->hash_size = 1;
   arena->hash_table = malloc(sizeof(int) * arena->hash_size);
@@ -1824,6 +1933,11 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
     } else {
       arena->nsec_count = 0;
     }
+  }
+
+  if (build_nsec3_index(arena) != 0) {
+    syslog(LOG_ERR, "[Zone] build_zone_index: OOM during NSEC3 index allocation");
+    return -1;
   }
 
   if (arena->count > 0) {

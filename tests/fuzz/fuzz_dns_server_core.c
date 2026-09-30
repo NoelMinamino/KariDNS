@@ -120,7 +120,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.default_origin = "fuzz.local.";
 
-        parse_zone_fast(text_buf, fuzz_size, &arena, &ctx);
+        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 && build_zone_index(&arena, true) == 0) {
+            /* NSEC3 index (R-34): every chain is sorted in hash order and is the chain found for its own RRs */
+            for (size_t c = 0; c < arena.nsec3_chain_count; c++) {
+                const nsec3_chain_t *ch = &arena.nsec3_chains[c];
+                for (size_t i = 0; i < ch->count; i++) {
+                    const nsec3_index_entry_t *e = &ch->entries[i];
+                    if (zone_find_nsec3_chain(&arena, e->rec) != ch) abort();
+                    if (i > 0) {
+                        const nsec3_index_entry_t *p = &ch->entries[i - 1];
+                        size_t n = p->hash_len < e->hash_len ? p->hash_len : e->hash_len;
+                        int d = strncasecmp(p->hash, e->hash, n);
+                        if (d > 0 || (d == 0 && p->hash_len > e->hash_len)) abort();
+                    }
+                }
+            }
+        }
         zone_arena_destroy(&arena);
     }
     else if (branch == 2) {
