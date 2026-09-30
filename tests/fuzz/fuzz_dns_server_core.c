@@ -100,6 +100,58 @@ static void check_nsec3_index(zone_arena_t *arena) {
     }
 }
 
+/* R-31: the NSEC3 parameters chosen by build_zone_index() are a usable NSEC3PARAM (Flags 0, SHA-1, decodable salt of
+ * at most 255 octets) with its own chain, and the decoded salt is that of the record */
+static void check_nsec3_active(zone_arena_t *arena) {
+    const nsec3_params_t *p = &arena->nsec3_active;
+    if (!p->param) return;
+    uint8_t flags, salt[255];
+    if (p->param->type_code != 51 || p->algorithm != 1 || p->param->rdata_count < 4) abort();
+    if (!parse_u8(p->param->rdata[1], &flags) || flags != 0) abort();
+    if (p->chain != zone_find_nsec3_chain(arena, p->param)) abort();
+    size_t n = hex_to_bytes(p->param->rdata[3], salt, sizeof(salt));
+    if (n == (size_t)-1 || n != p->salt_len || memcmp(salt, p->salt, n) != 0) abort();
+}
+
+/* Phase 9: DO=1 queries against the fuzzed zone (answer sections, RRSIG attachment, NSEC/NSEC3 proofs, glue),
+ * with a 512-octet and a 4096-octet EDNS buffer, for the apex, a missing name and the first owners of the zone. */
+static void query_fuzzed_zone(zone_arena_t *arena) {
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, arena, memory_order_release);
+    static const uint16_t types[] = { 255, 1, 43, 48, 15, 2 };
+    const char *names[6] = { "fuzz.local.", "nx.fuzz.local.", "a.b.fuzz.local.", NULL, NULL, NULL };
+    uint16_t own_type[6] = { 6, 1, 1, 0, 0, 0 };
+    for (size_t i = 0, k = 3; i < arena->count && k < 6; i++)
+        if (arena->records[i].name) { own_type[k] = arena->records[i].type_code; names[k++] = arena->records[i].name; }
+    for (int n = 0; n < 6 && names[n]; n++) {
+        for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+            uint16_t qt = t == 1 ? own_type[n] : types[t];
+            uint8_t req[300], res[4096];
+            memset(req, 0, 12);
+            req[5] = 1;   // QDCOUNT
+            req[11] = 1;  // ARCOUNT (OPT)
+            long w = write_uncompressed_name(req, 12, 12 + 255, names[n]);
+            if (w <= 0) continue;
+            size_t off = 12 + (size_t)w;
+            req[off++] = (uint8_t)(qt >> 8); req[off++] = (uint8_t)qt; req[off++] = 0; req[off++] = 1;
+            uint16_t udp = (t & 1) ? 512 : 4096;
+            const uint8_t opt[11] = { 0, 0, 41, (uint8_t)(udp >> 8), (uint8_t)udp, 0, 0, 0x80, 0, 0, 0 };  // DO=1
+            memcpy(req + off, opt, sizeof(opt));
+            off += sizeof(opt);
+            char qname[DNS_NAME_TEXT_SIZE] = "";
+            uint16_t qtype = 0, qclass = 1;
+            size_t qend = 0;
+            parse_query_question_fast(req, off, qname, sizeof(qname), &qtype, &qclass, &qend);
+            compress_ctx_t comp_ctx;
+            memset(&comp_ctx, 0, sizeof(comp_ctx));
+            compress_ctx_init_packet(&comp_ctx);
+            rate_limit_config_t *rrl = NULL;
+            process_dns_query(req, off, res, sizeof(res), qname, qtype, "127.0.0.1", &comp_ctx, false, &rrl,
+                              &g_fuzz_snap);
+        }
+    }
+    atomic_store_explicit(&g_fuzz_entry.rcu.active, &g_fuzz_arena, memory_order_release);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size == 0) return 0;
     init_fuzz_environment();
@@ -137,8 +189,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.default_origin = "fuzz.local.";
 
-        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 && build_zone_index(&arena, true) == 0)
+        if (parse_zone_fast(text_buf, fuzz_size, &arena, &ctx) >= 0 && build_zone_index(&arena, true) == 0) {
             check_nsec3_index(&arena);
+            check_nsec3_active(&arena);
+            query_fuzzed_zone(&arena);
+        }
         zone_arena_destroy(&arena);
     }
     else if (branch == 2) {

@@ -72,7 +72,6 @@ program_plugin_t *find_program_plugin(const char *view_name, const char *domain)
 #ifdef KARIDNS_UNIT_TEST
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
-size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
                                     const char client_loc[2],
                                     const char *client_ecs_tag,
@@ -86,7 +85,7 @@ bool append_glue_records(zone_arena_t *current_zone, const char *target,
                          const char *client_ecs_tag,
                          const char *client_loc_tag,
                          additional_from_auth_t policy,
-                         view_snapshot_t *view);
+                         view_snapshot_t *view, bool dnssec_ok);
 void collect_additional_rr_glue(dns_record_t *rec,
                                 const char *glue_targets[16],
                                 int *glue_target_count,

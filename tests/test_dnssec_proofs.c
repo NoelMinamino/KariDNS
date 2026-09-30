@@ -1214,6 +1214,489 @@ static void test_dnssec_wire_decode_malformed(void) {
     printf("  -> malformed RDATA stays opaque; well-formed edge cases decode.\n");
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * Phase 9 (AUDIT_FINDINGS R-03, R-04, O-16, O-17, R-31, R-32). Signatures are placeholders: what is checked is
+ * which RRs the server puts in which section and in which order.
+ * ---------------------------------------------------------------------------------------------- */
+#define P9_SIG "20300101000000 20200101000000 12345"
+
+static uint16_t p9_rrsig_covered(const gr_resp_t *r, const gr_rr_t *rr) {
+    return (uint16_t)((r->msg[rr->rdoff] << 8) | r->msg[rr->rdoff + 1]);
+}
+
+/* O-16 / R-04: in section `sect` every RRset is contiguous, its RRSIGs follow it directly, and no RR appears
+ * twice (RFC 2181 §5). */
+static void p9_expect_grouped(const gr_resp_t *r, int sect, const char *what) {
+    const gr_rr_t *cur = NULL, *prev = NULL;
+    for (int i = 0; i < r->nrr; i++) {
+        const gr_rr_t *rr = &r->rr[i];
+        if (rr->sect != sect) continue;
+        for (int j = 0; j < i; j++) {
+            const gr_rr_t *o = &r->rr[j];
+            if (o->sect == sect && o->type == rr->type && strcasecmp(o->name, rr->name) == 0 &&
+                o->rdlen == rr->rdlen && memcmp(r->msg + o->rdoff, r->msg + rr->rdoff, rr->rdlen) == 0) {
+                fprintf(stderr, "%s: duplicate type-%u RR %s\n", what, rr->type, rr->name); dump_resp(r); assert(0);
+            }
+        }
+        if (rr->type == 46) {
+            if (!cur || p9_rrsig_covered(r, rr) != cur->type || strcasecmp(rr->name, cur->name) != 0) {
+                fprintf(stderr, "%s: RRSIG %s (covers %u) does not follow its RRset\n", what, rr->name,
+                        p9_rrsig_covered(r, rr));
+                dump_resp(r); assert(0);
+            }
+        } else if (!(cur && prev && prev->type != 46 && cur->type == rr->type && strcasecmp(cur->name, rr->name) == 0)) {
+            for (int j = 0; j < i; j++) {
+                if (r->rr[j].sect == sect && r->rr[j].type == rr->type && strcasecmp(r->rr[j].name, rr->name) == 0) {
+                    fprintf(stderr, "%s: RRset %s type %u is split\n", what, rr->name, rr->type); dump_resp(r); assert(0);
+                }
+            }
+            cur = rr;
+        }
+        prev = rr;
+    }
+}
+
+static int p9_count_owner(const gr_resp_t *r, int sect, int type, const char *owner) {
+    int n = 0;
+    for (int i = 0; i < r->nrr; i++)
+        if (r->rr[i].sect == sect && (type < 0 || r->rr[i].type == type) && strcasecmp(r->rr[i].name, owner) == 0) n++;
+    return n;
+}
+
+static void p9_query_bufsize(const char *qname, uint16_t qtype, uint16_t udp_size, gr_resp_t *out) {
+    uint8_t req[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x4592, qname, qtype, true);
+    req[req_len - 8] = (uint8_t)(udp_size >> 8);   // OPT CLASS = UDP payload size (RFC 6891 §6.1.2)
+    req[req_len - 7] = (uint8_t)(udp_size & 0xFF);
+    gr_query_raw(req, req_len, qname, qtype, "192.0.2.100", false, out);
+}
+
+static const char *ZONE_SIG =
+    "$ORIGIN sig.test.\n"
+    "$TTL 300\n"
+    "@ SOA ns1 h 1 3600 600 86400 60\n"
+    "@ RRSIG SOA 8 2 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "@ NS ns1\n"
+    "@ NS ns2.sub\n"
+    "@ RRSIG NS 8 2 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "@ DNSKEY 256 3 8 AwEAAQ==\n"
+    "@ RRSIG DNSKEY 8 2 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "@ DNSKEY 257 3 8 AwEAAw==\n"
+    "@ RRSIG DNSKEY 8 2 300 20300101000000 20200101000000 54321 sig.test. BBBBBBBB\n"
+    "@ NSEC mail.sig.test. NS SOA RRSIG NSEC DNSKEY\n"
+    "@ RRSIG NSEC 8 2 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "mail A 192.0.2.2\n"
+    "mail RRSIG A 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "mail NSEC ns1.sig.test. A RRSIG NSEC\n"
+    "mail RRSIG NSEC 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "ns1 A 192.0.2.1\n"
+    "ns1 RRSIG A 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "ns1 NSEC sub.sig.test. A AAAA RRSIG NSEC\n"
+    "ns1 AAAA 2001:db8::1\n"
+    "ns1 RRSIG NSEC 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "ns1 RRSIG AAAA 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "sub NS ns2.sub\n"
+    "sub NSEC *.wild.sig.test. NS RRSIG NSEC\n"
+    "sub RRSIG NSEC 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "ns2.sub A 192.0.2.53\n"
+    /* not authoritative (below the cut at sub): must never be attached, even if present */
+    "ns2.sub RRSIG A 8 4 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "*.wild A 192.0.2.80\n"
+    "*.wild RRSIG A 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "*.wild TXT \"w\"\n"
+    "*.wild RRSIG TXT 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n"
+    "*.wild NSEC sig.test. A TXT RRSIG NSEC\n"
+    "*.wild RRSIG NSEC 8 3 300 " P9_SIG " sig.test. AAAAAAAA\n";
+
+static void test_dnssec_rrsig_sections(void) {
+    printf("[TEST] DNSSEC: RRSIGs in Authority/Additional, RRsets before their RRSIGs, no duplicates (R-03, R-04, O-16, O-17)...\n");
+    gr_setup("sig.test.", ZONE_SIG);
+    gr_resp_t r;
+
+    /* R-03: apex NS in Authority with RRSIG(NS); in-zone NS target in Additional with RRSIG(A)/RRSIG(AAAA);
+     * glue below the cut (ns2.sub) without RRSIG (RFC 4035 §3.1.1, §2.2) */
+    gr_query("mail.sig.test.", 1, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && !(g_gr.res[2] & 0x02));
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 46) == 1);
+    CHECK(&r, gr_count(&r, 2, 2) == 2 && gr_count(&r, 2, 46) == 1);
+    CHECK(&r, p9_count_owner(&r, 3, 1, "ns1.sig.test.") == 1 && p9_count_owner(&r, 3, 28, "ns1.sig.test.") == 1);
+    CHECK(&r, p9_count_owner(&r, 3, 46, "ns1.sig.test.") == 2);
+    CHECK(&r, p9_count_owner(&r, 3, 1, "ns2.sub.sig.test.") == 1 && p9_count_owner(&r, 3, 46, "ns2.sub.sig.test.") == 0);
+    p9_expect_grouped(&r, 1, "mail A answer");
+    p9_expect_grouped(&r, 2, "mail A authority");
+    p9_expect_grouped(&r, 3, "mail A additional");
+
+    /* DO=0: no RRSIG anywhere */
+    gr_query("mail.sig.test.", 1, false, &r);
+    CHECK(&r, gr_count(&r, 1, 46) == 0 && gr_count(&r, 2, 46) == 0 && gr_count(&r, 3, 46) == 0);
+    CHECK(&r, p9_count_owner(&r, 3, 1, "ns1.sig.test.") == 1);
+
+    /* R-04: ANY + DO=1: every RRSIG exactly once, after its RRset */
+    gr_query("ns1.sig.test.", 255, true, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 28) == 1 && gr_count(&r, 1, 47) == 1);
+    CHECK(&r, gr_count(&r, 1, 46) == 3);
+    p9_expect_grouped(&r, 1, "ANY answer");
+
+    /* O-16: two DNSKEYs, then both RRSIG(DNSKEY) (key rollover state) */
+    gr_query("sig.test.", 48, true, &r);
+    CHECK(&r, gr_count(&r, 1, 48) == 2 && gr_count(&r, 1, 46) == 2);
+    CHECK(&r, r.rr[0].type == 48 && r.rr[1].type == 48 && r.rr[2].type == 46 && r.rr[3].type == 46);
+    p9_expect_grouped(&r, 1, "DNSKEY answer");
+
+    /* O-17: wildcard NODATA; the next-closer cover and the wildcard-owner NSEC are the same RR: once, signed */
+    gr_query("a.wild.sig.test.", 15, true, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, -1) == 0);
+    EXPECT_NS(&r, "wildcard NODATA", "*.wild.sig.test.");
+    CHECK(&r, gr_count(&r, 2, 46) == 2);   // RRSIG(SOA) + RRSIG(NSEC)
+    p9_expect_grouped(&r, 2, "wildcard NODATA authority");
+
+    /* wildcard ANY + DO=1: each RRset (A, TXT, ...) with the QNAME as owner, followed by its own RRSIG, once */
+    gr_query("b.wild.sig.test.", 255, true, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1);
+    CHECK(&r, gr_count(&r, 1, 46) == gr_count(&r, 1, -1) - gr_count(&r, 1, 46));
+    CHECK(&r, p9_count_owner(&r, 1, -1, "b.wild.sig.test.") == gr_count(&r, 1, -1));
+    p9_expect_grouped(&r, 1, "wildcard ANY answer");
+    EXPECT_NS(&r, "wildcard ANY proof", "*.wild.sig.test.");
+
+    /* QTYPE RRSIG: all RRSIGs at the name, each once, nothing else in the Answer */
+    gr_query("ns1.sig.test.", 46, true, &r);
+    CHECK(&r, gr_count(&r, 1, -1) == 3 && gr_count(&r, 1, 46) == 3);
+
+    /* R-04 sibling: QTYPE A + MQTYPE RRSIG (RFC 10029, option 20): RRSIG(A) once (was written twice) */
+    {
+        uint8_t req[512];
+        size_t req_len = 0;
+        build_dns_query(req, &req_len, 0x4592, "ns1.sig.test.", 1, true);
+        req[req_len - 1] = 6;   // OPT RDLEN
+        const uint8_t mq[6] = { 0x00, 0x14, 0x00, 0x02, 0x00, 46 };
+        memcpy(req + req_len, mq, sizeof(mq));
+        req_len += sizeof(mq);
+        g_gr.cfg.rfc10029_mqtype_enable = true;
+        g_gr.cfg.max_mqtypes = 4;
+        gr_query_raw(req, req_len, "ns1.sig.test.", 1, "192.0.2.100", false, &r);
+        g_gr.cfg.rfc10029_mqtype_enable = false;
+        CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 46) == 3 && gr_count(&r, 1, -1) == 4);
+        p9_expect_grouped(&r, 2, "MQTYPE authority");
+    }
+
+    /* referral to sub: NS unsigned; the NSEC proving the missing DS; glue without RRSIG */
+    gr_query("host.sub.sig.test.", 1, true, &r);
+    CHECK(&r, !r.aa && gr_count(&r, 2, 2) == 1 && gr_count(&r, 2, 47) == 1 && gr_count(&r, 2, 46) == 1);
+    CHECK(&r, p9_count_owner(&r, 3, 1, "ns2.sub.sig.test.") == 1 && gr_count(&r, 3, 46) == 0);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> sections signed, RRsets contiguous, no duplicate RRSIG/NSEC.\n");
+}
+
+/* Zone for the size limits: `long_at` selects the RRSIG with a 420-octet signature. */
+static void p9_sigb_zone(char *buf, size_t cap, int long_at) {
+    char lsig[561];
+    memset(lsig, 'A', 560);
+    lsig[560] = '\0';
+    snprintf(buf, cap,
+             "$ORIGIN sigb.test.\n$TTL 300\n"
+             "@ SOA ns1 h 1 3600 600 86400 60\n"
+             "@ RRSIG SOA 8 2 300 " P9_SIG " sigb.test. AAAAAAAA\n"
+             "@ NS ns1\n"
+             "@ RRSIG NS 8 2 300 " P9_SIG " sigb.test. %s\n"
+             "@ NSEC mail.sigb.test. NS SOA RRSIG NSEC\n"
+             "@ RRSIG NSEC 8 2 300 " P9_SIG " sigb.test. AAAAAAAA\n"
+             "mail A 192.0.2.2\n"
+             "mail RRSIG A 8 3 300 " P9_SIG " sigb.test. AAAAAAAA\n"
+             "mail NSEC ns1.sigb.test. A RRSIG NSEC\n"
+             "mail RRSIG NSEC 8 3 300 " P9_SIG " sigb.test. AAAAAAAA\n"
+             "ns1 A 192.0.2.1\n"
+             "ns1 RRSIG A 8 3 300 " P9_SIG " sigb.test. %s\n"
+             "ns1 NSEC sigb.test. A RRSIG NSEC\n"
+             "ns1 RRSIG NSEC 8 3 300 " P9_SIG " sigb.test. %s\n",
+             long_at == 1 ? lsig : "AAAAAAAA", long_at == 0 ? lsig : "AAAAAAAA", long_at == 2 ? lsig : "AAAAAAAA");
+}
+
+static void test_dnssec_rrsig_size_limits(void) {
+    printf("[TEST] DNSSEC: RRSIG that does not fit: Additional dropped without TC, Authority/proof -> TC (R-03)...\n");
+    static char zone[4096];
+    gr_resp_t r;
+
+    /* Additional RRSIG too large for 512 octets: RRSIG dropped, the A kept, no TC (RFC 4035 §3.1.1) */
+    p9_sigb_zone(zone, sizeof(zone), 0);
+    gr_setup("sigb.test.", zone);
+    p9_query_bufsize("mail.sigb.test.", 1, 512, &r);
+    CHECK(&r, !(g_gr.res[2] & 0x02) && r.rcode == 0);
+    CHECK(&r, gr_count(&r, 2, 46) == 1 && p9_count_owner(&r, 3, 1, "ns1.sigb.test.") == 1 && gr_count(&r, 3, 46) == 0);
+    p9_query_bufsize("mail.sigb.test.", 1, 4096, &r);   // with room the RRSIG is there
+    CHECK(&r, gr_count(&r, 3, 46) == 1);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* Authority RRSIG(NS) too large: TC=1 and no unsigned-looking partial RRSIG set */
+    p9_sigb_zone(zone, sizeof(zone), 1);
+    gr_setup("sigb.test.", zone);
+    p9_query_bufsize("mail.sigb.test.", 1, 512, &r);
+    CHECK(&r, (g_gr.res[2] & 0x02) && gr_count(&r, 2, 46) == 0);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* NXDOMAIN proof does not fit (decision 2): proof removed and TC=1 */
+    p9_sigb_zone(zone, sizeof(zone), 2);
+    gr_setup("sigb.test.", zone);
+    p9_query_bufsize("nx.sigb.test.", 1, 512, &r);
+    CHECK(&r, r.rcode == 3 && (g_gr.res[2] & 0x02) && gr_count(&r, 2, 47) == 0);
+    p9_query_bufsize("nx.sigb.test.", 1, 4096, &r);
+    CHECK(&r, r.rcode == 3 && !(g_gr.res[2] & 0x02) && gr_count(&r, 2, 47) == 2);
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> size limits handled per RFC 4035 3.1.1.\n");
+}
+
+/* R-31: hashes of the names below with salt 0xCD x 255, 0 iterations, and with salt AA11, from BIND's nsec3hash
+ * (an implementation independent of the code under test). */
+#define S255_APEX "FHHUD9MMO2DP7JQBCVO2D6EO8PAF50R8"   /* s255.test */
+#define S255_NS1  "9E66AP5OEAJKNL9SF6C0FFQAQMIH9IU9"   /* ns1.s255.test */
+#define S255_WWW  "KH9DH759AS7CLAE5P98T19H8AV5NMQ8C"   /* www.s255.test */
+/* nx.s255.test = E36KCAH2..., *.s255.test = UPV5HC80... */
+#define AA11_APEX "7TM0UC4ORAKQGRN5MFQR43L9JNFVEJJB"   /* s255.test, salt AA11 */
+#define AA11_NS1  "PJN6RTSF7UFE0DU85ARMFPRPDAMR4BI5"   /* ns1.s255.test, salt AA11 */
+
+static void p9_s255_zone(char *buf, size_t cap, const char *params) {
+    char s[511];
+    for (int i = 0; i < 255; i++) memcpy(s + 2 * i, "CD", 2);
+    s[510] = '\0';
+    char p[2048];
+    snprintf(p, sizeof(p), params, s);   /* params may use %s for the 255-octet salt */
+    snprintf(buf, cap,
+             "$ORIGIN s255.test.\n$TTL 300\n"
+             "@ SOA ns1 h 1 3600 600 86400 60\n"
+             "@ NS ns1\n"
+             "%s"
+             "ns1 A 192.0.2.1\n"
+             "www A 192.0.2.2\n"
+             S255_APEX " NSEC3 1 0 0 %s " S255_WWW " NS SOA RRSIG NSEC3PARAM\n"
+             S255_WWW " NSEC3 1 0 0 %s " S255_NS1 " A RRSIG\n"
+             S255_NS1 " NSEC3 1 0 0 %s " S255_APEX " A RRSIG\n"
+             /* a second chain with salt AA11 that is incomplete (its next owner does not exist) */
+             AA11_APEX " NSEC3 1 0 0 AA11 " AA11_NS1 " NS SOA RRSIG NSEC3PARAM\n",
+             p, s, s, s);
+}
+
+static void p9_expect_s255_nxdomain(const char *what) {
+    gr_resp_t r;
+    gr_query("nx.s255.test.", 1, true, &r);
+    static const char *const want[] = { S255_APEX ".s255.test.", S255_NS1 ".s255.test.", S255_WWW ".s255.test." };
+    CHECK(&r, r.rcode == 3);
+    expect_owner_set(&r, 2, 50, want, 3, false, what);
+    gr_query("www.s255.test.", 15, true, &r);   // NODATA: the matching NSEC3 only
+    static const char *const want_nd[] = { S255_WWW ".s255.test." };
+    CHECK(&r, r.rcode == 0);
+    expect_owner_set(&r, 2, 50, want_nd, 1, false, what);
+}
+
+static void test_nsec3_params_selection(void) {
+    printf("[TEST] DNSSEC: NSEC3PARAM choice, 255-octet salt, Flags != 0 ignored (R-31)...\n");
+    static char zone[8192];
+    const nsec3_params_t *a = &g_gr.arena.nsec3_active;
+
+    /* 255-octet salt (RFC 5155 §3.1.5): hashes with the whole salt (was truncated to 64 octets) */
+    p9_s255_zone(zone, sizeof(zone), "@ NSEC3PARAM 1 0 0 %s\n");
+    gr_setup("s255.test.", zone);
+    assert(a->param && a->salt_len == 255 && a->salt[254] == 0xCD && a->chain && a->chain->count == 3);
+    p9_expect_s255_nxdomain("255-octet salt");
+    zone_arena_destroy(&g_gr.arena);
+
+    /* RFC 5155 §4.1.2: an NSEC3PARAM with Flags 1 listed first MUST be ignored */
+    p9_s255_zone(zone, sizeof(zone), "@ NSEC3PARAM 1 1 0 AA11\n@ NSEC3PARAM 1 0 0 %s\n");
+    gr_setup("s255.test.", zone);
+    assert(a->param && a->salt_len == 255);
+    p9_expect_s255_nxdomain("flags 1 first");
+    zone_arena_destroy(&g_gr.arena);
+
+    /* §7.3: two usable NSEC3PARAMs; the first (AA11) has an incomplete chain, the complete one is chosen */
+    p9_s255_zone(zone, sizeof(zone), "@ NSEC3PARAM 1 0 0 AA11\n@ NSEC3PARAM 1 0 0 %s\n");
+    gr_setup("s255.test.", zone);
+    assert(a->param && a->salt_len == 255 && a->chain && a->chain->count == 3);
+    p9_expect_s255_nxdomain("incomplete first chain");
+    zone_arena_destroy(&g_gr.arena);
+
+    /* the incomplete chain is still used when it is the only one (with the parameters of its NSEC3PARAM) */
+    p9_s255_zone(zone, sizeof(zone), "@ NSEC3PARAM 1 0 0 AA11\n");
+    gr_setup("s255.test.", zone);
+    assert(a->param && a->salt_len == 2 && a->salt[0] == 0xAA && a->salt[1] == 0x11 && a->chain->count == 1);
+    zone_arena_destroy(&g_gr.arena);
+
+    /* no usable NSEC3PARAM (only Flags 1; a 256-octet salt; an odd-length salt; hash algorithm 2): no NSEC3 proof */
+    const char *const unusable[] = { "@ NSEC3PARAM 1 1 0 %s\n", "@ NSEC3PARAM 1 0 0 %sCD\n", "@ NSEC3PARAM 1 0 0 ABC\n",
+                                     "@ NSEC3PARAM 2 0 0 %s\n" };
+    for (size_t i = 0; i < sizeof(unusable) / sizeof(unusable[0]); i++) {
+        p9_s255_zone(zone, sizeof(zone), unusable[i]);
+        gr_setup("s255.test.", zone);
+        assert(a->param == NULL);
+        gr_resp_t r;
+        gr_query("nx.s255.test.", 1, true, &r);
+        CHECK(&r, r.rcode == 3 && gr_count(&r, 2, 50) == 0 && gr_count(&r, 2, 6) == 1);
+        zone_arena_destroy(&g_gr.arena);
+    }
+
+    /* hex_to_bytes(): strict, never truncates */
+    uint8_t out[255];
+    assert(hex_to_bytes("", out, sizeof(out)) == 0 && hex_to_bytes("-", out, sizeof(out)) == 0);
+    assert(hex_to_bytes("aB0f", out, 2) == 2 && out[0] == 0xAB && out[1] == 0x0F);
+    assert(hex_to_bytes("aB0f", out, 1) == (size_t)-1);
+    assert(hex_to_bytes("aB0", out, sizeof(out)) == (size_t)-1);
+    assert(hex_to_bytes("zz", out, sizeof(out)) == (size_t)-1);
+    assert(hex_to_bytes("a b", out, sizeof(out)) == (size_t)-1);
+    printf("  -> NSEC3 parameters chosen per RFC 5155 4.1.2 / 7.3; 255-octet salt hashed in full.\n");
+}
+
+/* R-32: several zones in one view (parent pn.test., children sec. and ins.pn.test., other.test.) */
+static struct {
+    zone_arena_t arena[5];
+    zone_db_entry_t entry[5];
+    zone_db_entry_t *entries[5];
+    char *acl[1];
+    view_snapshot_t view;
+    zone_db_snapshot_t snap;
+    server_config_t cfg;
+    uint8_t res[4096];
+} g_mz;
+
+static void mz_reset(void) {
+    memset(&g_mz, 0, sizeof(g_mz));
+    g_mz.acl[0] = (char *)"any";
+    g_mz.view.name = "default";
+    g_mz.view.entries = g_mz.entries;
+    g_mz.view.match_clients = g_mz.acl;
+    g_mz.view.match_clients_count = 1;
+    g_mz.snap.views = &g_mz.view;
+    g_mz.snap.view_count = 1;
+}
+
+static void mz_add(const char *origin, const char *text) {
+    size_t i = g_mz.view.zone_count++;
+    zone_arena_init(&g_mz.arena[i]);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = origin, .is_standalone_mode = true, .err_out = &err };
+    char *buf = arena_strdup(&g_mz.arena[i], text);
+    assert(buf && parse_zone_fast(buf, strlen(buf), &g_mz.arena[i], &ctx) >= 0);
+    assert(build_zone_index(&g_mz.arena[i], true) == 0);
+    strncpy(g_mz.entry[i].domain, origin, sizeof(g_mz.entry[i].domain) - 1);
+    g_mz.entry[i].kind = ZONE_KIND_PRIMARY;
+    atomic_store_explicit(&g_mz.entry[i].rcu.active, &g_mz.arena[i], memory_order_release);
+    g_mz.entries[i] = &g_mz.entry[i];
+}
+
+static void mz_free(void) {
+    for (size_t i = 0; i < g_mz.view.zone_count; i++) zone_arena_destroy(&g_mz.arena[i]);
+}
+
+static void mz_query(const char *qname, uint16_t qtype, bool dnssec_ok, gr_resp_t *out) {
+    uint8_t req[512];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x4592, qname, qtype, dnssec_ok);
+    compress_ctx_t comp;
+    memset(&comp, 0, sizeof(comp));
+    compress_ctx_init_packet(&comp);
+    rate_limit_config_t *rrl_out = NULL;
+    zone_db_entry_t *matched = NULL;
+    int n = process_dns_query_impl(req, req_len, g_mz.res, sizeof(g_mz.res), qname, qtype, "192.0.2.100", &comp,
+                                   false, &rrl_out, &g_mz.snap, &g_mz.cfg, &matched);
+    assert(n >= DNS_HEADER_SIZE && gr_parse(g_mz.res, (size_t)n, out));
+}
+
+static const char *ZONE_PN =
+    "$ORIGIN pn.test.\n$TTL 300\n"
+    "@ SOA ns1 h 1 3600 600 86400 60\n"
+    "@ RRSIG SOA 8 2 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "@ NS ns1\n"
+    "@ RRSIG NS 8 2 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "@ NSEC ins.pn.test. NS SOA RRSIG NSEC\n"
+    "@ RRSIG NSEC 8 2 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "ins NS ns1.ins\n"
+    "ins NSEC ns1.pn.test. NS RRSIG NSEC\n"
+    "ins RRSIG NSEC 8 3 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "ns1.ins A 192.0.2.54\n"
+    "ns1 A 192.0.2.1\n"
+    "ns1 RRSIG A 8 3 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "ns1 NSEC sec.pn.test. A RRSIG NSEC\n"
+    "ns1 RRSIG NSEC 8 3 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "sec NS ns1.sec\n"
+    "sec DS 12345 13 2 2BB1834370273412E81E3272C18B868FD63804EB61A086C38D04FF2DEDFE2516\n"
+    "sec RRSIG DS 8 3 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "sec NSEC pn.test. NS DS RRSIG NSEC\n"
+    "sec RRSIG NSEC 8 3 300 " P9_SIG " pn.test. AAAAAAAA\n"
+    "ns1.sec A 192.0.2.53\n";
+static const char *ZONE_SEC =
+    "$ORIGIN sec.pn.test.\n$TTL 300\n@ SOA ns1 h 7 3600 600 86400 60\n@ NS ns1\nns1 A 192.0.2.53\n"
+    "x CNAME sec.pn.test.\n";
+static const char *ZONE_INS =
+    "$ORIGIN ins.pn.test.\n$TTL 300\n@ SOA ns1 h 7 3600 600 86400 60\n@ NS ns1\nns1 A 192.0.2.54\n";
+static const char *ZONE_OTHER =
+    "$ORIGIN other.test.\n$TTL 300\n@ SOA ns1 h 1 3600 600 86400 60\n@ NS ns1\nns1 A 192.0.2.9\n"
+    "alias CNAME sec.pn.test.\n";
+
+static void test_ds_from_parent_zone(void) {
+    printf("[TEST] DNSSEC: DS at a child apex answered from the hosted parent (R-32)...\n");
+    gr_resp_t r;
+    mz_reset();
+    mz_add("sec.pn.test.", ZONE_SEC);   // children first: the order of the view must not matter
+    mz_add("ins.pn.test.", ZONE_INS);
+    mz_add("pn.test.", ZONE_PN);
+    mz_add("other.test.", ZONE_OTHER);
+
+    /* signed parent has the DS: DS + RRSIG(DS) from the parent (RFC 4035 §3.1.4.1) */
+    mz_query("sec.pn.test.", 43, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 43) == 1 && gr_count(&r, 1, 46) == 1);
+    CHECK(&r, p9_count_owner(&r, 2, 2, "pn.test.") == 1);   // the parent's apex NS, not the child's
+    mz_query("sec.pn.test.", 43, false, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 43) == 1 && gr_count(&r, 1, 46) == 0);
+
+    /* no DS in the parent: NODATA with the parent's SOA and the parent's NSEC for ins.pn.test. */
+    mz_query("ins.pn.test.", 43, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0);
+    CHECK(&r, p9_count_owner(&r, 2, 6, "pn.test.") == 1 && p9_count_owner(&r, 2, 47, "ins.pn.test.") == 1);
+
+    /* other types at the child apex still come from the child */
+    mz_query("sec.pn.test.", 6, false, &r);
+    CHECK(&r, gr_count(&r, 1, 6) == 1 && p9_count_owner(&r, 1, 6, "sec.pn.test.") == 1);
+
+    /* CNAME from another zone and from inside the child to the child apex: the DS still comes from the parent */
+    mz_query("alias.other.test.", 43, true, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 5) == 1 && p9_count_owner(&r, 1, 43, "sec.pn.test.") == 1);
+    mz_query("x.sec.pn.test.", 43, true, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 5) == 1 && p9_count_owner(&r, 1, 43, "sec.pn.test.") == 1);
+
+    /* zone selection (also used by the RRL counters and the program/forward routing) */
+    assert(find_zone_for_query(&g_mz.view, "sec.pn.test.", 43) == &g_mz.entry[2]);
+    assert(find_zone_for_query(&g_mz.view, "SEC.PN.TEST", 43) == &g_mz.entry[2]);
+    assert(find_zone_for_query(&g_mz.view, "sec.pn.test.", 1) == &g_mz.entry[0]);
+    assert(find_zone_for_query(&g_mz.view, "www.sec.pn.test.", 43) == &g_mz.entry[0]);
+    assert(find_zone_for_query(&g_mz.view, "sec.pn.test.", 0) == &g_mz.entry[0]);    // not a QUERY
+    assert(find_zone_for_query(&g_mz.view, "pn.test.", 43) == &g_mz.entry[2]);       // no parent served
+    g_mz.entry[2].kind = ZONE_KIND_FORWARD;                                            // a forward parent is not used
+    assert(find_zone_for_query(&g_mz.view, "sec.pn.test.", 43) == &g_mz.entry[0]);
+    g_mz.entry[2].kind = ZONE_KIND_PROGRAM;                                            // a program parent is
+    assert(find_zone_for_query(&g_mz.view, "sec.pn.test.", 43) == &g_mz.entry[2]);
+    mz_free();
+
+    /* parent not served: the child answers authoritatively with NODATA from its apex (§3.1.4.1) */
+    mz_reset();
+    mz_add("sec.pn.test.", ZONE_SEC);
+    mz_query("sec.pn.test.", 43, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, -1) == 0 && p9_count_owner(&r, 2, 6, "sec.pn.test.") == 1);
+    mz_free();
+
+    /* a single-label child uses the root zone as its parent */
+    zone_db_entry_t root, tld;
+    memset(&root, 0, sizeof(root));
+    memset(&tld, 0, sizeof(tld));
+    strcpy(root.domain, ".");
+    strcpy(tld.domain, "test.");
+    zone_db_entry_t *ents[2] = { &tld, &root };
+    view_snapshot_t v;
+    memset(&v, 0, sizeof(v));
+    v.entries = ents;
+    v.zone_count = 2;
+    assert(find_zone_for_query(&v, "test.", 43) == &root);
+    assert(find_zone_for_query(&v, "test.", 2) == &tld);
+    assert(find_zone_for_query(&v, ".", 43) == &root);
+    printf("  -> DS comes from the parent when it is served, otherwise from the child apex.\n");
+}
+
 int main(void) {
     printf("=== Starting DNSSEC Negative-Proof Tests ===\n");
     test_dnssec_wire_decode_roundtrip();
@@ -1226,6 +1709,10 @@ int main(void) {
     test_nsec3_hash_escaped_names();
     test_nsec3_rfc5155_appendix_b();
     test_nsec_rfc4035_appendix_b();
+    test_nsec3_params_selection();
+    test_dnssec_rrsig_sections();
+    test_dnssec_rrsig_size_limits();
+    test_ds_from_parent_zone();
     printf("=== All DNSSEC Negative-Proof Tests PASSED ===\n");
     return 0;
 }

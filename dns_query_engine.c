@@ -56,17 +56,12 @@ static inline bool attach_covering_rrsig(zone_arena_t *zone, size_t hash_idx,
                                    0xFFFFFFFF);
 }
 
-static bool zone_uses_nsec3(zone_arena_t *zone, const char *apex_name) {
-  uint32_t apex_hash = calc_fnv1a_str(apex_name);
-  size_t apex_idx = apex_hash & (zone->hash_size - 1);
-  for (int i = zone->hash_table[apex_idx]; i != -1;
-       i = zone->records[i].next_record) {
-    dns_record_t *rec = &zone->records[i];
-    if (rec->type_code == 51 /* NSEC3PARAM */ &&
-        domain_names_match_ci(rec->name, apex_name))
-      return true;
-  }
-  return false;
+/* R-31: NSEC3 parameters chosen for the zone by build_zone_index() (select_nsec3_params(): Flags 0, SHA-1, salt of
+ * 0-255 octets, complete chain first; RFC 5155 §4.1.2, §7.3). NULL when the zone has no usable NSEC3PARAM at
+ * apex_name: the zone then gives NSEC proofs (or none). The salt is decoded once, not per query. */
+static const nsec3_params_t *zone_nsec3(const zone_arena_t *zone, const char *apex_name) {
+  const nsec3_params_t *p = &zone->nsec3_active;
+  return (p->param && domain_names_match_ci(p->param->name, apex_name)) ? p : NULL;
 }
 
 static bool is_non_data_rrtype(uint16_t t) {
@@ -141,161 +136,6 @@ STATIC_TEST bool tinydns_record_currently_valid(const dns_record_t *rec, time_t 
     return true;
 }
 
-STATIC_TEST bool append_glue_records(zone_arena_t *current_zone, const char *target,
-                                     const char *zone_apex, uint8_t *res,
-                                     size_t max_res_len, uint16_t *offset,
-                                     compress_ctx_t *comp_ctx, uint16_t *arcount,
-                                     const char client_loc[2],
-                                     const char *client_ecs_tag,
-                                     const char *client_loc_tag,
-                                     additional_from_auth_t policy,
-                                     view_snapshot_t *view) {
-
-  if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
-
-  // 1. Fast path: check prelinked glue
-  if (current_zone->prelinked_glue && current_zone->prelinked_glue_count > 0) {
-    for (int e = 0; e < current_zone->prelinked_glue_count; e++) {
-      prelinked_glue_entry_t *entry = &current_zone->prelinked_glue[e];
-      if (entry->target_name && domain_names_match_ci(entry->target_name, target)) {
-        time_t tinydns_now = current_zone->is_tinydns_format ? time(NULL) : 0;
-        for (int r = 0; r < entry->record_count; r++) {
-          dns_record_t *rec = entry->records[r];
-          if (!rec) continue;
-          uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-          dns_record_t rec_copy = *rec;
-          rec_copy.ttl_value = eff_ttl;
-          uint16_t saved_offset = *offset;
-          if (serialize_dns_record(res, max_res_len, offset,
-                                   &rec_copy, comp_ctx,
-                                   NULL, 0xFFFFFFFF) < 0) {
-            *offset = saved_offset;
-            return false;
-          } else {
-            (*arcount)++;
-          }
-        }
-        return true;
-      }
-    }
-  }
-
-  // 2. In-zone search (covers in-domain glue and out-of-zone glue in current_zone)
-  bool is_in_domain = domain_name_is_at_or_below(target, zone_apex);
-
-  if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !is_in_domain) {
-    return true;
-  }
-
-  bool in_zone_found = false;
-  if (current_zone->hash_size > 0 && current_zone->hash_table) {
-    time_t tinydns_now = (current_zone && current_zone->is_tinydns_format) ? time(NULL) : 0;
-    uint32_t hashes[2];
-    int h_count = 1;
-    hashes[0] = calc_fnv1a_str(target);
-    if (target[0] != '\0') {
-      hashes[1] = calc_fnv1a_other_root_form(target);
-      h_count = 2;
-    }
-
-    dns_record_t *added_recs[32];
-    int added_count = 0;
-
-    for (int h = 0; h < h_count; h++) {
-      size_t idx = hashes[h] & (current_zone->hash_size - 1);
-      if (h == 1 && idx == (hashes[0] & (current_zone->hash_size - 1))) continue;
-      for (int j = current_zone->hash_table[idx]; j != -1;
-           j = current_zone->records[j].next_record) {
-        dns_record_t *rec = &current_zone->records[j];
-        if ((rec->type_code == 1 || rec->type_code == 28) &&
-            domain_names_match_ci(rec->name, target)) {
-          bool dup = false;
-          for (int a = 0; a < added_count; a++) {
-            if (added_recs[a] == rec) { dup = true; break; }
-          }
-          if (dup) continue;
-          if (added_count < 32) added_recs[added_count++] = rec;
-
-          uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-          dns_record_t rec_copy = *rec;
-          rec_copy.ttl_value = eff_ttl;
-          uint16_t saved_offset = *offset;
-          if (serialize_dns_record(res, max_res_len, offset,
-                                   &rec_copy, comp_ctx,
-                                   NULL, 0xFFFFFFFF) < 0) {
-            *offset = saved_offset;
-            return false;
-          } else {
-            (*arcount)++;
-            in_zone_found = true;
-          }
-        }
-      }
-    }
-  }
-
-  if (in_zone_found) {
-    return true;
-  }
-
-  // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
-  if (policy == ADDITIONAL_AUTH_YES && view) {
-    zone_db_entry_t *sib_entry = find_zone_in_view(view, target);
-    if (sib_entry) {
-      zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
-      if (sib_arena && sib_arena != current_zone && sib_arena->hash_size > 0 && sib_arena->hash_table) {
-        time_t tinydns_now = sib_arena->is_tinydns_format ? time(NULL) : 0;
-        uint32_t hashes[2];
-        int h_count = 1;
-        hashes[0] = calc_fnv1a_str(target);
-        if (target[0] != '\0') {
-          hashes[1] = calc_fnv1a_other_root_form(target);
-          h_count = 2;
-        }
-
-        dns_record_t *added_recs[32];
-        int added_count = 0;
-
-        for (int h = 0; h < h_count; h++) {
-          size_t idx = hashes[h] & (sib_arena->hash_size - 1);
-          if (h == 1 && idx == (hashes[0] & (sib_arena->hash_size - 1))) continue;
-          for (int j = sib_arena->hash_table[idx]; j != -1;
-               j = sib_arena->records[j].next_record) {
-            dns_record_t *rec = &sib_arena->records[j];
-            if ((rec->type_code == 1 || rec->type_code == 28) &&
-                domain_names_match_ci(rec->name, target)) {
-              bool dup = false;
-              for (int a = 0; a < added_count; a++) {
-                if (added_recs[a] == rec) { dup = true; break; }
-              }
-              if (dup) continue;
-              if (added_count < 32) added_recs[added_count++] = rec;
-
-              uint32_t eff_ttl;
-              if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-              dns_record_t rec_copy = *rec;
-              rec_copy.ttl_value = eff_ttl;
-              uint16_t saved_offset = *offset;
-              if (serialize_dns_record(res, max_res_len, offset,
-                                       &rec_copy, comp_ctx,
-                                       NULL, 0xFFFFFFFF) < 0) {
-                *offset = saved_offset;
-                return false;
-              } else {
-                (*arcount)++;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  return true;
-}
-
 STATIC_TEST void collect_additional_rr_glue(dns_record_t *rec,
                                        const char *glue_targets[16],
                                        int *glue_target_count,
@@ -324,6 +164,205 @@ STATIC_TEST void collect_additional_rr_glue(dns_record_t *rec,
   }
 }
 
+/* 応答に載せるレコードの絞り込み条件 (tinydns の location / 時刻、ECS / location タグ)。answer_scope が
+ * NULL でなければ、見たレコードごとに note_ecs_variant() で ECS SCOPE を記録する (Answer セクション用)。 */
+typedef struct {
+  const char *client_loc;     /* char[2] */
+  const char *client_ecs_tag;
+  const char *client_loc_tag;
+  uint8_t zone_scope;
+  uint8_t *answer_scope;
+} rr_filter_t;
+
+/* Additional セクションに載せる名前 (MX/SRV/NS のターゲット) */
+typedef struct {
+  const char *targets[16];
+  int count;
+  bool minimal;
+} glue_list_t;
+
+enum { RRSIG_NONE, RRSIG_REQUIRED, RRSIG_OPTIONAL };
+
+static inline void note_ecs_variant(const dns_record_t *rec, uint16_t qtype, uint8_t zone_scope,
+                                    uint8_t *answer_scope);
+
+/* O-16 / R-03: 1 つの RRset (owner と type が同じレコード全部) を書き、続けてその RRSIG を書く。
+ * RRset のレコードは隣り合わせにし、RRSIG を途中に挟まない (RFC 2181 §5、BIND/Unbound と同じ並び)。
+ * idxs[] は owner が入っているハッシュバケット (ルートの有無の 2 形を見る呼び出し元は 2 つ)、owner_override は
+ * ワイルドカード展開のときの QNAME。
+ * - RRset が入りきらない: RRset を丸ごと取り消して -1 (RFC 2181 §9: RRset の一部だけを返さない。呼び出し側で TC)。
+ * - RRSIG が入りきらない: RRSIG だけ取り消す。rrsig_mode が RRSIG_REQUIRED (Answer / Authority) なら -1
+ *   (RFC 4035 §3.1.1: TC を立てる)、RRSIG_OPTIONAL (Additional) なら RRset を残して成功扱い
+ *   (§3.1.1: "MUST NOT set the TC bit solely because these RRSIG RRs didn't fit")。
+ * 戻り値は書いたレコード数 (有効なレコードが無ければ 0)。 */
+static int emit_rrset(zone_arena_t *zone, const size_t *idxs, int n_idx, const char *owner,
+                      const char *owner_override, uint16_t type, uint16_t qclass, const rr_filter_t *f,
+                      int rrsig_mode, uint8_t *res, size_t max_res_len, uint16_t *offset,
+                      compress_ctx_t *comp_ctx, uint16_t *count, glue_list_t *glue) {
+  uint16_t start_offset = *offset, start_count = *count;
+  time_t now = zone->is_tinydns_format ? time(NULL) : 0;
+  const dns_record_t *first = NULL;
+  size_t first_idx = 0;
+  int written = 0;
+  for (int h = 0; h < n_idx; h++) {
+    if (h > 0 && idxs[h] == idxs[0]) continue;
+    for (int i = zone->hash_table[idxs[h]]; i != -1; i = zone->records[i].next_record) {
+      dns_record_t *rec = &zone->records[i];
+      if (rec->type_code != type || !domain_names_match_ci(rec->name, owner)) continue;
+      uint16_t r_class = rec->class_val ? rec->class_val : 1;
+      if (qclass != 255 && qclass != r_class) continue;
+      if (f->answer_scope) note_ecs_variant(rec, type, f->zone_scope, f->answer_scope);
+      uint32_t eff_ttl;
+      if (!tinydns_record_currently_valid(rec, now, f->client_loc, f->client_ecs_tag, f->client_loc_tag, &eff_ttl))
+        continue;
+      dns_record_t rec_copy = *rec;
+      rec_copy.ttl_value = eff_ttl;
+      if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, owner_override, 0xFFFFFFFF) < 0) {
+        *offset = start_offset;
+        *count = start_count;
+        return -1;
+      }
+      (*count)++;
+      written++;
+      if (!first) {
+        first = rec;
+        first_idx = idxs[h];
+      }
+      if (glue) collect_additional_rr_glue(&rec_copy, glue->targets, &glue->count, glue->minimal);
+    }
+  }
+  if (written == 0 || rrsig_mode == RRSIG_NONE || type == 46) return written;
+  uint16_t rrset_offset = *offset, rrset_count = *count;
+  if (!attach_covering_rrsig(zone, first_idx, first->name, owner_override, type, res, max_res_len, offset,
+                             comp_ctx, count)) {
+    *offset = rrset_offset;
+    *count = rrset_count;
+    if (rrsig_mode == RRSIG_REQUIRED) return -1;
+  }
+  return written;
+}
+
+/* ハッシュ表で name が入るバケット。名前の末尾のルートの '.' の有無で 2 形あるので両方返す (同じなら 1 つ)。 */
+static int name_buckets(const zone_arena_t *zone, const char *name, size_t idxs[2]) {
+  idxs[0] = calc_fnv1a_str(name) & (zone->hash_size - 1);
+  if (name[0] == '\0') return 1;
+  idxs[1] = calc_fnv1a_other_root_form(name) & (zone->hash_size - 1);
+  return idxs[1] == idxs[0] ? 1 : 2;
+}
+
+static bool zone_has_rrset(const zone_arena_t *zone, const char *name, uint16_t type) {
+  size_t idxs[2];
+  int n = name_buckets(zone, name, idxs);
+  for (int h = 0; h < n; h++)
+    for (int i = zone->hash_table[idxs[h]]; i != -1; i = zone->records[i].next_record)
+      if (zone->records[i].type_code == type && domain_names_match_ci(zone->records[i].name, name)) return true;
+  return false;
+}
+
+/* R-03: name はこのゾーンの権威データか。頂点より下の名前 (name 自身を含む) に NS RRset があれば、そこはゾーン
+ * カットで、name はグルー (権威データではなく署名されない。RFC 4035 §2.2、RFC 1034 §4.2.1)。 */
+static bool name_is_authoritative(const zone_arena_t *zone, const char *name, const char *apex) {
+  if (!domain_name_is_at_or_below(name, apex)) return false;
+  for (const char *n = name; n && *n && !domain_names_match_ci(n, apex);) {
+    if (zone_has_rrset(zone, n, 2)) return false;
+    n = strchr_unescaped(n, '.');
+    if (n) n++;
+  }
+  return true;
+}
+
+/* target の A と AAAA を zone から Additional セクションに書く (RRset ごとに、A の後に AAAA)。DO=1 で target が
+ * このゾーンの権威データなら RRSIG も付ける (R-03、RFC 4035 §3.1.1。入りきらなければ RRSIG だけ落とし TC は
+ * 立てない)。戻り値: 書いたレコード数、入りきらなければ -1。 */
+static int append_additional_from_zone(zone_arena_t *zone, const char *apex, const char *target, bool dnssec_ok,
+                                       const rr_filter_t *f, uint8_t *res, size_t max_res_len, uint16_t *offset,
+                                       compress_ctx_t *comp_ctx, uint16_t *arcount) {
+  if (zone->hash_size == 0 || !zone->hash_table) return 0;
+  size_t idxs[2];
+  int n = name_buckets(zone, target, idxs);
+  int mode = (dnssec_ok && name_is_authoritative(zone, target, apex)) ? RRSIG_OPTIONAL : RRSIG_NONE;
+  static const uint16_t types[2] = { 1, 28 };
+  int total = 0;
+  for (int t = 0; t < 2; t++) {
+    int w = emit_rrset(zone, idxs, n, target, NULL, types[t], 255, f, mode, res, max_res_len, offset, comp_ctx,
+                       arcount, NULL);
+    if (w < 0) return -1;
+    total += w;
+  }
+  return total;
+}
+
+STATIC_TEST bool append_glue_records(zone_arena_t *current_zone, const char *target,
+                                     const char *zone_apex, uint8_t *res,
+                                     size_t max_res_len, uint16_t *offset,
+                                     compress_ctx_t *comp_ctx, uint16_t *arcount,
+                                     const char client_loc[2],
+                                     const char *client_ecs_tag,
+                                     const char *client_loc_tag,
+                                     additional_from_auth_t policy,
+                                     view_snapshot_t *view, bool dnssec_ok) {
+
+  if (!current_zone || !target || policy == ADDITIONAL_AUTH_NO) return true;
+
+  // 1. Fast path: check prelinked glue. The copies carry no RRSIGs, so DO=1 takes the lookup below (R-03).
+  if (!dnssec_ok && current_zone->prelinked_glue && current_zone->prelinked_glue_count > 0) {
+    for (int e = 0; e < current_zone->prelinked_glue_count; e++) {
+      prelinked_glue_entry_t *entry = &current_zone->prelinked_glue[e];
+      if (entry->target_name && domain_names_match_ci(entry->target_name, target)) {
+        time_t tinydns_now = current_zone->is_tinydns_format ? time(NULL) : 0;
+        uint16_t start_offset = *offset, start_arcount = *arcount;
+        for (int r = 0; r < entry->record_count; r++) {
+          dns_record_t *rec = entry->records[r];
+          if (!rec) continue;
+          uint32_t eff_ttl;
+          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
+          dns_record_t rec_copy = *rec;
+          rec_copy.ttl_value = eff_ttl;
+          if (serialize_dns_record(res, max_res_len, offset,
+                                   &rec_copy, comp_ctx,
+                                   NULL, 0xFFFFFFFF) < 0) {
+            // RFC 2181 §9: この名前のアドレスは一部だけ残さない
+            *offset = start_offset;
+            *arcount = start_arcount;
+            return false;
+          } else {
+            (*arcount)++;
+          }
+        }
+        return true;
+      }
+    }
+  }
+
+  rr_filter_t f = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+
+  // 2. In-zone search (covers in-domain glue and out-of-zone glue in current_zone)
+  bool is_in_domain = domain_name_is_at_or_below(target, zone_apex);
+
+  if (policy == ADDITIONAL_AUTH_IN_DOMAIN && !is_in_domain) {
+    return true;
+  }
+
+  int w = append_additional_from_zone(current_zone, zone_apex, target, dnssec_ok, &f, res, max_res_len, offset,
+                                      comp_ctx, arcount);
+  if (w < 0) return false;
+  if (w > 0) return true;
+
+  // 3. Fallback: Search sibling authoritative zones in view dynamically if policy == ADDITIONAL_AUTH_YES
+  if (policy == ADDITIONAL_AUTH_YES && view) {
+    zone_db_entry_t *sib_entry = find_zone_in_view(view, target);
+    if (sib_entry) {
+      zone_arena_t *sib_arena = atomic_load_explicit(&sib_entry->rcu.active, memory_order_acquire);
+      if (sib_arena && sib_arena != current_zone &&
+          append_additional_from_zone(sib_arena, sib_entry->domain, target, dnssec_ok, &f, res, max_res_len,
+                                      offset, comp_ctx, arcount) < 0)
+        return false;
+    }
+  }
+
+  return true;
+}
+
 STATIC_TEST bool nsec_covers_name(const dns_record_t *rec, const char *name) {
   if (!rec || rec->type_code != 47 || rec->rdata_count < 1 || !rec->rdata[0] ||
       !rec->name || !name)
@@ -340,6 +379,8 @@ STATIC_TEST bool nsec_covers_name(const dns_record_t *rec, const char *name) {
   }
 }
 
+/* NSEC index built by build_zone_index() (sorted in canonical order, RFC 4034 §6.1). No linear fallback (X-22): a
+ * zone whose index could not be allocated is not loaded, so a zone without the index has no NSEC RRs. */
 STATIC_TEST dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name) {
   if (!zone || !name) return NULL;
   if (zone->nsec_records && zone->nsec_count > 0) {
@@ -366,13 +407,6 @@ STATIC_TEST dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *nam
         return rec;
     }
     return NULL;
-  }
-
-  // Linear scan fallback
-  for (size_t i = 0; i < zone->count; i++) {
-    dns_record_t *rec = &zone->records[i];
-    if (rec->type_code == 47 && nsec_covers_name(rec, name))
-      return rec;
   }
   return NULL;
 }
@@ -434,17 +468,6 @@ STATIC_TEST const char *find_closest_encloser(zone_arena_t *zone, const char *qn
   return zone_apex;
 }
 
-
-STATIC_TEST size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
-    if (!hex || strcmp(hex, "-") == 0 || strcmp(hex, "") == 0) return 0;
-    size_t hlen = strlen(hex);
-    size_t count = 0;
-    for (size_t i = 0; i + 1 < hlen && count < max_out; i += 2) {
-        char byte_str[3] = { hex[i], hex[i+1], '\0' };
-        out[count++] = (uint8_t)strtoul(byte_str, NULL, 16);
-    }
-    return count;
-}
 
 /* RFC 5155 §5 / RFC 4034 §6.2: NSEC3 ハッシュの入力は、完全修飾・非圧縮・英字小文字化した
  * ワイヤ形式のオーナー名。表示形式のエスケープ (\., \DDD) はオクテットに戻す。失敗なら 0。 */
@@ -561,24 +584,38 @@ STATIC_TEST bool find_next_closer_name(const char *qname, const char *encloser, 
     return true;
 }
 
-STATIC_TEST bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
-                                uint8_t *res, size_t max_res_len, uint16_t *offset,
-                                compress_ctx_t *comp_ctx, uint16_t *nscount,
-                                dns_record_t **attached, int *attached_count) {
+/* O-17: 否定の証明に使う NSEC / NSEC3 を、その RRSIG と一緒に Authority に 1 回だけ書く (同じ RR が next closer の
+ * cover とワイルドカードの証明を兼ねることがある。RFC 2181 §5: RRset に重複を入れない)。ttl は配信する TTL
+ * (tinydns の有効期限による値。0xFFFFFFFF ならレコードの TTL)。false = 入りきらない: 呼び出し側は証明を
+ * 取り消して TC を立てる (RFC 4035 §3.1.1、§3.1.3)。 */
+static bool attach_denial_record(zone_arena_t *zone, dns_record_t *rec, uint32_t ttl,
+                                 uint8_t *res, size_t max_res_len, uint16_t *offset,
+                                 compress_ctx_t *comp_ctx, uint16_t *nscount,
+                                 dns_record_t **attached, int *attached_count) {
     if (!rec) return true;
     for (int i = 0; i < *attached_count; i++) {
         if (attached[i] == rec) return true;
     }
     if (*attached_count < 8) attached[(*attached_count)++] = rec;
 
-    if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+    dns_record_t rec_copy = *rec;
+    if (ttl != 0xFFFFFFFF) rec_copy.ttl_value = ttl;
+    if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
         return false;
     }
     (*nscount)++;
     uint32_t c_hash = calc_fnv1a_str(rec->name);
     size_t c_idx = c_hash & (zone->hash_size - 1);
-    return attach_covering_rrsig(zone, c_idx, rec->name, NULL, 50,
+    return attach_covering_rrsig(zone, c_idx, rec->name, NULL, rec->type_code,
                                  res, max_res_len, offset, comp_ctx, nscount);
+}
+
+STATIC_TEST bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
+                                uint8_t *res, size_t max_res_len, uint16_t *offset,
+                                compress_ctx_t *comp_ctx, uint16_t *nscount,
+                                dns_record_t **attached, int *attached_count) {
+    return attach_denial_record(zone, rec, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
+                                attached, attached_count);
 }
 
 STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
@@ -609,123 +646,67 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
     }
     uint32_t hash = (name == qname) ? qname_hash : calc_fnv1a_str(name);
     size_t idx = hash & (current_zone->hash_size - 1);
-    bool delegated = false;
-    for (int i = current_zone->hash_table[idx]; i != -1;
-         i = current_zone->records[i].next_record) {
-      dns_record_t *rec = &current_zone->records[i];
-      if (rec->type_code == 2 &&
-          domain_names_match_ci(rec->name, name)) {
-        uint32_t eff_ttl;
-        if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-        delegated = true;
-        dns_record_t rec_copy = *rec;
-        rec_copy.ttl_value = eff_ttl;
-        if (serialize_dns_record(res, max_res_len, offset,
-                                 &rec_copy, comp_ctx, NULL,
-                                 0xFFFFFFFF) < 0) {
-          res[2] |= 0x02;
-          return true;
-        } else
-          (*nscount)++;
-      }
+    rr_filter_t flt = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+    // 委任の NS は子ゾーンのデータで署名されない (RFC 4035 §2.2)。入りきらなければ NS を丸ごと外して TC。
+    int ns_written = emit_rrset(current_zone, &idx, 1, name, NULL, 2, 255, &flt, RRSIG_NONE, res, max_res_len,
+                                offset, comp_ctx, nscount, NULL);
+    if (ns_written < 0) {
+      res[2] &= ~0x04;
+      res[2] |= 0x02;
+      return true;
     }
-    if (delegated) {
+    if (ns_written > 0) {
       res[2] &= ~0x04; // Clear AA (Referral response MUST NOT have AA set)
 
       // DNSSEC delegation handling (RFC 4035 §3.1.4 / RFC 5155 §7.2.3)
       if (dnssec_ok) {
-        bool has_ds = false;
-        for (int i = current_zone->hash_table[idx]; i != -1;
-             i = current_zone->records[i].next_record) {
-          dns_record_t *rec = &current_zone->records[i];
-          if (rec->type_code == 43 /* DS */ && strcasecmp(rec->name, name) == 0) {
-            uint32_t eff_ttl;
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-            has_ds = true;
-            dns_record_t rec_copy = *rec;
-            rec_copy.ttl_value = eff_ttl;
-            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
-              res[2] |= 0x02;
-              return true;
-            }
-            (*nscount)++;
-          }
+        int ds_written = emit_rrset(current_zone, &idx, 1, name, NULL, 43, 255, &flt, RRSIG_REQUIRED, res,
+                                    max_res_len, offset, comp_ctx, nscount, NULL);
+        if (ds_written < 0) {
+          res[2] |= 0x02;
+          return true;
         }
-        if (has_ds) {
-          if (!attach_covering_rrsig(current_zone, idx, name, NULL, 43,
-                                     res, max_res_len, offset, comp_ctx, nscount)) {
-            res[2] |= 0x02;
-            return true;
-          }
-        } else {
+        if (ds_written == 0) {
           // Insecure Delegation: Prove non-existence of DS (RFC 4035 §3.1.4 / RFC 5155 §7.2.3)
-          if (!zone_uses_nsec3(current_zone, zone_apex)) {
-            bool nsec_added = false;
+          dns_record_t *attached[8];
+          int attached_cnt = 0;
+          const nsec3_params_t *n3 = zone_nsec3(current_zone, zone_apex);
+          if (!n3) {
+            dns_record_t *nsec = NULL;
+            uint32_t nsec_ttl = 0xFFFFFFFF;
             for (int i = current_zone->hash_table[idx]; i != -1;
                  i = current_zone->records[i].next_record) {
               dns_record_t *rec = &current_zone->records[i];
               if (rec->type_code == 47 /* NSEC */ && strcasecmp(rec->name, name) == 0) {
                 if (rec->rdata_count < 1) break;
-                uint32_t eff_ttl;
-                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-                dns_record_t rec_copy = *rec;
-                rec_copy.ttl_value = eff_ttl;
-                if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
-                  res[2] |= 0x02;
-                  return true;
-                }
-                (*nscount)++;
-                if (!attach_covering_rrsig(current_zone, idx, name, NULL, 47,
-                                           res, max_res_len, offset, comp_ctx, nscount)) {
-                  res[2] |= 0x02;
-                  return true;
-                }
-                nsec_added = true;
+                if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &nsec_ttl)) continue;
+                nsec = rec;
                 break;
               }
             }
-            if (!nsec_added) {
-              dns_record_t *cover = find_covering_nsec(current_zone, name);
-              if (cover) {
-                if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
-                  res[2] |= 0x02;
-                  return true;
-                }
-                (*nscount)++;
-                uint32_t c_hash = calc_fnv1a_str(cover->name);
-                size_t c_idx = c_hash & (current_zone->hash_size - 1);
-                if (!attach_covering_rrsig(current_zone, c_idx, cover->name, NULL, 47,
-                                           res, max_res_len, offset, comp_ctx, nscount)) {
-                  res[2] |= 0x02;
-                  return true;
-                }
-              }
+            if (!nsec) {
+              nsec = find_covering_nsec(current_zone, name);
+              nsec_ttl = 0xFFFFFFFF;
+            }
+            if (!attach_denial_record(current_zone, nsec, nsec_ttl, res, max_res_len, offset, comp_ctx, nscount,
+                                      attached, &attached_cnt)) {
+              res[2] |= 0x02;
+              return true;
             }
           } else {
             // NSEC3 Insecure Delegation Proof (RFC 5155 §7.2.3)
-            uint32_t a_hash = calc_fnv1a_str(zone_apex);
-            size_t a_idx = a_hash & (current_zone->hash_size - 1);
-            dns_record_t *param_rec = NULL;
-            for (int i = current_zone->hash_table[a_idx]; i != -1; i = current_zone->records[i].next_record) {
-              if (current_zone->records[i].type_code == 51 &&
-                  domain_names_match_ci(current_zone->records[i].name, zone_apex)) {
-                param_rec = &current_zone->records[i];
-                break;
-              }
-            }
-            if (param_rec && param_rec->rdata_count >= 4) {
-              uint8_t algo = (uint8_t)atoi(param_rec->rdata[0]);
-              uint16_t iterations = (uint16_t)atoi(param_rec->rdata[2]);
-              uint8_t salt[64];
-              size_t salt_len = hex_to_bytes(param_rec->rdata[3], salt, sizeof(salt));
-              dns_record_t *attached_nsec3[8];
-              int attached_nsec3_cnt = 0;
+            {
+              const dns_record_t *param_rec = n3->param;
+              uint8_t algo = n3->algorithm;
+              uint16_t iterations = n3->iterations;
+              const uint8_t *salt = n3->salt;
+              size_t salt_len = n3->salt_len;
 
               char q_hash[64];
               if (compute_nsec3_hash(name, algo, iterations, salt, salt_len, q_hash, sizeof(q_hash))) {
                 dns_record_t *m_rec = find_matching_nsec3(current_zone, param_rec, q_hash, zone_apex);
                 if (m_rec) {
-                  if (!attach_nsec3_record(current_zone, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+                  if (!attach_nsec3_record(current_zone, m_rec, res, max_res_len, offset, comp_ctx, nscount, attached, &attached_cnt)) {
                     res[2] |= 0x02;
                     return true;
                   }
@@ -733,7 +714,7 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
                   // Opt-Out: Next Closer covering NSEC3 and Closest Provable Encloser matching NSEC3 (RFC 5155 §7.2.3)
                   dns_record_t *c_rec = find_covering_nsec3(current_zone, param_rec, q_hash);
                   if (c_rec) {
-                    if (!attach_nsec3_record(current_zone, c_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+                    if (!attach_nsec3_record(current_zone, c_rec, res, max_res_len, offset, comp_ctx, nscount, attached, &attached_cnt)) {
                       res[2] |= 0x02;
                       return true;
                     }
@@ -744,7 +725,7 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
                     if (compute_nsec3_hash(encloser, algo, iterations, salt, salt_len, ce_hash, sizeof(ce_hash))) {
                       dns_record_t *ce_rec = find_matching_nsec3(current_zone, param_rec, ce_hash, zone_apex);
                       if (ce_rec) {
-                        if (!attach_nsec3_record(current_zone, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached_nsec3, &attached_nsec3_cnt)) {
+                        if (!attach_nsec3_record(current_zone, ce_rec, res, max_res_len, offset, comp_ctx, nscount, attached, &attached_cnt)) {
                           res[2] |= 0x02;
                           return true;
                         }
@@ -765,7 +746,8 @@ STATIC_TEST bool find_delegation(zone_arena_t *current_zone, const char *qname,
             current_zone->records[i].rdata_count > 0) {
           const char *target = current_zone->records[i].rdata[0];
           if (!append_glue_records(current_zone, target, zone_apex, res,
-                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, view)) {
+                                   max_res_len, offset, comp_ctx, arcount, client_loc, client_ecs_tag, client_loc_tag, policy, view,
+                                   dnssec_ok)) {
             res[2] |= 0x02;
             return true;
           }
@@ -788,6 +770,14 @@ static inline void note_ecs_variant(const dns_record_t *rec, uint16_t qtype, uin
   if (rec->ecs_subnet_tag == NULL) return;
   if (qtype != 255 && rec->type_code != qtype && rec->type_code != 5 && rec->type_code != 39) return;
   if (zone_scope > *answer_scope) *answer_scope = zone_scope;
+}
+
+/* types[] にまだ無ければ t を加えて false、既にあれば true (同じ名前の RRset を 1 回だけ書くため) */
+static bool rrset_type_seen(uint16_t types[64], int *count, uint16_t t) {
+  for (int i = 0; i < *count; i++)
+    if (types[i] == t) return true;
+  if (*count < 64) types[(*count)++] = t;
+  return false;
 }
 
 static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
@@ -814,9 +804,15 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
   char visited_qnames[16][DNS_NAME_TEXT_SIZE];
   int visited_count = 0;
   strlcpy(visited_qnames[visited_count++], current_qname, sizeof(visited_qnames[0]));
-  const char *glue_targets[16];
-  int glue_target_count = 0;
-  memset(glue_targets, 0, sizeof(glue_targets));
+  glue_list_t glue;
+  memset(&glue, 0, sizeof(glue));
+  glue.minimal = minimal_responses;
+  /* R-04: RRSIG 自体が要求されたとき (QTYPE RRSIG、または MQTYPE に RRSIG) は、その名前の RRSIG が全部その
+   * RRset に入るので、他の RRset には付けない (同じ RRSIG を 2 回書かない。RFC 2181 §5)。 */
+  bool rrsig_requested = false;
+  for (int k = 0; k < num_qtypes; k++)
+    if (qtypes[k] == 46) rrsig_requested = true;
+  bool sign_answers = dnssec_ok && !rrsig_requested;
   bool chain_exhausted = true;
   bool any_cname_wc_expanded = false;
   char first_wc_qname[DNS_NAME_TEXT_SIZE] = {0};
@@ -868,8 +864,9 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     bool found = false, type_matched = false, cname_followed = false, wc_found = false;
     uint32_t hash = current_qname_hash;
     size_t idx = hash & (current_zone->hash_size - 1);
-    uint16_t signed_types[64];
-    int signed_types_count = 0;
+    uint16_t written_types[64];
+    int written_count = 0;
+    rr_filter_t flt = { client_loc, client_ecs_tag, client_loc_tag, zone_scope, answer_scope };
     bool has_any = (qtypes[0] == 255);
     bool skip_synthesis = false;
     if (has_any && minimal_any) {
@@ -979,32 +976,16 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             }
           }
           if (qtypes[0] == 255 || qtypes[0] == rec_type) {
+            // R-04: DO=1 の ANY では RRSIG は各 RRset の後ろに付けるだけで、単独のレコードとしては書かない
+            if (has_any && dnssec_ok && rec_type == 46) continue;
             type_matched = true;
-            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
-                                     NULL, 0xFFFFFFFF) < 0) {
+            // O-16: RRset はタイプごとに 1 回、全レコードを続けて書き、その後ろに RRSIG
+            if (rrset_type_seen(written_types, &written_count, rec_type)) continue;
+            if (emit_rrset(current_zone, &idx, 1, current_qname, NULL, rec_type, qclass, &flt,
+                           (sign_answers && rec_type != 46) ? RRSIG_REQUIRED : RRSIG_NONE, res, max_res_len, offset,
+                           comp_ctx, ancount, &glue) < 0) {
               res[2] |= 0x02;
               return;
-            }
-            (*ancount)++;
-            collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-            if (dnssec_ok && rec_type != 46) {
-              bool already_signed = false;
-              for (int s = 0; s < signed_types_count; s++) {
-                if (signed_types[s] == rec_type) {
-                  already_signed = true;
-                  break;
-                }
-              }
-              if (!already_signed) {
-                if (signed_types_count < (int)(sizeof(signed_types) / sizeof(signed_types[0]))) {
-                  signed_types[signed_types_count++] = rec_type;
-                }
-                if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, rec_type,
-                                          res, max_res_len, offset, comp_ctx, ancount)) {
-                  res[2] |= 0x02;
-                  return;
-                }
-              }
             }
           }
         }
@@ -1114,8 +1095,8 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
           wc_found = false;
           if (current_zone->hash_table[wc_idx] != -1) {
             memcpy(&wc_name[2], parent, parent_len + 1);
-            uint16_t wc_signed_types[64];
-            int wc_signed_types_count = 0;
+            uint16_t wc_written_types[64];
+            int wc_written_count = 0;
             for (int i = current_zone->hash_table[wc_idx]; i != -1;
                  i = current_zone->records[i].next_record) {
               dns_record_t *rec = &current_zone->records[i];
@@ -1181,32 +1162,15 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                   break;
                 } else {
                   if (qtypes[0] == 255 || qtypes[0] == rec_type) {
+                    // R-04 / O-16: exact-name の場合と同じ (RRSIG は各 RRset の後ろ、RRset ごとに 1 回)
+                    if (has_any && dnssec_ok && rec_type == 46) continue;
                     type_matched = true;
-                    if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
-                                             current_qname, 0xFFFFFFFF) < 0) {
+                    if (rrset_type_seen(wc_written_types, &wc_written_count, rec_type)) continue;
+                    if (emit_rrset(current_zone, &wc_idx, 1, wc_name, current_qname, rec_type, qclass, &flt,
+                                   (sign_answers && rec_type != 46) ? RRSIG_REQUIRED : RRSIG_NONE, res, max_res_len,
+                                   offset, comp_ctx, ancount, &glue) < 0) {
                       res[2] |= 0x02;
                       return;
-                    } else
-                      (*ancount)++;
-                    collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-                    if (dnssec_ok && rec_type != 46) {
-                      bool already_signed = false;
-                      for (int s = 0; s < wc_signed_types_count; s++) {
-                        if (wc_signed_types[s] == rec_type) {
-                          already_signed = true;
-                          break;
-                        }
-                      }
-                      if (!already_signed) {
-                        if (wc_signed_types_count < (int)(sizeof(wc_signed_types) / sizeof(wc_signed_types[0]))) {
-                          wc_signed_types[wc_signed_types_count++] = rec_type;
-                        }
-                        if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, rec_type,
-                                                  res, max_res_len, offset, comp_ctx, ancount)) {
-                          res[2] |= 0x02;
-                          return;
-                        }
-                      }
                     }
                   }
                 }
@@ -1253,34 +1217,15 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         uint16_t qtx = qtypes[j];
         bool this_qtx_failed = false;
         bool qtx_matched = false;
-        int saved_glue_target_count = glue_target_count;
+        int saved_glue_count = glue.count;
         resolve_checkpoint_t cp = save_checkpoint(offset, ancount, nscount, arcount);
+        int qtx_mode = (sign_answers && qtx != 46) ? RRSIG_REQUIRED : RRSIG_NONE;
 
-        bool qtx_signed = false;
-        for (int i = current_zone->hash_table[final_idx]; i != -1; i = current_zone->records[i].next_record) {
-          dns_record_t *rec = &current_zone->records[i];
-          uint16_t r_class = rec->class_val ? rec->class_val : 1;
-          bool class_matches = (qclass == 255 || qclass == r_class);
-          if (class_matches && strcasecmp(rec->name, current_qname) == 0 && rec->type_code == qtx) {
-            uint32_t eff_ttl;
-            note_ecs_variant(rec, qtx, zone_scope, answer_scope);
-            if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-            qtx_matched = true;
-            dns_record_t rec_copy = *rec;
-            rec_copy.ttl_value = eff_ttl;
-            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
-              this_qtx_failed = true; break;
-            }
-            (*ancount)++;
-            collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-            if (dnssec_ok && qtx != 46 && !qtx_signed) {
-              if (!attach_covering_rrsig(current_zone, final_idx, current_qname, NULL, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
-                this_qtx_failed = true; break;
-              }
-              qtx_signed = true;
-            }
-          }
-        }
+        // O-16: RRset を続けて書き、その後ろに RRSIG (exact-name と同じヘルパー)
+        int w = emit_rrset(current_zone, &final_idx, 1, current_qname, NULL, qtx, qclass, &flt, qtx_mode, res,
+                           max_res_len, offset, comp_ctx, ancount, &glue);
+        if (w < 0) this_qtx_failed = true;
+        else if (w > 0) qtx_matched = true;
 
         if (!qtx_matched && !this_qtx_failed) {
           const char *parent = current_qname;
@@ -1293,33 +1238,12 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             uint32_t wc_hash = calc_fnv1a_continue(FNV1A_WILDCARD_PREFIX_HASH, parent);
             size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
             wc_found = false;
-            bool wc_qtx_signed = false;
             if (current_zone->hash_table[wc_idx] != -1) {
               memcpy(&wc_name[2], parent, parent_len + 1);
-              for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
-                dns_record_t *rec = &current_zone->records[i];
-                uint16_t r_class = rec->class_val ? rec->class_val : 1;
-                bool class_matches = (qclass == 255 || qclass == r_class);
-                if (class_matches && strcasecmp(rec->name, wc_name) == 0 && rec->type_code == qtx) {
-                  uint32_t eff_ttl;
-                  note_ecs_variant(rec, qtx, zone_scope, answer_scope);
-                  if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-                  wc_found = true; qtx_matched = true;
-                  dns_record_t rec_copy = *rec;
-                  rec_copy.ttl_value = eff_ttl;
-                  if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx, current_qname, 0xFFFFFFFF) < 0) {
-                    this_qtx_failed = true; break;
-                  }
-                  (*ancount)++;
-                  collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-                  if (dnssec_ok && qtx != 46 && !wc_qtx_signed) {
-                    if (!attach_covering_rrsig(current_zone, wc_idx, wc_name, current_qname, qtx, res, max_res_len, offset, comp_ctx, ancount)) {
-                      this_qtx_failed = true; break;
-                    }
-                    wc_qtx_signed = true;
-                  }
-                }
-              }
+              int ww = emit_rrset(current_zone, &wc_idx, 1, wc_name, current_qname, qtx, qclass, &flt, qtx_mode,
+                                  res, max_res_len, offset, comp_ctx, ancount, &glue);
+              if (ww < 0) this_qtx_failed = true;
+              else if (ww > 0) wc_found = qtx_matched = true;
             }
             if (wc_found || this_qtx_failed) break;
 
@@ -1331,7 +1255,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
 
         if (this_qtx_failed) {
           restore_checkpoint(&cp, offset, ancount, nscount, arcount);
-          glue_target_count = saved_glue_target_count;
+          glue.count = saved_glue_count;
           break;
         } else {
           if (!qtx_matched) all_matched = false;
@@ -1444,26 +1368,17 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     int nsec_attached_cnt = 0;
     dns_record_t *attached_nsec3[8];
     int attached_nsec3_cnt = 0;
-    if (dnssec_ok && !zone_uses_nsec3(current_zone, db_entry->domain)) {
+    const nsec3_params_t *n3 = dnssec_ok ? zone_nsec3(current_zone, db_entry->domain) : NULL;
+    if (dnssec_ok && !n3) {
+      /* O-17: attach_denial_record() は同じ NSEC を 2 回書かず、RRSIG が入らないときも失敗を返す */
       if (found && wc_found) {
         // RFC 4035 §3.1.3.3: Wildcard answer proof (QNAME non-existence)
         dns_record_t *cover = find_covering_nsec(current_zone, current_qname);
-        if (cover) {
-          if (nsec_attached_cnt < 8) nsec_attached[nsec_attached_cnt++] = cover;
-          if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx,
-                                   NULL, 0xFFFFFFFF) < 0) {
-            nsec_failed = true;
-          } else {
-            (*nscount)++;
-            uint32_t c_hash = calc_fnv1a_str(cover->name);
-            size_t c_idx = c_hash & (current_zone->hash_size - 1);
-            if (!attach_covering_rrsig(current_zone, c_idx, cover->name, NULL, 47,
-                                       res, max_res_len, offset, comp_ctx, nscount)) {
-              nsec_failed = true;
-            }
-          }
-        }
+        if (!attach_denial_record(current_zone, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
+                                  nsec_attached, &nsec_attached_cnt))
+          nsec_failed = true;
         if (!all_matched && !nsec_failed) {
+          // RFC 4035 §3.1.3.4: wildcard NODATA: the NSEC of the wildcard owner proves the type is missing
           const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag, client_loc_tag);
           if (encloser) {
             char wc_name[DNS_NAME_TEXT_SIZE];
@@ -1473,18 +1388,16 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             for (int i = current_zone->hash_table[wc_idx]; i != -1; i = current_zone->records[i].next_record) {
               dns_record_t *rec = &current_zone->records[i];
               if (rec->type_code == 47 && strcasecmp(rec->name, wc_name) == 0) {
-                if (serialize_dns_record(res, max_res_len, offset, rec, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
+                if (!attach_denial_record(current_zone, rec, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx,
+                                          nscount, nsec_attached, &nsec_attached_cnt))
                   nsec_failed = true;
-                } else {
-                  (*nscount)++;
-                  attach_covering_rrsig(current_zone, wc_idx, wc_name, NULL, 47, res, max_res_len, offset, comp_ctx, nscount);
-                }
                 break;
               }
             }
           }
         }
       } else if (found && !all_matched) {
+        bool nsec_at_name = false;
         for (int i = current_zone->hash_table[idx]; i != -1;
              i = current_zone->records[i].next_record) {
           dns_record_t *rec = &current_zone->records[i];
@@ -1493,55 +1406,25 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             if (rec->rdata_count < 1) break; // 壊れたNSECは無視
             uint32_t eff_ttl;
             if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-            dns_record_t rec_copy = *rec;
-            rec_copy.ttl_value = eff_ttl;
-            if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
-                                     NULL, 0xFFFFFFFF) < 0) {
-              nsec_failed = true; break;
-            }
-            (*nscount)++;
-            if (!attach_covering_rrsig(current_zone, idx, current_qname, NULL, 47,
-                                       res, max_res_len, offset, comp_ctx, nscount)) {
-              nsec_failed = true; break;
-            }
+            nsec_at_name = true;
+            if (!attach_denial_record(current_zone, rec, eff_ttl, res, max_res_len, offset, comp_ctx, nscount,
+                                      nsec_attached, &nsec_attached_cnt))
+              nsec_failed = true;
             break;
           }
         }
-        if (ent_nodata && !nsec_failed && nsec_attached_cnt == 0) {
+        if (ent_nodata && !nsec_failed && !nsec_at_name) {
           // An ENT owns no NSEC; the NSEC that covers it (its next name is a descendant) proves it exists.
           dns_record_t *cover = find_covering_nsec(current_zone, current_qname);
-          if (cover) {
-            if (nsec_attached_cnt < 8) nsec_attached[nsec_attached_cnt++] = cover;
-            if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
-              nsec_failed = true;
-            } else {
-              (*nscount)++;
-              uint32_t c_hash = calc_fnv1a_str(cover->name);
-              size_t c_idx = c_hash & (current_zone->hash_size - 1);
-              if (!attach_covering_rrsig(current_zone, c_idx, cover->name, NULL, 47,
-                                         res, max_res_len, offset, comp_ctx, nscount)) {
-                nsec_failed = true;
-              }
-            }
-          }
+          if (!attach_denial_record(current_zone, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
+                                    nsec_attached, &nsec_attached_cnt))
+            nsec_failed = true;
         }
       } else if (!found) {
         dns_record_t *cover = find_covering_nsec(current_zone, current_qname);
-        if (cover) {
-          if (nsec_attached_cnt < 8) nsec_attached[nsec_attached_cnt++] = cover;
-          if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx,
-                                   NULL, 0xFFFFFFFF) < 0) {
-            nsec_failed = true;
-          } else {
-            (*nscount)++;
-            uint32_t c_hash = calc_fnv1a_str(cover->name);
-            size_t c_idx = c_hash & (current_zone->hash_size - 1);
-            if (!attach_covering_rrsig(current_zone, c_idx, cover->name, NULL, 47,
-                                       res, max_res_len, offset, comp_ctx, nscount)) {
-              nsec_failed = true;
-            }
-          }
-        }
+        if (!attach_denial_record(current_zone, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
+                                  nsec_attached, &nsec_attached_cnt))
+          nsec_failed = true;
 
         if (!nsec_failed) {
           const char *encloser = find_closest_encloser(current_zone, current_qname, db_entry->domain, client_loc, client_ecs_tag, client_loc_tag);
@@ -1551,44 +1434,21 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             if (written > 0 && (size_t)written < sizeof(wc_name)) {
               if (!cover || !nsec_covers_name(cover, wc_name)) {
                 dns_record_t *wc_cover = find_covering_nsec(current_zone, wc_name);
-                if (wc_cover && wc_cover != cover) {
-                  if (serialize_dns_record(res, max_res_len, offset, wc_cover, comp_ctx,
-                                           NULL, 0xFFFFFFFF) < 0) {
-                    nsec_failed = true;
-                  } else {
-                    (*nscount)++;
-                    uint32_t wc_hash = calc_fnv1a_str(wc_cover->name);
-                    size_t wc_idx = wc_hash & (current_zone->hash_size - 1);
-                    if (!attach_covering_rrsig(current_zone, wc_idx, wc_cover->name, NULL, 47,
-                                               res, max_res_len, offset, comp_ctx, nscount)) {
-                      nsec_failed = true;
-                    }
-                  }
-                }
+                if (!attach_denial_record(current_zone, wc_cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx,
+                                          nscount, nsec_attached, &nsec_attached_cnt))
+                  nsec_failed = true;
               }
             }
           }
         }
       }
-    } else if (dnssec_ok && zone_uses_nsec3(current_zone, db_entry->domain)) {
-      dns_record_t *param_rec = NULL;
-      if (!apex_hash_computed) {
-        apex_hash = calc_fnv1a_str(db_entry->domain);
-        apex_idx = apex_hash & (current_zone->hash_size - 1);
-        apex_hash_computed = true;
-      }
-      for (int i = current_zone->hash_table[apex_idx]; i != -1; i = current_zone->records[i].next_record) {
-        if (current_zone->records[i].type_code == 51 &&
-            domain_names_match_ci(current_zone->records[i].name, db_entry->domain)) {
-          param_rec = &current_zone->records[i];
-          break;
-        }
-      }
-      if (param_rec && param_rec->rdata_count >= 4) {
-        uint8_t algo = (uint8_t)atoi(param_rec->rdata[0]);
-        uint16_t iterations = (uint16_t)atoi(param_rec->rdata[2]);
-        uint8_t salt[64];
-        size_t salt_len = hex_to_bytes(param_rec->rdata[3], salt, sizeof(salt));
+    } else if (n3) {
+      {
+        const dns_record_t *param_rec = n3->param;
+        uint8_t algo = n3->algorithm;
+        uint16_t iterations = n3->iterations;
+        const uint8_t *salt = n3->salt;
+        size_t salt_len = n3->salt_len;
 
         if (found && wc_found) {
           // RFC 5155 §7.2.5 & §8.5: Wildcard answer proof (Closest Encloser & Next Closer covering)
@@ -1686,44 +1546,19 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     if (dnssec_ok && any_cname_wc_expanded && !nsec_failed) {
       zone_arena_t *wc_zone = first_wc_zone ? first_wc_zone : current_zone;
       const char *wc_apex = first_wc_apex[0] ? first_wc_apex : db_entry->domain;
-      if (!zone_uses_nsec3(wc_zone, wc_apex)) {
+      const nsec3_params_t *wc_n3 = zone_nsec3(wc_zone, wc_apex);
+      if (!wc_n3) {
         dns_record_t *cover = find_covering_nsec(wc_zone, first_wc_qname);
-        if (cover) {
-          bool already_attached = false;
-          for (int a = 0; a < nsec_attached_cnt; a++) {
-            if (nsec_attached[a] == cover) { already_attached = true; break; }
-          }
-          if (!already_attached) {
-            if (nsec_attached_cnt < 8) nsec_attached[nsec_attached_cnt++] = cover;
-            if (serialize_dns_record(res, max_res_len, offset, cover, comp_ctx, NULL, 0xFFFFFFFF) < 0) {
-              nsec_failed = true;
-            } else {
-              (*nscount)++;
-              uint32_t c_hash = calc_fnv1a_str(cover->name);
-              size_t c_idx = c_hash & (wc_zone->hash_size - 1);
-              if (!attach_covering_rrsig(wc_zone, c_idx, cover->name, NULL, 47,
-                                         res, max_res_len, offset, comp_ctx, nscount)) {
-                nsec_failed = true;
-              }
-            }
-          }
-        }
+        if (!attach_denial_record(wc_zone, cover, 0xFFFFFFFF, res, max_res_len, offset, comp_ctx, nscount,
+                                  nsec_attached, &nsec_attached_cnt))
+          nsec_failed = true;
       } else {
-        uint32_t a_hash = calc_fnv1a_str(wc_apex);
-        size_t a_idx = a_hash & (wc_zone->hash_size - 1);
-        dns_record_t *p_rec = NULL;
-        for (int i = wc_zone->hash_table[a_idx]; i != -1; i = wc_zone->records[i].next_record) {
-          if (wc_zone->records[i].type_code == 51 &&
-              domain_names_match_ci(wc_zone->records[i].name, wc_apex)) {
-            p_rec = &wc_zone->records[i];
-            break;
-          }
-        }
-        if (p_rec && p_rec->rdata_count >= 4) {
-          uint8_t algo = (uint8_t)atoi(p_rec->rdata[0]);
-          uint16_t iterations = (uint16_t)atoi(p_rec->rdata[2]);
-          uint8_t salt[64];
-          size_t salt_len = hex_to_bytes(p_rec->rdata[3], salt, sizeof(salt));
+        {
+          const dns_record_t *p_rec = wc_n3->param;
+          uint8_t algo = wc_n3->algorithm;
+          uint16_t iterations = wc_n3->iterations;
+          const uint8_t *salt = wc_n3->salt;
+          size_t salt_len = wc_n3->salt_len;
 
           const char *encloser = find_closest_encloser(wc_zone, first_wc_qname, wc_apex, client_loc, client_ecs_tag, client_loc_tag);
           if (!encloser) encloser = wc_apex;
@@ -1754,47 +1589,35 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     }
     
     if (nsec_failed) {
+      /* 決定事項 2: 否定の証明 (NSEC/NSEC3 と RRSIG) は Authority の署名付き RRset で、省けば署名の無い応答に
+       * 見える。入りきらなければ証明を外して TC を立てる (RFC 4035 §3.1.1、§3.1.3)。 */
       restore_checkpoint(&nsec_cp, offset, ancount, nscount, arcount);
+      res[2] |= 0x02;
+      return;
     }
     
     // ==== フェーズ9: Authority NS/Glue付加 ====
     bool needs_ns = false;
     if (qtypes[0] != 2 && qtypes[0] != 255) { needs_ns = true; }
     if (type_matched && !minimal_responses && needs_ns) {
-      if (!apex_hash_computed) {
-        apex_hash = calc_fnv1a_str(db_entry->domain);
-        apex_idx = apex_hash & (current_zone->hash_size - 1);
-        apex_hash_computed = true;
-      }
-      for (int i = current_zone->hash_table[apex_idx]; i != -1;
-           i = current_zone->records[i].next_record) {
-        dns_record_t *rec = &current_zone->records[i];
-        if (rec->type_code == 2 &&
-            domain_names_match_ci(rec->name, db_entry->domain)) {
-          uint32_t eff_ttl;
-          if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
-          dns_record_t rec_copy = *rec;
-          rec_copy.ttl_value = eff_ttl;
-          if (serialize_dns_record(res, max_res_len, offset, &rec_copy, comp_ctx,
-                                   NULL, 0xFFFFFFFF) < 0) {
-            res[2] |= 0x02;
-            return;
-          } else {
-            (*nscount)++;
-            if (rec->rdata_count > 0) {
-              collect_additional_rr_glue(&rec_copy, glue_targets, &glue_target_count, minimal_responses);
-            }
-          }
-        }
+      /* R-03: 頂点の NS は署名された RRset。DO=1 なら RRSIG(NS) も付け、入りきらなければ TC (RFC 4035 §3.1.1) */
+      size_t apex_idxs[2];
+      int n_apex = name_buckets(current_zone, db_entry->domain, apex_idxs);
+      rr_filter_t ns_flt = { client_loc, client_ecs_tag, client_loc_tag, 0, NULL };
+      if (emit_rrset(current_zone, apex_idxs, n_apex, db_entry->domain, NULL, 2, 255, &ns_flt,
+                     dnssec_ok ? RRSIG_REQUIRED : RRSIG_NONE, res, max_res_len, offset, comp_ctx, nscount,
+                     &glue) < 0) {
+        res[2] |= 0x02;
+        return;
       }
     }
 
     // ==== フェーズ10: Additional Glue付加 ====
-    if (!minimal_responses && glue_target_count > 0 && policy != ADDITIONAL_AUTH_NO) {
-      for (int k = 0; k < glue_target_count; k++) {
-        if (!append_glue_records(current_zone, glue_targets[k], db_entry->domain,
+    if (!minimal_responses && glue.count > 0 && policy != ADDITIONAL_AUTH_NO) {
+      for (int k = 0; k < glue.count; k++) {
+        if (!append_glue_records(current_zone, glue.targets[k], db_entry->domain,
                                  res, max_res_len, offset, comp_ctx, arcount,
-                                 client_loc, client_ecs_tag, client_loc_tag, policy, view)) {
+                                 client_loc, client_ecs_tag, client_loc_tag, policy, view, dnssec_ok)) {
           break; // バッファ上限に達した場合は以後のグルー追加を中断 (RFC 2181 §9)
         }
       }

@@ -1903,6 +1903,10 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
     nsec_arena.records[1] = nsec2;
     nsec_arena.count = 2;
 
+    // X-22: no linear scan without the NSEC index (build_zone_index() fails the load when it cannot allocate it)
+    assert(find_covering_nsec(&nsec_arena, "b.example.") == NULL);
+    assert(build_zone_index(&nsec_arena, false) == 0 && nsec_arena.nsec_count == 2);
+
     dns_record_t *cov = find_covering_nsec(&nsec_arena, "b.example.");
     assert(cov != NULL && strcmp(cov->name, "a.example.") == 0);
 
@@ -2030,7 +2034,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     uint16_t dummy_off = 0, dummy_ar = 0;
     compress_ctx_t comp;
     compress_ctx_init(&comp);
-    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL) == true);
+    assert(append_glue_records(NULL, "target.com.", "apex.com.", dummy_res, sizeof(dummy_res), &dummy_off, &comp, &dummy_ar, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false) == true);
 
     // 5. record_observatory_response
     zone_db_entry_t obs_entry;
@@ -7425,7 +7429,7 @@ static void test_query_engine_feature_case_191(void) {
     assert(hex_to_bytes("-", out, sizeof(out)) == 0);
     assert(hex_to_bytes("", out, sizeof(out)) == 0);
     assert(hex_to_bytes(NULL, out, sizeof(out)) == 0);
-    assert(hex_to_bytes("deadbeef", out, 2) == 2);
+    assert(hex_to_bytes("deadbeef", out, 2) == (size_t)-1); // R-31: longer than max_out fails (was truncated to 2)
 }
 
 static void test_query_engine_feature_case_192(void) {

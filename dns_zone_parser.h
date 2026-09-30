@@ -98,6 +98,18 @@ typedef struct {
   size_t count;
 } nsec3_chain_t;
 
+/* R-31: the NSEC3 parameters the zone's denial proofs use, chosen once by build_zone_index() (RFC 5155 §4.1.2:
+ * Flags 0 only; §7.3: one of several NSEC3PARAM RRs; §3.1.5: salt of 0-255 octets). param == NULL: no usable
+ * NSEC3PARAM at the apex, i.e. the zone does not use NSEC3 for answers. */
+typedef struct {
+  const dns_record_t *param;  /* the chosen NSEC3PARAM RR (its owner is the apex) */
+  const nsec3_chain_t *chain; /* its chain in the NSEC3 index, NULL if the zone has no NSEC3 RR for it */
+  uint8_t algorithm;
+  uint16_t iterations;
+  uint8_t salt_len;
+  uint8_t salt[255];
+} nsec3_params_t;
+
 typedef struct zone_arena_s {
   dns_record_t *records;
   size_t count;
@@ -117,6 +129,7 @@ typedef struct zone_arena_s {
   nsec3_chain_t *nsec3_chains;         /* built by build_zone_index(); entries point into nsec3_entries */
   size_t nsec3_chain_count;
   nsec3_index_entry_t *nsec3_entries;
+  nsec3_params_t nsec3_active;         /* built by build_zone_index() */
   char **sorted_unique_names;
   size_t sorted_unique_count;
   _Atomic int reader_count;
@@ -154,6 +167,9 @@ void zone_arena_free_sorted_indexes(zone_arena_t *arena);
 bool nsec3_rdata_params(const dns_record_t *rec, uint8_t *algorithm, uint16_t *iterations, const char **salt);
 /* The chain of `arena` with the parameters of the NSEC3PARAM (or NSEC3) record `param`, or NULL. */
 const nsec3_chain_t *zone_find_nsec3_chain(const zone_arena_t *arena, const dns_record_t *param);
+/* Hex text to octets without truncation: 0 for "", "-" or NULL; (size_t)-1 for an odd number of digits, a character
+ * that is not a hex digit, or more than max_out octets. */
+size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 /* RFC 1034 s4.2: drop records whose owner is not at or below apex (call before build_zone_index). */
 size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
                                    void (*report)(const dns_record_t *rec, void *ud), void *ud);

@@ -1685,6 +1685,7 @@ void zone_arena_free_sorted_indexes(zone_arena_t *arena) {
   arena->nsec3_chain_count = 0;
   free(arena->nsec3_entries);
   arena->nsec3_entries = NULL;
+  memset(&arena->nsec3_active, 0, sizeof(arena->nsec3_active));
   free(arena->sorted_unique_names);
   arena->sorted_unique_names = NULL;
   arena->sorted_unique_count = 0;
@@ -1797,6 +1798,80 @@ const nsec3_chain_t *zone_find_nsec3_chain(const zone_arena_t *arena, const dns_
     if (cmp_nsec3_params(ch->algorithm, ch->iterations, ch->salt, alg, it, salt) == 0) return ch;
   }
   return NULL;
+}
+
+size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
+  if (!hex || strcmp(hex, "-") == 0) return 0;
+  size_t hlen = strlen(hex);
+  if (hlen % 2 != 0 || hlen / 2 > max_out) return (size_t)-1;
+  for (size_t i = 0; i < hlen; i += 2) {
+    int hi = hex_char_to_val(hex[i]), lo = hex_char_to_val(hex[i + 1]);
+    if (hi < 0 || lo < 0) return (size_t)-1;
+    out[i / 2] = (uint8_t)((hi << 4) | lo);
+  }
+  return hlen / 2;
+}
+
+/* RFC 5155 §3.1.7: every Next Hashed Owner Name is the owner hash of the following RR in hash order, and the last RR
+ * points back to the first, so a complete chain covers every possible hash. */
+static bool nsec3_chain_complete(const nsec3_chain_t *ch) {
+  for (size_t i = 0; i < ch->count; i++) {
+    const nsec3_index_entry_t *next = &ch->entries[(i + 1) % ch->count];
+    const char *nh = ch->entries[i].rec->rdata[4];
+    if (strlen(nh) != next->hash_len || strncasecmp(nh, next->hash, next->hash_len) != 0) return false;
+  }
+  return ch->count > 0;
+}
+
+/* R-31: choose the NSEC3 parameters of the zone once, when the index is built (not per query). The apex is the owner
+ * of the SOA. Usable NSEC3PARAM RRs at the apex: Flags 0 (RFC 5155 §4.1.2 "NSEC3PARAM RRs with a Flags field value
+ * other than zero MUST be ignored"), hash algorithm 1 (SHA-1, the only one defined, §11; §7.4 for unknown ones), and
+ * a salt of 0-255 octets in hex (§3.1.5, §3.2). With several of them the server "must choose one" (§7.3): the first
+ * in record order whose chain is complete, else the first whose chain is indexed, else the first usable one. */
+static void select_nsec3_params(zone_arena_t *arena) {
+  const char *apex = NULL;
+  for (size_t i = 0; i < arena->count && !apex; i++)
+    if (arena->records[i].name && arena->records[i].type_code == 6) apex = arena->records[i].name;
+  if (!apex) return;
+
+  size_t seen = 0, usable = 0;
+  int best_rank = 0; // 3 = complete chain, 2 = indexed chain, 1 = usable without NSEC3 RRs
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *rec = &arena->records[i];
+    if (rec->type_code != 51 || !rec->name || !domain_names_match_ci(rec->name, apex)) continue;
+    seen++;
+    uint8_t alg, flags;
+    uint16_t it;
+    const char *salt_text;
+    nsec3_params_t p;
+    memset(&p, 0, sizeof(p));
+    if (!nsec3_rdata_params(rec, &alg, &it, &salt_text) || !parse_u8(rec->rdata[1], &flags) || flags != 0 ||
+        alg != 1)
+      continue;
+    size_t salt_len = hex_to_bytes(salt_text, p.salt, sizeof(p.salt));
+    if (salt_len == (size_t)-1) continue;
+    usable++;
+    p.param = rec;
+    p.chain = zone_find_nsec3_chain(arena, rec);
+    p.algorithm = alg;
+    p.iterations = it;
+    p.salt_len = (uint8_t)salt_len;
+    int rank = !p.chain ? 1 : (nsec3_chain_complete(p.chain) ? 3 : 2);
+    if (rank > best_rank) {
+      best_rank = rank;
+      arena->nsec3_active = p;
+    }
+  }
+  if (seen == 0) return;
+  const nsec3_params_t *a = &arena->nsec3_active;
+  if (!a->param) {
+    syslog(LOG_NOTICE, "[Zone] %s: none of the %zu NSEC3PARAM RRs is usable (Flags 0, algorithm 1, salt of at most "
+           "255 octets; RFC 5155 s4.1.2); NSEC3 is not used for denial of existence", apex, seen);
+  } else if (usable > 1 || best_rank < 3) {
+    syslog(LOG_NOTICE, "[Zone] %s: using NSEC3PARAM 1 0 %u %s (%zu usable of %zu; chain %s)", apex, a->iterations,
+           a->param->rdata[3], usable, seen,
+           best_rank == 3 ? "complete" : (best_rank == 2 ? "INCOMPLETE" : "MISSING"));
+  }
 }
 
 /* [T9] RFC 2181 s5.2: same owner+type RRset TTLs normalized to minimum.
@@ -1931,7 +2006,10 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
       arena->nsec_count = idx;
       qsort(arena->nsec_records, arena->nsec_count, sizeof(dns_record_t *), cmp_canonical_nsec_ptr);
     } else {
-      arena->nsec_count = 0;
+      /* X-22: without the index every NSEC lookup would scan the whole zone (the random-subdomain cost of R-34);
+       * fail like the NSEC3 index instead (the callers treat it as a load / transfer / UPDATE failure). */
+      syslog(LOG_ERR, "[Zone] build_zone_index: OOM during NSEC index allocation");
+      return -1;
     }
   }
 
@@ -1939,6 +2017,7 @@ int build_zone_index(zone_arena_t *arena, bool harmonize_ttls) {
     syslog(LOG_ERR, "[Zone] build_zone_index: OOM during NSEC3 index allocation");
     return -1;
   }
+  select_nsec3_params(arena);
 
   if (arena->count > 0) {
     char **tmp_names = malloc(sizeof(char *) * arena->count);

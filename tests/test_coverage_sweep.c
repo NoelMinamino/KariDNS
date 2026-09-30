@@ -1032,9 +1032,9 @@ static void test_engine_helper_edges(void) {
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
     assert(find_delegation(&z, "a.", 0, "a.", res, sizeof(res), &off, &cc, &cnt, &cnt, false,
                            "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false) == false);
-    assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL));
-    assert(append_glue_records(&z, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL));
-    assert(append_glue_records(&z, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL));
+    assert(append_glue_records(NULL, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(&z, NULL, "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_YES, NULL, false));
+    assert(append_glue_records(&z, "a.", "a.", res, sizeof(res), &off, &cc, &cnt, "\0\0", NULL, NULL, ADDITIONAL_AUTH_NO, NULL, false));
 
     /* nsec_covers_name with malformed records */
     dns_record_t r; memset(&r, 0, sizeof(r));
@@ -1079,8 +1079,10 @@ static void test_engine_helper_edges(void) {
     assert(hex_to_bytes(NULL, hb, 4) == 0);
     assert(hex_to_bytes("-", hb, 4) == 0);
     assert(hex_to_bytes("", hb, 4) == 0);
-    assert(hex_to_bytes("0102030405", hb, 4) == 4);
-    assert(hex_to_bytes("abc", hb, 4) == 1);
+    assert(hex_to_bytes("01020304", hb, 4) == 4 && hb[3] == 4);
+    assert(hex_to_bytes("0102030405", hb, 4) == (size_t)-1); // R-31: too long for the buffer: fail, no truncation
+    assert(hex_to_bytes("abc", hb, 4) == (size_t)-1);  // R-31: odd number of digits
+    assert(hex_to_bytes("0g", hb, 4) == (size_t)-1);   // R-31: not a hex digit
     zone_db_entry_t e; memset(&e, 0, sizeof(e));
     for (int rc = 0; rc < 6; rc++) { record_observatory_response(&e, (uint8_t)rc, 0); record_observatory_response(&e, (uint8_t)rc, 1); }
     record_observatory_response(NULL, 0, 0);

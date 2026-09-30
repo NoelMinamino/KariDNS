@@ -1719,12 +1719,13 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
 }
 
 
-// Type Bitmap (NSEC/NSEC3/CSYNC用) を構築するヘルパー
+// Type Bitmap (NSEC/NSEC3/CSYNC用) を構築するヘルパー。型の一覧は rdata[] の一部なので MAX_RDATA 個以下で、
+// 作業領域はスタックに置く (X-23: 問い合わせの応答を組み立てる経路なので malloc しない。CLAUDE.md Rule 1)。
 static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset, char *const *types, int type_count) {
     if (type_count == 0) return 0;
-    
-    uint16_t *codes = malloc(sizeof(uint16_t) * type_count);
-    if (!codes) return -1;
+    if (type_count < 0 || type_count > MAX_RDATA) return -1;
+
+    uint16_t codes[MAX_RDATA];
     for (int i = 0; i < type_count; i++) {
         codes[i] = get_type_code(types[i]);
     }
@@ -1752,7 +1753,7 @@ static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset
         if (window != current_window) {
             if (current_window != -1) {
                 size_t map_len = (max_bit_in_window / 8) + 1;
-                if (*offset + 2 + map_len > max_res_len) { free(codes); return -1; }
+                if (*offset + 2 + map_len > max_res_len) return -1;
                 res[(*offset)++] = current_window;
                 res[(*offset)++] = (uint8_t)map_len;
                 memcpy(&res[*offset], bitmap, map_len);
@@ -1769,14 +1770,13 @@ static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset
     
     if (current_window != -1) {
         size_t map_len = (max_bit_in_window / 8) + 1;
-        if (*offset + 2 + map_len > max_res_len) { free(codes); return -1; }
+        if (*offset + 2 + map_len > max_res_len) return -1;
         res[(*offset)++] = current_window;
         res[(*offset)++] = (uint8_t)map_len;
         memcpy(&res[*offset], bitmap, map_len);
         *offset += map_len;
     }
     
-    free(codes);
     return 0;
 }
 

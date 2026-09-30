@@ -276,7 +276,8 @@ register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE o
 # 3. DNSSEC & Message Digests
 register_test "dnssec" "sh" "tests/run_zonemd_val_test.sh" "RFC 8976 ZONEMD verification against test vectors"
 register_test "dnssec" "sh" "tests/run_dnssec_negative_soa_rrsig_test.sh" "RFC 4035 Negative response SOA covering RRSIG"
-register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4034 DS delegation record referral in NS responses"
+register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4035 3.1.4.1 DS at a delegation point: parent answers, referrals, DS for a hosted child apex from the parent (R-32)"
+register_test "dnssec" "sh" "tests/run_dnssec_answer_sections_test.sh" "DNSSEC answers on signed zones: RRSIGs in Authority/Additional, grouped RRsets, NSEC3PARAM choice and 255-octet salt, DS from the parent, delv validation (R-03, R-04, O-16, O-17, R-31, R-32; SKIP without dnssec-signzone)"
 
 # 4. Dynamic Update (RFC 2136)
 register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling"
