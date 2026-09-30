@@ -1628,11 +1628,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       (strcasecmp(zone->type, "slave") == 0 || strcasecmp(zone->type, "secondary") == 0)) {
     syslog(LOG_WARNING,
            "[Config] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
-           "Dynamic Update requests to secondary zones will be rejected at runtime with NOTAUTH (RFC 2136)",
+           "Dynamic Update requests to secondary zones are refused at runtime (REFUSED; updates are not forwarded to the primary)",
            zone->domain);
     fprintf(stderr,
            "[WARNING] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
-           "Dynamic Update requests to secondary zones will be rejected at runtime with NOTAUTH (RFC 2136)\n",
+           "Dynamic Update requests to secondary zones are refused at runtime (REFUSED; updates are not forwarded to the primary)\n",
            zone->domain);
   }
   *zone_out = zone;

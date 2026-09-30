@@ -3524,18 +3524,132 @@ static bool name_is_in_zone(const char *name, const char *zone_name) {
     return domain_name_is_at_or_below(name, zone_name);
 }
 
+/* RFC 2136 §3.4.1.2, RFC 6895 §3.1: TYPE 0、OPT (RFC 6891 §6.1.1) と 128-255 (QTYPE とメタタイプ:
+ * ANY, AXFR, IXFR, MAILA, MAILB, TSIG, TKEY) はゾーンに置けない。未知の型は RFC 3597 に従って受け付ける。*/
+static bool update_type_is_meta(uint16_t type) {
+    return type == 0 || type == 41 || (type >= 128 && type <= 255);
+}
+
+/* RFC 4035 §2.5: CNAME と同じ名前に置けるのは RRSIG と NSEC、および KEY (RFC 3007) だけ。*/
+static bool type_may_coexist_with_cname(uint16_t type) {
+    return type == 46 || type == 47 || type == 25;
+}
+
+static int update_bucket_head(const zone_arena_t *arena, const char *name) {
+    return arena->hash_table[calc_fnv1a_str(name) & (arena->hash_size - 1)];
+}
+
+static bool update_rec_is_at(const dns_record_t *rec, const char *name) {
+    return rec->name && strcasecmp(rec->name, name) == 0; // name == NULL は削除済み (tombstone)
+}
+
+/* 同じ名前に、type_code == type (type 255 は全型) のレコードがあるか。*/
+static bool update_zone_has(const zone_arena_t *arena, const char *name, uint16_t type) {
+    for (int k = update_bucket_head(arena, name); k != -1; k = arena->records[k].next_record) {
+        const dns_record_t *r = &arena->records[k];
+        if (update_rec_is_at(r, name) && (type == 255 || r->type_code == type)) return true;
+    }
+    return false;
+}
+
+static int update_find_rr(const zone_arena_t *arena, const dns_record_t *rr) {
+    for (int k = update_bucket_head(arena, rr->name); k != -1; k = arena->records[k].next_record) {
+        if (arena->records[k].name && compare_records(&arena->records[k], rr, true)) return k;
+    }
+    return -1;
+}
+
+/* WKS の ADDRESS と PROTOCOL。ゾーンファイル由来はテキスト、UPDATE 由来は wire (generic_data)。*/
+static bool update_wks_key(const dns_record_t *rec, uint8_t addr[4], uint8_t *proto) {
+    if (rec->generic_data && rec->generic_len >= 5) {
+        memcpy(addr, rec->generic_data, 4);
+        *proto = rec->generic_data[4];
+        return true;
+    }
+    if (rec->rdata_count < 2 || !rec->rdata[0] || !rec->rdata[1]) return false;
+    if (inet_pton(AF_INET, rec->rdata[0], addr) != 1) return false;
+    if (strcasecmp(rec->rdata[1], "TCP") == 0) *proto = 6;
+    else if (strcasecmp(rec->rdata[1], "UDP") == 0) *proto = 17;
+    else if (!parse_u8(rec->rdata[1], proto)) return false;
+    return true;
+}
+
+static uint32_t update_soa_serial(const dns_record_t *soa) {
+    return (soa->rdata_count >= 3 && soa->rdata[2]) ? (uint32_t)strtoul(soa->rdata[2], NULL, 10) : 0;
+}
+
+/* RFC 2136 §3.4.2.7: Update RR が置き換えるゾーンの RR か。CNAME, SOA と DNAME (RFC 6672 §5.2) は
+ * 1 つしか置けないので RRset を置き換える。WKS は ADDRESS と PROTOCOL が同じなら置き換える。
+ * それ以外は RDATA が同じ RR だけ。*/
+static bool update_replaces(const dns_record_t *zrr, const dns_record_t *rr) {
+    uint16_t t = rr->type_code;
+    if (t == 5 || t == 6 || t == 39) return true;
+    if (t == 11) {
+        uint8_t za[4], ra[4], zp, rp;
+        if (update_wks_key(zrr, za, &zp) && update_wks_key(rr, ra, &rp) &&
+            memcmp(za, ra, 4) == 0 && zp == rp) {
+            return true;
+        }
+    }
+    return compare_records(zrr, rr, true);
+}
+
+static int update_append_record(zone_arena_t *standby, const dns_record_t *rec) {
+    if (standby->count >= standby->records_cap) {
+        size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
+        if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return -1;
+        dns_record_t *new_arr = realloc(standby->records, new_cap * sizeof(dns_record_t));
+        if (!new_arr) return -1;
+        standby->records = new_arr;
+        standby->records_cap = new_cap;
+    }
+    dns_record_t *new_rec = &standby->records[standby->count];
+    *new_rec = *rec;
+    dns_record_preparse_cache(standby, new_rec);
+
+    // In-flight chain linking
+    size_t hidx = calc_fnv1a_str(new_rec->name) & (standby->hash_size - 1);
+    new_rec->next_record = standby->hash_table[hidx];
+    standby->hash_table[hidx] = (int)standby->count;
+    standby->count++;
+    return 0;
+}
+
+/* RR の固定部 (NAME の後の TYPE, CLASS, TTL, RDLENGTH) を読み、offset を RR の次へ進める。*/
+static int update_read_rr_header(const uint8_t *req, size_t req_len, size_t *offset, zone_arena_t *arena,
+                                 char **name, uint16_t *type, uint16_t *class_val, uint32_t *ttl,
+                                 uint16_t *rdlen) {
+    if (expand_wire_name(req, req_len, *offset, offset, arena, name) != 0) return -1;
+    if (*offset + 10 > req_len) return -1;
+    const uint8_t *p = req + *offset;
+    *type = (uint16_t)((p[0] << 8) | p[1]);
+    *class_val = (uint16_t)((p[2] << 8) | p[3]);
+    *ttl = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
+    *rdlen = (uint16_t)((p[8] << 8) | p[9]);
+    *offset += 10 + (size_t)*rdlen;
+    return *offset > req_len ? -1 : 0;
+}
+
+/* RFC 2136 §3.2.5 と §3.4.2.7 の疑似コードどおりに処理する。戻り値は RCODE。
+ * standby は呼び出し側が active から複製したもので、0 以外を返したときは呼び出し側が捨てる
+ * (§3.4.2.1, §3.7: UPDATE 全体を適用するか、何も適用しないか)。*/
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
-                             int *out_prcount, int *out_upcount) {
+                             update_result_t *out) {
+    update_result_t result;
+    memset(&result, 0, sizeof(result));
+    if (out) *out = result;
     if (req_len < DNS_HEADER_SIZE) return 1; // FORMERR
     uint16_t zocount = (req[4] << 8) | req[5];
     uint16_t prcount = (req[6] << 8) | req[7];
     uint16_t upcount = (req[8] << 8) | req[9];
 
-    if (out_prcount) *out_prcount = prcount;
-    if (out_upcount) *out_upcount = upcount;
+    result.prcount = prcount;
+    result.upcount = upcount;
+    if (out) *out = result;
 
+    // §3.1.1: Zone Section は 1 つで ZTYPE は SOA (FORMERR)。ZNAME/ZCLASS が自分のゾーンでなければ NOTAUTH。
     if (zocount != 1) return 1; // FORMERR
 
     // Prevent DoS: Hard limit on number of updates per message
@@ -3544,7 +3658,6 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     }
 
     size_t offset = DNS_HEADER_SIZE;
-    // Skip Zone Section
     char *zname;
     if (expand_wire_name(req, req_len, offset, &offset, standby, &zname) != 0) return 1;
     if (offset + 4 > req_len) return 1;
@@ -3553,210 +3666,177 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     offset += 4;
 
     if (ztype != 6) return 1; // SOA
-    if (!domain_names_match_ci(zname, zone_name)) return 9; // NOTAUTH
+    // ゾーンはすべて IN。ANY/NONE を ZCLASS にすると RR のクラスの区別ができない。
+    if (zone_class != 1 || !domain_names_match_ci(zname, zone_name)) return 9; // NOTAUTH
 
-    // Prerequisite Section (3.2)
     if (build_zone_index(standby, true) != 0) return 2; // SERVFAIL on OOM
 
+    // Prerequisite Section (§3.2.5)
+    uint32_t temp_offsets[1000]; // CLASS が ZCLASS の前提条件 (値に依存する RRset の存在, §3.2.3) の位置
+    int temp_count = 0;
     for (int i = 0; i < prcount; i++) {
         size_t rec_start_offset = offset;
         char *name;
-        if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
-        if (offset + 10 > req_len) return 1;
-        /* [RFC 2136 §3.2.5] PrerequisiteセクションのNAMEがゾーン外の場合はNOTZONE(10)を返却 */
+        uint16_t type, class_val, rdlen;
+        uint32_t ttl;
+        if (update_read_rr_header(req, req_len, &offset, standby, &name, &type, &class_val, &ttl, &rdlen) != 0) return 1;
+        if (ttl != 0) return 1; // FORMERR (§3.2.1-§3.2.3)
         if (!name_is_in_zone(name, zone_name)) return 10; // NOTZONE
-        uint16_t type = (req[offset] << 8) | req[offset + 1];
-        uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
-        uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];
-        offset += 10 + rdlen;
-        if (offset > req_len) return 1;
-
-        bool name_exists = false;
-        bool rrset_exists = false;
-        uint32_t h = calc_fnv1a_str(name);
-        size_t hidx = h & (standby->hash_size - 1);
-        for (int k = standby->hash_table[hidx]; k != -1; k = standby->records[k].next_record) {
-            if (!standby->records[k].name) continue; // Skip tombstones
-            if (strcasecmp(standby->records[k].name, name) == 0) {
-                name_exists = true;
-                if (type == 255 || standby->records[k].type_code == type) {
-                    rrset_exists = true;
-                }
-            }
-        }
 
         if (class_val == 255) { // ANY
             if (rdlen != 0) return 1;
-            if (type == 255) {
-                if (!name_exists) return 3; // NXDOMAIN
-            } else {
-                if (!rrset_exists) return 8; // NXRRSET
-            }
+            if (!update_zone_has(standby, name, type)) return type == 255 ? 3 : 8; // NXDOMAIN / NXRRSET
         } else if (class_val == 254) { // NONE
             if (rdlen != 0) return 1;
-            if (type == 255) {
-                if (name_exists) return 6; // YXDOMAIN
-            } else {
-                if (rrset_exists) return 7; // YXRRSET
-            }
+            if (update_zone_has(standby, name, type)) return type == 255 ? 6 : 7; // YXDOMAIN / YXRRSET
+        } else if (class_val == zone_class) {
+            temp_offsets[temp_count++] = (uint32_t)rec_start_offset;
         } else {
-            // zone class
-            if (class_val != zone_class) return 1; // FORMERR
-            if (!rrset_exists) return 8; // NXRRSET
-            size_t temp_offset = rec_start_offset; 
-            dns_record_t parsed_rec;
-            memset(&parsed_rec, 0, sizeof(parsed_rec));
-            uint16_t dummy_type;
-            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
-            
-            bool found_exact = false;
-            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
-            size_t phidx = ph & (standby->hash_size - 1);
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue; // Skip tombstones
-                if (compare_records(&standby->records[k], &parsed_rec, true)) {
-                    found_exact = true;
-                    break;
-                }
+            return 1; // FORMERR
+        }
+    }
+    dns_record_t *temp = NULL;
+    if (temp_count > 0) {
+        temp = arena_alloc(standby, (size_t)temp_count * sizeof(dns_record_t));
+        if (!temp) return 2; // SERVFAIL
+    }
+    for (int i = 0; i < temp_count; i++) {
+        size_t temp_offset = temp_offsets[i];
+        memset(&temp[i], 0, sizeof(temp[i]));
+        uint16_t dummy_type;
+        if (parse_resource_record(req, req_len, &temp_offset, standby, &temp[i], &dummy_type) != 0) return 1;
+    }
+    /* §3.2.3: <NAME, TYPE> ごとに RRset を作り、ゾーンの RRset と集合として等しいか
+     * (同じメンバーで、多くも少なくもない) を比べる。TTL は比べない。*/
+    for (int i = 0; i < temp_count; i++) {
+        const dns_record_t *first = &temp[i];
+        bool seen = false;
+        for (int j = 0; j < i && !seen; j++) {
+            seen = temp[j].type_code == first->type_code && strcasecmp(temp[j].name, first->name) == 0;
+        }
+        if (seen) continue;
+        for (int j = i; j < temp_count; j++) {
+            if (temp[j].type_code != first->type_code || strcasecmp(temp[j].name, first->name) != 0) continue;
+            if (update_find_rr(standby, &temp[j]) < 0) return 8; // NXRRSET
+        }
+        for (int k = update_bucket_head(standby, first->name); k != -1; k = standby->records[k].next_record) {
+            const dns_record_t *zrr = &standby->records[k];
+            if (!update_rec_is_at(zrr, first->name) || zrr->type_code != first->type_code) continue;
+            bool member = false;
+            for (int j = i; j < temp_count && !member; j++) {
+                member = compare_records(zrr, &temp[j], true);
             }
-            if (!found_exact) return 8; // NXRRSET
+            if (!member) return 8; // NXRRSET
         }
     }
 
-    // Update Section (3.4)
+    // Update Section prescan (§3.4.1.3): エラーはゾーンを変える前にすべて検出する。
+    size_t update_offset = offset;
+    for (int i = 0; i < upcount; i++) {
+        char *name;
+        uint16_t type, class_val, rdlen;
+        uint32_t ttl;
+        if (update_read_rr_header(req, req_len, &offset, standby, &name, &type, &class_val, &ttl, &rdlen) != 0) return 1;
+        if (!name_is_in_zone(name, zone_name)) return 10; // NOTZONE
+        if (class_val == zone_class) {
+            if (update_type_is_meta(type)) return 1;
+        } else if (class_val == 255) { // ANY
+            if (ttl != 0 || rdlen != 0 || (type != 255 && update_type_is_meta(type))) return 1;
+        } else if (class_val == 254) { // NONE
+            if (ttl != 0 || update_type_is_meta(type)) return 1;
+        } else {
+            return 1; // FORMERR
+        }
+    }
+
+    // Update Section (§3.4.2.7)。規則に合わない Update RR はエラーにせず無視する (next [rr])。
+    offset = update_offset;
     for (int i = 0; i < upcount; i++) {
         size_t rec_start_offset = offset;
         char *name;
-        if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
-        if (offset + 10 > req_len) return 1;
-        uint16_t type = (req[offset] << 8) | req[offset + 1];
-        uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
-        uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];
-        offset += 10 + rdlen;
-        if (offset > req_len) return 1;
+        uint16_t type, class_val, rdlen;
+        uint32_t ttl;
+        if (update_read_rr_header(req, req_len, &offset, standby, &name, &type, &class_val, &ttl, &rdlen) != 0) return 1;
+        bool at_apex = domain_names_match_ci(name, zone_name);
 
-        if (class_val == 255) { // ANY (Delete RRset/Domain)
-            if (rdlen != 0) return 1;
-            if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
-            if (type == 2 && domain_names_match_ci(name, zone_name)) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
-            /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 (ADD分岐と同一のチェックを削除系にも追加) */
-            if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
-
-            uint32_t h = calc_fnv1a_str(name);
-            size_t hidx = h & (standby->hash_size - 1);
-            for (int k = standby->hash_table[hidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue; // Skip tombstones
-                if (strcasecmp(standby->records[k].name, name) == 0) {
-                    if (type == 255 || standby->records[k].type_code == type) {
-                        if (standby->records[k].type_code == 6) { continue; } // protect SOA
-                        if (standby->records[k].type_code == 2 && domain_names_match_ci(name, zone_name)) { continue; } // protect apex NS
-                        standby->records[k].name = NULL; // Tombstone delete
-                    }
-                }
+        if (class_val == 255) { // ANY: RRset (TYPE ANY なら名前の全 RRset) を削除
+            // §3.4.2.3: 頂点の SOA と NS は削除しない
+            if (at_apex && (type == 6 || type == 2)) continue;
+            for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
+                dns_record_t *zrr = &standby->records[k];
+                if (!update_rec_is_at(zrr, name) || (type != 255 && zrr->type_code != type)) continue;
+                if (at_apex && (zrr->type_code == 6 || zrr->type_code == 2)) continue;
+                zrr->name = NULL; // Tombstone delete
+                result.changed = true;
             }
-        } else if (class_val == 254) { // NONE (Delete exact RR)
-            if (type == 6) return 5; // REFUSED
-            /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 */
-            if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
-            
-            size_t temp_offset = rec_start_offset;
-            dns_record_t parsed_rec;
-            memset(&parsed_rec, 0, sizeof(parsed_rec));
-            uint16_t dummy_type;
-            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
-            
-            if (parsed_rec.type_code == 2 && domain_names_match_ci(parsed_rec.name, zone_name)) {
-                // RFC 2136 §3.4.2.4: At least one NS RR must remain at the zone apex
-                int active_apex_ns = 0;
-                for (size_t r = 0; r < standby->count; r++) {
-                    if (standby->records[r].name &&
-                        standby->records[r].type_code == 2 &&
-                        domain_names_match_ci(standby->records[r].name, zone_name)) {
-                        active_apex_ns++;
-                    }
-                }
-                if (active_apex_ns <= 1) {
-                    return 5; // REFUSED (cannot delete last NS at apex)
-                }
-            }
-
-            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
-            size_t phidx = ph & (standby->hash_size - 1);
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue; // Skip tombstones
-                if (compare_records(&standby->records[k], &parsed_rec, true)) {
-                    standby->records[k].name = NULL; // Tombstone delete
-                }
-            }
-        } else { // ADD
-            // (a) メタタイプの拒否 (RFC 2136 §3.4.2.2)
-            if (type == 0 || type == 41 || (type >= 128 && type <= 254) || type == 249 || type == 250 ||
-                type == 251 || type == 252 || type == 255) {
-                return 1; // FORMERR
-            }
-            // (b) クラスの一致確認 (RFC 2136 §3.4.1.3)
-            if (class_val != zone_class) {
-                return 1; // FORMERR
-            }
-            // (c) owner name のゾーン内包含チェック
-            if (!name_is_in_zone(name, zone_name)) {
-                return 5; // REFUSED
-            }
-
-            size_t temp_offset = rec_start_offset;
-            dns_record_t parsed_rec;
-            memset(&parsed_rec, 0, sizeof(parsed_rec));
-            uint16_t dummy_type;
-            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
-
-            bool found_exact = false;
-            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
-            size_t phidx = ph & (standby->hash_size - 1);
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue;
-                if (compare_records(&standby->records[k], &parsed_rec, true)) {
-                    found_exact = true;
-                    break;
-                }
-            }
-            if (found_exact) continue; // no-op
-
-            // CNAME/DNAME exclusivity check (RFC 2136 §3.4.2.3, RFC 1034 §3.6.2, RFC 6672 §2.3)
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue;
-                if (strcasecmp(standby->records[k].name, parsed_rec.name) == 0) {
-                    if (parsed_rec.type_code == 5 /* CNAME */ || parsed_rec.type_code == 39 /* DNAME */) {
-                        if (standby->records[k].type_code != 46 && standby->records[k].type_code != 47) {
-                            return 5; // REFUSED: CNAME/DNAME cannot coexist with other types
-                        }
-                    } else if (parsed_rec.type_code != 46 && parsed_rec.type_code != 47) {
-                        if (standby->records[k].type_code == 5 /* CNAME */ || standby->records[k].type_code == 39 /* DNAME */) {
-                            return 5; // REFUSED: Cannot add record to name with existing CNAME/DNAME
-                        }
-                    }
-                }
-            }
-
-            if (standby->count >= standby->records_cap) {
-                size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
-                if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return 2;
-                dns_record_t *new_arr = realloc(standby->records, new_cap * sizeof(dns_record_t));
-                if (!new_arr) return 2;
-                standby->records = new_arr;
-                standby->records_cap = new_cap;
-            }
-            dns_record_t *new_rec = &standby->records[standby->count];
-            *new_rec = parsed_rec;
-            dns_record_preparse_cache(standby, new_rec);
-
-            // In-flight chain linking
-            uint32_t h = calc_fnv1a_str(new_rec->name);
-            size_t hidx = h & (standby->hash_size - 1);
-            new_rec->next_record = standby->hash_table[hidx];
-            standby->hash_table[hidx] = (int)standby->count;
-
-            standby->count++;
+            continue;
         }
+
+        size_t temp_offset = rec_start_offset;
+        dns_record_t rr;
+        memset(&rr, 0, sizeof(rr));
+        uint16_t dummy_type;
+        if (parse_resource_record(req, req_len, &temp_offset, standby, &rr, &dummy_type) != 0) return 1;
+
+        if (class_val == 254) { // NONE: RDATA が同じ RR を削除
+            // §3.4.2.4: SOA は削除しない。頂点に残った最後の NS も削除しない。
+            if (type == 6) continue;
+            if (type == 2 && at_apex) {
+                int apex_ns = 0;
+                for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
+                    if (update_rec_is_at(&standby->records[k], name) && standby->records[k].type_code == 2) apex_ns++;
+                }
+                if (apex_ns <= 1) continue;
+            }
+            for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
+                if (standby->records[k].name && compare_records(&standby->records[k], &rr, true)) {
+                    standby->records[k].name = NULL; // Tombstone delete
+                    result.changed = true;
+                }
+            }
+            continue;
+        }
+
+        // ZCLASS: 追加 (§3.4.2.2)
+        // CNAME と他のデータは共存しない (RFC 1034 §3.6.2, RFC 4035 §2.5)。衝突する Update RR は無視する。
+        bool conflict = false;
+        for (int k = update_bucket_head(standby, name); k != -1 && !conflict; k = standby->records[k].next_record) {
+            const dns_record_t *zrr = &standby->records[k];
+            if (!update_rec_is_at(zrr, name)) continue;
+            if (type == 5) {
+                conflict = zrr->type_code != 5 && !type_may_coexist_with_cname(zrr->type_code);
+            } else if (!type_may_coexist_with_cname(type)) {
+                conflict = zrr->type_code == 5;
+            }
+        }
+        if (conflict) continue;
+
+        // SOA は頂点の SOA より新しいシリアル (RFC 1982) のときだけ置き換える。それ以外は無視 (§3.6)。
+        if (type == 6) {
+            int soa_idx = -1;
+            for (int k = update_bucket_head(standby, name); k != -1 && soa_idx < 0; k = standby->records[k].next_record) {
+                if (update_rec_is_at(&standby->records[k], name) && standby->records[k].type_code == 6) soa_idx = k;
+            }
+            if (soa_idx < 0 || !serial_is_newer(update_soa_serial(&rr), update_soa_serial(&standby->records[soa_idx]))) continue;
+        }
+
+        bool replaced = false;
+        for (int k = update_bucket_head(standby, name); k != -1 && !replaced; k = standby->records[k].next_record) {
+            dns_record_t *zrr = &standby->records[k];
+            if (!update_rec_is_at(zrr, name) || zrr->type_code != type || !update_replaces(zrr, &rr)) continue;
+            replaced = true;
+            if (compare_records(zrr, &rr, false)) break; // 同じ RR (TTL も同じ): 変化なし
+            int next = zrr->next_record;
+            *zrr = rr;
+            zrr->next_record = next;
+            dns_record_preparse_cache(standby, zrr);
+            result.changed = true;
+            if (type == 6) result.soa_replaced = true;
+        }
+        if (replaced) continue;
+
+        if (update_append_record(standby, &rr) != 0) return 2; // SERVFAIL (§3.4.2.1)
+        result.changed = true;
     }
 
     // Compaction pass: remove tombstoned records
@@ -3771,6 +3851,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     }
     standby->count = write_idx;
 
+    if (out) *out = result;
     return 0; // NOERROR
 }
 

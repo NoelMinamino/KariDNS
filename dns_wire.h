@@ -392,10 +392,18 @@ bool dns_find_opt_rr(const uint8_t *msg, size_t msg_len, size_t *opt_off, size_t
 // 質問の直後へ移して残す (RFC 6891 §7)。TC ビットは呼び出し側で立てる。戻り値は新しい長さ。
 size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end);
 
+// UPDATE (RFC 2136) の処理結果。changed が false なら standby は active と同じ内容。
+typedef struct {
+    int prcount;
+    int upcount;
+    bool changed;       // ゾーンのデータが変わった
+    bool soa_replaced;  // SOA が新しいシリアルの SOA で置き換わった (§3.4.2.2, §3.6)
+} update_result_t;
+
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
-                             int *out_prcount, int *out_upcount);
+                             update_result_t *out);
 
 // ============================================================================
 // Protocol Buffers Encoder (Minimal, Dependency-Free)

@@ -278,7 +278,7 @@ register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4034 DS deleg
 
 # 4. Dynamic Update (RFC 2136)
 register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling"
-register_test "update" "sh" "tests/run_update_slave_notauth_test.sh" "RFC 2136 §3.8 Slave rejection with NOTAUTH"
+register_test "update" "sh" "tests/run_update_secondary_refused_test.sh" "RFC 2136 §3.1 UPDATE to a secondary refused, NOTAUTH for unserved zones"
 register_test "update" "sh" "tests/run_ttl_harmonization_update_test.sh" "TTL harmonization on dynamic updates"
 
 # 5. EDNS / Cookies / ECS / Multi-QTYPE

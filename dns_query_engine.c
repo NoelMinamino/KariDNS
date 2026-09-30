@@ -3003,13 +3003,25 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
       return DNS_HEADER_SIZE;
     }
+    /* RFC 2136 §3.1.1, §3.1.2: ZTYPE が SOA でなければ FORMERR。ZNAME と ZCLASS がこのサーバー
+     * (クライアントのビュー) のゾーンでなければ NOTAUTH。どちらも権限の確認 (§3.3) より前に行う。
+     * ZOCOUNT (QDCOUNT) != 1 は上で FORMERR にしている。上位のゾーンに一致しただけのときも NOTAUTH。*/
+    int zone_rcode = 0;
+    size_t zone_end = get_question_end_offset(req, req_len, 1);
+    uint16_t zclass = (zone_end >= DNS_HEADER_SIZE + 5)
+                          ? (uint16_t)((req[zone_end - 2] << 8) | req[zone_end - 1]) : 0;
+    if (qtype != 6) {
+      zone_rcode = 1; // FORMERR
+    } else if (!db_entry || !view || zclass != 1 || !domain_names_match_ci(db_entry->domain, current_qname)) {
+      zone_rcode = 9; // NOTAUTH
+    }
     bool has_tsig = packet_has_tsig(req, req_len);
     bool auth = false;
     bool zone_is_master = false;
     tsig_key_t *matched_key = NULL;
     tsig_key_t *attempted_key = NULL;
     int tsig_error_code = 0;
-    if (db_entry && view) {
+    if (zone_rcode == 0) {
       zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, db_entry->domain);
       if (zcfg) {
         if (zcfg->type && (strcasecmp(zcfg->type, "master") == 0 || strcasecmp(zcfg->type, "primary") == 0)) {
@@ -3076,11 +3088,15 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     res[2] &= ~0x01; // RD=0 per RFC 2136 §2.2 / §3.8
     
     int rcode = 5; // REFUSED
-    if (auth && zone_is_master) {
+    if (zone_rcode != 0) {
+      rcode = zone_rcode;
+    } else if (!zone_is_master && !(has_tsig && tsig_error_code != 0)) {
+      /* RFC 2136 §3.1.2 はセカンダリに UPDATE をプライマリへ転送させる (§6)。KariDNS は転送しない
+       * ので、方針による拒否 (RFC 1035 §4.1.1 REFUSED) を返す。allow-update を満たしていても同じ。
+       * TSIG の検証エラーは下の NOTAUTH (RFC 8945 §5.2) のまま。*/
+      add_ede(&edns, send_ede, 18, "Updates are not accepted for a secondary zone");
+    } else if (auth && zone_is_master) {
       rcode = handle_dynamic_update(req, req_len, db_entry, client_ip, matched_key ? matched_key->name : "<none>");
-    } else if (auth && !zone_is_master) {
-      rcode = 9; // NOTAUTH (RFC 2136 §3.8: Server is not the primary for the zone)
-      add_ede(&edns, send_ede, 20, "This server is not the primary for the zone");
     } else {
       if (attempted_key || has_tsig) {
         rcode = 9; // NOTAUTH

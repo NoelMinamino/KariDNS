@@ -3998,8 +3998,55 @@ static void test_dynamic_update_prereq_rrset_exists_value_independent(void) {
     printf("  -> prereq RRset exists value-independent passed.\n");
 }
 
+/* RFC 2136 §3.2.3: prerequisites "RRset exists (value dependent)" on www.vdep.example. (A 192.0.2.1,
+ * 192.0.2.2), optionally followed by the update "add www A 192.0.2.<add_last>". Returns the RCODE; *www_count
+ * is the number of www A records afterwards. */
+static int vdep_update_run(const uint8_t *prereq_lasts, int n, uint8_t add_last, update_result_t *ur, int *www_count) {
+    zone_arena_t arena;
+    memset(&arena, 0, sizeof(arena));
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "vdep.example.", .is_standalone_mode = true, .err_out = &err };
+    const char ztext[] = "$ORIGIN vdep.example.\n$TTL 300\n@ IN SOA ns1 host 1 7200 3600 1209600 300\n@ IN NS ns1\n"
+                         "ns1 IN A 192.0.2.53\nwww IN A 192.0.2.1\nwww IN A 192.0.2.2\n";
+    char *zbuf = arena_strdup(&arena, ztext); // the arena keeps pointers into the text
+    assert(parse_zone_fast(zbuf, strlen(zbuf), &arena, &ctx) >= 0);
+    assert(build_zone_index(&arena, true) == 0);
+
+    uint8_t ureq[512];
+    memset(ureq, 0, sizeof(ureq));
+    ureq[2] = 0x28; // UPDATE
+    ureq[5] = 1;    // ZOCOUNT
+    ureq[7] = (uint8_t)n; // PRCOUNT
+    ureq[9] = add_last ? 1 : 0; // UPCOUNT
+    size_t off = 12;
+    off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "vdep.example.");
+    ureq[off++] = 0; ureq[off++] = 6; ureq[off++] = 0; ureq[off++] = 1;
+    for (int i = 0; i <= n; i++) {
+        if (i == n && !add_last) break;
+        off += (size_t)write_uncompressed_name(ureq, off, sizeof(ureq), "www.vdep.example.");
+        uint32_t ttl = (i == n) ? 300 : 0; // prerequisite TTL must be 0 (§3.2.3)
+        uint8_t rr[14] = { 0, 1, 0, 1, (uint8_t)(ttl >> 24), (uint8_t)(ttl >> 16), (uint8_t)(ttl >> 8), (uint8_t)ttl,
+                           0, 4, 192, 0, 2, (i == n) ? add_last : prereq_lasts[i] };
+        memcpy(ureq + off, rr, sizeof(rr));
+        off += sizeof(rr);
+    }
+    int rcode = process_update_sections(ureq, off, "vdep.example.", &arena, ur);
+    *www_count = 0;
+    for (size_t i = 0; i < arena.count; i++) {
+        if (arena.records[i].name && arena.records[i].type_code == 1 &&
+            strcasecmp(arena.records[i].name, "www.vdep.example.") == 0) (*www_count)++;
+    }
+    zone_arena_destroy(&arena);
+    return rcode;
+}
+
 static void test_dynamic_update_prereq_rrset_exists_value_dependent(void) {
     printf("[TEST] Query Engine: Dynamic Update prerequisite RRset exists (value-dependent)...\n");
+    update_result_t ur;
+    int cnt;
+    const uint8_t exact[2] = { 1, 2 };
+    assert(vdep_update_run(exact, 2, 0, &ur, &cnt) == 0 && !ur.changed && cnt == 2);
     printf("  -> prereq RRset exists value-dependent passed.\n");
 }
 
@@ -4522,15 +4569,11 @@ static void test_query_engine_dynamic_update_tsig_invalid_key_code18(void) {
     printf("  -> Dynamic update Invalid Key passed.\n");
 }
 
-static void test_query_engine_dynamic_update_not_primary_code20(void) {
-    printf("[TEST] Query Engine: Dynamic update secondary zone error (code 20)...\n");
-    uint16_t ede_code = 20;
-    assert(ede_code == 20);
-    printf("  -> Dynamic update secondary zone passed.\n");
-}
+/* UPDATE to a secondary zone (REFUSED, EDE 18) is tested through process_dns_query_impl() in
+ * test_dynamic_update_engine.c test_update_dispatch_zone_section(). */
 
-static void test_query_engine_dynamic_update_no_matching_zone_refused(void) {
-    printf("[TEST] Query Engine: Dynamic update non-existent zone REFUSED...\n");
+static void test_query_engine_dynamic_update_no_matching_zone_notauth(void) {
+    printf("[TEST] Query Engine: Dynamic update non-existent zone NOTAUTH (RFC 2136 §3.1.2)...\n");
     zone_db_snapshot_t snap; memset(&snap, 0, sizeof(snap));
     uint8_t qpkt[256]; size_t qlen = 0;
     build_dns_query(qpkt, &qlen, 0x5501, "unknown.zone.", 6 /* SOA */, false);
@@ -4540,8 +4583,8 @@ static void test_query_engine_dynamic_update_no_matching_zone_refused(void) {
     uint8_t rpkt[512];
     int rlen = process_dns_query(qpkt, qlen, rpkt, sizeof(rpkt), "unknown.zone.", 6, "127.0.0.1", &comp_ctx, false, &rrl, &snap);
     assert(rlen >= 12);
-    assert((rpkt[3] & 0x0F) == 5); // REFUSED
-    printf("  -> Dynamic update REFUSED passed.\n");
+    assert((rpkt[3] & 0x0F) == 9); // NOTAUTH
+    printf("  -> Dynamic update NOTAUTH passed.\n");
 }
 
 static void test_query_engine_dynamic_update_prereq_type_any_no_data(void) {
@@ -4814,14 +4857,22 @@ static void test_query_engine_multiview_acl_exact_match_fallback(void) {
 
 static void test_query_engine_update_prereq_value_dependent_match(void) {
     printf("[TEST] Query Engine: dynamic update prereq RRset exists (value-dependent)...\n");
-    uint16_t prereq_class = 1; // IN
-    assert(prereq_class == 1);
+    update_result_t ur;
+    int cnt;
+    const uint8_t reversed[2] = { 2, 1 };
+    assert(vdep_update_run(reversed, 2, 3, &ur, &cnt) == 0 && ur.changed && cnt == 3);
 }
 
 static void test_query_engine_update_prereq_value_dependent_mismatch(void) {
     printf("[TEST] Query Engine: dynamic update prereq RRset exists value mismatch NXRRSET...\n");
-    uint8_t nxrrset_rcode = 8; // NXRRSET
-    assert(nxrrset_rcode == 8);
+    update_result_t ur;
+    int cnt;
+    const uint8_t subset[1] = { 1 };      // R-11 d: a subset of the zone RRset is not equal
+    const uint8_t superset[3] = { 1, 2, 3 };
+    const uint8_t other[2] = { 1, 9 };
+    assert(vdep_update_run(subset, 1, 3, &ur, &cnt) == 8 && cnt == 2);
+    assert(vdep_update_run(superset, 3, 3, &ur, &cnt) == 8 && cnt == 2);
+    assert(vdep_update_run(other, 2, 3, &ur, &cnt) == 8 && cnt == 2);
 }
 
 static void test_query_engine_update_prereq_name_in_use_cname(void) {
@@ -4838,8 +4889,9 @@ static void test_query_engine_update_prereq_name_not_in_use_yxdomain(void) {
 
 static void test_query_engine_update_action_add_duplicate_silent_ignore(void) {
     printf("[TEST] Query Engine: dynamic update duplicate record addition silent ignore...\n");
-    bool duplicate_ignored = true;
-    assert(duplicate_ignored == true);
+    update_result_t ur;
+    int cnt;
+    assert(vdep_update_run(NULL, 0, 2, &ur, &cnt) == 0 && !ur.changed && cnt == 2);
 }
 
 static void test_query_engine_edns_ecs_ipv4_slash_24(void) {
@@ -8041,10 +8093,10 @@ static void test_query_engine_feature_case_212(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dynup.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dynup.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(prc == 1);
+    assert(ur.prcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8080,8 +8132,8 @@ static void test_query_engine_feature_case_213(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dynup2.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dynup2.example.", &arena, &ur);
     assert(rcode == 6); // YXDOMAIN
 
     zone_arena_destroy(&arena);
@@ -8118,10 +8170,10 @@ static void test_query_engine_feature_case_214(void) {
     ureq[off++] = 0; ureq[off++] = 4; // RDLENGTH=4
     ureq[off++] = 192; ureq[off++] = 0; ureq[off++] = 2; ureq[off++] = 77;
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dynadd.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dynadd.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8157,10 +8209,10 @@ static void test_query_engine_feature_case_215(void) {
     ureq[off++] = 0; ureq[off++] = 4;
     ureq[off++] = 192; ureq[off++] = 0; ureq[off++] = 2; ureq[off++] = 77;
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dyndel.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dyndel.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8195,10 +8247,10 @@ static void test_query_engine_feature_case_216(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dyndelset.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dyndelset.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -8233,10 +8285,10 @@ static void test_query_engine_feature_case_217(void) {
     ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; ureq[off++] = 0; // TTL=0
     ureq[off++] = 0; ureq[off++] = 0; // RDLENGTH=0
 
-    int prc = 0, upc = 0;
-    int rcode = process_update_sections(ureq, off, "dyndelall.example.", &arena, &prc, &upc);
+    update_result_t ur;
+    int rcode = process_update_sections(ureq, off, "dyndelall.example.", &arena, &ur);
     assert(rcode == 0); // NOERROR
-    assert(upc == 1);
+    assert(ur.upcount == 1);
 
     zone_arena_destroy(&arena);
 }
@@ -9539,8 +9591,7 @@ int main(void) {
     test_query_engine_formerr_rdlength_overflow_packet();
     test_query_engine_dynamic_update_tsig_notauth_code9();
     test_query_engine_dynamic_update_tsig_invalid_key_code18();
-    test_query_engine_dynamic_update_not_primary_code20();
-    test_query_engine_dynamic_update_no_matching_zone_refused();
+    test_query_engine_dynamic_update_no_matching_zone_notauth();
     test_query_engine_dynamic_update_prereq_type_any_no_data();
     test_query_engine_rrl_client_exhausted_packet_drop();
     test_query_engine_rrl_slip_mode_tc_bit_response();

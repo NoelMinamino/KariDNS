@@ -50,6 +50,17 @@ uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
   return new_serial;
 }
 
+static uint32_t soa_serial_in_arena(const zone_arena_t *arena, const char *zone_name) {
+  for (size_t i = 0; i < arena->count; i++) {
+    const dns_record_t *rec = &arena->records[i];
+    if (rec->type_code == 6 && rec->name && domain_names_match_ci(rec->name, zone_name) &&
+        rec->rdata_count >= 3 && rec->rdata[2]) {
+      return (uint32_t)strtoul(rec->rdata[2], NULL, 10);
+    }
+  }
+  return 0;
+}
+
 int handle_dynamic_update(const uint8_t *req, size_t req_len,
                           zone_db_entry_t *entry,
                           const char *client_ip,
@@ -75,16 +86,25 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
 
   clone_zone_arena(z_active, z_standby);
 
-  int prcount = 0, upcount = 0;
-  int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &prcount, &upcount);
-  if (rcode != 0) {
+  update_result_t result;
+  int rcode = process_update_sections(req, req_len, entry->domain, z_standby, &result);
+  if (rcode != 0 || !result.changed) {
+    /* エラーなら何も適用しない (RFC 2136 §3.4.2.1)。何も変わらなかった UPDATE (前提条件だけ、
+     * 無視された RR や既存と同じ RR だけ) はシリアルを上げず、公開も NOTIFY もしない (§3.6)。*/
     zone_arena_clear_data_pools(z_standby);
     pthread_mutex_unlock(&entry->writer_lock);
+    if (rcode == 0) {
+      syslog(LOG_INFO, "[Update] client=%s key=%s zone='%s' prcount=%d upcount=%d: no change",
+             client_ip, matched_key_name, entry->domain, result.prcount, result.upcount);
+    }
     return rcode;
   }
 
-  uint32_t new_serial = bump_soa_serial_in_arena(z_standby, entry->domain);
-  if (new_serial != 0) {
+  /* RFC 2136 §3.6: UPDATE が SOA を新しいシリアルで置き換えたときはそのシリアルを使い、
+   * それ以外はサーバーがシリアルを増やす。*/
+  uint32_t new_serial = result.soa_replaced ? soa_serial_in_arena(z_standby, entry->domain)
+                                            : bump_soa_serial_in_arena(z_standby, entry->domain);
+  if (result.soa_replaced || new_serial != 0) {
     atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
   }
 
@@ -121,7 +141,7 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   syslog(LOG_NOTICE,
          "[Update] client=%s key=%s zone='%s' prcount=%d upcount=%d "
          "(in-memory only, will revert on reload)",
-         client_ip, matched_key_name, entry->domain, prcount, upcount);
+         client_ip, matched_key_name, entry->domain, result.prcount, result.upcount);
 
   return 0; // NOERROR
 }

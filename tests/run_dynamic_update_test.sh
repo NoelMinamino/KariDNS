@@ -189,6 +189,52 @@ fi
 echo "[+] TYPE=41 OPT in UPDATE ADD successfully rejected with FORMERR."
 check_asan_log
 
+echo "[*] 8. RFC 2136 §3 semantics (R-01, R-11): RCODE and zone content..."
+TK="hmac-sha256:test-key:C+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y="
+# upd EXPECTED_STATUS ZONE ARGS... : send an UPDATE signed with test-key and check the RCODE
+upd() {
+    _want=$1; _zone=$2; shift 2
+    $DAG "$_zone" @127.0.0.1 -p 10053 +nohexdump -y "$TK" "$@" > out.txt 2>&1 || true
+    if ! grep -q "opcode: UPDATE, status: $_want" out.txt; then
+        echo "[FAIL] expected $_want for UPDATE $*"
+        cat out.txt
+        exit 1
+    fi
+}
+soa_serials() {
+    $DAG dynupdate.com. SOA @127.0.0.1 -p 10053 +short +nohexdump | awk '{print $3}' | tr '\n' ' '
+}
+# R-01: an SOA with a newer serial replaces the SOA (one SOA, that serial, not incremented again)
+upd NOERROR dynupdate.com --update-add 'dynupdate.com 3600 IN SOA ns1.dynupdate.com. admin.dynupdate.com. 2026071900 3600 1800 604800 86400'
+[ "$(soa_serials)" = "2026071900 " ] || { echo "[FAIL] R-01: SOA after update: $(soa_serials)"; exit 1; }
+# an older serial is ignored
+upd NOERROR dynupdate.com --update-add 'dynupdate.com 3600 IN SOA ns1.dynupdate.com. admin.dynupdate.com. 2026071800 3600 1800 604800 86400'
+[ "$(soa_serials)" = "2026071900 " ] || { echo "[FAIL] older SOA serial was applied: $(soa_serials)"; exit 1; }
+# prerequisites only: NOERROR, serial unchanged (RFC 2136 §3.6)
+upd NOERROR dynupdate.com --prereq-yxdomain test.dynupdate.com
+[ "$(soa_serials)" = "2026071900 " ] || { echo "[FAIL] prerequisite-only UPDATE changed the serial: $(soa_serials)"; exit 1; }
+# R-11 a: owner outside the zone -> NOTZONE
+upd NOTZONE dynupdate.com --update-add 'x.other.test 300 IN A 192.0.2.9'
+# R-11 b: CNAME next to other data is ignored, the rest of the update is applied
+upd NOERROR dynupdate.com --update-add 'test.dynupdate.com 300 IN CNAME ns1.dynupdate.com' --update-add 'r11b.dynupdate.com 300 IN A 192.0.2.21'
+$DAG test.dynupdate.com. CNAME @127.0.0.1 -p 10053 +short +nohexdump > res.txt
+[ ! -s res.txt ] || { echo "[FAIL] R-11 b: CNAME added next to TXT"; cat res.txt; exit 1; }
+$DAG r11b.dynupdate.com. A @127.0.0.1 -p 10053 +short +nohexdump > res.txt
+grep -qx "192.0.2.21" res.txt || { echo "[FAIL] R-11 b: the update RR after the ignored CNAME was not applied"; exit 1; }
+# R-11 c: deleting the apex NS RRset is ignored
+upd NOERROR dynupdate.com --update-del 'dynupdate.com NS'
+$DAG dynupdate.com. NS @127.0.0.1 -p 10053 +short +nohexdump > res.txt
+grep -qx "ns1.dynupdate.com." res.txt || { echo "[FAIL] R-11 c: apex NS deleted"; exit 1; }
+# R-11 d: value-dependent prerequisite must match the whole RRset
+upd NOERROR dynupdate.com --update-add 'r11d.dynupdate.com 300 IN A 192.0.2.31' --update-add 'r11d.dynupdate.com 300 IN A 192.0.2.32'
+upd NXRRSET dynupdate.com --prereq=yxrrset:r11d.dynupdate.com:A:192.0.2.31 --update-add 'r11d-sub.dynupdate.com 300 IN A 192.0.2.33'
+$DAG r11d-sub.dynupdate.com. A @127.0.0.1 -p 10053 +short +nohexdump > res.txt
+[ ! -s res.txt ] || { echo "[FAIL] R-11 d: update applied after a subset prerequisite"; exit 1; }
+# R-11 f: zone section naming a name below the zone apex -> NOTAUTH
+upd NOTAUTH sub.dynupdate.com --update-add 'x.sub.dynupdate.com 300 IN A 192.0.2.9'
+echo "[+] RFC 2136 §3 semantics checked."
+check_asan_log
+
 echo "[*] 7. Reload Server to check ephemeral behavior..."
 $KARICTL -f "$CTL_CONF" reload
 sleep 1
