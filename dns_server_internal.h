@@ -462,6 +462,7 @@ void zone_arena_clear_data_pools(zone_arena_t *arena);
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
 void free_ixfr_txn(ixfr_txn_t *txn);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
+zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
 zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
 view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_name);
 zone_db_entry_t *snapshot_get_zone_in_view(zone_db_snapshot_t *snap, const char *view_name, const char *domain);
@@ -506,7 +507,7 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst);
 uint32_t get_effective_query_log_max_qps(const server_config_t *cfg);
 void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype);
 bool ensure_priv_dir_safe(const char *dir_buf);
 bool init_logging_channels(server_config_t *cfg);
 bool init_logging_channels_ex(server_config_t *cfg, bool hand_off);
@@ -595,7 +596,7 @@ void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_
                      uint32_t max_qps);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg,
                                zone_observatory_snapshot_t *out);
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype);
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void backend_sig_handler(int sig);

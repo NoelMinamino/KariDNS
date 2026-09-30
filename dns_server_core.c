@@ -1308,7 +1308,7 @@ void init_async_io_pool(void) {
   }
 }
 
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype) {
   if (!snap || !qname) return false;
   view_snapshot_t *view = select_view(snap, client_ip);
   if (!view) return false;
@@ -1316,7 +1316,7 @@ bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, con
   if (!cfg) return false;
 
   bool is_synth = false;
-  zone_db_entry_t *entry = find_zone_in_view(view, qname);
+  zone_db_entry_t *entry = find_zone_for_query(view, qname, qtype); // R-32: DS at a child apex goes to the parent
   if (entry) {
     zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, entry->domain);
     if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "program") == 0 || strcasecmp(zcfg->type, "forward") == 0)) {
@@ -1736,7 +1736,7 @@ worker_startup_success:;
             write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, ipc_msg->addr_len,
                                ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
-            if (is_zone_synthetic_type(snap, client_ip, qname)) {
+            if (is_zone_synthetic_type(snap, client_ip, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0)) {
               uint8_t *heap_req = malloc((size_t)payload_received);
               if (!heap_req) {
                 if (rlog_enabled) {
@@ -1801,7 +1801,7 @@ worker_startup_success:;
                     drop_packet = true;
                   }
                   view_snapshot_t *rrl_v = select_view(snap, client_ip);
-                  zone_db_entry_t *rrl_z = rrl_v ? find_zone_in_view(rrl_v, qname) : NULL;
+                  zone_db_entry_t *rrl_z = rrl_v ? find_zone_for_query(rrl_v, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
                   if (rrl_z) {
                     if (tc_packet) {
                       atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
@@ -2289,7 +2289,7 @@ process_tcp_client: ;
               break;
             }
           } else {
-            if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
+            if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0)) {
               uint8_t *heap_req = malloc(msg_len);
               if (!heap_req) {
                 free(ctx_tcp);

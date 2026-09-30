@@ -1225,11 +1225,13 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     
     // ==== フェーズ5: CNAMEチェーン処理・クロスゾーン切り替え ====
     if (cname_followed) {
-      bool in_zone = domain_name_is_at_or_below(current_qname, db_entry->domain);
+      /* R-32: 対象がこのゾーンの頂点で QTYPE が DS なら、同じゾーンで続けずに親ゾーンを探す */
+      bool in_zone = domain_name_is_at_or_below(current_qname, db_entry->domain) &&
+                     !(qtypes[0] == 43 && domain_names_match_ci(current_qname, db_entry->domain));
       if (in_zone)
         continue;
       else {
-        zone_db_entry_t *new_db_entry = find_zone_in_view(view, current_qname);
+        zone_db_entry_t *new_db_entry = find_zone_for_query(view, current_qname, qtypes[0]); // R-32
         if (new_db_entry) {
           zone_arena_t *new_zone = atomic_load_explicit(&new_db_entry->rcu.active, memory_order_acquire);
           *db_entry_ptr = new_db_entry;
@@ -2725,7 +2727,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (snap) {
     view = select_view(snap, client_ip);
     if (view) {
-      db_entry = find_zone_in_view(view, current_qname);
+      // R-32: 子ゾーン頂点への DS は親ゾーンで答える (QUERY のみ)。RRL、統計、wire キャッシュもこのゾーンを使う。
+      db_entry = find_zone_for_query(view, current_qname, ((req[2] >> 3) & 0x0F) == 0 ? qtype : 0);
     }
   }
 

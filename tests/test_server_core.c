@@ -636,15 +636,15 @@ static void test_synthetic_zone_and_find_domain(void) {
     snap.view_count = 1;
 
     // is_zone_synthetic_type: Master -> false
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "master.example.") == false);
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "master.example.", 1) == false);
     // is_zone_synthetic_type: Forward -> true
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "fwd.example.") == true);
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "fwd.example.", 1) == true);
     // is_zone_synthetic_type: Program -> true
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.") == true);
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.", 1) == true);
     // Non-existent zone -> false
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "nonexistent.example.") == false);
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "nonexistent.example.", 1) == false);
     // NULL parameters -> false
-    assert(is_zone_synthetic_type(NULL, "127.0.0.1", "fwd.example.") == false);
+    assert(is_zone_synthetic_type(NULL, "127.0.0.1", "fwd.example.", 1) == false);
 
     atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
     printf("  -> is_zone_synthetic_type & find_configured_domain passed.\n");
@@ -2682,8 +2682,8 @@ static void test_synthetic_zone_catalog_and_reverse(void) {
     snap.views = &view;
     snap.view_count = 1;
 
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.") == true);
-    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "other.example.") == false);
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.", 1) == true);
+    assert(is_zone_synthetic_type(&snap, "127.0.0.1", "other.example.", 1) == false);
     printf("  -> synthetic zone types passed.\n");
 }
 

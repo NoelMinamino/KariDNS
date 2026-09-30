@@ -241,6 +241,23 @@ zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname) {
   return view_suffix_hash_lookup(view, "", 0);
 }
 
+/* R-32: RFC 4035 §3.1.4.1 / §3.1.5: DS は委任点の親側にしか無い権威データで、子ゾーンは DS を持たない。
+ * QTYPE DS の QNAME が見つかったゾーンの頂点そのものなら、親の名前 (最初のラベルを除いた名前、1 ラベルなら
+ * ルート) で探し直し、あればそのゾーンから答える (DS、または親の SOA と NSEC/NSEC3 による NODATA。親がさらに
+ * 上で委任していれば参照応答)。親を持たないとき、または親が forward ゾーン (権威データを持たない) のときは
+ * 子の頂点から権威のある NODATA を返す (§3.1.4.1 がこの場合に定める応答)。QUERY 以外は qtype に 0 を渡す。 */
+zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype) {
+  zone_db_entry_t *entry = find_zone_in_view(view, qname);
+  if (qtype != 43 || !entry || !domain_names_match_ci(entry->domain, qname)) return entry;
+  size_t q_len = zone_key_len(qname);
+  if (q_len == 0) return entry; // ルート自身の DS は親を持たない
+  const char *dot = strchr_unescaped(qname, '.');
+  const char *parent = (dot && (size_t)(dot - qname) < q_len) ? dot + 1 : ".";
+  zone_db_entry_t *p = find_zone_in_view(view, parent);
+  if (!p || p == entry || p->kind == ZONE_KIND_FORWARD) return entry;
+  return p;
+}
+
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name) {
   zone_db_entry_t *z = calloc(1, sizeof(zone_db_entry_t));
   if (!z) return NULL;
