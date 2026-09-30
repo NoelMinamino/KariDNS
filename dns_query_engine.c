@@ -1922,14 +1922,11 @@ STATIC_TEST int build_synthetic_servfail(const uint8_t *req, size_t req_len,
   if (req_len < DNS_HEADER_SIZE || max_res_len < DNS_HEADER_SIZE) return 0; // 応答しようがない
   uint16_t qdcount = (req[4] << 8) | req[5];
   size_t q_end = (size_t)get_question_end_offset(req, req_len, qdcount);
-  size_t copy_len = q_end > max_res_len ? max_res_len : q_end;
+  /* [M-4] 質問セクションが入らないときは QDCOUNT=0 でヘッダだけにする
+   * (途中までの質問を返すと QDCOUNT と内容が食い違う)。*/
+  size_t copy_len = q_end > max_res_len ? DNS_HEADER_SIZE : q_end;
   memcpy(res, req, copy_len);
-  res[2] |= 0x80;              // QR=1
-  res[2] &= ~0x06;             // AA=0, TC=0 をクリア
-  res[3] = (res[3] & 0xF0) | 2; // RCODE=2 (SERVFAIL), RA/Z/AD/CDは維持
-  /* [M-4] 質問セクションが切り詰められた場合 QDCOUNT と実内容が乖離しないよう
-   * copy_len < q_end (切り詰めが発生した) なら QDCOUNT=0 に設定する。
-   * 切り詰めなし (q_end <= max_res_len) の場合はそのまま維持 (SERVFAIL は QDCOUNT=1 許容)。*/
+  dns_init_response_header(res, req, 2, false); // SERVFAIL、AA/TC/RA/Z/AD=0 (R-05)
   if (q_end > max_res_len) {
     res[4] = 0; res[5] = 0; // QDCOUNT=0 (切り詰め時)
   }
@@ -1997,10 +1994,14 @@ STATIC_TEST ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t 
   return (ssize_t)nread;
 }
 
+/* max_res_len: 応答の上限 (UDP ではクライアントの上限。超えたら TC=1 に切り詰める)。
+ * res_cap: res の容量。disable-auto-tc-flag yes のときは max_res_len を超えてもそのまま返すが、
+ * res_cap は超えない (O-01)。res_cap を超える応答は TC=1 に切り詰める。 */
 STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *domain,
                                     const uint8_t *req, size_t req_len,
-                                    uint8_t *res, size_t max_res_len,
+                                    uint8_t *res, size_t max_res_len, size_t res_cap,
                                     const char *client_ip, bool is_tcp) {
+  if (max_res_len > res_cap) max_res_len = res_cap;
   program_plugin_t *plugin = find_program_plugin(view_name, domain);
   if (!plugin || atomic_load_explicit(&plugin->dead, memory_order_acquire)) {
     return build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
@@ -2035,8 +2036,9 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
         syslog(LOG_ERR, "[Plugin] zone '%s' returned response > 65535 bytes (%u); rejecting with SERVFAIL",
                domain, (unsigned int)resp_len);
         ok = false;
-      } else if (plugin->disable_auto_tc_flag) {
-        // disable-auto-tc-flag yes (default: no): do not truncate or force TC=1; send full response as-is (up to 65535)
+      } else if (plugin->disable_auto_tc_flag && resp_len <= res_cap) {
+        // disable-auto-tc-flag yes (default: no): do not truncate or force TC=1; send full response as-is
+        // (up to 65535, but never more than the response buffer holds: O-01)
         if (read_all_timeout(plugin->stdout_fd, res, resp_len, remaining_ms(deadline)) == (ssize_t)resp_len) {
           result_len = (int)resp_len;
           ok = true;
@@ -2052,7 +2054,7 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
         }
       } else {
         syslog(LOG_INFO, "[Plugin] zone '%s' returned oversized response (%u > %zu); truncating with TC=1",
-               domain, (unsigned int)resp_len, max_res_len);
+               domain, (unsigned int)resp_len, plugin->disable_auto_tc_flag ? res_cap : max_res_len);
         /* 最初の max_res_len 分を res に読み込み、残りを読み捨ててパイプの同期を保つ。
          * 共有締切の残り時間を使うため、宣言長がどれだけ大きくても合計の待ち時間は plugin->timeout_ms を超えない。 */
         size_t first_chunk = max_res_len;
@@ -2637,12 +2639,13 @@ void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const 
 }
 
 
-/* program / forward ゾーンが上限超過で切り詰めた応答 (TC=1、質問セクションのみ) は、
- * 上流の OPT を失っている。問い合わせに OPT があれば付け直す (RFC 6891 §7)。 */
-static int add_opt_to_truncated_passthrough(uint8_t *res, size_t max_res_len, int len,
-                                            edns_info_t *edns, bool is_tcp, server_config_t *cfg) {
-  if (len < DNS_HEADER_SIZE || !edns->present || !(res[2] & 0x02)) return len;
-  if (dns_find_opt_rr(res, (size_t)len, NULL, NULL)) return len;
+/* program / forward ゾーンの応答のうち、質問セクションだけのもの (上限超過で切り詰めた TC=1 応答、
+ * KariDNS が合成した SERVFAIL、上流が OPT なしで返したエラー) には OPT が無い。問い合わせに OPT が
+ * あれば付ける (RFC 6891 §6.1.1、§7)。AR=0 なので TSIG の後ろに付けてしまうことはない。 */
+static int add_opt_to_bare_passthrough(uint8_t *res, size_t max_res_len, int len,
+                                       edns_info_t *edns, bool is_tcp, server_config_t *cfg) {
+  if (len < DNS_HEADER_SIZE || !edns->present) return len;
+  if ((res[6] | res[7] | res[8] | res[9] | res[10] | res[11]) != 0) return len;
   uint16_t offset = (uint16_t)len;
   uint16_t arcount = (uint16_t)((res[10] << 8) | res[11]);
   assemble_edns_opt(res, max_res_len, &offset, &arcount, edns, 0, is_tcp, cfg);
@@ -2657,6 +2660,18 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                             bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                             zone_db_snapshot_t *snap, server_config_t *cfg,
                             zone_db_entry_t **out_matched_entry) {
+  return process_dns_query_impl_cap(req, req_len, res, max_res_len, 0, qname, qtype, client_ip, comp_ctx,
+                                    is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry);
+}
+
+/* res_cap: res の実際の容量 (バイト)。0 なら不明で、従来どおり max_res_len (UDP では EDNS の
+ * サイズに置き換えた後の値) を容量とみなす。max_res_len は応答の上限 (UDP ではクライアントの上限)。 */
+int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
+                               size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                               const char *client_ip, compress_ctx_t *comp_ctx,
+                               bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                               zone_db_snapshot_t *snap, server_config_t *cfg,
+                               zone_db_entry_t **out_matched_entry) {
   if (req_len < DNS_HEADER_SIZE) {
     return 0; // 不正な短いパケットは無応答で破棄
   }
@@ -2702,14 +2717,14 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   edns_info_t edns;
   memset(&edns, 0, sizeof(edns));
   edns.present = false;
-  if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0 || edns.has_malformed_cookie) {
-    memcpy(res, req, DNS_HEADER_SIZE);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
-    memset(&res[4], 0, 8); // qdcount, ancount, nscount, arcount = 0
-    return DNS_HEADER_SIZE;
+  if (parse_edns_opt(req, req_len, qdcount, ancount_req, nscount_req, arcount_req, &edns) < 0) {
+    /* OPT 自体が使えない (所有者名が root でない、追加セクション以外、複数、RDATA 切れ): OPT なしの FORMERR */
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, NULL, is_tcp, cfg);
   }
   edns.ede_count = 0; // 反射防止
+  /* R-13: ecs-enable no のサーバーは ECS を実装していないものとして扱い、オプションを無視する
+   * (AUDIT_FINDINGS §8 の決定。RFC 6891 §6.1.2: 知らないオプションは無視する)。 */
+  if (edns.has_malformed_ecs && !(cfg && cfg->ecs_enable)) edns.has_malformed_ecs = false;
   if (edns.present && edns.udp_payload_size < 512) {
     edns.udp_payload_size = 512;
   }
@@ -2748,97 +2763,46 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (edns.saw_invalid_mqtype_response_in_query || edns.mqtype_query_duplicated) {
-    memcpy(res, req, DNS_HEADER_SIZE);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0xF0) | 1; // FORMERR
-    res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0;
-    uint16_t offset = DNS_HEADER_SIZE;
-    uint16_t arcount = 0;
-    if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-    res[10] = arcount >> 8; res[11] = arcount & 0xFF;
-    return offset;
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
   }
 
   if (edns.present && edns.version > 0) {
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80; // QR=1
-    res[3] &= 0xF0; // RCODE=0 (Base RCODE)
-    
-    // 質問セクション以降をクリア
-    res[6] = 0; res[7] = 0; // ANCOUNT=0
-    res[8] = 0; res[9] = 0; // NSCOUNT=0
-    
-    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
-    uint16_t arcount = 0;
-    
-    // RFC 6891: 応答にはサーバーがサポートする最大のバージョン(0)をセットする
+    // RFC 6891 §6.1.3: 応答にはサーバーがサポートする最大のバージョン(0)をセットする。
+    // オプションの意味はバージョンごとに決まるので、オプションの不正より先に BADVERS を返す。
     edns.version = 0;
-    
     // rcode_ext = 1 (1 << 4 | Base 0 = 16 = BADVERS)
-    assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 1, is_tcp, cfg);
-    res[10] = arcount >> 8;
-    res[11] = arcount & 0xFF;
-    return offset;
+    return dns_build_error_response(req, req_len, res, max_res_len, 0, 1, qdcount, &edns, is_tcp, cfg);
+  }
+
+  /* 長さが不正な COOKIE (RFC 7873 §5.2.2)、不正な ECS (RFC 7871 §6、§7.2.1) は FORMERR。
+   * RFC 6891 §7: オプションの不正による FORMERR には OPT を付ける (R-13)。 */
+  if (edns.has_malformed_cookie || edns.has_malformed_ecs) {
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
   }
 
   uint8_t opcode = (req[2] >> 3) & 0x0F;
   if (opcode != 0 && opcode != 4 && opcode != 5) {
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
     add_ede(&edns, send_ede, 21, "This opcode is not supported by this server");
-    
-    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
-    res[6] = 0; res[7] = 0; // ANCOUNT = 0
-    res[8] = 0; res[9] = 0; // NSCOUNT = 0
-    uint16_t arcount = 0;
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-    }
-    res[10] = arcount >> 8;
-    res[11] = arcount & 0xFF;
-    return offset;
+    return dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg); // NOTIMP
   }
 
   // RFC 9619: OPCODE=0(QUERY) allows QDCOUNT 0 or 1; only QDCOUNT>1 is FORMERR.
   // OPCODE=4(NOTIFY)/5(UPDATE) still require QDCOUNT==1.
   bool qdcount_invalid = (opcode == 0) ? (qdcount > 1) : (qdcount != 1);
   if (qdcount_invalid) {
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
     add_ede(&edns, send_ede, 0, NULL);
-    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
-    res[6] = 0; res[7] = 0; // ANCOUNT = 0
-    res[8] = 0; res[9] = 0; // NSCOUNT = 0
-    uint16_t arcount = 0;
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-    }
-    res[10] = arcount >> 8;
-    res[11] = arcount & 0xFF;
-    return offset;
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg); // FORMERR
   }
 
   // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.
   if (opcode == 0 && qdcount == 0) {
     if (edns.has_mqtype_query) {
       // RFC 10029 §3.3: MQTYPE-Query option in a query with QDCOUNT=0 MUST be FORMERR.
-      memcpy(res, req, DNS_HEADER_SIZE);
-      res[2] |= 0x80;                      // QR=1
-      res[3] = (res[3] & 0xF0) | 1;        // FORMERR
-      res[6] = 0; res[7] = 0;              // ANCOUNT=0
-      res[8] = 0; res[9] = 0;              // NSCOUNT=0
-      res[10] = 0; res[11] = 0;            // ARCOUNT=0 (OPT自体は付けない。他のopcode==4/5分岐と挙動を合わせる)
-      return DNS_HEADER_SIZE;
+      // RFC 6891 §7: オプションに起因する FORMERR には OPT を付ける。
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg);
     }
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80; // QR=1
-    res[3] &= 0xF0; // NOERROR
+    dns_init_response_header(res, req, 0, false); // NOERROR
+    res[4] = 0; res[5] = 0; // QDCOUNT=0
     res[6] = 0; res[7] = 0; // ANCOUNT=0
     res[8] = 0; res[9] = 0; // NSCOUNT=0
     uint16_t offset0 = DNS_HEADER_SIZE;
@@ -2866,18 +2830,19 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
-        size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-        memcpy(res, req, copy_len);
-        res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
-        res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
-        return copy_len;
+        /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
+         * RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)。 */
+        add_ede(&edns, send_ede, 21, "NOTIFY and UPDATE are not supported for this zone type");
+        int len = dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg);
+        res[2] &= ~0x01;
+        return len;
       }
     }
     if (edns.has_mqtype_query) {
-      memcpy(res, req, DNS_HEADER_SIZE);
-      res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 1;
-      res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
-      return DNS_HEADER_SIZE;
+      // RFC 10029 §3.3: QUERY 以外への MQTYPE-Query は FORMERR。RFC 6891 §7: OPT を付ける。
+      int len = dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+      res[2] &= ~0x01;
+      return len;
     }
     bool has_tsig = packet_has_tsig(req, req_len);
     bool auth = false;
@@ -2938,13 +2903,8 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       }
     }
       
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x84; // QR=1, AA=1
-    res[2] &= ~0x01; // RD=0 per RFC 1996 §3.7
-    
+    uint8_t notify_rcode = 0;
     if (auth) {
-      res[3] &= 0xF0;
       atomic_store_explicit(&db_entry->refresh_now, true, memory_order_release);
       if (g_control_kq != -1) {
         struct kevent ev;
@@ -2953,32 +2913,30 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       }
     } else {
       if (attempted_key || has_tsig) {
-          res[3] = (res[3] & 0xF0) | 9; // NOTAUTH
+          notify_rcode = 9; // NOTAUTH
           add_ede(&edns, send_ede, 18, "Invalid TSIG");
       } else {
-          res[3] = (res[3] & 0xF0) | 5; // REFUSED
+          notify_rcode = 5; // REFUSED
           add_ede(&edns, send_ede, 18, "Query refused due to access control");
       }
     }
-    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
-    res[6] = 0; res[7] = 0; // ANCOUNT = 0
-    res[8] = 0; res[9] = 0; // NSCOUNT = 0
-    uint16_t arcount = 0;
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-    }
-    res[10] = arcount >> 8;
-    res[11] = arcount & 0xFF;
-    
+    int offset = dns_build_error_response(req, req_len, res, max_res_len, notify_rcode, 0, qdcount,
+                                      &edns, is_tcp, cfg);
+    /* RFC 1996 §4.7: 受け付けた NOTIFY への応答は flags QR AA、RD=0 (§3.7)。
+     * 拒否した NOTIFY はゾーンの権威として答えていないので AA=0 (R-06)。 */
+    res[2] &= ~0x01;
+    if (auth) res[2] |= 0x04;
+
     tsig_key_t *sign_key = auth ? matched_key : attempted_key;
-    if (sign_key) {
-      size_t sign_len = offset;
+    if (sign_key && offset >= DNS_HEADER_SIZE) {
+      size_t sign_len = (size_t)offset;
       if (tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false) == 0) {
-        offset = sign_len;
+        offset = (int)sign_len;
       } else {
+        res[2] &= ~0x04;
         res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
         res[10] = 0; res[11] = 0; // ARCOUNT = 0
-        offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+        offset = (int)get_question_end_offset(res, (size_t)offset, qdcount);
       }
     }
     return offset;
@@ -2990,18 +2948,19 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       zone_config_t *zc = find_zone_config_in_view(cfg_chk, view->name, db_entry->domain);
       if (zc && zc->type && (strcasecmp(zc->type, "program") == 0 ||
                               strcasecmp(zc->type, "forward") == 0)) {
-        size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-        memcpy(res, req, copy_len);
-        res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 0x04; // NOTIMP
-        res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
-        return copy_len;
+        /* R-12: 要求の本体は返さず質問セクションで切り、OPT と EDE 21 (RFC 8914 §4.22) を付ける。
+         * RD=0 (RFC 1996 §3.7、RFC 2136 §3.8)。 */
+        add_ede(&edns, send_ede, 21, "NOTIFY and UPDATE are not supported for this zone type");
+        int len = dns_build_error_response(req, req_len, res, max_res_len, 4, 0, qdcount, &edns, is_tcp, cfg);
+        res[2] &= ~0x01;
+        return len;
       }
     }
     if (edns.has_mqtype_query) {
-      memcpy(res, req, DNS_HEADER_SIZE);
-      res[2] |= 0x80; res[2] &= ~0x01; res[3] = (res[3] & 0xF0) | 1;
-      res[6] = 0; res[7] = 0; res[8] = 0; res[9] = 0; res[10] = 0; res[11] = 0;
-      return DNS_HEADER_SIZE;
+      // RFC 10029 §3.3: QUERY 以外への MQTYPE-Query は FORMERR。RFC 6891 §7: OPT を付ける。
+      int len = dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
+      res[2] &= ~0x01;
+      return len;
     }
     /* RFC 2136 §3.1.1, §3.1.2: ZTYPE が SOA でなければ FORMERR。ZNAME と ZCLASS がこのサーバー
      * (クライアントのビュー) のゾーンでなければ NOTAUTH。どちらも権限の確認 (§3.3) より前に行う。
@@ -3082,11 +3041,6 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       auth = false;
     }
     
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80; // QR=1
-    res[2] &= ~0x01; // RD=0 per RFC 2136 §2.2 / §3.8
-    
     int rcode = 5; // REFUSED
     if (zone_rcode != 0) {
       rcode = zone_rcode;
@@ -3106,28 +3060,21 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       }
     }
     
-    // Some rcodes like FORMERR (1) shouldn't leak the RCODE logic into res[3] directly without properly mapping
-    res[3] = (res[3] & 0xF0) | (rcode & 0x0F);
-    
-    uint16_t offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
-    res[6] = 0; res[7] = 0; // ANCOUNT = 0
-    res[8] = 0; res[9] = 0; // NSCOUNT = 0
-    uint16_t arcount = 0;
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-    }
-    res[10] = arcount >> 8;
-    res[11] = arcount & 0xFF;
-    
+    /* RFC 2136 §3.8: ID と OPCODE を写し、ゾーンセクション以外のセクションは返さない (カウント 0)。
+     * QR=1、RD=0 (§2.2 / §3.8)。AA は UPDATE 応答では意味を持たないので 0。 */
+    int offset = dns_build_error_response(req, req_len, res, max_res_len, (uint8_t)(rcode & 0x0F), 0, qdcount,
+                                      &edns, is_tcp, cfg);
+    res[2] &= ~0x01;
+
     tsig_key_t *sign_key = auth ? matched_key : attempted_key;
-    if (sign_key) {
-      size_t sign_len = offset;
+    if (sign_key && offset >= DNS_HEADER_SIZE) {
+      size_t sign_len = (size_t)offset;
       if (tsig_sign_packet(res, &sign_len, max_res_len, sign_key, auth ? 0 : tsig_error_code, tsig_mac, &tsig_mac_len, NULL, 0, false) == 0) {
-        offset = sign_len;
+        offset = (int)sign_len;
       } else {
         res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
         res[10] = 0; res[11] = 0; // ARCOUNT = 0
-        offset = (uint16_t)get_question_end_offset(res, copy_len, qdcount);
+        offset = (int)get_question_end_offset(res, (size_t)offset, qdcount);
       }
     }
     return offset;
@@ -3145,13 +3092,15 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
       uint16_t server_udp_size = edns.server_udp_size ? edns.server_udp_size : KARIDNS_UDP_BUFSIZE_DEFAULT;
       if (edns.udp_payload_size > server_udp_size)
         edns.udp_payload_size = server_udp_size;
-      /* max_res_len は呼び出し側バッファの容量上限も兼ねる。呼び出し側が
-       * UDP 既定値 (512) 未満の小さなバッファを渡した場合に EDNS の
-       * payload size で拡大すると res[] の範囲外へ書き込む (スタック破壊)。
-       * 本番経路は常に >= 512 を渡すため挙動は変わらない。 */
-      if (edns.udp_payload_size > UDP_DEFAULT_MAX_RES_LEN &&
-          max_res_len >= UDP_DEFAULT_MAX_RES_LEN)
+      /* UDP 応答の上限はクライアントが OPT で通知したサイズ (512 以上に丸め、サーバーの
+       * udp-bufsize 以下。RFC 6891 §6.2.3、§6.2.5)。呼び出し側の max_res_len が大きくても小さくても
+       * 置き換える (以前は 512 ちょうどのとき呼び出し側の値のままで、非同期経路では 4096 まで
+       * 返しえた)。呼び出し側が 512 未満の小さなバッファを渡したときは広げない (res[] の範囲外へ
+       * 書き込むため)。res_cap が分かっていればそれを超えない。 */
+      if (max_res_len >= UDP_DEFAULT_MAX_RES_LEN) {
         max_res_len = edns.udp_payload_size;
+        if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
+      }
     }
   }
 
@@ -3202,42 +3151,20 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     return -1;
   }
   if (q_offset + 4 > req_len) {
-    size_t copy_len = req_len > max_res_len ? max_res_len : req_len;
-    memcpy(res, req, copy_len);
-    res[2] |= 0x80;
-    res[3] = (res[3] & 0xF0) | 0x01; // FORMERR
+    // QTYPE/QCLASS が欠けている: 質問を区切れないので QDCOUNT=0 の FORMERR
     add_ede(&edns, send_ede, 0, NULL);
-    uint16_t offset = copy_len;
-    uint16_t arcount = 0;
-    res[6] = 0; res[7] = 0; // ANCOUNT = 0
-    res[8] = 0; res[9] = 0; // NSCOUNT = 0
-    if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-    }
-    res[10] = arcount >> 8;
-    res[11] = arcount & 0xFF;
-    return offset;
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg);
   }
     if (db_entry) {
         time_t deadline = zone_expire_deadline(db_entry);
         if (deadline > 0 && time(NULL) > deadline) {
             bool serve_stale = (cfg_for_ede != NULL && cfg_for_ede->serve_stale);
             if (!serve_stale) {
-                size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
-                memcpy(res, req, copy_len);
-                res[2] |= 0x80;
-                res[3] = (res[3] & 0xF0) | 0x02; // SERVFAIL
-                add_ede(&edns, send_ede, 3, "Zone expired (SOA EXPIRE exceeded)");
-                uint16_t offset = copy_len;
-                uint16_t arcount = 0;
-                res[6] = 0; res[7] = 0; // ANCOUNT = 0
-                res[8] = 0; res[9] = 0; // NSCOUNT = 0
-                if (edns.present) {
-                    assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-                }
-                res[10] = arcount >> 8;
-                res[11] = arcount & 0xFF;
-                return offset;
+                /* R-18: 期限切れのゾーンは答えられない。RFC 8914 §4.25 (24 Invalid Data) が
+                 * 「最新のゾーンが古すぎる、または期限切れ」を例に挙げる。EDE 3 (§4.4) は古いデータで
+                 * 答えたときのもので、下の serve-stale の経路だけで使う。 */
+                add_ede(&edns, send_ede, 24, "Zone expired (SOA EXPIRE exceeded)");
+                return dns_build_error_response(req, req_len, res, max_res_len, 2, 0, 1, &edns, is_tcp, cfg);
             } else {
                 add_ede(&edns, send_ede, 3, "Stale Answer (Zone EXPIRED)");
             }
@@ -3248,15 +3175,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 
     // UDP経由(is_tcp == 0)でAXFR(252)を受信した場合はRFC 5936違反のためFORMERRを返す
     if (!is_tcp && qtype == 252) {
-      size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
-      memcpy(res, req, copy_len);
-      res[2] |= 0x80; // QR = 1
-      res[3] = (res[3] & 0xF0) | 1; // RCODE = 1 (FORMERR)
-      res[4] = 0; res[5] = 1; // QDCOUNT = 1
-      res[6] = 0; res[7] = 0; // ANCOUNT = 0
-      res[8] = 0; res[9] = 0; // NSCOUNT = 0
-      res[10] = 0; res[11] = 0; // ARCOUNT = 0
-      return copy_len;
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg); // FORMERR
     }
 
     if (__builtin_expect(qclass == 1, 1)) {
@@ -3266,27 +3185,15 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     } else if (qclass == 3) {
       // CH class
     } else {
-      size_t copy_len = q_offset + 4 > max_res_len ? max_res_len : q_offset + 4;
-      memcpy(res, req, copy_len);
-      res[2] |= 0x80;
-      res[3] = (res[3] & 0xF0) | 0x05; // REFUSED
       add_ede(&edns, send_ede, 0, NULL);
-      uint16_t offset = copy_len;
-      uint16_t arcount = 0;
-      res[6] = 0; res[7] = 0; // ANCOUNT = 0
-      res[8] = 0; res[9] = 0; // NSCOUNT = 0
-      if (edns.present) {
-        assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-      }
-      res[10] = arcount >> 8;
-      res[11] = arcount & 0xFF;
-      return offset;
+      return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg); // REFUSED
     }
   q_offset += 4;
   memcpy(res, req, q_offset);
   register_wire_name_for_compression(res, DNS_HEADER_SIZE, comp_ctx);
-  res[2] |= 0x84;
-  res[3] &= 0xF0;
+  /* R-05: RA/Z/AD/TC は問い合わせから写さない。AA=1 は権威データの応答の既定で、委任・REFUSED・
+   * SERVFAIL・BADCOOKIE ではそれぞれの経路で落とす。 */
+  dns_init_response_header(res, req, 0, true);
   if (db_entry && view) {
     server_config_t *cfg_lookup = cfg;
     zone_config_t *zcfg = find_zone_config_in_view(cfg_lookup, view->name, db_entry->domain);
@@ -3301,8 +3208,9 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
         }
       }
       int plugin_result_len = dispatch_to_program_zone(
-          view->name, zcfg->domain, req, req_len, res, max_res_len, client_ip, is_tcp);
-      plugin_result_len = add_opt_to_truncated_passthrough(res, max_res_len, plugin_result_len,
+          view->name, zcfg->domain, req, req_len, res, max_res_len,
+          res_cap != 0 ? res_cap : max_res_len, client_ip, is_tcp);
+      plugin_result_len = add_opt_to_bare_passthrough(res, max_res_len, plugin_result_len,
                                                             &edns, is_tcp, cfg);
 
       // programゾーンも他ゾーンと同じRRL設定(out_rrl_cfgは関数冒頭で既に
@@ -3314,7 +3222,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
     }
     if (zcfg && zcfg->type && strcasecmp(zcfg->type, "forward") == 0) {
       int fwd_len = dispatch_forward_zone(zcfg, req, req_len, res, max_res_len);
-      return add_opt_to_truncated_passthrough(res, max_res_len, fwd_len, &edns, is_tcp, cfg);
+      return add_opt_to_bare_passthrough(res, max_res_len, fwd_len, &edns, is_tcp, cfg);
     }
   }
 
@@ -3323,6 +3231,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   res[10] = 0; res[11] = 0;
 
   if (!current_zone) {
+    res[2] &= ~0x04; // R-06: 権威を持たない名前への REFUSED は AA=0 (RFC 1035 §4.1.1)
     res[3] = (res[3] & 0xF0) | 5;
     if (!view) {
       add_ede(&edns, send_ede, 18, "Query refused due to access control (no view matched)");
@@ -3340,6 +3249,7 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (current_zone->count == 0) {
+    res[2] &= ~0x04; // R-27: データを持たないので AA=0
     res[3] = (res[3] & 0xF0) | 2; // SERVFAIL
     add_ede(&edns, send_ede, 14, "Zone not ready (empty)");
     uint16_t offset = q_offset;
@@ -3529,43 +3439,21 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
 
   if (edns.has_mqtype_query) {
     if (edns.mqtype_count == 0 || is_non_data_rrtype(qtype)) {
-      res[2] |= 0x80;
-      res[3] = (res[3] & 0xF0) | 1; // FORMERR
-      res[6] = 0; res[7] = 0;
-      res[8] = 0; res[9] = 0;
-      offset = q_offset;
-      arcount = 0;
-      if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-      res[10] = (uint8_t)(arcount >> 8);
-      res[11] = (uint8_t)(arcount & 0xFF);
-      return offset;
+      // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
     }
     int limit = (cfg_for_ede && cfg_for_ede->max_mqtypes > 0) ? cfg_for_ede->max_mqtypes : 4;
     for (int i = 0; i < edns.mqtype_count && num_qtypes <= limit; i++) {
        uint16_t mq = edns.mqtypes[i];
        if (is_non_data_rrtype(mq)) {
-          res[2] |= 0x80;
-          res[3] = (res[3] & 0xF0) | 1;
-          res[6] = 0; res[7] = 0;
-          res[8] = 0; res[9] = 0;
-          offset = q_offset; arcount = 0;
-          if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-          res[10] = (uint8_t)(arcount >> 8);
-          res[11] = (uint8_t)(arcount & 0xFF);
-          return offset;
+          // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
+          return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
        }
        bool dup = false;
        for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == mq) { dup = true; break; } }
        if (dup) {
-          res[2] |= 0x80;
-          res[3] = (res[3] & 0xF0) | 1;
-          res[6] = 0; res[7] = 0;
-          res[8] = 0; res[9] = 0;
-          offset = q_offset; arcount = 0;
-          if (edns.present) assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
-          res[10] = (uint8_t)(arcount >> 8);
-          res[11] = (uint8_t)(arcount & 0xFF);
-          return offset;
+          // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
+          return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg);
        }
        qtypes[num_qtypes++] = mq;
     }
@@ -3636,10 +3524,19 @@ int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       const char *client_ip, compress_ctx_t *comp_ctx,
                       bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                       zone_db_snapshot_t *snap) {
+  return process_dns_query_cap(req, req_len, res, max_res_len, 0, qname, qtype, client_ip, comp_ctx,
+                               is_tcp, out_rrl_cfg, snap);
+}
+
+int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
+                          size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                          const char *client_ip, compress_ctx_t *comp_ctx,
+                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          zone_db_snapshot_t *snap) {
   server_config_t *cfg = acquire_config_snapshot();
   zone_db_entry_t *matched_entry = NULL;
-  int ret = process_dns_query_impl(req, req_len, res, max_res_len, qname, qtype,
-                                   client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry);
+  int ret = process_dns_query_impl_cap(req, req_len, res, max_res_len, res_cap, qname, qtype,
+                                       client_ip, comp_ctx, is_tcp, out_rrl_cfg, snap, cfg, &matched_entry);
   release_config_snapshot(cfg);
   if (ret >= DNS_HEADER_SIZE && matched_entry) {
     uint8_t rcode = res[3] & 0x0F;

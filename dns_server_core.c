@@ -1209,8 +1209,9 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
       rate_limit_config_t *rrl_cfg = NULL;
       size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
-      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, max_res,
-                                      task.qname, task.qtype, task.client_ip,
+      int res_len = process_dns_query_cap(task.req_buf, task.req_len, res_buf, max_res,
+                                          UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t),
+                                          task.qname, task.qtype, task.client_ip,
                                       &thread_compress_ctx, false, &rrl_cfg, task.snap);
       free(task.req_buf);
 
@@ -1783,8 +1784,9 @@ worker_startup_success:;
             uint8_t *res_buf = batch->tx_buffers[n_tx] + sizeof(udp_ipc_t);
             rate_limit_config_t *rrl_cfg = NULL;
             int res_len =
-                process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
-                                  qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
+                process_dns_query_cap(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
+                                      qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
             if (res_len > 0) {
               bool drop_packet = false;
               bool tc_packet = false;
@@ -2289,24 +2291,12 @@ process_tcp_client: ;
             }
             if (!allowed || !entry) {
               uint8_t res_buf[1024];
-              size_t copy_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
-              memcpy(res_buf, msg, copy_len);
+              size_t copy_len;
               if (tsig_error) {
-                res_buf[2] |= 0x84;
-                res_buf[3] |= 0x09;
+                /* NOTAUTH、AA=0 (R-06)、質問セクションまで (Rule 3)。TSIG の判定と署名は phase 6 (R-07)。 */
                 add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
-                
-                uint16_t qd = (msg[4] << 8) | msg[5];
-                uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
-                uint16_t arcount = 0;
-                if (edns.present) {
-                  assemble_edns_opt(res_buf, sizeof(res_buf), &offset, &arcount, &edns, 0, true, cfg);
-                }
-                res_buf[6] = 0; res_buf[7] = 0;
-                res_buf[8] = 0; res_buf[9] = 0;
-                res_buf[10] = arcount >> 8;
-                res_buf[11] = arcount & 0xFF;
-                copy_len = offset;
+                copy_len = (size_t)dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), 9, 0, 1,
+                                                            &edns, true, cfg);
 
                 int sign_rc = 0;
                 if (matched_key)
@@ -2329,21 +2319,10 @@ process_tcp_client: ;
                   break;
                 }
               } else {
-                res_buf[2] |= 0x84;
-                res_buf[3] |= 0x05;
+                /* REFUSED、AA=0 (R-06)、質問セクションまで (Rule 3) */
                 add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
-                
-                uint16_t qd = (msg[4] << 8) | msg[5];
-                uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
-                uint16_t arcount = 0;
-                if (edns.present) {
-                  assemble_edns_opt(res_buf, sizeof(res_buf), &offset, &arcount, &edns, 0, true, cfg);
-                }
-                res_buf[6] = 0; res_buf[7] = 0;
-                res_buf[8] = 0; res_buf[9] = 0;
-                res_buf[10] = arcount >> 8;
-                res_buf[11] = arcount & 0xFF;
-                copy_len = offset;
+                copy_len = (size_t)dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), 5, 0, 1,
+                                                            &edns, true, cfg);
               }
               release_config_snapshot(cfg);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};

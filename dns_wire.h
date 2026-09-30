@@ -281,6 +281,7 @@ typedef struct {
 
     // EDNS Client Subnet (ECS, RFC 7871)
     bool has_ecs;
+    bool has_malformed_ecs;     // 受信: 形式が不正な ECS (RFC 7871 §6)。has_ecs は false のまま
     uint16_t ecs_family;
     uint8_t ecs_source_prefix;
     uint8_t ecs_scope_prefix;
@@ -391,6 +392,19 @@ bool dns_find_opt_rr(const uint8_t *msg, size_t msg_len, size_t *opt_off, size_t
 // 応答を質問セクションまで切り詰める (AN/NS/AR を落とす) が、OPT RR があれば
 // 質問の直後へ移して残す (RFC 6891 §7)。TC ビットは呼び出し側で立てる。戻り値は新しい長さ。
 size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end);
+
+// 応答ヘッダの 3〜4 バイト目 (フラグと RCODE) を req から作る。ID と OPCODE、RD、CD は問い合わせから
+// 引き継ぎ、QR=1、AA は引数どおり、TC/RA/Z/AD は 0 (RFC 1035 §4.1.1、RFC 4035 §3.1.6)。
+// カウント (4〜11 バイト目) は変更しない。
+void dns_init_response_header(uint8_t *res, const uint8_t *req, uint8_t rcode, bool aa);
+// エラー応答の共通ビルダー。ヘッダは dns_init_response_header() (AA=0)、本文は要求の質問セクションを
+// qd_keep 個だけ写し、それ以外 (回答・権威・追加、UPDATE の各セクション) は返さない。質問を区切れない、
+// または入らないときは QDCOUNT=0。edns が OPT 付きの要求なら OPT (EDE を含む) を付ける (RFC 6891 §6.1.1、
+// §7)。MQTYPE と EXPIRE は応答データに関するオプションなので付けない。edns=NULL なら OPT なし。
+// 戻り値は応答の長さ (要求がヘッダより短い、または max_res_len < 12 なら 0)。
+int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                             uint8_t rcode, uint8_t ext_rcode, uint16_t qd_keep,
+                             edns_info_t *edns, bool is_tcp, struct server_config_s *cfg);
 
 // UPDATE (RFC 2136) の処理結果。changed が false なら standby は active と同じ内容。
 typedef struct {

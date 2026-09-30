@@ -10,6 +10,8 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <unistd.h>
 
 #include "dns_wire.h"
 #include "dns_config_parser.h"
@@ -1845,7 +1847,7 @@ static void test_program_plugins_and_forward_zone_helpers(void) {
 
     // 6. dispatch_to_program_zone with no plugin registered -> returns synthetic SERVFAIL
     uint8_t prog_res[512];
-    int pr_len = dispatch_to_program_zone("", "unregistered.prog.", qpkt, qlen, prog_res, sizeof(prog_res), "127.0.0.1", false);
+    int pr_len = dispatch_to_program_zone("", "unregistered.prog.", qpkt, qlen, prog_res, sizeof(prog_res), sizeof(prog_res), "127.0.0.1", false);
     assert(pr_len > 0);
     assert((prog_res[3] & 0x0F) == 2); // SERVFAIL
 
@@ -2209,7 +2211,7 @@ static void test_query_engine_helpers_and_edge_cases(void) {
     assert(question_section_matches(valid_qpkt, valid_qlen, valid_qpkt, valid_qlen) == true);
     assert(question_section_matches(qpkt, sizeof(qpkt), qpkt, sizeof(qpkt)) == false);
     assert(question_section_matches(NULL, 0, valid_qpkt, valid_qlen) == false);
-    int pgm_res = dispatch_to_program_zone("", "invalid.zone.", valid_qpkt, valid_qlen, rpkt, sizeof(rpkt), "127.0.0.1", false);
+    int pgm_res = dispatch_to_program_zone("", "invalid.zone.", valid_qpkt, valid_qlen, rpkt, sizeof(rpkt), sizeof(rpkt), "127.0.0.1", false);
     assert(pgm_res >= 12);
     assert((rpkt[3] & 0x0F) == 2); // SERVFAIL
 
@@ -9255,21 +9257,21 @@ static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(voi
     size_t req_len = 0;
     build_dns_query(req, &req_len, 0x1234, "plugtest.example.", 1, false);
 
-    int rc1 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc1 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(rc1 >= 12); // Returns synthetic SERVFAIL packet length
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
     assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 1);
     assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == false);
 
     // Second failure -> reaches max_failures (2) -> marks dead
-    int rc2 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc2 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(rc2 >= 12);
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
     assert(atomic_load_explicit(&plugin.consecutive_failures, memory_order_relaxed) == 2);
     assert(atomic_load_explicit(&plugin.dead, memory_order_relaxed) == true);
 
     // Third call while dead -> immediately returns SERVFAIL without pipe I/O
-    int rc3 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), "127.0.0.1", false);
+    int rc3 = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(rc3 >= 12);
     assert((res[3] & 0x0F) == 2); // SERVFAIL (RCODE=2)
 
@@ -9280,6 +9282,65 @@ static void test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark(voi
     g_program_plugins_count = 0;
 
     printf("  -> Program zone plugin timeout & dead mark passed.\n");
+}
+
+/* O-01: with disable-auto-tc-flag yes the plugin reply is returned as-is even above max_res_len, but never
+ * beyond the response buffer (res_cap); a larger reply is cut to a TC=1 reply and the rest is drained. */
+static void test_query_engine_program_zone_reply_bounded_by_buffer(void) {
+    printf("[TEST] Query Engine: Program zone reply bounded by the response buffer (disable-auto-tc-flag)...\n");
+    int in_p[2], out_p[2];
+    assert(pipe(in_p) == 0);
+    assert(pipe(out_p) == 0);
+    program_plugin_t plugin;
+    memset(&plugin, 0, sizeof(plugin));
+    strncpy(plugin.domain, "plugtest.example.", sizeof(plugin.domain) - 1);
+    plugin.pid = -1;
+    plugin.stdin_fd = in_p[1];
+    plugin.stdout_fd = out_p[0];
+    pthread_mutex_init(&plugin.lock, NULL);
+    plugin.timeout_ms = 1000;
+    plugin.max_failures = 5;
+    plugin.disable_auto_tc_flag = true;
+    atomic_init(&plugin.consecutive_failures, 0);
+    atomic_init(&plugin.dead, false);
+    g_program_plugins = &plugin;
+    g_program_plugins_count = 1;
+
+    uint8_t req[64];
+    size_t req_len = 0;
+    build_dns_query(req, &req_len, 0x1234, "plugtest.example.", 1, false);
+    static uint8_t reply[1000];
+    memset(reply, 0, sizeof(reply));
+    memcpy(reply, req, req_len);
+    reply[2] |= 0x80;
+
+    static uint8_t res[1024];
+    const size_t res_cap = 600, max_res = 512;
+    for (int round = 0; round < 2; round++) {
+        size_t rlen = round == 0 ? 550 : sizeof(reply);   /* 550: above max_res, fits res_cap; 1000: does not fit */
+        uint8_t pfx[2] = { (uint8_t)(rlen >> 8), (uint8_t)rlen };
+        assert(write(out_p[1], pfx, 2) == 2);
+        assert(write(out_p[1], reply, rlen) == (ssize_t)rlen);
+        memset(res, 0xA5, sizeof(res));
+        int n = dispatch_to_program_zone("", "plugtest.example.", req, req_len, res, max_res, res_cap, "127.0.0.1", false);
+        for (size_t i = res_cap; i < sizeof(res); i++) assert(res[i] == 0xA5);   /* nothing written beyond res_cap */
+        if (round == 0) {
+            assert(n == 550 && (res[2] & 0x02) == 0);                           /* sent as-is (documented) */
+        } else {
+            assert(n >= 12 && (size_t)n <= max_res && (res[2] & 0x02) != 0);    /* TC=1, question only */
+        }
+    }
+    /* the rest of the oversized reply was drained: the pipe is empty and in sync */
+    struct pollfd pfd = { .fd = out_p[0], .events = POLLIN };
+    assert(poll(&pfd, 1, 0) == 0);
+    assert(atomic_load(&plugin.consecutive_failures) == 0);
+
+    pthread_mutex_destroy(&plugin.lock);
+    close(in_p[0]); close(in_p[1]);
+    close(out_p[0]); close(out_p[1]);
+    g_program_plugins = NULL;
+    g_program_plugins_count = 0;
+    printf("  -> Program zone reply bound passed.\n");
 }
 
 static void test_query_engine_opcode_header_validations(void) {
@@ -9500,6 +9561,7 @@ int main(void) {
     printf("=== Starting Expanded Query Engine Unit Tests ===\n");
     test_query_engine_dname_cname_wildcard_truncation();
     test_query_engine_program_zone_plugin_pipe_timeout_and_dead_mark();
+    test_query_engine_program_zone_reply_bounded_by_buffer();
     test_query_engine_opcode_header_validations();
     test_all_rr_types_and_resolution();
     test_dnssec_negative_and_delegation_proofs();

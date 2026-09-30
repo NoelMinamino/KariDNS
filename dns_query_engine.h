@@ -25,6 +25,20 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                           zone_db_snapshot_t *snap, server_config_t *cfg,
                           zone_db_entry_t **out_matched_entry);
 
+/* res_cap: res の実際の容量。0 なら max_res_len を容量とみなす (process_dns_query / _impl はこれ)。
+ * max_res_len は応答の上限で、UDP では EDNS で通知されたサイズに置き換えられる。 */
+int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
+                          size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                          const char *client_ip, compress_ctx_t *comp_ctx,
+                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          zone_db_snapshot_t *snap);
+int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
+                               size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                               const char *client_ip, compress_ctx_t *comp_ctx,
+                               bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                               zone_db_snapshot_t *snap, server_config_t *cfg,
+                               zone_db_entry_t **out_matched_entry);
+
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
 bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void spawn_program_zone_plugins(server_config_t *cfg);
@@ -117,7 +131,7 @@ ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
 int64_t monotonic_ms(void);
 uint32_t remaining_ms(int64_t deadline);
 int dispatch_to_program_zone(const char *view_name, const char *domain, const uint8_t *req, size_t req_len,
-                             uint8_t *res, size_t max_res_len,
+                             uint8_t *res, size_t max_res_len, size_t res_cap,
                              const char *client_ip, bool is_tcp);
 ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,

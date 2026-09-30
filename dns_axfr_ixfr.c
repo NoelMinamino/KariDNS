@@ -1004,7 +1004,7 @@ static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
     ec->answers = 0;
     memset(ec->res, 0, 65535);
     memcpy(ec->res, ec->req, ec->q_offset); /* クエリのヘッダと質問セクションをそのままコピー */
-    ec->res[2] |= 0x84; ec->res[3] &= 0xF0;
+    dns_init_response_header(ec->res, ec->req, 0, true); /* QR=1 AA=1、RA/Z/AD/TC は写さない (R-05) */
     ec->res[8] = 0; ec->res[9] = 0; ec->res[10] = 0; ec->res[11] = 0;
 
     memset(&ec->comp_ctx, 0, sizeof(ec->comp_ctx));
@@ -1079,11 +1079,19 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                         const struct sockaddr_storage *client_addr, socklen_t client_len,
                         const struct sockaddr_storage *server_addr, bool has_server_addr) {
   if (!entry) {
+    /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06)、質問セクションまで (Rule 3)、
+     * 要求に OPT があれば OPT を付ける (RFC 6891 §6.1.1)。 */
     uint8_t res_buf[UDP_DEFAULT_MAX_RES_LEN];
-    size_t copy_len = req_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : req_len;
-    memcpy(res_buf, req, copy_len);
-    res_buf[2] |= 0x84;
-    res_buf[3] |= 0x05;
+    edns_info_t req_edns_r = {0};
+    bool edns_ok = req_len >= DNS_HEADER_SIZE &&
+                   parse_edns_opt(req, req_len, (uint16_t)((req[4] << 8) | req[5]), (uint16_t)((req[6] << 8) | req[7]),
+                                  (uint16_t)((req[8] << 8) | req[9]), (uint16_t)((req[10] << 8) | req[11]),
+                                  &req_edns_r) == 0;
+    req_edns_r.ede_count = 0;
+    int built = dns_build_error_response(req, req_len, res_buf, sizeof(res_buf), 5, 0, 1,
+                                         edns_ok ? &req_edns_r : NULL, true, NULL);
+    if (built <= 0) return;
+    size_t copy_len = (size_t)built;
     uint8_t len_prefix[2] = {(uint8_t)(copy_len >> 8), (uint8_t)(copy_len & 0xFF)};
     write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
                        (const struct sockaddr *)client_addr, client_len,
@@ -1280,8 +1288,7 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
   memset(res, 0, 65535);
   memcpy(res, req, q_offset);
-  res[2] |= 0x84;
-  res[3] &= 0xF0;
+  dns_init_response_header(res, req, 0, true); /* QR=1 AA=1、RA/Z/AD/TC は写さない (R-05) */
   res[8] = 0;
   res[9] = 0;
   res[10] = 0;

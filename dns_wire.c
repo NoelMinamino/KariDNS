@@ -3237,25 +3237,38 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                 }
                             }
                         } else if (opt_code == 8) { // EDNS Client Subnet (RFC 7871)
-                            if (edns->has_ecs) {
+                            if (edns->has_ecs || edns->has_malformed_ecs) {
                                 rdata_offset += opt_len;
                                 continue;
                             }
-                            if (opt_len < 4) return -1;
-                            uint16_t family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
-                            if (family != 1 && family != 2) return -1;
-                            uint8_t source_prefix = req[rdata_offset + 2];
-                            if (family == 1 && source_prefix > 32) return -1;
-                            if (family == 2 && source_prefix > 128) return -1;
-                            uint8_t scope_prefix = req[rdata_offset + 3];
-                            if (scope_prefix != 0) return -1;
-                            size_t expected_addr_len = (source_prefix + 7) / 8;
-                            size_t actual_addr_len = opt_len - 4;
-                            if (actual_addr_len != expected_addr_len) return -1;
-                            if (source_prefix % 8 != 0) {
+                            /* RFC 7871 §6: FAMILY、SOURCE/SCOPE の範囲、ADDRESS の長さとパディングが不正なら
+                             * FORMERR (§7.2.1)。RFC 6891 §7: オプションの不正は OPT 付きの FORMERR にするので、
+                             * ここでは -1 (OPT 自体が使えない) にせず印だけ付けて解析を続ける。*/
+                            bool ecs_ok = opt_len >= 4;
+                            uint16_t family = 0;
+                            uint8_t source_prefix = 0, scope_prefix = 0;
+                            size_t expected_addr_len = 0, actual_addr_len = 0;
+                            if (ecs_ok) {
+                                family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
+                                source_prefix = req[rdata_offset + 2];
+                                scope_prefix = req[rdata_offset + 3];
+                                expected_addr_len = (source_prefix + 7) / 8;
+                                actual_addr_len = opt_len - 4;
+                                if (family != 1 && family != 2) ecs_ok = false;
+                                else if (family == 1 && source_prefix > 32) ecs_ok = false;
+                                else if (family == 2 && source_prefix > 128) ecs_ok = false;
+                                else if (scope_prefix != 0) ecs_ok = false;
+                                else if (actual_addr_len != expected_addr_len) ecs_ok = false;
+                            }
+                            if (ecs_ok && source_prefix % 8 != 0) {
                                 uint8_t pad_mask = (uint8_t)((1u << (8 - (source_prefix % 8))) - 1);
                                 uint8_t last_byte = req[rdata_offset + 4 + expected_addr_len - 1];
-                                if ((last_byte & pad_mask) != 0) return -1;
+                                if ((last_byte & pad_mask) != 0) ecs_ok = false;
+                            }
+                            if (!ecs_ok) {
+                                edns->has_malformed_ecs = true;
+                                rdata_offset += opt_len;
+                                continue;
                             }
                             edns->has_ecs = true;
                             edns->ecs_family = family;
@@ -3338,6 +3351,53 @@ bool dns_find_opt_rr(const uint8_t *msg, size_t msg_len, size_t *opt_off, size_t
         }
     }
     return false;
+}
+
+void dns_init_response_header(uint8_t *res, const uint8_t *req, uint8_t rcode, bool aa) {
+    res[0] = req[0];
+    res[1] = req[1];
+    /* RFC 1035 §4.1.1: QR=1、OPCODE と RD は問い合わせから。AA は権威データを返すときだけ。
+     * TC は応答側で決める (問い合わせの TC は引き継がない)。*/
+    res[2] = (uint8_t)(0x80 | (req[2] & 0x78) | (req[2] & 0x01) | (aa ? 0x04 : 0));
+    /* RA=0 (再帰しない)、Z=0 (RFC 1035 §4.1.1)、AD=0 (RFC 4035 §3.1.6: 検証しないので立てない)。
+     * CD は §3.1.6 では権威応答でクリアが SHOULD だが、BIND と同じくエコーする (AUDIT_FINDINGS §8 の決定)。*/
+    res[3] = (uint8_t)((req[3] & 0x10) | (rcode & 0x0F));
+}
+
+int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                             uint8_t rcode, uint8_t ext_rcode, uint16_t qd_keep,
+                             edns_info_t *edns, bool is_tcp, struct server_config_s *cfg) {
+    if (req_len < DNS_HEADER_SIZE || max_res_len < DNS_HEADER_SIZE) return 0;
+    dns_init_response_header(res, req, rcode, false);
+    size_t q_end = DNS_HEADER_SIZE;
+    for (uint16_t i = 0; i < qd_keep; i++) {
+        size_t next;
+        if (skip_wire_name(req, req_len, q_end, &next) != 0 || next + 4 > req_len) {
+            qd_keep = 0;
+            q_end = DNS_HEADER_SIZE;
+            break;
+        }
+        q_end = next + 4;
+    }
+    if (q_end > max_res_len || q_end > UINT16_MAX) {
+        qd_keep = 0;
+        q_end = DNS_HEADER_SIZE;
+    }
+    /* CLAUDE.md Rule 3: 質問の直後で切ってから OPT を付ける (要求の残りのバイトを残さない) */
+    memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, q_end - DNS_HEADER_SIZE);
+    res[4] = (uint8_t)(qd_keep >> 8); res[5] = (uint8_t)(qd_keep & 0xFF);
+    res[6] = 0; res[7] = 0;
+    res[8] = 0; res[9] = 0;
+    uint16_t offset = (uint16_t)q_end;
+    uint16_t arcount = 0;
+    if (edns && edns->present) {
+        edns->has_mqtype_query = false;
+        edns->mqtype_count = 0;
+        edns->send_expire = false;
+        assemble_edns_opt(res, max_res_len, &offset, &arcount, edns, ext_rcode, is_tcp, cfg);
+    }
+    res[10] = (uint8_t)(arcount >> 8); res[11] = (uint8_t)(arcount & 0xFF);
+    return offset;
 }
 
 size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end) {

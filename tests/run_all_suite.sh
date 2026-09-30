@@ -284,6 +284,7 @@ register_test "update" "sh" "tests/run_ttl_harmonization_update_test.sh" "TTL ha
 # 5. EDNS / Cookies / ECS / Multi-QTYPE
 register_test "edns" "sh" "tests/run_bind_ecs_subnet_test.sh" "RFC 7871 \$ECS-SUBNET tag split-horizon routing"
 register_test "edns" "sh" "tests/run_mqtype_qdcount0_test.sh" "RFC 10029 Multi-QTYPE & RFC 9619 QDCOUNT=0"
+register_test "edns" "sh" "tests/run_response_header_test.sh" "RFC 1035 §4.1.1 / RFC 6891 §7 response header bits and error responses (R-05, R-06, R-12, R-13, R-18)"
 
 # 6. Response Rate Limiting (RRL) & Anti-DoS
 register_test "rrl" "sh" "tests/run_rrl_window_test.sh" "RRL sliding window rate limit & SLIP truncated responses"

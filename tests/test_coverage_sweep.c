@@ -917,7 +917,7 @@ static void pg_run(int scn, bool disable_tc, size_t max_res, int rounds, uint32_
     uint8_t req[512], res[8192];
     for (int r = 0; r < rounds; r++) {
         size_t len = sw_build(req, (uint16_t)(0x7100 + r), 0x01, 0, "a.prog.test.", 1, 1, 0);
-        int n = dispatch_to_program_zone("", "prog.test.", req, len, res, max_res, r & 1 ? NULL : "192.0.2.9", r & 1);
+        int n = dispatch_to_program_zone("", "prog.test.", req, len, res, max_res, max_res, r & 1 ? NULL : "192.0.2.9", r & 1);
         assert(n >= 0);
     }
     close(in_p[1]);
@@ -946,11 +946,12 @@ static void test_program_zone_emulated(void) {
     /* unknown zone / dead plugin / helpers */
     uint8_t req[512], res[512];
     size_t len = sw_build(req, 1, 1, 0, "a.prog.test.", 1, 1, 0);
-    assert(dispatch_to_program_zone("", "none.test.", req, len, res, sizeof(res), NULL, false) > 0);
+    assert(dispatch_to_program_zone("", "none.test.", req, len, res, sizeof(res), sizeof(res), NULL, false) > 0);
     assert(find_program_plugin("", NULL) == NULL);
     assert(build_synthetic_servfail(req, 5, res, sizeof(res)) == 0);
     assert(build_synthetic_servfail(req, len, res, 5) == 0);
-    assert(build_synthetic_servfail(req, len, res, 16) == 16 && res[5] == 0);
+    /* question does not fit: header only with QDCOUNT=0 (no partial question bytes) */
+    assert(build_synthetic_servfail(req, len, res, 16) == DNS_HEADER_SIZE && res[5] == 0);
     assert(remaining_ms(monotonic_ms() - 10) == 0);
     assert(remaining_ms(monotonic_ms() + 100000) > 0);
     assert(write_all_timeout(-1, req, 4, 10) == -1);

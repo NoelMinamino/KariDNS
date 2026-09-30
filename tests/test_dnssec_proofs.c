@@ -32,7 +32,7 @@ int build_synthetic_servfail(const uint8_t *req, size_t req_len,
 ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeout_ms);
 ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
 int dispatch_to_program_zone(const char *view_name, const char *domain, const uint8_t *req, size_t req_len,
-                             uint8_t *res, size_t max_res_len,
+                             uint8_t *res, size_t max_res_len, size_t res_cap,
                              const char *client_ip, bool is_tcp);
 bool question_section_matches(const uint8_t *resp, size_t resp_len,
                               const uint8_t *req, size_t req_len);
