@@ -459,31 +459,113 @@ static void free_partial_view(view_config_t *view) {
   free(view);
 }
 
-/* [T7] 定義済み TSIG キーリストを線形探索するヘルパー */
+/* [T7] 定義済み TSIG キーリストを線形探索するヘルパー。
+ * 鍵名は DNS 名なので大文字小文字と末尾のドットを区別しない (D-03。重複の検出と同じ規則) */
 static bool key_name_is_defined(const tsig_key_t *keys, const char *name) {
   if (!name) return false;
   for (const tsig_key_t *k = keys; k; k = k->next) {
-    if (k->name && strcmp(k->name, name) == 0) return true;
+    if (k->name && domain_names_match_ci(k->name, name)) return true;
   }
   return false;
 }
 
-/* [T7] allow-update エントリーが IP/CIDR/any/none 系のトークンかどうかの簡易判定。
- * 完全な判定ではないため警告目的のみで使用すること。*/
-static bool looks_like_acl_address_token(const char *tok) {
-  if (!tok) return true;
-  if (strcmp(tok, "any") == 0 || strcmp(tok, "none") == 0) return true;
-  const char *p = (tok[0] == '!') ? tok + 1 : tok;
-  char buf[128];
-  strncpy(buf, p, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
-  char *slash = strchr(buf, '/');
-  if (slash) *slash = '\0';
-  struct in_addr a4;
-  struct in6_addr a6;
-  if (inet_pton(AF_INET, buf, &a4) == 1) return true;
-  if (inet_pton(AF_INET6, buf, &a6) == 1) return true;
-  return false;
+/* D-22: BIND の組み込み ACL 名。any と none は要素として使える。localhost と localnets は
+ * インターフェイスのアドレスに依存し、サンドボックス内のリロードで求め直せないので未対応 */
+static bool acl_name_is_builtin(const char *name) {
+  return strcasecmp(name, "any") == 0 || strcasecmp(name, "none") == 0 ||
+         strcasecmp(name, "localhost") == 0 || strcasecmp(name, "localnets") == 0;
+}
+
+/* アドレス、プレフィックス、any、none のどれか (none は何にも一致しない) */
+static bool acl_entry_is_address(const char *t) {
+  if (strcmp(t, "any") == 0 || strcmp(t, "none") == 0) return true;
+  cidr_entry_t e;
+  return cidr_entry_parse(&e, t);
+}
+
+typedef enum { ACL_USE_TRANSFER, ACL_USE_UPDATE, ACL_USE_ADDRESS } acl_use_t;
+
+static int acl_reject(token_ctx_t *ctx, const char *where, const char *entry, const char *why) {
+  syslog(LOG_ERR, "[Config] %s: entry '%s' %s", where, entry, why);
+  fprintf(stderr, "[ERROR] %s: entry '%s' %s\n", where, entry, why);
+  if (ctx) ctx->error_occurred = true;
+  return -1;
+}
+
+/* src の要素を out へ展開する。名前付き ACL の参照は同じ内容を波括弧で書いたものとして
+ * 展開する (否定は parse_acl_list() の "! { ... }" と同じ規則: 各要素を否定し、二重否定は肯定)。
+ * key 要素は allow-transfer では keys_out へ、allow-update では鍵名として out へ入れる。 */
+static int acl_expand_into(token_ctx_t *ctx, const server_config_t *cfg, const char *where, acl_use_t use,
+                           char *const *src, int src_count, bool negate, int depth,
+                           char ***out, int *out_count, char ***keys_out, int *keys_count) {
+  for (int i = 0; i < src_count; i++) {
+    const char *e = src[i];
+    if (!e) continue;
+    bool neg = negate != (e[0] == '!');
+    const char *t = (e[0] == '!') ? e + 1 : e;
+    if (t[0] == ACL_KEY_MARK) {
+      const char *kname = t + 1;
+      if (neg) return acl_reject(ctx, where, kname, "is a negated key, which is not supported");
+      if (!key_name_is_defined(cfg->keys, kname))
+        return acl_reject(ctx, where, kname, "names a key that is not defined in any key {} block");
+      if (use == ACL_USE_ADDRESS) return acl_reject(ctx, where, kname, "is a key; only addresses can be used here");
+      if (use == ACL_USE_TRANSFER) {
+        APPEND_STR(*keys_out, *keys_count, strdup(kname));
+      } else {
+        APPEND_STR(*out, *out_count, strdup(kname));
+      }
+      continue;
+    }
+    if (acl_entry_is_address(t)) {
+      if (negate && strcmp(t, "any") == 0) continue; /* "! { any; }" の any は parse_acl_list() と同じく捨てる */
+      size_t tlen = strlen(t);
+      char *v = malloc(tlen + 2);
+      if (!v) { if (ctx) ctx->error_occurred = true; return -1; }
+      snprintf(v, tlen + 2, "%s%s", neg ? "!" : "", t);
+      APPEND_STR(*out, *out_count, v);
+      continue;
+    }
+    if (acl_name_is_builtin(t))
+      return acl_reject(ctx, where, t, "is not supported (list the addresses instead)");
+    const acl_def_t *acl = NULL;
+    for (const acl_def_t *a = cfg->acls; a; a = a->next)
+      if (strcasecmp(a->name, t) == 0) { acl = a; break; }
+    if (acl) {
+      if (depth >= MAX_INCLUDE_DEPTH) return acl_reject(ctx, where, t, "nests acl references too deeply (loop?)");
+      if (acl_expand_into(ctx, cfg, where, use, acl->entries, acl->count, neg, depth + 1,
+                          out, out_count, keys_out, keys_count) != 0)
+        return -1;
+      continue;
+    }
+    /* allow-update は従来どおり鍵名だけの要素も受け付ける (key "name" と同じ意味) */
+    if (use == ACL_USE_UPDATE && !neg && key_name_is_defined(cfg->keys, t)) {
+      APPEND_STR(*out, *out_count, strdup(t));
+      continue;
+    }
+    return acl_reject(ctx, where, e, use == ACL_USE_UPDATE
+                                         ? "is not an address, prefix, any, none, a defined acl or a defined key"
+                                         : "is not an address, prefix, any, none or a defined acl");
+  }
+  return 0;
+}
+
+/* 1つの ACL フィールドを展開して置き換え、parsed を作り直す */
+static int acl_expand_field(token_ctx_t *ctx, const server_config_t *cfg, const char *where, acl_use_t use,
+                            char ***list, int *count, acl_entry_t **parsed, char ***keys, int *keys_count) {
+  if (*count <= 0) return 0;
+  char **out = NULL;
+  int out_count = 0;
+  int rc = acl_expand_into(ctx, cfg, where, use, *list, *count, false, 0, &out, &out_count, keys, keys_count);
+  for (int i = 0; i < *count; i++) free((*list)[i]);
+  free(*list);
+  *list = out;
+  *count = out_count;
+  if (rc != 0) return -1;
+  if (parsed) {
+    free(*parsed);
+    *parsed = acl_list_parse(*list, *count);
+  }
+  return 0;
 }
 
 void free_server_config_fields(server_config_t *cfg) {
@@ -548,6 +630,17 @@ void free_server_config_fields(server_config_t *cfg) {
     k = next_k;
   }
   cfg->keys = NULL;
+
+  acl_def_t *a = cfg->acls;
+  while (a) {
+    acl_def_t *next_a = a->next;
+    for (int i = 0; i < a->count; i++) free(a->entries[i]);
+    free(a->entries);
+    free(a->name);
+    free(a);
+    a = next_a;
+  }
+  cfg->acls = NULL;
 
   if (cfg->control.socket_path) { free(cfg->control.socket_path); cfg->control.socket_path = NULL; }
   if (cfg->control.algorithm) { free(cfg->control.algorithm); cfg->control.algorithm = NULL; }
@@ -678,6 +771,66 @@ static void skip_unknown_block(token_ctx_t *ctx) {
   }
 }
 
+/* D-02: 真偽値は全ての文で同じ規則にする。BIND と同じく yes/no/true/false/1/0 を
+ * 大文字小文字を区別せずに受け付け、それ以外は false を返す (呼び出し側で設定エラーにする)。 */
+bool parse_config_bool(const char *s, bool *out) {
+  if (!s || !out) return false;
+  if (strcasecmp(s, "yes") == 0 || strcasecmp(s, "true") == 0 || strcmp(s, "1") == 0) {
+    *out = true;
+    return true;
+  }
+  if (strcasecmp(s, "no") == 0 || strcasecmp(s, "false") == 0 || strcmp(s, "0") == 0) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+/* additional-from-auth: 真偽値に加えて in-domain (別名 in-zone) を受け付ける */
+static bool parse_additional_from_auth(const char *s, additional_from_auth_t *out) {
+  bool b;
+  if (s && (strcasecmp(s, "in-domain") == 0 || strcasecmp(s, "in-zone") == 0)) {
+    *out = ADDITIONAL_AUTH_IN_DOMAIN;
+    return true;
+  }
+  if (!parse_config_bool(s, &b)) return false;
+  *out = b ? ADDITIONAL_AUTH_YES : ADDITIONAL_AUTH_NO;
+  return true;
+}
+
+/* 不正な値を報告して設定エラーにする。zone が NULL でなければゾーン名を付ける。 */
+static void report_bad_value(token_ctx_t *ctx, const char *zone, const char *name, const char *val,
+                             const char *expected) {
+  if (zone) {
+    syslog(LOG_ERR, "[Config] zone '%s': invalid %s value '%s' (expected %s)", zone, name, val ? val : "", expected);
+    fprintf(stderr, "[ERROR] zone '%s': invalid %s value '%s' (expected %s)\n", zone, name, val ? val : "", expected);
+  } else {
+    syslog(LOG_ERR, "[Config] invalid %s value '%s' (expected %s)", name, val ? val : "", expected);
+    fprintf(stderr, "[ERROR] invalid %s value '%s' (expected %s)\n", name, val ? val : "", expected);
+  }
+  if (ctx) ctx->error_occurred = true;
+}
+
+static void report_bad_bool(token_ctx_t *ctx, const char *zone, const char *name, const char *val) {
+  report_bad_value(ctx, zone, name, val, "yes or no");
+}
+
+/* "<name> <bool>;" の値とセミコロンを読む。不正な値や構文は -1。 */
+static int parse_bool_statement(token_ctx_t *ctx, const char *zone, const char *name, bool *out) {
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+  if (!parse_config_bool(tok.value, out)) {
+    report_bad_bool(ctx, zone, name, tok.value);
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) { free_token(&tok); return -1; }
+  free_token(&tok);
+  return 0;
+}
+
 bool match_cidr(const char *client_ip_str, const char *cidr_str) {
   if (!client_ip_str || !cidr_str)
     return false;
@@ -775,7 +928,7 @@ static int parse_string_list(token_ctx_t *ctx, char ***list, int *count) {
   return parse_string_list_inner(ctx, list, count);
 }
 
-typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD, ACL_KEY_REJECT } acl_key_mode_t;
+typedef enum { ACL_KEY_AS_LIST_ENTRY, ACL_KEY_AS_TSIG_FIELD, ACL_KEY_REJECT, ACL_KEY_MARKED } acl_key_mode_t;
 
 static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
                            acl_key_mode_t key_mode, char ***tsig_keys_out, int *tsig_keys_count_out) {
@@ -823,6 +976,19 @@ static int parse_acl_list(token_ctx_t *ctx, char ***list, int *count,
             free_token(&tok);
             if (key_mode == ACL_KEY_AS_TSIG_FIELD && tsig_keys_out && tsig_keys_count_out) {
                 APPEND_STR(*tsig_keys_out, *tsig_keys_count_out, val);
+            } else if (key_mode == ACL_KEY_MARKED) {
+                /* 名前付き ACL の key 要素。参照先の文で意味が決まるので印を付けて残す */
+                size_t vlen = strlen(val);
+                char *marked = malloc(vlen + 2);
+                if (!marked) {
+                    free(val);
+                    if (ctx) ctx->error_occurred = true;
+                    return -1;
+                }
+                marked[0] = ACL_KEY_MARK;
+                memcpy(marked + 1, val, vlen + 1);
+                free(val);
+                APPEND_STR(*list, *count, marked);
             } else {
                 APPEND_STR(*list, *count, val);
             }
@@ -1047,10 +1213,14 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     } else if (strcmp(key, "slip") == 0) {
       if (valid) rrl->slip = (int)num_val;
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
-    } else if (strcmp(key, "log-only") == 0) {
-      rrl->log_only = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
-    } else if (strcmp(key, "early-drop") == 0) {
-      rrl->early_drop = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (strcmp(key, "log-only") == 0 || strcmp(key, "early-drop") == 0) {
+      bool *dst = (strcmp(key, "log-only") == 0) ? &rrl->log_only : &rrl->early_drop;
+      if (!parse_config_bool(val, dst)) {
+        report_bad_bool(ctx, NULL, key, val);
+        free(key);
+        free(val);
+        return -1;
+      }
     } else {
       syslog(LOG_WARNING, "[Config] Unknown rate-limit option '%s'", key);
     }
@@ -1252,8 +1422,68 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
   return 0;
 }
 
+/* notify-retries / notify-retry-interval / notify-retry-backoff。options (zone_domain NULL) と zone で共通。
+ * 戻り値: 0 = このキーではない、1 = 読んで nr に設定した、-1 = 値が不正 (ログ済み)。 */
+static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, const char *key,
+                                     notify_retry_config_t *nr) {
+  if (strcmp(key, "notify-retries") == 0) {
+    if (parse_transport_param(ctx, zone_domain, key, false, 0, NOTIFY_RETRIES_MAX, &nr->retries) != 0) return -1;
+    nr->retries_set = true;
+    return 1;
+  }
+  if (strcmp(key, "notify-retry-interval") == 0) {
+    if (parse_transport_param(ctx, zone_domain, key, false, 1, NOTIFY_RETRY_INTERVAL_MAX, &nr->interval) != 0)
+      return -1;
+    nr->interval_set = true;
+    return 1;
+  }
+  if (strcmp(key, "notify-retry-backoff") != 0) return 0;
+  conf_token_t tok = get_next_token(ctx);
+  bool ok = tok.type == TOKEN_STRING && tok.value &&
+            (strcasecmp(tok.value, "fixed") == 0 || strcasecmp(tok.value, "exponential") == 0);
+  if (!ok) {
+    const char *v = (tok.type == TOKEN_STRING && tok.value) ? tok.value : "";
+    if (zone_domain) {
+      syslog(LOG_ERR, "[Config] zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)",
+             zone_domain, v);
+      fprintf(stderr, "[ERROR] zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n",
+              zone_domain, v);
+    } else {
+      syslog(LOG_ERR, "[Config] Invalid notify-retry-backoff value '%s' (expected fixed or exponential)", v);
+      fprintf(stderr, "[ERROR] Invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n", v);
+    }
+    free_token(&tok);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  nr->backoff = strcasecmp(tok.value, "exponential") == 0 ? NOTIFY_BACKOFF_EXPONENTIAL : NOTIFY_BACKOFF_FIXED;
+  nr->backoff_set = true;
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  bool semi = tok.type == TOKEN_SEMICOLON;
+  free_token(&tok);
+  return semi ? 1 : -1;
+}
+
+notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone) {
+  notify_retry_config_t r = {NOTIFY_RETRIES_DEFAULT, NOTIFY_RETRY_INTERVAL_DEFAULT, NOTIFY_BACKOFF_FIXED,
+                             true, true, true};
+  if (cfg) {
+    r.retries = cfg->notify_retry.retries;
+    r.interval = cfg->notify_retry.interval;
+    r.backoff = cfg->notify_retry.backoff;
+  }
+  if (zone) {
+    if (zone->notify_retry.retries_set) r.retries = zone->notify_retry.retries;
+    if (zone->notify_retry.interval_set) r.interval = zone->notify_retry.interval;
+    if (zone->notify_retry.backoff_set) r.backoff = zone->notify_retry.backoff;
+  }
+  return r;
+}
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
+  int nr_rc = 0;
   if (tok.type != TOKEN_STRING) {
     free_token(&tok);
     return -1;
@@ -1273,15 +1503,26 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
     if (ctx) ctx->error_occurred = true;
     return -1;
   }
-  size_t dl = strlen(zone->domain);
-  if (dl > 0 && zone->domain[dl - 1] != '.') {
-    char *norm = malloc(dl + 2);
-    if (norm) {
-      memcpy(norm, zone->domain, dl);
-      norm[dl] = '.';
-      norm[dl + 1] = '\0';
+  /* ゾーン名はゾーンデータ・クエリ名と同じ正規形 (dns_wire.h) の絶対名にする (R-29)。
+   * 正規形が 255 文字を超える名前はゾーン名として扱わない (ゾーンのエントリは 256 バイト)。 */
+  char norm[DNS_NAME_TEXT_SIZE];
+  size_t nl = dns_name_normalize(zone->domain, norm, sizeof(norm) - 1);
+  if (nl != (size_t)-1 && (nl == 0 || dns_name_len_no_root(norm, nl) == nl)) {
+    norm[nl++] = '.'; // 相対名 (末尾ドットなし) を絶対名に。"" はルート
+    norm[nl] = '\0';
+  }
+  if (nl == (size_t)-1 || nl > 255) {
+    syslog(LOG_ERR, "[Config] invalid zone name '%s' (bad escape, empty label, or name too long)", zone->domain);
+    fprintf(stderr, "[ERROR] invalid zone name '%s' (bad escape, empty label, or name too long)\n", zone->domain);
+    free_zone_config(zone);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  if (strcmp(norm, zone->domain) != 0) {
+    char *copy = strdup(norm);
+    if (copy) {
       free(zone->domain);
-      zone->domain = norm;
+      zone->domain = copy;
     }
   }
   tok = get_next_token(ctx);
@@ -1365,18 +1606,20 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       }
       free_token(&tok);
       if (strcmp(key, "type") == 0) {
-        if (strcasecmp(val, "primary") == 0) {
+        /* D-23: 型名は小文字の正規名で持つ (使う側は strcmp("master") などで比べる) */
+        const char *canon = NULL;
+        if (strcasecmp(val, "primary") == 0 || strcasecmp(val, "master") == 0)
+          canon = "master";
+        else if (strcasecmp(val, "secondary") == 0 || strcasecmp(val, "slave") == 0)
+          canon = "slave";
+        else if (strcasecmp(val, "program") == 0)
+          canon = "program";
+        else if (strcasecmp(val, "forward") == 0)
+          canon = "forward";
+        if (canon) {
           free(val);
-          zone->type = strdup("master");
-        } else if (strcasecmp(val, "secondary") == 0) {
-          free(val);
-          zone->type = strdup("slave");
-        } else if (strcasecmp(val, "master") == 0 || strcasecmp(val, "slave") == 0) {
-          zone->type = val;
-        } else if (strcasecmp(val, "program") == 0) {
-          zone->type = val;
-        } else if (strcasecmp(val, "forward") == 0) {
-          zone->type = val;
+          free(zone->type);
+          zone->type = strdup(canon);
         } else {
           syslog(LOG_ERR, "[Config] Unknown zone type '%s' for zone '%s' (expected master/primary, slave/secondary, forward, or program)", val, zone->domain);
           fprintf(stderr, "[ERROR] Unknown zone type '%s' for zone '%s'\n", val, zone->domain);
@@ -1410,8 +1653,13 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       else if (strcmp(key, "notify-source") == 0)
         zone->notify_source = val;
       else if (strcmp(key, "catalog-zone") == 0) {
-        if (strcasecmp(val, "yes") == 0)
-          zone->is_catalog = true;
+        if (!parse_config_bool(val, &zone->is_catalog)) {
+          report_bad_bool(ctx, zone->domain, key, val);
+          free(key);
+          free(val);
+          free_zone_config(zone);
+          return -1;
+        }
         free(val);
       }
     } else if (strcmp(key, "program") == 0) {
@@ -1515,15 +1763,12 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
       zone->additional_from_auth_specified = true;
-      if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-        zone->additional_from_auth = ADDITIONAL_AUTH_YES;
-      else if (strcmp(tok.value, "in-domain") == 0 || strcmp(tok.value, "in-zone") == 0)
-        zone->additional_from_auth = ADDITIONAL_AUTH_IN_DOMAIN;
-      else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-        zone->additional_from_auth = ADDITIONAL_AUTH_NO;
-      else {
-        syslog(LOG_WARNING, "[Config] zone '%s': Unknown additional-from-auth value '%s', defaulting to yes", zone->domain, tok.value);
-        zone->additional_from_auth = ADDITIONAL_AUTH_YES;
+      if (!parse_additional_from_auth(tok.value, &zone->additional_from_auth)) {
+        report_bad_value(ctx, zone->domain, key, tok.value, "yes, no or in-domain");
+        free(key);
+        free_zone_config(zone);
+        free_token(&tok);
+        return -1;
       }
       free_token(&tok);
       tok = get_next_token(ctx);
@@ -1542,16 +1787,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         free_token(&tok);
         return -1;
       }
-      if (strcasecmp(tok.value, "yes") == 0 || strcasecmp(tok.value, "true") == 0) {
-        zone->disable_auto_tc_flag = true;
-      } else if (strcasecmp(tok.value, "no") == 0 || strcasecmp(tok.value, "false") == 0) {
-        zone->disable_auto_tc_flag = false;
-      } else {
-        syslog(LOG_ERR, "[Config] zone '%s': invalid disable-auto-tc-flag value '%s' (expected yes or no)", zone->domain, tok.value);
+      if (!parse_config_bool(tok.value, &zone->disable_auto_tc_flag)) {
+        report_bad_bool(ctx, zone->domain, key, tok.value);
         free(key);
         free_zone_config(zone);
         free_token(&tok);
-        if (ctx) ctx->error_occurred = true;
         return -1;
       }
       free_token(&tok);
@@ -1563,6 +1803,13 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
       free_token(&tok);
+    } else if (strncmp(key, "notify-retr", 11) == 0 &&
+               (nr_rc = parse_notify_retry_option(ctx, zone->domain, key, &zone->notify_retry)) != 0) {
+      if (nr_rc < 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
     } else if (strcmp(key, "zone-tcp-mss") == 0 || strcmp(key, "zone-tcp-window") == 0 ||
                strcmp(key, "zone-tcp-sndbuf") == 0 || strcmp(key, "zone-udp-bufsize") == 0) {
       int v = 0;
@@ -1617,11 +1864,11 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
       (strcasecmp(zone->type, "slave") == 0 || strcasecmp(zone->type, "secondary") == 0)) {
     syslog(LOG_WARNING,
            "[Config] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
-           "Dynamic Update requests to secondary zones will be rejected at runtime with NOTAUTH (RFC 2136)",
+           "Dynamic Update requests to secondary zones are refused at runtime (REFUSED; updates are not forwarded to the primary)",
            zone->domain);
     fprintf(stderr,
            "[WARNING] Zone '%s' is type 'slave'/'secondary' but has 'allow-update' configured; "
-           "Dynamic Update requests to secondary zones will be rejected at runtime with NOTAUTH (RFC 2136)\n",
+           "Dynamic Update requests to secondary zones are refused at runtime (REFUSED; updates are not forwarded to the primary)\n",
            zone->domain);
   }
   *zone_out = zone;
@@ -1681,16 +1928,23 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
     } else if (strcmp(key_prop, "queue-size") == 0 || strcmp(key_prop, "queue_size") == 0) {
       config->dnstap.queue_size = (uint32_t)strtoul(val, NULL, 10);
       free(val);
-    } else if (strcmp(key_prop, "log-queries") == 0 || strcmp(key_prop, "auth-query") == 0) {
-      config->dnstap.log_auth_query = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
-      msg_type_specified = true;
-      free(val);
-    } else if (strcmp(key_prop, "log-responses") == 0 || strcmp(key_prop, "auth-response") == 0) {
-      config->dnstap.log_auth_response = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
-      msg_type_specified = true;
-      free(val);
-    } else if (strcmp(key_prop, "require-connect") == 0) {
-      config->dnstap.require_connect = (strcmp(val, "yes") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (strcmp(key_prop, "log-queries") == 0 || strcmp(key_prop, "auth-query") == 0 ||
+               strcmp(key_prop, "log-responses") == 0 || strcmp(key_prop, "auth-response") == 0 ||
+               strcmp(key_prop, "require-connect") == 0) {
+      bool *dst = &config->dnstap.require_connect;
+      if (strcmp(key_prop, "log-queries") == 0 || strcmp(key_prop, "auth-query") == 0) {
+        dst = &config->dnstap.log_auth_query;
+        msg_type_specified = true;
+      } else if (strcmp(key_prop, "log-responses") == 0 || strcmp(key_prop, "auth-response") == 0) {
+        dst = &config->dnstap.log_auth_response;
+        msg_type_specified = true;
+      }
+      if (!parse_config_bool(val, dst)) {
+        report_bad_bool(ctx, NULL, key_prop, val);
+        free(val);
+        free(key_prop);
+        return -1;
+      }
       free(val);
     } else {
       free(val);
@@ -1709,6 +1963,7 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
 }
 
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
+  int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
   config->port = 53;
   config->bind_addresses = NULL;
@@ -1731,6 +1986,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_any_ttl = 86400;
   config->wire_cache_max_records = 0;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
+  config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
+  config->notify_retry.interval = NOTIFY_RETRY_INTERVAL_DEFAULT;
+  config->notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
   config->query_log_max_qps = 5000;
   config->query_log_buffer_size = 32768;
   config->max_mqtypes = 4;
@@ -1842,23 +2100,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
         } else if (strcmp(key, "ecs-enable") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->ecs_enable = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->ecs_enable = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
+          if (parse_bool_statement(ctx, NULL, key, &config->ecs_enable) != 0) {
             free(key);
             return -1;
           }
-          free_token(&tok);
         } else if (strcmp(key, "ecs-trusted-resolvers") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_LBRACE) {
@@ -1885,68 +2130,25 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
         } else if (strcmp(key, "send-extended-errors") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->send_extended_errors = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->send_extended_errors = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
+          if (parse_bool_statement(ctx, NULL, key, &config->send_extended_errors) != 0) {
             free(key);
             return -1;
           }
-          free_token(&tok);
         } else if (strcmp(key, "serve-stale") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->serve_stale = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->serve_stale = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
+          if (parse_bool_statement(ctx, NULL, key, &config->serve_stale) != 0) {
             free(key);
             return -1;
           }
-          free_token(&tok);
         } else if (strcmp(key, "rfc10029-mqtype") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->rfc10029_mqtype_enable = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->rfc10029_mqtype_enable = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
+          if (parse_bool_statement(ctx, NULL, key, &config->rfc10029_mqtype_enable) != 0) {
             free(key);
             return -1;
           }
-          free_token(&tok);
         } else if (strcmp(key, "tcp-connection-reuse") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0) config->tcp_connection_reuse = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0) config->tcp_connection_reuse = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
-          free_token(&tok);
+          if (parse_bool_statement(ctx, NULL, key, &config->tcp_connection_reuse) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "tcp-idle-timeout") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
@@ -2018,41 +2220,15 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }
           free_token(&tok);
         } else if (strcmp(key, "minimal-responses") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->minimal_responses = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->minimal_responses = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
+          if (parse_bool_statement(ctx, NULL, key, &config->minimal_responses) != 0) {
             free(key);
             return -1;
           }
-          free_token(&tok);
         } else if (strcmp(key, "minimal-any") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->minimal_any = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->minimal_any = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
+          if (parse_bool_statement(ctx, NULL, key, &config->minimal_any) != 0) {
             free(key);
             return -1;
           }
-          free_token(&tok);
         } else if (strcmp(key, "additional-from-auth") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -2060,15 +2236,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free_token(&tok);
             return -1;
           }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->additional_from_auth = ADDITIONAL_AUTH_YES;
-          else if (strcmp(tok.value, "in-domain") == 0 || strcmp(tok.value, "in-zone") == 0)
-            config->additional_from_auth = ADDITIONAL_AUTH_IN_DOMAIN;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->additional_from_auth = ADDITIONAL_AUTH_NO;
-          else {
-            syslog(LOG_WARNING, "[Config] Unknown additional-from-auth value '%s', defaulting to yes", tok.value);
-            config->additional_from_auth = ADDITIONAL_AUTH_YES;
+          if (!parse_additional_from_auth(tok.value, &config->additional_from_auth)) {
+            report_bad_value(ctx, NULL, key, tok.value, "yes, no or in-domain");
+            free(key);
+            free_token(&tok);
+            return -1;
           }
           free_token(&tok);
           tok = get_next_token(ctx);
@@ -2128,24 +2300,10 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           free_token(&tok);
         } else if (strcmp(key, "allow-program-zones") == 0) {
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_STRING) {
+          if (parse_bool_statement(ctx, NULL, key, &config->allow_program_zones) != 0) {
             free(key);
-            free_token(&tok);
             return -1;
           }
-          if (strcmp(tok.value, "yes") == 0 || strcmp(tok.value, "true") == 0)
-            config->allow_program_zones = true;
-          else if (strcmp(tok.value, "no") == 0 || strcmp(tok.value, "false") == 0)
-            config->allow_program_zones = false;
-          free_token(&tok);
-          tok = get_next_token(ctx);
-          if (tok.type != TOKEN_SEMICOLON) {
-            free(key);
-            free_token(&tok);
-            return -1;
-          }
-          free_token(&tok);
         } else if (strcmp(key, "max-mqtypes") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -2211,6 +2369,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strncmp(key, "notify-retr", 11) == 0 &&
+                   (nr_rc = parse_notify_retry_option(ctx, NULL, key, &config->notify_retry)) != 0) {
+          if (nr_rc < 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "tcp-mss") == 0) {
           if (parse_transport_param(ctx, NULL, key, false, KARIDNS_TCP_MSS_MIN, KARIDNS_TCP_MSS_MAX,
                                     &config->tcp_mss) != 0) {
@@ -2358,6 +2522,29 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       else
         last_zone->next = zone;
       last_zone = zone;
+    } else if (strcmp(tok.value, "acl") == 0) {
+      /* D-22: acl "name" { <address_match_element>; ... }; (BIND named.conf) */
+      free_token(&tok);
+      tok = get_next_token(ctx);
+      if (tok.type != TOKEN_STRING) { free_token(&tok); return -1; }
+      acl_def_t *acl = safe_calloc_or_die(1, sizeof(acl_def_t));
+      if (!acl) { free_token(&tok); if (ctx) ctx->error_occurred = true; return -1; }
+      acl->name = tok.value;
+      tok.value = NULL;
+      free_token(&tok);
+      /* 先にリストへつなぐ。途中のエラーでも free_server_config_fields() が解放する */
+      bool dup_name = false;
+      for (const acl_def_t *e = config->acls; e; e = e->next)
+        if (strcasecmp(e->name, acl->name) == 0) dup_name = true;
+      acl->next = config->acls;
+      config->acls = acl;
+      if (dup_name || acl_name_is_builtin(acl->name)) {
+        syslog(LOG_ERR, "[Config] acl '%s' is %s", acl->name, dup_name ? "defined twice" : "a built-in name");
+        fprintf(stderr, "[ERROR] acl '%s' is %s\n", acl->name, dup_name ? "defined twice" : "a built-in name");
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+      }
+      if (parse_acl_list(ctx, &acl->entries, &acl->count, ACL_KEY_MARKED, NULL, NULL) != 0) return -1;
     } else if (strcmp(tok.value, "key") == 0) {
       free_token(&tok);
       tok = get_next_token(ctx);
@@ -2504,7 +2691,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       }
       free_token(&tok);
       for (tsig_key_t *existing = config->keys; existing; existing = existing->next) {
-        if (strcasecmp(existing->name, tsig->name) == 0) {
+        if (domain_names_match_ci(existing->name, tsig->name)) {
           syslog(LOG_ERR, "[Config] Duplicate TSIG key '%s' defined; rejecting configuration", tsig->name);
           fprintf(stderr, "[ERROR] Duplicate TSIG key '%s' defined\n", tsig->name);
           free(tsig->name);
@@ -2672,11 +2859,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           ch->max_qps = config->query_log_max_qps;
           ch->max_qps_specified = false;
           pthread_mutex_init(&ch->lock, NULL);
+          /* 先にリストへつなぐ。途中のエラーでも free_server_config_fields() が解放する */
+          ch->next = config->logging.channels;
+          config->logging.channels = ch;
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_LBRACE) {
             free(dir);
-            free(ch->name);
-            free(ch);
             free_token(&tok);
             return -1;
           }
@@ -2785,19 +2973,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             } else if (strcmp(opt, "print-time") == 0 ||
                        strcmp(opt, "print-category") == 0 ||
                        strcmp(opt, "print-severity") == 0) {
-              tok = get_next_token(ctx);
-              bool val =
-                  (tok.type == TOKEN_STRING && strcmp(tok.value, "yes") == 0);
-              free_token(&tok);
-              tok = get_next_token(ctx);
-              if (tok.type == TOKEN_SEMICOLON)
-                free_token(&tok);
-              if (strcmp(opt, "print-time") == 0)
-                ch->print_time = val;
-              else if (strcmp(opt, "print-category") == 0)
-                ch->print_category = val;
-              else
-                ch->print_severity = val;
+              bool *dst = (strcmp(opt, "print-time") == 0) ? &ch->print_time
+                        : (strcmp(opt, "print-category") == 0) ? &ch->print_category
+                        : &ch->print_severity;
+              if (parse_bool_statement(ctx, NULL, opt, dst) != 0) {
+                free(opt);
+                free(dir);
+                return -1;
+              }
             } else if (strcmp(opt, "max-qps") == 0) {
               tok = get_next_token(ctx);
               if (tok.type == TOKEN_STRING) {
@@ -2822,8 +3005,6 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           tok = get_next_token(ctx);
           if (tok.type == TOKEN_SEMICOLON)
             free_token(&tok);
-          ch->next = config->logging.channels;
-          config->logging.channels = ch;
         } else if (strcmp(dir, "category") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -2834,34 +3015,67 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           char *cat_name = tok.value;
           tok.value = NULL;
           free_token(&tok);
+          /* D-01: category <name> { <channel>; ... }; 先頭のチャネルを使い、残りは警告して無視する */
+          char **slot = NULL;
+          if (strcmp(cat_name, "queries") == 0) {
+            slot = &config->logging.queries_channel_name;
+          } else if (strcmp(cat_name, "responses") == 0) {
+            slot = &config->logging.responses_channel_name;
+          } else {
+            syslog(LOG_WARNING, "[Config] Unknown logging category '%s', ignoring", cat_name);
+            fprintf(stderr, "[WARNING] Unknown logging category '%s', ignoring\n", cat_name);
+          }
           tok = get_next_token(ctx);
-          if (tok.type == TOKEN_LBRACE) {
+          if (tok.type != TOKEN_LBRACE) {
+            free(cat_name);
+            free(dir);
             free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+          if (slot) {
+            free(*slot); /* 空のリストはそのカテゴリを出力しない */
+            *slot = NULL;
+          }
+          while (1) {
             tok = get_next_token(ctx);
-            if (strcmp(cat_name, "queries") == 0 && tok.type == TOKEN_STRING) {
-              if (config->logging.queries_channel_name) free(config->logging.queries_channel_name);
-              config->logging.queries_channel_name = tok.value;
+            if (tok.type == TOKEN_RBRACE) {
+              free_token(&tok);
+              break;
+            }
+            if (tok.type != TOKEN_STRING) {
+              free(cat_name);
+              free(dir);
+              free_token(&tok);
+              return -1;
+            }
+            if (slot && !*slot) {
+              *slot = tok.value;
               tok.value = NULL;
-            } else if (strcmp(cat_name, "responses") == 0 && tok.type == TOKEN_STRING) {
-              if (config->logging.responses_channel_name) free(config->logging.responses_channel_name);
-              config->logging.responses_channel_name = tok.value;
-              tok.value = NULL;
-            } else {
-              syslog(LOG_WARNING, "[Config] Unknown logging category '%s', ignoring", cat_name);
-              fprintf(stderr, "[WARNING] Unknown logging category '%s', ignoring\n", cat_name);
+            } else if (slot) {
+              syslog(LOG_WARNING, "[Config] logging category '%s': only the first channel ('%s') is used, ignoring '%s'",
+                     cat_name, *slot, tok.value);
+              fprintf(stderr, "[WARNING] logging category '%s': only the first channel ('%s') is used, ignoring '%s'\n",
+                      cat_name, *slot, tok.value);
             }
             free_token(&tok);
             tok = get_next_token(ctx);
-            if (tok.type == TOKEN_SEMICOLON)
+            if (tok.type != TOKEN_SEMICOLON) {
+              free(cat_name);
+              free(dir);
               free_token(&tok);
-            tok = get_next_token(ctx);
-            if (tok.type == TOKEN_RBRACE)
-              free_token(&tok);
+              return -1;
+            }
+            free_token(&tok);
           }
           free(cat_name);
           tok = get_next_token(ctx);
-          if (tok.type == TOKEN_SEMICOLON)
+          if (tok.type != TOKEN_SEMICOLON) {
+            free(dir);
             free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
         } else
           skip_unknown_block(ctx);
         free(dir);
@@ -2960,6 +3174,37 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
     }
   }
 
+  /* D-22: 名前付き ACL の参照を展開し、アドレスでも ACL 名でもない要素を設定エラーにする。
+   * フラットなゾーンリストは構造体のコピーなので、それを作る前に行う */
+  {
+    char where[DNS_NAME_TEXT_SIZE + 128];
+    if (config->ecs_trusted_resolvers_count > 0 &&
+        acl_expand_field(ctx, config, "options ecs-trusted-resolvers", ACL_USE_ADDRESS,
+                         &config->ecs_trusted_resolvers, &config->ecs_trusted_resolvers_count,
+                         &config->ecs_trusted_resolvers_parsed, NULL, NULL) != 0)
+      return -1;
+    for (view_config_t *v = config->views; v; v = v->next) {
+      snprintf(where, sizeof(where), "view '%s' match-clients", v->name);
+      if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &v->match_clients, &v->match_clients_count,
+                           &v->match_clients_parsed, NULL, NULL) != 0)
+        return -1;
+      for (zone_config_t *z = v->zones; z; z = z->next) {
+        snprintf(where, sizeof(where), "zone '%s' allow-transfer", z->domain);
+        if (acl_expand_field(ctx, config, where, ACL_USE_TRANSFER, &z->allow_transfer, &z->allow_transfer_count,
+                             &z->allow_transfer_parsed, &z->tsig_keys, &z->tsig_keys_count) != 0)
+          return -1;
+        snprintf(where, sizeof(where), "zone '%s' allow-update", z->domain);
+        if (acl_expand_field(ctx, config, where, ACL_USE_UPDATE, &z->allow_update, &z->allow_update_count,
+                             &z->allow_update_parsed, NULL, NULL) != 0)
+          return -1;
+        snprintf(where, sizeof(where), "zone '%s' ecs-trusted-resolvers", z->domain);
+        if (acl_expand_field(ctx, config, where, ACL_USE_ADDRESS, &z->ecs_trusted_resolvers,
+                             &z->ecs_trusted_resolvers_count, &z->ecs_trusted_resolvers_parsed, NULL, NULL) != 0)
+          return -1;
+      }
+    }
+  }
+
   /* [T7] TSIGキー参照の未定義検出 (checkconf相当の健全性チェック) */
   for (view_config_t *v = config->views; v; v = v->next) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
@@ -2979,21 +3224,6 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           fprintf(stderr, "[ERROR] Zone '%s': allow-transfer key '%s' is not defined in any key {} block\n",
                   z->domain, z->tsig_keys[i]);
           return -1;
-        }
-      }
-      /* allow-update: IP/CIDR以外のエントリーがキー定義に一致しない場合は警告(起動は継続) */
-      for (int i = 0; i < z->allow_update_count; i++) {
-        const char *entry = z->allow_update[i];
-        if (looks_like_acl_address_token(entry)) continue;
-        if (!key_name_is_defined(config->keys, entry)) {
-          syslog(LOG_WARNING,
-                 "[Config] Zone '%s': allow-update entry '%s' does not match any defined key "
-                 "and is not a valid IP/CIDR; likely a typo",
-                 z->domain, entry);
-          fprintf(stderr,
-                  "[WARNING] Zone '%s': allow-update entry '%s' does not match any defined key "
-                  "and is not a valid IP/CIDR; likely a typo\n",
-                  z->domain, entry);
         }
       }
     }

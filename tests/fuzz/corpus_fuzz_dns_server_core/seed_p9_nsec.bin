@@ -1,0 +1,59 @@
+1; File written on Wed Sep 30 11:55:20 2026
+; dnssec-signzone version 9.20.29
+fuzz.local.				      300 IN SOA	ns1.fuzz.local. h.fuzz.local. 1 3600 600 86400 60
+fuzz.local.				      300 IN RRSIG	SOA 13 2 300 20261030105520 20260930105520 15780 fuzz.local. RZ+3xcsnk8mMtywPGt55xKqve3J0UTcJw5ZudtExIVrlsNHU5NVodVaY 51m0bPCfK9oBE1h7uXQeJiouPVLvvQ==
+; resign=20261030105520
+fuzz.local.				      300 IN NS		ns1.fuzz.local.
+fuzz.local.				      300 IN RRSIG	NS 13 2 300 20261030105520 20260930105520 15780 fuzz.local. EFxASnzTmsYaOQ6bbL7MCV2Gee94vCaAAy8Siwts3J2nc/HtGbCXZPDY uKi5DJomu/RR5wbssWrcHmEgtS7U8w==
+; resign=20261030105520
+fuzz.local.				      60 IN NSEC	d.fuzz.local. NS SOA RRSIG NSEC DNSKEY
+fuzz.local.				      60 IN RRSIG	NSEC 13 2 60 20261030105520 20260930105520 15780 fuzz.local. 4tFJrARDS1pErOB2sKsXqfRD/JJ5C6HuN/iVUdO3Rz/U5FAhZ/uBphtO Nh81XzsbzlcnEDPFkNYa18V6OzrvXg==
+; resign=20261030105520
+fuzz.local.				      300 IN DNSKEY	256 3 13 /k4Lf9jvVe4IEDpxXW74dgQN3noylgQ0rD+jU3u9+1w8l1fjvTgLa36m 0DJAvXbDvDrIISjVk+LgyHn2lTnz/g==
+fuzz.local.				      300 IN DNSKEY	257 3 13 b9jnLF0qCu0QqYhJPd4ajWRmJ31PJpP9qSSSBRzymjniyeGv2DxJFjEf YwZiyOEGUiSaSh/+7XJU1ALyyg1xCA==
+fuzz.local.				      300 IN RRSIG	DNSKEY 13 2 300 20261030105520 20260930105520 15780 fuzz.local. /+5yAn+vCYetmfq/dLQGfDZF9xAmH1lpi37TsQ54JLfNx/o3TIlnyiAD JSLVLiwRb8HkPVvRDS1h1Tz20dQrpA==
+fuzz.local.				      300 IN RRSIG	DNSKEY 13 2 300 20261030105520 20260930105520 24676 fuzz.local. q0H/gh0nwYPtixFfNiWdPoBpUnT/tdBOnOswKkp4h6dztunLedkyClQA FB6mgOq7jt8bhgLqsyfTMK6zpsPM/w==
+; resign=20261030105520
+d.fuzz.local.				      300 IN DNAME	ns1.fuzz.local.
+d.fuzz.local.				      300 IN RRSIG	DNAME 13 3 300 20261030105520 20260930105520 15780 fuzz.local. YslOptmSm56o9knIigwH1MHBB5d2nOuCIYcFPYlH+yEtqLVcaQADt3DW 7Inp/hGEZpRwsSnNO1HAj+iM0fYNXQ==
+; resign=20261030105520
+d.fuzz.local.				      60 IN NSEC	i.fuzz.local. DNAME RRSIG NSEC
+d.fuzz.local.				      60 IN RRSIG	NSEC 13 3 60 20261030105520 20260930105520 15780 fuzz.local. 84+JwT92zz4XMxB7bgJl3cJq+DktVBI57DKa1Dx7tLV9aYdointa1Say 0dELwoqHMT104EI62SX0di3N5sjo+g==
+; resign=20261030105520
+i.fuzz.local.				      300 IN NS		ns.i.fuzz.local.
+i.fuzz.local.				      60 IN NSEC	mail.fuzz.local. NS RRSIG NSEC
+i.fuzz.local.				      60 IN RRSIG	NSEC 13 3 60 20261030105520 20260930105520 15780 fuzz.local. HApZoNQJAigFK4ywTg1aOPV/WWCIp89k1sWuvGUjd2Ap6+6qBNnCac02 B7nIKEmiUfaPfzI+kviETGDcXj2j0Q==
+; resign=20261030105520
+ns.i.fuzz.local.			      300 IN A		192.0.2.4
+mail.fuzz.local.			      300 IN MX		10 ns1.fuzz.local.
+mail.fuzz.local.			      300 IN RRSIG	MX 13 3 300 20261030105520 20260930105520 15780 fuzz.local. DQgkychFnFZ3IWMDshmLuIrZfb/sIkFyHQ2F4TfhWtDPiaOkJHXzu5UC Oe0wxpre7wtx2L9XcwcXCTkmayDnNQ==
+; resign=20261030105520
+mail.fuzz.local.			      60 IN NSEC	ns1.fuzz.local. MX RRSIG NSEC
+mail.fuzz.local.			      60 IN RRSIG	NSEC 13 3 60 20261030105520 20260930105520 15780 fuzz.local. qIFyQWz9O/J6Om5buPB4NkS1S3Rc5u5JpUhEaHcYmqdMzFDpencOu/qG DhW/+h27tqwUhhnUpoH8wT1FMKfgiA==
+; resign=20261030105520
+ns1.fuzz.local.				      300 IN A		192.0.2.1
+ns1.fuzz.local.				      300 IN RRSIG	A 13 3 300 20261030105520 20260930105520 15780 fuzz.local. hBNHT2v5oxOP71ZgYzfH3aSjucrqZhbzpP2/fPmQhMClsgwz9NEK3rCt P5vFlGghaa0TvAlVgsZlbtodd2YrVg==
+; resign=20261030105520
+ns1.fuzz.local.				      300 IN AAAA	2001:db8::1
+ns1.fuzz.local.				      300 IN RRSIG	AAAA 13 3 300 20261030105520 20260930105520 15780 fuzz.local. FCwIRXtzRA3ngNtRIDDKuxwBQqSOzbhWky5rIuDbjhBgz5DS28Opv/JI GIGmIBWwo7txePCWIb6Wm8uxCDGBWg==
+; resign=20261030105520
+ns1.fuzz.local.				      60 IN NSEC	s.fuzz.local. A AAAA RRSIG NSEC
+ns1.fuzz.local.				      60 IN RRSIG	NSEC 13 3 60 20261030105520 20260930105520 15780 fuzz.local. XHg66W1pLJRcEaysMnMBABbezO5ej8dNRKjFBIi0EuYHRI5DaN7CclKy y3j06+fBx2Y/JTlAlgkXLu1QLHK/WA==
+; resign=20261030105520
+s.fuzz.local.				      300 IN NS		ns.s.fuzz.local.
+s.fuzz.local.				      300 IN DS		12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01234567 89ABCDEF
+s.fuzz.local.				      300 IN RRSIG	DS 13 3 300 20261030105520 20260930105520 15780 fuzz.local. 1e6/nlow3e4XOqr/FCexzGy0C5mMkfS2r5kMY3xGUKM6o5fEoD2cXh8j U37YDmXS38QQinx6YWd61g09z4qCHQ==
+; resign=20261030105520
+s.fuzz.local.				      60 IN NSEC	*.w.fuzz.local. NS DS RRSIG NSEC
+s.fuzz.local.				      60 IN RRSIG	NSEC 13 3 60 20261030105520 20260930105520 15780 fuzz.local. YoLm07I4nwAKI7+7rqy+7Scjjfk+VbWg+KorWgVs5E8EPE8HTYKxBkxj PD9rVu5pDDaRWqPZqd0Gl48EPZzn/A==
+; resign=20261030105520
+ns.s.fuzz.local.			      300 IN A		192.0.2.3
+*.w.fuzz.local.				      300 IN A		192.0.2.2
+*.w.fuzz.local.				      300 IN RRSIG	A 13 3 300 20261030105520 20260930105520 15780 fuzz.local. sL+XHyD7UIGp2gehKGCabecKxazY7Bt95ln8Nd8PtSZC3Gjfkn8G0cWk iLcByB6qxud9/MiYOIj8UOCsKkVv1g==
+; resign=20261030105520
+*.w.fuzz.local.				      300 IN TXT	"w"
+*.w.fuzz.local.				      300 IN RRSIG	TXT 13 3 300 20261030105520 20260930105520 15780 fuzz.local. vvjo+RaD/wS5+77+KiAFXFeO/us4rMKGRzwRdyNFGqCJuG4dHidMBwn9 u/0PnKHsn/wz0jV+A4s8qSO6lBSOVQ==
+; resign=20261030105520
+*.w.fuzz.local.				      60 IN NSEC	fuzz.local. A TXT RRSIG NSEC
+*.w.fuzz.local.				      60 IN RRSIG	NSEC 13 3 60 20261030105520 20260930105520 15780 fuzz.local. wawWxUhBSCRNln5kgms3OOwsJRezO+NFJNk92d/J9dUjVDE+CKx/utCz 2WMG0HwhHIuQlyAYBvFORwhznjL0/Q==
+; resign=20261030105520

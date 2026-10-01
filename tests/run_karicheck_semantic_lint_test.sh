@@ -42,7 +42,8 @@ fi
 # Test 1b: Out-of-bailiwick Glue Detection (WARNING)
 echo "[+] Test 1b: Out-of-bailiwick glue check (orphan_glue.zone)..."
 OUT1B=$(./karicheck zone example.com. tests/zones/orphan_glue.zone 2>&1 || true)
-if echo "$OUT1B" | grep -q "Out-of-bailiwick glue record 'ns1.example.net.' in zone 'example.com.'"; then
+# R-27: out-of-zone glue is reported (and ignored) as out-of-zone data, like the server loader does
+if echo "$OUT1B" | grep -q "\[WARNING\] Zone 'example.com.': out-of-zone record 'ns1.example.net.' A ignored"; then
     echo "  PASS: Out-of-bailiwick glue warning detected."
 else
     echo "  FAIL: Expected out-of-bailiwick glue warning missing:"

@@ -117,18 +117,25 @@ static const char *const OK_LINES[] = {
     "CH TXT \"chaos\"",
     "3600 IN A 192.0.2.9",
     "IN 3600 A 192.0.2.9",
-    "A 192.0.2.9"
-};
-/* Parse fine but serialize_dns_record() rejects them. IPSECKEY with gateway type 0 (no gateway, "." per RFC 4025
- * section 2.3) is RFC-valid, so this is a probable serializer gap; SINK (RFC-draft type 40) is likewise
- * unserializable. Executed for robustness only - NOT pinned as expected behaviour. */
-static const char *const KNOWN_SERIALIZE_GAPS[] = {
-    /* RR type / class mnemonics are matched case-sensitively today (BIND accepts "in a", "IN Mx"): these are
-     * rejected at parse time, which the loop below tolerates (it only requires "no crash"). */
+    "A 192.0.2.9",
+    /* R-22 a/b: type and class mnemonics are case-insensitive (RFC 1035 2.3.3), CLASSnn per RFC 3597 5 */
+    "in a 192.0.2.1", "IN a 192.0.2.1", "In A 192.0.2.1", "IN Mx 10 m.example.", "IN txt \"x\"",
+    "CLASS1 A 192.0.2.1", "class3 TXT \"chaos\"", "HS TXT \"hesiod\"", "CLASS42 TYPE65280 \\# 2 0102",
+    /* RFC 4025 3.1: gateway type 0 is written as "."; the public key is optional */
     "IN IPSECKEY 10 0 2 . AQNRU3mG7TVTO2BkR47usntb102uFJtugbo6BSGvgqt4AQ==",
     "IN IPSECKEY 10 0 1 . AQNR",
-    "IN SINK 1 1 AQIDBAUG",
-    "in a 192.0.2.1", "IN a 192.0.2.1", "In A 192.0.2.1", "IN Mx 10 m.example.", "IN txt \"x\"",
+    "IN IPSECKEY 10 1 0 192.0.2.38",
+    /* D-08: SINK (draft-ietf-dnsind-kitchen-sink-02 3): meaning coding subcoding base64 */
+    "IN SINK 1 2 3 AQIDBAUG",
+    "IN SINK 1 2 3 AQID BAUG",
+    "IN SINK 0 0 0",
+    /* D-08: the remaining README types without a sample above */
+    "IN A6 0 2001:db8::1",
+    "IN A6 64 ::1:2:3:4 prefix.example.",
+    "IN A6 128 prefix.example.",
+    "IN ATMA 39246f000e7c9c031200010001000002082044590c00",
+    "IN ATMA +358400123456",
+    "IN RKEY 0 3 5 AQIDBAUG",
 };
 static const char *const PARSE_FAIL_LINES[] = {
     "IN A 256.1.1.1",
@@ -153,6 +160,9 @@ static const char *const PARSE_FAIL_LINES[] = {
     "IN BOGUSTYPE 1 2 3"
 };
 static const char *const SERIALIZE_FAIL_LINES[] = {
+    /* ATMA: one token (BIND atma_34.c); the old "format address" two-token form is rejected */
+    "IN ATMA 0 358400123456", "IN ATMA +3584a", "IN ATMA 39246", "IN ATMA .3924", "IN ATMA 39..24", "IN ATMA +",
+    "IN SINK 1 2", "IN SINK 1 2 300 AQID", "IN SINK 1 2 3 !!!!", "IN IPSECKEY 10 0 2 gw.example. AQNR",
     "IN MX 70000 mail.example.",
     "IN MX 10",
     "IN MX mail.example.",
@@ -224,6 +234,8 @@ static const char *const LENIENT_LINES[] = {
     "IN SOA ns.example. h.example. x 2 3 4 5"
 };
 static const struct { const char *type; const char *rdata_hex; } EXPECTED_WIRE[] = {
+    { "SINK", "010203010203040506" },
+    { "ATMA", "0039246f000e7c9c031200010001000002082044590c00" },
     { "A", "c0000201" }, { "AAAA", "20010db8000000000000000000000001" }, { "MX", "000a046d61696c076578616d706c6500" },
     { "SRV", "000a003c13c403736970076578616d706c6500" }, { "TXT", "0474657874067365636f6e64" },
     { "CAA", "000569737375656c657473656e63727970742e6f7267" },
@@ -410,16 +422,6 @@ static void test_rejection_tables(void) {
         int rc = serialize_dns_record(wire, sizeof(wire), &off, &z.arena.records[z.arena.count - 1], NULL, NULL, 0xFFFFFFFF);
         if (rc == 0) { fprintf(stderr, "must fail to serialize: %s\n", SERIALIZE_FAIL_LINES[i]); assert(0); }
         zt_free(&z);                                           /* ... karicheck's dry-run serialization rejects it */
-    }
-    for (size_t i = 0; i < N(KNOWN_SERIALIZE_GAPS); i++) {
-        zt_t z;
-        zt_load_line(&z, KNOWN_SERIALIZE_GAPS[i]);
-        if (z.rc >= 0) {
-            uint8_t wire[4096];
-            uint16_t off = 0;
-            (void)serialize_dns_record(wire, sizeof(wire), &off, &z.arena.records[z.arena.count - 1], NULL, NULL, 0xFFFFFFFF);
-        }
-        zt_free(&z);
     }
     for (size_t i = 0; i < N(LENIENT_LINES); i++) {            /* robustness only */
         zt_t z;
@@ -945,8 +947,343 @@ static void test_extended_negative_paths(void) {
     printf("  -> extended negative paths verified.\n");
 }
 
+static int g_ooz_reports;
+static void count_ooz(const dns_record_t *rec, void *ud) {
+    (void)rec;
+    assert(ud == &g_ooz_reports);
+    g_ooz_reports++;
+}
+
+/* R-27 (RFC 1034 §4.2): out-of-zone records are removed before indexing; label boundaries and
+ * presentation escapes are respected. */
+static void test_drop_out_of_zone(void) {
+    printf("[TEST] zone_arena_drop_out_of_zone / domain_name_is_at_or_below...\n");
+    assert(domain_name_is_at_or_below("example.test.", "example.test."));
+    assert(domain_name_is_at_or_below("example.test", "EXAMPLE.test."));
+    assert(domain_name_is_at_or_below("a.b.example.test.", "example.test"));
+    assert(!domain_name_is_at_or_below("xexample.test.", "example.test."));
+    assert(!domain_name_is_at_or_below("test.", "example.test."));
+    assert(!domain_name_is_at_or_below("a\\.example.test.", "example.test.")); /* one label "a.example" */
+    assert(domain_name_is_at_or_below("a\\\\.example.test.", "example.test.")); /* "a\\" then "example" */
+    assert(domain_name_is_at_or_below("anything.example.", "."));
+    assert(domain_name_is_at_or_below("anything.example.", ""));
+    assert(!domain_name_is_at_or_below(NULL, "example.test."));
+
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "example.test.", .is_standalone_mode = true, .err_out = &err };
+    static char text[] =
+        "$TTL 60\n"
+        "@ IN SOA ns1 h 1 2 3 4 5\n"
+        "@ IN NS ns1\n"
+        "@ IN NS ns.other.test.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "ns.other.test. IN A 192.0.2.2\n"            /* out-of-zone glue */
+        "10.2.0.192.in-addr.arpa. IN PTR www.example.test.\n"
+        "xexample.test. IN A 192.0.2.3\n"
+        "www IN A 192.0.2.4\n";
+    assert(parse_zone_fast(text, strlen(text), &arena, &ctx) >= 0);
+    size_t before = arena.count;
+    g_ooz_reports = 0;
+    size_t dropped = zone_arena_drop_out_of_zone(&arena, "example.test.", count_ooz, &g_ooz_reports);
+    assert(dropped == 3 && g_ooz_reports == 3);
+    assert(arena.count == before - 3);
+    for (size_t i = 0; i < arena.count; i++)
+        assert(domain_name_is_at_or_below(arena.records[i].name, "example.test."));
+    /* the in-zone records keep their order and data */
+    assert(strcasecmp(arena.records[arena.count - 1].name, "www.example.test.") == 0);
+    assert(strcmp(arena.records[arena.count - 1].rdata[0], "192.0.2.4") == 0);
+    assert(build_zone_index(&arena, true) == 0);
+    assert(zone_arena_drop_out_of_zone(&arena, "example.test.", NULL, NULL) == 0);
+    assert(zone_arena_drop_out_of_zone(NULL, "example.test.", NULL, NULL) == 0);
+    zone_arena_destroy(&arena);
+    printf("  -> out-of-zone drop passed.\n");
+}
+
+/* ---------------------------------------------------------------- phase 11: R-22, D-18, D-08, O-14 */
+static uint32_t wire_ttl_of(dns_record_t *r) {
+    uint8_t wire[4096];
+    uint16_t off = 0;
+    assert(serialize_dns_record(wire, sizeof(wire), &off, r, NULL, NULL, 0xFFFFFFFF) == 0);
+    size_t p = 0;
+    while (wire[p]) p += 1 + wire[p];
+    p++;
+    return ((uint32_t)wire[p + 4] << 24) | ((uint32_t)wire[p + 5] << 16) | ((uint32_t)wire[p + 6] << 8) | wire[p + 7];
+}
+
+static void must_reject(const char *text, const char *why) {
+    zt_t z;
+    zt_load(&z, text);
+    if (z.rc >= 0) { fprintf(stderr, "must be rejected (%s):\n%s", why, text); assert(0); }
+    assert(z.err.error_message && z.err.error_message[0]);
+    zt_free(&z);
+}
+
+static void test_r22_mnemonics_and_classes(void) {
+    printf("[TEST] Zone parser: R-22 a/b case-insensitive mnemonics, class field...\n");
+    zt_t z;
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ in soa ns h 1 2 3 4 5\n@ In Ns ns\n"
+                "w 300 in a 192.0.2.1\n"
+                "m IN mx 10 w\n"
+                "s rrsig a 13 2 300 20300101000000 20200101000000 12345 example. AAAAAAAA\n"
+                "n nsec n2.example. a rrsig Nsec\n"
+                "c1 CLASS1 A 192.0.2.2\n"
+                "c3 class3 TXT x\n"
+                "h hs TXT x\n"
+                "c42 300 CLASS42 TYPE65280 \\# 2 0102\n"
+                "t 300 CH 400 TYPE65281 \\# 0\n");          /* class once, then TTL once: 400 is the type here */
+    assert(z.rc < 0);                                        /* "400" is not a type: second TTL is rejected */
+    zt_free(&z);
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ in soa ns h 1 2 3 4 5\n@ In Ns ns\n"
+                "w 300 in a 192.0.2.1\n"
+                "m IN mx 10 w\n"
+                "s rrsig a 13 2 300 20300101000000 20200101000000 12345 example. AAAAAAAA\n"
+                "n nsec n2.example. a rrsig Nsec\n"
+                "c1 CLASS1 A 192.0.2.2\n"
+                "c3 class3 TXT x\n"
+                "h hs TXT x\n"
+                "c42 300 CLASS42 TYPE65280 \\# 2 0102\n");
+    ASSERT_PARSED(&z);
+    dns_record_t *w = zt_find(&z, "w.example.", 1);
+    assert(w && w->class_val == 1 && strcmp(w->type, "A") == 0 && strcmp(w->class_str, "IN") == 0);
+    dns_record_t *m = zt_find(&z, "m.example.", 15);
+    assert(m && strcmp(m->type, "MX") == 0 && strcmp(m->rdata[1], "w.example.") == 0);
+    dns_record_t *s = zt_find(&z, "s.example.", 46);
+    assert(s);
+    uint8_t wire[4096];
+    const uint8_t *rd;
+    size_t rdlen;
+    assert(ser_rdata(s, wire, sizeof(wire), &rd, &rdlen) == 0);
+    assert(rd[0] == 0 && rd[1] == 1);                        /* type covered "a" -> A */
+    dns_record_t *n = zt_find(&z, "n.example.", 47);
+    assert(n && ser_rdata(n, wire, sizeof(wire), &rd, &rdlen) == 0);
+    /* n2.example. + window 0, 6 octets: A(1) RRSIG(46) NSEC(47) */
+    static const uint8_t nsec_want[] = { 2, 'n', '2', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0, 6, 0x40, 0, 0, 0, 0, 3 };
+    assert(rdlen == sizeof(nsec_want) && memcmp(rd, nsec_want, rdlen) == 0);
+    assert(zt_find(&z, "c1.example.", 1)->class_val == 1);
+    assert(zt_find(&z, "c3.example.", 16)->class_val == 3);
+    assert(zt_find(&z, "h.example.", 16)->class_val == 4);
+    dns_record_t *c42 = zt_find(&z, "c42.example.", 65280);
+    assert(c42 && c42->class_val == 42 && c42->ttl_value == 300);
+    uint16_t off = 0;
+    assert(serialize_dns_record(wire, sizeof(wire), &off, c42, NULL, NULL, 0xFFFFFFFF) == 0);
+    assert(wire[15] == 0 && wire[16] == 42);                 /* "c42.example." is 13 octets, then TYPE(2) CLASS(2) */
+    zt_free(&z);
+
+    static const char *const bad[] = {
+        "x NONE A 192.0.2.1\n", "x any A 192.0.2.1\n", "x CLASS0 A 192.0.2.1\n", "x CLASS254 A 192.0.2.1\n",
+        "x CLASS255 A 192.0.2.1\n", "x CLASS65302 A 192.0.2.1\n", "x CLASS65536 A 192.0.2.1\n",
+        "x IN IN A 192.0.2.1\n", "x 300 300 A 192.0.2.1\n", "x IN ANY 192.0.2.1\n", "x CLASS1x A 192.0.2.1\n",
+    };
+    for (size_t i = 0; i < N(bad); i++) {
+        char text[1024];
+        snprintf(text, sizeof(text), "%s%s", SOA_HEAD, bad[i]);
+        must_reject(text, "class field");
+    }
+    printf("  -> mnemonics and classes passed.\n");
+}
+
+static void test_r22_omitted_ttl(void) {
+    printf("[TEST] Zone parser: R-22 c omitted TTL (RFC 1035 5.1, RFC 2308 4, BIND SOA MINIMUM)...\n");
+    zt_t z;
+    /* no $TTL: the last explicitly stated TTL */
+    zt_load(&z, "$ORIGIN example.\n@ 7200 IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns A 192.0.2.1\n"
+                "w 60 A 192.0.2.2\nx A 192.0.2.3\n$GENERATE 1-1 g$ 45 A 192.0.2.$\nafter A 192.0.2.4\n");
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "example.", 2)->ttl_value == 7200);
+    assert(zt_find(&z, "ns.example.", 1)->ttl_value == 7200);
+    assert(zt_find(&z, "w.example.", 1)->ttl_value == 60);
+    assert(zt_find(&z, "x.example.", 1)->ttl_value == 60);
+    assert(zt_find(&z, "g1.example.", 1)->ttl_value == 45);
+    assert(zt_find(&z, "after.example.", 1)->ttl_value == 45);  /* the $GENERATE TTL was explicit */
+    zt_free(&z);
+    /* $TTL wins over the last explicit TTL */
+    zt_load(&z, "$ORIGIN example.\n$TTL 100\n@ 7200 IN SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n");
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "ns.example.", 1)->ttl_value == 100 && zt_find(&z, "example.", 2)->ttl_value == 100);
+    zt_free(&z);
+    /* no TTL information at all: the SOA takes its MINIMUM, which then acts like $TTL */
+    zt_load(&z, "$ORIGIN example.\n@ IN SOA ns h 1 2 3 4 555\n@ NS ns\nw 60 A 192.0.2.2\nx A 192.0.2.3\n");
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "example.", 6)->ttl_value == 555 && zt_find(&z, "example.", 2)->ttl_value == 555);
+    assert(zt_find(&z, "w.example.", 1)->ttl_value == 60 && zt_find(&z, "x.example.", 1)->ttl_value == 555);
+    zt_free(&z);
+    /* nothing at all before a non-SOA record: 3600 (kept; BIND rejects the zone) */
+    zt_load(&z, "$ORIGIN example.\nw A 192.0.2.2\n");
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "w.example.", 1)->ttl_value == 3600);
+    zt_free(&z);
+
+    /* the last explicit TTL is shared with $INCLUDE files in both directions */
+    char dir[] = "/tmp/karidns_zttl_XXXXXX";
+    assert(mkdtemp(dir));
+    char p[512];
+    snprintf(p, sizeof(p), "%s/i.inc", dir); write_file(p, "i A 192.0.2.5\nj 90 A 192.0.2.6\n");
+    zt_load_in(&z, "$ORIGIN example.\n@ 7200 IN SOA ns h 1 2 3 4 5\n@ NS ns\nw 60 A 192.0.2.2\n"
+                   "$INCLUDE i.inc\nk A 192.0.2.7\n", "example.", dir);
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "i.example.", 1)->ttl_value == 60);
+    assert(zt_find(&z, "j.example.", 1)->ttl_value == 90);
+    assert(zt_find(&z, "k.example.", 1)->ttl_value == 90);
+    zt_free(&z);
+    snprintf(p, sizeof(p), "rm -rf %s", dir);
+    assert(system(p) == 0);
+    printf("  -> omitted TTL passed.\n");
+}
+
+static void test_r22_relative_origin(void) {
+    printf("[TEST] Zone parser: R-22 d relative $ORIGIN / $INCLUDE origin...\n");
+    char dir[] = "/tmp/karidns_zorg_XXXXXX";
+    assert(mkdtemp(dir));
+    char p[512];
+    snprintf(p, sizeof(p), "%s/o.inc", dir); write_file(p, "@ A 192.0.2.12\nhost A 192.0.2.13\n");
+    zt_t z;
+    zt_load_in(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n"
+                   "$ORIGIN sub\nx A 192.0.2.1\n$ORIGIN deeper\ny A 192.0.2.2\n"
+                   "$ORIGIN example.\n$INCLUDE o.inc rel\nafter A 192.0.2.3\n", "example.", dir);
+    ASSERT_PARSED(&z);
+    assert(zt_find(&z, "x.sub.example.", 1));
+    assert(zt_find(&z, "y.deeper.sub.example.", 1));
+    assert(zt_find(&z, "rel.example.", 1) && zt_find(&z, "host.rel.example.", 1));
+    assert(zt_find(&z, "after.example.", 1));                  /* the include does not change the parent origin */
+    zt_free(&z);
+    snprintf(p, sizeof(p), "rm -rf %s", dir);
+    assert(system(p) == 0);
+    printf("  -> relative origins passed.\n");
+}
+
+static void test_r22_generate_bind(void) {
+    printf("[TEST] Zone parser: R-22 e / D-18 $GENERATE (any type, quoted rhs, n/N, escapes, tags)...\n");
+    zt_t z;
+    zt_load(&z, "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\n"
+                "$GENERATE 1-2 m$ MX \"10 mail$\"\n"
+                "$GENERATE 1-1 _s$._tcp SRV \"0 5 80${0,0,d} t$\"\n"
+                "$GENERATE 1-2 t$ TXT v$\n"
+                "$GENERATE 1-1 ${0,7,n}.r PTR h$\n"
+                "$GENERATE 255-255 ${0,3,n}.r PTR h$\n"
+                "$GENERATE 255-255 ${0,3,N}.u PTR h$\n"
+                "$GENERATE 1-1 c$ CH TXT x\n"
+                "$GENERATE 1-1 a\\$b$ A 192.0.2.$\n"
+                "$ECS-SUBNET-TAG eu 198.51.100.0/24\n$ECS-SUBNET eu\n"
+                "$GENERATE 1-1 e$ A 192.0.2.$\n"
+                "$ECS-SUBNET none\n"
+                "$GENERATE 1-1 l$ ns ns$\n");
+    ASSERT_PARSED(&z);
+    dns_record_t *mx = zt_find(&z, "m2.example.", 15);
+    assert(mx && mx->rdata_count == 2 && strcmp(mx->rdata[0], "10") == 0 && strcmp(mx->rdata[1], "mail2.example.") == 0);
+    dns_record_t *srv = zt_find(&z, "_s1._tcp.example.", 33);
+    assert(srv && srv->rdata_count == 4 && strcmp(srv->rdata[2], "801") == 0 && strcmp(srv->rdata[3], "t1.example.") == 0);
+    dns_record_t *t = zt_find(&z, "t2.example.", 16);
+    assert(t && strcmp(t->rdata[0], "v2") == 0);
+    assert(zt_find(&z, "1.0.0.0.r.example.", 12));             /* BIND nibbles(): width counts the dots */
+    assert(zt_find(&z, "f.f.r.example.", 12));
+    dns_record_t *u = zt_find(&z, "F.F.u.example.", 12);
+    assert(u && strncmp(u->name, "F.F.", 4) == 0);            /* N = upper-case hex digits */
+    dns_record_t *c = zt_find(&z, "c1.example.", 16);
+    assert(c && c->class_val == 3);
+    assert(zt_find(&z, "a$b1.example.", 1) || zt_find(&z, "a\\$b1.example.", 1));   /* "\$" is a literal '$' */
+    dns_record_t *e = zt_find(&z, "e1.example.", 1);
+    assert(e && e->ecs_subnet_tag && strcmp(e->ecs_subnet_tag, "eu") == 0);
+    dns_record_t *l = zt_find(&z, "l1.example.", 2);
+    assert(l && strcmp(l->rdata[0], "ns1.example.") == 0 && l->ecs_subnet_tag == NULL);
+    uint8_t wire[4096];
+    const uint8_t *rd;
+    size_t rdlen;
+    assert(ser_rdata(mx, wire, sizeof(wire), &rd, &rdlen) == 0 && rd[0] == 0 && rd[1] == 10);
+    zt_free(&z);
+
+    static const char *const bad[] = {
+        "$GENERATE 1-2 m$ MX 10 mail$\n",                       /* rhs with spaces must be quoted */
+        "$GENERATE 1-2 q$ ANY x\n",                             /* meta type */
+        "$GENERATE 1-2 q$ NOSUCHTYPE x\n",
+        "$GENERATE 1-2 \"a b$\" A 192.0.2.1\n",                 /* lhs must stay one token */
+        "$GENERATE 1-2 $$x A 192.0.2.1\n",                      /* lhs must not become a directive */
+        "$GENERATE 1-2 h$ A 192.0.2.$$\n",                      /* invalid address via the normal record checks */
+        "$GENERATE 1-2 h$ NONE A 192.0.2.1\n",
+        "$GENERATE 0-1 h${-1,1,n} A 192.0.2.1\n",               /* negative nibble value */
+        "$GENERATE 1-2 h${0,1,q} A 192.0.2.1\n",
+    };
+    for (size_t i = 0; i < N(bad); i++) {
+        char text[1024];
+        snprintf(text, sizeof(text), "%s%s", SOA_HEAD, bad[i]);
+        must_reject(text, "$GENERATE");
+    }
+    /* an error in a generated line points at the $GENERATE line, not into the synthesized buffer */
+    char text[1024];
+    snprintf(text, sizeof(text), "%s$GENERATE 1-2 h$ A 192.0.2.$$\n", SOA_HEAD);
+    zt_load(&z, text);
+    assert(z.rc < 0 && z.err.error_offset == (size_t)(strstr(text, "$GENERATE") - text));
+    zt_free(&z);
+    printf("  -> $GENERATE passed.\n");
+}
+
+static void test_o14_ttl_high_bit(void) {
+    printf("[TEST] O-14: TTL with the high-order bit set is 2147483647 everywhere (RFC 8767 4)...\n");
+    zt_t z;
+    zt_load_line(&z, "IN A 192.0.2.1");
+    ASSERT_PARSED(&z);
+    dns_record_t *r = &z.arena.records[z.arena.count - 1];
+    r->ttl_value = 0x80000000u;
+    assert(wire_ttl_of(r) == 0x7FFFFFFFu);
+    r->ttl_value = 0xFFFFFFFFu;
+    assert(wire_ttl_of(r) == 0x7FFFFFFFu);
+    r->ttl_value = 0x7FFFFFFFu;
+    assert(wire_ttl_of(r) == 0x7FFFFFFFu);
+    r->ttl_value = 300;
+    assert(wire_ttl_of(r) == 300);
+    /* the AXFR/IXFR receive path stores the clamped value */
+    static const uint8_t rr[] = { 0, 0, 1, 0, 1, 0x80, 0, 0, 0, 0, 4, 192, 0, 2, 1 };
+    size_t off = 0;
+    dns_record_t got;
+    memset(&got, 0, sizeof(got));
+    uint16_t type = 0;
+    assert(parse_resource_record(rr, sizeof(rr), &off, &z.arena, &got, &type) == 0);
+    assert(type == 1 && got.ttl_value == 0x7FFFFFFFu);
+    assert(parse_ttl_value("4294967296") == 2147483647u && parse_ttl_value("99999999999999999999w") == 2147483647u);
+    assert(parse_ttl_value("1w2d") == 777600u);
+    zt_free(&z);
+    printf("  -> TTL clamp passed.\n");
+}
+
+static void expect_rdata(const char *line, const uint8_t *want, size_t want_len) {
+    zt_t z;
+    zt_load_line(&z, line);
+    ASSERT_PARSED(&z);
+    uint8_t wire[4096];
+    const uint8_t *rd;
+    size_t rdlen;
+    assert(ser_rdata(&z.arena.records[z.arena.count - 1], wire, sizeof(wire), &rd, &rdlen) == 0);
+    if (rdlen != want_len || memcmp(rd, want, rdlen) != 0) { fprintf(stderr, "wrong RDATA for %s\n", line); assert(0); }
+    zt_free(&z);
+}
+
+static void test_d08_readme_types(void) {
+    printf("[TEST] D-08: SINK, ATMA and IPSECKEY gateway 0 wire format...\n");
+    static const uint8_t sink[] = { 1, 2, 3, 1, 2, 3, 4, 5, 6 };
+    expect_rdata("IN SINK 1 2 3 AQID BAUG", sink, sizeof(sink));            /* base64 split over tokens */
+    static const uint8_t sink0[] = { 0, 0, 0 };
+    expect_rdata("IN SINK 0 0 0", sink0, sizeof(sink0));
+    static const uint8_t e164[] = { 1, '3', '5', '8', '4', '0', '0', '1', '2', '3', '4', '5', '6' };
+    expect_rdata("IN ATMA +358.400.123456", e164, sizeof(e164));             /* format 1, periods dropped */
+    static const uint8_t aesa[] = { 0, 0x39, 0x24, 0x6f };
+    expect_rdata("IN ATMA 39.246f", aesa, sizeof(aesa));
+    static const uint8_t ipsec0[] = { 10, 0, 1, 0x01, 0x03, 0x51 };          /* no gateway octets (RFC 4025 2.3) */
+    expect_rdata("IN IPSECKEY 10 0 1 . AQNR", ipsec0, sizeof(ipsec0));
+    static const uint8_t ipsec_nokey[] = { 10, 1, 0, 192, 0, 2, 38 };        /* public key omitted (RFC 4025 3.1) */
+    expect_rdata("IN IPSECKEY 10 1 0 192.0.2.38", ipsec_nokey, sizeof(ipsec_nokey));
+    printf("  -> README type wire formats passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
+    test_d08_readme_types();
+    test_r22_mnemonics_and_classes();
+    test_r22_omitted_ttl();
+    test_r22_relative_origin();
+    test_r22_generate_bind();
+    test_o14_ttl_high_bit();
+    test_drop_out_of_zone();
     test_all_types_parse_and_serialize();
     test_rfc3597_generic_form();
     test_svcb_quoted_values();

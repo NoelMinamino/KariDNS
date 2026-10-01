@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -62,6 +63,7 @@ struct mmsghdr {
 extern int g_cwd_fd;
 extern int g_control_kq;
 extern int g_notify_ipc[2];
+extern int g_notify_resp_ipc[2];
 extern char g_startup_cwd[PATH_MAX];
 
 #define DNS_PORT 53
@@ -181,6 +183,11 @@ typedef struct {
   bool has_current_loc_tag;
   char current_ecs_tag[64];
   bool has_current_ecs_tag;
+  uint32_t out_of_zone_skipped; /* R-27: 読み飛ばしたゾーン外 RR の数 */
+  uint16_t query_id;      /* R-19: 送った要求の ID と QTYPE (xfr_check_response_header() が照合する) */
+  uint16_t query_type;
+  bool got_first_msg;
+  uint8_t rcode;          /* エラーの RCODE で転送が終わったときの値 (0 = エラー応答ではない) */
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)
@@ -284,9 +291,28 @@ typedef struct {
   _Atomic time_t   last_notify_time;
 } zone_observatory_t;
 
+/* ゾーンの役割。リロードで既存エントリを再利用してよいかの判定に使う (O-13) */
+typedef enum {
+  ZONE_KIND_OTHER = 0,
+  ZONE_KIND_PRIMARY,
+  ZONE_KIND_SECONDARY,
+  ZONE_KIND_FORWARD,
+  ZONE_KIND_PROGRAM,
+} zone_kind_t;
+
+static inline zone_kind_t zone_kind_from_type(const char *type) {
+  if (!type) return ZONE_KIND_OTHER;
+  if (strcasecmp(type, "master") == 0 || strcasecmp(type, "primary") == 0) return ZONE_KIND_PRIMARY;
+  if (strcasecmp(type, "slave") == 0 || strcasecmp(type, "secondary") == 0) return ZONE_KIND_SECONDARY;
+  if (strcasecmp(type, "forward") == 0) return ZONE_KIND_FORWARD;
+  if (strcasecmp(type, "program") == 0) return ZONE_KIND_PROGRAM;
+  return ZONE_KIND_OTHER;
+}
+
 typedef struct {
   char domain[256];
   char view_name[64];
+  zone_kind_t kind;
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
@@ -381,6 +407,7 @@ typedef struct {
 
 typedef struct program_plugin {
   char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
+  char view_name[64];     /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
   pid_t pid;
   int stdin_fd;           /* karidns -> script への書き込み側 */
   int stdout_fd;          /* script -> karidns への読み込み側 */
@@ -440,9 +467,12 @@ void zone_arena_clear_data_pools(zone_arena_t *arena);
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);
 void free_ixfr_txn(ixfr_txn_t *txn);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
+zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
+zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
+view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_name);
+zone_db_entry_t *snapshot_get_zone_in_view(zone_db_snapshot_t *snap, const char *view_name, const char *domain);
 void prelink_zone_additional_glue(zone_arena_t *current_zone,
                                   const char *zone_domain,
-                                  zone_db_snapshot_t *snap,
                                   view_snapshot_t *view,
                                   additional_from_auth_t policy);
 
@@ -482,7 +512,7 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst);
 uint32_t get_effective_query_log_max_qps(const server_config_t *cfg);
 void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, zone_observatory_snapshot_t *out);
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype);
 bool ensure_priv_dir_safe(const char *dir_buf);
 bool init_logging_channels(server_config_t *cfg);
 bool init_logging_channels_ex(server_config_t *cfg, bool hand_off);
@@ -522,7 +552,7 @@ typedef struct {
   struct sockaddr_storage server_addr;
   socklen_t server_len;
   bool has_server_addr;
-  char qname[256];
+  char qname[DNS_NAME_TEXT_SIZE];
   uint16_t qtype;
   uint16_t qclass;
   bool has_edns;
@@ -544,6 +574,23 @@ typedef struct {
 
 extern async_io_pool_t g_async_io_pool;
 
+/* D-13 / O-05: 設定の再読み込みの結果。karictl reload / reconfig の応答に使う */
+typedef enum {
+  CONFIG_RELOAD_OK = 0,
+  CONFIG_RELOAD_ZONE_ERRORS, /* 設定は反映した。zones_failed 個のゾーンが読み込めなかった */
+  CONFIG_RELOAD_READ_ERROR,  /* 設定ファイルを読めない。反映していない */
+  CONFIG_RELOAD_PARSE_ERROR, /* 設定の誤り。反映していない */
+  CONFIG_RELOAD_REJECTED,    /* 設定は正しいが適用できない (detail に理由)。反映していない */
+  CONFIG_RELOAD_POSTPONED    /* 前の設定の読み手が残っている。制御スレッドが後で再試行する */
+} config_reload_status_t;
+
+typedef struct {
+  config_reload_status_t status;
+  int zones_failed;
+  char detail[384];         /* 失敗したゾーン名、または拒否の理由 */
+  char restart_needed[192]; /* O-09: 変わったが再起動まで反映されない設定 ("port, bind-address") */
+} config_reload_result_t;
+
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
 extern int g_broker_sock;
@@ -561,9 +608,9 @@ extern volatile sig_atomic_t g_backend_should_exit;
 
 bool enqueue_async_io_task(const async_io_task_t *task);
 void *async_io_worker_func(void *arg);
-void reload_all_zones(void);
-void perform_config_reload(void);
-void perform_config_reload_ext(bool skip_unchanged);
+config_reload_result_t reload_all_zones(void);
+config_reload_result_t perform_config_reload(void);
+config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,
@@ -571,7 +618,7 @@ void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_
                      uint32_t max_qps);
 void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg,
                                zone_observatory_snapshot_t *out);
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname);
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype);
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void backend_sig_handler(int sig);

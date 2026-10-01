@@ -4,6 +4,7 @@
 #include "dns_dnstap.h"
 #include "dns_utils.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -38,6 +39,13 @@ static pthread_mutex_t g_dir_fd_lock = PTHREAD_MUTEX_INITIALIZER;
 bool g_bypass_cap_enter = false;
 // g_capsicum_enabled is defined in dns_utils.c and declared in dns_utils.h
 
+static bool path_has_dotdot_component(const char *p) {
+  for (const char *s = p; (s = strstr(s, "..")) != NULL; s += 2) {
+    if ((s == p || s[-1] == '/') && (s[2] == '\0' || s[2] == '/')) return true;
+  }
+  return false;
+}
+
 static int get_or_open_dir_fd(const char *dirpath, bool writable) {
   pthread_mutex_lock(&g_dir_fd_lock);
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
@@ -55,8 +63,15 @@ static int get_or_open_dir_fd(const char *dirpath, bool writable) {
     return -1;
   }
   int fd;
+  char abs_dir[PATH_MAX];
   if (dirpath[0] == '/')
     fd = open(dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+  else if (path_has_dotdot_component(dirpath) && g_startup_cwd[0] != '\0' &&
+           snprintf(abs_dir, sizeof(abs_dir), "%s/%s", g_startup_cwd, dirpath) < (int)sizeof(abs_dir))
+    /* D-24: 権利を絞った g_cwd_fd からは ".." を辿れない (FreeBSD の strict relative lookup)。
+     * サンドボックスに入る前なら起動時ディレクトリからの絶対パスで開く。絶対パスは元から
+     * 開けるので、これで新たに開ける範囲が広がるわけではない。キャッシュの鍵は dirpath のまま */
+    fd = open(abs_dir, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
   else
     fd = (g_cwd_fd >= 0)
              ? openat(g_cwd_fd, dirpath, O_DIRECTORY | O_CLOEXEC | O_RDONLY)
@@ -144,6 +159,45 @@ int renameat_via_dir_cache(const char *old_path, const char *new_path) {
   if (ofd < 0 || nfd < 0)
     return -1;
   return renameat(ofd, obase, nfd, nbase);
+}
+
+/* file_path と同じディレクトリの各エントリー名で cb を呼ぶ。キャッシュ済みの書き込み用
+ * ディレクトリ fd から "." を開き直して読む (サンドボックス内でも新たな資源は取らない。
+ * dup だとファイル位置を共有し、同じディレクトリを読む別スレッドと干渉する) */
+int list_dir_via_dir_cache(const char *file_path, void (*cb)(const char *name, void *ud), void *ud) {
+  char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+  if (!split_path_for_openat(file_path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+    errno = EINVAL;
+    return -1;
+  }
+  int dfd = get_or_open_dir_fd(dirbuf, true);
+  if (dfd < 0)
+    return -1;
+  int fd = openat(dfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  DIR *d = fdopendir(fd);
+  if (!d) {
+    close(fd);
+    return -1;
+  }
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL)
+    cb(de->d_name, ud);
+  closedir(d);
+  return 0;
+}
+
+int unlink_via_dir_cache(const char *path) {
+  char dirbuf[PATH_MAX], basebuf[PATH_MAX];
+  if (!split_path_for_openat(path, dirbuf, sizeof(dirbuf), basebuf, sizeof(basebuf))) {
+    errno = EINVAL;
+    return -1;
+  }
+  int dfd = get_or_open_dir_fd(dirbuf, true);
+  if (dfd < 0)
+    return -1;
+  return unlinkat(dfd, basebuf, 0);
 }
 
 void limit_server_socket_rights(int fd, bool is_listening_tcp) {

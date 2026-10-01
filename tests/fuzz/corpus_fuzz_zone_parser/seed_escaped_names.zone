@@ -1,0 +1,17 @@
+; R-29: owner names and targets with master-file escapes (RFC 1035 §5.1, RFC 4343 §2.1)
+$ORIGIN escape.test.
+$TTL 3600
+escape.test. IN SOA ns1.escape.test. hostmaster.escape.test. 1 7200 3600 1209600 3600
+escape.test. IN NS ns1.escape.test.
+ns1 IN A 192.0.2.1
+
+a\.b IN A 192.0.2.2
+b IN A 192.0.2.8
+sp\032ace IN A 192.0.2.3
+c\(p IN A 192.0.2.4
+\065bc IN A 192.0.2.5
+\200x IN A 192.0.2.6
+t\.x IN A 192.0.2.7
+My\032Printer._ipp._tcp IN SRV 0 0 631 ns1.escape.test.
+alias IN CNAME sp\032ace
+alias2 IN CNAME t\.x.escape.test.

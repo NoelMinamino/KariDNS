@@ -1,0 +1,12 @@
+$ORIGIN example.
+@ 7200 in soa ns h ( 1 2 3 4 5 )
+@ In Ns ns
+ns A 192.0.2.1
+w 300 CLASS1 a 192.0.2.2
+h hs txt "hesiod"
+c class3 TXT chaos
+$ORIGIN sub
+x A 192.0.2.3
+$INCLUDE missing.inc rel
+s rrsig a 13 2 300 20300101000000 20200101000000 12345 example. AAAAAAAA
+n nsec n2.example. a rrsig nsec

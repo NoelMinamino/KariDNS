@@ -64,10 +64,13 @@ run_check() {
     fi
 }
 
+# Negative check. REQUIRED must match the same output, so that an empty output (server down, timeout)
+# does not pass.
 run_check_not() {
     NAME="$1"
     CMD="$2"
     UNEXPECTED="$3"
+    REQUIRED="$4"
 
     echo -n "Test: $NAME ... "
     OUTPUT=$(eval "$CMD" 2>&1 || true)
@@ -77,9 +80,25 @@ run_check_not() {
         echo "  Unexpected pattern found: $UNEXPECTED"
         echo "  Output: $OUTPUT"
         FAILED=$((FAILED + 1))
+    elif ! echo "$OUTPUT" | grep -E -q "$REQUIRED"; then
+        echo "FAILED"
+        echo "  Command: $CMD"
+        echo "  Required pattern not found: $REQUIRED"
+        echo "  Output: $OUTPUT"
+        FAILED=$((FAILED + 1))
     else
         echo "OK"
     fi
+}
+
+# ECS option of the response (RFC 7871 §7.2.1): FAMILY/SOURCE/ADDRESS echo the query, SCOPE as expected.
+# dag prints it as "CLIENT-SUBNET: <ADDRESS>/<SOURCE>/<SCOPE>" (the family follows from the address).
+run_ecs_check() {
+    NAME="$1"
+    QUERY="$2"
+    EXPECTED_ECS="$3"
+    STATUS="${4:-NOERROR}"
+    run_check "$NAME" "$DAG $QUERY +nohexdump" "status: $STATUS,.*CLIENT-SUBNET: $EXPECTED_ECS( |\$)"
 }
 
 echo "=== 0. Setting up test files for \$ECS-SUBNET directive ==="
@@ -149,7 +168,7 @@ EOF
 # Zone 4: tinydns zone non-interference
 cat << 'EOF' > "$TMP_DIR/tiny.data"
 .tiny.test:127.0.0.1:ns1.tiny.test:2560
-+www.tiny.test:1.2.3.4:300
++www.tiny.test:192.0.2.44:300
 EOF
 
 # Zone 5: Invalid tag for karicheck test
@@ -172,8 +191,8 @@ options {
     ecs-enable yes;
     ecs-trusted-resolvers { 127.0.0.1; };
     ecs-tags {
-        tag "us" { 8.8.8.0/24; 1.1.1.0/24; };
-        tag "eu" { 5.6.7.0/24; 2001:db8:ee::/32; };
+        tag "us" { 192.0.2.0/25; 198.51.100.128/25; };
+        tag "eu" { 192.0.2.128/25; 2001:db8:ee::/48; };
         tag "jp" { 203.0.113.0/24; };
     };
 };
@@ -187,9 +206,9 @@ zone "cdn.example." {
     type master;
     file "$TMP_DIR/cdn.zone";
     ecs-tags {
-        tag "us-east" { 8.8.8.0/24; };
-        tag "us-west" { 1.2.3.0/24; };
-        tag "eu" { 5.6.7.0/24; };
+        tag "us-east" { 192.0.2.0/25; };
+        tag "us-west" { 198.51.100.0/25; };
+        tag "eu" { 192.0.2.128/25; };
     };
 };
 
@@ -214,7 +233,7 @@ options {
     ecs-enable yes;
     ecs-trusted-resolvers { 127.0.0.1; };
     ecs-tags {
-        tag "us" { 8.8.8.0/24; };
+        tag "us" { 192.0.2.0/25; };
     };
 };
 
@@ -233,7 +252,7 @@ options {
     ecs-enable yes;
     ecs-trusted-resolvers { 127.0.0.1; };
     ecs-tags {
-        tag "us" { 8.8.8.0/35; };
+        tag "us" { 192.0.2.0/35; };
     };
 };
 
@@ -251,7 +270,7 @@ options {
     $USER_OPT
     ecs-enable no;
     ecs-tags {
-        tag "us" { 8.8.8.0/24; };
+        tag "us" { 192.0.2.0/25; };
     };
 };
 
@@ -268,10 +287,10 @@ options {
     bind-address { 127.0.0.1; };
     $USER_OPT
     ecs-enable yes;
-    ecs-trusted-resolvers { 10.0.0.53; };
+    ecs-trusted-resolvers { 192.0.2.53; };
     ecs-tags {
-        tag "us" { 8.8.8.0/24; 1.1.1.0/24; };
-        tag "eu" { 5.6.7.0/24; 2001:db8:ee::/32; };
+        tag "us" { 192.0.2.0/25; 198.51.100.128/25; };
+        tag "eu" { 192.0.2.128/25; 2001:db8:ee::/48; };
         tag "jp" { 203.0.113.0/24; };
     };
 };
@@ -284,7 +303,7 @@ EOF
 
 echo "=== 1. Validating configuration with karicheck ==="
 run_check "karicheck conf valid" "$KARICHECK conf $TMP_DIR/karidns.conf" "\[OK\] Config file .* is valid\."
-run_check "karicheck zones valid" "$KARICHECK zones $TMP_DIR/karidns.conf" "\[INFO\] Checked 4 zones\. Errors: 0"
+run_check "karicheck zones valid" "$KARICHECK zones $TMP_DIR/karidns.conf" "\[INFO\] Checked 4 zones \(0 skipped\)\. Errors: 0"
 
 run_check "karicheck conf detects undefined tag in zone" \
     "$KARICHECK zones $TMP_DIR/conf_invalid_tag.conf 2>&1 || true" \
@@ -292,7 +311,7 @@ run_check "karicheck conf detects undefined tag in zone" \
 
 run_check "karicheck conf detects invalid CIDR (/35)" \
     "$KARICHECK conf $TMP_DIR/conf_invalid_cidr.conf 2>&1 || true" \
-    "Invalid CIDR '8\.8\.8\.0/35'"
+    "Invalid CIDR '192\.0\.2\.0/35'"
 
 run_check "karicheck conf warning when ecs-tags defined but ecs-enable no" \
     "$KARICHECK conf $TMP_DIR/conf_ecs_disabled_warning.conf 2>&1 || true" \
@@ -311,23 +330,23 @@ fi
 
 echo "=== 3. Testing Global Tag Matching (\$ECS-SUBNET us/eu/jp/default) ==="
 
-# US tag: 8.8.8.0/24
+# US tag: 192.0.2.0/25
 run_check "US client gets 'us' (192.0.2.1) and 'default' (192.0.2.3)" \
-    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=8.8.8.50" \
+    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=192.0.2.50" \
     "192\.0\.2\.1.*192\.0\.2\.3|192\.0\.2\.3.*192\.0\.2\.1"
 
 run_check_not "US client does not get 'eu' or 'jp'" \
-    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=8.8.8.50" \
-    "192\.0\.2\.2|192\.0\.2\.10"
+    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=192.0.2.50" \
+    "192\.0\.2\.2|192\.0\.2\.10" "^192\.0\.2\.3$"
 
-# EU tag (IPv4): 5.6.7.0/24
+# EU tag (IPv4): 192.0.2.128/25
 run_check "EU client gets 'eu' (192.0.2.2) and 'default' (192.0.2.3)" \
-    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=5.6.7.88" \
+    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=192.0.2.200/32" \
     "192\.0\.2\.2.*192\.0\.2\.3|192\.0\.2\.3.*192\.0\.2\.2"
 
 run_check_not "EU client does not get 'us' or 'jp'" \
-    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=5.6.7.88" \
-    "192\.0\.2\.1$|192\.0\.2\.10"
+    "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=192.0.2.200/32" \
+    "192\.0\.2\.1$|192\.0\.2\.10" "^192\.0\.2\.3$"
 
 # EU tag (IPv6): 2001:db8:ee::/32
 run_check "EU IPv6 client gets 'eu' (192.0.2.2) and 'default' (192.0.2.3)" \
@@ -346,7 +365,7 @@ run_check "Unknown subnet gets only 'default' (192.0.2.3)" \
 
 run_check_not "Unknown subnet does not get tagged records" \
     "$DAG www.example.com A @127.0.0.1 -p $PORT +short +subnet=198.51.100.1" \
-    "192\.0\.2\.1|192\.0\.2\.2|192\.0\.2\.10"
+    "192\.0\.2\.1$|192\.0\.2\.2|192\.0\.2\.10" "^192\.0\.2\.3$"
 
 # Query without ECS (+nosubnet) gets only 'default'
 run_check "Query without ECS gets only 'default' (192.0.2.3)" \
@@ -355,18 +374,44 @@ run_check "Query without ECS gets only 'default' (192.0.2.3)" \
 
 # $ECS-SUBNET none record (mail) is unrestricted
 run_check "'none' record is returned to any client" \
-    "$DAG mail.example.com A @127.0.0.1 -p $PORT +short +subnet=8.8.8.1" \
+    "$DAG mail.example.com A @127.0.0.1 -p $PORT +short +subnet=192.0.2.1" \
     "^192\.0\.2\.25$"
+
+echo "=== 3b. Response ECS option: FAMILY/SOURCE/ADDRESS echo and SCOPE (RFC 7871 §6, §7.2.1, §7.4) ==="
+# The ADDRESS must be the query's (SOURCE + 7) / 8 octets, not cut to SCOPE (R-02). SCOPE is the shortest
+# prefix around the client for which the answer is the same (R-14): the tag's prefix, or for a client in no
+# tag, the prefix that keeps clear of every tag's range. Tags: us 192.0.2.0/25, 198.51.100.128/25;
+# eu 192.0.2.128/25, 2001:db8:ee::/48; jp 203.0.113.0/24.
+run_ecs_check "ECS: 'us' client, /32 echoed, SCOPE /25 (the tag)" \
+    "www.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/25"
+run_ecs_check "ECS: 'eu' client after the 'us' /25, SCOPE /25" \
+    "www.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.200/32" "192\.0\.2\.200/32/25"
+run_ecs_check "ECS: 'jp' client, SCOPE /24" \
+    "www.example.com A @127.0.0.1 -p $PORT +subnet=203.0.113.5/32" "203\.0\.113\.5/32/24"
+run_ecs_check "ECS: client in no tag gets the default with a non-zero SCOPE (/25 next to 198.51.100.128/25)" \
+    "www.example.com A @127.0.0.1 -p $PORT +subnet=198.51.100.1/32" "198\.51\.100\.1/32/25"
+run_ecs_check "ECS: IPv6 'eu' client, /56 echoed, SCOPE /48" \
+    "www.example.com A @127.0.0.1 -p $PORT +subnet=2001:db8:ee:1200::/56" "2001:db8:ee:1200::/56/48"
+run_ecs_check "ECS: SOURCE /24 too short for the /25 tags -> SCOPE longer than SOURCE" \
+    "www.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.0/24" "192\.0\.2\.0/24/25"
+run_ecs_check "ECS: name without tagged records -> SCOPE 0" \
+    "mail.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.1/32" "192\.0\.2\.1/32/0"
+run_ecs_check "ECS: NXDOMAIN -> SCOPE 0" \
+    "nx.example.com A @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/0" "NXDOMAIN"
+run_ecs_check "ECS: NODATA for a tagged name -> SCOPE 0" \
+    "www.example.com AAAA @127.0.0.1 -p $PORT +subnet=192.0.2.50/32" "192\.0\.2\.50/32/0"
+run_ecs_check "ECS: zone-level tags (cdn.example 'us-west' 198.51.100.0/25)" \
+    "edge.cdn.example A @127.0.0.1 -p $PORT +subnet=198.51.100.4/32" "198\.51\.100\.4/32/25"
 
 echo "=== 4. Testing Zone-Level Override of ecs-tags ==="
 
-# cdn.example has zone-level ecs-tags (us-east: 8.8.8.0/24, us-west: 1.2.3.0/24, eu: 5.6.7.0/24)
-run_check "cdn.example: 8.8.8.0/24 matches 'us-east' (192.0.2.101)" \
-    "$DAG edge.cdn.example A @127.0.0.1 -p $PORT +short +subnet=8.8.8.1" \
+# cdn.example has zone-level ecs-tags (us-east: 192.0.2.0/25, us-west: 198.51.100.0/25, eu: 192.0.2.128/25)
+run_check "cdn.example: 192.0.2.0/25 matches 'us-east' (192.0.2.101)" \
+    "$DAG edge.cdn.example A @127.0.0.1 -p $PORT +short +subnet=192.0.2.1/32" \
     "192\.0\.2\.101.*192\.0\.2\.199|192\.0\.2\.199.*192\.0\.2\.101"
 
-run_check "cdn.example: 1.2.3.0/24 matches 'us-west' (192.0.2.102)" \
-    "$DAG edge.cdn.example A @127.0.0.1 -p $PORT +short +subnet=1.2.3.4" \
+run_check "cdn.example: 198.51.100.0/25 matches 'us-west' (192.0.2.102)" \
+    "$DAG edge.cdn.example A @127.0.0.1 -p $PORT +short +subnet=198.51.100.4/32" \
     "192\.0\.2\.102.*192\.0\.2\.199|192\.0\.2\.199.*192\.0\.2\.102"
 
 # In global tags, 203.0.113.0/24 is 'jp', but cdn.example overrides tags and has NO 'jp' tag.
@@ -380,11 +425,11 @@ echo "=== 5. Testing \$INCLUDE penetration ==="
 # inc_child.zone sets $ECS-SUBNET us.
 # after-include in inc_parent.zone has 192.0.2.51 (under us) and 192.0.2.52 (under default).
 run_check "\$INCLUDE penetrates tag to parent: US client gets 192.0.2.51 & 192.0.2.52" \
-    "$DAG after-include.inc.example A @127.0.0.1 -p $PORT +short +subnet=8.8.8.1" \
+    "$DAG after-include.inc.example A @127.0.0.1 -p $PORT +short +subnet=192.0.2.1/32" \
     "192\.0\.2\.51.*192\.0\.2\.52|192\.0\.2\.52.*192\.0\.2\.51"
 
 run_check "\$INCLUDE penetrates tag: EU client gets only default (192.0.2.52)" \
-    "$DAG after-include.inc.example A @127.0.0.1 -p $PORT +short +subnet=5.6.7.1" \
+    "$DAG after-include.inc.example A @127.0.0.1 -p $PORT +short +subnet=192.0.2.129/32" \
     "^192\.0\.2\.52$"
 
 echo "=== 6. Testing Fail-Closed Security (Untrusted Resolvers) ==="
@@ -392,14 +437,14 @@ echo "=== 6. Testing Fail-Closed Security (Untrusted Resolvers) ==="
 # (a) If alias IP 127.0.0.2 is available on main server (where only 127.0.0.1 is trusted):
 if [ "$ALIAS_ADDED" = "1" ]; then
     run_check "Client from untrusted alias IP 127.0.0.2 gets only default" \
-        "$DAG www.example.com A @127.0.0.1 -p $PORT -b $ALIAS_IP +short +subnet=8.8.8.1" \
+        "$DAG www.example.com A @127.0.0.1 -p $PORT -b $ALIAS_IP +short +subnet=192.0.2.1/32" \
         "^192\.0\.2\.3$"
 fi
 
 echo "=== 7. Testing tinydns Non-Interference ==="
 run_check "tinydns zone answers query regardless of ECS" \
-    "$DAG www.tiny.test A @127.0.0.1 -p $PORT +short +subnet=8.8.8.1" \
-    "^1\.2\.3\.4$"
+    "$DAG www.tiny.test A @127.0.0.1 -p $PORT +short +subnet=192.0.2.1/32" \
+    "^192\.0\.2\.44$"
 
 echo "=== 8. Testing Fail-Closed with Untrusted Server Config (Single-Instance Restart) ==="
 # Stop main server (frontend and capsicum backend) before starting untrusted instance
@@ -418,12 +463,16 @@ if ! kill -0 "$SERVER_UNTRUSTED_PID" 2>/dev/null; then
 fi
 
 run_check "Untrusted resolver query with ECS gets ONLY default (192.0.2.3)" \
-    "$DAG www.example.com A @127.0.0.1 -p $PORT_UNTRUSTED +short +subnet=8.8.8.1" \
+    "$DAG www.example.com A @127.0.0.1 -p $PORT_UNTRUSTED +short +subnet=192.0.2.1/32" \
     "^192\.0\.2\.3$"
 
 run_check_not "Untrusted resolver query never sees tagged records" \
-    "$DAG www.example.com A @127.0.0.1 -p $PORT_UNTRUSTED +short +subnet=8.8.8.1" \
-    "192\.0\.2\.1"
+    "$DAG www.example.com A @127.0.0.1 -p $PORT_UNTRUSTED +short +subnet=192.0.2.1/32" \
+    "192\.0\.2\.1$" "^192\.0\.2\.3$"
+
+# the ECS address is not used for an untrusted source: one answer for all networks
+run_ecs_check "ECS: untrusted source, ADDRESS echoed, SCOPE 0" \
+    "www.example.com A @127.0.0.1 -p $PORT_UNTRUSTED +subnet=192.0.2.1/32" "192\.0\.2\.1/32/0"
 
 kill -9 "$SERVER_UNTRUSTED_PID" 2>/dev/null || true
 wait "$SERVER_UNTRUSTED_PID" 2>/dev/null || true

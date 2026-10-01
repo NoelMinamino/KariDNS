@@ -46,14 +46,43 @@ int compare_canonical_name(const char *name1, const char *name2);
 bool serial_is_newer(uint32_t s1, uint32_t s2);
 const char *strchr_unescaped(const char *s, char c);
 
+static inline bool dns_char_is_escaped(const char *s, size_t pos) {
+    size_t bs = 0;
+    while (pos > bs && s[pos - bs - 1] == '\\') bs++;
+    return (bs % 2) == 1;
+}
+
+/* 名前 (正規形, dns_wire.h) の長さから、末尾のエスケープされない '.' を除いたもの。
+ * "." と "" は 0。 */
+static inline size_t dns_name_len_no_root(const char *name, size_t len) {
+    if (len > 0 && name[len - 1] == '.' && !dns_char_is_escaped(name, len - 1)) len--;
+    return len;
+}
+
+/* 2 つの名前 (正規形) が DNS 名として同じか。末尾ドットの有無は問わない。
+ * 正規形では英字が必ずそのまま書かれるので、大文字小文字を無視した文字列比較が
+ * RFC 4343 §2 の比較と一致する。 */
 static inline bool domain_names_match_ci(const char *a, const char *b) {
     if (!a || !b) return false;
     if (strcasecmp(a, b) == 0) return true;
-    size_t la = strlen(a);
-    size_t lb = strlen(b);
-    if (la == lb + 1 && a[la - 1] == '.' && strncasecmp(a, b, lb) == 0) return true;
-    if (lb == la + 1 && b[lb - 1] == '.' && strncasecmp(a, b, la) == 0) return true;
-    return false;
+    size_t la = dns_name_len_no_root(a, strlen(a));
+    size_t lb = dns_name_len_no_root(b, strlen(b));
+    return la == lb && strncasecmp(a, b, la) == 0;
+}
+
+/* name (表示形式) が apex と同じか、その下にあるか。末尾ドットの有無は問わない。
+ * ラベル境界は、エスケープされていない '.' だけとする ("a\.example.test" は
+ * "example.test" の下ではない)。apex が "." または "" ならルートなので常に true。
+ * RFC 1034 §4.2: ゾーンは apex とその下の (カットより上の) データからなる。 */
+static inline bool domain_name_is_at_or_below(const char *name, const char *apex) {
+    if (!name || !apex) return false;
+    size_t nl = dns_name_len_no_root(name, strlen(name));
+    size_t al = dns_name_len_no_root(apex, strlen(apex));
+    if (al == 0) return true;
+    if (nl < al || strncasecmp(name + (nl - al), apex, al) != 0) return false;
+    if (nl == al) return true;
+    size_t dot = nl - al - 1;
+    return name[dot] == '.' && !dns_char_is_escaped(name, dot);
 }
 
 #endif

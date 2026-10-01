@@ -83,7 +83,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     };
     char init_zone[] = "dyn.example.com. 3600 IN SOA ns1.dyn.example.com. admin.dyn.example.com. 1 3600 1800 604800 86400\n"
                        "dyn.example.com. 3600 IN NS ns1.dyn.example.com.\n"
-                       "dyn.example.com. 3600 IN A 192.0.2.1\n";
+                       "dyn.example.com. 3600 IN A 192.0.2.1\n"
+                       /* names for the RFC 2136 §3.4.2 rules: RRset equality, CNAME conflicts, delegation */
+                       "www.dyn.example.com. 3600 IN A 192.0.2.10\n"
+                       "www.dyn.example.com. 3600 IN A 192.0.2.11\n"
+                       "alias.dyn.example.com. 3600 IN CNAME www.dyn.example.com.\n"
+                       "sub.dyn.example.com. 3600 IN NS ns.sub.dyn.example.com.\n";
     parse_zone_fast(init_zone, sizeof(init_zone) - 1, &entry.rcu.arena_a, &ctx);
     build_zone_index(&entry.rcu.arena_a, true);
 

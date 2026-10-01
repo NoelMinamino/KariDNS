@@ -191,6 +191,18 @@ ecs-test IN A   172.16.0.1
 - **Fail-Closed Security**:
   If `ecs-enable yes;` is not set, if a query arrives from a resolver not listed in `ecs-trusted-resolvers`, or if no ECS option is provided, only unrestricted (default) records are returned.
 
+### 4.3 ECS Option in Responses (SCOPE PREFIX-LENGTH)
+
+When a query carries an ECS option and `ecs-enable yes;` is set, the response carries an ECS option too (RFC 7871 §7.2.1):
+
+- **FAMILY, SOURCE PREFIX-LENGTH and ADDRESS** are copied unchanged from the query. Resolvers discard responses in which they differ (RFC 7871 §11).
+- **SCOPE PREFIX-LENGTH** tells the resolver for which network it may cache the answer:
+  - If an RRset in the Answer section has `$ECS-SUBNET` variants (whether or not the client matched one of them), SCOPE is the shortest prefix around the client address for which every address gets the same tag decision. For a client inside a tag, that is the prefix of the matching CIDR, made longer where an earlier-defined CIDR lies inside it. For a client in no tag, it is the prefix that keeps clear of every defined CIDR of the same family. Overlapping definitions are therefore split into non-overlapping prefixes, as RFC 7871 §7.2.1 requires ("MUST NOT overlap prefixes"); nothing is rejected at load time.
+  - SCOPE can be longer than SOURCE PREFIX-LENGTH when the client sent too few bits to decide (for example SOURCE /24 against /25 tags). RFC 7871 §7.2.1 allows this; resolvers then keep the answer for that source prefix only.
+  - SCOPE is 0 when the answer does not depend on the subnet: the name has no tagged variants, the resolver is not in `ecs-trusted-resolvers`, or no tag of the client's address family exists.
+  - Negative answers (NXDOMAIN, NODATA) and referrals always have SCOPE 0 (RFC 7871 §7.4). A name that exists only for some tags therefore gets a negative answer with SCOPE 0 for the other clients, which resolvers may cache for all networks. Give such names an unrestricted (default) record if clients outside the tags must not see a negative answer.
+- `$LOCATION` and tinydns `%` locations use the resolver's own address, not the ECS option, and do not change SCOPE.
+
 ---
 
 ## 5. Coexistence of `$LOCATION` and `$ECS-SUBNET` in BIND Zones
@@ -212,7 +224,7 @@ KariDNS solves this with **Extended AXFR**:
 - A KariDNS primary recognizes Option 65153 and replies with an Extended AXFR stream in which the KariDNS-specific data is carried as private-use record types in the private CLASS `65302`:
   - In BIND zones: tag definitions (`$LOCATION-TAG` as TYPE `65403`, `$ECS-SUBNET-TAG` as TYPE `65404`), record state transitions (`$LOCATION` as TYPE `65401`, `$ECS-SUBNET` as TYPE `65402`) and the zone's trusted ECS resolvers (TYPE `65407`).
   - In tinydns zones: location definitions (`%`, TYPE `65405`) and wrapped records (TYPE `65406`) preserving location tags and countdown timestamps.
-- An IXFR request that carries Option 65153 is answered with a full Extended AXFR.
+- An IXFR request that carries Option 65153 is answered with a full Extended AXFR only when the zone has KariDNS-specific data (tag definitions, location definitions, tinydns data, or trusted ECS resolvers for the zone or the server). Otherwise it is answered like any IXFR (RFC 1995): a single SOA when the secondary is up to date, the differences when the primary's history covers the secondary's serial, else a full (Extended) AXFR. A secondary that receives an IXFR copies its current data and applies the differences, so changes of KariDNS-specific data always reach it by a full transfer.
 - Secondary seamlessly unwraps the transfer and populates its in-memory arena, enabling identical steering on the secondary server.
 
 ### 6.2 Standard AXFR Fallback (Plan B)

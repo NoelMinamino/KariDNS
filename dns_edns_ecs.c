@@ -317,6 +317,30 @@ bool wrap_tinydns_record(const dns_record_t *rec, dns_record_t *out_wrap, uint8_
   return true;
 }
 
+/* 先頭から数えて a と b が一致しているビット数 (最大 max_bits)。 */
+static uint8_t ecs_common_prefix_bits(const uint8_t *a, const uint8_t *b, uint8_t max_bits) {
+    uint8_t n = 0;
+    while (n + 8 <= max_bits && a[n / 8] == b[n / 8]) n += 8;
+    if (n < max_bits) {
+        uint8_t diff = (uint8_t)(a[n / 8] ^ b[n / 8]);
+        uint8_t same = 0;
+        while (same < 8 && !(diff & (0x80u >> same))) same++;
+        n = (uint8_t)(n + same);
+        if (n > max_bits) n = max_bits;
+    }
+    return n;
+}
+
+/* クライアントサブネットに対応するタグを返す (最初に一致したタグが勝つ)。
+ * *out_scope_prefix には、ADDRESS/L に含まれる全アドレスが同じ判定 (同じタグ、または
+ * どのタグにも一致しない) になる最短の L を書く。RFC 7871 §7.2.1: SCOPE PREFIX-LENGTH は
+ * 応答が対象とするネットワークを示し、応答は互いに重なるプレフィックスを返してはならない
+ * (MUST NOT overlap)。重なる定義は §7.2.1 の deaggregate と同じ考え方で分割する。
+ *   - 一致した CIDR より前に調べた CIDR のうち、ADDRESS を含まないものについては、
+ *     ADDRESS/L と交わらない長さ (共通プレフィックス長 + 1) が必要。
+ *   - 一致した CIDR の内側なら、それより後の CIDR は判定に影響しない。
+ *   - どれにも一致しない場合は、同じ FAMILY の全 CIDR が対象。
+ * L は SOURCE PREFIX-LENGTH より長くなることがある (§7.2.1 で許される。呼び出し側で切り詰めない)。 */
 const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,
                                    const uint8_t *addr, uint16_t family, uint8_t *out_scope_prefix) {
     if (out_scope_prefix) *out_scope_prefix = 0;
@@ -331,40 +355,39 @@ const char *resolve_ecs_subnet_tag(const zone_arena_t *zone, const server_config
 
     int af = (family == 1) ? AF_INET : ((family == 2) ? AF_INET6 : -1);
     if (af == -1) return NULL;
+    uint8_t family_bits = (af == AF_INET) ? 32 : 128;
 
-    for (int i = 0; i < tag_count; i++) {
+    uint8_t scope = 0;
+    const char *found = NULL;
+    for (int i = 0; i < tag_count && !found; i++) {
         for (int j = 0; j < tags[i].cidr_count; j++) {
             const ecs_cidr_entry_t *ce = &tags[i].cidrs[j];
-            bool match = false;
             if (ce->parsed.valid) {
-                match = cidr_entry_match(&ce->parsed, af, addr);
+                if (cidr_entry_match(&ce->parsed, af, addr)) {
+                    if (!ce->parsed.is_any && ce->parsed.prefix > scope) scope = ce->parsed.prefix;
+                    found = tags[i].tag;
+                    break;
+                }
+                if (ce->parsed.family == af) {
+                    uint8_t cp = ecs_common_prefix_bits(addr, ce->parsed.addr, ce->parsed.prefix);
+                    if ((uint8_t)(cp + 1) > scope) scope = (uint8_t)(cp + 1);
+                }
             } else if (ce->cidr) {
+                /* 解析できなかった定義は文字列で照合する。範囲が分からないので、
+                 * この定義が判定に関わる場合は FAMILY の全ビットを SCOPE にする。 */
                 char ip_buf[INET6_ADDRSTRLEN];
-                if (inet_ntop(af, addr, ip_buf, sizeof(ip_buf))) {
-                    match = match_cidr(ip_buf, ce->cidr);
+                if (inet_ntop(af, addr, ip_buf, sizeof(ip_buf)) && match_cidr(ip_buf, ce->cidr)) {
+                    scope = family_bits;
+                    found = tags[i].tag;
+                    break;
                 }
-            }
-            if (match) {
-                if (out_scope_prefix) {
-                    if (ce->parsed.valid && !ce->parsed.is_any) {
-                        *out_scope_prefix = ce->parsed.prefix;
-                    } else if (ce->cidr) {
-                        const char *slash = strchr(ce->cidr, '/');
-                        if (slash) {
-                            int pfx = atoi(slash + 1);
-                            *out_scope_prefix = (pfx >= 0 && pfx <= 128) ? (uint8_t)pfx : 0;
-                        } else {
-                            *out_scope_prefix = (family == 1) ? 32 : 128;
-                        }
-                    } else {
-                        *out_scope_prefix = (family == 1) ? 32 : 128;
-                    }
-                }
-                return tags[i].tag;
+                scope = family_bits;
             }
         }
     }
-    return NULL;
+    if (scope > family_bits) scope = family_bits;
+    if (out_scope_prefix) *out_scope_prefix = scope;
+    return found;
 }
 
 const char *resolve_bind_location_tag(const zone_arena_t *zone, const server_config_t *cfg, const zone_config_t *zcfg,

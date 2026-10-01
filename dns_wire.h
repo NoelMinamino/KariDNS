@@ -65,6 +65,13 @@ typedef struct {
     uint64_t ede_ns;
     uint64_t ede_oth;
     uint64_t dnstap_truncated;
+    /* D-12: 動いている karidns 自身の値 (起動時に取得)。karictl のローカルの値ではない */
+    char version[32];
+    char hostname[256];
+    char os_name[64];
+    char os_release[64];
+    char machine[64];
+    int ncpus;
 } karidns_status_t;
 
 // ============================================================================
@@ -281,6 +288,7 @@ typedef struct {
 
     // EDNS Client Subnet (ECS, RFC 7871)
     bool has_ecs;
+    bool has_malformed_ecs;     // 受信: 形式が不正な ECS (RFC 7871 §6)。has_ecs は false のまま
     uint16_t ecs_family;
     uint8_t ecs_source_prefix;
     uint8_t ecs_scope_prefix;
@@ -311,6 +319,11 @@ void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t star
 
 // ワイヤーフォーマット名前操作
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset);
+/* IXFR 要求 (RFC 1995 §3) の Authority にあるクライアントの SOA から SERIAL を取り出す。q_end は質問セクションの
+ * 直後。Answer は読み飛ばす。最初の Authority RR が SOA で SERIAL まで読めれば true。TCP と UDP の IXFR で共有する。*/
+bool ixfr_request_client_serial(const uint8_t *req, size_t req_len, size_t q_end, uint32_t *serial);
+/* RFC 4648 §7 base32hex (upper case, no padding; RFC 5155 §3.3). */
+void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap);
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out);
 
 // レコード型変換・解析
@@ -333,6 +346,19 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
                      uint8_t *prior_mac, size_t *prior_mac_len,
                      const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
                      bool is_subsequent);
+/* 署名する TSIG の Time Signed と Fudge。NULL なら現在時刻と 300。
+ * BADTIME の応答はクライアントの値を使う (RFC 8945 §5.2.3)。 */
+typedef struct {
+    uint64_t time_signed;
+    uint16_t fudge;
+} tsig_sign_times_t;
+int tsig_sign_packet_ex(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
+                        uint8_t *prior_mac, size_t *prior_mac_len,
+                        const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                        bool is_subsequent, const tsig_sign_times_t *times);
+/* key_name / alg で tsig_error の TSIG RR を付けたときに増えるバイト数 (MAC は alg の最大長)。
+ * 名前が不正なら 0。 */
+size_t tsig_rr_wire_size(const char *key_name, const char *alg, uint16_t tsig_error);
 // 注意: mac_out は最低 EVP_MAX_MD_SIZE (64) バイトを確保すること。
 // mac_len_out には実際にコピーされたバイト数（<= EVP_MAX_MD_SIZE）が返る。
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
@@ -341,6 +367,28 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
                        bool is_subsequent,
                        uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
                        size_t *mac_len_out);
+/* tsig_verify_packet() の戻り値: TSIG が解釈できない (複数、最後の RR でない、RDATA の欠け、
+ * MAC Size が範囲外)。RFC 8945 §5.2、§5.2.2.1 により FORMERR。 */
+#define TSIG_VERIFY_FORMERR (-2)
+/* tsig_verify_packet_ex() が返す、検証したメッセージの TSIG の値 */
+typedef struct {
+    uint64_t time_signed;
+    uint16_t fudge;
+    uint16_t error;       /* TSIG の Error */
+    bool truncated;       /* MAC Size がハッシュ長より短い (RFC 8945 §5.2.2.1 で許される切り詰め) */
+} tsig_verify_info_t;
+/* 戻り値: 0 = 検証成功、-1 = TSIG がない、TSIG_VERIFY_FORMERR、
+ * 17 = 鍵名またはアルゴリズムが key と違う (BADKEY)、16 = MAC 不一致 (BADSIG)、18 = 時刻範囲外 (BADTIME)。
+ * 18 のときも mac_out に検証できた MAC を返す (BADTIME の応答の署名に使う。RFC 8945 §5.3.2)。
+ * 応答の検証 (prior_mac を渡した最初のメッセージ) で、MAC Size 0 の無署名エラー (RFC 8945 §5.3.2)
+ * なら TSIG の Error (16/17) を返す。 */
+int tsig_verify_packet_ex(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
+                          const uint8_t *prior_mac, size_t prior_mac_len,
+                          const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                          bool is_subsequent,
+                          uint8_t *mac_out /* >= EVP_MAX_MD_SIZE bytes */,
+                          size_t *mac_len_out, tsig_verify_info_t *info);
+/* TSIG が追加セクションの最後にただ 1 つあり、読めるときだけ true */
 bool packet_has_tsig(const uint8_t *packet, size_t packet_len);
 
 // SIG(0) & DNSKEY Tag
@@ -348,8 +396,50 @@ uint16_t compute_dnskey_tag(const uint8_t *rdata, size_t rdlen);
 uint16_t compute_sig0_keytag(const sig0_key_t *key);
 int sig0_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, sig0_key_t *key);
 
+// ============================================================================
+// 名前の内部表現 (サーバー・karicheck 共通の正規テキスト形式)
+//   ラベル中のオクテット '.' と '\' は "\." と "\\"、0x00-0x20 と 0x7F-0xFF は "\DDD"、
+//   それ以外はそのまま。大文字小文字は保持し、絶対名は末尾にエスケープされない '.'、
+//   ルートは "."。RFC 4343 §2.1 のエスケープ規則。この形では、DNS 名としての一致
+//   (RFC 4343 §2: オクテット比較、ASCII 英字のみ大文字小文字を区別しない) が
+//   文字列の strcasecmp の一致と同じになる (英字は必ずそのまま書かれるため)。
+//   ゾーンパーサ、tinydns ローダー、クエリ名、XFR/UPDATE の受信名は全てこの形で作る。
+// ============================================================================
+// 255 オクテットの名前を全て \DDD で書いても収まる大きさ (RFC 1035 §2.3.4)
+#define DNS_NAME_TEXT_SIZE 1025
+// 1 ラベル (len オクテット) を正規形で out に書く。書いた文字数、入りきらなければ (size_t)-1。NUL は付けない。
+size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap);
+// 表示形式の名前 (\X, \DDD を含んでよい) を正規形にする。末尾ドットの有無は入力に従う。
+// 戻り値は strlen(out)。不正なエスケープ、空ラベル、63 オクテット超のラベル、
+// 255 オクテット超の名前 (RFC 1035 §2.3.4)、バッファ不足なら (size_t)-1。
+size_t dns_name_normalize(const char *in, char *out, size_t cap);
+
+/* メッセージ中の TSIG RR (RFC 8945 §4.2) */
+typedef struct {
+    size_t rr_offset;               /* TSIG RR の先頭。ここまでが TSIG を除いたメッセージ */
+    size_t timers_offset;           /* Time Signed の位置 */
+    char key_name[DNS_NAME_TEXT_SIZE];
+    char alg_name[DNS_NAME_TEXT_SIZE];
+    uint64_t time_signed;
+    uint16_t fudge;
+    uint16_t mac_size;
+    const uint8_t *mac;
+    uint16_t orig_id;
+    uint16_t error;
+    uint16_t other_len;
+    const uint8_t *other;
+} tsig_rr_t;
+/* TSIG RR を探して読む。0 = TSIG なし、1 = 読めた、-1 = 解釈できない TSIG (複数ある、追加セクションの
+ * 最後の RR でない、CLASS が ANY でない、RDATA が欠けている。RFC 8945 §5.2 で FORMERR)。 */
+int tsig_parse_rr(const uint8_t *packet, size_t packet_len, tsig_rr_t *out);
+
+/* 圧縮ポインタをたどって名前を正規形 (上記) で buf に書く。buf は DNS_NAME_TEXT_SIZE あれば足りる。 */
+int expand_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset,
+                               char *buf, size_t buf_size);
 int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size);
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name);
+// downcase=true なら RFC 4034 §6.2 の正規ワイヤ形式 (英字を小文字化)
+long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
 uint32_t parse_ttl_value(const char *ttl_str);
@@ -372,10 +462,31 @@ bool dns_find_opt_rr(const uint8_t *msg, size_t msg_len, size_t *opt_off, size_t
 // 質問の直後へ移して残す (RFC 6891 §7)。TC ビットは呼び出し側で立てる。戻り値は新しい長さ。
 size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end);
 
+// 応答ヘッダの 3〜4 バイト目 (フラグと RCODE) を req から作る。ID と OPCODE、RD、CD は問い合わせから
+// 引き継ぎ、QR=1、AA は引数どおり、TC/RA/Z/AD は 0 (RFC 1035 §4.1.1、RFC 4035 §3.1.6)。
+// カウント (4〜11 バイト目) は変更しない。
+void dns_init_response_header(uint8_t *res, const uint8_t *req, uint8_t rcode, bool aa);
+// エラー応答の共通ビルダー。ヘッダは dns_init_response_header() (AA=0)、本文は要求の質問セクションを
+// qd_keep 個だけ写し、それ以外 (回答・権威・追加、UPDATE の各セクション) は返さない。質問を区切れない、
+// または入らないときは QDCOUNT=0。edns が OPT 付きの要求なら OPT (EDE を含む) を付ける (RFC 6891 §6.1.1、
+// §7)。MQTYPE と EXPIRE は応答データに関するオプションなので付けない。edns=NULL なら OPT なし。
+// 戻り値は応答の長さ (要求がヘッダより短い、または max_res_len < 12 なら 0)。
+int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                             uint8_t rcode, uint8_t ext_rcode, uint16_t qd_keep,
+                             edns_info_t *edns, bool is_tcp, struct server_config_s *cfg);
+
+// UPDATE (RFC 2136) の処理結果。changed が false なら standby は active と同じ内容。
+typedef struct {
+    int prcount;
+    int upcount;
+    bool changed;       // ゾーンのデータが変わった
+    bool soa_replaced;  // SOA が新しいシリアルの SOA で置き換わった (§3.4.2.2, §3.6)
+} update_result_t;
+
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
-                             int *out_prcount, int *out_upcount);
+                             update_result_t *out);
 
 // ============================================================================
 // Protocol Buffers Encoder (Minimal, Dependency-Free)

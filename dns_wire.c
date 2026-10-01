@@ -199,6 +199,9 @@ void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t star
     while (packet_buf[p] != 0) {
         if (label_count >= 127) return; // 異常に長い名前は無視 (安全側)
         if (p >= 0x4000) return;        // 圧縮ポインタで表現できない範囲は登録不要
+        // 圧縮ポインタ / 拡張ラベル (上位 2 ビットが 0 でない) は長さではない (RFC 1035 §4.1.4)。
+        // 長さとして読み進めると、コピーした質問の外 (バッファの外) を読む。登録しないで戻る。
+        if ((packet_buf[p] & 0xC0) != 0) return;
         label_offsets[label_count++] = p;
         p += 1 + packet_buf[p];
     }
@@ -266,6 +269,32 @@ int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) 
     return 0;
 }
 
+bool ixfr_request_client_serial(const uint8_t *req, size_t req_len, size_t q_end, uint32_t *serial) {
+    if (!req || req_len < DNS_HEADER_SIZE) return false;
+    uint16_t ancount = (uint16_t)((req[6] << 8) | req[7]);
+    uint16_t nscount = (uint16_t)((req[8] << 8) | req[9]);
+    if (nscount == 0) return false;
+    size_t p = q_end, next_p;
+    for (uint16_t i = 0; i < ancount; i++) {
+        if (skip_wire_name(req, req_len, p, &next_p) != 0 || next_p + 10 > req_len) return false;
+        p = next_p + 10 + (size_t)((req[next_p + 8] << 8) | req[next_p + 9]);
+        if (p > req_len) return false;
+    }
+    if (skip_wire_name(req, req_len, p, &next_p) != 0 || next_p + 10 > req_len) return false;
+    p = next_p;
+    uint16_t type = (uint16_t)((req[p] << 8) | req[p + 1]);
+    size_t rdlen = (size_t)((req[p + 8] << 8) | req[p + 9]);
+    p += 10;
+    if (type != 6 || p + rdlen > req_len) return false;
+    size_t rp = p;
+    /* RDATA: MNAME RNAME SERIAL ... (RFC 1035 §3.3.13) */
+    if (skip_wire_name(req, p + rdlen, rp, &next_p) != 0) return false;
+    if (skip_wire_name(req, p + rdlen, next_p, &rp) != 0) return false;
+    if (rp + 4 > p + rdlen) return false;
+    *serial = ((uint32_t)req[rp] << 24) | ((uint32_t)req[rp + 1] << 16) | ((uint32_t)req[rp + 2] << 8) | req[rp + 3];
+    return true;
+}
+
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset) {
     if (!packet || current_offset >= packet_len) return -1;
     size_t p = current_offset; bool jumped = false; size_t jumped_offset = 0;
@@ -298,15 +327,16 @@ int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offs
     *next_offset = jumped ? jumped_offset : p; return 0;
 }
 
-int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
-    if (!packet || current_offset >= packet_len) return -1;
+int expand_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset,
+                               char *buf, size_t buf_size) {
+    if (!packet || current_offset >= packet_len || !buf || buf_size < 2) return -1;
     size_t p = current_offset, jumped_offset = 0; bool jumped = false;
     uint64_t visited[(65536 + 63) / 64];
     size_t words_to_clear = (packet_len + 63) / 64;
     if (words_to_clear > (65536 + 63) / 64) words_to_clear = (65536 + 63) / 64;
     memset(visited, 0, words_to_clear * sizeof(uint64_t));
 
-    char buf[1025]; size_t written = 0;
+    size_t written = 0;
     size_t total_wire_len = 0;
     while (1) {
         if (p >= packet_len) return -1;
@@ -331,55 +361,30 @@ int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_of
         total_wire_len += 1 + len;
         if (total_wire_len > 255) return -1;
         if (len == 0) {
-            if (written == 0 || buf[written - 1] != '.') { 
-                if (written >= sizeof(buf) - 1) return -1; 
-                buf[written++] = '.'; 
-            } 
-            buf[written++] = '\0'; 
-            break; 
+            if (written == 0) buf[written++] = '.'; // ルート
+            buf[written++] = '\0';
+            break;
         }
-        if (written > 0 && buf[written - 1] != '.') { 
-            if (written >= sizeof(buf) - 1) return -1; 
-            buf[written++] = '.'; 
-        }
-        if (p + len > packet_len) return -1;
-        bool needs_escape = false;
-        for (int i = 0; i < len; i++) {
-            uint8_t c = packet[p + i];
-            if (c == '.' || c == '\\' || c < 0x21 || c >= 0x7F) {
-                needs_escape = true;
-                break;
-            }
-        }
-        if (!needs_escape) {
-            if (written + len >= sizeof(buf)) return -1;
-            memcpy(&buf[written], &packet[p], len);
-            written += len;
-            p += len;
-        } else {
-            for (int i = 0; i < len; i++) {
-                uint8_t c = packet[p++];
-                if (c == '.' || c == '\\') {
-                    if (written + 2 >= sizeof(buf)) return -1;
-                    buf[written++] = '\\';
-                    buf[written++] = (char)c;
-                } else if (c < 0x21 || c >= 0x7F) {
-                    if (written + 4 >= sizeof(buf)) return -1;
-                    buf[written++] = '\\';
-                    buf[written++] = '0' + (c / 100);
-                    buf[written++] = '0' + ((c / 10) % 10);
-                    buf[written++] = '0' + (c % 10);
-                } else {
-                    if (written + 1 >= sizeof(buf)) return -1;
-                    buf[written++] = (char)c;
-                }
-            }
-        }
+        if (p + len > packet_len || written + 2 > buf_size) return -1;
+        // ラベルの後に区切りの '.' を置く (前の文字で判定すると、'.' で終わるラベルの後に区切りが入らない)。
+        // 255 オクテット以下の名前は正規形で DNS_NAME_TEXT_SIZE に必ず収まる。
+        size_t n = dns_label_to_text(&packet[p], len, &buf[written], buf_size - written - 2);
+        if (n == (size_t)-1) return -1;
+        written += n;
+        buf[written++] = '.';
+        p += len;
     }
-    *next_offset = jumped ? jumped_offset : p; 
-    char *dst = arena_alloc(arena, written);
+    *next_offset = jumped ? jumped_offset : p;
+    return (int)written; /* NUL を含む長さ */
+}
+
+int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out) {
+    char buf[DNS_NAME_TEXT_SIZE];
+    int written = expand_wire_name_to_buffer(packet, packet_len, current_offset, next_offset, buf, sizeof(buf));
+    if (written < 0) return -1;
+    char *dst = arena_alloc(arena, (size_t)written);
     if (!dst) return -1;
-    memcpy(dst, buf, written);
+    memcpy(dst, buf, (size_t)written);
     if (name_out) *name_out = dst;
     return 0;
 }
@@ -394,6 +399,225 @@ const char *get_type_str(uint16_t type, zone_arena_t *arena) {
     return buf;
 }
 
+/* RFC 4648 §7 base32hex, upper case, without padding (RFC 5155 §3.3). */
+void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    size_t out_len = 0;
+    uint32_t buffer = 0;
+    int bits_left = 0;
+    for (size_t i = 0; i < len; i++) {
+        buffer = (buffer << 8) | data[i];
+        bits_left += 8;
+        while (bits_left >= 5) {
+            if (out_len + 1 >= out_cap) { out[out_len] = '\0'; return; }
+            out[out_len++] = alphabet[(buffer >> (bits_left - 5)) & 0x1F];
+            bits_left -= 5;
+        }
+    }
+    if (bits_left > 0 && out_len + 1 < out_cap) {
+        out[out_len++] = alphabet[(buffer << (5 - bits_left)) & 0x1F];
+    }
+    out[out_len] = '\0';
+}
+
+/* ---------------------------------------------------------------------------
+ * 転送・UPDATE で受け取った DNSSEC レコード (R-33)
+ *
+ * RDATA は generic_data にそのまま残し (応答はプライマリが送ったバイト列のまま)、DNSSEC の処理が読む
+ * テキストのフィールドを、ゾーンファイルのパーサと同じ並びで rdata[] に追加する:
+ *   RRSIG      型 / アルゴリズム / ラベル数 / 元の TTL / 失効 / 開始 (YYYYMMDDHHmmSS) / 鍵タグ / 署名者 / 署名 (base64)
+ *   NSEC       次の名前 / 型...
+ *   NSEC3      アルゴリズム / フラグ / 反復回数 / ソルト (hex、空なら "-") / 次のハッシュ (base32hex) / 型...
+ *   NSEC3PARAM アルゴリズム / フラグ / 反復回数 / ソルト
+ *   DNSKEY     フラグ / プロトコル / アルゴリズム / 公開鍵 (base64)
+ *   DS         鍵タグ / アルゴリズム / ダイジェスト型 / ダイジェスト (hex)
+ * 戻り値: 0 = 展開した、-1 = RDATA が壊れている、-2 = arena の確保に失敗。
+ * ------------------------------------------------------------------------- */
+
+/* RDATA 中の名前。RFC 4034 §3.1.7 / §4.1.1: Signer's Name と Next Domain Name は圧縮してはならない。
+ * RDATA は応答にそのまま写すので (RFC 3597 §4 と同じ理由)、ポインタを含む名前は壊れた RDATA とする。 */
+static int dnssec_rdata_name(const uint8_t *rd, size_t rdlen, size_t *pos, zone_arena_t *arena, char **out) {
+    for (size_t p = *pos;;) {
+        if (p >= rdlen) return -1;
+        uint8_t len = rd[p];
+        if (len & 0xC0) return -1;
+        p += 1 + (size_t)len;
+        if (len == 0) break;
+    }
+    char buf[DNS_NAME_TEXT_SIZE];
+    size_t next;
+    int written = expand_wire_name_to_buffer(rd, rdlen, *pos, &next, buf, sizeof(buf));
+    if (written < 0) return -1;
+    char *dst = arena_alloc(arena, (size_t)written);
+    if (!dst) return -2;
+    memcpy(dst, buf, (size_t)written);
+    *out = dst;
+    *pos = next;
+    return 0;
+}
+
+static int dnssec_rdata_push(dns_record_t *rec, char *field) {
+    if (!field) return -2;
+    rec->rdata[rec->rdata_count++] = field;
+    return 0;
+}
+
+static char *dnssec_rdata_uint(zone_arena_t *arena, uint32_t v) {
+    char *s = arena_alloc(arena, 11);
+    if (s) snprintf(s, 11, "%u", v);
+    return s;
+}
+
+/* RFC 4034 §3.2: 時刻は UTC の YYYYMMDDHHmmSS。parse_dnssec_time() の逆 (days-to-civil, H. Hinnant)。
+ * gmtime() は使わない: Backend は capability mode で動き、gmtime() は UTC のゾーン情報ファイルを開くことがある。 */
+static char *dnssec_rdata_time(zone_arena_t *arena, uint32_t t) {
+    uint64_t z = (uint64_t)t / 86400 + 719468;
+    uint32_t secs = t % 86400;
+    uint64_t era = z / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint64_t y = yoe + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    unsigned m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y++;
+    char *s = arena_alloc(arena, 15);
+    if (s) snprintf(s, 15, "%04u%02u%02u%02u%02u%02u", (unsigned)y, m, d,
+                    secs / 3600, (secs / 60) % 60, secs % 60);
+    return s;
+}
+
+static char *dnssec_rdata_hex(zone_arena_t *arena, const uint8_t *d, size_t n) {
+    static const char digits[] = "0123456789ABCDEF";
+    char *s = arena_alloc(arena, n * 2 + 1);
+    if (!s) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        s[2 * i] = digits[d[i] >> 4];
+        s[2 * i + 1] = digits[d[i] & 0x0F];
+    }
+    s[n * 2] = '\0';
+    return s;
+}
+
+static char *dnssec_rdata_b64(zone_arena_t *arena, const uint8_t *d, size_t n) {
+    char *s = arena_alloc(arena, 4 * ((n + 2) / 3) + 1);
+    if (!s) return NULL;
+    if (n == 0) s[0] = '\0';
+    else EVP_EncodeBlock((unsigned char *)s, d, (int)n);
+    return s;
+}
+
+/* RFC 4034 §4.1.2 / RFC 5155 §3.2.1: ウィンドウ番号は昇順、ビットマップ長は 1〜32。ビットマップは空でもよい
+ * (RFC 6840 §6.4: Empty Non-Terminal の NSEC3)。疑似型のビットは読むときに無視する (RFC 4034 §4.1.2)。
+ * 型 0 はデータの型にならない (RFC 6895 §3.1) ので同様に省く (テキストの符号化 encode_type_bitmap() も 0 を捨てる)。
+ * テキストの型一覧を読む処理は無いので、rdata[] に入りきらない分は省いて警告する。 */
+static int dnssec_rdata_bitmap(const uint8_t *rd, size_t rdlen, size_t pos, zone_arena_t *arena, dns_record_t *rec) {
+    int last_window = -1;
+    bool truncated = false;
+    while (pos < rdlen) {
+        if (pos + 2 > rdlen) return -1;
+        uint8_t win = rd[pos], blen = rd[pos + 1];
+        pos += 2;
+        if ((int)win <= last_window || blen < 1 || blen > 32 || pos + blen > rdlen) return -1;
+        last_window = win;
+        for (unsigned i = 0; i < blen; i++) {
+            for (unsigned b = 0; b < 8; b++) {
+                if (!(rd[pos + i] & (0x80 >> b))) continue;
+                uint16_t t = (uint16_t)(win * 256 + i * 8 + b);
+                if (t == 0 || t == 41 || (t >= 249 && t <= 255)) continue; // 0, OPT, TKEY..ANY
+                if (rec->rdata_count >= MAX_RDATA) { truncated = true; continue; }
+                char tmp[16];
+                const char *n = format_type_name(t, tmp, sizeof(tmp));
+                char *field = (char *)n;
+                if (n == tmp) {
+                    field = arena_alloc(arena, strlen(tmp) + 1);
+                    if (!field) return -2;
+                    memcpy(field, tmp, strlen(tmp) + 1);
+                }
+                rec->rdata[rec->rdata_count++] = field;
+            }
+        }
+        pos += blen;
+    }
+    if (truncated)
+        syslog(LOG_WARNING, "[AXFR] %s %s: type bitmap has more types than the text form holds (%d); wire RDATA kept",
+               rec->name ? rec->name : "?", rec->type_code == 47 ? "NSEC" : "NSEC3", MAX_RDATA);
+    return 0;
+}
+
+static int decode_dnssec_rdata(const uint8_t *rd, size_t rdlen, zone_arena_t *arena, dns_record_t *rec) {
+    size_t pos = 0;
+    int rc;
+    switch (rec->type_code) {
+    case 46: { // RRSIG (RFC 4034 §3.1)
+        if (rdlen < 18) return -1;
+        char tmp[16];
+        const char *tn = format_type_name((uint16_t)((rd[0] << 8) | rd[1]), tmp, sizeof(tmp));
+        char *covered = (char *)tn;
+        if (tn == tmp) {
+            covered = arena_alloc(arena, strlen(tmp) + 1);
+            if (covered) memcpy(covered, tmp, strlen(tmp) + 1);
+        }
+        uint32_t orig_ttl = ((uint32_t)rd[4] << 24) | ((uint32_t)rd[5] << 16) | ((uint32_t)rd[6] << 8) | rd[7];
+        uint32_t sig_exp = ((uint32_t)rd[8] << 24) | ((uint32_t)rd[9] << 16) | ((uint32_t)rd[10] << 8) | rd[11];
+        uint32_t sig_inc = ((uint32_t)rd[12] << 24) | ((uint32_t)rd[13] << 16) | ((uint32_t)rd[14] << 8) | rd[15];
+        if ((rc = dnssec_rdata_push(rec, covered)) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[2]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[3]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, orig_ttl))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_time(arena, sig_exp))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_time(arena, sig_inc))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, (uint32_t)((rd[16] << 8) | rd[17])))) != 0)
+            return rc;
+        pos = 18;
+        char *signer;
+        if ((rc = dnssec_rdata_name(rd, rdlen, &pos, arena, &signer)) != 0) return rc;
+        rec->rdata[rec->rdata_count++] = signer;
+        return dnssec_rdata_push(rec, dnssec_rdata_b64(arena, rd + pos, rdlen - pos));
+    }
+    case 47: { // NSEC (RFC 4034 §4.1)
+        char *next;
+        if ((rc = dnssec_rdata_name(rd, rdlen, &pos, arena, &next)) != 0) return rc;
+        rec->rdata[rec->rdata_count++] = next;
+        return dnssec_rdata_bitmap(rd, rdlen, pos, arena, rec);
+    }
+    case 50:   // NSEC3 (RFC 5155 §3.2)
+    case 51: { // NSEC3PARAM (RFC 5155 §4.2)
+        if (rdlen < 5) return -1;
+        size_t salt_len = rd[4];
+        pos = 5 + salt_len;
+        if (pos > rdlen || (rec->type_code == 51 && pos != rdlen)) return -1;
+        if ((rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[0]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[1]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, (uint32_t)((rd[2] << 8) | rd[3])))) != 0 ||
+            (rc = dnssec_rdata_push(rec, salt_len ? dnssec_rdata_hex(arena, rd + 5, salt_len) : "-")) != 0)
+            return rc;
+        if (rec->type_code == 51) return 0;
+        /* RFC 5155 §3.2: Next Hashed Owner Name は Hash Length オクテット。長さ 0 のハッシュは順序を作れない。 */
+        if (pos >= rdlen || rd[pos] == 0 || pos + 1 + rd[pos] > rdlen) return -1;
+        size_t hash_len = rd[pos++];
+        char *hash = arena_alloc(arena, hash_len * 8 / 5 + 2);
+        if (!hash) return -2;
+        dns_base32hex_encode(rd + pos, hash_len, hash, hash_len * 8 / 5 + 2);
+        rec->rdata[rec->rdata_count++] = hash;
+        return dnssec_rdata_bitmap(rd, rdlen, pos + hash_len, arena, rec);
+    }
+    case 48: // DNSKEY (RFC 4034 §2.1)
+    case 43: // DS (RFC 4034 §5.1)
+        if (rdlen < 4) return -1;
+        if ((rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, (uint32_t)((rd[0] << 8) | rd[1])))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[2]))) != 0 ||
+            (rc = dnssec_rdata_push(rec, dnssec_rdata_uint(arena, rd[3]))) != 0)
+            return rc;
+        return dnssec_rdata_push(rec, rec->type_code == 48 ? dnssec_rdata_b64(arena, rd + 4, rdlen - 4)
+                                                           : dnssec_rdata_hex(arena, rd + 4, rdlen - 4));
+    default:
+        return 0;
+    }
+}
+
 int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offset, zone_arena_t *arena, dns_record_t *rec, uint16_t *type_out) {
     char *name; if (expand_wire_name(packet, packet_len, *offset, offset, arena, &name) != 0) { syslog(LOG_ERR, "[AXFR] parse_resource_record: expand_wire_name failed for owner name"); return -1; }
     rec->name = name; if (*offset + 10 > packet_len) { syslog(LOG_ERR, "[AXFR] parse_resource_record: packet too short for header"); return -1; }
@@ -406,6 +630,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     *type_out = type; rec->type_code = type;
     rec->class_str = (class_val == 1) ? "IN" : ((class_val == DNS_CLASS_KARIDNS_EXT) ? "KARIDNS" : "CH");
     rec->type = (char *)get_type_str(type, arena);
+    if (ttl > 0x7FFFFFFF) ttl = 0x7FFFFFFF; // RFC 8767 §4: 送るときと同じ値で持つ (O-14)
     rec->ttl_value = ttl;
     rec->class_val = class_val;
     char *ttl_buf = arena_alloc(arena, 16); if (!ttl_buf) return -1; snprintf(ttl_buf, 16, "%u", ttl); rec->ttl = ttl_buf;
@@ -560,6 +785,14 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
         rec->generic_data = blob;
         rec->generic_len = rdlen;
         rec->rdata_count = 0;
+        // R-33: DNSSEC の型はテキストのフィールドも持たせる (RDATA は blob のまま応答に使う)
+        int rc = decode_dnssec_rdata(&packet[*offset], rdlen, arena, rec);
+        if (rc == -2) return -1;
+        if (rc != 0) {
+            rec->rdata_count = 0;
+            syslog(LOG_WARNING, "[AXFR] %s %s: malformed RDATA (%u octets); kept as opaque data, not used for DNSSEC",
+                   rec->name, rec->type ? rec->type : "?", rdlen);
+        }
     }
     dns_record_preparse_cache(arena, rec);
     *offset += rdlen; return 0;
@@ -632,11 +865,69 @@ long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, co
     }
     if (offset + w_len + 1 > max_len) return -1;
     buf[offset + w_len++] = 0;
+    if (w_len > 255) return -1; // RFC 1035 §2.3.4: 名前は 255 オクテット以下
     return (long)w_len;
 }
 
 long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const char *name) {
     return write_uncompressed_name_ext(buf, offset, max_len, name, true);
+}
+
+size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = label[i];
+        if (c == '.' || c == '\\') {
+            if (w + 2 > cap) return (size_t)-1;
+            out[w++] = '\\';
+            out[w++] = (char)c;
+        } else if (c < 0x21 || c >= 0x7F) {
+            // RFC 4343 §2.1: 0x21-0x7E の外は \DDD (10 進 3 桁)
+            if (w + 4 > cap) return (size_t)-1;
+            out[w++] = '\\';
+            out[w++] = (char)('0' + c / 100);
+            out[w++] = (char)('0' + (c / 10) % 10);
+            out[w++] = (char)('0' + c % 10);
+        } else {
+            if (w + 1 > cap) return (size_t)-1;
+            out[w++] = (char)c;
+        }
+    }
+    return w;
+}
+
+size_t dns_name_normalize(const char *in, char *out, size_t cap) {
+    if (!in || !out || cap < 2) return (size_t)-1;
+    if (in[0] == '\0' || strcmp(in, ".") == 0) {
+        size_t n = (in[0] == '\0') ? 0 : 1;
+        memcpy(out, ".", n);
+        out[n] = '\0';
+        return n;
+    }
+    size_t w = 0, wire_len = 1; // 終端のルートラベル分
+    const char *p = in;
+    uint8_t label[64];
+    while (p && *p) {
+        const char *next_p = NULL;
+        int len = parse_label(p, label, &next_p);
+        if (len <= 0) return (size_t)-1; // 不正なエスケープ / 63 オクテット超 / 空ラベル ("a..b", ".a")
+        wire_len += (size_t)len + 1;
+        if (wire_len > 255) return (size_t)-1;
+        if (w > 0) {
+            if (w + 1 >= cap) return (size_t)-1;
+            out[w++] = '.';
+        }
+        size_t n = dns_label_to_text(label, (size_t)len, out + w, cap - w - 1);
+        if (n == (size_t)-1) return (size_t)-1;
+        w += n;
+        if (next_p && *next_p == '\0') { // 末尾のエスケープされない '.' (絶対名)
+            if (w + 1 >= cap) return (size_t)-1;
+            out[w++] = '.';
+        }
+        p = next_p;
+    }
+    out[w] = '\0';
+    return w;
 }
 
 
@@ -735,6 +1026,7 @@ static size_t wire_name_length(const char *name) {
 int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, char *buf, size_t buf_size) {
     size_t p = current_offset;
     size_t written = 0;
+    size_t total_wire_len = 0;
     while (1) {
         if (p >= packet_len) return -1;
         uint8_t len = packet[p];
@@ -742,37 +1034,24 @@ int extract_wire_name_to_buffer(const uint8_t *packet, size_t packet_len, size_t
             return -1; // RFC 8945 TSIG algorithm names MUST NOT be compressed (and reject extended labels)
         }
         p++;
+        total_wire_len += 1 + len;
+        if (total_wire_len > 255) return -1; // RFC 1035 §2.3.4
         if (len == 0) {
-            if (written == 0 || buf[written - 1] != '.') { 
-                if (written >= buf_size) return -1; 
-                buf[written++] = '.'; 
-            } 
-            if (written >= buf_size) return -1;
-            buf[written++] = '\0'; 
-            break; 
-        }
-        if (written > 0 && buf[written - 1] != '.') { 
-            if (written >= buf_size) return -1; 
-            buf[written++] = '.'; 
-        }
-        if (written + (len * 4) >= buf_size || p + len > packet_len) return -1;
-        for (int i = 0; i < len; i++) {
-            uint8_t c = packet[p++];
-            if (c == '.' || c == '\\') {
-                if (written + 2 > buf_size) return -1;
-                buf[written++] = '\\';
-                buf[written++] = (char)c;
-            } else if (c < 0x21 || c >= 0x7F) {
-                if (written + 4 > buf_size) return -1;
-                buf[written++] = '\\';
-                buf[written++] = '0' + (c / 100);
-                buf[written++] = '0' + ((c / 10) % 10);
-                buf[written++] = '0' + (c % 10);
-            } else {
-                if (written + 1 > buf_size) return -1;
-                buf[written++] = (char)c;
+            if (written == 0) {
+                if (written + 1 >= buf_size) return -1;
+                buf[written++] = '.'; // ルート
             }
+            if (written >= buf_size) return -1;
+            buf[written++] = '\0';
+            break;
         }
+        if (p + len > packet_len || written + 1 >= buf_size) return -1;
+        // expand_wire_name() と同じ正規形。区切りの '.' はラベルの後に置く。
+        size_t n = dns_label_to_text(&packet[p], len, &buf[written], buf_size - written - 1);
+        if (n == (size_t)-1) return -1;
+        written += n;
+        buf[written++] = '.';
+        p += len;
     }
     *next_offset = p; 
     return 0;
@@ -835,10 +1114,25 @@ const EVP_MD *tsig_algorithm_evp_md(const char *alg) {
     return tsig_algorithm_from_name(alg);
 }
 
+size_t tsig_rr_wire_size(const char *key_name, const char *alg, uint16_t tsig_error) {
+    size_t kl = wire_name_length(key_name), al = wire_name_length(alg);
+    if (kl == (size_t)-1 || al == (size_t)-1) return 0;
+    return kl + 10 /* TYPE CLASS TTL RDLENGTH */ + al + 10 /* Time Signed, Fudge, MAC Size */
+         + EVP_MAX_MD_SIZE + 6 /* Original ID, Error, Other Len */ + (tsig_error == 18 ? 6 : 0);
+}
+
 int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
                      uint8_t *prior_mac, size_t *prior_mac_len,
                      const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
                      bool is_subsequent) {
+    return tsig_sign_packet_ex(packet, packet_len, max_len, key, tsig_error, prior_mac, prior_mac_len,
+                               unsigned_intermediate_msgs, unsigned_intermediate_msgs_len, is_subsequent, NULL);
+}
+
+int tsig_sign_packet_ex(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_key_t *key, uint16_t tsig_error,
+                        uint8_t *prior_mac, size_t *prior_mac_len,
+                        const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                        bool is_subsequent, const tsig_sign_times_t *times) {
     if (!key) return -1;
     if (*packet_len < DNS_HEADER_SIZE) return -1; // OOBアクセスの防止
 
@@ -848,16 +1142,9 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
 
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
 
-    size_t needed = keyname_wire_len
-                  + 8   /* TYPE(2)+CLASS(2)+TTL(4) */
-                  + 2   /* RDLENGTH */
-                  + alg_wire_len
-                  + 10  /* Time Signed(6)+Fudge(2)+MAC Size(2) */
-                  + EVP_MAX_MD_SIZE /* MAC本体。実際のアルゴリズムに関わらず最大値で安全側に見積もる */
-                  + 6   /* Original ID(2)+Error(2)+Other Len(2) */
-                  + (tsig_error == 18 ? 6 : 0); /* Other Data (BADTIMEの場合のみ6バイト) */
-
-    if (*packet_len + needed > max_len) return -1;
+    /* MAC 本体は実際のアルゴリズムに関わらず最大値で安全側に見積もる */
+    size_t needed = tsig_rr_wire_size(key->name, alg, tsig_error);
+    if (needed == 0 || *packet_len + needed > max_len) return -1;
     size_t pre_mac_len = *packet_len;
     size_t pre_mac_cap = pre_mac_len
                        + (prior_mac_len && *prior_mac_len > 0 ? *prior_mac_len + 2 : 0)
@@ -886,6 +1173,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     memcpy(&pre_mac[offset], packet, pre_mac_len);
     offset += pre_mac_len;
     if (!is_subsequent) {
+        /* RFC 8945 §4.3.3: 鍵名とアルゴリズム名は正規ワイヤ形式 (小文字。write_uncompressed_name) */
         long w = write_uncompressed_name(pre_mac, offset, pre_mac_cap, key->name);
         if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
@@ -895,17 +1183,19 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         if (w < 0) { if (use_malloc) free(pre_mac); return -1; }
         offset += (size_t)w;
     }
-    uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
+    /* RFC 8945 §5.2.3: BADTIME の応答は Time Signed と Fudge にクライアントの値を入れる */
+    uint64_t now = times ? times->time_signed
+                         : ((key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL));
+    uint16_t fudge = times ? times->fudge : 300;
+    uint64_t now_48 = (uint64_t)time(NULL); /* BADTIME の Other Data: サーバーの現在時刻 */
     pre_mac[offset++] = (now >> 40) & 0xFF; pre_mac[offset++] = (now >> 32) & 0xFF;
     pre_mac[offset++] = (now >> 24) & 0xFF; pre_mac[offset++] = (now >> 16) & 0xFF;
     pre_mac[offset++] = (now >> 8) & 0xFF; pre_mac[offset++] = now & 0xFF;
-    uint16_t fudge = 300;
     pre_mac[offset++] = fudge >> 8; pre_mac[offset++] = fudge & 0xFF;
     if (!is_subsequent) {
         pre_mac[offset++] = tsig_error >> 8; pre_mac[offset++] = tsig_error & 0xFF; // Error
         if (tsig_error == 18) {
             pre_mac[offset++] = 0; pre_mac[offset++] = 6; // Other Len
-            uint64_t now_48 = time(NULL);
             pre_mac[offset++] = (now_48 >> 40) & 0xFF; pre_mac[offset++] = (now_48 >> 32) & 0xFF;
             pre_mac[offset++] = (now_48 >> 24) & 0xFF; pre_mac[offset++] = (now_48 >> 16) & 0xFF;
             pre_mac[offset++] = (now_48 >> 8) & 0xFF; pre_mac[offset++] = now_48 & 0xFF;
@@ -915,7 +1205,7 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     }
     unsigned int mac_len = 0; unsigned char mac[EVP_MAX_MD_SIZE];
     if (tsig_error == 16 || tsig_error == 17) {
-        // RFC 8945 §5.3.1: If error is BADSIG or BADKEY, MAC size MUST be 0 and MAC data MUST be empty
+        // RFC 8945 §5.3.2: BADSIG / BADKEY の応答は無署名 (MAC Size 0、MAC は空)
         mac_len = 0;
     } else if (key->secret_decoded_len > 0) {
         const EVP_MD *evp_md = tsig_algorithm_from_name(alg);
@@ -926,12 +1216,12 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
         HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, offset, mac, &mac_len);
     }
     if (use_malloc) free(pre_mac);
-    
+
     if (prior_mac_len && prior_mac) {
         *prior_mac_len = mac_len;
         if (mac_len > 0) memcpy(prior_mac, mac, mac_len);
     }
-    
+
     size_t p_offset = *packet_len;
     long w2 = write_uncompressed_name(packet, p_offset, max_len, key->name);
     if (w2 < 0) return -1;
@@ -956,7 +1246,6 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     packet[p_offset++] = tsig_error >> 8; packet[p_offset++] = tsig_error & 0xFF; // Error
     if (tsig_error == 18) {
         packet[p_offset++] = 0; packet[p_offset++] = 6; // Other Len
-        uint64_t now_48 = time(NULL);
         packet[p_offset++] = (now_48 >> 40) & 0xFF; packet[p_offset++] = (now_48 >> 32) & 0xFF;
         packet[p_offset++] = (now_48 >> 24) & 0xFF; packet[p_offset++] = (now_48 >> 16) & 0xFF;
         packet[p_offset++] = (now_48 >> 8) & 0xFF; packet[p_offset++] = now_48 & 0xFF;
@@ -971,89 +1260,129 @@ int tsig_sign_packet(uint8_t *packet, size_t *packet_len, size_t max_len, tsig_k
     return 0;
 }
 
+int tsig_parse_rr(const uint8_t *packet, size_t packet_len, tsig_rr_t *out) {
+    if (!packet || packet_len < DNS_HEADER_SIZE) return 0;
+    uint16_t qdcount = (packet[4] << 8) | packet[5], ancount = (packet[6] << 8) | packet[7];
+    uint16_t nscount = (packet[8] << 8) | packet[9], arcount = (packet[10] << 8) | packet[11];
+    if (arcount == 0) return 0;
+    size_t offset = DNS_HEADER_SIZE;
+    for (int i = 0; i < qdcount; i++) {
+        if (skip_name_inplace(packet, packet_len, &offset) != 0 || offset + 4 > packet_len) return 0;
+        offset += 4;
+    }
+    uint32_t total = (uint32_t)ancount + nscount + arcount;
+    size_t tsig_rr = 0;
+    int tsig_count = 0;
+    bool tsig_last = false;
+    for (uint32_t i = 0; i < total; i++) {
+        size_t rr = offset;
+        /* TSIG より後ろが読めなければ、TSIG は最後の RR ではない (RFC 8945 §5.2) */
+        if (skip_name_inplace(packet, packet_len, &offset) != 0 || offset + 10 > packet_len)
+            return tsig_count ? -1 : 0;
+        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
+        uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
+        if (offset + 10 + rdlen > packet_len) return (tsig_count || type == 250) ? -1 : 0;
+        if (type == 250) {
+            tsig_count++;
+            tsig_rr = rr;
+            tsig_last = (i == total - 1) && (i >= (uint32_t)ancount + nscount);
+        }
+        offset += 10 + (size_t)rdlen;
+    }
+    if (tsig_count == 0) return 0;
+    /* RFC 8945 §5.2: TSIG は追加セクションの最後にただ 1 つ。それ以外は FORMERR */
+    if (tsig_count > 1 || !tsig_last) return -1;
+
+    size_t p;
+    if (expand_wire_name_to_buffer(packet, packet_len, tsig_rr, &p, out->key_name, sizeof(out->key_name)) < 0)
+        return -1;
+    if (p + 10 > packet_len) return -1;
+    uint16_t class = (packet[p + 2] << 8) | packet[p + 3];
+    if (class != 255) return -1; // RFC 8945 §4.2: CLASS MUST be ANY
+    size_t rdata_end = p + 10 + (((size_t)packet[p + 8] << 8) | packet[p + 9]);
+    p += 10;
+    /* RFC 8945 §4.2: Algorithm Name は圧縮しない */
+    if (extract_wire_name_to_buffer(packet, rdata_end, p, &p, out->alg_name, sizeof(out->alg_name)) != 0) return -1;
+    if (p + 10 > rdata_end) return -1;
+    out->rr_offset = tsig_rr;
+    out->timers_offset = p;
+    out->time_signed = ((uint64_t)packet[p] << 40) | ((uint64_t)packet[p + 1] << 32) |
+                       ((uint64_t)packet[p + 2] << 24) | ((uint64_t)packet[p + 3] << 16) |
+                       ((uint64_t)packet[p + 4] << 8) | (uint64_t)packet[p + 5];
+    out->fudge = (packet[p + 6] << 8) | packet[p + 7];
+    out->mac_size = (packet[p + 8] << 8) | packet[p + 9];
+    p += 10;
+    if (p + out->mac_size + 6 > rdata_end) return -1;
+    out->mac = &packet[p];
+    p += out->mac_size;
+    out->orig_id = (packet[p] << 8) | packet[p + 1];
+    out->error = (packet[p + 2] << 8) | packet[p + 3];
+    out->other_len = (packet[p + 4] << 8) | packet[p + 5];
+    p += 6;
+    if (p + out->other_len > rdata_end) return -1;
+    out->other = &packet[p];
+    return 1;
+}
+
 int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
                        const uint8_t *prior_mac, size_t prior_mac_len,
                        const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
                        bool is_subsequent,
                        uint8_t *mac_out, size_t *mac_len_out) {
-    if (!key || packet_len < DNS_HEADER_SIZE) return -1;
-    uint16_t arcount = (packet[10] << 8) | packet[11];
-    if (arcount == 0) return -1;
-    size_t offset = DNS_HEADER_SIZE;
-    uint16_t qdcount = (packet[4] << 8) | packet[5], ancount = (packet[6] << 8) | packet[7], nscount = (packet[8] << 8) | packet[9];
-    for (int i = 0; i < qdcount; i++) {
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
+    return tsig_verify_packet_ex(packet, packet_len, key, prior_mac, prior_mac_len,
+                                 unsigned_intermediate_msgs, unsigned_intermediate_msgs_len, is_subsequent,
+                                 mac_out, mac_len_out, NULL);
+}
 
-        offset += 4;
+int tsig_verify_packet_ex(const uint8_t *packet, size_t packet_len, tsig_key_t *key,
+                          const uint8_t *prior_mac, size_t prior_mac_len,
+                          const uint8_t *unsigned_intermediate_msgs, size_t unsigned_intermediate_msgs_len,
+                          bool is_subsequent,
+                          uint8_t *mac_out, size_t *mac_len_out, tsig_verify_info_t *info) {
+    if (!key || !packet || packet_len < DNS_HEADER_SIZE) return -1;
+    tsig_rr_t rr;
+    int pr = tsig_parse_rr(packet, packet_len, &rr);
+    if (pr == 0) return -1;
+    if (pr < 0) return TSIG_VERIFY_FORMERR;
+    if (info) {
+        info->time_signed = rr.time_signed;
+        info->fudge = rr.fudge;
+        info->error = rr.error;
+        info->truncated = false;
     }
-    size_t last_rr_offset = 0;
-    for (int i = 0; i < ancount + nscount + arcount; i++) {
-        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
-        if (offset >= packet_len) return -1;
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return -1;
 
-        if (offset + 10 > packet_len) return -1;
-        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
-        if (i < ancount + nscount + arcount - 1 && type == 250) {
-            return -1; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
-        }
-        uint16_t rdlen = (packet[offset+8] << 8) | packet[offset+9];
-        offset += 10 + rdlen;
-    }
-    if (last_rr_offset == 0 || offset > packet_len) return -1;
-    size_t tsig_p = last_rr_offset;
-    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return -1;
-
-    if (tsig_p + 10 > packet_len) return -1;
-    uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p+1];
-    if (type != 250) return -1;
-    uint16_t class = (packet[tsig_p+2] << 8) | packet[tsig_p+3];
-    if (class != 255) return -1;
-    tsig_p += 10;
-    size_t alg_start = tsig_p;
-    char wire_alg_name[256];
-    if (extract_wire_name_to_buffer(packet, packet_len, alg_start, &tsig_p, wire_alg_name, sizeof(wire_alg_name)) != 0) return -1;
-
-    if (tsig_p + 16 > packet_len) return -1;
-    size_t time_fudge_start = tsig_p;
-    uint64_t time_signed = 
-        ((uint64_t)packet[time_fudge_start] << 40) | ((uint64_t)packet[time_fudge_start+1] << 32) |
-        ((uint64_t)packet[time_fudge_start+2] << 24) | ((uint64_t)packet[time_fudge_start+3] << 16) |
-        ((uint64_t)packet[time_fudge_start+4] << 8)  |  (uint64_t)packet[time_fudge_start+5];
-    uint16_t fudge = (packet[time_fudge_start+6] << 8) | packet[time_fudge_start+7];
-    uint64_t now = (key && key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
-    uint64_t upper = (UINT64_MAX - fudge < time_signed) ? UINT64_MAX : time_signed + fudge;
-    uint64_t lower = (time_signed < fudge) ? 0 : time_signed - fudge;
-    tsig_p += 8;
-    uint16_t mac_size = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    if (tsig_p + mac_size + 6 > packet_len) return -1;
-    const uint8_t *mac = &packet[tsig_p]; tsig_p += mac_size;
-    uint16_t orig_id = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    if (!is_subsequent && orig_id != (((uint16_t)packet[0] << 8) | packet[1])) {
-        return 16; // BADSIG per RFC 8945 §5.3.1
-    }
-    uint16_t err = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    uint16_t other_len = (packet[tsig_p] << 8) | packet[tsig_p+1]; tsig_p += 2;
-    if (tsig_p + other_len > packet_len) return -1;
-    
+    /* RFC 8945 §5.2: 鍵 → MAC → 時刻の順に調べる。
+     * §5.2.1: 鍵名 (DNS 名として比較) かアルゴリズムが違えば BADKEY */
     const char *alg = key->algorithm ? key->algorithm : "hmac-sha256";
-    const EVP_MD *evp_md = tsig_algorithm_from_name(wire_alg_name);
-    if (!evp_md) return 21; // BADALG
-    if (evp_md != tsig_algorithm_from_name(alg)) return 21; // BADALG
-    
+    const EVP_MD *evp_md = tsig_algorithm_from_name(rr.alg_name);
+    if (!evp_md || evp_md != tsig_algorithm_from_name(alg) || !domain_names_match_ci(rr.key_name, key->name))
+        return 17; // BADKEY
+    size_t hash_len = (size_t)EVP_MD_size(evp_md);
+
+    /* RFC 8945 §5.3.2: サーバーは鍵や MAC のエラーを MAC Size 0 の無署名で返す。要求への応答を
+     * 検証しているときは、その Error をそのまま返す (呼び出し側が BADSIG/BADKEY を表示できるように) */
+    if (rr.mac_size == 0 && prior_mac && prior_mac_len > 0 && !is_subsequent &&
+        (rr.error == 16 || rr.error == 17))
+        return rr.error;
+    /* RFC 8945 §5.2.2.1: MAC Size がハッシュ長より大きい、または max(10, ハッシュ長/2) より小さいと FORMERR */
+    size_t min_mac = hash_len / 2 > 10 ? hash_len / 2 : 10;
+    if (rr.mac_size > hash_len || rr.mac_size < min_mac) return TSIG_VERIFY_FORMERR;
+
+    size_t last_rr_offset = rr.rr_offset;
+    uint16_t arcount = (packet[10] << 8) | packet[11];
     size_t keyname_wire_len = wire_name_length(key->name);
-    size_t alg_wire_len = wire_name_length(wire_alg_name);
+    size_t alg_wire_len = wire_name_length(rr.alg_name);
     if (keyname_wire_len == (size_t)-1 || alg_wire_len == (size_t)-1) return -1;
     size_t pre_mac_cap = (prior_mac_len > 0 ? prior_mac_len + 2 : 0)
                        + unsigned_intermediate_msgs_len
-                       + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + other_len;
-    
+                       + last_rr_offset + keyname_wire_len + 6 + alg_wire_len + 8 + 4 + rr.other_len;
+
     uint8_t *pre_mac = NULL;
     bool use_malloc = pre_mac_cap > sizeof(g_tsig_pre_mac_buf);
     if (use_malloc) pre_mac = malloc(pre_mac_cap);
     else pre_mac = g_tsig_pre_mac_buf;
     if (!pre_mac) return -1;
-    
+
     size_t p_offset = 0;
     if (prior_mac && prior_mac_len > 0) {
         pre_mac[p_offset++] = prior_mac_len >> 8;
@@ -1065,82 +1394,58 @@ int tsig_verify_packet(const uint8_t *packet, size_t packet_len, tsig_key_t *key
         memcpy(&pre_mac[p_offset], unsigned_intermediate_msgs, unsigned_intermediate_msgs_len);
         p_offset += unsigned_intermediate_msgs_len;
     }
-    
+
+    /* RFC 8945 §4.3.2: TSIG を除き、ARCOUNT を 1 減らし、ID を Original ID に置き換えたメッセージ。
+     * Original ID がメッセージ ID と違ってもよい (§4.2: 転送された UPDATE。R-20) */
     memcpy(&pre_mac[p_offset], packet, last_rr_offset);
-    pre_mac[p_offset + 0] = orig_id >> 8; pre_mac[p_offset + 1] = orig_id & 0xFF;
+    pre_mac[p_offset + 0] = rr.orig_id >> 8; pre_mac[p_offset + 1] = rr.orig_id & 0xFF;
     uint16_t new_arcount = arcount - 1;
     pre_mac[p_offset + 10] = new_arcount >> 8; pre_mac[p_offset + 11] = new_arcount & 0xFF;
     p_offset += last_rr_offset;
 
     if (!is_subsequent) {
+        /* RFC 8945 §4.3.3: 鍵名とアルゴリズム名は正規ワイヤ形式 (小文字) */
         long w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, key->name);
         if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
         p_offset += (size_t)w3;
-        
+
         if (p_offset + 6 > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
         pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 255;
         pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0; pre_mac[p_offset++] = 0;
-        
-        w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, wire_alg_name);
+
+        w3 = write_uncompressed_name(pre_mac, p_offset, pre_mac_cap, rr.alg_name);
         if (w3 < 0) { if (use_malloc) free(pre_mac); return -1; }
         p_offset += (size_t)w3;
     }
-    
-    if (p_offset + 8 + (!is_subsequent ? 4 + other_len : 0) > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
-    memcpy(&pre_mac[p_offset], &packet[time_fudge_start], 8); p_offset += 8;
+
+    if (p_offset + 8 + (!is_subsequent ? 4 + rr.other_len : 0) > pre_mac_cap) { if (use_malloc) free(pre_mac); return -1; }
+    memcpy(&pre_mac[p_offset], &packet[rr.timers_offset], 8); p_offset += 8;
     if (!is_subsequent) {
-        pre_mac[p_offset++] = err >> 8; pre_mac[p_offset++] = err & 0xFF;
-        pre_mac[p_offset++] = other_len >> 8; pre_mac[p_offset++] = other_len & 0xFF;
-        if (other_len > 0) { memcpy(&pre_mac[p_offset], &packet[tsig_p], other_len); p_offset += other_len; }
+        pre_mac[p_offset++] = rr.error >> 8; pre_mac[p_offset++] = rr.error & 0xFF;
+        pre_mac[p_offset++] = rr.other_len >> 8; pre_mac[p_offset++] = rr.other_len & 0xFF;
+        if (rr.other_len > 0) { memcpy(&pre_mac[p_offset], rr.other, rr.other_len); p_offset += rr.other_len; }
     }
     unsigned int calc_mac_len = 0; unsigned char calc_mac[EVP_MAX_MD_SIZE];
     HMAC(evp_md, key->secret_decoded, key->secret_decoded_len, pre_mac, p_offset, calc_mac, &calc_mac_len);
     if (use_malloc) free(pre_mac);
-    if (mac_size != calc_mac_len) {
-        /* [T8] サイズ検証: 站切り消しすぎまたは範囲外のサイズは即座に BADSIG */
-        if (mac_size < 10 || mac_size < calc_mac_len / 2 || mac_size > calc_mac_len) return 16; // BADSIG
-    }
-    /* [T8] 元の if/else 両分岐の重複 const_time_memcmp を統合 */
-    if (const_time_memcmp(calc_mac, mac, mac_size) != 0) return 16; // BADSIG
-    if (now > upper || now < lower) return 18; // BADTIME (RFC 8945 §5.3.1)
+    /* 切り詰めた MAC は先頭 mac_size オクテットだけを比べる (RFC 8945 §5.2.2.1) */
+    if (calc_mac_len < rr.mac_size || const_time_memcmp(calc_mac, rr.mac, rr.mac_size) != 0) return 16; // BADSIG
+    /* 検証できた MAC は BADTIME のときも返す (RFC 8945 §5.3.2: BADTIME の応答は要求の MAC を含めて署名) */
     if (mac_out && mac_len_out) {
-        *mac_len_out = mac_size;
-        memcpy(mac_out, mac, mac_size);
+        *mac_len_out = rr.mac_size;
+        memcpy(mac_out, rr.mac, rr.mac_size);
     }
+    if (info) info->truncated = rr.mac_size < hash_len;
+    uint64_t now = (key->fuzztime > 0) ? (uint64_t)key->fuzztime : (uint64_t)time(NULL);
+    uint64_t upper = (UINT64_MAX - rr.fudge < rr.time_signed) ? UINT64_MAX : rr.time_signed + rr.fudge;
+    uint64_t lower = (rr.time_signed < rr.fudge) ? 0 : rr.time_signed - rr.fudge;
+    if (now > upper || now < lower) return 18; // BADTIME (RFC 8945 §5.2.3)
     return 0;
 }
 
 bool packet_has_tsig(const uint8_t *packet, size_t packet_len) {
-    if (!packet || packet_len < DNS_HEADER_SIZE) return false;
-    uint16_t arcount = (packet[10] << 8) | packet[11];
-    if (arcount == 0) return false;
-    size_t offset = DNS_HEADER_SIZE;
-    uint16_t qdcount = (packet[4] << 8) | packet[5];
-    uint16_t ancount = (packet[6] << 8) | packet[7];
-    uint16_t nscount = (packet[8] << 8) | packet[9];
-    for (int i = 0; i < qdcount; i++) {
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
-        offset += 4;
-    }
-    size_t last_rr_offset = 0;
-    for (int i = 0; i < ancount + nscount + arcount; i++) {
-        if (i == ancount + nscount + arcount - 1) last_rr_offset = offset;
-        if (offset >= packet_len) return false;
-        if (skip_name_inplace(packet, packet_len, &offset) != 0) return false;
-        if (offset + 10 > packet_len) return false;
-        uint16_t type = (packet[offset] << 8) | packet[offset + 1];
-        if (i < ancount + nscount + arcount - 1 && type == 250) {
-            return false; // RFC 8945 §5.1: Multiple TSIG RRs must be rejected
-        }
-        uint16_t rdlen = (packet[offset + 8] << 8) | packet[offset + 9];
-        offset += 10 + rdlen;
-    }
-    if (last_rr_offset == 0 || offset > packet_len) return false;
-    size_t tsig_p = last_rr_offset;
-    if (skip_name_inplace(packet, packet_len, &tsig_p) != 0) return false;
-    if (tsig_p + 10 > packet_len) return false;
-    uint16_t type = (packet[tsig_p] << 8) | packet[tsig_p + 1];
-    return (type == 250);
+    tsig_rr_t rr;
+    return tsig_parse_rr(packet, packet_len, &rr) == 1;
 }
 
 // ============================================================================
@@ -1441,12 +1746,13 @@ int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, 
 }
 
 
-// Type Bitmap (NSEC/NSEC3/CSYNC用) を構築するヘルパー
+// Type Bitmap (NSEC/NSEC3/CSYNC用) を構築するヘルパー。型の一覧は rdata[] の一部なので MAX_RDATA 個以下で、
+// 作業領域はスタックに置く (X-23: 問い合わせの応答を組み立てる経路なので malloc しない。CLAUDE.md Rule 1)。
 static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset, char *const *types, int type_count) {
     if (type_count == 0) return 0;
-    
-    uint16_t *codes = malloc(sizeof(uint16_t) * type_count);
-    if (!codes) return -1;
+    if (type_count < 0 || type_count > MAX_RDATA) return -1;
+
+    uint16_t codes[MAX_RDATA];
     for (int i = 0; i < type_count; i++) {
         codes[i] = get_type_code(types[i]);
     }
@@ -1474,7 +1780,7 @@ static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset
         if (window != current_window) {
             if (current_window != -1) {
                 size_t map_len = (max_bit_in_window / 8) + 1;
-                if (*offset + 2 + map_len > max_res_len) { free(codes); return -1; }
+                if (*offset + 2 + map_len > max_res_len) return -1;
                 res[(*offset)++] = current_window;
                 res[(*offset)++] = (uint8_t)map_len;
                 memcpy(&res[*offset], bitmap, map_len);
@@ -1491,14 +1797,13 @@ static int encode_type_bitmap(uint8_t *res, size_t max_res_len, uint16_t *offset
     
     if (current_window != -1) {
         size_t map_len = (max_bit_in_window / 8) + 1;
-        if (*offset + 2 + map_len > max_res_len) { free(codes); return -1; }
+        if (*offset + 2 + map_len > max_res_len) return -1;
         res[(*offset)++] = current_window;
         res[(*offset)++] = (uint8_t)map_len;
         memcpy(&res[*offset], bitmap, map_len);
         *offset += map_len;
     }
     
-    free(codes);
     return 0;
 }
 
@@ -1652,7 +1957,7 @@ uint32_t parse_ttl_value(const char *ttl_str) {
     }
     if (all_digits) {
         uint64_t v = strtoull(ttl_str, NULL, 10);
-        // RFC 2181 §8: TTLは符号なし32bit、最上位ビットは立てない(実質最大2147483647)
+        // RFC 8767 §4: 最上位ビットの立った値は正の値として扱い、2147483647 に丸める (O-14。エンコーダーと同じ)
         if (v > 2147483647ULL) v = 2147483647ULL;
         return (uint32_t)v;
     }
@@ -1675,10 +1980,11 @@ uint32_t parse_ttl_value(const char *ttl_str) {
             }
             endptr++;
         }
-        total += (uint64_t)num * multiplier;
+        if (num > 2147483647ULL / multiplier || total > 2147483647ULL) total = 2147483648ULL; // 桁あふれさせない
+        else total += (uint64_t)num * multiplier;
         p = endptr;
     }
-    // RFC 2181 §8: TTLは符号なし32bit、最上位ビットは立てない(実質最大2147483647)
+    // RFC 8767 §4: 2147483647 に丸める (O-14)
     if (total > 2147483647ULL) total = 2147483647ULL;
     return (uint32_t)total;
 }
@@ -1762,7 +2068,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     if (ttl == 0 && rec->ttl && *rec->ttl) {
         ttl = parse_ttl_value(rec->ttl);
     }
-    if (ttl > 0x7FFFFFFF) ttl = 0; // RFC 2181 §8: TTL >= 2^31 is treated as 0
+    /* RFC 8767 §4 (RFC 1035 §3.2.1/§4.1.3 と RFC 2181 §8 を改訂): 最上位ビットの立った TTL は 0 ではなく
+     * 正の値として扱う。ゾーンファイルのパーサ (parse_ttl_value) と同じく 2147483647 に丸める (O-14)。 */
+    if (ttl > 0x7FFFFFFF) ttl = 0x7FFFFFFF;
     if (override_ttl != 0xFFFFFFFF && override_ttl < ttl) ttl = override_ttl;
     
     res[offset++] = ttl >> 24; res[offset++] = (ttl >> 16) & 0xFF; res[offset++] = (ttl >> 8) & 0xFF; res[offset++] = ttl & 0xFF;
@@ -2129,28 +2437,26 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if ((size_t)offset + 3 > max_res_len) return -1;
                 res[offset++] = prec; res[offset++] = gw_type; res[offset++] = alg;
                 
-                int pk_idx = 3;
-                if (gw_type == 1) { // IPv4
-                    if (rec->rdata_count < 5) return -1;
+                /* RFC 4025 §3.1: gateway 欄は必須 (type 0 なら "."), 公開鍵は省略できる (長さ 0) */
+                if (rec->rdata_count < 4) return -1;
+                int pk_idx = 4;
+                if (gw_type == 0) { // no gateway
+                    if (strcmp(rec->rdata[3], ".") != 0) return -1;
+                } else if (gw_type == 1) { // IPv4
                     if ((size_t)offset + 4 > max_res_len) return -1;
                     struct in_addr addr;
                     if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
-                    pk_idx = 4;
                 } else if (gw_type == 2) { // IPv6
-                    if (rec->rdata_count < 5) return -1;
                     if ((size_t)offset + 16 > max_res_len) return -1;
                     struct in6_addr addr;
                     if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
-                    pk_idx = 4;
                 } else if (gw_type == 3) { // Domain name
-                    if (rec->rdata_count < 5) return -1;
                     long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
                     if (w < 0) return -1;
                     offset += (size_t)w;
-                    pk_idx = 4;
-                } else if (gw_type != 0) {
+                } else {
                     return -1;
                 }
                 
@@ -2780,6 +3086,21 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += tlen;
                 break;
             }
+            case 40: { // SINK (draft-ietf-dnsind-kitchen-sink-02 §2, §3): meaning, coding, subcoding + base64 data
+                if (rec->rdata_count < 3) return -1;
+                uint8_t meaning, coding, subcoding;
+                if (!parse_u8(rec->rdata[0], &meaning) ||
+                    !parse_u8(rec->rdata[1], &coding) ||
+                    !parse_u8(rec->rdata[2], &subcoding)) return -1;
+                if ((size_t)offset + 3 > max_res_len) return -1;
+                res[offset++] = meaning; res[offset++] = coding; res[offset++] = subcoding;
+                if (rec->rdata_count > 3) {
+                    size_t off = offset;
+                    if (decode_concat_b64_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
+                    offset = off;
+                }
+                break;
+            }
             case 61: case 49: { // OPENPGPKEY, DHCID
                 if (rec->rdata_count < 1) return -1;
                 size_t off = offset;
@@ -2984,31 +3305,40 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 break;
             }
-            case 34: { // ATMA (RFC 2163 §2): format byte + address
-                // rdata[0] = format: "0" = E.164 (ASCII digits), "1" = AESA (20 bytes hex)
-                // rdata[1] = address string
-                if (rec->rdata_count < 2) return -1;
-                uint8_t atma_fmt;
-                if (!parse_u8(rec->rdata[0], &atma_fmt) || atma_fmt > 1) return -1;
+            case 34: { // ATMA (ATM Forum af-dans-0152.000; 表記は BIND lib/dns/rdata/in_1/atma_34.c と同じ)
+                // 1 トークン: '+' で始まれば E.164 (format 1, 十進数字)、それ以外は AESA (format 0, 16進)。
+                // どちらも区切りの '.' を書ける (先頭・末尾・連続は不可)。
+                if (rec->rdata_count != 1) return -1;
+                const char *a = rec->rdata[0];
+                bool e164 = (a[0] == '+');
+                if (e164) a++;
                 if ((size_t)offset + 1 > max_res_len) return -1;
-                res[offset++] = atma_fmt;
-                if (atma_fmt == 0) {
-                    // E.164: フォーマットバイト(0x00) + ASCII 十進数字列
-                    const char *digits = rec->rdata[1];
-                    size_t dlen = strlen(digits);
-                    if (dlen == 0) return -1;
-                    if ((size_t)offset + dlen > max_res_len) return -1;
-                    memcpy(&res[offset], digits, dlen);
-                    offset += dlen;
-                } else {
-                    // AESA: フォーマットバイト(0x01) + 20バイト生データ (16進デコード)
-                    uint8_t aesa[20];
-                    size_t aesa_len = hex_decode(rec->rdata[1], aesa, sizeof(aesa));
-                    if (aesa_len == (size_t)-1 || aesa_len != 20) return -1;
-                    if ((size_t)offset + 20 > max_res_len) return -1;
-                    memcpy(&res[offset], aesa, 20);
-                    offset += 20;
+                res[offset++] = e164 ? 1 : 0;
+                bool last_period = true;
+                int hi = -1;
+                size_t n = 0;
+                for (; *a; a++) {
+                    if (*a == '.') {
+                        if (last_period) return -1;
+                        last_period = true;
+                        continue;
+                    }
+                    last_period = false;
+                    if (e164) {
+                        if (*a < '0' || *a > '9') return -1;
+                        if ((size_t)offset + 1 > max_res_len) return -1;
+                        res[offset++] = (uint8_t)*a;
+                    } else {
+                        int v = hex_char_to_val(*a);
+                        if (v < 0) return -1;
+                        if (hi < 0) { hi = v; continue; }
+                        if ((size_t)offset + 1 > max_res_len) return -1;
+                        res[offset++] = (uint8_t)((hi << 4) | v);
+                        hi = -1;
+                    }
+                    n++;
                 }
+                if (n == 0 || last_period || hi >= 0) return -1;
                 break;
             }
             case 38: { // A6 (RFC 2874 §3, deprecated by RFC 6563)
@@ -3220,25 +3550,38 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                                 }
                             }
                         } else if (opt_code == 8) { // EDNS Client Subnet (RFC 7871)
-                            if (edns->has_ecs) {
+                            if (edns->has_ecs || edns->has_malformed_ecs) {
                                 rdata_offset += opt_len;
                                 continue;
                             }
-                            if (opt_len < 4) return -1;
-                            uint16_t family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
-                            if (family != 1 && family != 2) return -1;
-                            uint8_t source_prefix = req[rdata_offset + 2];
-                            if (family == 1 && source_prefix > 32) return -1;
-                            if (family == 2 && source_prefix > 128) return -1;
-                            uint8_t scope_prefix = req[rdata_offset + 3];
-                            if (scope_prefix != 0) return -1;
-                            size_t expected_addr_len = (source_prefix + 7) / 8;
-                            size_t actual_addr_len = opt_len - 4;
-                            if (actual_addr_len != expected_addr_len) return -1;
-                            if (source_prefix % 8 != 0) {
+                            /* RFC 7871 §6: FAMILY、SOURCE/SCOPE の範囲、ADDRESS の長さとパディングが不正なら
+                             * FORMERR (§7.2.1)。RFC 6891 §7: オプションの不正は OPT 付きの FORMERR にするので、
+                             * ここでは -1 (OPT 自体が使えない) にせず印だけ付けて解析を続ける。*/
+                            bool ecs_ok = opt_len >= 4;
+                            uint16_t family = 0;
+                            uint8_t source_prefix = 0, scope_prefix = 0;
+                            size_t expected_addr_len = 0, actual_addr_len = 0;
+                            if (ecs_ok) {
+                                family = (req[rdata_offset] << 8) | req[rdata_offset + 1];
+                                source_prefix = req[rdata_offset + 2];
+                                scope_prefix = req[rdata_offset + 3];
+                                expected_addr_len = (source_prefix + 7) / 8;
+                                actual_addr_len = opt_len - 4;
+                                if (family != 1 && family != 2) ecs_ok = false;
+                                else if (family == 1 && source_prefix > 32) ecs_ok = false;
+                                else if (family == 2 && source_prefix > 128) ecs_ok = false;
+                                else if (scope_prefix != 0) ecs_ok = false;
+                                else if (actual_addr_len != expected_addr_len) ecs_ok = false;
+                            }
+                            if (ecs_ok && source_prefix % 8 != 0) {
                                 uint8_t pad_mask = (uint8_t)((1u << (8 - (source_prefix % 8))) - 1);
                                 uint8_t last_byte = req[rdata_offset + 4 + expected_addr_len - 1];
-                                if ((last_byte & pad_mask) != 0) return -1;
+                                if ((last_byte & pad_mask) != 0) ecs_ok = false;
+                            }
+                            if (!ecs_ok) {
+                                edns->has_malformed_ecs = true;
+                                rdata_offset += opt_len;
+                                continue;
                             }
                             edns->has_ecs = true;
                             edns->ecs_family = family;
@@ -3323,6 +3666,53 @@ bool dns_find_opt_rr(const uint8_t *msg, size_t msg_len, size_t *opt_off, size_t
     return false;
 }
 
+void dns_init_response_header(uint8_t *res, const uint8_t *req, uint8_t rcode, bool aa) {
+    res[0] = req[0];
+    res[1] = req[1];
+    /* RFC 1035 §4.1.1: QR=1、OPCODE と RD は問い合わせから。AA は権威データを返すときだけ。
+     * TC は応答側で決める (問い合わせの TC は引き継がない)。*/
+    res[2] = (uint8_t)(0x80 | (req[2] & 0x78) | (req[2] & 0x01) | (aa ? 0x04 : 0));
+    /* RA=0 (再帰しない)、Z=0 (RFC 1035 §4.1.1)、AD=0 (RFC 4035 §3.1.6: 検証しないので立てない)。
+     * CD は §3.1.6 では権威応答でクリアが SHOULD だが、BIND と同じくエコーする (AUDIT_FINDINGS §8 の決定)。*/
+    res[3] = (uint8_t)((req[3] & 0x10) | (rcode & 0x0F));
+}
+
+int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                             uint8_t rcode, uint8_t ext_rcode, uint16_t qd_keep,
+                             edns_info_t *edns, bool is_tcp, struct server_config_s *cfg) {
+    if (req_len < DNS_HEADER_SIZE || max_res_len < DNS_HEADER_SIZE) return 0;
+    dns_init_response_header(res, req, rcode, false);
+    size_t q_end = DNS_HEADER_SIZE;
+    for (uint16_t i = 0; i < qd_keep; i++) {
+        size_t next;
+        if (skip_wire_name(req, req_len, q_end, &next) != 0 || next + 4 > req_len) {
+            qd_keep = 0;
+            q_end = DNS_HEADER_SIZE;
+            break;
+        }
+        q_end = next + 4;
+    }
+    if (q_end > max_res_len || q_end > UINT16_MAX) {
+        qd_keep = 0;
+        q_end = DNS_HEADER_SIZE;
+    }
+    /* CLAUDE.md Rule 3: 質問の直後で切ってから OPT を付ける (要求の残りのバイトを残さない) */
+    memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, q_end - DNS_HEADER_SIZE);
+    res[4] = (uint8_t)(qd_keep >> 8); res[5] = (uint8_t)(qd_keep & 0xFF);
+    res[6] = 0; res[7] = 0;
+    res[8] = 0; res[9] = 0;
+    uint16_t offset = (uint16_t)q_end;
+    uint16_t arcount = 0;
+    if (edns && edns->present) {
+        edns->has_mqtype_query = false;
+        edns->mqtype_count = 0;
+        edns->send_expire = false;
+        assemble_edns_opt(res, max_res_len, &offset, &arcount, edns, ext_rcode, is_tcp, cfg);
+    }
+    res[10] = (uint8_t)(arcount >> 8); res[11] = (uint8_t)(arcount & 0xFF);
+    return offset;
+}
+
 size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end) {
     if (!res || res_len < DNS_HEADER_SIZE) return res_len;
     if (q_end < DNS_HEADER_SIZE || q_end > res_len) q_end = DNS_HEADER_SIZE;
@@ -3382,13 +3772,15 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
         rdlen += 4 + 4;
     }
 
+    /* RFC 7871 §7.2.1: FAMILY, SOURCE PREFIX-LENGTH, ADDRESS は問い合わせと同じ値を返す (MUST)。
+     * ADDRESS は SOURCE PREFIX-LENGTH 分のオクテット (§6)。長さとパディングは parse_edns_opt() で
+     * 検査済みなので、受け取ったバイト列をそのまま返す。SCOPE の値は ADDRESS の長さに関係しない。 */
     uint8_t ecs_addr_bytes = 0;
     if (edns && edns->has_ecs && (!cfg || cfg->ecs_enable)) {
-        ecs_addr_bytes = (edns->ecs_scope_prefix + 7) / 8;
+        ecs_addr_bytes = (uint8_t)((edns->ecs_source_prefix + 7) / 8);
         if (edns->ecs_family == 1 && ecs_addr_bytes > 4) ecs_addr_bytes = 4;
         else if (edns->ecs_family == 2 && ecs_addr_bytes > 16) ecs_addr_bytes = 16;
         else if (edns->ecs_family != 1 && edns->ecs_family != 2) ecs_addr_bytes = 0;
-        else if (ecs_addr_bytes > sizeof(edns->ecs_addr)) ecs_addr_bytes = sizeof(edns->ecs_addr);
         rdlen += 4 + 4 + ecs_addr_bytes;
     }
 
@@ -3502,34 +3894,135 @@ void assemble_edns_opt(uint8_t *res, size_t max_res_len,
 }
 
 static bool name_is_in_zone(const char *name, const char *zone_name) {
-    if (!name || !zone_name) return false;
-    if (strcmp(zone_name, ".") == 0) return true;
-    size_t n_len = strlen(name);
-    size_t z_len = strlen(zone_name);
-    if (n_len < z_len) return false;
-    if (strcasecmp(name + n_len - z_len, zone_name) != 0) return false;
-    if (n_len > z_len) {
-        if (name[n_len - z_len - 1] != '.') return false;
-        // Verify the dot is not escaped
-        int bs = 0;
-        for (int i = (int)(n_len - z_len - 2); i >= 0 && name[i] == '\\'; i--) bs++;
-        if (bs % 2 != 0) return false;
+    return domain_name_is_at_or_below(name, zone_name);
+}
+
+/* RFC 2136 §3.4.1.2, RFC 6895 §3.1: TYPE 0、OPT (RFC 6891 §6.1.1) と 128-255 (QTYPE とメタタイプ:
+ * ANY, AXFR, IXFR, MAILA, MAILB, TSIG, TKEY) はゾーンに置けない。未知の型は RFC 3597 に従って受け付ける。*/
+static bool update_type_is_meta(uint16_t type) {
+    return type == 0 || type == 41 || (type >= 128 && type <= 255);
+}
+
+/* RFC 4035 §2.5: CNAME と同じ名前に置けるのは RRSIG と NSEC、および KEY (RFC 3007) だけ。*/
+static bool type_may_coexist_with_cname(uint16_t type) {
+    return type == 46 || type == 47 || type == 25;
+}
+
+static int update_bucket_head(const zone_arena_t *arena, const char *name) {
+    return arena->hash_table[calc_fnv1a_str(name) & (arena->hash_size - 1)];
+}
+
+static bool update_rec_is_at(const dns_record_t *rec, const char *name) {
+    return rec->name && strcasecmp(rec->name, name) == 0; // name == NULL は削除済み (tombstone)
+}
+
+/* 同じ名前に、type_code == type (type 255 は全型) のレコードがあるか。*/
+static bool update_zone_has(const zone_arena_t *arena, const char *name, uint16_t type) {
+    for (int k = update_bucket_head(arena, name); k != -1; k = arena->records[k].next_record) {
+        const dns_record_t *r = &arena->records[k];
+        if (update_rec_is_at(r, name) && (type == 255 || r->type_code == type)) return true;
     }
+    return false;
+}
+
+static int update_find_rr(const zone_arena_t *arena, const dns_record_t *rr) {
+    for (int k = update_bucket_head(arena, rr->name); k != -1; k = arena->records[k].next_record) {
+        if (arena->records[k].name && compare_records(&arena->records[k], rr, true)) return k;
+    }
+    return -1;
+}
+
+/* WKS の ADDRESS と PROTOCOL。ゾーンファイル由来はテキスト、UPDATE 由来は wire (generic_data)。*/
+static bool update_wks_key(const dns_record_t *rec, uint8_t addr[4], uint8_t *proto) {
+    if (rec->generic_data && rec->generic_len >= 5) {
+        memcpy(addr, rec->generic_data, 4);
+        *proto = rec->generic_data[4];
+        return true;
+    }
+    if (rec->rdata_count < 2 || !rec->rdata[0] || !rec->rdata[1]) return false;
+    if (inet_pton(AF_INET, rec->rdata[0], addr) != 1) return false;
+    if (strcasecmp(rec->rdata[1], "TCP") == 0) *proto = 6;
+    else if (strcasecmp(rec->rdata[1], "UDP") == 0) *proto = 17;
+    else if (!parse_u8(rec->rdata[1], proto)) return false;
     return true;
 }
 
+static uint32_t update_soa_serial(const dns_record_t *soa) {
+    return (soa->rdata_count >= 3 && soa->rdata[2]) ? (uint32_t)strtoul(soa->rdata[2], NULL, 10) : 0;
+}
+
+/* RFC 2136 §3.4.2.7: Update RR が置き換えるゾーンの RR か。CNAME, SOA と DNAME (RFC 6672 §5.2) は
+ * 1 つしか置けないので RRset を置き換える。WKS は ADDRESS と PROTOCOL が同じなら置き換える。
+ * それ以外は RDATA が同じ RR だけ。*/
+static bool update_replaces(const dns_record_t *zrr, const dns_record_t *rr) {
+    uint16_t t = rr->type_code;
+    if (t == 5 || t == 6 || t == 39) return true;
+    if (t == 11) {
+        uint8_t za[4], ra[4], zp, rp;
+        if (update_wks_key(zrr, za, &zp) && update_wks_key(rr, ra, &rp) &&
+            memcmp(za, ra, 4) == 0 && zp == rp) {
+            return true;
+        }
+    }
+    return compare_records(zrr, rr, true);
+}
+
+static int update_append_record(zone_arena_t *standby, const dns_record_t *rec) {
+    if (standby->count >= standby->records_cap) {
+        size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
+        if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return -1;
+        dns_record_t *new_arr = realloc(standby->records, new_cap * sizeof(dns_record_t));
+        if (!new_arr) return -1;
+        standby->records = new_arr;
+        standby->records_cap = new_cap;
+    }
+    dns_record_t *new_rec = &standby->records[standby->count];
+    *new_rec = *rec;
+    dns_record_preparse_cache(standby, new_rec);
+
+    // In-flight chain linking
+    size_t hidx = calc_fnv1a_str(new_rec->name) & (standby->hash_size - 1);
+    new_rec->next_record = standby->hash_table[hidx];
+    standby->hash_table[hidx] = (int)standby->count;
+    standby->count++;
+    return 0;
+}
+
+/* RR の固定部 (NAME の後の TYPE, CLASS, TTL, RDLENGTH) を読み、offset を RR の次へ進める。*/
+static int update_read_rr_header(const uint8_t *req, size_t req_len, size_t *offset, zone_arena_t *arena,
+                                 char **name, uint16_t *type, uint16_t *class_val, uint32_t *ttl,
+                                 uint16_t *rdlen) {
+    if (expand_wire_name(req, req_len, *offset, offset, arena, name) != 0) return -1;
+    if (*offset + 10 > req_len) return -1;
+    const uint8_t *p = req + *offset;
+    *type = (uint16_t)((p[0] << 8) | p[1]);
+    *class_val = (uint16_t)((p[2] << 8) | p[3]);
+    *ttl = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
+    *rdlen = (uint16_t)((p[8] << 8) | p[9]);
+    *offset += 10 + (size_t)*rdlen;
+    return *offset > req_len ? -1 : 0;
+}
+
+/* RFC 2136 §3.2.5 と §3.4.2.7 の疑似コードどおりに処理する。戻り値は RCODE。
+ * standby は呼び出し側が active から複製したもので、0 以外を返したときは呼び出し側が捨てる
+ * (§3.4.2.1, §3.7: UPDATE 全体を適用するか、何も適用しないか)。*/
 int process_update_sections(const uint8_t *req, size_t req_len,
                              const char *zone_name,
                              zone_arena_t *standby,
-                             int *out_prcount, int *out_upcount) {
+                             update_result_t *out) {
+    update_result_t result;
+    memset(&result, 0, sizeof(result));
+    if (out) *out = result;
     if (req_len < DNS_HEADER_SIZE) return 1; // FORMERR
     uint16_t zocount = (req[4] << 8) | req[5];
     uint16_t prcount = (req[6] << 8) | req[7];
     uint16_t upcount = (req[8] << 8) | req[9];
 
-    if (out_prcount) *out_prcount = prcount;
-    if (out_upcount) *out_upcount = upcount;
+    result.prcount = prcount;
+    result.upcount = upcount;
+    if (out) *out = result;
 
+    // §3.1.1: Zone Section は 1 つで ZTYPE は SOA (FORMERR)。ZNAME/ZCLASS が自分のゾーンでなければ NOTAUTH。
     if (zocount != 1) return 1; // FORMERR
 
     // Prevent DoS: Hard limit on number of updates per message
@@ -3538,7 +4031,6 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     }
 
     size_t offset = DNS_HEADER_SIZE;
-    // Skip Zone Section
     char *zname;
     if (expand_wire_name(req, req_len, offset, &offset, standby, &zname) != 0) return 1;
     if (offset + 4 > req_len) return 1;
@@ -3547,210 +4039,177 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     offset += 4;
 
     if (ztype != 6) return 1; // SOA
-    if (!domain_names_match_ci(zname, zone_name)) return 9; // NOTAUTH
+    // ゾーンはすべて IN。ANY/NONE を ZCLASS にすると RR のクラスの区別ができない。
+    if (zone_class != 1 || !domain_names_match_ci(zname, zone_name)) return 9; // NOTAUTH
 
-    // Prerequisite Section (3.2)
     if (build_zone_index(standby, true) != 0) return 2; // SERVFAIL on OOM
 
+    // Prerequisite Section (§3.2.5)
+    uint32_t temp_offsets[1000]; // CLASS が ZCLASS の前提条件 (値に依存する RRset の存在, §3.2.3) の位置
+    int temp_count = 0;
     for (int i = 0; i < prcount; i++) {
         size_t rec_start_offset = offset;
         char *name;
-        if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
-        if (offset + 10 > req_len) return 1;
-        /* [RFC 2136 §3.2.5] PrerequisiteセクションのNAMEがゾーン外の場合はNOTZONE(10)を返却 */
+        uint16_t type, class_val, rdlen;
+        uint32_t ttl;
+        if (update_read_rr_header(req, req_len, &offset, standby, &name, &type, &class_val, &ttl, &rdlen) != 0) return 1;
+        if (ttl != 0) return 1; // FORMERR (§3.2.1-§3.2.3)
         if (!name_is_in_zone(name, zone_name)) return 10; // NOTZONE
-        uint16_t type = (req[offset] << 8) | req[offset + 1];
-        uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
-        uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];
-        offset += 10 + rdlen;
-        if (offset > req_len) return 1;
-
-        bool name_exists = false;
-        bool rrset_exists = false;
-        uint32_t h = calc_fnv1a_str(name);
-        size_t hidx = h & (standby->hash_size - 1);
-        for (int k = standby->hash_table[hidx]; k != -1; k = standby->records[k].next_record) {
-            if (!standby->records[k].name) continue; // Skip tombstones
-            if (strcasecmp(standby->records[k].name, name) == 0) {
-                name_exists = true;
-                if (type == 255 || standby->records[k].type_code == type) {
-                    rrset_exists = true;
-                }
-            }
-        }
 
         if (class_val == 255) { // ANY
             if (rdlen != 0) return 1;
-            if (type == 255) {
-                if (!name_exists) return 3; // NXDOMAIN
-            } else {
-                if (!rrset_exists) return 8; // NXRRSET
-            }
+            if (!update_zone_has(standby, name, type)) return type == 255 ? 3 : 8; // NXDOMAIN / NXRRSET
         } else if (class_val == 254) { // NONE
             if (rdlen != 0) return 1;
-            if (type == 255) {
-                if (name_exists) return 6; // YXDOMAIN
-            } else {
-                if (rrset_exists) return 7; // YXRRSET
-            }
+            if (update_zone_has(standby, name, type)) return type == 255 ? 6 : 7; // YXDOMAIN / YXRRSET
+        } else if (class_val == zone_class) {
+            temp_offsets[temp_count++] = (uint32_t)rec_start_offset;
         } else {
-            // zone class
-            if (class_val != zone_class) return 1; // FORMERR
-            if (!rrset_exists) return 8; // NXRRSET
-            size_t temp_offset = rec_start_offset; 
-            dns_record_t parsed_rec;
-            memset(&parsed_rec, 0, sizeof(parsed_rec));
-            uint16_t dummy_type;
-            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
-            
-            bool found_exact = false;
-            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
-            size_t phidx = ph & (standby->hash_size - 1);
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue; // Skip tombstones
-                if (compare_records(&standby->records[k], &parsed_rec, true)) {
-                    found_exact = true;
-                    break;
-                }
+            return 1; // FORMERR
+        }
+    }
+    dns_record_t *temp = NULL;
+    if (temp_count > 0) {
+        temp = arena_alloc(standby, (size_t)temp_count * sizeof(dns_record_t));
+        if (!temp) return 2; // SERVFAIL
+    }
+    for (int i = 0; i < temp_count; i++) {
+        size_t temp_offset = temp_offsets[i];
+        memset(&temp[i], 0, sizeof(temp[i]));
+        uint16_t dummy_type;
+        if (parse_resource_record(req, req_len, &temp_offset, standby, &temp[i], &dummy_type) != 0) return 1;
+    }
+    /* §3.2.3: <NAME, TYPE> ごとに RRset を作り、ゾーンの RRset と集合として等しいか
+     * (同じメンバーで、多くも少なくもない) を比べる。TTL は比べない。*/
+    for (int i = 0; i < temp_count; i++) {
+        const dns_record_t *first = &temp[i];
+        bool seen = false;
+        for (int j = 0; j < i && !seen; j++) {
+            seen = temp[j].type_code == first->type_code && strcasecmp(temp[j].name, first->name) == 0;
+        }
+        if (seen) continue;
+        for (int j = i; j < temp_count; j++) {
+            if (temp[j].type_code != first->type_code || strcasecmp(temp[j].name, first->name) != 0) continue;
+            if (update_find_rr(standby, &temp[j]) < 0) return 8; // NXRRSET
+        }
+        for (int k = update_bucket_head(standby, first->name); k != -1; k = standby->records[k].next_record) {
+            const dns_record_t *zrr = &standby->records[k];
+            if (!update_rec_is_at(zrr, first->name) || zrr->type_code != first->type_code) continue;
+            bool member = false;
+            for (int j = i; j < temp_count && !member; j++) {
+                member = compare_records(zrr, &temp[j], true);
             }
-            if (!found_exact) return 8; // NXRRSET
+            if (!member) return 8; // NXRRSET
         }
     }
 
-    // Update Section (3.4)
+    // Update Section prescan (§3.4.1.3): エラーはゾーンを変える前にすべて検出する。
+    size_t update_offset = offset;
+    for (int i = 0; i < upcount; i++) {
+        char *name;
+        uint16_t type, class_val, rdlen;
+        uint32_t ttl;
+        if (update_read_rr_header(req, req_len, &offset, standby, &name, &type, &class_val, &ttl, &rdlen) != 0) return 1;
+        if (!name_is_in_zone(name, zone_name)) return 10; // NOTZONE
+        if (class_val == zone_class) {
+            if (update_type_is_meta(type)) return 1;
+        } else if (class_val == 255) { // ANY
+            if (ttl != 0 || rdlen != 0 || (type != 255 && update_type_is_meta(type))) return 1;
+        } else if (class_val == 254) { // NONE
+            if (ttl != 0 || update_type_is_meta(type)) return 1;
+        } else {
+            return 1; // FORMERR
+        }
+    }
+
+    // Update Section (§3.4.2.7)。規則に合わない Update RR はエラーにせず無視する (next [rr])。
+    offset = update_offset;
     for (int i = 0; i < upcount; i++) {
         size_t rec_start_offset = offset;
         char *name;
-        if (expand_wire_name(req, req_len, offset, &offset, standby, &name) != 0) return 1;
-        if (offset + 10 > req_len) return 1;
-        uint16_t type = (req[offset] << 8) | req[offset + 1];
-        uint16_t class_val = (req[offset + 2] << 8) | req[offset + 3];
-        uint16_t rdlen = (req[offset + 8] << 8) | req[offset + 9];
-        offset += 10 + rdlen;
-        if (offset > req_len) return 1;
+        uint16_t type, class_val, rdlen;
+        uint32_t ttl;
+        if (update_read_rr_header(req, req_len, &offset, standby, &name, &type, &class_val, &ttl, &rdlen) != 0) return 1;
+        bool at_apex = domain_names_match_ci(name, zone_name);
 
-        if (class_val == 255) { // ANY (Delete RRset/Domain)
-            if (rdlen != 0) return 1;
-            if (type == 6) return 5; // REFUSED (cannot delete SOA this way)
-            if (type == 2 && domain_names_match_ci(name, zone_name)) return 5; // REFUSED: RFC 2136 §3.4.2.4 (cannot delete apex NS RRset)
-            /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 (ADD分岐と同一のチェックを削除系にも追加) */
-            if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
-
-            uint32_t h = calc_fnv1a_str(name);
-            size_t hidx = h & (standby->hash_size - 1);
-            for (int k = standby->hash_table[hidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue; // Skip tombstones
-                if (strcasecmp(standby->records[k].name, name) == 0) {
-                    if (type == 255 || standby->records[k].type_code == type) {
-                        if (standby->records[k].type_code == 6) { continue; } // protect SOA
-                        if (standby->records[k].type_code == 2 && domain_names_match_ci(name, zone_name)) { continue; } // protect apex NS
-                        standby->records[k].name = NULL; // Tombstone delete
-                    }
-                }
+        if (class_val == 255) { // ANY: RRset (TYPE ANY なら名前の全 RRset) を削除
+            // §3.4.2.3: 頂点の SOA と NS は削除しない
+            if (at_apex && (type == 6 || type == 2)) continue;
+            for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
+                dns_record_t *zrr = &standby->records[k];
+                if (!update_rec_is_at(zrr, name) || (type != 255 && zrr->type_code != type)) continue;
+                if (at_apex && (zrr->type_code == 6 || zrr->type_code == 2)) continue;
+                zrr->name = NULL; // Tombstone delete
+                result.changed = true;
             }
-        } else if (class_val == 254) { // NONE (Delete exact RR)
-            if (type == 6) return 5; // REFUSED
-            /* [T2] RFC 2136 §3.4.2.2: owner name のゾーン内包含検証 */
-            if (!name_is_in_zone(name, zone_name)) return 5; // REFUSED
-            
-            size_t temp_offset = rec_start_offset;
-            dns_record_t parsed_rec;
-            memset(&parsed_rec, 0, sizeof(parsed_rec));
-            uint16_t dummy_type;
-            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
-            
-            if (parsed_rec.type_code == 2 && domain_names_match_ci(parsed_rec.name, zone_name)) {
-                // RFC 2136 §3.4.2.4: At least one NS RR must remain at the zone apex
-                int active_apex_ns = 0;
-                for (size_t r = 0; r < standby->count; r++) {
-                    if (standby->records[r].name &&
-                        standby->records[r].type_code == 2 &&
-                        domain_names_match_ci(standby->records[r].name, zone_name)) {
-                        active_apex_ns++;
-                    }
-                }
-                if (active_apex_ns <= 1) {
-                    return 5; // REFUSED (cannot delete last NS at apex)
-                }
-            }
-
-            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
-            size_t phidx = ph & (standby->hash_size - 1);
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue; // Skip tombstones
-                if (compare_records(&standby->records[k], &parsed_rec, true)) {
-                    standby->records[k].name = NULL; // Tombstone delete
-                }
-            }
-        } else { // ADD
-            // (a) メタタイプの拒否 (RFC 2136 §3.4.2.2)
-            if (type == 0 || type == 41 || (type >= 128 && type <= 254) || type == 249 || type == 250 ||
-                type == 251 || type == 252 || type == 255) {
-                return 1; // FORMERR
-            }
-            // (b) クラスの一致確認 (RFC 2136 §3.4.1.3)
-            if (class_val != zone_class) {
-                return 1; // FORMERR
-            }
-            // (c) owner name のゾーン内包含チェック
-            if (!name_is_in_zone(name, zone_name)) {
-                return 5; // REFUSED
-            }
-
-            size_t temp_offset = rec_start_offset;
-            dns_record_t parsed_rec;
-            memset(&parsed_rec, 0, sizeof(parsed_rec));
-            uint16_t dummy_type;
-            if (parse_resource_record(req, req_len, &temp_offset, standby, &parsed_rec, &dummy_type) != 0) return 1;
-
-            bool found_exact = false;
-            uint32_t ph = calc_fnv1a_str(parsed_rec.name);
-            size_t phidx = ph & (standby->hash_size - 1);
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue;
-                if (compare_records(&standby->records[k], &parsed_rec, true)) {
-                    found_exact = true;
-                    break;
-                }
-            }
-            if (found_exact) continue; // no-op
-
-            // CNAME/DNAME exclusivity check (RFC 2136 §3.4.2.3, RFC 1034 §3.6.2, RFC 6672 §2.3)
-            for (int k = standby->hash_table[phidx]; k != -1; k = standby->records[k].next_record) {
-                if (!standby->records[k].name) continue;
-                if (strcasecmp(standby->records[k].name, parsed_rec.name) == 0) {
-                    if (parsed_rec.type_code == 5 /* CNAME */ || parsed_rec.type_code == 39 /* DNAME */) {
-                        if (standby->records[k].type_code != 46 && standby->records[k].type_code != 47) {
-                            return 5; // REFUSED: CNAME/DNAME cannot coexist with other types
-                        }
-                    } else if (parsed_rec.type_code != 46 && parsed_rec.type_code != 47) {
-                        if (standby->records[k].type_code == 5 /* CNAME */ || standby->records[k].type_code == 39 /* DNAME */) {
-                            return 5; // REFUSED: Cannot add record to name with existing CNAME/DNAME
-                        }
-                    }
-                }
-            }
-
-            if (standby->count >= standby->records_cap) {
-                size_t new_cap = standby->records_cap == 0 ? 256 : standby->records_cap * 2;
-                if (new_cap > SIZE_MAX / sizeof(dns_record_t)) return 2;
-                dns_record_t *new_arr = realloc(standby->records, new_cap * sizeof(dns_record_t));
-                if (!new_arr) return 2;
-                standby->records = new_arr;
-                standby->records_cap = new_cap;
-            }
-            dns_record_t *new_rec = &standby->records[standby->count];
-            *new_rec = parsed_rec;
-            dns_record_preparse_cache(standby, new_rec);
-
-            // In-flight chain linking
-            uint32_t h = calc_fnv1a_str(new_rec->name);
-            size_t hidx = h & (standby->hash_size - 1);
-            new_rec->next_record = standby->hash_table[hidx];
-            standby->hash_table[hidx] = (int)standby->count;
-
-            standby->count++;
+            continue;
         }
+
+        size_t temp_offset = rec_start_offset;
+        dns_record_t rr;
+        memset(&rr, 0, sizeof(rr));
+        uint16_t dummy_type;
+        if (parse_resource_record(req, req_len, &temp_offset, standby, &rr, &dummy_type) != 0) return 1;
+
+        if (class_val == 254) { // NONE: RDATA が同じ RR を削除
+            // §3.4.2.4: SOA は削除しない。頂点に残った最後の NS も削除しない。
+            if (type == 6) continue;
+            if (type == 2 && at_apex) {
+                int apex_ns = 0;
+                for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
+                    if (update_rec_is_at(&standby->records[k], name) && standby->records[k].type_code == 2) apex_ns++;
+                }
+                if (apex_ns <= 1) continue;
+            }
+            for (int k = update_bucket_head(standby, name); k != -1; k = standby->records[k].next_record) {
+                if (standby->records[k].name && compare_records(&standby->records[k], &rr, true)) {
+                    standby->records[k].name = NULL; // Tombstone delete
+                    result.changed = true;
+                }
+            }
+            continue;
+        }
+
+        // ZCLASS: 追加 (§3.4.2.2)
+        // CNAME と他のデータは共存しない (RFC 1034 §3.6.2, RFC 4035 §2.5)。衝突する Update RR は無視する。
+        bool conflict = false;
+        for (int k = update_bucket_head(standby, name); k != -1 && !conflict; k = standby->records[k].next_record) {
+            const dns_record_t *zrr = &standby->records[k];
+            if (!update_rec_is_at(zrr, name)) continue;
+            if (type == 5) {
+                conflict = zrr->type_code != 5 && !type_may_coexist_with_cname(zrr->type_code);
+            } else if (!type_may_coexist_with_cname(type)) {
+                conflict = zrr->type_code == 5;
+            }
+        }
+        if (conflict) continue;
+
+        // SOA は頂点の SOA より新しいシリアル (RFC 1982) のときだけ置き換える。それ以外は無視 (§3.6)。
+        if (type == 6) {
+            int soa_idx = -1;
+            for (int k = update_bucket_head(standby, name); k != -1 && soa_idx < 0; k = standby->records[k].next_record) {
+                if (update_rec_is_at(&standby->records[k], name) && standby->records[k].type_code == 6) soa_idx = k;
+            }
+            if (soa_idx < 0 || !serial_is_newer(update_soa_serial(&rr), update_soa_serial(&standby->records[soa_idx]))) continue;
+        }
+
+        bool replaced = false;
+        for (int k = update_bucket_head(standby, name); k != -1 && !replaced; k = standby->records[k].next_record) {
+            dns_record_t *zrr = &standby->records[k];
+            if (!update_rec_is_at(zrr, name) || zrr->type_code != type || !update_replaces(zrr, &rr)) continue;
+            replaced = true;
+            if (compare_records(zrr, &rr, false)) break; // 同じ RR (TTL も同じ): 変化なし
+            int next = zrr->next_record;
+            *zrr = rr;
+            zrr->next_record = next;
+            dns_record_preparse_cache(standby, zrr);
+            result.changed = true;
+            if (type == 6) result.soa_replaced = true;
+        }
+        if (replaced) continue;
+
+        if (update_append_record(standby, &rr) != 0) return 2; // SERVFAIL (§3.4.2.1)
+        result.changed = true;
     }
 
     // Compaction pass: remove tombstoned records
@@ -3765,6 +4224,7 @@ int process_update_sections(const uint8_t *req, size_t req_len,
     }
     standby->count = write_idx;
 
+    if (out) *out = result;
     return 0; // NOERROR
 }
 
@@ -3943,8 +4403,9 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                     rec->cache.rrsig.signer = rec->rdata[7];
                     rec->cache.rrsig.signature = NULL; 
                     rec->cache.rrsig.signature_len = 0;
-                    
-                    if (arena) {
+
+                    // 転送・UPDATE 由来 (R-33) は generic_data をそのまま書き出すので、署名のデコードは不要
+                    if (arena && !rec->generic_data) {
                         size_t b64_len = strlen(rec->rdata[8]);
                         for (int i = 9; i < rec->rdata_count; i++) {
                             if (rec->rdata[i]) b64_len += strlen(rec->rdata[i]);
@@ -4058,6 +4519,8 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
     size_t offset = DNS_HEADER_SIZE;
     size_t written = 0;
     bool qname_completed = false;
+    bool too_long = false;
+    size_t wire_len = 1; // 終端のルートラベル
 
     while (offset < len) {
         uint8_t label_len = buf[offset];
@@ -4079,28 +4542,26 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
             break;
         }
         offset++;
-        if (written > 0 && qname[written - 1] != '.') {
-            if (written + 1 < qname_size) {
-                qname[written++] = '.';
-            }
+        wire_len += 1 + (size_t)label_len;
+        if (wire_len > 255) { // RFC 1035 §2.3.4
+            too_long = true;
+            break;
         }
-        for (size_t b = 0; b < label_len; b++) {
-            uint8_t c = buf[offset + b];
-            if (c == '.' || c == '\\') {
-                if (written + 2 < qname_size) {
-                    qname[written++] = '\\';
-                    qname[written++] = (char)c;
-                }
-            } else {
-                if (written + 1 < qname_size) {
-                    qname[written++] = (char)c;
-                }
-            }
+        // 正規形 (dns_label_to_text)。ゾーンデータの名前と同じ規則で書くので、そのまま比較できる。
+        // 入りきらない名前は切り詰めずに失敗させる (切り詰めた名前は別の名前に一致しうる)。
+        size_t n = (written + 1 < qname_size)
+                       ? dns_label_to_text(&buf[offset], label_len, &qname[written], qname_size - written - 1)
+                       : (size_t)-1;
+        if (n == (size_t)-1 || written + n + 1 >= qname_size) {
+            too_long = true;
+            break;
         }
+        written += n;
+        qname[written++] = '.';
         offset += label_len;
     }
 
-    if (!qname_completed) {
+    if (!qname_completed || too_long) {
         if (qname && qname_size > 0) qname[0] = '\0';
         if (qtype) *qtype = 0;
         if (qclass) *qclass = 1;
@@ -4108,16 +4569,14 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
         return false;
     }
 
-    if (written == 0 || (written > 0 && qname[written - 1] != '.')) {
-        if (written + 1 < qname_size) {
-            qname[written++] = '.';
+    if (written == 0) {
+        if (qname_size < 2) {
+            qname[0] = '\0';
+            return false;
         }
+        qname[written++] = '.'; // ルート
     }
-    if (written < qname_size) {
-        qname[written] = '\0';
-    } else {
-        qname[qname_size - 1] = '\0';
-    }
+    qname[written] = '\0';
 
     if (offset + 4 <= len) {
         if (qtype) *qtype = (uint16_t)((buf[offset] << 8) | buf[offset + 1]);

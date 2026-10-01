@@ -46,6 +46,7 @@
 #include <sys/un.h>
 #include <sys/ucred.h>
 #include <sys/uio.h>
+#include <sys/utsname.h>
 
 #include "dns_wire.h" // 分離したワイヤーフォーマット操作用ヘッダ
 #include "dns_server_internal.h"
@@ -103,11 +104,25 @@ STATIC_TEST int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
 STATIC_TEST int g_num_workers = 0;
 char g_startup_cwd[PATH_MAX] = "";
 int g_notify_ipc[2];
+/* NOTIFY の応答 (QR=1, OPCODE=4) を UDP ワーカーから制御スレッドへ渡す (Backend の中だけで使う) */
+int g_notify_resp_ipc[2] = {-1, -1};
 int g_control_sock = -1;
 _Atomic(bool) g_frontend_alive = true;
 
 time_t g_boot_time = 0;
 time_t g_last_configured_time = 0;
+
+/* D-12: karictl status に返す karidns 自身の値。起動時 (サンドボックスの前) に1回だけ取る */
+static struct {
+  struct utsname un;
+  int ncpus;
+} g_host_status_info;
+
+STATIC_TEST void capture_host_status_info(void) {
+  if (uname(&g_host_status_info.un) != 0) memset(&g_host_status_info.un, 0, sizeof(g_host_status_info.un));
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  g_host_status_info.ncpus = n > 0 ? (int)n : 1;
+}
 _Atomic int g_xfers_running = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_clients = ATOMIC_VAR_INIT(0);
 _Atomic int g_tcp_high_water = ATOMIC_VAR_INIT(0);
@@ -634,8 +649,10 @@ void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
     if (c >= 0x21 && c <= 0x7E && c != '\\' && c != '"' && c != ';') {
       dst[di++] = (char)c;
     } else if (c == '\\') {
+      // qname は正規形 (dns_wire.h) で、エスケープ (\., \\, \DDD) 済み。二重にエスケープしない
       dst[di++] = '\\';
-      dst[di++] = '\\';
+      if (src[si + 1] != '\0') dst[di++] = src[++si];
+      else dst[di++] = '\\';
     } else if (c == '"') {
       dst[di++] = '\\';
       dst[di++] = '"';
@@ -654,6 +671,75 @@ void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
   dst[di < dst_size ? di : dst_size - 1] = '\0';
 }
 
+/* 同じ日付の日付付きログの連番の上限 (<path>.YYYYMMDD.1 .. .9999) */
+#define LOG_TS_MAX_SEQ 9999
+
+typedef struct {
+    const char *base;  /* ログファイルのベース名 */
+    size_t base_len;
+    uint64_t *keys;    /* 日付 * 10000 + 連番 */
+    size_t count, cap;
+} ts_log_scan_t;
+
+/* "<base>.YYYYMMDD" と "<base>.YYYYMMDD.N" (N は 1..9999) だけを数える。それ以外は消さない */
+static void ts_log_scan_cb(const char *name, void *ud) {
+    ts_log_scan_t *s = ud;
+    if (strncmp(name, s->base, s->base_len) != 0 || name[s->base_len] != '.') return;
+    const char *p = name + s->base_len + 1;
+    uint64_t date = 0, seq = 0;
+    for (int i = 0; i < 8; i++, p++) {
+        if (!isdigit((unsigned char)*p)) return;
+        date = date * 10 + (uint64_t)(*p - '0');
+    }
+    if (*p == '.') {
+        p++;
+        if (*p == '0') return; /* 作るのは先頭が 0 でない連番だけ */
+        int n = 0;
+        for (; isdigit((unsigned char)*p) && n < 5; p++, n++) seq = seq * 10 + (uint64_t)(*p - '0');
+        if (n == 0 || n > 4 || seq == 0) return;
+    }
+    if (*p != '\0') return;
+    if (s->count == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 32;
+        uint64_t *nk = realloc(s->keys, ncap * sizeof(*nk));
+        if (!nk) return;
+        s->keys = nk;
+        s->cap = ncap;
+    }
+    s->keys[s->count++] = date * 10000 + seq;
+}
+
+static int ts_key_desc(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x < y) - (x > y);
+}
+
+/* D-21: suffix timestamp と versions <n> を併用したときは、日付付きのファイルを新しい順に n 個だけ残す
+ * (BIND lib/isc/log.c の roll_timestamp() / remove_old_tsversions() と同じ。versions を省略した
+ * ときは削除しない)。ロガースレッドだけが呼ぶ (クエリ処理のホットパスではない)。 */
+static void prune_timestamped_logs(const char *file_path, int versions) {
+    const char *slash = strrchr(file_path, '/');
+    ts_log_scan_t s = { .base = slash ? slash + 1 : file_path };
+    s.base_len = strlen(s.base);
+    if (list_dir_via_dir_cache(file_path, ts_log_scan_cb, &s) != 0) {
+        syslog(LOG_ERR, "[Logging] Cannot list the directory of '%s' to remove old log files: %m", file_path);
+        free(s.keys);
+        return;
+    }
+    if (s.count > (size_t)versions) {
+        qsort(s.keys, s.count, sizeof(*s.keys), ts_key_desc);
+        for (size_t i = (size_t)versions; i < s.count; i++) {
+            char old_name[600];
+            unsigned date = (unsigned)(s.keys[i] / 10000), seq = (unsigned)(s.keys[i] % 10000);
+            int r = seq ? snprintf(old_name, sizeof(old_name), "%s.%08u.%u", file_path, date, seq)
+                        : snprintf(old_name, sizeof(old_name), "%s.%08u", file_path, date);
+            if (r > 0 && r < (int)sizeof(old_name) && unlink_via_dir_cache(old_name) != 0 && errno != ENOENT)
+                syslog(LOG_ERR, "[Logging] Failed to remove old log file '%s': %m", old_name);
+        }
+    }
+    free(s.keys);
+}
+
 void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct tm *tm_info) {
     int today = (tm_info->tm_year + 1900) * 10000 + (tm_info->tm_mon + 1) * 100 + tm_info->tm_mday;
     pthread_mutex_lock(&ch->lock);
@@ -669,13 +755,22 @@ void log_write_rotated(log_channel_t *ch, const char *log_buf, int len, struct t
         bool rotate_rename_failed = false;
 
         if (ch->suffix_timestamp) {
+            /* D-21: 同じ日に2回目以降のローテーションでは <path>.YYYYMMDD.N にして上書きしない */
             char new_name[600];
+            struct stat ex;
             int r = snprintf(new_name, sizeof(new_name), "%s.%08d", ch->file_path, ch->current_date);
-            if (r > 0 && r < (int)sizeof(new_name)) {
-                if (renameat_via_dir_cache(ch->file_path, new_name) != 0) {
-                    rotate_rename_failed = true;
-                    syslog(LOG_ERR, "[Logging] Failed to rotate log file '%s' to '%s': %m", ch->file_path, new_name);
-                }
+            for (int seq = 1; r > 0 && r < (int)sizeof(new_name) && seq <= LOG_TS_MAX_SEQ &&
+                              stat_via_dir_cache(new_name, &ex) == 0; seq++)
+                r = snprintf(new_name, sizeof(new_name), "%s.%08d.%d", ch->file_path, ch->current_date, seq);
+            if (r <= 0 || r >= (int)sizeof(new_name) || stat_via_dir_cache(new_name, &ex) == 0) {
+                rotate_rename_failed = true;
+                syslog(LOG_ERR, "[Logging] Cannot rotate log file '%s': no free name for date %08d", ch->file_path,
+                       ch->current_date);
+            } else if (renameat_via_dir_cache(ch->file_path, new_name) != 0) {
+                rotate_rename_failed = true;
+                syslog(LOG_ERR, "[Logging] Failed to rotate log file '%s' to '%s': %m", ch->file_path, new_name);
+            } else if (ch->versions > 0) {
+                prune_timestamped_logs(ch->file_path, ch->versions);
             }
         } else if (ch->versions > 0) {
             for (int i = ch->versions - 1; i >= 0; i--) {
@@ -1207,8 +1302,9 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       uint8_t *res_buf = res_buf_full + sizeof(udp_ipc_t);
       rate_limit_config_t *rrl_cfg = NULL;
       size_t max_res = task.has_edns ? BUFFER_SIZE : UDP_DEFAULT_MAX_RES_LEN;
-      int res_len = process_dns_query(task.req_buf, task.req_len, res_buf, max_res,
-                                      task.qname, task.qtype, task.client_ip,
+      int res_len = process_dns_query_cap(task.req_buf, task.req_len, res_buf, max_res,
+                                          UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t),
+                                          task.qname, task.qtype, task.client_ip,
                                       &thread_compress_ctx, false, &rrl_cfg, task.snap);
       free(task.req_buf);
 
@@ -1305,7 +1401,7 @@ void init_async_io_pool(void) {
   }
 }
 
-bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname) {
+bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype) {
   if (!snap || !qname) return false;
   view_snapshot_t *view = select_view(snap, client_ip);
   if (!view) return false;
@@ -1313,7 +1409,7 @@ bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, con
   if (!cfg) return false;
 
   bool is_synth = false;
-  zone_db_entry_t *entry = find_zone_in_view(view, qname);
+  zone_db_entry_t *entry = find_zone_for_query(view, qname, qtype); // R-32: DS at a child apex goes to the parent
   if (entry) {
     zone_config_t *zcfg = find_zone_config_in_view(cfg, view->name, entry->domain);
     if (zcfg && zcfg->type && (strcasecmp(zcfg->type, "program") == 0 || strcasecmp(zcfg->type, "forward") == 0)) {
@@ -1666,6 +1762,9 @@ worker_startup_success:;
             // クエリパケットの検証: QRビットが0(クエリ)であることを期待
             uint8_t flags = req_buf[2];
             if (!__builtin_expect((flags & 0x80) == 0, 1)) {
+              /* RFC 1996 §3.6, §4.8: 送った NOTIFY の応答は制御スレッドが照合して再送を止める */
+              if (((flags >> 3) & 0x0F) == 4)
+                send(g_notify_resp_ipc[1], ipc_msg, sizeof(udp_ipc_t) + (size_t)ipc_msg->payload_len, MSG_DONTWAIT);
               continue;
             }
 
@@ -1681,7 +1780,7 @@ worker_startup_success:;
             }
 
             // --- 高速ワンパス走査 ---
-            char qname[256] = "";
+            char qname[DNS_NAME_TEXT_SIZE] = "";
             uint16_t qtype = 0;
             uint16_t qclass = 1;
             size_t question_end = DNS_HEADER_SIZE;
@@ -1733,7 +1832,7 @@ worker_startup_success:;
             write_dnstap_event(ctx, 1 /*AUTH_QUERY*/, req_buf, payload_received, client_addr, ipc_msg->addr_len,
                                ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
-            if (is_zone_synthetic_type(snap, client_ip, qname)) {
+            if (is_zone_synthetic_type(snap, client_ip, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0)) {
               uint8_t *heap_req = malloc((size_t)payload_received);
               if (!heap_req) {
                 if (rlog_enabled) {
@@ -1781,8 +1880,9 @@ worker_startup_success:;
             uint8_t *res_buf = batch->tx_buffers[n_tx] + sizeof(udp_ipc_t);
             rate_limit_config_t *rrl_cfg = NULL;
             int res_len =
-                process_dns_query(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN, qname,
-                                  qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
+                process_dns_query_cap(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
+                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
+                                      qtype, client_ip, &thread_compress_ctx, false, &rrl_cfg, snap);
             if (res_len > 0) {
               bool drop_packet = false;
               bool tc_packet = false;
@@ -1797,7 +1897,7 @@ worker_startup_success:;
                     drop_packet = true;
                   }
                   view_snapshot_t *rrl_v = select_view(snap, client_ip);
-                  zone_db_entry_t *rrl_z = rrl_v ? find_zone_in_view(rrl_v, qname) : NULL;
+                  zone_db_entry_t *rrl_z = rrl_v ? find_zone_for_query(rrl_v, qname, ((req_buf[2] >> 3) & 0x0F) == 0 ? qtype : 0) : NULL;
                   if (rrl_z) {
                     if (tc_packet) {
                       atomic_fetch_add_explicit(&rrl_z->observatory.rrl_slipped, 1, memory_order_relaxed);
@@ -2057,7 +2157,7 @@ process_tcp_client: ;
           EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
           kevent(kq, &ev_del, 1, NULL, 0, NULL);
 
-          char qname[256] = "";
+          char qname[DNS_NAME_TEXT_SIZE] = "";
           uint16_t qtype = 0;
           uint16_t qclass = 1;
           size_t question_end = DNS_HEADER_SIZE;
@@ -2123,16 +2223,16 @@ process_tcp_client: ;
           }
 
           if ((qtype == 252 || qtype == 251) && !is_synthetic_zone) {
+            /* R-07, R-10: TSIG を先に検証する (鍵は要求の鍵名とアルゴリズムで決める。RFC 8945 §5.2)。
+             * TSIG のエラーは NOTAUTH、解釈できない TSIG は FORMERR。その後に allow-transfer を調べ、
+             * 拒否は REFUSED。応答は tsig_finish_response() で署名する (検証できた要求には同じ鍵で)。 */
+            tsig_request_t tsig;
+            tsig_check_request(cfg, msg, msg_len, ctx_tcp->client_ip, &tsig);
+            tsig_key_t *matched_key = (tsig.status == TSIG_REQ_VALID) ? tsig.key : NULL;
             bool allowed = false;
-            uint16_t tsig_error = 0;
-            tsig_key_t *matched_key = NULL;
-            uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
-            static_assert(sizeof(tsig_mac) >= 64, "tsig_mac must be >= EVP_MAX_MD_SIZE (64)");
-            size_t tsig_mac_len = 0;
-            if (zcfg) {
+            if (zcfg && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
               bool has_acl = (zcfg->allow_transfer_count > 0);
-              bool has_tsig = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
-              
+              bool has_keys = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
               bool acl_ok = false;
               if (has_acl) {
                 if (zcfg->allow_transfer_parsed) {
@@ -2141,72 +2241,25 @@ process_tcp_client: ;
                   acl_ok = check_acl(ctx_tcp->client_ip, zcfg->allow_transfer, zcfg->allow_transfer_count);
                 }
               }
-              bool tsig_ok = false;
-              
-              if (has_tsig) {
-                // allow-transfer { key "A"; key "B"; ... } で指定された全キー名を候補として、
-                // それぞれに対応する tsig_key_t を探し、TSIG検証が成功するものが1つでもあれば許可する。
-                // (どの鍵で署名されたかはメッセージを見るまで分からないため、候補を順に試す)
-                bool any_key_recognized = false;
-                for (int ki = 0; ki < zcfg->tsig_keys_count && !tsig_ok; ki++) {
-                  const char *cand_name = zcfg->tsig_keys[ki];
-                  tsig_key_t *k = cfg->keys;
-                  while (k) {
-                    if (strcmp(k->name, cand_name) == 0) break;
-                    k = k->next;
-                  }
-                  if (!k) continue; // このキー名は定義されていない。次の候補へ
-                  any_key_recognized = true;
-                  size_t tmp_mac_len = 0;
-                  uint8_t tmp_mac[64];
-                  int err = tsig_verify_packet(msg, msg_len, k, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
-                  if (err == 0) {
-                    matched_key = k;
-                    memcpy(tsig_mac, tmp_mac, tmp_mac_len);
-                    tsig_mac_len = tmp_mac_len;
-                    tsig_ok = true;
-                    tsig_error = 0;
-                    break;
-                  } else if (tsig_error == 0) {
-                    tsig_error = err > 0 ? err : 16; // 最初に遭遇した検証エラーを記録
-                  }
-                }
-                // 後方互換: 旧来の tsig-key 単一指定(allow-transfer外の標準directive)も引き続きサポートする
-                if (!tsig_ok && zcfg->tsig_key) {
-                  tsig_key_t *k = cfg->keys;
-                  while (k) {
-                    if (strcmp(k->name, zcfg->tsig_key) == 0) break;
-                    k = k->next;
-                  }
-                  if (k) {
-                    any_key_recognized = true;
-                    size_t tmp_mac_len = 0;
-                    uint8_t tmp_mac[64];
-                    int err = tsig_verify_packet(msg, msg_len, k, NULL, 0, NULL, 0, false, tmp_mac, &tmp_mac_len);
-                    if (err == 0) {
-                      matched_key = k;
-                      memcpy(tsig_mac, tmp_mac, tmp_mac_len);
-                      tsig_mac_len = tmp_mac_len;
-                      tsig_ok = true;
-                      tsig_error = 0;
-                    } else if (tsig_error == 0) {
-                      tsig_error = err > 0 ? err : 16;
-                    }
-                  }
-                }
-                if (!any_key_recognized) {
-                  tsig_error = 17; // BADKEY: 設定されているキー名のうち、どれ一つとして定義済みキーと一致しなかった
-                }
-              }
-              
-              if (has_acl && has_tsig) {
-                  allowed = (acl_ok && tsig_ok);
+              /* allow-transfer { key "A"; ... } の鍵か、ゾーンの tsig-key で署名されていること (D-03: 名前は DNS 名として比較) */
+              bool key_ok = false;
+              for (int ki = 0; matched_key && ki < zcfg->tsig_keys_count && !key_ok; ki++)
+                key_ok = tsig_key_names_equal(matched_key->name, zcfg->tsig_keys[ki]);
+              if (matched_key && !key_ok && zcfg->tsig_key)
+                key_ok = tsig_key_names_equal(matched_key->name, zcfg->tsig_key);
+              /* アドレスと鍵の両方があれば両方を満たすこと (docs/karidns.md allow-transfer) */
+              if (has_acl && has_keys) {
+                  allowed = (acl_ok && key_ok);
               } else if (has_acl) {
                   allowed = acl_ok;
-              } else if (has_tsig) {
-                  allowed = tsig_ok;
+              } else if (has_keys) {
+                  allowed = key_ok;
               }
             }
+            uint8_t tsig_mac[64]; /* >= EVP_MAX_MD_SIZE */
+            static_assert(sizeof(tsig_mac) >= sizeof(tsig.mac), "tsig_mac must hold the request MAC");
+            size_t tsig_mac_len = matched_key ? tsig.mac_len : 0;
+            if (tsig_mac_len > 0) memcpy(tsig_mac, tsig.mac, tsig_mac_len);
             zone_db_entry_t *entry = xfr_view ? find_zone_in_view(xfr_view, qname) : NULL;
             if (allowed && entry) {
               release_config_snapshot(cfg);
@@ -2225,8 +2278,7 @@ process_tcp_client: ;
                   memcpy(&args->server_addr, &ctx_tcp->server_addr, sizeof(ctx_tcp->server_addr));
                   args->server_len = ctx_tcp->server_len;
                   args->has_server_addr = ctx_tcp->has_server_addr;
-                  strncpy(args->qname, qname, 255);
-                  args->qname[255] = '\0';
+                  strlcpy(args->qname, qname, sizeof(args->qname));
                   args->qclass = qclass;
                   args->qtype = qtype;
                   args->has_edns = has_edns;
@@ -2288,62 +2340,29 @@ process_tcp_client: ;
             }
             if (!allowed || !entry) {
               uint8_t res_buf[1024];
-              size_t copy_len = msg_len > UDP_DEFAULT_MAX_RES_LEN ? UDP_DEFAULT_MAX_RES_LEN : msg_len;
-              memcpy(res_buf, msg, copy_len);
-              if (tsig_error) {
-                res_buf[2] |= 0x84;
-                res_buf[3] |= 0x09;
-                add_ede(&edns, cfg->send_extended_errors, 18, "Query refused due to access control");
-                
-                uint16_t qd = (msg[4] << 8) | msg[5];
-                uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
-                uint16_t arcount = 0;
-                if (edns.present) {
-                  assemble_edns_opt(res_buf, sizeof(res_buf), &offset, &arcount, &edns, 0, true, cfg);
-                }
-                res_buf[6] = 0; res_buf[7] = 0;
-                res_buf[8] = 0; res_buf[9] = 0;
-                res_buf[10] = arcount >> 8;
-                res_buf[11] = arcount & 0xFF;
-                copy_len = offset;
-
-                int sign_rc = 0;
-                if (matched_key)
-                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf),
-                                             matched_key, tsig_error, tsig_mac, &tsig_mac_len, NULL, 0, false);
-                else {
-                  tsig_key_t dummy = {0};
-                  dummy.name = (zcfg && zcfg->tsig_keys_count > 0) ? zcfg->tsig_keys[0] : (zcfg ? zcfg->tsig_key : "unknown");
-                  dummy.algorithm = "hmac-sha256";
-                  sign_rc = tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), &dummy,
-                                             17, tsig_mac, &tsig_mac_len, NULL, 0, false);
-                }
-                if (sign_rc != 0) {
-                  release_config_snapshot(cfg);
-                  close(client_fd);
-                  dec_tcp_clients();
-                  free(ctx_tcp);
-                  client_closed = true;
-                  rcu_reader_exit(ctx);
-                  break;
-                }
+              uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
+              if (tsig.status == TSIG_REQ_FORMERR) {
+                rcode = 1;       /* RFC 8945 §5.2: 解釈できない TSIG */
+              } else if (tsig.status == TSIG_REQ_ERROR) {
+                rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
+                add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Invalid TSIG");
               } else {
-                res_buf[2] |= 0x84;
-                res_buf[3] |= 0x05;
                 add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
-                
-                uint16_t qd = (msg[4] << 8) | msg[5];
-                uint16_t offset = (uint16_t)get_question_end_offset(res_buf, copy_len, qd);
-                uint16_t arcount = 0;
-                if (edns.present) {
-                  assemble_edns_opt(res_buf, sizeof(res_buf), &offset, &arcount, &edns, 0, true, cfg);
-                }
-                res_buf[6] = 0; res_buf[7] = 0;
-                res_buf[8] = 0; res_buf[9] = 0;
-                res_buf[10] = arcount >> 8;
-                res_buf[11] = arcount & 0xFF;
-                copy_len = offset;
               }
+              /* 質問セクションまで (Rule 3)。TSIG なしの要求への応答は署名しない (RFC 8945 §5.3) */
+              int built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+                                                   &edns, true, cfg);
+              int signed_len = tsig_finish_response(res_buf, (size_t)built, sizeof(res_buf), &tsig);
+              if (signed_len < DNS_HEADER_SIZE) {
+                release_config_snapshot(cfg);
+                close(client_fd);
+                dec_tcp_clients();
+                free(ctx_tcp);
+                client_closed = true;
+                rcu_reader_exit(ctx);
+                break;
+              }
+              size_t copy_len = (size_t)signed_len;
               release_config_snapshot(cfg);
               uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
@@ -2366,7 +2385,7 @@ process_tcp_client: ;
               break;
             }
           } else {
-            if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname)) {
+            if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0)) {
               uint8_t *heap_req = malloc(msg_len);
               if (!heap_req) {
                 free(ctx_tcp);
@@ -2538,27 +2557,63 @@ static ctrl_client_t *get_ctrl_client(int fd) {
   return NULL;
 }
 
-STATIC_TEST void perform_config_reload_ext(bool skip_unchanged);
+STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
 
-STATIC_TEST void reload_all_zones(void) {
-  perform_config_reload_ext(false);
+STATIC_TEST config_reload_result_t reload_all_zones(void) {
+  return perform_config_reload_ext(false);
 }
 
-STATIC_TEST void perform_config_reload(void) {
-  perform_config_reload_ext(true);
+STATIC_TEST config_reload_result_t perform_config_reload(void) {
+  return perform_config_reload_ext(true);
 }
 
-STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
-  g_last_configured_time = time(NULL);
+/* "a, b" の形で item を足す (重複は足さない)。入りきらなければ足さない */
+static void append_list_item(char *buf, size_t sz, const char *item) {
+  size_t used = strlen(buf);
+  if (strstr(buf, item)) return;
+  snprintf(buf + used, sz - used, "%s%s", used ? ", " : "", item);
+}
+
+static bool str_differs(const char *a, const char *b) {
+  if (!a || !b) return a != b;
+  return strcmp(a, b) != 0;
+}
+
+/* O-09: 起動時にだけ使う設定 (docs/karidns.md "General syntax") が変わっていれば名前を並べる */
+static void collect_restart_only_changes(const server_config_t *o, const server_config_t *n, char *buf, size_t sz) {
+  if (o->port != n->port) append_list_item(buf, sz, "port");
+  bool addrs_differ = o->bind_address_count != n->bind_address_count;
+  for (int i = 0; !addrs_differ && i < n->bind_address_count; i++)
+    addrs_differ = str_differs(o->bind_addresses[i], n->bind_addresses[i]);
+  if (addrs_differ) append_list_item(buf, sz, "bind-address");
+  if (str_differs(o->user, n->user)) append_list_item(buf, sz, "user");
+  if (str_differs(o->group, n->group)) append_list_item(buf, sz, "group");
+  if (str_differs(o->pid_file, n->pid_file)) append_list_item(buf, sz, "pid-file");
+  if (o->udp_recvbuf_size != n->udp_recvbuf_size) append_list_item(buf, sz, "udp-recvbuf-size");
+  if (o->udp_sndbuf_size != n->udp_sndbuf_size) append_list_item(buf, sz, "udp-sndbuf-size");
+  if (o->tcp_window != n->tcp_window) append_list_item(buf, sz, "tcp-window");
+  if (o->control.enabled != n->control.enabled || str_differs(o->control.socket_path, n->control.socket_path))
+    append_list_item(buf, sz, "control-channel socket");
+  if (o->dnstap.enabled != n->dnstap.enabled || str_differs(o->dnstap.socket_path, n->dnstap.socket_path))
+    append_list_item(buf, sz, "dnstap socket");
+}
+
+STATIC_TEST config_reload_result_t perform_config_reload_ext(bool skip_unchanged) {
+  config_reload_result_t res;
+  memset(&res, 0, sizeof(res));
   char *config_str = read_entire_file(g_config_path, NULL, NULL);
-  if (!config_str)
-    return;
+  if (!config_str) {
+    res.status = CONFIG_RELOAD_READ_ERROR;
+    snprintf(res.detail, sizeof(res.detail), "cannot read %s", g_config_path ? g_config_path : "(no configuration file)");
+    syslog(LOG_ERR, "[Config] Reload failed: %s; keeping the current configuration.", res.detail);
+    return res;
+  }
   server_config_t *active =
       atomic_load_explicit(&g_config_db.active, memory_order_acquire);
   server_config_t *standby = (active == &g_config_db.config_a)
                                  ? &g_config_db.config_b
                                  : &g_config_db.config_a;
-  
+
   /* [H-2] 既存のリーダーが参照を終えるのを待機。
    * standby は前回の公開で退いた設定で、retire_epoch はその公開で得た値
    * (公開してから世代を進めるので、これ以下の世代のリーダーだけが standby を持ちうる)。
@@ -2566,76 +2621,148 @@ STATIC_TEST void perform_config_reload_ext(bool skip_unchanged) {
    * 読み取り区間の中で読むので、この待機の後は standby を解放してよい。*/
   if (!rcu_writer_wait_until_safe(g_config_db.retire_epoch, 10000)) {
     syslog(LOG_WARNING, "[Config] Reload postponed: existing readers still active on previous configuration (timeout 10s).");
+    res.status = CONFIG_RELOAD_POSTPONED;
+    snprintf(res.detail, sizeof(res.detail), "readers of the previous configuration are still active");
     free(config_str);
-    return;
+    return res;
   }
-  
+
   free_server_config_fields(standby);
-  if (parse_named_conf_ext(config_str, g_config_path, standby) == 0) {
-    if (g_cli_port_override > 0) {
-      standby->port = g_cli_port_override;
-    }
-    if (geteuid() == 0 && !standby->user) {
-      syslog(LOG_ERR,
-             "[Config] Reload rejected: running as root but new configuration has no 'user' directive in options{}.");
-      fprintf(stderr,
-             "[ERROR] Reload rejected: running as root but new configuration has no 'user' directive in options{}.\n");
-      free_server_config_fields(standby);
-      free(config_str);
-      return;
-    }
-    if (!init_logging_channels(standby)) {
-      syslog(LOG_ERR, "[Config] Reload rejected: one or more log files could not be opened; "
-                      "keeping the current configuration.");
-      fprintf(stderr, "[ERROR] Reload rejected: one or more log files could not be opened; "
-                      "keeping the current configuration.\n");
-      free_server_config_fields(standby);
-      free(config_str);
-      return;
-    }
-    g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
-    // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
-    if (standby->dnstap.enabled) {
-      dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
-    }
-    rebuild_zone_db_from_config(standby, skip_unchanged);
-    for (view_config_t *v = standby->views; v; v = v->next) {
-      for (zone_config_t *z = v->zones; z; z = z->next) {
-        if (z->type && strcasecmp(z->type, "program") == 0) {
-          bool already_running = false;
-          for (int i = 0; i < g_program_plugins_count; i++) {
-            if (strcasecmp(g_program_plugins[i].domain, z->domain) == 0) {
-              already_running = true;
-              /* M-4: 実行中の設定と新しい設定を比較し、変わっていれば警告 */
-              char new_fingerprint[512];
-              compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
-              if (strcmp(g_program_plugins[i].config_fingerprint, new_fingerprint) != 0) {
-                syslog(LOG_WARNING, "[Plugin] zone '%s' (type program) configuration changed "
-                       "(program/program-args/program-user/program-timeout/program-max-failures), "
-                       "but the running plugin process cannot be restarted without a full karidns "
-                       "restart (Capsicum sandbox is already active). The OLD configuration is "
-                       "still in effect for this zone.", z->domain);
-              }
-              break;
-            }
+  if (parse_named_conf_ext(config_str, g_config_path, standby) != 0) {
+    res.status = CONFIG_RELOAD_PARSE_ERROR;
+    snprintf(res.detail, sizeof(res.detail), "configuration error in %s (see syslog)", g_config_path);
+    syslog(LOG_ERR, "Failed to reload configuration: parse error.");
+    free(config_str);
+    return res;
+  }
+  free(config_str);
+  if (g_cli_port_override > 0) {
+    standby->port = g_cli_port_override;
+  }
+  if (geteuid() == 0 && !standby->user) {
+    syslog(LOG_ERR,
+           "[Config] Reload rejected: running as root but new configuration has no 'user' directive in options{}.");
+    fprintf(stderr,
+           "[ERROR] Reload rejected: running as root but new configuration has no 'user' directive in options{}.\n");
+    free_server_config_fields(standby);
+    res.status = CONFIG_RELOAD_REJECTED;
+    snprintf(res.detail, sizeof(res.detail), "running as root but the configuration has no 'user' in options{}");
+    return res;
+  }
+  if (!init_logging_channels(standby)) {
+    syslog(LOG_ERR, "[Config] Reload rejected: one or more log files could not be opened; "
+                    "keeping the current configuration.");
+    fprintf(stderr, "[ERROR] Reload rejected: one or more log files could not be opened; "
+                    "keeping the current configuration.\n");
+    free_server_config_fields(standby);
+    res.status = CONFIG_RELOAD_REJECTED;
+    snprintf(res.detail, sizeof(res.detail), "one or more log files could not be opened");
+    return res;
+  }
+  if (active) collect_restart_only_changes(active, standby, res.restart_needed, sizeof(res.restart_needed));
+  g_config_db.retire_epoch = rcu_writer_publish(&g_config_db.active, standby);
+  g_last_configured_time = time(NULL);
+  // dnstap の接続先は起動時のみだが、出力するメッセージ種別はリロードで反映できる
+  if (standby->dnstap.enabled) {
+    dnstap_set_message_types(standby->dnstap.log_auth_query, standby->dnstap.log_auth_response);
+  }
+  res.zones_failed = rebuild_zone_db_from_config_ext(standby, skip_unchanged, res.detail, sizeof(res.detail));
+  if (res.zones_failed < 0) {
+    res.zones_failed = 0;
+    snprintf(res.detail, sizeof(res.detail), "zone database could not be rebuilt (out of memory)");
+    res.status = CONFIG_RELOAD_ZONE_ERRORS;
+  } else if (res.zones_failed > 0) {
+    res.status = CONFIG_RELOAD_ZONE_ERRORS;
+  }
+  for (view_config_t *v = standby->views; v; v = v->next) {
+    for (zone_config_t *z = v->zones; z; z = z->next) {
+      if (z->type && strcasecmp(z->type, "program") == 0) {
+        program_plugin_t *running = find_program_plugin(v->name, z->domain);
+        if (running) {
+          /* M-4: 実行中の設定と新しい設定を比較し、変わっていれば警告 */
+          char new_fingerprint[512];
+          compute_program_zone_fingerprint(z, new_fingerprint, sizeof(new_fingerprint));
+          if (strcmp(running->config_fingerprint, new_fingerprint) != 0) {
+            syslog(LOG_WARNING, "[Plugin] zone '%s' in view '%s' (type program) configuration changed "
+                   "(program/program-args/program-user/program-timeout/program-max-failures), "
+                   "but the running plugin process cannot be restarted without a full karidns "
+                   "restart (Capsicum sandbox is already active). The OLD configuration is "
+                   "still in effect for this zone.", z->domain, v->name);
+            append_list_item(res.restart_needed, sizeof(res.restart_needed), "type program zone settings");
           }
-          if (!already_running) {
-            syslog(LOG_ERR, "[Plugin] zone '%s' (type program) was added via reload but "
-                   "cannot be started without a full restart (Capsicum sandbox is already active). "
-                   "This zone will return SERVFAIL until karidns is restarted.", z->domain);
-          }
+        } else {
+          syslog(LOG_ERR, "[Plugin] zone '%s' in view '%s' (type program) was added via reload but "
+                 "cannot be started without a full restart (Capsicum sandbox is already active). "
+                 "This zone will return SERVFAIL until karidns is restarted.", z->domain, v->name);
+          append_list_item(res.restart_needed, sizeof(res.restart_needed), "new type program zones");
         }
       }
     }
-    syslog(LOG_NOTICE, "Configuration and zones reloaded successfully.");
-  } else {
-    syslog(LOG_ERR, "Failed to reload configuration: parse error.");
   }
-  free(config_str);
+  if (res.restart_needed[0])
+    syslog(LOG_WARNING, "[Config] Reload: changed settings take effect only after a restart: %s", res.restart_needed);
+  if (res.status == CONFIG_RELOAD_ZONE_ERRORS)
+    syslog(LOG_ERR, "[Config] Configuration reloaded, but %d zone(s) failed to load: %s",
+           res.zones_failed, res.detail);
+  else
+    syslog(LOG_NOTICE, "Configuration and zones reloaded successfully.");
+  return res;
+}
+
+/* O-10: 延期したリロード。制御スレッドだけが読み書きする */
+static bool g_reload_pending = false;
+static bool g_reload_pending_full = false; /* 延期したものに全ゾーンの再読み込みが含まれる */
+
+static config_reload_result_t run_config_reload(bool skip_unchanged) {
+  bool full = !skip_unchanged || g_reload_pending_full;
+  config_reload_result_t r = perform_config_reload_ext(!full);
+  if (r.status == CONFIG_RELOAD_POSTPONED) {
+    g_reload_pending = true;
+    g_reload_pending_full = full;
+  } else {
+    g_reload_pending = false;
+    g_reload_pending_full = false;
+  }
+  return r;
+}
+
+#define CTRL_RELOAD_REPLY_SIZE 768
+
+/* D-13: reload / reconfig の応答。失敗は "ERROR ..." にして karictl が終了コード 3 を返せるようにする */
+static int format_reload_reply(const config_reload_result_t *r, const char *ok_text, char *buf, size_t sz) {
+  char note[sizeof(r->restart_needed) + 32] = "";
+  if (r->restart_needed[0])
+    snprintf(note, sizeof(note), " (restart needed for: %s)", r->restart_needed);
+  int n;
+  switch (r->status) {
+  case CONFIG_RELOAD_OK:
+    n = snprintf(buf, sz, "%s%s\n", ok_text, note);
+    break;
+  case CONFIG_RELOAD_ZONE_ERRORS:
+    n = snprintf(buf, sz, "ERROR configuration applied, but %d zone(s) failed to load: %s%s\n", r->zones_failed,
+                 r->detail, note);
+    break;
+  case CONFIG_RELOAD_POSTPONED:
+    n = snprintf(buf, sz, "ERROR reload postponed: %s; it is retried automatically\n", r->detail);
+    break;
+  default:
+    n = snprintf(buf, sz, "ERROR configuration not applied: %s\n", r->detail);
+    break;
+  }
+  if (n < 0) n = 0;
+  if ((size_t)n >= sz) {
+    n = (int)sz - 1;
+    buf[n - 1] = '\n';
+  }
+  return n;
 }
 
 const char *find_configured_domain(const char *arg, char *out_buf, size_t out_size) {
   if (!out_buf || out_size == 0) return arg;
+  /* karictl の引数も設定のゾーン名と同じ正規形 (dns_wire.h) にしてから比べる
+   * ("sp\032ace.test" と "c\(p.test" などのエスケープの書き方の違いを吸収する)。 */
+  char norm[DNS_NAME_TEXT_SIZE];
+  if (dns_name_normalize(arg, norm, sizeof(norm)) != (size_t)-1) arg = norm;
   snprintf(out_buf, out_size, "%s", arg);
   server_config_t *active = acquire_config_snapshot();
   if (!active) return out_buf;
@@ -2676,6 +2803,11 @@ void *control_thread_func(void *arg) {
       pthread_exit(NULL);
     }
   }
+  if (g_notify_resp_ipc[0] >= 0) {
+    EV_SET(&ev_set[0], g_notify_resp_ipc[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+    if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1)
+      syslog(LOG_ERR, "[Control] Cannot watch NOTIFY answers: %m (outbound NOTIFY is not retransmitted correctly)");
+  }
 
   struct kevent ev_list[4];
   while (1) {
@@ -2686,6 +2818,18 @@ void *control_thread_func(void *arg) {
       break;
     }
     for (int i = 0; i < n; i++) {
+      if (ev_list[i].filter == EVFILT_READ && g_notify_resp_ipc[0] >= 0 &&
+          ev_list[i].ident == (uintptr_t)g_notify_resp_ipc[0]) {
+        /* UDP ワーカーが回してきた NOTIFY の応答 (udp_ipc_t + DNS メッセージ) */
+        uint8_t nbuf[sizeof(udp_ipc_t) + 4096];
+        ssize_t nlen;
+        while ((nlen = recv(g_notify_resp_ipc[0], nbuf, sizeof(nbuf), MSG_DONTWAIT)) >= (ssize_t)sizeof(udp_ipc_t)) {
+          udp_ipc_t *im = (udp_ipc_t *)nbuf;
+          if (im->payload_len > nlen - (ssize_t)sizeof(udp_ipc_t)) continue;
+          notify_handle_response(nbuf + sizeof(udp_ipc_t), im->payload_len, (const struct sockaddr *)&im->client_addr);
+        }
+        continue;
+      }
       if (g_control_sock >= 0 && ev_list[i].ident == (uintptr_t)g_control_sock) {
         // リスニングソケットをノンブロッキング化して accept でのハングを完全防止
         int sflags = fcntl(g_control_sock, F_GETFL, 0);
@@ -2898,13 +3042,17 @@ void *control_thread_func(void *arg) {
                 release_zone_snapshot(snap);
               } else {
                 syslog(LOG_NOTICE, "[Control] Received full reload command");
-                reload_all_zones();
-                send(cfd, "OK reloaded\n", 12, 0);
+                config_reload_result_t rr = run_config_reload(false);
+                char reply[CTRL_RELOAD_REPLY_SIZE];
+                int rlen = format_reload_reply(&rr, "OK reloaded", reply, sizeof(reply));
+                send(cfd, reply, (size_t)rlen, 0);
               }
             } else if (strcmp(cmd, "reconfig") == 0) {
               syslog(LOG_NOTICE, "[Control] Received reconfig command");
-              perform_config_reload();
-              send(cfd, "OK\n", 3, 0);
+              config_reload_result_t rr = run_config_reload(true);
+              char reply[CTRL_RELOAD_REPLY_SIZE];
+              int rlen = format_reload_reply(&rr, "OK", reply, sizeof(reply));
+              send(cfd, reply, (size_t)rlen, 0);
             } else if (strcmp(cmd, "stop") == 0) {
               syslog(LOG_NOTICE, "[Control] Received stop command");
               udp_ipc_t msg;
@@ -2951,6 +3099,12 @@ void *control_thread_func(void *arg) {
               st.ede_ns = atomic_load_explicit(&g_ede_not_supported_total, memory_order_relaxed);
               st.ede_oth = atomic_load_explicit(&g_ede_other_total, memory_order_relaxed);
               st.dnstap_truncated = atomic_load_explicit(&g_dnstap_truncated_total, memory_order_relaxed);
+              snprintf(st.version, sizeof(st.version), "%s", KARIDNS_VERSION);
+              snprintf(st.hostname, sizeof(st.hostname), "%s", g_host_status_info.un.nodename);
+              snprintf(st.os_name, sizeof(st.os_name), "%s", g_host_status_info.un.sysname);
+              snprintf(st.os_release, sizeof(st.os_release), "%s", g_host_status_info.un.release);
+              snprintf(st.machine, sizeof(st.machine), "%s", g_host_status_info.un.machine);
+              st.ncpus = g_host_status_info.ncpus;
               
               struct iovec iov[2];
               iov[0].iov_base = "OK ";
@@ -3059,6 +3213,11 @@ void *control_thread_func(void *arg) {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
+              } else if (lr.entry && !lr.entry->is_secondary) {
+                /* O-06: 転送元を持つのはセカンダリ (カタログのメンバーを含む) だけ。プライマリの
+                 * シリアルを 0 にすると UDP IXFR や karictl zonestatus の値が壊れる。 */
+                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' is not a secondary", canon_arg);
+                send(cfd, "ERROR zone is not a secondary\n", 30, 0);
               } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
                 atomic_store_explicit(&lr.entry->serial, 0, memory_order_release);
@@ -3083,10 +3242,19 @@ void *control_thread_func(void *arg) {
           free_ctrl_client(cfd);
         }
       } else if (ev_list[i].filter == EVFILT_SIGNAL && ev_list[i].ident == SIGHUP) {
-        perform_config_reload();
+        /* O-10: EVFILT_SIGNAL (EV_CLEAR) は前回の取り出し以降の SIGHUP をまとめて1件にし、
+         * data に回数を入れる。リロード中に届いた SIGHUP は次の1回のリロードにまとめる */
+        if (ev_list[i].data > 1)
+          syslog(LOG_NOTICE, "[Config] %ld SIGHUP signals arrived while busy; reloading once", (long)ev_list[i].data);
+        run_config_reload(true);
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
+        if (g_reload_pending) {
+          /* O-10: 読み手が残っていて延期したリロードを捨てずにやり直す */
+          syslog(LOG_NOTICE, "[Config] Retrying the postponed reload");
+          run_config_reload(!g_reload_pending_full);
+        }
         // Check control clients timeout: 5s unauthenticated or 15s inactive
         ctrl_client_t *curr_c = g_ctrl_clients;
         while (curr_c) {
@@ -3107,6 +3275,8 @@ void *control_thread_func(void *arg) {
           }
           curr_c = next_c;
         }
+
+        notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
 
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
@@ -3184,7 +3354,7 @@ void *control_thread_func(void *arg) {
                                     if (tsig_key_name[0] != '\0' && active) {
                                         tsig_key_t *k = active->keys;
                                         while (k) {
-                                            if (strcmp(k->name, tsig_key_name) == 0) {
+                                            if (tsig_key_names_equal(k->name, tsig_key_name)) {
                                                 bg_ctx->has_tsig = true;
                                                 strncpy(bg_ctx->tsig_name, k->name,
                                                         sizeof(bg_ctx->tsig_name) - 1);
@@ -3544,6 +3714,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
     close(g_notify_ipc[0]);
   }
   close(g_notify_ipc[1]);
+  close(g_notify_resp_ipc[0]);
+  close(g_notify_resp_ipc[1]);
 
   server_config_t *cfg = acquire_config_snapshot();
 
@@ -4181,6 +4353,15 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   cap_rights_limit(g_notify_ipc[0], &n_rights_0);
   cap_rights_init(&n_rights_1, CAP_SEND, CAP_EVENT, CAP_FCNTL);
   cap_rights_limit(g_notify_ipc[1], &n_rights_1);
+
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_resp_ipc) < 0) {
+    syslog(LOG_CRIT, "[IPC] Failed to create NOTIFY response socketpair: %m");
+    exit(1);
+  }
+  fcntl(g_notify_resp_ipc[0], F_SETFL, fcntl(g_notify_resp_ipc[0], F_GETFL, 0) | O_NONBLOCK);
+  fcntl(g_notify_resp_ipc[1], F_SETFL, fcntl(g_notify_resp_ipc[1], F_GETFL, 0) | O_NONBLOCK);
+  cap_rights_limit(g_notify_resp_ipc[0], &n_rights_0);
+  cap_rights_limit(g_notify_resp_ipc[1], &n_rights_1);
 }
 
 /* 非root起動時に、path (pid file / 制御ソケット) を作成できるかを
@@ -4401,7 +4582,8 @@ int main(int argc, char **argv) {
   tzset();
   g_boot_time = time(NULL);
   g_last_configured_time = g_boot_time;
-  
+  capture_host_status_info();
+
   // Force OpenSSL lazy initialization before entering Capsicum sandbox.
   // NOTE: RFC 9018 Server Cookie は SipHash-2-4 (OpenSSL非依存) になったため、従来のように
   // generate_server_cookie() を呼んでもOpenSSLは初期化されない。かつてはその内部の
@@ -4626,7 +4808,13 @@ int main(int argc, char **argv) {
   }
 
   atomic_init(&g_config_db.active, &g_config_db.config_a);
-  rebuild_zone_db_from_config(&g_config_db.config_a, false);
+  {
+    char failed_zones[384];
+    int nfailed = rebuild_zone_db_from_config_ext(&g_config_db.config_a, false, failed_zones, sizeof(failed_zones));
+    if (nfailed > 0)
+      syslog(LOG_ERR, "[Startup] %d zone(s) failed to load and answer SERVFAIL until reloaded: %s", nfailed,
+             failed_zones);
+  }
 
   int total_cores = sysconf(_SC_NPROCESSORS_ONLN);
   if (total_cores <= 0)
@@ -4819,6 +5007,8 @@ int main(int argc, char **argv) {
     }
     close(g_notify_ipc[0]);
     close(g_notify_ipc[1]);
+    close(g_notify_resp_ipc[0]);
+    close(g_notify_resp_ipc[1]);
     if (g_control_sock >= 0) {
       close(g_control_sock);
       g_control_sock = -1;

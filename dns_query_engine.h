@@ -25,8 +25,22 @@ int process_dns_query_impl(const uint8_t *req, size_t req_len, uint8_t *res,
                           zone_db_snapshot_t *snap, server_config_t *cfg,
                           zone_db_entry_t **out_matched_entry);
 
+/* res_cap: res の実際の容量。0 なら max_res_len を容量とみなす (process_dns_query / _impl はこれ)。
+ * max_res_len は応答の上限で、UDP では EDNS で通知されたサイズに置き換えられる。 */
+int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
+                          size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                          const char *client_ip, compress_ctx_t *comp_ctx,
+                          bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                          zone_db_snapshot_t *snap);
+int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
+                               size_t max_res_len, size_t res_cap, const char *qname, uint16_t qtype,
+                               const char *client_ip, compress_ctx_t *comp_ctx,
+                               bool is_tcp, rate_limit_config_t **out_rrl_cfg,
+                               zone_db_snapshot_t *snap, server_config_t *cfg,
+                               zone_db_entry_t **out_matched_entry);
+
 view_snapshot_t *select_view(zone_db_snapshot_t *snap, const char *client_ip);
-bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out);
+bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void spawn_program_zone_plugins(server_config_t *cfg);
 void compute_program_zone_fingerprint(const zone_config_t *z, char *out, size_t out_cap);
 size_t get_question_end_offset(const uint8_t *pkt, size_t len, uint16_t qdcount);
@@ -52,12 +66,12 @@ typedef struct resolve_checkpoint {
     uint16_t arcount;
 } resolve_checkpoint_t;
 
-void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *domain);
+void build_zone_response_cache(zone_arena_t *arena, server_config_t *cfg, const char *view_name, const char *domain);
+program_plugin_t *find_program_plugin(const char *view_name, const char *domain);
 
 #ifdef KARIDNS_UNIT_TEST
 void restore_checkpoint(const resolve_checkpoint_t *cp, uint16_t *offset,
                         uint16_t *ancount, uint16_t *nscount, uint16_t *arcount);
-size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 bool tinydns_record_currently_valid(const dns_record_t *rec, time_t now,
                                     const char client_loc[2],
                                     const char *client_ecs_tag,
@@ -71,7 +85,7 @@ bool append_glue_records(zone_arena_t *current_zone, const char *target,
                          const char *client_ecs_tag,
                          const char *client_loc_tag,
                          additional_from_auth_t policy,
-                         view_snapshot_t *view);
+                         view_snapshot_t *view, bool dnssec_ok);
 void collect_additional_rr_glue(dns_record_t *rec,
                                 const char *glue_targets[16],
                                 int *glue_target_count,
@@ -88,8 +102,9 @@ bool compute_nsec3_hash(const char *name, uint8_t algo, uint16_t iterations,
                         const uint8_t *salt, size_t salt_len,
                         char *out_b32, size_t out_b32_sz);
 bool nsec3_covers_hash(const char *owner_hash, const char *next_hash, const char *target_hash);
-dns_record_t *find_matching_nsec3(zone_arena_t *zone, const char *hash_b32, const char *apex);
-dns_record_t *find_covering_nsec3(zone_arena_t *zone, const char *target_hash);
+dns_record_t *find_matching_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *hash_b32,
+                                  const char *apex);
+dns_record_t *find_covering_nsec3(zone_arena_t *zone, const dns_record_t *param, const char *target_hash);
 bool find_next_closer_name(const char *qname, const char *encloser, char *out, size_t out_sz);
 bool attach_nsec3_record(zone_arena_t *zone, dns_record_t *rec,
                          uint8_t *res, size_t max_res_len, uint16_t *offset,
@@ -115,9 +130,8 @@ ssize_t write_all_timeout(int fd, const uint8_t *buf, size_t len, uint32_t timeo
 ssize_t read_all_timeout(int fd, uint8_t *buf, size_t len, uint32_t timeout_ms);
 int64_t monotonic_ms(void);
 uint32_t remaining_ms(int64_t deadline);
-program_plugin_t *find_program_plugin(const char *domain);
-int dispatch_to_program_zone(const char *domain, const uint8_t *req, size_t req_len,
-                             uint8_t *res, size_t max_res_len,
+int dispatch_to_program_zone(const char *view_name, const char *domain, const uint8_t *req, size_t req_len,
+                             uint8_t *res, size_t max_res_len, size_t res_cap,
                              const char *client_ip, bool is_tcp);
 ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                         const uint8_t *query, size_t query_len,
@@ -127,7 +141,7 @@ int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, size_t req_le
                           uint8_t *res, size_t max_res_len);
 bool nsec_covers_name(const dns_record_t *rec, const char *name);
 dns_record_t *find_covering_nsec(zone_arena_t *zone, const char *name);
-bool spawn_one_program_plugin(zone_config_t *zcfg, program_plugin_t *out);
+bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, program_plugin_t *out);
 void record_observatory_response(zone_db_entry_t *entry, uint8_t rcode, uint16_t ancount);
 #endif
 

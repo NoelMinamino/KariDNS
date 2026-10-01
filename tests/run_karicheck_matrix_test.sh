@@ -155,7 +155,11 @@ ns A 192.0.2.1'
 raw_zone empty   1 "[ERROR]" ''
 out=$("$KC" zone z.example. /nonexistent/x.zone 2>&1); rc=$?
 check "missing-file" 1 "Could not open file" "$out" "$rc"
-check "absolute-path-warning" 1 "absolute or contains '../'" "$out" "$rc"
+# D-24: the server opens absolute and "../" zone paths, so karicheck no longer warns about them
+case "$out" in
+    *"absolute or contains '../'"*) echo "  FAIL [no-absolute-path-warning]: warning still printed"; FAIL=$((FAIL + 1)) ;;
+    *) PASS=$((PASS + 1)) ;;
+esac
 
 # ---- tinydns-data zones ------------------------------------------------------------------------------
 td_case hex3       1 "type '3' requires a 32-character hexadecimal IPv6 address" '3www.example.com:20010db8:300'
@@ -185,7 +189,7 @@ conf_case fwd_nofwd     conf 1 "has type 'forward' but no 'forwarders' specified
 conf_case prog_denied   conf 1 "'allow-program-zones' is not enabled" 'zone "p.example" { type program; program "/bin/true"; };'
 conf_case prog_notexec  conf 0 "is not executable (access X_OK failed" 'options { allow-program-zones yes; };
 zone "p.example" { type program; program "/nonexistent/prog"; };'
-conf_case prog_skipped  zones 0 "Skipping file validation for program zone" 'options { allow-program-zones yes; };
+conf_case prog_skipped  zones 0 "Checked 0 zones (1 skipped)" 'options { allow-program-zones yes; };
 zone "p.example" { type program; program "/bin/true"; };'
 conf_case ecs_badcidr   conf 1 "Invalid CIDR '999.0.0.0/8' in options.ecs-tags" 'options { ecs-enable yes; ecs-tags { tag "a" { 999.0.0.0/8; }; }; };'
 conf_case loc_badcidr   conf 1 "Invalid CIDR '10.0.0.0/99' in options.location-tags" 'options { location-tags { tag "a" { 10.0.0.0/99; }; }; };'

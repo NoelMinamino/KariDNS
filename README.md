@@ -79,7 +79,7 @@ KariDNS natively parses, validates, and serializes the following standard and ex
 
 ### Zone File Formats & Directives
 - **Standard BIND Format (Default):**
-  - Directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (supports up to 32 files and 16 nesting levels within Capsicum constraints), `$GENERATE`, `$LOCATION`, `$LOCATION-TAG`, `$ECS-SUBNET`, `$ECS-SUBNET-TAG`.
+  - Directives: `$ORIGIN`, `$TTL`, `$INCLUDE` (supports up to 32 files and 16 nesting levels within Capsicum constraints), `$GENERATE` (BIND syntax, any RR type; see `docs/karidns.md` "ZONE FILE FORMAT"), `$LOCATION`, `$LOCATION-TAG`, `$ECS-SUBNET`, `$ECS-SUBNET-TAG`.
 - **djbdns/tinydns Plain-Text Format (`file-format tinydns;`):**
   - Loads zone data directly from djbdns/tinydns plain-text `data` files (not compiled `data.cdb`).
   - Supports record markers `.` (SOA+NS+A), `&` (NS+A), `+` (A), `=` (A+PTR), `-` (disabled/comment), `@` (MX+A), `'` (TXT, 127-byte chunking), `^` (PTR), `C` (CNAME), `Z` (complete SOA), `:` (generic RR), and the common extensions `3` (AAAA), `6` (AAAA+PTR), `S` (SRV), `N` (NAPTR) and `_` (SSHFP).

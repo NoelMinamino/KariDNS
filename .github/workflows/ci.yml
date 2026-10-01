@@ -132,7 +132,7 @@ jobs:
             sh ./tests/run_ttl_harmonization_test.sh
             sh ./tests/run_ttl_harmonization_update_test.sh
             sh ./tests/run_ttl_rfc2181_clamp_test.sh
-            sh ./tests/run_update_slave_notauth_test.sh
+            sh ./tests/run_update_secondary_refused_test.sh
             sh ./tests/run_zone_oom_partial_load_test.sh
             sh ./tests/run_zone_type_secondary_test.sh
             echo "::endgroup::"

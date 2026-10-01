@@ -28,7 +28,7 @@ Legend:
 | RFC 1982 | Serial Number Arithmetic | ✅ Full | Serial number arithmetic is used to evaluate SOA serial increments during IXFR/NOTIFY (`serial_is_newer()` in `dns_utils.c`) |
 | RFC 1995 | Incremental Zone Transfer (IXFR) | ✅ Full | `ixfr_history_t` (`dns_server_internal.h`), `compute_ixfr_diff()` (`dns_axfr_ixfr.c`) |
 | RFC 1996 | A Mechanism for Prompt Notification of Zone Changes (NOTIFY) | ✅ Full | Send and receive supported. Outbound NOTIFY goes to `also-notify` and the apex NS hosts except the SOA MNAME host (`send_notify_to_all()` in `dns_dynamic_update.c`). Inbound NOTIFY authenticated via `masters` IP match, plus optional TSIG (`dns_query_engine.c`). For `type "forward"` / `type "program"` zones, NOTIFY is cleanly rejected with `NOTIMP` |
-| RFC 2181 | Clarifications to the DNS Specification | ✅ Full | TTL values with the high bit set (≥ 2^31) are now capped to 0 at the single conversion point in `serialize_dns_record` (`dns_wire.c`), per §8 |
+| RFC 2181 | Clarifications to the DNS Specification | ✅ Full | TTL values with the high bit set (≥ 2^31) are served as 2147483647 (RFC 8767 §4 amends §8): zone file parser, record encoder (`serialize_dns_record`) and zone transfer receive path |
 | RFC 2308 | Negative Caching of DNS Queries | ✅ Full | On NXDOMAIN/NODATA, the SOA MINIMUM field is used as the TTL override for the authority-section SOA (`dns_query_engine.c`) |
 | RFC 2317 | Classless IN-ADDR.ARPA Delegation (BCP 20) | ✅ Full | Sub-/24 reverse DNS delegation is supported via standard CNAME redirection |
 | RFC 3225 | Indicating Resolver Support of DNSSEC (DO bit in EDNS) | ✅ Full | Supported; DO bit (0x8000) parsed from EDNS flags and used to gate DNSSEC (RRSIG/NSEC) inclusion (`dns_wire.c`, `dns_query_engine.c`) |
