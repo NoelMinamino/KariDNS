@@ -173,11 +173,12 @@ zone "example.com" {
 - Comments: `# ...`, `// ...` and `/* ... */`.
 - Values may be quoted (`"..."`) or bare words. A single token is limited to 4096 bytes (longer tokens are truncated with a warning). The configuration file (and each included file) may be at most 256 MiB.
 - `include "file";` may appear anywhere and inserts the file in place. Relative paths are resolved against the directory of the file that contains the `include`. Includes can be nested up to 16 levels deep; circular includes are rejected.
-- Boolean values accept `yes` / `true` and `no` / `false`. For the `rate-limit` and `dnstap` flags, `1` is accepted as true as well, and any other value means false.
+- Boolean values accept `yes` / `true` / `1` and `no` / `false` / `0` (case-insensitive), in every statement, as BIND does. Any other value is a configuration error.
 - Zone names are normalized to their fully qualified form (a trailing `.` is added), so `"example.com"` and `"example.com."` are the same zone. A class after the zone name (`zone "example.com" IN { ... };`) is **not** accepted.
-- Relative file paths (zone `file`, log `file`, `pid-file`, ...) are resolved against the working directory `karidns` was started from. Use absolute paths when starting from an rc script.
+- Relative file paths (zone `file`, log `file`, `pid-file`, ...) are resolved against the working directory `karidns` was started from, including paths that contain `../`. Use absolute paths when starting from an rc script. The server opens the directories of zone and log files when it starts, before it enters the Capsicum sandbox; a zone or log file that a reload adds in a directory the server has not used before cannot be opened (the zone answers SERVFAIL and `karictl reload` / `reconfig` report it) until the next restart.
 - Unknown statements and options are skipped silently (up to the next `;` at the same block level), so a misspelled option has no effect. Use [`karicheck conf`](karicheck.md) to validate a configuration.
-- Settings that are fixed when the server starts (`port`, `bind-address`, `user`, `group`, `pid-file`, `udp-recvbuf-size`, `udp-sndbuf-size`, `tcp-window`, the `control-channel` socket path, `dnstap`, the `type program` zone processes) need a restart; a reload (`SIGHUP`, `karictl reload` / `reconfig`) applies everything else.
+- Settings that are fixed when the server starts (`port`, `bind-address`, `user`, `group`, `pid-file`, `udp-recvbuf-size`, `udp-sndbuf-size`, `tcp-window`, the `control-channel` socket path, `dnstap`, the `type program` zone processes) need a restart; a reload (`SIGHUP`, `karictl reload` / `reconfig`) applies everything else. When a reload changes one of them, the server logs a warning that names it, and `karictl` shows it as `OK (restart needed for: ...)`.
+- A reload that cannot be applied (the file cannot be read, a configuration error, a log file that cannot be opened) keeps the running configuration. A reload whose zone files fail to load applies the configuration and serves SERVFAIL for those zones; the failed zones are logged. If readers of the previous configuration are still active after 10 seconds, the reload is postponed and retried every second until it runs. `SIGHUP` signals that arrive while a reload is running are merged into one reload.
 
 ### Top-level statements
 
@@ -190,9 +191,10 @@ zone "example.com" {
 | `control-channel { ... };` | Enables the [`karictl(8)`](karictl.md) control socket. |
 | `logging { ... };` | Log channels and categories. |
 | `dnstap { ... };` | dnstap output (same block as inside `options`). |
+| `acl "<name>" { ... };` | A named address match list (see Address match lists). |
 | `include "<file>";` | Includes another file. |
 
-Duplicate zones (in the same view or at top level), duplicate views and duplicate keys (names compared case-insensitively) are rejected.
+Duplicate zones (in the same view or at top level), duplicate views, duplicate keys and duplicate `acl` names (names compared case-insensitively) are rejected.
 
 ### `options { ... }`
 
@@ -213,7 +215,7 @@ Duplicate zones (in the same view or at top level), duplicate views and duplicat
 | `minimal-responses yes\|no;` | `no` | Do not add glue / additional-section records. |
 | `minimal-any yes\|no;` | `no` | RFC 8482: answer `QTYPE=ANY` with a synthesized `HINFO "RFC8482" ""` record instead of all RRsets. When the query has DO=1 and the name has RRSIG records, a single RRset is returned instead (RFC 8482 §4.2). |
 | `minimal-any-ttl <seconds>;` | `86400` | TTL of the synthesized RFC 8482 `HINFO` record. |
-| `additional-from-auth yes\|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Unknown values are treated as `yes` with a warning. Can be overridden per zone. |
+| `additional-from-auth yes\|in-domain\|no;` | `yes` | Whether additional-section data (glue, MX/SRV targets) is taken from the server's authoritative data. `in-domain` (alias `in-zone`) limits it to names inside the zone of the answer. Any other value is a configuration error. Can be overridden per zone. |
 | `send-extended-errors yes\|no;` | `yes` | Add Extended DNS Errors (EDE, RFC 8914) to responses of EDNS queries. |
 | `notify-retries <n>;` | `5` | 0–10. How many times a NOTIFY that got no answer is sent again (RFC 1996 §3.6). Can be overridden per zone. |
 | `notify-retry-interval <seconds>;` | `60` | 1–3600. Time from sending a NOTIFY to its first retransmission, and the wait for an answer after the last one. Can be overridden per zone. |
@@ -298,13 +300,13 @@ logging {
 
 | Item | Description |
 |---|---|
-| `file` | Log file. With `size`, the file is rotated when it would exceed the size: with `versions <n>` the old files are kept as `<path>.0` … `<path>.<n-1>`, without `versions` the file is truncated. With `suffix timestamp`, the file is also rotated daily and renamed to `<path>.YYYYMMDD`. |
+| `file` | Log file. With `size`, the file is rotated when it would exceed the size: with `versions <n>` the old files are kept as `<path>.0` … `<path>.<n-1>`, without `versions` the file is truncated. With `suffix timestamp`, the file is also rotated daily, and every rotation (daily or by size) renames it to `<path>.YYYYMMDD`; a second rotation on the same day uses `<path>.YYYYMMDD.1`, then `.2`, … (up to `.9999`), so no rotated file is overwritten. With `suffix timestamp` and `versions <n>`, only the `n` newest `<path>.YYYYMMDD[.N]` files are kept and older ones are deleted after each rotation, as BIND does; without `versions` (or with `versions unlimited`) none are deleted. Other files in the directory are never removed. |
 | `print-time`, `print-category`, `print-severity` | Add the timestamp, category and severity to each line (default `no`). |
 | `max-qps` | Per-channel override of `query-log-max-qps` for the `queries` category. |
 | `category queries` | Query log. |
 | `category responses` | Response log. |
 
-Only the `queries` and `responses` categories exist; other categories are ignored with a warning. Each category uses one channel (the first name in the braces), and a category that names an undefined channel is an error. Other channel options (such as BIND's `severity`) are ignored. Operational messages go to syslog (facility `daemon`).
+Only the `queries` and `responses` categories exist; other categories are ignored with a warning. A category may list several channels (`category queries { a; b; };`), but only the first one is used and the others are ignored with a warning; an empty list (`{ };`) turns the category off. A category that names an undefined channel is an error. Other channel options (such as BIND's `severity`) are ignored. Operational messages go to syslog (facility `daemon`).
 
 ### `key "<name>" { ... }`
 
@@ -351,13 +353,15 @@ A zone that appears in several views is a separate zone in each view: its own fi
 
 ### Address match lists (ACLs)
 
-`allow-transfer`, `allow-update`, `match-clients` and `ecs-trusted-resolvers` take a list of entries evaluated in order; the first matching entry decides. An entry is an IPv4/IPv6 address, a CIDR prefix or `any`; a leading `!` (or a nested `! { ... };` block) negates it. A client that matches no entry is denied. In `allow-transfer` and `allow-update`, `key "<name>";` adds a TSIG key.
+`allow-transfer`, `allow-update`, `match-clients` and `ecs-trusted-resolvers` take a list of entries evaluated in order; the first matching entry decides. An entry is an IPv4/IPv6 address, a CIDR prefix, `any`, `none` (matches nothing) or the name of an `acl`; a leading `!` (or a nested `! { ... };` block) negates it. A client that matches no entry is denied. In `allow-transfer` and `allow-update`, `key "<name>";` adds a TSIG key; in `allow-update` the bare name of a defined key is accepted as well.
+
+`acl "<name>" { ... };` defines a named list with the same entries (including `key`, other `acl` names and negation). It may be defined before or after it is used. A reference works as if the list were written in place as a nested `{ ... };` block, and `!name` negates each of its entries like `! { ... };`. An `acl` that contains a `key` can be used in `allow-transfer` and `allow-update` only, and a key cannot be negated. The built-in names `any` and `none` are supported; BIND's `localhost` and `localnets` are not (list the addresses instead). Any other entry (a mistyped address, an undefined name) is a configuration error, so `karicheck conf` reports it.
 
 ### `zone "<name>" { ... }`
 
 | Option | Applies to | Description |
 |---|---|---|
-| `type <type>;` | all | `master` (alias `primary`, the default), `slave` (alias `secondary`), `forward`, or `program`. |
+| `type <type>;` | all | `master` (alias `primary`, the default), `slave` (alias `secondary`), `forward`, or `program`. Case-insensitive. |
 | `file "<path>";` | master, slave | Zone file. For a secondary zone the file is optional: if it exists it is loaded at startup as the initial data, and the zone is then refreshed from the primary. Transferred data is kept in memory only and is never written to the file, so after a restart a secondary serves the file's data (or nothing) until its first transfer. Ignored (with a warning) for `forward` and `program` zones. Records whose owner is not at or below the zone name (out-of-zone data, including address records for name servers outside the zone) are not loaded; each is logged as "ignoring out-of-zone data", as BIND does (RFC 1034 §4.2). A secondary likewise skips and logs out-of-zone records received in a transfer instead of rejecting the transfer. |
 | `file-format bind\|tinydns;` | master | `bind` (default) or `tinydns` (djbdns `data` file). See TINYDNS ZONE FORMAT. |
 | `masters { <addr> [port <n>]; ... };` | slave, catalog | Primary servers. NOTIFY is accepted from any listed address; the refresh and transfer use the **first** entry. Port default 53. Transfer requests carry the EDNS EXPIRE option (RFC 7314); the returned value (capped by SOA EXPIRE) sets the zone's expire timer, so a secondary that transfers from another secondary expires no later than its source. The refresh sends IXFR (AXFR when the zone has no data yet, or after `karictl retransfer`). Every message of the answer must carry the request's ID, QR=1 and OPCODE 0, and the first one the request's question (RFC 5936 §2.2.1); otherwise the transfer is rejected and logged. An answer with an error RCODE ends the transfer at once and is logged with the RCODE (and the TSIG error, when the primary rejected the zone's `tsig-key`); a primary that answers IXFR with FORMERR or NOTIMP is asked once more with AXFR (RFC 1995 §4). |

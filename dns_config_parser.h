@@ -199,6 +199,16 @@ typedef struct view_config {
   struct view_config *next;
 } view_config_t;
 
+/* D-22: トップレベルの acl "name" { ... }; 。要素は parse 時の文字列のまま持ち、
+ * 設定全体を読んだ後に各 ACL の参照を展開する。key 要素は ACL_KEY_MARK を先頭に付けて区別する */
+#define ACL_KEY_MARK '\001'
+typedef struct acl_def {
+  char *name;
+  char **entries;
+  int count;
+  struct acl_def *next;
+} acl_def_t;
+
 typedef struct server_config_s {
   int port;
   char **bind_addresses;
@@ -210,6 +220,7 @@ typedef struct server_config_s {
   zone_config_t *zones; /* 所有権を持たない参照専用フラットリスト。ビュー内ゾーンへのポインタを共有しており、フィールド書き込みや free_zone_config() は絶対に行わないこと */
   bool zones_are_flat;  /* zones が参照専用フラットリストであるかどうかの追跡フラグ */
   tsig_key_t *keys;
+  acl_def_t *acls;
   logging_config_t logging;
   control_channel_config_t control;
   dnstap_config_t dnstap;
@@ -298,6 +309,7 @@ void free_rate_limit_config(rate_limit_config_t *rrl);
 #include <sys/types.h>
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino);
 bool match_cidr(const char *client_ip_str, const char *cidr_str);
+bool parse_config_bool(const char *s, bool *out);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
 void *safe_realloc_or_die_test_wrapper(void *ptr, size_t size);
 void *safe_calloc_or_die_test_wrapper(size_t nmemb, size_t size);

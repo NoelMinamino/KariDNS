@@ -49,7 +49,8 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     zone_db_entry_t *catalog_entry_to_update,
     zone_config_t *catalog_cfg,
     catalog_member_id_t *new_desired_members, int new_desired_count);
-void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged);
+int rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged);
+int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged, char *failed, size_t failed_sz);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
 void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
 

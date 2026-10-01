@@ -708,16 +708,8 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     int error_count = 0;
     int warning_count = 0;
 
-    if (is_standalone) {
-        if (file_path[0] == '/' || strstr(file_path, "../")) {
-            fprintf(stderr, "[WARNING] The zone file path given on the command line is absolute "
-                             "or contains '../'. This is resolved directly against the host "
-                             "filesystem in standalone karicheck, but the real server resolves "
-                             "zone 'file' paths relative to its sandboxed base directory under "
-                             "KariDNS's Capsicum sandbox — behavior may differ there.\n");
-            warning_count++;
-        }
-    }
+    /* D-24: karidns は相対パス ("../" を含むものも) を起動時のディレクトリから、絶対パスはそのまま
+     * 開くので、standalone モードでも絶対パスや "../" を警告しない */
 
     bool failed = false;
     char *buf = read_file_or_die(file_path, &failed);
@@ -1854,20 +1846,22 @@ int main(int argc, char **argv) {
 
         int error_count = 0;
         int checked = 0;
+        int skipped = 0;
         for (view_config_t *v = cfg.views; v; v = v->next) {
             for (zone_config_t *z = v->zones; z; z = z->next) {
-                if (z->type && strcasecmp(z->type, "program") == 0) {
-                    printf("[INFO] Skipping file validation for program zone '%s'\n", z->domain);
-                    checked++;
-                } else if (!z->type || (strcmp(z->type, "master") == 0 || strcmp(z->type, "primary") == 0)) {
+                /* 型名はパーサが小文字の master/slave/forward/program に正規化している (D-23) */
+                if (!z->type || strcmp(z->type, "master") == 0) {
                     if (check_zone(z->domain, z->file, false, z->is_catalog, z->file_format, z, &cfg, v) != 0) {
                         error_count++;
                     }
                     checked++;
+                } else {
+                    printf("[INFO] Skipping zone '%s' (type %s): no zone file to check\n", z->domain, z->type);
+                    skipped++;
                 }
             }
         }
-        printf("[INFO] Checked %d zones. Errors: %d\n", checked, error_count);
+        printf("[INFO] Checked %d zones (%d skipped). Errors: %d\n", checked, skipped, error_count);
         return (error_count > 0) ? 1 : 0;
     } else if (strcmp(cmd, "zone") == 0) {
         if (argc < 3) {

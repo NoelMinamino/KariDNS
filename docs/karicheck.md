@@ -44,13 +44,13 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 : Validate the configuration file (see [Configuration checks](#configuration-checks)).
 
 `zones [config_path]`
-: Validate the configuration file, then every `type master` / `type primary` zone declared in it, using each zone's `file-format`. `type program` zones are reported as skipped; secondary and forward zones are not checked. Prints the number of checked zones and errors at the end.
+: Validate the configuration file, then every `type master` / `type primary` zone declared in it (the type name is case-insensitive), using each zone's `file-format`. Secondary, forward and program zones are not checked and are reported as skipped. Prints the number of checked and skipped zones and the number of errors at the end (`Checked N zones (M skipped). Errors: E`).
 
 `zone <domain> [config_path]`
 : Look up `<domain>` in the configuration file and validate its zone file with the zone's settings (`file-format`, `catalog-zone`, tags). If several views define the zone, each view's definition is checked; the exit status is 1 if any of them fails.
 
 `zone <domain> <zone_file_path>`
-: Standalone mode: parse and validate `<zone_file_path>` as a BIND-format zone for `<domain>` without a configuration file. The third argument is treated as a configuration file if it contains `.conf`, and as a zone file otherwise. A path that is absolute or contains `../` gives a warning, because the server resolves zone paths inside its sandbox.
+: Standalone mode: parse and validate `<zone_file_path>` as a BIND-format zone for `<domain>` without a configuration file. The third argument is treated as a configuration file if it contains `.conf`, and as a zone file otherwise. A relative path is resolved against the current directory; the server resolves relative zone paths (also with `../`) against the directory it was started from.
 
 `-v`, `--version`
 : Print the version and exit.
@@ -61,7 +61,10 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 
 ### Configuration checks
 
-- Syntax of the whole file, including `include` files, with the same rules as `karidns` (undefined TSIG keys in `tsig-key` / `allow-transfer`, duplicate zones/views/keys, invalid option values, ...).
+- Syntax of the whole file, including `include` files, with the same rules as `karidns` (undefined TSIG keys in `tsig-key` / `allow-transfer`, duplicate zones/views/keys/acls, invalid option values, ...).
+- Boolean values other than `yes`/`true`/`1`/`no`/`false`/`0` are errors.
+- Every entry of `allow-transfer`, `allow-update`, `match-clients`, `ecs-trusted-resolvers` and `acl` must be an address, a prefix, `any`, `none`, a defined `acl` (or, in `allow-update`, a defined key); anything else, including `localhost` and `localnets`, is an error.
+- A logging `category` that lists more than one channel gives a warning (only the first one is used).
 - `type program` zones: `program` must be set and be an absolute path, and `program-args` may have at most 62 entries (errors); a `program` that is not executable and a `program-user` that differs from `options { user }` give warnings. `allow-program-zones yes;` is required when any program zone exists.
 - `type forward` zones must have `forwarders`; a forwarder equal to one of the server's own `bind-address` / `port` pairs gives a self-loop warning.
 - Every CIDR in `ecs-tags` and `location-tags` (in `options` and in zones) must be valid; `ecs-tags` without `ecs-enable yes;` gives a warning.

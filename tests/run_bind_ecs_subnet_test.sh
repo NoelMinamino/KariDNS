@@ -303,7 +303,7 @@ EOF
 
 echo "=== 1. Validating configuration with karicheck ==="
 run_check "karicheck conf valid" "$KARICHECK conf $TMP_DIR/karidns.conf" "\[OK\] Config file .* is valid\."
-run_check "karicheck zones valid" "$KARICHECK zones $TMP_DIR/karidns.conf" "\[INFO\] Checked 4 zones\. Errors: 0"
+run_check "karicheck zones valid" "$KARICHECK zones $TMP_DIR/karidns.conf" "\[INFO\] Checked 4 zones \(0 skipped\)\. Errors: 0"
 
 run_check "karicheck conf detects undefined tag in zone" \
     "$KARICHECK zones $TMP_DIR/conf_invalid_tag.conf 2>&1 || true" \

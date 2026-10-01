@@ -13,6 +13,8 @@ void limit_client_socket_rights(int fd);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
 int stat_via_dir_cache(const char *path, struct stat *sb);
 int renameat_via_dir_cache(const char *old_path, const char *new_path);
+int list_dir_via_dir_cache(const char *file_path, void (*cb)(const char *name, void *ud), void *ud);
+int unlink_via_dir_cache(const char *path);
 
 /* options { user / group } の解決結果。privileged=true は root 起動で
  * setgroups/setgid/setuid による降格が必要なことを示す。 */

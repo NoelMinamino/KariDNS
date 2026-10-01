@@ -1744,11 +1744,19 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
     return new_snap;
 }
 
-void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
+int rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
+    return rebuild_zone_db_from_config_ext(config, skip_unchanged, NULL, 0);
+}
+
+/* 戻り値: 読み込みに失敗したプライマリゾーンの数 (D-13)。スナップショットを作れなければ -1。
+ * failed が NULL でなければ、失敗したゾーン名を ", " 区切りで入れる (入りきらなければ "..." で終える) */
+int rebuild_zone_db_from_config_ext(server_config_t *config, bool skip_unchanged, char *failed, size_t failed_sz) {
+    int nfailed = 0;
+    if (failed && failed_sz > 0) failed[0] = '\0';
     zone_db_snapshot_t *new_snap = rebuild_zone_db_snapshot(config, NULL, NULL, NULL, NULL, 0);
     if (!new_snap) {
         syslog(LOG_ERR, "[Core] Failed to rebuild zone DB snapshot from config due to allocation failure. Reload aborted.");
-        return;
+        return -1;
     }
 
     for (view_config_t *v = config->views; v; v = v->next) {
@@ -1760,8 +1768,16 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
                     struct stat st;
                     if (skip_unchanged && stat_via_dir_cache(z->file, &st) == 0 && entry->last_loaded_mtime != 0 && st.st_mtime == entry->last_loaded_mtime) {
                         syslog(LOG_DEBUG, "[Config] zone '%s' file unchanged (mtime match), skipping reload", z->domain);
-                    } else {
-                        reload_master_zone(entry, z);
+                    } else if (reload_master_zone(entry, z) != RELOAD_OK) {
+                        nfailed++;
+                        if (failed && failed_sz > 0) {
+                            size_t used = strlen(failed);
+                            int w = snprintf(failed + used, failed_sz - used, "%s%s", used ? ", " : "", z->domain);
+                            if (w < 0 || (size_t)w >= failed_sz - used) {
+                                /* 入りきらない: 末尾を "..." にする */
+                                if (failed_sz >= 4) memcpy(failed + failed_sz - 4, "...", 4);
+                            }
+                        }
                     }
                 }
                 release_zone_snapshot(snap);
@@ -1826,6 +1842,7 @@ void rebuild_zone_db_from_config(server_config_t *config, bool skip_unchanged) {
         }
         release_zone_snapshot(relink_snap);
     }
+    return nfailed;
 }
 
 void zone_arena_clear_data_pools(zone_arena_t *arena) {

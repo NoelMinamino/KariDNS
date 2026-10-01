@@ -47,8 +47,10 @@ Commands that take a zone name accept an optional view name as the next argument
 
 `status`
 : Query and display runtime statistics from the running `karidns` daemon:
-  - Version, host name, OS, architecture and kernel release, CPU count and worker thread count
-  - Server boot time, time of the last (re)configuration and the configuration file path
+  - Version, host name, OS, architecture and kernel release and CPU count of the running server (taken when it started), and its worker thread count
+  - Server boot time, time of the last successful (re)configuration (both to the second) and the configuration file path
+
+  `karictl` and `karidns` must be the same version: the reply is a binary structure, and a reply of another size is shown as is and exits with status 3.
   - Number of zones and number of running AXFR/IXFR transfers
   - Whether query and response logging are enabled
   - Current and high-water TCP connection counts
@@ -56,10 +58,17 @@ Commands that take a zone name accept an optional view name as the next argument
   - Security counters: RRL dropped/slipped responses, Extended DNS Error counters (18 Prohibited, 20 Not Authoritative, 21 Not Supported, other) and truncated dnstap messages
 
 `reload [zone [view]]`
-: Without arguments, re-read the configuration file and **all** zone files. With a zone name, reload only that zone: a primary zone re-reads its zone file (errors such as a missing file, a parse error, a missing SOA or a running AXFR are reported), and a secondary zone starts a new transfer from its primary.
+: Without arguments, re-read the configuration file and **all** zone files (see `reconfig` for the replies). With a zone name, reload only that zone: a primary zone re-reads its zone file (errors such as a missing file, a parse error, a missing SOA or a running AXFR are reported), and a secondary zone starts a new transfer from its primary.
 
 `reconfig`
 : Re-read the configuration file and apply it (added or removed zones, ACLs, rate limits, ...). Zone files whose modification time has not changed are not re-read. This is the same as sending `SIGHUP` to the server.
+  `reload` (without arguments) and `reconfig` answer:
+  - `OK` (`OK reloaded` for `reload`): the configuration was applied and every zone loaded. When a setting that needs a restart changed, `(restart needed for: port, ...)` follows.
+  - `ERROR configuration applied, but N zone(s) failed to load: <zones>`: the new configuration is in use, and the listed zones (also logged to syslog) answer SERVFAIL until their files can be loaded.
+  - `ERROR configuration not applied: <reason>`: the file could not be read, has an error (see syslog or `karicheck conf`), or a log file could not be opened; the running configuration is kept.
+  - `ERROR reload postponed: ...`: readers of the previous configuration were still active; the server retries the reload by itself every second.
+
+  Every `ERROR` reply makes `karictl` exit with status 3.
 
 `stop`
 : Stop the `karidns` daemon.
@@ -117,7 +126,7 @@ The file is not parsed as a full configuration file: `karictl` takes the quoted 
 : The secret could not be read or decoded from the configuration file, the challenge was invalid, or authentication failed.
 
 `3`
-: The server returned an error (`ERROR ...`) or an invalid `observatory` response.
+: The server returned an error (`ERROR ...`, including a failed `reload` or `reconfig`) or an invalid `status` or `observatory` response.
 
 ---
 

@@ -65,6 +65,13 @@ typedef struct {
     uint64_t ede_ns;
     uint64_t ede_oth;
     uint64_t dnstap_truncated;
+    /* D-12: 動いている karidns 自身の値 (起動時に取得)。karictl のローカルの値ではない */
+    char version[32];
+    char hostname[256];
+    char os_name[64];
+    char os_release[64];
+    char machine[64];
+    int ncpus;
 } karidns_status_t;
 
 // ============================================================================

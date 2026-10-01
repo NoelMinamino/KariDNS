@@ -574,6 +574,23 @@ typedef struct {
 
 extern async_io_pool_t g_async_io_pool;
 
+/* D-13 / O-05: 設定の再読み込みの結果。karictl reload / reconfig の応答に使う */
+typedef enum {
+  CONFIG_RELOAD_OK = 0,
+  CONFIG_RELOAD_ZONE_ERRORS, /* 設定は反映した。zones_failed 個のゾーンが読み込めなかった */
+  CONFIG_RELOAD_READ_ERROR,  /* 設定ファイルを読めない。反映していない */
+  CONFIG_RELOAD_PARSE_ERROR, /* 設定の誤り。反映していない */
+  CONFIG_RELOAD_REJECTED,    /* 設定は正しいが適用できない (detail に理由)。反映していない */
+  CONFIG_RELOAD_POSTPONED    /* 前の設定の読み手が残っている。制御スレッドが後で再試行する */
+} config_reload_status_t;
+
+typedef struct {
+  config_reload_status_t status;
+  int zones_failed;
+  char detail[384];         /* 失敗したゾーン名、または拒否の理由 */
+  char restart_needed[192]; /* O-09: 変わったが再起動まで反映されない設定 ("port, bind-address") */
+} config_reload_result_t;
+
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
 extern int g_broker_sock;
@@ -591,9 +608,9 @@ extern volatile sig_atomic_t g_backend_should_exit;
 
 bool enqueue_async_io_task(const async_io_task_t *task);
 void *async_io_worker_func(void *arg);
-void reload_all_zones(void);
-void perform_config_reload(void);
-void perform_config_reload_ext(bool skip_unchanged);
+config_reload_result_t reload_all_zones(void);
+config_reload_result_t perform_config_reload(void);
+config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,
                      const char *qname, uint16_t qclass, uint16_t qtype,

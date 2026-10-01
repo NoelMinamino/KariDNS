@@ -40,9 +40,7 @@
 #include <grp.h>
 
 // Internal server core prototypes for testing
-void perform_config_reload(void);
-void perform_config_reload_ext(bool skip_unchanged);
-void reload_all_zones(void);
+// (perform_config_reload / perform_config_reload_ext / reload_all_zones come from dns_server_internal.h)
 void run_frontend_router(pid_t backend_pid, int router_id);
 void backend_sig_handler(int sig);
 void daemonize(void);
@@ -496,6 +494,87 @@ static void test_log_write_rotated(void) {
     unlink(ts_path);
 
     printf("  -> log_write_rotated passed.\n");
+}
+
+/* D-21: suffix timestamp のサイズローテーションが同じ日に何度起きても上書きせず、
+ * versions <n> のときは日付付きのファイルを新しい順に n 個だけ残す (BIND と同じ) */
+static int count_lines_of(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int n = 0, c;
+    while ((c = fgetc(f)) != EOF) if (c == '\n') n++;
+    fclose(f);
+    return n;
+}
+
+static void rotate_ts_run(int versions, int *kept_files, int *kept_lines) {
+    char dir[] = "/tmp/karidns_test_tsrot_XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    char path[256], p[300];
+    snprintf(path, sizeof(path), "%s/q.log", dir);
+    /* 対象外のファイル: 別のベース名、日付でない接尾辞、先頭 0 の連番 */
+    const char *others[] = { "other.log.20250101", "q.log.notes", "q.log.20250101.01", "q.log.2025010" };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        snprintf(p, sizeof(p), "%s/%s", dir, others[i]);
+        int fd = open(p, O_WRONLY | O_CREAT, 0644);
+        assert(fd >= 0);
+        close(fd);
+    }
+    snprintf(p, sizeof(p), "%s.20250101", path); /* 前日以前のローテーション済みファイル */
+    FILE *old = fopen(p, "w");
+    assert(old);
+    fputs("old\n", old);
+    fclose(old);
+
+    log_channel_t ch;
+    memset(&ch, 0, sizeof(ch));
+    ch.file_path = path;
+    ch.size_limit = 50;
+    ch.versions = versions;
+    ch.suffix_timestamp = true;
+    pthread_mutex_init(&ch.lock, NULL);
+    ch.fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert(ch.fd >= 0);
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    int today = (tm_info.tm_year + 1900) * 10000 + (tm_info.tm_mon + 1) * 100 + tm_info.tm_mday;
+    ch.current_date = today;
+
+    const char *line = "0123456789012345678901234567890123456789\n"; /* 41 bytes: 1 line per file */
+    for (int i = 0; i < 6; i++) log_write_rotated(&ch, line, (int)strlen(line), &tm_info);
+    close(ch.fd);
+    pthread_mutex_destroy(&ch.lock);
+
+    /* 6 行 = 現在のファイル 1 行 + 同じ日のローテーション 5 回 (.DATE, .DATE.1 .. .DATE.4) */
+    *kept_files = 0;
+    *kept_lines = count_lines_of(path);
+    for (int seq = 0; seq <= 4; seq++) {
+        if (seq) snprintf(p, sizeof(p), "%s.%08d.%d", path, today, seq);
+        else snprintf(p, sizeof(p), "%s.%08d", path, today);
+        int n = count_lines_of(p);
+        if (n >= 0) { (*kept_files)++; *kept_lines += n; unlink(p); }
+    }
+    snprintf(p, sizeof(p), "%s.20250101", path);
+    if (count_lines_of(p) >= 0) { (*kept_files)++; unlink(p); }
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        snprintf(p, sizeof(p), "%s/%s", dir, others[i]);
+        assert(unlink(p) == 0); /* 形式の違うファイルは消さない */
+    }
+    unlink(path);
+    assert(rmdir(dir) == 0);
+}
+
+static void test_log_write_rotated_timestamp_versions(void) {
+    printf("[TEST] Server Core: suffix timestamp rotation keeps every file of the day, versions prunes (D-21)...\n");
+    int files, lines;
+    rotate_ts_run(0, &files, &lines);
+    assert(files == 6);  /* versions なし: 何も消さない (今日の 5 個 + 前日の 1 個) */
+    assert(lines == 6);  /* 書いた 6 行が全部残る (上書きしない) */
+    rotate_ts_run(3, &files, &lines);
+    assert(files == 3);  /* 新しい 3 個 (.DATE.2 .. .DATE.4) だけ残る。前日のものは消える */
+    assert(lines == 4);  /* 現在のファイル 1 行 + 残った 3 個 */
+    printf("  -> timestamp rotation passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -5546,6 +5625,7 @@ int main(void) {
     test_query_log_max_qps_and_circuit_breaker();
     test_submit_response_log();
     test_log_write_rotated();
+    test_log_write_rotated_timestamp_versions();
     test_fill_observatory_snapshot();
     test_synthetic_zone_and_find_domain();
     test_ensure_priv_dir_safe();
