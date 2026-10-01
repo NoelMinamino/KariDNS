@@ -338,12 +338,23 @@ static char *resolve_include_path(const char *base_dir, const char *rel_path,
 
 #define MAX_INCLUDE_DEPTH 16
 
+/* 1つのゾーンの読み込み中に、$INCLUDE と $GENERATE をまたいで共有する状態。
+ * origin だけは $INCLUDE ごとに別 (RFC 1035 §5.1: $INCLUDE は親ファイルの origin を変えない)。 */
+typedef struct {
+    char **origin_io;
+    char **ttl_io;       /* $TTL (RFC 2308 §4)。TTL の無い SOA の MINIMUM もここに入る (BIND と同じ) */
+    char **last_ttl_io;  /* 最後に明示された TTL (RFC 1035 §5.1) */
+    char **ecs_tag_io;
+    char **loc_tag_io;
+} zone_parse_state_t;
+
+static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
+                             const zone_parse_state_t *st, bool finalize);
+
 static int process_include(char **fields, int field_idx, zone_arena_t *arena,
-                            parse_context_t *ctx, char **origin_io, char *cur_buf) {
-    if (!ctx || !ctx->shared_ttl_io) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = "$INCLUDE requires shared_ttl_io to be configured by the caller";
-        }
+                            parse_context_t *ctx, const zone_parse_state_t *st, char *cur_buf) {
+    if (!ctx || !ctx->load_file_cb || !ctx->base_dir) {
+        if (ctx && ctx->err_out) ctx->err_out->error_message = "$INCLUDE is not available (no file loader configured by the caller)";
         return -1;
     }
     if (field_idx < 2) {
@@ -417,30 +428,32 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     arena->file_paths[arena->file_buf_count] = resolved;
     arena->file_buf_count++;
 
-    char *saved_origin = *origin_io;
-    char *child_origin = (field_idx > 2) ? fields[2] : *origin_io;
+    /* RFC 1035 §5.1: $INCLUDE の origin 引数も、相対名なら現在の origin を補う (R-22 d) */
+    char *child_origin = *st->origin_io;
+    if (field_idx > 2) {
+        child_origin = expand_domain_name(fields[2], *st->origin_io, arena);
+        if (!validate_domain_name_length(child_origin, ctx->err_out, fields[2], cur_buf))
+            return -1;
+    }
 
     ctx->visited_paths[ctx->visited_count] = resolved;
     if (ctx->visited_devs) ctx->visited_devs[ctx->visited_count] = cur_dev;
     if (ctx->visited_inos) ctx->visited_inos[ctx->visited_count] = cur_ino;
     ctx->visited_count++;
 
-    parse_context_t child_ctx = *ctx; 
+    parse_context_t child_ctx = *ctx;
     child_ctx.default_origin = child_origin;
     child_ctx.current_depth = ctx->current_depth + 1;
-    child_ctx.shared_ttl_io = ctx->shared_ttl_io; 
-    child_ctx.shared_ecs_tag_io = ctx->shared_ecs_tag_io;
-    child_ctx.shared_loc_tag_io = ctx->shared_loc_tag_io;
+    zone_parse_state_t child_st = *st;
+    child_st.origin_io = &child_origin;
 
-    int rc = parse_zone_fast(file_content, strlen(file_content), arena, &child_ctx);
+    int rc = parse_zone_buffer(file_content, strlen(file_content), arena, &child_ctx, &child_st, false);
 
     if (rc < 0 && ctx && ctx->err_out && !ctx->err_out->file_path) {
         ctx->err_out->file_path = resolved;
     }
 
     ctx->visited_count--;
-
-    *origin_io = saved_origin;
 
     return rc;
 }
@@ -472,6 +485,37 @@ dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, cons
     dns_record_t *rec = &arena->records[arena->count++];
     memset(rec, 0, sizeof(dns_record_t));
     return rec;
+}
+
+/* クラス欄のニーモニック (RFC 1035 §5.1, RFC 3597 §5)。大文字小文字は区別しない (RFC 1035 §2.3.3)。
+ * NONE/ANY も「クラス欄」としては認識し、ゾーンデータに使えるかは呼び出し側で判定する。 */
+static bool parse_class_token(const char *s, uint16_t *out) {
+    if (strcasecmp(s, "IN") == 0) { *out = 1; return true; }
+    if (strcasecmp(s, "CH") == 0) { *out = 3; return true; }
+    if (strcasecmp(s, "HS") == 0) { *out = 4; return true; }
+    if (strcasecmp(s, "NONE") == 0) { *out = 254; return true; }
+    if (strcasecmp(s, "ANY") == 0) { *out = 255; return true; }
+    if (strncasecmp(s, "CLASS", 5) == 0 && s[5] != '\0') {
+        unsigned long v = 0;
+        for (const char *d = s + 5; *d; d++) {
+            if (*d < '0' || *d > '9') return false;
+            v = v * 10 + (unsigned long)(*d - '0');
+            if (v > 65535) return false;
+        }
+        *out = (uint16_t)v;
+        return true;
+    }
+    return false;
+}
+
+/* ゾーンデータとして置けないクラス: 0 (予約)、NONE/ANY (QCLASS と UPDATE 専用。RFC 6895 §3.2、
+ * RFC 2136 §2.4)、KariDNS が内部で使う私用クラス (ゾーンファイルから注入させない)。 */
+static bool class_allowed_in_zone_data(uint16_t cls) {
+    return cls != 0 && cls != 254 && cls != 255 && cls != DNS_CLASS_KARIDNS_EXT;
+}
+
+static void upcase_in_place(char *s) {
+    for (; *s; s++) *s = (char)toupper((unsigned char)*s);
 }
 
 #define MAX_GENERATE_COUNT 100000
@@ -533,9 +577,41 @@ static int parse_generate_range(const char *range_str, generate_range_t *out, pa
     return 0;
 }
 
+/* BIND の $GENERATE の n/N 修飾子 (lib/dns/master.c nibbles()): 値を下位ニブルから順に 1 桁ずつ
+ * '.' で区切って書く (逆引きの ip6.arpa 名を作るため)。width は '.' も含めた文字数で、足りなければ 0 を補う。 */
+static int generate_nibbles(char *out, size_t out_cap, int width, char mode, uint64_t value) {
+    static const char hex_lc[] = "0123456789abcdef", hex_uc[] = "0123456789ABCDEF";
+    const char *hex = (mode == 'n') ? hex_lc : hex_uc;
+    size_t n = 0;
+    do {
+        if (n + 1 >= out_cap) return -1;
+        out[n++] = hex[value & 0x0f];
+        value >>= 4;
+        if (width > 0) width--;
+        if (width > 0 || value != 0) {
+            if (n + 1 >= out_cap) return -1;
+            out[n++] = '.';
+            if (width > 0) width--;
+        }
+    } while (value != 0 || width > 0);
+    out[n] = '\0';
+    return (int)n;
+}
+
+/* BIND の genname() と同じ規則で $GENERATE の lhs / rhs を展開する。
+ * "$" は値、"$$" は "$"、"${offset[,width[,base]]}" の base は d o x X n N。
+ * '\' はその次の 1 文字と一緒にそのまま写す ("\$" は後で名前・RDATA として読むときに '$' になる)。 */
 static size_t expand_generate_template(const char *tmpl, uint64_t value, char *out, size_t out_cap, parse_error_t *err_out) {
     size_t out_len = 0;
     for (const char *p = tmpl; *p; ) {
+        if (*p == '\\') {
+            size_t n = (p[1] != '\0') ? 2 : 1;
+            if (out_len + n > out_cap) return (size_t)-1;
+            memcpy(out + out_len, p, n);
+            out_len += n;
+            p += n;
+            continue;
+        }
         if (*p == '$') {
             p++;
             if (*p == '$') {
@@ -573,16 +649,25 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
                 }
                 p++;
             }
-            if (base != 'd' && base != 'o' && base != 'x' && base != 'X') {
-                if (err_out) err_out->error_message = "$GENERATE base must be one of d,o,x,X";
+            if (base != 'd' && base != 'o' && base != 'x' && base != 'X' && base != 'n' && base != 'N') {
+                if (err_out) err_out->error_message = "$GENERATE base must be one of d,o,x,X,n,N";
                 return (size_t)-1;
             }
 
             int64_t v = (int64_t)value + offset;
-            char numbuf[80];
-            const char *fmt = (base == 'd') ? "%0*lld" : (base == 'o') ? "%0*llo" : (base == 'x') ? "%0*llx" : "%0*llX";
-            int n = (base == 'd') ? snprintf(numbuf, sizeof(numbuf), fmt, width, (long long)v)
+            char numbuf[160];
+            int n;
+            if (base == 'n' || base == 'N') {
+                if (v < 0) {
+                    if (err_out) err_out->error_message = "$GENERATE nibble value must not be negative";
+                    return (size_t)-1;
+                }
+                n = generate_nibbles(numbuf, sizeof(numbuf), width, base, (uint64_t)v);
+            } else {
+                const char *fmt = (base == 'd') ? "%0*lld" : (base == 'o') ? "%0*llo" : (base == 'x') ? "%0*llx" : "%0*llX";
+                n = (base == 'd') ? snprintf(numbuf, sizeof(numbuf), fmt, width, (long long)v)
                                   : snprintf(numbuf, sizeof(numbuf), fmt, width, (unsigned long long)v);
+            }
             if (n < 0 || (size_t)n >= sizeof(numbuf)) return (size_t)-1;
             if (out_len + (size_t)n > out_cap) return (size_t)-1;
             memcpy(out + out_len, numbuf, (size_t)n);
@@ -597,138 +682,150 @@ static size_t expand_generate_template(const char *tmpl, uint64_t value, char *o
     return out_len;
 }
 
+static void generate_error(parse_context_t *ctx, const char *msg, const char *tok, const char *cur_buf) {
+    if (!ctx || !ctx->err_out) return;
+    if (msg) ctx->err_out->error_message = msg;
+    ctx->err_out->error_offset = (size_t)(tok - cur_buf);
+    ctx->err_out->token_length = strlen(tok);
+}
+
+/* 展開した lhs は 1 行の先頭のオーナー名として読み直すので、1 トークンでなければならない */
+static bool generate_lhs_is_single_token(const char *s) {
+    if (s[0] == '\0' || s[0] == '$') return false;
+    for (; *s; s++) {
+        if (*s == '\\') {
+            if (s[1] == '\0') return false;
+            s++;
+            continue;
+        }
+        if (IS_SPACE(*s) || IS_NEWLINE(*s) || *s == '"' || *s == ';' || *s == '(' || *s == ')') return false;
+    }
+    return true;
+}
+
+/* $GENERATE range lhs [ttl] [class] type rhs (BIND の構文。ttl と class は順不同)。
+ * rhs は 1 フィールドで、空白を含む RDATA は引用符で囲む (例: MX "10 mail$")。
+ * 値ごとに "lhs [ttl] [class] type rhs" の 1 行を作り、通常のレコード行と同じ処理に通す
+ * (BIND も展開した rhs を通常の RDATA として読む)。そのため型の制限は無く、検証・エスケープ・
+ * TTL の既定値・$ECS-SUBNET / $LOCATION のタグも通常の行と同じになる (R-22 e, D-18)。 */
 static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
-                             parse_context_t *ctx, const char *origin,
-                             const char *default_ttl, const char *cur_buf,
-                             const char *ecs_tag, const char *loc_tag) {
+                             parse_context_t *ctx, const zone_parse_state_t *st, const char *cur_buf) {
     if (field_idx < 5) {
-        if (ctx && ctx->err_out) ctx->err_out->error_message = "$GENERATE requires range lhs type rhs";
+        generate_error(ctx, "$GENERATE requires range lhs [ttl] [class] type rhs", fields[0], cur_buf);
         return -1;
     }
     parse_error_t local_err = {0};
     generate_range_t range;
     if (parse_generate_range(fields[1], &range, &local_err) != 0) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = local_err.error_message;
-            ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
-            ctx->err_out->token_length = strlen(fields[1]);
-        }
+        generate_error(ctx, local_err.error_message, fields[1], cur_buf);
         return -1;
     }
 
     const char *lhs_tmpl = fields[2];
-    const char *type_str = NULL;
-    const char *rhs_tmpl = NULL;
-    const char *class_str = "IN";
-    const char *ttl_str = default_ttl;
-
+    const char *ttl_str = NULL, *class_str = NULL, *type_str = NULL, *rhs_tmpl = NULL;
     int i = 3;
-    while (i < field_idx) {
-        char first_char = fields[i][0];
-        if (first_char >= '0' && first_char <= '9') {
+    for (; i < field_idx; i++) {
+        uint16_t cls;
+        if (!ttl_str && fields[i][0] >= '0' && fields[i][0] <= '9') {
             ttl_str = fields[i];
-        } else if (strcasecmp(fields[i], "IN") == 0 || strcasecmp(fields[i], "CH") == 0) {
+        } else if (!class_str && parse_class_token(fields[i], &cls)) {
             class_str = fields[i];
         } else {
             type_str = fields[i];
-            if (i + 1 < field_idx) {
-                rhs_tmpl = fields[i + 1];
-            }
             break;
         }
-        i++;
     }
-
+    if (type_str && i + 1 < field_idx) rhs_tmpl = fields[i + 1];
     if (!type_str || !rhs_tmpl) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = "$GENERATE requires range lhs [ttl] [class] type rhs";
-            ctx->err_out->error_offset = (size_t)(fields[0] - cur_buf);
-            ctx->err_out->token_length = strlen(fields[0]);
-        }
+        generate_error(ctx, "$GENERATE requires range lhs [ttl] [class] type rhs", fields[0], cur_buf);
+        return -1;
+    }
+    if (i + 2 < field_idx) {
+        generate_error(ctx, "$GENERATE rhs must be a single field (quote an rhs that contains spaces)",
+                       fields[i + 2], cur_buf);
+        return -1;
+    }
+    if (get_type_code(type_str) == 0) {
+        generate_error(ctx, "Unknown record type", type_str, cur_buf);
         return -1;
     }
 
-    uint16_t type_code = get_type_code(type_str);
-    if (type_code != 1 && type_code != 28 && type_code != 2 &&
-        type_code != 5 && type_code != 12 && type_code != 39 &&
-        type_code != 16) {
-        if (ctx && ctx->err_out) {
-            ctx->err_out->error_message = "$GENERATE does not support this record type";
-            ctx->err_out->error_offset = (size_t)(fields[3] - cur_buf);
-            ctx->err_out->token_length = strlen(fields[3]);
-        }
-        return -1;
-    }
-
-    char name_buf[512], rdata_buf[512];
+    char lhs_buf[DNS_NAME_TEXT_SIZE], rhs_buf[4096];
     for (uint64_t v = range.start; v <= range.stop; v += range.step) {
-        size_t name_len = expand_generate_template(lhs_tmpl, v, name_buf, sizeof(name_buf), &local_err);
-        if (name_len == (size_t)-1) {
-            if (ctx && ctx->err_out) {
-                ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE lhs expansion failed";
-                ctx->err_out->error_offset = (size_t)(fields[2] - cur_buf);
-                ctx->err_out->token_length = strlen(fields[2]);
-            }
+        size_t lhs_len = expand_generate_template(lhs_tmpl, v, lhs_buf, sizeof(lhs_buf), &local_err);
+        if (lhs_len == (size_t)-1) {
+            generate_error(ctx, local_err.error_message ? local_err.error_message : "$GENERATE lhs expansion failed",
+                           fields[2], cur_buf);
             return -1;
         }
-        size_t rdata_len = expand_generate_template(rhs_tmpl, v, rdata_buf, sizeof(rdata_buf), &local_err);
-        if (rdata_len == (size_t)-1) {
-            if (ctx && ctx->err_out) {
-                ctx->err_out->error_message = local_err.error_message ? local_err.error_message : "$GENERATE rhs expansion failed";
-                ctx->err_out->error_offset = (size_t)(fields[4] - cur_buf);
-                ctx->err_out->token_length = strlen(fields[4]);
-            }
+        if (!generate_lhs_is_single_token(lhs_buf)) {
+            generate_error(ctx, "$GENERATE lhs must expand to a single owner name", fields[2], cur_buf);
+            return -1;
+        }
+        size_t rhs_len = expand_generate_template(rhs_tmpl, v, rhs_buf, sizeof(rhs_buf), &local_err);
+        if (rhs_len == (size_t)-1) {
+            generate_error(ctx, local_err.error_message ? local_err.error_message : "$GENERATE rhs expansion failed",
+                           rhs_tmpl, cur_buf);
             return -1;
         }
 
-        dns_record_t *rec = arena_alloc_record(arena, ctx, fields[0], cur_buf);
-        if (!rec) return -1;
-        rec->ecs_subnet_tag = (char *)ecs_tag;
-        rec->bind_location_tag = (char *)loc_tag;
-
-        char *name_copy = arena_alloc(arena, name_len + 1);
-        if (!name_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
-        memcpy(name_copy, name_buf, name_len + 1);
-
-        char *rdata_copy = arena_alloc(arena, rdata_len + 1);
-        if (!rdata_copy) { if (ctx && ctx->err_out) ctx->err_out->error_message = "Out of memory"; return -1; }
-        memcpy(rdata_copy, rdata_buf, rdata_len + 1);
-
-        rec->name = expand_domain_name(name_copy, origin, arena);
-        if (!validate_domain_name_length(rec->name, ctx ? ctx->err_out : NULL, fields[0], cur_buf)) {
+        /* レコードは行バッファ内の文字列を指すので、行はアリーナに置く */
+        size_t line_cap = lhs_len + rhs_len + strlen(type_str) + (ttl_str ? strlen(ttl_str) : 0) +
+                          (class_str ? strlen(class_str) : 0) + 8;
+        char *line = arena_alloc(arena, line_cap);
+        if (!line) {
+            generate_error(ctx, "Out of memory", fields[0], cur_buf);
             return -1;
         }
-        rec->ttl = (char *)ttl_str;
-        rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
-        rec->class_str = (char *)class_str;
-        rec->type = (char *)type_str;
-        rec->type_code = type_code;
-        rec->rdata_count = 1;
-        rec->rdata[0] = rdata_copy;
-
-        if (type_code == 2 || type_code == 5 || type_code == 12 || type_code == 39) {
-            rec->rdata[0] = expand_domain_name(rec->rdata[0], origin, arena);
-            if (!validate_domain_name_length(rec->rdata[0], ctx ? ctx->err_out : NULL, fields[4], cur_buf)) {
-                return -1;
-            }
+        int line_len = snprintf(line, line_cap, "%s %s%s%s%s%s %s\n", lhs_buf,
+                                ttl_str ? ttl_str : "", ttl_str ? " " : "",
+                                class_str ? class_str : "", class_str ? " " : "", type_str, rhs_buf);
+        if (line_len < 0 || (size_t)line_len >= line_cap) {
+            generate_error(ctx, "$GENERATE line too long", fields[0], cur_buf);
+            return -1;
         }
 
-        if (v == UINT64_MAX) break;
+        /* 生成した行で origin が変わることは無いが、親の origin は書き換えさせない */
+        char *gen_origin = *st->origin_io;
+        zone_parse_state_t gen_st = *st;
+        gen_st.origin_io = &gen_origin;
+        if (parse_zone_buffer(line, (size_t)line_len, arena, ctx, &gen_st, false) < 0) {
+            /* エラー位置は生成した行ではなく、$GENERATE の行を指す */
+            generate_error(ctx, NULL, fields[0], cur_buf);
+            return -1;
+        }
+
+        if (range.stop - v < range.step) break;
     }
     return 0;
 }
 
 int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx) {
-  char *prev_owner = NULL;
   char *origin = ctx ? (char *)ctx->default_origin : NULL;
   char *local_ttl_storage = NULL;
+  char *last_ttl = NULL;
   char *local_ecs_tag_storage = NULL;
   char *local_loc_tag_storage = NULL;
+  zone_parse_state_t st = {
+    .origin_io = &origin,
+    .ttl_io = (ctx && ctx->shared_ttl_io) ? ctx->shared_ttl_io : &local_ttl_storage,
+    .last_ttl_io = &last_ttl,
+    .ecs_tag_io = (ctx && ctx->shared_ecs_tag_io) ? ctx->shared_ecs_tag_io : &local_ecs_tag_storage,
+    .loc_tag_io = (ctx && ctx->shared_loc_tag_io) ? ctx->shared_loc_tag_io : &local_loc_tag_storage,
+  };
+  return parse_zone_buffer(buf, size, arena, ctx, &st, true);
+}
+
+/* finalize: 最上位のファイルの読み込みの最後に、全レコードの前処理キャッシュを作る。
+ * $INCLUDE と $GENERATE の行は最上位がまとめて処理するので false で呼ぶ。 */
+static int parse_zone_buffer(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx,
+                             const zone_parse_state_t *st, bool finalize) {
+  char *prev_owner = NULL;
   char **prev_owner_io = &prev_owner;
-  char **origin_io = &origin;
-  char **default_ttl_str_io = (ctx && ctx->shared_ttl_io) ? ctx->shared_ttl_io : &local_ttl_storage;
-  char **ecs_tag_io = (ctx && ctx->shared_ecs_tag_io) ? ctx->shared_ecs_tag_io : &local_ecs_tag_storage;
-  char **loc_tag_io = (ctx && ctx->shared_loc_tag_io) ? ctx->shared_loc_tag_io : &local_loc_tag_storage;
+  char **origin_io = st->origin_io;
+  char **default_ttl_str_io = st->ttl_io;
+  char **ecs_tag_io = st->ecs_tag_io;
+  char **loc_tag_io = st->loc_tag_io;
   if (!buf || size == 0 || !arena)
     return -1;
   char *p = buf, *end = buf + size;
@@ -950,24 +1047,26 @@ PROCESS_RECORD:
   }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$ORIGIN") == 0) {
     if (field_idx > 1) {
-      if (!validate_domain_name_length(fields[1], ctx ? ctx->err_out : NULL, fields[1], buf)) {
+      /* RFC 1035 §5.1: 相対名の $ORIGIN は現在の origin を補って絶対名にする (R-22 d) */
+      char *new_origin = expand_domain_name(fields[1], *origin_io, arena);
+      if (!validate_domain_name_length(new_origin, ctx ? ctx->err_out : NULL, fields[1], buf)) {
         return -1;
       }
-      *origin_io = fields[1];
+      *origin_io = new_origin;
     }
     if (p < end)
       goto STATE_START_LINE;
     goto DONE;
   }
     if (fields[0][0] == '$' && strcasecmp(fields[0], "$INCLUDE") == 0) {
-        if (process_include(fields, field_idx, arena, ctx, origin_io, buf) < 0)
+        if (process_include(fields, field_idx, arena, ctx, st, buf) < 0)
             return -1;
         if (p < end)
             goto STATE_START_LINE;
         goto DONE;
     }
     if (fields[0][0] == '$' && strcasecmp(fields[0], "$GENERATE") == 0) {
-        if (process_generate(fields, field_idx, arena, ctx, *origin_io, *default_ttl_str_io, buf, *ecs_tag_io, *loc_tag_io) != 0)
+        if (process_generate(fields, field_idx, arena, ctx, st, buf) != 0)
             return -1;
         if (p < end)
             goto STATE_START_LINE;
@@ -1108,20 +1207,33 @@ PROCESS_RECORD:
       return -1;
   }
   *prev_owner_io = rec->name;
-  rec->ttl = *default_ttl_str_io;
+  rec->ttl = NULL;
   rec->class_str = NULL;
   rec->type = NULL;
   rec->rdata_count = 0;
+  /* RFC 1035 §5.1: <owner> [<TTL>] [<class>] <type> <RDATA>。TTL と class は順不同で各 1 回
+   * (2 つ目は型として読むので、BIND と同じく不正な型になる)。 */
+  char *explicit_ttl = NULL;
+  uint16_t class_val = 1; // クラス省略時は IN (BIND はゾーンのクラスを使う。KariDNS のゾーンは IN)
   int i = 1;
   while (i < field_idx) {
     char first_char = fields[i][0];
-    if (first_char >= '0' && first_char <= '9')
-      rec->ttl = fields[i];
-    else if ((first_char == 'I' && fields[i][1] == 'N' &&
-              fields[i][2] == '\0') ||
-             strcmp(fields[i], "CH") == 0)
+    uint16_t cls;
+    if (!explicit_ttl && first_char >= '0' && first_char <= '9')
+      explicit_ttl = fields[i];
+    else if (!rec->class_str && parse_class_token(fields[i], &cls)) {
+      if (!class_allowed_in_zone_data(cls)) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "Class not allowed in zone data (0, NONE, ANY or a reserved class)";
+          ctx->err_out->error_offset = (size_t)(fields[i] - buf);
+          ctx->err_out->token_length = strlen(fields[i]);
+        }
+        return -1;
+      }
+      upcase_in_place(fields[i]);
       rec->class_str = fields[i];
-    else {
+      class_val = cls;
+    } else {
       rec->type = fields[i];
       i++;
       break;
@@ -1158,6 +1270,7 @@ PROCESS_RECORD:
     }
     return -1;
   }
+  upcase_in_place(rec->type); // 型名は大文字小文字を区別しない (RFC 1035 §2.3.3)。以後は大文字の綴りで扱う
 
   /* Meta-types (OPT/TKEY/TSIG/IXFR/AXFR/MAILB/MAILA/ANY, and NXNAME per
    * RFC 9824) are QTYPE-only / synthesized-on-the-fly pseudo-RRs. They must
@@ -1174,11 +1287,22 @@ PROCESS_RECORD:
     return -1;
   }
   
-  rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
-  rec->class_val = 1; // Default to IN
-  if (rec->class_str && strcasecmp(rec->class_str, "CH") == 0) {
-      rec->class_val = 3;
+  /* TTL を省略したときの値 (R-22 c)。BIND (lib/dns/master.c) と同じ順で決める:
+   * 明示した TTL > $TTL (RFC 2308 §4) > 最後に明示された TTL (RFC 1035 §5.1) >
+   * TTL の手がかりが無い SOA ならその MINIMUM (以後の既定値になる) > 3600。 */
+  if (explicit_ttl) {
+    rec->ttl = explicit_ttl;
+    *st->last_ttl_io = explicit_ttl;
+  } else if (*default_ttl_str_io) {
+    rec->ttl = *default_ttl_str_io;
+  } else if (*st->last_ttl_io) {
+    rec->ttl = *st->last_ttl_io;
+  } else if (rec->type_code == 6 && rec->rdata_count == 7) {
+    rec->ttl = rec->rdata[6];
+    *default_ttl_str_io = rec->rdata[6];
   }
+  rec->ttl_value = rec->ttl ? parse_ttl_value(rec->ttl) : 3600;
+  rec->class_val = class_val;
   
   // A-1: Unescape fields appropriately
   // Owner name, type, class, ttl are handled without unescaping.
@@ -1540,8 +1664,10 @@ PROCESS_RECORD:
   if (p < end)
     goto STATE_START_LINE;
 DONE:
-  for (size_t i = 0; i < arena->count; i++) {
-    dns_record_preparse_cache(arena, &arena->records[i]);
+  if (finalize) {
+    for (size_t i = 0; i < arena->count; i++) {
+      dns_record_preparse_cache(arena, &arena->records[i]);
+    }
   }
   return arena->count;
 }

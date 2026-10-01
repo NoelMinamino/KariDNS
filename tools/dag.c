@@ -1622,11 +1622,24 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
             sink_split_hex(sink, &pkt[abs_offset], rdlen, 0);
             return;
         }
-        case 34: { // ATMA (RFC 2163 §2): format byte + address
-            // dig と同じ表示: フォーマットバイトを除いた残りのバイト列を hex 表示
+        case 34: { // ATMA (ATM Forum af-dans-0152.000): format byte + address
+            // dig と同じ表示 (BIND atma_34.c totext): format 0 (AESA) は残りのバイト列を hex、
+            // format 1 (E.164) は '+' に続けて数字列。それ以外の format は汎用形式
             if (rdlen < 2) { sink_printf(sink, "(malformed ATMA)"); return; }
-            sink_split_hex(sink, &pkt[abs_offset + 1], rdlen - 1, 0);
-            return;
+            if (pkt[abs_offset] == 0) {
+                for (uint16_t k = 1; k < rdlen; k++) sink_printf(sink, "%02x", pkt[abs_offset + k]); // BIND は小文字
+                return;
+            }
+            if (pkt[abs_offset] == 1) {
+                bool digits_only = true;
+                for (uint16_t k = 1; k < rdlen; k++)
+                    if (pkt[abs_offset + k] < '0' || pkt[abs_offset + k] > '9') digits_only = false;
+                if (digits_only) {
+                    sink_printf(sink, "+%.*s", (int)(rdlen - 1), (const char *)&pkt[abs_offset + 1]);
+                    return;
+                }
+            }
+            break;
         }
         case 38: { // A6 (RFC 2874 §3): prefix-length + suffix + optional prefix name
             if (rdlen < 1) { sink_printf(sink, "(malformed A6)"); return; }

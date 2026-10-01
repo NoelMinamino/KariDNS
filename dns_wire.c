@@ -630,6 +630,7 @@ int parse_resource_record(const uint8_t *packet, size_t packet_len, size_t *offs
     *type_out = type; rec->type_code = type;
     rec->class_str = (class_val == 1) ? "IN" : ((class_val == DNS_CLASS_KARIDNS_EXT) ? "KARIDNS" : "CH");
     rec->type = (char *)get_type_str(type, arena);
+    if (ttl > 0x7FFFFFFF) ttl = 0x7FFFFFFF; // RFC 8767 §4: 送るときと同じ値で持つ (O-14)
     rec->ttl_value = ttl;
     rec->class_val = class_val;
     char *ttl_buf = arena_alloc(arena, 16); if (!ttl_buf) return -1; snprintf(ttl_buf, 16, "%u", ttl); rec->ttl = ttl_buf;
@@ -1956,7 +1957,7 @@ uint32_t parse_ttl_value(const char *ttl_str) {
     }
     if (all_digits) {
         uint64_t v = strtoull(ttl_str, NULL, 10);
-        // RFC 2181 §8: TTLは符号なし32bit、最上位ビットは立てない(実質最大2147483647)
+        // RFC 8767 §4: 最上位ビットの立った値は正の値として扱い、2147483647 に丸める (O-14。エンコーダーと同じ)
         if (v > 2147483647ULL) v = 2147483647ULL;
         return (uint32_t)v;
     }
@@ -1979,10 +1980,11 @@ uint32_t parse_ttl_value(const char *ttl_str) {
             }
             endptr++;
         }
-        total += (uint64_t)num * multiplier;
+        if (num > 2147483647ULL / multiplier || total > 2147483647ULL) total = 2147483648ULL; // 桁あふれさせない
+        else total += (uint64_t)num * multiplier;
         p = endptr;
     }
-    // RFC 2181 §8: TTLは符号なし32bit、最上位ビットは立てない(実質最大2147483647)
+    // RFC 8767 §4: 2147483647 に丸める (O-14)
     if (total > 2147483647ULL) total = 2147483647ULL;
     return (uint32_t)total;
 }
@@ -2066,7 +2068,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
     if (ttl == 0 && rec->ttl && *rec->ttl) {
         ttl = parse_ttl_value(rec->ttl);
     }
-    if (ttl > 0x7FFFFFFF) ttl = 0; // RFC 2181 §8: TTL >= 2^31 is treated as 0
+    /* RFC 8767 §4 (RFC 1035 §3.2.1/§4.1.3 と RFC 2181 §8 を改訂): 最上位ビットの立った TTL は 0 ではなく
+     * 正の値として扱う。ゾーンファイルのパーサ (parse_ttl_value) と同じく 2147483647 に丸める (O-14)。 */
+    if (ttl > 0x7FFFFFFF) ttl = 0x7FFFFFFF;
     if (override_ttl != 0xFFFFFFFF && override_ttl < ttl) ttl = override_ttl;
     
     res[offset++] = ttl >> 24; res[offset++] = (ttl >> 16) & 0xFF; res[offset++] = (ttl >> 8) & 0xFF; res[offset++] = ttl & 0xFF;
@@ -2433,28 +2437,26 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 if ((size_t)offset + 3 > max_res_len) return -1;
                 res[offset++] = prec; res[offset++] = gw_type; res[offset++] = alg;
                 
-                int pk_idx = 3;
-                if (gw_type == 1) { // IPv4
-                    if (rec->rdata_count < 5) return -1;
+                /* RFC 4025 §3.1: gateway 欄は必須 (type 0 なら "."), 公開鍵は省略できる (長さ 0) */
+                if (rec->rdata_count < 4) return -1;
+                int pk_idx = 4;
+                if (gw_type == 0) { // no gateway
+                    if (strcmp(rec->rdata[3], ".") != 0) return -1;
+                } else if (gw_type == 1) { // IPv4
                     if ((size_t)offset + 4 > max_res_len) return -1;
                     struct in_addr addr;
                     if (inet_pton(AF_INET, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s_addr, 4); offset += 4;
-                    pk_idx = 4;
                 } else if (gw_type == 2) { // IPv6
-                    if (rec->rdata_count < 5) return -1;
                     if ((size_t)offset + 16 > max_res_len) return -1;
                     struct in6_addr addr;
                     if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
-                    pk_idx = 4;
                 } else if (gw_type == 3) { // Domain name
-                    if (rec->rdata_count < 5) return -1;
                     long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
                     if (w < 0) return -1;
                     offset += (size_t)w;
-                    pk_idx = 4;
-                } else if (gw_type != 0) {
+                } else {
                     return -1;
                 }
                 
@@ -3084,6 +3086,21 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += tlen;
                 break;
             }
+            case 40: { // SINK (draft-ietf-dnsind-kitchen-sink-02 §2, §3): meaning, coding, subcoding + base64 data
+                if (rec->rdata_count < 3) return -1;
+                uint8_t meaning, coding, subcoding;
+                if (!parse_u8(rec->rdata[0], &meaning) ||
+                    !parse_u8(rec->rdata[1], &coding) ||
+                    !parse_u8(rec->rdata[2], &subcoding)) return -1;
+                if ((size_t)offset + 3 > max_res_len) return -1;
+                res[offset++] = meaning; res[offset++] = coding; res[offset++] = subcoding;
+                if (rec->rdata_count > 3) {
+                    size_t off = offset;
+                    if (decode_concat_b64_rdata(&rec->rdata[3], rec->rdata_count - 3, res, max_res_len, &off) != 0) return -1;
+                    offset = off;
+                }
+                break;
+            }
             case 61: case 49: { // OPENPGPKEY, DHCID
                 if (rec->rdata_count < 1) return -1;
                 size_t off = offset;
@@ -3288,31 +3305,40 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 break;
             }
-            case 34: { // ATMA (RFC 2163 §2): format byte + address
-                // rdata[0] = format: "0" = E.164 (ASCII digits), "1" = AESA (20 bytes hex)
-                // rdata[1] = address string
-                if (rec->rdata_count < 2) return -1;
-                uint8_t atma_fmt;
-                if (!parse_u8(rec->rdata[0], &atma_fmt) || atma_fmt > 1) return -1;
+            case 34: { // ATMA (ATM Forum af-dans-0152.000; 表記は BIND lib/dns/rdata/in_1/atma_34.c と同じ)
+                // 1 トークン: '+' で始まれば E.164 (format 1, 十進数字)、それ以外は AESA (format 0, 16進)。
+                // どちらも区切りの '.' を書ける (先頭・末尾・連続は不可)。
+                if (rec->rdata_count != 1) return -1;
+                const char *a = rec->rdata[0];
+                bool e164 = (a[0] == '+');
+                if (e164) a++;
                 if ((size_t)offset + 1 > max_res_len) return -1;
-                res[offset++] = atma_fmt;
-                if (atma_fmt == 0) {
-                    // E.164: フォーマットバイト(0x00) + ASCII 十進数字列
-                    const char *digits = rec->rdata[1];
-                    size_t dlen = strlen(digits);
-                    if (dlen == 0) return -1;
-                    if ((size_t)offset + dlen > max_res_len) return -1;
-                    memcpy(&res[offset], digits, dlen);
-                    offset += dlen;
-                } else {
-                    // AESA: フォーマットバイト(0x01) + 20バイト生データ (16進デコード)
-                    uint8_t aesa[20];
-                    size_t aesa_len = hex_decode(rec->rdata[1], aesa, sizeof(aesa));
-                    if (aesa_len == (size_t)-1 || aesa_len != 20) return -1;
-                    if ((size_t)offset + 20 > max_res_len) return -1;
-                    memcpy(&res[offset], aesa, 20);
-                    offset += 20;
+                res[offset++] = e164 ? 1 : 0;
+                bool last_period = true;
+                int hi = -1;
+                size_t n = 0;
+                for (; *a; a++) {
+                    if (*a == '.') {
+                        if (last_period) return -1;
+                        last_period = true;
+                        continue;
+                    }
+                    last_period = false;
+                    if (e164) {
+                        if (*a < '0' || *a > '9') return -1;
+                        if ((size_t)offset + 1 > max_res_len) return -1;
+                        res[offset++] = (uint8_t)*a;
+                    } else {
+                        int v = hex_char_to_val(*a);
+                        if (v < 0) return -1;
+                        if (hi < 0) { hi = v; continue; }
+                        if ((size_t)offset + 1 > max_res_len) return -1;
+                        res[offset++] = (uint8_t)((hi << 4) | v);
+                        hi = -1;
+                    }
+                    n++;
                 }
+                if (n == 0 || last_period || hi >= 0) return -1;
                 break;
             }
             case 38: { // A6 (RFC 2874 §3, deprecated by RFC 6563)

@@ -334,9 +334,9 @@ eid-node    IN EID \# 4 01020304
 ; NIMLOC (Nimrod Locator, Type 32)
 nimloc-node IN NIMLOC \# 4 01020304
 
-; ATMA (ATM Address, Type 34, RFC 2163)
-; format=0 (E.164) + ASCII digits
-atma-node   IN ATMA 0 16175551234
+; ATMA (ATM Address, Type 34, ATM Forum af-dans-0152.000; BIND atma_34.c presentation)
+; "+" = E.164 (format 1) + ASCII digits
+atma-node   IN ATMA +16175551234
 
 ; A6 (IPv6 with prefix chain, Type 38, RFC 2874)
 ; prefix-length=0 → full IPv6 address, no prefix name required

@@ -794,10 +794,21 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
 
     /* サーバー (reload_master_zone) と同じく、tinydns の親子ゾーンの振り分けには
      * このゾーンと同じ view のゾーン名を使う */
-    const char *view_zone_ptrs[256];
+    const char **view_zone_ptrs = NULL;
     int view_zone_cnt = 0;
     if (view) {
-        for (const zone_config_t *vz = view->zones; vz && view_zone_cnt < 256; vz = vz->next) {
+        /* 件数の上限は置かない (O-11: サーバーと同じく view の全ゾーン) */
+        size_t n = 0;
+        for (const zone_config_t *vz = view->zones; vz; vz = vz->next) n++;
+        view_zone_ptrs = n > 0 ? calloc(n, sizeof(*view_zone_ptrs)) : NULL;
+        if (n > 0 && !view_zone_ptrs) {
+            fprintf(stderr, "[ERROR] Out of memory\n");
+            free((void*)ctx.base_dir);
+            zone_arena_destroy(&arena);
+            free(root_path);
+            return 1;
+        }
+        for (const zone_config_t *vz = view->zones; vz; vz = vz->next) {
             if (vz->domain) view_zone_ptrs[view_zone_cnt++] = vz->domain;
         }
     }
@@ -810,6 +821,8 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     } else {
         res = parse_zone_fast(mutable_buf, strlen(mutable_buf), &arena, &ctx);
     }
+    free(view_zone_ptrs);
+    ctx.all_zone_names = NULL;
     if (res < 0) {
         print_error_context(file_path, buf, &err, &arena);
         free((void*)ctx.base_dir);

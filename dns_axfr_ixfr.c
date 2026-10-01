@@ -443,12 +443,12 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
               rec->generic_len = 0;
               rec->type_code = orig_type;
               rec->class_val = orig_class;
-              rec->ttl_value = orig_ttl;
+              rec->ttl_value = orig_ttl > 0x7FFFFFFFu ? 0x7FFFFFFFu : orig_ttl; // RFC 8767 §4 (O-14)
               rec->type = (char *)get_type_str(orig_type, standby);
               rec->class_str = (orig_class == 1) ? "IN" : "CH";
               char *ttl_buf = arena_alloc(standby, 16);
               if (ttl_buf) {
-                snprintf(ttl_buf, 16, "%u", orig_ttl);
+                snprintf(ttl_buf, 16, "%u", rec->ttl_value);
                 rec->ttl = ttl_buf;
               }
               type = orig_type;

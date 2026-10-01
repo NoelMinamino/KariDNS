@@ -326,6 +326,7 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
     rec->name = owner;
     rec->type = arena_strdup(arena, type_str);
     rec->type_code = type_code;
+    if (ttl > 2147483647UL) ttl = 2147483647UL; // RFC 8767 §4: BIND 形式と同じく丸める (O-14。32 bit への切り捨てもしない)
     rec->ttl_value = (uint32_t)ttl;
     rec->class_val = 1; // IN
     rec->class_str = "IN";

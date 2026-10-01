@@ -734,7 +734,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   ctx.err_out = &parse_err;
 
   server_config_t *active_cfg = acquire_config_snapshot();
-  const char *all_zone_ptrs[256];
+  const char **all_zone_ptrs = NULL;
   int all_zone_cnt = 0;
   // 親子ゾーンの振り分けに使うのは、このゾーンと同じ view のゾーンだけ (R-26)。
   // 別の view にしか無い子ゾーンの名前で、この view のレコードを落とさない。
@@ -745,15 +745,21 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       }
   }
   if (own_view) {
+      /* view のゾーン数だけ確保する (O-11: 以前は 256 件で打ち切り、それを超えると共有 data の
+       * レコードが親ゾーンに入ることがあった)。ゾーンの読み込みはクエリの経路ではない。 */
+      size_t n = 0;
+      for (zone_config_t *zc = own_view->zones; zc; zc = zc->next) n++;
+      all_zone_ptrs = n > 0 ? calloc(n, sizeof(*all_zone_ptrs)) : NULL;
+      if (n > 0 && !all_zone_ptrs) {
+          release_config_snapshot(active_cfg);
+          free((void*)ctx.base_dir);
+          free(root_path);
+          syslog(LOG_ERR, "[ZoneLoader] Out of memory building the zone list for '%s'", entry->domain);
+          pthread_mutex_unlock(&entry->writer_lock);
+          return RELOAD_ERR_PARSE;
+      }
       for (zone_config_t *zc = own_view->zones; zc; zc = zc->next) {
-          if (zc->domain) {
-              if (all_zone_cnt < 256) {
-                  all_zone_ptrs[all_zone_cnt++] = zc->domain;
-              } else {
-                  syslog(LOG_WARNING, "[ZoneLoader] Configured zones exceed 256; parent-child delegation filtering may be degraded for '%s'", entry->domain);
-                  break;
-              }
-          }
+          if (zc->domain) all_zone_ptrs[all_zone_cnt++] = zc->domain;
       }
   }
   ctx.all_zone_names = (all_zone_cnt > 0) ? all_zone_ptrs : NULL;
@@ -766,6 +772,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   }
   release_config_snapshot(active_cfg);
+  free(all_zone_ptrs);
   free((void*)ctx.base_dir);
   free(root_path);
 

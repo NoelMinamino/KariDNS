@@ -1,5 +1,6 @@
 #include "dns_utils.h"
 #include "dns_wire.h"
+#include <ctype.h>
 
 _Atomic bool g_capsicum_enabled = false;
 
@@ -63,9 +64,8 @@ bool is_meta_rrtype(uint16_t type_code) {
     }
 }
 
-uint16_t get_type_code(const char *type_str) {
-  if (!type_str)
-    return 0;
+/* type_str は大文字の綴り。get_type_code() から呼ぶ */
+static uint16_t type_code_upper(const char *type_str) {
   switch (type_str[0]) {
   case 'A':
     if (strcmp(type_str, "A") == 0)
@@ -297,6 +297,22 @@ uint16_t get_type_code(const char *type_str) {
     break;
   }
   return 0;
+}
+
+/* RR 型のニーモニックは大文字小文字を区別しない (RFC 1035 §2.3.3, §5.1。BIND/NSD も同じ)。
+ * 最長のニーモニックより長い文字列は既知の型ではない (TYPE65535 も収まる長さ)。 */
+uint16_t get_type_code(const char *type_str) {
+  if (!type_str)
+    return 0;
+  char upper[24];
+  size_t i = 0;
+  for (; type_str[i] != '\0'; i++) {
+    if (i + 1 >= sizeof(upper))
+      return 0;
+    upper[i] = (char)toupper((unsigned char)type_str[i]);
+  }
+  upper[i] = '\0';
+  return type_code_upper(upper);
 }
 
 char *get_base_dir(const char *path) {

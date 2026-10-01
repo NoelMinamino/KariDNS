@@ -529,6 +529,33 @@ zone "corp.example.com." {
 
 ---
 
+## ZONE FILE FORMAT
+
+The default `file-format` is the master file format of RFC 1035 §5 as BIND reads it.
+
+- **Records**: `<owner> [<TTL>] [<class>] <type> <RDATA>`; TTL and class may appear in either order, each once.
+  Type and class mnemonics are case-insensitive (`in a`, `IN Mx`). Unknown types and classes use the RFC 3597
+  forms `TYPEnn`, `CLASSnn` and `\# <length> <hex>`.
+- **Classes**: `IN` (the default when the class is omitted), `CH`, `HS` and `CLASSnn` are kept with the record. The
+  server answers queries of class IN and CH; records of other classes are loaded but not answered (queries of
+  those classes are REFUSED). `NONE`, `ANY`, `CLASS0` and class 65302 (used internally by KariDNS) are errors.
+- **Omitted TTL** (same order as BIND): the TTL on the record; else `$TTL` (RFC 2308 §4); else the last TTL
+  written explicitly on a record (RFC 1035 §5.1, also across `$INCLUDE`); else, for an SOA record, its MINIMUM
+  field, which then acts like `$TTL`; else 3600 (BIND rejects such a zone).
+- **TTL values** above 2147483647 are served as 2147483647 (RFC 8767 §4); this also applies to records received
+  by zone transfer.
+- **`$ORIGIN <name>`** and the origin argument of **`$INCLUDE <file> [<origin>]`**: a name without a trailing dot
+  is relative to the current origin (RFC 1035 §5.1). `$INCLUDE` does not change the origin of the including file.
+- **`$GENERATE <range> <lhs> [<TTL>] [<class>] <type> <rhs>`** (BIND syntax): `<range>` is `start-stop[/step]`
+  (at most 100,000 records). For each value, `$` in `<lhs>` and `<rhs>` is replaced by the value,
+  `${offset[,width[,base]]}` with base `d`, `o`, `x`, `X`, `n` or `N` (`n`/`N`: nibbles in reverse order separated
+  by dots, as for `ip6.arpa`; the width counts the dots), `$$` gives `$` and `\$` a literal `$`. Any RR type can be
+  generated; the resulting line is read like any other record line, so `$ECS-SUBNET`/`$LOCATION` tags and the TTL
+  rules apply. `<rhs>` is one field: quote RDATA that contains spaces, e.g.
+  `$GENERATE 1-10 host$ MX "10 mail$"`.
+
+---
+
 ## TINYDNS ZONE FORMAT
 
 KariDNS can load zone data directly from djbdns/tinydns-style plain-text

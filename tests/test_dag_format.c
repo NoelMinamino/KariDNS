@@ -367,6 +367,13 @@ static void test_dig_compat_formatting(void) {
     static const uint8_t sink_empty[] = { 5, 6, 7 };
     show(40, sink_empty, sizeof(sink_empty), out, sizeof(out), false);
     assert(strcmp(out, "5 6 7 ") == 0 || strcmp(out, "5 6 7") == 0);
+    /* ATMA (BIND atma_34.c totext): format 0 = AESA in hex, format 1 = E.164 as "+digits" */
+    static const uint8_t atma_aesa[] = { 0, 0x39, 0x24, 0x6f };
+    show(34, atma_aesa, sizeof(atma_aesa), out, sizeof(out), false);
+    assert(strcmp(out, "39246f") == 0);
+    static const uint8_t atma_e164[] = { 1, '3', '5', '8', '4' };
+    show(34, atma_e164, sizeof(atma_e164), out, sizeof(out), false);
+    assert(strcmp(out, "+3584") == 0);
 
     /* EID / NIMLOC: bare hex, no "\# len" prefix */
     static const uint8_t raw4[] = { 0x01, 0x02, 0x03, 0x04 };
