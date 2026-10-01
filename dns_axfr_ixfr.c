@@ -192,6 +192,68 @@ void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_are
   pthread_mutex_unlock(&entry->ixfr_history.lock);
 }
 
+static const char *xfr_rcode_name(unsigned rcode) {
+  static const char *const names[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED",
+                                      "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};
+  return rcode < sizeof(names) / sizeof(names[0]) ? names[rcode] : "RCODE";
+}
+
+int xfr_check_response_header(const uint8_t *msg, size_t msg_len, axfr_session_t *session, const char *domain) {
+  const char *qt = session->query_type == 251 ? "IXFR" : "AXFR";
+  if (msg_len < DNS_HEADER_SIZE) {
+    syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting %s response: %zu bytes, shorter than a DNS header",
+           domain, qt, msg_len);
+    return -1;
+  }
+  /* RFC 5936 §2.2.1: ID は全メッセージで要求の ID、QR=1、OPCODE=0。違うものは別の応答として捨てる
+   * (Note a)。1本の TCP 接続で要求は1つだけなので、転送を失敗にする。 */
+  uint16_t id = (uint16_t)((msg[0] << 8) | msg[1]);
+  if (id != session->query_id) {
+    syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting %s response: ID %u does not match the request ID %u",
+           domain, qt, id, session->query_id);
+    return -1;
+  }
+  if ((msg[2] & 0x80) == 0 || ((msg[2] >> 3) & 0x0F) != 0) {
+    syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting %s response: QR=%u OPCODE=%u (expected QR=1 OPCODE=0)",
+           domain, qt, (unsigned)(msg[2] >> 7), (unsigned)((msg[2] >> 3) & 0x0F));
+    return -1;
+  }
+  uint16_t qdcount = (uint16_t)((msg[4] << 8) | msg[5]);
+  bool first = !session->got_first_msg;
+  session->got_first_msg = true;
+  /* RFC 5936 §2.2.1, §2.2.2: 最初のメッセージとエラー応答は QDCOUNT=1 で要求の質問を写す。
+   * 後続のメッセージは 0 か 1。 */
+  unsigned rcode = msg[3] & 0x0F;
+  if (qdcount > 1 || (qdcount == 0 && (first || rcode != 0))) {
+    syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting %s response: QDCOUNT %u", domain, qt, qdcount);
+    return -1;
+  }
+  if (qdcount == 1) {
+    char qname[DNS_NAME_TEXT_SIZE];
+    size_t q_end;
+    if (expand_wire_name_to_buffer(msg, msg_len, DNS_HEADER_SIZE, &q_end, qname, sizeof(qname)) < 0 ||
+        q_end + 4 > msg_len) {
+      syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting %s response: malformed question section", domain, qt);
+      return -1;
+    }
+    uint16_t rtype = (uint16_t)((msg[q_end] << 8) | msg[q_end + 1]);
+    uint16_t rclass = (uint16_t)((msg[q_end + 2] << 8) | msg[q_end + 3]);
+    if (!domain_names_match_ci(qname, domain) || rtype != session->query_type || rclass != 1) {
+      syslog(LOG_WARNING, "[AXFR] zone '%s': rejecting %s response: question '%s' type %u class %u does not "
+             "match the request", domain, qt, qname, rtype, rclass);
+      return -1;
+    }
+  }
+  /* RFC 5936 §2.2.1 Note e): エラーの RCODE ならその場で転送を終える (タイムアウトを待たない) */
+  if (rcode != 0) {
+    session->rcode = (uint8_t)rcode;
+    syslog(LOG_WARNING, "[AXFR] zone '%s': primary answered the %s request with %s (%u)",
+           domain, qt, xfr_rcode_name(rcode), rcode);
+    return 1;
+  }
+  return 0;
+}
+
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
                      zone_arena_t *standby, zone_arena_t *active,
                      axfr_session_t *session, const char *domain) {
@@ -546,6 +608,26 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
       zone_arena_destroy(&tmp_arena);
       return -1;
     }
+    int hdr = xfr_check_response_header(msg, msg_len, session, entry->domain);
+    if (hdr != 0) {
+      if (hdr > 0 && tsig_key && !is_subsequent) {
+        /* エラー応答の TSIG を調べてログに出す (RFC 8945 §5.3.2: プライマリが要求の TSIG を
+         * 受け付けなかったときは MAC の無い TSIG で Error に BADKEY/BADSIG を入れて返す) */
+        uint8_t err_mac[64];
+        size_t err_mac_len = 0;
+        int tv = tsig_verify_packet(msg, msg_len, tsig_key, prior_mac_len > 0 ? prior_mac : NULL, prior_mac_len,
+                                    NULL, 0, false, err_mac, &err_mac_len);
+        if (tv == 16 || tv == 17)
+          syslog(LOG_WARNING, "[AXFR] zone '%s': the primary rejected our TSIG key '%s' (%s)", entry->domain,
+                 tsig_key->name ? tsig_key->name : "", tv == 17 ? "BADKEY" : "BADSIG");
+        else if (tv != 0)
+          syslog(LOG_WARNING, "[AXFR] zone '%s': the error response is not signed with key '%s'", entry->domain,
+                 tsig_key->name ? tsig_key->name : "");
+      }
+      if (unsigned_msgs) free(unsigned_msgs);
+      zone_arena_destroy(&tmp_arena);
+      return -1;
+    }
     if (tsig_key) {
       bool has_tsig = packet_has_tsig(msg, msg_len);
       if (!has_tsig) {
@@ -691,7 +773,8 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
         }
         atomic_store_explicit(&entry->observatory.last_transfer_time, (uint64_t)time(NULL), memory_order_relaxed);
 
-        send_notify_to_all(entry->domain, entry->view_name);
+        // RFC 1996 §4.6: 自分もプライマリとして下流へ通知する (送信と再送は制御スレッド)
+        notify_request_send(entry);
         ret_code = 1;
       } else {
         pthread_mutex_lock(&entry->writer_lock);
@@ -725,6 +808,115 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
   release_config_snapshot(cfg);
   rcu_aux_read_unlock();
   return ret_code;
+}
+
+/* 転送要求 (AXFR、serial が 0 でなければ IXFR) を TCP の長さ前置き付きで buf に組み立てる。
+ * IXFR の Authority にはクライアントの版の SOA (RFC 1995 §3)、OPT には長さ 0 の EXPIRE (RFC 7314 §4) と
+ * Extended AXFR を付け、鍵があれば署名する (req_mac に要求の MAC)。戻り値は全体の長さ、失敗は 0。 */
+static size_t build_xfr_request(uint8_t *buf, size_t cap, const char *domain, uint32_t serial, uint16_t id,
+                                tsig_key_t *tsig_key, uint8_t *req_mac, size_t *req_mac_len) {
+  uint8_t *hdr = &buf[2];
+  size_t len = 2;
+  if (cap < 2 + DNS_HEADER_SIZE + UDP_DEFAULT_MAX_RES_LEN) return 0;
+  memset(hdr, 0, DNS_HEADER_SIZE);
+  hdr[0] = id >> 8;
+  hdr[1] = id & 0xFF;
+  hdr[5] = 0x01;
+  hdr[9] = serial ? 0x01 : 0x00;
+  len += DNS_HEADER_SIZE;
+  long w = write_uncompressed_name(buf, len, cap - UDP_DEFAULT_MAX_RES_LEN, domain);
+  if (w <= 0) return 0;
+  len += (size_t)w;
+  buf[len++] = 0x00;
+  buf[len++] = serial ? 251 : 252;
+  buf[len++] = 0x00;
+  buf[len++] = 1;
+  if (serial) {
+    /* 所有者名は QNAME への圧縮ポインタ、MNAME と RNAME は root、SERIAL の後は 0 */
+    static const uint8_t soa_head[] = {0xC0, 0x0C, 0x00, 6, 0x00, 1, 0, 0, 0, 0, 0x00, 22, 0, 0};
+    memcpy(&buf[len], soa_head, sizeof(soa_head));
+    len += sizeof(soa_head);
+    buf[len++] = serial >> 24;
+    buf[len++] = (serial >> 16) & 0xFF;
+    buf[len++] = (serial >> 8) & 0xFF;
+    buf[len++] = serial & 0xFF;
+    memset(&buf[len], 0, 16);
+    len += 16;
+  }
+  uint32_t domain_hash = calc_fnv1a_str(domain);
+  const uint8_t opt[] = {
+      0, 0x00, 41, 0x10, 0x00, 0, 0, 0, 0,
+      0x00, 0x0D, /* RDLEN: 4 (EXPIRE) + 9 (Extended AXFR) */
+      0x00, EDNS_OPTION_EXPIRE, 0x00, 0x00,
+      (EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF, EDNS_OPTION_KARIDNS_EXT & 0xFF, 0x00, 0x05,
+      KARIDNS_EXT_VERSION, (domain_hash >> 24) & 0xFF, (domain_hash >> 16) & 0xFF, (domain_hash >> 8) & 0xFF,
+      domain_hash & 0xFF};
+  memcpy(&buf[len], opt, sizeof(opt));
+  len += sizeof(opt);
+  hdr[11] = 1;
+  *req_mac_len = 0;
+  if (tsig_key) {
+    size_t p_len = len - 2;
+    if (tsig_sign_packet(hdr, &p_len, cap - 2, tsig_key, 0, req_mac, req_mac_len, NULL, 0, false) != 0)
+      return 0;
+    len = p_len + 2;
+  }
+  buf[0] = (uint8_t)((len - 2) >> 8);
+  buf[1] = (uint8_t)((len - 2) & 0xFF);
+  return len;
+}
+
+/* 1回の転送: 接続し、要求を送り、応答を処理する。戻り値は handle_axfr_event() と同じ
+ * (1 = 転送した、2 = 最新、-1 = 失敗。エラー応答なら session->rcode にその RCODE)。 */
+static int xfr_attempt(axfr_bg_ctx_t *ctx, struct sockaddr_storage *master_addr, int family,
+                       tsig_key_t *tsig_key, uint32_t ixfr_serial, axfr_session_t *session) {
+  uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
+  memset(session, 0, sizeof(*session));
+  session->query_id = (uint16_t)(arc4random() & 0xFFFF);
+  session->query_type = ixfr_serial ? 251 : 252;
+  session->is_ixfr = ixfr_serial != 0;
+  /* AXFR に切り替えたときも、手元より古い版は受け取らない (parse_xfr_packet() のロールバック検査) */
+  session->client_serial = active_serial;
+
+  size_t addr_len = (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+  int tcp_fd = broker_connect_opts(family, SOCK_STREAM, (struct sockaddr *)master_addr, addr_len,
+                                   &ctx->tcp_opts);
+  if (tcp_fd < 0) {
+    syslog(LOG_ERR, "[AXFR] Failed to connect to %s for zone %s", ctx->master_ip, ctx->domain);
+    return -1;
+  }
+  limit_client_socket_rights(tcp_fd);
+  struct timeval tv;
+  tv.tv_sec = 30;
+  tv.tv_usec = 0;
+  setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+  setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
+  tcp_stream_ctx_t *stream_ctx = calloc(1, sizeof(tcp_stream_ctx_t));
+  if (!stream_ctx) {
+    close(tcp_fd);
+    syslog(LOG_ERR, "[AXFR] Failed to allocate memory for stream_ctx");
+    return -1;
+  }
+  uint8_t axfr_req[2048];
+  uint8_t req_mac[64];
+  size_t req_mac_len = 0;
+  int axfr_res = -1;
+  size_t req_len = build_xfr_request(axfr_req, sizeof(axfr_req), ctx->domain, ixfr_serial, session->query_id,
+                                     tsig_key, req_mac, &req_mac_len);
+  if (req_len == 0) {
+    syslog(LOG_ERR, "[AXFR] Failed to build%s request for zone %s", tsig_key ? " TSIG-signed" : "", ctx->domain);
+  } else if (send(tcp_fd, axfr_req, req_len, 0) == (ssize_t)req_len) {
+    // handle_axfr_event() は writer_lock を持ったまま読み取り区間に入るので、先にスロットを確保する
+    rcu_aux_thread_pin();
+    axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, session, tsig_key,
+                                 req_mac_len > 0 ? req_mac : NULL, req_mac_len);
+    rcu_aux_thread_unpin();
+  } else {
+    syslog(LOG_ERR, "[AXFR] Failed to send request for zone %s to %s", ctx->domain, ctx->master_ip);
+  }
+  free(stream_ctx);
+  close(tcp_fd);
+  return axfr_res;
 }
 
 void *axfr_bg_thread_func(void *arg) {
@@ -773,165 +965,24 @@ void *axfr_bg_thread_func(void *arg) {
     pthread_exit(NULL);
   }
 
-  size_t addr_len = (domain_family == AF_INET) ? sizeof(struct sockaddr_in)
-                                               : sizeof(struct sockaddr_in6);
-  int tcp_fd = broker_connect_opts(domain_family, SOCK_STREAM,
-                                   (struct sockaddr *)&master_addr, addr_len, &ctx->tcp_opts);
-  if (tcp_fd >= 0) {
-    limit_client_socket_rights(tcp_fd);
-    struct timeval tv;
-    tv.tv_sec = 30;
-    tv.tv_usec = 0;
-    setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
-    setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
-    tcp_stream_ctx_t *stream_ctx = calloc(1, sizeof(tcp_stream_ctx_t));
-    if (!stream_ctx) {
-      close(tcp_fd);
-      syslog(LOG_ERR, "[AXFR] Failed to allocate memory for stream_ctx");
-      if (ctx->entry)
-        atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
-      free(ctx);
-      if (bg_snap)
-        release_zone_snapshot(bg_snap);
-      atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
-      pthread_exit(NULL);
-    }
-    axfr_session_t session = {0};
-    uint8_t axfr_req[2048];
-    uint16_t req_len = 0;
-    uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
-    uint8_t *dns_hdr = &axfr_req[2];
-    uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
-    dns_hdr[0] = id >> 8;
-    dns_hdr[1] = id & 0xFF;
-    dns_hdr[2] = 0x00;
-    dns_hdr[3] = 0x00;
-    dns_hdr[4] = 0x00;
-    dns_hdr[5] = 0x01;
-    dns_hdr[6] = 0x00;
-    dns_hdr[7] = 0x00;
-    dns_hdr[8] = 0x00;
-    dns_hdr[9] = active_serial ? 0x01 : 0x00;
-    dns_hdr[10] = 0x00;
-    dns_hdr[11] = 0x00;
-    req_len = 14;
-    const char *d = ctx->domain;
-    while (*d) {
-      const char *dot = strchr_unescaped(d, '.');
-      size_t len = dot ? (size_t)(dot - d) : strlen(d);
-      if (len > 63)
-        len = 63;
-      if (req_len + len + 2 > sizeof(axfr_req) - UDP_DEFAULT_MAX_RES_LEN)
-        break;
-      axfr_req[req_len++] = (uint8_t)len;
-      memcpy(&axfr_req[req_len], d, len);
-      req_len += len;
-      if (!dot)
-        break;
-      d = dot + 1;
-    }
-    axfr_req[req_len++] = 0;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = active_serial ? 251 : 252;
-    session.is_ixfr = active_serial ? true : false;
-    session.client_serial = active_serial;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 1;
-    if (active_serial) {
-      axfr_req[req_len++] = 0xC0;
-      axfr_req[req_len++] = 0x0C;
-      axfr_req[req_len++] = 0x00;
-      axfr_req[req_len++] = 6;
-      axfr_req[req_len++] = 0x00;
-      axfr_req[req_len++] = 1;
-      axfr_req[req_len++] = 0x00;
-      axfr_req[req_len++] = 0;
-      axfr_req[req_len++] = 0;
-      axfr_req[req_len++] = 0;
-      axfr_req[req_len++] = 0x00;
-      axfr_req[req_len++] = 22;
-      axfr_req[req_len++] = 0;
-      axfr_req[req_len++] = 0;
-      axfr_req[req_len++] = active_serial >> 24;
-      axfr_req[req_len++] = (active_serial >> 16) & 0xFF;
-      axfr_req[req_len++] = (active_serial >> 8) & 0xFF;
-      axfr_req[req_len++] = active_serial & 0xFF;
-      for (int i = 0; i < 16; i++)
-        axfr_req[req_len++] = 0;
-    }
-    axfr_req[req_len++] = 0;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 41;
-    axfr_req[req_len++] = 0x10;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 0x00;
-    uint32_t domain_hash = calc_fnv1a_str(ctx->domain);
-    axfr_req[req_len++] = 0x00; // RDLEN: 9 (Extended AXFR) + 4 (EXPIRE)
-    axfr_req[req_len++] = 0x0D;
-    // RFC 7314 §4: 転送要求には長さ 0 の EXPIRE を付ける
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = EDNS_OPTION_EXPIRE;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = (EDNS_OPTION_KARIDNS_EXT >> 8) & 0xFF;
-    axfr_req[req_len++] = EDNS_OPTION_KARIDNS_EXT & 0xFF;
-    axfr_req[req_len++] = 0x00;
-    axfr_req[req_len++] = 0x05; // Option Length: 5
-    axfr_req[req_len++] = KARIDNS_EXT_VERSION;
-    axfr_req[req_len++] = (domain_hash >> 24) & 0xFF;
-    axfr_req[req_len++] = (domain_hash >> 16) & 0xFF;
-    axfr_req[req_len++] = (domain_hash >> 8) & 0xFF;
-    axfr_req[req_len++] = domain_hash & 0xFF;
-    dns_hdr[11]++;
-    uint8_t req_mac[64];
-    size_t req_mac_len = 0;
-    if (tsig_key_ptr) {
-      size_t p_len = req_len - 2;
-      if (tsig_sign_packet(&axfr_req[2], &p_len, sizeof(axfr_req) - 2,
-                           tsig_key_ptr, 0, req_mac, &req_mac_len, NULL, 0, false) != 0) {
-        syslog(LOG_ERR, "[AXFR] Failed to TSIG-sign request for zone %s", ctx->domain);
-        free(stream_ctx);
-        close(tcp_fd);
-        if (ctx->entry)
-          atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
-        free(ctx);
-        if (bg_snap)
-          release_zone_snapshot(bg_snap);
-        atomic_fetch_sub_explicit(&g_xfers_running, 1, memory_order_relaxed);
-        pthread_exit(NULL);
-      }
-      req_len = p_len + 2;
-    }
-    uint16_t msg_len = req_len - 2;
-    axfr_req[0] = msg_len >> 8;
-    axfr_req[1] = msg_len & 0xFF;
-    if (send(tcp_fd, axfr_req, req_len, 0) == req_len) {
-      // handle_axfr_event() は writer_lock を持ったまま読み取り区間に入るので、先にスロットを確保する
-      rcu_aux_thread_pin();
-      int axfr_res = handle_axfr_event(tcp_fd, ctx->entry, stream_ctx, &session, tsig_key_ptr,
-                                       req_mac_len > 0 ? req_mac : NULL, req_mac_len);
-      rcu_aux_thread_unpin();
-      if (session.out_of_zone_skipped > 0) {
-        syslog(LOG_WARNING, "[AXFR] zone %s: ignored %u out-of-zone record(s) sent by %s",
-               ctx->domain, session.out_of_zone_skipped, ctx->master_ip);
-      }
-      if (axfr_res == 1) {
-        syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
-      } else if (axfr_res == 2) {
-        // Zone is up to date. Do not log to avoid spam on short refresh intervals.
-      } else {
-        syslog(LOG_ERR, "[AXFR] Failed to transfer zone %s from %s", ctx->domain, ctx->master_ip);
-      }
-    } else {
-      syslog(LOG_ERR, "[AXFR] Failed to send request for zone %s to %s", ctx->domain, ctx->master_ip);
-    }
-    free(stream_ctx);
-    close(tcp_fd);
+  axfr_session_t session;
+  uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
+  int axfr_res = xfr_attempt(ctx, &master_addr, domain_family, tsig_key_ptr, active_serial, &session);
+  /* R-19, RFC 1995 §4: IXFR を扱えないプライマリ (FORMERR / NOTIMP) からは AXFR で1回だけ取り直す */
+  if (axfr_res < 0 && active_serial != 0 && (session.rcode == 1 || session.rcode == 4)) {
+    syslog(LOG_NOTICE, "[AXFR] zone %s: %s does not support IXFR, retrying with AXFR", ctx->domain, ctx->master_ip);
+    axfr_res = xfr_attempt(ctx, &master_addr, domain_family, tsig_key_ptr, 0, &session);
+  }
+  if (session.out_of_zone_skipped > 0) {
+    syslog(LOG_WARNING, "[AXFR] zone %s: ignored %u out-of-zone record(s) sent by %s",
+           ctx->domain, session.out_of_zone_skipped, ctx->master_ip);
+  }
+  if (axfr_res == 1) {
+    syslog(LOG_NOTICE, "[AXFR] Successfully transferred zone %s from %s", ctx->domain, ctx->master_ip);
+  } else if (axfr_res == 2) {
+    // Zone is up to date. Do not log to avoid spam on short refresh intervals.
   } else {
-    syslog(LOG_ERR, "[AXFR] Failed to connect to %s for zone %s", ctx->master_ip, ctx->domain);
+    syslog(LOG_ERR, "[AXFR] Failed to transfer zone %s from %s", ctx->domain, ctx->master_ip);
   }
   if (ctx->entry)
     atomic_store_explicit(&ctx->entry->is_transferring, false,
@@ -1073,32 +1124,71 @@ static int axfr_emit_zone_record(axfr_emit_ctx_t *ec, const dns_record_t *rec_it
   return axfr_emit_record(ec, rec_item);
 }
 
+/* 転送要求への1通だけのエラー応答 (RFC 5936 §2.2: 質問セクションを写し、それで転送を終える)。
+ * 質問セクションまでで切り (Rule 3)、要求に OPT があれば OPT と EDE を付け (RFC 6891 §6.1.1)、
+ * 検証できた TSIG があれば同じ鍵で署名する (RFC 8945 §5.3)。aa は応答の AA ビット。 */
+static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len, uint8_t rcode, bool aa,
+                            uint16_t ede_code, const char *ede_text,
+                            tsig_key_t *tsig_key, const uint8_t *req_mac, size_t req_mac_len,
+                            const struct sockaddr_storage *client_addr, socklen_t client_len,
+                            const struct sockaddr_storage *server_addr, bool has_server_addr) {
+  uint8_t res_buf[UDP_DEFAULT_MAX_RES_LEN];
+  edns_info_t req_edns_r = {0};
+  bool edns_ok = req_len >= DNS_HEADER_SIZE &&
+                 parse_edns_opt(req, req_len, (uint16_t)((req[4] << 8) | req[5]), (uint16_t)((req[6] << 8) | req[7]),
+                                (uint16_t)((req[8] << 8) | req[9]), (uint16_t)((req[10] << 8) | req[11]),
+                                &req_edns_r) == 0 && req_edns_r.present;
+  req_edns_r.ede_count = 0;
+  if (edns_ok && ede_code != 0xFFFF) add_ede(&req_edns_r, true, ede_code, ede_text);
+  int built = dns_build_error_response(req, req_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+                                       edns_ok ? &req_edns_r : NULL, true, NULL);
+  if (built <= 0) return;
+  if (aa) res_buf[2] |= 0x04;
+  size_t copy_len = (size_t)built;
+  if (tsig_key) {
+    uint8_t mac[64];
+    size_t mac_len = 0;
+    if (req_mac_len > sizeof(mac)) return;
+    if (req_mac_len > 0) memcpy(mac, req_mac, req_mac_len);
+    mac_len = req_mac_len;
+    if (tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), tsig_key, 0, mac, &mac_len, NULL, 0, false) != 0)
+      return;
+  }
+  uint8_t len_prefix[2] = {(uint8_t)(copy_len >> 8), (uint8_t)(copy_len & 0xFF)};
+  write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
+                     (const struct sockaddr *)client_addr, client_len,
+                     has_server_addr ? (const struct sockaddr *)server_addr : NULL,
+                     has_server_addr, IPPROTO_TCP);
+  send_tcp_robust(client_fd, len_prefix, 2);
+  send_tcp_robust(client_fd, res_buf, copy_len);
+}
+
+/* Extended AXFR (KariDNS 拡張) でしか運べないデータがゾーンにあるか。無ければ拡張を求める
+ * KariDNS セカンダリの IXFR にも差分で答えられる (X-24)。セカンダリは IXFR を受けると
+ * 自分の active を複製して差分を当てるので、拡張データの更新はこの判定で AXFR に回す。 */
+static bool zone_needs_extended_axfr(const zone_arena_t *zone, const zone_db_entry_t *entry) {
+  if (zone->bind_location_tag_count > 0 || zone->bind_ecs_tag_count > 0 || zone->location_count > 0 ||
+      zone->is_tinydns_format || zone->bind_ecs_trusted_resolver_count > 0)
+    return true;
+  bool cfg_trusted = false;
+  server_config_t *cfg = acquire_config_snapshot();
+  if (cfg) {
+    zone_config_t *zcfg = find_zone_config_in_view(cfg, entry->view_name, entry->domain);
+    cfg_trusted = (zcfg && zcfg->ecs_trusted_resolvers_count > 0) || cfg->ecs_trusted_resolvers_count > 0;
+    release_config_snapshot(cfg);
+  }
+  return cfg_trusted;
+}
+
 void send_axfr_response(int client_fd, const char *qname __attribute__((unused)), uint8_t *req,
                         uint16_t req_len, tsig_key_t *tsig_key, zone_db_entry_t *entry,
                         uint8_t *req_mac, size_t req_mac_len,
                         const struct sockaddr_storage *client_addr, socklen_t client_len,
                         const struct sockaddr_storage *server_addr, bool has_server_addr) {
   if (!entry) {
-    /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06)、質問セクションまで (Rule 3)、
-     * 要求に OPT があれば OPT を付ける (RFC 6891 §6.1.1)。 */
-    uint8_t res_buf[UDP_DEFAULT_MAX_RES_LEN];
-    edns_info_t req_edns_r = {0};
-    bool edns_ok = req_len >= DNS_HEADER_SIZE &&
-                   parse_edns_opt(req, req_len, (uint16_t)((req[4] << 8) | req[5]), (uint16_t)((req[6] << 8) | req[7]),
-                                  (uint16_t)((req[8] << 8) | req[9]), (uint16_t)((req[10] << 8) | req[11]),
-                                  &req_edns_r) == 0;
-    req_edns_r.ede_count = 0;
-    int built = dns_build_error_response(req, req_len, res_buf, sizeof(res_buf), 5, 0, 1,
-                                         edns_ok ? &req_edns_r : NULL, true, NULL);
-    if (built <= 0) return;
-    size_t copy_len = (size_t)built;
-    uint8_t len_prefix[2] = {(uint8_t)(copy_len >> 8), (uint8_t)(copy_len & 0xFF)};
-    write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
-                       (const struct sockaddr *)client_addr, client_len,
-                       has_server_addr ? (const struct sockaddr *)server_addr : NULL,
-                       has_server_addr, IPPROTO_TCP);
-    send_tcp_robust(client_fd, len_prefix, 2);
-    send_tcp_robust(client_fd, res_buf, copy_len);
+    /* 権威を持たないゾーンへの転送要求: REFUSED、AA=0 (R-06) */
+    axfr_send_error(client_fd, req, req_len, 5, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
+                    client_addr, client_len, server_addr, has_server_addr);
     return;
   }
   zone_arena_t *current_zone = NULL;
@@ -1113,9 +1203,13 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
                               memory_order_release);
   } while (1);
-  if (!current_zone || current_zone->count == 0) {
+  if (current_zone->count == 0) {
+    /* X-19: まだデータの無いゾーン (未転送のセカンダリなど)。何も送らないとクライアントは
+     * タイムアウトまで待つので、SERVFAIL と EDE 14 Not Ready (RFC 8914 §4.15) で終える。 */
     atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
                               memory_order_release);
+    axfr_send_error(client_fd, req, req_len, 2, false, 14, "Zone not loaded", tsig_key, req_mac, req_mac_len,
+                    client_addr, client_len, server_addr, has_server_addr);
     return;
   }
 
@@ -1139,32 +1233,15 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   uint16_t qtype = (q_offset >= 4) ? ((req[q_offset - 4] << 8) | req[q_offset - 3]) : 0;
   bool is_ixfr = (qtype == 251);
   uint32_t client_serial = 0;
-  if (is_ixfr) {
-    uint16_t nscount = (req[8] << 8) | req[9];
-    if (nscount > 0) {
-      size_t p = q_offset;
-      size_t next_p;
-      if (skip_wire_name(req, req_len, p, &next_p) == 0) {
-        p = next_p;
-        if (p + 10 <= req_len) {
-          uint16_t auth_type = (req[p] << 8) | req[p+1];
-          uint16_t auth_rdlen = (req[p+8] << 8) | req[p+9];
-          p += 10;
-          if (auth_type == 6 && p + auth_rdlen <= req_len) {
-            size_t rp = p;
-            if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
-              rp = next_p;
-              if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
-                rp = next_p;
-                if (rp + 4 <= p + auth_rdlen) {
-                  client_serial = ((uint32_t)req[rp] << 24) | ((uint32_t)req[rp+1] << 16) | ((uint32_t)req[rp+2] << 8) | req[rp+3];
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+  /* RFC 1995 §3: IXFR 要求の Authority にはクライアントの版の SOA がある。無ければ FORMERR
+   * (BIND も "IXFR request missing SOA" で FORMERR)。 */
+  bool has_client_soa = is_ixfr && ixfr_request_client_serial(req, req_len, q_offset, &client_serial);
+  if (is_ixfr && !has_client_soa) {
+    free(res);
+    atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
+    axfr_send_error(client_fd, req, req_len, 1, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
+                    client_addr, client_len, server_addr, has_server_addr);
+    return;
   }
   uint16_t req_qd = (req[4] << 8) | req[5];
   uint16_t req_an = (req[6] << 8) | req[7];
@@ -1181,6 +1258,8 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
   }
   edns_info_t resp_edns = {0};
+  /* R-16, RFC 5936 §2.2.5: 要求に OPT があれば最初のメッセージに OPT を1つ付ける */
+  if (req_edns.present) resp_edns.present = true;
   if (is_extended_axfr) {
     resp_edns.present = true;
     resp_edns.has_karidns_ext = true;
@@ -1215,11 +1294,16 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   int txn_count = 0;
   uint32_t current_serial = strtoul(current_zone->records[soa_idx].rdata[2], NULL, 10);
 
-  if (is_extended_axfr && is_ixfr) {
+  /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982 の比較) を持つクライアントには現在の SOA 1件で答える。 */
+  bool client_up_to_date = is_ixfr && (client_serial == current_serial ||
+                                       serial_is_newer(client_serial, current_serial));
+  /* X-24: 拡張を求める KariDNS セカンダリの IXFR は、拡張でしか運べないデータがあるときだけ
+   * Extended AXFR にする。それ以外は通常の IXFR (差分が無ければ下で AXFR) で答える。 */
+  if (is_extended_axfr && is_ixfr && !client_up_to_date && zone_needs_extended_axfr(current_zone, entry)) {
     is_ixfr = false;
   }
 
-  if (is_ixfr && client_serial == current_serial) {
+  if (client_up_to_date) {
     send_ixfr = true;
   } else if (is_ixfr) {
     pthread_mutex_lock(&entry->ixfr_history.lock);

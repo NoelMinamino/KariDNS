@@ -224,7 +224,7 @@ KariDNS solves this with **Extended AXFR**:
 - A KariDNS primary recognizes Option 65153 and replies with an Extended AXFR stream in which the KariDNS-specific data is carried as private-use record types in the private CLASS `65302`:
   - In BIND zones: tag definitions (`$LOCATION-TAG` as TYPE `65403`, `$ECS-SUBNET-TAG` as TYPE `65404`), record state transitions (`$LOCATION` as TYPE `65401`, `$ECS-SUBNET` as TYPE `65402`) and the zone's trusted ECS resolvers (TYPE `65407`).
   - In tinydns zones: location definitions (`%`, TYPE `65405`) and wrapped records (TYPE `65406`) preserving location tags and countdown timestamps.
-- An IXFR request that carries Option 65153 is answered with a full Extended AXFR.
+- An IXFR request that carries Option 65153 is answered with a full Extended AXFR only when the zone has KariDNS-specific data (tag definitions, location definitions, tinydns data, or trusted ECS resolvers for the zone or the server). Otherwise it is answered like any IXFR (RFC 1995): a single SOA when the secondary is up to date, the differences when the primary's history covers the secondary's serial, else a full (Extended) AXFR. A secondary that receives an IXFR copies its current data and applies the differences, so changes of KariDNS-specific data always reach it by a full transfer.
 - Secondary seamlessly unwraps the transfer and populates its in-memory arena, enabling identical steering on the secondary server.
 
 ### 6.2 Standard AXFR Fallback (Plan B)

@@ -1,6 +1,7 @@
 #define OPENSSL_SUPPRESS_DEPRECATED 1
 #define STATIC_TEST
 #include "dns_snapshot_rcu.h"
+#include "dns_dynamic_update.h"
 #include "dns_server_internal.h"
 #include "dns_catalog_zone.h"
 #include "dns_edns_ecs.h"
@@ -650,6 +651,9 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   }
   zone_arena_t *z_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   zone_arena_t *z_standby = (z_active == &entry->rcu.arena_a) ? &entry->rcu.arena_b : &entry->rcu.arena_a;
+  /* R-21: 読み込み済みのゾーンの版が変わったら NOTIFY を送る (起動時の最初の読み込みでは送らない) */
+  bool was_loaded = z_active->count > 0;
+  uint32_t old_serial = entry->serial;
   if (!rcu_writer_wait_until_safe(entry->rcu.retire_epoch, 60000)) {
     syslog(LOG_WARNING, "[Zone] Reload of zone '%s' postponed: RCU grace period wait timed out (60s).", entry->domain);
     free(buf);
@@ -889,6 +893,8 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   }
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
+  // RFC 1996 §4.5: プライマリのゾーンが変わったらセカンダリへ通知する
+  if (was_loaded && !entry->is_secondary && entry->serial != old_serial) notify_request_send(entry);
   return RELOAD_OK;
 }
 
@@ -898,6 +904,51 @@ STATIC_TEST void abort_rebuild_snapshot(zone_db_snapshot_t *new_snap, const char
         free_zone_db_snapshot(new_snap);
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+}
+
+/* R-28, RFC 9432 §5.4: カタログメンバーの同一性は (メンバーゾーン名, メンバーノードのラベル) だけで決まる。
+ * group (§4.3.2) は設定の選び分けにしか使わないので比較に含めない。ht/chain/hsize は
+ * calc_catalog_member_hash() で作ったハッシュ表 (作れなかったときは NULL で線形探索)。 */
+static int catalog_member_index(const catalog_member_id_t *list, int count, const int *ht, const int *chain,
+                                size_t hsize, const char *domain, const char *unique_id) {
+    if (ht && chain) {
+        size_t idx = calc_catalog_member_hash(domain, unique_id) & (hsize - 1);
+        for (int j = ht[idx]; j != -1; j = chain[j]) {
+            if (strcasecmp(domain, list[j].domain) == 0 && strcmp(unique_id, list[j].unique_id) == 0) return j;
+        }
+        return -1;
+    }
+    for (int j = 0; j < count; j++) {
+        if (strcasecmp(domain, list[j].domain) == 0 && strcmp(unique_id, list[j].unique_id) == 0) return j;
+    }
+    return -1;
+}
+
+static bool catalog_groups_equal(const catalog_member_id_t *a, const catalog_member_id_t *b) {
+    if (a->group_count != b->group_count) return false;
+    for (int k = 0; k < a->group_count; k++) {
+        if (strcmp(a->groups[k], b->groups[k]) != 0) return false;
+    }
+    return true;
+}
+
+/* メンバーのゾーンエントリの group をその場で置き換える (エントリと転送の状態はそのまま)。
+ * entry->groups を読むのは解放だけで、書き手はスナップショットを作り直すこのスレッドだけ。 */
+static void catalog_entry_set_groups(zone_db_entry_t *entry, const catalog_member_id_t *m) {
+    if (entry->groups) {
+        for (int g = 0; g < entry->group_count; g++) free(entry->groups[g]);
+        free(entry->groups);
+        entry->groups = NULL;
+    }
+    entry->group_count = 0;
+    if (m->group_count <= 0) return;
+    entry->groups = calloc(m->group_count, sizeof(char *));
+    if (!entry->groups) return;
+    for (int g = 0; g < m->group_count; g++) {
+        entry->groups[g] = strdup(m->groups[g]);
+        if (!entry->groups[g]) break;
+        entry->group_count = g + 1;
+    }
 }
 
 zone_db_snapshot_t *rebuild_zone_db_snapshot(
@@ -1250,45 +1301,22 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
 
         for (int i = 0; i < new_desired_count; i++) {
-            bool found = false;
-            if (cur_hash_table && cur_chain_next) {
-                uint32_t h = calc_catalog_member_hash(new_desired_members[i].domain, new_desired_members[i].unique_id);
-                size_t idx = h & (cur_hash_size - 1);
-                for (int j = cur_hash_table[idx]; j != -1; j = cur_chain_next[j]) {
-                    if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
-                        strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
-                        bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
-                        if (groups_match) {
-                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
-                                if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
-                                    groups_match = false; break;
-                                }
-                            }
-                        }
-                        if (groups_match) {
-                            found = true; break;
-                        }
-                    }
-                }
-            } else {
-                for (int j = 0; j < catalog_entry_to_update->catalog_member_count; j++) {
-                    if (strcasecmp(new_desired_members[i].domain, catalog_entry_to_update->catalog_members[j].domain) == 0 &&
-                        strcmp(new_desired_members[i].unique_id, catalog_entry_to_update->catalog_members[j].unique_id) == 0) {
-                        bool groups_match = (new_desired_members[i].group_count == catalog_entry_to_update->catalog_members[j].group_count);
-                        if (groups_match) {
-                            for (int k = 0; k < new_desired_members[i].group_count; k++) {
-                                if (strcmp(new_desired_members[i].groups[k], catalog_entry_to_update->catalog_members[j].groups[k]) != 0) {
-                                    groups_match = false; break;
-                                }
-                            }
-                        }
-                        if (groups_match) {
-                            found = true; break;
-                        }
-                    }
+            int cur_idx = catalog_member_index(catalog_entry_to_update->catalog_members, cur_count,
+                                               cur_hash_table, cur_chain_next, cur_hash_size,
+                                               new_desired_members[i].domain, new_desired_members[i].unique_id);
+            bool found = cur_idx >= 0;
+            if (found && target_view &&
+                !catalog_groups_equal(&new_desired_members[i], &catalog_entry_to_update->catalog_members[cur_idx])) {
+                /* R-28: group だけの変更はメンバーの削除と追加にしない (RFC 9432 §4.3.2, §5.4) */
+                zone_db_entry_t *existing = find_catalog_parent_in_snapshot(target_view, new_desired_members[i].domain);
+                if (existing && existing->is_catalog_member &&
+                    strcasecmp(existing->owning_catalog_domain, catalog_entry_to_update->domain) == 0) {
+                    catalog_entry_set_groups(existing, &new_desired_members[i]);
+                    syslog(LOG_INFO, "[Catalog] Updated group property of member '%s' (unique-id: %s)",
+                           existing->domain, new_desired_members[i].unique_id);
                 }
             }
-            
+
             bool member_accepted = true;
             bool needs_creation = true;
 
@@ -1316,25 +1344,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                                            existing->domain, existing->catalog_member_unique_id, existing->owning_catalog_domain, catalog_entry_to_update->domain);
                                     strncpy(existing->owning_catalog_domain, catalog_entry_to_update->domain, sizeof(existing->owning_catalog_domain) - 1);
                                     
-                                    // Deep copy new groups in-place
-                                    if (existing->groups) {
-                                        for (int g = 0; g < existing->group_count; g++) {
-                                            free(existing->groups[g]);
-                                        }
-                                        free(existing->groups);
-                                        existing->groups = NULL;
-                                    }
-                                    existing->group_count = new_desired_members[i].group_count;
-                                    if (existing->group_count > 0) {
-                                        existing->groups = calloc(existing->group_count, sizeof(char*));
-                                        if (existing->groups) {
-                                            for (int g = 0; g < existing->group_count; g++) {
-                                                existing->groups[g] = strdup(new_desired_members[i].groups[g]);
-                                            }
-                                        } else {
-                                            existing->group_count = 0;
-                                        }
-                                    }
+                                    catalog_entry_set_groups(existing, &new_desired_members[i]);
                                     needs_creation = false;
                                 } else {
                                     // State reset
@@ -1403,46 +1413,10 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
         }
 
         for (int i = 0; i < catalog_entry_to_update->catalog_member_count; i++) {
-            bool found = false;
-            if (des_hash_table && des_chain_next) {
-                uint32_t h = calc_catalog_member_hash(catalog_entry_to_update->catalog_members[i].domain,
-                                                      catalog_entry_to_update->catalog_members[i].unique_id);
-                size_t idx = h & (des_hash_size - 1);
-                for (int j = des_hash_table[idx]; j != -1; j = des_chain_next[j]) {
-                    if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
-                        strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
-                        bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
-                        if (groups_match) {
-                            /* i indexes the current members, j the desired ones (was swapped: OOB/UAF read) */
-                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
-                                if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
-                                    groups_match = false; break;
-                                }
-                            }
-                        }
-                        if (groups_match) {
-                            found = true; break;
-                        }
-                    }
-                }
-            } else {
-                for (int j = 0; j < new_desired_count; j++) {
-                    if (strcasecmp(catalog_entry_to_update->catalog_members[i].domain, new_desired_members[j].domain) == 0 &&
-                        strcmp(catalog_entry_to_update->catalog_members[i].unique_id, new_desired_members[j].unique_id) == 0) {
-                        bool groups_match = (catalog_entry_to_update->catalog_members[i].group_count == new_desired_members[j].group_count);
-                        if (groups_match) {
-                            for (int k = 0; k < catalog_entry_to_update->catalog_members[i].group_count; k++) {
-                                if (strcmp(catalog_entry_to_update->catalog_members[i].groups[k], new_desired_members[j].groups[k]) != 0) {
-                                    groups_match = false; break;
-                                }
-                            }
-                        }
-                        if (groups_match) {
-                            found = true; break;
-                        }
-                    }
-                }
-            }
+            bool found = catalog_member_index(new_desired_members, new_desired_count,
+                                              des_hash_table, des_chain_next, des_hash_size,
+                                              catalog_entry_to_update->catalog_members[i].domain,
+                                              catalog_entry_to_update->catalog_members[i].unique_id) >= 0;
             if (!found) {
                 removed_members[removed_count++] = catalog_entry_to_update->catalog_members[i];
             }

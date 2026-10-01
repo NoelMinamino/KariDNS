@@ -269,6 +269,32 @@ int skip_name_inplace(const uint8_t *packet, size_t packet_len, size_t *offset) 
     return 0;
 }
 
+bool ixfr_request_client_serial(const uint8_t *req, size_t req_len, size_t q_end, uint32_t *serial) {
+    if (!req || req_len < DNS_HEADER_SIZE) return false;
+    uint16_t ancount = (uint16_t)((req[6] << 8) | req[7]);
+    uint16_t nscount = (uint16_t)((req[8] << 8) | req[9]);
+    if (nscount == 0) return false;
+    size_t p = q_end, next_p;
+    for (uint16_t i = 0; i < ancount; i++) {
+        if (skip_wire_name(req, req_len, p, &next_p) != 0 || next_p + 10 > req_len) return false;
+        p = next_p + 10 + (size_t)((req[next_p + 8] << 8) | req[next_p + 9]);
+        if (p > req_len) return false;
+    }
+    if (skip_wire_name(req, req_len, p, &next_p) != 0 || next_p + 10 > req_len) return false;
+    p = next_p;
+    uint16_t type = (uint16_t)((req[p] << 8) | req[p + 1]);
+    size_t rdlen = (size_t)((req[p + 8] << 8) | req[p + 9]);
+    p += 10;
+    if (type != 6 || p + rdlen > req_len) return false;
+    size_t rp = p;
+    /* RDATA: MNAME RNAME SERIAL ... (RFC 1035 §3.3.13) */
+    if (skip_wire_name(req, p + rdlen, rp, &next_p) != 0) return false;
+    if (skip_wire_name(req, p + rdlen, next_p, &rp) != 0) return false;
+    if (rp + 4 > p + rdlen) return false;
+    *serial = ((uint32_t)req[rp] << 24) | ((uint32_t)req[rp + 1] << 16) | ((uint32_t)req[rp + 2] << 8) | req[rp + 3];
+    return true;
+}
+
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset) {
     if (!packet || current_offset >= packet_len) return -1;
     size_t p = current_offset; bool jumped = false; size_t jumped_offset = 0;

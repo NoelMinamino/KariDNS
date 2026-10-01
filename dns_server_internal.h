@@ -63,6 +63,7 @@ struct mmsghdr {
 extern int g_cwd_fd;
 extern int g_control_kq;
 extern int g_notify_ipc[2];
+extern int g_notify_resp_ipc[2];
 extern char g_startup_cwd[PATH_MAX];
 
 #define DNS_PORT 53
@@ -183,6 +184,10 @@ typedef struct {
   char current_ecs_tag[64];
   bool has_current_ecs_tag;
   uint32_t out_of_zone_skipped; /* R-27: 読み飛ばしたゾーン外 RR の数 */
+  uint16_t query_id;      /* R-19: 送った要求の ID と QTYPE (xfr_check_response_header() が照合する) */
+  uint16_t query_type;
+  bool got_first_msg;
+  uint8_t rcode;          /* エラーの RCODE で転送が終わったときの値 (0 = エラー応答ではない) */
 } axfr_session_t;
 
 // クエリログ用 固定長イベント構造体 (バイナリ保持)

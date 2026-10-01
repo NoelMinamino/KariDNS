@@ -1173,6 +1173,60 @@ static void test_config_negative_patterns(void) {
     printf("  -> config parser error & warning branches verified.\n");
 }
 
+/* notify-retries / notify-retry-interval / notify-retry-backoff (RFC 1996 §3.6: operator parameters,
+ * defaults 60 s and 5 retransmissions). docs/karidns.md: options and zone, zone overrides options. */
+static void test_notify_retry(void) {
+    printf("[TEST] notify-retries / notify-retry-interval / notify-retry-backoff...\n");
+    server_config_t cfg;
+    if (parse_ok("options { };", &cfg)) {
+        notify_retry_config_t r = notify_retry_effective(&cfg, NULL);
+        CHECK(r.retries == 5 && r.interval == 60 && r.backoff == NOTIFY_BACKOFF_FIXED);
+        free_server_config_fields(&cfg);
+    }
+    /* no configuration at all: the built-in defaults */
+    notify_retry_config_t d = notify_retry_effective(NULL, NULL);
+    CHECK(d.retries == 5 && d.interval == 60 && d.backoff == NOTIFY_BACKOFF_FIXED);
+
+    if (parse_ok("options { notify-retries 3; notify-retry-interval 3; notify-retry-backoff exponential; };"
+                 "zone \"a.example\" { type master; file \"a.zone\"; notify-retry-interval 10; };"
+                 "zone \"b.example\" { type master; file \"b.zone\"; notify-retries 0; notify-retry-backoff FIXED; };"
+                 "zone \"c.example\" { type master; file \"c.zone\"; };", &cfg)) {
+        const zone_config_t *a = first_zone(&cfg);
+        const zone_config_t *b = a ? a->next : NULL;
+        const zone_config_t *c = b ? b->next : NULL;
+        CHECK(cfg.notify_retry.retries == 3 && cfg.notify_retry.interval == 3);
+        CHECK(cfg.notify_retry.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
+        notify_retry_config_t ra = notify_retry_effective(&cfg, a);
+        CHECK(ra.retries == 3 && ra.interval == 10 && ra.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
+        notify_retry_config_t rb = notify_retry_effective(&cfg, b);
+        CHECK(rb.retries == 0 && rb.interval == 3 && rb.backoff == NOTIFY_BACKOFF_FIXED);
+        notify_retry_config_t rc = notify_retry_effective(&cfg, c);
+        CHECK(rc.retries == 3 && rc.interval == 3 && rc.backoff == NOTIFY_BACKOFF_EXPONENTIAL);
+        CHECK(c && !c->notify_retry.retries_set && !c->notify_retry.interval_set && !c->notify_retry.backoff_set);
+        free_server_config_fields(&cfg);
+    }
+    /* range boundaries are inclusive */
+    if (parse_ok("options { notify-retries 10; notify-retry-interval 3600; };", &cfg)) {
+        CHECK(cfg.notify_retry.retries == 10 && cfg.notify_retry.interval == 3600);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { notify-retries 0; notify-retry-interval 1; };", &cfg)) {
+        CHECK(cfg.notify_retry.retries == 0 && cfg.notify_retry.interval == 1);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("notify-retries above 10", "options { notify-retries 11; };");
+    expect_reject("notify-retries negative", "options { notify-retries -1; };");
+    expect_reject("notify-retry-interval 0", "options { notify-retry-interval 0; };");
+    expect_reject("notify-retry-interval above 3600", "options { notify-retry-interval 3601; };");
+    expect_reject("notify-retry-interval junk", "options { notify-retry-interval 60s; };");
+    expect_reject("notify-retry-backoff unknown", "options { notify-retry-backoff linear; };");
+    expect_reject("notify-retry-backoff missing semicolon", "options { notify-retry-backoff fixed };");
+    expect_reject("zone notify-retries out of range",
+                  "zone \"a.example\" { type master; file \"a.zone\"; notify-retries 99; };");
+    expect_reject("zone notify-retry-backoff unknown",
+                  "zone \"a.example\" { type master; file \"a.zone\"; notify-retry-backoff 2; };");
+}
+
 int main(void) {
     printf("=== Starting Config Directive Tests ===\n");
     test_defaults();
@@ -1181,6 +1235,7 @@ int main(void) {
     test_numeric_directives_invalid();
     test_buffer_sizes();
     test_transport_params();
+    test_notify_retry();
     test_additional_from_auth();
     test_options_syntax_errors();
     test_ecs_and_location_tags();

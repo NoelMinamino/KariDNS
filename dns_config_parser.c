@@ -1253,8 +1253,68 @@ static int parse_transport_param(token_ctx_t *ctx, const char *zone_domain, cons
   return 0;
 }
 
+/* notify-retries / notify-retry-interval / notify-retry-backoff。options (zone_domain NULL) と zone で共通。
+ * 戻り値: 0 = このキーではない、1 = 読んで nr に設定した、-1 = 値が不正 (ログ済み)。 */
+static int parse_notify_retry_option(token_ctx_t *ctx, const char *zone_domain, const char *key,
+                                     notify_retry_config_t *nr) {
+  if (strcmp(key, "notify-retries") == 0) {
+    if (parse_transport_param(ctx, zone_domain, key, false, 0, NOTIFY_RETRIES_MAX, &nr->retries) != 0) return -1;
+    nr->retries_set = true;
+    return 1;
+  }
+  if (strcmp(key, "notify-retry-interval") == 0) {
+    if (parse_transport_param(ctx, zone_domain, key, false, 1, NOTIFY_RETRY_INTERVAL_MAX, &nr->interval) != 0)
+      return -1;
+    nr->interval_set = true;
+    return 1;
+  }
+  if (strcmp(key, "notify-retry-backoff") != 0) return 0;
+  conf_token_t tok = get_next_token(ctx);
+  bool ok = tok.type == TOKEN_STRING && tok.value &&
+            (strcasecmp(tok.value, "fixed") == 0 || strcasecmp(tok.value, "exponential") == 0);
+  if (!ok) {
+    const char *v = (tok.type == TOKEN_STRING && tok.value) ? tok.value : "";
+    if (zone_domain) {
+      syslog(LOG_ERR, "[Config] zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)",
+             zone_domain, v);
+      fprintf(stderr, "[ERROR] zone '%s': invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n",
+              zone_domain, v);
+    } else {
+      syslog(LOG_ERR, "[Config] Invalid notify-retry-backoff value '%s' (expected fixed or exponential)", v);
+      fprintf(stderr, "[ERROR] Invalid notify-retry-backoff value '%s' (expected fixed or exponential)\n", v);
+    }
+    free_token(&tok);
+    if (ctx) ctx->error_occurred = true;
+    return -1;
+  }
+  nr->backoff = strcasecmp(tok.value, "exponential") == 0 ? NOTIFY_BACKOFF_EXPONENTIAL : NOTIFY_BACKOFF_FIXED;
+  nr->backoff_set = true;
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  bool semi = tok.type == TOKEN_SEMICOLON;
+  free_token(&tok);
+  return semi ? 1 : -1;
+}
+
+notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone) {
+  notify_retry_config_t r = {NOTIFY_RETRIES_DEFAULT, NOTIFY_RETRY_INTERVAL_DEFAULT, NOTIFY_BACKOFF_FIXED,
+                             true, true, true};
+  if (cfg) {
+    r.retries = cfg->notify_retry.retries;
+    r.interval = cfg->notify_retry.interval;
+    r.backoff = cfg->notify_retry.backoff;
+  }
+  if (zone) {
+    if (zone->notify_retry.retries_set) r.retries = zone->notify_retry.retries;
+    if (zone->notify_retry.interval_set) r.interval = zone->notify_retry.interval;
+    if (zone->notify_retry.backoff_set) r.backoff = zone->notify_retry.backoff;
+  }
+  return r;
+}
+
 static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
   conf_token_t tok = get_next_token(ctx);
+  int nr_rc = 0;
   if (tok.type != TOKEN_STRING) {
     free_token(&tok);
     return -1;
@@ -1575,6 +1635,13 @@ static int parse_zone_block(token_ctx_t *ctx, zone_config_t **zone_out) {
         return -1;
       }
       free_token(&tok);
+    } else if (strncmp(key, "notify-retr", 11) == 0 &&
+               (nr_rc = parse_notify_retry_option(ctx, zone->domain, key, &zone->notify_retry)) != 0) {
+      if (nr_rc < 0) {
+        free(key);
+        free_zone_config(zone);
+        return -1;
+      }
     } else if (strcmp(key, "zone-tcp-mss") == 0 || strcmp(key, "zone-tcp-window") == 0 ||
                strcmp(key, "zone-tcp-sndbuf") == 0 || strcmp(key, "zone-udp-bufsize") == 0) {
       int v = 0;
@@ -1721,6 +1788,7 @@ static int parse_dnstap_block(token_ctx_t *ctx, server_config_t *config) {
 }
 
 static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) {
+  int nr_rc = 0;
   memset(config, 0, sizeof(server_config_t));
   config->port = 53;
   config->bind_addresses = NULL;
@@ -1743,6 +1811,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_any_ttl = 86400;
   config->wire_cache_max_records = 0;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
+  config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
+  config->notify_retry.interval = NOTIFY_RETRY_INTERVAL_DEFAULT;
+  config->notify_retry.backoff = NOTIFY_BACKOFF_FIXED;
   config->query_log_max_qps = 5000;
   config->query_log_buffer_size = 32768;
   config->max_mqtypes = 4;
@@ -2223,6 +2294,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strncmp(key, "notify-retr", 11) == 0 &&
+                   (nr_rc = parse_notify_retry_option(ctx, NULL, key, &config->notify_retry)) != 0) {
+          if (nr_rc < 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "tcp-mss") == 0) {
           if (parse_transport_param(ctx, NULL, key, false, KARIDNS_TCP_MSS_MIN, KARIDNS_TCP_MSS_MAX,
                                     &config->tcp_mss) != 0) {

@@ -68,7 +68,7 @@ Commands that take a zone name accept an optional view name as the next argument
 : Send DNS NOTIFY messages for `<zone>` now: to the `also-notify` servers and to the addresses of the zone's apex NS hosts, except the host named in the SOA MNAME field (RFC 1996 §3.2).
 
 `retransfer <zone> [view]`
-: For a secondary zone, discard the current serial and start a new transfer from the primary immediately.
+: For a secondary zone (including a catalog member zone), discard the current serial and start a new transfer (AXFR) from the primary immediately. For any other zone the server answers `ERROR zone is not a secondary` and karictl exits with status 3; the zone is not changed.
 
 `zonestatus <zone> [view]`
 : Display the SOA serial and refresh interval of `<zone>` (`OK serial=<n> refresh=<n>`).

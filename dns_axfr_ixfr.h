@@ -59,6 +59,10 @@ typedef struct {
 int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
                      zone_arena_t *standby, zone_arena_t *active,
                      axfr_session_t *session, const char *domain);
+/* R-19: 転送応答の1通のヘッダーと質問を session->query_id / query_type / domain と照合する
+ * (RFC 5936 §2.2.1、§2.2.2)。0 = 問題なし、-1 = 応答として受け付けない (ログ済み)、
+ * 1 = エラーの RCODE (session->rcode に設定、ログ済み)。 */
+int xfr_check_response_header(const uint8_t *msg, size_t msg_len, axfr_session_t *session, const char *domain);
 
 int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
                       tcp_stream_ctx_t *stream_ctx, axfr_session_t *session,

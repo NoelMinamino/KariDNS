@@ -103,6 +103,8 @@ STATIC_TEST int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
 STATIC_TEST int g_num_workers = 0;
 char g_startup_cwd[PATH_MAX] = "";
 int g_notify_ipc[2];
+/* NOTIFY の応答 (QR=1, OPCODE=4) を UDP ワーカーから制御スレッドへ渡す (Backend の中だけで使う) */
+int g_notify_resp_ipc[2] = {-1, -1};
 int g_control_sock = -1;
 _Atomic(bool) g_frontend_alive = true;
 
@@ -1669,6 +1671,9 @@ worker_startup_success:;
             // クエリパケットの検証: QRビットが0(クエリ)であることを期待
             uint8_t flags = req_buf[2];
             if (!__builtin_expect((flags & 0x80) == 0, 1)) {
+              /* RFC 1996 §3.6, §4.8: 送った NOTIFY の応答は制御スレッドが照合して再送を止める */
+              if (((flags >> 3) & 0x0F) == 4)
+                send(g_notify_resp_ipc[1], ipc_msg, sizeof(udp_ipc_t) + (size_t)ipc_msg->payload_len, MSG_DONTWAIT);
               continue;
             }
 
@@ -2598,6 +2603,11 @@ void *control_thread_func(void *arg) {
       pthread_exit(NULL);
     }
   }
+  if (g_notify_resp_ipc[0] >= 0) {
+    EV_SET(&ev_set[0], g_notify_resp_ipc[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+    if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1)
+      syslog(LOG_ERR, "[Control] Cannot watch NOTIFY answers: %m (outbound NOTIFY is not retransmitted correctly)");
+  }
 
   struct kevent ev_list[4];
   while (1) {
@@ -2608,6 +2618,18 @@ void *control_thread_func(void *arg) {
       break;
     }
     for (int i = 0; i < n; i++) {
+      if (ev_list[i].filter == EVFILT_READ && g_notify_resp_ipc[0] >= 0 &&
+          ev_list[i].ident == (uintptr_t)g_notify_resp_ipc[0]) {
+        /* UDP ワーカーが回してきた NOTIFY の応答 (udp_ipc_t + DNS メッセージ) */
+        uint8_t nbuf[sizeof(udp_ipc_t) + 4096];
+        ssize_t nlen;
+        while ((nlen = recv(g_notify_resp_ipc[0], nbuf, sizeof(nbuf), MSG_DONTWAIT)) >= (ssize_t)sizeof(udp_ipc_t)) {
+          udp_ipc_t *im = (udp_ipc_t *)nbuf;
+          if (im->payload_len > nlen - (ssize_t)sizeof(udp_ipc_t)) continue;
+          notify_handle_response(nbuf + sizeof(udp_ipc_t), im->payload_len, (const struct sockaddr *)&im->client_addr);
+        }
+        continue;
+      }
       if (g_control_sock >= 0 && ev_list[i].ident == (uintptr_t)g_control_sock) {
         // リスニングソケットをノンブロッキング化して accept でのハングを完全防止
         int sflags = fcntl(g_control_sock, F_GETFL, 0);
@@ -2981,6 +3003,11 @@ void *control_thread_func(void *arg) {
                 send(cfd, "ERROR zone not found\n", 21, 0);
               } else if (nmatches > 1) {
                 send(cfd, "ERROR zone exists in multiple views; specify view (e.g. 'retransfer <zone> <view>')\n", 86, 0);
+              } else if (lr.entry && !lr.entry->is_secondary) {
+                /* O-06: 転送元を持つのはセカンダリ (カタログのメンバーを含む) だけ。プライマリの
+                 * シリアルを 0 にすると UDP IXFR や karictl zonestatus の値が壊れる。 */
+                syslog(LOG_ERR, "[Control] Command 'retransfer' failed: zone '%s' is not a secondary", canon_arg);
+                send(cfd, "ERROR zone is not a secondary\n", 30, 0);
               } else if (lr.entry) {
                 syslog(LOG_NOTICE, "[Control] Received retransfer command for zone: %s", canon_arg);
                 atomic_store_explicit(&lr.entry->serial, 0, memory_order_release);
@@ -3029,6 +3056,8 @@ void *control_thread_func(void *arg) {
           }
           curr_c = next_c;
         }
+
+        notify_retransmit_due(now); /* RFC 1996 §3.6: 応答の無い NOTIFY の再送 */
 
         server_config_t *active = acquire_config_snapshot();
         zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
@@ -3466,6 +3495,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
     close(g_notify_ipc[0]);
   }
   close(g_notify_ipc[1]);
+  close(g_notify_resp_ipc[0]);
+  close(g_notify_resp_ipc[1]);
 
   server_config_t *cfg = acquire_config_snapshot();
 
@@ -4103,6 +4134,15 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   cap_rights_limit(g_notify_ipc[0], &n_rights_0);
   cap_rights_init(&n_rights_1, CAP_SEND, CAP_EVENT, CAP_FCNTL);
   cap_rights_limit(g_notify_ipc[1], &n_rights_1);
+
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_resp_ipc) < 0) {
+    syslog(LOG_CRIT, "[IPC] Failed to create NOTIFY response socketpair: %m");
+    exit(1);
+  }
+  fcntl(g_notify_resp_ipc[0], F_SETFL, fcntl(g_notify_resp_ipc[0], F_GETFL, 0) | O_NONBLOCK);
+  fcntl(g_notify_resp_ipc[1], F_SETFL, fcntl(g_notify_resp_ipc[1], F_GETFL, 0) | O_NONBLOCK);
+  cap_rights_limit(g_notify_resp_ipc[0], &n_rights_0);
+  cap_rights_limit(g_notify_resp_ipc[1], &n_rights_1);
 }
 
 /* 非root起動時に、path (pid file / 制御ソケット) を作成できるかを
@@ -4741,6 +4781,8 @@ int main(int argc, char **argv) {
     }
     close(g_notify_ipc[0]);
     close(g_notify_ipc[1]);
+    close(g_notify_resp_ipc[0]);
+    close(g_notify_resp_ipc[1]);
     if (g_control_sock >= 0) {
       close(g_control_sock);
       g_control_sock = -1;

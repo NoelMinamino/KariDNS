@@ -312,6 +312,9 @@ void register_wire_name_for_compression(const uint8_t *packet_buf, uint16_t star
 
 // ワイヤーフォーマット名前操作
 int skip_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset);
+/* IXFR 要求 (RFC 1995 §3) の Authority にあるクライアントの SOA から SERIAL を取り出す。q_end は質問セクションの
+ * 直後。Answer は読み飛ばす。最初の Authority RR が SOA で SERIAL まで読めれば true。TCP と UDP の IXFR で共有する。*/
+bool ixfr_request_client_serial(const uint8_t *req, size_t req_len, size_t q_end, uint32_t *serial);
 /* RFC 4648 §7 base32hex (upper case, no padding; RFC 5155 §3.3). */
 void dns_base32hex_encode(const uint8_t *data, size_t len, char *out, size_t out_cap);
 int expand_wire_name(const uint8_t *packet, size_t packet_len, size_t current_offset, size_t *next_offset, zone_arena_t *arena, char **name_out);

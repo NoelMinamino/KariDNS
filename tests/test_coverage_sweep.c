@@ -2312,6 +2312,9 @@ static void xfr_replay(const uint8_t *stream, size_t len, const char *dom, const
     close(sp[0]);
     tcp_stream_ctx_t sc; memset(&sc, 0, sizeof(sc));
     axfr_session_t s2; memset(&s2, 0, sizeof(s2)); s2.is_ixfr = ixfr; s2.client_serial = cserial;
+    /* R-19: handle_axfr_event() checks the response ID and QTYPE against the request it sent */
+    if (len >= 4) s2.query_id = (uint16_t)((stream[2] << 8) | stream[3]);
+    s2.query_type = ixfr ? 251 : 252;
     int hrc = handle_axfr_event(sp[1], &sec, &sc, &s2, k, mac, maclen);
     if (getenv("SW_SYSLOG")) fprintf(stderr, "XFRDBG len=%zu ixfr=%d hrc=%d parsed_upto=%zu\n", len, ixfr, hrc, o);
     close(sp[1]);

@@ -3054,48 +3054,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   // If update is needed (or diff required), set TC=1 and send current SOA to prompt client to retry over TCP.
   if (!is_tcp && qtype == 251) {
     uint32_t client_serial = 0;
-    bool has_client_soa = false;
-    uint16_t req_ancount = (req[6] << 8) | req[7];
-    uint16_t req_nscount = (req[8] << 8) | req[9];
-    size_t p = q_offset;
-    size_t next_p;
-
-    // Skip any answer records if present in the request
-    for (uint16_t i = 0; i < req_ancount; i++) {
-      if (skip_wire_name(req, req_len, p, &next_p) != 0) break;
-      p = next_p;
-      if (p + 10 > req_len) break;
-      uint16_t rdlen = (req[p + 8] << 8) | req[p + 9];
-      p += 10 + rdlen;
-      if (p > req_len) break;
-    }
-
-    if (req_nscount > 0 && p < req_len) {
-      if (skip_wire_name(req, req_len, p, &next_p) == 0) {
-        p = next_p;
-        if (p + 10 <= req_len) {
-          uint16_t auth_type = (req[p] << 8) | req[p + 1];
-          uint16_t auth_rdlen = (req[p + 8] << 8) | req[p + 9];
-          p += 10;
-          if (auth_type == 6 && p + auth_rdlen <= req_len) {
-            size_t rp = p;
-            if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
-              rp = next_p;
-              if (skip_wire_name(req, req_len, rp, &next_p) == 0) {
-                rp = next_p;
-                if (rp + 4 <= p + auth_rdlen) {
-                  client_serial = ((uint32_t)req[rp] << 24) |
-                                  ((uint32_t)req[rp + 1] << 16) |
-                                  ((uint32_t)req[rp + 2] << 8) |
-                                  req[rp + 3];
-                  has_client_soa = true;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    /* RFC 1995 §3: クライアントの版の SOA が Authority に無ければ FORMERR (TCP と同じ) */
+    if (!ixfr_request_client_serial(req, req_len, q_offset, &client_serial))
+      return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg);
 
     dns_record_t *soa_rec = NULL;
     uint32_t apex_hash = calc_fnv1a_str(db_entry->domain);
@@ -3125,7 +3086,8 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       current_serial = atomic_load_explicit(&db_entry->serial, memory_order_relaxed);
     }
 
-    bool is_up_to_date = (has_client_soa && client_serial == current_serial);
+    /* R-15, RFC 1995 §2: 同じか新しい版 (RFC 1982) なら最新なので、TC を立てずに SOA 1件で答える */
+    bool is_up_to_date = (client_serial == current_serial || serial_is_newer(client_serial, current_serial));
     if (!is_up_to_date) {
       res[2] |= 0x02; // Set TC (Truncated) bit to prompt TCP retry
     }

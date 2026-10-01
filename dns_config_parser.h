@@ -53,6 +53,22 @@ typedef enum {
   ADDITIONAL_AUTH_NO = 2         /* no: Additionalセクションへのアドレス付加を行わない */
 } additional_from_auth_t;
 
+/* 送信する NOTIFY の再送 (RFC 1996 §3.6: 間隔と回数は運用者が決める値)。
+ * options の値は常に有効。zone の値は *_set のものだけが options を上書きする。 */
+#define NOTIFY_RETRIES_DEFAULT 5
+#define NOTIFY_RETRIES_MAX 10
+#define NOTIFY_RETRY_INTERVAL_DEFAULT 60
+#define NOTIFY_RETRY_INTERVAL_MAX 3600
+typedef enum { NOTIFY_BACKOFF_FIXED = 0, NOTIFY_BACKOFF_EXPONENTIAL = 1 } notify_backoff_t;
+typedef struct {
+  int retries;        /* notify-retries: 最初の送信の後に再送する回数 */
+  int interval;       /* notify-retry-interval: 最初の再送までの秒数 */
+  notify_backoff_t backoff; /* notify-retry-backoff: fixed は同じ間隔、exponential は再送ごとに倍 */
+  bool retries_set;
+  bool interval_set;
+  bool backoff_set;
+} notify_retry_config_t;
+
 typedef struct zone_config {
   char *domain;
   char *file;
@@ -121,6 +137,8 @@ typedef struct zone_config {
   int zone_tcp_window;      /* SO_RCVBUF (受信ウィンドウ) */
   int zone_tcp_sndbuf;      /* SO_SNDBUF (送信バッファ) */
   uint16_t zone_udp_bufsize; /* EDNS UDP ペイロードサイズ上限 (512..4096) */
+
+  notify_retry_config_t notify_retry; /* ゾーン単位の上書き (*_set のもの) */
 
   struct zone_config *next;
 } zone_config_t;
@@ -219,6 +237,7 @@ typedef struct server_config_s {
   int udp_recvbuf_size;
   int udp_sndbuf_size;
   /* TCP の転送パラメータ (0 = OS 既定) */
+  notify_retry_config_t notify_retry;
   int tcp_mss;              /* TCP_MAXSEG。accept 直後に各接続へ設定 (送信 MSS を下げる方向のみ) */
   int tcp_window;           /* SO_RCVBUF と SO_SNDBUF。listen() 前に設定し accept 済みソケットへ
                              * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
@@ -273,6 +292,8 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
 void config_lexer_cleanup(token_ctx_t *ctx);
 void free_server_config_fields(server_config_t *cfg);
 void free_zone_config(zone_config_t *z);
+/* zone (NULL 可) の NOTIFY 再送の設定を、options の値で補って返す */
+notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const zone_config_t *zone);
 void free_rate_limit_config(rate_limit_config_t *rrl);
 #include <sys/types.h>
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino);

@@ -26,6 +26,7 @@
 #include "dns_cidr.h"
 #include "dns_tsig_acl.h"
 #include "dns_utils.h"
+#include "dns_catalog_zone.h"
 #include "sweep_watchdog.h"
 
 // Mock globals
@@ -778,10 +779,60 @@ static void test_snapshot_rebuild_case_31(void) {
     assert(strlen(coo_property) > 0);
 }
 
+/* R-28, RFC 9432 §4.3.2 / §5.4: a change of the group property keeps the member zone (same entry, no new
+ * transfer); a change of the member node label still replaces it. */
+static zone_db_entry_t *cat32_step(zone_db_entry_t *cat, zone_config_t *zcfg, int serial, const char *label,
+                                   const char *extra, zone_db_snapshot_t **snap_out) {
+    char text[512];
+    snprintf(text, sizeof(text),
+             "$ORIGIN cat32.example.\n$TTL 60\n@ IN SOA ns h %d 2 3 4 5\n@ IN NS invalid.\n"
+             "version IN TXT \"2\"\n%s.zones IN PTR m32.example.\n%s", serial, label, extra);
+    wfile("cat32.zone", text);
+    if (cat) {
+        /* karictl reload <catalog>: reload the zone, then process its membership */
+        assert(reload_master_zone(cat, zcfg) == RELOAD_OK);
+        catalog_process_membership(cat, zcfg, "__default__");
+    }
+    *snap_out = acquire_retained_zone_snapshot();
+    return snapshot_get_zone_in_view(*snap_out, "__default__", "m32.example.");
+}
+
 static void test_snapshot_rebuild_case_32(void) {
-    printf("[TEST] Snapshot Rebuild: Catalog zone group property in snapshot...\n");
-    const char *grp_property = "group1";
-    assert(strcmp(grp_property, "group1") == 0);
+    printf("[TEST] Snapshot Rebuild: catalog group change keeps the member zone, unique-id change replaces it...\n");
+    zone_db_snapshot_t *s1, *s2, *s3, *s4, *s5;
+    cat32_step(NULL, NULL, 1, "abc", "", &s1);
+    release_zone_snapshot(s1);
+    server_config_t *cfg = load_conf(
+        "options { directory \"%s\"; };\n"
+        "zone \"cat32.example\" { type master; file \"%s/cat32.zone\"; catalog-zone yes; };\n", g_dir, g_dir);
+    s1 = build(cfg, false);
+    zone_db_entry_t *m1 = snapshot_get_zone_in_view(s1, "__default__", "m32.example.");
+    zone_db_entry_t *cat = snapshot_get_zone_in_view(s1, "__default__", "cat32.example.");
+    assert(m1 && cat && m1->is_catalog_member && m1->group_count == 0);
+    assert(strcmp(m1->catalog_member_unique_id, "abc") == 0);
+    atomic_store_explicit(&m1->refresh_now, false, memory_order_release);
+    zone_config_t *zcfg = find_zone_config_in_view(cfg, "__default__", "cat32.example.");
+    assert(zcfg && zcfg->is_catalog);
+
+    /* group added: same entry, no refresh, groups updated */
+    zone_db_entry_t *m2 = cat32_step(cat, zcfg, 2, "abc", "group.abc.zones IN TXT \"g1\"\n", &s2);
+    assert(m2 == m1);
+    assert(!atomic_load_explicit(&m2->refresh_now, memory_order_acquire));
+    assert(m2->group_count == 1 && strcmp(m2->groups[0], "g1") == 0);
+    /* group changed, then removed */
+    zone_db_entry_t *m3 = cat32_step(cat, zcfg, 3, "abc", "group.abc.zones IN TXT \"g2\"\n", &s3);
+    assert(m3 == m1 && m3->group_count == 1 && strcmp(m3->groups[0], "g2") == 0);
+    zone_db_entry_t *m4 = cat32_step(cat, zcfg, 4, "abc", "", &s4);
+    assert(m4 == m1 && m4->group_count == 0 && !atomic_load_explicit(&m4->refresh_now, memory_order_acquire));
+    /* member node label changed: removal and re-add (new entry, new transfer) */
+    zone_db_entry_t *m5 = cat32_step(cat, zcfg, 5, "xyz", "", &s5);
+    assert(m5 && m5 != m1 && strcmp(m5->catalog_member_unique_id, "xyz") == 0);
+    assert(atomic_load_explicit(&m5->refresh_now, memory_order_acquire));
+    release_zone_snapshot(s1);
+    release_zone_snapshot(s2);
+    release_zone_snapshot(s3);
+    release_zone_snapshot(s4);
+    release_zone_snapshot(s5);
 }
 
 static void test_snapshot_rebuild_case_33(void) {

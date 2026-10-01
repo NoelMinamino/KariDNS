@@ -4337,11 +4337,6 @@ static void test_catalog_zone_coo_property_verification(void) {
     printf("  -> catalog coo property passed.\n");
 }
 
-static void test_catalog_zone_group_property_verification(void) {
-    printf("[TEST] Query Engine: Catalog zone group property processing...\n");
-    printf("  -> catalog group property passed.\n");
-}
-
 static void test_tinydns_timestamp_high_precision_epoch(void) {
     printf("[TEST] Query Engine: Tinydns timestamp epoch conversions...\n");
     time_t t = 1700000000;
@@ -9650,7 +9645,6 @@ int main(void) {
     test_rrl_whitelist_subnet_bypass();
     test_proxy_v2_tlv_additional_options_skip();
     test_catalog_zone_coo_property_verification();
-    test_catalog_zone_group_property_verification();
     test_tinydns_timestamp_high_precision_epoch();
     test_tinydns_location_two_character_codes();
     test_query_engine_opcode_iquery_notimp();
