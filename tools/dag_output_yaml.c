@@ -281,7 +281,9 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
                 const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
 
                 static char rdata_raw[65536];
+                g_dag_rdata_class = klass;
                 format_rdata_for_display(pkt, pkt_len, type, rdata_start, rdlen, rdata_raw, sizeof(rdata_raw), dopt);
+                g_dag_rdata_class = 1;
 
                 char name_esc[DNS_NAME_TEXT_SIZE * 2];
                 static char rdata_esc[131072];
@@ -297,7 +299,7 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
     }
     if (sig_label && sig_line[0] && show_sec[2]) {
         printf("      %s_PSEUDOSECTION:\n", sig_label);
-        printf("      - '%s'\n", sig_line);
+        printf("      - '%s'\n\n", sig_line); /* dig leaves an empty line after it */
     }
 }
 

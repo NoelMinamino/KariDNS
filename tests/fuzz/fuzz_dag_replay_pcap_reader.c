@@ -25,6 +25,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         12,  // LINKTYPE_RAW
         101, // LINKTYPE_RAW_ALT
         0,   // LINKTYPE_NULL
+        108, // LINKTYPE_LOOP
         65535 // Unknown / invalid linktype
     };
 

@@ -402,11 +402,14 @@ static void test_dag_cli_parsing_helpers_and_error_paths(void) {
     assert(parse_opcode_value(NULL) == -1);
 
     // 2. get_ede_error_string
-    for (uint16_t code = 0; code <= 29; code++) {
-        const char *s = get_ede_error_string(code);
-        assert(s != NULL && strcmp(s, "Unassigned") != 0);
+    /* dig 9.20 names RFC 8914 codes 0-24 and prints later codes by number */
+    for (uint16_t code = 0; code <= 24; code++) {
+        assert(get_ede_error_string(code) != NULL);
     }
-    assert(strcmp(get_ede_error_string(999), "Unassigned") == 0);
+    assert(strcmp(get_ede_error_string(0), "Other") == 0);
+    assert(strcmp(get_ede_error_string(19), "Stale NXDOMAIN Answer") == 0);
+    assert(get_ede_error_string(25) == NULL);
+    assert(get_ede_error_string(999) == NULL);
 
     // 3. rcode_name & opcode_name
     assert(strcmp(rcode_name(0), "NOERROR") == 0);

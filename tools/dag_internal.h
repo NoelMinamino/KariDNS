@@ -153,6 +153,20 @@ static inline uint32_t dag_arc4random(void) {
 const char *dag_strcasestr(const char *haystack, const char *needle);
 
 extern bool g_dag_suppress_stdout;
+extern size_t g_dag_pseudo_opt_off;
+extern bool g_dag_show_stray_opt;
+extern uint16_t g_dag_rdata_class;
+
+/* dag_parse_message(): outcome of parsing a response the way BIND (dig) does */
+typedef struct {
+    const char *fatal;  /* "Got bad packet" reason (the message is not shown), NULL if parsed */
+    bool malformed;     /* recoverable error: "Message parser reports malformed message packet" */
+    size_t end;         /* parsing stopped here; the octets after it are "extra bytes" */
+    uint16_t count[4];  /* records accepted per section (question, answer, authority, additional) */
+    size_t opt_off;     /* offset of the OPT pseudo-RR, SIZE_MAX if none */
+} dag_parse_t;
+void dag_parse_message(const uint8_t *pkt, size_t len, dag_parse_t *out);
+bool print_parse_diagnostics(const uint8_t *pkt, size_t len, const dag_parse_t *ps);
 #define printf(...) do { if (!g_dag_suppress_stdout) { fprintf(stdout, __VA_ARGS__); } } while(0)
 
 extern zone_arena_t g_dag_arena;
@@ -161,6 +175,12 @@ extern struct timespec g_dag_query_time;
 extern struct timespec g_dag_response_time;
 extern char g_last_server_ip[INET6_ADDRSTRLEN + 1];
 extern int g_last_socket_family;
+/* do_udp_exchange(): further checks of an answer whose header and ID matched (QR, opcode, question; set by dag).
+ * Returns false to ignore the answer and keep waiting. NULL in programs that do not set it. */
+typedef bool (*dag_answer_check_fn)(const uint8_t *query, size_t query_len, const uint8_t *resp, size_t resp_len);
+extern dag_answer_check_fn g_dag_answer_check;
+/* do_udp_exchange() return value for a timeout (dig: ";; communications error to ...: timed out") */
+#define DAG_EXCHANGE_TIMEOUT (-2)
 
 /* Types */
 typedef enum {
@@ -377,6 +397,7 @@ typedef struct {
     bool show_crypto;
     bool show_query_message;
     bool rrcomments;
+    bool rrcomments_set;   /* +[no]rrcomments was given (otherwise +multiline shows key comments, like dig) */
     bool onesoa;
     bool show_badcookie_msg;
     bool show_badvers_msg;
@@ -391,6 +412,7 @@ typedef struct {
      * +padding で付けた PADDING を長さなしで表示する (レンダリング前のメッセージを表示するため)。 */
     bool msg_is_query;
     bool query_auto_padding;
+    bool parse_diag_done;   /* run_test() already printed the parse diagnostics before the banner */
 } display_opts_t;
 
 /* +trace2 (フルリゾルバ相当の反復解決) の設定 */

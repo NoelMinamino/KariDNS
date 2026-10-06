@@ -26,7 +26,7 @@ The KariDNS automated test suite is managed via the unified runner script [`test
 | `dnstap` | **dnstap Logging** | Frame Streams / Protobuf logging | 1 | Shell script + receiver |
 | `tinydns` | **tinydns Format** | djbdns data format, %location split-horizon, TAI64 timestamps | 2 | Shell script + `karidns` |
 | `core` | **Server Core Engine** | RFC 1034/1035 resolution, forward & program zones, glue, RCU reload, lifecycle, adversarial inputs, `karicheck` / `karictl` | 40 | Shell script + `karidns` / `karictl` / `karicheck` |
-| `dag` | **Diagnostic Tool** | `run_dag_ci_test.sh` (Part 1-19 + Part 20-21 parallel sub-suites) and the individual dag test scripts | 58 | Shell scripts (included by default; skip with `--no-dag`) |
+| `dag` | **Diagnostic Tool** | `run_dag_ci_test.sh` (Part 1-19 + Part 20-21 parallel sub-suites) and the individual dag test scripts | 60 | Shell scripts (included by default; skip with `--no-dag`) |
 | `regression` | **Regression & Fuzz** | ASan/UBSan smoke, concurrency stress, libFuzzer harnesses, coverage tooling, BIND differential | 6 | Shell script + libFuzzer / ASan binaries |
 | **Total** | | | **169** | *(111 without the `dag` category)* |
 
@@ -83,7 +83,7 @@ This table maps RFC standards recognized in [`KariDNS_RFC_GUIDELINE.md`](../Kari
 
 ---
 
-## 3. Exhaustive Test Inventory (173 Registered Tests)
+## 3. Exhaustive Test Inventory (175 Registered Tests)
 
 The complete inventory of all test targets registered in `tests/run_all_suite.sh` (`sh tests/run_all_suite.sh --list`), grouped by their registered category in registration order. `bin` targets are C unit test binaries built by the Makefile; the others are shell scripts.
 
@@ -343,6 +343,8 @@ The complete inventory of all test targets registered in `tests/run_all_suite.sh
 | 154 | [`run_dag_yaml_rdata_test.sh`](run_dag_yaml_rdata_test.sh) | `dag` (`tools/dag_output_yaml.c`) | Structured Output | **Positive** | YAML output: decoded `rdata:` fields and section contents for the standard RR types. |
 | 155 | [`run_dag_yaml_rrsig_decode_test.sh`](run_dag_yaml_rrsig_decode_test.sh) | `dag` (`tools/dag_output_yaml.c`) | RFC 4034 §3.1 | **Positive** | Decoding RRSIG inception and expiration timestamps into human-readable ISO dates. |
 | 156 | [`run_dag_yaml_socket_family_force_test.sh`](run_dag_yaml_socket_family_force_test.sh) | `dag` (`tools/dag_output_yaml.c`) | Socket Telemetry | **Positive** | Verifying socket family forcing and telemetry in YAML outputs. |
+| 190 | [`run_dag_dig_output_compat_test.sh`](run_dag_dig_output_compat_test.sh) | `dag` (`tools/dag.c`, `tools/dag_edns_client.c`, `tools/dag_output_yaml.c`) | RFC 7314, RFC 7828 §3.2.1, RFC 7830, RFC 7873 §5.3, RFC 8945 §5.3.2 | **dig differential (9.20.29)** | Against KariDNS: EDNS option text and order (EXPIRE durations, TCP-KEEPALIVE, PADDING, NSID, OPT=N), BADVERS without EXT RCODE and the signed BADVERS retry (X-36), TSIG pseudosection and verify texts, "; Transfer failed.", `+noall +answer` without dumps (T-07), YAML display flags, `+qr` and millisecond timestamps (T-09, T-13), escaped names (X-14), `+search`/`+showsearch` (D-14), `+multiline` key comments and generic RDATA (T-08). Compares with dig directly when dig 9.20 is installed. |
+| 191 | [`run_dag_malformed_compat_test.sh`](run_dag_malformed_compat_test.sh) | `dag` (`tools/dag.c` `dag_parse_message`, `tools/dag_transport.c`) | RFC 1035 §4.1.4, RFC 5452 §9.1, RFC 6891 §6.1.1 | **dig differential (9.20.29)** | Every scenario of `mock_anomalous_dns_server.pl` through a program zone: ignored answers (ID, opcode, question mismatch, short header) and the timeout, "Got bad packet" for bad pointers/label types/long names, malformed RDATA with extra-byte counts, stray OPT records, class mismatch (Chaosnet A), RCODE/EDE names, BADCOOKIE without cookies, TC retry (T-12). Compares every scenario with dig directly when dig 9.20 is installed. |
 | 157 | [`run_dag_yaml_socket_family_test.sh`](run_dag_yaml_socket_family_test.sh) | `dag` (`tools/dag_output_yaml.c`) | Socket Telemetry | **Positive** | Transport family telemetry reporting in YAML statistics section. |
 
 ---

@@ -157,8 +157,8 @@ static void test_fi_dag_formatters_and_helpers(void) {
     uint32_t wh = 0, rh = 0;
     calculate_packet_hashes(dns_pkt, off, &wh, &rh);
 
-    size_t extra_bytes = 0;
-    check_packet_malformed(dns_pkt, off, &extra_bytes);
+    dag_parse_t ps;
+    dag_parse_message(dns_pkt, off, &ps);
 
     query_opts_t qo;
     memset(&qo, 0, sizeof(qo));

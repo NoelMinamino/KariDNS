@@ -432,6 +432,8 @@ register_test "dag" "sh" "tests/run_dag_yaml_rdata_test.sh" "dag YAML output RDA
 register_test "dag" "sh" "tests/run_dag_yaml_rrsig_decode_test.sh" "dag YAML RRSIG structured decoding"
 register_test "dag" "sh" "tests/run_dag_yaml_socket_family_force_test.sh" "dag YAML -4/-6 socket_family priority & verification"
 register_test "dag" "sh" "tests/run_dag_yaml_socket_family_test.sh" "dag YAML socket_family accuracy test"
+register_test "dag" "sh" "tests/run_dag_dig_output_compat_test.sh" "dag output compatible with dig 9.20 (EDNS, YAML, TSIG, search, multiline)"
+register_test "dag" "sh" "tests/run_dag_malformed_compat_test.sh" "dag malformed-response diagnostics compatible with dig 9.20"
 
 # If -l or --list, print tests and exit
 if [ "${LIST_ONLY}" -eq 1 ]; then

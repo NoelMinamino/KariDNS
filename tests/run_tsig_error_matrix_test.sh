@@ -94,12 +94,18 @@ kill -0 "$PRIMARY_PID" 2>/dev/null || fail "primary did not start"
 q() {
     "$DAG" @127.0.0.1 -p $PPORT +nohexdump "$@" > "$W/out.txt" 2>&1 || true
 }
+# q_xfr: like q for a zone transfer. dag prints a refused transfer like dig ("; Transfer failed." after the
+# records, no header), so the RCODE is taken from a second run with +yaml, appended to out.txt
+q_xfr() {
+    q "$@"
+    "$DAG" @127.0.0.1 -p $PPORT +nohexdump +yaml "$@" >> "$W/out.txt" 2>&1 || true
+}
 upd() { # <zone> <key spec or ""> ; adds x.<zone> A
     z=$1; k=$2
     q "$z" ${k:+-y hmac-sha256:$k} --update-add "x.$z 300 IN A 192.0.2.9"
 }
 expect_status() {
-    grep -q "status: $1," "$W/out.txt" || fail "$2: expected status $1"
+    grep -qE "status: $1(,|$)" "$W/out.txt" || fail "$2: expected status $1"
 }
 # expect_tsig <owner> <error> <macsize> <what>: the response's TSIG RR (owner is compared case-insensitively)
 expect_tsig() {
@@ -125,7 +131,7 @@ expect_status REFUSED "UPDATE m.test K2"; expect_tsig k2. NOERROR 32 "UPDATE m.t
 upd m.test "k3:$S2"
 expect_status NOTAUTH "UPDATE m.test unknown key"; expect_tsig k3. BADKEY 0 "UPDATE m.test unknown key"
 upd m.test "k1:$BAD"
-expect_status NOTAUTH "UPDATE m.test bad secret"; expect_tsig k1. BADVERS/BADSIG 0 "UPDATE m.test bad secret"
+expect_status NOTAUTH "UPDATE m.test bad secret"; expect_tsig k1. BADSIG 0 "UPDATE m.test bad secret"
 upd n.test "k1:$S1"
 expect_status REFUSED "UPDATE n.test"; expect_tsig k1. NOERROR 32 "UPDATE n.test"; expect_verified "UPDATE n.test"
 upd p.test "K2:$S2"
@@ -138,19 +144,19 @@ echo "[OK] UPDATE: TSIG errors NOTAUTH (unsigned), denials REFUSED (signed with 
 q ax.test AXFR -y "hmac-sha256:k1:$S1"
 grep -q "^www\.ax\.test\." "$W/out.txt" || fail "AXFR ax.test k1: no zone data"
 expect_verified "AXFR ax.test k1"
-q ax.test AXFR -y "hmac-sha256:k1:$BAD"
-expect_status NOTAUTH "AXFR bad secret"; expect_tsig k1. BADVERS/BADSIG 0 "AXFR bad secret"
-q ax.test AXFR -y "hmac-sha256:k3:$S1"
+q_xfr ax.test AXFR -y "hmac-sha256:k1:$BAD"
+expect_status NOTAUTH "AXFR bad secret"; expect_tsig k1. BADSIG 0 "AXFR bad secret"
+q_xfr ax.test AXFR -y "hmac-sha256:k3:$S1"
 expect_status NOTAUTH "AXFR unknown key"; expect_tsig k3. BADKEY 0 "AXFR unknown key"
-q ax.test AXFR -y "hmac-sha256:k1:$S1" +fuzztime=1646972129
+q_xfr ax.test AXFR -y "hmac-sha256:k1:$S1" +fuzztime=1646972129
 expect_status NOTAUTH "AXFR stale time"; expect_tsig k1. BADTIME 32 "AXFR stale time"
 # R-08: Time Signed is the client's time, Other Len 6 (server time)
 grep -qE "ANY[[:space:]]+TSIG[[:space:]]+hmac-sha256\.[[:space:]]+1646972129[[:space:]]+300[[:space:]]+32[[:space:]].*BADTIME[[:space:]]+6[[:space:]]" "$W/out.txt" \
     || fail "AXFR stale time: BADTIME response must carry the client's Time Signed and Other Len 6"
-q ay.test AXFR -y "hmac-sha256:k1:$S1"
+q_xfr ay.test AXFR -y "hmac-sha256:k1:$S1"
 expect_status REFUSED "AXFR ay.test (address not allowed)"; expect_tsig k1. NOERROR 32 "AXFR ay.test"
 expect_verified "AXFR ay.test"
-q ax.test AXFR
+q_xfr ax.test AXFR
 expect_status REFUSED "AXFR unsigned"; expect_no_tsig "AXFR unsigned"
 # D-03: allow-transfer { key "k2"; } names the key defined as "K2"
 q az.test AXFR -y "hmac-sha256:k2:$S2"
@@ -177,7 +183,7 @@ q www.m.test A -y "hmac-sha256:k1:$S1" +tcp
 expect_status NOERROR "signed QUERY over TCP"; expect_tsig k1. NOERROR 32 "signed QUERY over TCP"
 expect_verified "signed QUERY over TCP"
 q www.m.test A -y "hmac-sha256:k1:$BAD"
-expect_status NOTAUTH "signed QUERY bad secret"; expect_tsig k1. BADVERS/BADSIG 0 "signed QUERY bad secret"
+expect_status NOTAUTH "signed QUERY bad secret"; expect_tsig k1. BADSIG 0 "signed QUERY bad secret"
 grep -q "^www\.m\.test\..*192\.0\.2\.10" "$W/out.txt" && fail "signed QUERY bad secret: answer returned"
 echo "[OK] QUERY"
 

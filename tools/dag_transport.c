@@ -123,6 +123,7 @@ void send_proxyv2_if_enabled(int sock, const query_opts_t *qo, bool is_tcp) {
  * 6. Networking
  * ==================================================================== */
 int g_last_socket_family = AF_INET;
+dag_answer_check_fn g_dag_answer_check = NULL;
 struct timespec g_dag_query_time;
 struct timespec g_dag_response_time;
 
@@ -338,6 +339,7 @@ int connect_tcp(const char *server, int port, const query_opts_t *qo, int timeou
     return sock;
 }
 
+
 ssize_t do_udp_exchange(const char *server, int port, const query_opts_t *qo,
                                 const uint8_t *pkt, size_t pkt_len,
                                 uint8_t *resp, size_t resp_cap, int timeout_sec) {
@@ -399,7 +401,7 @@ ssize_t do_udp_exchange(const char *server, int port, const query_opts_t *qo,
         }
         if (remain_sec < 0 || (remain_sec == 0 && remain_usec <= 0)) {
             close(sock);
-            return -1; // Timeout
+            return DAG_EXCHANGE_TIMEOUT;
         }
 
 #ifdef _WIN32
@@ -415,23 +417,29 @@ ssize_t do_udp_exchange(const char *server, int port, const query_opts_t *qo,
 
         ssize_t n = recv(sock, resp, resp_cap, 0);
         if (n < 0) {
-            if (errno == ECONNREFUSED) {
+            bool refused = (errno == ECONNREFUSED);
+            if (refused) {
                 printf(";; communications error to %s#%d: connection refused\n", server, port);
             }
             close(sock);
-            return -1; // Timeout or network error
+            return refused ? -1 : DAG_EXCHANGE_TIMEOUT;
         }
-        if (n < 2) {
-            // Malformed/too short response, discard and keep waiting
-            continue;
-        }
-
-        if (!skip_id_check) {
+        /* Like dig 9.20, answers that cannot belong to this query are reported and ignored, and dag keeps waiting
+         * for the right one until the timeout (RFC 5452 §9.1: ID and question must match). */
+        if (skip_id_check) {
+            if (n < 2) continue;
+        } else {
+            if (n < 12) {
+                printf(";; Warning: short (< header size) message received\n");
+                continue;
+            }
             uint16_t resp_id = (resp[0] << 8) | resp[1];
             if (resp_id != sent_id) {
-                fprintf(stderr, ";; Warning: ID mismatch: expected %u, got %u\n", sent_id, resp_id);
-                continue; // Discard spoofed / stray packet and wait for matching response (RFC 5452)
+                printf(";; Warning: ID mismatch: expected ID %u, got %u\n", sent_id, resp_id);
+                continue;
             }
+            /* opcode and question are checked by dag (dag_check_answer() in dag.c) */
+            if (g_dag_answer_check && !g_dag_answer_check(pkt, pkt_len, resp, (size_t)n)) continue;
         }
 
         // RFC 7873 §5.2: Client Cookie Echo Verification

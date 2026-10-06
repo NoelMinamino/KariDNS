@@ -25,6 +25,19 @@ bool pcap_extract_l4(const uint8_t *data, size_t len, uint32_t linktype, pcap_l4
         if (proto != 0x0800 && proto != 0x86DD) return false;
     } else if (linktype == 12 || linktype == 101) { // RAW IP
         ip_offset = 0;
+    } else if (linktype == 0 || linktype == 108) {
+        /* LINKTYPE_NULL (0): 4-byte address family in the capturing host's byte order; LINKTYPE_LOOP (108): the
+         * same in network byte order (tcpdump.org link-layer header types). AF_INET is 2 everywhere, AF_INET6 is
+         * 10 (Linux), 24 (NetBSD/OpenBSD), 28 (FreeBSD/DragonFly), 30 (macOS); either byte order is accepted. */
+        uint32_t le = (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+        uint32_t be = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+        uint32_t af = (le < 256) ? le : be;
+        uint8_t want_version;
+        if (af == 2) want_version = 4;
+        else if (af == 10 || af == 24 || af == 28 || af == 30) want_version = 6;
+        else return false;
+        ip_offset = 4;
+        if ((data[ip_offset] >> 4) != want_version) return false;
     } else {
         if ((data[0] >> 4) == 4 || (data[0] >> 4) == 6) {
             ip_offset = 0;

@@ -865,13 +865,9 @@ void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
         /* 状態: クライアント部が送ったものと違えば bad、サーバ部があれば good、
          * クライアント部だけ返ってきたら echoed (dig と同じ)。自分のクエリには付けない。 */
         const char *status = NULL;
-        if (!is_query && olen >= 8) {
-            if (dopt && dopt->has_expected_client_cookie) {
-                if (memcmp(dopt->expected_client_cookie, d, 8) != 0) status = "bad";
-                else status = (olen > 8) ? "good" : "echoed";
-            } else if (olen > 8) {
-                status = "good";
-            }
+        if (!is_query && olen >= 8 && dopt && dopt->has_expected_client_cookie) {
+            if (memcmp(dopt->expected_client_cookie, d, 8) != 0) status = "bad";
+            else status = (olen > 8) ? "good" : "echoed";
         }
         if (is_yaml && olen >= 8) {
             printf("%sCOOKIE:\n%s  CLIENT: ", indent, indent);
@@ -941,18 +937,21 @@ void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
         if (tlen >= sizeof(ede_text)) tlen = sizeof(ede_text) - 1;
         memcpy(ede_text, &d[2], tlen);
         ede_text[tlen] = '\0';
+        /* codes dig has no name for are printed by number only */
+        char named[96] = "";
+        if (msg) snprintf(named, sizeof(named), " (%s)", msg);
         if (is_yaml) {
             printf("%sEDE:\n", indent);
-            printf("%s  INFO-CODE: %u (%s)\n", indent, info_code, msg);
+            printf("%s  INFO-CODE: %u%s\n", indent, info_code, named);
             if (tlen > 0) {
                 char text_esc[1024];
                 yaml_double_quote_escape(ede_text, text_esc, sizeof(text_esc));
                 printf("%s  EXTRA-TEXT: \"%s\"\n", indent, text_esc);
             }
         } else if (tlen > 0) {
-            printf("%sEDE: %u (%s): (%s)\n", indent, info_code, msg, ede_text);
+            printf("%sEDE: %u%s: (%s)\n", indent, info_code, named, ede_text);
         } else {
-            printf("%sEDE: %u (%s)\n", indent, info_code, msg);
+            printf("%sEDE: %u%s\n", indent, info_code, named);
         }
     } else if (code == 20 || code == 21) { // MQTYPE
         printf("%s%s: ", indent, code == 20 ? "MQTYPE-Query" : "MQTYPE-Response");

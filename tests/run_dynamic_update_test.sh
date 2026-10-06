@@ -118,7 +118,7 @@ fi
 
 echo "[*] 2c. UPDATE signed with the allowed key name but a wrong secret: NOTAUTH, BADSIG, unsigned (RFC 8945 §5.2.2)..."
 $DAG dynupdate.com a @127.0.0.1 -p 10053 --update-add 'new1.dynupdate.com 300 A 1.2.3.5' +nohexdump -y hmac-sha256:test-key:D+Cxy/p+lR2oHn+o8K2ZlJ2C/lH1X4Q+N/k/mN9mN2Y= > out.txt 2>&1 || true
-if ! grep -q "status: NOTAUTH" out.txt || ! tsig_line test-key "BADVERS/BADSIG" | grep -qE "[[:space:]]0[[:space:]]+[0-9]+[[:space:]]+BADVERS/BADSIG"; then
+if ! grep -q "status: NOTAUTH" out.txt || ! tsig_line test-key "BADSIG" | grep -qE "[[:space:]]0[[:space:]]+[0-9]+[[:space:]]+BADSIG"; then
     echo "[FAIL] Wrong secret: expected NOTAUTH with TSIG error BADSIG and MAC size 0."
     cat out.txt
     exit 1
