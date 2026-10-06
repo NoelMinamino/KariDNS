@@ -96,7 +96,7 @@ $TTL 3600
 EOF
 run_check_zone_fail "Reject in-bailiwick NS lacking A/AAAA glue" "example.com" "$TMP_DIR/missing_ns_glue.zone" "lacks A/AAAA glue"
 
-# 2. In-bailiwick MX target missing glue
+# 2. In-bailiwick MX target without A/AAAA: only a warning, no RFC requires an address for an MX target (K-02)
 cat <<'EOF' > "$TMP_DIR/missing_mx_glue.zone"
 $ORIGIN example.com.
 $TTL 3600
@@ -105,7 +105,16 @@ $TTL 3600
 ns1     IN A     192.0.2.1
 @       IN MX    10 mail-inbailiwick.example.com.
 EOF
-run_check_zone_fail "Reject in-bailiwick MX lacking A/AAAA glue" "example.com" "$TMP_DIR/missing_mx_glue.zone" "lacks A/AAAA glue"
+run_check_zone_warn "Warn on in-bailiwick MX without A/AAAA" "example.com" "$TMP_DIR/missing_mx_glue.zone" "^\[WARNING\] In-bailiwick MX target 'mail-inbailiwick.example.com.' has no A/AAAA record"
+TEST_COUNT=$((TEST_COUNT + 1))
+echo -n "Test $TEST_COUNT: In-bailiwick MX without A/AAAA keeps exit status 0 ... "
+if "$KARICHECK" zone example.com "$TMP_DIR/missing_mx_glue.zone" > "$TMP_DIR/out.txt" 2>&1; then
+    echo "OK"
+else
+    echo "FAIL (exit status is not 0)"
+    cat "$TMP_DIR/out.txt" >&2
+    FAILED=$((FAILED + 1))
+fi
 
 # 3. Out-of-bailiwick orphan glue record (WARNING)
 cat <<'EOF' > "$TMP_DIR/orphan_glue.zone"

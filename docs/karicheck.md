@@ -79,7 +79,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - Exactly one SOA record at the zone apex, and at least one NS record at the apex
    - CNAME exclusivity (CNAME must not co-exist with other record types at the same owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), and NS/MX/SRV targets that point to a CNAME (RFC 2181 §10.3)
    - Out-of-zone records (owner not at or below the zone name, e.g. address records for name servers outside the zone) give a warning and are left out of all further checks, because the server does not load them (RFC 1034 §4.2); the exit status is not affected
-   - In-bailiwick delegation targets must have A/AAAA glue, glue addresses must be valid; records occluded by a delegation give warnings
+   - In-bailiwick NS targets (apex and delegations) must have an A/AAAA record in the zone (error); in-bailiwick MX and SRV targets without A/AAAA give a warning only, because no RFC requires an address for them. Records occluded by a delegation give warnings
    - Inconsistent TTLs within one RRset (warning)
    - SOA MNAME pointing to a CNAME (warning)
    - Meta-types (e.g. `OPT`, `TSIG`, `AXFR`) must not appear in zone data
@@ -87,16 +87,21 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - Catalog zones (`catalog-zone yes;`): `version.<zone> TXT "2"` is required, and group TXT records without a member PTR record give warnings
 3. **Record Field Validation**:
    - A/AAAA addresses; SRV, NAPTR, CAA (RFC 8659 tags and flags), SSHFP, HIP, WKS, GPOS, X25, ISDN, EUI48/EUI64, CSYNC, DSYNC and SVCB/HTTPS target fields
-   - NSEC3/NSEC3PARAM: hash algorithm, reserved flag bits, opt-out, and iteration count (RFC 5155, RFC 9276)
+   - WKS: the protocol is a number (0-255) or `TCP` / `UDP` (any case), as the server reads it; a port that is not a number (0-65535), e.g. a service name, gives a warning because the server leaves it out of the bit map
+   - NSEC3PARAM at the apex: Flags other than 0 are an error (RFC 5155 §4.1.2: such an NSEC3PARAM MUST be ignored, and the server ignores it); a hash algorithm other than 1 (SHA-1), an iteration count other than 0 (RFC 9276 §3.1: MUST be 0) and a non-empty salt (RFC 9276 §3.1: SHOULD NOT) give warnings; more than 100 iterations are an error. A warning is also given when no NSEC3PARAM is usable, or when the one the server uses has no NSEC3 RRs
+   - NSEC3 records are checked once per chain (RRs with the same hash algorithm, iterations and salt), not once per RR: hash algorithm, reserved flag bits, opt-out (RFC 9276 §3.1), iterations and salt as above, and a warning for a chain that matches no NSEC3PARAM with Flags 0 (the server does not use it)
 4. **DNSSEC Algorithm & Digest Verification (RFC 8624 / RFC 8078)**:
    - Evaluates DNSSEC algorithms in DNSKEY and RRSIG records against RFC 8624 status recommendations (e.g., flagging deprecated SHA-1 or MD5 algorithms)
    - Validates DS digest types (warning on deprecated digests)
    - Recognizes RFC 8078 CDS and CDNSKEY delete signals (Algorithm=0 / DigestType=0) without false-positive warnings
 5. **RFC 8976 ZONEMD Message Digest Verification**:
    - The ZONEMD serial must match the SOA serial, and ZONEMD should be at the zone apex.
-   - ZONEMD records with scheme 1 (SIMPLE) and hash algorithm 1 (SHA-384) or 2 (SHA-512) are verified by computing the canonical zone digest; other schemes and algorithms are skipped. Out-of-zone records are not part of the zone and therefore not part of the digest.
+   - ZONEMD records with scheme 1 (SIMPLE) and hash algorithm 1 (SHA-384) or 2 (SHA-512) are verified by computing the zone digest of RFC 8976 §3.3: RRs in DNSSEC canonical form and order (RFC 4034 §6.2 and §6.3, with RFC 6840 §5.1: owner names and the domain names in the RDATA of the types listed there in lower case), duplicates digested once, occluded data and non-apex ZONEMD RRs included, the apex ZONEMD RRs and their RRSIG left out. Out-of-zone records are not part of the zone and therefore not part of the digest.
+   - Other schemes and hash algorithms are reported as not verified (`[INFO]`). Two ZONEMD RRs with the same scheme and hash algorithm, and a digest whose length does not match the hash algorithm, are errors (RFC 8976 §4).
+   - Every ZONEMD with a supported scheme and hash algorithm must match. This is stricter than the RFC 8976 §4 verifier rule (one matching ZONEMD is enough): karicheck checks the zone before it is published, and a recipient may support only one of the hash algorithms.
+   - The digest is verified even when the zone has other errors.
 
-Each zone check prints `[RESULT] Zone '<zone>': <n> error(s), <n> warning(s)` followed by `[OK]` or `[FAIL]`.
+Each zone check prints `[RESULT] Zone '<zone>': <n> error(s), <n> warning(s)` followed by `[OK]` or `[FAIL]`. The counts are the numbers of `[ERROR]` and `[WARNING]` lines printed for that zone, including the ZONEMD verification; `[INFO]` lines are not counted.
 
 ---
 

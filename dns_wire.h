@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <time.h>
 #ifdef _WIN32
 #include <winsock2.h>
@@ -34,6 +36,20 @@ static inline bool parse_u16(const char *s, uint16_t *out) {
     if (*endptr != '\0' || val < 0 || val > 65535) return false;
     if (out) *out = (uint16_t)val;
     return true;
+}
+
+/* WKS の PROTOCOL (RFC 1035 §3.4.2: マスターファイルでは名前か 10 進数)。名前は WKS の用途である
+ * TCP と UDP (大文字小文字を区別しない、BIND と同じ) だけ。シリアライザと karicheck が共有する (K-03)。 */
+static inline bool dns_wks_protocol_from_text(const char *s, uint8_t *out) {
+    if (s && strcasecmp(s, "TCP") == 0) {
+        if (out) *out = 6;
+        return true;
+    }
+    if (s && strcasecmp(s, "UDP") == 0) {
+        if (out) *out = 17;
+        return true;
+    }
+    return parse_u8(s, out);
 }
 
 // Forward declarations

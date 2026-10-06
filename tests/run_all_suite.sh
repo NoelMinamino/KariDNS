@@ -316,6 +316,7 @@ register_test "core" "sh" "tests/run_roundtrip_test.sh" "Zone parser to wire ser
 register_test "core" "sh" "tests/run_karicheck_glue_test.sh" "karicheck in-bailiwick glue record verification"
 register_test "core" "sh" "tests/run_karicheck_semantic_lint_test.sh" "karicheck RFC semantic linter checks"
 register_test "core" "sh" "tests/run_karicheck_matrix_test.sh" "karicheck diagnostic matrix: RDATA/DNSSEC/structure/tinydns/catalog/config lint, exit status contract"
+register_test "core" "sh" "tests/run_karicheck_zonemd_ldns_test.sh" "karicheck ZONEMD digests against ldns-signzone (SKIP without ldns)"
 register_test "core" "sh" "tests/run_phase2_core_audit_test.sh" "Phase 2 Core architecture audit test"
 register_test "core" "sh" "tests/run_phase2_audit_part2_test.sh" "Phase 2 Security & boundary validation"
 register_test "core" "sh" "tests/run_response_section_order_test.sh" "RFC 1035 Response section ordering"

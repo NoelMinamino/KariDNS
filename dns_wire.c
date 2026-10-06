@@ -3145,11 +3145,7 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 
                 // Protocol
                 uint8_t proto = 0;
-                if (strcasecmp(rec->rdata[1], "TCP") == 0) proto = 6;
-                else if (strcasecmp(rec->rdata[1], "UDP") == 0) proto = 17;
-                else {
-                    if (!parse_u8(rec->rdata[1], &proto)) return -1;
-                }
+                if (!dns_wks_protocol_from_text(rec->rdata[1], &proto)) return -1;
                 res[offset++] = proto;
                 
                 // Port Bitmap
@@ -3949,10 +3945,7 @@ static bool update_wks_key(const dns_record_t *rec, uint8_t addr[4], uint8_t *pr
     }
     if (rec->rdata_count < 2 || !rec->rdata[0] || !rec->rdata[1]) return false;
     if (inet_pton(AF_INET, rec->rdata[0], addr) != 1) return false;
-    if (strcasecmp(rec->rdata[1], "TCP") == 0) *proto = 6;
-    else if (strcasecmp(rec->rdata[1], "UDP") == 0) *proto = 17;
-    else if (!parse_u8(rec->rdata[1], proto)) return false;
-    return true;
+    return dns_wks_protocol_from_text(rec->rdata[1], proto);
 }
 
 static uint32_t update_soa_serial(const dns_record_t *soa) {
