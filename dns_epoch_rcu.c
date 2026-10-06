@@ -7,10 +7,10 @@
 #include <inttypes.h>
 
 _Atomic uint64_t g_global_epoch = ATOMIC_VAR_INIT(0);
-worker_ctx_t g_resp_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
-worker_ctx_t g_query_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
+rcu_reader_slot_t g_resp_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
+rcu_reader_slot_t g_query_logger_rcu_ctx = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) };
 
-worker_ctx_t g_async_io_rcu_ctxs[MAX_ASYNC_IO_RCU_WORKERS] = {
+rcu_reader_slot_t g_async_io_rcu_ctxs[MAX_ASYNC_IO_RCU_WORKERS] = {
     [0 ... MAX_ASYNC_IO_RCU_WORKERS - 1] = { .rcu_observed_epoch = ATOMIC_VAR_INIT(RCU_EPOCH_IDLE) }
 };
 int g_async_io_rcu_worker_count = MAX_ASYNC_IO_RCU_WORKERS;

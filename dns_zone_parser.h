@@ -44,6 +44,9 @@ typedef struct parse_context_s {
      * その最初のオーナー名 (arena 内の文字列)。all_zone_names が無ければ数えない。 */
     size_t out_of_zone_count;
     const char *first_out_of_zone;
+    /* tinydns: SOA serial に使うデータファイルの mtime (0 = 不明、読み込み時刻を使う)。
+     * パーサ自身はファイルを stat しない (X-13: サンドボックス内の再読み込みではパスを使えない)。 */
+    time_t source_mtime;
 } parse_context_t;
 
 typedef struct {
@@ -132,7 +135,6 @@ typedef struct zone_arena_s {
   nsec3_params_t nsec3_active;         /* built by build_zone_index() */
   char **sorted_unique_names;
   size_t sorted_unique_count;
-  _Atomic int reader_count;
   bool is_tinydns_format; /* parse_tinydns_data()が呼ばれたzone_arenaでのみtrue */
   tinydns_location_entry_t *locations; /* NULL可 */
   int location_count;

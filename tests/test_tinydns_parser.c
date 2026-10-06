@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <time.h>
 
 #include "../dns_wire.h"
 #include "../dns_config_parser.h"
@@ -840,6 +841,37 @@ static void test_third_party_patch_records(void) {
     free(buf);
 }
 
+/* X-13: SOA serial は ctx->source_mtime から取り、パスを stat しない
+ * (存在しないパスを visited_paths[0] に置いても mtime が使われる)。0 なら読み込み時刻。 */
+static void test_soa_serial_from_source_mtime(void) {
+    printf("--- Test: SOA serial from source_mtime (X-13) ---\n");
+    for (int with_mtime = 0; with_mtime <= 1; with_mtime++) {
+        char buf[] = ".tiny.test:192.0.2.1:a:300\n";
+        zone_arena_t arena;
+        zone_arena_init(&arena);
+        parse_error_t err = {0};
+        char *paths[1] = { "/nonexistent.test/tiny.data" };
+        parse_context_t ctx = { .default_origin = "tiny.test.", .err_out = &err,
+                                .visited_paths = paths, .visited_count = 1, .visited_cap = 1,
+                                .source_mtime = with_mtime ? (time_t)1700000000 : 0 };
+        time_t before = time(NULL);
+        int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
+        time_t after = time(NULL);
+        TEST_ASSERT(count > 0, "tinydns data parses");
+        const char *serial = NULL;
+        for (size_t i = 0; i < arena.count; i++)
+            if (arena.records[i].type_code == 6 && arena.records[i].rdata_count >= 3) serial = arena.records[i].rdata[2];
+        TEST_ASSERT(serial != NULL, "SOA present");
+        if (serial && with_mtime) {
+            TEST_ASSERT(strcmp(serial, "1700000000") == 0, "SOA serial is source_mtime");
+        } else if (serial) {
+            unsigned long s = strtoul(serial, NULL, 10);
+            TEST_ASSERT(s >= (unsigned long)before && s <= (unsigned long)after, "SOA serial is the load time without source_mtime");
+        }
+        zone_arena_destroy(&arena);
+    }
+}
+
 int main(void) {
     printf("==================================================\n");
     printf(" Running KariDNS tinydns Parser Tests (djbdns 1.05)\n");
@@ -855,6 +887,7 @@ int main(void) {
     test_location_directive_and_records();
     test_location_cidr_prefix();
     test_third_party_patch_records();
+    test_soa_serial_from_source_mtime();
 
     printf("==================================================\n");
     printf(" Test Results: %d / %d Passed\n", pass_count, test_count);

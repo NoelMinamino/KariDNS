@@ -24,6 +24,8 @@
 #include <time.h>
 #include <unistd.h>
 
+/* 頂点の SOA のシリアルを 1 増やし、新しいシリアルを返す。0 は失敗 (SOA が無い、arena の確保失敗)。
+ * 増やした結果の 0 は 1 にするので、成功時に 0 は返らない。 */
 uint32_t bump_soa_serial_in_arena(zone_arena_t *arena, const char *zone_name) {
   if (!arena || !zone_name) return 0;
   uint32_t new_serial = 0;
@@ -106,8 +108,15 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
    * それ以外はサーバーがシリアルを増やす。*/
   uint32_t new_serial = result.soa_replaced ? soa_serial_in_arena(z_standby, entry->domain)
                                             : bump_soa_serial_in_arena(z_standby, entry->domain);
-  if (result.soa_replaced || new_serial != 0) {
-    atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
+  if (!result.soa_replaced && new_serial == 0) {
+    /* X-17: シリアルを上げられなかった (arena の確保失敗、または頂点の SOA が無い)。変更したゾーンを
+     * 同じシリアルで公開するとセカンダリが転送しない (RFC 2136 §3.6) ので、UPDATE 全体を捨てて
+     * SERVFAIL にする (§3.4.2.1 と同じく何も適用しない)。 */
+    zone_arena_clear_data_pools(z_standby);
+    pthread_mutex_unlock(&entry->writer_lock);
+    syslog(LOG_ERR, "[Update] client=%s zone='%s': SOA serial could not be incremented; update aborted",
+           client_ip, entry->domain);
+    return 2; // SERVFAIL
   }
 
   if (build_zone_index(z_standby, true) != 0) {
@@ -129,6 +138,8 @@ int handle_dynamic_update(const uint8_t *req, size_t req_len,
   if (cur_snap) release_zone_snapshot(cur_snap);
 
   compute_ixfr_diff(entry, z_active, z_standby);
+  /* 公開する直前に記録する (索引の構築に失敗して公開しなかった UPDATE のシリアルを残さない) */
+  atomic_store_explicit(&entry->serial, new_serial, memory_order_release);
 
   entry->rcu.retire_epoch = rcu_writer_publish(&entry->rcu.active, z_standby);
   pthread_mutex_unlock(&entry->writer_lock);

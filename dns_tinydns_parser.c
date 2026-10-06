@@ -1050,14 +1050,12 @@ int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context
     if (!buf || !arena) return -1;
     arena->is_tinydns_format = true;
 
-    // SOA serial 用にファイルの mtime を取得
+    // SOA serial はデータファイルの mtime (tinydns-data と同じ)。mtime は呼び出し側が開いた fd から
+    // 渡す (X-13: Capsicum の中の再読み込みでパスを stat するとバックエンドが TRAP_CAP で止まる)。
     uint32_t default_serial = (uint32_t)time(NULL);
-    if (ctx && ctx->visited_paths && ctx->visited_count > 0 && ctx->visited_paths[0]) {
-        struct stat st;
-        if (stat(ctx->visited_paths[0], &st) == 0) {
-            default_serial = (uint32_t)st.st_mtime;
-            if (default_serial == 0) default_serial = 1;
-        }
+    if (ctx && ctx->source_mtime > 0) {
+        default_serial = (uint32_t)ctx->source_mtime;
+        if (default_serial == 0) default_serial = 1;
     }
 
     size_t linestart = 0;

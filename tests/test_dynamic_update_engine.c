@@ -121,6 +121,15 @@ static void test_bump_soa_serial(void) {
     uint32_t s_none = bump_soa_serial_in_arena(&arena, "otherzone.com.");
     assert(s_none == 0);
 
+    // X-17: the arena cannot allocate the new serial text -> 0 (failure), SOA unchanged
+    size_t saved_pools = arena.data_pool_count, saved_idx = arena.current_pool_idx;
+    arena.data_pool_count = 128;                    // arena_alloc() refuses a 129th pool
+    arena.current_pool_idx = arena.current_pool_cap; // and the current pool is full
+    assert(bump_soa_serial_in_arena(&arena, "example.com.") == 0);
+    assert(strcmp(arena.records[0].rdata[2], "1") == 0);
+    arena.data_pool_count = saved_pools;
+    arena.current_pool_idx = saved_idx;
+
     zone_arena_destroy(&arena);
     printf("  -> bump_soa_serial_in_arena passed.\n");
 }
@@ -1443,6 +1452,21 @@ static void test_handle_dynamic_update_serial_rules(void) {
     assert(atomic_load(&entry.rcu.active) == cur);
     assert(upd_count(cur, "new3." UZ, 1) == 0);
     assert(atomic_load(&entry.serial) == 501);
+
+    /* X-17: the serial cannot be incremented (here no apex SOA in the copy; an arena allocation failure in
+     * bump_soa_serial_in_arena() takes the same branch): SERVFAIL, nothing published, serial unchanged,
+     * no NOTIFY (RFC 2136 §3.6: a changed zone must get a new serial). */
+    dns_record_t *apex_soa = (dns_record_t *)upd_get(cur, UZ, 6); // the test changes the copy source
+    apex_soa->type_code = 99;
+    atomic_store(&entry.notify_now, false);
+    upd_begin(&m);
+    upd_a(&m, false, "new4." UZ, 1, 300, 23);
+    assert(handle_dynamic_update(m.b, m.len, &entry, "192.0.2.1", "<none>") == 2);
+    assert(atomic_load(&entry.rcu.active) == cur);
+    assert(upd_count(cur, "new4." UZ, 1) == 0);
+    assert(atomic_load(&entry.serial) == 501);
+    assert(!atomic_load(&entry.notify_now));
+    apex_soa->type_code = 6;
 
     upd_entry_destroy(&entry);
     printf("  -> Serial rules passed.\n");

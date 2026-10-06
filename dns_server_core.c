@@ -846,7 +846,7 @@ void *response_logger_thread_func(void *arg) {
         
         if (atomic_load_explicit(&g_resp_log_ring[idx].ready, memory_order_acquire)) {
             resp_log_entry_t *entry = &g_resp_log_ring[idx];
-            rcu_reader_enter(&g_resp_logger_rcu_ctx);
+            rcu_slot_reader_enter(&g_resp_logger_rcu_ctx);
             server_config_t *cfg = acquire_config_snapshot();
             
             if (cfg && cfg->logging.responses_channel) {
@@ -902,7 +902,7 @@ void *response_logger_thread_func(void *arg) {
                 }
             }
             release_config_snapshot(cfg);
-            rcu_reader_exit(&g_resp_logger_rcu_ctx);
+            rcu_slot_reader_exit(&g_resp_logger_rcu_ctx);
             
             // Consumerのポインタを進める
             atomic_store_explicit(&entry->ready, false, memory_order_release);
@@ -1009,7 +1009,7 @@ void *query_logger_thread_func(void *arg) {
     uint64_t last_reported_dropped = 0;
 
     while (1) {
-        rcu_reader_enter(&g_query_logger_rcu_ctx);
+        rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
         log_channel_t *ch = (cfg && cfg->logging.queries_channel) ? cfg->logging.queries_channel : NULL;
 
@@ -1142,7 +1142,7 @@ void *query_logger_thread_func(void *arg) {
         }
 
         if (cfg) release_config_snapshot(cfg);
-        rcu_reader_exit(&g_query_logger_rcu_ctx);
+        rcu_slot_reader_exit(&g_query_logger_rcu_ctx);
 
         // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
         usleep(any_work ? 1000 : 10000);
@@ -1438,7 +1438,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
     g_async_io_pool.count--;
     pthread_mutex_unlock(&g_async_io_pool.lock);
 
-    rcu_reader_enter(&g_async_io_rcu_ctxs[thread_idx]);
+    rcu_slot_reader_enter(&g_async_io_rcu_ctxs[thread_idx]);
     if (!task.is_tcp) {
       // UDP async resolution
       alignas(udp_ipc_t) uint8_t res_buf_full[UDP_IPC_BUFFER_SIZE];
@@ -1474,12 +1474,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
         } else if (slip_triggered) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
-          res_buf[2] |= 0x02; // Set TC bit
-          int qlen = (int)task.question_end;
-          if (qlen > res_len) qlen = res_len;
-          if (qlen > (int)task.req_len) qlen = (int)task.req_len;
-          // 質問セクションまで切り詰めるが、OPT は残す (RFC 6891 §7)
-          qlen = (int)dns_truncate_keep_opt(res_buf, (size_t)res_len, (size_t)qlen);
+          /* TC=1、質問と OPT だけ。署名付きの要求なら署名し直す (X-20) */
+          int qlen = (int)dns_rrl_slip_response(res_buf, (size_t)res_len, UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t));
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, qlen,
                              &task.client_addr, task.client_len,
                              task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_UDP);
@@ -1496,7 +1492,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
         submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                             0, 0, 0, false, false);
       }
-      rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
+      rcu_slot_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
       release_zone_snapshot(task.snap);
     } else {
       // TCP async resolution
@@ -1515,7 +1511,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
                               0, 0, 0, false, false);
         }
-        rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
+        rcu_slot_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
         release_zone_snapshot(task.snap);
         if (res_len > 0) {
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, tcp_res, res_len,
@@ -1525,7 +1521,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
         }
         free(tcp_res);
       } else {
-        rcu_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
+        rcu_slot_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
         release_zone_snapshot(task.snap);
         free(task.req_buf);
       }
@@ -2089,12 +2085,9 @@ worker_startup_success:;
               memcpy(&res_msg->client_addr, &ipc_msg->client_addr, copy_len);
 
               if (__builtin_expect(tc_packet, 0)) {
-                res_buf[2] |= 0x02; // Set TC bit
-                int qlen = (int)question_end;
-                if (qlen > res_len) qlen = res_len;
-                if (qlen > payload_received) qlen = payload_received;
-                // 質問セクションまで切り詰めるが、OPT は残す (RFC 6891 §7)
-                qlen = (int)dns_truncate_keep_opt(res_buf, (size_t)res_len, (size_t)qlen);
+                /* TC=1、質問と OPT だけ。署名付きの要求なら署名し直す (X-20) */
+                int qlen = (int)dns_rrl_slip_response(res_buf, (size_t)res_len,
+                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t));
                 res_msg->payload_len = qlen;
                 batch->tx_iov[n_tx].iov_len = sizeof(udp_ipc_t) + qlen;
               } else {
@@ -2332,8 +2325,12 @@ process_tcp_client: ;
             tsig_request_t tsig;
             tsig_check_request(cfg, msg, msg_len, ctx_tcp->client_ip, &tsig);
             tsig_key_t *matched_key = (tsig.status == TSIG_REQ_VALID) ? tsig.key : NULL;
+            /* X-28, RFC 6891 §6.1.3: 実装していない EDNS VERSION は、クエリ経路と同じく TSIG の検証の後、
+             * allow-transfer より前に BADVERS (TSIG が正しければ署名する) */
+            bool badvers = tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR &&
+                           edns_version_unsupported(&edns);
             bool allowed = false;
-            if (zcfg && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
+            if (zcfg && !badvers && tsig.status != TSIG_REQ_ERROR && tsig.status != TSIG_REQ_FORMERR) {
               bool has_acl = (zcfg->allow_transfer_count > 0);
               bool has_keys = (zcfg->tsig_keys_count > 0) || (zcfg->tsig_key != NULL);
               bool acl_ok = false;
@@ -2439,17 +2436,22 @@ process_tcp_client: ;
             if (!allowed || !entry) {
               uint8_t res_buf[1024];
               uint8_t rcode = 5; /* REFUSED: 方針による拒否 (RFC 1035 §4.1.1、RFC 5936 §5)。AA=0 (R-06) */
-              if (tsig.status == TSIG_REQ_FORMERR) {
-                rcode = 1;       /* RFC 8945 §5.2: 解釈できない TSIG */
-              } else if (tsig.status == TSIG_REQ_ERROR) {
-                rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
-                add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Invalid TSIG");
+              int built;
+              if (badvers) {
+                built = dns_build_badvers_response(msg, msg_len, res_buf, sizeof(res_buf), 1, &edns, true, cfg);
               } else {
-                add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
+                if (tsig.status == TSIG_REQ_FORMERR) {
+                  rcode = 1;       /* RFC 8945 §5.2: 解釈できない TSIG */
+                } else if (tsig.status == TSIG_REQ_ERROR) {
+                  rcode = 9;       /* RFC 8945 §5.2.1-§5.2.4: TSIG のエラーは NOTAUTH */
+                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Invalid TSIG");
+                } else {
+                  add_ede(&edns, cfg ? cfg->send_extended_errors : false, 18, "Query refused due to access control");
+                }
+                /* 質問セクションまで (Rule 3)。TSIG なしの要求への応答は署名しない (RFC 8945 §5.3) */
+                built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, 1,
+                                                 &edns, true, cfg);
               }
-              /* 質問セクションまで (Rule 3)。TSIG なしの要求への応答は署名しない (RFC 8945 §5.3) */
-              int built = dns_build_error_response(msg, msg_len, res_buf, sizeof(res_buf), rcode, 0, 1,
-                                                   &edns, true, cfg);
               int signed_len = tsig_finish_response(res_buf, (size_t)built, sizeof(res_buf), &tsig);
               if (signed_len < DNS_HEADER_SIZE) {
                 release_config_snapshot(cfg);

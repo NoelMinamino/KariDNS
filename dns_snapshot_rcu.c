@@ -286,10 +286,6 @@ zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name
   return z;
 }
 
-void wait_for_readers(zone_arena_t *arena) {
-  (void)arena;
-}
-
 void free_zone_db_entry(zone_db_entry_t *entry) {
   if (!entry) return;
   if (entry->groups) {
@@ -635,9 +631,10 @@ static void log_out_of_zone_record(const dns_record_t *rec, void *ud) {
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
   if (!entry || !zcfg || !zcfg->file) return RELOAD_ERR_FILE_READ;
   const char *file = zcfg->file;
-  dev_t root_dev = 0;
-  ino_t root_ino = 0;
-  char *buf = read_entire_file(file, &root_dev, &root_ino);
+  struct stat root_st;
+  char *buf = read_entire_file_stat(file, &root_st);
+  dev_t root_dev = root_st.st_dev;
+  ino_t root_ino = root_st.st_ino;
   if (!buf) {
     syslog(LOG_ERR, "[Zone] Failed to read file '%s' for zone '%s'.", file, entry->domain);
     return RELOAD_ERR_FILE_READ;
@@ -732,6 +729,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   ctx.visited_devs[0] = root_dev;
   ctx.visited_inos[0] = root_ino;
   ctx.err_out = &parse_err;
+  ctx.source_mtime = root_st.st_mtime; // X-13: tinydns の SOA serial。パーサはパスを stat しない
 
   server_config_t *active_cfg = acquire_config_snapshot();
   const char **all_zone_ptrs = NULL;

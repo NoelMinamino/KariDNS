@@ -12,6 +12,7 @@
 #ifdef __FreeBSD__
 #include <sys/capsicum.h>
 #include <sys/event.h>
+#include <sys/procdesc.h>
 #endif
 
 #define STATIC_TEST
@@ -1190,22 +1191,21 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
     
     // ==== フェーズ5: CNAMEチェーン処理・クロスゾーン切り替え ====
     if (cname_followed) {
-      /* R-32: 対象がこのゾーンの頂点で QTYPE が DS なら、同じゾーンで続けずに親ゾーンを探す */
-      bool in_zone = domain_name_is_at_or_below(current_qname, db_entry->domain) &&
-                     !(qtypes[0] == 43 && domain_names_match_ci(current_qname, db_entry->domain));
-      if (in_zone)
-        continue;
-      else {
-        zone_db_entry_t *new_db_entry = find_zone_for_query(view, current_qname, qtypes[0]); // R-32
-        if (new_db_entry) {
-          zone_arena_t *new_zone = atomic_load_explicit(&new_db_entry->rcu.active, memory_order_acquire);
-          *db_entry_ptr = new_db_entry;
-          *current_zone_ptr = new_zone;
-          continue;
-        } else {
-          return;
-        }
+      /* X-27, RFC 1034 §4.3.2 step 3a: CNAME/DNAME の後は新しい QNAME で step 1 からやり直す。step 2 で
+       * 「QNAME に最も近い祖先のゾーン」を選ぶので、対象が今のゾーンの下でも、同じビューに子ゾーンが
+       * あればそちらで答える (以前は親ゾーンに留まり、子への委任を返していた)。DS は R-32 の規則で
+       * find_zone_for_query() が親ゾーンを選ぶ。forward/program ゾーンのデータは持たないので CNAME で止める。 */
+      zone_db_entry_t *new_db_entry = find_zone_for_query(view, current_qname, qtypes[0]);
+      if (!view && domain_name_is_at_or_below(current_qname, db_entry->domain) &&
+          !(qtypes[0] == 43 && domain_names_match_ci(current_qname, db_entry->domain)))
+        new_db_entry = db_entry; // ビューの無い呼び出し (応答キャッシュの構築など) はこのゾーンだけで続ける
+      if (!new_db_entry || new_db_entry->kind == ZONE_KIND_FORWARD || new_db_entry->kind == ZONE_KIND_PROGRAM)
+        return;
+      if (new_db_entry != db_entry) {
+        *db_entry_ptr = new_db_entry;
+        *current_zone_ptr = atomic_load_explicit(&new_db_entry->rcu.active, memory_order_acquire);
       }
+      continue;
     }
     
     // ==== フェーズ6: 複数QTYPE追加解決 ====
@@ -1925,8 +1925,18 @@ STATIC_TEST int dispatch_to_program_zone(const char *view_name, const char *doma
       syslog(LOG_CRIT, "[Plugin] zone '%s' exceeded max failures; marking dead "
              "(will return SERVFAIL until restart)", domain);
       if (plugin->pid > 0) {
+#ifdef __FreeBSD__
+        /* X-11: ここはサンドボックスの中。kill(pid) は ECAPMODE (PROC_TRAPCAP で SIGTRAP) になり
+         * バックエンドごと止まるので、起動時に得たプロセス記述子で止める。close() で回収される。 */
+        if (plugin->proc_fd >= 0) {
+          pdkill(plugin->proc_fd, SIGKILL);
+          close(plugin->proc_fd);
+          plugin->proc_fd = -1;
+        }
+#else
         kill(plugin->pid, SIGKILL);
         waitpid(plugin->pid, NULL, WNOHANG);
+#endif
       }
     }
     result_len = build_synthetic_servfail(req, req_len, res, max_res_len); // M-1
@@ -2037,6 +2047,25 @@ STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss
 }
 
 _Thread_local query_rrl_info_t t_query_rrl_info;
+/* X-20: 直前の要求の TSIG の状態 (鍵は設定スナップショット内)。RRL の slip 応答の署名に使う */
+static _Thread_local tsig_request_t t_query_tsig;
+
+size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap) {
+  if (res_len < DNS_HEADER_SIZE) return res_len;
+  res[2] |= 0x02; // TC=1
+  /* 質問の終わりは応答自身から求める (要求の質問を写していない応答 (QDCOUNT=0 の FORMERR など) でも
+   * OPT の途中で切らない)。質問セクションまで切り詰めるが、OPT は残す (RFC 6891 §7) */
+  size_t q_end = get_question_end_offset(res, res_len, (uint16_t)((res[4] << 8) | res[5]));
+  size_t len = dns_truncate_keep_opt(res, res_len, q_end);
+  if (t_query_tsig.status == TSIG_REQ_NONE || t_query_tsig.status == TSIG_REQ_FORMERR) return len;
+  size_t limit = t_query_tsig.res_limit;
+  if (limit == 0 || limit > buf_cap) limit = buf_cap;
+  int signed_len = tsig_finish_response(res, len, limit, &t_query_tsig);
+  if (signed_len >= DNS_HEADER_SIZE) return (size_t)signed_len;
+  /* HMAC の計算に失敗したときだけ。以前と同じ無署名の TC 応答 (クライアントは TCP で問い直す) */
+  syslog(LOG_WARNING, "[RRL] could not sign the slip response; sending it unsigned");
+  return len;
+}
 
 _Thread_local static uint8_t s_forward_req_buf[65535];
 _Thread_local static uint8_t s_forward_res_buf[65535];
@@ -2193,7 +2222,13 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
     return false;
   }
 
+  int proc_fd = -1;
+#ifdef __FreeBSD__
+  /* X-11: 子を止めるのはサンドボックスに入った後なので、pid ではなくプロセス記述子で持つ */
+  pid_t pid = pdfork(&proc_fd, PD_CLOEXEC);
+#else
   pid_t pid = fork();
+#endif
   if (pid < 0) {
     syslog(LOG_ERR, "[Plugin] fork() failed for zone '%s': %m", zcfg->domain);
     close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]);
@@ -2264,12 +2299,16 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
   cap_rights_t rights_r;
   cap_rights_init(&rights_r, CAP_READ, CAP_EVENT, CAP_FCNTL);
   cap_rights_limit(out_pipe[0], &rights_r);
+  cap_rights_t rights_pd;
+  cap_rights_init(&rights_pd, CAP_PDKILL);
+  cap_rights_limit(proc_fd, &rights_pd);
 #endif
 
   strncpy(out->domain, zcfg->domain, sizeof(out->domain) - 1);
   out->domain[sizeof(out->domain) - 1] = '\0';
   strlcpy(out->view_name, view_name ? view_name : "", sizeof(out->view_name));
   out->pid = pid;
+  out->proc_fd = proc_fd;
   out->stdin_fd = in_pipe[1];
   out->stdout_fd = out_pipe[0];
   pthread_mutex_init(&out->lock, NULL);
@@ -2568,6 +2607,7 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   tsig_request_t tsig;
   tsig_check_request(cfg, req, req_len, client_ip, &tsig);
+  t_query_tsig.status = TSIG_REQ_NONE; /* X-20: slip 応答の署名用。署名のない要求では使わない */
   if (tsig.status == TSIG_REQ_NONE) {
     return process_query_body(req, req_len, res, max_res_len, res_cap, qname, qtype, client_ip, comp_ctx,
                               is_tcp, out_rrl_cfg, snap, cfg, out_matched_entry, NULL);
@@ -2590,6 +2630,7 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
   if (ret < DNS_HEADER_SIZE) return ret;
   size_t limit = tsig.res_limit;
   if (res_cap != 0 && limit > res_cap) limit = res_cap;
+  t_query_tsig = tsig;
   return tsig_finish_response(res, (size_t)ret, limit, &tsig);
 }
 
@@ -2704,12 +2745,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
   }
 
-  if (edns.present && edns.version > 0) {
-    // RFC 6891 §6.1.3: 応答にはサーバーがサポートする最大のバージョン(0)をセットする。
-    // オプションの意味はバージョンごとに決まるので、オプションの不正より先に BADVERS を返す。
-    edns.version = 0;
-    // rcode_ext = 1 (1 << 4 | Base 0 = 16 = BADVERS)
-    return dns_build_error_response(req, req_len, res, max_res_len, 0, 1, qdcount, &edns, is_tcp, cfg);
+  if (edns_version_unsupported(&edns)) {
+    // RFC 6891 §6.1.3: BADVERS。オプションの意味はバージョンごとに決まるので、オプションの不正より先に返す。
+    // AXFR/IXFR の受付 (dns_server_core.c) も同じ順序 (TSIG の検証の後、他の検査の前) で同じ関数を使う (X-28)。
+    return dns_build_badvers_response(req, req_len, res, max_res_len, qdcount, &edns, is_tcp, cfg);
   }
 
   /* 長さが不正な COOKIE (RFC 7873 §5.2.2)、不正な ECS (RFC 7871 §6、§7.2.1) は FORMERR。
@@ -2730,6 +2769,13 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   if (qdcount_invalid) {
     add_ede(&edns, send_ede, 0, NULL);
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, qdcount, &edns, is_tcp, cfg); // FORMERR
+  }
+
+  /* X-15, RFC 1035 §4.1.4: 最初の名前の圧縮ポインタは前に現れた名前を指せない (指せるのはヘッダだけ)。
+   * 質問を写し返せないので QDCOUNT=0 の FORMERR (以前はポインタの先によって無応答、または別の名前の答え)。 */
+  if (qdcount == 1 && wire_question_name_compressed(req, req_len)) {
+    add_ede(&edns, send_ede, 0, NULL);
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 0, &edns, is_tcp, cfg); // FORMERR
   }
 
   // RFC 9619: QDCOUNT=0 QUERY – no question section, return minimal response.

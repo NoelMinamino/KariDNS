@@ -425,6 +425,8 @@ typedef struct program_plugin {
   char domain[256];      /* zone_db_entry_t->domain と同じ形式(FQDN, 末尾ドット) */
   char view_name[64];     /* 同じゾーン名が別の view にもあり得るので view と組で引く (O-12) */
   pid_t pid;
+  int proc_fd;            /* FreeBSD: pdfork() のプロセス記述子 (CAP_PDKILL のみ)。-1 = なし。
+                           * capability mode では kill(pid) ができないので pdkill() で止める (X-11) */
   int stdin_fd;           /* karidns -> script への書き込み側 */
   int stdout_fd;          /* script -> karidns への読み込み側 */
   pthread_mutex_t lock;    /* 1子プロセスを複数workerから同時に叩かないための直列化 */
@@ -477,7 +479,6 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(server_config_t *config,
                                              catalog_member_id_t *new_desired_members,
                                              int new_desired_count);
 
-void wait_for_readers(zone_arena_t *arena);
 void clone_zone_arena(zone_arena_t *src, zone_arena_t *dst);
 void zone_arena_clear_data_pools(zone_arena_t *arena);
 void compute_ixfr_diff(zone_db_entry_t *entry, zone_arena_t *old_arena, zone_arena_t *new_arena);

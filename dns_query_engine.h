@@ -20,6 +20,11 @@ typedef struct {
 } query_rrl_info_t;
 extern _Thread_local query_rrl_info_t t_query_rrl_info;
 
+/* RRL の slip 応答: 直前の process_dns_query*() が作った応答 res[0..res_len) を TC=1 にして質問
+ * と OPT だけに切り詰め、要求に TSIG があれば同じ鍵で署名し直す (X-20、RFC 8945 §5.3。BIND 9.20 の slip 応答も
+ * 署名される)。同じスレッドで、同じ設定スナップショットの読み取り区間の中で呼ぶこと。戻り値は新しい長さ。 */
+size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap);
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,

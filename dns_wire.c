@@ -3713,6 +3713,14 @@ int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, s
     return offset;
 }
 
+int dns_build_badvers_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                               uint16_t qd_keep, edns_info_t *edns, bool is_tcp, struct server_config_s *cfg) {
+    /* RFC 6891 §6.1.3: 応答の VERSION はこのサーバーが実装する最大 (0)。BADVERS = 16 は
+     * 拡張 RCODE 1 (上位 8 ビット) とヘッダの RCODE 0 (下位 4 ビット) で表す */
+    edns->version = 0;
+    return dns_build_error_response(req, req_len, res, max_res_len, 0, 1, qd_keep, edns, is_tcp, cfg);
+}
+
 size_t dns_truncate_keep_opt(uint8_t *res, size_t res_len, size_t q_end) {
     if (!res || res_len < DNS_HEADER_SIZE) return res_len;
     if (q_end < DNS_HEADER_SIZE || q_end > res_len) q_end = DNS_HEADER_SIZE;
@@ -4503,6 +4511,18 @@ size_t pb_encode_fixed32_field(uint8_t *out, size_t out_cap, uint32_t field_no, 
     return tag_len + 4;
 }
 
+bool wire_question_name_compressed(const uint8_t *buf, size_t len) {
+    size_t offset = DNS_HEADER_SIZE;
+    while (offset < len) {
+        uint8_t l = buf[offset];
+        if (l == 0) return false;
+        if ((l & 0xC0) == 0xC0) return true;
+        if (l > 63) return false; // 0x40/0x80 の種類は別の検査 (skip_wire_name) で弾く
+        offset += 1 + (size_t)l;
+    }
+    return false;
+}
+
 // ============================================================================
 // 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
 // ============================================================================
@@ -4530,11 +4550,9 @@ bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size
             break;
         }
         if ((label_len & 0xC0) == 0xC0) {
-            if (offset + 2 > len) {
-                break;
-            }
-            offset += 2;
-            qname_completed = true;
+            // X-15: 質問の名前はメッセージ最初の名前なので、圧縮ポインタは「前に現れた名前」を
+            // 指せない (RFC 1035 §4.1.4)。以前はポインタの手前で名前を終えて、別の (短い) 名前として
+            // ログ・振り分けに渡していた。不正な名前として扱い、エンジンが FORMERR を返す。
             break;
         }
         // RFC 1035 s2.3.4: max label length is 63 octets

@@ -235,13 +235,6 @@ static void test_snapshot_retain_release_and_gc(void) {
     assert(strcmp(entry->view_name, "default") == 0);
     free_zone_db_entry(entry);
 
-    // wait_for_readers NULL and empty
-    wait_for_readers(NULL);
-    zone_arena_t arena;
-    memset(&arena, 0, sizeof(arena));
-    arena.reader_count = ATOMIC_VAR_INIT(0);
-    wait_for_readers(&arena);
-
     // abort_rebuild_snapshot NULL and valid
     abort_rebuild_snapshot(NULL, "unit_test_null");
     zone_db_snapshot_t *dummy_snap = calloc(1, sizeof(zone_db_snapshot_t));

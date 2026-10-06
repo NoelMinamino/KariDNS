@@ -474,6 +474,13 @@ void dns_init_response_header(uint8_t *res, const uint8_t *req, uint8_t rcode, b
 int dns_build_error_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
                              uint8_t rcode, uint8_t ext_rcode, uint16_t qd_keep,
                              edns_info_t *edns, bool is_tcp, struct server_config_s *cfg);
+// OPT の VERSION がこのサーバーの実装 (0) を超える要求か (RFC 6891 §6.1.3)。
+static inline bool edns_version_unsupported(const edns_info_t *edns) {
+    return edns->present && edns->version > 0;
+}
+// その要求への BADVERS 応答 (OPT VERSION 0、質問を qd_keep 個写す)。クエリ経路と AXFR/IXFR の受付で共有する。
+int dns_build_badvers_response(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                               uint16_t qd_keep, edns_info_t *edns, bool is_tcp, struct server_config_s *cfg);
 
 // UPDATE (RFC 2136) の処理結果。changed が false なら standby は active と同じ内容。
 typedef struct {
@@ -537,8 +544,13 @@ typedef struct {
     uint64_t wirecache_bytes;
 } zone_observatory_snapshot_t;
 
+// 最初の質問 (UPDATE ではゾーンセクション) の名前に圧縮ポインタがあるか (X-15)。メッセージ最初の名前の
+// ポインタは前に現れた名前を指せない (RFC 1035 §4.1.4) ので、そのような要求は FORMERR にする。
+bool wire_question_name_compressed(const uint8_t *buf, size_t len);
+
 // ============================================================================
 // 高速クエリQuestion部パースヘルパー (UDP/TCP共通)
+// 圧縮ポインタを含む名前は不正として false を返す (X-15)
 // ============================================================================
 bool parse_query_question_fast(const uint8_t *buf, size_t len, char *qname, size_t qname_size,
                                uint16_t *qtype, uint16_t *qclass, size_t *question_end);

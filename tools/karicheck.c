@@ -783,6 +783,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
     ctx.visited_paths[0] = root_path;
     ctx.visited_devs[0] = root_dev;
     ctx.visited_inos[0] = root_ino;
+    ctx.source_mtime = root_st.st_mtime; /* tinydns の SOA serial (サーバーと同じくファイルの mtime) */
 
     /* サーバー (reload_master_zone) と同じく、tinydns の親子ゾーンの振り分けには
      * このゾーンと同じ view のゾーン名を使う */

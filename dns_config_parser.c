@@ -712,17 +712,23 @@ void free_server_config_fields(server_config_t *cfg) {
 }
 
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino) {
+  struct stat st;
+  char *str = read_entire_file_stat(path, &st);
+  if (str) {
+    if (out_dev) *out_dev = st.st_dev;
+    if (out_ino) *out_ino = st.st_ino;
+  }
+  return str;
+}
+
+/* 読んだ fd の fstat() の結果を out_st に返す (取れなければ 0 で埋める)。ゾーンの再読み込みは
+ * サンドボックスの中なので、mtime もパスではなくこの fd から取る (X-13)。 */
+char *read_entire_file_stat(const char *path, struct stat *out_st) {
+  memset(out_st, 0, sizeof(*out_st));
   int fd = open_via_dir_cache(path, O_RDONLY, 0, false);
   if (fd < 0)
     return NULL;
-  
-  if (out_dev || out_ino) {
-    struct stat st;
-    if (fstat(fd, &st) == 0) {
-      if (out_dev) *out_dev = st.st_dev;
-      if (out_ino) *out_ino = st.st_ino;
-    }
-  }
+  if (fstat(fd, out_st) != 0) memset(out_st, 0, sizeof(*out_st));
 
   FILE *f = fdopen(fd, "rb");
   if (!f) {

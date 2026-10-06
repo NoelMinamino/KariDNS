@@ -1187,23 +1187,13 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
                     client_addr, client_len, server_addr, has_server_addr);
     return;
   }
-  zone_arena_t *current_zone = NULL;
-  do {
-    current_zone =
-        atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-    atomic_fetch_add_explicit(&current_zone->reader_count, 1,
-                              memory_order_acquire);
-    if (current_zone ==
-        atomic_load_explicit(&entry->rcu.active, memory_order_acquire))
-      break;
-    atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                              memory_order_release);
-  } while (1);
+  /* arena は呼び出し側 (axfr_worker_thread) の読み取り区間 (rcu_aux_read_lock) と entry->active_axfr
+   * (writer は wait_for_active_axfr() で待つ) で守られる。X-03: arena の reader_count は待つ側が
+   * 無かったので削除した。 */
+  zone_arena_t *current_zone = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
   if (current_zone->count == 0) {
     /* X-19: まだデータの無いゾーン (未転送のセカンダリなど)。何も送らないとクライアントは
      * タイムアウトまで待つので、SERVFAIL と EDE 14 Not Ready (RFC 8914 §4.15) で終える。 */
-    atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                              memory_order_release);
     axfr_send_error(client_fd, req, req_len, 2, false, 14, "Zone not loaded", tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
     return;
@@ -1211,14 +1201,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
 
   uint8_t *res = calloc(1, 65535);
   if (!res) {
-    atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                              memory_order_release);
     return;
   }
   size_t q_offset = DNS_HEADER_SIZE;
   if (skip_wire_name(req, req_len, q_offset, &q_offset) != 0) {
       free(res);
-      atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
       return;
   }
   if (q_offset + 4 > req_len) {
@@ -1234,7 +1221,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
   bool has_client_soa = is_ixfr && ixfr_request_client_serial(req, req_len, q_offset, &client_serial);
   if (is_ixfr && !has_client_soa) {
     free(res);
-    atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
     axfr_send_error(client_fd, req, req_len, 1, false, 0xFFFF, NULL, tsig_key, req_mac, req_mac_len,
                     client_addr, client_len, server_addr, has_server_addr);
     return;
@@ -1279,8 +1265,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
   }
   if (soa_idx < 0) {
-    atomic_fetch_sub_explicit(&current_zone->reader_count, 1,
-                              memory_order_release);
     free(res);
     return;
   }
@@ -1570,7 +1554,6 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
     }
   }
   if (res) free(res);
-  atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
   return;
 
 axfr_error:
@@ -1580,7 +1563,6 @@ axfr_error:
     }
   }
   if (res) free(res);
-  atomic_fetch_sub_explicit(&current_zone->reader_count, 1, memory_order_release);
 }
 
 void *axfr_worker_thread(void *arg) {

@@ -316,6 +316,8 @@ notify_retry_config_t notify_retry_effective(const server_config_t *cfg, const z
 void free_rate_limit_config(rate_limit_config_t *rrl);
 #include <sys/types.h>
 char *read_entire_file(const char *path, dev_t *out_dev, ino_t *out_ino);
+struct stat;
+char *read_entire_file_stat(const char *path, struct stat *out_st);
 bool match_cidr(const char *client_ip_str, const char *cidr_str);
 bool parse_config_bool(const char *s, bool *out);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);

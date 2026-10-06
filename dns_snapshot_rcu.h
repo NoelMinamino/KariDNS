@@ -34,7 +34,6 @@ view_snapshot_t *snapshot_find_view(zone_db_snapshot_t *snap, const char *view_n
 zone_db_entry_t *find_zone_exact_in_view(view_snapshot_t *view, const char *domain);
 zone_db_entry_t *find_zone_in_view(view_snapshot_t *view, const char *qname);
 zone_db_entry_t *find_zone_for_query(view_snapshot_t *view, const char *qname, uint16_t qtype);
-void wait_for_readers(zone_arena_t *arena);
 void free_zone_db_entry(zone_db_entry_t *entry);
 void *gc_snapshot_thread(void *arg);
 zone_db_entry_t *create_new_zone_entry(const char *domain, const char *view_name);

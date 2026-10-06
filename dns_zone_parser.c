@@ -1675,7 +1675,6 @@ DONE:
 void zone_arena_init(zone_arena_t *arena) {
   if (!arena) return;
   memset(arena, 0, sizeof(*arena));
-  atomic_init(&arena->reader_count, 0);
 }
 void zone_arena_free_include_buffers(zone_arena_t *arena) {
   for (int i = 0; i < arena->file_buf_count; i++) {
