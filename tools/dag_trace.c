@@ -29,7 +29,7 @@ static void choose_ns_resolver(ns_resolver_t *rsv, const char *eff_server, int p
 
 static int resolve_ns_addr_type(const char *ns_name, uint16_t qtype, const ns_resolver_t *rsv,
                                 const query_opts_t *base_qo, bool use_tcp,
-                                char out[][64], int count, int out_cap) {
+                                char out[][64], char out_names[][256], int count, int out_cap) {
     query_opts_t resolve_qo = *base_qo;
     resolve_qo.rd_flag = true;
     /* TSIG 鍵は @server 用なのでシステムリゾルバには付けない */
@@ -54,6 +54,7 @@ static int resolve_ns_addr_type(const char *ns_name, uint16_t qtype, const ns_re
         dns_record_t rec; uint16_t type;
         if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
         if (type == qtype && rec.rdata_count > 0 && count < out_cap) {
+            if (out_names) snprintf(out_names[count], 256, "%s", ns_name);
             snprintf(out[count++], 64, "%s", rec.rdata[0]);
         }
     }
@@ -63,15 +64,15 @@ static int resolve_ns_addr_type(const char *ns_name, uint16_t qtype, const ns_re
 /* NS 名群の A/AAAA を解決して out に集める。解決できなかった NS 名は dig と同様に報告する。 */
 static int resolve_ns_addresses(char names[][256], int name_count, const ns_resolver_t *rsv,
                                 const query_opts_t *base_qo, bool use_tcp,
-                                char out[][64], int out_cap, bool report) {
+                                char out[][64], char out_names[][256], int out_cap, bool report) {
     int count = 0;
     for (int j = 0; j < name_count && count < out_cap; j++) {
         int before = count;
         if (base_qo->pref_family == AF_UNSPEC || base_qo->pref_family == AF_INET) {
-            count = resolve_ns_addr_type(names[j], 1 /* A */, rsv, base_qo, use_tcp, out, count, out_cap);
+            count = resolve_ns_addr_type(names[j], 1 /* A */, rsv, base_qo, use_tcp, out, out_names, count, out_cap);
         }
         if (count < out_cap && (base_qo->pref_family == AF_UNSPEC || base_qo->pref_family == AF_INET6)) {
-            count = resolve_ns_addr_type(names[j], 28 /* AAAA */, rsv, base_qo, use_tcp, out, count, out_cap);
+            count = resolve_ns_addr_type(names[j], 28 /* AAAA */, rsv, base_qo, use_tcp, out, out_names, count, out_cap);
         }
         if (count == before && report) {
             size_t nlen = strlen(names[j]);
@@ -115,289 +116,254 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
 
     int ret = 0;
 
-    for (int cname_depth = 0; cname_depth <= TRACE_MAX_CNAME_DEPTH; cname_depth++) {
-        char target_ips[32][64];
-        int target_count = 0;
-        ns_resolver_t trace_rsv = { eff_server, port, false };
+    char target_ips[32][64];
+    char target_names[32][256]; /* target_ips[i] を持つ NS 名 (dig と同様に Received 行に表示する) */
+    int target_count = 0;
+    ns_resolver_t trace_rsv = { eff_server, port, false };
 
-        query_opts_t root_qo = *qo;
-        root_qo.rd_flag = true;
-        uint8_t root_req_mac[64];
-        size_t root_req_mac_len = 0;
-        size_t root_qlen = build_and_sign_query(root_qbuf, 65535, ".", 2 /* NS */, &root_qo, root_req_mac, &root_req_mac_len);
-        if (root_qlen == 0) {
-            fprintf(stderr, "Error: Failed to construct root query for +trace\n");
-            ret = 1;
-            goto cleanup;
+    query_opts_t root_qo = *qo;
+    root_qo.rd_flag = true;
+    uint8_t root_req_mac[64];
+    size_t root_req_mac_len = 0;
+    size_t root_qlen = build_and_sign_query(root_qbuf, 65535, ".", 2 /* NS */, &root_qo, root_req_mac, &root_req_mac_len);
+    if (root_qlen == 0) {
+        fprintf(stderr, "Error: Failed to construct root query for +trace\n");
+        ret = 1;
+        goto cleanup;
+    }
+
+    if (!no_hexdump_query && !dopt->yaml) {
+        printf("Query (%zd bytes):\n", root_qlen);
+        hexdump(root_qbuf, root_qlen);
+        printf("\n");
+    }
+
+    struct timespec start_ts, end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    ssize_t root_n = do_dns_exchange_auto(eff_server, port, &root_qo, root_qbuf, root_qlen, root_resp, 65535, root_qo.timeout_sec, eff_use_tcp);
+    clock_gettime(CLOCK_MONOTONIC, &end_ts);
+
+    if (root_n <= 0) {
+        if (dopt->yaml) {
+            printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
+        } else {
+            printf(";; connection timed out; no servers could be reached\n");
+        }
+        ret = 9;
+        goto cleanup;
+    }
+
+    int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
+    trace_record_result(eff_server, root_n, root_resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
+    if (!no_hexdump_response && !dopt->yaml) {
+        printf("Response (%zd bytes):\n", root_n);
+        hexdump(root_resp, (size_t)root_n);
+        printf("\n");
+    }
+
+    if (root_n > 12) {
+        if (root_qo.want_tsig) {
+            uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+            int terr = tsig_verify_packet(root_resp, (size_t)root_n, &root_qo.tsig_key, root_req_mac, root_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
+            print_tsig_verify_error(terr, root_resp, (size_t)root_n);
+        }
+        if (dopt->yaml) {
+            print_response_yaml(root_resp, root_n, eff_server, port, eff_use_tcp, dopt);
+        } else {
+            axfr_state_t dummy_axfr = {0};
+            print_response(root_resp, root_n, &dummy_axfr, &trace_dopt);
+            int dt_ms_root = timespec_diff_ms(&start_ts, &end_ts);
+            /* dig: "from ADDR#PORT(@server に指定した名前)" */
+            trace_print_received(root_n, g_last_server_ip[0] ? g_last_server_ip : eff_server, port, eff_server, dt_ms_root);
         }
 
-        if (!no_hexdump_query && !dopt->yaml) {
-            printf("Query (%zd bytes):\n", root_qlen);
-            hexdump(root_qbuf, root_qlen);
-            printf("\n");
+        size_t offset = 12;
+        int r_qd = (root_resp[4] << 8) | root_resp[5];
+        int r_an = (root_resp[6] << 8) | root_resp[7];
+        int r_ns = (root_resp[8] << 8) | root_resp[9];
+        int r_ar = (root_resp[10] << 8) | root_resp[11];
+        for (int i = 0; i < r_qd; i++) {
+            char *d;
+            if (expand_wire_name(root_resp, root_n, offset, &offset, &g_dag_arena, &d) != 0) break;
+            offset += 4;
         }
 
-        struct timespec start_ts, end_ts;
-        clock_gettime(CLOCK_MONOTONIC, &start_ts);
-        ssize_t root_n = do_dns_exchange_auto(eff_server, port, &root_qo, root_qbuf, root_qlen, root_resp, 65535, root_qo.timeout_sec, eff_use_tcp);
-        clock_gettime(CLOCK_MONOTONIC, &end_ts);
+        char rns_names[32][256];
+        char rns_owners[32][256];
+        int rns_count = 0;
+        trace_collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
+        trace_collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
+        /* +noglue (default, BIND 9.20+ dig compatible): ADDITIONAL section is ignored and
+         * nameserver addresses are resolved via the configured resolver below.
+         * +glue: legacy behavior, use A/AAAA from ADDITIONAL first.
+         * +glue=indomain: use only in-domain glue (BIND named 9.18.41/9.20.15+). */
+        if (root_qo.use_glue) {
+            target_count = trace_collect_glue(root_resp, root_n, &offset, r_ar, rns_names, rns_owners, rns_count,
+                                        &root_qo, target_ips, target_names, target_count, 32, !dopt->yaml);
+        }
 
-        if (root_n <= 0) {
+        if (rns_count > 0) {
+            /* @server が再帰応答しない (RA=0, 例: @198.41.0.4) 場合は dig と同様に
+             * システムリゾルバで NS 名を解決する。 */
+            ns_resolver_t rsv;
+            choose_ns_resolver(&rsv, eff_server, port, (root_resp[3] & 0x80) != 0);
+            if (target_count == 0) {
+                target_count = resolve_ns_addresses(rns_names, rns_count, &rsv, &root_qo, eff_use_tcp,
+                                                    target_ips, target_names, 32, !dopt->yaml);
+            }
+            trace_rsv = rsv;
+        }
+    }
+
+    if (target_count == 0) {
+        if (root_n > 12 && !dopt->yaml) {
+            printf(";; No root nameserver addresses %s, stopping trace.\n",
+                   root_qo.use_glue ? "found" : "resolved");
+        }
+        ret = 0;
+        goto cleanup;
+    }
+
+    query_opts_t hop_qo = *qo;
+    hop_qo.rd_flag = false;
+
+    for (int hop = 1; hop < 32 && target_count > 0; hop++) {
+        reset_dag_arena();
+        size_t qlen = 0;
+        uint8_t hop_req_mac[64];
+        size_t hop_req_mac_len = 0;
+        if (hex_payload) {
+            qlen = parse_hex_string(hex_payload, qbuf, 65535);
+            if (qlen == 0 || qlen > 65535) {
+                fprintf(stderr, "Error: Invalid, empty, or oversized hex payload (max 65535 bytes)\n");
+                ret = 1;
+                goto cleanup;
+            }
+        } else {
+            int qtype_val = parse_qtype(qtype_s);
+            if (qtype_val < 0) {
+                ret = 1;
+                goto cleanup;
+            }
+            qlen = build_and_sign_query(qbuf, 65535, current_qname, (uint16_t)qtype_val, &hop_qo, hop_req_mac, &hop_req_mac_len);
+            if (qlen == 0) break;
+        }
+
+        ssize_t n = -1;
+        int active_target_idx = 0;
+
+        for (int ti = 0; ti < target_count; ti++) {
+            if (!no_hexdump_query && !dopt->yaml) {
+                printf("Query (%zd bytes):\n", qlen);
+                hexdump(qbuf, qlen);
+                printf("\n");
+            }
+            clock_gettime(CLOCK_MONOTONIC, &start_ts);
+            n = do_dns_exchange_auto(target_ips[ti], port, &hop_qo, qbuf, qlen, resp, 65535, hop_qo.timeout_sec, eff_use_tcp);
+            clock_gettime(CLOCK_MONOTONIC, &end_ts);
+            if (n > 0) {
+                active_target_idx = ti;
+                break;
+            }
             if (dopt->yaml) {
                 printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
             } else {
-                printf(";; connection timed out; no servers could be reached\n");
+                printf(";; connection to %s#%d timed out; trying next server...\n", target_ips[ti], port);
+            }
+        }
+
+        if (n <= 0) {
+            if (dopt->yaml) {
+                printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
+            } else {
+                printf(";; no servers could be reached for hop %d\n", hop);
             }
             ret = 9;
             goto cleanup;
         }
 
-        int dt_ms = timespec_diff_ms(&start_ts, &end_ts);
-        trace_record_result(eff_server, root_n, root_resp, dt_ms, eff_use_tcp ? "TCP" : "UDP");
+        int dt_ms_hop = timespec_diff_ms(&start_ts, &end_ts);
+        trace_record_result(target_ips[active_target_idx], n, resp, dt_ms_hop, eff_use_tcp ? "TCP" : "UDP");
+
         if (!no_hexdump_response && !dopt->yaml) {
-            printf("Response (%zd bytes):\n", root_n);
-            hexdump(root_resp, (size_t)root_n);
+            printf("Response (%zd bytes):\n", n);
+            hexdump(resp, (size_t)n);
             printf("\n");
         }
 
-        if (root_n > 12) {
-            if (root_qo.want_tsig) {
-                uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
-                int terr = tsig_verify_packet(root_resp, (size_t)root_n, &root_qo.tsig_key, root_req_mac, root_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-                if (terr == -1) {
-                    printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
-                } else if (terr != 0) {
-                    printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
-                }
-                fflush(stdout);
-            }
-            if (dopt->yaml) {
-                print_response_yaml(root_resp, root_n, eff_server, port, eff_use_tcp, dopt);
-            } else {
-                axfr_state_t dummy_axfr = {0};
-                print_response(root_resp, root_n, &dummy_axfr, &trace_dopt);
-                int dt_ms_root = timespec_diff_ms(&start_ts, &end_ts);
-                printf(";; Received %zd bytes from %s#%d in %d ms\n\n", root_n, eff_server, port, dt_ms_root);
-            }
-
-            size_t offset = 12;
-            int r_qd = (root_resp[4] << 8) | root_resp[5];
-            int r_an = (root_resp[6] << 8) | root_resp[7];
-            int r_ns = (root_resp[8] << 8) | root_resp[9];
-            int r_ar = (root_resp[10] << 8) | root_resp[11];
-            for (int i = 0; i < r_qd; i++) {
-                char *d;
-                if (expand_wire_name(root_resp, root_n, offset, &offset, &g_dag_arena, &d) != 0) break;
-                offset += 4;
-            }
-
-            char rns_names[32][256];
-            char rns_owners[32][256];
-            int rns_count = 0;
-            trace_collect_rrs_by_type(root_resp, root_n, &offset, r_an, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
-            trace_collect_rrs_by_type(root_resp, root_n, &offset, r_ns, 2 /* NS */, rns_names, rns_owners, &rns_count, 32);
-            /* +noglue (default, BIND 9.20+ dig compatible): ADDITIONAL section is ignored and
-             * nameserver addresses are resolved via the configured resolver below.
-             * +glue: legacy behavior, use A/AAAA from ADDITIONAL first.
-             * +glue=indomain: use only in-domain glue (BIND named 9.18.41/9.20.15+). */
-            if (root_qo.use_glue) {
-                target_count = trace_collect_glue(root_resp, root_n, &offset, r_ar, rns_names, rns_owners, rns_count,
-                                            &root_qo, target_ips, target_count, 32, !dopt->yaml);
-            }
-
-            if (rns_count > 0) {
-                /* @server が再帰応答しない (RA=0, 例: @198.41.0.4) 場合は dig と同様に
-                 * システムリゾルバで NS 名を解決する。 */
-                ns_resolver_t rsv;
-                choose_ns_resolver(&rsv, eff_server, port, (root_resp[3] & 0x80) != 0);
-                if (target_count == 0) {
-                    target_count = resolve_ns_addresses(rns_names, rns_count, &rsv, &root_qo, eff_use_tcp,
-                                                        target_ips, 32, !dopt->yaml);
-                }
-                trace_rsv = rsv;
-            }
+        if (n > 12 && hop_qo.want_tsig) {
+            uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
+            int terr = tsig_verify_packet(resp, (size_t)n, &hop_qo.tsig_key, hop_req_mac, hop_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
+            print_tsig_verify_error(terr, resp, (size_t)n);
         }
 
-        if (target_count == 0) {
-            if (root_n > 12 && !dopt->yaml) {
-                printf(";; No root nameserver addresses %s, stopping trace.\n",
-                       root_qo.use_glue ? "found" : "resolved");
-            }
-            ret = 0;
-            goto cleanup;
+        if (dopt->yaml) {
+            print_response_yaml(resp, n, target_ips[active_target_idx], port, eff_use_tcp, dopt);
+        } else {
+            axfr_state_t dummy_axfr = {0};
+            print_response(resp, n, &dummy_axfr, &trace_dopt);
+            trace_print_received(n, target_ips[active_target_idx], port, target_names[active_target_idx], dt_ms_hop);
         }
 
-        query_opts_t hop_qo = *qo;
-        hop_qo.rd_flag = false;
-        bool follow_cname = false;
+        if (n < 12) break;
+        int flags = (resp[2] << 8) | resp[3];
+        int ancount = (resp[6] << 8) | resp[7];
+        int nscount = (resp[8] << 8) | resp[9];
+        int arcount = (resp[10] << 8) | resp[11];
+        int rcode = flags & 0x0F;
 
-        for (int hop = 1; hop < 32 && target_count > 0; hop++) {
-            reset_dag_arena();
-            size_t qlen = 0;
-            uint8_t hop_req_mac[64];
-            size_t hop_req_mac_len = 0;
-            if (hex_payload) {
-                qlen = parse_hex_string(hex_payload, qbuf, 65535);
-                if (qlen == 0 || qlen > 65535) {
-                    fprintf(stderr, "Error: Invalid, empty, or oversized hex payload (max 65535 bytes)\n");
-                    ret = 1;
-                    goto cleanup;
-                }
-            } else {
-                int qtype_val = parse_qtype(qtype_s);
-                if (qtype_val < 0) {
-                    ret = 1;
-                    goto cleanup;
-                }
-                qlen = build_and_sign_query(qbuf, 65535, current_qname, (uint16_t)qtype_val, &hop_qo, hop_req_mac, &hop_req_mac_len);
-                if (qlen == 0) break;
-            }
+        /* 回答 (CNAME を含む) またはエラーで終わる。BIND dig +trace と同様に CNAME の先は辿らない
+         * (連鎖を辿るのは +trace2)。 */
+        if (ancount > 0 || rcode != 0) break;
 
-            ssize_t n = -1;
-            int active_target_idx = 0;
+        if (nscount == 0) break;
 
-            for (int ti = 0; ti < target_count; ti++) {
-                if (!no_hexdump_query && !dopt->yaml) {
-                    printf("Query (%zd bytes):\n", qlen);
-                    hexdump(qbuf, qlen);
-                    printf("\n");
-                }
-                clock_gettime(CLOCK_MONOTONIC, &start_ts);
-                n = do_dns_exchange_auto(target_ips[ti], port, &hop_qo, qbuf, qlen, resp, 65535, hop_qo.timeout_sec, eff_use_tcp);
-                clock_gettime(CLOCK_MONOTONIC, &end_ts);
-                if (n > 0) {
-                    active_target_idx = ti;
-                    break;
-                }
-                if (dopt->yaml) {
-                    printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
+        size_t offset = 12;
+        int qdcount = (resp[4] << 8) | resp[5];
+        for (int i = 0; i < qdcount; i++) {
+            char *dummy;
+            if (expand_wire_name(resp, n, offset, &offset, &g_dag_arena, &dummy) != 0) break;
+            offset += 4;
+        }
+
+        char ns_names[16][256];
+        char ns_owners[16][256];
+        int ns_count = 0;
+        trace_collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, ns_owners, &ns_count, 16);
+
+        int new_target_count = 0;
+        char new_target_ips[16][64];
+        char new_target_names[16][256];
+        if (hop_qo.use_glue) {
+            new_target_count = trace_collect_glue(resp, n, &offset, arcount, ns_names, ns_owners, ns_count,
+                                            &hop_qo, new_target_ips, new_target_names, 0, 16, !dopt->yaml);
+        }
+
+        if (new_target_count == 0 && ns_count > 0) {
+            new_target_count = resolve_ns_addresses(ns_names, ns_count, &trace_rsv, &hop_qo, eff_use_tcp,
+                                                    new_target_ips, new_target_names, 16, !dopt->yaml);
+        }
+
+        if (new_target_count == 0) {
+            if (!dopt->yaml) {
+                if (hop_qo.use_glue) {
+                    printf(";; No glue found for next hop, stopping trace.\n");
                 } else {
-                    printf(";; connection to %s#%d timed out; trying next server...\n", target_ips[ti], port);
+                    printf(";; No nameserver addresses resolved for next hop, stopping trace.\n");
                 }
             }
-
-            if (n <= 0) {
-                if (dopt->yaml) {
-                    printf("- type: DIG_ERROR\n  message: |\n    no servers could be reached\n");
-                } else {
-                    printf(";; no servers could be reached for hop %d\n", hop);
-                }
-                ret = 9;
-                goto cleanup;
-            }
-
-            int dt_ms_hop = timespec_diff_ms(&start_ts, &end_ts);
-            trace_record_result(target_ips[active_target_idx], n, resp, dt_ms_hop, eff_use_tcp ? "TCP" : "UDP");
-
-            if (!no_hexdump_response && !dopt->yaml) {
-                printf("Response (%zd bytes):\n", n);
-                hexdump(resp, (size_t)n);
-                printf("\n");
-            }
-
-            if (n > 12 && hop_qo.want_tsig) {
-                uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
-                int terr = tsig_verify_packet(resp, (size_t)n, &hop_qo.tsig_key, hop_req_mac, hop_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-                if (terr == -1) {
-                    printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
-                } else if (terr != 0) {
-                    printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
-                }
-                fflush(stdout);
-            }
-
-            if (dopt->yaml) {
-                print_response_yaml(resp, n, target_ips[active_target_idx], port, eff_use_tcp, dopt);
-            } else {
-                axfr_state_t dummy_axfr = {0};
-                print_response(resp, n, &dummy_axfr, &trace_dopt);
-                printf(";; Received %zd bytes from %s#%d in %d ms\n\n", n, target_ips[active_target_idx], port, dt_ms_hop);
-            }
-
-            if (n < 12) break;
-            int flags = (resp[2] << 8) | resp[3];
-            int ancount = (resp[6] << 8) | resp[7];
-            int nscount = (resp[8] << 8) | resp[9];
-            int arcount = (resp[10] << 8) | resp[11];
-            int rcode = flags & 0x0F;
-
-            if (ancount > 0 || rcode != 0) {
-                if (rcode == 0 && ancount > 0) {
-                    char cname_target[256] = "";
-                    size_t an_off = 12;
-                    int qdcount = (resp[4] << 8) | resp[5];
-                    for (int i = 0; i < qdcount; i++) {
-                        char *dummy;
-                        if (expand_wire_name(resp, n, an_off, &an_off, &g_dag_arena, &dummy) != 0) break;
-                        an_off += 4;
-                    }
-                    for (int i = 0; i < ancount; i++) {
-                        dns_record_t rec; uint16_t rtype;
-                        if (parse_resource_record(resp, n, &an_off, &g_dag_arena, &rec, &rtype) != 0) break;
-                        if (rtype == 5 /* CNAME */ && rec.rdata_count > 0) {
-                            snprintf(cname_target, sizeof(cname_target), "%s", rec.rdata[0]);
-                        }
-                    }
-                    if (cname_target[0] != '\0' && cname_depth < TRACE_MAX_CNAME_DEPTH) {
-                        strlcpy(current_qname, cname_target, sizeof(current_qname));
-                        follow_cname = true;
-                    }
-                }
-                break;
-            }
-
-            if (nscount == 0) break;
-
-            size_t offset = 12;
-            int qdcount = (resp[4] << 8) | resp[5];
-            for (int i = 0; i < qdcount; i++) {
-                char *dummy;
-                if (expand_wire_name(resp, n, offset, &offset, &g_dag_arena, &dummy) != 0) break;
-                offset += 4;
-            }
-
-            char ns_names[16][256];
-            char ns_owners[16][256];
-            int ns_count = 0;
-            trace_collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, ns_owners, &ns_count, 16);
-
-            int new_target_count = 0;
-            char new_target_ips[16][64];
-            if (hop_qo.use_glue) {
-                new_target_count = trace_collect_glue(resp, n, &offset, arcount, ns_names, ns_owners, ns_count,
-                                                &hop_qo, new_target_ips, 0, 16, !dopt->yaml);
-            }
-
-            if (new_target_count == 0 && ns_count > 0) {
-                new_target_count = resolve_ns_addresses(ns_names, ns_count, &trace_rsv, &hop_qo, eff_use_tcp,
-                                                        new_target_ips, 16, !dopt->yaml);
-            }
-
-            if (new_target_count == 0) {
-                if (!dopt->yaml) {
-                    if (hop_qo.use_glue) {
-                        printf(";; No glue found for next hop, stopping trace.\n");
-                    } else {
-                        printf(";; No nameserver addresses resolved for next hop, stopping trace.\n");
-                    }
-                }
-                break;
-            }
-
-            target_count = new_target_count;
-            _Static_assert(sizeof(target_ips[0]) == sizeof(new_target_ips[0]), "buffer size mismatch");
-            for(int i=0; i<target_count; i++) {
-                if (strlcpy(target_ips[i], new_target_ips[i], sizeof(target_ips[i])) >= sizeof(target_ips[i])) {
-                    fprintf(stderr, "warning: target IP truncated\n");
-                }
-            }
-        } // end hop loop
-
-        if (follow_cname) {
-            continue;
+            break;
         }
-        break;
-    } // end cname_depth loop
+
+        target_count = new_target_count;
+        _Static_assert(sizeof(target_ips[0]) == sizeof(new_target_ips[0]), "buffer size mismatch");
+        for(int i=0; i<target_count; i++) {
+            if (strlcpy(target_ips[i], new_target_ips[i], sizeof(target_ips[i])) >= sizeof(target_ips[i])) {
+                fprintf(stderr, "warning: target IP truncated\n");
+            }
+            memcpy(target_names[i], new_target_names[i], sizeof(target_names[i]));
+        }
+    } // end hop loop
 
 cleanup:
     free(root_qbuf);
@@ -450,12 +416,7 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
     if (ns_qo.want_tsig) {
         uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
         int terr = tsig_verify_packet(resp, (size_t)n, &ns_qo.tsig_key, ns_req_mac, ns_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-        if (terr == -1) {
-            printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
-        } else if (terr != 0) {
-            printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
-        }
-        fflush(stdout);
+        print_tsig_verify_error(terr, resp, (size_t)n);
     }
     int qdcount = (resp[4] << 8) | resp[5];
     int ancount = (resp[6] << 8) | resp[7];
@@ -622,12 +583,7 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
             if (qo.want_tsig) {
                 uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
                 int terr = tsig_verify_packet(resp, (size_t)sn, &qo.tsig_key, soa_req_mac, soa_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-                if (terr == -1) {
-                    printf(";; Couldn't verify signature: expected a TSIG or SIG(0)\n");
-                } else if (terr != 0) {
-                    printf(";; Couldn't verify signature: tsig verify failure (%d)\n", terr);
-                }
-                fflush(stdout);
+                print_tsig_verify_error(terr, resp, (size_t)sn);
             }
             int sancount = (resp[6] << 8) | resp[7];
             size_t soff = 12;

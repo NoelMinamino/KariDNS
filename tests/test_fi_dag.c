@@ -164,7 +164,7 @@ static void test_fi_dag_formatters_and_helpers(void) {
     memset(&qo, 0, sizeof(qo));
     display_opts_t dopt;
     memset(&dopt, 0, sizeof(dopt));
-    print_sent_query(dns_pkt, off, &qo, &dopt);
+    print_sent_query(dns_pkt, off, NULL, 53, false, &qo, &dopt);
 
     (void)count_non_opt_rrs(dns_pkt, off, 12, 0);
 

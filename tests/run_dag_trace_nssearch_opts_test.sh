@@ -149,6 +149,16 @@ else
         echo "$OUT_GLUE" | sed 's/^/    /'
         FAILED=$((FAILED + 1))
     fi
+
+    # T-06: the NS lookup and the SOA answers answer different questions; like dig, no comparison table
+    echo -n "Test: +nssearch prints no multi-server comparison table ... "
+    if ! echo "$OUT_GLUE" | grep -q "MULTI-SERVER COMPARISON"; then
+        echo "OK"
+    else
+        echo "FAILED"
+        echo "$OUT_GLUE" | sed 's/^/    /'
+        FAILED=$((FAILED + 1))
+    fi
 fi
 
 echo "=== 4. Testing +trace and +nssearch with TSIG (-y) ==="

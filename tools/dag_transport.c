@@ -123,6 +123,8 @@ void send_proxyv2_if_enabled(int sock, const query_opts_t *qo, bool is_tcp) {
  * 6. Networking
  * ==================================================================== */
 int g_last_socket_family = AF_INET;
+struct timespec g_dag_query_time;
+struct timespec g_dag_response_time;
 
 /*
  * server引数(IPv4リテラル / IPv6リテラル / FQDN)をsockaddr_storageへ解決する。
@@ -1207,13 +1209,17 @@ ssize_t do_dns_exchange_auto(const char *server, int port, const query_opts_t *q
                                      const uint8_t *pkt, size_t pkt_len,
                                      uint8_t *resp, size_t resp_cap, int timeout_sec,
                                      bool force_tcp) {
+    clock_gettime(CLOCK_REALTIME, &g_dag_query_time);
+    ssize_t n;
     if (force_tcp || (qo && (qo->use_doh || qo->use_tls))) {
-        return do_dns_exchange_by_transport(server, port, qo, force_tcp, pkt, pkt_len, resp, resp_cap, timeout_sec);
+        n = do_dns_exchange_by_transport(server, port, qo, force_tcp, pkt, pkt_len, resp, resp_cap, timeout_sec);
+    } else {
+        n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+        if (n >= 4 && (resp[2] & 0x02) != 0 && (!qo || !qo->ignore_tc)) { // TC bit detected (truncation)
+            ssize_t tn = do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
+            if (tn > 0) n = tn;
+        }
     }
-    ssize_t n = do_udp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
-    if (n >= 4 && (resp[2] & 0x02) != 0 && (!qo || !qo->ignore_tc)) { // TC bit detected (truncation)
-        ssize_t tn = do_tcp_exchange(server, port, qo, pkt, pkt_len, resp, resp_cap, timeout_sec);
-        if (tn > 0) return tn;
-    }
+    clock_gettime(CLOCK_REALTIME, &g_dag_response_time);
     return n;
 }

@@ -212,6 +212,61 @@ static void test_classify_referral(void) {
     CHECK(classify(&p, "www.example.test.", 1, "test.", &r) == IT_RESP_LAME);
 }
 
+/* T-10: 1 セクションの RR 数に上限 (以前は 96) を設けず、後ろの RR も読む */
+static void test_classify_many_rrs(void) {
+    printf("[TEST] classify: sections with more than 96 RRs\n");
+    pkt_t p;
+    it_resp_t r;
+
+    /* 無関係な A 120 個の後ろに問い合わせた名前の A */
+    pkt_begin(&p, QR | AA, "www.example.test.", 1);
+    for (int i = 0; i < 120; i++) rr_a(&p, SEC_AN, "o.example.test.", "192.0.2.200");
+    rr_a(&p, SEC_AN, "www.example.test.", "192.0.2.10");
+    CHECK(classify(&p, "www.example.test.", 1, "example.test.", &r) == IT_RESP_ANSWER);
+    CHECK(r.naddr == 1);
+    CHECK(r.naddr == 1 && strcmp(r.addrs[0], "192.0.2.10") == 0);
+
+    /* ADDITIONAL の 120 個目より後ろにある glue */
+    pkt_begin(&p, QR, "www.example.test.", 1);
+    rr_name(&p, SEC_NS, "example.test.", 2, "ns1.example.test.");
+    for (int i = 0; i < 120; i++) rr_a(&p, SEC_AR, "o.test.", "192.0.2.200");
+    rr_a(&p, SEC_AR, "ns1.example.test.", "192.0.2.1");
+    CHECK(classify(&p, "www.example.test.", 1, "test.", &r) == IT_RESP_REFERRAL);
+    CHECK(r.nglue == 1);
+    CHECK(r.nglue == 1 && strcmp(r.glue[0].addr, "192.0.2.1") == 0);
+
+    /* ANCOUNT がパケットに入りきらない値でも範囲外を読まずに不正応答とする */
+    pkt_begin(&p, QR | AA, "www.example.test.", 1);
+    rr_a(&p, SEC_AN, "www.example.test.", "192.0.2.10");
+    p.an = 65535;
+    CHECK(classify(&p, "www.example.test.", 1, "example.test.", &r) == IT_RESP_BAD);
+}
+
+/* T-06: 比較表は同じ質問 (QNAME は大文字小文字を区別しない) への応答どうしだけを比べる */
+static void test_comparison_rows(void) {
+    printf("[TEST] comparison summary: rows are compared only for the same question\n");
+    static server_result_t a, b;
+    pkt_t p;
+    pkt_begin(&p, QR, "www.example.test.", 1);
+    memset(&a, 0, sizeof(a));
+    memcpy(a.resp_buf, p.b, p.len); a.resp_len = (ssize_t)p.len; a.qdcount = 1; a.msg_index = 1;
+    pkt_begin(&p, QR, "WWW.Example.TEST.", 1);
+    memset(&b, 0, sizeof(b));
+    memcpy(b.resp_buf, p.b, p.len); b.resp_len = (ssize_t)p.len; b.qdcount = 1; b.msg_index = 1;
+    CHECK(results_comparable(&a, &b));
+    b.msg_index = 2;                                   /* AXFR の別メッセージ */
+    CHECK(!results_comparable(&a, &b));
+    pkt_begin(&p, QR, "www.example.test.", 28);        /* QTYPE が違う */
+    memcpy(b.resp_buf, p.b, p.len); b.msg_index = 1;
+    CHECK(!results_comparable(&a, &b));
+    pkt_begin(&p, QR, "example.test.", 1);             /* +trace の別の段 / -f の別の行 */
+    memcpy(b.resp_buf, p.b, p.len); b.resp_len = (ssize_t)p.len;
+    CHECK(!results_comparable(&a, &b));
+    b.resp_len = 5;                                    /* 短すぎる応答 */
+    CHECK(!results_comparable(&a, &b));
+    reset_dag_arena();
+}
+
 static void test_classify_answers(void) {
     printf("[TEST] classify: answers, aliases and negative responses\n");
     pkt_t p;
@@ -442,6 +497,8 @@ int main(void) {
     test_name_helpers();
     test_classify_referral();
     test_classify_answers();
+    test_classify_many_rrs();
+    test_comparison_rows();
     test_classify_errors();
     test_classify_truncation();
     test_roothints();

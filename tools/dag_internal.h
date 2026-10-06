@@ -156,6 +156,9 @@ extern bool g_dag_suppress_stdout;
 #define printf(...) do { if (!g_dag_suppress_stdout) { fprintf(stdout, __VA_ARGS__); } } while(0)
 
 extern zone_arena_t g_dag_arena;
+/* +yaml の query_time / response_time (CLOCK_REALTIME)。問い合わせの送信直前と応答の受信後に設定する */
+extern struct timespec g_dag_query_time;
+extern struct timespec g_dag_response_time;
 extern char g_last_server_ip[INET6_ADDRSTRLEN + 1];
 extern int g_last_socket_family;
 
@@ -311,6 +314,8 @@ typedef struct {
     bool server_explicit;
 
     bool use_search_list;
+    bool search_more;     /* 検索リストにまだ候補がある (NXDOMAIN なら次へ進む; +showsearch でなければ表示しない) */
+    bool no_cmd_banner;   /* 見出し "; <<>> dag <<>>" を出さない (+qr の検索リストの 2 番目以降) */
     char *search_domain;
     int ndots;
 
@@ -382,6 +387,10 @@ typedef struct {
     bool has_expected_client_cookie;
     uint8_t expected_client_cookie[8];
     bool check_dns64prefix;
+    /* 表示中のメッセージが dag の送ったクエリ (+qr) か。dig は自分のクエリの COOKIE に状態を付けず、
+     * +padding で付けた PADDING を長さなしで表示する (レンダリング前のメッセージを表示するため)。 */
+    bool msg_is_query;
+    bool query_auto_padding;
 } display_opts_t;
 
 /* +trace2 (フルリゾルバ相当の反復解決) の設定 */
@@ -442,6 +451,11 @@ const char *format_ttl_units(uint32_t ttl, char *buf, size_t buf_size);
 const char *format_class_name(uint16_t klass, char *buf, size_t buf_size);
 const char *opcode_name(uint8_t opcode);
 const char *rcode_name(uint16_t rcode);
+const char *tsig_rcode_name(uint16_t error);
+void print_tsig_verify_error(int err, const uint8_t *resp, size_t n);
+int dag_expand_name(const uint8_t *pkt, size_t pkt_len, size_t off, size_t *next, zone_arena_t *arena, char **out);
+const char *find_sig_pseudo_rr(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount, size_t *rr_off);
+const char *format_duration_text(uint32_t secs, char *buf, size_t buf_size);
 const char *get_ede_error_string(uint16_t code);
 void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                              size_t abs_offset, uint16_t rdlen,

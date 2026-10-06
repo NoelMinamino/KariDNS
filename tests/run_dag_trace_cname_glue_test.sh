@@ -182,13 +182,39 @@ MOCK_PID=$!
 sleep 0.5
 
 echo "=== 1. Testing +trace with Out-of-Bailiwick Delegation (No Glue Fallback) ==="
-echo -n "Test: Trace succeeds through glue resolution and CNAME re-trace ... "
+echo -n "Test: Trace succeeds through glue resolution and stops at the CNAME like dig ... "
+: > "$QUERY_LOG"
 OUT=$("$DAG" @127.0.0.1 -p $PORT example.com A +trace +timeout=2 2>&1 || true)
-if echo "$OUT" | grep -q "ns1\.external\.org" && echo "$OUT" | grep -q "cdn\.example\.net"; then
+# BIND dig +trace (9.20) ends at the authoritative CNAME answer and does not restart for the target (T-14)
+if echo "$OUT" | grep -q "ns1\.external\.org" && echo "$OUT" | grep -qE "^example\.com\.[[:space:]].*CNAME[[:space:]]+cdn\.example\.net\." \
+   && ! echo "$OUT" | grep -q "192\.0\.2\.100" && ! grep -qi "^cdn\.example\.net\." "$QUERY_LOG"; then
     echo "OK"
 else
     echo "FAILED"
+    echo "  Queries:"
+    sed 's/^/    /' "$QUERY_LOG"
     echo "  Output:"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test: Received lines name the server like dig (T-05) ... "
+# first hop: the @server text; later hops: the NS name the address belongs to
+if echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(127\.0\.0\.1\) in [0-9]+ ms" \
+   && echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(a\.root-servers\.net\) in [0-9]+ ms" \
+   && echo "$OUT" | grep -qE "^;; Received [0-9]+ bytes from 127\.0\.0\.1#$PORT\(ns1\.external\.org\) in [0-9]+ ms"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "$OUT" | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo -n "Test: no multi-server comparison table after a trace (T-06) ... "
+if ! echo "$OUT" | grep -q "MULTI-SERVER COMPARISON"; then
+    echo "OK"
+else
+    echo "FAILED"
     echo "$OUT" | sed 's/^/    /'
     FAILED=$((FAILED + 1))
 fi

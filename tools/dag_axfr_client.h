@@ -11,6 +11,7 @@ struct axfr_state_s {
     size_t first_soa_norm_len;
     int soa_seen_count;
     bool axfr_complete;
+    bool failed;        /* 最初のメッセージがエラー RCODE: dig と同じく "; Transfer failed." を出して統計は出さない */
 };
 
 void check_axfr_soa(axfr_state_t *state, const uint8_t *pkt, size_t pkt_len, const char *name, const uint8_t *hdr, uint16_t rdlen);

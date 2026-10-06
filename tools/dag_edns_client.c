@@ -240,32 +240,7 @@ uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
         pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* OPTION-LENGTH = 0 (empty request) */
     }
 
-    if (qo->want_expire_opt) {
-        if ((size_t)offset + 4 <= max_len) {
-            pkt[offset++] = 0x00; pkt[offset++] = 0x09; /* OPTION-CODE = EDNS EXPIRE (RFC 7314) */
-            pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* OPTION-LENGTH = 0 */
-        }
-    }
-
-    if (qo->send_keepalive) {
-        if ((size_t)offset + 4 <= max_len) {
-            pkt[offset++] = 0x00; pkt[offset++] = 11; /* OPTION-CODE = edns-tcp-keepalive */
-            pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* OPTION-LENGTH = 0 */
-        }
-    }
-
-    if (qo->want_cookie) {
-        uint16_t opt_len = 8 + (uint16_t)qo->server_cookie_len;
-        if ((size_t)offset + 4 + opt_len > max_len) goto done;
-        pkt[offset++] = 0x00; pkt[offset++] = 0x0A; /* OPTION-CODE = COOKIE */
-        pkt[offset++] = opt_len >> 8; pkt[offset++] = opt_len & 0xFF;
-        memcpy(&pkt[offset], qo->client_cookie, 8); offset += 8;
-        if (qo->server_cookie_len > 0) {
-            memcpy(&pkt[offset], qo->server_cookie, qo->server_cookie_len);
-            offset += qo->server_cookie_len;
-        }
-    }
-
+    /* dig 9.20 と同じ順: NSID, CLIENT-SUBNET, COOKIE, EXPIRE, TCP-KEEPALIVE, +ednsopt, PADDING */
     if (qo->want_subnet) {
         int addr_bytes = (qo->subnet_prefix + 7) / 8;
         uint16_t opt_len = 4 + (uint16_t)addr_bytes;
@@ -287,6 +262,32 @@ uint16_t build_opt_record(uint8_t *pkt, size_t max_len, uint16_t offset,
         }
         memcpy(&pkt[offset], addr_copy, addr_bytes);
         offset += addr_bytes;
+    }
+
+    if (qo->want_cookie) {
+        uint16_t opt_len = 8 + (uint16_t)qo->server_cookie_len;
+        if ((size_t)offset + 4 + opt_len > max_len) goto done;
+        pkt[offset++] = 0x00; pkt[offset++] = 0x0A; /* OPTION-CODE = COOKIE */
+        pkt[offset++] = opt_len >> 8; pkt[offset++] = opt_len & 0xFF;
+        memcpy(&pkt[offset], qo->client_cookie, 8); offset += 8;
+        if (qo->server_cookie_len > 0) {
+            memcpy(&pkt[offset], qo->server_cookie, qo->server_cookie_len);
+            offset += qo->server_cookie_len;
+        }
+    }
+
+    if (qo->want_expire_opt) {
+        if ((size_t)offset + 4 <= max_len) {
+            pkt[offset++] = 0x00; pkt[offset++] = 0x09; /* OPTION-CODE = EDNS EXPIRE (RFC 7314) */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* OPTION-LENGTH = 0 */
+        }
+    }
+
+    if (qo->send_keepalive) {
+        if ((size_t)offset + 4 <= max_len) {
+            pkt[offset++] = 0x00; pkt[offset++] = 11; /* OPTION-CODE = edns-tcp-keepalive */
+            pkt[offset++] = 0x00; pkt[offset++] = 0x00; /* OPTION-LENGTH = 0 */
+        }
     }
 
     for (int i = 0; i < qo->custom_edns_opt_count; i++) {
@@ -821,6 +822,10 @@ size_t build_and_sign_query(uint8_t *pkt, size_t max_len,
         size_t dummy_mac_len = 0;
         uint8_t *mac_ptr = out_mac ? out_mac : dummy_mac;
         size_t *mac_len_ptr = out_mac_len ? out_mac_len : &dummy_mac_len;
+        /* tsig_sign_packet() digests *mac_len_ptr bytes of mac_ptr as the "request MAC", which belongs only in a
+         * response (RFC 8945 §4.3.1). A query must start from zero, otherwise a re-sent query (BADVERS/BADCOOKIE
+         * retry) carries the previous query's MAC in its digest and the server answers BADSIG (X-36). */
+        *mac_len_ptr = 0;
         if (tsig_sign_packet(pkt, &pkt_len, max_len, &key, 0, mac_ptr, mac_len_ptr, NULL, 0, false) != 0) {
             fprintf(stderr, "Error: tsig_sign_packet failed\n");
             return 0;
@@ -838,92 +843,117 @@ size_t build_and_sign_query(uint8_t *pkt, size_t max_len,
 }
 
 
+/* dig の表記: 16 進バイトを空白区切りで並べ、表示可能な ASCII を ("...") で添える (NSID, PADDING, 未知のオプション) */
+static void print_option_hex_ascii(const uint8_t *data, uint16_t len) {
+    for (uint16_t j = 0; j < len; j++) printf(" %02x", data[j]);
+    printf(" (\"");
+    for (uint16_t j = 0; j < len; j++) putchar((data[j] >= 0x20 && data[j] < 0x7f) ? data[j] : '.');
+    printf("\")");
+}
+
+/* EDNS オプション 1 個を dig 9.20 と同じ形で出す。indent が ';' で始まれば通常表示、それ以外は YAML。 */
 void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
                                          uint16_t code, uint16_t olen,
                                          const char *indent,
                                          const display_opts_t *dopt) {
     if (!indent) indent = "";
     bool is_yaml = (indent[0] != ';');
+    bool is_query = dopt && dopt->msg_is_query;
+    const uint8_t *d = &pkt[p];
 
-    if (code == 10) { // COOKIE
+    if (code == 10) { // COOKIE (RFC 7873)
+        /* 状態: クライアント部が送ったものと違えば bad、サーバ部があれば good、
+         * クライアント部だけ返ってきたら echoed (dig と同じ)。自分のクエリには付けない。 */
+        const char *status = NULL;
+        if (!is_query && olen >= 8) {
+            if (dopt && dopt->has_expected_client_cookie) {
+                if (memcmp(dopt->expected_client_cookie, d, 8) != 0) status = "bad";
+                else status = (olen > 8) ? "good" : "echoed";
+            } else if (olen > 8) {
+                status = "good";
+            }
+        }
         if (is_yaml && olen >= 8) {
-            char c_cookie[64] = "";
-            char s_cookie[128] = "";
-            for (int j = 0; j < 8; j++) snprintf(c_cookie + j * 2, 3, "%02x", pkt[p + j]);
-            bool c_match = true;
-            if (dopt && dopt->has_expected_client_cookie) {
-                c_match = (memcmp(dopt->expected_client_cookie, &pkt[p], 8) == 0);
-            }
+            printf("%sCOOKIE:\n%s  CLIENT: ", indent, indent);
+            for (int j = 0; j < 8; j++) printf("%02x", d[j]);
+            printf("\n");
             if (olen > 8) {
-                for (int j = 8; j < olen && (j - 8) * 2 < (int)sizeof(s_cookie) - 3; j++) {
-                    snprintf(s_cookie + (j - 8) * 2, 3, "%02x", pkt[p + j]);
-                }
+                printf("%s  SERVER: ", indent);
+                for (uint16_t j = 8; j < olen; j++) printf("%02x", d[j]);
+                printf("\n");
             }
-            printf("%sCOOKIE:\n", indent);
-            printf("%s  CLIENT: %s\n", indent, c_cookie);
-            if (s_cookie[0] != '\0') {
-                printf("%s  SERVER: %s\n", indent, s_cookie);
-            }
-            if (dopt && dopt->has_expected_client_cookie) {
-                printf("%s  STATUS: %s\n", indent, c_match ? "good" : "bad");
-            }
+            if (status) printf("%s  STATUS: %s\n", indent, status);
+        } else {
+            printf("%sCOOKIE: ", indent);
+            for (uint16_t j = 0; j < olen; j++) printf("%02x", d[j]);
+            if (status) printf(" (%s)", status);
+            printf("\n");
         }
-        return;
-    } else if (code == 3) { // NSID
-        printf("%sNSID: ", indent);
-        for (uint16_t j = 0; j < olen; j++) printf("%02x", pkt[p + j]);
-        printf(" (\"");
-        for (uint16_t j = 0; j < olen; j++) {
-            unsigned char c = pkt[p + j];
-            printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
-        }
-        printf("\")\n");
+    } else if (code == 3) { // NSID (RFC 5001)
+        printf("%sNSID:", indent);
+        if (olen > 0) print_option_hex_ascii(d, olen);
+        printf("\n");
     } else if (code == 8 && olen >= 4) { // CLIENT-SUBNET
-        uint16_t family = (pkt[p] << 8) | pkt[p+1];
-        uint8_t src_prefix = pkt[p+2];
-        uint8_t scope_prefix = pkt[p+3];
+        uint16_t family = (d[0] << 8) | d[1];
+        uint8_t src_prefix = d[2];
+        uint8_t scope_prefix = d[3];
         char abuf[64] = "?";
         uint8_t addr[16] = {0};
         int addr_bytes = olen - 4;
         if (addr_bytes > 16) addr_bytes = 16;
-        memcpy(addr, &pkt[p + 4], addr_bytes);
+        memcpy(addr, &d[4], addr_bytes);
         if (family == 1) inet_ntop(AF_INET, addr, abuf, sizeof(abuf));
         else if (family == 2) inet_ntop(AF_INET6, addr, abuf, sizeof(abuf));
         printf("%sCLIENT-SUBNET: %s/%u/%u\n", indent, abuf, src_prefix, scope_prefix);
-    } else if (code == 9) { // EXPIRE
-        if (olen >= 4) {
-            uint32_t exp_sec = ((uint32_t)pkt[p]<<24)|((uint32_t)pkt[p+1]<<16)|((uint32_t)pkt[p+2]<<8)|pkt[p+3];
-            printf("%sEXPIRE: %u (seconds)\n", indent, exp_sec);
+    } else if (code == 9 && (olen == 0 || olen == 4)) { // EXPIRE (RFC 7314)
+        if (olen == 4) {
+            uint32_t exp_sec = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | ((uint32_t)d[2] << 8) | d[3];
+            char dur[128];
+            format_duration_text(exp_sec, dur, sizeof(dur));
+            if (is_yaml) printf("%sEXPIRE: %u # %s\n", indent, exp_sec, dur);
+            else printf("%sEXPIRE: %u (%s)\n", indent, exp_sec, dur);
         } else {
-            printf("%sEXPIRE%s\n", indent, is_yaml ? ":" : "");
+            printf("%sEXPIRE:\n", indent);
         }
-    } else if (code == 11) { // KEEPALIVE
-        if (olen >= 2) {
-            uint16_t to = (pkt[p] << 8) | pkt[p+1];
-            printf("%sKEEPALIVE: %u\n", indent, to);
+    } else if (code == 11 && (olen == 0 || olen == 2)) { // edns-tcp-keepalive (RFC 7828), units of 100 ms
+        if (olen == 2) {
+            uint16_t to = (d[0] << 8) | d[1];
+            printf("%sTCP-KEEPALIVE: %u.%u secs\n", indent, to / 10, to % 10);
         } else {
-            printf("%sKEEPALIVE%s\n", indent, is_yaml ? ":" : "");
+            printf("%sTCP-KEEPALIVE:\n", indent);
         }
-    } else if (code == 12) { // PADDING
-        printf("%sPADDING: %u octets\n", indent, olen);
-    } else if (code == 15) { // EDE
-        if (is_yaml && olen >= 2) {
-            uint16_t info_code = (pkt[p] << 8) | pkt[p+1];
-            const char *msg = get_ede_error_string(info_code);
+    } else if (code == 12) { // PADDING (RFC 7830)
+        printf("%sPADDING:", indent);
+        if (olen > 0 && !(is_query && dopt->query_auto_padding)) {
+            if (is_yaml) print_option_hex_ascii(d, olen);
+            else printf(" (%u bytes)", olen);
+        }
+        printf("\n");
+    } else if (code == 15) { // EDE (RFC 8914)
+        if (olen < 2) {
+            printf("%sEDE:\n", indent);
+            return;
+        }
+        uint16_t info_code = (d[0] << 8) | d[1];
+        const char *msg = get_ede_error_string(info_code);
+        char ede_text[512];
+        size_t tlen = olen - 2;
+        if (tlen >= sizeof(ede_text)) tlen = sizeof(ede_text) - 1;
+        memcpy(ede_text, &d[2], tlen);
+        ede_text[tlen] = '\0';
+        if (is_yaml) {
             printf("%sEDE:\n", indent);
             printf("%s  INFO-CODE: %u (%s)\n", indent, info_code, msg);
-            if (olen > 2) {
-                char ede_text[512];
-                size_t tlen = olen - 2;
-                if (tlen >= sizeof(ede_text)) tlen = sizeof(ede_text) - 1;
-                memcpy(ede_text, &pkt[p + 2], tlen);
-                ede_text[tlen] = '\0';
-                char text_esc[512];
+            if (tlen > 0) {
+                char text_esc[1024];
                 yaml_double_quote_escape(ede_text, text_esc, sizeof(text_esc));
                 printf("%s  EXTRA-TEXT: \"%s\"\n", indent, text_esc);
             }
+        } else if (tlen > 0) {
+            printf("%sEDE: %u (%s): (%s)\n", indent, info_code, msg, ede_text);
+        } else {
+            printf("%sEDE: %u (%s)\n", indent, info_code, msg);
         }
-        return;
     } else if (code == 20 || code == 21) { // MQTYPE
         printf("%s%s: ", indent, code == 20 ? "MQTYPE-Query" : "MQTYPE-Response");
         if (olen % 2 != 0) {
@@ -932,7 +962,7 @@ void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
             printf("(empty)\n");
         } else {
             for (uint16_t j = 0; j < olen; j += 2) {
-                uint16_t mq = (pkt[p + j] << 8) | pkt[p + j + 1];
+                uint16_t mq = (d[j] << 8) | d[j + 1];
                 char tbuf[16];
                 const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
                 if (j > 0) printf(" ");
@@ -941,12 +971,8 @@ void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
             printf("\n");
         }
     } else {
-        printf("%sOPTION: %u", indent, code);
-        if (olen > 0) {
-            printf(": ");
-            for (uint16_t j = 0; j < olen; j++) printf("%02x ", pkt[p + j]);
-        }
+        printf("%sOPT=%u:", indent, code);
+        if (olen > 0) print_option_hex_ascii(d, olen);
         printf("\n");
     }
 }
-

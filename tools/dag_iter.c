@@ -28,7 +28,6 @@
 #define IT_MAX_REFERRALS       32
 #define IT_MAX_CNAME           16
 #define IT_MAX_QMIN_QUERIES    10   /* RFC 9156 MAX_MINIMISE_COUNT */
-#define IT_SEC_CAP             96   /* 1 セクションから読み取る RR 数の上限 */
 #define IT_BUF_SIZE            65535
 
 /* ------------------------------------------------------------------ */
@@ -219,15 +218,21 @@ it_resp_kind_t dag_iter_classify(const uint8_t *pkt, size_t len, const char *qna
     if (out->rcode == 5) IT_RET(IT_RESP_LAME, "REFUSED");
     if (out->rcode != 0 && out->rcode != 3) IT_RET(IT_RESP_LAME, "rcode %s", rcode_name(out->rcode));
 
-    secs = calloc(3 * IT_SEC_CAP, sizeof(it_rr_t));
+    /* 全 RR を読む (上限で黙って捨てない)。RR は最短でも 11 オクテット (root owner + TYPE/CLASS/TTL/RDLENGTH)
+     * なので、パケットに入りうる数で確保量を抑える。 */
+    size_t fit = (len - off) / 11;
+    size_t an_cap = (size_t)an < fit ? (size_t)an : fit;
+    size_t ns_cap = (size_t)ns < fit ? (size_t)ns : fit;
+    size_t ar_cap = (size_t)ar < fit ? (size_t)ar : fit;
+    secs = calloc(an_cap + ns_cap + ar_cap + 1, sizeof(it_rr_t));
     if (!secs) IT_RET(IT_RESP_BAD, "out of memory");
-    it_rr_t *ans = secs, *auth = secs + IT_SEC_CAP, *add = secs + 2 * IT_SEC_CAP;
+    it_rr_t *ans = secs, *auth = secs + an_cap, *add = secs + an_cap + ns_cap;
     bool err = false;
-    int nan = it_read_section(pkt, len, &off, an, ans, IT_SEC_CAP, &err);
+    int nan = it_read_section(pkt, len, &off, an, ans, (int)an_cap, &err);
     if (err) IT_RET(IT_RESP_BAD, "malformed answer section");
-    int nau = it_read_section(pkt, len, &off, ns, auth, IT_SEC_CAP, &err);
+    int nau = it_read_section(pkt, len, &off, ns, auth, (int)ns_cap, &err);
     if (err) IT_RET(IT_RESP_BAD, "malformed authority section");
-    int nad = it_read_section(pkt, len, &off, ar, add, IT_SEC_CAP, &err); /* 追加部の破損は致命的でない */
+    int nad = it_read_section(pkt, len, &off, ar, add, (int)ar_cap, &err); /* 追加部の破損は致命的でない */
 
     /* ANSWER の CNAME/DNAME を辿る。ゾーン外の名前に出たらそこで止める。 */
     char cur[256];
@@ -738,8 +743,7 @@ static int it_exchange(it_ctx_t *ctx, const char *addr, const char *nsname, cons
             } else if (!ctx->dopt->short_mode) {
                 axfr_state_t dummy_axfr = {0};
                 print_response(ctx->rbuf, (size_t)n, &dummy_axfr, &ctx->hop_dopt);
-                printf(";; Received %zd bytes from %s#%d(%.*s) in %d ms\n\n",
-                       n, addr, ctx->port, it_disp_len(nsname), nsname, ms);
+                trace_print_received(n, addr, ctx->port, nsname, ms);
             }
         }
 

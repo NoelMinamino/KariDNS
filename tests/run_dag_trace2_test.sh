@@ -255,7 +255,8 @@ ok() {
 
 run "delegation with in-domain glue" www.example.test A +trace2
 expect "^www.example.test.*192.0.2.1" && expect "trace2: NOERROR for www.example.test" \
-    && expect "(ns.example.test)" && expect "0 in 0 sub-resolutions" && ok
+    && expect "(ns.example.test)" && expect "0 in 0 sub-resolutions" \
+    && expect_not "MULTI-SERVER COMPARISON" && ok
 
 run "glueless NS resolved iteratively" www.glueless.test A +trace2
 expect "^;; \[sub\] ns2.other.alt -> 127.0.0.4" && expect "^www.glueless.test.*192.0.2.2" \

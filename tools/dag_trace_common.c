@@ -58,7 +58,7 @@ bool trace_name_equal(const char *a, const char *b) {
  * 無視して報告する。無視された NS 名は後段で解決される。 */
 int trace_collect_glue(const uint8_t *pkt, size_t pkt_len, size_t *roff, int arcount,
                        char ns_names[][256], char ns_owners[][256], int ns_count,
-                       const query_opts_t *qo, char out[][64], int count, int out_cap, bool report) {
+                       const query_opts_t *qo, char out[][64], char out_names[][256], int count, int out_cap, bool report) {
     char ignored[16][256];
     int ignored_count = 0;
     for (int i = 0; i < arcount; i++) {
@@ -84,10 +84,17 @@ int trace_collect_glue(const uint8_t *pkt, size_t pkt_len, size_t *roff, int arc
                 continue;
             }
             if (count < out_cap) {
+                if (out_names) snprintf(out_names[count], 256, "%s", ns_names[j]);
                 snprintf(out[count++], 64, "%s", rec.rdata[0]);
             }
             break;
         }
     }
     return count;
+}
+
+void trace_print_received(ssize_t n, const char *addr, int port, const char *name, int ms) {
+    size_t len = strlen(name);
+    if (len > 1 && name[len - 1] == '.') len--;
+    printf(";; Received %zd bytes from %s#%d(%.*s) in %d ms\n\n", n, addr, port, (int)len, name, ms);
 }
