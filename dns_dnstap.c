@@ -1,7 +1,9 @@
 #include "dns_dnstap.h"
 #include "dns_server_internal.h"
 
-#include <sys/capsicum.h>
+#ifdef __FreeBSD__
+#include <sys/capsicum.h> /* 再接続したソケットの権利を絞る (Capsicum は FreeBSD のみ) */
+#endif
 
 int g_dnstap_sock = -1;
 _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
@@ -499,10 +501,12 @@ static int dnstap_reconnect(void) {
     int sock = broker_connect_opts(AF_UNIX, SOCK_STREAM, (struct sockaddr *)&sun, sizeof(sun), &copts);
     if (sock < 0) return -1;
     if (!dnstap_handshake(sock)) return -1;
+#ifdef __FreeBSD__
     cap_rights_t rights;
     cap_rights_init(&rights, CAP_READ, CAP_RECV, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT,
                     CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
     cap_rights_limit(sock, &rights);
+#endif
     return sock;
 }
 
