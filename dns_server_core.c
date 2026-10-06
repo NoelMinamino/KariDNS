@@ -92,6 +92,8 @@ STATIC_TEST const char *g_config_path = NULL;
 static int g_cli_port_override = 0;
 _Atomic int g_bound_workers = 0;
 STATIC_TEST _Atomic bool g_privilege_drop_complete = false;
+// 制御スレッドが SIGTERM / SIGINT を EVFILT_SIGNAL で受けられるようになった (backend_sig_handler)
+STATIC_TEST _Atomic bool g_control_signals_ready = false;
 #define MAX_ZONE_AXFR 4
 
 #define NUM_FRONTEND_ROUTERS 2
@@ -194,6 +196,8 @@ const char *bind_error_hint(int err, int port) {
 // ワーカースレッドのTCPリスニングソケットの bind() 失敗数。
 // Backendは全ワーカーのbind完了後にこれを確認し、1件でもあれば起動を中止する。
 STATIC_TEST _Atomic int g_tcp_bind_failures = 0;
+// 起動に失敗したワーカースレッドの数 (X-33)。1 本でもあれば起動を中止する。
+STATIC_TEST _Atomic int g_worker_start_failures = 0;
 
 // Broker
 STATIC_TEST int g_broker_sock = -1;
@@ -214,24 +218,8 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
    * オラクル"になり得る。connect()自体に特権は不要なため、fork直後・
    * 要求ループ開始前に、サーバ本体と同じ実行ユーザーへ降格する。
    * 降格に失敗した場合は稼働を継続させず終了する(fail-closed)。 */
+  /* 降格先は main() が起動時に解決した g_run_identity (O-18: ここで名前を引き直さない) */
   bool need_drop = (geteuid() == 0);
-  uid_t drop_uid = (uid_t)-1;
-  gid_t drop_gid = (gid_t)-1;
-  if (need_drop) {
-    const char *user = g_config_db.config_a.user;
-    if (user) {
-      struct passwd *pwd = getpwnam(user);
-      if (pwd) {
-        drop_uid = pwd->pw_uid;
-        drop_gid = pwd->pw_gid;
-        const char *group = g_config_db.config_a.group;
-        if (group) {
-          struct group *grp = getgrnam(group);
-          if (grp) drop_gid = grp->gr_gid;
-        }
-      }
-    }
-  }
 
   pid_t pid = fork();
   if (pid < 0) {
@@ -242,24 +230,36 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   if (pid == 0) {
     close(sv[0]);
     if (need_drop) {
-      if (drop_uid == (uid_t)-1 ||
-          setgroups(0, NULL) != 0 ||
-          setgid(drop_gid) != 0 ||
-          setuid(drop_uid) != 0 ||
-          getuid() != drop_uid || geteuid() != drop_uid ||
-          getgid() != drop_gid || getegid() != drop_gid) {
+      char id_err[256];
+      if (!g_run_identity.privileged || !g_run_identity.has_user ||
+          !apply_run_identity_id(&g_run_identity, id_err, sizeof(id_err))) {
         syslog(LOG_ERR, "[Broker] Failed to drop privileges; refusing to run as root");
         close(sv[1]);
         _exit(1);
       }
     }
+    /* AF_UNIX で connect してよいのは起動時に設定された dnstap ソケットだけ (再接続用)。
+     * それ以外のローカルソケットへ実行ユーザーとして接続させる口にはしない。 */
+    char allowed_unix_path[sizeof(((struct sockaddr_un *)0)->sun_path)] = "";
+    if (g_config_db.config_a.dnstap.enabled && g_config_db.config_a.dnstap.socket_path)
+      strlcpy(allowed_unix_path, g_config_db.config_a.dnstap.socket_path, sizeof(allowed_unix_path));
     broker_req_t req;
     while (recv(sv[1], &req, sizeof(req), MSG_WAITALL) == sizeof(req)) {
-      int sock = socket(req.family, req.type, 0);
+      size_t addr_len = 0;
+      if (req.family == AF_INET)
+        addr_len = sizeof(struct sockaddr_in);
+      else if (req.family == AF_INET6)
+        addr_len = sizeof(struct sockaddr_in6);
+      else if (req.family == AF_UNIX && req.type == SOCK_STREAM && allowed_unix_path[0] != '\0') {
+        struct sockaddr_un *sun = (struct sockaddr_un *)&req.addr;
+        sun->sun_path[sizeof(sun->sun_path) - 1] = '\0';
+        if (sun->sun_family == AF_UNIX && strcmp(sun->sun_path, allowed_unix_path) == 0)
+          addr_len = sizeof(struct sockaddr_un);
+      }
+      int sock = addr_len > 0 ? socket(req.family, req.type, 0) : -1;
+      int ret = -1;
       if (sock >= 0) {
-        size_t addr_len = (req.family == AF_INET) ? sizeof(struct sockaddr_in)
-                                                  : sizeof(struct sockaddr_in6);
-        if (req.type == SOCK_STREAM) {
+        if (req.type == SOCK_STREAM && req.family != AF_UNIX) {
           /* zone-tcp-window / zone-tcp-sndbuf (または tcp-window): connect() 前なので
            * SYN で通知する初期ウィンドウから効く */
           if (req.tcp_opts.rcvbuf > 0)
@@ -267,54 +267,39 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
           if (req.tcp_opts.sndbuf > 0)
             setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &req.tcp_opts.sndbuf, sizeof(int));
         }
+        /* O-04: 接続の完了はここでは待たない。非ブロッキングで connect() を始めた fd を
+         * すぐ返し、完了待ち (と TCP_MAXSEG) は要求側が自分の期限で行う。待っている間に
+         * 他の要求 (別のゾーン転送や forward) がブローカーで止まらない。 */
         fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
-        int ret = connect(sock, (struct sockaddr *)&req.addr, addr_len);
-        if (ret < 0 && errno == EINPROGRESS) {
-          struct pollfd pfd = { .fd = sock, .events = POLLOUT };
-          if (poll(&pfd, 1, 4000) > 0) {
-            int so_error = 0;
-            socklen_t elen = sizeof(so_error);
-            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &elen) == 0 && so_error == 0) {
-              ret = 0;
-            }
-          }
-        }
-        if (ret == 0) {
-          fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) & ~O_NONBLOCK);
-#ifdef TCP_MAXSEG
-          /* zone-tcp-mss / tcp-mss: 確立後に送信 MSS を下げる (apply_tcp_mss() と同じ理由) */
-          if (req.type == SOCK_STREAM && req.tcp_opts.mss > 0)
-            setsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, &req.tcp_opts.mss, sizeof(int));
-#endif
-          struct msghdr msg = {0};
-          struct cmsghdr *cmsg;
-          char buf[CMSG_SPACE(sizeof(int))];
-          memset(buf, 0, sizeof(buf));
-          char data[1] = {0};
-          struct iovec io = {.iov_base = data, .iov_len = 1};
-          msg.msg_iov = &io;
-          msg.msg_iovlen = 1;
-          msg.msg_control = buf;
-          msg.msg_controllen = sizeof(buf);
-          cmsg = CMSG_FIRSTHDR(&msg);
-          cmsg->cmsg_level = SOL_SOCKET;
-          cmsg->cmsg_type = SCM_RIGHTS;
-          cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-          *(int *)CMSG_DATA(cmsg) = sock;
-          sendmsg(sv[1], &msg, 0);
-        } else {
-          char data[1] = {1};
-          struct iovec io = {.iov_base = data, .iov_len = 1};
-          struct msghdr msg = {.msg_iov = &io, .msg_iovlen = 1};
-          sendmsg(sv[1], &msg, 0);
-        }
-        close(sock);
+        ret = connect(sock, (struct sockaddr *)&req.addr, addr_len);
+        if (ret < 0 && errno == EINPROGRESS)
+          ret = 0;
+      }
+      if (ret == 0) {
+        struct msghdr msg = {0};
+        struct cmsghdr *cmsg;
+        char buf[CMSG_SPACE(sizeof(int))];
+        memset(buf, 0, sizeof(buf));
+        char data[1] = {0};
+        struct iovec io = {.iov_base = data, .iov_len = 1};
+        msg.msg_iov = &io;
+        msg.msg_iovlen = 1;
+        msg.msg_control = buf;
+        msg.msg_controllen = sizeof(buf);
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        *(int *)CMSG_DATA(cmsg) = sock;
+        sendmsg(sv[1], &msg, 0);
       } else {
         char data[1] = {1};
         struct iovec io = {.iov_base = data, .iov_len = 1};
         struct msghdr msg = {.msg_iov = &io, .msg_iovlen = 1};
         sendmsg(sv[1], &msg, 0);
       }
+      if (sock >= 0)
+        close(sock);
     }
     close(sv[1]);
     exit(0);
@@ -332,6 +317,33 @@ int broker_connect(int family, int type, struct sockaddr *addr,
   return broker_connect_opts(family, type, addr, addr_len, NULL);
 }
 
+/* ブローカーから受け取った、接続を始めたばかりの fd の完了を待つ。
+ * 成功時は TCP_MAXSEG を当て、ブロッキングモードへ戻して true。 */
+static bool broker_finish_connect(int fd, int type, const tcp_sockopts_t *tcp_opts) {
+  int timeout_ms = (tcp_opts && tcp_opts->connect_timeout_ms > 0) ? tcp_opts->connect_timeout_ms
+                                                                    : BROKER_CONNECT_TIMEOUT_MS;
+  struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+  int pr;
+  do {
+    pr = poll(&pfd, 1, timeout_ms);
+  } while (pr < 0 && errno == EINTR);
+  if (pr <= 0)
+    return false;
+  int so_error = 0;
+  socklen_t elen = sizeof(so_error);
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &elen) != 0 || so_error != 0)
+    return false;
+#ifdef TCP_MAXSEG
+  /* zone-tcp-mss / tcp-mss: 確立後に送信 MSS を下げる (apply_tcp_mss() と同じ理由) */
+  if (type == SOCK_STREAM && tcp_opts && tcp_opts->mss > 0)
+    setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &tcp_opts->mss, sizeof(int));
+#else
+  (void)type;
+#endif
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK);
+  return true;
+}
+
 int broker_connect_opts(int family, int type, struct sockaddr *addr,
                         size_t addr_len, const tcp_sockopts_t *tcp_opts) {
   if (g_broker_sock < 0)
@@ -344,6 +356,8 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
   req.type = type;
   memcpy(&req.addr, addr, addr_len);
   if (tcp_opts) req.tcp_opts = *tcp_opts;
+  /* 要求と応答の対応を保つためだけの排他。ブローカーは connect() の完了を待たずに
+   * 応答するので、保持するのは2回のシステムコールの間だけ (O-04)。 */
   static pthread_mutex_t broker_lock = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&broker_lock);
   if (send(g_broker_sock, &req, sizeof(req), 0) != sizeof(req)) {
@@ -369,6 +383,10 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr,
   if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS)
     fd = *(int *)CMSG_DATA(cmsg);
   pthread_mutex_unlock(&broker_lock);
+  if (fd >= 0 && !broker_finish_connect(fd, type, tcp_opts)) {
+    close(fd);
+    return -1;
+  }
   return fd;
 }
 
@@ -454,20 +472,15 @@ int read_dns_tcp_message(int fd, tcp_stream_ctx_t *ctx, uint8_t **msg_out,
 // ============================================================================
 
 /* 実行ユーザー(options { user / group })へ引き渡すログの所有者を求める。
- * root起動かつ user 指定時以外は (uid_t)-1 (所有者変更なし)。 */
-static void resolve_log_owner(const server_config_t *cfg, uid_t *uid, gid_t *gid) {
+ * root起動かつ user 指定時以外は (uid_t)-1 (所有者変更なし)。
+ * O-18: main() が起動時に解決した g_run_identity を使う (user/group の変更は再起動が
+ * 必要な設定なので、reload 時の設定から引き直さない)。 */
+static void resolve_log_owner(uid_t *uid, gid_t *gid) {
   *uid = (uid_t)-1;
   *gid = (gid_t)-1;
-  if (geteuid() == 0 && cfg->user) {
-    struct passwd *pwd = getpwnam(cfg->user);
-    if (pwd) {
-      *uid = pwd->pw_uid;
-      *gid = pwd->pw_gid;
-      if (cfg->group) {
-        struct group *grp = getgrnam(cfg->group);
-        if (grp) *gid = grp->gr_gid;
-      }
-    }
+  if (geteuid() == 0 && g_run_identity.has_user) {
+    *uid = g_run_identity.uid;
+    *gid = g_run_identity.gid;
   }
 }
 
@@ -532,7 +545,7 @@ bool init_logging_channels_ex(server_config_t *cfg, bool hand_off) {
   uid_t target_uid = (uid_t)-1;
   gid_t target_gid = (gid_t)-1;
   if (hand_off)
-    resolve_log_owner(cfg, &target_uid, &target_gid);
+    resolve_log_owner(&target_uid, &target_gid);
 
   log_channel_t *ch = cfg->logging.channels;
   while (ch) {
@@ -579,7 +592,7 @@ bool init_logging_channels(server_config_t *cfg) {
 void hand_off_logging_channels(server_config_t *cfg) {
   uid_t target_uid;
   gid_t target_gid;
-  resolve_log_owner(cfg, &target_uid, &target_gid);
+  resolve_log_owner(&target_uid, &target_gid);
   if (target_uid == (uid_t)-1)
     return;
   for (log_channel_t *ch = cfg->logging.channels; ch; ch = ch->next) {
@@ -1209,6 +1222,136 @@ ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
   return sent;
 }
 
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+  if (len > 65535)
+    return -1;
+  uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+  struct iovec iov[2] = {{.iov_base = prefix, .iov_len = 2},
+                         {.iov_base = (void *)(uintptr_t)msg, .iov_len = len}};
+  struct iovec *cur = iov;
+  int cnt = 2;
+  /* sendmsg(): クライアント fd の権限は CAP_SEND で、writev() の CAP_WRITE は無い */
+  while (cnt > 0) {
+    struct msghdr mh = {.msg_iov = cur, .msg_iovlen = cnt};
+    ssize_t n = sendmsg(fd, &mh, 0);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+        if (poll(&pfd, 1, 30000) <= 0)
+          return -1;
+        continue;
+      }
+      return -1;
+    }
+    if (n == 0)
+      return -1;
+    while (cnt > 0 && (size_t)n >= cur->iov_len) {
+      n -= (ssize_t)cur->iov_len;
+      cur++;
+      cnt--;
+    }
+    if (cnt > 0) {
+      cur->iov_base = (uint8_t *)cur->iov_base + n;
+      cur->iov_len -= (size_t)n;
+    }
+  }
+  return (ssize_t)len;
+}
+
+// D-04: 平文 TCP の接続コンテキストのプール。フリーリストの先頭は (世代 << 32) | (添字 + 1)
+// で、世代を CAS のたびに進めて ABA を防ぐ。払い出しと返却はどのワーカーからでもよい。
+static tcp_stream_ctx_t *g_tcp_pool;
+static _Atomic uint32_t *g_tcp_pool_next; /* 次の空きの 添字 + 1 (0 = 終端) */
+static _Atomic uint64_t g_tcp_pool_head;
+
+bool tcp_pool_init(void) {
+  if (g_tcp_pool)
+    return true;
+  /* 約 66 KB × MAX_TCP_CLIENTS。ページは実際に使われるまで割り当てられない */
+  g_tcp_pool = calloc(MAX_TCP_CLIENTS, sizeof(tcp_stream_ctx_t));
+  g_tcp_pool_next = calloc(MAX_TCP_CLIENTS, sizeof(*g_tcp_pool_next));
+  if (!g_tcp_pool || !g_tcp_pool_next) {
+    free(g_tcp_pool);
+    free(g_tcp_pool_next);
+    g_tcp_pool = NULL;
+    g_tcp_pool_next = NULL;
+    return false;
+  }
+  for (uint32_t i = 0; i < MAX_TCP_CLIENTS; i++)
+    atomic_init(&g_tcp_pool_next[i], i + 1 < MAX_TCP_CLIENTS ? i + 2 : 0);
+  atomic_store_explicit(&g_tcp_pool_head, 1, memory_order_release);
+  return true;
+}
+
+tcp_stream_ctx_t *tcp_ctx_alloc(void) {
+  if (!g_tcp_pool)
+    return NULL;
+  uint64_t old = atomic_load_explicit(&g_tcp_pool_head, memory_order_acquire);
+  for (;;) {
+    uint32_t top = (uint32_t)old;
+    if (top == 0)
+      return NULL; /* MAX_TCP_CLIENTS 本すべて使用中 */
+    uint32_t next = atomic_load_explicit(&g_tcp_pool_next[top - 1], memory_order_relaxed);
+    uint64_t nw = (((old >> 32) + 1) << 32) | next;
+    if (atomic_compare_exchange_weak_explicit(&g_tcp_pool_head, &old, nw, memory_order_acq_rel,
+                                              memory_order_acquire)) {
+      tcp_stream_ctx_t *c = &g_tcp_pool[top - 1];
+      memset(c, 0, offsetof(tcp_stream_ctx_t, buf));
+      return c;
+    }
+  }
+}
+
+void tcp_ctx_free(tcp_stream_ctx_t *c) {
+  if (!c || !g_tcp_pool)
+    return;
+  uint32_t idx = (uint32_t)(c - g_tcp_pool);
+  uint64_t old = atomic_load_explicit(&g_tcp_pool_head, memory_order_relaxed);
+  for (;;) {
+    atomic_store_explicit(&g_tcp_pool_next[idx], (uint32_t)old, memory_order_relaxed);
+    uint64_t nw = (((old >> 32) + 1) << 32) | (idx + 1);
+    if (atomic_compare_exchange_weak_explicit(&g_tcp_pool_head, &old, nw, memory_order_release,
+                                              memory_order_relaxed))
+      return;
+  }
+}
+
+/* TCP クライアントのコンテキストをプールへ返す。同じ kevent() で受け取った後続のイベントの
+ * うち、この接続のもの (ident と udata が一致) は無効にする (返したコンテキストを見ないように)。
+ * kevent の登録は呼び出し側が先に外しておくこと。 */
+static void tcp_client_forget(int client_fd, tcp_stream_ctx_t *ctx_tcp,
+                              struct kevent *ev_list, int from, int n_events) {
+  for (int j = from + 1; j < n_events; j++) {
+    if (ev_list[j].ident == (uintptr_t)client_fd && ev_list[j].udata == ctx_tcp &&
+        (ev_list[j].filter == EVFILT_READ || ev_list[j].filter == EVFILT_TIMER)) {
+      ev_list[j].udata = NULL;
+      ev_list[j].filter = 0;
+    }
+  }
+  tcp_ctx_free(ctx_tcp);
+}
+
+/* TCP クライアントの接続を閉じる共通処理 (D-04: 以前は約10か所に複製され、後続イベントを
+ * 無効にしない箇所があった)。 */
+static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
+                             struct kevent *ev_list, int from, int n_events) {
+  struct kevent ev_del[2];
+  /* READ を先に: 期限切れで消えた ONESHOT タイマーの削除が失敗しても READ は外れる */
+  EV_SET(&ev_del[0], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+  EV_SET(&ev_del[1], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+  kevent(kq, ev_del, 2, NULL, 0, NULL);
+  close(client_fd);
+  dec_tcp_clients();
+  tcp_client_forget(client_fd, ctx_tcp, ev_list, from, n_events);
+}
+
+/* 次のメッセージの期限までの時間 (ms、最小 1)。RFC 7766 §6.2.3 */
+static uint32_t tcp_ms_until(int64_t deadline_ms, int64_t now_ms) {
+  return deadline_ms > now_ms ? (uint32_t)(deadline_ms - now_ms) : 1;
+}
+
 // UDP / IPC 送信失敗のログ。ホットパスで syslog が溢れないよう、スレッドごとに
 // 1 秒 1 回へ間引き、間引いた件数を次のログにまとめて出す。
 // is_ipc: Frontend/Backend 間の AF_UNIX SOCK_DGRAM (EMSGSIZE は net.local.dgram.maxdgram 超過)
@@ -1312,8 +1455,12 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       // 応答の送出まで読み取り区間を保つ (IPC への send は非ブロッキング)。
       if (res_len > 0) {
         bool slip_triggered = false;
-        rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
-        if (rrl_check(&task.ipc_hdr.client_addr, cls, rrl_cfg, &slip_triggered)) {
+        /* D-05: ワーカーの UDP 経路と同じキー */
+        rrl_key_t rrl_key;
+        char rrl_name[DNS_NAME_TEXT_SIZE];
+        rrl_make_key(&rrl_key, res_buf, (size_t)res_len, task.qname, task.qtype, task.qclass,
+                     t_query_rrl_info.zone, t_query_rrl_info.wildcard, rrl_name, sizeof(rrl_name));
+        if (rrl_check_key(&task.ipc_hdr.client_addr, &rrl_key, rrl_cfg, &slip_triggered)) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, res_len,
@@ -1374,9 +1521,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, tcp_res, res_len,
                              &task.client_addr, task.client_len,
                              task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_TCP);
-          uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
-          send_tcp_robust(task.client_fd, len_prefix, 2);
-          send_tcp_robust(task.client_fd, tcp_res, res_len);
+          (void)send_tcp_dns_message(task.client_fd, tcp_res, (size_t)res_len); /* RFC 7766 §8 */
         }
         free(tcp_res);
       } else {
@@ -1391,14 +1536,19 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
   return NULL;
 }
 
-void init_async_io_pool(void) {
+/* 1本でも起動できなければ false (起動中止。O-15: 呼び出し側は backend_exit() で終わる) */
+bool init_async_io_pool(void) {
   memset(&g_async_io_pool, 0, sizeof(g_async_io_pool));
   pthread_mutex_init(&g_async_io_pool.lock, NULL);
   pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
   g_async_io_pool.running = true;
   for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
-    pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, (void *)(uintptr_t)i);
+    if (pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, (void *)(uintptr_t)i) != 0) {
+      syslog(LOG_ERR, "[Backend] Failed to start async I/O thread %d: %m", i);
+      return false;
+    }
   }
+  return true;
 }
 
 bool is_zone_synthetic_type(zone_db_snapshot_t *snap, const char *client_ip, const char *qname, uint16_t qtype) {
@@ -1444,7 +1594,7 @@ void fast_ipv4_to_str(uint32_t ip_be, char *dst) {
  * (zone-tcp-mss / zone-tcp-window / zone-tcp-sndbuf) があればそれを、なければ
  * グローバルの tcp-mss / tcp-window を使う。受信側なので rcvbuf が主に効く。 */
 STATIC_TEST tcp_sockopts_t xfr_tcp_sockopts(const server_config_t *cfg, const zone_config_t *zcfg) {
-  tcp_sockopts_t o = {0, 0, 0};
+  tcp_sockopts_t o = {0, 0, 0, 0};
   if (cfg) {
     o.mss = cfg->tcp_mss;
     o.rcvbuf = cfg->tcp_window;
@@ -1528,6 +1678,7 @@ STATIC_TEST void apply_zone_tcp_opts(int fd, tcp_stream_ctx_t *c, const zone_con
 
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
+  uint8_t *tcp_res_buf = NULL;
 #ifndef CPU_SETSIZE
 #define CPU_SETSIZE 256
 #endif
@@ -1540,6 +1691,11 @@ void *worker_thread_func(void *arg) {
                          &cpuset) != 0)
     goto worker_startup_failed;
 
+  /* D-04: TCP 応答の組み立て用バッファはワーカーごとに起動時に1つ確保する
+   * (以前はクエリごとに malloc(65535))。 */
+  tcp_res_buf = malloc(65535);
+  if (!tcp_res_buf)
+    goto worker_startup_failed;
   int kq = kqueue();
   if (kq < 0)
     goto worker_startup_failed;
@@ -1661,6 +1817,11 @@ void *worker_thread_func(void *arg) {
   goto worker_startup_success;
 
 worker_startup_failed:
+  free(tcp_res_buf);
+  /* X-33: 起動できなかったワーカーを main() に知らせる (このワーカーの IPC を読む者が
+   * いなくなり、そこへ振り分けられた UDP クエリが黙って捨てられるのを防ぐ) */
+  atomic_store_explicit(&ctx->startup_failed, true, memory_order_release);
+  atomic_fetch_add(&g_worker_start_failures, 1);
   atomic_fetch_add(&g_bound_workers, 1);
   pthread_exit(NULL);
 
@@ -1670,7 +1831,7 @@ worker_startup_success:;
   while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
     sched_yield();
   if (getppid() != parent_pid)
-    exit(0);
+    backend_shutdown(0); /* O-15: スレッドが動いているので exit() は使わない */
   compress_ctx_t thread_compress_ctx = {0};
   struct kevent ev_list[MAX_EVENTS];
 
@@ -1700,12 +1861,15 @@ worker_startup_success:;
     bool qlog_enabled = (active && active->logging.queries_channel != NULL);
     uint32_t eff_max_qps = qlog_enabled ? get_effective_query_log_max_qps(active) : 0;
     bool rlog_enabled = response_log_enabled(active);
+    /* D-06 / RFC 7766 §6.2.3: 最初のメッセージまでの待ち時間と、メッセージ間の待ち時間 */
+    uint32_t tcp_initial_ms = (active && active->tcp_initial_timeout > 0) ? active->tcp_initial_timeout : 10000;
+    uint32_t tcp_idle_ms = (active && active->tcp_idle_timeout > 0) ? active->tcp_idle_timeout : 10000;
     release_config_snapshot(active);
     rcu_reader_exit(ctx);
 
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].udata == (void *)(uintptr_t)1001) {
-        exit(0);
+        backend_shutdown(0); /* Supervisor が終了した (O-15: exit() は使わない) */
       } else if (ev_list[i].filter == EVFILT_TIMER) {
         int client_fd = ev_list[i].ident;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
@@ -1714,20 +1878,8 @@ worker_startup_success:;
           ctx_tcp->quota_yield = false;
           goto process_tcp_client;
         }
-        // RFC 7766 §6.2.3: Idle timeout expired; close connection immediately
-        struct kevent ev_del[2];
-        EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-        EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        kevent(kq, ev_del, 2, NULL, 0, NULL);
-        close(client_fd);
-        dec_tcp_clients();
-        free(ctx_tcp);
-        for (int j = i + 1; j < n_events; j++) {
-          if (ev_list[j].ident == (uintptr_t)client_fd) {
-            ev_list[j].udata = NULL;
-            ev_list[j].filter = 0;
-          }
-        }
+        // RFC 7766 §6.2.3: 次のメッセージの期限が過ぎた。接続を閉じる
+        tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
       } else if (ev_list[i].udata == (void *)1) {
         // UDP (IPC経由: recvmmsg / sendmmsg によるバッチ送受信)
         int active_fd = ev_list[i].ident; // my_ipc_fd
@@ -1887,10 +2039,14 @@ worker_startup_success:;
               bool drop_packet = false;
               bool tc_packet = false;
 
-              if (__builtin_expect(rrl_cfg != NULL, 0)) {
+              if (__builtin_expect(rrl_cfg != NULL && rrl_cfg->configured, 0)) {
                 bool slip_triggered = false;
-                rrl_response_class_t cls = get_rrl_class(res_buf, res_len);
-                if (!rrl_check(&ipc_msg->client_addr, cls, rrl_cfg, &slip_triggered)) {
+                /* D-05: BIND と同じキー (クライアントのプレフィックス + 応答の種類 + 名前) */
+                rrl_key_t rrl_key;
+                char rrl_name[DNS_NAME_TEXT_SIZE];
+                rrl_make_key(&rrl_key, res_buf, (size_t)res_len, qname, qtype, qclass, t_query_rrl_info.zone,
+                             t_query_rrl_info.wildcard, rrl_name, sizeof(rrl_name));
+                if (!rrl_check_key(&ipc_msg->client_addr, &rrl_key, rrl_cfg, &slip_triggered)) {
                   if (slip_triggered) {
                     tc_packet = true;
                   } else {
@@ -1998,27 +2154,31 @@ worker_startup_success:;
           }
           accept_count++;
 
+          /* 上限は開いている TCP 接続の数で数える (AXFR スレッドや非同期 I/O スレッドへ渡した
+           * 接続はプールのコンテキストを返しているが、閉じるまで g_tcp_clients に数えられる) */
           if (atomic_load_explicit(&g_tcp_clients, memory_order_acquire) >= MAX_TCP_CLIENTS) {
             close(client_fd);
             continue;
           }
-
+          /* D-04: コンテキストは起動時に確保したプールから取る */
+          tcp_stream_ctx_t *ctx_tcp = tcp_ctx_alloc();
+          if (!ctx_tcp) {
+            close(client_fd);
+            continue;
+          }
           inc_tcp_clients();
 
           limit_client_socket_rights(client_fd);
           int cflags = fcntl(client_fd, F_GETFL, 0);
           fcntl(client_fd, F_SETFL, cflags | O_NONBLOCK);
-          tcp_stream_ctx_t *ctx_tcp = calloc(1, sizeof(tcp_stream_ctx_t));
-          if (!ctx_tcp) {
-            close(client_fd);
-            dec_tcp_clients();
-            continue;
-          }
           clock_gettime(CLOCK_MONOTONIC, &ctx_tcp->connect_time);
           apply_tcp_mss(client_fd, ctx_tcp, accept_tcp_mss);
+          /* D-06: 最初のメッセージの期限は tcp-initial-timeout (RFC 7766 §6.2.3) */
+          ctx_tcp->idle_deadline_ms = (int64_t)ctx_tcp->connect_time.tv_sec * 1000 +
+                                      ctx_tcp->connect_time.tv_nsec / 1000000 + tcp_initial_ms;
           struct kevent ev_timeout;
           EV_SET(&ev_timeout, client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
-                 10000, ctx_tcp);
+                 tcp_initial_ms, ctx_tcp);
           kevent(kq, &ev_timeout, 1, NULL, 0, NULL);
 
           memcpy(&ctx_tcp->client_addr, &client_addr, sizeof(client_addr));
@@ -2049,19 +2209,7 @@ process_tcp_client: ;
         tcp_stream_ctx_t *ctx_tcp = (tcp_stream_ctx_t *)ev_list[i].udata;
         if (!ctx_tcp) continue;
         if (ev_list[i].flags & (EV_EOF | EV_ERROR)) {
-          struct kevent ev_del[2];
-          EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-          EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-          kevent(kq, ev_del, 2, NULL, 0, NULL);
-          close(client_fd);
-          dec_tcp_clients();
-          free(ctx_tcp);
-          for (int j = i + 1; j < n_events; j++) {
-            if (ev_list[j].ident == (uintptr_t)client_fd) {
-              ev_list[j].udata = NULL;
-              ev_list[j].filter = 0;
-            }
-          }
+          tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
           continue;
         }
 
@@ -2070,19 +2218,7 @@ process_tcp_client: ;
         clock_gettime(CLOCK_MONOTONIC, &now_mono);
         int64_t elapsed_sec = (int64_t)(now_mono.tv_sec - ctx_tcp->connect_time.tv_sec);
         if (elapsed_sec >= 60) {
-          struct kevent ev_del[2];
-          EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-          EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-          kevent(kq, ev_del, 2, NULL, 0, NULL);
-          close(client_fd);
-          dec_tcp_clients();
-          free(ctx_tcp);
-          for (int j = i + 1; j < n_events; j++) {
-            if (ev_list[j].ident == (uintptr_t)client_fd) {
-              ev_list[j].udata = NULL;
-              ev_list[j].filter = 0;
-            }
-          }
+          tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
           continue;
         }
 
@@ -2094,20 +2230,8 @@ process_tcp_client: ;
           uint16_t msg_len = 0;
           int ret = read_dns_tcp_message(client_fd, ctx_tcp, &msg, &msg_len);
           if (ret < 0) {
-            struct kevent ev_del[2];
-            EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-            EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-            kevent(kq, ev_del, 2, NULL, 0, NULL);
-            close(client_fd);
-            dec_tcp_clients();
-            free(ctx_tcp);
+            tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
             client_closed = true;
-            for (int j = i + 1; j < n_events; j++) {
-              if (ev_list[j].ident == (uintptr_t)client_fd) {
-                ev_list[j].udata = NULL;
-                ev_list[j].filter = 0;
-              }
-            }
             break;
           }
           if (ret == 0) {
@@ -2115,44 +2239,23 @@ process_tcp_client: ;
           }
 
           if (msg_len < DNS_HEADER_SIZE) {
-            struct kevent ev_del[2];
-            EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-            EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-            kevent(kq, ev_del, 2, NULL, 0, NULL);
-            close(client_fd);
-            dec_tcp_clients();
-            free(ctx_tcp);
+            tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
             client_closed = true;
-            for (int j = i + 1; j < n_events; j++) {
-              if (ev_list[j].ident == (uintptr_t)client_fd) {
-                ev_list[j].udata = NULL;
-                ev_list[j].filter = 0;
-              }
-            }
             break;
           }
 
           // [RFC 1035 §4.1.1 / RFC 5452] QR=1 (レスポンスパケット) の破棄
           if (msg_len >= DNS_HEADER_SIZE && (msg[2] & 0x80) != 0) {
             submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, 0, "<response-on-query-port>", 0, 0, 0, false, false);
-            struct kevent ev_del[2];
-            EV_SET(&ev_del[0], client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
-            EV_SET(&ev_del[1], client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-            kevent(kq, ev_del, 2, NULL, 0, NULL);
-            close(client_fd);
-            dec_tcp_clients();
-            free(ctx_tcp);
+            tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
             client_closed = true;
-            for (int j = i + 1; j < n_events; j++) {
-              if (ev_list[j].ident == (uintptr_t)client_fd) {
-                ev_list[j].udata = NULL;
-                ev_list[j].filter = 0;
-              }
-            }
             break;
           }
 
           processed_queries++;
+          /* メッセージを1つ受け取り終えたので、次のメッセージの期限を tcp-idle-timeout で決め直す
+           * (RFC 7766 §6.2.3) */
+          ctx_tcp->idle_deadline_ms = (int64_t)now_mono.tv_sec * 1000 + now_mono.tv_nsec / 1000000 + tcp_idle_ms;
           struct kevent ev_del;
           EV_SET(&ev_del, client_fd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
           kevent(kq, &ev_del, 1, NULL, 0, NULL);
@@ -2321,14 +2424,9 @@ process_tcp_client: ;
                     allowed = false;
                   } else {
                     pthread_detach(t);
-                    free(ctx_tcp);
+                    /* fd は AXFR スレッドのもの。kevent は上で外してある */
+                    tcp_client_forget(client_fd, ctx_tcp, ev_list, i, n_events);
                     client_closed = true;
-                    for (int j = i + 1; j < n_events; j++) {
-                      if (ev_list[j].ident == (uintptr_t)client_fd) {
-                        ev_list[j].udata = NULL;
-                        ev_list[j].filter = 0;
-                      }
-                    }
                     rcu_reader_exit(ctx);
                     break;
                   }
@@ -2355,42 +2453,34 @@ process_tcp_client: ;
               int signed_len = tsig_finish_response(res_buf, (size_t)built, sizeof(res_buf), &tsig);
               if (signed_len < DNS_HEADER_SIZE) {
                 release_config_snapshot(cfg);
-                close(client_fd);
-                dec_tcp_clients();
-                free(ctx_tcp);
+                tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
                 client_closed = true;
                 rcu_reader_exit(ctx);
                 break;
               }
               size_t copy_len = (size_t)signed_len;
               release_config_snapshot(cfg);
-              uint8_t len_prefix[2] = {copy_len >> 8, copy_len & 0xFF};
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
                                  &ctx_tcp->client_addr, ctx_tcp->client_len,
                                  ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL,
                                  ctx_tcp->has_server_addr, IPPROTO_TCP);
-              if (send_tcp_robust(client_fd, len_prefix, 2) < 0 ||
-                  send_tcp_robust(client_fd, res_buf, copy_len) < 0) {
-                // fall through to close/free
-              }
-              
-              submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, 
+              (void)send_tcp_dns_message(client_fd, res_buf, copy_len); /* 失敗しても下で閉じる */
+
+              submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname,
                                   qclass, qtype, res_buf[3] & 0x0F, has_edns, dnssec_ok);
 
-              close(client_fd);
-              dec_tcp_clients();
-              free(ctx_tcp);
+              tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
               client_closed = true;
               rcu_reader_exit(ctx);
               break;
             }
           } else {
             if (is_zone_synthetic_type(snap, ctx_tcp->client_ip, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0)) {
+              /* forward / program ゾーン: 非同期 I/O スレッドへ渡すために要求を複製する
+               * (D-04 で文書化した例外。平文 TCP のホットパスではない) */
               uint8_t *heap_req = malloc(msg_len);
               if (!heap_req) {
-                free(ctx_tcp);
-                close(client_fd);
-                dec_tcp_clients();
+                tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
                 client_closed = true;
                 rcu_reader_exit(ctx);
                 break;
@@ -2422,7 +2512,8 @@ process_tcp_client: ;
               task.question_end = 0;
               task.snap = snap;
               retain_zone_snapshot(task.snap);
-              free(ctx_tcp);
+              /* fd は非同期 I/O スレッドのもの。kevent は上で外してある */
+              tcp_client_forget(client_fd, ctx_tcp, ev_list, i, n_events);
 
               rcu_reader_exit(ctx);
               if (!enqueue_async_io_task(&task)) {
@@ -2434,41 +2525,31 @@ process_tcp_client: ;
               client_closed = true;
               break;
             }
-            uint8_t *tcp_res = malloc(65535);
-            if (tcp_res) {
-              int res_len = process_dns_query(msg, msg_len, tcp_res, 65535,
-                                              qname, qtype, ctx_tcp->client_ip,
-                                              &thread_compress_ctx, true, NULL, snap);
-              if (res_len > 0) {
-                submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
-                                    tcp_res[3] & 0x0F, has_edns, dnssec_ok);
-                write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, tcp_res, res_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
-                                   ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL, ctx_tcp->has_server_addr, IPPROTO_TCP);
-                uint8_t len_prefix[2] = {res_len >> 8, res_len & 0xFF};
-                if (send_tcp_robust(client_fd, len_prefix, 2) < 0 ||
-                    send_tcp_robust(client_fd, tcp_res, res_len) < 0) {
-                  free(tcp_res);
-                  close(client_fd);
-                  dec_tcp_clients();
-                  free(ctx_tcp);
-                  client_closed = true;
-                  rcu_reader_exit(ctx);
-                  break;
-                }
-              } else {
-                submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>", 
-                                    0, 0, 0, false, false);
+            /* D-04: 応答はワーカーごとのバッファ (起動時に確保) に組み立てる */
+            int res_len = process_dns_query(msg, msg_len, tcp_res_buf, 65535,
+                                            qname, qtype, ctx_tcp->client_ip,
+                                            &thread_compress_ctx, true, NULL, snap);
+            if (res_len > 0) {
+              submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
+                                  tcp_res_buf[3] & 0x0F, has_edns, dnssec_ok);
+              write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, tcp_res_buf, res_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
+                                 ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL, ctx_tcp->has_server_addr, IPPROTO_TCP);
+              if (send_tcp_dns_message(client_fd, tcp_res_buf, (size_t)res_len) < 0) {
+                tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
+                client_closed = true;
+                rcu_reader_exit(ctx);
+                break;
               }
-              free(tcp_res);
+            } else {
+              submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>",
+                                  0, 0, 0, false, false);
             }
-            
+
             server_config_t *cfg = acquire_config_snapshot();
             bool reuse = (cfg && cfg->tcp_connection_reuse);
             release_config_snapshot(cfg);
             if (!reuse) {
-              close(client_fd);
-              dec_tcp_clients();
-              free(ctx_tcp);
+              tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
               client_closed = true;
               rcu_reader_exit(ctx);
               break;
@@ -2482,19 +2563,14 @@ process_tcp_client: ;
         }
 
         if (!client_closed) {
-          rcu_reader_enter(ctx);
-          server_config_t *cfg = acquire_config_snapshot();
-          uint32_t idle_timeout = (cfg && cfg->tcp_idle_timeout > 0) ? cfg->tcp_idle_timeout : 10000;
-          release_config_snapshot(cfg);
-          rcu_reader_exit(ctx);
-
-          // [Slowloris対策] 未完了データ受信中の場合は3秒タイムアウト
-          if (ctx_tcp->state == TCP_STATE_READ_BODY || ctx_tcp->accumulated > 0) {
-            idle_timeout = 3000;
-          }
+          /* RFC 7766 §6.2.3: 期限はメッセージを受け取り終えたときにだけ延ばす (上で更新)。
+           * メッセージの一部が届いても延ばさないので、少しずつ送り続けても居座れない。 */
+          struct timespec ts_now;
+          clock_gettime(CLOCK_MONOTONIC, &ts_now);
+          int64_t now_ms = (int64_t)ts_now.tv_sec * 1000 + ts_now.tv_nsec / 1000000;
 
           struct kevent evs[2];
-          uint32_t to_ms = (processed_queries >= 16) ? 1 : idle_timeout;
+          uint32_t to_ms = (processed_queries >= 16) ? 1 : tcp_ms_until(ctx_tcp->idle_deadline_ms, now_ms);
           ctx_tcp->quota_yield = (processed_queries >= 16);
           EV_SET(&evs[0], client_fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0,
                  to_ms, ctx_tcp);
@@ -2509,6 +2585,7 @@ process_tcp_client: ;
     }
   }
   close(kq);
+  free(tcp_res_buf);
   pthread_exit(NULL);
 }
 
@@ -2788,14 +2865,19 @@ void *control_thread_func(void *arg) {
   if (kq < 0)
     pthread_exit(NULL);
   g_control_kq = kq;
-  struct kevent ev_set[3];
+  struct kevent ev_set[5];
   EV_SET(&ev_set[0], SIGHUP, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
   EV_SET(&ev_set[1], 1, EVFILT_TIMER, EV_ADD | EV_CLEAR, 0, 1000, NULL);
   EV_SET(&ev_set[2], 2, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
-  if (kevent(kq, ev_set, 3, NULL, 0, NULL) == -1) {
+  /* SIGTERM / SIGINT: シグナルハンドラは起動後は何もせずに戻り、ここで受けた制御スレッドが
+   * backend_shutdown() する (EVFILT_SIGNAL はハンドラがあっても配送を記録する) */
+  EV_SET(&ev_set[3], SIGTERM, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
+  EV_SET(&ev_set[4], SIGINT, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, 0, 0, NULL);
+  if (kevent(kq, ev_set, 5, NULL, 0, NULL) == -1) {
     close(kq);
     pthread_exit(NULL);
   }
+  atomic_store_explicit(&g_control_signals_ready, true, memory_order_release);
   if (g_control_sock >= 0) {
     EV_SET(&ev_set[0], g_control_sock, EVFILT_READ, EV_ADD, 0, 0, NULL);
     if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1) {
@@ -2808,6 +2890,13 @@ void *control_thread_func(void *arg) {
     if (kevent(kq, ev_set, 1, NULL, 0, NULL) == -1)
       syslog(LOG_ERR, "[Control] Cannot watch NOTIFY answers: %m (outbound NOTIFY is not retransmitted correctly)");
   }
+
+  /* O-18: main() の起動処理 (権限降格・Capsicum 突入) が終わるまで、制御コマンド・SIGHUP・
+   * タイマーを処理しない。reload は設定の読み込みやログの所有者の引き渡しを行うので、
+   * 起動途中の main() と並行して走らせない。kqueue の登録は済ませてあるので、その間の
+   * 接続や SIGHUP は待たされるだけで失われない。 */
+  while (!atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire))
+    usleep(1000);
 
   struct kevent ev_list[4];
   while (1) {
@@ -3062,7 +3151,7 @@ void *control_thread_func(void *arg) {
               memcpy(pkt, &msg, sizeof(msg));
               send(g_notify_ipc[1], pkt, sizeof(pkt), 0);
               send(cfd, "OK stopping\n", 12, 0);
-              exit(0);
+              backend_shutdown(0); /* O-15: exit() は他スレッドと並行して atexit を走らせる */
             } else if (strcmp(cmd, "status") == 0) {
               karidns_status_t st;
               memset(&st, 0, sizeof(st));
@@ -3247,6 +3336,11 @@ void *control_thread_func(void *arg) {
         if (ev_list[i].data > 1)
           syslog(LOG_NOTICE, "[Config] %ld SIGHUP signals arrived while busy; reloading once", (long)ev_list[i].data);
         run_config_reload(true);
+      } else if (ev_list[i].filter == EVFILT_SIGNAL &&
+                 (ev_list[i].ident == SIGTERM || ev_list[i].ident == SIGINT)) {
+        /* O-03: 起動後の SIGTERM / SIGINT はここで受け、dnstap を閉じてから終了する */
+        syslog(LOG_NOTICE, "[Backend] Received signal %d; shutting down", (int)ev_list[i].ident);
+        backend_shutdown(0);
       } else if (ev_list[i].filter == EVFILT_TIMER ||
                  ev_list[i].filter == EVFILT_USER) {
         time_t now = time(NULL);
@@ -3726,10 +3820,10 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
 
   // 特権破棄 (setgid / setuid)。非root起動で user/group が実行ユーザー自身を
   // 指している場合は降格不要としてそのまま続行する (resolve_run_identity 参照)。
+  // 降格先は main() が起動時に解決した g_run_identity (O-18)。
   {
     char id_err[512];
-    if (!apply_run_identity(cfg ? cfg->user : NULL, cfg ? cfg->group : NULL,
-                            id_err, sizeof(id_err))) {
+    if (!apply_run_identity_id(&g_run_identity, id_err, sizeof(id_err))) {
       syslog(LOG_ERR, "[Frontend %d] %s", router_id, id_err);
       fprintf(stderr, "[ERROR] [Frontend %d] %s\n", router_id, id_err);
       release_config_snapshot(cfg);
@@ -4244,16 +4338,40 @@ __attribute__((weak)) int __llvm_profile_write_file(void);
 #endif
 #endif
 
-STATIC_TEST volatile sig_atomic_t g_backend_should_exit = 0;
+/* X-01: ハンドラはどのスレッドでも動くので、volatile sig_atomic_t ではなくロックフリーの
+ * atomic にする (C11 7.14.1.1 はハンドラと割り込まれたコードの間しか定めない)。 */
+STATIC_TEST _Atomic int g_backend_should_exit = 0;
+/* SIGTERM / SIGINT。起動が終わって制御スレッドがシグナルを受けられるようになった後は、
+ * 制御スレッドが dnstap に STOP を送ってから終了する (O-03) ので、ここでは何もしない。
+ * 起動中と、2回目のシグナル (終了処理が止まっている場合) はすぐに終了する。 */
 STATIC_TEST void backend_sig_handler(int sig) {
   (void)sig;
-  g_backend_should_exit = 1;
+  int already = atomic_exchange_explicit(&g_backend_should_exit, 1, memory_order_acq_rel);
+  if (!already &&
+      atomic_load_explicit(&g_privilege_drop_complete, memory_order_acquire) &&
+      atomic_load_explicit(&g_control_signals_ready, memory_order_acquire)) {
+    return;
+  }
 #ifdef __clang__
   if (__llvm_profile_write_file) {
     __llvm_profile_write_file();
   }
 #endif
   _exit(0);
+}
+
+/* Backend の通常の終了 (SIGTERM、karictl stop、Supervisor の終了)。dnstap のリングを
+ * 送り切って STOP / FINISH を交わしてから _exit() する (O-03、O-15)。複数のスレッドから
+ * 同時に呼ばれたら、最初の1つだけが進み、残りはプロセスの終了を待つ。 */
+static _Atomic bool g_backend_shutting_down = false;
+__attribute__((noreturn)) void backend_shutdown(int code) {
+  if (atomic_exchange_explicit(&g_backend_shutting_down, true, memory_order_acq_rel)) {
+    for (;;)
+      sleep(1);
+  }
+  syslog(LOG_NOTICE, "[Backend] Shutting down");
+  dnstap_shutdown(DNSTAP_SHUTDOWN_WAIT_MS);
+  backend_exit(code);
 }
 
 STATIC_TEST void supervisor_sig_handler(int sig) {
@@ -4417,18 +4535,20 @@ STATIC_TEST bool validate_program_zone_users(server_config_t *cfg) {
     for (zone_config_t *z = v->zones; z; z = z->next) {
       if (!z->type || strcasecmp(z->type, "program") != 0 || !z->program_user)
         continue;
-      struct passwd *pwd = getpwnam(z->program_user);
-      if (pwd && pwd->pw_uid == geteuid() && pwd->pw_uid == getuid())
+      uid_t puid;
+      gid_t pgid;
+      bool found = lookup_user_ids(z->program_user, &puid, &pgid);
+      if (found && puid == geteuid() && puid == getuid())
         continue;
       syslog(LOG_ERR, "[Config] Refusing to start: zone '%s': program-user '%s' %s; a non-root "
                       "process (uid %u) cannot switch to another user. Start karidns as root, or "
                       "set program-user to the user karidns runs as.",
-             z->domain, z->program_user, pwd ? "differs from the running user" : "not found",
+             z->domain, z->program_user, found ? "differs from the running user" : "not found",
              (unsigned)geteuid());
       fprintf(stderr, "[ERROR] Refusing to start: zone '%s': program-user '%s' %s; a non-root "
                       "process (uid %u) cannot switch to another user. Start karidns as root, or "
                       "set program-user to the user karidns runs as.\n",
-              z->domain, z->program_user, pwd ? "differs from the running user" : "not found",
+              z->domain, z->program_user, found ? "differs from the running user" : "not found",
               (unsigned)geteuid());
       return false;
     }
@@ -4702,12 +4822,13 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // user/group がこのプロセスで適用可能か (非root起動なら実行ユーザー自身か)
+  // user/group がこのプロセスで適用可能か (非root起動なら実行ユーザー自身か)。
+  // O-18: 解決はここ (スレッドを作る前) の1回だけで、以後の降格 (frontend / backend /
+  // broker) とログ・制御ソケットの所有者の引き渡しは g_run_identity を使う。
   {
-    run_identity_t id;
     char id_err[512];
     if (!resolve_run_identity(g_config_db.config_a.user, g_config_db.config_a.group,
-                              &id, id_err, sizeof(id_err))) {
+                              &g_run_identity, id_err, sizeof(id_err))) {
       syslog(LOG_ERR, "[Config] Refusing to start: %s", id_err);
       fprintf(stderr, "[ERROR] Refusing to start: %s\n", id_err);
       free_server_config_fields(&g_config_db.config_a);
@@ -4880,23 +5001,13 @@ int main(int argc, char **argv) {
       if (bind(g_control_sock, (struct sockaddr *)&un, sizeof(un)) == 0) {
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         listen(g_control_sock, 128);
-        server_config_t *cfg = &g_config_db.config_a;
-        if (cfg->user) {
-          struct passwd *pwd = getpwnam(cfg->user);
-          if (pwd) {
-            uid_t target_uid = pwd->pw_uid;
-            gid_t target_gid = pwd->pw_gid;
-            if (cfg->group) {
-              struct group *grp = getgrnam(cfg->group);
-              if (grp) target_gid = grp->gr_gid;
-            }
-            /* [SEC] ソケットFDに対する fchown() は FreeBSD で EINVAL となるため、
-             * 事前に O_DIRECTORY で開いた安全なディレクトリFD (dir_fd) と
-             * AT_SYMLINK_NOFOLLOW を用いて fchownat() を実行し、
-             * TOCTOU/シンボリックリンク攻撃を防ぎつつ所有者を変更する。 */
-            if (dir_fd >= 0) {
-              fchownat(dir_fd, leaf_name, target_uid, target_gid, AT_SYMLINK_NOFOLLOW);
-            }
+        if (g_run_identity.has_user) {
+          /* [SEC] ソケットFDに対する fchown() は FreeBSD で EINVAL となるため、
+           * 事前に O_DIRECTORY で開いた安全なディレクトリFD (dir_fd) と
+           * AT_SYMLINK_NOFOLLOW を用いて fchownat() を実行し、
+           * TOCTOU/シンボリックリンク攻撃を防ぎつつ所有者を変更する。 */
+          if (dir_fd >= 0) {
+            fchownat(dir_fd, leaf_name, g_run_identity.uid, g_run_identity.gid, AT_SYMLINK_NOFOLLOW);
           }
         }
         if (dir_fd >= 0) {
@@ -5107,7 +5218,16 @@ int main(int argc, char **argv) {
     }
   }
   close(g_notify_ipc[0]); // Frontend側端点をクローズ
-  init_async_io_pool();
+  // O-15: ここから先はスレッドが動いているので、致命的なエラーは backend_exit() (_exit) で終える
+  if (!init_async_io_pool()) {
+    fprintf(stderr, "[ERROR] [Backend] Failed to start the async I/O threads; aborting startup\n");
+    backend_exit(EXIT_FAILURE);
+  }
+  if (!tcp_pool_init()) { /* D-04 */
+    syslog(LOG_ERR, "[Backend] Cannot allocate the TCP connection pool; aborting startup");
+    fprintf(stderr, "[ERROR] [Backend] Cannot allocate the TCP connection pool; aborting startup\n");
+    backend_exit(EXIT_FAILURE);
+  }
   rrl_init();
 
   server_config_t *cfg = &g_config_db.config_a;
@@ -5119,7 +5239,7 @@ int main(int argc, char **argv) {
   pthread_t *threads = calloc(num_workers, sizeof(pthread_t));
   worker_ctx_t *ctxs = calloc(num_workers, sizeof(worker_ctx_t));
   if (!threads || !ctxs)
-    exit(1);
+    backend_exit(1);
   for (int i = 0; i < num_workers; i++) {
     ctxs[i].thread_id = i;
     ctxs[i].core_id = (g_num_frontend_routers + i) % total_cores;
@@ -5146,7 +5266,7 @@ int main(int argc, char **argv) {
     atomic_init(&ctxs[i].query_count, 0);
     atomic_init(&ctxs[i].rcu_observed_epoch, RCU_EPOCH_IDLE);
     if (!ctxs[i].qlog_ring.events || !ctxs[i].dnstap_ring.events)
-      exit(EXIT_FAILURE);
+      backend_exit(EXIT_FAILURE);
   }
 
   atomic_store_explicit(&g_worker_ctxs, ctxs, memory_order_release);
@@ -5154,11 +5274,11 @@ int main(int argc, char **argv) {
 
   pthread_t control_thread;
   if (pthread_create(&control_thread, NULL, control_thread_func, NULL) != 0)
-    exit(1);
+    backend_exit(1);
 
   for (int i = 0; i < num_workers; i++) {
     if (pthread_create(&threads[i], NULL, worker_thread_func, &ctxs[i]) != 0)
-      exit(EXIT_FAILURE);
+      backend_exit(EXIT_FAILURE);
   }
 
   uint32_t dnstap_aux_buf_size = (cfg->dnstap.queue_size >= 64) ? cfg->dnstap.queue_size : 4096;
@@ -5182,7 +5302,19 @@ int main(int argc, char **argv) {
   if (atomic_load(&g_tcp_bind_failures) > 0) {
     syslog(LOG_ERR, "[Backend] Failed to bind TCP listening socket(s); aborting startup");
     fprintf(stderr, "[ERROR] [Backend] Failed to bind TCP listening socket(s); aborting startup\n");
-    exit(EXIT_FAILURE);
+    backend_exit(EXIT_FAILURE);
+  }
+  // X-33: 起動できなかったワーカー (cpuset / kqueue / バッファの確保の失敗) があれば中止する。
+  // 以前はそのワーカーが受け持つ IPC を誰も読まないまま稼働していた。
+  int failed_workers = atomic_load(&g_worker_start_failures);
+  if (failed_workers > 0) {
+    syslog(LOG_ERR, "[Backend] %d worker thread(s) failed to start; aborting startup", failed_workers);
+    fprintf(stderr, "[ERROR] [Backend] %d worker thread(s) failed to start; aborting startup\n", failed_workers);
+    for (int i = 0; i < num_workers; i++) {
+      if (atomic_load_explicit(&ctxs[i].startup_failed, memory_order_acquire))
+        pthread_join(threads[i], NULL); /* 終わったスレッドを回収する (O-15: _exit の前に) */
+    }
+    backend_exit(EXIT_FAILURE);
   }
 
   // 重要: type "program" ゾーンの子プロセスへの権限降格(program-user)は
@@ -5194,10 +5326,10 @@ int main(int argc, char **argv) {
 
   {
     char id_err[512];
-    if (!apply_run_identity(cfg->user, cfg->group, id_err, sizeof(id_err))) {
+    if (!apply_run_identity_id(&g_run_identity, id_err, sizeof(id_err))) {
       syslog(LOG_ERR, "[Backend] %s", id_err);
       fprintf(stderr, "[ERROR] [Backend] %s\n", id_err);
-      exit(EXIT_FAILURE);
+      backend_exit(EXIT_FAILURE);
     }
   }
 
@@ -5209,32 +5341,38 @@ int main(int argc, char **argv) {
   // (parse_dnssec_time()のような日数計算アルゴリズム)を使うこと。
   tzset();
   pthread_t response_logger_thread;
-  if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) exit(1);
+  if (pthread_create(&response_logger_thread, NULL, response_logger_thread_func, NULL) != 0) backend_exit(1);
   pthread_t query_logger_thread;
-  if (pthread_create(&query_logger_thread, NULL, query_logger_thread_func, NULL) != 0) exit(1);
+  if (pthread_create(&query_logger_thread, NULL, query_logger_thread_func, NULL) != 0) backend_exit(1);
 
   if (cfg->dnstap.enabled && cfg->dnstap.socket_path) {
     dnstap_set_message_types(cfg->dnstap.log_auth_query, cfg->dnstap.log_auth_response);
+    /* O-03: 切れた (または起動時に繋がらなかった) ときはブローカー経由で繋ぎ直す */
+    dnstap_enable_reconnect(cfg->dnstap.socket_path);
+    /* O-03: Message.query_zone は送信スレッドがゾーン DB から埋める */
+    dnstap_set_zone_filler(dnstap_fill_query_zone);
     g_dnstap_sock = dnstap_connect_and_handshake(cfg->dnstap.socket_path, cfg->dnstap.identity, cfg->dnstap.version);
     if (g_dnstap_sock >= 0) {
       atomic_store_explicit(&g_dnstap_connected, true, memory_order_release);
       syslog(LOG_NOTICE, "[dnstap] connected and handshaked to %s", cfg->dnstap.socket_path);
       fprintf(stderr, "[dnstap] connected and handshaked to %s\n", cfg->dnstap.socket_path);
     } else {
-      syslog(LOG_WARNING, "[dnstap] failed to connect to %s, dnstap disabled", cfg->dnstap.socket_path);
-      fprintf(stderr, "[dnstap] failed to connect to %s, dnstap disabled\n", cfg->dnstap.socket_path);
+      syslog(LOG_WARNING, "[dnstap] failed to connect to %s; retrying in the background", cfg->dnstap.socket_path);
+      fprintf(stderr, "[dnstap] failed to connect to %s; retrying in the background\n", cfg->dnstap.socket_path);
       if (cfg->dnstap.require_connect) {
         syslog(LOG_ERR, "[dnstap] require-connect is enabled and connection failed, aborting startup");
         fprintf(stderr, "[dnstap] require-connect is enabled and connection failed, aborting startup\n");
-        exit(EXIT_FAILURE);
+        backend_exit(EXIT_FAILURE);
       }
     }
   }
   pthread_t dnstap_sender_thread;
   if (pthread_create(&dnstap_sender_thread, NULL, dnstap_sender_thread_func, NULL) != 0) {
     syslog(LOG_ERR, "[dnstap] failed to create sender thread");
-    exit(1);
+    backend_exit(1);
   }
+  /* 送信スレッドは終了時 (dnstap_shutdown) に自分で戻る。誰も join しない */
+  pthread_detach(dnstap_sender_thread);
   
   enter_capsicum_sandbox(); // サンドボックス突入
 
@@ -5245,70 +5383,11 @@ int main(int argc, char **argv) {
     pthread_join(threads[i], NULL);
   pthread_join(control_thread, NULL);
 
-  // シャットダウン前にリングバッファ内の未送信dnstapイベントを確実にドレイン
-  if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
-    uint8_t shutdown_scratch_buf[65535 + 128];
-    if (num_workers > 0 && ctxs) {
-      for (int w = 0; w < num_workers; w++) {
-        dnstap_ring_t *ring = &ctxs[w].dnstap_ring;
-        if (!ring->events) continue;
-        uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-        uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
-        while (t != h) {
-          dnstap_event_t *ev = &ring->events[t & ring->mask];
-          dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, shutdown_scratch_buf, sizeof(shutdown_scratch_buf));
-          t++;
-        }
-        atomic_store_explicit(&ring->tail, t, memory_order_release);
-      }
-    }
-    if (g_aux_dnstap_ring.events) {
-      uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
-      uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
-      while (t != h) {
-        dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
-        if (atomic_load_explicit(&ev->ready, memory_order_acquire)) {
-          dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, shutdown_scratch_buf, sizeof(shutdown_scratch_buf));
-          atomic_store_explicit(&ev->ready, false, memory_order_release);
-        }
-        t++;
-      }
-      atomic_store_explicit(&g_aux_dnstap_ring.tail, t, memory_order_release);
-    }
-  }
-
-  for (int i = 0; i < num_workers; i++) {
-    if (ctxs[i].qlog_ring.events) {
-      free(ctxs[i].qlog_ring.events);
-      ctxs[i].qlog_ring.events = NULL;
-    }
-    if (ctxs[i].dnstap_ring.events) {
-      free(ctxs[i].dnstap_ring.events);
-      ctxs[i].dnstap_ring.events = NULL;
-    }
-  }
-  if (g_aux_dnstap_ring.events) {
-    free(g_aux_dnstap_ring.events);
-    g_aux_dnstap_ring.events = NULL;
-  }
-  if (g_dnstap_sock >= 0) {
-    close(g_dnstap_sock);
-    g_dnstap_sock = -1;
-  }
-  free(ctxs);
-  free(threads);
-
-  server_config_t *active = acquire_config_snapshot();
-  if (active) {
-    release_config_snapshot(active);
-    free_server_config_fields(active);
-  }
-  rrl_shutdown();
-#ifdef __clang__
-  if (__llvm_profile_write_file) {
-    __llvm_profile_write_file();
-  }
-#endif
-  return 0;
+  // ワーカーと制御スレッドが通常終わることはない (終了は backend_shutdown() の _exit)。
+  // ここへ来るのは全スレッドの kevent() が失敗したときだけ。dnstap の送信スレッドや
+  // 非同期 I/O スレッドはまだ動いているので、リングや設定は解放せずに同じ終了処理を通す
+  // (以前はここで送信スレッドと並行してリングを読み、解放していた)。
+  syslog(LOG_ERR, "[Backend] All worker threads have stopped; shutting down");
+  backend_shutdown(EXIT_FAILURE);
 }
 #endif /* !KARIDNS_UNIT_TEST */

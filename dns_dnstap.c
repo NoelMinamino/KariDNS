@@ -1,6 +1,8 @@
 #include "dns_dnstap.h"
 #include "dns_server_internal.h"
 
+#include <sys/capsicum.h>
+
 int g_dnstap_sock = -1;
 _Atomic bool g_dnstap_connected = ATOMIC_VAR_INIT(false);
 _Atomic uint64_t g_dnstap_truncated_total = ATOMIC_VAR_INIT(0);
@@ -18,6 +20,7 @@ dnstap_aux_ring_t g_aux_dnstap_ring;
 static const char DNSTAP_CONTENT_TYPE[] = "protobuf:dnstap.Dnstap";
 static char g_dnstap_identity[256];
 static char g_dnstap_version[256];
+static bool dnstap_handshake(int sock);
 
 int dnstap_connect_and_handshake(const char *socket_path, const char *identity, const char *version) {
     if (!socket_path || !*socket_path) return -1;
@@ -45,7 +48,11 @@ int dnstap_connect_and_handshake(const char *socket_path, const char *identity, 
         close(sock);
         return -1;
     }
+    return dnstap_handshake(sock) ? sock : -1;
+}
 
+/* Frame Streams の双方向ハンドシェイク (READY -> ACCEPT -> START)。失敗したら sock を閉じる。 */
+static bool dnstap_handshake(int sock) {
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -68,34 +75,34 @@ int dnstap_connect_and_handshake(const char *socket_path, const char *identity, 
 
     if (writev(sock, r_iov, 2) < 0) {
         close(sock);
-        return -1;
+        return false;
     }
 
     // Receive ACCEPT frame
     uint32_t esc = 0, acc_len_be = 0;
     if (recv(sock, &esc, 4, MSG_WAITALL) != 4 || ntohl(esc) != FSTRM_CONTROL_ESCAPE) {
         close(sock);
-        return -1;
+        return false;
     }
     if (recv(sock, &acc_len_be, 4, MSG_WAITALL) != 4) {
         close(sock);
-        return -1;
+        return false;
     }
     uint32_t acc_len = ntohl(acc_len_be);
     if (acc_len < 4 || acc_len > 1024) {
         close(sock);
-        return -1;
+        return false;
     }
     uint8_t acc_buf[1024];
     if (recv(sock, acc_buf, acc_len, MSG_WAITALL) != (ssize_t)acc_len) {
         close(sock);
-        return -1;
+        return false;
     }
     uint32_t acc_type = ((uint32_t)acc_buf[0] << 24) | ((uint32_t)acc_buf[1] << 16) |
                         ((uint32_t)acc_buf[2] << 8) | (uint32_t)acc_buf[3];
     if (acc_type != FSTRM_CONTROL_ACCEPT) {
         close(sock);
-        return -1;
+        return false;
     }
 
     // Send START frame: escape(4B, 0) + len(4B, 34) + type(4B, 2) + field(4B, 1) + ct_len(4B, 22) + "protobuf:dnstap.Dnstap" (22B)
@@ -114,10 +121,10 @@ int dnstap_connect_and_handshake(const char *socket_path, const char *identity, 
 
     if (writev(sock, s_iov, 2) < 0) {
         close(sock);
-        return -1;
+        return false;
     }
 
-    return sock;
+    return true;
 }
 
 size_t dnstap_build_message(const dnstap_event_meta_t *meta,
@@ -182,6 +189,11 @@ size_t dnstap_build_message(const dnstap_event_meta_t *meta,
         msg_offset += pb_encode_fixed32_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 13, (uint32_t)meta->ts.tv_nsec);
         msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 14, wire, wire_len);
     }
+    // Message.query_zone (field 11, bytes): クエリが属するゾーンのワイヤ形式の名前 (dnstap.proto)
+    if (meta->query_zone_len > 0 && meta->query_zone_len <= sizeof(meta->query_zone)) {
+        msg_offset += pb_encode_bytes_field(msg_buf + msg_offset, sizeof(msg_buf) - msg_offset, 11,
+                                            meta->query_zone, meta->query_zone_len);
+    }
 
     // Top-level Dnstap: field 1 (identity), field 2 (version), field 15 (type = 1, MESSAGE, required), field 14 (message)
     size_t out_offset = 0;
@@ -245,6 +257,7 @@ void fill_dnstap_event(dnstap_event_meta_t *meta,
     clock_gettime(CLOCK_REALTIME, &meta->ts);
     meta->message_type = message_type;
     meta->protocol = protocol;
+    meta->query_zone_len = 0; /* 送信スレッドが送る直前に埋める (dnstap_set_zone_filler) */
     if (client_addr && client_addr_len > 0) {
         size_t copy_len = client_addr_len < sizeof(meta->client_addr) ? client_addr_len : sizeof(meta->client_addr);
         memcpy(&meta->client_addr, client_addr, copy_len);
@@ -337,79 +350,206 @@ void write_dnstap_event(worker_ctx_t *ctx, uint8_t message_type,
     }
 }
 
+/* O-03: 再接続先 (起動時に設定された socket) と、終了要求の状態 */
+static char g_dnstap_reconnect_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static _Atomic int g_dnstap_stop_state = 0; /* 0 = 稼働, 1 = 終了要求, 2 = 終了済み */
+
+void dnstap_enable_reconnect(const char *socket_path) {
+    if (!socket_path) return;
+    strlcpy(g_dnstap_reconnect_path, socket_path, sizeof(g_dnstap_reconnect_path));
+}
+
+bool dnstap_shutdown(int timeout_ms) {
+    int expected = 0;
+    atomic_compare_exchange_strong(&g_dnstap_stop_state, &expected, 1);
+    for (int waited = 0; waited < timeout_ms; waited += 10) {
+        if (atomic_load_explicit(&g_dnstap_stop_state, memory_order_acquire) == 2) return true;
+        usleep(10000);
+    }
+    return atomic_load_explicit(&g_dnstap_stop_state, memory_order_acquire) == 2;
+}
+
+static void (*g_dnstap_zone_filler)(dnstap_event_meta_t *, const uint8_t *, size_t);
+
+void dnstap_set_zone_filler(void (*fn)(dnstap_event_meta_t *, const uint8_t *, size_t)) {
+    g_dnstap_zone_filler = fn;
+}
+
+static void dnstap_fill_zone(dnstap_event_meta_t *meta, const uint8_t *wire, size_t wire_len) {
+    meta->query_zone_len = 0;
+    if (g_dnstap_zone_filler) g_dnstap_zone_filler(meta, wire, wire_len);
+}
+
+/* 書き込みに失敗した接続を閉じる。再接続先があれば後で繋ぎ直す (O-03)。 */
+static void dnstap_drop_connection(void) {
+    int err = errno;
+    atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
+    if (g_dnstap_sock >= 0) {
+        close(g_dnstap_sock);
+        g_dnstap_sock = -1;
+    }
+    syslog(LOG_WARNING, "[dnstap] write failed, %s: %s",
+           g_dnstap_reconnect_path[0] ? "reconnecting" : "dnstap disabled until restart", strerror(err));
+    fprintf(stderr, "[dnstap] write failed: %s\n", strerror(err));
+}
+
+/* 全リングの溜まっているイベントを送る。送れなくなったら false (接続は閉じてある)。 */
+static bool dnstap_drain_rings(uint8_t *scratch, size_t scratch_cap, bool *any_work) {
+    int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+    worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
+    if (num_workers > 0 && workers) {
+        for (int w = 0; w < num_workers; w++) {
+            dnstap_ring_t *ring = &workers[w].dnstap_ring;
+            if (!ring->events) continue;
+            uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+            uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+            bool ok = true;
+            while (t != h) {
+                dnstap_event_t *ev = &ring->events[t & ring->mask];
+                *any_work = true;
+                dnstap_fill_zone(&ev->meta, ev->wire, ev->wire_len);
+                if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, scratch, scratch_cap)) {
+                    ok = false;
+                    break;
+                }
+                t++;
+            }
+            atomic_store_explicit(&ring->tail, t, memory_order_release);
+            if (!ok) {
+                dnstap_drop_connection();
+                return false;
+            }
+        }
+    }
+    if (g_aux_dnstap_ring.events) {
+        uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
+        uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
+        bool ok = true;
+        while (t != h) {
+            dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+            if (!atomic_load_explicit(&ev->ready, memory_order_acquire)) {
+                break;
+            }
+            *any_work = true;
+            dnstap_fill_zone(&ev->meta, ev->wire, ev->wire_len);
+            if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len, scratch, scratch_cap)) {
+                ok = false;
+                break;
+            }
+            atomic_store_explicit(&ev->ready, false, memory_order_release);
+            t++;
+        }
+        atomic_store_explicit(&g_aux_dnstap_ring.tail, t, memory_order_release);
+        if (!ok) {
+            dnstap_drop_connection();
+            return false;
+        }
+    }
+    return true;
+}
+
+/* 接続していない間に溜まったイベントは捨てる (リングを詰まらせない) */
+static void dnstap_discard_rings(void) {
+    int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+    worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
+    if (num_workers > 0 && workers) {
+        for (int w = 0; w < num_workers; w++) {
+            dnstap_ring_t *ring = &workers[w].dnstap_ring;
+            if (!ring->events) continue;
+            uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+            atomic_store_explicit(&ring->tail, h, memory_order_release);
+        }
+    }
+    if (g_aux_dnstap_ring.events) {
+        uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
+        uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
+        /* 書き込み途中のスロットは書き手が後で ready を立てるので、立っているものだけ下ろす */
+        while (t != h) {
+            dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
+            if (!atomic_load_explicit(&ev->ready, memory_order_acquire)) break;
+            atomic_store_explicit(&ev->ready, false, memory_order_release);
+            t++;
+        }
+        atomic_store_explicit(&g_aux_dnstap_ring.tail, t, memory_order_release);
+    }
+}
+
+/* Frame Streams の双方向プロトコルの終わり: STOP を送り、受信側の FINISH を待つ
+ * (SO_RCVTIMEO はハンドシェイクで 2 秒に設定済み)。 */
+static void dnstap_send_stop(int sock) {
+    uint32_t stop_frame[3] = { htonl(FSTRM_CONTROL_ESCAPE), htonl(4), htonl(FSTRM_CONTROL_STOP) };
+    if (send(sock, stop_frame, sizeof(stop_frame), 0) != (ssize_t)sizeof(stop_frame)) return;
+    uint32_t fin[3];
+    if (recv(sock, fin, sizeof(fin), MSG_WAITALL) == (ssize_t)sizeof(fin) &&
+        ntohl(fin[0]) == FSTRM_CONTROL_ESCAPE && ntohl(fin[1]) == 4 && ntohl(fin[2]) == FSTRM_CONTROL_FINISH) {
+        syslog(LOG_NOTICE, "[dnstap] stream closed (STOP/FINISH)");
+    } else {
+        syslog(LOG_WARNING, "[dnstap] no FINISH from the collector after STOP");
+    }
+}
+
+/* 起動後の再接続はブローカーに AF_UNIX ソケットを繋がせる (Backend は Capsicum の中で
+ * パス名を開けない。Rule 2)。ブローカーは起動時に設定された dnstap ソケットにしか繋がない。 */
+static int dnstap_reconnect(void) {
+    struct sockaddr_un sun;
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strlcpy(sun.sun_path, g_dnstap_reconnect_path, sizeof(sun.sun_path));
+    tcp_sockopts_t copts = { .connect_timeout_ms = 2000 };
+    int sock = broker_connect_opts(AF_UNIX, SOCK_STREAM, (struct sockaddr *)&sun, sizeof(sun), &copts);
+    if (sock < 0) return -1;
+    if (!dnstap_handshake(sock)) return -1;
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_READ, CAP_RECV, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT,
+                    CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
+    cap_rights_limit(sock, &rights);
+    return sock;
+}
+
+static int64_t dnstap_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 void *dnstap_sender_thread_func(void *arg) {
     (void)arg;
     static uint8_t g_dnstap_scratch_buf[65535 + 128]; // 送信スレッドは1本のみなので競合しない
+    int64_t next_retry_ms = 0;
+    int backoff_ms = 1000;
     while (1) {
         bool any_work = false;
-        int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
-        worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
-        if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) {
-            if (num_workers > 0 && workers) {
-                for (int w = 0; w < num_workers; w++) {
-                    dnstap_ring_t *ring = &workers[w].dnstap_ring;
-                    if (!ring->events) continue;
-                    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-                    uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
-                    while (t != h) {
-                        dnstap_event_t *ev = &ring->events[t & ring->mask];
-                        any_work = true;
-                        if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len,
-                                               g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf))) {
-                            atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
-                            if (g_dnstap_sock >= 0) {
-                                close(g_dnstap_sock);
-                                g_dnstap_sock = -1;
-                            }
-                            syslog(LOG_WARNING, "[dnstap] write failed, disabling dnstap until restart: %s",
-                                   strerror(errno));
-                            fprintf(stderr, "[dnstap] write failed: %s\n", strerror(errno));
-                            break;
-                        }
-                        t++;
-                    }
-                    atomic_store_explicit(&ring->tail, t, memory_order_release);
-                    if (!atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed)) break;
-                }
+        bool connected = atomic_load_explicit(&g_dnstap_connected, memory_order_acquire);
+        if (atomic_load_explicit(&g_dnstap_stop_state, memory_order_acquire) == 1) {
+            /* O-03: 終了要求。溜まっているイベントを送り切ってから STOP / FINISH */
+            if (connected && dnstap_drain_rings(g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf), &any_work)) {
+                dnstap_send_stop(g_dnstap_sock);
+                atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
+                close(g_dnstap_sock);
+                g_dnstap_sock = -1;
             }
-            if (atomic_load_explicit(&g_dnstap_connected, memory_order_relaxed) && g_aux_dnstap_ring.events) {
-                uint32_t t = atomic_load_explicit(&g_aux_dnstap_ring.tail, memory_order_relaxed);
-                uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_acquire);
-                while (t != h) {
-                    dnstap_aux_event_t *ev = &g_aux_dnstap_ring.events[t & g_aux_dnstap_ring.mask];
-                    if (!atomic_load_explicit(&ev->ready, memory_order_acquire)) {
-                        break;
-                    }
-                    any_work = true;
-                    if (!dnstap_send_frame(&ev->meta, ev->wire, ev->wire_len,
-                                           g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf))) {
-                        atomic_store_explicit(&g_dnstap_connected, false, memory_order_release);
-                        if (g_dnstap_sock >= 0) {
-                            close(g_dnstap_sock);
-                            g_dnstap_sock = -1;
-                        }
-                        syslog(LOG_WARNING, "[dnstap] write failed, disabling dnstap until restart: %s",
-                               strerror(errno));
-                        fprintf(stderr, "[dnstap] write failed: %s\n", strerror(errno));
-                        break;
-                    }
-                    atomic_store_explicit(&ev->ready, false, memory_order_release);
-                    t++;
-                }
-                atomic_store_explicit(&g_aux_dnstap_ring.tail, t, memory_order_release);
+            atomic_store_explicit(&g_dnstap_stop_state, 2, memory_order_release);
+            return NULL;
+        }
+        if (connected) {
+            if (!dnstap_drain_rings(g_dnstap_scratch_buf, sizeof(g_dnstap_scratch_buf), &any_work)) {
+                backoff_ms = 1000;
+                next_retry_ms = dnstap_now_ms() + backoff_ms;
             }
         } else {
-            if (num_workers > 0 && workers) {
-                for (int w = 0; w < num_workers; w++) {
-                    dnstap_ring_t *ring = &workers[w].dnstap_ring;
-                    if (!ring->events) continue;
-                    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
-                    atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+            dnstap_discard_rings();
+            /* O-03: 切れた接続はブローカー経由で繋ぎ直す (1 秒から 60 秒まで倍々で間隔を空ける) */
+            if (g_dnstap_reconnect_path[0] != '\0' && dnstap_now_ms() >= next_retry_ms) {
+                int sock = dnstap_reconnect();
+                if (sock >= 0) {
+                    g_dnstap_sock = sock;
+                    atomic_store_explicit(&g_dnstap_connected, true, memory_order_release);
+                    syslog(LOG_NOTICE, "[dnstap] reconnected to %s", g_dnstap_reconnect_path);
+                    backoff_ms = 1000;
+                } else {
+                    next_retry_ms = dnstap_now_ms() + backoff_ms;
+                    backoff_ms = backoff_ms >= 30000 ? 60000 : backoff_ms * 2;
                 }
-            }
-            if (g_aux_dnstap_ring.events) {
-                uint32_t h = atomic_load_explicit(&g_aux_dnstap_ring.head, memory_order_relaxed);
-                atomic_store_explicit(&g_aux_dnstap_ring.tail, h, memory_order_relaxed);
             }
         }
         usleep(any_work ? 1000 : 10000);

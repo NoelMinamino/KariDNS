@@ -30,12 +30,18 @@ karidns [-v | --version | -V] [-f] [-p port | -p pid_file] [-P pid_file] [-c con
    - **Manager (Supervisor) Process**: The process started by the administrator. It parses the configuration, performs the startup checks, forks the other processes and supervises them: if any child exits, all children are stopped. `SIGHUP` is forwarded to the backend.
    - **Frontend Router Processes**: Bind the privileged network sockets (UDP/TCP port 53) and dispatch network traffic to the backend workers. One router is started on hosts with up to 3 CPU cores, two on larger hosts.
    - **Backend Process**: Operates in FreeBSD Capsicum capability mode (`cap_enter(2)`). DNS packet parsing and response generation are performed by the worker threads (one or two on hosts with up to 3 cores, otherwise the number of cores minus two) without direct filesystem access or socket creation permissions. Configuration and zone files are accessed via pre-opened directory descriptors (`openat(2)` / `renameat(2)`).
-   - **Connect Broker**: A small unprivileged helper that opens the outbound TCP connections the sandboxed backend cannot create itself (for example zone transfers of secondary zones from their primary).
+   - **Connect Broker**: A small unprivileged helper that opens the outbound connections the sandboxed backend cannot create itself (zone transfers of secondary zones from their primary, forward-zone queries, and reconnecting to the dnstap collector). It starts a non-blocking `connect(2)` and hands the socket back at once; the backend waits for the connection to complete within its own time limit, so one slow server does not hold up other outbound connections. It only connects to UNIX sockets for the `dnstap` socket configured at startup.
+   - **Startup order**: user and group are looked up once, before any thread is started, and the same identity is used by all processes and for log and control-socket ownership. Control commands (`karictl`), `SIGHUP` and the control thread's timers are processed only after the backend has dropped privileges and entered capability mode.
+   - If the kernel has no `CAPABILITY_MODE` (`cap_enter(2)` fails with `ENOSYS`), the backend logs `Capsicum is not available ... running WITHOUT the capability-mode sandbox` at `LOG_CRIT` and keeps running. Any other `cap_enter(2)` failure aborts startup.
+   - **Shutdown**: on `SIGTERM`/`SIGINT`, `karictl stop`, or when the manager process goes away, the backend sends the dnstap frames that are still queued, ends the Frame Streams session (STOP / FINISH) and exits. A second signal exits at once.
 2. **Read-Copy-Update (RCU) Architecture**:
    - Zone data and configuration pointers are swapped atomically using C11 atomic operations (`memory_order_acquire` / `memory_order_release`), allowing worker threads to serve queries concurrently during zone reloads without locking.
 3. **Memory Arena Allocator (`zone_arena_t`)**:
-   - For ordinary read-only queries (e.g. standard `QUERY` lookups), dynamic memory allocations (`malloc`/`free`) are not used; stack buffers and bump-allocated memory arenas (`zone_arena_t`) are used for request handling.
-   - The exception is Dynamic Update (`RFC 2136`, OPCODE=5): applying an update clones the zone's active arena into the standby arena (`clone_zone_arena`, using `realloc`) and computes an IXFR diff (`compute_ixfr_diff`, using `malloc`) so that secondaries can be notified incrementally. This path is synchronous with the query but is inherently a write path, not the hot read path.
+   - For ordinary read-only queries (e.g. standard `QUERY` lookups) over UDP and TCP, dynamic memory allocations (`malloc`/`free`) are not used; stack buffers and bump-allocated memory arenas (`zone_arena_t`) are used for request handling. TCP connection state comes from a pool of 1000 connection contexts allocated when the backend starts (memory pages are only used once a context has been used), and each worker thread builds its TCP responses in a buffer allocated at startup.
+   - Exceptions:
+     - Dynamic Update (`RFC 2136`, OPCODE=5): applying an update clones the zone's active arena into the standby arena (`clone_zone_arena`, using `realloc`) and computes an IXFR diff (`compute_ixfr_diff`, using `malloc`) so that secondaries can be notified incrementally. This path is synchronous with the query but is inherently a write path, not the hot read path.
+     - `type forward` and `type program` zones: the query is copied to the heap and handed to a separate pool of I/O threads through a queue protected by a mutex, so that waiting for the forwarder or the program does not block a worker thread.
+     - Outgoing zone transfers (AXFR/IXFR): each transfer runs in its own thread, which receives its parameters in a heap block.
 4. **Kqueue Event Loop**:
    - Network I/O events for TCP connections and UDP sockets are managed using FreeBSD `kqueue(2)`.
 
@@ -210,8 +216,9 @@ Duplicate zones (in the same view or at top level), duplicate views, duplicate k
 | `tcp-mss <n>;` | not set (OS default) | 536–65495. See [TRANSPORT TUNING](#transport-tuning-tcp-mss--window-udp-payload-size). |
 | `tcp-window <size>;` | not set (OS default) | 4K–64M, `K`/`M` suffix allowed. See TRANSPORT TUNING. |
 | `udp-bufsize <n>;` | `1232` | 512–4096. Maximum UDP response size and the payload size advertised in the response OPT. See TRANSPORT TUNING. |
-| `tcp-connection-reuse yes\|no;` | `no` | Keep TCP connections open for further queries (RFC 7766). |
-| `tcp-idle-timeout <ms>;` | `10000` | Idle timeout of TCP connections in **milliseconds** (0 means the default). |
+| `tcp-connection-reuse yes\|no;` | `no` | Keep TCP connections open for further queries (RFC 7766 §6.2.1). With `no`, the connection is closed after the first response. With `yes`, pipelined queries are read and answered in the order they arrive (not concurrently, RFC 7766 §6.2.1.1 is a SHOULD), up to 16 per turn of the event loop. Any TCP connection is closed 60 s after it was opened at the latest. |
+| `tcp-initial-timeout <ms>;` | `10000` | Time in **milliseconds** a new TCP connection may take to deliver its first complete query (0 means the default). |
+| `tcp-idle-timeout <ms>;` | `10000` | Time in **milliseconds** after a complete query in which the next one must have arrived completely (0 means the default). It is not extended while only part of a message has arrived (RFC 7766 §6.2.3), so a client that sends a message a few bytes at a time is disconnected. Also the value advertised in edns-tcp-keepalive (RFC 7828). |
 | `minimal-responses yes\|no;` | `no` | Do not add glue / additional-section records. |
 | `minimal-any yes\|no;` | `no` | RFC 8482: answer `QTYPE=ANY` with a synthesized `HINFO "RFC8482" ""` record instead of all RRsets. When the query has DO=1 and the name has RRSIG records, a single RRset is returned instead (RFC 8482 §4.2). |
 | `minimal-any-ttl <seconds>;` | `86400` | TTL of the synthesized RFC 8482 `HINFO` record. |
@@ -239,18 +246,36 @@ Duplicate zones (in the same view or at top level), duplicate views, duplicate k
 
 ### `rate-limit { ... }` (in `options` or `zone`)
 
-A `rate-limit` block in a zone replaces the server-wide block for that zone. Rates are per client address and response class; `0` means no limit for that class.
+A `rate-limit` block in a zone replaces the server-wide block for that zone. `0` means no limit for that class. Only UDP responses are limited.
+
+Responses are counted like BIND (`lib/dns/rrl.c`): clients are grouped by address prefix (`ipv4-prefix-length`, `ipv6-prefix-length`), and within a client prefix each kind of response has its own budget per name:
+
+| Response | Counted per |
+|---|---|
+| NOERROR with data | QNAME + QTYPE + QCLASS. Answers made from a wildcard share one budget per zone (`*.<zone>`). |
+| NODATA | QNAME + QCLASS (wildcard: `*.<zone>`) |
+| NXDOMAIN | the zone (random names under one zone share one budget) |
+| Referral (delegation) | the delegation point + QCLASS |
+| Errors (SERVFAIL, REFUSED, FORMERR, ...) | the client prefix only |
+| `all-per-second` | the client prefix only, all responses |
+
+Differences from BIND: the table has a fixed size of 131072 entries (`min-table-size` / `max-table-size` are accepted and ignored); `qps-scale` is accepted and ignored; `nxdomains-per-second` and `errors-per-second` default to `0` (no limit) instead of `responses-per-second`; responses that carry a valid server cookie are limited like any other.
 
 | Option | Default | Description |
 |---|---|---|
 | `responses-per-second <n>;` | `0` | Limit for positive (NOERROR with data) responses. |
 | `nodata-per-second <n>;` | value of `responses-per-second` | Limit for NODATA responses. |
 | `nxdomains-per-second <n>;` | `0` | Limit for NXDOMAIN responses. |
+| `referrals-per-second <n>;` | value of `responses-per-second` | Limit for referrals (delegations to a child zone). |
 | `errors-per-second <n>;` | `0` | Limit for error responses. |
+| `all-per-second <n>;` | `0` | Limit for all responses to one client prefix, whatever the name. When both limits apply, this one decides. |
+| `ipv4-prefix-length <n>;` | `24` | 0–32. IPv4 clients in the same prefix share their budgets. |
+| `ipv6-prefix-length <n>;` | `56` | 0–128. IPv6 clients in the same prefix share their budgets. |
+| `qps-scale`, `min-table-size`, `max-table-size` | — | Accepted for BIND compatibility; no effect (warning). |
 | `window <seconds>;` | `15` | Accounting window (maximum 3600). |
 | `slip <n>;` | `2` | Every *n*-th limited UDP response is sent truncated (TC=1) instead of being dropped; `0` drops all. |
 | `log-only yes\|no;` | `no` | Only log what would be limited. |
-| `early-drop yes\|no;` | `no` | For `type program` zones: drop UDP queries from clients whose budget is already exhausted before the query is passed to the program. |
+| `early-drop yes\|no;` | `no` | For `type program` zones: drop UDP queries before they are passed to the program when the client's budget for a positive answer to this QNAME/QTYPE (or its `all-per-second` budget) is already exhausted. |
 | `exempt-clients { <addr/cidr>; ... };` | none | Clients that are never limited. |
 
 Negative or non-numeric values are ignored with a warning; unknown keys are ignored with a warning.
@@ -259,15 +284,17 @@ Negative or non-numeric values are ignored with a warning; unknown keys are igno
 
 | Option | Default | Description |
 |---|---|---|
-| `socket "<path>";` (alias `socket-path`) | none | UNIX socket of the Frame Streams collector (e.g. `fstrm_capture`). The connection is made once at startup. |
+| `socket "<path>";` (alias `socket-path`) | none | UNIX socket of the Frame Streams collector (e.g. `fstrm_capture`). The first connection is made at startup. When the collector goes away (or was not running at startup), the server reconnects through the connect broker, first after 1 s and then with the interval doubling up to 60 s; events produced while disconnected are dropped. The reconnection runs as the `user` karidns runs as, so that user must be allowed to connect to the socket. |
 | `identity "<string>";` | none | dnstap `identity` field. |
 | `version "<string>";` | none | dnstap `version` field. |
 | `queue-size <n>;` (alias `queue_size`) | `4096` | Entries in each worker's dnstap ring buffer (values below 64 use the default; rounded up to a power of two). |
-| `require-connect yes\|no;` | `no` | Abort startup when the collector cannot be reached (otherwise dnstap is disabled with a warning). |
+| `require-connect yes\|no;` | `no` | Abort startup when the collector cannot be reached (otherwise startup continues and the server keeps trying to connect). |
 | `log-queries yes\|no;` (alias `auth-query`) | see below | Emit `AUTH_QUERY` messages. |
 | `log-responses yes\|no;` (alias `auth-response`) | see below | Emit `AUTH_RESPONSE` messages. |
 
-When neither `log-queries` nor `log-responses` is given, both queries and responses are logged. When one of them is given, only the types set to `yes` are logged (the other one defaults to `no`). The message types are taken over on reload; the collector socket itself is connected only at startup.
+When neither `log-queries` nor `log-responses` is given, both queries and responses are logged. When one of them is given, only the types set to `yes` are logged (the other one defaults to `no`). The message types are taken over on reload; a changed `socket` path needs a restart.
+
+`AUTH_QUERY` and `AUTH_RESPONSE` messages carry `query_zone` (the zone that contains the QNAME in the client's view, looked up when the message is sent). At shutdown the queued messages are sent and the Frame Streams session is ended with STOP / FINISH.
 
 `karictl status` reports the number of truncated dnstap messages.
 
@@ -379,7 +406,7 @@ A zone that appears in several views is a separate zone in each view: its own fi
 | `disable-auto-tc-flag yes\|no;` | program | See PROGRAM ZONE PLUGINS. Any other value is an error. |
 | `zone-tcp-mss`, `zone-tcp-window`, `zone-tcp-sndbuf`, `zone-udp-bufsize` | all | Per-zone transport settings; see TRANSPORT TUNING. |
 | `forwarders { <addr> [port <n>]; ... };` | forward | Upstream servers; see FORWARD ZONES. |
-| `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000). |
+| `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000), shared by the forwarders: each one gets the remaining time divided by the number of forwarders not tried yet. |
 | `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;` | program | See PROGRAM ZONE PLUGINS. |
 
 ---
@@ -525,7 +552,7 @@ zone "corp.example.com." {
 
 > [!NOTE]
 > **Forward Zone Processing Semantics:**
-> - **Transparent Query Relaying**: KariDNS does not maintain zone resource records locally for forward zones. Incoming queries matching the zone are forwarded to the configured `forwarders` list in order, failing over to the next forwarder within the shared `forward-timeout` budget.
+> - **Transparent Query Relaying**: KariDNS does not maintain zone resource records locally for forward zones. Incoming queries matching the zone are forwarded to the configured `forwarders` list in order, failing over to the next forwarder within the shared `forward-timeout` budget. Each forwarder gets the remaining time divided by the number of forwarders not tried yet (with two forwarders and the default 2000 ms: 1000 ms each, the second one also gets what the first one did not use). A reply whose ID, QR bit or question does not match is discarded and the wait for that forwarder continues (RFC 5452 §9.1). The fallback to TCP after a truncated reply, including its connection setup, uses the time that is still left.
 > - **No Subprocess Overhead**: Unlike `type program` zones, forward zones do not spawn external processes and do not require global opt-in flags like `allow-program-zones`.
 > - **Immediate Reload Support**: Changes to `forwarders` or `forward-timeout` take effect immediately upon configuration reload (`SIGHUP` / `karictl reload`) without requiring a full server restart.
 > - **Unsupported Operations**: Dynamic Update (RFC 2136), Zone Transfer (`AXFR`/`IXFR`), and `NOTIFY` requests are not supported on forward zones and are rejected with `NOTIMP`.

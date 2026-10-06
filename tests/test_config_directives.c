@@ -179,10 +179,16 @@ static void test_numeric_directives(void) {
     printf("[TEST] numeric options directives: valid values and boundaries...\n");
     server_config_t cfg;
 
+    if (parse_ok("options { tcp-initial-timeout 1500; tcp-idle-timeout 4294967295; };", &cfg)) {
+        CHECK(cfg.tcp_initial_timeout == 1500);
+        CHECK(cfg.tcp_idle_timeout == 4294967295u);
+        free_server_config_fields(&cfg);
+    }
     if (parse_ok("options { port 5353; tcp-idle-timeout 0; query-log-max-qps 250; "
                  "minimal-any-ttl 300; wire-cache-max-records 12345; };", &cfg)) {
         CHECK(cfg.port == 5353);
         CHECK(cfg.tcp_idle_timeout == 0);
+        CHECK(cfg.tcp_initial_timeout == 10000);   /* D-06: default */
         CHECK(cfg.query_log_max_qps == 250);
         CHECK(cfg.minimal_any_ttl == 300);
         CHECK(cfg.wire_cache_max_records == 12345);
@@ -220,6 +226,9 @@ static void test_numeric_directives_invalid(void) {
         "options { tcp-idle-timeout -1; };",
         "options { tcp-idle-timeout abc; };",
         "options { tcp-idle-timeout 10s; };",
+        "options { tcp-initial-timeout -1; };",
+        "options { tcp-initial-timeout 2.5; };",
+        "options { tcp-idle-timeout 4294967296; };",
         "options { query-log-max-qps abc; };",
         "options { minimal-any-ttl -1; };",
         "options { minimal-any-ttl 1.5; };",
@@ -735,6 +744,24 @@ static void test_zone_rate_limit(void) {
         CHECK(cfg.rrl.window_seconds == 15);
         CHECK(cfg.rrl.slip == 2);
         CHECK(cfg.rrl.nodata_per_second_set == false);
+        free_server_config_fields(&cfg);
+    }
+    /* D-05: BIND options: prefix lengths, referrals-per-second (defaults to responses-per-second),
+     * all-per-second; qps-scale / min-table-size / max-table-size are accepted but have no effect */
+    if (parse_ok("options { rate-limit { responses-per-second 8; all-per-second 30; ipv4-prefix-length 32; "
+                 "ipv6-prefix-length 64; qps-scale 250; min-table-size 500; max-table-size 20000; }; };", &cfg)) {
+        CHECK(cfg.rrl.referrals_per_second == 8);
+        CHECK(cfg.rrl.referrals_per_second_set == false);
+        CHECK(cfg.rrl.all_per_second == 30);
+        CHECK(cfg.rrl.ipv4_prefix_length == 32 && cfg.rrl.ipv4_prefix_length_set);
+        CHECK(cfg.rrl.ipv6_prefix_length == 64 && cfg.rrl.ipv6_prefix_length_set);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { rate-limit { responses-per-second 8; referrals-per-second 3; ipv4-prefix-length 33; "
+                 "ipv6-prefix-length 129; }; };", &cfg)) {
+        CHECK(cfg.rrl.referrals_per_second == 3 && cfg.rrl.referrals_per_second_set);
+        CHECK(cfg.rrl.ipv4_prefix_length == 24 && !cfg.rrl.ipv4_prefix_length_set);   /* out of range: ignored */
+        CHECK(cfg.rrl.ipv6_prefix_length == 56 && !cfg.rrl.ipv6_prefix_length_set);
         free_server_config_fields(&cfg);
     }
     expect_reject("rate-limit without braces", "options { rate-limit yes; };");

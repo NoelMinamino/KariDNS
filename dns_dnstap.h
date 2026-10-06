@@ -30,6 +30,10 @@ typedef struct {
     struct sockaddr_storage server_addr;
     socklen_t server_addr_len;
     bool has_server_addr;
+    // Message.query_zone (field 11): クエリが属するゾーンの名前 (ワイヤ形式)。送信スレッドが
+    // 送る直前に埋める (O-03)。0 なら付けない。
+    uint16_t query_zone_len;
+    uint8_t query_zone[255];
 } dnstap_event_meta_t;
 
 // dnstap用イベント: UDPワーカーのSPSCリング専用。
@@ -82,6 +86,20 @@ void dnstap_set_message_types(bool log_auth_query, bool log_auth_response);
 extern dnstap_aux_ring_t g_aux_dnstap_ring;
 
 int dnstap_connect_and_handshake(const char *socket_path, const char *identity, const char *version);
+
+/* O-03: 書き込みに失敗して切断したら、送信スレッドがブローカー経由でこのソケットへ再接続する
+ * (1 秒から 60 秒まで間隔を倍にしながら)。起動時に接続を試みた後で呼ぶ。 */
+void dnstap_enable_reconnect(const char *socket_path);
+
+/* O-03: 送信スレッドにリングを送り切らせ、STOP を送って FINISH を待たせる (Frame Streams の
+ * 双方向プロトコル)。終わるか timeout_ms が過ぎたら戻る。終わっていれば true。 */
+#define DNSTAP_SHUTDOWN_WAIT_MS 3000
+bool dnstap_shutdown(int timeout_ms);
+
+/* 送信スレッドが送る直前に meta->query_zone を埋める関数を登録する (起動時、main())。
+ * 実体は dns_query_engine.c の dnstap_fill_query_zone() (ゾーン DB を引く)。 */
+void dnstap_set_zone_filler(void (*fn)(dnstap_event_meta_t *meta, const uint8_t *wire, size_t wire_len));
+void dnstap_fill_query_zone(dnstap_event_meta_t *meta, const uint8_t *wire, size_t wire_len);
 
 size_t dnstap_build_message(const dnstap_event_meta_t *meta,
                             const uint8_t *wire, size_t wire_len,

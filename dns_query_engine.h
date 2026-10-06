@@ -12,6 +12,14 @@
 #include "dns_zone_parser.h"
 #include "dns_server_internal.h"
 
+/* D-05: 直前の process_dns_query*() が応答を作ったゾーンと、答えがワイルドカードから作られたか
+ * (RRL のキー)。同じスレッドで、同じスナップショットを持っている間だけ有効。 */
+typedef struct {
+  const char *zone;
+  bool wildcard;
+} query_rrl_info_t;
+extern _Thread_local query_rrl_info_t t_query_rrl_info;
+
 int process_dns_query(const uint8_t *req, size_t req_len, uint8_t *res,
                       size_t max_res_len, const char *qname, uint16_t qtype,
                       const char *client_ip, compress_ctx_t *comp_ctx,

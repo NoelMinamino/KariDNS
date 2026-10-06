@@ -441,6 +441,22 @@ struct passwd *getpwnam(const char *name) {
     return real_fn ? real_fn(name) : NULL;
 }
 
+/* getpwnam_r / getgrnam_r: a fault means "not found" (rc 0, *result NULL), or the
+ * given errno as the return value. */
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t len, struct passwd **result) {
+    int err = 0, noop = 0;
+    if (check_and_trigger_fi("getpwnam_r", &err, &noop)) { *result = NULL; return err; }
+    FI_REAL(int, getpwnam_r, (const char *, struct passwd *, char *, size_t, struct passwd **));
+    return real_fn ? real_fn(name, pwd, buf, len, result) : ENOSYS;
+}
+
+int getgrnam_r(const char *name, struct group *grp, char *buf, size_t len, struct group **result) {
+    int err = 0, noop = 0;
+    if (check_and_trigger_fi("getgrnam_r", &err, &noop)) { *result = NULL; return err; }
+    FI_REAL(int, getgrnam_r, (const char *, struct group *, char *, size_t, struct group **));
+    return real_fn ? real_fn(name, grp, buf, len, result) : ENOSYS;
+}
+
 int renameat(int fromfd, const char *from, int tofd, const char *to) {
     int err = 0, noop = 0;
     if (check_and_trigger_fi("renameat", &err, &noop)) { errno = err; return -1; }

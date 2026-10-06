@@ -1141,6 +1141,13 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
   rrl->nodata_per_second_set = false;
   rrl->nxdomains_per_second = 0;
   rrl->errors_per_second = 0;
+  rrl->referrals_per_second = 0;
+  rrl->referrals_per_second_set = false;
+  rrl->all_per_second = 0;
+  rrl->ipv4_prefix_length = 24;
+  rrl->ipv6_prefix_length = 56;
+  rrl->ipv4_prefix_length_set = false;
+  rrl->ipv6_prefix_length_set = false;
   rrl->window_seconds = 15;
   rrl->slip = 2;
   rrl->exempt_clients = NULL;
@@ -1207,6 +1214,36 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     } else if (strcmp(key, "errors-per-second") == 0) {
       if (valid) rrl->errors_per_second = (int)num_val;
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+    } else if (strcmp(key, "referrals-per-second") == 0) {
+      if (valid) {
+        rrl->referrals_per_second = (int)num_val;
+        rrl->referrals_per_second_set = true;
+      } else {
+        syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      }
+    } else if (strcmp(key, "all-per-second") == 0) {
+      if (valid) rrl->all_per_second = (int)num_val;
+      else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+    } else if (strcmp(key, "ipv4-prefix-length") == 0 || strcmp(key, "ipv6-prefix-length") == 0) {
+      /* D-05: BIND と同じ名前と範囲 (IPv4 0-32、IPv6 0-128) */
+      bool v4 = (key[3] == '4');
+      long max_len = v4 ? 32 : 128;
+      if (valid && num_val <= max_len) {
+        if (v4) {
+          rrl->ipv4_prefix_length = (uint8_t)num_val;
+          rrl->ipv4_prefix_length_set = true;
+        } else {
+          rrl->ipv6_prefix_length = (uint8_t)num_val;
+          rrl->ipv6_prefix_length_set = true;
+        }
+      } else {
+        syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s' (0-%ld), ignoring",
+               val, key, max_len);
+      }
+    } else if (strcmp(key, "qps-scale") == 0 || strcmp(key, "min-table-size") == 0 ||
+               strcmp(key, "max-table-size") == 0) {
+      /* BIND の設定をそのまま読めるように受け付けるが、表は固定長でこれらは効かない (D-05) */
+      syslog(LOG_WARNING, "[Config] rate-limit option '%s' is accepted for BIND compatibility but has no effect", key);
     } else if (strcmp(key, "window") == 0) {
       if (*endptr == '\0' && num_val > 0) rrl->window_seconds = (int)num_val;
       else syslog(LOG_WARNING, "[Config] Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
@@ -1232,6 +1269,10 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     // nodata-per-second が明示指定されていない場合は responses-per-second を流用する
     // （既存設定ファイルの後方互換のためのデフォルト）
     rrl->nodata_per_second = rrl->responses_per_second;
+  }
+  if (!rrl->referrals_per_second_set) {
+    // referrals-per-second も同じ (BIND の既定と同じ)
+    rrl->referrals_per_second = rrl->responses_per_second;
   }
   
   tok = get_next_token(ctx);
@@ -1981,6 +2022,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   memset(config->cookie_secrets, 0, sizeof(config->cookie_secrets));
   config->cookie_secret_count = 0;
   config->tcp_idle_timeout = 10000;
+  config->tcp_initial_timeout = 10000;
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
@@ -2149,17 +2191,23 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             free(key);
             return -1;
           }
-        } else if (strcmp(key, "tcp-idle-timeout") == 0) {
+        } else if (strcmp(key, "tcp-idle-timeout") == 0 || strcmp(key, "tcp-initial-timeout") == 0) {
+          /* ミリ秒 (0 = 既定の 10000)。tcp-initial-timeout は最初のメッセージまで、
+           * tcp-idle-timeout はメッセージ間の待ち時間 (D-06、RFC 7766 §6.2.3) */
+          uint32_t *dst = (strcmp(key, "tcp-idle-timeout") == 0) ? &config->tcp_idle_timeout
+                                                                 : &config->tcp_initial_timeout;
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) { free(key); free_token(&tok); return -1; }
           char *endptr;
+          errno = 0;
           unsigned long v = strtoul(tok.value, &endptr, 10);
-          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0])) {
-            syslog(LOG_ERR, "[Config] Invalid tcp-idle-timeout value '%s' (must be a non-negative integer)", tok.value);
-            fprintf(stderr, "[ERROR] Invalid tcp-idle-timeout value '%s' (must be a non-negative integer)\n", tok.value);
+          if (*endptr != '\0' || tok.value[0] == '-' || isspace((unsigned char)tok.value[0]) ||
+              errno == ERANGE || v > UINT32_MAX) {
+            syslog(LOG_ERR, "[Config] Invalid %s value '%s' (must be a non-negative integer of milliseconds)", key, tok.value);
+            fprintf(stderr, "[ERROR] Invalid %s value '%s' (must be a non-negative integer of milliseconds)\n", key, tok.value);
             free(key); free_token(&tok); return -1;
           }
-          config->tcp_idle_timeout = (int)v;
+          *dst = (uint32_t)v;
           free_token(&tok);
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_SEMICOLON) { free(key); free_token(&tok); return -1; }

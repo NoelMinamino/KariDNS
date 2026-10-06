@@ -40,6 +40,13 @@ typedef struct {
   bool nodata_per_second_set;
   uint32_t nxdomains_per_second;
   uint32_t errors_per_second;
+  uint32_t referrals_per_second;  /* D-05: BIND と同じ。未指定なら responses-per-second */
+  bool referrals_per_second_set;
+  uint32_t all_per_second;        /* D-05: クライアント (プレフィックス) ごとの全応答。0 = 制限なし */
+  uint8_t ipv4_prefix_length;     /* D-05: クライアントをまとめる長さ (_set でなければ既定 24) */
+  uint8_t ipv6_prefix_length;     /* D-05: 同 (_set でなければ既定 56) */
+  bool ipv4_prefix_length_set;
+  bool ipv6_prefix_length_set;
   uint32_t window_seconds;
   uint32_t slip;
   ip_port_t *exempt_clients;
@@ -238,6 +245,7 @@ typedef struct server_config_s {
   bool rfc10029_mqtype_enable;
   bool tcp_connection_reuse;
   uint32_t tcp_idle_timeout;
+  uint32_t tcp_initial_timeout; /* ms。最初のメッセージを受け取るまでの待ち時間 (D-06) */
   char *nsid_string;
   /* RFC 9018 DNS Server Cookies. `cookie-secret "<32 hex>";` may be repeated: the first
    * secret generates new Server Cookies, all secrets are accepted for verification

@@ -52,6 +52,8 @@ void *async_io_worker_func(void *arg);
 void start_connect_broker(void);
 extern pid_t g_broker_pid;
 extern _Atomic bool g_privilege_drop_complete;
+extern _Atomic bool g_control_signals_ready;
+extern _Atomic int g_backend_should_exit;
 bool preflight_writable_path(const char *path, const char *what, bool foreground,
                              bool check_existing, const char *hint);
 bool validate_program_zone_users(server_config_t *cfg);
@@ -563,6 +565,86 @@ static void rotate_ts_run(int versions, int *kept_files, int *kept_lines) {
     }
     unlink(path);
     assert(rmdir(dir) == 0);
+}
+
+/* D-04: TCP connection contexts come from a pool allocated once; R-24: length + message in one write */
+static void *tcp_pool_churn(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 20000; i++) {
+        tcp_stream_ctx_t *c = tcp_ctx_alloc();
+        if (c) {
+            c->accumulated = 7;
+            tcp_ctx_free(c);
+        }
+    }
+    return NULL;
+}
+
+static void test_tcp_pool_and_single_write(void) {
+    printf("[TEST] Server Core: TCP context pool (D-04) and one-write TCP messages (RFC 7766 §8)...\n");
+    assert(tcp_pool_init());
+    assert(tcp_pool_init());   /* idempotent */
+    static tcp_stream_ctx_t *held[MAX_TCP_CLIENTS];
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        held[i] = tcp_ctx_alloc();
+        assert(held[i] != NULL);
+        assert(held[i]->accumulated == 0 && held[i]->state == TCP_STATE_READ_LEN && held[i]->idle_deadline_ms == 0);
+        held[i]->accumulated = 99;   /* dirty it: the next user must get it cleared */
+        held[i]->buf[0] = 0x5a;
+    }
+    assert(tcp_ctx_alloc() == NULL);   /* MAX_TCP_CLIENTS in use: no more connections */
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        for (int j = i + 1; j < i + 4 && j < MAX_TCP_CLIENTS; j++) assert(held[i] != held[j]);
+    }
+    tcp_ctx_free(held[17]);
+    tcp_stream_ctx_t *again = tcp_ctx_alloc();
+    assert(again == held[17] && again->accumulated == 0);
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) tcp_ctx_free(i == 17 ? again : held[i]);
+
+    /* concurrent alloc/free from several threads (lock-free list; run under TSan in CI) */
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++) assert(pthread_create(&th[i], NULL, tcp_pool_churn, NULL) == 0);
+    for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
+    int count = 0;
+    while (count < MAX_TCP_CLIENTS && (held[count] = tcp_ctx_alloc()) != NULL) count++;
+    assert(count == MAX_TCP_CLIENTS);   /* nothing lost or duplicated */
+    assert(tcp_ctx_alloc() == NULL);
+    for (int i = 0; i < count; i++) tcp_ctx_free(held[i]);
+
+    /* send_tcp_dns_message(): the peer reads prefix and message together */
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    uint8_t msg[300];
+    for (size_t i = 0; i < sizeof(msg); i++) msg[i] = (uint8_t)i;
+    assert(send_tcp_dns_message(sv[0], msg, sizeof(msg)) == (ssize_t)sizeof(msg));
+    uint8_t in[400];
+    ssize_t n = recv(sv[1], in, sizeof(in), 0);
+    assert(n == (ssize_t)sizeof(msg) + 2);
+    assert(in[0] == 0x01 && in[1] == 0x2c && memcmp(in + 2, msg, sizeof(msg)) == 0);
+    assert(send_tcp_dns_message(sv[0], msg, 65536) == -1);   /* does not fit the length field */
+    /* a message larger than the socket buffer is still sent completely */
+    int small = 4096;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    static uint8_t big[60000], got[60002];
+    for (size_t i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i * 7);
+    pid_t reader = fork();
+    assert(reader >= 0);
+    if (reader == 0) {
+        size_t have = 0;
+        while (have < sizeof(got)) {
+            ssize_t r = recv(sv[1], got + have, sizeof(got) - have, 0);
+            if (r <= 0) _exit(1);
+            have += (size_t)r;
+        }
+        _exit(got[0] == 0xea && got[1] == 0x60 && memcmp(got + 2, big, sizeof(big)) == 0 ? 0 : 2);
+    }
+    assert(send_tcp_dns_message(sv[0], big, sizeof(big)) == (ssize_t)sizeof(big));
+    int st = 0;
+    waitpid(reader, &st, 0);
+    assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(sv[0]);
+    close(sv[1]);
+    printf("  -> TCP context pool and one-write messages passed.\n");
 }
 
 static void test_log_write_rotated_timestamp_versions(void) {
@@ -1133,6 +1215,9 @@ static void test_control_socket_thread_and_commands(void) {
     atomic_store_explicit(&g_config_db.active, &mock_cfg, memory_order_release);
     atomic_store_explicit(&g_zone_db_active, &snap, memory_order_release);
 
+    /* O-18: until startup has completed the control thread serves nothing */
+    bool saved_drop = atomic_load(&g_privilege_drop_complete);
+    atomic_store(&g_privilege_drop_complete, false);
     pthread_t th;
     res = pthread_create(&th, NULL, control_thread_func, NULL);
     assert(res == 0);
@@ -1146,6 +1231,9 @@ static void test_control_socket_thread_and_commands(void) {
     assert(res == 0);
 
     char rbuf[1024];
+    struct pollfd gate_pfd = { .fd = cfd1, .events = POLLIN };
+    assert(poll(&gate_pfd, 1, 300) == 0);             /* no CHALLENGE during startup */
+    atomic_store(&g_privilege_drop_complete, true);   /* startup done: the queued connection is served */
     ssize_t n = recv(cfd1, rbuf, sizeof(rbuf) - 1, 0);
     assert(n > 0);
     rbuf[n] = '\0';
@@ -1274,6 +1362,7 @@ static void test_control_socket_thread_and_commands(void) {
 
     pthread_cancel(th);
     pthread_join(th, NULL);
+    atomic_store(&g_privilege_drop_complete, saved_drop);
 
     close(lfd);
     unlink(sock_path);
@@ -1767,15 +1856,32 @@ static void test_server_core_process_lifecycle_and_signals(void) {
     close(g_notify_ipc[0]);
     close(g_notify_ipc[1]);
 
-    // 4. backend_sig_handler in child process
+    // 4. backend_sig_handler in child process: during startup it exits at once
     pid_t cpid1 = fork();
     assert(cpid1 >= 0);
     if (cpid1 == 0) {
+        atomic_store(&g_privilege_drop_complete, false);
         backend_sig_handler(SIGTERM);
         _exit(1);
     }
     int status1 = 0;
     waitpid(cpid1, &status1, 0);
+    assert(WIFEXITED(status1) && WEXITSTATUS(status1) == 0);
+
+    // 4b. O-03: after startup the control thread shuts down (dnstap STOP); the handler only
+    // records the signal. A second signal (shutdown stuck) exits at once.
+    pid_t cpid1b = fork();
+    assert(cpid1b >= 0);
+    if (cpid1b == 0) {
+        atomic_store(&g_privilege_drop_complete, true);
+        atomic_store(&g_control_signals_ready, true);
+        g_backend_should_exit = 0;
+        backend_sig_handler(SIGTERM);
+        if (!g_backend_should_exit) _exit(2);
+        backend_sig_handler(SIGTERM);
+        _exit(1);
+    }
+    waitpid(cpid1b, &status1, 0);
     assert(WIFEXITED(status1) && WEXITSTATUS(status1) == 0);
 
     // 5. daemonize in child process
@@ -1806,8 +1912,14 @@ static void test_server_core_process_lifecycle_and_signals(void) {
     if (cpid3 == 0) {
         server_config_t test_cfg;
         memset(&test_cfg, 0, sizeof(test_cfg));
-        test_cfg.user = "nonexistent_user_12345";
         test_cfg.port = 53556;
+        /* O-18: the router drops to the identity main() resolved; a drop that cannot be
+         * done (not root) must end the router */
+        memset(&g_run_identity, 0, sizeof(g_run_identity));
+        g_run_identity.privileged = true;
+        g_run_identity.has_user = true;
+        g_run_identity.uid = getuid() == 0 ? 65534 : getuid() + 1;
+        g_run_identity.gid = getgid();
         atomic_store_explicit(&g_config_db.active, &test_cfg, memory_order_release);
         g_num_frontend_routers = 1;
         g_num_workers = 1;
@@ -1819,8 +1931,15 @@ static void test_server_core_process_lifecycle_and_signals(void) {
         _exit(0);
     }
     int status3 = 0;
-    waitpid(cpid3, &status3, 0);
-    assert(WIFEXITED(status3));
+    /* as root the drop succeeds and the router keeps running: stop it after a while */
+    for (int t = 0; t < 30 && waitpid(cpid3, &status3, WNOHANG) == 0; t++)
+        usleep(100000);
+    if (kill(cpid3, 0) == 0 && getuid() == 0) {
+        kill(cpid3, SIGKILL);
+        waitpid(cpid3, &status3, 0);
+    } else {
+        assert(WIFEXITED(status3) && WEXITSTATUS(status3) == EXIT_FAILURE);
+    }
 
     printf("  -> Process lifecycle, signals, router & worker passed.\n");
 }
@@ -2053,7 +2172,12 @@ static void test_log_hand_off_after_priv_dir_check(void) {
     struct stat st;
     assert(stat(sub, &st) == 0 && st.st_uid == 0);   /* not handed off yet */
     assert(ensure_priv_dir_safe(sub));               /* pid file dir check passes */
+    /* the owner comes from the identity main() resolved at startup (O-18) */
+    run_identity_t saved_id = g_run_identity;
+    char id_err[256];
+    assert(resolve_run_identity(cfg.user, NULL, &g_run_identity, id_err, sizeof(id_err)));
     hand_off_logging_channels(&cfg);
+    g_run_identity = saved_id;
     uid_t nobody = getpwnam("nobody")->pw_uid;
     assert(stat(sub, &st) == 0 && st.st_uid == nobody);
     /* The log file itself is not checked: on FreeBSD it is opened via
@@ -2222,14 +2346,15 @@ static void test_broker_connect_opts_and_xfr_tcp_sockopts(void) {
     assert(listen(lfd, 4) == 0);
 
     /* as root the broker drops to the configured user and refuses to run without one */
-    char *saved_user = g_config_db.config_a.user;
-    static char nobody_user[] = "nobody";
-    g_config_db.config_a.user = nobody_user;
+    run_identity_t saved_id = g_run_identity;
+    char id_err[256];
+    if (geteuid() == 0)
+        assert(resolve_run_identity("nobody", NULL, &g_run_identity, id_err, sizeof(id_err)));
     start_connect_broker();
-    g_config_db.config_a.user = saved_user;
+    g_run_identity = saved_id;
     assert(g_broker_sock >= 0);
 
-    tcp_sockopts_t want = { 1200, 512 * 1024, 256 * 1024 };
+    tcp_sockopts_t want = { 1200, 512 * 1024, 256 * 1024, 0 };
     int fd = broker_connect_opts(AF_INET, SOCK_STREAM, (struct sockaddr *)&sa, sizeof(sa), &want);
     assert(fd >= 0);
     int v = 0;
@@ -5626,6 +5751,7 @@ int main(void) {
     test_submit_response_log();
     test_log_write_rotated();
     test_log_write_rotated_timestamp_versions();
+    test_tcp_pool_and_single_write();
     test_fill_observatory_snapshot();
     test_synthetic_zone_and_find_domain();
     test_ensure_priv_dir_safe();

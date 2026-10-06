@@ -1042,13 +1042,11 @@ static int axfr_emit_record(axfr_emit_ctx_t *ec, const dns_record_t *rec) {
       ec->is_subsequent = true;
       prev_offset = (uint16_t)sign_len;
     }
-    uint8_t len_prefix[2] = {(uint8_t)(prev_offset >> 8), (uint8_t)(prev_offset & 0xFF)};
     write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, ec->res, prev_offset,
                        (const struct sockaddr *)ec->client_addr, ec->client_len,
                        ec->has_server_addr ? (const struct sockaddr *)ec->server_addr : NULL,
                        ec->has_server_addr, IPPROTO_TCP);
-    if (send_tcp_robust(ec->client_fd, len_prefix, 2) < 0) return -1;
-    if (send_tcp_robust(ec->client_fd, ec->res, prev_offset) < 0) return -1;
+    if (send_tcp_dns_message(ec->client_fd, ec->res, prev_offset) < 0) return -1; /* RFC 7766 §8 */
 
     /* 次のパケットの準備（QDCOUNT=1 と質問セクションを必ず引き継ぐ） */
     ec->offset = ec->q_offset;
@@ -1154,13 +1152,11 @@ static void axfr_send_error(int client_fd, const uint8_t *req, uint16_t req_len,
     if (tsig_sign_packet(res_buf, &copy_len, sizeof(res_buf), tsig_key, 0, mac, &mac_len, NULL, 0, false) != 0)
       return;
   }
-  uint8_t len_prefix[2] = {(uint8_t)(copy_len >> 8), (uint8_t)(copy_len & 0xFF)};
   write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, res_buf, copy_len,
                      (const struct sockaddr *)client_addr, client_len,
                      has_server_addr ? (const struct sockaddr *)server_addr : NULL,
                      has_server_addr, IPPROTO_TCP);
-  send_tcp_robust(client_fd, len_prefix, 2);
-  send_tcp_robust(client_fd, res_buf, copy_len);
+  send_tcp_dns_message(client_fd, res_buf, copy_len); /* RFC 7766 §8 */
 }
 
 /* Extended AXFR (KariDNS 拡張) でしか運べないデータがゾーンにあるか。無ければ拡張を求める
@@ -1560,14 +1556,11 @@ void send_axfr_response(int client_fd, const char *qname __attribute__((unused))
       }
       ec.offset = (uint16_t)sign_len;
     }
-    uint8_t len_prefix[2] = {(uint8_t)(ec.offset >> 8), (uint8_t)(ec.offset & 0xFF)};
     write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, ec.res, ec.offset,
                        (const struct sockaddr *)client_addr, client_len,
                        has_server_addr ? (const struct sockaddr *)server_addr : NULL,
                        has_server_addr, IPPROTO_TCP);
-    if (send_tcp_robust(client_fd, len_prefix, 2) < 0)
-      goto axfr_error;
-    if (send_tcp_robust(client_fd, ec.res, ec.offset) < 0)
+    if (send_tcp_dns_message(client_fd, ec.res, ec.offset) < 0) /* RFC 7766 §8 */
       goto axfr_error;
   }
 

@@ -14,9 +14,9 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
 - **Privilege-Separated Processes & Capsicum Sandboxing:**
   - **Frontend:** Binds privileged ports (UDP/TCP 53) and manages network sockets (one or two frontend router processes, depending on the number of CPU cores).
   - **Backend:** Enters Capsicum capability mode (`cap_enter()`) to parse DNS queries and generate responses without direct filesystem or network socket creation privileges. Zone and configuration files are reloaded using pre-opened directory descriptors (`openat`/`renameat`).
-  - A supervisor process starts and monitors the others, and a small connect broker opens the outbound TCP connections the sandboxed backend needs (e.g. zone transfers from a primary).
+  - A supervisor process starts and monitors the others, and a small connect broker opens the outbound connections the sandboxed backend needs (zone transfers from a primary, forward zones, dnstap reconnection).
 - **Memory Arenas:**
-  - Zone data is loaded into memory arenas (`zone_arena_t`), avoiding `malloc`/`free` allocations during query processing.
+  - Zone data is loaded into memory arenas (`zone_arena_t`), avoiding `malloc`/`free` allocations during query processing over UDP and TCP (TCP connection state comes from a pool allocated at startup). Exceptions: Dynamic Update, `forward`/`program` zones and outgoing zone transfers (see `docs/karidns.md`).
 - **Lock-Free Read-Copy-Update (RCU):**
   - Thread synchronization uses C11 atomic operations (`stdatomic.h`) to swap zone and configuration pointers without blocking worker threads during reloads.
 - **Kqueue-based Event Loop:**
@@ -33,7 +33,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
 - **Dynamic DNS Update:** Ephemeral DNS UPDATE handling (RFC 2136 / RFC 3007) with prerequisite evaluation and TSIG verification.
 - **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, DS, CDS, CDNSKEY, CSYNC, etc.). Includes RFC 8976 (ZONEMD) digest validation.
 - **Security & Rate Limiting:**
-  - **Response Rate Limiting (RRL):** BIND9-compatible token-bucket rate limiting with response classification, CIDR aggregation, and `slip` truncation.
+  - **Response Rate Limiting (RRL):** token-bucket rate limiting keyed like BIND 9 (client prefix with `ipv4-prefix-length`/`ipv6-prefix-length`, response kind, QNAME/zone/delegation point), `all-per-second`, and `slip` truncation. Differences from BIND are listed in `docs/karidns.md`.
   - **DNS Cookies (RFC 7873 / RFC 9018):** Interoperable SipHash-2-4 Server Cookies with configurable, rotatable `cookie-secret`; BADCOOKIE and 30-minute refresh handling.
   - **TSIG (RFC 8945):** Transaction authentication supporting HMAC-MD5, SHA1, SHA224, SHA256, SHA384, and SHA512.
   - **Extended DNS Errors (EDE, RFC 8914):** Returns diagnostic error codes when queries cannot be fulfilled normally.

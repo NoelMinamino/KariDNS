@@ -269,3 +269,11 @@ int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr
     (void)tcp_opts;
     return broker_connect(family, type, addr, addr_len);
 }
+
+/* send_tcp_dns_message(): goes through the send_tcp_robust() mock above (length prefix, then message) */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
+    uint8_t prefix[2] = {(uint8_t)(len >> 8), (uint8_t)(len & 0xFF)};
+    if (send_tcp_robust(fd, prefix, 2) < 0) return -1;
+    if (send_tcp_robust(fd, msg, len) < 0) return -1;
+    return (ssize_t)len;
+}

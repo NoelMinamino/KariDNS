@@ -149,7 +149,6 @@ typedef struct {
 typedef enum { TCP_STATE_READ_LEN, TCP_STATE_READ_BODY } tcp_state_t;
 typedef struct {
   tcp_state_t state;
-  uint8_t buf[65536 + 2];
   size_t accumulated;
   uint16_t msg_len;
   char client_ip[INET6_ADDRSTRLEN];
@@ -166,7 +165,23 @@ typedef struct {
   int applied_sndbuf;
   int orig_rcvbuf;   /* ゾーン値を当てる前の SO_RCVBUF (未指定ゾーンへ戻すため)。-1 = 取得失敗 */
   int orig_sndbuf;
+  /* 次のメッセージを受け取り終えるべき時刻 (CLOCK_MONOTONIC, ms)。accept 時に
+   * tcp-initial-timeout、メッセージを1つ受け取り終えるたびに tcp-idle-timeout で決め、
+   * メッセージの一部を受け取っても延ばさない (RFC 7766 §6.2.3)。 */
+  int64_t idle_deadline_ms;
+  /* buf は最後に置く: プールから払い出すときはこの手前までだけを 0 にする (D-04) */
+  uint8_t buf[65536 + 2];
 } tcp_stream_ctx_t;
+
+/* D-04: 平文 TCP の接続コンテキストは Backend 起動時に MAX_TCP_CLIENTS 個を確保し、
+ * ロックフリーのフリーリストで使い回す (accept のたびに calloc しない)。 */
+bool tcp_pool_init(void);
+tcp_stream_ctx_t *tcp_ctx_alloc(void);
+void tcp_ctx_free(tcp_stream_ctx_t *ctx);
+
+/* DNS メッセージを 2 バイトの長さと一緒に1回の sendmsg() で送る (RFC 7766 §8)。
+ * 送り切れなければ書き込み可能になるのを待って続ける。戻り値は送ったメッセージ長、失敗時 -1。 */
+ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len);
 
 typedef struct {
   bool is_finished;
@@ -233,6 +248,7 @@ struct worker_ctx {
 
   time_t log_current_sec;
   uint32_t log_emitted_this_sec;
+  _Atomic bool startup_failed; /* X-33: このワーカーは起動に失敗して終わった (main() が join する) */
 
   udp_batch_ctx_t batch;
 };
@@ -487,12 +503,16 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
 /* broker_connect_opts() がブローカー側で TCP ソケットへ設定する値 (0 = 未指定)。
  * rcvbuf / sndbuf は connect() 前に設定するので SYN で通知する初期ウィンドウから効く。
  * mss は FreeBSD では未接続ソケットに mssdflt (既定 536) を超える値を設定できないため、
- * connect() 成功後に設定する (送信 MSS を下げる方向のみ)。 */
+ * connect() 成功後に設定する (送信 MSS を下げる方向のみ)。
+ * connect_timeout_ms は接続完了を待つ上限 (0 = BROKER_CONNECT_TIMEOUT_MS)。待つのは
+ * 要求側で、ブローカーは非ブロッキングの connect() を始めた fd をすぐに返す (O-04)。 */
 typedef struct {
   int mss;
   int rcvbuf;
   int sndbuf;
+  int connect_timeout_ms;
 } tcp_sockopts_t;
+#define BROKER_CONNECT_TIMEOUT_MS 4000
 
 /* ブローカーへの connect 代行要求 (要求側と子プロセスで共有する唯一の定義) */
 typedef struct {
@@ -502,6 +522,8 @@ typedef struct {
   tcp_sockopts_t tcp_opts;
 } broker_req_t;
 
+/* family は AF_INET / AF_INET6、または AF_UNIX (起動時に設定された dnstap ソケットだけ。
+ * dnstap の再接続用)。戻り値は接続済みでブロッキングモードの fd、失敗時 -1。 */
 int broker_connect(int family, int type, struct sockaddr *addr, size_t addr_len);
 int broker_connect_opts(int family, int type, struct sockaddr *addr, size_t addr_len,
                         const tcp_sockopts_t *tcp_opts);
@@ -526,7 +548,7 @@ void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_
 void *control_thread_func(void *arg);
 void *response_logger_thread_func(void *arg);
 void *query_logger_thread_func(void *arg);
-void init_async_io_pool(void);
+bool init_async_io_pool(void);
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
@@ -604,7 +626,7 @@ extern int g_pid_fd;
 extern char g_pid_file_path[1024];
 extern volatile sig_atomic_t g_supervisor_should_exit;
 extern volatile sig_atomic_t g_supervisor_got_sighup;
-extern volatile sig_atomic_t g_backend_should_exit;
+extern _Atomic int g_backend_should_exit;
 
 bool enqueue_async_io_task(const async_io_task_t *task);
 void *async_io_worker_func(void *arg);
@@ -641,6 +663,8 @@ extern _Atomic int g_tcp_high_water;
 extern _Atomic int g_bound_workers;
 extern _Atomic bool g_frontend_alive;
 extern _Atomic bool g_privilege_drop_complete;
+/* Backend の通常の終了 (dnstap の STOP/FINISH の後に _exit)。O-03 / O-15 */
+__attribute__((noreturn)) void backend_shutdown(int code);
 extern _Atomic bool g_qlog_circuit_broken;
 extern resp_log_entry_t g_resp_log_ring[RESP_LOG_RING_SIZE];
 extern _Atomic uint64_t g_resp_log_tail;

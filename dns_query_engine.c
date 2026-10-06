@@ -1109,6 +1109,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                 if (!tinydns_record_currently_valid(rec, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &eff_ttl)) continue;
                 found = true;
                 wc_found = true;
+                t_query_rrl_info.wildcard = true; /* D-05: RRL は "*.<ゾーン>" で数える */
                 uint16_t rec_type = rec->type_code;
                 bool follow_cname = false;
                 if (rec_type == 5) {
@@ -1244,6 +1245,7 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                                   res, max_res_len, offset, comp_ctx, ancount, &glue);
               if (ww < 0) this_qtx_failed = true;
               else if (ww > 0) wc_found = qtx_matched = true;
+              if (wc_found) t_query_rrl_info.wildcard = true; /* D-05 */
             }
             if (wc_found || this_qtx_failed) break;
 
@@ -1973,17 +1975,53 @@ STATIC_TEST bool question_section_matches(const uint8_t *resp, size_t resp_len,
   return memcmp(req + roff, resp + soff, 4) == 0;
 }
 
+/* 2 バイトの長さとメッセージを1回の writev() で書く (RFC 7766 §8)。書き切れなければ
+ * timeout_ms まで書き込み可能を待って続ける。戻り値はメッセージ長、失敗時 -1。 */
+static ssize_t write_dns_tcp_timeout(int fd, const uint8_t *msg, size_t len, uint32_t timeout_ms) {
+  int64_t deadline = monotonic_ms() + timeout_ms;
+  uint8_t prefix[2] = { (uint8_t)(len >> 8), (uint8_t)(len & 0xFF) };
+  struct iovec iov[2] = { { .iov_base = prefix, .iov_len = 2 },
+                          { .iov_base = (void *)(uintptr_t)msg, .iov_len = len } };
+  struct iovec *cur = iov;
+  int cnt = 2;
+  while (cnt > 0) {
+    uint32_t rem = remaining_ms(deadline);
+    if (rem == 0) return -1;
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+    int ret = poll(&pfd, 1, (int)rem);
+    if (ret < 0 && errno == EINTR) continue;
+    if (ret <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return -1;
+    ssize_t n = writev(fd, cur, cnt);
+    if (n <= 0) {
+      if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+      return -1;
+    }
+    while (cnt > 0 && (size_t)n >= cur->iov_len) {
+      n -= (ssize_t)cur->iov_len;
+      cur++;
+      cnt--;
+    }
+    if (cnt > 0) {
+      cur->iov_base = (uint8_t *)cur->iov_base + n;
+      cur->iov_len -= (size_t)n;
+    }
+  }
+  return (ssize_t)len;
+}
+
 STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss_len,
                                const uint8_t *query, size_t query_len,
                                uint8_t *resp_out, size_t resp_out_cap,
                                uint32_t timeout_ms) {
   if (!ss || !query || !resp_out) return -1;
-  int fd = broker_connect(ss->ss_family, SOCK_STREAM, (struct sockaddr *)ss, ss_len);
+  /* D-20: 接続の完了待ちも同じ締切に含める (以前はブローカーの固定 4 秒) */
+  tcp_sockopts_t copts = { .connect_timeout_ms = timeout_ms > 0 ? (int)timeout_ms : 1 };
+  int64_t deadline = monotonic_ms() + timeout_ms;
+  int fd = broker_connect_opts(ss->ss_family, SOCK_STREAM, (struct sockaddr *)ss, ss_len, &copts);
   if (fd < 0) return -1;
+  timeout_ms = remaining_ms(deadline);
 
-  uint8_t len_prefix[2] = { (uint8_t)(query_len >> 8), (uint8_t)(query_len & 0xFF) };
-  if (write_all_timeout(fd, len_prefix, 2, timeout_ms) != 2 ||
-      write_all_timeout(fd, query, query_len, timeout_ms) != (ssize_t)query_len) {
+  if (query_len > 65535 || write_dns_tcp_timeout(fd, query, query_len, timeout_ms) != (ssize_t)query_len) {
     close(fd);
     return -1;
   }
@@ -1997,6 +2035,8 @@ STATIC_TEST ssize_t forward_via_tcp(const struct sockaddr_storage *ss, size_t ss
   close(fd);
   return got;
 }
+
+_Thread_local query_rrl_info_t t_query_rrl_info;
 
 _Thread_local static uint8_t s_forward_req_buf[65535];
 _Thread_local static uint8_t s_forward_res_buf[65535];
@@ -2044,25 +2084,44 @@ STATIC_TEST int dispatch_forward_zone(zone_config_t *zcfg, const uint8_t *req, s
       continue;
     }
 
+    /* D-20: 残り時間を、まだ試していないフォワーダー (このフォワーダーを含む) で等分する。
+     * 最初のフォワーダーが応答しなくても、後ろのフォワーダーに時間が残る。 */
+    uint32_t share = rem / (uint32_t)(zcfg->forwarders_count - i);
+    if (share == 0) share = 1;
+    int64_t fwd_deadline = monotonic_ms() + share;
+
     ssize_t got = -1;
+    bool mismatched = false;
     if (send(sock, s_forward_req_buf, req_len, 0) == (ssize_t)req_len) {
-      struct pollfd pfd = { .fd = sock, .events = POLLIN };
-      if (poll(&pfd, 1, (int)rem) > 0)
-        got = recv(sock, s_forward_res_buf, sizeof(s_forward_res_buf), 0);
+      /* ID・QR・質問が一致する応答だけを受け取る (RFC 5452 §9.1)。一致しないデータグラムは
+       * 捨てて、このフォワーダーの持ち時間が尽きるまで待ち続ける (D-20)。 */
+      for (;;) {
+        uint32_t wait_ms = remaining_ms(fwd_deadline);
+        if (wait_ms == 0) break;
+        struct pollfd pfd = { .fd = sock, .events = POLLIN };
+        int pr = poll(&pfd, 1, (int)wait_ms);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) break;
+        ssize_t n = recv(sock, s_forward_res_buf, sizeof(s_forward_res_buf), 0);
+        if (n < 0) break; /* ICMP unreachable など: 次のフォワーダーへ */
+        if (n >= (ssize_t)DNS_HEADER_SIZE &&
+            ((s_forward_res_buf[0] << 8) | s_forward_res_buf[1]) == fresh_id &&
+            (s_forward_res_buf[2] & 0x80) &&
+            question_section_matches(s_forward_res_buf, (size_t)n, req, req_len)) {
+          got = n;
+          break;
+        }
+        mismatched = true;
+      }
     }
     close(sock);
 
+    if (mismatched)
+      syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' returned a mismatched "
+             "response (id/question mismatch), discarded", zcfg->domain, fwd->ip, fwd->port);
     if (got < (ssize_t)DNS_HEADER_SIZE) {
       syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' timed out or failed, trying next",
              zcfg->domain, fwd->ip, fwd->port);
-      continue;
-    }
-
-    uint16_t resp_id = (s_forward_res_buf[0] << 8) | s_forward_res_buf[1];
-    if (resp_id != fresh_id || !(s_forward_res_buf[2] & 0x80) ||
-        !question_section_matches(s_forward_res_buf, (size_t)got, req, req_len)) {
-      syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' returned a mismatched "
-             "response (id/question mismatch), discarding", zcfg->domain, fwd->ip, fwd->port);
       continue;
     }
 
@@ -2122,6 +2181,11 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
     return false;
   }
 
+  /* program-user は fork 前に解決する (O-18: fork した子で getpwnam() を呼ばない) */
+  uid_t prog_uid = (uid_t)-1;
+  gid_t prog_gid = (gid_t)-1;
+  bool prog_user_found = zcfg->program_user && lookup_user_ids(zcfg->program_user, &prog_uid, &prog_gid);
+
   int in_pipe[2];  // parent(karidns) write -> child(script) stdin
   int out_pipe[2]; // child(script) stdout -> parent(karidns) read
   if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
@@ -2163,13 +2227,12 @@ bool spawn_one_program_plugin(zone_config_t *zcfg, const char *view_name, progra
     }
 
     if (zcfg->program_user) {
-      struct passwd *pwd = getpwnam(zcfg->program_user);
-      if (!pwd) { _exit(126); }
+      if (!prog_user_found) { _exit(126); }
       if (geteuid() == 0) {
         if (setgroups(0, NULL) != 0) _exit(126);
-        if (setgid(pwd->pw_gid) != 0) _exit(126);
-        if (setuid(pwd->pw_uid) != 0) _exit(126);
-      } else if (pwd->pw_uid != geteuid() || pwd->pw_uid != getuid()) {
+        if (setgid(prog_gid) != 0) _exit(126);
+        if (setuid(prog_uid) != 0) _exit(126);
+      } else if (prog_uid != geteuid() || prog_uid != getuid()) {
         // 非root起動では別ユーザーへ切り替えられない。main()の起動前検証
         // (validate_program_zone_users) で弾かれるはずだが念のため fail-closed。
         fprintf(stderr, "[FATAL] Zone '%s': program-user '%s' differs from the non-root user "
@@ -2235,14 +2298,14 @@ void spawn_program_zone_plugins(server_config_t *cfg) {
            "allow-program-zones is not set to yes in options{}. Refusing to start.", count);
     fprintf(stderr, "[FATAL] type \"program\" zones require "
             "'allow-program-zones yes;' in options{}.\n");
-    exit(EXIT_FAILURE);
+    backend_exit(EXIT_FAILURE); /* O-15: スレッド起動後に Backend から呼ばれる */
   }
 
   syslog(LOG_WARNING, "[Plugin] %d program zone(s) enabled. "
          "This is a TEST-ONLY feature; do not use in production.", count);
 
   g_program_plugins = calloc(count, sizeof(program_plugin_t));
-  if (!g_program_plugins) exit(EXIT_FAILURE);
+  if (!g_program_plugins) backend_exit(EXIT_FAILURE);
 
   int idx = 0;
   for (view_config_t *v = cfg->views; v; v = v->next) {
@@ -2498,6 +2561,8 @@ int process_dns_query_impl_cap(const uint8_t *req, size_t req_len, uint8_t *res,
                                bool is_tcp, rate_limit_config_t **out_rrl_cfg,
                                zone_db_snapshot_t *snap, server_config_t *cfg,
                                zone_db_entry_t **out_matched_entry) {
+  t_query_rrl_info.zone = NULL; /* D-05: 早い段階で返す応答 (エラー) のために先に消す */
+  t_query_rrl_info.wildcard = false;
   if (req_len < DNS_HEADER_SIZE) {
     return 0; // 不正な短いパケットは無応答で破棄
   }
@@ -2558,6 +2623,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   zone_config_t *matched_zcfg = (db_entry && view && cfg)
       ? find_zone_config_in_view(cfg, view->name, db_entry->domain)
       : NULL;
+  /* D-05: RRL のキー (NXDOMAIN はゾーン名、ワイルドカードの答えは "*.<ゾーン>") */
+  t_query_rrl_info.zone = db_entry ? db_entry->domain : NULL;
+  t_query_rrl_info.wildcard = false;
   if (out_rrl_cfg) {
     *out_rrl_cfg = cfg ? &cfg->rrl : NULL;
     if (matched_zcfg && matched_zcfg->rrl.configured) {
@@ -2966,7 +3034,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
         struct sockaddr_storage ss;
         if (resolve_ip_port_to_sockaddr(client_ip, 0, &ss) > 0) {
-          if (rrl_is_client_exhausted(&ss, rrl)) {
+          /* D-05: 応答を作る前なので、この名前・型への NOERROR のバケット (と all-per-second) を見る */
+          rrl_key_t key = { .cls = RRL_RESP_NOERROR, .name = qname, .qtype = qtype, .qclass = qclass };
+          if (rrl_key_exhausted(&ss, &key, rrl)) {
             return 0; // スクリプトを叩かずにドロップ
           }
         }
@@ -3270,4 +3340,42 @@ int process_dns_query_cap(const uint8_t *req, size_t req_len, uint8_t *res,
     record_observatory_response(matched_entry, rcode, ancount);
   }
   return ret;
+}
+
+/* dnstap Message.query_zone (field 11) を埋める (O-03)。dnstap の送信スレッドが送る直前に
+ * dnstap_set_zone_filler() 経由で呼ぶ (クエリの経路では呼ばない)。 */
+void dnstap_fill_query_zone(dnstap_event_meta_t *meta, const uint8_t *wire, size_t wire_len) {
+    meta->query_zone_len = 0;
+    if (wire_len <= DNS_HEADER_SIZE || ((wire[4] << 8) | wire[5]) == 0) return;
+    char qname[DNS_NAME_TEXT_SIZE];
+    uint16_t qtype = 0, qclass = 0;
+    size_t qend = 0;
+    if (!parse_query_question_fast(wire, wire_len, qname, sizeof(qname), &qtype, &qclass, &qend)) return;
+    char client_ip[INET6_ADDRSTRLEN] = "";
+    if (meta->client_addr.ss_family == AF_INET)
+        inet_ntop(AF_INET, &((const struct sockaddr_in *)&meta->client_addr)->sin_addr, client_ip, sizeof(client_ip));
+    else if (meta->client_addr.ss_family == AF_INET6)
+        inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&meta->client_addr)->sin6_addr, client_ip, sizeof(client_ip));
+
+    /* 応答を作ったときと同じく、クライアントのビューで QNAME を含む最も近いゾーンを引く。
+     * 送信時点のスナップショットなので、その間にリロードがあれば新しいゾーン構成で決まる。 */
+    char zone[DNS_NAME_TEXT_SIZE];
+    bool found = false;
+    rcu_aux_read_lock();
+    zone_db_snapshot_t *snap = acquire_zone_snapshot();
+    view_snapshot_t *view = snap ? select_view(snap, client_ip) : NULL;
+    zone_db_entry_t *entry = view ? find_zone_in_view(view, qname) : NULL;
+    if (entry) {
+        strlcpy(zone, entry->domain, sizeof(zone));
+        found = true;
+    }
+    rcu_aux_read_unlock();
+    if (!found) return;
+    if (zone[0] == '\0' || strcmp(zone, ".") == 0) {
+        meta->query_zone[0] = 0; /* ルートゾーン */
+        meta->query_zone_len = 1;
+        return;
+    }
+    long n = write_uncompressed_name(meta->query_zone, 0, sizeof(meta->query_zone), zone);
+    if (n > 0) meta->query_zone_len = (uint16_t)n;
 }
