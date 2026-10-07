@@ -231,6 +231,37 @@ static const char *type_mnemonic(const char *line) {
     return mn;
 }
 
+/* The RRSIG cache in dns_wire.c passed an uninitialized start offset to decode_concat_b64_rdata(); a stale
+ * stack value of 1..4 put that many garbage octets in front of the signature (seen as a round-trip failure
+ * on FreeBSD 14.4 only). Dirty the stack with each value before parsing: the RDATA must not change. */
+static void __attribute__((noinline)) dirty_stack(size_t v) {
+    volatile size_t s[4096];
+    for (size_t i = 0; i < 4096; i++) s[i] = v;
+}
+
+static void test_rrsig_cache_signature(void) {
+    printf("[TEST] dns_wire: RRSIG signature cache independent of stale stack contents...\n");
+    const char *line = NULL;
+    for (size_t i = 0; i < N(ROUNDTRIP_LINES); i++)
+        if (!strncmp(ROUNDTRIP_LINES[i], "IN RRSIG ", 9)) line = ROUNDTRIP_LINES[i];
+    assert(line);
+    uint8_t ref[4096], rd[4096];
+    size_t reflen = 0, rdlen = 0;
+    uint16_t type = 0;
+    for (size_t v = 0; v <= 8; v++) {
+        dirty_stack(v);
+        zone_arena_t a;
+        assert(parse_line(&a, line));
+        assert(wire_rdata(&a, v ? rd : ref, sizeof(rd), v ? &rdlen : &reflen, &type));
+        zone_arena_destroy(&a);
+        if (v && (rdlen != reflen || memcmp(rd, ref, rdlen) != 0)) {
+            fprintf(stderr, "stale stack value %zu changed the RRSIG RDATA (%zu -> %zu octets)\n", v, reflen, rdlen);
+            assert(0);
+        }
+    }
+    printf("  -> passed.\n");
+}
+
 static void test_round_trip_all_types(void) {
     printf("[TEST] dag: display -> zone parser round trip for %zu RR presentation forms...\n", N(ROUNDTRIP_LINES));
     size_t checked = 0, unreadable = 0;
@@ -889,6 +920,7 @@ int main(void) {
     test_character_string_escaping();
     test_amtrelay_layout();
     test_dig_compat_formatting();
+    test_rrsig_cache_signature();
     test_round_trip_all_types();
     test_truncation_robustness();
     test_dag_cli_parsing_helpers_and_error_paths();

@@ -4414,7 +4414,7 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                         size_t max_dec_len = b64_len * 3 / 4 + 4;
                         uint8_t *dec_buf = arena_alloc(arena, max_dec_len);
                         if (dec_buf) {
-                            size_t real_len;
+                            size_t real_len = 0;   /* 入出力: decode_concat_b64_rdata() はこの位置から書き込む */
                             if (decode_concat_b64_rdata(&rec->rdata[8], rec->rdata_count - 8, dec_buf, max_dec_len, &real_len) == 0) {
                                 rec->cache.rrsig.signature = dec_buf;
                                 rec->cache.rrsig.signature_len = real_len;
