@@ -3008,11 +3008,10 @@ static void print_lookup_stats(const display_opts_t *dopt, const query_opts_t *q
     printf("\n");
 }
 
-/* "; <<>> dag <<>> ..." の見出しと、送信したクエリの 16 進ダンプ。qo->no_cmd_banner は検索リストの
- * 2 番目以降の候補 (+qr のとき dig は見出しを 1 回だけ出す) */
-static void print_lookup_preamble(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
-                                  const char *qtype_s, const char *server, int port, bool use_tcp,
-                                  const uint8_t *pkt, size_t pkt_len, bool no_hexdump_query) {
+/* "; <<>> dag <<>> ..." の見出し (+cmd)。qo->no_cmd_banner は検索リストの 2 番目以降の候補
+ * (+qr のとき dig は見出しを 1 回だけ出す)。通常の問い合わせと +trace (dag_trace.c) が使う。 */
+void dag_print_cmd_banner(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
+                          const char *qtype_s, const char *server, int port, bool use_tcp) {
     if (dopt->short_mode || dopt->yaml) return;
     if (dopt->show_cmd && !qo->no_cmd_banner) {
         printf("\n"); /* dig starts the banner with an empty line */
@@ -3035,6 +3034,14 @@ static void print_lookup_preamble(const query_opts_t *qo, const display_opts_t *
         }
         printf(";; global options: +cmd\n");
     }
+}
+
+/* 見出しと、送信したクエリの 16 進ダンプ */
+static void print_lookup_preamble(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
+                                  const char *qtype_s, const char *server, int port, bool use_tcp,
+                                  const uint8_t *pkt, size_t pkt_len, bool no_hexdump_query) {
+    if (dopt->short_mode || dopt->yaml) return;
+    dag_print_cmd_banner(qo, dopt, qname, qtype_s, server, port, use_tcp);
     if (!no_hexdump_query) {
         printf("Query (%zu bytes):\n", pkt_len);
         hexdump(pkt, pkt_len);
@@ -3818,7 +3825,8 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +tcp-window=N                Force TCP Receive/Send Window Size to N bytes\n"
         "  +[no]fail                    Do not try next server if SERVFAIL is received\n"
         "  +[no]trace                   Trace delegation hierarchy down from root servers (honors +tcp; falls back to TCP on truncated responses;\n"
-        "                               ignores ADDITIONAL section unless +glue is given; implies +noadditional;\n"
+        "                               ignores ADDITIONAL section unless +glue is given; implies +noadditional,\n"
+        "                               +dnssec and +authority like dig (later options override them);\n"
         "                               stops at a CNAME answer like dig, +trace2 follows it)\n"
         "  +[no]trace2[=brief|normal|verbose]\n"
         "                               Resolve iteratively like a full resolver (BIND/Unbound) without any local resolver:\n"
@@ -4918,6 +4926,11 @@ KARIDNS_TOOL_FN int parse_query_arg_token(int argc, char **argv, int i, query_sp
             spec->do_trace = true;
             /* BIND dig 同様、+trace は +noadditional を含意する (後続の +additional で上書き可) */
             spec->dopt.show_additional = false;
+            /* X-45: dig 9.20 の +trace は +dnssec と +authority も含意する (後続の +nodnssec / +noauthority で
+             * 上書き可。"+noall +answer +trace" でも委任の NS/DS が出る。実機で確認) */
+            spec->qo.want_opt = true;
+            spec->qo.dnssec_ok = true;
+            spec->dopt.show_authority = true;
         } else if (strcmp(arg, "+notrace") == 0) {
             spec->do_trace = false;
         } else if (strcmp(arg, "+trace2") == 0 || strncmp(arg, "+trace2=", 8) == 0) {

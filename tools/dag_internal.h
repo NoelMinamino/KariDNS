@@ -478,6 +478,9 @@ void print_tsig_verify_error(int err, const uint8_t *resp, size_t n);
 int dag_expand_name(const uint8_t *pkt, size_t pkt_len, size_t off, size_t *next, zone_arena_t *arena, char **out);
 const char *find_sig_pseudo_rr(const uint8_t *pkt, size_t pkt_len, size_t offset, uint16_t arcount, size_t *rr_off);
 const char *format_duration_text(uint32_t secs, char *buf, size_t buf_size);
+/* "; <<>> dag <<>> ..." banner, "; (N servers found)", ";; global options: +cmd" (dig: printed when +cmd) */
+void dag_print_cmd_banner(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
+                          const char *qtype_s, const char *server, int port, bool use_tcp);
 const char *get_ede_error_string(uint16_t code);
 void format_rdata_for_display(const uint8_t *pkt, size_t pkt_len, uint16_t type,
                              size_t abs_offset, uint16_t rdlen,

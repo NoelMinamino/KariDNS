@@ -132,6 +132,9 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         goto cleanup;
     }
 
+    /* X-45: dig +trace starts with the same banner as a normal lookup (found in the live comparison) */
+    dag_print_cmd_banner(qo, dopt, qname, qtype_s, eff_server, port, eff_use_tcp);
+
     if (!no_hexdump_query && !dopt->yaml) {
         printf("Query (%zd bytes):\n", root_qlen);
         hexdump(root_qbuf, root_qlen);
@@ -330,6 +333,9 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
         char ns_owners[16][256];
         int ns_count = 0;
         trace_collect_rrs_by_type(resp, n, &offset, nscount, 2 /* NS */, ns_names, ns_owners, &ns_count, 16);
+        /* X-45: an Authority section without NS (SOA, NSEC: a NODATA answer, or an RFC 9824 compact denial with
+         * RCODE NOERROR) is not a referral: the trace ends here without a message, like dig */
+        if (ns_count == 0) break;
 
         int new_target_count = 0;
         char new_target_ips[16][64];
