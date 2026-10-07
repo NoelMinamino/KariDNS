@@ -129,9 +129,13 @@ attack() {
 echo "[+] Raw control-channel attacks (port ${PORT})..."
 attack bad_hmac "AUTH_FAILED"
 attack unknown_cmd "AUTH_FAILED"
-# a line longer than the 1024-byte buffer: the server drops the client without a reply
-# (dns_server_core.c control loop, "buf_len >= sizeof(c->buf) - 1")
-attack giant_cmd "<closed>"
+# a line longer than the 1024-byte buffer: "ERROR buffer overflow", logged, client dropped (X-47)
+attack giant_cmd "ERROR buffer overflow"
+if grep -q "\[Control\] Command buffer overflow, dropping client" "${TMP_DIR}/server.log"; then
+    echo "  [OK] buffer overflow logged"
+else
+    fail "giant_cmd: '[Control] Command buffer overflow' not logged"
+fi
 attack silent "<closed>"
 
 # expect_exit <expected status> <output regex or ""> <label> <command...>

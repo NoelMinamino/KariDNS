@@ -2994,13 +2994,8 @@ void *control_thread_func(void *arg) {
           free_ctrl_client(cfd);
           continue;
         }
+        /* 行の処理後は buf_len < sizeof(c->buf) - 1 (改行の無いまま満杯になったクライアントは下で切断する) */
         size_t space_left = sizeof(c->buf) - c->buf_len - 1;
-        if (space_left == 0) {
-            send(cfd, "ERROR buffer overflow\n", 22, 0);
-            syslog(LOG_ERR, "[Control] Command buffer overflow, dropping client");
-            free_ctrl_client(cfd);
-            continue;
-        }
         ssize_t r = recv(cfd, c->buf + c->buf_len, space_left, 0);
         if (r <= 0) {
           free_ctrl_client(cfd);
@@ -3330,6 +3325,9 @@ void *control_thread_func(void *arg) {
           memmove(c->buf, nl + 1, rem);
           c->buf_len = rem;
         } else if (c->buf_len >= sizeof(c->buf) - 1) {
+          /* X-47: 1 行がバッファ (1023 バイト + NUL) に収まらない。理由を返してから切断する */
+          send(cfd, "ERROR buffer overflow\n", 22, 0);
+          syslog(LOG_ERR, "[Control] Command buffer overflow, dropping client");
           free_ctrl_client(cfd);
         }
       } else if (ev_list[i].filter == EVFILT_SIGNAL && ev_list[i].ident == SIGHUP) {
