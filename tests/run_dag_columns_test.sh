@@ -40,6 +40,7 @@ ns1  IN A   192.0.2.1
 www  IN A   192.0.2.80
 a-very-long-owner-name-for-columns IN A 192.0.2.81
 big  2147483647 IN A 192.0.2.82
+nx   IN NSEC nx2.col.test. RRSIG NSEC NXNAME
 EOF
 
 cat > "$W/k.conf" <<EOF
@@ -95,6 +96,8 @@ check "question line (';' not counted)" "www.col.test A +noall +question" \
     ";www.col.test.<T><T><T>IN<T>A"
 check "question line +multiline" "www.col.test A +multiline +noall +question" \
     ";www.col.test.<T><T>IN A"
+check "type 128 (RFC 9824 NXNAME) printed as TYPE128 like dig 9.20" "nx.col.test NSEC +noall +answer" \
+    "nx.col.test.<T><T>300<T>IN<T>NSEC<T>nx2.col.test. RRSIG NSEC TYPE128"
 check "+multiline SOA (BIND soa_6.c layout)" "col.test SOA +multiline +noall +answer" \
 "col.test.<T><T>300 IN SOA ns1.col.test. hostmaster.col.test. (
 <T><T><T><T>1          ; serial

@@ -963,7 +963,7 @@ void decode_and_print_edns_option(const uint8_t *pkt, size_t p,
             for (uint16_t j = 0; j < olen; j += 2) {
                 uint16_t mq = (d[j] << 8) | d[j + 1];
                 char tbuf[16];
-                const char *mq_name = format_type_name(mq, tbuf, sizeof(tbuf));
+                const char *mq_name = dag_type_name(mq, tbuf, sizeof(tbuf));
                 if (j > 0) printf(" ");
                 printf("%s", mq_name);
             }

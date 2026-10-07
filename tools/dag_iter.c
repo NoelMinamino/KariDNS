@@ -672,7 +672,7 @@ static void it_print_hop_header(const it_ctx_t *ctx, const char *qname, uint16_t
                                 const char *addr, const char *nsname, const char *zone) {
     if (ctx->depth == 0 || !it_out_enabled(ctx)) return;
     char tbuf[32];
-    const char *tname = format_type_name(qtype, tbuf, sizeof(tbuf));
+    const char *tname = dag_type_name(qtype, tbuf, sizeof(tbuf));
     printf(";; [sub %d] %.*s/%s @%s(%.*s) for %.*s\n", ctx->depth,
            it_disp_len(qname), qname, tname, addr,
            it_disp_len(nsname), nsname, it_disp_len(zone), zone);
@@ -958,7 +958,7 @@ static void it_iterate(it_ctx_t *ctx, const char *qname, uint16_t qtype, it_resu
             if (it_show_note(ctx)) {
                 printf(";; qname minimisation: %s for %.*s/%s, retrying with full name\n",
                        dag_iter_kind_name(r->kind), it_disp_len(send_name), send_name,
-                       format_type_name(send_type, tbuf, sizeof(tbuf)));
+                       dag_type_name(send_type, tbuf, sizeof(tbuf)));
             }
             qmin_on = false;
             continue;

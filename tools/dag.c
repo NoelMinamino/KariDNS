@@ -436,7 +436,7 @@ KARIDNS_TOOL_FN void decode_type_bitmap(const uint8_t *bitmap, size_t bitmap_len
                 if (b & (0x80 >> bit)) {
                     uint16_t type_code = (window << 8) | (byte_idx * 8 + bit);
                     char tbuf[32];
-                    const char *tname = format_type_name(type_code, tbuf, sizeof(tbuf));
+                    const char *tname = dag_type_name(type_code, tbuf, sizeof(tbuf));
                     if (out_len >= out_cap) return;
                     int n = snprintf(out + out_len, out_cap - out_len, "%s%s",
                                       (out_len > 0) ? " " : "", tname);
@@ -1481,7 +1481,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 if (dag_expand_name(pkt, pkt_len, abs_offset + 5, &next, &g_dag_arena, &target) == 0 &&
                     next <= abs_offset + rdlen) {
                     char tbuf[32];
-                    const char *tname = format_type_name(target_type, tbuf, sizeof(tbuf));
+                    const char *tname = dag_type_name(target_type, tbuf, sizeof(tbuf));
                     if (scheme == 1) {
                         sink_printf(sink, "%s NOTIFY %u %s", tname, port, target);
                     } else {
@@ -1514,7 +1514,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                 if (dag_expand_name(pkt, pkt_len, abs_offset + 18, &next, &g_dag_arena, &signer) == 0 &&
                     next <= abs_offset + rdlen) {
                     char cov_buf[32];
-                    const char *cov_str = (cov == 0) ? "0" : format_type_name(cov, cov_buf, sizeof(cov_buf));
+                    const char *cov_str = (cov == 0) ? "0" : dag_type_name(cov, cov_buf, sizeof(cov_buf));
                     char exp_buf[32], incep_buf[32];
                     format_rrsig_time(exp, exp_buf, sizeof(exp_buf));
                     format_rrsig_time(incep, incep_buf, sizeof(incep_buf));
@@ -1788,7 +1788,7 @@ KARIDNS_TOOL_FN void format_rdata_common(const uint8_t *pkt, size_t pkt_len, uin
                         uint16_t tc = (uint16_t)((i - boff) * 8 + (7 - bit));
                         if (tc == 0) continue;
                         char tbuf[32];
-                        sink_printf(sink, " %s", format_type_name(tc, tbuf, sizeof(tbuf)));
+                        sink_printf(sink, " %s", dag_type_name(tc, tbuf, sizeof(tbuf)));
                     }
                 }
             }
@@ -2169,7 +2169,7 @@ KARIDNS_TOOL_FN bool print_one_rr(const uint8_t *pkt, size_t pkt_len, size_t *of
         snprintf(cname_buf, sizeof(cname_buf), "CLASS%u", klass);
         cname = cname_buf;
     } else {
-        tname = format_type_name(type, tname_buf, sizeof(tname_buf));
+        tname = dag_type_name(type, tname_buf, sizeof(tname_buf));
         cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
     }
 
@@ -2423,7 +2423,7 @@ KARIDNS_TOOL_FN void print_sent_query(const uint8_t *pkt, size_t pkt_len, const 
                 snprintf(qcname_buf, sizeof(qcname_buf), "CLASS%u", qclass);
                 qcname = qcname_buf;
             } else {
-                qtname = format_type_name(qtype, qtname_buf, sizeof(qtname_buf));
+                qtname = dag_type_name(qtype, qtname_buf, sizeof(qtname_buf));
                 qcname = format_class_name(qclass, qcname_buf, sizeof(qcname_buf));
             }
             char idn_buf[512];
@@ -2697,7 +2697,7 @@ static bool dag_check_answer(const uint8_t *q, size_t qlen, const uint8_t *r, si
         if (dl > 1 && disp[dl - 1] == '.') dl--;
         char tbuf[32], cbuf[32];
         printf(";; ;; Question section mismatch: got %.*s/%s/%s\n", (int)dl, disp,
-               format_type_name((r[rnext] << 8) | r[rnext + 1], tbuf, sizeof(tbuf)),
+               dag_type_name((r[rnext] << 8) | r[rnext + 1], tbuf, sizeof(tbuf)),
                format_class_name((r[rnext + 2] << 8) | r[rnext + 3], cbuf, sizeof(cbuf)));
         return false;
     }
@@ -2807,7 +2807,7 @@ void print_response(const uint8_t *pkt, size_t pkt_len, axfr_state_t *axfr_state
                 snprintf(qcname_buf, sizeof(qcname_buf), "CLASS%u", qclass);
                 qcname = qcname_buf;
             } else {
-                qtname = format_type_name(qtype, qtname_buf, sizeof(qtname_buf));
+                qtname = dag_type_name(qtype, qtname_buf, sizeof(qtname_buf));
                 qcname = format_class_name(qclass, qcname_buf, sizeof(qcname_buf));
             }
             char idn_buf[512];
@@ -3006,6 +3006,17 @@ static void print_lookup_stats(const display_opts_t *dopt, const query_opts_t *q
         printf(";; WARNING -- Some TSIG could not be validated\n");
     }
     printf("\n");
+}
+
+/* dig 9.20 と同じ型の表記。共有の dag_type_name() (dns_utils.c) はサーバーと karicheck も使うので
+ * RFC 9824 の NXNAME (128) を知っているが、dig 9.20.29 は "TYPE128" と出す (dig 互換を優先する、ユーザー判断)。
+ * 入力の "NXNAME" は従来どおり受け付ける。 */
+const char *dag_type_name(uint16_t type, char *buf, size_t buf_size) {
+    if (type == 128) {
+        snprintf(buf, buf_size, "TYPE%u", type);
+        return buf;
+    }
+    return format_type_name(type, buf, buf_size);
 }
 
 /* "; <<>> dag <<>> ..." の見出し (+cmd)。qo->no_cmd_banner は検索リストの 2 番目以降の候補

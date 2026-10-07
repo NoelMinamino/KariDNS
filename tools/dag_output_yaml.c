@@ -188,7 +188,7 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
             char cname_buf[16];
             char name_esc[DNS_NAME_TEXT_SIZE * 2];
             yaml_single_quote_escape(name ? name : ".", name_esc, sizeof(name_esc));
-            const char *tname = format_type_name(qtype, tname_buf, sizeof(tname_buf));
+            const char *tname = dag_type_name(qtype, tname_buf, sizeof(tname_buf));
             const char *cname = format_class_name(qclass, cname_buf, sizeof(cname_buf));
             printf("        - '%s %s %s'\n", name_esc, cname, tname);
         }
@@ -231,7 +231,7 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
                 format_rdata_for_display(pkt, pkt_len, type, next + 10, rdlen, sig_rdata, sizeof(sig_rdata), dopt);
                 char raw[sizeof(sig_line)];
                 snprintf(raw, sizeof(raw), "%s %u %s %s %s", name, ttl, format_class_name(klass, cname_buf, sizeof(cname_buf)),
-                         format_type_name(type, tname_buf, sizeof(tname_buf)), sig_rdata);
+                         dag_type_name(type, tname_buf, sizeof(tname_buf)), sig_rdata);
                 yaml_single_quote_escape(raw, sig_line, sizeof(sig_line));
             }
         }
@@ -264,7 +264,7 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
                     snprintf(ttl_str, sizeof(ttl_str), "%u", ttl);
                 }
 
-                const char *tname = format_type_name(type, tname_buf, sizeof(tname_buf));
+                const char *tname = dag_type_name(type, tname_buf, sizeof(tname_buf));
                 const char *cname = format_class_name(klass, cname_buf, sizeof(cname_buf));
 
                 static char rdata_raw[65536];
