@@ -444,12 +444,6 @@ static void test_snapshot_rebuild_case_8(void) {
     release_zone_snapshot(snap);
 }
 
-static void test_snapshot_rebuild_case_9(void) {
-    printf("[TEST] Snapshot Rebuild: Zone serial mismatch detection...\n");
-    uint32_t s1 = 100, s2 = 105;
-    assert(s2 > s1);
-}
-
 static void test_snapshot_rebuild_case_10(void) {
     printf("[TEST] Snapshot Rebuild: Multiple views isolation...\n");
     wfile("v_int.zone", "$ORIGIN test.example.\n$TTL 60\n@ IN SOA ns h 1 2 3 4 5\n@ IN NS ns\nns IN A 10.0.0.1\n");
@@ -463,13 +457,6 @@ static void test_snapshot_rebuild_case_10(void) {
     assert(snap != NULL);
     assert(snap->view_count == 2);
     release_zone_snapshot(snap);
-}
-
-static void test_snapshot_rebuild_case_11(void) {
-    printf("[TEST] Snapshot Rebuild: Epoch retirement queue increment...\n");
-    uint64_t epoch = 10;
-    epoch++;
-    assert(epoch == 11);
 }
 
 static void test_snapshot_rebuild_case_12(void) {
@@ -565,12 +552,6 @@ static void test_snapshot_rebuild_case_19(void) {
     release_zone_snapshot(snap);
 }
 
-static void test_snapshot_rebuild_case_20(void) {
-    printf("[TEST] Snapshot Rebuild: ZONEMD verification placeholder...\n");
-    bool verified = true;
-    assert(verified == true);
-}
-
 static void test_snapshot_rebuild_case_21(void) {
     printf("[TEST] Snapshot Rebuild: Zone arena memory stats...\n");
     zone_arena_t arena;
@@ -625,14 +606,6 @@ static void test_snapshot_rebuild_case_25(void) {
     assert(parse_zone_fast(ztext, strlen(ztext), &arena, &ctx) >= 0);
     assert(build_zone_index(&arena, true) == 0);
     zone_arena_destroy(&arena);
-}
-
-static void test_snapshot_rebuild_case_26(void) {
-    printf("[TEST] Snapshot Rebuild: Master zone file modification detection...\n");
-    struct stat st;
-    memset(&st, 0, sizeof(st));
-    st.st_mtime = 123456789;
-    assert(st.st_mtime > 0);
 }
 
 static void test_snapshot_rebuild_case_27(void) {
@@ -766,12 +739,6 @@ static void test_snapshot_rebuild_type_change(void) {
     release_zone_snapshot(s3);
 }
 
-static void test_snapshot_rebuild_case_31(void) {
-    printf("[TEST] Snapshot Rebuild: Catalog zone COO syntax verification in snapshot...\n");
-    const char *coo_property = "coo.example.";
-    assert(strlen(coo_property) > 0);
-}
-
 /* R-28, RFC 9432 §4.3.2 / §5.4: a change of the group property keeps the member zone (same entry, no new
  * transfer); a change of the member node label still replaces it. */
 static zone_db_entry_t *cat32_step(zone_db_entry_t *cat, zone_config_t *zcfg, int serial, const char *label,
@@ -835,14 +802,6 @@ static void test_snapshot_rebuild_case_33(void) {
     assert(cidr_entry_parse(&cidr, "192.0.2.0/24") == true);
     assert(cidr.valid == true);
     assert(cidr.prefix == 24);
-}
-
-static void test_snapshot_rebuild_case_34(void) {
-    printf("[TEST] Snapshot Rebuild: Standby zone reload identical serial skip...\n");
-    uint32_t current_serial = 2026090101;
-    uint32_t new_serial = 2026090101;
-    bool should_skip = (current_serial == new_serial);
-    assert(should_skip == true);
 }
 
 static void test_snapshot_rebuild_case_35(void) {
@@ -924,9 +883,7 @@ int main(void) {
     test_snapshot_rebuild_case_6();
     test_snapshot_rebuild_case_7();
     test_snapshot_rebuild_case_8();
-    test_snapshot_rebuild_case_9();
     test_snapshot_rebuild_case_10();
-    test_snapshot_rebuild_case_11();
     test_snapshot_rebuild_case_12();
     test_snapshot_rebuild_case_13();
     test_snapshot_rebuild_case_14();
@@ -935,22 +892,18 @@ int main(void) {
     test_snapshot_rebuild_case_17();
     test_snapshot_rebuild_case_18();
     test_snapshot_rebuild_case_19();
-    test_snapshot_rebuild_case_20();
     test_snapshot_rebuild_case_21();
     test_snapshot_rebuild_case_22();
     test_snapshot_rebuild_case_23();
     test_snapshot_rebuild_case_24();
     test_snapshot_rebuild_case_25();
-    test_snapshot_rebuild_case_26();
     test_snapshot_rebuild_case_27();
     test_snapshot_rebuild_case_28();
     test_snapshot_rebuild_case_29();
     test_snapshot_rebuild_case_30();
     test_snapshot_rebuild_type_change();
-    test_snapshot_rebuild_case_31();
     test_snapshot_rebuild_case_32();
     test_snapshot_rebuild_case_33();
-    test_snapshot_rebuild_case_34();
     test_snapshot_rebuild_case_35();
     /* Remove the scratch directory in-process: detached snapshot GC threads may
      * still be running here, and fork()/exec from a multi-threaded process (as

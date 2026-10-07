@@ -2426,25 +2426,6 @@ static void test_parse_xfr_packet_ixfr_multiple_soa_transitions(void) {
     printf("  -> multi-step IXFR sequence passed.\n");
 }
 
-static void test_parse_xfr_packet_ixfr_duplicate_records(void) {
-    printf("[TEST] AXFR/IXFR: parse_xfr_packet duplicate record handling...\n");
-    axfr_session_t session;
-    memset(&session, 0, sizeof(session));
-    session.client_serial = 100;
-
-    assert(session.initial_soa_serial == 0);
-    printf("  -> duplicate record handling passed.\n");
-}
-
-static void test_parse_xfr_packet_unknown_custom_types(void) {
-    printf("[TEST] AXFR/IXFR: parse_xfr_packet private/custom RR types...\n");
-    axfr_session_t session;
-    memset(&session, 0, sizeof(session));
-
-    assert(session.is_extended_mode == false);
-    printf("  -> private/custom RR types passed.\n");
-}
-
 static void test_parse_xfr_packet_karidns_ext_tags_parsing(void) {
     printf("[TEST] AXFR/IXFR: parse_xfr_packet Option 65153 tag definitions...\n");
     axfr_session_t session;
@@ -2594,16 +2575,6 @@ static void test_handle_axfr_event_nonblocking_drain(void) {
     printf("  -> non-blocking socket drain passed.\n");
 }
 
-static void test_handle_axfr_event_intermediate_tsig_interval(void) {
-    printf("[TEST] AXFR/IXFR: handle_axfr_event intermediate TSIG frequency...\n");
-    axfr_session_t session;
-    memset(&session, 0, sizeof(session));
-    session.soa_count = 1;
-    session.soa_count++;
-    assert(session.soa_count == 2);
-    printf("  -> intermediate TSIG frequency passed.\n");
-}
-
 static void test_handle_axfr_event_extended_mode_hash_check(void) {
     printf("[TEST] AXFR/IXFR: handle_axfr_event Extended mode hash verification...\n");
     axfr_session_t session;
@@ -2631,14 +2602,6 @@ static void test_handle_axfr_event_eagain_and_partial_recv(void) {
     printf("  -> EAGAIN partial recv passed.\n");
 }
 
-static void test_handle_axfr_event_corrupt_packet_header(void) {
-    printf("[TEST] AXFR/IXFR: handle_axfr_event corrupt header rejection...\n");
-    uint8_t corrupt[12] = { 0 };
-    corrupt[3] = 2; // RCODE=SERVFAIL
-    assert((corrupt[3] & 0x0F) == 2);
-    printf("  -> corrupt header rejection passed.\n");
-}
-
 static void test_handle_axfr_event_out_of_zone_bailiwick_record(void) {
     printf("[TEST] AXFR/IXFR: handle_axfr_event out-of-bailiwick record filtering...\n");
     axfr_session_t session;
@@ -2648,13 +2611,6 @@ static void test_handle_axfr_event_out_of_zone_bailiwick_record(void) {
     assert(domain_names_match_ci("zone.example.", "zone.example.") == true);
     assert(domain_names_match_ci("rogue.attacker.com.", "zone.example.") == false);
     printf("  -> out-of-bailiwick record filtering passed.\n");
-}
-
-static void test_handle_axfr_event_soa_minimum_and_timers(void) {
-    printf("[TEST] AXFR/IXFR: handle_axfr_event SOA timers parsing...\n");
-    uint32_t refresh = 7200, retry = 3600, expire = 1209600, minimum = 300;
-    assert(refresh == 7200 && retry == 3600 && expire == 1209600 && minimum == 300);
-    printf("  -> SOA timers parsing passed.\n");
 }
 
 static void test_ixfr_txn_allocation_and_free_cycles(void) {
@@ -2678,41 +2634,6 @@ static void test_wait_for_active_axfr_immediate_and_timeout(void) {
     bool ok = wait_for_active_axfr(&entry, 100);
     assert(ok == true);
     printf("  -> wait_for_active_axfr immediate return passed.\n");
-}
-
-static void test_axfr_session_buffer_growth_and_reset(void) {
-    printf("[TEST] AXFR/IXFR: axfr_session buffer growth and reset...\n");
-    axfr_session_t s;
-    memset(&s, 0, sizeof(s));
-    s.initial_soa_serial = 100;
-    s.client_serial = 90;
-    s.is_ixfr = true;
-    assert(s.initial_soa_serial == 100);
-    assert(s.client_serial == 90);
-    assert(s.is_ixfr == true);
-    printf("  -> session buffer growth passed.\n");
-}
-
-static void test_axfr_client_tsig_fuzztime_validation(void) {
-    printf("[TEST] AXFR/IXFR: AXFR client TSIG fuzztime override...\n");
-    tsig_key_t key;
-    memset(&key, 0, sizeof(key));
-    key.fuzztime = 1700000000;
-    assert(key.fuzztime == 1700000000);
-    printf("  -> fuzztime override passed.\n");
-}
-
-static void test_axfr_catalog_zone_sync_flags(void) {
-    printf("[TEST] AXFR/IXFR: catalog zone member sync notification flags...\n");
-    zone_db_entry_t entry;
-    memset(&entry, 0, sizeof(entry));
-    entry.is_catalog_member = true;
-    assert(entry.is_catalog_member == true);
-    zone_config_t zcfg;
-    memset(&zcfg, 0, sizeof(zcfg));
-    zcfg.is_catalog = true;
-    assert(zcfg.is_catalog == true);
-    printf("  -> catalog zone sync flags passed.\n");
 }
 
 
@@ -2747,36 +2668,6 @@ static void test_snapshot_rcu_garbage_collection_epoch_advance(void) {
     printf("  -> epoch advance passed.\n");
 }
 
-static void test_snapshot_rcu_view_generation_tracking(void) {
-    printf("[TEST] Snapshot RCU: view generation atomic updates...\n");
-    view_snapshot_t view;
-    memset(&view, 0, sizeof(view));
-    view.name = "default";
-    assert(strcmp(view.name, "default") == 0);
-    printf("  -> view generation tracking passed.\n");
-}
-
-static void test_snapshot_rcu_multiple_views_isolation(void) {
-    printf("[TEST] Snapshot RCU: multiple views isolation...\n");
-    view_snapshot_t views[2];
-    memset(views, 0, sizeof(views));
-    views[0].name = "internal";
-    views[1].name = "external";
-    assert(views[0].name != views[1].name);
-    printf("  -> multiple views isolation passed.\n");
-}
-
-static void test_axfr_ixfr_multi_packet_delta_streaming(void) {
-    printf("[TEST] AXFR/IXFR: multi-packet delta streaming packet boundaries...\n");
-    axfr_session_t s;
-    memset(&s, 0, sizeof(s));
-    s.is_ixfr = true;
-    s.initial_soa_serial = 100;
-    s.client_serial = 90;
-    assert(s.is_ixfr == true);
-    printf("  -> multi-packet delta streaming passed.\n");
-}
-
 static void test_axfr_ixfr_soa_serial_equal_up_to_date(void) {
     printf("[TEST] AXFR/IXFR: SOA serial equal up-to-date immediate response...\n");
     zone_db_entry_t entry;
@@ -2785,99 +2676,6 @@ static void test_axfr_ixfr_soa_serial_equal_up_to_date(void) {
     atomic_init(&entry.serial, 2026092401);
     assert(atomic_load(&entry.serial) == 2026092401);
     printf("  -> serial equal up-to-date passed.\n");
-}
-
-static void test_axfr_ixfr_soa_serial_backward_rejection(void) {
-    printf("[TEST] AXFR/IXFR: SOA serial decreased rejection (serial arithmetic)...\n");
-    uint32_t cur = 100;
-    uint32_t client = 200;
-    // RFC 1982 serial comparison: (int32_t)(cur - client) < 0
-    assert((int32_t)(cur - client) < 0);
-    printf("  -> serial backward rejection passed.\n");
-}
-
-static void test_axfr_ixfr_non_contiguous_delta_fallback_to_axfr(void) {
-    printf("[TEST] AXFR/IXFR: non-contiguous delta gap triggers AXFR fallback...\n");
-    zone_db_entry_t entry;
-    memset(&entry, 0, sizeof(entry));
-    entry.ixfr_history.count = 1;
-    // History contains delta from 50->100, client asks for 10
-    assert(entry.ixfr_history.count == 1);
-    printf("  -> non-contiguous delta fallback passed.\n");
-}
-
-static void test_axfr_ixfr_delta_history_overflow_trim(void) {
-    printf("[TEST] AXFR/IXFR: delta history ring buffer capacity...\n");
-    zone_db_entry_t entry;
-    memset(&entry, 0, sizeof(entry));
-    assert(entry.ixfr_history.count == 0);
-    printf("  -> delta history trim passed.\n");
-}
-
-static void test_axfr_ixfr_session_tcp_disconnect_rollback(void) {
-    printf("[TEST] AXFR/IXFR: TCP disconnect during transfer rollback...\n");
-    axfr_session_t s;
-    memset(&s, 0, sizeof(s));
-    s.is_finished = false;
-    assert(s.is_finished == false);
-    printf("  -> TCP disconnect rollback passed.\n");
-}
-
-static void test_axfr_ixfr_streaming_buffer_size_limit(void) {
-    printf("[TEST] AXFR/IXFR: AXFR streaming 64KB message boundary...\n");
-    uint8_t buf[65536];
-    memset(buf, 0, sizeof(buf));
-    assert(sizeof(buf) == 65536);
-    printf("  -> streaming buffer limit passed.\n");
-}
-
-static void test_axfr_ixfr_intermediate_tsig_verification(void) {
-    printf("[TEST] AXFR/IXFR: intermediate TSIG periodic signature frequency...\n");
-    axfr_session_t s;
-    memset(&s, 0, sizeof(s));
-    s.soa_count = 1;
-    s.soa_count++;
-    assert(s.soa_count == 2);
-    printf("  -> intermediate TSIG frequency passed.\n");
-}
-
-static void test_axfr_ixfr_tsig_error_code_bad_key(void) {
-    printf("[TEST] AXFR/IXFR: TSIG error BADKEY (code 17)...\n");
-    uint16_t err = 17;
-    assert(err == 17);
-    printf("  -> BADKEY error passed.\n");
-}
-
-static void test_axfr_ixfr_tsig_error_code_bad_sig(void) {
-    printf("[TEST] AXFR/IXFR: TSIG error BADSIG (code 16)...\n");
-    uint16_t err = 16;
-    assert(err == 16);
-    printf("  -> BADSIG error passed.\n");
-}
-
-static void test_axfr_ixfr_tsig_error_code_bad_time(void) {
-    printf("[TEST] AXFR/IXFR: TSIG error BADTIME (code 18)...\n");
-    uint16_t err = 18;
-    assert(err == 18);
-    printf("  -> BADTIME error passed.\n");
-}
-
-static void test_axfr_ixfr_extended_mode_hash_mismatch(void) {
-    printf("[TEST] AXFR/IXFR: Extended mode hash mismatch fallback...\n");
-    axfr_session_t s;
-    memset(&s, 0, sizeof(s));
-    s.is_extended_mode = true;
-    assert(s.is_extended_mode == true);
-    printf("  -> extended mode hash mismatch passed.\n");
-}
-
-static void test_axfr_ixfr_catalog_zone_member_sync(void) {
-    printf("[TEST] AXFR/IXFR: catalog zone member synchronization flags...\n");
-    zone_db_entry_t entry;
-    memset(&entry, 0, sizeof(entry));
-    entry.is_catalog_member = true;
-    assert(entry.is_catalog_member == true);
-    printf("  -> catalog member sync passed.\n");
 }
 
 static void test_axfr_ixfr_out_of_bailiwick_record_drop(void) {
@@ -2938,20 +2736,6 @@ static void test_axfr_ixfr_tinydns_location_records_in_axfr(void) {
     printf("  -> tinydns location records passed.\n");
 }
 
-static void test_axfr_ixfr_tinydns_timestamp_records_in_axfr(void) {
-    printf("[TEST] AXFR/IXFR: tinydns timestamp format in AXFR...\n");
-    uint64_t ts = 1700000000;
-    assert(ts > 0);
-    printf("  -> tinydns timestamp passed.\n");
-}
-
-static void test_axfr_ixfr_rfc3597_generic_rdata_in_axfr(void) {
-    printf("[TEST] AXFR/IXFR: RFC 3597 generic RR wire serialization...\n");
-    uint8_t rdata[4] = { 1, 2, 3, 4 };
-    assert(rdata[0] == 1);
-    printf("  -> generic rdata in AXFR passed.\n");
-}
-
 static void test_axfr_ixfr_eagain_nonblocking_drain(void) {
     printf("[TEST] AXFR/IXFR: EAGAIN non-blocking socket drain simulation...\n");
     int sv[2];
@@ -2963,14 +2747,6 @@ static void test_axfr_ixfr_eagain_nonblocking_drain(void) {
     printf("  -> EAGAIN drain passed.\n");
 }
 
-static void test_axfr_ixfr_corrupt_packet_header_discard(void) {
-    printf("[TEST] AXFR/IXFR: corrupt packet header RCODE check...\n");
-    uint8_t pkt[12] = { 0 };
-    pkt[3] = 1; // FORMERR
-    assert((pkt[3] & 0x0F) == 1);
-    printf("  -> corrupt header discard passed.\n");
-}
-
 static void test_axfr_ixfr_wait_for_active_axfr_timeout(void) {
     printf("[TEST] AXFR/IXFR: wait_for_active_axfr timeout check...\n");
     zone_db_entry_t entry;
@@ -2979,13 +2755,6 @@ static void test_axfr_ixfr_wait_for_active_axfr_timeout(void) {
     bool ok = wait_for_active_axfr(&entry, 50);
     assert(ok == true);
     printf("  -> wait timeout passed.\n");
-}
-
-static void test_axfr_ixfr_soa_timers_refresh_retry_expire(void) {
-    printf("[TEST] AXFR/IXFR: SOA refresh, retry, expire validation...\n");
-    uint32_t refresh = 3600, retry = 1800, expire = 604800;
-    assert(refresh > retry && expire > refresh);
-    printf("  -> SOA timers passed.\n");
 }
 
 static void test_axfr_ixfr_ixfr_txn_arena_cleanup(void) {
@@ -3011,53 +2780,6 @@ static void test_axfr_ixfr_catalog_property_group_sync(void) {
     printf("  -> catalog group sync passed.\n");
 }
 
-static void test_axfr_ixfr_notify_trigger_on_update(void) {
-    printf("[TEST] AXFR/IXFR: trigger NOTIFY after zone reload...\n");
-    bool notify_pending = true;
-    assert(notify_pending == true);
-    printf("  -> notify trigger passed.\n");
-}
-
-static void test_axfr_ixfr_notify_source_ip_filter(void) {
-    printf("[TEST] AXFR/IXFR: NOTIFY source IP matching ACL...\n");
-    const char *src = "192.0.2.53";
-    assert(strcmp(src, "192.0.2.53") == 0);
-    printf("  -> notify source filter passed.\n");
-}
-
-static void test_axfr_ixfr_axfr_client_tsig_fuzztime(void) {
-    printf("[TEST] AXFR/IXFR: client TSIG fuzztime time travel...\n");
-    tsig_key_t key;
-    memset(&key, 0, sizeof(key));
-    key.fuzztime = 123456789;
-    assert(key.fuzztime == 123456789);
-    printf("  -> fuzztime time travel passed.\n");
-}
-
-static void test_axfr_ixfr_axfr_session_reset_lifecycle(void) {
-    printf("[TEST] AXFR/IXFR: axfr_session reset and re-initialization...\n");
-    axfr_session_t s;
-    memset(&s, 0, sizeof(s));
-    s.is_finished = true;
-    memset(&s, 0, sizeof(s));
-    assert(s.is_finished == false);
-    printf("  -> session reset lifecycle passed.\n");
-}
-
-static void test_axfr_ixfr_ixfr_diff_soa_ttl_change(void) {
-    printf("[TEST] AXFR/IXFR: IXFR diff generation on SOA TTL modification...\n");
-    uint32_t old_ttl = 300, new_ttl = 600;
-    assert(old_ttl != new_ttl);
-    printf("  -> SOA TTL change diff passed.\n");
-}
-
-static void test_axfr_ixfr_ixfr_diff_ns_glue_addition(void) {
-    printf("[TEST] AXFR/IXFR: IXFR diff generation on NS glue address addition...\n");
-    const char *glue_ip = "192.0.2.10";
-    assert(strlen(glue_ip) > 0);
-    printf("  -> NS glue addition diff passed.\n");
-}
-
 
 /* ------------------------------------------------------------------------ Round 3 tests (+60) */
 
@@ -3067,13 +2789,6 @@ static void test_axfr_ixfr_serial_equal_returns_single_soa(void) {
     strlcpy(entry.domain, "uptodate.example.", sizeof(entry.domain));
     atomic_init(&entry.serial, 2026092401);
     assert(atomic_load(&entry.serial) == 2026092401);
-}
-
-static void test_axfr_ixfr_serial_future_returns_single_soa(void) {
-    printf("[TEST] AXFR/IXFR: client serial ahead of server serial...\n");
-    uint32_t s_server = 100;
-    uint32_t s_client = 200;
-    assert((int32_t)(s_server - s_client) < 0);
 }
 
 static void test_axfr_ixfr_delta_single_delete_and_add(void) {
@@ -3163,24 +2878,6 @@ static void test_axfr_ixfr_extended_tag_ecs_tagdef(void) {
     size_t len = pack_tag_def_rdata(buf, sizeof(buf), &tag);
     assert(len > 0);
     free(tag.cidrs);
-}
-
-static void test_axfr_ixfr_extended_tag_ecs_trusted(void) {
-    printf("[TEST] Extended AXFR: ECS_TRUSTED resolver encoding...\n");
-    uint8_t tr_buf[64] = { 1, 10, '1', '0', '.', '0', '.', '0', '.', '1', '/', '8' };
-    assert(tr_buf[0] == 1);
-}
-
-static void test_axfr_ixfr_extended_tag_tinydns_locdef(void) {
-    printf("[TEST] Extended AXFR: TINYDNS_LOCDEF encoding...\n");
-    uint8_t tloc[7] = { 'u', 's', 24, 192, 0, 2, 0 };
-    assert(tloc[0] == 'u' && tloc[1] == 's');
-}
-
-static void test_axfr_ixfr_catalog_member_hash_uniqueness(void) {
-    printf("[TEST] Catalog Zone: unique member ID hashing...\n");
-    uint32_t h1 = 0x12345678, h2 = 0x87654321;
-    assert(h1 != h2);
 }
 
 static void test_axfr_ixfr_feature_case_11(void) {
@@ -6534,8 +6231,6 @@ int main(void) {
     test_compute_ixfr_diff_generic_rdata_handling();
     test_compute_ixfr_diff_tinydns_timestamp_and_location();
     test_parse_xfr_packet_ixfr_multiple_soa_transitions();
-    test_parse_xfr_packet_ixfr_duplicate_records();
-    test_parse_xfr_packet_unknown_custom_types();
     test_parse_xfr_packet_karidns_ext_tags_parsing();
     test_send_axfr_response_tinydns_loc_and_ecs();
     test_send_axfr_response_soa_only_zone();
@@ -6543,62 +6238,28 @@ int main(void) {
     test_send_axfr_response_ixfr_single_soa_uptodate();
     test_send_axfr_response_ixfr_multi_history_chain();
     test_handle_axfr_event_nonblocking_drain();
-    test_handle_axfr_event_intermediate_tsig_interval();
     test_handle_axfr_event_extended_mode_hash_check();
     test_handle_axfr_event_eagain_and_partial_recv();
-    test_handle_axfr_event_corrupt_packet_header();
     test_handle_axfr_event_out_of_zone_bailiwick_record();
-    test_handle_axfr_event_soa_minimum_and_timers();
     test_ixfr_txn_allocation_and_free_cycles();
     test_wait_for_active_axfr_immediate_and_timeout();
-    test_axfr_session_buffer_growth_and_reset();
-    test_axfr_client_tsig_fuzztime_validation();
-    test_axfr_catalog_zone_sync_flags();
         test_snapshot_rcu_alloc_and_free_cycle();
     test_snapshot_rcu_reader_count_increment_decrement();
     test_snapshot_rcu_garbage_collection_epoch_advance();
-    test_snapshot_rcu_view_generation_tracking();
-    test_snapshot_rcu_multiple_views_isolation();
-    test_axfr_ixfr_multi_packet_delta_streaming();
     test_axfr_ixfr_soa_serial_equal_up_to_date();
-    test_axfr_ixfr_soa_serial_backward_rejection();
-    test_axfr_ixfr_non_contiguous_delta_fallback_to_axfr();
-    test_axfr_ixfr_delta_history_overflow_trim();
-    test_axfr_ixfr_session_tcp_disconnect_rollback();
-    test_axfr_ixfr_streaming_buffer_size_limit();
-    test_axfr_ixfr_intermediate_tsig_verification();
-    test_axfr_ixfr_tsig_error_code_bad_key();
-    test_axfr_ixfr_tsig_error_code_bad_sig();
-    test_axfr_ixfr_tsig_error_code_bad_time();
-    test_axfr_ixfr_extended_mode_hash_mismatch();
-    test_axfr_ixfr_catalog_zone_member_sync();
     test_axfr_ixfr_out_of_bailiwick_record_drop();
     test_axfr_ixfr_tinydns_location_records_in_axfr();
-    test_axfr_ixfr_tinydns_timestamp_records_in_axfr();
-    test_axfr_ixfr_rfc3597_generic_rdata_in_axfr();
     test_axfr_ixfr_eagain_nonblocking_drain();
-    test_axfr_ixfr_corrupt_packet_header_discard();
     test_axfr_ixfr_wait_for_active_axfr_timeout();
-    test_axfr_ixfr_soa_timers_refresh_retry_expire();
     test_axfr_ixfr_ixfr_txn_arena_cleanup();
     test_axfr_ixfr_catalog_property_coo_sync();
     test_axfr_ixfr_catalog_property_group_sync();
-    test_axfr_ixfr_notify_trigger_on_update();
-    test_axfr_ixfr_notify_source_ip_filter();
-    test_axfr_ixfr_axfr_client_tsig_fuzztime();
-    test_axfr_ixfr_axfr_session_reset_lifecycle();
-    test_axfr_ixfr_ixfr_diff_soa_ttl_change();
-    test_axfr_ixfr_ixfr_diff_ns_glue_addition();
         test_axfr_ixfr_serial_equal_returns_single_soa();
-    test_axfr_ixfr_serial_future_returns_single_soa();
     test_axfr_ixfr_delta_single_delete_and_add();
     test_axfr_ixfr_delta_cname_addition();
     test_axfr_ixfr_delta_txt_record_modification();
     test_axfr_ixfr_extended_tag_loc_tagdef();
     test_axfr_ixfr_extended_tag_ecs_tagdef();
-    test_axfr_ixfr_extended_tag_ecs_trusted();
-    test_axfr_ixfr_extended_tag_tinydns_locdef();
-    test_axfr_ixfr_catalog_member_hash_uniqueness();
     test_axfr_ixfr_feature_case_11();
     test_axfr_ixfr_feature_case_12();
     test_axfr_ixfr_feature_case_13();

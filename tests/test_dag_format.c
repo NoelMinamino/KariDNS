@@ -631,38 +631,6 @@ static void test_dag_format_case_1(void) {
     free_query_opts(&spec.qo);
 }
 
-static void test_dag_format_case_2(void) {
-    printf("[TEST] DAG Format: YAML format NXDOMAIN response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x83; // NXDOMAIN
-    assert((pkt[3] & 0x0F) == 3);
-}
-
-static void test_dag_format_case_3(void) {
-    printf("[TEST] DAG Format: YAML format SERVFAIL response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x82; // SERVFAIL
-    assert((pkt[3] & 0x0F) == 2);
-}
-
-static void test_dag_format_case_4(void) {
-    printf("[TEST] DAG Format: YAML format REFUSED response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x85; // REFUSED
-    assert((pkt[3] & 0x0F) == 5);
-}
-
-static void test_dag_format_case_5(void) {
-    printf("[TEST] DAG Format: YAML format FORMERR response...\n");
-    uint8_t pkt[512];
-    memset(pkt, 0, 12);
-    pkt[2] = 0x81; pkt[3] = 0x81; // FORMERR
-    assert((pkt[3] & 0x0F) == 1);
-}
-
 static void test_dag_format_case_6(void) {
     printf("[TEST] DAG Format: JSON output flag setup...\n");
     query_spec_t spec;
@@ -925,10 +893,6 @@ int main(void) {
     test_truncation_robustness();
     test_dag_cli_parsing_helpers_and_error_paths();
         test_dag_format_case_1();
-    test_dag_format_case_2();
-    test_dag_format_case_3();
-    test_dag_format_case_4();
-    test_dag_format_case_5();
     test_dag_format_case_6();
     test_dag_format_case_7();
     test_dag_format_case_8();

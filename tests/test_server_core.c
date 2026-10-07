@@ -71,10 +71,10 @@ static void test_fast_ipv4_to_str(void) {
         "10.0.0.1",
         "192.168.1.254",
         "255.255.255.255",
-        "1.2.3.4",
-        "99.100.101.102",
-        "8.8.8.8",
-        "1.1.1.1",
+        "192.0.2.4",
+        "198.51.100.99",
+        "198.51.100.8",
+        "203.0.113.1",
         "100.64.0.1"
     };
     size_t count = sizeof(test_ips) / sizeof(test_ips[0]);
@@ -2416,20 +2416,6 @@ static void test_control_multiview_and_timeout_cases(void) {
 }
 
 
-static void test_control_reload_zone_specific(void) {
-    printf("[TEST] Server Core: Control reload zone specific domain...\n");
-    char cmd[128] = "RELOAD example.com.\n";
-    assert(strlen(cmd) > 0);
-    printf("  -> reload zone command test passed.\n");
-}
-
-static void test_control_flush_cache(void) {
-    printf("[TEST] Server Core: Control flush cache command...\n");
-    char cmd[64] = "FLUSH\n";
-    assert(strlen(cmd) > 0);
-    printf("  -> flush cache command test passed.\n");
-}
-
 static void test_control_status_and_stats_dump(void) {
     printf("[TEST] Server Core: Control STATUS and STATS dump...\n");
     zone_db_entry_t entry;
@@ -2442,23 +2428,6 @@ static void test_control_status_and_stats_dump(void) {
     fill_observatory_snapshot(&entry, &cfg, &snap);
     assert(strcmp(snap.domain, "statdump.example.") == 0);
     printf("  -> status and stats dump passed.\n");
-}
-
-static void test_control_invalid_hmac_auth(void) {
-    printf("[TEST] Server Core: Control invalid HMAC authentication rejection...\n");
-    uint8_t bad_digest[32] = {0xFF};
-    assert(bad_digest[0] == 0xFF);
-    printf("  -> invalid HMAC auth rejection passed.\n");
-}
-
-static void test_control_bad_command_and_overflow(void) {
-    printf("[TEST] Server Core: Control bad command syntax and buffer overflow handling...\n");
-    char long_cmd[8192];
-    memset(long_cmd, 'A', sizeof(long_cmd) - 2);
-    long_cmd[sizeof(long_cmd) - 2] = '\n';
-    long_cmd[sizeof(long_cmd) - 1] = '\0';
-    assert(strlen(long_cmd) > 4096);
-    printf("  -> bad command handling passed.\n");
 }
 
 static void test_tcp_client_high_watermark_tracking(void) {
@@ -2606,13 +2575,6 @@ static void test_control_zonestatus_empty_and_populated(void) {
     printf("  -> ZONESTATUS formatting passed.\n");
 }
 
-static void test_control_axfr_trigger_command(void) {
-    printf("[TEST] Server Core: Control AXFR trigger command...\n");
-    char cmd[64] = "TRANSFER zonestat.example.\n";
-    assert(strlen(cmd) > 0);
-    printf("  -> AXFR trigger command passed.\n");
-}
-
 static void test_broker_connect_error_branches(void) {
     printf("[TEST] Server Core: Broker connect error handling...\n");
     struct sockaddr_in addr;
@@ -2627,34 +2589,6 @@ static void test_broker_connect_error_branches(void) {
 }
 
 
-static void test_control_command_stop(void) {
-    printf("[TEST] Server Core: Control STOP command parsing...\n");
-    char cmd[] = "STOP\n";
-    assert(strcmp(cmd, "STOP\n") == 0);
-    printf("  -> control STOP passed.\n");
-}
-
-static void test_control_command_reconfig_syntax(void) {
-    printf("[TEST] Server Core: Control RECONFIG command parsing...\n");
-    char cmd[] = "RECONFIG\n";
-    assert(strcmp(cmd, "RECONFIG\n") == 0);
-    printf("  -> control RECONFIG passed.\n");
-}
-
-static void test_control_command_notify_trigger(void) {
-    printf("[TEST] Server Core: Control NOTIFY command trigger...\n");
-    char cmd[] = "NOTIFY example.com.\n";
-    assert(strncmp(cmd, "NOTIFY", 6) == 0);
-    printf("  -> control NOTIFY passed.\n");
-}
-
-static void test_control_command_unknown_directive(void) {
-    printf("[TEST] Server Core: Control unknown command response...\n");
-    char cmd[] = "UNKNOWN_CMD\n";
-    assert(strncmp(cmd, "UNKNOWN", 7) == 0);
-    printf("  -> control unknown command passed.\n");
-}
-
 static void test_control_socket_eof_handling(void) {
     printf("[TEST] Server Core: Control socket client disconnect / EOF...\n");
     int sv[2];
@@ -2666,22 +2600,6 @@ static void test_control_socket_eof_handling(void) {
         close(sv[0]);
     }
     printf("  -> control EOF passed.\n");
-}
-
-static void test_control_socket_line_too_long_overflow(void) {
-    printf("[TEST] Server Core: Control line buffer overflow protection...\n");
-    char big_line[8192];
-    memset(big_line, 'X', sizeof(big_line) - 1);
-    big_line[sizeof(big_line) - 1] = '\0';
-    assert(strlen(big_line) == 8191);
-    printf("  -> control buffer overflow passed.\n");
-}
-
-static void test_control_socket_null_hmac_secret(void) {
-    printf("[TEST] Server Core: Control socket NULL HMAC secret verification...\n");
-    uint8_t d[32] = { 0 };
-    assert(d[0] == 0);
-    printf("  -> control NULL HMAC passed.\n");
 }
 
 static void test_control_socket_partial_writes(void) {
@@ -2888,6 +2806,7 @@ static void test_synthetic_zone_catalog_and_reverse(void) {
 
     assert(is_zone_synthetic_type(&snap, "127.0.0.1", "prog.example.", 1) == true);
     assert(is_zone_synthetic_type(&snap, "127.0.0.1", "other.example.", 1) == false);
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release); // cfg is on this stack frame
     printf("  -> synthetic zone types passed.\n");
 }
 
@@ -2905,6 +2824,7 @@ static void test_find_configured_domain_case_insensitive(void) {
     const char *found = find_configured_domain("MYDOMAIN.EXAMPLE.COM.", buf, sizeof(buf));
     assert(found != NULL);
     assert(strcmp(found, "mydomain.example.com.") == 0);
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release); // cfg is on this stack frame
     printf("  -> find_configured_domain case insensitive passed.\n");
 }
 
@@ -2940,19 +2860,6 @@ static void test_ensure_priv_dir_safe_world_writable(void) {
     printf("  -> world-writable rejection passed.\n");
 }
 
-static void test_open_router_udp_sockets_port_binding(void) {
-    printf("[TEST] Server Core: open_router_udp_sockets port binding validation...\n");
-    server_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    char *binds[1] = { "127.0.0.1" };
-    cfg.bind_addresses = binds;
-    cfg.bind_address_count = 1;
-    cfg.port = 5353;
-    assert(cfg.bind_address_count == 1);
-    assert(cfg.port == 5353);
-    printf("  -> UDP port binding validation passed.\n");
-}
-
 static void test_setup_udp_socket_buffers_failure(void) {
     printf("[TEST] Server Core: setup_udp_socket_buffers invalid fd (-1)...\n");
     // Invalid socket fd should handle error without crashing
@@ -2967,21 +2874,115 @@ static void test_setup_ipc_tables_max_workers_boundary(void) {
     printf("  -> IPC tables max workers passed.\n");
 }
 
+/* perform_config_reload_ext() against real files: configuration and zone files of the reload tests */
+static char g_rl_conf[256], g_rl_zone_a[256], g_rl_zone_b[256];
+
+static void rl_write_zone(const char *path, const char *origin, int serial) {
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    fprintf(f, "$ORIGIN %s.\n$TTL 300\n@ IN SOA ns hostmaster %d 7200 3600 1209600 300\n@ IN NS ns\n"
+               "ns IN A 192.0.2.1\n", origin, serial);
+    fclose(f);
+}
+
+/* Writes a configuration with the zones a.reload.test / b.reload.test (when the flag is set) into the view
+ * "default" and reloads it. Returns the reload status. */
+static config_reload_status_t rl_reload(bool with_a, bool with_b, bool skip_unchanged) {
+    FILE *f = fopen(g_rl_conf, "w");
+    assert(f != NULL);
+    fprintf(f, "options {\n  port 5354;\n  user \"nobody\";\n  group \"nobody\";\n};\nview \"default\" {\n");
+    if (with_a) fprintf(f, "  zone \"a.reload.test\" { type master; file \"%s\"; };\n", g_rl_zone_a);
+    if (with_b) fprintf(f, "  zone \"b.reload.test\" { type master; file \"%s\"; };\n", g_rl_zone_b);
+    fprintf(f, "};\n");
+    fclose(f);
+    g_config_path = g_rl_conf;
+    return perform_config_reload_ext(skip_unchanged).status;
+}
+
+/* Serial of the zone in the published snapshot; -1 when the zone is not served. The zone entry and its
+ * arena are not usable as evidence of a reload: Pass 2 of every rebuild republishes each zone's arena
+ * (glue prelink), so the arena pointer changes even for a zone that was not loaded again. */
+static long rl_zone_serial(const char *domain) {
+    zone_db_snapshot_t *snap = acquire_zone_snapshot();
+    retain_zone_snapshot(snap);
+    zone_db_entry_t *e = snap ? snapshot_get_zone_in_view(snap, "default", domain) : NULL;
+    zone_arena_t *a = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
+    long serial = (a && a->count > 0) ? (long)e->serial : -1;
+    release_zone_snapshot(snap);
+    return serial;
+}
+
+/* Rewrites a zone file with a new serial but restores its old modification time, so a reload that skips
+ * unchanged files (mtime match, rebuild_zone_db_from_config_ext()) keeps the loaded serial. */
+static void rl_rewrite_keep_mtime(const char *path, const char *origin, int serial) {
+    struct stat st;
+    assert(stat(path, &st) == 0);
+    rl_write_zone(path, origin, serial);
+    struct timeval tv[2] = { { st.st_atime, 0 }, { st.st_mtime, 0 } };
+    assert(utimes(path, tv) == 0);
+}
+
+static void rl_setup(void) {
+    /* earlier tests may leave g_config_db.active pointing at their own (stack) configuration */
+    atomic_store_explicit(&g_config_db.active, NULL, memory_order_release);
+    snprintf(g_rl_conf, sizeof(g_rl_conf), "/tmp/karidns_rl_%ld.conf", (long)getpid());
+    snprintf(g_rl_zone_a, sizeof(g_rl_zone_a), "/tmp/karidns_rl_%ld_a.zone", (long)getpid());
+    snprintf(g_rl_zone_b, sizeof(g_rl_zone_b), "/tmp/karidns_rl_%ld_b.zone", (long)getpid());
+    rl_write_zone(g_rl_zone_a, "a.reload.test", 1);
+    rl_write_zone(g_rl_zone_b, "b.reload.test", 1);
+}
+
+static void rl_cleanup(void) {
+    unlink(g_rl_conf);
+    unlink(g_rl_zone_a);
+    unlink(g_rl_zone_b);
+}
+
 static void test_perform_config_reload_identical_config(void) {
-    printf("[TEST] Server Core: perform_config_reload identical config no-op...\n");
-    server_config_t old_c, new_c;
-    memset(&old_c, 0, sizeof(old_c));
-    memset(&new_c, 0, sizeof(new_c));
+    printf("[TEST] Server Core: perform_config_reload identical config keeps unchanged zones...\n");
+    rl_setup();
+    assert(rl_reload(true, false, false) == CONFIG_RELOAD_OK);
+    assert(rl_zone_serial("a.reload.test.") == 1);
+    /* reload (skip unchanged): same configuration, file mtime unchanged -> the zone is not loaded again */
+    rl_rewrite_keep_mtime(g_rl_zone_a, "a.reload.test", 2);
+    assert(rl_reload(true, false, true) == CONFIG_RELOAD_OK);
+    assert(rl_zone_serial("a.reload.test.") == 1);
+    /* full reload (reload_all_zones()): every zone is loaded again */
+    assert(rl_reload(true, false, false) == CONFIG_RELOAD_OK);
+    assert(rl_zone_serial("a.reload.test.") == 2);
+    rl_cleanup();
     printf("  -> config reload identical passed.\n");
 }
 
 static void test_perform_config_reload_removed_zone(void) {
     printf("[TEST] Server Core: perform_config_reload removed zone deletion...\n");
+    rl_setup();
+    assert(rl_reload(true, true, false) == CONFIG_RELOAD_OK);
+    assert(rl_zone_serial("a.reload.test.") == 1 && rl_zone_serial("b.reload.test.") == 1);
+    rl_rewrite_keep_mtime(g_rl_zone_a, "a.reload.test", 2);
+    assert(rl_reload(true, false, true) == CONFIG_RELOAD_OK);
+    assert(rl_zone_serial("b.reload.test.") == -1);        // removed from the configuration: not served
+    assert(rl_zone_serial("a.reload.test.") == 1);         // the other zone is not loaded again
+    rl_cleanup();
     printf("  -> config reload removed zone passed.\n");
 }
 
 static void test_perform_config_reload_added_zone(void) {
     printf("[TEST] Server Core: perform_config_reload added zone instantiation...\n");
+    rl_setup();
+    assert(rl_reload(true, false, false) == CONFIG_RELOAD_OK);
+    assert(rl_zone_serial("b.reload.test.") == -1);
+    rl_rewrite_keep_mtime(g_rl_zone_a, "a.reload.test", 2);
+    rl_write_zone(g_rl_zone_b, "b.reload.test", 7);
+    assert(rl_reload(true, true, true) == CONFIG_RELOAD_OK);
+    assert(rl_zone_serial("b.reload.test.") == 7);         // added zone loaded from its file
+    assert(rl_zone_serial("a.reload.test.") == 1);
+    /* a zone whose file is missing is reported; the rest of the configuration is applied */
+    unlink(g_rl_zone_b);
+    snprintf(g_rl_zone_b, sizeof(g_rl_zone_b), "/tmp/karidns_rl_%ld_missing.zone", (long)getpid());
+    assert(rl_reload(true, true, false) == CONFIG_RELOAD_ZONE_ERRORS);
+    assert(rl_zone_serial("a.reload.test.") == 2);
+    rl_cleanup();
     printf("  -> config reload added zone passed.\n");
 }
 
@@ -3027,46 +3028,6 @@ static void test_broker_connect_udp_dgram_error(void) {
 
 /* ------------------------------------------------------------------------ Round 2 tests (+45) */
 
-static void test_server_program_zone_pipe_creation_failure(void) {
-    printf("[TEST] Server Core: program zone pipe creation error handling...\n");
-    // Handled gracefully without crash
-    printf("  -> program zone pipe failure passed.\n");
-}
-
-static void test_server_program_zone_fork_child_setup(void) {
-    printf("[TEST] Server Core: program zone child process setup flags...\n");
-    zone_config_t zcfg;
-    memset(&zcfg, 0, sizeof(zcfg));
-    zcfg.domain = "prog.child.example.";
-    zcfg.type = "program";
-    zcfg.program_path = "/bin/echo";
-    assert(strcmp(zcfg.type, "program") == 0);
-    printf("  -> program zone child setup passed.\n");
-}
-
-static void test_server_program_zone_consecutive_failure_dead_mark(void) {
-    printf("[TEST] Server Core: program zone consecutive failure dead mark...\n");
-    bool dead = true;
-    assert(dead == true);
-    printf("  -> program zone dead mark passed.\n");
-}
-
-static void test_server_program_zone_allow_program_zones_disabled(void) {
-    printf("[TEST] Server Core: program zone rejected when allow-program-zones is no...\n");
-    server_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.allow_program_zones = false;
-    assert(cfg.allow_program_zones == false);
-    printf("  -> allow-program-zones disabled passed.\n");
-}
-
-static void test_server_forward_zone_budget_exhaustion(void) {
-    printf("[TEST] Server Core: forward zone timeout budget exhaustion...\n");
-    int budget_ms = 0;
-    assert(budget_ms <= 0);
-    printf("  -> forward zone budget exhaustion passed.\n");
-}
-
 static void test_server_forward_zone_invalid_ip_formatting(void) {
     printf("[TEST] Server Core: forward zone invalid IP address string...\n");
     const char *bad_ip = "999.999.999.999";
@@ -3084,33 +3045,10 @@ static void test_server_forward_zone_invalid_port_formatting(void) {
     printf("  -> forward invalid port passed.\n");
 }
 
-static void test_server_forward_zone_retry_secondary_forwarder(void) {
-    printf("[TEST] Server Core: forward zone failover to second forwarder...\n");
-    int forwarder_idx = 1;
-    assert(forwarder_idx == 1);
-    printf("  -> forward failover passed.\n");
-}
-
 static void test_server_cookie_generation_secret_init(void) {
     printf("[TEST] Server Core: DNS Cookie secret initialization...\n");
     init_server_cookie_secret();
     printf("  -> cookie secret init passed.\n");
-}
-
-static void test_server_cookie_generation_failure_fallback(void) {
-    printf("[TEST] Server Core: DNS Cookie generation fallback...\n");
-    uint8_t sc[16];
-    memset(sc, 0, sizeof(sc));
-    assert(sizeof(sc) == 16);
-    printf("  -> cookie failure fallback passed.\n");
-}
-
-static void test_server_cookie_validation_expired_timestamp(void) {
-    printf("[TEST] Server Core: DNS Cookie expired timestamp rejection...\n");
-    uint32_t cookie_time = 1000;
-    uint32_t now = 50000;
-    assert(now - cookie_time > 3600);
-    printf("  -> cookie expired timestamp passed.\n");
 }
 
 static void test_server_control_command_status_detailed_fields(void) {
@@ -3143,13 +3081,6 @@ static void test_server_control_command_reconfig_syntax_error_abort(void) {
     printf("  -> reconfig syntax error abort passed.\n");
 }
 
-static void test_server_control_command_zonestatus_secondary_zone(void) {
-    printf("[TEST] Server Core: Control ZONESTATUS secondary slave zone...\n");
-    const char *ztype = "slave";
-    assert(strcmp(ztype, "slave") == 0);
-    printf("  -> zonestatus secondary zone passed.\n");
-}
-
 static void test_server_tcp_client_max_connections_refusal(void) {
     printf("[TEST] Server Core: TCP max client connection rejection...\n");
     _Atomic(int) cur_tcp;
@@ -3159,13 +3090,6 @@ static void test_server_tcp_client_max_connections_refusal(void) {
     printf("  -> TCP max connection refusal passed.\n");
 }
 
-static void test_server_tcp_client_idle_timeout_drain(void) {
-    printf("[TEST] Server Core: TCP idle client connection timeout drain...\n");
-    int idle_timeout = 30;
-    assert(idle_timeout == 30);
-    printf("  -> TCP idle timeout passed.\n");
-}
-
 static void test_server_tcp_client_keepalive_counter_decrement(void) {
     printf("[TEST] Server Core: TCP keepalive counter atomic dec...\n");
     _Atomic(int) clients;
@@ -3173,52 +3097,6 @@ static void test_server_tcp_client_keepalive_counter_decrement(void) {
     atomic_fetch_sub(&clients, 1);
     assert(atomic_load(&clients) == 4);
     printf("  -> TCP keepalive decrement passed.\n");
-}
-
-static void test_server_ipc_worker_queue_overflow_handling(void) {
-    printf("[TEST] Server Core: IPC worker message queue overflow...\n");
-    bool queue_full = true;
-    assert(queue_full == true);
-    printf("  -> IPC queue overflow passed.\n");
-}
-
-static void test_server_ipc_worker_unknown_message_type_discard(void) {
-    printf("[TEST] Server Core: IPC worker unknown message type discard...\n");
-    uint8_t unknown_msg_type = 255;
-    assert(unknown_msg_type == 255);
-    printf("  -> IPC unknown message discard passed.\n");
-}
-
-static void test_server_log_rotated_open_failure_handling(void) {
-    printf("[TEST] Server Core: log rotation open destination failure...\n");
-    int fd = -1;
-    assert(fd < 0);
-    printf("  -> log rotation open failure passed.\n");
-}
-
-static void test_server_log_rotated_daily_timestamp_rotation(void) {
-    printf("[TEST] Server Core: log rotation daily timestamp check...\n");
-    time_t t1 = 1700000000;
-    time_t t2 = t1 + 86400;
-    assert(t2 > t1);
-    printf("  -> log rotation daily timestamp passed.\n");
-}
-
-static void test_server_log_rotated_size_limit_exact_boundary(void) {
-    printf("[TEST] Server Core: log rotation exact max bytes boundary...\n");
-    size_t cur_size = 1048576;
-    size_t max_size = 1048576;
-    assert(cur_size >= max_size);
-    printf("  -> log rotation size boundary passed.\n");
-}
-
-static void test_server_observatory_query_rate_calculation(void) {
-    printf("[TEST] Server Core: observatory query rate per second calculation...\n");
-    uint64_t qcount = 1000;
-    uint32_t duration = 10;
-    uint64_t qps = qcount / duration;
-    assert(qps == 100);
-    printf("  -> observatory QPS calculation passed.\n");
 }
 
 static void test_server_observatory_tcp_connections_peak(void) {
@@ -3236,13 +3114,6 @@ static void test_server_privilege_drop_already_unprivileged_user(void) {
         assert(geteuid() != 0);
     }
     printf("  -> privilege drop non-root passed.\n");
-}
-
-static void test_server_privilege_drop_invalid_username_error(void) {
-    printf("[TEST] Server Core: privilege drop invalid user error detection...\n");
-    const char *bad_user = "nonexistent_user_9999_xyz";
-    assert(strlen(bad_user) > 0);
-    printf("  -> privilege drop invalid user passed.\n");
 }
 
 static void test_server_safe_dir_nonexistent_parent_creation(void) {
@@ -3263,45 +3134,6 @@ static void test_server_safe_dir_sticky_bit_directory_rejection(void) {
     printf("  -> safe dir sticky bit passed.\n");
 }
 
-static void test_server_router_udp_multiple_bind_interfaces(void) {
-    printf("[TEST] Server Core: router UDP multiple bind address list...\n");
-    server_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    char *binds[2] = { "127.0.0.1", "::1" };
-    cfg.bind_addresses = binds;
-    cfg.bind_address_count = 2;
-    assert(cfg.bind_address_count == 2);
-    printf("  -> router UDP multi-bind passed.\n");
-}
-
-static void test_server_router_udp_ipv6_only_socket_option(void) {
-    printf("[TEST] Server Core: router UDP IPV6_V6ONLY socket option...\n");
-    int opt = 1;
-    assert(opt == 1);
-    printf("  -> router UDP IPV6_V6ONLY passed.\n");
-}
-
-static void test_server_async_io_pool_queue_full_drop(void) {
-    printf("[TEST] Server Core: async I/O pool queue saturation...\n");
-    bool pool_full = true;
-    assert(pool_full == true);
-    printf("  -> async I/O queue full passed.\n");
-}
-
-static void test_server_async_io_pool_shutdown_task_completion(void) {
-    printf("[TEST] Server Core: async I/O pool worker shutdown completion...\n");
-    bool shutdown_complete = true;
-    assert(shutdown_complete == true);
-    printf("  -> async I/O shutdown passed.\n");
-}
-
-static void test_server_broker_connect_einprogress_handling(void) {
-    printf("[TEST] Server Core: broker connect EINPROGRESS non-blocking status...\n");
-    int err = EINPROGRESS;
-    assert(err == EINPROGRESS);
-    printf("  -> broker connect EINPROGRESS passed.\n");
-}
-
 static void test_server_broker_connect_send_failure_unlock(void) {
     printf("[TEST] Server Core: broker connect send failure mutex unlock...\n");
     struct sockaddr_in sa;
@@ -3311,20 +3143,6 @@ static void test_server_broker_connect_send_failure_unlock(void) {
     int res = broker_connect(AF_INET, SOCK_STREAM, (struct sockaddr *)&sa, sizeof(sa));
     assert(res == -1);
     printf("  -> broker connect send failure unlock passed.\n");
-}
-
-static void test_server_config_reload_zone_ttl_modification(void) {
-    printf("[TEST] Server Core: config reload zone TTL update...\n");
-    uint32_t ttl1 = 300, ttl2 = 600;
-    assert(ttl1 != ttl2);
-    printf("  -> config reload TTL mod passed.\n");
-}
-
-static void test_server_config_reload_zone_view_migration(void) {
-    printf("[TEST] Server Core: config reload zone view reassignment...\n");
-    const char *v1 = "default", *v2 = "internal";
-    assert(strcmp(v1, v2) != 0);
-    printf("  -> config reload view migration passed.\n");
 }
 
 static void test_server_signal_sigusr1_observatory_dump_flag(void) {
@@ -3358,13 +3176,6 @@ static void test_server_response_logger_ring_drop_counter(void) {
     atomic_fetch_add(&drops, 1);
     assert(atomic_load(&drops) == 1);
     printf("  -> response logger drop counter passed.\n");
-}
-
-static void test_server_query_logger_batch_flush_timer(void) {
-    printf("[TEST] Server Core: query logger periodic batch flush timeout...\n");
-    int flush_interval_ms = 1000;
-    assert(flush_interval_ms == 1000);
-    printf("  -> query logger batch timer passed.\n");
 }
 
 static void test_server_fast_ipv4_all_zeros_and_broadcast(void) {
@@ -3421,40 +3232,6 @@ static void test_server_tcp_client_keepalive_zero_decrement(void) {
     _Atomic int clients; atomic_init(&clients, 1);
     atomic_fetch_sub(&clients, 1);
     assert(atomic_load(&clients) == 0);
-}
-
-static void test_server_logging_channel_print_time_option(void) {
-    printf("[TEST] Server Core: log channel print-time prefix...\n");
-    log_channel_t ch; memset(&ch, 0, sizeof(ch));
-    ch.print_time = true;
-    assert(ch.print_time == true);
-}
-
-static void test_server_logging_channel_print_category_option(void) {
-    printf("[TEST] Server Core: log channel print-category prefix...\n");
-    log_channel_t ch; memset(&ch, 0, sizeof(ch));
-    ch.print_category = true;
-    assert(ch.print_category == true);
-}
-
-static void test_server_logging_channel_print_severity_option(void) {
-    printf("[TEST] Server Core: log channel print-severity prefix...\n");
-    log_channel_t ch; memset(&ch, 0, sizeof(ch));
-    ch.print_severity = true;
-    assert(ch.print_severity == true);
-}
-
-static void test_server_observatory_qps_window_division(void) {
-    printf("[TEST] Server Core: observatory QPS window duration division...\n");
-    uint64_t count = 5000; uint32_t window = 5;
-    uint64_t qps = count / window;
-    assert(qps == 1000);
-}
-
-static void test_server_control_command_flush_all_views(void) {
-    printf("[TEST] Server Core: control command 'flush' all views...\n");
-    const char *cmd = "flush";
-    assert(strcmp(cmd, "flush") == 0);
 }
 
 static void test_server_core_feature_case_11(void) {
@@ -4370,34 +4147,6 @@ static void test_server_core_signal_flag_toggles(void) {
     assert(atomic_load(&flag_running) == 0);
 }
 
-static void test_server_core_worker_backpressure_ratio(void) {
-    printf("[TEST] Server Core: worker thread backlog and saturation ratio...\n");
-    size_t q_len = 80;
-    size_t q_max = 100;
-    double saturation = (double)q_len / (double)q_max;
-    assert(saturation >= 0.80);
-}
-
-static void test_server_core_capsicum_rights_io_descriptors(void) {
-    printf("[TEST] Server Core: Capsicum rights initialization for UDP/TCP sockets...\n");
-    uint64_t rights = 0x01 | 0x02 | 0x04;
-    assert((rights & 0x01) && (rights & 0x02));
-}
-
-static void test_server_core_observatory_latency_percentiles(void) {
-    printf("[TEST] Server Core: observatory query latency metrics calculation...\n");
-    uint64_t total_queries = 10000;
-    uint64_t total_time_us = 50000;
-    double avg_us = (double)total_time_us / (double)total_queries;
-    assert(avg_us == 5.0);
-}
-
-static void test_server_core_ipc_frame_header_validation(void) {
-    printf("[TEST] Server Core: privileged IPC pipe message framing...\n");
-    uint32_t magic = 0x4B415249; // 'KARI'
-    assert(magic == 0x4B415249);
-}
-
 static void test_server_core_feature_case_101(void) {
     printf("[TEST] Server Core: system and process validation case 101...\n");
     char ip_buf[16];
@@ -5114,67 +4863,11 @@ static void test_server_core_feature_case_158(void) {
     assert((pkt[2] >> 3) == 4);
 }
 
-static void test_server_core_feature_case_159(void) {
-    printf("[TEST] Server Core: RRL slip mode TC=1 truncation header set...\n");
-    uint8_t res[512];
-    memset(res, 0, 12);
-    res[2] = 0x80; // QR=1
-    res[2] |= 0x02; // TC=1
-    assert((res[2] & 0x02) != 0);
-}
-
 static void test_server_core_feature_case_160(void) {
     printf("[TEST] Server Core: RRL drop mode metric increment...\n");
     _Atomic uint64_t drop_count = ATOMIC_VAR_INIT(0);
     atomic_fetch_add_explicit(&drop_count, 1, memory_order_relaxed);
     assert(atomic_load_explicit(&drop_count, memory_order_relaxed) == 1);
-}
-
-static void test_server_core_feature_case_161(void) {
-    printf("[TEST] Server Core: TCP connections max limit check...\n");
-    int max_clients = 100;
-    int cur_clients = 100;
-    bool allow = (cur_clients < max_clients);
-    assert(allow == false);
-    cur_clients = 99;
-    allow = (cur_clients < max_clients);
-    assert(allow == true);
-}
-
-static void test_server_core_feature_case_162(void) {
-    printf("[TEST] Server Core: TCP keepalive interval decrement...\n");
-    int idle_time = 30;
-    idle_time -= 5;
-    assert(idle_time == 25);
-}
-
-static void test_server_core_feature_case_163(void) {
-    printf("[TEST] Server Core: Config reload zone addition detection...\n");
-    server_config_t old_cfg, new_cfg;
-    memset(&old_cfg, 0, sizeof(old_cfg));
-    memset(&new_cfg, 0, sizeof(new_cfg));
-    zone_config_t z1, z2;
-    memset(&z1, 0, sizeof(z1)); z1.domain = "z1.example.";
-    memset(&z2, 0, sizeof(z2)); z2.domain = "z2.example.";
-    old_cfg.zones = &z1;
-    z1.next = &z2;
-    new_cfg.zones = &z1; // Has z1 and z2
-    assert(old_cfg.zones != NULL);
-    assert(new_cfg.zones->next != NULL);
-}
-
-static void test_server_core_feature_case_164(void) {
-    printf("[TEST] Server Core: Config reload epoch retirement...\n");
-    uint64_t current_epoch = 42;
-    current_epoch++;
-    assert(current_epoch == 43);
-}
-
-static void test_server_core_feature_case_165(void) {
-    printf("[TEST] Server Core: Zone DB serial increment detection...\n");
-    uint32_t old_serial = 2026090101;
-    uint32_t new_serial = 2026090102;
-    assert(new_serial > old_serial);
 }
 
 static void test_server_core_feature_case_166(void) {
@@ -5208,72 +4901,6 @@ static void test_server_core_feature_case_169(void) {
     }
 }
 
-static void test_server_core_feature_case_170(void) {
-    printf("[TEST] Server Core: IPC ring buffer slot header validation...\n");
-    struct ipc_slot {
-        uint32_t magic;
-        uint16_t len;
-        uint16_t flags;
-    } slot;
-    slot.magic = 0x4B415249; // "KARI"
-    slot.len = 64;
-    slot.flags = 0x01;
-    assert(slot.magic == 0x4B415249);
-    assert(slot.len == 64);
-}
-
-static void test_server_core_feature_case_171(void) {
-    printf("[TEST] Server Core: IPC message dispatch query packet...\n");
-    uint8_t msg[128];
-    memset(msg, 0, sizeof(msg));
-    msg[0] = 1; // Msg type 1 = query
-    assert(msg[0] == 1);
-}
-
-static void test_server_core_feature_case_172(void) {
-    printf("[TEST] Server Core: IPC message dispatch control packet...\n");
-    uint8_t msg[128];
-    memset(msg, 0, sizeof(msg));
-    msg[0] = 2; // Msg type 2 = control
-    assert(msg[0] == 2);
-}
-
-static void test_server_core_feature_case_173(void) {
-    printf("[TEST] Server Core: Worker backpressure ratio computation...\n");
-    uint32_t queue_depth = 800;
-    uint32_t queue_capacity = 1000;
-    double ratio = (double)queue_depth / (double)queue_capacity;
-    assert(ratio >= 0.80);
-}
-
-static void test_server_core_feature_case_174(void) {
-    printf("[TEST] Server Core: Logging severity level check...\n");
-    int min_level = 3; // WARNING
-    assert(2 < min_level); // INFO dropped
-    assert(4 >= min_level); // ERROR kept
-}
-
-static void test_server_core_feature_case_175(void) {
-    printf("[TEST] Server Core: Logging category mask check...\n");
-    uint32_t category_mask = 0x07; // CONFIG | SECURITY | ZONE
-    uint32_t msg_cat = 0x02; // SECURITY
-    assert((category_mask & msg_cat) != 0);
-}
-
-static void test_server_core_feature_case_176(void) {
-    printf("[TEST] Server Core: Log rotation on size threshold...\n");
-    size_t cur_size = 10485760; // 10 MB
-    size_t max_size = 10485760;
-    assert(cur_size >= max_size);
-}
-
-static void test_server_core_feature_case_177(void) {
-    printf("[TEST] Server Core: Log rotation on day change...\n");
-    time_t t1 = 1727136000; // Day A
-    time_t t2 = 1727222400; // Day B
-    assert((t2 / 86400) > (t1 / 86400));
-}
-
 static void test_server_core_feature_case_178(void) {
     printf("[TEST] Server Core: Control socket HMAC verification matching...\n");
     const char *key = "controlsecret";
@@ -5299,31 +4926,6 @@ static void test_server_core_feature_case_180(void) {
     char resp[256];
     snprintf(resp, sizeof(resp), "{\"status\":\"running\",\"version\":\"%s\"}", KARIDNS_VERSION);
     assert(strstr(resp, "\"status\":\"running\"") != NULL);
-}
-
-static void test_server_core_feature_case_181(void) {
-    printf("[TEST] Server Core: Control stats command counter aggregation...\n");
-    uint64_t q1 = 100, q2 = 200, q3 = 300;
-    uint64_t total = q1 + q2 + q3;
-    assert(total == 600);
-}
-
-static void test_server_core_feature_case_182(void) {
-    printf("[TEST] Server Core: Control reload zone specific dispatch...\n");
-    const char *zone_to_reload = "specific.zone.";
-    assert(strcasecmp(zone_to_reload, "specific.zone.") == 0);
-}
-
-static void test_server_core_feature_case_183(void) {
-    printf("[TEST] Server Core: Control flush cache dispatch...\n");
-    const char *view_to_flush = "default";
-    assert(strcmp(view_to_flush, "default") == 0);
-}
-
-static void test_server_core_feature_case_184(void) {
-    printf("[TEST] Server Core: Control zonestatus secondary zone info...\n");
-    uint32_t refresh = 3600, retry = 600, expire = 1209600;
-    assert(refresh > retry && expire > refresh);
 }
 
 static void test_server_core_feature_case_185(void) {
@@ -5405,25 +5007,6 @@ static void test_server_core_feature_case_193(void) {
     assert(strcmp(fp1, fp2) != 0);
 }
 
-static void test_server_core_feature_case_194(void) {
-    printf("[TEST] Server Core: Secondary zone AXFR bg task context setup...\n");
-    struct local_bg {
-        bool in_progress;
-        uint32_t serial;
-    } bg;
-    bg.in_progress = true;
-    bg.serial = 100;
-    assert(bg.in_progress == true);
-    assert(bg.serial == 100);
-}
-
-static void test_server_core_feature_case_195(void) {
-    printf("[TEST] Server Core: Secondary zone IXFR fallback to AXFR...\n");
-    bool ixfr_supported = false;
-    bool do_fallback = !ixfr_supported;
-    assert(do_fallback == true);
-}
-
 static void test_server_core_feature_case_196(void) {
     printf("[TEST] Server Core: Catalog zone member zone addition event...\n");
     _Atomic int member_count = ATOMIC_VAR_INIT(5);
@@ -5446,67 +5029,11 @@ static void test_server_core_feature_case_198(void) {
     assert((client_ip & mask) == (allowed_net & mask));
 }
 
-static void test_server_core_feature_case_199(void) {
-    printf("[TEST] Server Core: Dynamic update TSIG key matching...\n");
-    const char *k1 = "update-key.";
-    const char *k2 = "update-key.";
-    assert(strcmp(k1, k2) == 0);
-}
-
 static void test_server_core_feature_case_200(void) {
     printf("[TEST] Server Core: Response logging ring buffer overflow drop counter...\n");
     _Atomic uint64_t dropped_logs = ATOMIC_VAR_INIT(0);
     atomic_fetch_add_explicit(&dropped_logs, 1, memory_order_relaxed);
     assert(atomic_load_explicit(&dropped_logs, memory_order_relaxed) == 1);
-}
-
-static void test_server_core_feature_case_201(void) {
-    printf("[TEST] Server Core: Query logging max QPS circuit breaker trigger...\n");
-    uint32_t current_qps = 50000;
-    uint32_t max_log_qps = 10000;
-    bool circuit_broken = (current_qps > max_log_qps);
-    assert(circuit_broken == true);
-}
-
-static void test_server_core_feature_case_202(void) {
-    printf("[TEST] Server Core: Observatory latency percentile computation...\n");
-    uint64_t latencies[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    uint64_t p50 = latencies[5];
-    uint64_t p90 = latencies[9];
-    assert(p50 == 6);
-    assert(p90 == 10);
-}
-
-static void test_server_core_feature_case_203(void) {
-    printf("[TEST] Server Core: Observatory query rate window smoothing...\n");
-    uint64_t total_queries = 1200;
-    uint32_t window_sec = 60;
-    uint64_t avg_qps = total_queries / window_sec;
-    assert(avg_qps == 20);
-}
-
-static void test_server_core_feature_case_204(void) {
-    printf("[TEST] Server Core: Forward zone upstream retry secondary on failure...\n");
-    int failed_upstream = 0;
-    int next_upstream = (failed_upstream + 1) % 2;
-    assert(next_upstream == 1);
-}
-
-static void test_server_core_feature_case_205(void) {
-    printf("[TEST] Server Core: Forward zone query budget rate exhaustion...\n");
-    int budget = 0;
-    bool allowed = (budget > 0);
-    assert(allowed == false);
-}
-
-static void test_server_core_feature_case_206(void) {
-    printf("[TEST] Server Core: Server cookie generation with secondary secret rollover...\n");
-    server_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    memset(cfg.cookie_secrets[0], 0x11, 16);
-    memset(cfg.cookie_secrets[1], 0x22, 16);
-    cfg.cookie_secret_count = 2;
-    assert(cfg.cookie_secret_count == 2);
 }
 
 static void test_server_core_feature_case_207(void) {
@@ -5526,11 +5053,6 @@ static void test_server_core_feature_case_207(void) {
     assert(generate_server_cookie(&cfg_prev_only, "192.0.2.1", c_cookie, s_cookie, now));
     server_cookie_status_t st = verify_server_cookie(&cfg, "192.0.2.1", c_cookie, s_cookie, sizeof(s_cookie), now);
     assert(st == SERVER_COOKIE_VALID);
-}
-
-static void test_server_core_feature_case_208(void) {
-    printf("[TEST] Server Core: Capability mode sandbox rights on stdio...\n");
-    assert(STDIN_FILENO == 0 && STDOUT_FILENO == 1 && STDERR_FILENO == 2);
 }
 
 static void test_server_core_feature_case_209(void) {
@@ -5773,11 +5295,7 @@ int main(void) {
     test_broker_connect_opts_and_xfr_tcp_sockopts();
     test_server_core_process_lifecycle_and_signals();
     test_control_multiview_and_timeout_cases();
-    test_control_reload_zone_specific();
-    test_control_flush_cache();
     test_control_status_and_stats_dump();
-    test_control_invalid_hmac_auth();
-    test_control_bad_command_and_overflow();
     test_tcp_client_high_watermark_tracking();
     test_response_log_ring_buffer_overflow();
     test_query_log_circuit_breaker();
@@ -5787,15 +5305,8 @@ int main(void) {
     test_acquire_release_config_snapshot_concurrency();
     test_server_core_sighup_sigusr1_handlers();
     test_control_zonestatus_empty_and_populated();
-    test_control_axfr_trigger_command();
     test_broker_connect_error_branches();
-    test_control_command_stop();
-    test_control_command_reconfig_syntax();
-    test_control_command_notify_trigger();
-    test_control_command_unknown_directive();
     test_control_socket_eof_handling();
-    test_control_socket_line_too_long_overflow();
-    test_control_socket_null_hmac_secret();
     test_control_socket_partial_writes();
     test_tcp_client_tracking_overflow_underflow();
     test_tcp_client_high_water_atomic_cas_race();
@@ -5814,7 +5325,6 @@ int main(void) {
     test_find_configured_domain_case_insensitive();
     test_ensure_priv_dir_safe_symlink_attack();
     test_ensure_priv_dir_safe_world_writable();
-    test_open_router_udp_sockets_port_binding();
     test_nonroot_startup_identity_and_preflight();
     test_log_hand_off_after_priv_dir_check();
     test_setup_udp_socket_buffers_failure();
@@ -5827,49 +5337,24 @@ int main(void) {
     test_broker_connect_nonblocking_stream();
     test_broker_connect_udp_dgram_error();
 
-    test_server_program_zone_pipe_creation_failure();
-    test_server_program_zone_fork_child_setup();
-    test_server_program_zone_consecutive_failure_dead_mark();
-    test_server_program_zone_allow_program_zones_disabled();
-    test_server_forward_zone_budget_exhaustion();
     test_server_forward_zone_invalid_ip_formatting();
     test_server_forward_zone_invalid_port_formatting();
-    test_server_forward_zone_retry_secondary_forwarder();
     test_server_cookie_generation_secret_init();
-    test_server_cookie_generation_failure_fallback();
-    test_server_cookie_validation_expired_timestamp();
     test_server_control_command_status_detailed_fields();
     test_server_control_command_stats_json_output();
     test_server_control_command_flush_cache_specific_view();
     test_server_control_command_reconfig_syntax_error_abort();
-    test_server_control_command_zonestatus_secondary_zone();
     test_server_tcp_client_max_connections_refusal();
-    test_server_tcp_client_idle_timeout_drain();
     test_server_tcp_client_keepalive_counter_decrement();
-    test_server_ipc_worker_queue_overflow_handling();
-    test_server_ipc_worker_unknown_message_type_discard();
-    test_server_log_rotated_open_failure_handling();
-    test_server_log_rotated_daily_timestamp_rotation();
-    test_server_log_rotated_size_limit_exact_boundary();
-    test_server_observatory_query_rate_calculation();
     test_server_observatory_tcp_connections_peak();
     test_server_privilege_drop_already_unprivileged_user();
-    test_server_privilege_drop_invalid_username_error();
     test_server_safe_dir_nonexistent_parent_creation();
     test_server_safe_dir_sticky_bit_directory_rejection();
-    test_server_router_udp_multiple_bind_interfaces();
-    test_server_router_udp_ipv6_only_socket_option();
-    test_server_async_io_pool_queue_full_drop();
-    test_server_async_io_pool_shutdown_task_completion();
-    test_server_broker_connect_einprogress_handling();
     test_server_broker_connect_send_failure_unlock();
-    test_server_config_reload_zone_ttl_modification();
-    test_server_config_reload_zone_view_migration();
     test_server_signal_sigusr1_observatory_dump_flag();
     test_server_signal_sigpipe_ignored_in_worker();
     test_server_control_thread_kqueue_register_failure();
     test_server_response_logger_ring_drop_counter();
-    test_server_query_logger_batch_flush_timer();
     test_server_fast_ipv4_all_zeros_and_broadcast();
     test_server_escape_qname_non_printable_bytes();
     test_server_sighup_atomic_flag_toggle();
@@ -5877,11 +5362,6 @@ int main(void) {
     test_server_sigusr1_observatory_atomic_flag();
     test_server_tcp_client_counter_overflow_guard();
     test_server_tcp_client_keepalive_zero_decrement();
-    test_server_logging_channel_print_time_option();
-    test_server_logging_channel_print_category_option();
-    test_server_logging_channel_print_severity_option();
-    test_server_observatory_qps_window_division();
-    test_server_control_command_flush_all_views();
     test_server_core_feature_case_11();
     test_server_core_feature_case_12();
     test_server_core_feature_case_13();
@@ -5973,10 +5453,6 @@ int main(void) {
     test_server_core_feature_case_99();
     test_server_core_feature_case_100();
     test_server_core_signal_flag_toggles();
-    test_server_core_worker_backpressure_ratio();
-    test_server_core_capsicum_rights_io_descriptors();
-    test_server_core_observatory_latency_percentiles();
-    test_server_core_ipc_frame_header_validation();
     test_server_core_feature_case_101();
     test_server_core_feature_case_102();
     test_server_core_feature_case_103();
@@ -6035,32 +5511,14 @@ int main(void) {
         test_server_core_feature_case_156();
     test_server_core_feature_case_157();
     test_server_core_feature_case_158();
-    test_server_core_feature_case_159();
     test_server_core_feature_case_160();
-    test_server_core_feature_case_161();
-    test_server_core_feature_case_162();
-    test_server_core_feature_case_163();
-    test_server_core_feature_case_164();
-    test_server_core_feature_case_165();
     test_server_core_feature_case_166();
     test_server_core_feature_case_167();
     test_server_core_feature_case_168();
     test_server_core_feature_case_169();
-    test_server_core_feature_case_170();
-    test_server_core_feature_case_171();
-    test_server_core_feature_case_172();
-    test_server_core_feature_case_173();
-    test_server_core_feature_case_174();
-    test_server_core_feature_case_175();
-    test_server_core_feature_case_176();
-    test_server_core_feature_case_177();
     test_server_core_feature_case_178();
     test_server_core_feature_case_179();
     test_server_core_feature_case_180();
-    test_server_core_feature_case_181();
-    test_server_core_feature_case_182();
-    test_server_core_feature_case_183();
-    test_server_core_feature_case_184();
     test_server_core_feature_case_185();
     test_server_core_feature_case_186();
     test_server_core_feature_case_187();
@@ -6070,21 +5528,11 @@ int main(void) {
     test_server_core_feature_case_191();
     test_server_core_feature_case_192();
     test_server_core_feature_case_193();
-    test_server_core_feature_case_194();
-    test_server_core_feature_case_195();
     test_server_core_feature_case_196();
     test_server_core_feature_case_197();
     test_server_core_feature_case_198();
-    test_server_core_feature_case_199();
     test_server_core_feature_case_200();
-    test_server_core_feature_case_201();
-    test_server_core_feature_case_202();
-    test_server_core_feature_case_203();
-    test_server_core_feature_case_204();
-    test_server_core_feature_case_205();
-    test_server_core_feature_case_206();
     test_server_core_feature_case_207();
-    test_server_core_feature_case_208();
     test_server_core_feature_case_209();
     test_server_core_feature_case_210();
     printf("=== All KariDNS Server Core Unit Tests PASSED! ===\n");
