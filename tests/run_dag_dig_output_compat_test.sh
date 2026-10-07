@@ -147,6 +147,44 @@ run sig-node.example.com SIG +multiline +noall +answer; has "SIG A 13 4 86400 20
 run sink-node.example.com SINK +multiline +noall +answer; has "SINK 1 2 3 (" && ok
 run example.com SOA +multiline +norrcomments +noall +answer; has "86400)" && hasnt "; serial" && ok
 
+echo "=== batch file and several queries (X-46) ==="
+# dig applies the options given on the command line to every -f line (it clones its default lookup), prints the
+# full banner for the first query only, then "; <<>> DiG ... <<>> <line>" for each later batch line and no banner
+# for later command-line queries.
+# (comment lines are skipped by dig only before the first query, so the comment is on the first line here)
+printf '; comment\nesc.test SOA\nns1.esc.test A\nax.test SOA +notcp\n' > "$TMP_DIR/batch.txt"
+count() { # label regex expected
+    n=$(grep -c -E -- "$2" "$OUT" || true)
+    if [ "$n" -eq "$3" ]; then return 0; fi
+    echo "FAIL [$CUR]: $1: $n lines match '$2', expected $3"; sed 's/^/    | /' "$OUT" | head -60; FAILED=$((FAILED + 1)); return 1
+}
+run +tcp -f "$TMP_DIR/batch.txt"
+count "banner lines" "^; <<>> dag <<>> " 3 && count "server found" "^; \(1 server found\)$" 1 &&
+    count "global options" "^;; global options: \+cmd$" 1 &&
+    count "over TCP (+notcp on a line is ignored, as by dig)" "^;; SERVER: .*\(TCP\)$" 3 &&
+    has "ns1.esc.test. 300 IN A 192.0.2.1" && ok
+run +short -f "$TMP_DIR/batch.txt";       lines 3 && has "192.0.2.1" && ok
+printf 'esc.test SOA +tcp\nns1.esc.test A +bufsize=1000 +qr\n' > "$TMP_DIR/batch_lineopts.txt"
+run -f "$TMP_DIR/batch_lineopts.txt"
+count "+tcp on a line is ignored (dig 9.20)" "^;; SERVER: .*\(UDP\)$" 2 && has "udp: 1000" && ok
+run esc.test SOA ns1.esc.test A ax.test SOA +tcp
+count "banner lines" "^; <<>> dag <<>> " 1 && count "global options" "^;; global options: \+cmd$" 1 &&
+    count "answers" "status: NOERROR" 3 && count "over TCP (last query only)" "^;; SERVER: .*\(TCP\)$" 1 && ok
+# dig skips '#' / ';' / empty lines only before the first query; later ones are queries ("; note" -> ";." and
+# "note.", an empty line -> ". NS"), and a line may hold several queries
+printf '# leading comment\n;\n\nesc.test SOA\n; note\n\n#x ns1.esc.test A\n' > "$TMP_DIR/batch_comments.txt"
+run +noall +question -f "$TMP_DIR/batch_comments.txt"
+lines 6 && has ";esc.test. IN SOA" && has ';\;. IN A' && has ";note. IN A" && has ";. IN NS" && has ";#x. IN A" &&
+    has ";ns1.esc.test. IN A" && ok
+# X-49: TYPE<n> / CLASS<n> above 65535 are domain names, as in dig
+run +noall +question x.test TYPE65536 CLASS70000 TYPE65535
+lines 3 && has ";x.test. IN A" && has ";TYPE65536. IN A" && has ";CLASS70000. IN TYPE65535" && ok
+printf 'esc.test SOA\nesc.test SOA @127.0.0.1 -p 1 +time=1 +tries=1\n' > "$TMP_DIR/batch_unreach.txt"
+CUR="-f with an unreachable line: exit status 9"
+"$DAG" $S -f "$TMP_DIR/batch_unreach.txt" > "$OUT" 2>&1
+rc=$?
+if [ "$rc" -eq 9 ]; then has "status: NOERROR" && ok; else echo "FAIL [$CUR]: exit status $rc"; FAILED=$((FAILED + 1)); fi
+
 if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
     echo "=== comparison with $(dig -v 2>&1) ==="
     norm() {
@@ -193,7 +231,22 @@ ax.test AXFR
 ax.test SOA -y hmac-sha256:k1:AAAA
 example.com DNSKEY +multiline
 example.com SOA +multiline +norrcomments
++tcp -f $TMP_DIR/batch.txt
++short -f $TMP_DIR/batch.txt
+-f $TMP_DIR/batch_lineopts.txt
+-f $TMP_DIR/batch_comments.txt
++noall +question x.test TYPE65536 CLASS70000 TYPE65535
 EOF
+    # several queries on the command line: +nohexdump must precede the first query to be global for dag
+    c="esc.test SOA ns1.esc.test A ax.test SOA +tcp"
+    eval "dig $S $c" 2>/dev/null | norm > "$TMP_DIR/dig.txt"
+    eval "\"$DAG\" $S +nohexdump $c" 2>/dev/null | norm > "$TMP_DIR/dag.txt"
+    CUR="$c (vs dig)"
+    if cmp -s "$TMP_DIR/dig.txt" "$TMP_DIR/dag.txt"; then
+        PASSED=$((PASSED + 1))
+    else
+        echo "FAIL [$CUR]"; diff "$TMP_DIR/dig.txt" "$TMP_DIR/dag.txt" | head -20 | sed 's/^/    /'; FAILED=$((FAILED + 1))
+    fi
 else
     echo "SKIP: dig 9.20 not installed; direct comparison not run"
 fi

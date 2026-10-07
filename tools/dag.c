@@ -160,15 +160,10 @@ KARIDNS_TOOL_FN bool is_known_qtype(const char *s) {
     return resolve_qtype(s, NULL);
 }
 
+/* X-49: like dig, "TYPE<n>" is a type only for n <= 65535 (RFC 3597 §5); "TYPE65536" is a domain name */
 KARIDNS_TOOL_FN bool is_qtype_syntax_or_known(const char *s) {
     if (!s) return false;
-    if (is_known_qtype(s)) return true;
-    if (strncasecmp(s, "TYPE", 4) == 0 && isdigit((unsigned char)s[4])) {
-        const char *p = s + 4;
-        while (*p && isdigit((unsigned char)*p)) p++;
-        if (*p == '\0') return true;
-    }
-    return false;
+    return is_known_qtype(s);
 }
 
 int parse_qtype(const char *s) {
@@ -3020,12 +3015,15 @@ const char *dag_type_name(uint16_t type, char *buf, size_t buf_size) {
 }
 
 /* "; <<>> dag <<>> ..." の見出し (+cmd)。qo->no_cmd_banner は検索リストの 2 番目以降の候補
- * (+qr のとき dig は見出しを 1 回だけ出す)。通常の問い合わせと +trace (dag_trace.c) が使う。 */
+ * (+qr のとき dig は見出しを 1 回だけ出す)。qo->cmd_banner_style は 2 番目以降のクエリ (dig は見出しを
+ * 最初のクエリにだけ出し、-f の 2 行目以降は "; <<>>" 行だけ、コマンドラインの 2 番目以降は出さない)。
+ * 通常の問い合わせと +trace (dag_trace.c) が使う。 */
 void dag_print_cmd_banner(const query_opts_t *qo, const display_opts_t *dopt, const char *qname,
                           const char *qtype_s, const char *server, int port, bool use_tcp) {
     if (dopt->short_mode || dopt->yaml) return;
-    if (dopt->show_cmd && !qo->no_cmd_banner) {
-        printf("\n"); /* dig starts the banner with an empty line */
+    if (dopt->show_cmd && !qo->no_cmd_banner && qo->cmd_banner_style != CMD_BANNER_NONE) {
+        bool line_only = (qo->cmd_banner_style == CMD_BANNER_LINE);
+        if (!line_only) printf("\n"); /* dig starts the banner with an empty line */
         const char *disp_qname = qo->orig_qname ? qo->orig_qname : qname;
         const char *disp_qtype = qo->orig_qtype_s ? qo->orig_qtype_s : (qtype_s ? qtype_s : "");
         if (qo->server_explicit) {
@@ -3035,7 +3033,7 @@ void dag_print_cmd_banner(const query_opts_t *qo, const display_opts_t *dopt, co
             } else {
                 printf("; <<>> dag <<>> %s @%s%s\n", disp_qname, server, use_tcp ? " (tcp)" : "");
             }
-            printf("; (%d server%s found)\n", found_cnt, found_cnt == 1 ? "" : "s");
+            if (!line_only) printf("; (%d server%s found)\n", found_cnt, found_cnt == 1 ? "" : "s");
         } else {
             if (disp_qtype[0]) {
                 printf("; <<>> dag <<>> %s %s%s\n", disp_qname, disp_qtype, use_tcp ? " (tcp)" : "");
@@ -3043,7 +3041,7 @@ void dag_print_cmd_banner(const query_opts_t *qo, const display_opts_t *dopt, co
                 printf("; <<>> dag <<>> %s%s\n", disp_qname, use_tcp ? " (tcp)" : "");
             }
         }
-        printf(";; global options: +cmd\n");
+        if (!line_only) printf(";; global options: +cmd\n");
     }
 }
 
@@ -3763,6 +3761,17 @@ KARIDNS_TOOL_FN void print_multi_server_summary(bool use_ldnsz, bool is_yaml, bo
     }
 }
 
+/* End of one query of several (command-line tuples, batch-file lines): print its multi-server summary, unless
+ * +nofail failover over a server list already did, and start the next one with an empty result table. */
+void finish_query_tuple(const query_spec_t *s) {
+    bool used_nofail = s->qo.nofail && !s->test_all && !s->do_trace && !s->do_trace2 && !s->do_nssearch &&
+                       s->server_arg && strchr(s->server_arg, ',') != NULL;
+    if (!used_nofail)
+        print_multi_server_summary(s->use_ldnsz, s->dopt.yaml, s->do_trace || s->do_trace2,
+                                   !(s->do_trace || s->do_trace2 || s->do_nssearch));
+    g_server_count = 0;
+}
+
 
 KARIDNS_TOOL_FN void usage(const char *prog) {
     (void)prog;
@@ -4382,12 +4391,6 @@ KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const
     return last_overall_rc;
 }
 
-#define MAX_DAG_QUERIES 64
-
-typedef struct {
-    int start;
-    int end;
-} arg_slice_t;
 
 
 
@@ -4460,8 +4463,16 @@ KARIDNS_TOOL_FN bool is_known_qclass_str(const char *s, uint16_t *out_class) {
         if (out_class) *out_class = 4;
         return true;
     }
+    /* X-49: "CLASS<n>" (RFC 3597 §5) only with decimal digits and n <= 65535, as dig parses it; anything else
+     * (CLASS70000, CLASS1x) is a domain name (it was truncated to 16 bits before) */
     if (strncasecmp(s, "CLASS", 5) == 0 && isdigit((unsigned char)s[5])) {
-        if (out_class) *out_class = (uint16_t)atoi(s + 5);
+        unsigned long v = 0;
+        for (const char *p = s + 5; *p; p++) {
+            if (!isdigit((unsigned char)*p)) return false;
+            v = v * 10 + (unsigned long)(*p - '0');
+            if (v > 65535) return false;
+        }
+        if (out_class) *out_class = (uint16_t)v;
         return true;
     }
     return false;
@@ -5662,6 +5673,115 @@ int execute_query_spec(query_spec_t *spec) {
     return exit_code;
 }
 
+/* Splits argv[1..argc) into the global options (argv[1..*global_end)) and query tuples (name / type / class
+ * with their options), as dig does for several queries on one command line or one batch-file line. Returns the
+ * number of tuples, or -1 (message printed) when there are more than MAX_DAG_QUERIES. */
+int split_query_tuples(int argc, char **argv, arg_slice_t *queries, int *global_end) {
+    int query_count = 0;
+    *global_end = 1;
+
+    bool in_queries = false;
+    bool cur_has_name = false;
+    bool cur_has_type = false;
+    bool cur_has_class = false;
+    int cur_start = 1;
+
+    for (int i = 1; i < argc; ) {
+        int count = get_arg_consume_count(argc, argv, i);
+        const char *arg = argv[i];
+
+        bool is_name_arg = false;
+        bool is_type_arg = false;
+        bool is_class_arg = false;
+        bool is_reverse = false;
+
+        if (arg[0] == '@' || arg[0] == '-' || arg[0] == '+') {
+            if (strcmp(arg, "-x") == 0) {
+                is_reverse = true;
+                is_name_arg = true;
+                is_type_arg = true;
+                is_class_arg = true;
+            } else if (strcmp(arg, "-q") == 0) {
+                is_name_arg = true;
+            } else if (strcmp(arg, "-t") == 0) {
+                is_type_arg = true;
+            } else if (strcmp(arg, "-c") == 0) {
+                is_class_arg = true;
+            } else if (strcmp(arg, "--hex") == 0 || strncmp(arg, "--hex=", 6) == 0) {
+                is_name_arg = true;
+                is_type_arg = true;
+            }
+        } else {
+            // 位置引数
+            if (is_known_qclass_str(arg, NULL)) {
+                is_class_arg = true;
+            } else if (is_qtype_syntax_or_known(arg)) {
+                is_type_arg = true;
+            } else {
+                is_name_arg = true;
+            }
+        }
+
+        if (!in_queries) {
+            if (is_name_arg || is_type_arg || is_class_arg) {
+                in_queries = true;
+                cur_start = i;
+                cur_has_name = is_name_arg;
+                cur_has_type = is_type_arg;
+                cur_has_class = is_class_arg;
+                *global_end = i;
+            }
+        } else {
+            bool start_new_query = false;
+            if (is_reverse) {
+                if (cur_has_name || cur_has_type || cur_has_class) {
+                    start_new_query = true;
+                }
+            } else if (is_name_arg && cur_has_name) {
+                start_new_query = true;
+            } else if (is_type_arg && cur_has_name && cur_has_type) {
+                start_new_query = true;
+            } else if (is_class_arg && cur_has_name && cur_has_class) {
+                start_new_query = true;
+            }
+
+            if (start_new_query) {
+                if (query_count >= MAX_DAG_QUERIES) {
+                    fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
+                    return -1;
+                }
+                queries[query_count].start = cur_start;
+                queries[query_count].end = i;
+                query_count++;
+
+                cur_start = i;
+                cur_has_name = is_name_arg;
+                cur_has_type = is_type_arg;
+                cur_has_class = is_class_arg;
+            } else {
+                if (is_name_arg) cur_has_name = true;
+                if (is_type_arg) cur_has_type = true;
+                if (is_class_arg) cur_has_class = true;
+            }
+        }
+
+        i += count;
+    }
+
+    if (in_queries) {
+        if (query_count >= MAX_DAG_QUERIES) {
+            fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
+            return -1;
+        }
+        queries[query_count].start = cur_start;
+        queries[query_count].end = argc;
+        query_count++;
+    } else {
+        *global_end = argc;
+    }
+    return query_count;
+}
+
 #if defined(KARIDNS_COVERAGE_LINKAGE) && !defined(main)
 /* Coverage builds: the tests #include this file with "#define main dag_main",
  * so the body below is named dag_main here as well; llvm-cov then merges the
@@ -5750,106 +5870,10 @@ int main(int argc, char **argv) {
     // クエリタプルの境界検出 (Token Slicing)
     int global_end = 1;
     arg_slice_t queries[MAX_DAG_QUERIES];
-    int query_count = 0;
-
-    bool in_queries = false;
-    bool cur_has_name = false;
-    bool cur_has_type = false;
-    bool cur_has_class = false;
-    int cur_start = 1;
-
-    for (int i = 1; i < argc; ) {
-        int count = get_arg_consume_count(argc, argv, i);
-        const char *arg = argv[i];
-
-        bool is_name_arg = false;
-        bool is_type_arg = false;
-        bool is_class_arg = false;
-        bool is_reverse = false;
-
-        if (arg[0] == '@' || arg[0] == '-' || arg[0] == '+') {
-            if (strcmp(arg, "-x") == 0) {
-                is_reverse = true;
-                is_name_arg = true;
-                is_type_arg = true;
-                is_class_arg = true;
-            } else if (strcmp(arg, "-q") == 0) {
-                is_name_arg = true;
-            } else if (strcmp(arg, "-t") == 0) {
-                is_type_arg = true;
-            } else if (strcmp(arg, "-c") == 0) {
-                is_class_arg = true;
-            } else if (strcmp(arg, "--hex") == 0 || strncmp(arg, "--hex=", 6) == 0) {
-                is_name_arg = true;
-                is_type_arg = true;
-            }
-        } else {
-            // 位置引数
-            if (is_known_qclass_str(arg, NULL)) {
-                is_class_arg = true;
-            } else if (is_qtype_syntax_or_known(arg)) {
-                is_type_arg = true;
-            } else {
-                is_name_arg = true;
-            }
-        }
-
-        if (!in_queries) {
-            if (is_name_arg || is_type_arg || is_class_arg) {
-                in_queries = true;
-                cur_start = i;
-                cur_has_name = is_name_arg;
-                cur_has_type = is_type_arg;
-                cur_has_class = is_class_arg;
-                global_end = i;
-            }
-        } else {
-            bool start_new_query = false;
-            if (is_reverse) {
-                if (cur_has_name || cur_has_type || cur_has_class) {
-                    start_new_query = true;
-                }
-            } else if (is_name_arg && cur_has_name) {
-                start_new_query = true;
-            } else if (is_type_arg && cur_has_name && cur_has_type) {
-                start_new_query = true;
-            } else if (is_class_arg && cur_has_name && cur_has_class) {
-                start_new_query = true;
-            }
-
-            if (start_new_query) {
-                if (query_count >= MAX_DAG_QUERIES) {
-                    fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
-                    return 1;
-                }
-                queries[query_count].start = cur_start;
-                queries[query_count].end = i;
-                query_count++;
-
-                cur_start = i;
-                cur_has_name = is_name_arg;
-                cur_has_type = is_type_arg;
-                cur_has_class = is_class_arg;
-            } else {
-                if (is_name_arg) cur_has_name = true;
-                if (is_type_arg) cur_has_type = true;
-                if (is_class_arg) cur_has_class = true;
-            }
-        }
-
-        i += count;
-    }
-
-    if (in_queries) {
-        if (query_count >= MAX_DAG_QUERIES) {
-            fprintf(stderr, "error: too many queries specified (max %d)\n", MAX_DAG_QUERIES);
-            return 1;
-        }
-        queries[query_count].start = cur_start;
-        queries[query_count].end = argc;
-        query_count++;
-    } else {
-        global_end = argc;
+    int query_count = split_query_tuples(argc, argv, queries, &global_end);
+    if (query_count < 0) {
+        free_query_opts(&global_spec.qo);
+        return 1;
     }
 
     // グローバル引数区間のパース
@@ -5890,6 +5914,7 @@ int main(int argc, char **argv) {
     for (int q = 0; q < query_count; q++) {
         query_spec_t local_spec = global_spec;
         deep_copy_query_opts(&local_spec.qo, &global_spec.qo);
+        if (q > 0) local_spec.qo.cmd_banner_style = CMD_BANNER_NONE; /* dig: one banner for the command line */
         if (queries[q].start < queries[q].end) {
             if (parse_arg_slice(queries[q].start, queries[q].end, argc, argv, &local_spec) < 0) {
                 last_exit_code = 1;
@@ -5914,14 +5939,7 @@ int main(int argc, char **argv) {
         if (rc != 0) last_exit_code = rc;
         free_query_opts(&local_spec.qo);
 
-        if (query_count > 1) {
-            bool used_nofail = local_spec.qo.nofail && (!local_spec.test_all) && (!local_spec.do_trace) && (!local_spec.do_trace2) && (!local_spec.do_nssearch) && (!local_spec.batch_file) && (local_spec.server_arg && strchr(local_spec.server_arg, ',') != NULL);
-            if (!used_nofail) {
-                print_multi_server_summary(local_spec.use_ldnsz, local_spec.dopt.yaml, local_spec.do_trace || local_spec.do_trace2,
-                                           !(local_spec.do_trace || local_spec.do_trace2 || local_spec.do_nssearch));
-            }
-            g_server_count = 0;
-        }
+        if (query_count > 1) finish_query_tuple(&local_spec);
     }
 
     if (query_count <= 1) {

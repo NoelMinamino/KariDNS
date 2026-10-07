@@ -13,7 +13,7 @@
 #   4. Plain-HTTP DoH (RFC 8484 message format): POST, GET, chunked transfer
 #      encoding, HTTP 400/404/500 reported as errors
 #   5. Multi-message AXFR and IXFR (RFC 1995) output
-#   6. Replay: PCAP link types Ethernet, 802.1Q, Linux SLL, raw IP, NULL, LOOP;
+#   6. Replay: PCAP link types Ethernet, 802.1Q, Linux SLL, SLL2, raw IP, NULL, LOOP;
 #      text query lists; --output json; --diff; --compare-recorded; --max-queries
 #   7. TSIG (RFC 8945) against karidns: every HMAC algorithm signs the query and
 #      verifies the signed response; keyfile with comments; BADSIG and BADKEY
@@ -137,6 +137,14 @@ expect "+keepopen: three answers" "$TMP_DIR/keepopen.out" "IN[[:space:]]+A[[:spa
     "IN[[:space:]]+AAAA[[:space:]]+2001:db8::34$" "IN[[:space:]]+TXT[[:space:]]+\"v=spf1 -all\"$"
 count_is "+keepopen: all over TCP" "$TMP_DIR/keepopen.out" "^;; SERVER: .*\(TCP\)$" 3
 if [ "$accepts" -eq 1 ]; then ok "+keepopen: one TCP connection for three queries"; else ng "+keepopen: $accepts TCP connections for three queries (expected 1)"; fi
+# the same from a batch file: the command-line +tcp +keepopen apply to every line (dig behaviour, X-46)
+printf 'example.com A\nexample.com AAAA\nexample.com TXT\n' > "$TMP_DIR/batch.txt"
+accepts_before=$(grep -c "^ACCEPT tcp" "$TMP_DIR/mock.log" || true)
+qm keepopen_batch +tcp +keepopen -f "$TMP_DIR/batch.txt"
+accepts=$(( $(grep -c "^ACCEPT tcp" "$TMP_DIR/mock.log" || true) - accepts_before ))
+count_is "-f +tcp +keepopen: every line over TCP" "$TMP_DIR/keepopen_batch.out" "^;; SERVER: .*\(TCP\)$" 3
+expect_not "-f +nohexdump applies to the lines" "$TMP_DIR/keepopen_batch.out" "^Query \("
+if [ "$accepts" -eq 1 ]; then ok "-f +keepopen: one TCP connection for three lines"; else ng "-f +keepopen: $accepts TCP connections for three lines (expected 1)"; fi
 
 echo "=== [3/7] Plain-HTTP DoH ==="
 qm doh_post +http-plain-post example.com
@@ -188,6 +196,8 @@ write_pcap("$dir/eth.pcap", 1, $mac . "\x08\x00" . $l3);                        
 write_pcap("$dir/vlan.pcap", 1, $mac . "\x81\x00\x00\x64\x08\x00" . $l3);        # 802.1Q tag
 # LINKTYPE_LINUX_SLL (113): packet type, ARPHRD type, address length, 8-byte address, protocol (16 bytes)
 write_pcap("$dir/sll.pcap", 113, pack("nnna8n", 0, 1, 6, "\x00\x11\x22\x33\x44\x55", 0x0800) . $l3);
+# LINKTYPE_LINUX_SLL2 (276): protocol type, reserved, ifindex, ARPHRD type, packet type, address length, address (20)
+write_pcap("$dir/sll2.pcap", 276, pack("nnNnCCa8", 0x0800, 0, 2, 1, 0, 6, $mac) . $l3);
 write_pcap("$dir/raw.pcap", 101, $l3);                                           # LINKTYPE_RAW
 write_pcap("$dir/null.pcap", 0, pack("V", 2) . $l3);                             # LINKTYPE_NULL, host order
 write_pcap("$dir/loop.pcap", 108, pack("N", 2) . $l3);                           # LINKTYPE_LOOP, network order
@@ -200,7 +210,7 @@ replay() { # name args...
     echo $? > "$TMP_DIR/$name.rc"
     set -e
 }
-for f in eth vlan sll raw null loop; do
+for f in eth vlan sll sll2 raw null loop; do
     replay "rep_$f" "$TMP_DIR/$f.pcap"
     expect "replay $f.pcap" "$TMP_DIR/rep_$f.out" "^Total Queries Replayed: 1$" "^  Received: 1$" "^  RCODEs:   NOERROR=1 "
     rc_is "replay $f.pcap: exit status 0" "rep_$f" 0

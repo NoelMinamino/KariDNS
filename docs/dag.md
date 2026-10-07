@@ -630,6 +630,21 @@ In this mode:
 - Options preceding the first domain name tuple act as **global defaults**.
 - Query-specific options override the global options for that particular query.
 - Options like `+cmd` and `+short` maintain global effect across all queries.
+- As in `dig`, the `; <<>> dag <<>>` banner is printed once, for the first query.
+
+`-f <file>` reads queries from a file, one line at a time, exactly as `dig` 9.20 does: lines starting with `#` or
+`;` and empty lines are skipped only before the first query; every later line is parsed as a query line (a later
+`; note` line queries `;.` and `note.`, a later empty line queries `. NS`, the default query). A line may hold
+several queries (name / type / class tuples, as on the command line). Every line starts from all the
+options given on the command line (transport, display, EDNS, TSIG, `@server`, `-p`, ...) and the options on the
+line override them, except `+[no]tcp` and `+[no]vc`, which `dig` 9.20 ignores on batch lines (the transport is the
+one given on the command line); the lines run in one process, so `+keepopen` keeps the TCP/TLS/HTTPS connection open across
+lines. The first query prints the full banner, later lines only the `; <<>> dag <<>> ...` line. The exit status is
+that of the last line that failed (e.g. 9 when its servers could not be reached), 0 when all lines got an answer.
+
+```sh
+dag @192.0.2.53 +tcp +keepopen +nohexdump -f queries.txt
+```
 
 ---
 
@@ -809,7 +824,7 @@ dag example.com A @127.0.0.1 --test-all
 | `fuzz_dag` (`fuzz_dag_response`) | Response parser and display | Response decoding and dig-style formatting |
 | `fuzz_dag_hash` | Packet semantic hash & RDATA formatting | `calculate_packet_hashes()` → `format_rdata_for_display()` |
 | `fuzz_dag_iter_classify` | `+trace2` response classification | `dag_iter_classify()`: CNAME/DNAME chains, referral and glue extraction with bailiwick checks, SOA detection |
-| `fuzz_dag_replay_pcap_reader` | `--replay` PCAP frame decoder | Link-layer (Ethernet, Linux SLL, raw, NULL, LOOP) / IP / UDP / TCP decoding |
+| `fuzz_dag_replay_pcap_reader` | `--replay` PCAP frame decoder | Link-layer (Ethernet, Linux SLL / SLL2, raw, NULL, LOOP) / IP / UDP / TCP decoding |
 | `fuzz_dag_replay_diff` | `--replay` differential engine | `diff_dns_responses()` |
 | `fuzz_dag_tcp_reassembly` | TCP stream reassembly for PCAP replay | Segment ordering and DNS-over-TCP framing |
 | `fuzz_dag_chunked_http` | DoH HTTP/1.1 chunked transfer decoder | `decode_http_response_body()` boundary values |

@@ -96,6 +96,14 @@ static void test_fi_dag_formatters_and_helpers(void) {
     assert(is_qtype_syntax_or_known("A"));
     assert(is_qtype_syntax_or_known("TYPE1"));
     assert(!is_qtype_syntax_or_known("INVALID_TYPE"));
+    /* X-49: like dig, TYPE<n> / CLASS<n> only up to 65535; larger numbers or trailing junk make a domain name */
+    assert(is_qtype_syntax_or_known("TYPE65535"));
+    assert(!is_qtype_syntax_or_known("TYPE65536"));
+    assert(!is_qtype_syntax_or_known("type70000"));
+    assert(is_known_qclass_str("CLASS65535", &qc) && qc == 65535);
+    assert(!is_known_qclass_str("CLASS65536", &qc));
+    assert(!is_known_qclass_str("CLASS70000", &qc));
+    assert(!is_known_qclass_str("CLASS1x", &qc));
 
     assert(parse_opcode_value("QUERY") == 0);
     assert(parse_opcode_value("IQUERY") == 1);

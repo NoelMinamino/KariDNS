@@ -174,7 +174,7 @@ fi
 echo "=== 3. Testing Batch Mode Resilience Against Per-Line Errors ==="
 cat << EOF > "$TMP_DIR/batch_resilience.txt"
 test.internal.zone A +tcp +nohexdump
-test.internal.zone INVALIDQTYPE
+test.internal.zone -t INVALIDQTYPE
 -h
 test.internal.zone TXT +nohexdump
 EOF

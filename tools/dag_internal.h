@@ -336,6 +336,8 @@ typedef struct {
     bool use_search_list;
     bool search_more;     /* 検索リストにまだ候補がある (NXDOMAIN なら次へ進む; +showsearch でなければ表示しない) */
     bool no_cmd_banner;   /* 見出し "; <<>> dag <<>>" を出さない (+qr の検索リストの 2 番目以降) */
+    uint8_t cmd_banner_style; /* dig: 最初のクエリだけ完全な見出し。CMD_BANNER_LINE = -f の 2 行目以降 ("; <<>>" 行だけ)、
+                                 CMD_BANNER_NONE = コマンドラインの 2 番目以降のクエリ (見出しなし) */
     char *search_domain;
     int ndots;
 
@@ -498,6 +500,14 @@ void free_query_opts(query_opts_t *qo);
 void prescan_always_global_options(int argc, char **argv, query_spec_t *global_spec);
 int parse_arg_slice(int start, int end, int argc, char **argv, query_spec_t *spec);
 int execute_query_spec(query_spec_t *spec);
+void finish_query_tuple(const query_spec_t *spec);
+#define MAX_DAG_QUERIES 64
+typedef struct {
+    int start;
+    int end;
+} arg_slice_t;
+int split_query_tuples(int argc, char **argv, arg_slice_t *queries, int *global_end);
+enum { CMD_BANNER_FULL = 0, CMD_BANNER_LINE = 1, CMD_BANNER_NONE = 2 };
 
 /* Break helpers */
 extern break_opt_t g_breaks[MAX_BREAKS];
