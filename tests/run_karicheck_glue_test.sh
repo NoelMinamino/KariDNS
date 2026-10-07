@@ -65,6 +65,13 @@ if echo "$OUT4" | grep -q "lacks A/AAAA glue"; then
     echo "  FAIL: Unexpected missing glue error on example.com.zone."
     exit 1
 fi
+# the sample zone is valid as a whole: its ZONEMD matches (RFC 8976 §4) and there are no errors
+if ! echo "$OUT4" | grep -q "^\[OK\] ZONEMD (Scheme 1, Hash 1) for 'example.com.' is VALID.$" ||
+   ! echo "$OUT4" | grep -q "^\[RESULT\] Zone 'example.com.': 0 error(s), "; then
+    echo "  FAIL: example.com.zone is not valid (ZONEMD or other errors):"
+    echo "$OUT4" | grep -E "ERROR|ZONEMD|RESULT"
+    exit 1
+fi
 echo "  PASS: example.com.zone passed without false positive delegation/glue warnings."
 
 echo "=== All karicheck Delegation & Glue Tests Passed! ==="

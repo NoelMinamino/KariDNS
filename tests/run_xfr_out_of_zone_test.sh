@@ -43,8 +43,8 @@ grep -q "^10\.2\.0\.192\.in-addr\.arpa\." "$TMP_DIR/example.com.zone" || { echo 
 USER_OPT=""
 [ "$(id -u)" = "0" ] && USER_OPT="user \"nobody\"; group \"nobody\";"
 
-# 1. karicheck: warning naming the record. (example.com.zone fails its ZONEMD check with or
-#    without this change, so the exit status is checked on a small zone below.)
+# 1. karicheck: warning naming the record. (The exit status is checked on a small zone below,
+#    where the out-of-zone record is the only diagnostic.)
 KC_OUT=$("$KARICHECK" zone example.com "$TMP_DIR/example.com.zone" 2>&1)
 if echo "$KC_OUT" | grep -q "\[WARNING\] Zone 'example.com.': out-of-zone record '10.2.0.192.in-addr.arpa.' PTR ignored"; then
     pass "karicheck warns about the out-of-zone PTR in example.com.zone"
