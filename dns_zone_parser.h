@@ -175,6 +175,8 @@ size_t hex_to_bytes(const char *hex, uint8_t *out, size_t max_out);
 /* RFC 1034 s4.2: drop records whose owner is not at or below apex (call before build_zone_index). */
 size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
                                    void (*report)(const dns_record_t *rec, void *ud), void *ud);
+/* X-32: drop records whose RDATA cannot be written in wire format (call before build_zone_index). */
+size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns_record_t *rec, void *ud), void *ud);
 bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_ttl);
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target);
 uint32_t calc_fnv1a_str(const char *str);

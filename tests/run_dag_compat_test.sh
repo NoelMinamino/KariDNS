@@ -8,7 +8,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MOCK_PL="$SCRIPT_DIR/mock_dns_server.pl"
-PORT=$((10500 + $$ % 10000))
+# X-26: 10500-19498, so the mock never takes 19999, the port of the "unreachable server" check below
+PORT=$((10500 + $$ % 9000))
 
 if [ ! -x "$ROOT_DIR/dag" ]; then
     echo "=== Building tools/dag with make ==="

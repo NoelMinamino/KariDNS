@@ -77,7 +77,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - tinydns `data` files (through a configuration file with `file-format tinydns;`): invalid location prefix lengths (`/n` above 32, error), duplicate location codes, malformed IPv6 fields of `3`/`6` lines, and SRV/NAPTR/SSHFP field ranges of generic lines
 2. **Zone Integrity & Structural Invariants**:
    - Exactly one SOA record at the zone apex, and at least one NS record at the apex
-   - CNAME exclusivity (CNAME must not co-exist with other record types at the same owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), and NS/MX/SRV targets that point to a CNAME (RFC 2181 §10.3)
+   - CNAME exclusivity (CNAME must not co-exist with other record types at the same owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), NS/MX targets that point to a CNAME (error, RFC 2181 §10.3) and SRV targets that point to a CNAME (warning, RFC 2782 "the name MUST NOT be an alias"; BIND's `check-srv-cname` default is also a warning)
    - Out-of-zone records (owner not at or below the zone name, e.g. address records for name servers outside the zone) give a warning and are left out of all further checks, because the server does not load them (RFC 1034 §4.2); the exit status is not affected
    - In-bailiwick NS targets (apex and delegations) must have an A/AAAA record in the zone (error); in-bailiwick MX and SRV targets without A/AAAA give a warning only, because no RFC requires an address for them. Records occluded by a delegation give warnings
    - Inconsistent TTLs within one RRset (warning)
@@ -87,7 +87,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - Catalog zones (`catalog-zone yes;`): `version.<zone> TXT "2"` is required, and group TXT records without a member PTR record give warnings
 3. **Record Field Validation**:
    - A/AAAA addresses; SRV, NAPTR, CAA (RFC 8659 tags and flags), SSHFP, HIP, WKS, GPOS, X25, ISDN, EUI48/EUI64, CSYNC, DSYNC and SVCB/HTTPS target fields
-   - WKS: the protocol is a number (0-255) or `TCP` / `UDP` (any case), as the server reads it; a port that is not a number (0-65535), e.g. a service name, gives a warning because the server leaves it out of the bit map
+   - WKS: the protocol is a number (0-255) or `TCP` / `UDP` (any case), as the server reads it; a port is a number (0-65535) or a service name from the server's built-in table (RFC 1035 §3.4.2; the IANA names of the common ports, e.g. `smtp`, `http`, `domain`); any other port gives a warning, and the record is reported as an error because the server cannot load it
    - NSEC3PARAM at the apex: Flags other than 0 are an error (RFC 5155 §4.1.2: such an NSEC3PARAM MUST be ignored, and the server ignores it); a hash algorithm other than 1 (SHA-1), an iteration count other than 0 (RFC 9276 §3.1: MUST be 0) and a non-empty salt (RFC 9276 §3.1: SHOULD NOT) give warnings; more than 100 iterations are an error. A warning is also given when no NSEC3PARAM is usable, or when the one the server uses has no NSEC3 RRs
    - NSEC3 records are checked once per chain (RRs with the same hash algorithm, iterations and salt), not once per RR: hash algorithm, reserved flag bits, opt-out (RFC 9276 §3.1), iterations and salt as above, and a warning for a chain that matches no NSEC3PARAM with Flags 0 (the server does not use it)
 4. **DNSSEC Algorithm & Digest Verification (RFC 8624 / RFC 8078)**:

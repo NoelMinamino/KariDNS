@@ -873,6 +873,118 @@ long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const 
     return write_uncompressed_name_ext(buf, offset, max_len, name, true);
 }
 
+/* X-38: WKS のポート名 (RFC 1035 §3.4.2 "both ports and protocols are expressed using mnemonics or decimal
+ * numbers")。BIND は getservbyname() で引くが、ゾーンは Capsicum の中で読むので /etc/services は開けない
+ * (CLAUDE.md Rule 2)。IANA の登録名 (FreeBSD の /etc/services と同じ) の主なものを固定表で持つ。
+ * proto が 0 の行は TCP と UDP の両方、それ以外はその番号のプロトコルだけ。 */
+static const struct { const char *name; uint16_t port; uint8_t proto; } wks_services[] = {
+    { "tcpmux", 1, 0 },       { "echo", 7, 0 },          { "discard", 9, 0 },      { "systat", 11, 0 },
+    { "daytime", 13, 0 },     { "netstat", 15, 0 },      { "qotd", 17, 0 },        { "chargen", 19, 0 },
+    { "ftp-data", 20, 0 },    { "ftp", 21, 0 },          { "ssh", 22, 0 },         { "telnet", 23, 0 },
+    { "smtp", 25, 0 },        { "time", 37, 0 },         { "rlp", 39, 0 },         { "nameserver", 42, 0 },
+    { "whois", 43, 0 },       { "nicname", 43, 0 },      { "tacacs", 49, 0 },      { "domain", 53, 0 },
+    { "bootps", 67, 0 },      { "bootpc", 68, 0 },       { "tftp", 69, 0 },        { "gopher", 70, 0 },
+    { "finger", 79, 0 },      { "http", 80, 0 },         { "www", 80, 0 },         { "kerberos", 88, 0 },
+    { "supdup", 95, 0 },      { "hostname", 101, 0 },    { "iso-tsap", 102, 0 },   { "csnet-ns", 105, 0 },
+    { "rtelnet", 107, 0 },    { "pop2", 109, 0 },        { "pop3", 110, 0 },       { "sunrpc", 111, 0 },
+    { "auth", 113, 0 },       { "sftp", 115, 0 },        { "uucp-path", 117, 0 },  { "nntp", 119, 0 },
+    { "ntp", 123, 0 },        { "netbios-ns", 137, 0 },  { "netbios-dgm", 138, 0 },{ "netbios-ssn", 139, 0 },
+    { "imap", 143, 0 },       { "snmp", 161, 0 },        { "snmp-trap", 162, 0 },  { "bgp", 179, 0 },
+    { "irc", 194, 0 },        { "ldap", 389, 0 },        { "https", 443, 0 },      { "submissions", 465, 0 },
+    { "exec", 512, 6 },       { "biff", 512, 17 },       { "login", 513, 6 },      { "who", 513, 17 },
+    { "shell", 514, 6 },      { "syslog", 514, 17 },     { "printer", 515, 0 },    { "talk", 517, 0 },
+    { "ntalk", 518, 0 },      { "route", 520, 0 },       { "timed", 525, 0 },      { "uucp", 540, 0 },
+    { "klogin", 543, 0 },     { "kshell", 544, 0 },      { "submission", 587, 0 }, { "ldaps", 636, 0 },
+    { "rsync", 873, 0 },      { "ftps-data", 989, 0 },   { "ftps", 990, 0 },       { "telnets", 992, 0 },
+    { "imaps", 993, 0 },      { "pop3s", 995, 0 },
+};
+
+bool dns_wks_port_from_text(const char *s, uint8_t proto, uint16_t *out) {
+    if (parse_u16(s, out)) return true;
+    if (!s) return false;
+    for (size_t i = 0; i < sizeof(wks_services) / sizeof(wks_services[0]); i++) {
+        if ((wks_services[i].proto == 0 ? (proto == 6 || proto == 17) : wks_services[i].proto == proto) &&
+            strcasecmp(wks_services[i].name, s) == 0) {
+            if (out) *out = wks_services[i].port;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 非圧縮のワイヤ形式の名前を小文字にし、その長さを返す (壊れていれば 0) */
+static size_t downcase_wire_name(uint8_t *p, size_t avail) {
+    size_t i = 0;
+    while (i < avail) {
+        uint8_t l = p[i];
+        if (l == 0) return i + 1;
+        if (l > 63 || i + 1 + l > avail) return 0;
+        for (size_t k = i + 1; k <= i + l; k++) {
+            if (p[k] >= 'A' && p[k] <= 'Z') p[k] |= 0x20;
+        }
+        i += 1 + (size_t)l;
+    }
+    return 0;
+}
+
+/* RFC 4034 §6.2 item 3 の型 (RFC 6840 §5.1 で NSEC を除く。HINFO は名前を含まない) は、正規形で RDATA 内の
+ * ドメイン名も小文字にする。一覧に無い型の名前はそのまま (RFC 3597 §7)。
+ * serialize_dns_record() はキャッシュ済みの NS/CNAME/PTR/DNAME/MX/SOA の名前を元の大文字小文字のまま書くので、
+ * 正規形が要る呼び出し側 (ZONEMD、UPDATE の RR 比較) はこれで小文字にする。rd は非圧縮の RDATA。 */
+void dns_canonical_downcase_rdata(uint16_t type, uint8_t *rd, size_t len) {
+    size_t off, n;
+    switch (type) {
+        case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: // NS MD MF CNAME MB MG MR PTR
+        case 30: case 39: // NXT (名前 + ビットマップ), DNAME
+            downcase_wire_name(rd, len);
+            break;
+        case 6: case 14: case 17: // SOA, MINFO, RP: 先頭に名前が 2 つ
+            n = downcase_wire_name(rd, len);
+            if (n > 0) downcase_wire_name(rd + n, len - n);
+            break;
+        case 15: case 18: case 21: case 36: // MX, AFSDB, RT, KX: 16 ビットの値 + 名前
+            if (len > 2) downcase_wire_name(rd + 2, len - 2);
+            break;
+        case 26: // PX: preference + MAP822 + MAPX400
+            if (len > 2 && (n = downcase_wire_name(rd + 2, len - 2)) > 0) {
+                downcase_wire_name(rd + 2 + n, len - 2 - n);
+            }
+            break;
+        case 33: // SRV: priority, weight, port + target
+            if (len > 6) downcase_wire_name(rd + 6, len - 6);
+            break;
+        case 24: case 46: // SIG, RRSIG: 18 オクテットの固定部 + Signer's Name
+            if (len > 18) downcase_wire_name(rd + 18, len - 18);
+            break;
+        case 35: // NAPTR: order, preference, flags, services, regexp (character-string) + replacement
+            off = 4;
+            for (int s = 0; s < 3 && off < len; s++) off += 1 + (size_t)rd[off];
+            if (off < len) downcase_wire_name(rd + off, len - off);
+            break;
+        case 38: // A6 (RFC 2874 §3.1.1): prefix len, ceil((128 - prefix len) / 8) オクテットの suffix, prefix name
+            if (len > 0 && rd[0] > 0 && rd[0] <= 128) {
+                off = 1 + (size_t)(128 - rd[0] + 7) / 8;
+                if (off < len) downcase_wire_name(rd + off, len - off);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+long dns_record_canonical_rdata(const dns_record_t *rec, uint8_t *buf, size_t cap) {
+    /* 所有者名をルートにして RR 全体を書き、固定部 (名前 1 + TYPE/CLASS/TTL/RDLENGTH 10) の後ろを使う */
+    uint16_t len = 0;
+    if (cap > 65535) cap = 65535;
+    if (serialize_dns_record(buf, cap, &len, rec, NULL, ".", 0xFFFFFFFF) != 0) return -1;
+    if (len < 11 || buf[0] != 0) return -1;
+    size_t rdlen = ((size_t)buf[9] << 8) | buf[10];
+    if (11 + rdlen != len) return -1;
+    memmove(buf, buf + 11, rdlen);
+    dns_canonical_downcase_rdata(rec->type_code, buf, rdlen);
+    return (long)rdlen;
+}
+
 size_t dns_label_to_text(const uint8_t *label, size_t len, char *out, size_t cap) {
     size_t w = 0;
     for (size_t i = 0; i < len; i++) {
@@ -2135,7 +2247,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     break;
                 }
                 if (rec->rdata_count == 0) return -1;
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                /* X-37: RFC 4034 §6.2 item 3 に無い NSAP-PTR の名前は大文字小文字を保つ (DNAME は一覧にある) */
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], rec_type == 39);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -2453,7 +2566,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     if (inet_pton(AF_INET6, rec->rdata[3], &addr) != 1) return -1;
                     memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                 } else if (gw_type == 3) { // Domain name
-                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                    /* X-37: IPSECKEY は RFC 4034 §6.2 item 3 の一覧に無いので、名前の大文字小文字を保つ
+                     * (署名者はそのまま署名する。小文字にすると RRSIG が検証できない) */
+                    long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[3], false);
                     if (w < 0) return -1;
                     offset += (size_t)w;
                 } else {
@@ -2492,7 +2607,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     memcpy(&res[offset], &addr.s6_addr, 16); offset += 16;
                 } else if (type == 3) { // Domain name
                     if (rec->rdata_count < 4) return -1;
-                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                    /* X-37: AMTRELAY は RFC 4034 §6.2 item 3 の一覧に無い: 大文字小文字を保つ */
+                    long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[3], false);
                     if (w < 0) return -1;
                     offset += (size_t)w;
                 } else if (type != 0) {
@@ -2771,8 +2887,9 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 offset += pk_len;
                 
                 // 残りのトークンを Rendezvous Server (非圧縮ドメイン名) として書き出す
+                // X-37: HIP は RFC 4034 §6.2 item 3 の一覧に無い (RFC 8005 §5): 大文字小文字を保つ
                 for (; r_idx < rec->rdata_count; r_idx++) {
-                    long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[r_idx]);
+                    long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[r_idx], false);
                     if (w < 0) return -1;
                     offset += w;
                 }
@@ -3061,7 +3178,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 res[offset++] = scheme;
                 res[offset++] = port >> 8; res[offset++] = port & 0xFF;
 
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[3]);
+                /* X-37: DSYNC は RFC 4034 §6.2 item 3 の一覧に無い: 大文字小文字を保つ */
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[3], false);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -3153,10 +3271,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 int max_port = -1;
                 for (int i = 2; i < rec->rdata_count; i++) {
                     uint16_t port;
-                    if (parse_u16(rec->rdata[i], &port)) {
-                        bitmap[port / 8] |= (1 << (7 - (port % 8)));
-                        if ((int)port > max_port) max_port = (int)port;
-                    }
+                    /* X-38: 読めないポートは黙って落とさず、レコード全体を書けないものにする (ロード時に警告して除く) */
+                    if (!dns_wks_port_from_text(rec->rdata[i], proto, &port)) return -1;
+                    bitmap[port / 8] |= (1 << (7 - (port % 8)));
+                    if ((int)port > max_port) max_port = (int)port;
                 }
                 if (max_port >= 0) {
                     size_t map_len = (max_port / 8) + 1;
@@ -3189,7 +3307,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 uint16_t pref;
                 if (!parse_u16(rec->rdata[0], &pref)) return -1;
                 res[offset++] = pref >> 8; res[offset++] = pref & 0xFF;
-                long w = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                /* X-37: LP (RFC 6742) は RFC 4034 §6.2 item 3 の一覧に無い: 大文字小文字を保つ */
+                long w = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], rec_type != 107);
                 if (w < 0) return -1;
                 offset += w;
                 break;
@@ -3257,10 +3376,11 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
             }
             case 58: { // TALINK (Trust Anchor LINK)
                 if (rec->rdata_count < 2) return -1;
-                long w0 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[0]);
+                /* X-37: TALINK は RFC 4034 §6.2 item 3 の一覧に無い: 大文字小文字を保つ */
+                long w0 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[0], false);
                 if (w0 < 0) return -1;
                 offset += (size_t)w0;
-                long w1 = write_uncompressed_name(res, offset, max_res_len, rec->rdata[1]);
+                long w1 = write_uncompressed_name_ext(res, offset, max_res_len, rec->rdata[1], false);
                 if (w1 < 0) return -1;
                 offset += (size_t)w1;
                 break;

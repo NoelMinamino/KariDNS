@@ -125,14 +125,23 @@ bool compare_records(const dns_record_t *a, const dns_record_t *b, bool ignore_t
   if (a->ecs_subnet_tag && b->ecs_subnet_tag && strcasecmp(a->ecs_subnet_tag, b->ecs_subnet_tag) != 0) return false;
   if ((a->bind_location_tag == NULL) != (b->bind_location_tag == NULL)) return false;
   if (a->bind_location_tag && b->bind_location_tag && strcasecmp(a->bind_location_tag, b->bind_location_tag) != 0) return false;
-  if (a->rdata_count != b->rdata_count) return false;
-  for (int i = 0; i < a->rdata_count; i++) {
-    if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) return false;
-    if (a->rdata[i] && b->rdata[i] && strcmp(a->rdata[i], b->rdata[i]) != 0) return false;
+  /* 同じ表現で同じ値なら等しい (よくある場合はここで終わる) */
+  bool same_text = (a->rdata_count == b->rdata_count && a->generic_len == b->generic_len);
+  for (int i = 0; same_text && i < a->rdata_count; i++) {
+    if ((a->rdata[i] == NULL) != (b->rdata[i] == NULL)) same_text = false;
+    else if (a->rdata[i] && b->rdata[i] && strcmp(a->rdata[i], b->rdata[i]) != 0) same_text = false;
   }
-  if (a->generic_len != b->generic_len) return false;
-  if (a->generic_len > 0 && memcmp(a->generic_data, b->generic_data, a->generic_len) != 0) return false;
-  return true;
+  if (same_text && a->generic_len > 0 && memcmp(a->generic_data, b->generic_data, a->generic_len) != 0) same_text = false;
+  if (same_text) return true;
+  /* X-16, X-25: RFC 2136 §1.1.1 (RR は RDATA が等しければ等しい)、§1.1.2 (名前は RFC 1035 §2.3.3 のとおり
+   * 大文字小文字を区別しない)。テキスト (ゾーンファイル) とワイヤ (転送、UPDATE) の表現の違い、数値の書き方、
+   * 名前の大文字小文字に依らないよう、RFC 4034 §6.2 の正規形の RDATA で比べる (BIND の dns_rdata_compare()
+   * と同じく、一覧に無い型の名前は区別する)。 */
+  uint8_t wa[65535], wb[65535];
+  long la = dns_record_canonical_rdata(a, wa, sizeof(wa));
+  if (la < 0) return false;
+  long lb = dns_record_canonical_rdata(b, wb, sizeof(wb));
+  return lb == la && memcmp(wa, wb, (size_t)la) == 0;
 }
 
 bool record_exists_in_arena(zone_arena_t *arena, const dns_record_t *target) {
@@ -2297,5 +2306,29 @@ size_t zone_arena_drop_out_of_zone(zone_arena_t *arena, const char *apex,
     kept++;
   }
   arena->count = kept;
+  return dropped;
+}
+
+/* X-32: RDATA をワイヤ形式に書けないレコード (パーサは受け付けたが値が型の形式に合わないもの) を取り除く。
+ * 残しておくと応答から黙って落ち、AXFR はそのレコードで転送を打ち切る (後ろのレコードが届かない)。
+ * zone_arena_drop_out_of_zone() と同じく build_zone_index() より前に呼ぶ。戻り値は取り除いた件数。 */
+size_t zone_arena_drop_unencodable(zone_arena_t *arena, void (*report)(const dns_record_t *rec, void *ud), void *ud) {
+  if (!arena || !arena->records) return 0;
+  /* ゾーンの読み込みはクエリの経路ではないので、作業領域はヒープに 1 回だけ取る */
+  uint8_t *buf = malloc(65535);
+  if (!buf) return 0;
+  size_t kept = 0, dropped = 0;
+  for (size_t i = 0; i < arena->count; i++) {
+    dns_record_t *r = &arena->records[i];
+    if (dns_record_canonical_rdata(r, buf, 65535) < 0) {
+      if (report) report(r, ud);
+      dropped++;
+      continue;
+    }
+    if (kept != i) arena->records[kept] = *r;
+    kept++;
+  }
+  arena->count = kept;
+  free(buf);
   return dropped;
 }

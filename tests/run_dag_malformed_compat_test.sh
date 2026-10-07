@@ -131,28 +131,72 @@ if [ "$(grep -c "Got answer" "$OUT")" -ne 1 ]; then
     echo "FAIL [flag-tc]: expected exactly one printed answer (the TCP one)"; FAILED=$((FAILED + 1))
 fi
 
+# X-43: over TCP dig 9.20 does not wait for another answer: an ID mismatch or a question mismatch ends the lookup
+# (nothing else is printed, exit code 0); an opcode mismatch waits for the next message on the same connection
+run_tcp() { # scenario [extra options]; sets RC
+    sc="$1"; shift
+    "$DAG" @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS +tcp "$@" +nohexdump > "$OUT.raw" 2>&1
+    RC=$?
+    sed -E 's/[[:space:]]+/ /g; s/ $//' "$OUT.raw" > "$OUT"
+    CUR="$sc +tcp $*"
+}
+rc_is() {
+    if [ "$RC" = "$1" ]; then return 0; fi
+    echo "FAIL [$CUR]: exit code $RC, expected $1"; FAILED=$((FAILED + 1)); return 1
+}
+run_tcp id-mismatch;    has ";; ERROR: ID mismatch: expected ID" && hasnt "Got answer" && hasnt "<<>> dag" && rc_is 0 && ok
+run_tcp query-mismatch; has ";; ;; Question section mismatch: got mismatch-spoofed.anomaly.test/A/IN" && hasnt "Got answer" && hasnt "$REACH" && rc_is 0 && ok
+run_tcp multi-question; has "$MAL" && has ";; ;; Question section mismatch: got sub.multi-question.anomaly.test/AAAA/IN" && hasnt "Got answer" && rc_is 0 && ok
+run_tcp opcode-status;  has ";; Warning: Opcode mismatch: expected QUERY, got STATUS" && has "$REACH" && hasnt "Got answer" && rc_is 9 && ok
+run_tcp no-question;    has ";; missing question section" && has "Got answer" && rc_is 0 && ok
+run_tcp short-header;   has ";; ERROR: short (< header size) message" && hasnt "Got bad packet" && hasnt "$REACH" && rc_is 0 && ok
+
+# X-44: +short prints the parse diagnostics like dig and only the records that parsed; +yaml prints no ";;" lines,
+# nothing for a message that cannot be parsed, and a DIG_ERROR document when no answer is accepted
+run rdata-short-a +short;    has "$MAL" && hasnt "truncated" && hasnt "192.0.2" && ok
+run compression-loop +short; has ";; Got bad packet: bad compression pointer" && has "18 bytes" && ok
+run ancount-underflow +short; has "$MAL" && has "192.0.2.1" && ok
+run compression-loop +yaml;  hasnt "type: MESSAGE" && hasnt ";;" && ok
+[ -s "$OUT" ] && { echo "FAIL [$CUR]: expected no output"; sed 's/^/    | /' "$OUT"; FAILED=$((FAILED + 1)); }
+run id-mismatch +yaml;       has "- type: DIG_ERROR" && has "no servers could be reached" && hasnt ";;" && ok
+run rdata-opt-truncated +yaml; hasnt "OPT_PSEUDOSECTION" && hasnt "ADDITIONAL_SECTION" && has "ADDITIONAL: 1" && ok
+run multi-opt +yaml +additional;      has "OPT_PSEUDOSECTION:" && has "ADDITIONAL_SECTION:" && has "- '. 0 CLASS4096 OPT '" && ok
+run unclosed-label +yaml +question; has "QUESTION: 1" && hasnt "QUESTION_SECTION" && ok
+run flag-z +yaml;            has "flags: qr aa" && has "MBZ: 0x4" && hasnt "flags: qr aa z" && ok
+run flag-rd-ra +yaml;        has "type: RECURSIVE_RESPONSE" && ok
+run flag-rd +yaml;           has "type: AUTH_RESPONSE" && ok
+run rcode-badkey +yaml;      has "status: 17" && hasnt "status: ?17" && ok
+
 # direct comparison with dig 9.20 (optional)
 if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
     echo "=== comparison with $(dig -v 2>&1) ==="
     norm() {
         sed -E -e 's/^; <<>> .*/; <<>> BANNER/' -e '/^;; global options/d' -e '/^; \([0-9] server found\)/d' \
+            -e 's/(query_time|response_time): !!timestamp .*/\1: T/' \
             -e 's/id: [0-9]+/id: X/' -e 's/expected ID [0-9]+, got [0-9]+/expected ID X, got Y/' \
             -e 's/^(.. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..) .*/\1/' -e 's/^[0-9a-f]{2} [0-9a-f]{2} (8[0-9a-f] )/XX XX \1/' \
             -e 's/[[:space:]]+/ /g' -e 's/ $//' | grep -v '^$'
     }
+    # Every scenario in the default format, +short, +yaml (X-44) and over TCP (X-43), exit codes included.
     # class-mismatch depends on the random query ID (its RDATA points into the header) and is checked above
-    for sc in $(perl -ne 'print "$1\n" if /^\s+"  ([a-z0-9-]+)\.\$display_zone/' "$SCRIPT_DIR/mock_anomalous_dns_server.pl" |
-                grep -v '^drop$\|^what-is-my-ip$\|^tcp-max-65535$\|^class-mismatch$'); do
-        dig @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS 2>&1 | norm > "$TMP_DIR/dig.txt"
-        "$DAG" @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS +nohexdump 2>&1 | norm > "$TMP_DIR/dag.txt"
-        CUR="$sc (vs dig)"
-        if cmp -s "$TMP_DIR/dig.txt" "$TMP_DIR/dag.txt"; then
-            PASSED=$((PASSED + 1))
-        else
-            echo "FAIL [$CUR]"
-            diff "$TMP_DIR/dig.txt" "$TMP_DIR/dag.txt" | head -20 | sed 's/^/    /'
-            FAILED=$((FAILED + 1))
-        fi
+    for mode in "" "+short" "+yaml" "+tcp"; do
+        for sc in $(perl -ne 'print "$1\n" if /^\s+"  ([a-z0-9-]+)\.\$display_zone/' "$SCRIPT_DIR/mock_anomalous_dns_server.pl" |
+                    grep -v '^drop$\|^what-is-my-ip$\|^tcp-max-65535$\|^class-mismatch$'); do
+            dig @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode > "$TMP_DIR/dig.raw" 2>&1
+            drc=$?
+            "$DAG" @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode +nohexdump > "$TMP_DIR/dag.raw" 2>&1
+            grc=$?
+            norm < "$TMP_DIR/dig.raw" > "$TMP_DIR/dig.txt"
+            norm < "$TMP_DIR/dag.raw" > "$TMP_DIR/dag.txt"
+            CUR="$sc $mode (vs dig)"
+            if cmp -s "$TMP_DIR/dig.txt" "$TMP_DIR/dag.txt" && [ "$drc" = "$grc" ]; then
+                PASSED=$((PASSED + 1))
+            else
+                echo "FAIL [$CUR]: exit code dig=$drc dag=$grc"
+                diff "$TMP_DIR/dig.txt" "$TMP_DIR/dag.txt" | head -20 | sed 's/^/    /'
+                FAILED=$((FAILED + 1))
+            fi
+        done
     done
 else
     echo "SKIP: dig 9.20 not installed; direct comparison not run"

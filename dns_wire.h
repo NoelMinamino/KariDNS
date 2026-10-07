@@ -52,6 +52,9 @@ static inline bool dns_wks_protocol_from_text(const char *s, uint8_t *out) {
     return parse_u8(s, out);
 }
 
+/* WKS のポート (RFC 1035 §3.4.2: 名前か 10 進数)。名前は固定表で引く (X-38)。シリアライザと karicheck が共有する。 */
+bool dns_wks_port_from_text(const char *s, uint8_t proto, uint16_t *out);
+
 // Forward declarations
 struct server_config_s;
 struct evp_pkey_st;
@@ -458,6 +461,11 @@ long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const 
 long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
+/* RFC 4034 §6.2 item 3 (RFC 6840 §5.1) の型について、非圧縮の RDATA 内のドメイン名を小文字にする */
+void dns_canonical_downcase_rdata(uint16_t type, uint8_t *rd, size_t len);
+/* rec の RDATA を正規形 (非圧縮、上の型の名前は小文字) で buf に書き、長さを返す。書けなければ -1。
+ * テキスト形式 (ゾーンファイル) とワイヤ形式 (転送、UPDATE) のレコードを同じ形で比べるのに使う。 */
+long dns_record_canonical_rdata(const dns_record_t *rec, uint8_t *buf, size_t cap);
 uint32_t parse_ttl_value(const char *ttl_str);
 
 // EDNS

@@ -98,6 +98,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // Fuzz dynamic update handling
     handle_dynamic_update(data, size, &entry, "127.0.0.1", "key-admin");
 
+    /* X-35: an applied update records its IXFR difference in entry.ixfr_history (compute_ixfr_diff()); the
+     * server keeps it for the life of the zone, this per-input entry must release it or every applied update
+     * leaks one transaction (the RSS grew to the 2 GB limit of the build host in a few minutes) */
+    for (int i = 0; i < MAX_IXFR_HISTORY; i++) {
+        if (entry.ixfr_history.entries[i]) free_ixfr_txn(entry.ixfr_history.entries[i]);
+    }
+
     zone_arena_destroy(&entry.rcu.arena_a);
     zone_arena_destroy(&entry.rcu.arena_b);
     pthread_mutex_destroy(&entry.writer_lock);

@@ -190,6 +190,8 @@ static const char *const SERIALIZE_FAIL_LINES[] = {
     "IN EUI64 00-00-5e-ef-10-00-00",
     "IN WKS 192.0.2.1 bogusproto 25",
     "IN WKS 999.1.1.1 6 25",
+    "IN WKS 192.0.2.1 TCP nosuchservice 25",   /* X-38: unknown port name -> not encodable (was dropped silently) */
+    "IN WKS 192.0.2.1 UDP exec",               /* X-38: exec is a TCP-only name */
     "IN NAPTR 100 10 \"S\" \"SIP+D2U\"",
     "IN HTTPS 1 . port=99999",
     "IN SVCB 1 svc.example. ipv4hint=1.2.3",
@@ -1275,8 +1277,168 @@ static void test_d08_readme_types(void) {
     printf("  -> README type wire formats passed.\n");
 }
 
+/* ---------------------------------------------------------------- phase 15b: X-16, X-25, X-32, X-37, X-38 */
+static void test_x37_rdata_name_case(void) {
+    printf("[TEST] X-37: RDATA names of types outside RFC 4034 6.2 keep their case...\n");
+    static const uint8_t ipsec[] = { 10, 3, 2, 2, 'G', 'w', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0x01, 0x03, 0x51 };
+    expect_rdata("IN IPSECKEY 10 3 2 Gw.Example. AQNR", ipsec, sizeof(ipsec));
+    static const uint8_t talink[] = { 1, 'P', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0, 1, 'n', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN TALINK P.Example. n.example.", talink, sizeof(talink));
+    static const uint8_t lp[] = { 0, 10, 2, 'L', 'p', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN LP 10 Lp.Example.", lp, sizeof(lp));
+    static const uint8_t amt[] = { 10, 3, 1, 'R', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN AMTRELAY 10 0 3 R.Example.", amt, sizeof(amt));
+    static const uint8_t nsap_ptr[] = { 1, 'F', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN NSAP-PTR F.Example.", nsap_ptr, sizeof(nsap_ptr));
+    static const uint8_t dsync[] = { 0, 59, 1, 0x14, 0xb4, 1, 'S', 7, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN DSYNC CDS NOTIFY 5300 S.Example.", dsync, sizeof(dsync));
+    /* types in the RFC 4034 6.2 list are still written in lower case in the uncompressed text path */
+    static const uint8_t afsdb[] = { 0, 1, 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    expect_rdata("IN AFSDB 1 A.Example.", afsdb, sizeof(afsdb));
+    /* the canonical form lower-cases only the listed types */
+    uint8_t rd[] = { 0, 1, 1, 'A', 0 };
+    dns_canonical_downcase_rdata(18, rd, sizeof(rd));
+    assert(rd[3] == 'a');
+    uint8_t rd2[] = { 10, 3, 2, 1, 'A', 0 };
+    dns_canonical_downcase_rdata(45, rd2, sizeof(rd2));
+    assert(rd2[4] == 'A');
+    printf("  -> RDATA name case passed.\n");
+}
+
+static void test_x38_wks_port_names(void) {
+    printf("[TEST] X-38: WKS port mnemonics (RFC 1035 3.4.2)...\n");
+    uint16_t port = 0;
+    assert(dns_wks_port_from_text("25", 6, &port) && port == 25);
+    assert(dns_wks_port_from_text("smtp", 6, &port) && port == 25);
+    assert(dns_wks_port_from_text("HTTP", 6, &port) && port == 80);
+    assert(dns_wks_port_from_text("domain", 17, &port) && port == 53);
+    assert(dns_wks_port_from_text("biff", 17, &port) && port == 512);
+    assert(!dns_wks_port_from_text("biff", 6, &port));
+    assert(dns_wks_port_from_text("exec", 6, &port) && port == 512);
+    assert(!dns_wks_port_from_text("smtp", 1, &port));        /* names only for TCP and UDP */
+    assert(dns_wks_port_from_text("7", 1, &port) && port == 7);
+    assert(!dns_wks_port_from_text("nosuchservice", 6, &port));
+    assert(!dns_wks_port_from_text("65536", 6, &port));
+    assert(!dns_wks_port_from_text(NULL, 6, &port));
+    /* 192.0.2.20, TCP, ports 25 80 443 (bit map up to octet 55) */
+    uint8_t want[5 + 56] = { 192, 0, 2, 20, 6 };
+    want[5 + 3] = 0x40;   /* 25 */
+    want[5 + 10] = 0x80;  /* 80 */
+    want[5 + 55] = 0x10;  /* 443 */
+    expect_rdata("IN WKS 192.0.2.20 TCP smtp HTTP 443", want, sizeof(want));
+    printf("  -> WKS port names passed.\n");
+}
+
+static int g_unencodable_reports;
+static void count_unencodable(const dns_record_t *rec, void *ud) {
+    assert(ud == &g_unencodable_reports);
+    assert(rec->name && strcasecmp(rec->name, "bad.example.") == 0);
+    g_unencodable_reports++;
+}
+
+static void test_x32_drop_unencodable(void) {
+    printf("[TEST] X-32: records that cannot be encoded are dropped one by one...\n");
+    zt_t z;
+    char text[1024];
+    snprintf(text, sizeof(text), "%s"
+             "a1 IN A 192.0.2.11\n"
+             "bad IN IPSECKEY 10 1 2 not-an-address AQNR\n"
+             "bad IN WKS 192.0.2.21 TCP nosuchservice 25\n"
+             "a2 IN A 192.0.2.12\n", SOA_HEAD);
+    zt_load(&z, text);
+    ASSERT_PARSED(&z);
+    size_t before = z.arena.count;
+    g_unencodable_reports = 0;
+    assert(zone_arena_drop_unencodable(&z.arena, count_unencodable, &g_unencodable_reports) == 2);
+    assert(g_unencodable_reports == 2 && z.arena.count == before - 2);
+    assert(strcasecmp(z.arena.records[z.arena.count - 1].name, "a2.example.") == 0);
+    assert(build_zone_index(&z.arena, true) == 0);
+    assert(zone_arena_drop_unencodable(&z.arena, NULL, NULL) == 0);
+    assert(zone_arena_drop_unencodable(NULL, NULL, NULL) == 0);
+    zt_free(&z);
+    printf("  -> unencodable drop passed.\n");
+}
+
+/* a record in wire form (as stored by UPDATE and zone transfers) */
+static dns_record_t wire_rr(const char *name, uint16_t type, const uint8_t *rd, uint16_t len) {
+    dns_record_t r;
+    memset(&r, 0, sizeof(r));
+    r.name = (char *)name;
+    r.type_code = type;
+    r.class_val = 1;
+    r.generic_data = (uint8_t *)rd;
+    r.generic_len = len;
+    return r;
+}
+
+static void test_x16_x25_compare_records(void) {
+    printf("[TEST] X-16, X-25: compare_records() uses the canonical RDATA (RFC 2136 1.1.1, 1.1.2)...\n");
+    zt_t z;
+    char text[2048];
+    snprintf(text, sizeof(text), "%s"
+             "m IN MX 10 mail.example.\n"
+             "m IN MX 10 MAIL.Example.\n"
+             "m IN MX 20 mail.example.\n"
+             "n IN NS NS2.EXAMPLE.\n"
+             "a IN A 192.0.2.1\n"
+             "ip IN IPSECKEY 10 3 2 gw.example. AQNR\n"
+             "ip IN IPSECKEY 10 3 2 GW.example. AQNR\n"
+             "s IN RRSIG A 13 2 300 20300101000000 20200101000000 12345 Example. AQNR\n"
+             "k IN DNSKEY 257 3 13 AQNR\n", SOA_HEAD);
+    zt_load(&z, text);
+    ASSERT_PARSED(&z);
+    dns_record_t *mx1 = NULL, *mx2 = NULL, *mx3 = NULL, *ip1 = NULL, *ip2 = NULL;
+    for (size_t i = 0; i < z.arena.count; i++) {
+        dns_record_t *r = &z.arena.records[i];
+        if (r->type_code == 15) { if (!mx1) mx1 = r; else if (!mx2) mx2 = r; else mx3 = r; }
+        if (r->type_code == 45) { if (!ip1) ip1 = r; else ip2 = r; }
+    }
+    assert(mx1 && mx2 && mx3 && ip1 && ip2);
+    assert(compare_records(mx1, mx2, true));          /* names in MX RDATA: case-insensitive */
+    assert(!compare_records(mx1, mx3, true));         /* different preference */
+    assert(!compare_records(ip1, ip2, true));         /* IPSECKEY is not in the RFC 4034 6.2 list */
+    assert(compare_records(ip1, ip1, false));
+
+    /* text (zone file) against wire (UPDATE / transfer) */
+    static const uint8_t ns_wire[] = { 3, 'n', 's', '2', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 };
+    dns_record_t ns_w = wire_rr("n.example.", 2, ns_wire, sizeof(ns_wire));
+    assert(compare_records(zt_find(&z, "n.example.", 2), &ns_w, true));
+    static const uint8_t a_wire[] = { 192, 0, 2, 1 }, a_other[] = { 192, 0, 2, 2 };
+    dns_record_t a_w = wire_rr("A.example.", 1, a_wire, 4), a_o = wire_rr("a.example.", 1, a_other, 4);
+    assert(compare_records(zt_find(&z, "a.example.", 1), &a_w, true));
+    assert(!compare_records(zt_find(&z, "a.example.", 1), &a_o, true));
+    /* X-25: DNSSEC records from the zone file match their wire form (signer name compared in lower case) */
+    dns_record_t *sig = zt_find(&z, "s.example.", 46);
+    uint8_t buf[512];
+    long len = dns_record_canonical_rdata(sig, buf, sizeof(buf));
+    assert(len > 18);
+    uint8_t sig_wire[512];
+    memcpy(sig_wire, buf, (size_t)len);
+    sig_wire[19] = 'E';                               /* "Example" in the signer's name */
+    dns_record_t sig_w = wire_rr("s.example.", 46, sig_wire, (uint16_t)len);
+    assert(compare_records(sig, &sig_w, true));
+    sig_wire[len - 1] ^= 1;                           /* one bit of the signature differs */
+    assert(!compare_records(sig, &sig_w, true));
+    dns_record_t *key = zt_find(&z, "k.example.", 48);
+    static const uint8_t key_wire[] = { 0x01, 0x01, 3, 13, 0x01, 0x03, 0x51 };
+    dns_record_t key_w = wire_rr("k.example.", 48, key_wire, sizeof(key_wire));
+    assert(compare_records(key, &key_w, true));
+    /* the TTL still counts unless ignored, and the type always counts */
+    key_w.ttl_value = 1;
+    key_w.ttl = (char *)"1";
+    assert(!compare_records(key, &key_w, false));
+    key_w.type_code = 60;
+    assert(!compare_records(key, &key_w, true));
+    zt_free(&z);
+    printf("  -> canonical RR comparison passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
+    test_x37_rdata_name_case();
+    test_x38_wks_port_names();
+    test_x32_drop_unencodable();
+    test_x16_x25_compare_records();
     test_d08_readme_types();
     test_r22_mnemonics_and_classes();
     test_r22_omitted_ttl();

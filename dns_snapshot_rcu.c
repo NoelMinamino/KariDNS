@@ -628,6 +628,14 @@ static void log_out_of_zone_record(const dns_record_t *rec, void *ud) {
          rec->name ? rec->name : "", rec->type ? rec->type : "");
 }
 
+static void log_unencodable_record(const dns_record_t *rec, void *ud) {
+  out_of_zone_log_t *l = ud;
+  if (l->logged >= OUT_OF_ZONE_LOG_MAX) return;
+  l->logged++;
+  syslog(LOG_WARNING, "[Zone] zone '%s': ignoring record '%s' %s: its RDATA cannot be encoded "
+         "(karicheck shows the reason)", l->zone, rec->name ? rec->name : "", rec->type ? rec->type : "");
+}
+
 reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) {
   if (!entry || !zcfg || !zcfg->file) return RELOAD_ERR_FILE_READ;
   const char *file = zcfg->file;
@@ -798,6 +806,13 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       syslog(LOG_WARNING, "[Zone] zone '%s': ignored %zu tinydns record(s) that belong to no configured zone "
              "in view '%s' (first: '%s') in '%s'", entry->domain, ctx.out_of_zone_count, entry->view_name,
              ctx.first_out_of_zone ? ctx.first_out_of_zone : "", file);
+  }
+  /* X-32: 書けないレコードはその 1 件だけ警告して除く (応答や AXFR で他のレコードを巻き込まない) */
+  out_of_zone_log_t bad = { entry->domain, 0 };
+  size_t bad_count = zone_arena_drop_unencodable(z_standby, log_unencodable_record, &bad);
+  if (bad_count > 0) {
+      syslog(LOG_WARNING, "[Zone] zone '%s': ignored %zu record(s) that cannot be encoded from '%s'",
+             entry->domain, bad_count, file);
   }
 
   if (build_zone_index(z_standby, true) != 0) {

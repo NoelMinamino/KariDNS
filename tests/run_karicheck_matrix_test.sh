@@ -190,10 +190,14 @@ zone_case mx_then_ns  1 "In-bailiwick NS target 'x.z.example.' lacks A/AAAA glue
 sub NS x.z.example.'
 zone_case ns_once     1 "0 warning(s)" '@ NS ns2.z.example.'
 
-# ---- WKS (K-03): protocol names like the server, port tokens the server drops ----------------------------
+# ---- WKS (K-03): protocol names like the server; port names from the server's table (X-38) ----------------
 zone_case wks_names   0 "0 error(s), 0 warning(s)" 'w WKS 192.0.2.1 TCP 25 80
-u WKS 192.0.2.1 udp 53'
-zone_case wks_port    0 "0 error(s), 2 warning(s)" 'w WKS 192.0.2.1 TCP smtp 70000'
+u WKS 192.0.2.1 udp 53
+s WKS 192.0.2.1 TCP smtp HTTP 443
+d WKS 192.0.2.1 UDP domain biff'
+# a port the server cannot encode: warning for the port and error for the record (the server leaves it out)
+zone_case wks_port    1 "1 error(s), 1 warning(s)" 'w WKS 192.0.2.1 TCP smtp 70000'
+zone_case wks_badname 1 "1 error(s), 1 warning(s)" 'w WKS 192.0.2.1 UDP exec'
 
 # ---- counting (K-04): warnings that were printed but not counted before ----------------------------------
 zone_case count_ds    0 "0 error(s), 1 warning(s)" 'k DS 1 8 1 0123456789abcdef0123456789abcdef01234567'

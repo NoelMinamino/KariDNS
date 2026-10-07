@@ -116,6 +116,21 @@ else
     FAILED=1
 fi
 
+# Test 4c: RFC 2782 SRV target that is a CNAME (WARNING, X-39); "." and a target with an address are not reported
+echo "[+] Test 4c: RFC 2782 SRV CNAME target check..."
+set +e
+OUT4C=$(./karicheck zone srv.test. tests/zones/test_lint_srv_cname.zone 2>&1)
+EXIT4C=$?
+set -e
+if [ $EXIT4C -eq 0 ] && echo "$OUT4C" | grep -q "SRV record '_sip._tcp.srv.test.' points to CNAME target 'alias.srv.test.'" \
+   && echo "$OUT4C" | grep -q "0 error(s), 1 warning(s)" && ! echo "$OUT4C" | grep -q "_ldap._tcp\|_none._tcp"; then
+    echo "  PASS: RFC 2782 SRV CNAME target warning detected (exit=$EXIT4C)."
+else
+    echo "  FAIL: RFC 2782 SRV CNAME target warning missing or wrong (exit=$EXIT4C):"
+    echo "$OUT4C"
+    FAILED=1
+fi
+
 # Test 5: ZONEMD Serial Mismatch
 echo "[+] Test 5: ZONEMD SOA serial consistency check..."
 set +e

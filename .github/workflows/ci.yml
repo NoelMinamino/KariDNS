@@ -73,18 +73,9 @@ jobs:
             make -j"$NCPU" unit-tests-asan < /dev/null
             echo "::endgroup::"
 
-            echo "::group::🔍 [Smoke Test] Test dag client against Google DNS"
-            echo "Testing UDP query..."
-            ./dag www.google.com A @8.8.8.8
-            
-            echo "Testing TCP query..."
-            ./dag google.com TXT @8.8.8.8 +tcp
-
-            echo "Testing mutiple UDP query..."
-            ./dag www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
-
-            echo "Testing multiple TCP query..."
-            ./dag google.com TXT @8.8.8.8,9.9.9.9,1.1.1.1 +tcp
+            echo "::group::🔍 [Smoke Test] Test dag client against a local mock server"
+            # X-09: no real domains or public resolvers (UDP, TCP, multiple servers, AXFR)
+            sh ./tests/run_ci_dag_smoke.sh
             echo "::endgroup::"
 
             echo "::group::🛡️ [Functional & Protocol Tests]"
@@ -233,12 +224,8 @@ jobs:
         run: |
           echo "::group::🔍 Test dag execution"
           ./dag --help || true
-          echo "Testing UDP query..."
-          ./dag www.google.com A @8.8.8.8
-          echo "Testing TCP query..."
-          ./dag google.com TXT @8.8.8.8 +tcp
-          echo "Testing multiple UDP query..."
-          ./dag www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
+          # X-09: queries a local mock server (no real domains or public resolvers)
+          sh ./tests/run_ci_dag_smoke.sh
           echo "::endgroup::"
 
   build-dag-windows:
@@ -260,6 +247,7 @@ jobs:
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-libidn2
             make
+            perl
 
       - name: Build dag.exe
         shell: msys2 {0}
@@ -272,12 +260,8 @@ jobs:
         run: |
           echo "::group::🔍 Test dag.exe execution"
           ./dag.exe --help || true
-          echo "Testing UDP query..."
-          ./dag.exe www.google.com A @8.8.8.8
-          echo "Testing TCP query..."
-          ./dag.exe google.com TXT @8.8.8.8 +tcp
-          echo "Testing multiple UDP query..."
-          ./dag.exe www.google.com A @8.8.8.8,9.9.9.9,1.1.1.1
+          # X-09: queries a local mock server (no real domains or public resolvers)
+          DAG=./dag.exe sh ./tests/run_ci_dag_smoke.sh
           echo "::endgroup::"
 
   # ---------------------------------------------------------------------------

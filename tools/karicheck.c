@@ -270,64 +270,6 @@ KARIDNS_TOOL_FN void print_error_context(const char *root_file_path, const char 
     fprintf(stderr, "\033[0m\n\n");
 }
 
-/* RFC 4034 §6.2 item 3 の型 (RFC 6840 §5.1 で NSEC を除く。HINFO は名前を含まない) は、正規形で RDATA 内の
- * ドメイン名も小文字にする。serialize_dns_record() はキャッシュ済みの NS/CNAME/PTR/DNAME/MX/SOA の名前を
- * 元の大文字小文字のまま書くので、ここで明示的に小文字にする (K-01)。p は非圧縮のワイヤ形式の名前。 */
-static size_t kc_downcase_wire_name(uint8_t *p, size_t avail) {
-    size_t i = 0;
-    while (i < avail) {
-        uint8_t l = p[i];
-        if (l == 0) return i + 1;
-        if (l > 63 || i + 1 + l > avail) return 0;
-        for (size_t k = i + 1; k <= i + l; k++) {
-            if (p[k] >= 'A' && p[k] <= 'Z') p[k] |= 0x20;
-        }
-        i += 1 + (size_t)l;
-    }
-    return 0;
-}
-
-static void kc_downcase_rdata_names(uint16_t type, uint8_t *rd, size_t len) {
-    size_t off, n;
-    switch (type) {
-        case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12: // NS MD MF CNAME MB MG MR PTR
-        case 30: case 39: // NXT (名前 + ビットマップ), DNAME
-            kc_downcase_wire_name(rd, len);
-            break;
-        case 6: case 14: case 17: // SOA, MINFO, RP: 先頭に名前が 2 つ
-            n = kc_downcase_wire_name(rd, len);
-            if (n > 0) kc_downcase_wire_name(rd + n, len - n);
-            break;
-        case 15: case 18: case 21: case 36: // MX, AFSDB, RT, KX: 16 ビットの値 + 名前
-            if (len > 2) kc_downcase_wire_name(rd + 2, len - 2);
-            break;
-        case 26: // PX: preference + MAP822 + MAPX400
-            if (len > 2 && (n = kc_downcase_wire_name(rd + 2, len - 2)) > 0) {
-                kc_downcase_wire_name(rd + 2 + n, len - 2 - n);
-            }
-            break;
-        case 33: // SRV: priority, weight, port + target
-            if (len > 6) kc_downcase_wire_name(rd + 6, len - 6);
-            break;
-        case 24: case 46: // SIG, RRSIG: 18 オクテットの固定部 + Signer's Name
-            if (len > 18) kc_downcase_wire_name(rd + 18, len - 18);
-            break;
-        case 35: // NAPTR: order, preference, flags, services, regexp (character-string) + replacement
-            off = 4;
-            for (int s = 0; s < 3 && off < len; s++) off += 1 + (size_t)rd[off];
-            if (off < len) kc_downcase_wire_name(rd + off, len - off);
-            break;
-        case 38: // A6 (RFC 2874 §3.1.1): prefix len, ceil((128 - prefix len) / 8) オクテットの suffix, prefix name
-            if (len > 0 && rd[0] > 0 && rd[0] <= 128) {
-                off = 1 + (size_t)(128 - rd[0] + 7) / 8;
-                if (off < len) kc_downcase_wire_name(rd + off, len - off);
-            }
-            break;
-        default:
-            break;
-    }
-}
-
 /* RFC 4034 §6.2 の正規形の RR 1 件 (名前は非圧縮、所有者名と item 3 の型の RDATA 内の名前は小文字)。 */
 typedef struct {
     const dns_record_t *rec;
@@ -348,7 +290,8 @@ KARIDNS_TOOL_FN bool kc_canonical_rr(const dns_record_t *rec, kc_canon_rr_t *out
     if (owner + 10 > len) return false;
     size_t rdlen = ((size_t)buf[owner + 8] << 8) | buf[owner + 9];
     if (owner + 10 + rdlen != len) return false;
-    kc_downcase_rdata_names(rec->type_code, buf + owner + 10, rdlen);
+    /* RFC 4034 §6.2 item 3 の型の RDATA 内の名前を小文字に (K-01。共通関数は dns_wire.c) */
+    dns_canonical_downcase_rdata(rec->type_code, buf + owner + 10, rdlen);
     out->wire = malloc(len);
     if (!out->wire) return false;
     memcpy(out->wire, buf, len);
@@ -743,6 +686,20 @@ KARIDNS_TOOL_FN void lint_cname_targets(const char *domain, zone_arena_t *arena,
             if (c->type_code == 5 && domain_names_match_ci(c->name, target)) {
                 kc_error(t, "%s record '%s' points to CNAME target '%s' (RFC 2181 section 10.3)\n",
                         type_name, rec->name, target);
+                break;
+            }
+        }
+    }
+
+    /* X-39: RFC 2782 "Target": the name "MUST NOT be an alias". BIND の check-srv-cname の既定 (warn) に合わせて
+     * 警告にする。"." はサービスが無いことを表す (同じ節) ので調べない。 */
+    for (size_t i = 0; i < arena->count; i++) {
+        dns_record_t *rec = &arena->records[i];
+        if (rec->type_code != 33 || rec->rdata_count < 4 || !rec->rdata[3] || strcmp(rec->rdata[3], ".") == 0) continue;
+        for (size_t j = 0; j < arena->count; j++) {
+            dns_record_t *c = &arena->records[j];
+            if (c->type_code == 5 && domain_names_match_ci(c->name, rec->rdata[3])) {
+                kc_warning(t, "SRV record '%s' points to CNAME target '%s' (RFC 2782)\n", rec->name, rec->rdata[3]);
                 break;
             }
         }
@@ -1398,16 +1355,17 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         }
         if (tcode == 11) { // WKS
             /* K-03: プロトコルはサーバーのシリアライザと同じ規則で読む (番号 0-255、または TCP/UDP) */
-            uint8_t proto;
+            uint8_t proto = 0;
             if (rcount >= 2 && !dns_wks_protocol_from_text(rdata[1], &proto)) {
                 kc_warning(&tally, "WKS record protocol '%s' is neither a number (0-255) nor TCP/UDP for name '%s'\n",
                            rdata[1], arena.records[i].name);
             }
+            /* X-38: ポート名はサーバーと同じ固定表で引く。読めないポートがあるとレコードは書けない (下の試し書き) */
             for (int j = 2; j < rcount; j++) {
                 uint16_t port;
-                if (!parse_u16(rdata[j], &port)) {
-                    kc_warning(&tally, "WKS record port '%s' for name '%s' is not a number (0-65535); the server leaves "
-                                       "it out of the bit map\n", rdata[j], arena.records[i].name);
+                if (!dns_wks_port_from_text(rdata[j], proto, &port)) {
+                    kc_warning(&tally, "WKS record port '%s' for name '%s' is neither a number (0-65535) nor a known "
+                                       "service name for protocol %u\n", rdata[j], arena.records[i].name, proto);
                 }
             }
         }
@@ -1637,7 +1595,7 @@ KARIDNS_TOOL_FN int check_zone(const char *domain_raw, const char *file_path, bo
         if (wire_result < 0) {
             kc_error(&tally,
                 "Record '%s %s' at index %zu cannot be serialized to wire format "
-                "(this record would fail or be dropped when the server answers a real query). "
+                "(the server leaves this record out with a warning when it loads the zone). "
                 "Check field count and value ranges for this record type.\n",
                 arena.records[i].name, arena.records[i].type, i);
         }

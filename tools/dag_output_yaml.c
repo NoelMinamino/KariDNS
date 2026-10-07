@@ -58,6 +58,11 @@ static void yaml_timestamp(const struct timespec *t, char *out, size_t cap) {
  * +[no]comments (OPT_PSEUDOSECTION) に従う。 */
 void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server, uint16_t port, bool is_tcp, const display_opts_t *dopt) {
     if (pkt_len < 12) return;
+    /* X-44: the same parse as the text printer (dig 9.20 dns_message_parse()): dig +yaml prints nothing for a
+     * message it cannot parse, and only the records that parsed (header counts are shown as received) */
+    dag_parse_t ps;
+    dag_parse_message(pkt, pkt_len, &ps);
+    if (ps.fatal) return;
     bool is_query = dopt && dopt->msg_is_query;
     bool show_comments = !dopt || dopt->show_comments;
     bool show_question = !dopt || dopt->show_question;
@@ -80,10 +85,10 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
     uint8_t opcode = (flags >> 11) & 0xF;
     uint16_t rcode = flags & 0xF;
 
+    /* X-44: dig 9.20 calls an answer RECURSIVE_RESPONSE only when both RD and RA are set (AA does not matter) */
     const char *msg_type;
     if (is_query) msg_type = rd ? "RECURSIVE_QUERY" : "AUTH_QUERY";
-    else if (aa || !ra) msg_type = "AUTH_RESPONSE";
-    else msg_type = "RECURSIVE_RESPONSE";
+    else msg_type = (rd && ra) ? "RECURSIVE_RESPONSE" : "AUTH_RESPONSE";
 
     const char *family_str = (g_last_socket_family == AF_INET6) ? "INET6" : "INET";
     const char *proto_str = is_tcp ? "TCP" : "UDP";
@@ -91,45 +96,26 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
     yaml_timestamp(&g_dag_query_time, qtime, sizeof(qtime));
     yaml_timestamp(&g_dag_response_time, rtime, sizeof(rtime));
 
-    /* OPT を先に探す: 拡張 RCODE (TTL の上位 8 ビット, RFC 6891 §6.1.3) を status に含めるため */
-    size_t scan_off = 12;
-    for (int i = 0; i < qdcount; i++) {
-        size_t nxt;
-        if (skip_wire_name(pkt, pkt_len, scan_off, &nxt) != 0) break;
-        scan_off = nxt + 4;
-        if (scan_off > pkt_len) break;
-    }
-    int non_qd_total = ancount + nscount + arcount;
+    /* The OPT pseudo-RR found by the parser (other OPT records are shown as records, like dig): its extended
+     * RCODE (the upper 8 bits of the TTL, RFC 6891 §6.1.3) is part of the status */
     bool has_opt = false;
     uint8_t opt_ver = 0;
     uint16_t opt_udp = 0;
     uint16_t opt_ext_flags = 0;
     size_t opt_rdata = 0;
     uint16_t opt_rdlen = 0;
-
-    for (int i = 0; i < non_qd_total; i++) {
-        if (scan_off >= pkt_len) break;
-        size_t nxt;
-        if (skip_wire_name(pkt, pkt_len, scan_off, &nxt) != 0) break;
-        if (nxt + 10 > pkt_len) break;
-        uint16_t type = (pkt[nxt] << 8) | pkt[nxt+1];
-        uint16_t klass = (pkt[nxt+2] << 8) | pkt[nxt+3];
-        uint32_t ttl = ((uint32_t)pkt[nxt+4]<<24)|((uint32_t)pkt[nxt+5]<<16)|((uint32_t)pkt[nxt+6]<<8)|pkt[nxt+7];
-        uint16_t rdlen = (pkt[nxt+8] << 8) | pkt[nxt+9];
-        size_t rdata_start = nxt + 10;
-        if (rdata_start + rdlen > pkt_len) break;
-
-        if (i >= ancount + nscount && type == 41) { // OPT in additional
+    size_t opt_nxt;
+    if (ps.opt_off != SIZE_MAX && skip_wire_name(pkt, pkt_len, ps.opt_off, &opt_nxt) == 0 && opt_nxt + 10 <= pkt_len) {
+        uint32_t ttl = ((uint32_t)pkt[opt_nxt+4]<<24)|((uint32_t)pkt[opt_nxt+5]<<16)|((uint32_t)pkt[opt_nxt+6]<<8)|pkt[opt_nxt+7];
+        opt_rdlen = (pkt[opt_nxt+8] << 8) | pkt[opt_nxt+9];
+        opt_rdata = opt_nxt + 10;
+        if (opt_rdata + opt_rdlen <= pkt_len) {
             has_opt = true;
-            opt_udp = klass;
+            opt_udp = (pkt[opt_nxt+2] << 8) | pkt[opt_nxt+3];
             rcode |= (uint16_t)(((ttl >> 24) & 0xFF) << 4);
             opt_ver = (ttl >> 16) & 0xFF;
             opt_ext_flags = (ttl & 0xFFFF);
-            opt_rdata = rdata_start;
-            opt_rdlen = rdlen;
-            break;
         }
-        scan_off = rdata_start + rdlen;
     }
 
     printf("- type: MESSAGE\n");
@@ -146,7 +132,9 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
     printf("    query_port: 0\n");
     printf("    %s_message_data:\n", is_query ? "query" : "response");
     printf("      opcode: %s\n", opcode_name(opcode));
-    printf("      status: %s\n", rcode_name(rcode));
+    /* X-44: dig +yaml writes an unnamed RCODE as its number (the text form is "?N") */
+    const char *status = rcode_name(rcode);
+    printf("      status: %s\n", status[0] == '?' ? status + 1 : status);
     printf("      id: %u\n", id);
 
     printf("      flags:");
@@ -155,10 +143,10 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
     if (tc) printf(" tc");
     if (rd) printf(" rd");
     if (ra) printf(" ra");
-    if (z)  printf(" z");
     if (ad) printf(" ad");
     if (cd) printf(" cd");
     printf("\n");
+    if (z) printf("      MBZ: 0x4\n"); /* X-44: like dig +yaml (the text form puts "MBZ: 0x4;" in the flags line) */
 
     printf("      QUESTION: %u\n", qdcount);
     printf("      ANSWER: %u\n", ancount);
@@ -186,9 +174,9 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
     }
 
     size_t offset = 12;
-    if (qdcount > 0) {
+    if (ps.count[0] > 0) {
         if (show_question) printf("      %s:\n", (opcode == 5) ? "ZONE_SECTION" : "QUESTION_SECTION");
-        for (int i = 0; i < qdcount; i++) {
+        for (int i = 0; i < ps.count[0]; i++) {
             char *name = NULL; size_t next;
             if (dag_expand_name(pkt, pkt_len, offset, &next, &g_dag_arena, &name) != 0) break;
             if (next + 4 > pkt_len) break;
@@ -207,9 +195,9 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
     }
 
     struct { const char *section_yaml_name; int count; } sec_defs[] = {
-        { (opcode == 5) ? "PREREQUISITE_SECTION" : "ANSWER_SECTION", ancount },
-        { (opcode == 5) ? "UPDATE_SECTION" : "AUTHORITY_SECTION", nscount },
-        { "ADDITIONAL_SECTION", arcount }
+        { (opcode == 5) ? "PREREQUISITE_SECTION" : "ANSWER_SECTION", ps.count[1] },
+        { (opcode == 5) ? "UPDATE_SECTION" : "AUTHORITY_SECTION", ps.count[2] },
+        { "ADDITIONAL_SECTION", ps.count[3] }
     };
 
     /* ADDITIONAL の最後の TSIG/SIG(0) は dig と同じく TSIG_PSEUDOSECTION / SIG0_PSEUDOSECTION に出す */
@@ -219,16 +207,15 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
 
     for (int s = 0; s < 3; s++) {
         if (sec_defs[s].count <= 0) continue;
-        if (s == 2) sig_label = find_sig_pseudo_rr(pkt, pkt_len, offset, arcount, &sig_off);
+        if (s == 2) sig_label = find_sig_pseudo_rr(pkt, pkt_len, offset, ps.count[3], &sig_off);
         size_t sec_offset = offset;
         int non_opt_count = 0;
         for (int i = 0; i < sec_defs[s].count; i++) {
             size_t next;
             if (skip_wire_name(pkt, pkt_len, sec_offset, &next) != 0) break;
             if (next + 10 > pkt_len) break;
-            uint16_t type = (pkt[next] << 8) | pkt[next+1];
             uint16_t rdlen = (pkt[next+8] << 8) | pkt[next+9];
-            if (s != 2 || (type != 41 && !(sig_label && sec_offset == sig_off))) non_opt_count++;
+            if (s != 2 || (sec_offset != ps.opt_off && !(sig_label && sec_offset == sig_off))) non_opt_count++;
             sec_offset = next + 10 + rdlen;
         }
         if (s == 2 && sig_label) {
@@ -263,7 +250,7 @@ void print_response_yaml(const uint8_t *pkt, size_t pkt_len, const char *server,
                 size_t rdata_start = next + 10;
                 if (rdata_start + rdlen > pkt_len) break;
 
-                if (s == 2 && (type == 41 || (sig_label && rr_start == sig_off))) {
+                if (s == 2 && (rr_start == ps.opt_off || (sig_label && rr_start == sig_off))) {
                     offset = rdata_start + rdlen;
                     continue;
                 }
@@ -329,8 +316,7 @@ void print_response_yaml_dns64(const uint8_t *pkt, size_t pkt_len, const char *s
 
     const char *resp_type = "RESPONSE";
     if (qr) {
-        if (aa) resp_type = "AUTH_RESPONSE";
-        else resp_type = "RECURSIVE_RESPONSE";
+        resp_type = (rd && ra) ? "RECURSIVE_RESPONSE" : "AUTH_RESPONSE"; /* as in print_response_yaml() (X-44) */
     } else {
         resp_type = "QUERY";
     }
@@ -352,7 +338,9 @@ void print_response_yaml_dns64(const uint8_t *pkt, size_t pkt_len, const char *s
     printf("    query_port: 0\n");
     printf("    response_message_data:\n");
     printf("      opcode: %s\n", opcode_name(opcode));
-    printf("      status: %s\n", rcode_name(rcode));
+    /* X-44: dig +yaml writes an unnamed RCODE as its number (the text form is "?N") */
+    const char *status = rcode_name(rcode);
+    printf("      status: %s\n", status[0] == '?' ? status + 1 : status);
     printf("      id: %u\n", id);
 
     printf("      flags:");
@@ -361,10 +349,10 @@ void print_response_yaml_dns64(const uint8_t *pkt, size_t pkt_len, const char *s
     if (tc) printf(" tc");
     if (rd) printf(" rd");
     if (ra) printf(" ra");
-    if (z)  printf(" z");
     if (ad) printf(" ad");
     if (cd) printf(" cd");
     printf("\n");
+    if (z) printf("      MBZ: 0x4\n"); /* X-44: like dig +yaml (the text form puts "MBZ: 0x4;" in the flags line) */
 
     printf("      QUESTION: %u\n", qdcount);
     printf("      ANSWER: %u\n", ancount);

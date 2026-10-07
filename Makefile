@@ -961,6 +961,16 @@ fuzz_dag: $(FUZZ_DAG_SRCS:.c=.fz.o)
 fuzz_tsig_verify: $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
+# X-05: these harnesses had only coverage-build rules
+fuzz_query_engine: $(FUZZ_QUERY_ENGINE_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_QUERY_ENGINE_TARGET) $(FUZZ_QUERY_ENGINE_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto -lpthread -lm
+
+fuzz_xfr_packet: $(FUZZ_XFR_PACKET_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_XFR_PACKET_TARGET) $(FUZZ_XFR_PACKET_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto -lpthread -lm
+
+fuzz_dynamic_update: $(FUZZ_DYNAMIC_UPDATE_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DYNAMIC_UPDATE_TARGET) $(FUZZ_DYNAMIC_UPDATE_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto -lpthread -lm
+
 fuzz_dag_iter_classify: $(FUZZ_DAG_ITER_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_DAG_ITER_TARGET) $(FUZZ_DAG_ITER_SRCS:.c=.fz.o) $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
@@ -996,7 +1006,7 @@ fuzz_dag_all: fuzz_dag fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_htt
 fuzz_dag_test: fuzz_dag_all
 	@sh tests/run_fuzz_smoke_test.sh dag
 
-fuzz_karidns: fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_tsig_verify
+fuzz_karidns: fuzz fuzz_core fuzz_zone fuzz_conf fuzz_tsig fuzz_tsig_verify fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update
 
 fuzz_karidns_test: fuzz_karidns
 	@sh tests/run_fuzz_smoke_test.sh karidns
@@ -1038,6 +1048,14 @@ $(TSAN_TARGET): $(TSAN_OBJS)
 .SUFFIXES: .tsan.o .c
 .c.tsan.o:
 	$(CC) $(TSAN_CFLAGS) -c $< -o $@
+
+# X-34: the suffix rules for the sanitizer, unit-test and fuzz objects (.asan.o, .tsan.o, .uta.o, .utn.o, .fz.o)
+# have no header dependencies, so a header change relinked stale objects. Each of these objects depends on every
+# project header: coarse (a header change rebuilds them all) but the same with BSD make and GNU make.
+PROJECT_HDRS = dns_axfr_ixfr.h dns_catalog_zone.h dns_cidr.h dns_config_parser.h dns_dnstap.h dns_dynamic_update.h dns_edns_ecs.h dns_epoch_rcu.h dns_priv_sandbox.h dns_query_engine.h dns_rrl.h dns_server_internal.h dns_siphash.h dns_snapshot_rcu.h dns_tsig_acl.h dns_utils.h dns_wire.h dns_zone_parser.h tests/fi/kari_fi.h tests/sweep_watchdog.h tools/dag_axfr_client.h tools/dag_batch.h tools/dag_edns_client.h tools/dag_http.h tools/dag_internal.h tools/dag_iter.h tools/dag_output_yaml.h tools/dag_pcap_l4.h tools/dag_replay.h tools/dag_roothints.h tools/dag_tcp_reassembly.h tools/dag_trace.h tools/dag_trace_common.h tools/dag_transport.h tools/dag_tsig_client.h tools/karidns_tool_linkage.h 
+$(ASAN_OBJS) $(TSAN_OBJS): $(PROJECT_HDRS)
+$(TEST_ASAN_SRCS:.c=.utn.o) $(TEST_AXFR_IXFR_SRCS:.c=.uta.o) $(TEST_CATALOG_SRCS:.c=.uta.o) $(TEST_CIDR_SRCS:.c=.uta.o) $(TEST_CONFDIR_SRCS:.c=.utn.o) $(TEST_CONF_SRCS:.c=.utn.o) $(TEST_COV_SWEEP_DAG_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_NET_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_TOOLS_SRCS:.c=.uta.o) $(TEST_DAGFORMAT_SRCS:.c=.uta.o) $(TEST_DAGREASM_SRCS:.c=.utn.o) $(TEST_DAG_ITER_SRCS:.c=.uta.o) $(TEST_DAG_TOOLS_SRCS:.c=.uta.o) $(TEST_DNSSECPROOFS_SRCS:.c=.uta.o) $(TEST_DNSTAP_SRCS:.c=.uta.o) $(TEST_DYN_UPDATE_SRCS:.c=.uta.o) $(TEST_EDNS_ECS_SRCS:.c=.uta.o) $(TEST_EPOCH_RCU_SRCS:.c=.uta.o) $(TEST_HASH_SRCS:.c=.uta.o) $(TEST_QEPROTO_SRCS:.c=.uta.o) $(TEST_QUERY_EXP_SRCS:.c=.uta.o) $(TEST_RFC_VECTORS_SRCS:.c=.uta.o) $(TEST_RRL_SRCS:.c=.uta.o) $(TEST_SANDBOX_SRCS:.c=.uta.o) $(TEST_SERVER_CORE_SRCS:.c=.uta.o) $(TEST_SIG0_SRCS:.c=.utn.o) $(TEST_SNAPREBUILD_SRCS:.c=.uta.o) $(TEST_TINYDNS_SRCS:.c=.utn.o) $(TEST_TINYPATHS_SRCS:.c=.utn.o) $(TEST_WIREHELP_SRCS:.c=.utn.o) $(TEST_ZONEPATHS_SRCS:.c=.utn.o) : $(PROJECT_HDRS)
+$(FUZZ_CONF_SRCS:.c=.fz.o) $(FUZZ_CORE_SRCS:.c=.fz.o) $(FUZZ_DAG_AXFR_STREAM_SRCS:.c=.fz.o) $(FUZZ_DAG_BATCH_FILE_SRCS:.c=.fz.o) $(FUZZ_DAG_CHUNKED_HTTP_SRCS:.c=.fz.o) $(FUZZ_DAG_CLI_ARGS_SRCS:.c=.fz.o) $(FUZZ_DAG_HASH_SRCS:.c=.fz.o) $(FUZZ_DAG_ITER_SRCS:.c=.fz.o) $(FUZZ_DAG_RDATA_YAML_SRCS:.c=.fz.o) $(FUZZ_DAG_REPLAY_DIFF_SRCS:.c=.fz.o) $(FUZZ_DAG_REPLAY_PCAP_READER_SRCS:.c=.fz.o) $(FUZZ_DAG_SRCS:.c=.fz.o) $(FUZZ_DAG_TCP_REASSEMBLY_SRCS:.c=.fz.o) $(FUZZ_DYNAMIC_UPDATE_SRCS:.c=.fz.o) $(FUZZ_QUERY_ENGINE_SRCS:.c=.fz.o) $(FUZZ_SRCS:.c=.fz.o) $(FUZZ_TSIG_SRCS:.c=.fz.o) $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o) $(FUZZ_XFR_PACKET_SRCS:.c=.fz.o) $(FUZZ_ZONE_SRCS:.c=.fz.o) : $(PROJECT_HDRS)
 
 # --- ASan版ツール群 ---
 KARICHECK_ASAN_SRCS = tools/karicheck.c dns_config_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c
