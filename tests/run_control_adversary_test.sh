@@ -2,141 +2,178 @@
 # ==============================================================================
 # tests/run_control_adversary_test.sh - Control Channel Adversary Test
 # ==============================================================================
+# Malformed, unauthenticated and oversized control-channel traffic must be refused
+# without affecting the server: after every attack the server must still answer
+# `karictl status` and DNS queries. karictl's own error paths are checked by exit
+# status (1: socket, 2: configuration/authentication, 3: server returned ERROR).
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+. "${SCRIPT_DIR}/lib_proc.sh"
 cd "${ROOT_DIR}"
 
-if [ ! -x "./karidns" ] || [ ! -x "./karictl" ]; then
-    echo "SKIP: karidns or karictl binary not found"
-    exit 0
-fi
+[ -x ./karidns ] || make karidns
+[ -x ./karictl ] || make karictl
+[ -x ./dag ] || make dag
 
-TMP_DIR="$(mktemp -d /tmp/karidns_ctrl_adv.XXXXXX 2>/dev/null || mktemp -d)"
-PID_FILE="${TMP_DIR}/karidns.pid"
+TMP_DIR="$(mktemp -d /tmp/karidns_ctrl_adv.XXXXXX)"
+chmod 755 "${TMP_DIR}"
 CONF_FILE="${TMP_DIR}/karidns.conf"
 CTRL_SOCK="${TMP_DIR}/control.sock"
+SERVER_PID=""
+FAILED=0
 
 cleanup() {
-    if [ -f "${PID_FILE}" ]; then
-        PID=$(cat "${PID_FILE}" 2>/dev/null || true)
-        if [ -n "${PID}" ]; then
-            kill -TERM "${PID}" 2>/dev/null || true
-            sleep 0.1
-            kill -9 "${PID}" 2>/dev/null || true
-        fi
-    fi
-    pkill -9 -f "karidns.*${TMP_DIR}" 2>/dev/null || true
+    [ -n "${SERVER_PID}" ] && kari_kill_tree "${SERVER_PID}"
+    kari_kill_conf "${CONF_FILE}"
     rm -rf "${TMP_DIR}"
 }
 trap cleanup EXIT INT TERM
 
+fail() {
+    echo "  [FAIL] $*"
+    FAILED=$((FAILED + 1))
+}
+
 PORT=$((29000 + ( $$ % 10000 )))
+SECRET="c2VjcmV0MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3OA=="
+USER_OPT=""
+[ "$(id -u)" = "0" ] && USER_OPT="user \"nobody\"; group \"nobody\";"
+
+cat > "${TMP_DIR}/ctrl.zone" <<EOF
+\$ORIGIN ctrl.test.
+\$TTL 300
+@ IN SOA ns1 hostmaster 1 7200 3600 1209600 300
+@ IN NS ns1
+ns1 IN A 192.0.2.1
+EOF
 
 cat > "${CONF_FILE}" <<EOF
 options {
-    directory "${TMP_DIR}";
-    pid-file "${PID_FILE}";
-    listen-on { 127.0.0.1; };
     port ${PORT};
+    bind-address { 127.0.0.1; };
+    pid-file "none";
+    ${USER_OPT}
 };
-controls {
-    unix "${CTRL_SOCK}" perm 0600 secret "c2VjcmV0MTIz";
+control-channel {
+    socket "${CTRL_SOCK}";
+    algorithm hmac-sha256;
+    secret "${SECRET}";
 };
-zone "example.com" {
+zone "ctrl.test" {
     type master;
-    file "${ROOT_DIR}/tests/zones/example.com.zone";
+    file "${TMP_DIR}/ctrl.zone";
 };
 EOF
 
-# Create karictl configuration files
-cat > "${TMP_DIR}/karictl.conf" <<EOF
-socket "${CTRL_SOCK}";
-secret "c2VjcmV0MTIz";
+write_ctl_conf() { # file secret
+    cat > "$1" <<EOF
+key "karictl" {
+    algorithm hmac-sha256;
+    secret "$2";
+};
 EOF
+    chmod 600 "$1"
+}
+write_ctl_conf "${TMP_DIR}/karictl.conf" "${SECRET}"
+write_ctl_conf "${TMP_DIR}/wrong_secret.conf" "d3Jvbmc="
+write_ctl_conf "${TMP_DIR}/bad_secret.conf" "invalid%%%base64"
+write_ctl_conf "${TMP_DIR}/long_secret.conf" "$(printf 'A%.0s' $(seq 1 400))"
 
-cat > "${TMP_DIR}/wrong_secret.conf" <<EOF
-socket "${CTRL_SOCK}";
-secret "d3Jvbmc=";
-EOF
+KARICTL="./karictl -c ${TMP_DIR}/karictl.conf -s ${CTRL_SOCK}"
 
-cat > "${TMP_DIR}/bad_secret.conf" <<EOF
-socket "${CTRL_SOCK}";
-secret "invalid%%%base64";
-EOF
-
-cat > "${TMP_DIR}/long_secret.conf" <<EOF
-socket "${CTRL_SOCK}";
-secret "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-EOF
-
-# Start server
-./karidns -c "${CONF_FILE}" -f > "${TMP_DIR}/server.log" 2>&1 &
+./karidns -f "${CONF_FILE}" > "${TMP_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
-echo "${SERVER_PID}" > "${PID_FILE}"
 
-# Wait for control socket to appear
 READY=0
-for i in $(seq 1 30); do
-    if [ -S "${CTRL_SOCK}" ]; then
+for _ in $(seq 1 50); do
+    if [ -S "${CTRL_SOCK}" ] && ./dag @127.0.0.1 -p "${PORT}" ctrl.test SOA +short +timeout=1 +tries=1 2>/dev/null | grep -q hostmaster; then
         READY=1
         break
     fi
-    sleep 0.1
+    sleep 0.2
 done
-
 if [ "${READY}" -ne 1 ]; then
-    echo "SKIP: Control socket not available in this environment"
-    exit 0
+    echo "[FAIL] karidns did not start (control socket ${CTRL_SOCK} / DNS on port ${PORT})"
+    cat "${TMP_DIR}/server.log"
+    exit 1
 fi
 
-echo "[+] Control socket available at ${CTRL_SOCK}. Running adversary attacks..."
+# The server must be alive, accept an authenticated command and answer DNS.
+check_server_ok() { # label
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+        fail "$1: karidns is no longer running"
+        cat "${TMP_DIR}/server.log"
+        exit 1
+    fi
+    if ! out=$(${KARICTL} status 2>&1) || ! echo "${out}" | grep -q "^server is up and running$"; then
+        fail "$1: karictl status after the attack: ${out}"
+    fi
+    if ! ./dag @127.0.0.1 -p "${PORT}" ctrl.test SOA +timeout=2 +tries=1 +nohexdump 2>&1 | grep -q "status: NOERROR"; then
+        fail "$1: DNS query after the attack did not get NOERROR"
+    fi
+}
 
-# 1. Bad HMAC authentication
-perl tests/lib/ctrl_client.pl "${CTRL_SOCK}" bad_hmac || true
+# attack <mode> <expected reply regex>
+attack() {
+    out=$(perl tests/lib/ctrl_client.pl "${CTRL_SOCK}" "$1" 2>&1) || true
+    if echo "${out}" | grep -E -q "^REPLY: ($2)\$"; then
+        echo "  [OK] $1 -> $(echo "${out}" | sed -n 's/^REPLY: //p')"
+    else
+        fail "$1: expected reply '$2', got: ${out}"
+    fi
+    check_server_ok "$1"
+}
 
-# 2. Giant command string
-perl tests/lib/ctrl_client.pl "${CTRL_SOCK}" giant_cmd || true
+echo "[+] Raw control-channel attacks (port ${PORT})..."
+attack bad_hmac "AUTH_FAILED"
+attack unknown_cmd "AUTH_FAILED"
+# a line longer than the 1024-byte buffer: the server drops the client without a reply
+# (dns_server_core.c control loop, "buf_len >= sizeof(c->buf) - 1")
+attack giant_cmd "<closed>"
+attack silent "<closed>"
 
-# 3. Unknown command string
-perl tests/lib/ctrl_client.pl "${CTRL_SOCK}" unknown_cmd || true
+# expect_exit <expected status> <output regex or ""> <label> <command...>
+expect_exit() {
+    want="$1"; pattern="$2"; label="$3"; shift 3
+    set +e
+    out=$("$@" 2>&1)
+    rc=$?
+    set -e
+    if [ "${rc}" -ne "${want}" ]; then
+        fail "${label}: exit status ${rc}, expected ${want}: ${out}"
+    elif [ -n "${pattern}" ] && ! echo "${out}" | grep -E -q "${pattern}"; then
+        fail "${label}: output does not match '${pattern}': ${out}"
+    else
+        echo "  [OK] ${label} (exit ${rc})"
+    fi
+}
 
-# 4. Silent connection timeout
-perl tests/lib/ctrl_client.pl "${CTRL_SOCK}" silent || true
+echo "[+] karictl error paths..."
+expect_exit 0 "^KariDNS|karictl|[0-9]+\.[0-9]+" "karictl -v" ./karictl -v
+expect_exit 0 "^  secret \"[A-Za-z0-9+/]{43}=\";" "tsig-keygen" ./karictl tsig-keygen
+expect_exit 0 "^key \"test-key\" \{" "tsig-keygen with a key name" ./karictl tsig-keygen test-key
+expect_exit 1 "connect" "non-existent socket" ./karictl -c "${TMP_DIR}/karictl.conf" -s "${TMP_DIR}/nonexistent.sock" status
+expect_exit 2 "Could not read secret" "non-existent configuration" ./karictl -c "${TMP_DIR}/nonexistent.conf" -s "${CTRL_SOCK}" status
+expect_exit 2 "decode base64|Authentication failed" "secret that is not base64" ./karictl -c "${TMP_DIR}/bad_secret.conf" -s "${CTRL_SOCK}" status
+expect_exit 2 "too long" "secret longer than 341 characters" ./karictl -c "${TMP_DIR}/long_secret.conf" -s "${CTRL_SOCK}" status
+expect_exit 2 "Authentication failed: AUTH_FAILED" "wrong secret" ./karictl -c "${TMP_DIR}/wrong_secret.conf" -s "${CTRL_SOCK}" status
+expect_exit 3 "ERROR unknown command" "unknown command" ${KARICTL} unknown_bogus_command
+expect_exit 3 "ERROR zone not found" "zonestatus of an unknown zone" ${KARICTL} zonestatus nonexistent.test
+check_server_ok "karictl error paths"
 
-echo "[+] Running karictl CLI and error tests..."
+echo "[+] Authenticated commands..."
+expect_exit 0 "^server is up and running$" "status" ${KARICTL} status
+expect_exit 0 "^OK serial=1 refresh=7200" "zonestatus" ${KARICTL} zonestatus ctrl.test
+expect_exit 0 "OK reloaded" "reload of a zone" ${KARICTL} reload ctrl.test
+expect_exit 0 "" "observatory" ${KARICTL} observatory
+expect_exit 0 "" "notify" ${KARICTL} notify ctrl.test
+check_server_ok "authenticated commands"
 
-# karictl version & tsig-keygen
-./karictl -v >/dev/null 2>&1 || true
-./karictl tsig-keygen >/dev/null 2>&1 || true
-./karictl tsig-keygen test-key >/dev/null 2>&1 || true
-
-# Non-existent socket error (should return 1)
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${TMP_DIR}/nonexistent.sock" status >/dev/null 2>&1 || true
-
-# Non-existent config error (should return 2)
-./karictl -c "${TMP_DIR}/nonexistent.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
-
-# Bad secret format in config (should return 2)
-./karictl -c "${TMP_DIR}/bad_secret.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
-
-# Too long secret in config (should return 2)
-./karictl -c "${TMP_DIR}/long_secret.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
-
-# HMAC authentication mismatch against server (should return 2)
-./karictl -c "${TMP_DIR}/wrong_secret.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
-
-# Unknown command transmission (server returns ERROR, karictl returns 3)
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" unknown_bogus_command >/dev/null 2>&1 || true
-
-# Valid commands
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" status >/dev/null 2>&1 || true
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" zonestatus example.com >/dev/null 2>&1 || true
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" reload example.com >/dev/null 2>&1 || true
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" observatory >/dev/null 2>&1 || true
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" notify example.com >/dev/null 2>&1 || true
-./karictl -c "${TMP_DIR}/karictl.conf" -s "${CTRL_SOCK}" retransfer example.com >/dev/null 2>&1 || true
-
-echo "[+] Control adversary tests completed cleanly."
+if [ "${FAILED}" -ne 0 ]; then
+    echo "[FAIL] ${FAILED} control-channel check(s) failed"
+    exit 1
+fi
+echo "[+] Control adversary tests passed."
 exit 0

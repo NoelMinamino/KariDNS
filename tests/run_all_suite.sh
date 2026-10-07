@@ -272,7 +272,7 @@ register_test "xfr" "sh" "tests/run_extended_axfr_test.sh" "KariDNS Extended AXF
 register_test "xfr" "sh" "tests/run_axfr_multikey_tsig_test.sh" "Multi-key TSIG authentication in AXFR"
 register_test "xfr" "sh" "tests/run_tsig_error_matrix_test.sh" "RFC 8945 TSIG errors and authorization for UPDATE/AXFR/NOTIFY/QUERY (R-07, R-08, R-10, R-30, D-03)"
 register_test "xfr" "sh" "tests/run_udp_ixfr_test.sh" "RFC 1995 IXFR single-UDP packet transfer"
-register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone SOA refresh polling"
+register_test "xfr" "sh" "tests/run_zone_type_secondary_test.sh" "Secondary zone AXFR, REFRESH, EXPIRE (SERVFAIL + EDE 24, serve-stale EDE 3)"
 register_test "xfr" "sh" "tests/run_edns_expire_test.sh" "RFC 7314 EDNS EXPIRE option (primary, secondary, chained secondaries)"
 
 # 3. DNSSEC & Message Digests
@@ -299,7 +299,7 @@ register_test "rrl" "sh" "tests/run_glue_truncation_test.sh" "Additional section
 
 # 7. Catalog Zones (RFC 9432)
 register_test "catalog" "sh" "tests/run_catalog_zone_test.sh" "RFC 9432 Catalog Zone member provisioning"
-register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 Change of Ownership (CoO) migration"
+register_test "catalog" "sh" "tests/run_cve_coo_test.sh" "RFC 9432 CoO tracking under allocation failure"
 
 # 8. DNSTAP Telemetry Logging
 register_test "dnstap" "sh" "tests/run_dnstap_capture_test.sh" "DNSTAP frame streams capture verification"
@@ -359,8 +359,8 @@ register_test "core" "sh" "tests/run_malformed_detection_default_test.sh" "Struc
 register_test "core" "sh" "tests/run_matrix_queries_test.sh" "Table-driven Query Engine Matrix: Wildcard, DNAME, Delegation & NSEC proofs"
 register_test "core" "sh" "tests/run_server_lifecycle_test.sh" "Server lifecycle: port conflict, bad syntax, signals, and crash recovery"
 register_test "core" "sh" "tests/run_tcp_adversary_test.sh" "TCP state machine adversary: slowloris, framing errors, trickle, flood"
-register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel IPC adversary: invalid HMAC, buffer limits, timeouts"
-register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rule checks: SSHFP, RFC 8624, options linting"
+register_test "core" "sh" "tests/run_control_adversary_test.sh" "Control channel adversary: bad AUTH, oversized line, idle client, karictl exit statuses"
+register_test "core" "sh" "tests/run_karicheck_rules_test.sh" "karicheck diagnostic rules: SSHFP, RFC 8624, tcp-idle-timeout, program zones"
 register_test "core" "sh" "tests/run_karicheck_deep_rules_test.sh" "karicheck static lint rules: delegation, glue, CNAME & ZONEMD"
 register_test "core" "sh" "tests/run_zone_parser_error_paths_test.sh" "Zone parser error paths, escape sequences & malformed directives"
 register_test "core" "sh" "tests/run_karictl_adversary_test.sh" "karictl command line argument validation and socket error resilience"
@@ -375,11 +375,11 @@ register_test "regression" "sh" "tests/run_fuzz_smoke_test.sh" "libFuzzer crash-
 register_test "regression" "sh" "tests/run_break_duplicate_kind_override_test.sh" "Duplicate --break kind parameter override validation"
 
 # 12. dag Diagnostic Client & Scenario Matrix Suite (Run with -c dag or --include-dag)
-register_test "dag" "sh" "tests/run_dag_scenario_matrix_test.sh" "dag & karictl Multi-Protocol Scenario Matrix (Trace, Transport, Replay, IPC)"
+register_test "dag" "sh" "tests/run_dag_scenario_matrix_test.sh" "dag scenario matrix: TC fallback, PROXY v2, keepopen, DoH, XFR, replay, TSIG"
 register_test "dag" "sh" "tests/run_dag_ci_test.sh" "dag comprehensive CI test suite (Part 1-19 + Part 20-21 parallel sub-suites)"
 register_test "dag" "sh" "tests/run_dag_cli_anomalous_options_test.sh" "dag CLI anomalous options, YAML escaping & transport errors"
 register_test "dag" "sh" "tests/run_dag_batch_advanced_opts_test.sh" "dag Batch mode (-f) with advanced options"
-register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer smoke execution"
+register_test "dag" "sh" "tests/run_dag_fuzzer_test.sh" "dag fuzzer corpus regression (all harnesses, -runs=0)"
 register_test "dag" "sh" "tests/run_dag_apl_afdlength_overflow_test.sh" "dag APL afdlength buffer overflow regression test"
 register_test "dag" "sh" "tests/run_dag_audit_improvements_test.sh" "dag & dig audit improvements validation"
 register_test "dag" "sh" "tests/run_dag_axfr_tsig_unsigned_intermediate_test.sh" "dag AXFR TSIG intermediate unsigned message digest chaining"

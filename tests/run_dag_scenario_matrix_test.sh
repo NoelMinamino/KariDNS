@@ -2,184 +2,176 @@
 # ==============================================================================
 # run_dag_scenario_matrix_test.sh
 #
-# Comprehensive Multi-Protocol Scenario Matrix Integration Test for dag(1) & karictl(1)
+# Multi-protocol scenario matrix for dag(1) against tests/mock_dag_scenario_server.pl
+# and a local karidns. Every command's output is checked.
 #
 # Verifies:
-#   1. dag +trace: Full recursive delegation, missing glue fallback, CNAME chains,
-#                  CNAME loop detection, +tcp, +yaml, +short formatting
-#   2. dag +nssearch: SOA serial parity, serial mismatches, --hex payloads
-#   3. dag DoH Transport: RFC 8484 POST/GET, chunked encoding, HTTP 400/404/500,
-#                         connection keepalive reuse
-#   4. dag PROXY Protocol v2: LOCAL and PROXY modes (IPv4 & IPv6), invalid arg errors
-#   5. dag UDP Truncation & TCP Fallback: TC=1 automatic promotion to TCP
-#   6. dag AXFR/IXFR Streaming: Multi-message AXFR (50+ records across frames),
-#                               IXFR delta transfers, TSIG BADKEY/BADTIME
-#   7. dag Replay & Diff Engine: PCAP replay across all DLT types (Ethernet,
-#                                Linux SLL, SLL2, Raw IP, Loopback, 802.1Q VLAN),
-#                                text query lists, --diff, --compare-recorded,
-#                                --output-json, --output-yaml
-#   8. karictl Control Channel: status, observatory, stats, reload, reconfig, flush,
-#                               zonestatus, notify, axfr, zonemd-verify, logs,
-#                               permissions warning (0644 vs 0600), auth failure
+#   1. UDP truncation (TC=1) and the automatic retry over TCP
+#   2. PROXY protocol v2: LOCAL and PROXY (IPv4 / IPv6) headers as received by the
+#      server, invalid specification rejected
+#   3. +keepopen: several queries over one TCP connection (RFC 7766 §6.2.1)
+#   4. Plain-HTTP DoH (RFC 8484 message format): POST, GET, chunked transfer
+#      encoding, HTTP 400/404/500 reported as errors
+#   5. Multi-message AXFR and IXFR (RFC 1995) output
+#   6. Replay: PCAP link types Ethernet, 802.1Q, Linux SLL, raw IP, NULL, LOOP;
+#      text query lists; --output json; --diff; --compare-recorded; --max-queries
+#   7. TSIG (RFC 8945) against karidns: every HMAC algorithm signs the query and
+#      verifies the signed response; keyfile with comments; BADSIG and BADKEY
+#
+# Not covered here (dedicated tests): +trace / +trace2 (run_dag_trace_*_test.sh),
+# +nssearch (run_dag_trace_nssearch_*_test.sh), karictl (run_control_adversary_test.sh,
+# run_karictl_*_test.sh), DoH/DoT over TLS (run_dag_doh_dot_axfr_test.sh).
 # ==============================================================================
 
-set -e
+set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$SCRIPT_DIR/lib_proc.sh"
 
-echo "=== Building karidns, dag, and karictl ==="
-[ -x "$ROOT_DIR/dag" ] && [ -x "$ROOT_DIR/karictl" ] && [ -x "$ROOT_DIR/karidns" ] || {
-    make -C "$ROOT_DIR" dag karictl karidns
-}
+[ -x "$ROOT_DIR/dag" ] || make -C "$ROOT_DIR" dag
+[ -x "$ROOT_DIR/karidns" ] || make -C "$ROOT_DIR" karidns
 
 DAG="$ROOT_DIR/dag"
-KARICTL="$ROOT_DIR/karictl"
 KARIDNS="$ROOT_DIR/karidns"
-
 MOCK_PL="$SCRIPT_DIR/mock_dag_scenario_server.pl"
 PORT=$((23000 + $$ % 7000))
-CTRL_PORT=$((PORT + 1))
 KARI_PORT=$((PORT + 2))
-TMP_DIR="/tmp/dag_scenario_matrix_$$"
-
-rm -rf "$TMP_DIR"
-mkdir -p "$TMP_DIR"
+TMP_DIR="$(mktemp -d /tmp/dag_scenario_matrix.XXXXXX)"
+chmod 755 "$TMP_DIR"
 
 MOCK_PID=""
 KARI_PID=""
+FAILED=0
+PASSED=0
 
 cleanup() {
-    if [ -n "$MOCK_PID" ] && kill -0 "$MOCK_PID" 2>/dev/null; then
+    if [ -n "$MOCK_PID" ]; then
         kill "$MOCK_PID" 2>/dev/null || true
         wait "$MOCK_PID" 2>/dev/null || true
     fi
-    if [ -n "$KARI_PID" ] && kill -0 "$KARI_PID" 2>/dev/null; then
-        kill "$KARI_PID" 2>/dev/null || true
-        wait "$KARI_PID" 2>/dev/null || true
-    fi
+    [ -n "$KARI_PID" ] && kari_kill_tree "$KARI_PID"
+    kari_kill_conf "$TMP_DIR/karidns.conf"
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
 
-echo "=== [1/6] Launching Multi-Protocol Scenario Mock Server on Port $PORT ==="
-perl "$MOCK_PL" --port "$PORT" --host 127.0.0.1 > "$TMP_DIR/mock.log" 2>&1 &
-MOCK_PID=$!
-sleep 1
+ok() { PASSED=$((PASSED + 1)); echo "  [OK] $1"; }
+ng() { FAILED=$((FAILED + 1)); echo "  [FAIL] $1"; [ -n "${2:-}" ] && sed 's/^/      /' "$2" | head -40; return 0; }
 
-# Quick health check
-"$DAG" "@127.0.0.1" -p "$PORT" "ping.example.com" +timeout=2 +tries=1 > "$TMP_DIR/ping.out" 2>&1 || {
-    echo "Error: Failed to connect to mock DNS server"
-    cat "$TMP_DIR/mock.log"
-    exit 1
+# expect <label> <file> <extended regex>...: every regex must match a line of the file
+expect() {
+    label="$1"; file="$2"; shift 2
+    for re in "$@"; do
+        if ! grep -E -q -e "$re" "$file"; then
+            ng "$label (missing: $re)" "$file"
+            return 0
+        fi
+    done
+    ok "$label"
 }
 
-echo "=== [2/6] Executing dag +trace & +nssearch Scenario Tests ==="
-# 1. Standard Trace query
-"$DAG" "@127.0.0.1" -p "$PORT" +trace "trace.example.com" +tries=1 > "$TMP_DIR/trace_std.out" 2>&1 || true
+# expect_not <label> <file> <extended regex>: the regex must not match (paired with an expect on the same file)
+expect_not() {
+    if grep -E -q -e "$3" "$2"; then ng "$1 (unexpected: $3)" "$2"; else ok "$1"; fi
+}
 
-# 2. Trace with +tcp option
-"$DAG" "@127.0.0.1" -p "$PORT" +trace +tcp "trace.example.com" +tries=1 > "$TMP_DIR/trace_tcp.out" 2>&1 || true
+# count_is <label> <file> <regex> <n>
+count_is() {
+    n=$(grep -E -c -e "$3" "$2" || true)
+    if [ "$n" -eq "$4" ]; then ok "$1"; else ng "$1 ($n lines match '$3', expected $4)" "$2"; fi
+}
 
-# 3. Trace with +yaml output format
-"$DAG" "@127.0.0.1" -p "$PORT" +trace +yaml "trace.example.com" +tries=1 > "$TMP_DIR/trace_yaml.out" 2>&1 || true
+# dag against the mock; output in $TMP_DIR/<name>.out, exit status in $TMP_DIR/<name>.rc
+qm() {
+    name="$1"; shift
+    set +e
+    "$DAG" @127.0.0.1 -p "$PORT" +nohexdump +timeout=3 +tries=1 "$@" > "$TMP_DIR/$name.out" 2>&1
+    echo $? > "$TMP_DIR/$name.rc"
+    set -e
+}
+rc_is() { # label name expected
+    rc=$(cat "$TMP_DIR/$2.rc")
+    if [ "$rc" -eq "$3" ]; then ok "$1"; else ng "$1 (exit status $rc, expected $3)" "$TMP_DIR/$2.out"; fi
+}
 
-# 4. Trace with +short output format
-"$DAG" "@127.0.0.1" -p "$PORT" +trace +short "trace.example.com" +tries=1 > "$TMP_DIR/trace_short.out" 2>&1 || true
+echo "=== [1/7] Mock server on port $PORT ==="
+perl "$MOCK_PL" --port "$PORT" --host 127.0.0.1 > "$TMP_DIR/mock.log" 2>&1 &
+MOCK_PID=$!
+for _ in $(seq 1 30); do
+    grep -q "listening" "$TMP_DIR/mock.log" 2>/dev/null && break
+    sleep 0.1
+done
+qm ping ping.example.com
+if ! grep -q "status: NOERROR" "$TMP_DIR/ping.out"; then
+    echo "Error: the mock DNS server does not answer"
+    cat "$TMP_DIR/mock.log" "$TMP_DIR/ping.out"
+    exit 1
+fi
+expect "UDP query answered" "$TMP_DIR/ping.out" "^ping\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.34$" "\(UDP\)$"
 
-# 5. Trace with missing glue (external referral resolution)
-"$DAG" "@127.0.0.1" -p "$PORT" +trace "trace-noglue.example.com" +tries=1 > "$TMP_DIR/trace_noglue.out" 2>&1 || true
+echo "=== [2/7] Transport: TC fallback, PROXY v2, keepopen ==="
+qm tc tc-fallback.example.com
+expect "TC=1 over UDP -> retried over TCP" "$TMP_DIR/tc.out" "^;; Truncated, retrying in TCP mode\.$" \
+    "ANSWER: 10," "^tc-fallback\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.10$" "\(TCP\)$"
 
-# 6. Trace with CNAME chain
-"$DAG" "@127.0.0.1" -p "$PORT" +trace "trace-cname.example.com" +tries=1 > "$TMP_DIR/trace_cname.out" 2>&1 || true
+proxy_check() { # label name expected-log-line dag-args...
+    plabel="$1"; pname="$2"; pwant="$3"; shift 3
+    before=$(grep -c "^PROXY " "$TMP_DIR/mock.log" || true)
+    qm "$pname" +tcp "$@" example.com
+    expect "$plabel: answered" "$TMP_DIR/$pname.out" "status: NOERROR" "192\.0\.2\.34$"
+    grep "^PROXY " "$TMP_DIR/mock.log" | tail -n +$((before + 1)) > "$TMP_DIR/$pname.proxy"
+    expect "$plabel: header as received by the server" "$TMP_DIR/$pname.proxy" "^$pwant\$"
+}
+proxy_check "+proxy (LOCAL)" proxy_local "PROXY cmd=LOCAL fam=0 src=-#0 dst=-#0" +proxy
+proxy_check "+proxy IPv4" proxy_v4 "PROXY cmd=PROXY fam=1 src=192\.0\.2\.1#12345 dst=192\.0\.2\.2#53" "+proxy=192.0.2.1#12345-192.0.2.2#53"
+proxy_check "+proxy IPv6" proxy_v6 "PROXY cmd=PROXY fam=2 src=2001:db8::1#12345 dst=2001:db8::2#53" "+proxy=2001:db8::1#12345-2001:db8::2#53"
+qm proxy_err +tcp +proxy=invalid_proxy_format example.com
+expect "invalid +proxy specification rejected" "$TMP_DIR/proxy_err.out" "^dag: invalid proxy specification 'invalid_proxy_format'$"
+rc_is "invalid +proxy specification: exit status 1" proxy_err 1
 
-# 7. Trace with CNAME loop detection
-"$DAG" "@127.0.0.1" -p "$PORT" +trace "trace-loop.example.com" +tries=1 > "$TMP_DIR/trace_loop.out" 2>&1 || true
+accepts_before=$(grep -c "^ACCEPT tcp" "$TMP_DIR/mock.log" || true)
+qm keepopen +tcp +keepopen example.com A example.com AAAA example.com TXT
+accepts=$(( $(grep -c "^ACCEPT tcp" "$TMP_DIR/mock.log" || true) - accepts_before ))
+expect "+keepopen: three answers" "$TMP_DIR/keepopen.out" "IN[[:space:]]+A[[:space:]]+192\.0\.2\.34$" \
+    "IN[[:space:]]+AAAA[[:space:]]+2001:db8::34$" "IN[[:space:]]+TXT[[:space:]]+\"v=spf1 -all\"$"
+count_is "+keepopen: all over TCP" "$TMP_DIR/keepopen.out" "^;; SERVER: .*\(TCP\)$" 3
+if [ "$accepts" -eq 1 ]; then ok "+keepopen: one TCP connection for three queries"; else ng "+keepopen: $accepts TCP connections for three queries (expected 1)"; fi
 
-# 8. +nssearch query (matching serials)
-"$DAG" "@127.0.0.1" -p "$PORT" +nssearch "nssearch-sync.example.com" +tries=1 > "$TMP_DIR/nssearch_sync.out" 2>&1 || true
+echo "=== [3/7] Plain-HTTP DoH ==="
+qm doh_post +http-plain-post example.com
+expect "DoH POST" "$TMP_DIR/doh_post.out" "status: NOERROR" "192\.0\.2\.34$" "\(HTTP\)$"
+qm doh_get +http-plain-get example.com
+expect "DoH GET" "$TMP_DIR/doh_get.out" "status: NOERROR" "192\.0\.2\.34$" "\(HTTP-GET\)$"
+qm doh_chunked +http-plain-post chunked.example.com
+expect "DoH chunked transfer encoding" "$TMP_DIR/doh_chunked.out" "status: NOERROR" "^chunked\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.34$"
+for code in 400 404 500; do
+    qm "doh_$code" +http-plain-post "error$code.doh.test"
+    expect "DoH HTTP $code reported" "$TMP_DIR/doh_$code.out" "^;; DoH server returned HTTP status $code \(expected 200 OK\)$" "^;; no servers could be reached$"
+    rc_is "DoH HTTP $code: exit status 9" "doh_$code" 9
+done
 
-# 9. +nssearch query (mismatched serials)
-"$DAG" "@127.0.0.1" -p "$PORT" +nssearch "nssearch-mismatch.example.com" +tries=1 > "$TMP_DIR/nssearch_mis.out" 2>&1 || true
+echo "=== [4/7] AXFR / IXFR ==="
+qm axfr -t AXFR multi-axfr.example.com
+expect "multi-message AXFR" "$TMP_DIR/axfr.out" "^host20\.multi-axfr\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+10\.0\.0\.20$" \
+    "^txt20\.multi-axfr\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+TXT" "^ipv6-20\.multi-axfr\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+AAAA[[:space:]]+2001:db8::14$" \
+    "^;; XFR size: 62 records \(messages 3, bytes [0-9]+\)$"
+count_is "AXFR: SOA at start and end" "$TMP_DIR/axfr.out" "IN[[:space:]]+SOA[[:space:]]" 2
+qm ixfr -t IXFR=100 ixfr-delta.example.com
+expect "IXFR delta" "$TMP_DIR/ixfr.out" "^old\.ixfr-delta\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.1$" \
+    "^new\.ixfr-delta\.example\.com\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.2$" "^;; XFR size: 6 records \(messages 1, bytes [0-9]+\)$"
+count_is "IXFR: SOA 200 / 100 / 200 / 200" "$TMP_DIR/ixfr.out" "IN[[:space:]]+SOA[[:space:]].* 200 7200 " 3
 
-# 10. +nssearch with --hex payload
-"$DAG" "@127.0.0.1" -p "$PORT" +nssearch --hex=123401000001000000000000076578616d706c6503636f6d0000060001 "example.com" +tries=1 > "$TMP_DIR/nssearch_hex.out" 2>&1 || true
-
-
-echo "=== [3/6] Executing dag Transport, DoH, PROXYv2, and TC Fallback Tests ==="
-# 1. UDP Truncation (TC=1) with automatic TCP fallback
-"$DAG" "@127.0.0.1" -p "$PORT" "tc-fallback.example.com" > "$TMP_DIR/tc_fallback.out" 2>&1 || true
-
-# 2. DoH HTTP/1.1 POST query (+https-post)
-"$DAG" "@127.0.0.1" -p "$PORT" +https-post "example.com" > "$TMP_DIR/doh_post.out" 2>&1 || true
-
-# 3. DoH HTTP/1.1 GET query (+https-get)
-"$DAG" "@127.0.0.1" -p "$PORT" +https-get "example.com" > "$TMP_DIR/doh_get.out" 2>&1 || true
-
-# 4. DoH Chunked Transfer-Encoding
-"$DAG" "@127.0.0.1" -p "$PORT" +https-post "chunked.example.com" > "$TMP_DIR/doh_chunked.out" 2>&1 || true
-
-# 5. DoH HTTP Error Responses (400, 404, 500)
-"$DAG" "@127.0.0.1" -p "$PORT" +https-post "error400.doh.test" > "$TMP_DIR/doh_400.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" +https-post "error404.doh.test" > "$TMP_DIR/doh_404.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" +https-post "error500.doh.test" > "$TMP_DIR/doh_500.out" 2>&1 || true
-
-# 6. PROXY Protocol v2 (LOCAL and PROXY mode IPv4/IPv6)
-"$DAG" "@127.0.0.1" -p "$PORT" +tcp +proxy=local "example.com" > "$TMP_DIR/proxy_local.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" +tcp +proxy=192.0.2.1#12345-192.0.2.2#53 "example.com" > "$TMP_DIR/proxy_v4.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" +tcp +proxy=2001:db8::1#12345-2001:db8::2#53 "example.com" > "$TMP_DIR/proxy_v6.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" +tcp +proxy=invalid_proxy_format "example.com" > "$TMP_DIR/proxy_err.out" 2>&1 || true
-
-# 7. Connection Keepalive / Reusing TCP Socket (+keepopen)
-cat << 'EOF' > "$TMP_DIR/queries_batch.txt"
-# Test queries for keepopen reuse
-example.com A
-example.com AAAA
-example.com TXT
-EOF
-"$DAG" "@127.0.0.1" -p "$PORT" +tcp +keepopen -f "$TMP_DIR/queries_batch.txt" > "$TMP_DIR/keepopen.out" 2>&1 || true
-
-
-echo "=== [4/6] Executing dag TSIG, AXFR, and IXFR Tests ==="
-# 1. Multi-message AXFR streaming over TCP
-"$DAG" "@127.0.0.1" -p "$PORT" -t AXFR "multi-axfr.example.com" > "$TMP_DIR/axfr_multi.out" 2>&1 || true
-
-# 2. IXFR delta streaming over TCP and UDP
-"$DAG" "@127.0.0.1" -p "$PORT" -t IXFR=100 "ixfr-delta.example.com" > "$TMP_DIR/ixfr_udp.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" +tcp -t IXFR=100 "ixfr-delta.example.com" > "$TMP_DIR/ixfr_tcp.out" 2>&1 || true
-
-# 3. TSIG Key file parsing (with comments and padding)
-cat << 'EOF' > "$TMP_DIR/tsig_comments.key"
-# TSIG Key Configuration with comments and padding
-// C++ style comment line
-key "test-key-256" {
-    algorithm hmac-sha256;
-    secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl"; # base64 secret
-};
-EOF
-"$DAG" "@127.0.0.1" -p "$PORT" -k "$TMP_DIR/tsig_comments.key" "example.com" > "$TMP_DIR/tsig_file.out" 2>&1 || true
-
-# 4. TSIG CLI algorithms: hmac-sha256, hmac-sha512, hmac-sha1
-"$DAG" "@127.0.0.1" -p "$PORT" -y "hmac-sha256:mykey:dGVzdA==" "example.com" > "$TMP_DIR/tsig_sha256.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" -y "hmac-sha512:mykey:dGVzdA==" "example.com" > "$TMP_DIR/tsig_sha512.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" -y "hmac-sha1:mykey:dGVzdA==" "example.com" > "$TMP_DIR/tsig_sha1.out" 2>&1 || true
-
-# 5. TSIG Errors: BADKEY, BADTIME
-"$DAG" "@127.0.0.1" -p "$PORT" -y "hmac-sha256:badkey:dGVzdA==" "tsig-badkey.example.com" > "$TMP_DIR/tsig_badkey.out" 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$PORT" -y "hmac-sha256:testkey:dGVzdA==" "tsig-badtime.example.com" > "$TMP_DIR/tsig_badtime.out" 2>&1 || true
-
-
-echo "=== [5/6] Executing dag Replay, PCAP (All DLTs), and Differential Tests ==="
-# Generate synthetic PCAPs with Perl for all link types (Ethernet, Linux SLL, SLL2, Raw IP, Loopback, VLAN)
-perl -e '
+echo "=== [5/7] Replay ==="
+# One query (example.com A, from 127.0.0.1:12345 to 127.0.0.1:53) per capture.
+perl - "$TMP_DIR" <<'PERL'
 use strict;
 use warnings;
-
+my $dir = shift;
 sub write_pcap {
     my ($file, $linktype, @packets) = @_;
     open my $fh, ">", $file or die "Cannot open $file: $!";
     binmode $fh;
-    # Global header: magic (0xa1b2c3d4), ver 2.4, thiszone 0, sigfigs 0, snaplen 65535, network linktype
     print $fh pack("VvvVVVV", 0xa1b2c3d4, 2, 4, 0, 0, 65535, $linktype);
     for my $raw (@packets) {
         my $len = length($raw);
@@ -187,59 +179,39 @@ sub write_pcap {
     }
     close $fh;
 }
+my $dns = pack("n6", 0x1234, 0x0100, 1, 0, 0, 0) . "\x07example\x03com\x00\x00\x01\x00\x01";
+my $udp = pack("nnnn", 12345, 53, length($dns) + 8, 0);
+my $ip = pack("CCnnnCCnCCCCCCCC", 0x45, 0, length($dns) + 28, 1, 0, 64, 17, 0, 127, 0, 0, 1, 127, 0, 0, 1);
+my $l3 = $ip . $udp . $dns;
+my $mac = "\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb";
+write_pcap("$dir/eth.pcap", 1, $mac . "\x08\x00" . $l3);                        # LINKTYPE_ETHERNET
+write_pcap("$dir/vlan.pcap", 1, $mac . "\x81\x00\x00\x64\x08\x00" . $l3);        # 802.1Q tag
+# LINKTYPE_LINUX_SLL (113): packet type, ARPHRD type, address length, 8-byte address, protocol (16 bytes)
+write_pcap("$dir/sll.pcap", 113, pack("nnna8n", 0, 1, 6, "\x00\x11\x22\x33\x44\x55", 0x0800) . $l3);
+write_pcap("$dir/raw.pcap", 101, $l3);                                           # LINKTYPE_RAW
+write_pcap("$dir/null.pcap", 0, pack("V", 2) . $l3);                             # LINKTYPE_NULL, host order
+write_pcap("$dir/loop.pcap", 108, pack("N", 2) . $l3);                           # LINKTYPE_LOOP, network order
+PERL
 
-# 1. DNS Wire Payload
-my $dns_payload = pack("n6", 0x1234, 0x0100, 1, 0, 0, 0)
-                . "\x07example\x03com\x00\x00\x01\x00\x01";
-my $udp_hdr = pack("nnnn", 12345, 53, length($dns_payload) + 8, 0);
-my $ip_hdr = pack("CCnnnCCnCCCCCCCC", 0x45, 0, length($dns_payload) + 28, 1, 0, 64, 17, 0,
-                  127, 0, 0, 1, 127, 0, 0, 1);
-
-# 2. Ethernet (DLT 1)
-my $eth_hdr = "\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x08\x00";
-write_pcap("'"$TMP_DIR"'/replay_eth.pcap", 1, $eth_hdr . $ip_hdr . $udp_hdr . $dns_payload);
-
-# 3. 802.1Q VLAN Ethernet (DLT 1)
-my $eth_vlan_hdr = "\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x81\x00\x00\x64\x08\x00";
-write_pcap("'"$TMP_DIR"'/replay_vlan.pcap", 1, $eth_vlan_hdr . $ip_hdr . $udp_hdr . $dns_payload);
-
-# 4. Linux Cooked Capture v1 (DLT 113)
-my $sll_hdr = pack("nnnna8n", 0, 1, 6, 0, "\x00\x11\x22\x33\x44\x55\x00\x00", 0x0800);
-write_pcap("'"$TMP_DIR"'/replay_sll.pcap", 113, $sll_hdr . $ip_hdr . $udp_hdr . $dns_payload);
-
-# 5. Linux Cooked Capture v2 (DLT 276)
-my $sll2_hdr = pack("nCCnnnN", 0x0800, 0, 0, 0, 0, 0, 0);
-write_pcap("'"$TMP_DIR"'/replay_sll2.pcap", 276, $sll2_hdr . $ip_hdr . $udp_hdr . $dns_payload);
-
-# 6. Raw IPv4 (DLT 101)
-write_pcap("'"$TMP_DIR"'/replay_raw.pcap", 101, $ip_hdr . $udp_hdr . $dns_payload);
-
-# 7. Loopback (DLT 0)
-my $null_hdr = pack("V", 2); # AF_INET in little endian
-write_pcap("'"$TMP_DIR"'/replay_null.pcap", 0, $null_hdr . $ip_hdr . $udp_hdr . $dns_payload);
-'
-
-# Replay single PCAPs
-"$DAG" replay --server1="127.0.0.1:$PORT" "$TMP_DIR/replay_eth.pcap" > "$TMP_DIR/rep_eth.out" 2>&1 || true
-"$DAG" replay --server1="127.0.0.1:$PORT" "$TMP_DIR/replay_vlan.pcap" > "$TMP_DIR/rep_vlan.out" 2>&1 || true
-"$DAG" replay --server1="127.0.0.1:$PORT" "$TMP_DIR/replay_sll.pcap" > "$TMP_DIR/rep_sll.out" 2>&1 || true
-"$DAG" replay --server1="127.0.0.1:$PORT" "$TMP_DIR/replay_sll2.pcap" > "$TMP_DIR/rep_sll2.out" 2>&1 || true
-"$DAG" replay --server1="127.0.0.1:$PORT" "$TMP_DIR/replay_raw.pcap" > "$TMP_DIR/rep_raw.out" 2>&1 || true
-"$DAG" replay --server1="127.0.0.1:$PORT" "$TMP_DIR/replay_null.pcap" > "$TMP_DIR/rep_null.out" 2>&1 || true
-
-# Replay with JSON and YAML outputs
-"$DAG" replay --server1="127.0.0.1:$PORT" --output-json "$TMP_DIR/replay_eth.pcap" > "$TMP_DIR/rep_json.out" 2>&1 || true
-"$DAG" replay --server1="127.0.0.1:$PORT" --output-yaml "$TMP_DIR/replay_eth.pcap" > "$TMP_DIR/rep_yaml.out" 2>&1 || true
-
-# Replay with --diff and --compare-recorded
-"$DAG" replay --server1="127.0.0.1:$PORT" --server2="127.0.0.1:$PORT" --diff --diff-file="$TMP_DIR/diff.log" "$TMP_DIR/replay_eth.pcap" > "$TMP_DIR/rep_diff.out" 2>&1 || true
-"$DAG" replay --server1="127.0.0.1:$PORT" --compare-recorded "$TMP_DIR/replay_eth.pcap" > "$TMP_DIR/rep_comp.out" 2>&1 || true
-
-# Replay with --max-queries and --stop-after
-"$DAG" replay --server1="127.0.0.1:$PORT" --max-queries=1 --stop-after=1 "$TMP_DIR/replay_eth.pcap" > "$TMP_DIR/rep_limit.out" 2>&1 || true
-
-# Replay text query list with options (+dnssec, +nodnssec, +tcp, +udp, comments)
-cat << 'EOF' > "$TMP_DIR/text_queries.txt"
+replay() { # name args...
+    name="$1"; shift
+    set +e
+    "$DAG" --replay "$@" --server1 "127.0.0.1:$PORT" > "$TMP_DIR/$name.out" 2>&1
+    echo $? > "$TMP_DIR/$name.rc"
+    set -e
+}
+for f in eth vlan sll raw null loop; do
+    replay "rep_$f" "$TMP_DIR/$f.pcap"
+    expect "replay $f.pcap" "$TMP_DIR/rep_$f.out" "^Total Queries Replayed: 1$" "^  Received: 1$" "^  RCODEs:   NOERROR=1 "
+    rc_is "replay $f.pcap: exit status 0" "rep_$f" 0
+done
+replay rep_json "$TMP_DIR/eth.pcap" --output json
+expect "replay --output json" "$TMP_DIR/rep_json.out" "^  \"total_queries\": 1,$" "\"received\": 1,$" "\"noerror\": 1,$"
+replay rep_diff "$TMP_DIR/eth.pcap" --server2 "127.0.0.1:$PORT" --diff
+expect "replay --diff (same server twice)" "$TMP_DIR/rep_diff.out" "^  Compared: +1$" "^  Identical responses: 1 \(100\.0%\)$" "^  Mismatched responses: 0$"
+replay rep_comp "$TMP_DIR/eth.pcap" --compare-recorded
+expect "replay --compare-recorded" "$TMP_DIR/rep_comp.out" "^  RCODE Mismatches: +0$" "^  RRset Mismatches: +0$"
+cat > "$TMP_DIR/text_queries.txt" <<'EOF'
 # Comment line to skip
 ; Semicolon comment
 
@@ -248,94 +220,70 @@ example.com AAAA +nodnssec
 example.com TXT +tcp
 example.com MX +udp
 EOF
-"$DAG" replay --server1="127.0.0.1:$PORT" "$TMP_DIR/text_queries.txt" > "$TMP_DIR/rep_txt.out" 2>&1 || true
+replay rep_txt "$TMP_DIR/text_queries.txt"
+expect "replay of a text query list (comments skipped)" "$TMP_DIR/rep_txt.out" "^Total Queries Replayed: 4$" "^  Received: 4$" "NOERROR=4 "
+replay rep_limit "$TMP_DIR/text_queries.txt" --max-queries 1
+expect "replay --max-queries 1" "$TMP_DIR/rep_limit.out" "^  Sent: +1$" "^  Received: 1$"
 
-
-echo "=== [6/6] Executing karictl IPC Control Channel & Observatory Tests ==="
-# Launch actual KariDNS server with control channel configured
-cat << EOF > "$TMP_DIR/karidns.conf"
-options {
-    port $KARI_PORT;
-    bind-address { 127.0.0.1; };
-    user "nobody";
-    group "nobody";
-    response-cache-size 1024;
-};
-
-control-channel {
-    bind-address 127.0.0.1;
-    port $CTRL_PORT;
-    algorithm hmac-sha256;
-    secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
-};
-
-view "default" {
-    match-clients { any; };
-    zone "example.com" {
-        type master;
-        file "$TMP_DIR/example.com.zone";
-        allow-transfer { any; };
-    };
-};
+echo "=== [6/7] karidns for TSIG on port $KARI_PORT ==="
+SECRET="dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl"
+USER_OPT=""
+[ "$(id -u)" = "0" ] && USER_OPT="user \"nobody\"; group \"nobody\";"
+cat > "$TMP_DIR/tsig.zone" <<'EOF'
+$ORIGIN tsig.test.
+$TTL 300
+@   IN SOA ns1 hostmaster 1 7200 3600 1209600 300
+@   IN NS  ns1
+ns1 IN A   192.0.2.1
+www IN A   192.0.2.80
 EOF
-
-cat << EOF > "$TMP_DIR/example.com.zone"
-\$TTL 3600
-\$ORIGIN example.com.
-@ IN SOA ns1.example.com. hostmaster.example.com. (
-    2026092401 ; serial
-    7200       ; refresh
-    3600       ; retry
-    1209600    ; expire
-    3600       ; minimum
-)
-@       IN NS    ns1.example.com.
-ns1     IN A     127.0.0.1
-www     IN A     192.0.2.1
-EOF
-
-# Start KariDNS
-"$KARIDNS" -c "$TMP_DIR/karidns.conf" -d > "$TMP_DIR/karidns.log" 2>&1 &
+{
+    echo "options { port $KARI_PORT; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
+    for a in md5 sha1 sha224 sha256 sha384 sha512; do
+        echo "key \"k-$a\" { algorithm hmac-$a; secret \"$SECRET\"; };"
+    done
+    echo "zone \"tsig.test\" { type master; file \"$TMP_DIR/tsig.zone\"; };"
+} > "$TMP_DIR/karidns.conf"
+"$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns.log" 2>&1 &
 KARI_PID=$!
-sleep 1
+for _ in $(seq 1 50); do
+    "$DAG" @127.0.0.1 -p "$KARI_PORT" tsig.test SOA +short +timeout=1 +tries=1 2>/dev/null | grep -q hostmaster && break
+    sleep 0.2
+done
 
-# Send queries to populate Observatory metrics
-"$DAG" "@127.0.0.1" -p "$KARI_PORT" "www.example.com" A > /dev/null 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$KARI_PORT" "nxdomain.example.com" A > /dev/null 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$KARI_PORT" +tcp "www.example.com" A > /dev/null 2>&1 || true
-"$DAG" "@127.0.0.1" -p "$KARI_PORT" +dnssec "www.example.com" A > /dev/null 2>&1 || true
+qk() { # name args...
+    name="$1"; shift
+    "$DAG" @127.0.0.1 -p "$KARI_PORT" +nohexdump +timeout=3 +tries=1 www.tsig.test A "$@" > "$TMP_DIR/$name.out" 2>&1 || true
+}
 
-# Test karictl commands
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" status > "$TMP_DIR/ctl_status.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" observatory > "$TMP_DIR/ctl_observatory.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" stats > "$TMP_DIR/ctl_stats.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" reconfig > "$TMP_DIR/ctl_reconfig.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" reload > "$TMP_DIR/ctl_reload.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" flush > "$TMP_DIR/ctl_flush.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" zonestatus example.com > "$TMP_DIR/ctl_zonestatus.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" notify example.com > "$TMP_DIR/ctl_notify.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" axfr example.com > "$TMP_DIR/ctl_axfr.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" zonemd-verify example.com > "$TMP_DIR/ctl_zonemd.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" query-log on > "$TMP_DIR/ctl_qlog_on.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" query-log off > "$TMP_DIR/ctl_qlog_off.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" response-log on > "$TMP_DIR/ctl_rlog_on.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" response-log off > "$TMP_DIR/ctl_rlog_off.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" dump-cache > "$TMP_DIR/ctl_dump_cache.out" 2>&1 || true
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" sync-slaves > "$TMP_DIR/ctl_sync_slaves.out" 2>&1 || true
+echo "=== [7/7] TSIG (RFC 8945) ==="
+for spec in md5:16 sha1:20 sha224:28 sha256:32 sha384:48 sha512:64; do
+    a=${spec%%:*}; maclen=${spec#*:}
+    qk "tsig_$a" -y "hmac-$a:k-$a:$SECRET"
+    expect "TSIG hmac-$a: signed query, verified signed response" "$TMP_DIR/tsig_$a.out" "status: NOERROR" \
+        "^www\.tsig\.test\.[[:space:]]+300[[:space:]]+IN[[:space:]]+A[[:space:]]+192\.0\.2\.80$" \
+        "^k-$a\.[[:space:]]+0[[:space:]]+ANY[[:space:]]+TSIG[[:space:]]+hmac-$a\.[[:space:]]+[0-9]+[[:space:]]+300[[:space:]]+$maclen[[:space:]].*[[:space:]]NOERROR[[:space:]]+0[[:space:]]*$"
+    expect_not "TSIG hmac-$a: no verification warning" "$TMP_DIR/tsig_$a.out" "Couldn't verify|could not be validated"
+done
+cat > "$TMP_DIR/tsig_comments.key" <<EOF
+# TSIG Key Configuration with comments and padding
+// C++ style comment line
+key "k-sha384" {
+    algorithm hmac-sha384;
+    secret "$SECRET"; # base64 secret
+};
+EOF
+qk tsig_file -k "$TMP_DIR/tsig_comments.key"
+expect "TSIG keyfile with comments (-k)" "$TMP_DIR/tsig_file.out" "status: NOERROR" "^k-sha384\.[[:space:]]+0[[:space:]]+ANY[[:space:]]+TSIG[[:space:]]+hmac-sha384\..*[[:space:]]NOERROR[[:space:]]+0"
+expect_not "TSIG keyfile: no verification warning" "$TMP_DIR/tsig_file.out" "Couldn't verify|could not be validated"
+# RFC 8945 §5.2.2 / §5.2.1: wrong secret -> BADSIG, unknown key -> BADKEY (NOTAUTH, unsigned)
+qk tsig_badsig -y "hmac-sha256:k-sha256:d3Jvbmc="
+expect "TSIG wrong secret -> BADSIG" "$TMP_DIR/tsig_badsig.out" "status: NOTAUTH" "TSIG[[:space:]]+hmac-sha256\..*[[:space:]]BADSIG[[:space:]]" "^;; Couldn't verify signature: tsig indicates error$"
+qk tsig_badkey -y "hmac-sha256:nokey:$SECRET"
+expect "TSIG unknown key -> BADKEY" "$TMP_DIR/tsig_badkey.out" "status: NOTAUTH" "^nokey\.[[:space:]].*TSIG[[:space:]]+hmac-sha256\..*[[:space:]]BADKEY[[:space:]]"
 
-# Test karictl version and help
-"$KARICTL" version > "$TMP_DIR/ctl_ver.out" 2>&1 || true
-"$KARICTL" help > "$TMP_DIR/ctl_help.out" 2>&1 || true
-
-# Test karictl invalid command & wrong secret error paths
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" unknown-command > "$TMP_DIR/ctl_unknown.out" 2>&1 || true
-"$KARICTL" -s "127.0.0.1:53999" status > "$TMP_DIR/ctl_conn_refused.out" 2>&1 || true
-
-# Test config file permission warning (mode 0644 vs 0600)
-chmod 0644 "$TMP_DIR/karidns.conf"
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" status > "$TMP_DIR/ctl_perm_warn.out" 2>&1 || true
-chmod 0600 "$TMP_DIR/karidns.conf"
-"$KARICTL" -c "$TMP_DIR/karidns.conf" -s "127.0.0.1:$CTRL_PORT" status > "$TMP_DIR/ctl_perm_clean.out" 2>&1 || true
-
-echo "=== Comprehensive DAG & karictl Scenario Matrix: ALL TESTS PASSED! ==="
+echo "=== Results: $PASSED passed, $FAILED failed ==="
+if [ "$FAILED" -ne 0 ]; then
+    exit 1
+fi
 exit 0

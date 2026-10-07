@@ -229,6 +229,16 @@ EOF
 "$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
 sleep 1
 
+# RFC 9432 §5.3.1: without a coo property in catalog1 pointing to catalog2, the claim is
+# ignored and the member stays with catalog1 (same unique-id, still served)
+grep "Name collision for 'coo-test.com.' between 'catalog1.example.com.' and 'catalog2.example.com.'. Ignoring." karidns.log || { echo "Failed: collision without coo not reported"; cat karidns.log; kill $SERVER_PID; exit 1; }
+if grep -q "CoO transfer: .*'coo-test.com.'" karidns.log; then
+    echo "Failed: member migrated to catalog2 without a coo property"; cat karidns.log; kill $SERVER_PID; exit 1
+fi
+"$BIN_DIR/dag" -p 53530 @127.0.0.1 coo-test.com. SOA > dag_out.txt || true
+grep "status: SERVFAIL" dag_out.txt || { echo "Failed: coo-test.com no longer loaded after the ignored claim"; cat dag_out.txt; kill $SERVER_PID; exit 1; }
+echo "[+] CoO Test: claim without coo ignored"
+
 echo "[+] CoO Test: Initiating valid transfer (adding coo PTR to catalog1)..."
 cat << EOF > catalog1.zone
 \$ORIGIN catalog1.example.com.

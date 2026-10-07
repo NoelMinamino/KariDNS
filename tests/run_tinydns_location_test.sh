@@ -62,14 +62,24 @@ run_check() {
     fi
 }
 
+# run_check_not NAME CMD UNEXPECTED EXPECTED: UNEXPECTED must not appear and EXPECTED must, in the same
+# output (a negative check alone would pass when the server is down or the query times out)
 run_check_not() {
     NAME="$1"
     CMD="$2"
     UNEXPECTED="$3"
+    EXPECTED="$4"
 
     echo -n "Test: $NAME ... "
     OUTPUT=$(eval "$CMD" 2>&1 || true)
-    if echo "$OUTPUT" | grep -E -q "$UNEXPECTED"; then
+    FLAT_OUTPUT=$(echo "$OUTPUT" | tr '\n' ' ')
+    if ! echo "$FLAT_OUTPUT" | grep -E -q "$EXPECTED"; then
+        echo "FAILED"
+        echo "  Command: $CMD"
+        echo "  Expected pattern missing: $EXPECTED"
+        echo "  Output: $OUTPUT"
+        FAILED=$((FAILED + 1))
+    elif echo "$OUTPUT" | grep -E -q "$UNEXPECTED"; then
         echo "FAILED"
         echo "  Command: $CMD"
         echo "  Unexpected pattern found: $UNEXPECTED"
@@ -89,7 +99,7 @@ cat << 'EOF' > "$TMP_DIR/zone1.data"
 .zone1.test:127.0.0.1:ns1.zone1.test:2560
 +www.zone1.test:192.168.1.10:300::in
 +www.zone1.test:10.0.0.10:300::ex
-+www.zone1.test:1.2.3.4:300
++www.zone1.test:192.0.2.4:300
 +inonly.zone1.test:192.168.1.20:300::in
 +exonly.zone1.test:10.0.0.20:300::ex
 EOF
@@ -193,13 +203,14 @@ run_check "zone1 exonly returns NXDOMAIN" \
     "$DAG exonly.zone1.test A @127.0.0.1 -p $PORT" \
     "status: NXDOMAIN"
 
-run_check "zone1 www returns 'in' (192.168.1.10) and unrestricted (1.2.3.4)" \
+run_check "zone1 www returns 'in' (192.168.1.10) and unrestricted (192.0.2.4)" \
     "$DAG www.zone1.test A @127.0.0.1 -p $PORT +short" \
-    "192.168.1.10.*1.2.3.4|1.2.3.4.*192.168.1.10"
+    "192.168.1.10.*192.0.2.4|192.0.2.4.*192.168.1.10"
 
 run_check_not "zone1 www does NOT contain 'ex' (10.0.0.10)" \
     "$DAG www.zone1.test A @127.0.0.1 -p $PORT +short" \
-    "10\.0\.0\.10"
+    "10\.0\.0\.10" \
+    "192\.168\.1\.10"
 
 echo "=== 2. Zone 2 (Client is 'ex' via 127.0.0.1): ex-records match, in excluded ==="
 run_check "zone2 exonly matches" \
@@ -231,13 +242,14 @@ run_check "BIND zone query returns A 192.168.1.100" \
 
 echo "=== 6. Multi-Source IP Test (via 127.0.0.2 alias) ==="
 if [ "$ALIAS_ADDED" = "1" ] || $DAG www.zone1.test A @127.0.0.1 -p $PORT -b "$ALIAS_IP" >/dev/null 2>&1; then
-    run_check "zone1 from 127.0.0.2 returns 'ex' (10.0.0.10) and unrestricted (1.2.3.4)" \
+    run_check "zone1 from 127.0.0.2 returns 'ex' (10.0.0.10) and unrestricted (192.0.2.4)" \
         "$DAG www.zone1.test A @127.0.0.1 -p $PORT -b $ALIAS_IP +short" \
-        "10.0.0.10.*1.2.3.4|1.2.3.4.*10.0.0.10"
+        "10.0.0.10.*192.0.2.4|192.0.2.4.*10.0.0.10"
 
     run_check_not "zone1 from 127.0.0.2 does NOT contain 'in' (192.168.1.10)" \
         "$DAG www.zone1.test A @127.0.0.1 -p $PORT -b $ALIAS_IP +short" \
-        "192\.168\.1\.10"
+        "192\.168\.1\.10" \
+        "10\.0\.0\.10"
 
     run_check "zone1 exonly from 127.0.0.2 returns 10.0.0.20" \
         "$DAG exonly.zone1.test A @127.0.0.1 -p $PORT -b $ALIAS_IP +short" \
