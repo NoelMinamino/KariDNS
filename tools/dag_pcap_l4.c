@@ -23,6 +23,14 @@ bool pcap_extract_l4(const uint8_t *data, size_t len, uint32_t linktype, pcap_l4
         uint16_t proto = ((uint16_t)data[14] << 8) | data[15];
         ip_offset = 16;
         if (proto != 0x0800 && proto != 0x86DD) return false;
+    } else if (linktype == 276) {
+        /* LINKTYPE_LINUX_SLL2 (tcpdump.org link-layer header types): 20-octet header; protocol type (big-endian
+         * Ethernet type) at offset 0, then reserved, interface index, ARPHRD type, packet type, address length
+         * and an 8-octet address. Written by "tcpdump -i any" on current Linux. */
+        if (len < 20) return false;
+        uint16_t proto = ((uint16_t)data[0] << 8) | data[1];
+        ip_offset = 20;
+        if (proto != 0x0800 && proto != 0x86DD) return false;
     } else if (linktype == 12 || linktype == 101) { // RAW IP
         ip_offset = 0;
     } else if (linktype == 0 || linktype == 108) {

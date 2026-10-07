@@ -22,6 +22,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     static const uint32_t linktypes[] = {
         1,   // LINKTYPE_ETHERNET
         113, // LINKTYPE_LINUX_SLL
+        276, // LINKTYPE_LINUX_SLL2
         12,  // LINKTYPE_RAW
         101, // LINKTYPE_RAW_ALT
         0,   // LINKTYPE_NULL

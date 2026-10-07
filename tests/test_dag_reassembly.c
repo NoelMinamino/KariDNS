@@ -141,6 +141,18 @@ static void test_extract_l4(void) {
     assert(pcap_extract_l4(s.b, s.n, 113, &o) && o.src_port == 15 && o.l4_payload_len == sizeof(dns));
     s.b[14] = 0x08; s.b[15] = 0x06;                                       /* SLL protocol = ARP */
     assert(!pcap_extract_l4(s.b, s.n, 113, &o));
+    /* X-48: LINKTYPE_LINUX_SLL2 (276): protocol type, reserved, ifindex, ARPHRD, packet type, address length,
+     * 8-octet address = 20 octets */
+    {
+        frame_t s2;
+        static const uint8_t mac8[8] = { 2, 0, 0, 0, 0, 1, 0, 0 };
+        s2.n = 0; f16(&s2, 0x86DD); f16(&s2, 0); f32(&s2, 3); f16(&s2, 1); f8(&s2, 0); f8(&s2, 6); fbytes(&s2, mac8, 8);
+        ip6(&s2, 17, 8 + sizeof(dns), A6, B6); udp(&s2, 17, 18, 8 + sizeof(dns), dns, sizeof(dns));
+        assert(pcap_extract_l4(s2.b, s2.n, 276, &o) && o.ip_version == 6 && o.src_port == 17 && o.l4_payload_len == sizeof(dns));
+        s2.b[0] = 0x08; s2.b[1] = 0x06;                                   /* ARP */
+        assert(!pcap_extract_l4(s2.b, s2.n, 276, &o));
+        assert(!pcap_extract_l4(s2.b, 19, 276, &o));                      /* shorter than the header */
+    }
 
     /* frames that are not DNS carriers */
     eth(&f, 0x0806, false); for (int i = 0; i < 28; i++) f8(&f, 0);                  /* ARP */
