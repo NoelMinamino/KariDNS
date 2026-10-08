@@ -15,7 +15,7 @@
 #
 # Options:
 #   FUZZ_RUNS=1000          # Number of runs per target (default: 1000)
-#   FUZZ_SMOKE_SECONDS=5    # Time limit per target (used if FUZZ_RUNS is empty)
+#   FUZZ_SMOKE_SECONDS=5    # Time limit per target (used if FUZZ_RUNS is empty, e.g. FUZZ_RUNS= , or 0)
 
 set -u
 cd "$(dirname "$0")/.."
@@ -25,8 +25,9 @@ case "$MODE" in
     dag|karidns|all) ;;
     *) echo "usage: $0 [dag|karidns|all]"; exit 2 ;;
 esac
-FUZZ_RUNS="${FUZZ_RUNS:-1000}"
-FUZZ_SMOKE_SECONDS="${FUZZ_SMOKE_SECONDS:-}"
+# Only an unset FUZZ_RUNS gets the default: an empty one selects the time limit (X-53).
+FUZZ_RUNS="${FUZZ_RUNS-1000}"
+FUZZ_SMOKE_SECONDS="${FUZZ_SMOKE_SECONDS:-5}"
 
 FAILED=0
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/kari_fuzz_smoke.XXXXXX") || exit 1

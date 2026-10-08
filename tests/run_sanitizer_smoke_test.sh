@@ -28,6 +28,7 @@ ZONE_FILE="tests/zones/example.com.zone"
 ZONE_NAME="example.com"
 
 # $INCLUDE Test fixture (Use if present; if not, skip and issue a warning only)
+# valid_parent.zone includes valid_child.inc and valid_sub.inc (with an origin argument) (X-52)
 INCLUDE_VALID_ZONE="tests/include_tests/valid_parent.zone"
 INCLUDE_CYCLIC_ZONE="tests/include_tests/cyclic_a.zone"
 INCLUDE_ERROR_ZONE="tests/include_tests/error_caret.zone"
@@ -39,8 +40,9 @@ GENERATE_NORMAL="tests/zones/generate_normal.zone"
 GENERATE_BAD_RANGE="tests/zones/generate_bad_range.zone"
 GENERATE_BAD_WIDTH="tests/zones/generate_bad_width.zone"
 
-FUZZ_RUNS="${FUZZ_RUNS:-1000}"         # Default runs per fuzz target for quick CI smoke test
-FUZZ_SMOKE_SECONDS="${FUZZ_SMOKE_SECONDS:-}" # Optional time limit (if set and FUZZ_RUNS is empty)
+# Only an unset FUZZ_RUNS gets the default: an empty one (FUZZ_RUNS= ) or 0 selects the time limit (X-53).
+FUZZ_RUNS="${FUZZ_RUNS-1000}"          # Default runs per fuzz target for quick CI smoke test
+FUZZ_SMOKE_SECONDS="${FUZZ_SMOKE_SECONDS:-5}" # Time limit per target (used if FUZZ_RUNS is empty)
 
 FAILED=0
 log_fail() { echo "  -> FAIL: $1"; FAILED=1; }

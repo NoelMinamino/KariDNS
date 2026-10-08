@@ -1,0 +1,11 @@
+; Valid $INCLUDE fixture: karicheck must accept it (run_sanitizer_smoke_test.sh "$INCLUDE valid").
+; RFC 1035 §5.1: "$INCLUDE <file-name> [<domain-name>]"; the optional origin applies to the included
+; file only, and the origin of the including file is restored afterwards.
+$ORIGIN example.com.
+$TTL 3600
+@ IN SOA ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 3600
+@ IN NS ns1.example.com.
+ns1 IN A 192.0.2.1
+$INCLUDE valid_child.inc
+$INCLUDE valid_sub.inc sub.example.com.
+after IN A 192.0.2.4
