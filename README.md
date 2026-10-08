@@ -31,7 +31,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
   - **Forward Zones (`type forward`):** Transparent query forwarding to multiple upstream nameservers with per-zone timeouts, shared deadline budgeting, automatic failover, transaction ID randomization, and response verification.
   - **Program Zone Plugins (`type program`):** Test-only dynamic external process-backed zones communicating over stdin/stdout pipes with strict privilege dropping and automatic circuit-breaker failure isolation. For IPC protocol specifications and multi-language implementation examples (Perl, Python, C, Rust, Go), see **[KariDNS: 'type program' Zone Guide](docs/KariDNS_how_to_use_type_program_zone.md)**.
 - **Dynamic DNS Update:** Ephemeral DNS UPDATE handling (RFC 2136 / RFC 3007) with prerequisite evaluation and TSIG verification.
-- **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, DS, CDS, CDNSKEY, CSYNC, etc.). Includes RFC 8976 (ZONEMD) digest validation.
+- **DNSSEC Support (Static):** Serves pre-signed DNSSEC records (DNSKEY, RRSIG, NSEC, NSEC3, DS, CDS, CDNSKEY, CSYNC, etc.), with NSEC and NSEC3 denial-of-existence proofs. ZONEMD (RFC 8976) records are served like any other record; the server does not verify them, neither at load time nor after a zone transfer. `karicheck` verifies ZONEMD digests before a zone is published.
 - **Security & Rate Limiting:**
   - **Response Rate Limiting (RRL):** token-bucket rate limiting keyed like BIND 9 (client prefix with `ipv4-prefix-length`/`ipv6-prefix-length`, response kind, QNAME/zone/delegation point), `all-per-second`, and `slip` truncation. Differences from BIND are listed in `docs/karidns.md`.
   - **DNS Cookies (RFC 7873 / RFC 9018):** Interoperable SipHash-2-4 Server Cookies with configurable, rotatable `cookie-secret`; BADCOOKIE and 30-minute refresh handling.
@@ -83,7 +83,7 @@ KariDNS natively parses, validates, and serializes the following standard and ex
 - **djbdns/tinydns Plain-Text Format (`file-format tinydns;`):**
   - Loads zone data directly from djbdns/tinydns plain-text `data` files (not compiled `data.cdb`).
   - Supports record markers `.` (SOA+NS+A), `&` (NS+A), `+` (A), `=` (A+PTR), `-` (disabled/comment), `@` (MX+A), `'` (TXT, 127-byte chunking), `^` (PTR), `C` (CNAME), `Z` (complete SOA), `:` (generic RR), and the common extensions `3` (AAAA), `6` (AAAA+PTR), `S` (SRV), `N` (NAPTR) and `_` (SSHFP).
-  - Handles client geolocation steering with `%` location prefixes and trailing `:loc` record tags, parent/child zone delegation with longest-suffix matching, and load-time TAI64 `timestamp` / countdown TTL evaluation.
+  - Handles client geolocation steering with `%` location prefixes and trailing `:loc` record tags, parent/child zone delegation with longest-suffix matching, and TAI64 `timestamp` fields evaluated on every query, as `tinydns` does (a record that becomes active at the timestamp, or with `ttl` 0 one that expires there with a countdown TTL).
 
 ---
 

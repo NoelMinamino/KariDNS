@@ -357,7 +357,7 @@ TSIG processing (RFC 8945 §5.2, §5.3) is the same for every opcode (QUERY, NOT
 | Valid TSIG | The normal response, signed with the request's key |
 | No TSIG | The normal response or REFUSED, unsigned |
 
-A signed response that would not fit the client's UDP size with its TSIG is truncated (TC=1). A NOTIFY is accepted from a `masters` address and, when the zone has `tsig-key`, only when it is signed with that key. `allow-update` accepts a client whose address matches or whose request is signed with a listed key. A response that is cut down by RRL `slip` carries no TSIG.
+A signed response that would not fit the client's UDP size with its TSIG is truncated (TC=1). A NOTIFY is accepted from a `masters` address and, when the zone has `tsig-key`, only when it is signed with that key. `allow-update` accepts a client whose address matches or whose request is signed with a listed key. A truncated RRL `slip` response to a signed request is signed with the request's key as well, as in BIND 9.20 (signed requests are not exempt from rate limiting).
 
 ### `control-channel { ... }`
 
@@ -616,6 +616,20 @@ correctly without duplicate records).
 >   127-byte TXT character-string chunking, and the same lenient IPv4
 >   octet parsing (no range validation, trailing garbage tolerated) as
 >   the original `tinydns-data`.
+> - **Extensions** (not in djbdns 1.05). Empty numeric fields are 0; the
+>   default TTL is 86400; `timestamp` and `lo` work as for the other types:
+>   - `3fqdn:ip6:ttl:timestamp:lo`: AAAA. `ip6` is 32 hex digits without
+>     colons (e.g. `20010db8000000000000000000000001`).
+>   - `6fqdn:ip6:ttl:timestamp:lo`: AAAA plus PTR records under `ip6.arpa`
+>     and `ip6.int`.
+>   - `Sfqdn:ip:x:port:weight:priority:ttl:timestamp:lo`: SRV with target
+>     `x` (a full name, no expansion), plus an A record for `x` when `ip`
+>     is given.
+>   - `Nfqdn:order:pref:flags:service:regexp:replacement:ttl:timestamp:lo`:
+>     NAPTR. `flags`, `service` and `regexp` take the octal escapes of `:`
+>     records.
+>   - `_fqdn:algorithm:fptype:fingerprint:ttl:timestamp:lo`: SSHFP with a
+>     hex fingerprint; a line whose fingerprint is not valid hex is skipped.
 > - **`timestamp` field**: Supported with **real-time query evaluation**,
 >   identical to original djbdns behavior. A record whose `timestamp` is in
 >   the future is excluded dynamically on every query (not just at load time).

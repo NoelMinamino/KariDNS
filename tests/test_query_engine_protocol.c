@@ -921,6 +921,22 @@ static void test_response_header_and_error_builder(void) {
     check_hdr(&r, &q, 1, false, true);
     CHECK(&r, gr_count(&r, 3, 41) == 1);
 
+    /* RFC 9619 §4: a QUERY with QDCOUNT=0 is not malformed -> NOERROR without a question. A cookie-only query
+     * (RFC 7873 §5.4) gets its client cookie back with a server cookie (8 + 16 octets). */
+    static const uint8_t cookie_only[] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
+    put_hdr(&q, 0x4592, HDR_FLAGS_ALL, 0, 0, 0, 1); put_opt(&q, 0, 0, 0, cookie_only, sizeof(cookie_only));
+    ask(&q, "", 0, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, false, true);
+    size_t q0_clen = 0;
+    const uint8_t *q0_ck = gr_find_cookie(&r, &q0_clen, NULL);
+    CHECK(&r, r.msg[4] == 0 && r.msg[5] == 0 && r.counts[0] == 0 && r.counts[1] == 0 && gr_count(&r, 3, 41) == 1);
+    CHECK(&r, q0_ck != NULL && q0_clen == 24 && memcmp(q0_ck, cookie_only + 4, 8) == 0);
+    /* without OPT: the 12-octet header only */
+    put_hdr(&q, 0x4592, 0x0100, 0, 0, 0, 0);
+    ask(&q, "", 0, "192.0.2.100", false, &r);
+    check_hdr(&r, &q, 0, false, true);
+    CHECK(&r, r.len == DNS_HEADER_SIZE);
+
     /* RFC 10029 §3.3: MQTYPE-Query with QDCOUNT=0 -> FORMERR, now with OPT (RFC 6891 §7) */
     g_gr.cfg.rfc10029_mqtype_enable = true;
     static const uint8_t mq[] = { 0, 20, 0, 2, 0, 28 };
